@@ -236,6 +236,7 @@ impl Drop for ConnSub {
 /// connection close) aborts every forwarder → disconnect cleanup (§6.1).
 #[derive(Default)]
 pub(crate) struct ConnSubs {
+    pub(crate) pairing: crate::pairing::ConnectionPairing,
     subs: HashMap<String, ConnSub>,
     setup: crate::provider_setup::Connection,
     /// The server-bound hello used to refresh browser hosting on a live upgrade.
@@ -452,6 +453,18 @@ pub(crate) async fn process_frame(
             }
         }
         if let Some(server_info) = server_pairing_info {
+            if let Some(req) = crate::pairing::classify_self(value) {
+                let frame = panic_guard::guard_frame(
+                    &method,
+                    rpc_id.clone(),
+                    crate::pairing::handle_self(req, server_info, api, &mut subs.pairing),
+                )
+                .await;
+                return match frame {
+                    Some(frame) => out_tx.send_priority(frame).await.is_ok(),
+                    None => true,
+                };
+            }
             if let Some(req) = crate::server::classify(value) {
                 // server.* RPCs are local-only; gate on real connection origin (UDS vs TCP)
                 // not the locality flag. Task-local context set by transport (§5.2).

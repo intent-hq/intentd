@@ -347,7 +347,7 @@ where
             .await
         })
         .await;
-        if !frame_ok {
+        if !frame_ok || subs.pairing.revoked {
             break Ok(());
         }
     };

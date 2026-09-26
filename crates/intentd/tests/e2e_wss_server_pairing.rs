@@ -11,6 +11,8 @@
 #![cfg(unix)]
 
 mod common;
+#[path = "e2e_wss_server_pairing/personal_pairing.rs"]
+mod personal_pairing;
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};

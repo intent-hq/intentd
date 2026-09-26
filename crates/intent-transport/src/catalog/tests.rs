@@ -740,6 +740,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "note.update",
     "note.updateMetadata",
     "pairing.getInfo",
+    "pairing.getSelfInfo",
     "pr.refresh",
     "pr.status",
     "prMonitor.cancel",

@@ -92,6 +92,7 @@ pub struct AsyncTokenStore {
     write_timeout: Duration,
     cache_ttl: Duration,
     warn_interval: Duration,
+    changes: watch::Sender<Option<String>>,
 }
 
 /// Combined async state: the single cache slot, timeout-warn rate-limit
@@ -153,6 +154,7 @@ impl AsyncTokenStore {
     ) -> Self {
         Self {
             inner,
+            changes: watch::channel(None).0,
             state: Arc::new(Mutex::new(TokenState {
                 entry: None,
                 last_warn: None,
@@ -236,6 +238,7 @@ impl AsyncTokenStore {
                     value: Some(token.to_string()),
                     expires_at: Instant::now() + self.cache_ttl,
                 });
+                self.changes.send_replace(Some(hash_token(token)));
                 Ok(())
             }
             Ok(Ok(Err(e))) => Err(e),
@@ -343,6 +346,104 @@ impl AsyncTokenStore {
         };
         if should {
             tracing::warn!(account = %TOKEN_ACCOUNT, "{msg}");
+        }
+    }
+}
+
+/// Connection-owned bearer material. Deliberately neither Debug nor serializable:
+/// only the personal pairing fast path may copy it into an authenticated reply.
+pub(crate) struct AdmittedCredential {
+    pub(crate) resolved: ResolvedCredential,
+    token: String,
+    pub(crate) rotation: Option<LegacyRotation>,
+}
+
+/// A secret-free change watch for the legacy owner credential. Subscribe before
+/// admission; comparing hashes also handles a rotation racing the upgrade.
+pub(crate) struct LegacyRotation {
+    expected: String,
+    changes: watch::Receiver<Option<String>>,
+}
+
+impl LegacyRotation {
+    pub(crate) fn new(store: &AsyncTokenStore, token: &str) -> Self {
+        Self {
+            expected: hash_token(token),
+            changes: store.changes.subscribe(),
+        }
+    }
+
+    pub(crate) async fn revoked(&mut self) {
+        loop {
+            if self
+                .changes
+                .borrow_and_update()
+                .as_ref()
+                .is_some_and(|hash| hash != &self.expected)
+            {
+                return;
+            }
+            if self.changes.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+pub(crate) async fn await_rotation(rotation: &mut Option<LegacyRotation>) {
+    match rotation {
+        Some(rotation) => rotation.revoked().await,
+        None => std::future::pending().await,
+    }
+}
+
+impl AdmittedCredential {
+    pub(crate) fn new(
+        resolved: ResolvedCredential,
+        token: String,
+        rotation: LegacyRotation,
+    ) -> Self {
+        let rotation = matches!(resolved, ResolvedCredential::Legacy).then_some(rotation);
+        Self {
+            resolved,
+            token,
+            rotation,
+        }
+    }
+
+    pub(crate) fn token(&self) -> &str {
+        &self.token
+    }
+
+    /// Recheck the exact admission binding, never allow a bearer to resolve to
+    /// a different person (or change from a personal token to the global token).
+    pub(crate) async fn valid_for(
+        &self,
+        store: &AsyncTokenStore,
+        api: &dyn WorkspaceApi,
+        caller: &Caller,
+    ) -> bool {
+        let Some(id) = caller.principal_id() else {
+            return false;
+        };
+        match &self.resolved {
+            ResolvedCredential::Legacy => {
+                api.primary_principal_id()
+                    .await
+                    .is_ok_and(|primary| &primary == id)
+                    && store
+                        .load_token()
+                        .await
+                        .is_some_and(|stored| token_matches(&stored, &self.token))
+            }
+            ResolvedCredential::Principal(admitted) => {
+                admitted == id
+                    && api.principal_host_role(id.clone()).await.is_ok()
+                    && api
+                        .resolve_principal_credential(hash_token(&self.token))
+                        .await
+                        .is_ok_and(|resolved| resolved.as_ref() == Some(id))
+            }
         }
     }
 }

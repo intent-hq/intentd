@@ -15,7 +15,132 @@ use serde_json::{json, Value};
 
 use crate::events::{error_frame, error_frame_with_data, success_frame};
 use crate::server::{pairing_hosts, ServerPairingInfo};
-use intent_core::{Error, Result};
+use intent_core::{current_caller, Caller, Error, Result, WorkspaceApi};
+
+/// Private connection state; never persisted, logged, or exposed to agents.
+#[derive(Default)]
+pub(crate) struct ConnectionPairing {
+    pub(crate) admitted: Option<crate::auth::AdmittedCredential>,
+    pub(crate) revoked: bool,
+}
+
+pub(crate) struct SelfPairingRequest {
+    request: PairingRequest,
+    valid_params: bool,
+}
+
+pub(crate) fn classify_self(value: &Value) -> Option<SelfPairingRequest> {
+    Some(SelfPairingRequest {
+        request: classify_method(value, "pairing.getSelfInfo")?,
+        valid_params: value.get("params").is_none_or(|p| {
+            p.is_null()
+                || p.as_object().is_some_and(serde_json::Map::is_empty)
+                || p.as_array().is_some_and(Vec::is_empty)
+        }),
+    })
+}
+
+pub(crate) async fn handle_self(
+    req: SelfPairingRequest,
+    provider: &Arc<dyn ServerPairingInfo>,
+    api: &Arc<dyn WorkspaceApi>,
+    connection: &mut ConnectionPairing,
+) -> Option<String> {
+    let request = req.request;
+    let result = if req.valid_params {
+        get_self_info(
+            provider.as_ref(),
+            api.as_ref(),
+            connection.admitted.as_ref(),
+        )
+        .await
+    } else {
+        Err(Error::InvalidParams(
+            "pairing.getSelfInfo takes no parameters".into(),
+        ))
+    };
+    connection.revoked = matches!(result, Err(Error::Forbidden(_)));
+    if !request.id_present {
+        return None;
+    }
+    Some(match result {
+        Ok(value) => success_frame(&request.id_echo, &value),
+        Err(error) => {
+            let code = match error {
+                Error::InvalidParams(_) => Some("invalid-params"),
+                Error::Forbidden(_) => Some("access-revoked"),
+                Error::ListenerDown => Some("listener-down"),
+                _ => None,
+            };
+            if let Some(code) = code {
+                error_frame_with_data(
+                    &request.id_echo,
+                    error.code(),
+                    &error.to_string(),
+                    &json!({"code":code}),
+                )
+            } else {
+                error_frame(&request.id_echo, error.code(), &error.to_string())
+            }
+        }
+    })
+}
+
+async fn get_self_info(
+    provider: &dyn ServerPairingInfo,
+    api: &dyn WorkspaceApi,
+    admitted: Option<&crate::auth::AdmittedCredential>,
+) -> Result<Value> {
+    let denied = || Error::Forbidden("pairing access revoked".into());
+    let caller = current_caller().ok_or_else(denied)?;
+    let Caller::Wire { principal_id, .. } = &caller else {
+        return Err(denied());
+    };
+    let local = !crate::context::is_tcp_connection();
+    // Locality overrides and caller-supplied labels never select a credential.
+    let local_token;
+    let token = if local {
+        if api.primary_principal_id().await.ok().as_ref() != Some(principal_id) {
+            return Err(denied());
+        }
+        local_token = provider
+            .token_store()
+            .load_token()
+            .await
+            .ok_or_else(denied)?;
+        local_token.as_str()
+    } else {
+        let admitted = admitted.ok_or_else(denied)?;
+        if !admitted
+            .valid_for(provider.token_store(), api, &caller)
+            .await
+        {
+            return Err(denied());
+        }
+        admitted.token()
+    };
+    let snapshot = provider.pairing_snapshot().await;
+    let mut result = pairing_json(provider, &snapshot, token)?;
+    let principal = api.principal_me().await.map_err(|_| denied())?;
+    if principal["id"].as_str() != Some(principal_id.0.as_str()) {
+        return Err(denied());
+    }
+    // All route/profile awaits precede this final credential check. A removal
+    // that wins this ordering returns no token; one after it invalidates reuse.
+    let valid = if local {
+        provider.token_store().load_token().await.as_deref() == Some(token)
+    } else {
+        admitted
+            .expect("remote admission checked above")
+            .valid_for(provider.token_store(), api, &caller)
+            .await
+    };
+    if !valid {
+        return Err(denied());
+    }
+    result["principal"] = principal;
+    Ok(result)
+}
 
 /// Version of the `intent://pair` payload format (the `v` query parameter and
 /// the `version` field of the `pairing.getInfo` result).
@@ -81,6 +206,10 @@ pub(crate) struct PairingRequest {
 /// Classify a parsed frame as a `pairing.getInfo` request, or `None` to fall
 /// through to the JSON-RPC dispatcher. Mirrors `server::classify`.
 pub(crate) fn classify(value: &Value) -> Option<PairingRequest> {
+    classify_method(value, "pairing.getInfo")
+}
+
+fn classify_method(value: &Value, expected: &str) -> Option<PairingRequest> {
     let obj = value.as_object()?;
     if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         return None;
@@ -92,9 +221,8 @@ pub(crate) fn classify(value: &Value) -> Option<PairingRequest> {
             return None;
         }
     }
-    match method {
-        "pairing.getInfo" => {}
-        _ => return None,
+    if method != expected {
+        return None;
     }
     Some(PairingRequest {
         id_present: id_member.is_some(),
@@ -148,8 +276,17 @@ pub(crate) async fn handle(
 /// no other device can connect through it.
 async fn get_info_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
     let snapshot = provider.pairing_snapshot().await;
-    let port = snapshot.port.ok_or(Error::ListenerDown)?;
+    snapshot.port.ok_or(Error::ListenerDown)?;
     let token = crate::get_or_create_token(provider.token_store()).await?;
+    pairing_json(provider, &snapshot, &token)
+}
+
+fn pairing_json(
+    provider: &dyn ServerPairingInfo,
+    snapshot: &crate::server::PairingSnapshot,
+    token: &str,
+) -> Result<Value> {
+    let port = snapshot.port.ok_or(Error::ListenerDown)?;
     let cert = crate::ensure_tls_certificate(provider.data_dir())?;
     // Bind-aware hosts: a specific bind advertises exactly its non-loopback
     // addresses (loopback is never dialable from another device, so it is
@@ -158,7 +295,7 @@ async fn get_info_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
     // the tunnel — so an empty set with no tunnel errors instead of minting a
     // payload no other device can connect through. With the tunnel up, an
     // empty host list still pairs: the tc= route carries it.
-    let hosts = pairing_hosts(&snapshot);
+    let hosts = pairing_hosts(snapshot);
     if hosts.is_empty() && snapshot.tc_address.is_none() {
         let enumerated = snapshot
             .bind_addresses
@@ -177,7 +314,7 @@ async fn get_info_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
         &hosts,
         port,
         &cert.fingerprint256,
-        &token,
+        token,
         snapshot.tc_address.as_deref(),
     );
     let mut result = json!({

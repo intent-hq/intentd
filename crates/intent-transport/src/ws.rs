@@ -832,7 +832,7 @@ impl WsInner {
         // (auth off) is the local user, exactly like UDS.
         // Subscribe before admission so an upgrade racing revocation cannot miss it.
         let revocations = self.api.subscribe_principal_revocations();
-        let credential = if self.auth_enabled {
+        let admitted = if self.auth_enabled {
             // Keychain-backed token reads can stall on a locked/prompting OS
             // keychain; [`AsyncTokenStore`] offloads to the blocking pool with
             // a bounded per-call timeout + single-flight cache so a hung
@@ -841,16 +841,24 @@ impl WsInner {
                 self.token_store.as_ref(),
                 extract_token(authorization.as_deref(), target),
             ) {
-                (Some(store), Some(t)) => validate_token(store, self.api.as_ref(), &t).await,
+                (Some(store), Some(t)) => {
+                    let rotation = crate::auth::LegacyRotation::new(store, &t);
+                    validate_token(store, self.api.as_ref(), &t)
+                        .await
+                        .map(|resolved| crate::auth::AdmittedCredential::new(resolved, t, rotation))
+                }
                 _ => None,
             };
             let Some(resolved) = resolved else {
                 return reject(&mut stream, 401, "Unauthorized").await;
             };
-            resolved
+            Some(resolved)
         } else {
-            ResolvedCredential::Legacy
+            None
         };
+        let credential = admitted
+            .as_ref()
+            .map_or(ResolvedCredential::Legacy, |c| c.resolved.clone());
         let principal_credential = matches!(credential, ResolvedCredential::Principal(_));
         let caller = credential.into_caller(self.api.as_ref()).await;
         if principal_credential && caller.is_none() {
@@ -935,9 +943,15 @@ impl WsInner {
             WebSocketStream::from_raw_socket(stream, Role::Server, Some(config)).await
         };
         if path == "/tunnel" {
-            self.spawn_tunnel_connection(ws, caller, guest, revocations);
+            self.spawn_tunnel_connection(
+                ws,
+                caller,
+                guest,
+                revocations,
+                admitted.and_then(|c| c.rotation),
+            );
         } else {
-            self.spawn_connection(ws, caller, guest, revocations);
+            self.spawn_connection(ws, caller, guest, revocations, admitted);
         }
         Ok(())
     }
@@ -972,6 +986,7 @@ impl WsInner {
         caller: Option<Caller>,
         guest: Option<GuestAdmission>,
         revocations: Option<tokio::sync::broadcast::Receiver<intent_core::PrincipalId>>,
+        admitted: Option<crate::auth::AdmittedCredential>,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -983,7 +998,7 @@ impl WsInner {
             let last_pong = last_pong.clone();
             async move {
                 let _guest = guest;
-                this.connection_loop(id, ws, cmd_rx, last_pong, caller, revocations)
+                this.connection_loop(id, ws, cmd_rx, last_pong, caller, revocations, admitted)
                     .await;
             }
         });
@@ -1008,6 +1023,7 @@ impl WsInner {
         caller: Option<Caller>,
         guest: Option<GuestAdmission>,
         revocations: Option<tokio::sync::broadcast::Receiver<intent_core::PrincipalId>>,
+        rotation: Option<crate::auth::LegacyRotation>,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -1028,8 +1044,10 @@ impl WsInner {
                         principal_id,
                         revocations,
                     });
-                crate::tunnel::run_tunnel_connection(ws, cmd_rx, last_pong, limits, authority)
-                    .await;
+                crate::tunnel::run_tunnel_connection(
+                    ws, cmd_rx, last_pong, limits, authority, rotation,
+                )
+                .await;
                 this.deregister(id);
             }
         });
@@ -1225,6 +1243,7 @@ impl WsInner {
         last_pong: Arc<AtomicI64>,
         caller: Option<Caller>,
         mut revocations: Option<tokio::sync::broadcast::Receiver<intent_core::PrincipalId>>,
+        mut admitted: Option<crate::auth::AdmittedCredential>,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -1242,6 +1261,8 @@ impl WsInner {
         // so responses overtake queued bulk traffic on a saturated link.
         let (app_tx, mut app_rx) = conn::outbound_channel();
         let mut subs = ConnSubs::default();
+        let mut rotation = admitted.as_mut().and_then(|c| c.rotation.take());
+        subs.pairing.admitted = admitted;
         let mut forwards = ForwardRegistry::default();
         // Bind reverse authority independently of hello metadata. Members may
         // serve ordinary workspace browsers, while guests remain ineligible.
@@ -1285,17 +1306,22 @@ impl WsInner {
         loop {
             // Only revocation has priority; keep ordinary traffic fair so
             // a queued request burst cannot starve replies or heartbeats.
-            let input = tokio::select! {
-                biased;
-                revoked = recv_revocation(&mut revocations) => Input::Revoked(revoked),
-                input = async {
-                    tokio::select! {
-                        change = async { role_changes.as_mut().expect("guarded").recv().await }, if role_changes.is_some() => Input::RoleChanged(change.is_some()),
-                        incoming = stream.next() => Input::Incoming(incoming),
-                        Some(frame) = app_rx.recv() => Input::Outbound(frame),
-                        cmd = cmd_rx.recv() => Input::Command(cmd),
-                    }
-                } => input,
+            let input = if subs.pairing.revoked {
+                Input::Revoked(Err(()))
+            } else {
+                tokio::select! {
+                    biased;
+                    () = crate::auth::await_rotation(&mut rotation) => Input::Revoked(Err(())),
+                    revoked = recv_revocation(&mut revocations) => Input::Revoked(revoked),
+                    input = async {
+                        tokio::select! {
+                            change = async { role_changes.as_mut().expect("guarded").recv().await }, if role_changes.is_some() => Input::RoleChanged(change.is_some()),
+                            incoming = stream.next() => Input::Incoming(incoming),
+                            Some(frame) = app_rx.recv() => Input::Outbound(frame),
+                            cmd = cmd_rx.recv() => Input::Command(cmd),
+                        }
+                    } => input,
+                }
             };
             match input {
                 Input::Revoked(revoked) => {

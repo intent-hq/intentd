@@ -406,6 +406,7 @@ pub(crate) async fn run_tunnel_connection<S>(
     last_pong: Arc<AtomicI64>,
     limits: TunnelLimits,
     mut authority: Option<MemberAuthority>,
+    mut rotation: Option<crate::auth::LegacyRotation>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -426,6 +427,7 @@ pub(crate) async fn run_tunnel_connection<S>(
         // a stream's queue before its relay gets to drain it.
         let input = tokio::select! {
             biased;
+            () = crate::auth::await_rotation(&mut rotation) => Input::Revoked(Err(())),
             revoked = async { crate::ws::recv_revocation(&mut authority.as_mut().expect("guarded").revocations).await }, if authority.is_some() => Input::Revoked(revoked),
             input = async {
                 tokio::select! {
