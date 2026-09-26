@@ -44,7 +44,11 @@ fn spawn_serve(data_dir: &Path, home_dir: &Path) -> Child {
     common::enable_ws_api(data_dir);
     let mut cmd = common::serve_command();
     common::hermetic_github_identity(&mut cmd, data_dir);
-    cmd.env("INTENTD_DATA_DIR", data_dir)
+    // gh can resolve enterprise credentials when GH_HOST is inherited.
+    cmd.env_remove("GH_HOST")
+        .env_remove("GH_ENTERPRISE_TOKEN")
+        .env_remove("GITHUB_ENTERPRISE_TOKEN")
+        .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
@@ -52,9 +56,23 @@ fn spawn_serve(data_dir: &Path, home_dir: &Path) -> Child {
         .stdin(Stdio::null())
         .env("HOME", home_dir)
         .stdout(Stdio::null())
-        .stderr(Stdio::from(log))
-        .spawn()
-        .expect("spawn intentd serve")
+        .stderr(Stdio::from(log));
+    // Assert before spawning, so a broken fixture fails without using an
+    // inherited credential. Name missing contracts without printing values.
+    for key in [
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_HOST",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+    ] {
+        assert!(
+            cmd.get_envs()
+                .any(|(name, value)| name == key && value.is_none()),
+            "specialist fixture must remove inherited {key} before spawning"
+        );
+    }
+    cmd.spawn().expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
