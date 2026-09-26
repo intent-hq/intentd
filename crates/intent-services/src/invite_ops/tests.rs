@@ -3466,7 +3466,7 @@ async fn revoke_self_revokes_credentials_memberships_and_broadcasts() {
         .expect("revoke self");
     assert_eq!(
         revoked,
-        json!({ "revoked": true, "credentials": 2, "workspaces": 1 })
+        json!({ "revoked": true, "credentials": 2, "workspaces": 1, "hostMembershipRemoved":false })
     );
     assert!(f
         .store
@@ -3482,7 +3482,10 @@ async fn revoke_self_revokes_credentials_memberships_and_broadcasts() {
             .expect("role"),
         None
     );
-    assert_eq!(revocations.try_recv().expect("broadcast"), f.collaborator);
+    assert_eq!(
+        revocations.try_recv().expect("broadcast").principal_id,
+        f.collaborator
+    );
 }
 
 // --- verifier probes (adopted as regression tests) --------------------------

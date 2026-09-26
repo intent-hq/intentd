@@ -7088,6 +7088,7 @@ impl Services {
     ) -> Result<Value> {
         // Fail closed on a nonexistent target BEFORE touching the queue
         // (monorepo#564).
+        self.discard_revoked_instructions(&agent_id).await?;
         let session = self.require_agent_session(&agent_id).await?;
         let _mutation = self.workspace_mutations.enter(&session.workspace_id)?;
         let workspace_id = session.workspace_id.clone();

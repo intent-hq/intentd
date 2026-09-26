@@ -46,7 +46,18 @@ impl ServerPairingInfo for PairingInfo {
 }
 
 async fn start_pairing() -> (Server, Arc<PairingInfo>) {
+    start_pairing_with_admission(None).await
+}
+
+async fn start_pairing_with_admission(
+    gate: Option<Arc<RemovalAdmissionGate>>,
+) -> (Server, Arc<PairingInfo>) {
     let (api, bus, store, registry, dir) = make_services(None, None).await;
+    let api: Arc<dyn WorkspaceApi> = if let Some(gate) = gate {
+        Arc::new(RemovalAdmissionApi { actual: api, gate })
+    } else {
+        api
+    };
     let tls = ensure_tls_certificate(dir.path()).unwrap();
     let tokens = Arc::new(AsyncTokenStore::new(Arc::new(MemTokenStore::default())));
     tokens.store_token(TOKEN).await.unwrap();
@@ -202,6 +213,8 @@ async fn personal_pairing_returns_only_admitted_person() {
     let (srv, _info) = start_pairing().await;
     let owner = srv.store.get_primary_principal().await.unwrap();
     let mut owner_socket = reconnect(&srv, &owner, TOKEN).await;
+    let hello=owner_socket.call("client.hello",json!({"capabilities":{"hostMembership":false,"personalPairing":999,"authenticatedDevices":1}})).await;
+    assert_shared_capabilities(&hello);
     assert_pairing(
         &owner_socket.call("pairing.getSelfInfo", json!({})).await,
         TOKEN,
@@ -218,6 +231,8 @@ async fn personal_pairing_returns_only_admitted_person() {
                 .await
                 .unwrap();
         }
+        let hello=person.call("client.hello",json!({"capabilities":{"hostMembership":false,"personalPairing":999,"authenticatedDevices":1}})).await;
+        assert_shared_capabilities(&hello);
         let role = if member { "member" } else { "guest" };
         let response = person.call("pairing.getSelfInfo", json!({})).await;
         assert_pairing(&response, &token, &person.principal, role);
@@ -395,9 +410,12 @@ async fn personal_pairing_real_self_revocation_closes_multiple_devices() {
     assert_pairing(&response, &token, &person.principal, "member");
     let mut second = reconnect(&srv, &person.principal, &token).await;
     let mut other = Guest::connect(&srv, &"d2".repeat(32)).await;
+    let revoked = person.call("principal.revokeSelf", json!({})).await;
+    assert_eq!(revoked["result"]["revoked"], true);
+    assert_eq!(revoked["result"]["hostMembershipRemoved"], true);
     assert_eq!(
-        person.call("principal.revokeSelf", json!({})).await["result"]["revoked"],
-        true
+        srv.store.get_host_role(&person.principal.id).await.unwrap(),
+        intent_core::HostRole::Guest
     );
     assert_closed(&mut person.ws).await;
     assert_closed(&mut second.ws).await;
@@ -417,6 +435,65 @@ async fn personal_pairing_real_self_revocation_closes_multiple_devices() {
         &"d2".repeat(32),
         &other.principal,
         "guest",
+    );
+    srv.ws.stop().await;
+}
+
+#[tokio::test]
+async fn member_removal_real_owner_operation_closes_paired_devices() {
+    let (srv, _info) = start_pairing().await;
+    let owner = srv.store.get_primary_principal().await.unwrap();
+    let mut administrator = reconnect(&srv, &owner, TOKEN).await;
+    let token = "a6".repeat(32);
+    let mut member = Guest::connect(&srv, &token).await;
+    sqlx::query("INSERT INTO host_member (principal_id, added_at) VALUES (?, ?)")
+        .bind(&member.principal.id.0)
+        .bind(now_iso())
+        .execute(srv.store.write_pool())
+        .await
+        .unwrap();
+    assert_pairing(
+        &member.call("pairing.getSelfInfo", json!({})).await,
+        &token,
+        &member.principal,
+        "member",
+    );
+    let mut phone = reconnect(&srv, &member.principal, &token).await;
+    let mut other = Guest::connect(&srv, &"b6".repeat(32)).await;
+    assert_eq!(
+        administrator
+            .call(
+                "host.members.remove",
+                json!({"principalId":member.principal.id})
+            )
+            .await["result"],
+        json!({"removed":true})
+    );
+    assert_closed(&mut member.ws).await;
+    assert_closed(&mut phone.ws).await;
+    assert_eq!(
+        other.call("principal.me", json!({})).await["result"]["id"],
+        other.principal.id.0
+    );
+    assert_eq!(
+        administrator
+            .call(
+                "host.members.remove",
+                json!({"principalId":member.principal.id})
+            )
+            .await["result"],
+        json!({"removed":false})
+    );
+    assert_eq!(
+        status_code(
+            &https_request(
+                srv.port,
+                srv.cfg.clone(),
+                &upgrade_req("/ws", None, Some(&token))
+            )
+            .await
+        ),
+        401
     );
     srv.ws.stop().await;
 }
@@ -601,4 +678,499 @@ async fn personal_pairing_removal_racing_pair_and_upgrade_cannot_restore_access(
         );
     }
     srv.ws.stop().await;
+}
+
+async fn removal_tunnel(srv: &Server, token: &str) -> common::TlsWs {
+    let url = format!("wss://localhost:{}/tunnel?token={token}", srv.port);
+    common::wss_connect_with_retry(srv.port, srv.cfg.clone(), &url).await
+}
+async fn removal_frame(ws: &mut common::TlsWs) -> intent_transport::tunnel::Frame {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Binary(b))) => {
+                    return intent_transport::tunnel::Frame::decode(&b).unwrap()
+                }
+                Some(Ok(Message::Ping(b))) => ws.send(Message::Pong(b)).await.unwrap(),
+                _ => panic!("expected binary tunnel response"),
+            }
+        }
+    })
+    .await
+    .unwrap()
+}
+async fn removal_send(ws: &mut common::TlsWs, f: intent_transport::tunnel::Frame) {
+    ws.send(Message::Binary(f.encode().into())).await.unwrap();
+}
+async fn removal_roundtrip(ws: &mut common::TlsWs, peer: &mut TcpStream) {
+    use intent_transport::tunnel::Frame;
+    removal_send(
+        ws,
+        Frame::Data {
+            stream_id: 1,
+            payload: b"hello".to_vec(),
+        },
+    )
+    .await;
+    let mut bytes = [0; 5];
+    tokio::time::timeout(Duration::from_secs(5), peer.read_exact(&mut bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&bytes, b"hello");
+    peer.write_all(b"reply").await.unwrap();
+    assert_eq!(
+        removal_frame(ws).await,
+        Frame::Data {
+            stream_id: 1,
+            payload: b"reply".to_vec()
+        }
+    );
+}
+
+#[tokio::test]
+async fn member_removal_idle_active_tunnels_forwarding_and_final_control() {
+    use intent_transport::tunnel::Frame;
+    let (srv, _) = start_pairing().await;
+    let owner = srv.store.get_primary_principal().await.unwrap();
+    let mut admin = reconnect(&srv, &owner, TOKEN).await;
+    let token = "removal-personal-member";
+    let mut idle = Guest::connect(&srv, token).await;
+    sqlx::query("INSERT INTO host_member (principal_id,added_at) VALUES (?,?)")
+        .bind(&idle.principal.id.0)
+        .bind(now_iso())
+        .execute(srv.store.write_pool())
+        .await
+        .unwrap();
+    let second_token = "removal-another-device";
+    srv.store
+        .insert_principal_credential(&idle.principal.id, &sha256_hex(second_token.as_bytes()))
+        .await
+        .unwrap();
+    let mut active = reconnect(&srv, &idle.principal, second_token).await;
+    assert_pairing(
+        &active.call("pairing.getSelfInfo", json!({})).await,
+        second_token,
+        &active.principal,
+        "member",
+    );
+    let subscribed = idle
+        .call(
+            "events.subscribe",
+            json!({"eventTypes":["host:members-changed"]}),
+        )
+        .await;
+    let subscription = subscribed["result"]["subscriptionId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut unaffected = Guest::connect(&srv, "removal-unaffected").await;
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let forward = active
+        .call("forward.create", json!({"remotePort":port}))
+        .await;
+    let local = u16::try_from(forward["result"]["localPort"].as_u64().unwrap()).unwrap();
+    let mut downstream = TcpStream::connect(("127.0.0.1", local)).await.unwrap();
+    let (mut upstream, _) = listener.accept().await.unwrap();
+    downstream.write_all(b"ok").await.unwrap();
+    let mut two = [0; 2];
+    upstream.read_exact(&mut two).await.unwrap();
+    assert_eq!(&two, b"ok");
+    let mut idle_tunnel = removal_tunnel(&srv, token).await;
+    let mut active_tunnel = removal_tunnel(&srv, second_token).await;
+    removal_send(&mut active_tunnel, Frame::Open { stream_id: 1, port }).await;
+    assert_eq!(
+        removal_frame(&mut active_tunnel).await,
+        Frame::OpenOk { stream_id: 1 }
+    );
+    let (mut peer, _) = listener.accept().await.unwrap();
+    removal_roundtrip(&mut active_tunnel, &mut peer).await;
+    let mut kept_tunnel = removal_tunnel(&srv, TOKEN).await;
+    removal_send(&mut kept_tunnel, Frame::Open { stream_id: 1, port }).await;
+    assert_eq!(
+        removal_frame(&mut kept_tunnel).await,
+        Frame::OpenOk { stream_id: 1 }
+    );
+    let (mut kept_peer, _) = listener.accept().await.unwrap();
+    assert_eq!(
+        admin
+            .call(
+                "host.members.remove",
+                json!({"principalId":idle.principal.id})
+            )
+            .await["result"],
+        json!({"removed":true})
+    );
+    // A subscribed removed person receives the real durable control event,
+    // despite revocation having priority over ordinary bulk traffic.
+    let notification = tokio::time::timeout(Duration::from_secs(5), idle.ws.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let Message::Text(frame) = notification else {
+        panic!("removal control must precede close")
+    };
+    let control: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(control["params"]["subscriptionId"], subscription);
+    assert_eq!(control["params"]["event"]["type"], "host:members-changed");
+    assert_eq!(
+        control["params"]["event"]["data"]["principalId"],
+        idle.principal.id.0
+    );
+    assert_eq!(control["params"]["event"]["data"]["action"], "removed");
+    assert_closed(&mut idle.ws).await;
+    assert_closed(&mut active.ws).await;
+    assert_closed(&mut idle_tunnel).await;
+    assert_closed(&mut active_tunnel).await;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), downstream.read(&mut two))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), peer.read(&mut two))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    assert!(TcpStream::connect(("127.0.0.1", local)).await.is_err());
+    for old in [token, second_token] {
+        for path in ["/ws", "/tunnel"] {
+            assert_eq!(
+                status_code(
+                    &https_request(
+                        srv.port,
+                        srv.cfg.clone(),
+                        &upgrade_req(path, None, Some(old))
+                    )
+                    .await
+                ),
+                401
+            );
+        }
+    }
+    assert_eq!(
+        unaffected.call("principal.me", json!({})).await["result"]["id"],
+        unaffected.principal.id.0
+    );
+    assert_eq!(
+        admin.call("host.members.list", json!({})).await["result"]["members"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    removal_roundtrip(&mut kept_tunnel, &mut kept_peer).await;
+    srv.ws.stop().await;
+}
+
+#[derive(Default)]
+struct RemovalAdmissionGate {
+    before: Mutex<Option<SnapshotBarrier>>,
+    after: Mutex<Option<SnapshotBarrier>>,
+}
+struct RemovalAdmissionApi {
+    actual: Arc<dyn WorkspaceApi>,
+    gate: Arc<RemovalAdmissionGate>,
+}
+impl WorkspaceApi for RemovalAdmissionApi {
+    fn primary_principal_id(
+        &self,
+    ) -> intent_core::BoxFuture<'_, CoreResult<intent_core::PrincipalId>> {
+        self.actual.primary_principal_id()
+    }
+    fn principal_host_role(
+        &self,
+        id: intent_core::PrincipalId,
+    ) -> intent_core::BoxFuture<'_, CoreResult<intent_core::HostRole>> {
+        Box::pin(async move {
+            let role = self.actual.principal_host_role(id).await;
+            let pause = self.gate.after.lock().unwrap().take();
+            if let Some(pause) = pause {
+                let _ = pause.entered.send(());
+                let _ = pause.release.await;
+            }
+            role
+        })
+    }
+    fn resolve_principal_credential(
+        &self,
+        hash: String,
+    ) -> intent_core::BoxFuture<'_, CoreResult<Option<intent_core::PrincipalId>>> {
+        let pause = self.gate.before.lock().unwrap().take();
+        Box::pin(async move {
+            if let Some(pause) = pause {
+                let _ = pause.entered.send(());
+                let _ = pause.release.await;
+            }
+            self.actual.resolve_principal_credential(hash).await
+        })
+    }
+    fn host_members_remove(
+        &self,
+        id: intent_core::PrincipalId,
+    ) -> intent_core::BoxFuture<'_, CoreResult<Value>> {
+        self.actual.host_members_remove(id)
+    }
+    fn principal_me(&self) -> intent_core::BoxFuture<'_, CoreResult<Value>> {
+        self.actual.principal_me()
+    }
+    fn subscribe_principal_revocations(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<intent_core::PrincipalRevocation>> {
+        self.actual.subscribe_principal_revocations()
+    }
+}
+
+#[tokio::test]
+async fn member_removal_connection_admission_both_linearizations_cannot_reopen_access() {
+    for path in ["/ws", "/tunnel"] {
+        for admitted_first in [false, true] {
+            let gate = Arc::new(RemovalAdmissionGate::default());
+            let (srv, _) = start_pairing_with_admission(Some(gate.clone())).await;
+            let owner = srv.store.get_primary_principal().await.unwrap();
+            let mut admin = reconnect(&srv, &owner, TOKEN).await;
+            let token = "connection-removal-barrier";
+            let mut person = Guest::connect(&srv, token).await;
+            sqlx::query("INSERT INTO host_member (principal_id,added_at) VALUES (?,?)")
+                .bind(&person.principal.id.0)
+                .bind(now_iso())
+                .execute(srv.store.write_pool())
+                .await
+                .unwrap();
+            let (entered, reached) = tokio::sync::oneshot::channel();
+            let (release, wait) = tokio::sync::oneshot::channel();
+            let pause = SnapshotBarrier {
+                entered,
+                release: wait,
+            };
+            if admitted_first {
+                *gate.after.lock().unwrap() = Some(pause)
+            } else {
+                *gate.before.lock().unwrap() = Some(pause)
+            }
+            let tls = tls_connect(srv.port, srv.cfg.clone()).await;
+            let url = format!("wss://localhost:{}{path}?token={token}", srv.port);
+            let connect =
+                tokio::spawn(async move { tokio_tungstenite::client_async(url, tls).await });
+            tokio::time::timeout(Duration::from_secs(5), reached)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                admin
+                    .call(
+                        "host.members.remove",
+                        json!({"principalId":person.principal.id})
+                    )
+                    .await["result"]["removed"],
+                true
+            );
+            release.send(()).unwrap();
+            let result = connect.await.unwrap();
+            if admitted_first {
+                let (mut socket, _) = result.expect("the already admitted handshake may finish");
+                assert_closed(&mut socket).await;
+            } else {
+                assert!(
+                    matches!(result,Err(tokio_tungstenite::tungstenite::Error::Http(r)) if r.status().as_u16()==401)
+                );
+            }
+            assert_closed(&mut person.ws).await;
+            assert_eq!(
+                status_code(
+                    &https_request(
+                        srv.port,
+                        srv.cfg.clone(),
+                        &upgrade_req(path, None, Some(token))
+                    )
+                    .await
+                ),
+                401
+            );
+            srv.ws.stop().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn member_removal_invalidates_inflight_personal_pairing_through_real_owner_rpc() {
+    let (srv, info) = start_pairing().await;
+    let owner = srv.store.get_primary_principal().await.unwrap();
+    let mut admin = reconnect(&srv, &owner, TOKEN).await;
+    let token = "removal-inflight-pairing";
+    let mut person = Guest::connect(&srv, token).await;
+    sqlx::query("INSERT INTO host_member (principal_id,added_at) VALUES (?,?)")
+        .bind(&person.principal.id.0)
+        .bind(now_iso())
+        .execute(srv.store.write_pool())
+        .await
+        .unwrap();
+    let id = person.principal.id.clone();
+    let mut phone = reconnect(&srv, &person.principal, token).await;
+    assert_pairing(
+        &phone.call("pairing.getSelfInfo", json!({})).await,
+        token,
+        &phone.principal,
+        "member",
+    );
+    let (entered, reached) = tokio::sync::oneshot::channel();
+    let (release, wait) = tokio::sync::oneshot::channel();
+    *info.barrier.lock().unwrap() = Some(SnapshotBarrier {
+        entered,
+        release: wait,
+    });
+    let pairing = tokio::spawn(async move {
+        let response = person.call("pairing.getSelfInfo", json!({})).await;
+        (person, response)
+    });
+    tokio::time::timeout(Duration::from_secs(5), reached)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        admin
+            .call("host.members.remove", json!({"principalId":id}))
+            .await["result"]["removed"],
+        true
+    );
+    assert_closed(&mut phone.ws).await;
+    release.send(()).unwrap();
+    let (mut person, response) = pairing.await.unwrap();
+    assert_eq!(response["error"]["data"]["code"], "access-revoked");
+    assert!(!response.to_string().contains(token));
+    assert_closed(&mut person.ws).await;
+    srv.ws.stop().await;
+}
+
+#[tokio::test]
+async fn member_removal_reconciles_roster_directory_presence_and_snapshots() {
+    let (srv, _) = start_pairing().await;
+    let mut member = Guest::connect(&srv, "removal-roster-member").await;
+    sqlx::query("INSERT INTO host_member (principal_id,added_at) VALUES (?,?)")
+        .bind(&member.principal.id.0)
+        .bind(now_iso())
+        .execute(srv.store.write_pool())
+        .await
+        .unwrap();
+    let workspace = WorkspaceId::new();
+    srv.store
+        .insert_workspace(&fixture_workspace(&workspace))
+        .await
+        .unwrap();
+    assert_eq!(
+        member.call("principal.me", json!({})).await["result"]["hostRole"],
+        "member"
+    );
+    let hello = member
+        .call("client.hello", json!({"clientId":"removal-roster-phone"}))
+        .await;
+    assert!(hello.get("error").is_none());
+    let mut owner = PresenceClient::open(srv.port, srv.cfg.clone(), TOKEN).await;
+    assert_eq!(
+        owner
+            .call(1, "presence.snapshot", json!({"workspaceId":workspace}))
+            .await["result"]["members"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let sub = owner.call(2, "workspace.subscribe", json!({})).await;
+    let snapshot = owner
+        .push(sub["result"]["subscriptionId"].as_str().unwrap())
+        .await;
+    assert_eq!(snapshot["snapshot"].as_array().unwrap().len(), 1);
+    let events = owner
+        .call(
+            3,
+            "events.subscribe",
+            json!({"eventTypes":["host:members-changed","workspace:updated","presence:changed"]}),
+        )
+        .await;
+    assert!(events["result"]["subscriptionId"].is_string());
+    let before = owner.call(4, "principal.list", json!({})).await;
+    assert!(before["result"]["principals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["principalId"] == member.principal.id.0));
+    let removed = owner
+        .call(
+            5,
+            "host.members.remove",
+            json!({"principalId":member.principal.id}),
+        )
+        .await;
+    assert_eq!(removed["result"], json!({"removed":true}));
+    let event = removal_observed_event(&mut owner, "host:members-changed").await;
+    assert_eq!(event["data"]["principalId"], member.principal.id.0);
+    assert_eq!(event["data"]["action"], "removed");
+    let durable = srv
+        .store
+        .query_events(&intent_store::EventQuery {
+            event_types: vec!["host:members-changed".into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(durable
+        .iter()
+        .any(|row| Some(row.id.as_str()) == event["id"].as_str()));
+    let changed = removal_observed_event(&mut owner, "workspace:updated").await;
+    assert_eq!(
+        changed["data"]["changes"]["removedPrincipalId"],
+        member.principal.id.0
+    );
+    assert_eq!(changed["data"]["changes"]["members"], true);
+    let offline = removal_observed_event(&mut owner, "presence:changed").await;
+    assert!(offline["data"]["members"].as_array().unwrap().is_empty());
+    let directory = owner.call(6, "principal.list", json!({})).await;
+    assert!(!directory["result"]["principals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["principalId"] == member.principal.id.0));
+    let roster = owner
+        .call(
+            7,
+            "workspace.members.list",
+            json!({"workspaceId":workspace}),
+        )
+        .await;
+    assert_eq!(roster["result"]["members"].as_array().unwrap().len(), 1);
+    assert_eq!(roster["result"]["members"][0]["hostRole"], "owner");
+    let fresh = owner.call(8, "workspace.subscribe", json!({})).await;
+    let snapshot = owner
+        .push(fresh["result"]["subscriptionId"].as_str().unwrap())
+        .await;
+    assert_eq!(snapshot["snapshot"].as_array().unwrap().len(), 1);
+    assert_closed(&mut member.ws).await;
+    srv.ws.stop().await;
+}
+
+async fn removal_observed_event(client: &mut PresenceClient, kind: &str) -> Value {
+    if let Some(index) = client
+        .skipped
+        .iter()
+        .position(|v| v["method"] == "events.event" && v["params"]["event"]["type"] == kind)
+    {
+        return client.skipped.remove(index)["params"]["event"].clone();
+    }
+    client.event(kind).await
+}
+
+fn assert_shared_capabilities(hello: &Value) {
+    assert!(hello.get("error").is_none());
+    let capabilities = &hello["result"]["server"]["capabilities"];
+    assert_eq!(capabilities["hostMembership"], 1);
+    assert_eq!(capabilities["personalPairing"], 1);
+    assert!(capabilities.get("authenticatedDevices").is_none());
 }

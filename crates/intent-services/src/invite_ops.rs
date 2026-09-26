@@ -173,7 +173,7 @@ fn identity_provider(identity: &PrincipalIdentity) -> Option<Provider> {
 
 /// Live feed of principal ids whose credentials were just revoked; the
 /// transport closes the connections still bound to them.
-pub(crate) type PrincipalRevocations = broadcast::Sender<PrincipalId>;
+pub(crate) type PrincipalRevocations = broadcast::Sender<intent_core::PrincipalRevocation>;
 
 /// Broadcast capacity: revocations are rare and a lagging listener only
 /// misses closes for connections that fail on their next RPC anyway.
@@ -516,6 +516,8 @@ impl Services {
             revoked_at: None,
             redemption_count: 0,
         };
+        #[cfg(test)]
+        self.invite_create_commit_pause.pause().await;
         // The insert is what locks the primary identity, so it is
         // serialised with the identity transition and the creator's
         // identity is revalidated under the lock: a switch that landed
@@ -662,12 +664,9 @@ impl Services {
     /// `principal.revokeSelf`: see
     /// [`intent_core::WorkspaceApi::principal_revoke_self`].
     ///
-    /// The credentials are revoked BEFORE the memberships are snapshotted
-    /// and torn down: a concurrent `workspace.members.add` checks the
-    /// active-credential predicate inside its insert transaction, so an
-    /// add that begins after the revocation committed is refused, and an
-    /// add that committed first is in the snapshot and detached here —
-    /// no interleaving leaves a seated member without an active credential.
+    /// Revoke credentials, host membership, grants and queued instructions in
+    /// one write transaction. Concurrent grant/invite admissions recheck their
+    /// authority under the same database lock, then live egress is invalidated.
     pub(crate) async fn principal_revoke_self_op(&self) -> Result<Value> {
         let (principal_id, is_administrator) = self.self_principal().await?;
         if is_administrator {
@@ -677,22 +676,26 @@ impl Services {
                     .to_string(),
             ));
         }
-        let credentials = self
-            .store
-            .revoke_all_principal_credentials(&principal_id)
-            .await?;
-        let mut workspaces = 0u64;
-        for m in self.store.list_principal_memberships(&principal_id).await? {
-            if m.role == WorkspaceRole::Collaborator
-                && self
-                    .detach_collaborator(&m.workspace_id, &principal_id)
-                    .await?
-            {
-                workspaces += 1;
+        let _authority = self.human_instruction_authority.write().await;
+        let persist = self.agent_queue_persist_gate.lock().await;
+        let removal = self.store.revoke_principal_access(&principal_id).await?;
+        let changed = self.drop_principal_queues(&principal_id, true);
+        drop(persist);
+        if removal.removed {
+            self.finish_host_member_removal(&principal_id, &removal, changed)
+                .await;
+        } else {
+            let _ = self.principal_revocations.send(principal_id.clone().into());
+            for agent in changed {
+                self.publish_queue_updated(&agent).await;
+            }
+            for workspace in &removal.workspaces {
+                self.finish_collaborator_removal(workspace, &principal_id, true)
+                    .await?;
             }
         }
-        let _ = self.principal_revocations.send(principal_id);
-        Ok(json!({ "revoked": true, "credentials": credentials, "workspaces": workspaces }))
+        Ok(json!({"revoked":true,"credentials":removal.credentials,
+            "workspaces":removal.workspaces.len(),"hostMembershipRemoved":removal.removed}))
     }
 }
 
@@ -1144,6 +1147,8 @@ impl Services {
         existing_token: Option<&str>,
         authorization_generation: u64,
     ) -> Result<Value> {
+        #[cfg(test)]
+        self.invite_join_commit_pause.pause().await;
         let token = existing_token.map_or_else(random_hex_secret, str::to_owned);
         let token_hash = hash_secret(&token);
         let credential = match existing_token {
@@ -1239,3 +1244,6 @@ mod tests;
 
 #[cfg(test)]
 mod host_tests;
+
+#[cfg(test)]
+mod removal_tests;

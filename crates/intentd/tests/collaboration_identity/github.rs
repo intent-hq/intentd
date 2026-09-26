@@ -221,8 +221,16 @@ async fn collaboration_github_requests_only_gist_reports_broader_grant_and_isola
         hello["result"]["server"]["capabilities"]["collaborationIdentity"], 1,
         "{hello}"
     );
+    assert_eq!(
+        hello["result"]["server"]["capabilities"]["hostMembership"],
+        1
+    );
+    assert_eq!(
+        hello["result"]["server"]["capabilities"]["personalPairing"],
+        1
+    );
     assert!(hello["result"]["server"]["capabilities"]
-        .get("hostMembership")
+        .get("authenticatedDevices")
         .is_none());
     authorize(&h, &state, &mut rpc, 2).await;
     {

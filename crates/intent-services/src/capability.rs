@@ -652,7 +652,7 @@ impl Services {
         Ok(json!({ "added": added, "memberCount": member_count }))
     }
 
-    /// Mirror of [`Self::detach_collaborator`] for a direct add: seat the
+    /// Counterpart of [`Self::finish_collaborator_removal`] for a direct add: seat the
     /// `collaborator` under the guest cap in one store transaction
     /// ([`intent_store::Store::add_workspace_collaborator_within_cap`]) and,
     /// when a row was inserted, publish the `addedPrincipalId`
@@ -708,24 +708,6 @@ impl Services {
             .await;
         }
         Ok(added)
-    }
-
-    /// Shared teardown of a collaborator membership (`members.remove`,
-    /// `members.leave`, `principal.revokeSelf`): delete the row, drop the
-    /// member's queued messages and publish the `removedPrincipalId`
-    /// `workspace:updated`. Returns whether a row was deleted.
-    pub(crate) async fn detach_collaborator(
-        &self,
-        workspace_id: &WorkspaceId,
-        principal_id: &PrincipalId,
-    ) -> Result<bool> {
-        let removed = self
-            .store
-            .remove_workspace_member(workspace_id, principal_id)
-            .await?;
-        self.finish_collaborator_removal(workspace_id, principal_id, removed)
-            .await?;
-        Ok(removed)
     }
 
     pub(crate) async fn finish_collaborator_removal(

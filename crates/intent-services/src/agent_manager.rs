@@ -6960,12 +6960,38 @@ impl AgentManager {
     /// exactly the marked entry, bypassing the batch flush and the head pop;
     /// every other gate — busy, ready-to-send, archived, quarantine, retired
     /// — still applies.
-    async fn try_drain_queue_inner(
+    fn try_drain_queue_inner(
+        self: Arc<Self>,
+        agent_id: AgentId,
+        workspace_id: WorkspaceId,
+        redrive_error_park: bool,
+    ) -> intent_core::BoxFuture<'static, ()> {
+        Box::pin(async move {
+            let services = self.services.clone();
+            services
+                .instruction_admission(self.try_drain_queue_authorized(
+                    agent_id,
+                    workspace_id,
+                    redrive_error_park,
+                ))
+                .await;
+        })
+    }
+
+    async fn try_drain_queue_authorized(
         self: Arc<Self>,
         agent_id: AgentId,
         workspace_id: WorkspaceId,
         redrive_error_park: bool,
     ) {
+        if self
+            .services
+            .discard_revoked_instructions(&agent_id)
+            .await
+            .is_err()
+        {
+            return;
+        }
         let Ok(_mutation) = self.services.workspace_mutations.enter(&workspace_id) else {
             return;
         };
@@ -7321,6 +7347,9 @@ impl AgentManager {
     ) -> Result<Value> {
         // monorepo#564: fail closed on a nonexistent target BEFORE touching
         // the queue.
+        self.services
+            .discard_revoked_instructions(&agent_id)
+            .await?;
         let session = self.services.require_agent_session(&agent_id).await?;
         // Bind the activation to the target's OWN session workspace
         // (intent-hq/intent#5017): the router forwards the CALLER's
@@ -11564,6 +11593,22 @@ async fn run_message_worker(
                 }
             }
         }
+        // This is a separate drain from the explicit send/kick paths. Hold
+        // admission through selection and turn preparation, never through the
+        // already-running provider turn above. Removal either sweeps first or
+        // waits for this instruction to become admitted work.
+        let _instruction_authority = mgr.services.human_instruction_authority.read().await;
+        if mgr
+            .services
+            .discard_revoked_instructions(&agent_id)
+            .await
+            .is_err()
+        {
+            mgr.release_in_flight_slot(&agent_id);
+            break 'outer;
+        }
+        #[cfg(test)]
+        mgr.services.queue_drain_commit_pause.pause().await;
         // Batch flush (`agents.flushQueuedMessages`): same contract as the
         // `try_drain_queue` flush arm — ≥2 ready entries drain into one
         // combined provider turn; otherwise the single-entry arm below runs
@@ -11693,6 +11738,7 @@ async fn run_message_worker(
                 None => (Vec::new(), None),
             };
         if raced.is_empty() {
+            drop(_instruction_authority);
             // monorepo#1297: heal a busy-misclassified terminal idle. The
             // turn's `agent:idle` is published while this worker still holds
             // the busy slot (`end_turn` above runs after `run_prompt_turn`
@@ -11749,6 +11795,7 @@ async fn run_message_worker(
                         // pre-release archived arm above.
                         mgr.clear_worker(&agent_id);
                         mgr.end_turn(&agent_id).await;
+                        drop(_instruction_authority);
                         mgr.clone()
                             .try_drain_queue(agent_id.clone(), workspace_id.clone())
                             .await;

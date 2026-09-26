@@ -221,6 +221,7 @@ struct ConnSub {
     replace_group: Option<String>,
     lifecycle: Option<ChatLifecycle>,
     note_lease: bool,
+    host_removal_control: bool,
 }
 
 impl Drop for ConnSub {
@@ -249,6 +250,16 @@ pub(crate) struct ConnSubs {
 }
 
 impl ConnSubs {
+    /// The real committed removal event bypasses bulk delivery only for raw
+    /// subscriptions that requested it. Every other event producer is stopped.
+    pub(crate) fn removal_control(&self, event: &intent_core::Event) -> Vec<String> {
+        self.subs
+            .iter()
+            .filter(|(_, sub)| sub.host_removal_control)
+            .map(|(id, _)| events::build_event_notification(id, event))
+            .collect()
+    }
+
     fn insert(
         &mut self,
         id: String,
@@ -263,6 +274,7 @@ impl ConnSubs {
                 replace_group,
                 lifecycle,
                 note_lease: false,
+                host_removal_control: false,
             },
         );
     }
@@ -282,6 +294,7 @@ impl ConnSubs {
                 replace_group,
                 lifecycle: None,
                 note_lease: true,
+                host_removal_control: false,
             },
         );
     }
@@ -959,6 +972,15 @@ pub(crate) async fn handle_fast_path(
                         ..Default::default()
                     })
                 });
+                let host_removal_control = crate::context::is_non_administrator_caller()
+                    && api.subscribe_principal_revocations().is_some()
+                    && workspace_id.as_ref().is_none_or(String::is_empty)
+                    && event_types.iter().any(|pattern| {
+                        intent_services::events::event_type_matches(
+                            intent_core::events::HOST_MEMBERS_CHANGED,
+                            pattern,
+                        )
+                    });
                 let subscription = bus.subscribe(SubscriptionFilter {
                     event_types,
                     workspace_id,
@@ -989,8 +1011,13 @@ pub(crate) async fn handle_fast_path(
                     scoped_workspace,
                     subscription_id.clone(),
                     out_tx.clone(),
+                    host_removal_control,
                 ));
-                subs.insert(subscription_id, handle, replace_group, None);
+                subs.insert(subscription_id.clone(), handle, replace_group, None);
+                subs.subs
+                    .get_mut(&subscription_id)
+                    .expect("just inserted")
+                    .host_removal_control = host_removal_control;
                 true
             }
             Err(msg) => send_fast_path_error(id, &msg, out_tx).await,
@@ -1044,6 +1071,7 @@ async fn forward_subscription(
     scoped_workspace: Option<String>,
     subscription_id: String,
     out_tx: OutboundSender,
+    host_removal_control: bool,
 ) {
     // Everything this forwarder emits travels on the bulk lane; conflation
     // needs `reserve` / `try_reserve` on it, so hold the lane sender directly.
@@ -1093,6 +1121,13 @@ async fn forward_subscription(
                     return;
                 };
                 for mut event in batch {
+                    // The revocation branch sends this exact durable event once,
+                    // ahead of close, rather than racing its bulk forwarder.
+                    if host_removal_control && event.event_type == intent_core::events::HOST_MEMBERS_CHANGED
+                        && event.data["action"] == "removed"
+                        && crate::context::current_caller().and_then(|c| c.principal_id().cloned()).is_some_and(|id| event.data["principalId"] == id.0) {
+                        continue;
+                    }
                     if let Some(gate) = gate.as_mut() {
                         if !gate.allows(&event).await {
                             continue;

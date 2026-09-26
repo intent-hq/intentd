@@ -4792,13 +4792,13 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// Transport seam (multiplayer w4): a live feed of principal ids whose
+    /// Transport seam (multiplayer w4): a live feed of committed invalidations for principals whose
     /// credentials were just revoked, so a listener can close the connections
     /// still bound to them. `None` when the implementation has no principal
     /// store (test stubs).
     fn subscribe_principal_revocations(
         &self,
-    ) -> Option<tokio::sync::broadcast::Receiver<PrincipalId>> {
+    ) -> Option<tokio::sync::broadcast::Receiver<crate::PrincipalRevocation>> {
         None
     }
 
@@ -4997,6 +4997,20 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::host_members_list not implemented".into(),
+            ))
+        })
+    }
+
+    /// Owner-only atomic removal and credential/invitation revocation.
+    /// The primary cannot be removed; an inactive member is a no-op.
+    fn host_members_remove(
+        &self,
+        principal_id: PrincipalId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = principal_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::host_members_remove not implemented".into(),
             ))
         })
     }

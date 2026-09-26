@@ -618,6 +618,29 @@ impl Services {
         }
     }
 
+    pub(crate) async fn presence_host_member_removed(
+        &self,
+        principal: &PrincipalId,
+        workspaces: &[WorkspaceId],
+    ) {
+        let connections: Vec<_> = {
+            let mut state = self.presence.lock();
+            state.profile_epoch += 1;
+            state
+                .conns
+                .iter()
+                .filter(|(_, c)| &c.principal == principal)
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        for connection in connections {
+            self.presence_disconnect_op(connection).await;
+        }
+        for workspace in workspaces {
+            self.emit_presence_changed(workspace.as_str()).await;
+        }
+    }
+
     /// Publish `presence:changed` for `workspace_id` from the current table
     /// (one membership read).
     async fn emit_presence_changed(&self, workspace_id: &str) {

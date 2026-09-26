@@ -985,7 +985,7 @@ impl WsInner {
         ws: WebSocketStream<S>,
         caller: Option<Caller>,
         guest: Option<GuestAdmission>,
-        revocations: Option<tokio::sync::broadcast::Receiver<intent_core::PrincipalId>>,
+        revocations: Option<tokio::sync::broadcast::Receiver<intent_core::PrincipalRevocation>>,
         admitted: Option<crate::auth::AdmittedCredential>,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1022,7 +1022,7 @@ impl WsInner {
         ws: WebSocketStream<S>,
         caller: Option<Caller>,
         guest: Option<GuestAdmission>,
-        revocations: Option<tokio::sync::broadcast::Receiver<intent_core::PrincipalId>>,
+        revocations: Option<tokio::sync::broadcast::Receiver<intent_core::PrincipalRevocation>>,
         rotation: Option<crate::auth::LegacyRotation>,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1246,13 +1246,13 @@ impl WsInner {
         mut cmd_rx: mpsc::Receiver<ConnCmd>,
         last_pong: Arc<AtomicI64>,
         caller: Option<Caller>,
-        mut revocations: Option<tokio::sync::broadcast::Receiver<intent_core::PrincipalId>>,
+        mut revocations: Option<tokio::sync::broadcast::Receiver<intent_core::PrincipalRevocation>>,
         mut admitted: Option<crate::auth::AdmittedCredential>,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         enum Input {
-            Revoked(std::result::Result<intent_core::PrincipalId, ()>),
+            Revoked(std::result::Result<intent_core::PrincipalRevocation, ()>),
             RoleChanged(bool),
             Incoming(Option<std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>),
             Outbound(String),
@@ -1330,11 +1330,17 @@ impl WsInner {
             match input {
                 Input::Revoked(revoked) => {
                     match revoked {
-                        Ok(id) if Some(&id) != revoked_principal.as_ref() => {}
+                        Ok(ref revocation)
+                            if Some(&revocation.principal_id) != revoked_principal.as_ref() => {}
                         _ => {
                             // Stop streams and event producers before the bounded
                             // response drain; only already-admitted replies may leave.
                             forwards = ForwardRegistry::default();
+                            let control = revoked
+                                .ok()
+                                .and_then(|r| r.final_event)
+                                .map(|event| subs.removal_control(&event))
+                                .unwrap_or_default();
                             subs = ConnSubs::default();
                             reverse.close();
                             // Deliver in-flight RPC responses before the
@@ -1346,6 +1352,18 @@ impl WsInner {
                             // bounded so a stuck handler cannot keep a revoked
                             // connection open.
                             let deadline = tokio::time::Instant::now() + REVOKE_FLUSH_GRACE;
+                            for frame in control {
+                                if !matches!(
+                                    tokio::time::timeout_at(
+                                        deadline,
+                                        sink.send(Message::Text(frame.into()))
+                                    )
+                                    .await,
+                                    Ok(Ok(()))
+                                ) {
+                                    break;
+                                }
+                            }
                             while !app_tx.priority_idle() {
                                 let next =
                                     tokio::time::timeout_at(deadline, app_rx.recv_priority()).await;
@@ -1512,8 +1530,8 @@ impl WsInner {
 /// principal may have been missed. Without a feed this remains pending, so
 /// administrator/unbound connections never enter the revocation branch.
 pub(crate) async fn recv_revocation(
-    rx: &mut Option<tokio::sync::broadcast::Receiver<intent_core::PrincipalId>>,
-) -> std::result::Result<intent_core::PrincipalId, ()> {
+    rx: &mut Option<tokio::sync::broadcast::Receiver<intent_core::PrincipalRevocation>>,
+) -> std::result::Result<intent_core::PrincipalRevocation, ()> {
     let Some(rx) = rx.as_mut() else {
         return std::future::pending().await;
     };
@@ -1684,11 +1702,11 @@ mod tests {
         use futures_util::FutureExt as _;
         let (tx, rx) = tokio::sync::broadcast::channel(1);
         let mut rx = Some(rx);
-        let first = PrincipalId::new();
+        let first = intent_core::PrincipalRevocation::from(PrincipalId::new());
         tx.send(first.clone()).unwrap();
         assert_eq!(super::recv_revocation(&mut rx).await, Ok(first));
-        tx.send(PrincipalId::new()).unwrap();
-        tx.send(PrincipalId::new()).unwrap();
+        tx.send(PrincipalId::new().into()).unwrap();
+        tx.send(PrincipalId::new().into()).unwrap();
         assert_eq!(super::recv_revocation(&mut rx).await, Err(()));
         let mut closed = Some(tx.subscribe());
         drop(tx);

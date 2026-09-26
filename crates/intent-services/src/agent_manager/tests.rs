@@ -23376,3 +23376,193 @@ mod enqueue_origin_table {
         }
     }
 }
+
+#[intent_test_macros::daemon_test]
+async fn member_removal_preserves_running_turn_and_automation_but_sweeps_human_queue() {
+    use intent_core::{with_caller, Caller, HostRole, PrincipalId};
+    for drain_first in [false, true] {
+        let (_tmp, mgr, _bus) = manager_with_bus().await;
+        let mgr = Arc::new(mgr);
+        mgr.services.attach_agent_manager(&mgr);
+        let ws = WorkspaceId::new();
+        let id = AgentId::new();
+        seed_agent(&mgr, &ws, &id).await;
+        let person = PrincipalId::new();
+        sqlx::query(
+            "INSERT INTO principal (id,is_primary,created_at,updated_at) VALUES (?,0,'t0','t0')",
+        )
+        .bind(&person.0)
+        .execute(mgr.services.store.write_pool())
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO host_member (principal_id,added_at) VALUES (?,'t0')")
+            .bind(&person.0)
+            .execute(mgr.services.store.write_pool())
+            .await
+            .unwrap();
+        mgr.services
+            .store
+            .insert_principal_credential(&person, "worker-removal-credential")
+            .await
+            .unwrap();
+        let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
+        let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
+        let (prompt_tx, mut prompts) = mpsc::unbounded_channel();
+        let (finish_first, mut finish) = mpsc::unbounded_channel::<()>();
+        let mock = tokio::spawn(async move {
+            let mut lines = BufReader::new(c2a_agent).lines();
+            let mut write = a2c_agent;
+            while let Ok(Some(line)) = lines.next_line().await {
+                let value: Value = serde_json::from_str(&line).unwrap();
+                let (Some(rpc_id), Some(method)) =
+                    (value.get("id"), value.get("method").and_then(Value::as_str))
+                else {
+                    continue;
+                };
+                let result = match method {
+                    "initialize" => {
+                        json!({"protocolVersion":1,"agentCapabilities":{"loadSession":false}})
+                    }
+                    "session/new" => {
+                        json!({"sessionId":MGR_ACP_SID,"modes":MockModes::with_bypass().to_json()})
+                    }
+                    "session/prompt" => {
+                        prompt_tx.send(value["params"].clone()).unwrap();
+                        finish.recv().await.unwrap();
+                        json!({"stopReason":"end_turn"})
+                    }
+                    _ => json!({}),
+                };
+                let response = json!({"jsonrpc":"2.0","id":rpc_id,"result":result});
+                write
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+                write.flush().await.unwrap();
+            }
+        });
+        let (note_tx, note_rx) = mpsc::unbounded_channel();
+        let connection = Arc::new(Connection::new(
+            c2a_client,
+            a2c_client,
+            None,
+            ConnectionHooks {
+                notifications: Some(note_tx),
+                ..ConnectionHooks::default()
+            },
+        ));
+        let mut handle = mock_handle();
+        handle.connection = connection;
+        handle.notifications = Arc::new(TokioMutex::new(note_rx));
+        mgr.handles.lock().unwrap().insert(id.clone(), handle);
+        mgr.registry.register(id.clone(), mgr.make_kill(id.clone()));
+        let caller = Caller::Wire {
+            principal_id: person.clone(),
+            host_role: HostRole::Member,
+        };
+        let sent = with_caller(
+            caller.clone(),
+            mgr.services.agent_send_message(
+                ws.clone(),
+                id.clone(),
+                "running human".into(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                MessageOrigin::User,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sent["queued"], false);
+        let first = timeout(Duration::from_secs(10), prompts.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(first.to_string().contains("running human"));
+        with_caller(
+            caller,
+            mgr.services.agent_queue_message(
+                id.clone(),
+                "pending human".into(),
+                None,
+                None,
+                Some(json!({"source":"system"})),
+            ),
+        )
+        .await
+        .unwrap();
+        if !drain_first {
+            mgr.services
+                .agent_queue_message(
+                    id.clone(),
+                    "automatic continuation".into(),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        if drain_first {
+            // Stop the actual worker inside admission, after its first turn.
+            let (reached, release) = mgr.services.queue_drain_commit_pause.arm();
+            finish_first.send(()).unwrap();
+            reached.await.unwrap();
+            let mut remove = mgr.services.host_members_remove(person.clone());
+            let pending =
+                std::future::poll_fn(|cx| std::task::Poll::Ready(remove.as_mut().poll(cx))).await;
+            assert!(
+                pending.is_pending(),
+                "removal must serialize with selected instructions"
+            );
+            release.send(()).unwrap();
+            remove.await.unwrap();
+            let second = timeout(Duration::from_secs(10), prompts.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(second.to_string().contains("pending human"));
+            mgr.services
+                .agent_queue_message(
+                    id.clone(),
+                    "automatic continuation".into(),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            // This turn was admitted before revocation, so it may finish.
+            finish_first.send(()).unwrap();
+        } else {
+            // Removal completes while the real provider prompt is still blocked.
+            mgr.services
+                .host_members_remove(person.clone())
+                .await
+                .unwrap();
+            assert!(mgr.contains(&id));
+            assert!(mgr.is_busy(&id));
+            finish_first.send(()).unwrap();
+        }
+        let automatic = timeout(Duration::from_secs(10), prompts.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(automatic.to_string().contains("automatic continuation"));
+        // History may contain the admitted first turn; no removed queued user
+        // row may appear when removal linearized first.
+        if !drain_first {
+            assert!(!automatic.to_string().contains("pending human"));
+        }
+        finish_first.send(()).unwrap();
+        mgr.stop(&id).await;
+        mock.abort();
+        let _ = mock.await;
+    }
+}

@@ -70,6 +70,7 @@ pub struct HostMemberRemoval {
     pub credentials: u64,
     pub workspaces: Vec<WorkspaceId>,
     pub revoked_invites: Vec<String>,
+    pub affected_workspaces: Vec<WorkspaceId>,
 }
 
 #[expect(
@@ -99,6 +100,15 @@ async fn state_in_tx(conn: &mut SqliteConnection) -> Result<HostMembershipState>
 }
 
 impl Store {
+    /// Whether a revoked principal still lacks a replacement authorization.
+    /// Used at human queue drain, never for agent/automation continuations.
+    ///
+    /// # Errors
+    /// Returns `Internal` on a database failure.
+    pub async fn principal_instructions_revoked(&self, principal: &PrincipalId) -> Result<bool> {
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM principal_revocation WHERE principal_id = ?) AND NOT EXISTS(SELECT 1 FROM principal_credential WHERE principal_id = ? AND revoked_at IS NULL)")
+            .bind(&principal.0).bind(&principal.0).fetch_one(self.read_pool()).await.map_err(db_error)
+    }
     /// Read durable counters, also suitable for taking a proof challenge's
     /// authorization-generation snapshot before its identity is known.
     ///
@@ -436,11 +446,62 @@ impl Store {
         &self,
         principal_id: &PrincipalId,
     ) -> Result<HostMemberRemoval> {
+        self.remove_host_member_inner(principal_id, None, false)
+            .await
+    }
+
+    /// Owner removal, with authority checked under the same write transaction.
+    ///
+    /// # Errors
+    /// Returns `Forbidden` for a non-primary actor, `InvalidInput` for the
+    /// primary target, or `Internal` for a database failure.
+    pub async fn remove_host_member_by_owner(
+        &self,
+        actor: &PrincipalId,
+        principal_id: &PrincipalId,
+    ) -> Result<HostMemberRemoval> {
+        self.remove_host_member_inner(principal_id, Some(actor), false)
+            .await
+    }
+
+    /// Revoke the caller's own access, whether a guest or an active member.
+    /// The membership decision and credentials share one transaction.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` for the primary or `Internal` on a DB failure.
+    pub async fn revoke_principal_access(
+        &self,
+        principal_id: &PrincipalId,
+    ) -> Result<HostMemberRemoval> {
+        self.remove_host_member_inner(principal_id, None, true)
+            .await
+    }
+
+    async fn remove_host_member_inner(
+        &self,
+        principal_id: &PrincipalId,
+        owner: Option<&PrincipalId>,
+        revoke_guest: bool,
+    ) -> Result<HostMemberRemoval> {
         let mut tx = self
             .write_pool()
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(db_error)?;
+        if let Some(owner) = owner {
+            let authorized: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM principal WHERE id = ? AND is_primary = 1)",
+            )
+            .bind(&owner.0)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db_error)?;
+            if !authorized {
+                return Err(Error::Forbidden(
+                    "host.members.remove requires the host owner".into(),
+                ));
+            }
+        }
         let primary: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM principal WHERE id = ? AND is_primary = 1)",
         )
@@ -466,8 +527,20 @@ impl Store {
             credentials: 0,
             workspaces: Vec::new(),
             revoked_invites: Vec::new(),
+            affected_workspaces: Vec::new(),
         };
-        if removed {
+        if removed || revoke_guest {
+            if removed {
+                result.affected_workspaces = sqlx::query_scalar::<_, String>(
+                    "SELECT id FROM workspace WHERE id != '__chief__' ORDER BY id",
+                )
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(db_error)?
+                .into_iter()
+                .map(WorkspaceId)
+                .collect();
+            }
             let now = now_iso();
             sqlx::query("UPDATE host_membership_state SET authorization_generation = authorization_generation + 1 WHERE id = 1")
                 .execute(&mut *tx).await.map_err(db_error)?;
@@ -475,18 +548,24 @@ impl Store {
                 .bind(&principal_id.0).execute(&mut *tx).await.map_err(db_error)?;
             result.credentials = sqlx::query("UPDATE principal_credential SET revoked_at = ? WHERE principal_id = ? AND revoked_at IS NULL")
                 .bind(&now).bind(&principal_id.0).execute(&mut *tx).await.map_err(db_error)?.rows_affected();
-            result.workspaces = sqlx::query_scalar::<_, String>("DELETE FROM workspace_member WHERE principal_id = ? AND role = 'collaborator' RETURNING workspace_id")
-                .bind(&principal_id.0).fetch_all(&mut *tx).await.map_err(db_error)?.into_iter().map(WorkspaceId).collect();
+            result.workspaces = sqlx::query_scalar::<_, String>("DELETE FROM workspace_member WHERE principal_id = ? AND (role = 'collaborator' OR ?) RETURNING workspace_id")
+                .bind(&principal_id.0).bind(removed).fetch_all(&mut *tx).await.map_err(db_error)?.into_iter().map(WorkspaceId).collect();
             result.workspaces.sort_by(|a, b| a.0.cmp(&b.0));
-            let revoke = format!("UPDATE workspace_invite AS i SET revoked_at = ? WHERE i.created_by_principal_id = ? AND {INVITE_OPEN} RETURNING id");
-            result.revoked_invites = sqlx::query_scalar(&revoke)
-                .bind(&now)
-                .bind(&principal_id.0)
-                .bind(&now)
-                .fetch_all(&mut *tx)
-                .await
-                .map_err(db_error)?;
-            result.revoked_invites.sort();
+            if removed {
+                let revoke = format!("UPDATE workspace_invite AS i SET revoked_at = ? WHERE i.created_by_principal_id = ? AND {INVITE_OPEN} RETURNING id");
+                result.revoked_invites = sqlx::query_scalar(&revoke)
+                    .bind(&now)
+                    .bind(&principal_id.0)
+                    .bind(&now)
+                    .fetch_all(&mut *tx)
+                    .await
+                    .map_err(db_error)?;
+                result.revoked_invites.sort();
+            }
+            // Human attribution is stamped by the daemon before admission.
+            // Automatic and agent-origin messages strip this stamp.
+            sqlx::query("DELETE FROM agent_queue WHERE CASE WHEN json_valid(payload) THEN json_extract(payload, '$.messageMetadata.fromPrincipalId') END = ?")
+                .bind(&principal_id.0).execute(&mut *tx).await.map_err(db_error)?;
         }
         tx.commit().await.map_err(db_error)?;
         Ok(result)

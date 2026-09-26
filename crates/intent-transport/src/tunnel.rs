@@ -397,7 +397,7 @@ struct OutboundFrame {
 pub(crate) struct MemberAuthority {
     pub api: Arc<dyn intent_core::WorkspaceApi>,
     pub principal_id: intent_core::PrincipalId,
-    pub revocations: Option<tokio::sync::broadcast::Receiver<intent_core::PrincipalId>>,
+    pub revocations: Option<tokio::sync::broadcast::Receiver<intent_core::PrincipalRevocation>>,
 }
 
 pub(crate) async fn run_tunnel_connection<S>(
@@ -411,7 +411,7 @@ pub(crate) async fn run_tunnel_connection<S>(
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     enum Input {
-        Revoked(Result<intent_core::PrincipalId, ()>),
+        Revoked(Result<intent_core::PrincipalRevocation, ()>),
         Incoming(Option<Result<Message, tokio_tungstenite::tungstenite::Error>>),
         Outbound(OutboundFrame),
         Command(Option<ConnCmd>),
@@ -439,7 +439,9 @@ pub(crate) async fn run_tunnel_connection<S>(
         };
         match input {
             Input::Revoked(revoked) => {
-                if revoked.is_ok_and(|id| id != authority.as_ref().expect("guarded").principal_id) {
+                if revoked.is_ok_and(|r| {
+                    r.principal_id != authority.as_ref().expect("guarded").principal_id
+                }) {
                     continue;
                 }
                 let _ = sink

@@ -204,3 +204,20 @@ mod tests {
         assert!(invite.validate_new().is_err());
     }
 }
+
+/// Internal committed revocation feed. The optional durable removal event is
+/// the only control notification allowed through a closing member connection.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrincipalRevocation {
+    pub principal_id: crate::PrincipalId,
+    pub final_event: Option<std::sync::Arc<crate::Event>>,
+}
+
+impl From<crate::PrincipalId> for PrincipalRevocation {
+    fn from(principal_id: crate::PrincipalId) -> Self {
+        Self {
+            principal_id,
+            final_event: None,
+        }
+    }
+}

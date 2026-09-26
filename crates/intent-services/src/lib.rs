@@ -110,6 +110,7 @@ mod invite_ops;
 mod issue_cache;
 mod line_attribution;
 mod linear_ops;
+mod member_removal;
 mod model_catalog;
 mod nested_repos;
 mod note_merge;
@@ -1059,6 +1060,15 @@ pub struct Services {
     /// (`principal.revokeSelf`), consumed by the transport to close their
     /// connections (multiplayer w4).
     principal_revocations: invite_ops::PrincipalRevocations,
+    human_instruction_authority: Arc<tokio::sync::RwLock<()>>,
+    #[cfg(test)]
+    invite_create_commit_pause: Arc<member_removal::MutationBarrier>,
+    #[cfg(test)]
+    member_removal_commit_pause: Arc<member_removal::MutationBarrier>,
+    #[cfg(test)]
+    invite_join_commit_pause: Arc<member_removal::MutationBarrier>,
+    #[cfg(test)]
+    queue_drain_commit_pause: Arc<member_removal::MutationBarrier>,
     /// Ephemeral workspace / note presence table (multiplayer w5), shared
     /// with the caret coalescer's trailing-flush tasks.
     presence: Arc<presence::PresenceRegistry>,
@@ -1468,6 +1478,15 @@ impl Services {
             identity_rekey_generation: Arc::new(AtomicU64::new(0)),
             invite_nonces: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             invite_nonce_permits: invite_ops::new_nonce_permits(),
+            human_instruction_authority: Arc::new(tokio::sync::RwLock::new(())),
+            #[cfg(test)]
+            invite_create_commit_pause: Arc::new(member_removal::MutationBarrier::default()),
+            #[cfg(test)]
+            member_removal_commit_pause: Arc::new(member_removal::MutationBarrier::default()),
+            #[cfg(test)]
+            invite_join_commit_pause: Arc::new(member_removal::MutationBarrier::default()),
+            #[cfg(test)]
+            queue_drain_commit_pause: Arc::new(member_removal::MutationBarrier::default()),
             principal_revocations: tokio::sync::broadcast::channel(
                 invite_ops::REVOCATION_CHANNEL_CAPACITY,
             )
@@ -28907,7 +28926,7 @@ impl WorkspaceApi for Services {
         input: AgentDelegateInput,
         parent_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        self.execution_call(async move {
+        self.execution_call(self.instruction_admission(async move {
             self.require_member(&workspace_id).await?;
             if let Some(model) = input.model.as_deref() {
                 reject_compound_model("model", model)?;
@@ -28923,7 +28942,7 @@ impl WorkspaceApi for Services {
             }
             self.agent_delegate_op(workspace_id, input, parent_agent_id)
                 .await
-        })
+        }))
     }
 
     fn agent_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<Vec<AgentLite>>> {
@@ -29246,7 +29265,7 @@ impl WorkspaceApi for Services {
         priority: Option<String>,
         message_metadata: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
+        Box::pin(self.instruction_admission(async move {
             self.require_member(&workspace_id).await?;
             let message_metadata =
                 crate::principal_ops::stamp_principal_attribution(message_metadata)?;
@@ -29262,7 +29281,7 @@ impl WorkspaceApi for Services {
                 message_metadata,
             )
             .await
-        })
+        }))
     }
 
     fn agent_send_message(
@@ -29280,7 +29299,7 @@ impl WorkspaceApi for Services {
         message_metadata: Option<serde_json::Value>,
         origin: intent_core::MessageOrigin,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        self.execution_call(async move {
+        self.execution_call(self.instruction_admission(async move {
             self.require_agent_member_in(&agent_id, &workspace_id)
                 .await?;
             // intent-hq/intent#5669: an agent may not message itself. Checked
@@ -29367,7 +29386,7 @@ impl WorkspaceApi for Services {
                 )
                 .await
             }
-        })
+        }))
     }
 
     fn agent_send_queued_message_now(
@@ -29376,7 +29395,7 @@ impl WorkspaceApi for Services {
         agent_id: AgentId,
         message_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        self.execution_call(async move {
+        self.execution_call(self.instruction_admission(async move {
             self.require_agent_member_in(&agent_id, &workspace_id)
                 .await?;
             // Ownership (multiplayer): a guest collaborator force-sends only
@@ -29397,7 +29416,7 @@ impl WorkspaceApi for Services {
                         .await
                 }
             }
-        })
+        }))
     }
 
     fn agent_dismiss_questions(
@@ -29454,7 +29473,7 @@ impl WorkspaceApi for Services {
         file_blocks: Option<serde_json::Value>,
         model: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        self.execution_call(async move {
+        self.execution_call(self.instruction_admission(async move {
             self.require_agent_member_in(&agent_id, &workspace_id)
                 .await?;
             if let Some(model) = model.as_deref() {
@@ -29527,7 +29546,7 @@ impl WorkspaceApi for Services {
                 }
                 Ok(result)
             }
-        })
+        }))
     }
 
     fn agent_queue_message(
@@ -29538,7 +29557,7 @@ impl WorkspaceApi for Services {
         file_blocks: Option<serde_json::Value>,
         message_metadata: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
+        Box::pin(self.instruction_admission(async move {
             self.require_agent_member(&agent_id).await?;
             // Principal stamp (multiplayer w2): captured on the queue entry
             // so the drain-time persist and every `agent:queue:*` payload
@@ -29557,7 +29576,7 @@ impl WorkspaceApi for Services {
                 message_metadata,
             )
             .await
-        })
+        }))
     }
 
     fn agent_edit_queued_message(
@@ -29567,11 +29586,11 @@ impl WorkspaceApi for Services {
         content: String,
         editing: Option<bool>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
+        Box::pin(self.instruction_admission(async move {
             self.require_agent_member(&agent_id).await?;
             self.agent_edit_queued_message_op(agent_id, message_id, content, editing)
                 .await
-        })
+        }))
     }
 
     fn agent_remove_queued_message(
@@ -29629,14 +29648,14 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         agent_id: AgentId,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        self.execution_call(async move {
+        self.execution_call(self.instruction_admission(async move {
             self.require_agent_member(&agent_id).await?;
             if let Some(manager) = self.agent_manager() {
                 manager.agent_retry(agent_id, workspace_id).await
             } else {
                 Ok(serde_json::json!({ "ok": false }))
             }
-        })
+        }))
     }
 
     fn agent_set_model(
@@ -29917,7 +29936,7 @@ impl WorkspaceApi for Services {
         mut context_message: String,
         mut input: intent_core::AgentWakeOrCreateInput,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
+        Box::pin(self.instruction_admission(async move {
             self.require_member(&workspace_id).await?;
             if let Some(model) = input.model.as_deref() {
                 reject_compound_model("model", model)?;
@@ -29935,7 +29954,7 @@ impl WorkspaceApi for Services {
                 .await?;
             self.agent_wake_or_create_op(workspace_id, task_note_id, context_message, input)
                 .await
-        })
+        }))
     }
 
     fn agent_get_session_stats(
@@ -32154,7 +32173,7 @@ impl WorkspaceApi for Services {
 
     fn subscribe_principal_revocations(
         &self,
-    ) -> Option<tokio::sync::broadcast::Receiver<intent_core::PrincipalId>> {
+    ) -> Option<tokio::sync::broadcast::Receiver<intent_core::PrincipalRevocation>> {
         Some(self.principal_revocations.subscribe())
     }
 
@@ -32245,6 +32264,13 @@ impl WorkspaceApi for Services {
 
     fn host_members_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move { self.host_members_list_op().await })
+    }
+
+    fn host_members_remove(
+        &self,
+        principal_id: intent_core::PrincipalId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.host_members_remove_op(&principal_id).await })
     }
 
     fn host_invite_create(

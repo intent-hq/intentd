@@ -183,3 +183,144 @@ async fn personal_pairing_reuses_uds_owner_member_guest_credentials_after_daemon
         0
     );
 }
+
+#[tokio::test]
+async fn member_removal_real_uds_operation_rejects_old_devices_after_restart() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = common::test_tempdir_in("/tmp", "member-removal-restart-");
+    std::fs::write(
+        dir.path().join("config.toml"),
+        "[server.tunnel]\nenabled = true\n",
+    )
+    .unwrap();
+    let sidecar = dir.path().join("tailcat-fixture.py");
+    std::fs::write(&sidecar,"#!/usr/bin/env python3\nimport sys,pathlib,signal,json\nkey=next(x[6:] for x in sys.argv if x.startswith('--key='))\nif sys.argv[1]=='genkey': pathlib.Path(key).write_text('removal-fixture')\nelse:\n print(json.dumps({'listenAddr':'tc-removal-fixture'}),flush=True)\n signal.pause()\n").unwrap();
+    std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let store = Store::open(&dir.path().join("intentd.db")).await.unwrap();
+    let mut member = store.get_primary_principal().await.unwrap();
+    member.id = PrincipalId::new();
+    member.is_primary = false;
+    store.upsert_principal(&member).await.unwrap();
+    sqlx::query("INSERT INTO host_member (principal_id,added_at) VALUES (?,?)")
+        .bind(&member.id.0)
+        .bind(now_iso())
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    let tokens = ["restart-device-one", "restart-device-two"];
+    for token in tokens {
+        store
+            .insert_principal_credential(&member.id, &intent_transport::hash_token(token))
+            .await
+            .unwrap();
+    }
+    let mut guest = member.clone();
+    guest.id = PrincipalId::new();
+    store.upsert_principal(&guest).await.unwrap();
+    let guest_token = "restart-unaffected";
+    store
+        .insert_principal_credential(&guest.id, &intent_transport::hash_token(guest_token))
+        .await
+        .unwrap();
+    let socket = dir.path().join("intentd.sock");
+    let mut fingerprint = None;
+    for run in 0..2 {
+        let mut daemon = spawn_personal(dir.path(), &sidecar, run);
+        common::await_daemon_listening(
+            &mut daemon,
+            &socket,
+            &dir.path().join(format!("personal-{run}.log")),
+        )
+        .await;
+        let status = common::await_wss_status(&socket).await;
+        let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+        let hello=uds_rpc(&socket,0,"client.hello",json!({"capabilities":{"hostMembership":false,"personalPairing":999,"authenticatedDevices":1}})).await;
+        assert_eq!(
+            hello["result"]["server"]["capabilities"]["hostMembership"],
+            1
+        );
+        assert_eq!(
+            hello["result"]["server"]["capabilities"]["personalPairing"],
+            1
+        );
+        assert!(hello["result"]["server"]["capabilities"]
+            .get("authenticatedDevices")
+            .is_none());
+        assert_eq!(
+            hello["result"]["server"]["buildCommit"].as_str(),
+            intent_transport::BUILD_COMMIT
+        );
+        let info = uds_rpc(&socket, 1, "pairing.getSelfInfo", json!({})).await;
+        let fp = info["result"]["fingerprint"].as_str().unwrap().to_owned();
+        if let Some(previous) = &fingerprint {
+            assert_eq!(previous, &fp);
+        }
+        fingerprint = Some(fp.clone());
+        assert!(info["result"]["token"].as_str() == Some(TOKEN));
+        let url = format!("wss://localhost:{port}/ws?token={guest_token}");
+        let mut unaffected = common::wss_connect_with_retry(port, client_config(&fp), &url).await;
+        if run == 0 {
+            let mut phones = Vec::new();
+            for token in tokens {
+                let url = format!("wss://localhost:{port}/ws?token={token}");
+                let mut phone =
+                    common::wss_connect_with_retry(port, client_config(&fp), &url).await;
+                let pairing = call(&mut phone, 1, "pairing.getSelfInfo").await;
+                assert!(pairing["result"]["token"].as_str() == Some(token));
+                assert_eq!(pairing["result"]["principal"]["id"], member.id.0);
+                phones.push(phone);
+            }
+            let removed = uds_rpc(
+                &socket,
+                2,
+                "host.members.remove",
+                json!({"principalId":member.id}),
+            )
+            .await;
+            assert_eq!(removed["result"], json!({"removed":true}));
+            for phone in &mut phones {
+                let frame = timeout(common::rpc_read_timeout(), phone.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    matches!(frame,Message::Close(Some(f)) if u16::from(f.code)==1008 && f.reason=="credential revoked")
+                );
+            }
+        }
+        for token in tokens {
+            for path in ["/ws", "/tunnel"] {
+                let tls = common::tls_connect_with_retry(port, client_config(&fp)).await;
+                let url = format!("wss://localhost:{port}{path}?token={token}");
+                let refused = tokio_tungstenite::client_async(url, tls).await;
+                assert!(
+                    matches!(refused,Err(tokio_tungstenite::tungstenite::Error::Http(r)) if r.status().as_u16()==401)
+                );
+            }
+        }
+        let kept = call(&mut unaffected, 3, "pairing.getSelfInfo").await;
+        assert!(kept["result"]["token"].as_str() == Some(guest_token));
+        assert_eq!(kept["result"]["principal"]["hostRole"], "guest");
+        assert_eq!(
+            uds_rpc(&socket, 4, "host.members.list", json!({})).await["result"]["members"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(uds_rpc(&socket, 5, "system.shutdown", json!({}))
+            .await
+            .get("error")
+            .is_none());
+        assert!(daemon
+            .wait_with_timeout(common::rpc_read_timeout())
+            .unwrap()
+            .is_some());
+        let log = std::fs::read_to_string(dir.path().join(format!("personal-{run}.log"))).unwrap();
+        for token in tokens.into_iter().chain([TOKEN, guest_token]) {
+            assert!(!log.contains(token), "daemon must not log credentials");
+        }
+        eprintln!("member removal restart round {run}: build={:?}, pid={}, durable revocation rejects old WSS and tunnel bearers",intent_transport::BUILD_COMMIT,daemon.id());
+    }
+}

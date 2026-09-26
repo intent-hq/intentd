@@ -757,6 +757,13 @@ async fn dispatch(
         // (it wraps the secret into the `intent://invite` link with the
         // listener's own hosts/port); only list/revoke route here.
         "host.members.list" => api.host_members_list().await.map_err(domain_to_rpc),
+        "host.members.remove" => api
+            .host_members_remove(intent_core::PrincipalId(require_str_param(
+                params,
+                "principalId",
+            )?))
+            .await
+            .map_err(domain_to_rpc),
         "host.executionContext" => api.host_execution_context().await.map_err(domain_to_rpc),
         "host.invite.list" => api.host_invite_list().await.map_err(domain_to_rpc),
         "host.invite.revoke" => api

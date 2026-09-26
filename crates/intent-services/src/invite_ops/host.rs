@@ -74,6 +74,67 @@ fn host_invite_to_wire(invite: &HostInvite, envelope: Option<&dyn InviteLinkEnve
 }
 
 impl Services {
+    pub(crate) async fn host_members_remove_op(
+        &self,
+        principal: &intent_core::PrincipalId,
+    ) -> Result<Value> {
+        Self::require_administrator("host.members.remove")?;
+        let actor = match super::current_caller() {
+            Some(intent_core::Caller::Wire { principal_id, .. }) => principal_id,
+            Some(intent_core::Caller::Daemon) => self.store.get_primary_principal().await?.id,
+            _ => {
+                return Err(Error::Forbidden(
+                    "host.members.remove requires the host owner".into(),
+                ))
+            }
+        };
+        let _authority = self.human_instruction_authority.write().await;
+        #[cfg(test)]
+        self.member_removal_commit_pause.pause().await;
+        let persist = self.agent_queue_persist_gate.lock().await;
+        let removed = self
+            .store
+            .remove_host_member_by_owner(&actor, principal)
+            .await?;
+        let changed = self.drop_principal_queues(principal, removed.removed);
+        drop(persist);
+        self.finish_host_member_removal(principal, &removed, changed)
+            .await;
+        Ok(json!({"removed":removed.removed}))
+    }
+
+    pub(super) async fn finish_host_member_removal(
+        &self,
+        principal: &intent_core::PrincipalId,
+        removed: &intent_store::HostMemberRemoval,
+        changed_queues: Vec<intent_core::AgentId>,
+    ) {
+        if !removed.removed {
+            return;
+        }
+        // All authorization reads already see the committed state. Close
+        // transports even if an unrelated workspace disappears during egress.
+        let final_event = self.host_membership_event(intent_core::events::HOST_MEMBERS_CHANGED,
+            json!({"revision":removed.revision,"principalId":principal,"hostRole":"guest","action":"removed"})).await;
+        let _ = self
+            .principal_revocations
+            .send(intent_core::PrincipalRevocation {
+                principal_id: principal.clone(),
+                final_event: final_event.map(std::sync::Arc::new),
+            });
+        self.presence_host_member_removed(principal, &removed.affected_workspaces)
+            .await;
+        for agent in changed_queues {
+            self.publish_queue_updated(&agent).await;
+        }
+        for workspace in &removed.affected_workspaces {
+            if let Ok(count) = self.member_count(workspace).await {
+                crate::publish_event(self.event_bus.as_ref(), crate::workspace_updated_event(workspace,
+                    &json!({"members":true,"removedPrincipalId":principal,"memberCount":count,"invites":true}))).await;
+            }
+        }
+    }
+
     pub(crate) async fn host_members_list_op(&self) -> Result<Value> {
         Self::require_administrator("host.members.list")?;
         let snapshot = self.store.list_host_members().await?;
@@ -138,17 +199,22 @@ impl Services {
     }
 
     async fn host_invite_event(&self, invite_id: &str, action: &str) {
-        self.host_membership_event(
-            intent_core::events::HOST_INVITES_CHANGED,
-            json!({"inviteId":invite_id,"action":action}),
-        )
-        .await;
+        let _ = self
+            .host_membership_event(
+                intent_core::events::HOST_INVITES_CHANGED,
+                json!({"inviteId":invite_id,"action":action}),
+            )
+            .await;
     }
 
-    async fn host_membership_event(&self, event_type: &str, data: Value) {
-        crate::publish_event(
-            self.event_bus.as_ref(),
-            intent_store::NewEvent {
+    async fn host_membership_event(
+        &self,
+        event_type: &str,
+        data: Value,
+    ) -> Option<intent_core::Event> {
+        let bus = self.event_bus.as_ref()?;
+        match bus
+            .publish(&intent_store::NewEvent {
                 workspace_id: WorkspaceId::from_string(String::new()),
                 timestamp: now_iso(),
                 event_type: event_type.to_string(),
@@ -158,9 +224,15 @@ impl Services {
                 parent_event_id: None,
                 metadata: None,
                 data,
-            },
-        )
-        .await;
+            })
+            .await
+        {
+            Ok(event) => Some(event),
+            Err(error) => {
+                tracing::warn!(%error, "failed to publish host membership event");
+                None
+            }
+        }
     }
 
     pub(super) async fn commit_host_invite_join(
@@ -196,7 +268,7 @@ impl Services {
         };
         self.presence_profile_changed(&principal).await;
         if added {
-            self.host_membership_event(intent_core::events::HOST_MEMBERS_CHANGED,
+            let _ = self.host_membership_event(intent_core::events::HOST_MEMBERS_CHANGED,
                 json!({"revision":revision,"principalId":principal.id,"hostRole":"member","action":"added"})).await;
         }
         self.host_invite_event(&invite.id, "redeemed").await;

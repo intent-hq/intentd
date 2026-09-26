@@ -97,6 +97,16 @@ async fn mints_client_id_when_omitted() {
 }
 
 #[test]
+fn shared_host_capabilities_are_independent_of_client_authority() {
+    for local in [true, false] {
+        let server = server_json(false, "linux", "x86_64", "test", None, local);
+        assert_eq!(server["capabilities"]["hostMembership"], 1);
+        assert_eq!(server["capabilities"]["personalPairing"], 1);
+        assert!(server["capabilities"].get("authenticatedDevices").is_none());
+    }
+}
+
+#[test]
 fn server_identity_omits_an_unknown_build_commit() {
     let server = server_json(true, "linux", "x86_64", "1.2.3", None, true);
     assert_eq!(server["version"], "1.2.3");

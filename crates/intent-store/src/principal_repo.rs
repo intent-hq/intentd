@@ -1548,6 +1548,14 @@ impl Store {
                 .await
                 .map_err(|e| Error::Internal(format!("invite join open check failed: {e}")))?;
             let Some(open) = open else { return Ok(InviteJoinOutcome::Closed); };
+            let issuer: String = open.get("created_by_principal_id");
+            let authorized: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM principal p WHERE p.id = ? AND (p.is_primary = 1 \
+                 OR EXISTS(SELECT 1 FROM host_member h WHERE h.principal_id = p.id) \
+                 OR EXISTS(SELECT 1 FROM workspace_member m WHERE m.principal_id = p.id AND m.workspace_id = ? AND m.role = 'owner')))"
+            ).bind(&issuer).bind(&workspace_id.0).fetch_one(&mut *conn).await
+                .map_err(|e| Error::Internal(format!("invite issuer check failed: {e}")))?;
+            if !authorized { return Ok(InviteJoinOutcome::Closed); }
             if map_invite_row(&open).pin_identity_key().is_some_and(|pin| pin != identity_key) {
                 return Ok(InviteJoinOutcome::PinMismatch);
             }
