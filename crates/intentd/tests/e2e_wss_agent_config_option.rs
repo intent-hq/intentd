@@ -2662,3 +2662,133 @@ async fn effort_notice_is_deferred_and_restores_auto_after_load() {
 async fn effort_notice_is_deferred_and_excluded_from_recreated_history() {
     effort_notice_restart_case(false).await;
 }
+
+#[tokio::test]
+async fn effort_notice_auto_restores_new_model_default_after_load() {
+    let Some(script) = gate() else { return };
+    let dir = temp_data_dir();
+    let prompt_log = dir.path().join("prompts.jsonl");
+    let config_log = dir.path().join("config.jsonl");
+    let rpc_log = dir.path().join("rpc.jsonl");
+    let behavior = json!({
+        "advertiseLoadSession": true,
+        "modelSelection": {
+            "defaultModel": "reasoner-a", "models": ["reasoner-a", "reasoner-b"],
+            "thinking": {
+                "reasoner-a": {"current": "medium", "values": ["low", "medium", "high"]},
+                "reasoner-b": {"current": "low", "values": ["low", "medium", "high"]},
+            },
+        },
+    });
+    let _daemon = Daemon {
+        child: spawn_serve(
+            dir.path(),
+            "both",
+            &[
+                ("INTENTD_AUTH_TOKEN", TOKEN),
+                ("MOCK_AGENT_SCRIPT_PATH", &script),
+                ("MOCK_AGENT_CONFIG_OPTION_MODEL", "1"),
+                ("MOCK_AGENT_BEHAVIOR", &behavior.to_string()),
+                ("MOCK_AGENT_PROMPT_LOG", &prompt_log.to_string_lossy()),
+                ("MOCK_AGENT_CONFIG_LOG", &config_log.to_string_lossy()),
+                ("MOCK_AGENT_RPC_LOG", &rpc_log.to_string_lossy()),
+            ],
+        ),
+    };
+    let socket = dir.path().join("intentd.sock");
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let mut sub = connect_ws(port, cfg).await;
+    let workspace = wss_rpc(
+        &mut rpc,
+        1,
+        "workspace.create",
+        json!({"title":"Effort model default", "noPrompt":true}),
+    )
+    .await;
+    let ws_id = workspace["workspace"]["id"].as_str().unwrap();
+    wss_rpc(
+        &mut sub,
+        2,
+        "events.subscribe",
+        json!({"workspaceId":ws_id,"eventTypes":["agent:*"]}),
+    )
+    .await;
+    let created = wss_rpc(
+        &mut rpc,
+        3,
+        "agent.create",
+        json!({"workspaceId":ws_id,"name":"Effort model default","provider":"mock",
+            "model":"reasoner-a","reasoningEffort":"high"}),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap();
+    for (turn, model) in ["reasoner-a", "reasoner-b", "reasoner-b"]
+        .into_iter()
+        .enumerate()
+    {
+        if turn == 1 {
+            wss_rpc(
+                &mut rpc,
+                4,
+                "agent.setModel",
+                json!({"workspaceId":ws_id,"agentId":agent_id,"modelId":model,"providerId":"mock"}),
+            )
+            .await;
+        }
+        if turn > 0 {
+            let effort = if turn == 1 {
+                json!("high")
+            } else {
+                Value::Null
+            };
+            wss_rpc(
+                &mut rpc, 5, "agent.update",
+                json!({"workspaceId":ws_id,"agentId":agent_id,"changes":{"reasoningEffort":effort}}),
+            ).await;
+        }
+        wss_rpc(
+            &mut rpc,
+            6,
+            "agent.sendMessage",
+            json!({"workspaceId":ws_id,"agentId":agent_id,"content":format!("turn {turn}")}),
+        )
+        .await;
+        let notices = effort_notices_until_end(&mut sub, &mut rpc, ws_id, agent_id).await;
+        loop {
+            let frame = wss_event(&mut sub, 30).await;
+            let event = &frame["params"]["event"];
+            if event["type"] == "agent:idle" && event["data"]["agentId"] == agent_id {
+                break;
+            }
+        }
+        let prompts = read_config_log(&prompt_log);
+        assert_eq!(prompts[turn]["effectiveModel"], model);
+        assert_eq!(
+            prompts[turn]["effectiveEffort"],
+            if turn == 2 { "low" } else { "high" },
+            "Auto restores reasoner-b's confirmed default after model switch and load"
+        );
+        if turn == 2 {
+            assert_eq!(notices.len(), 1);
+            assert_eq!(
+                notices[0]["metadata"],
+                json!({"type":"effort_changed","from":"high","to":null})
+            );
+        } else {
+            assert!(
+                notices.is_empty(),
+                "unchanged effort stays silent across models"
+            );
+        }
+    }
+    assert!(read_config_log(&rpc_log)
+        .iter()
+        .any(|call| call["method"] == "session/load"));
+    assert!(read_config_log(&config_log)
+        .iter()
+        .any(|call| call["configId"] == "effort" && call["value"] == "low"));
+}

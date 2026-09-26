@@ -3834,7 +3834,12 @@ impl AgentManager {
                     )
                     .await?;
                 let default = self
-                    .resumed_effort_default(agent_id, &session_record.workspace_id, provider.id)
+                    .resumed_effort_default(
+                        agent_id,
+                        &session_record.workspace_id,
+                        provider,
+                        model_response.as_ref(),
+                    )
                     .await;
                 self.install_and_apply_thought_level(
                     conn.as_ref(),
@@ -3987,36 +3992,70 @@ impl AgentManager {
     /// A loaded session reports its current value, which may be a prior
     /// explicit override. Never relearn that value as Auto's default. With
     /// no matching durable baseline, leave Auto unconfirmed unless the
-    /// adapter advertises a default sentinel.
+    /// adapter advertises a default sentinel. A confirmed change to another
+    /// model can supply its own fresh effort default in the model response.
     async fn resumed_effort_default(
         &self,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
-        provider: &str,
+        provider: &ProviderConfig,
+        model_response: Option<&Value>,
     ) -> String {
         let state = self
             .services
             .store
             .get_agent_session_last_turn_effort(workspace_id, agent_id)
             .await;
-        match state {
-            Ok(Some(state))
-                if state.provider == provider
-                    && self
-                        .handles
-                        .lock()
-                        .unwrap()
-                        .get(agent_id)
-                        .is_some_and(|h| h.spawned_model == state.model) =>
-            {
-                state.default_value
-            }
-            Ok(_) => String::new(),
+        let state = match state {
+            Ok(Some(state)) if state.provider == provider.id => state,
+            Ok(_) => return String::new(),
             Err(e) => {
                 tracing::warn!(agent = %agent_id, error = %e, "failed to read resumed effort default");
-                String::new()
+                return String::new();
             }
+        };
+        let model = self
+            .handles
+            .lock()
+            .unwrap()
+            .get(agent_id)
+            .and_then(|h| h.spawned_model.clone());
+        if model == state.model {
+            return state.default_value;
         }
+        let (Some(from), Some(to)) = (
+            Self::provider_local_model_target(provider, state.model.as_deref()),
+            Self::provider_local_model_target(provider, model.as_deref()),
+        ) else {
+            return String::new();
+        };
+        let (from, to) = if provider.config_option_model_strips_effort {
+            (
+                Self::split_codex_model_effort(from).0,
+                Self::split_codex_model_effort(to).0,
+            )
+        } else {
+            (from, to)
+        };
+        if from == to {
+            return state.default_value;
+        }
+        let options = model_response.and_then(|r| r.get("configOptions"));
+        let confirmed = options.and_then(Value::as_array).is_some_and(|options| {
+            options
+                .iter()
+                .any(|option| option["id"] == "model" && option["currentValue"] == to)
+        });
+        if !confirmed {
+            return String::new();
+        }
+        options
+            .and_then(|options| {
+                serde_json::from_value::<Vec<SessionConfigOption>>(options.clone()).ok()
+            })
+            .and_then(|options| discover_thought_level(Some(&options)))
+            .map(|selector| selector.initial_value)
+            .unwrap_or_default()
     }
 
     /// Install the selector for the effective model before applying saved

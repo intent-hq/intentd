@@ -146,10 +146,12 @@ async fn effort_notice_uses_saved_default_only_for_matching_resumed_identity() {
     let (mgr, id, conn, calls, _db, _task) = setup(Some(option("medium"))).await;
     turn(&mgr, &id, &conn, Some("high")).await;
     let ws = WorkspaceId::from("ws-1");
-    let default = mgr.resumed_effort_default(&id, &ws, "auggie").await;
+    let default = mgr
+        .resumed_effort_default(&id, &ws, intent_providers::provider_config("auggie"), None)
+        .await;
     assert_eq!(default, "medium");
     assert!(mgr
-        .resumed_effort_default(&id, &ws, "other")
+        .resumed_effort_default(&id, &ws, intent_providers::provider_config("grok"), None)
         .await
         .is_empty());
     let record = mgr.services.store.get_agent_session(&id).await.unwrap();
@@ -174,9 +176,82 @@ async fn effort_notice_uses_saved_default_only_for_matching_resumed_identity() {
         .unwrap()
         .spawned_model = Some("other-model".into());
     assert!(mgr
-        .resumed_effort_default(&id, &ws, "auggie")
+        .resumed_effort_default(&id, &ws, intent_providers::provider_config("auggie"), None)
         .await
         .is_empty());
+}
+
+#[tokio::test]
+async fn effort_notice_learns_defaults_only_from_confirmed_model_changes() {
+    let (mgr, id, _conn, _calls, _db, _task) = setup(Some(option("high"))).await;
+    let ws = WorkspaceId::from("ws-1");
+    let provider = intent_providers::provider_config("codex");
+    let response = json!({"configOptions": [
+        {"id":"model","name":"Model","category":"model","type":"select",
+         "currentValue":"reasoner-b","options":[{"value":"reasoner-b","name":"B"}]},
+        {"id":"effort","name":"Effort","category":"thought_level","type":"select",
+         "currentValue":"low","options":[{"value":"low","name":"Low"},{"value":"high","name":"High"}]},
+    ]});
+    mgr.handles
+        .lock()
+        .unwrap()
+        .get_mut(&id)
+        .unwrap()
+        .spawned_model = Some("reasoner-b[high]".into());
+    assert!(
+        mgr.resumed_effort_default(&id, &ws, provider, Some(&response))
+            .await
+            .is_empty(),
+        "an unknown legacy model cannot prove a model change"
+    );
+    mgr.services
+        .store
+        .set_agent_session_last_turn_effort(
+            &ws,
+            &id,
+            &intent_store::AgentTurnEffort {
+                effort: Some("high".into()),
+                default_value: "medium".into(),
+                provider: "codex".into(),
+                model: Some("codex:reasoner-a[high]".into()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        mgr.resumed_effort_default(&id, &ws, provider, Some(&response))
+            .await,
+        "low"
+    );
+
+    let mut mismatch = response.clone();
+    mismatch["configOptions"][0]["currentValue"] = json!("reasoner-a");
+    let mut missing_effort = response.clone();
+    missing_effort["configOptions"]
+        .as_array_mut()
+        .unwrap()
+        .pop();
+    for response in [None, Some(json!({})), Some(mismatch), Some(missing_effort)] {
+        assert!(
+            mgr.resumed_effort_default(&id, &ws, provider, response.as_ref())
+                .await
+                .is_empty(),
+            "a missing or unconfirmed model/default cannot establish Auto"
+        );
+    }
+    // Provider prefixes and embedded effort changes do not change the model.
+    // Even a model response must not replace the saved default in that case.
+    mgr.handles
+        .lock()
+        .unwrap()
+        .get_mut(&id)
+        .unwrap()
+        .spawned_model = Some("reasoner-a[low]".into());
+    assert_eq!(
+        mgr.resumed_effort_default(&id, &ws, provider, Some(&response))
+            .await,
+        "medium"
+    );
 }
 
 #[tokio::test]
