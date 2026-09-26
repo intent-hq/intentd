@@ -509,6 +509,13 @@ async fn next_settings_changed<S>(ws: &mut WebSocketStream<S>) -> Value
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    next_settings_changed_data(ws).await["changes"].clone()
+}
+
+async fn next_settings_changed_data<S>(ws: &mut WebSocketStream<S>) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -521,7 +528,7 @@ where
                 if v["method"] == json!("events.event")
                     && v["params"]["event"]["type"] == json!("settings:changed")
                 {
-                    return v["params"]["event"]["data"]["changes"].clone();
+                    return v["params"]["event"]["data"].clone();
                 }
             }
             Some(Ok(Message::Ping(p))) => {
@@ -1414,15 +1421,39 @@ async fn redaction_placeholder_round_trip_keeps_secret_over_wss() {
         "echoing the placeholder must not clobber the stored secret"
     );
 
-    // A literal value still replaces.
+    // A literal secret and an ordinary setting still commit as one revision
+    // after secret persistence moves outside the global gate (#5554 part 2).
     let resp = wss_rpc(
         &mut ws,
         4,
         "settings.update",
-        json!({ "changes": [{ "path": "linear.token", "value": "lin_api_rotated" }] }),
+        json!({ "changes": [
+            { "path": "notifications.volume", "value": 0.75 },
+            { "path": "linear.token", "value": "lin_api_rotated" }
+        ] }),
     )
     .await;
     assert_success_envelope(&resp, 4);
+    let applied = json!([
+        { "path": "notifications.volume", "value": 0.75, "origin": "file" },
+        { "path": "linear.token", "value": PLACEHOLDER }
+    ]);
+    assert_eq!(resp["result"]["applied"], applied);
+    let event = next_settings_changed_data(&mut sub).await;
+    assert_eq!(event["changes"], applied);
+    assert_eq!(event["revision"], resp["result"]["revision"]);
+    let snapshot = wss_rpc(&mut ws, 5, "settings.list", json!({})).await;
+    assert_success_envelope(&snapshot, 5);
+    assert_eq!(snapshot["result"]["revision"], event["revision"]);
+    for expected in applied.as_array().unwrap() {
+        let entry = snapshot["result"]["settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["path"] == expected["path"])
+            .unwrap();
+        assert_eq!(entry["value"], expected["value"]);
+    }
     assert_eq!(
         stored_secret(&secrets_file, "linear.token").as_deref(),
         Some("lin_api_rotated")

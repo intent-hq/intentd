@@ -501,6 +501,26 @@ impl SettingsRegistry {
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn apply(&self, changes: &[(String, Value)]) -> Result<SettingsChanged> {
         let mut inner = self.inner.lock().expect("settings registry lock poisoned");
+        let (mut candidate, text, snapshot) = Self::validate_changes(&inner, changes)?;
+        atomic_write(&self.path, &text)?;
+        candidate.record_write(&text);
+        *inner = candidate;
+
+        Ok(self.publish_snapshot(snapshot, inner.generation))
+    }
+
+    /// Check a mixed settings batch before secret I/O without adopting or
+    /// publishing anything. `apply` validates again under its own lock: this
+    /// preflight is not a reservation across an awaited secret-store write.
+    pub(crate) fn validate(&self, changes: &[(String, Value)]) -> Result<()> {
+        let inner = self.inner.lock().expect("settings registry lock poisoned");
+        Self::validate_changes(&inner, changes).map(|_| ())
+    }
+
+    fn validate_changes(
+        inner: &Inner,
+        changes: &[(String, Value)],
+    ) -> Result<(Inner, String, Arc<SettingsSnapshot>)> {
         for (path, _) in changes {
             if !KNOWN_PATHS.contains(&path.as_str()) {
                 return Err(Error::InvalidParams(format!("unknown setting: {path}")));
@@ -549,11 +569,7 @@ impl SettingsRegistry {
             other => other,
         })?;
         let snapshot = Arc::new(build_snapshot(&candidate)?);
-        atomic_write(&self.path, &text)?;
-        candidate.record_write(&text);
-        *inner = candidate;
-
-        Ok(self.publish_snapshot(snapshot, inner.generation))
+        Ok((candidate, text, snapshot))
     }
 
     /// Re-parse externally edited file `text` (strict schema) and adopt it as
@@ -1254,6 +1270,40 @@ mod tests {
             SettingsFile::parse_str(&text).unwrap(),
             reg.snapshot().effective
         );
+    }
+
+    #[test]
+    fn validate_is_non_mutating_and_checks_rendered_config() {
+        let seed = "# preserve me\n[git]\nautoCommit = true\n";
+        let (_dir, path) = temp_config(Some(seed));
+        let reg = SettingsRegistry::load(&path).unwrap();
+        let snapshot = reg.snapshot();
+        let rx = reg.subscribe();
+        let unchanged = || {
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), seed);
+            assert!(Arc::ptr_eq(&reg.snapshot(), &snapshot));
+            assert_eq!(reg.generation(), 0);
+            assert_eq!(reg.write_stamp(), None);
+            assert!(!rx.has_changed().unwrap(), "preflight must not notify");
+            let inner = reg.inner.lock().unwrap();
+            assert_eq!(inner.doc.to_string(), seed);
+            assert_eq!(inner.file, SettingsFile::parse_str(seed).unwrap());
+        };
+
+        reg.validate(&set("git.autoCommit", json!(false))).unwrap();
+        unchanged();
+
+        // JSON accepts this u64, but TOML encodes it as a float that startup
+        // cannot load. Preflight must use the same document checks as apply.
+        let error = reg
+            .validate(&[
+                ("git.autoCommit".into(), json!(false)),
+                ("prMonitor.debounceSeconds".into(), json!(u64::MAX)),
+            ])
+            .expect_err("preflight must reject config that startup cannot load");
+        assert!(matches!(error, Error::InvalidParams(_)), "{error}");
+        assert!(error.to_string().contains("prMonitor.debounceSeconds"));
+        unchanged();
     }
 
     #[test]
