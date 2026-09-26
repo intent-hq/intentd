@@ -41,16 +41,23 @@ pub(crate) fn is_collaborator_caller() -> bool {
 /// an unfiltered query becomes the whole allowlist. Returns `false` when the
 /// narrowed query can match nothing (the caller should return an empty
 /// result without hitting the store).
-pub(crate) fn narrow_query_for_caller(q: &mut EventQuery) -> bool {
+pub(crate) fn narrow_query_for_caller(q: &mut EventQuery, member: bool) -> bool {
     if !is_collaborator_caller() {
         return true;
     }
     if !q.event_types.is_empty() {
-        q.event_types
-            .retain(|t| is_collaborator_event_type(t.as_str()));
+        q.event_types.retain(|t| {
+            is_collaborator_event_type(t.as_str())
+                || (member && intent_core::events::is_member_execution_event_type(t))
+        });
         return !q.event_types.is_empty();
     }
-    let allowed = COLLABORATOR_EVENT_TYPES.iter().map(|(t, _)| *t);
+    let allowed = COLLABORATOR_EVENT_TYPES.iter().map(|(t, _)| *t).chain(
+        intent_core::events::MEMBER_EVENT_TYPES
+            .iter()
+            .copied()
+            .filter(|_| member),
+    );
     q.event_types = match q.event_type_prefix.take() {
         Some(prefix) => allowed
             .filter(|t| t.starts_with(prefix.as_str()))
@@ -59,6 +66,24 @@ pub(crate) fn narrow_query_for_caller(q: &mut EventQuery) -> bool {
         None => allowed.map(str::to_string).collect(),
     };
     !q.event_types.is_empty()
+}
+
+impl crate::Services {
+    pub(crate) async fn narrow_event_query_for_caller(
+        &self,
+        q: &mut EventQuery,
+    ) -> intent_core::Result<bool> {
+        let member = match intent_core::current_caller() {
+            Some(Caller::Wire { principal_id, .. }) if is_collaborator_caller() => {
+                matches!(
+                    self.store.get_host_role(&principal_id).await?,
+                    intent_core::HostRole::Member | intent_core::HostRole::Owner
+                )
+            }
+            _ => false,
+        };
+        Ok(narrow_query_for_caller(q, member))
+    }
 }
 
 /// The lowercase wire string for an [`ActorType`] (matches the serde form).

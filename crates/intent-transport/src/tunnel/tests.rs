@@ -1386,6 +1386,7 @@ async fn slow_client_keeps_stream_and_heartbeats_alive_behind_large_response() {
         cmd_rx,
         Arc::new(AtomicI64::new(0)),
         TunnelLimits::default(),
+        None,
     ));
     for (stream_id, port) in [(2, echo_port), (1, response_port)] {
         client_send(&mut client_sink, Frame::Open { stream_id, port }).await;
@@ -1596,6 +1597,7 @@ async fn blocked_sink_client_stalls_only_its_own_stream_at_the_credit_window() {
         cmd_rx,
         Arc::new(AtomicI64::new(0)),
         TunnelLimits::default(),
+        None,
     ));
     for (stream_id, port) in [(2, echo_port), (1, reply_port)] {
         client_send(&mut client_sink, Frame::Open { stream_id, port }).await;

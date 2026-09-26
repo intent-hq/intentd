@@ -924,12 +924,46 @@ pub fn is_collaborator_event_type(event_type: &str) -> bool {
         .contains(event_type)
 }
 
-/// Narrow member additions needed by execution context and live permissions.
-/// Guest classification is unchanged. Delivery also rechecks durable authority.
+/// Additional types available to active host members. Workspace types still
+/// require effective access to the referenced ordinary workspace; global
+/// membership/context notifications have explicit delivery rules.
+pub const MEMBER_EVENT_TYPES: &[&str] = &[
+    AGENT_PERMISSION_REQUEST,
+    AGENT_PERMISSION_RESOLVED,
+    BROWSER_TAB_CLOSED,
+    BROWSER_TAB_OPENED,
+    BROWSER_TAB_UPDATED,
+    BUILD_COMPLETED,
+    BUILD_STARTED,
+    GIT_CLONE_DONE,
+    GIT_CLONE_PROGRESS,
+    GIT_ROOT_REGISTERED,
+    GIT_ROOT_UNREGISTERED,
+    GIT_ROOT_UPDATED,
+    HOOK_RUN_COMPLETED,
+    HOOK_RUN_STARTED,
+    HOST_EXEC_EXIT,
+    HOST_EXEC_STDERR,
+    HOST_EXEC_STDOUT,
+    HOST_EXECUTION_CONTEXT_CHANGED,
+    HOST_MEMBERS_CHANGED,
+    SCRIPT_CHANGED,
+    SCRIPT_OUTPUT,
+    SCRIPT_STATE,
+    TERMINAL_COMMAND,
+    TERMINAL_CWD,
+    TERMINAL_DATA,
+    TERMINAL_EXIT,
+    TERMINAL_TITLE,
+    TEST_COMPLETED,
+    TEST_STARTED,
+    WORKSPACE_TRANSFER_FAILED,
+    WORKSPACE_TRANSFER_PROGRESS,
+    WORKSPACE_TRANSFER_READY,
+];
+
+/// Whether a type is a member addition; delivery still checks its scope.
 #[must_use]
 pub fn is_member_execution_event_type(event_type: &str) -> bool {
-    matches!(
-        event_type,
-        HOST_EXECUTION_CONTEXT_CHANGED | AGENT_PERMISSION_REQUEST | AGENT_PERMISSION_RESOLVED
-    )
+    MEMBER_EVENT_TYPES.contains(&event_type)
 }

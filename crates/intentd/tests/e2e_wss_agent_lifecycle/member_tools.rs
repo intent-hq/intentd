@@ -903,15 +903,21 @@ async fn member_provider_safe_reads_use_host_cache_and_preserve_administration_o
     assert!(events
         .iter()
         .any(|row| row.id.as_str() == event["id"].as_str().unwrap() && row.data == context));
-    for method in [
-        "settings.list",
-        "host.env",
-        "host.providerTestPrompt",
-        "prMonitor.flush",
-    ] {
+    for method in ["settings.list", "host.env", "host.providerTestPrompt"] {
         let denied = wss_rpc_envelope(&mut client, 9, method, json!({})).await;
         assert_eq!(denied["error"]["code"], -32003, "{method}: {denied}");
     }
+    let flushed = wss_rpc_envelope(
+        &mut client,
+        9,
+        "prMonitor.flush",
+        json!({"workspaceId":ws,"monitorId":"unknown-monitor"}),
+    )
+    .await;
+    assert_eq!(
+        flushed["error"]["data"]["code"], "not-found",
+        "member reaches the scoped monitor lookup: {flushed}"
+    );
     let owner_status = wss_rpc(
         &mut owner,
         1,
@@ -933,7 +939,11 @@ async fn member_provider_safe_reads_use_host_cache_and_preserve_administration_o
         .execute(store.write_pool())
         .await
         .unwrap();
-    for method in ["host.providerDiscovery", "host.providerAuthStatus"] {
+    for method in [
+        "host.providerDiscovery",
+        "host.providerAuthStatus",
+        "prMonitor.flush",
+    ] {
         let denied =
             wss_rpc_envelope(&mut client, 10, method, json!({"providerId":"auggie"})).await;
         assert_eq!(

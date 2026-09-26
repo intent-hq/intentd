@@ -394,11 +394,18 @@ struct OutboundFrame {
 /// spawn/feed per-stream relay tasks, drain their outbound frames to the
 /// socket, answer pings, and honour heartbeat/shutdown control commands.
 /// All remaining stream tasks are aborted when the connection ends.
+pub(crate) struct MemberAuthority {
+    pub api: Arc<dyn intent_core::WorkspaceApi>,
+    pub principal_id: intent_core::PrincipalId,
+    pub revocations: Option<tokio::sync::broadcast::Receiver<intent_core::PrincipalId>>,
+}
+
 pub(crate) async fn run_tunnel_connection<S>(
     ws: WebSocketStream<S>,
     mut cmd_rx: mpsc::Receiver<ConnCmd>,
     last_pong: Arc<AtomicI64>,
     limits: TunnelLimits,
+    mut authority: Option<MemberAuthority>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -408,6 +415,12 @@ pub(crate) async fn run_tunnel_connection<S>(
     let inbound_budget = Arc::new(Semaphore::new(INBOUND_BYTES_PER_CONNECTION));
     loop {
         tokio::select! {
+            biased;
+            revoked = async { crate::ws::recv_revocation(&mut authority.as_mut().expect("guarded").revocations).await }, if authority.is_some() => {
+                if revoked.is_ok_and(|id| id != authority.as_ref().expect("guarded").principal_id) { continue; }
+                let _ = sink.send(Message::Close(Some(CloseFrame { code: CloseCode::Policy, reason: "credential revoked".into() }))).await;
+                break;
+            }
             incoming = stream.next() => match incoming {
                 Some(Err(e)) => {
                     // Over-limit inbound message/frame: tell the client why
@@ -431,6 +444,14 @@ pub(crate) async fn run_tunnel_connection<S>(
                             break;
                         }
                     };
+                    if matches!(frame, Frame::Open { .. }) {
+                        if let Some(authority) = &authority {
+                            if !authority.api.principal_host_role(authority.principal_id.clone()).await.is_ok_and(|role| role == intent_core::HostRole::Member) {
+                                let _ = sink.send(Message::Close(Some(CloseFrame {code: CloseCode::Policy, reason: "host membership required".into()}))).await;
+                                break;
+                            }
+                        }
+                    }
                     if !handle_frame(
                         frame,
                         &mut sink,

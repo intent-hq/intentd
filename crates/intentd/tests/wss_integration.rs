@@ -12,6 +12,9 @@ mod common;
 mod host_roles;
 #[path = "wss_integration/sharing.rs"]
 mod sharing;
+
+#[path = "wss_integration/member_transport.rs"]
+mod member_transport;
 #[path = "wss_integration/workspace_delete.rs"]
 mod workspace_delete;
 

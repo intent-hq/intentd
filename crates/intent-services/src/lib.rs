@@ -17117,10 +17117,13 @@ impl WorkspaceApi for Services {
 
     fn rules_get(
         &self,
-        _workspace_id: WorkspaceId,
+        workspace_id: WorkspaceId,
         rule_type: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { rules::RulesService::new(&self.store).get(&rule_type).await })
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            rules::RulesService::new(&self.store).get(&rule_type).await
+        })
     }
 
     fn rules_update(
@@ -17724,14 +17727,24 @@ impl WorkspaceApi for Services {
             // Multiplayer w3: a collaborator searches allowlisted rows only,
             // and an unscoped query only its member workspaces (the query
             // carries no SQL limit, so the post-filter is exact).
-            let mut events = if event_ops::narrow_query_for_caller(&mut q) {
+            let mut events = if self.narrow_event_query_for_caller(&mut q).await? {
                 store.query_events(&q).await?
             } else {
                 Vec::new()
             };
             if workspace_id.is_none() {
                 if let Some(visible) = self.visible_workspace_ids().await? {
-                    events.retain(|ev| visible.contains(&ev.workspace_id));
+                    // Narrowing above admits these safe global invalidations
+                    // only for current members, without exposing other globals.
+                    events.retain(|ev| {
+                        visible.contains(&ev.workspace_id)
+                            || (ev.workspace_id.as_str().is_empty()
+                                && matches!(
+                                    ev.event_type.as_str(),
+                                    intent_core::events::HOST_MEMBERS_CHANGED
+                                        | intent_core::events::HOST_EXECUTION_CONTEXT_CHANGED
+                                ))
+                    });
                 }
             }
             let matches = search_ops::event_matches(&events, &query, limit);
@@ -26600,7 +26613,7 @@ impl WorkspaceApi for Services {
                     limit: Some(100),
                     ..Default::default()
                 };
-                let events = if event_ops::narrow_query_for_caller(&mut q) {
+                let events = if self.narrow_event_query_for_caller(&mut q).await? {
                     store.query_events(&q).await?
                 } else {
                     Vec::new()
@@ -26618,7 +26631,7 @@ impl WorkspaceApi for Services {
                     since: Some(iso_minutes_ago(minutes)),
                     ..Default::default()
                 };
-                let events = if event_ops::narrow_query_for_caller(&mut q) {
+                let events = if self.narrow_event_query_for_caller(&mut q).await? {
                     store.query_events(&q).await?
                 } else {
                     Vec::new()
@@ -26647,7 +26660,7 @@ impl WorkspaceApi for Services {
             };
             // Multiplayer w3: a collaborator's summary is built from
             // allowlisted rows only.
-            let events = if event_ops::narrow_query_for_caller(&mut q) {
+            let events = if self.narrow_event_query_for_caller(&mut q).await? {
                 store.query_events(&q).await?
             } else {
                 Vec::new()
@@ -26722,7 +26735,7 @@ impl WorkspaceApi for Services {
             // Multiplayer w3: a collaborator reads only allowlisted rows;
             // the narrowing lands in the SQL type filter so `limit` and
             // `nextToken` count real rows.
-            if !event_ops::narrow_query_for_caller(&mut q) {
+            if !self.narrow_event_query_for_caller(&mut q).await? {
                 return Ok(if paginate {
                     serde_json::json!({ "items": [], "nextToken": serde_json::Value::Null })
                 } else {
@@ -30201,6 +30214,7 @@ impl WorkspaceApi for Services {
         stale_responding_after_ms: Option<i64>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             if let Some(agent) = agent_id.as_ref() {
                 self.require_agent_member(agent).await?;
             }

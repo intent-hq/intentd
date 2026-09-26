@@ -2405,3 +2405,126 @@ mod unbound_owner_only_methods {
         );
     }
 }
+
+/// Freeze a separate member remainder; the guest golden remains unchanged.
+#[test]
+fn member_methods_and_administrator_remainder_are_classified() {
+    const REFUSED: &[&str] = &[
+        "agent.memoryUsage",
+        "agent.replaceMessages",
+        "agent.reportToParent",
+        "client.list",
+        "debug.sampleStacks",
+        "github.authStatus",
+        "github.cancelAuth",
+        "github.connect",
+        "github.getUser",
+        "github.identityProof.create",
+        "github.identityProof.delete",
+        "github.revoke",
+        "host.checkAuggie",
+        "host.checkGh",
+        "host.checkGit",
+        "host.checkNode",
+        "host.createDirectory",
+        "host.directoryStatus",
+        "host.env",
+        "host.exec",
+        "host.execStream",
+        "host.execStream.cancel",
+        "host.execStream.write",
+        "host.findApp",
+        "host.findBinary",
+        "host.invite.create",
+        "host.invite.list",
+        "host.invite.revoke",
+        "host.listDirectory",
+        "host.listInstalledEditors",
+        "host.members.list",
+        "host.openInEditor",
+        "host.providerTestPrompt",
+        "identity.authStatus",
+        "identity.cancelAuth",
+        "identity.connect",
+        "identity.getUser",
+        "identity.revoke",
+        "identity.select",
+        "invite.accept",
+        "invite.challenge",
+        "invite.inspect",
+        "invite.prove",
+        "linear.authStatus",
+        "mcp.oauth.delete",
+        "mcp.oauth.get",
+        "mcp.oauth.list",
+        "mcp.oauth.set",
+        "mcp.servers.create",
+        "mcp.servers.delete",
+        "mcp.servers.getStatus",
+        "mcp.servers.list",
+        "mcp.servers.restart",
+        "mcp.servers.update",
+        "mcp.testConnection",
+        "metrics.clearAgentStats",
+        "metrics.getAllWorkspaceStats",
+        "pairing.getInfo",
+        "providers.setup.cancel",
+        "providers.setup.login",
+        "providers.setup.start",
+        "providers.setup.status",
+        "repo.remove",
+        "rules.update",
+        "sentry.authStatus",
+        "server.pairingInfo",
+        "server.rotateToken",
+        "settings.get",
+        "settings.list",
+        "settings.reset",
+        "settings.update",
+        "sourceControl.authStatus",
+        "sourceControl.cancelAuth",
+        "sourceControl.connect",
+        "sourceControl.getUser",
+        "sourceControl.identityProof.create",
+        "sourceControl.identityProof.delete",
+        "sourceControl.revoke",
+        "specialist.create",
+        "specialist.delete",
+        "specialist.edit",
+        "system.gitCredential",
+        "system.importLegacy",
+        "system.requestUpdate",
+        "system.shutdown",
+        "unsloth.status",
+        "unsloth.stop",
+    ];
+    let universe: BTreeSet<_> = ROUTER_METHODS
+        .iter()
+        .chain(FASTPATH_METHODS)
+        .copied()
+        .collect();
+    let allowed: BTreeSet<_> = super::MEMBER_METHODS.iter().copied().collect();
+    assert_eq!(allowed.len(), super::MEMBER_METHODS.len());
+    assert!(allowed
+        .iter()
+        .all(|m| universe.contains(m) && !collaborator_may_call(m)));
+    assert_eq!(
+        allowed.iter().copied().collect::<Vec<_>>(),
+        super::MEMBER_METHODS
+    );
+    let refused: Vec<_> = universe
+        .into_iter()
+        .filter(|m| !super::member_may_call(m))
+        .collect();
+    assert_eq!(refused, REFUSED);
+    for (alias, canonical) in METHOD_ALIASES {
+        assert_eq!(
+            super::member_may_call(alias),
+            super::member_may_call(canonical)
+        );
+    }
+    assert!(!super::member_may_call("unknown.method"));
+    for method in REVERSE_METHODS {
+        assert_eq!(super::member_may_call(method), *method == "browser.exec");
+    }
+}

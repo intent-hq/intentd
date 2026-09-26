@@ -242,6 +242,13 @@ fn channel_event_types_are_all_collaborator_visible() {
         assert!(!types.is_empty(), "{channel:?} tails no types");
         let hidden: Vec<&String> = types
             .iter()
+            // A workspace channel consumes the global role invalidation
+            // internally and re-reads caller-scoped rows; it never forwards
+            // the event payload (including the unrelated principal id).
+            .filter(|t| {
+                !(channel == Channel::Workspace
+                    && t.as_str() == intent_core::events::HOST_MEMBERS_CHANGED)
+            })
             .filter(|t| !intent_core::events::is_collaborator_event_type(t))
             .collect();
         assert!(

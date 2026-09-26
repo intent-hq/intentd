@@ -420,3 +420,45 @@ fn re_export_matches_module_function() {
         re_exported_is_known_event_type("nope")
     );
 }
+
+#[test]
+fn member_event_administrator_remainder_is_frozen() {
+    use intent_core::events::{is_member_execution_event_type, MEMBER_EVENT_TYPES};
+    const REFUSED: &[&str] = &[
+        "agent:delivery-confirmed",
+        "agent:event-delivery-failed",
+        "agent:event-delivery-timeout",
+        "agent:message:delivery-failed",
+        "agent:message:received",
+        "agent:message:sent",
+        "agent:subscribed",
+        "agent:subscriptions-restored",
+        "agent:unsubscribed",
+        "agent:woken-by-subscription",
+        "app:ui-highlight",
+        "app:ui-navigate",
+        "app:workspace-open",
+        "client:connected",
+        "client:disconnected",
+        "github:auth-changed",
+        "host:invites-changed",
+        "identity:auth-changed",
+        "mcp.servers:status-changed",
+        "mcp:notification",
+        "principal:identity-changed",
+        "settings:changed",
+        "sourceControl:auth-changed",
+    ];
+    let extra: BTreeSet<_> = MEMBER_EVENT_TYPES.iter().copied().collect();
+    assert_eq!(extra.len(), MEMBER_EVENT_TYPES.len());
+    assert!(extra
+        .iter()
+        .all(|t| is_known_event_type(t) && !is_collaborator_event_type(t)));
+    let refused: BTreeSet<_> = ALL_EVENT_TYPES
+        .iter()
+        .copied()
+        .filter(|t| !is_collaborator_event_type(t) && !is_member_execution_event_type(t))
+        .collect();
+    assert_eq!(refused.into_iter().collect::<Vec<_>>(), REFUSED);
+    assert!(!is_member_execution_event_type("unknown:event"));
+}
