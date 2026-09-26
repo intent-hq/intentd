@@ -222,7 +222,7 @@ where
                 let _ = ws.send(Message::Pong(p)).await;
             }
             Some(Ok(_)) => {}
-            other => panic!("expected text frame, got {other:?}"),
+            other => panic!("rpc {method} expected text frame, got {other:?}"),
         }
     }
 }
@@ -14808,6 +14808,27 @@ async fn edit_and_regenerate_truncates_and_replays_history_over_wss() {
     assert_eq!(messages[2]["role"], "user");
     let edit_target = messages[2]["id"].as_str().expect("target id").to_string();
 
+    // A second client already holds the old transcript. Editing must reset
+    // this standing subscription without a reconnect or a manufactured gap.
+    let removed_ids = [messages[2]["id"].clone(), messages[3]["id"].clone()];
+    let mut chat = connect_ws(port, cfg.clone()).await;
+    let chat_response = wss_rpc(
+        &mut chat,
+        1,
+        "chat.subscribe",
+        json!({ "agentId": agent_id, "deltaEncoding": "incremental" }),
+    )
+    .await;
+    let initial = wss_push(&mut chat, 15).await;
+    assert_eq!(initial["params"]["seq"], 0);
+    assert_eq!(
+        initial["params"]["snapshot"]["messages"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+
     let edited = wss_rpc(
         &mut rpc,
         14,
@@ -14892,6 +14913,59 @@ async fn edit_and_regenerate_truncates_and_replays_history_over_wss() {
         "result messageId names the persisted regenerated user row (PROTOCOL §5.5)"
     );
     assert_eq!(messages[3]["role"], "assistant");
+
+    let replacement_assistant_id = messages[3]["id"].clone();
+    timeout(Duration::from_secs(30), async {
+        let mut saw_reset = false;
+        let mut seq = 0;
+        loop {
+            let frame = wss_push(&mut chat, 30).await;
+            let params = &frame["params"];
+            assert_eq!(params["subscriptionId"], chat_response["subscriptionId"]);
+            seq += 1;
+            assert_eq!(params["seq"], seq, "reset keeps the sequence contiguous");
+            if params["kind"] == "snapshot" {
+                let snapshot = &params["snapshot"];
+                assert_eq!(snapshot["resumed"], false, "discard the cached suffix");
+                assert_eq!(snapshot["deltaEncoding"], "incremental");
+                let rows = snapshot["messages"].as_array().expect("reset rows");
+                assert!(rows.iter().all(|row| !removed_ids.contains(&row["id"])));
+                saw_reset = true;
+                // A fast replacement can finish before the bounded reset read.
+                if rows
+                    .iter()
+                    .any(|row| row["id"] == replacement_assistant_id && row["isStreaming"] != true)
+                {
+                    break;
+                }
+            } else {
+                let entities = ["added", "updated"]
+                    .into_iter()
+                    .flat_map(|key| params["delta"][key].as_array().into_iter().flatten());
+                let mut completed = false;
+                for entity in entities {
+                    if saw_reset {
+                        assert!(
+                            !removed_ids.contains(&entity["messageId"]),
+                            "old row restored: {frame}"
+                        );
+                    }
+                    completed |= entity["messageId"] == replacement_assistant_id
+                        && entity["streamingComplete"] == true;
+                }
+                if completed {
+                    assert!(
+                        saw_reset,
+                        "replacement streamed without invalidating the old transcript"
+                    );
+                    break;
+                }
+            }
+        }
+        assert!(saw_reset, "edit must reset the standing chat subscription");
+    })
+    .await
+    .expect("standing chat converged through the regenerated turn");
 
     // Outbound-prompt contract (fresh session + history replay): the
     // regenerated turn's prompt carries the kept prefix as `<supervisor>` XML

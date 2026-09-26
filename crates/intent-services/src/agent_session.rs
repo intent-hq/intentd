@@ -5228,6 +5228,12 @@ impl Services {
                     "blockId": transcript.block_id(block_index),
                     "blockType": block_type,
                 });
+                if let Some(t) = &text {
+                    // UTF-8 byte position within this block, not the turn.
+                    // A recovery snapshot can already contain this chunk by
+                    // the time a standing subscriber consumes its event.
+                    delta["textOffset"] = json!(transcript.text.len() - t.len());
+                }
                 if let Some(media) = media {
                     delta["media"] = Value::Object(media);
                 }
