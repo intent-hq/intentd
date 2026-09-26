@@ -827,10 +827,11 @@ fn channel_event_types_full_matrix() {
         "pr:linked",
         "pr:updated",
         "pr:unlinked",
+        "host:members-changed",
     ] {
         assert!(ws.iter().any(|s| s == t), "workspace missing {t}");
     }
-    assert_eq!(ws.len(), 10);
+    assert_eq!(ws.len(), 11);
     // Comment channel — single type.
     assert_eq!(
         channel_event_types(Channel::Comment),

@@ -1228,6 +1228,14 @@ impl WsInner {
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        enum Input {
+            Revoked(std::result::Result<intent_core::PrincipalId, ()>),
+            RoleChanged(bool),
+            Incoming(Option<std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>),
+            Outbound(String),
+            Command(Option<ConnCmd>),
+        }
+
         let (mut sink, mut stream) = ws.split();
         // Two-lane outbound queue: RPC responses on the priority lane, event/
         // subscription pushes on the bulk lane; `recv()` drains priority first
@@ -1275,11 +1283,24 @@ impl WsInner {
             revocations = None;
         }
         loop {
-            tokio::select! {
+            // Only revocation has priority; keep ordinary traffic fair so
+            // a queued request burst cannot starve replies or heartbeats.
+            let input = tokio::select! {
                 biased;
-                revoked = recv_revocation(&mut revocations) => {
+                revoked = recv_revocation(&mut revocations) => Input::Revoked(revoked),
+                input = async {
+                    tokio::select! {
+                        change = async { role_changes.as_mut().expect("guarded").recv().await }, if role_changes.is_some() => Input::RoleChanged(change.is_some()),
+                        incoming = stream.next() => Input::Incoming(incoming),
+                        Some(frame) = app_rx.recv() => Input::Outbound(frame),
+                        cmd = cmd_rx.recv() => Input::Command(cmd),
+                    }
+                } => input,
+            };
+            match input {
+                Input::Revoked(revoked) => {
                     match revoked {
-                        Ok(id) if Some(&id) != revoked_principal.as_ref() => {},
+                        Ok(id) if Some(&id) != revoked_principal.as_ref() => {}
                         _ => {
                             // Stop streams and event producers before the bounded
                             // response drain; only already-admitted replies may leave.
@@ -1296,16 +1317,25 @@ impl WsInner {
                             // connection open.
                             let deadline = tokio::time::Instant::now() + REVOKE_FLUSH_GRACE;
                             while !app_tx.priority_idle() {
-                                let next = tokio::time::timeout_at(deadline, app_rx.recv_priority()).await;
+                                let next =
+                                    tokio::time::timeout_at(deadline, app_rx.recv_priority()).await;
                                 let Ok(Some(frame)) = next else { break };
                                 if frame.len() > crate::MAX_OUTBOUND_MESSAGE_BYTES {
                                     continue;
                                 }
                                 if serde_json::from_str::<serde_json::Value>(&frame)
-                                    .is_ok_and(|value| value.get("method").is_some()) {
+                                    .is_ok_and(|value| value.get("method").is_some())
+                                {
                                     continue;
                                 }
-                                if !matches!(tokio::time::timeout_at(deadline, sink.send(Message::Text(frame.into()))).await, Ok(Ok(()))) {
+                                if !matches!(
+                                    tokio::time::timeout_at(
+                                        deadline,
+                                        sink.send(Message::Text(frame.into()))
+                                    )
+                                    .await,
+                                    Ok(Ok(()))
+                                ) {
                                     break;
                                 }
                             }
@@ -1319,8 +1349,8 @@ impl WsInner {
                         }
                     }
                 }
-                change = async { role_changes.as_mut().expect("guarded").recv().await }, if role_changes.is_some() => {
-                    if change.is_none() {
+                Input::RoleChanged(change) => {
+                    if !change {
                         role_changes = None;
                         continue;
                     }
@@ -1334,7 +1364,7 @@ impl WsInner {
                         reverse_guard.unbind();
                     }
                 }
-                incoming = stream.next() => match incoming {
+                Input::Incoming(incoming) => match incoming {
                     Some(Err(e)) => {
                         // Over-limit inbound message or frame (monorepo#495):
                         // tell the client why with a 1009 (Message Too Big)
@@ -1360,9 +1390,26 @@ impl WsInner {
                         // Wrap in connection context (is_tcp=true for WSS) so server.*
                         // RPCs gate on real origin, not the locality flag (§5.2), and
                         // bind the caller resolved at upgrade (multiplayer w1).
-                        let frame_ok = crate::context::with_request_context(true, caller.clone(), async {
-                            conn::process_frame(&text, &self.api, &self.bus, &app_tx, &mut subs, &mut forwards, &reverse, &reverse_guard, self.control.as_ref(), self.server_pairing_info.as_ref(), &mut client_id, self.locality_is_local, &self.rpc_limiter).await
-                        }).await;
+                        let frame_ok =
+                            crate::context::with_request_context(true, caller.clone(), async {
+                                conn::process_frame(
+                                    &text,
+                                    &self.api,
+                                    &self.bus,
+                                    &app_tx,
+                                    &mut subs,
+                                    &mut forwards,
+                                    &reverse,
+                                    &reverse_guard,
+                                    self.control.as_ref(),
+                                    self.server_pairing_info.as_ref(),
+                                    &mut client_id,
+                                    self.locality_is_local,
+                                    &self.rpc_limiter,
+                                )
+                                .await
+                            })
+                            .await;
                         if !frame_ok {
                             break;
                         }
@@ -1376,7 +1423,7 @@ impl WsInner {
                     None | Some(Ok(Message::Close(_))) => break,
                     Some(Ok(Message::Binary(_) | Message::Frame(_))) => {}
                 },
-                Some(frame) = app_rx.recv() => {
+                Input::Outbound(frame) => {
                     // Last-resort backstop for non-response frames
                     // (subscription pushes/events): oversized router
                     // responses are already replaced with a `-32010` error
@@ -1393,7 +1440,7 @@ impl WsInner {
                         break;
                     }
                 }
-                cmd = cmd_rx.recv() => match cmd {
+                Input::Command(cmd) => match cmd {
                     None => break,
                     Some(ConnCmd::Ping) => {
                         if sink.send(Message::Ping(Bytes::new())).await.is_err() {
@@ -1409,7 +1456,7 @@ impl WsInner {
                             .await;
                         break;
                     }
-                }
+                },
             }
         }
         drop(subs);

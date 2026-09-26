@@ -1648,7 +1648,6 @@ mod unbound_owner_only_methods {
     /// not something this table decides.
     const CONDITIONALLY_GATED_AT_SERVICE_LAYER: &[(&str, &str, Arming)] = &[
         ("agent.completeOnce", "ok", Arming::WorkspaceId),
-        ("agent.diagnostics", "ok", Arming::AgentId),
         ("agent.enhancePrompt", "ok", Arming::WorkspaceId),
         // Unscoped, the call proceeds to the worktree lookup (Internal here).
         ("git.agentCommit", "-32603", Arming::AgentId),
@@ -1672,8 +1671,6 @@ mod unbound_owner_only_methods {
         ("debug.sampleStacks", "ok"),
         // No gate: daemon-wide metrics read.
         ("metrics.getAllWorkspaceStats", "ok"),
-        // No gate: `_workspace_id` is unused; reads the global rule row.
-        ("rules.get", "ok"),
         // No gate: no-manager early return `{ running: false }`.
         ("unsloth.status", "ok"),
         // No gate: no-manager early return `{ stopped: false }`.

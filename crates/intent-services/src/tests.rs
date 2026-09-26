@@ -29786,7 +29786,7 @@ mod rules {
         assert!(got["updatedAt"].as_i64().unwrap() > 0);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn get_absent_type_reads_disabled_empty() {
         let tree = worktree();
         let (_tmp, _store, svc, ws) = setup(&tree.0).await;
