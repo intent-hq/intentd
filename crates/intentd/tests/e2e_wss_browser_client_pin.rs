@@ -379,17 +379,30 @@ async fn workspace_browser_client_pin_rpcs_over_secure_wss() {
     assert_eq!(
         keys,
         [
+            "avatarUrl",
             "capabilities",
             "clientId",
             "connectedAt",
             "connections",
             "deviceKind",
+            "displayName",
+            "hostRole",
             "hostname",
+            "login",
             "name",
             "prettyHostname",
+            "principalId",
             "transports"
         ]
     );
+    let me = wss_rpc(&mut a, 20, "principal.me", json!({})).await;
+    for row in clients {
+        assert_eq!(row["principalId"], me["result"]["id"]);
+        assert_eq!(row["hostRole"], "owner");
+        for key in ["login", "displayName", "avatarUrl"] {
+            assert_eq!(row.get(key), Some(&Value::Null));
+        }
+    }
 
     // A hello without host identification lists no host keys (presence-
     // detected, never null).

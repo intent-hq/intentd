@@ -737,10 +737,10 @@ mod collaborator_fan_out {
     }
 
     /// The reverse registry's transition → event-type mapping resolves to
-    /// taxonomy members that the allowlist refuses, so the exhaustive golden
-    /// in `intent-core/tests/events.rs` covers the transport's own emits.
+    /// taxonomy members that support caller-filtered device delivery. The
+    /// membership gate applies each guest's self-only audience separately.
     #[test]
-    fn client_transitions_publish_taxonomy_types_outside_the_allowlist() {
+    fn client_transitions_publish_taxonomy_types_with_scoped_audience() {
         use crate::reverse::{ClientTransition, ReverseClientIdentity};
         use intent_core::{ClientHostInfo, ClientId};
 
@@ -760,7 +760,7 @@ mod collaborator_fan_out {
         ] {
             let ty = transition.event_type();
             assert!(intent_core::events::is_known_event_type(ty), "{ty}");
-            assert!(!intent_core::events::is_collaborator_event_type(ty), "{ty}");
+            assert!(intent_core::events::is_collaborator_event_type(ty), "{ty}");
         }
     }
 }

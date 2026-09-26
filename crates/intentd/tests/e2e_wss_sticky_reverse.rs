@@ -792,12 +792,13 @@ async fn pinned_target_offline_reports_typed_error_without_fallback() {
 
 /// `client:connected` / `client:disconnected` (global, no `workspaceId`)
 /// reach an `events.subscribe` subscriber with
-/// `data: { clientId, name?, capabilities }` — once per logical client, not
+/// the device fields and server-bound person — once per logical client, not
 /// per connection: a second connection of the same `clientId` is silent, and
 /// `client:disconnected` fires only when the last one goes away.
 #[intent_test_macros::daemon_test]
 async fn client_connected_and_disconnected_events_are_published_per_logical_client() {
     let fx = boot().await;
+    let owner = fx.api.principal_me().await.unwrap();
     let mut sub = connect(fx.port).await;
     let ack = wss_rpc(
         &mut sub,
@@ -818,6 +819,8 @@ async fn client_connected_and_disconnected_events_are_published_per_logical_clie
             "clientId": "desktop-a",
             "name": "Intent Desktop @ desktop-a",
             "capabilities": { "browserExec": true },
+            "principalId": owner["id"], "hostRole": "owner",
+            "login": null, "displayName": null, "avatarUrl": null,
         })
     );
 
@@ -868,6 +871,7 @@ async fn heartbeat_abort_publishes_client_disconnected() {
         ..WsOptions::default()
     })
     .await;
+    let owner = fx.api.principal_me().await.unwrap();
     let mut sub = connect(fx.port).await;
     let ack = wss_rpc(
         &mut sub,
@@ -909,6 +913,8 @@ async fn heartbeat_abort_publishes_client_disconnected() {
             "clientId": "desktop-a",
             "name": "Intent Desktop @ desktop-a",
             "capabilities": { "browserExec": true },
+            "principalId": owner["id"], "hostRole": "owner",
+            "login": null, "displayName": null, "avatarUrl": null,
         })
     );
     await_registry_len(&fx.registry, 1).await;

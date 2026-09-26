@@ -16533,6 +16533,7 @@ async fn wss_tls_capability_gating_and_client_lifecycle_events() {
         ..WsOptions::default()
     })
     .await;
+    let owner = srv.store.get_primary_principal().await.unwrap();
     let mut sub = connect_ws(srv.port, srv.cfg.clone()).await;
     sub.send(Message::Text(
         r#"{"jsonrpc":"2.0","id":"sub","method":"events.subscribe","params":{"eventTypes":["client:connected","client:disconnected"]}}"#
@@ -16568,7 +16569,9 @@ async fn wss_tls_capability_gating_and_client_lifecycle_events() {
     let ev = await_client_event(&mut sub, "client:connected", "tls-aux").await;
     assert_eq!(
         ev["data"],
-        serde_json::json!({ "clientId": "tls-aux", "capabilities": {} })
+        serde_json::json!({ "clientId": "tls-aux", "capabilities": {"browserExec": false},
+            "principalId": owner.id, "hostRole": "owner",
+            "login": null, "displayName": null, "avatarUrl": null })
     );
     assert!(
         !srv.reverse_registry.is_connected(),
@@ -16592,7 +16595,9 @@ async fn wss_tls_capability_gating_and_client_lifecycle_events() {
     assert_eq!(ev["workspaceId"], "");
     assert_eq!(
         ev["data"],
-        serde_json::json!({ "clientId": "tls-desktop", "capabilities": { "browserExec": true } })
+        serde_json::json!({ "clientId": "tls-desktop", "capabilities": { "browserExec": true },
+            "principalId": owner.id, "hostRole": "owner",
+            "login": null, "displayName": null, "avatarUrl": null })
     );
 
     // Leave `desktop` unpolled: no pongs, so the heartbeat reaper aborts its
@@ -16600,7 +16605,9 @@ async fn wss_tls_capability_gating_and_client_lifecycle_events() {
     let ev = await_client_event(&mut sub, "client:disconnected", "tls-desktop").await;
     assert_eq!(
         ev["data"],
-        serde_json::json!({ "clientId": "tls-desktop", "capabilities": { "browserExec": true } })
+        serde_json::json!({ "clientId": "tls-desktop", "capabilities": { "browserExec": true },
+            "principalId": owner.id, "hostRole": "owner",
+            "login": null, "displayName": null, "avatarUrl": null })
     );
     assert!(!srv.reverse_registry.is_connected());
     assert!(srv
