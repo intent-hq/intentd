@@ -2320,6 +2320,13 @@ fn sh_squote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// A selection acknowledged by the adapter at this turn boundary.
+#[derive(Clone)]
+struct AppliedEffort {
+    selection: Option<String>,
+    default_value: String,
+}
+
 /// One live agent: its ACP [`Connection`] (own id space + pending map), the
 /// streaming-notification receiver consumed during a turn, the client-served
 /// request loop, the owned child (its process group is killed on teardown via
@@ -2376,6 +2383,9 @@ struct AgentHandle {
     /// `ensure_started` re-apply a mid-session `reasoningEffort` change on the
     /// LIVE child, so it lands before the next prompt without a respawn.
     thought_level: Option<ThoughtLevelOption>,
+    /// Set only after the latest turn-boundary application was acknowledged
+    /// (or already current). A rejection/unsupported option leaves it empty.
+    confirmed_effort: Option<AppliedEffort>,
     /// Pause gate for the idle wake listener (monorepo#855): while > 0 the
     /// listener neither locks nor consumes `notifications`. Raised around
     /// `start_session` so a `session/load` replay burst is always drained by
@@ -3395,6 +3405,7 @@ impl AgentManager {
             spawned_model: opts.model.map(std::string::ToString::to_string),
             spawned_provider: opts.provider.command.to_string(),
             thought_level: None,
+            confirmed_effort: None,
             wake_gate: Arc::new(AtomicUsize::new(0)),
             wake_listener: None,
         };
@@ -3822,12 +3833,21 @@ impl AgentManager {
                         stored_model.as_deref(),
                     )
                     .await?;
+                let default = self
+                    .resumed_effort_default(
+                        agent_id,
+                        &session_record.workspace_id,
+                        provider,
+                        model_response.as_ref(),
+                    )
+                    .await;
                 self.install_and_apply_thought_level(
                     conn.as_ref(),
                     &session_record,
                     &opened,
                     model_response,
                     stored_effort.as_deref(),
+                    Some(&default),
                 )
                 .await;
                 return Ok(opened.session_id);
@@ -3879,6 +3899,7 @@ impl AgentManager {
                 &opened,
                 model_response,
                 stored_effort.as_deref(),
+                None,
             )
             .await;
             return Ok(opened.session_id);
@@ -3927,6 +3948,7 @@ impl AgentManager {
                 &opened,
                 model_response,
                 stored_effort.as_deref(),
+                None,
             )
             .await;
             return Ok(opened.session_id);
@@ -3961,9 +3983,79 @@ impl AgentManager {
             &opened,
             model_response,
             stored_effort.as_deref(),
+            None,
         )
         .await;
         Ok(opened.session_id)
+    }
+
+    /// A loaded session reports its current value, which may be a prior
+    /// explicit override. Never relearn that value as Auto's default. With
+    /// no matching durable baseline, leave Auto unconfirmed unless the
+    /// adapter advertises a default sentinel. A confirmed change to another
+    /// model can supply its own fresh effort default in the model response.
+    async fn resumed_effort_default(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        provider: &ProviderConfig,
+        model_response: Option<&Value>,
+    ) -> String {
+        let state = self
+            .services
+            .store
+            .get_agent_session_last_turn_effort(workspace_id, agent_id)
+            .await;
+        let state = match state {
+            Ok(Some(state)) if state.provider == provider.id => state,
+            Ok(_) => return String::new(),
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "failed to read resumed effort default");
+                return String::new();
+            }
+        };
+        let model = self
+            .handles
+            .lock()
+            .unwrap()
+            .get(agent_id)
+            .and_then(|h| h.spawned_model.clone());
+        if model == state.model {
+            return state.default_value;
+        }
+        let (Some(from), Some(to)) = (
+            Self::provider_local_model_target(provider, state.model.as_deref()),
+            Self::provider_local_model_target(provider, model.as_deref()),
+        ) else {
+            return String::new();
+        };
+        let (from, to) = if provider.config_option_model_strips_effort {
+            (
+                Self::split_codex_model_effort(from).0,
+                Self::split_codex_model_effort(to).0,
+            )
+        } else {
+            (from, to)
+        };
+        if from == to {
+            return state.default_value;
+        }
+        let options = model_response.and_then(|r| r.get("configOptions"));
+        let confirmed = options.and_then(Value::as_array).is_some_and(|options| {
+            options
+                .iter()
+                .any(|option| option["id"] == "model" && option["currentValue"] == to)
+        });
+        if !confirmed {
+            return String::new();
+        }
+        options
+            .and_then(|options| {
+                serde_json::from_value::<Vec<SessionConfigOption>>(options.clone()).ok()
+            })
+            .and_then(|options| discover_thought_level(Some(&options)))
+            .map(|selector| selector.initial_value)
+            .unwrap_or_default()
     }
 
     /// Install the selector for the effective model before applying saved
@@ -3981,6 +4073,7 @@ impl AgentManager {
         opened: &AcpSessionOpened,
         model_response: Option<Value>,
         stored_effort: Option<&str>,
+        default_override: Option<&str>,
     ) {
         let mut thought_level = opened.thought_level.clone();
         if let Some(options) = model_response
@@ -3995,6 +4088,24 @@ impl AgentManager {
                     thought_level.as_ref(),
                 )
                 .await;
+        }
+        if let Some(selector) = thought_level.as_mut() {
+            // An explicit adapter default is authoritative, even on load.
+            if let Some(default) = selector
+                .values
+                .iter()
+                .find(|v| v.eq_ignore_ascii_case("default"))
+            {
+                selector.initial_value = default.clone();
+            } else if let Some(default) = default_override {
+                selector.initial_value = selector
+                    .values
+                    .iter()
+                    .find(|v| v.eq_ignore_ascii_case(default))
+                    .cloned()
+                    .or_else(|| selector.values.is_empty().then(|| default.to_string()))
+                    .unwrap_or_default();
+            }
         }
         if let Some(handle) = self.handles.lock().unwrap().get_mut(&session_record.id) {
             handle.thought_level = thought_level;
@@ -4025,13 +4136,11 @@ impl AgentManager {
         stored_effort: Option<&str>,
     ) {
         let requested = stored_effort.map(str::trim).filter(|e| !e.is_empty());
-        let Some((config_id, value)) = ({
-            let handles = self.handles.lock().unwrap();
-            handles.get(agent_id).and_then(|h| {
+        let Some((config_id, value, current, default_value)) = ({
+            let mut handles = self.handles.lock().unwrap();
+            handles.get_mut(agent_id).and_then(|h| {
+                h.confirmed_effort = None;
                 h.thought_level.as_ref().and_then(|t| {
-                    // The adapter's own spelling of the requested level; with
-                    // no advertised values the stored spelling is all we have.
-                    // A cleared effort targets the provider's opening default.
                     let value = match requested {
                         Some(effort) => {
                             match t.values.iter().find(|v| v.eq_ignore_ascii_case(effort)) {
@@ -4042,46 +4151,68 @@ impl AgentManager {
                         }
                         None => t.initial_value.clone(),
                     };
-                    (!value.is_empty() && !t.current_value.eq_ignore_ascii_case(&value))
-                        .then(|| (t.config_id.clone(), value))
+                    (!value.is_empty()).then(|| {
+                        (
+                            t.config_id.clone(),
+                            value,
+                            t.current_value.clone(),
+                            t.initial_value.clone(),
+                        )
+                    })
                 })
             })
         }) else {
             return;
         };
-        let effort = value.as_str();
-        match intent_acp::session::set_session_config_option(
-            conn,
-            acp_session_id,
-            &config_id,
-            effort,
-        )
-        .await
-        {
-            Ok(()) => {
-                tracing::debug!(
-                    agent = %agent_id,
-                    session_id = acp_session_id,
-                    config_id = %config_id,
-                    effort = %effort,
-                    "session/set_config_option applied reasoning effort"
-                );
-                if let Some(handle) = self.handles.lock().unwrap().get_mut(agent_id) {
-                    if let Some(t) = handle.thought_level.as_mut() {
-                        t.current_value = effort.to_string();
+        if !current.eq_ignore_ascii_case(&value) {
+            match intent_acp::session::set_session_config_option_response(
+                conn,
+                acp_session_id,
+                &config_id,
+                &value,
+            )
+            .await
+            {
+                Ok(response) => {
+                    // Older adapters acknowledge with {}. When a value is
+                    // echoed, it must actually confirm the requested setting.
+                    if let Some(actual) = response
+                        .get("configOptions")
+                        .and_then(Value::as_array)
+                        .and_then(|options| options.iter().find(|o| o["id"] == config_id))
+                        .and_then(|o| o["currentValue"].as_str())
+                    {
+                        if !actual.eq_ignore_ascii_case(&value) {
+                            if let Some(t) = self
+                                .handles
+                                .lock()
+                                .unwrap()
+                                .get_mut(agent_id)
+                                .and_then(|h| h.thought_level.as_mut())
+                            {
+                                t.current_value = actual.to_string();
+                            }
+                            tracing::warn!(agent = %agent_id, requested = %value, actual,
+                                "provider did not confirm reasoning effort");
+                            return;
+                        }
                     }
                 }
+                Err(e) => {
+                    tracing::warn!(agent = %agent_id, error = %e, effort = %value,
+                        "session/set_config_option failed; provider keeps its current reasoning effort");
+                    return;
+                }
             }
-            Err(e) => {
-                tracing::warn!(
-                    agent = %agent_id,
-                    session_id = acp_session_id,
-                    config_id = %config_id,
-                    effort = %effort,
-                    error = %e,
-                    "session/set_config_option failed; provider keeps its current reasoning effort"
-                );
+        }
+        if let Some(handle) = self.handles.lock().unwrap().get_mut(agent_id) {
+            if let Some(t) = handle.thought_level.as_mut() {
+                t.current_value.clone_from(&value);
             }
+            handle.confirmed_effort = Some(AppliedEffort {
+                selection: requested.map(|_| value),
+                default_value,
+            });
         }
     }
 
@@ -8455,6 +8586,92 @@ impl AgentManager {
         }
     }
 
+    /// Commit a confirmed effort at the successful turn boundary, never a
+    /// picker update. SQL NULL is an unobserved baseline; JSON effort:null is
+    /// Auto. The system row is excluded from provider history replay.
+    async fn maybe_persist_effort_change_notice(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        resolved: &ResolvedSpawn,
+    ) {
+        let applied = self
+            .handles
+            .lock()
+            .unwrap()
+            .get(agent_id)
+            .and_then(|h| h.confirmed_effort.clone());
+        let Some(applied) = applied else {
+            return;
+        };
+        let previous = match self
+            .services
+            .store
+            .get_agent_session_last_turn_effort(workspace_id, agent_id)
+            .await
+        {
+            Ok(state) => state,
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "failed to read last-turn effort");
+                return;
+            }
+        };
+        let state = intent_store::AgentTurnEffort {
+            effort: applied.selection,
+            default_value: applied.default_value,
+            provider: resolved.provider.id.to_string(),
+            model: resolved.model.clone(),
+        };
+        if let Some(from) = &previous {
+            let same = match (&from.effort, &state.effort) {
+                (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                (None, None) => true,
+                _ => false,
+            };
+            if !same {
+                let content = json!([{"type":"text", "text": format!(
+                    "Effort changed from {} to {}.",
+                    from.effort.as_deref().unwrap_or("Auto"),
+                    state.effort.as_deref().unwrap_or("Auto"),
+                )}]);
+                let metadata =
+                    json!({"type":"effort_changed", "from":from.effort, "to":state.effort});
+                match self
+                    .services
+                    .store
+                    .append_agent_message_with_metadata(
+                        agent_id,
+                        "system",
+                        &content,
+                        Some(&metadata),
+                        &now_iso(),
+                    )
+                    .await
+                {
+                    Ok(message) => {
+                        self.services.invalidate_agent_list_cache(workspace_id);
+                        self.services
+                            .publish_agent_message_events(workspace_id, agent_id, &message, None)
+                            .await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(agent = %agent_id, error = %e, "failed to persist effort-change notice");
+                    }
+                }
+            }
+        }
+        if previous.as_ref() != Some(&state) {
+            if let Err(e) = self
+                .services
+                .store
+                .set_agent_session_last_turn_effort(workspace_id, agent_id, &state)
+                .await
+            {
+                tracing::warn!(agent = %agent_id, error = %e, "failed to commit last-turn effort");
+            }
+        }
+    }
+
     /// Whether a pending `model_changed` row for the provider hop
     /// `from_provider` → `to_provider` is the deferred last-turn commit of a
     /// re-home the transcript already announces (intent-hq/intent#5737): the
@@ -8870,6 +9087,8 @@ impl AgentManager {
                         self.apply_thought_level(conn.as_ref(), agent_id, &acp, effort.as_deref())
                             .await;
                     }
+                    self.maybe_persist_effort_change_notice(agent_id, workspace_id, &resolved)
+                        .await;
                     return Ok(acp);
                 }
                 // The child/transport died while the agent sat idle
@@ -9095,6 +9314,8 @@ impl AgentManager {
         // row (the `provider_rehomed` notice already landed) — detected from
         // the transcript, so it holds on a retry after a failed first spawn.
         self.maybe_persist_model_change_notice(agent_id, workspace_id, &resolved)
+            .await;
+        self.maybe_persist_effort_change_notice(agent_id, workspace_id, &resolved)
             .await;
         self.spawn_attempt_provider.lock().unwrap().remove(agent_id);
         Ok(acp_session_id)
@@ -15994,6 +16215,7 @@ mod dead_child_respawn_tests {
             spawned_model: None,
             spawned_provider: "node".to_string(),
             thought_level: None,
+            confirmed_effort: None,
             wake_gate: Arc::new(AtomicUsize::new(0)),
             wake_listener: None,
         }
@@ -17366,9 +17588,10 @@ mod thought_level_tests {
 
     /// Answer every request with `{}` while recording the params of each
     /// `session/set_config_option` the daemon issued.
-    fn spawn_recording_responder(
+    pub(super) fn spawn_recording_responder(
         read: tokio::io::DuplexStream,
         write: tokio::io::DuplexStream,
+        response: Value,
     ) -> (JoinHandle<()>, Arc<Mutex<Vec<Value>>>) {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let recorded = calls.clone();
@@ -17390,7 +17613,9 @@ mod thought_level_tests {
                         .unwrap()
                         .push(value.get("params").cloned().unwrap_or(Value::Null));
                 }
-                let resp = json!({ "jsonrpc": "2.0", "id": id, "result": {} });
+                let mut resp = response.clone();
+                resp["jsonrpc"] = json!("2.0");
+                resp["id"] = id.clone();
                 if write
                     .write_all(format!("{resp}\n").as_bytes())
                     .await
@@ -17407,8 +17632,22 @@ mod thought_level_tests {
     /// Install a live fake handle wired to a recording responder, seeded with
     /// `thought_level`. Returns the handle's connection plus the recorded
     /// `session/set_config_option` params.
-    async fn setup(
+    pub(super) async fn setup(
         thought_level: Option<ThoughtLevelOption>,
+    ) -> (
+        AgentManager,
+        AgentId,
+        Arc<Connection>,
+        Arc<Mutex<Vec<Value>>>,
+        tempfile::TempDir,
+        JoinHandle<()>,
+    ) {
+        setup_with_response(thought_level, json!({"result": {}})).await
+    }
+
+    pub(super) async fn setup_with_response(
+        thought_level: Option<ThoughtLevelOption>,
+        response: Value,
     ) -> (
         AgentManager,
         AgentId,
@@ -17419,7 +17658,7 @@ mod thought_level_tests {
     ) {
         let (mgr, agent_id, db) = manager_with(None, None).await;
         let (c2a_agent, a2c_agent) = install_fake_handle(&mgr, &agent_id, None);
-        let (task, calls) = spawn_recording_responder(c2a_agent, a2c_agent);
+        let (task, calls) = spawn_recording_responder(c2a_agent, a2c_agent, response);
         let conn = {
             let mut handles = mgr.handles.lock().unwrap();
             let handle = handles.get_mut(&agent_id).unwrap();
@@ -17429,7 +17668,7 @@ mod thought_level_tests {
         (mgr, agent_id, conn, calls, db, task)
     }
 
-    fn option(current: &str) -> ThoughtLevelOption {
+    pub(super) fn option(current: &str) -> ThoughtLevelOption {
         ThoughtLevelOption {
             config_id: "effort".to_string(),
             initial_value: current.to_string(),
@@ -17471,6 +17710,7 @@ mod thought_level_tests {
                 &opened,
                 response,
                 Some("high"),
+                None,
             )
             .await;
             assert_eq!(calls.lock().unwrap()[0]["value"], "high");
@@ -17518,6 +17758,7 @@ mod thought_level_tests {
                 &opened,
                 Some(json!({"configOptions": options})),
                 Some("high"),
+                None,
             )
             .await;
             assert!(
@@ -19935,3 +20176,7 @@ mod agent_retry_tests {
         assert_eq!(session.status, AgentStatus::Active);
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "agent_manager/effort_notice_tests.rs"]
+mod effort_notice_tests;
