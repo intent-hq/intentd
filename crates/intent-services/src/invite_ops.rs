@@ -1149,6 +1149,13 @@ impl Services {
     ) -> Result<Value> {
         #[cfg(test)]
         self.invite_join_commit_pause.pause().await;
+        // A fresh proof after the durable removal is legitimate, but must not
+        // return a new bearer until the old revocation/presence sweep finishes.
+        // The write side is held through that service invalidation, including
+        // member self-revocation. Old proofs/bearers still fail in the store.
+        let _authority = self.human_instruction_authority.read().await;
+        #[cfg(test)]
+        self.invite_join_admission_pause.pause().await;
         let token = existing_token.map_or_else(random_hex_secret, str::to_owned);
         let token_hash = hash_secret(&token);
         let credential = match existing_token {

@@ -53,6 +53,17 @@ async fn start_pairing_with_admission(
     gate: Option<Arc<RemovalAdmissionGate>>,
 ) -> (Server, Arc<PairingInfo>) {
     let (api, bus, store, registry, dir) = make_services(None, None).await;
+    start_pairing_services(api, bus, store, registry, dir, gate).await
+}
+
+async fn start_pairing_services(
+    api: Arc<dyn WorkspaceApi>,
+    bus: EventBus,
+    store: Store,
+    registry: Arc<intent_services::SettingsRegistry>,
+    dir: tempfile::TempDir,
+    gate: Option<Arc<RemovalAdmissionGate>>,
+) -> (Server, Arc<PairingInfo>) {
     let api: Arc<dyn WorkspaceApi> = if let Some(gate) = gate {
         Arc::new(RemovalAdmissionApi { actual: api, gate })
     } else {
@@ -1174,3 +1185,6 @@ fn assert_shared_capabilities(hello: &Value) {
     assert_eq!(capabilities["personalPairing"], 1);
     assert!(capabilities.get("authenticatedDevices").is_none());
 }
+
+#[path = "member_removal_rejoin.rs"]
+mod member_removal_rejoin;

@@ -112,6 +112,8 @@ impl Services {
         if !removed.removed {
             return;
         }
+        #[cfg(test)]
+        self.member_removal_publication_pause.pause().await;
         // All authorization reads already see the committed state. Close
         // transports even if an unrelated workspace disappears during egress.
         let final_event = self.host_membership_event(intent_core::events::HOST_MEMBERS_CHANGED,

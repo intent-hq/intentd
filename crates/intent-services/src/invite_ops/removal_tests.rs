@@ -626,3 +626,103 @@ async fn member_removal_accept_rechecks_bearer_at_commit() {
         );
     }
 }
+
+#[tokio::test]
+async fn member_removal_fresh_rejoin_waits_for_committed_invalidation() {
+    use std::future::Future as _;
+    use std::task::Poll;
+    for self_revoke in [false, true] {
+        for scope in [InviteScope::Host, InviteScope::Workspace] {
+            let tmp = TempDb::new();
+            let mut f = fixture(&tmp).await;
+            f.services = f
+                .services
+                .with_event_bus(crate::events::EventBus::new(f.store.clone()));
+            let (person, old_token) = member(&mut f).await;
+            let invite = if scope == InviteScope::Host {
+                with_caller(
+                    Caller::Daemon,
+                    f.services.host_invite_create_op(InvitePin {
+                        login: "guest".into(),
+                        provider: Some("github".into()),
+                        host: None,
+                    }),
+                )
+                .await
+                .unwrap()
+            } else {
+                issue(&f, &f.owner, false).await
+            };
+            let (removed_committed, finish_removal) =
+                f.services.member_removal_publication_pause.arm();
+            let mut revocations = f.services.subscribe_principal_revocations().unwrap();
+            let services = f.services.clone();
+            let target = person.clone();
+            let remove = tokio::spawn(async move {
+                if self_revoke {
+                    with_caller(wire(&target), services.principal_revoke_self()).await
+                } else {
+                    with_caller(Caller::Daemon, services.host_members_remove(target)).await
+                }
+            });
+            removed_committed.await.unwrap();
+            assert!(f
+                .store
+                .resolve_active_principal_credential(&hash_secret(&old_token))
+                .await
+                .unwrap()
+                .is_none());
+            let generation = f
+                .store
+                .host_membership_state()
+                .await
+                .unwrap()
+                .authorization_generation;
+            let (joining, try_join) = f.services.invite_join_commit_pause.arm();
+            let (mut admitted, finish_join) = f.services.invite_join_admission_pause.arm();
+            let user = guest("guest", 4242);
+            let id = id_of(&invite);
+            let join = f
+                .services
+                .complete_invite_join(&id, &user, scope, generation);
+            tokio::pin!(join);
+            tokio::pin!(joining);
+            std::future::poll_fn(|cx| {
+                assert!(join.as_mut().poll(cx).is_pending());
+                joining.as_mut().poll(cx)
+            })
+            .await
+            .unwrap();
+            try_join.send(()).unwrap();
+            let pending = std::future::poll_fn(|cx| Poll::Ready(join.as_mut().poll(cx))).await;
+            assert!(pending.is_pending());
+            assert!(matches!(admitted.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)),
+                "fresh credential admission crossed a removal whose live invalidation is still pending");
+            finish_removal.send(()).unwrap();
+            remove.await.unwrap().unwrap();
+            assert_eq!(revocations.try_recv().unwrap().principal_id, person);
+            finish_join.send(()).unwrap();
+            let fresh = join.await.unwrap();
+            assert_eq!(fresh["principalId"], person.0);
+            assert_eq!(
+                fresh["hostRole"],
+                if scope == InviteScope::Host {
+                    "member"
+                } else {
+                    "guest"
+                }
+            );
+            assert!(fresh["token"].as_str() != Some(old_token.as_str()));
+            assert!(f
+                .store
+                .resolve_active_principal_credential(&hash_secret(fresh["token"].as_str().unwrap()))
+                .await
+                .unwrap()
+                .is_some());
+            assert!(
+                revocations.try_recv().is_err(),
+                "the old removal cannot invalidate the fresh credential"
+            );
+        }
+    }
+}

@@ -1068,6 +1068,10 @@ pub struct Services {
     #[cfg(test)]
     invite_join_commit_pause: Arc<member_removal::MutationBarrier>,
     #[cfg(test)]
+    invite_join_admission_pause: Arc<member_removal::MutationBarrier>,
+    #[cfg(test)]
+    member_removal_publication_pause: Arc<member_removal::MutationBarrier>,
+    #[cfg(test)]
     queue_drain_commit_pause: Arc<member_removal::MutationBarrier>,
     /// Ephemeral workspace / note presence table (multiplayer w5), shared
     /// with the caret coalescer's trailing-flush tasks.
@@ -1485,6 +1489,10 @@ impl Services {
             member_removal_commit_pause: Arc::new(member_removal::MutationBarrier::default()),
             #[cfg(test)]
             invite_join_commit_pause: Arc::new(member_removal::MutationBarrier::default()),
+            #[cfg(test)]
+            invite_join_admission_pause: Arc::new(member_removal::MutationBarrier::default()),
+            #[cfg(test)]
+            member_removal_publication_pause: Arc::new(member_removal::MutationBarrier::default()),
             #[cfg(test)]
             queue_drain_commit_pause: Arc::new(member_removal::MutationBarrier::default()),
             principal_revocations: tokio::sync::broadcast::channel(
