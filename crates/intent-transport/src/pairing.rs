@@ -30,8 +30,11 @@ pub(crate) struct SelfPairingRequest {
 }
 
 pub(crate) fn classify_self(value: &Value) -> Option<SelfPairingRequest> {
+    if value["method"] != "pairing.getSelfInfo" {
+        return None;
+    }
     Some(SelfPairingRequest {
-        request: classify_method(value, "pairing.getSelfInfo")?,
+        request: classify_request(value)?,
         valid_params: value.get("params").is_none_or(|p| {
             p.is_null()
                 || p.as_object().is_some_and(serde_json::Map::is_empty)
@@ -206,23 +209,22 @@ pub(crate) struct PairingRequest {
 /// Classify a parsed frame as a `pairing.getInfo` request, or `None` to fall
 /// through to the JSON-RPC dispatcher. Mirrors `server::classify`.
 pub(crate) fn classify(value: &Value) -> Option<PairingRequest> {
-    classify_method(value, "pairing.getInfo")
+    if value["method"] != "pairing.getInfo" {
+        return None;
+    }
+    classify_request(value)
 }
 
-fn classify_method(value: &Value, expected: &str) -> Option<PairingRequest> {
+fn classify_request(value: &Value) -> Option<PairingRequest> {
     let obj = value.as_object()?;
     if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         return None;
     }
-    let method = obj.get("method").and_then(Value::as_str)?;
     let id_member = obj.get("id");
     if let Some(v) = id_member {
         if !v.is_null() && !v.is_string() && !v.is_number() {
             return None;
         }
-    }
-    if method != expected {
-        return None;
     }
     Some(PairingRequest {
         id_present: id_member.is_some(),

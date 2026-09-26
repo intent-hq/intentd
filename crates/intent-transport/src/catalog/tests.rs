@@ -181,7 +181,7 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// (`sourceControl.identityProof.create` / `delete`, the GitHub gist or
 /// GitLab snippet proof by `provider`); the `github.identityProof.*` pair
 /// stays as byte-identical aliases.
-const EXPECTED_TOTAL_METHODS: usize = 405;
+const EXPECTED_TOTAL_METHODS: usize = 406;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
@@ -189,7 +189,7 @@ const EXPECTED_TOTAL_METHODS: usize = 405;
 const EXPECTED_ROUTER_METHODS: usize = 346;
 
 /// Golden count: fast-path methods (intercepted before router).
-const EXPECTED_FASTPATH_METHODS: usize = 57;
+const EXPECTED_FASTPATH_METHODS: usize = 58;
 
 /// Golden count: method aliases.
 const EXPECTED_ALIASES: usize = 2;

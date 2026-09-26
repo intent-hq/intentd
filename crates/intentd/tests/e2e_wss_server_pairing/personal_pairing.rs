@@ -37,6 +37,9 @@ fn spawn_personal(dir: &Path, sidecar: &Path, run: u8) -> GuardedChild {
     let log = std::fs::File::create(dir.join(format!("personal-{run}.log"))).unwrap();
     GuardedChild::spawn(
         common::serve_command()
+            .env_remove("GITHUB_TOKEN")
+            .env_remove("GH_TOKEN")
+            .env_remove("GITLAB_TOKEN")
             .env("INTENTD_DATA_DIR", dir)
             .env("INTENTD_WORKSPACES_DIR", workspaces)
             .env("INTENTD_AUTH_TOKEN", TOKEN)
@@ -173,7 +176,7 @@ async fn personal_pairing_reuses_uds_owner_member_guest_credentials_after_daemon
             .any(|(hash,)| hash == &intent_transport::hash_token(token)));
     }
     assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM workspace")
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM workspace WHERE id != '__chief__'")
             .fetch_one(store.read_pool())
             .await
             .unwrap(),

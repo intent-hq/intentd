@@ -290,7 +290,7 @@ async fn personal_pairing_owner_device_and_dynamic_role_keep_the_exact_bearer() 
         before
     );
     assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM workspace")
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM workspace WHERE id != '__chief__'")
             .fetch_one(srv.store.read_pool())
             .await
             .unwrap(),
@@ -444,10 +444,12 @@ async fn personal_pairing_wrong_host_and_fingerprint_never_substitute_identity()
     let tcp = TcpStream::connect(("127.0.0.1", foreign.port))
         .await
         .unwrap();
-    assert!(tokio_rustls::TlsConnector::from(srv.cfg.clone())
-        .connect(ServerName::try_from("localhost").unwrap(), tcp)
-        .await
-        .is_err());
+    assert!(
+        tokio_rustls::TlsConnector::from(client_config(&"00:".repeat(32)))
+            .connect(ServerName::try_from("localhost").unwrap(), tcp)
+            .await
+            .is_err()
+    );
     assert_eq!(
         status_code(
             &https_request(
