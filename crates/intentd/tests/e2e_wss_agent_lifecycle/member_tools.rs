@@ -338,12 +338,24 @@ async fn member_scripts_respect_managed_helper_policy_and_keep_alternative_helpe
     let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
     let mut owner = connect_ws(port, cfg.clone()).await;
     let mut member = member_connection(port, cfg).await;
-    let script=wss_rpc(&mut member,1,"script.create",json!({"workspaceId":ws,"name":"Credential probe","mode":"command",
-        "command":"git var GIT_AUTHOR_IDENT; git var GIT_COMMITTER_IDENT; printf 'protocol=https\\nhost=github.com\\n\\n' | git credential fill"})).await;
+    let command = "git var GIT_AUTHOR_IDENT; git var GIT_COMMITTER_IDENT; printf 'protocol=https\\nhost=github.com\\n\\n' | git credential fill";
+    let script = wss_rpc(
+        &mut member,
+        1,
+        "script.create",
+        json!({"workspaceId":ws,"name":"Credential probe","mode":"command","command":command}),
+    )
+    .await;
     let script_id = script["id"]
         .as_str()
         .or_else(|| script["script"]["id"].as_str())
         .expect("script id");
+    let override_script = wss_rpc(&mut member, 5, "script.create", json!({
+        "workspaceId":ws,"name":"Explicit environment probe","mode":"command","command":command,
+        "env":{"GIT_CONFIG_PARAMETERS":"","GIT_AUTHOR_NAME":"Script Author","GIT_AUTHOR_EMAIL":"script@example.invalid",
+            "GIT_COMMITTER_NAME":"Script Committer","GIT_COMMITTER_EMAIL":"script-committer@example.invalid"}
+    })).await;
+    let override_id = override_script["id"].as_str().expect("override script id");
     for (enabled, alternative) in [(true, false), (false, false), (false, true), (true, true)] {
         if alternative {
             assert!(std::process::Command::new("git").args(["config","--local","credential.helper","!f() { printf 'username=host-alternative\\npassword=fake-alternative-token\\n'; }; f"]).current_dir(&checkout).status().unwrap().success());
@@ -381,6 +393,36 @@ async fn member_scripts_respect_managed_helper_policy_and_keep_alternative_helpe
             assert!(
                 output.contains("password=fake-alternative-token"),
                 "{result}"
+            );
+        } else {
+            assert!(!output.contains("password="), "{result}");
+            assert_ne!(result["exitCode"], 0);
+        }
+        let result = wss_rpc(
+            &mut member,
+            6,
+            "script.run",
+            json!({"workspaceId":ws,"scriptId":override_id,"timeoutSeconds":15}),
+        )
+        .await;
+        let output = result["output"].as_str().unwrap();
+        assert!(
+            output.contains("Script Author <script@example.invalid>"),
+            "{result}"
+        );
+        assert!(
+            output.contains("Script Committer <script-committer@example.invalid>"),
+            "{result}"
+        );
+        assert!(
+            !output.contains("fake-host-repository-token"),
+            "explicit script helper env wins even when managed injection is enabled: {result}"
+        );
+        assert!(!output.contains("fake-identity-only-token"));
+        if alternative {
+            assert!(
+                output.contains("password=fake-alternative-token"),
+                "configured alternative survives the explicit override: {result}"
             );
         } else {
             assert!(!output.contains("password="), "{result}");

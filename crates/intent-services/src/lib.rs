@@ -17856,6 +17856,9 @@ impl WorkspaceApi for Services {
             // Workspace terminals use the host owner's execution setup.
             self.require_workspace_manager(&workspace_id, "terminal.create")
                 .await?;
+            // Management admission also permits deletion retries for missing
+            // workspaces; a member must not spawn an unmanageable terminal there.
+            self.require_member(&workspace_id).await?;
             terminal_ops::create(
                 pty,
                 bus,

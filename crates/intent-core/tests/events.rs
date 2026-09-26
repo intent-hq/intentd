@@ -242,6 +242,7 @@ const COLLABORATOR_REFUSED_EVENT_TYPES: &[&str] = &[
     "host:exec:exit",
     "host:exec:stderr",
     "host:exec:stdout",
+    "host:execution-context-changed",
     "host:invites-changed",
     "host:members-changed",
     "identity:auth-changed",

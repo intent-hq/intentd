@@ -730,16 +730,38 @@ async fn member_prompt_filter_retains_all_manageable_agents_and_no_hidden_ids() 
 
 #[cfg(unix)]
 #[tokio::test]
+async fn member_terminal_create_refuses_missing_workspace_without_spawning() {
+    let tmp = TempDb::new();
+    let (svc, _, member) = fixture(&tmp).await;
+    let missing = WorkspaceId::new();
+    let result = with_caller(
+        caller(&member),
+        svc.terminal_create(missing.clone(), 80, 24, None, Some("/bin/cat".into()), None),
+    )
+    .await;
+    let spawned = svc.pty.list_scope(missing.as_str());
+    // Clean up a mistakenly admitted process before the regression assertion.
+    for id in &spawned {
+        svc.pty.kill(*id).await;
+    }
+    assert!(matches!(result, Err(Error::NotFound(_))), "{result:?}");
+    assert!(spawned.is_empty(), "missing workspace spawned {spawned:?}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn member_terminal_ids_resolve_the_workspace_and_recheck_revocation() {
     let tmp = TempDb::new();
     let (svc, _, member) = fixture(&tmp).await;
     let ws = WorkspaceId::from("member-terminal");
     svc.store.insert_workspace(&workspace(&ws)).await.unwrap();
-    let spawned = svc
-        .pty
-        .spawn(intent_pty::SpawnSpec::new(ws.as_str(), "/bin/cat"))
-        .unwrap();
-    let id = spawned.to_string();
+    let created = with_caller(
+        caller(&member),
+        svc.terminal_create(ws.clone(), 80, 24, None, Some("/bin/cat".into()), None),
+    )
+    .await
+    .unwrap();
+    let id = created["terminalId"].as_str().unwrap().to_owned();
     with_caller(caller(&member), async {
         svc.terminal_write(
             id.clone(),

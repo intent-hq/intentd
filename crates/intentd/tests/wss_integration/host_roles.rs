@@ -169,6 +169,26 @@ async fn member_workspace_tools_and_safe_context_over_wss() {
         let reply = member.call(method, params).await;
         assert!(reply.get("error").is_none(), "{method}: {reply}");
     }
+    #[cfg(unix)]
+    {
+        let missing = WorkspaceId::new();
+        let reply = member
+            .call(
+                "terminal.create",
+                json!({"workspaceId":missing,"command":"/bin/cat"}),
+            )
+            .await;
+        // The regression must not leave a process behind if creation succeeds.
+        if let Some(id) = reply["result"]["terminalId"].as_str() {
+            intent_core::with_caller(
+                intent_core::Caller::Daemon,
+                srv.api.terminal_kill(id.into()),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(reply["error"]["data"]["code"], "not-found", "{reply}");
+    }
     for (method, params) in [
         ("settings.list", json!({})),
         ("repo.remove", json!({"path":"/tmp/foreign"})),
