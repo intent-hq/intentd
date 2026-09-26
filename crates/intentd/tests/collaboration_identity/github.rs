@@ -229,9 +229,10 @@ async fn collaboration_github_requests_only_gist_reports_broader_grant_and_isola
         hello["result"]["server"]["capabilities"]["personalPairing"],
         1
     );
-    assert!(hello["result"]["server"]["capabilities"]
-        .get("authenticatedDevices")
-        .is_none());
+    assert_eq!(
+        hello["result"]["server"]["capabilities"]["authenticatedDevices"],
+        1
+    );
     authorize(&h, &state, &mut rpc, 2).await;
     {
         let req = state.requests.lock().unwrap();
