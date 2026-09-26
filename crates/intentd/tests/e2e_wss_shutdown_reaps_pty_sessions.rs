@@ -63,7 +63,7 @@ async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
     let mut buf = String::new();
     timeout(common::rpc_read_timeout(), reader.read_line(&mut buf))
         .await
-        .expect("uds rpc timed out")
+        .unwrap_or_else(|_| panic!("UDS RPC {method} (id {id}) timed out waiting for response"))
         .expect("read uds response");
     serde_json::from_str(buf.trim_end()).expect("invalid JSON frame")
 }
@@ -164,7 +164,9 @@ where
     loop {
         let next = timeout(Duration::from_secs(15), ws.next())
             .await
-            .expect("wss rpc timed out");
+            .unwrap_or_else(|_| {
+                panic!("WSS RPC {method} (id {id}) timed out waiting for response")
+            });
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -295,7 +297,9 @@ async fn shutdown_reaps_terminal_and_script_pty_sessions() {
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     let mut cmd = common::serve_command();
+    common::hermetic_github_identity(&mut cmd, &data_dir);
     cmd.env("INTENTD_DATA_DIR", &data_dir)
+        .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
@@ -307,6 +311,21 @@ async fn shutdown_reaps_terminal_and_script_pty_sessions() {
     // Own process group so the DaemonGuard's SIGKILL cannot leak PTY children
     // if the test panics before the graceful path runs.
     cmd.process_group(0);
+    // Assert before boot so a missing override cannot fall back to shared state.
+    let explicit_env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+    let owned_workspaces = explicit_env.get(std::ffi::OsStr::new("INTENTD_WORKSPACES_DIR"))
+        == Some(&Some(data_dir.join("workspaces").as_os_str()));
+    let owned_secrets = explicit_env.get(std::ffi::OsStr::new("INTENTD_SECRETS_FILE"))
+        == Some(&Some(data_dir.join("secrets.json").as_os_str()));
+    let isolated_gh = explicit_env.get(std::ffi::OsStr::new("GH_CONFIG_DIR"))
+        == Some(&Some(data_dir.join("gh-config").as_os_str()));
+    let no_env_tokens = ["GITHUB_TOKEN", "GH_TOKEN"]
+        .iter()
+        .all(|key| explicit_env.get(std::ffi::OsStr::new(key)) == Some(&None));
+    assert!(
+        owned_workspaces && owned_secrets && isolated_gh && no_env_tokens,
+        "shutdown fixture isolation: owned workspaces={owned_workspaces}, owned secrets={owned_secrets}, disposable GH_CONFIG_DIR={isolated_gh}, removed env tokens={no_env_tokens}"
+    );
     let child = cmd.spawn().expect("spawn intentd serve");
     let mut daemon = DaemonGuard::process_only(child);
     if !await_uds(&socket).await {
@@ -406,8 +425,9 @@ async fn shutdown_reaps_terminal_and_script_pty_sessions() {
         }
     })
     .await
-    .expect("daemon did not exit after system.shutdown");
-    assert!(exit_ok, "daemon exited non-zero");
+    .expect("daemon-exit phase timed out after system.shutdown acknowledgement and terminal and script PTYs reap");
+    assert!(exit_ok, "daemon-exit phase returned a non-zero status");
+    eprintln!("shutdown complete: terminal and script PTYs reaped; daemon exited successfully");
 }
 
 fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {

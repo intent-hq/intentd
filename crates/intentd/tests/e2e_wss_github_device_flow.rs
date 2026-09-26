@@ -6,7 +6,8 @@
 //! a local mock of GitHub's `/login/device/code` + `/login/oauth/access_token`
 //! endpoints (via the `INTENTD_GITHUB_LOGIN_BASE_URI` seam), then drives the
 //! full connect → poll → authorized → revoke path over a pinned-TLS WebSocket.
-//! Hermetic: no live network, secrets land in a temp `INTENTD_SECRETS_FILE`.
+//! Both login and API requests stay on the local mock. Credentials use disposable
+//! `GH_CONFIG_DIR` and `INTENTD_SECRETS_FILE` paths; env tokens are removed.
 
 #![cfg(unix)]
 
@@ -15,7 +16,7 @@ mod common;
 use std::net::Ipv4Addr;
 use std::path::Path;
 use std::process::{Child, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -61,20 +62,39 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
         common::enable_ws_api(data_dir);
     }
     let mut cmd = common::serve_command();
+    common::hermetic_github_identity(&mut cmd, data_dir);
     cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
-        // Reduce token-resolution noise: strip env PATs. The `gh` CLI
-        // fallback can still resolve on a developer machine, which is why the
-        // tests never assert on `isConfigured` — only on device-flow state
-        // and the daemon's own secrets file.
-        .env_remove("GITHUB_TOKEN")
-        .env_remove("GH_TOKEN")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
     for (k, v) in env {
         cmd.env(k, v);
     }
+    // Fail before spawning if this fixture could resolve host credentials or
+    // contact public GitHub. Diagnostics name contracts, never their values.
+    let explicit_env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+    let isolated_gh = explicit_env.get(std::ffi::OsStr::new("GH_CONFIG_DIR"))
+        == Some(&Some(data_dir.join("gh-config").as_os_str()));
+    let local_login = explicit_env
+        .get(std::ffi::OsStr::new("INTENTD_GITHUB_LOGIN_BASE_URI"))
+        .and_then(|v| *v)
+        .and_then(|v| v.to_str())
+        .is_some_and(|v| v.starts_with("http://127.0.0.1:"));
+    let local_api = explicit_env
+        .get(std::ffi::OsStr::new("INTENTD_GITHUB_API_BASE_URI"))
+        .and_then(|v| *v)
+        .and_then(|v| v.to_str())
+        .is_some_and(|v| v.starts_with("http://127.0.0.1:"));
+    let owned_secrets = explicit_env.get(std::ffi::OsStr::new("INTENTD_SECRETS_FILE"))
+        == Some(&Some(data_dir.join("secrets.json").as_os_str()));
+    let no_env_tokens = ["GITHUB_TOKEN", "GH_TOKEN"]
+        .iter()
+        .all(|key| explicit_env.get(std::ffi::OsStr::new(key)) == Some(&None));
+    assert!(
+        isolated_gh && local_login && local_api && owned_secrets && no_env_tokens,
+        "device-auth fixture isolation: disposable GH_CONFIG_DIR={isolated_gh}, local login={local_login}, local API={local_api}, owned secrets={owned_secrets}, removed env tokens={no_env_tokens}"
+    );
     cmd.spawn().expect("spawn intentd serve")
 }
 
@@ -186,7 +206,9 @@ where
     loop {
         let next = timeout(Duration::from_secs(15), ws.next())
             .await
-            .expect("wss rpc timed out");
+            .unwrap_or_else(|_| {
+                panic!("WSS RPC {method} (id {id}) timed out waiting for response")
+            });
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -262,6 +284,7 @@ struct MockGithub {
     authorize: Arc<AtomicBool>,
     gist_scope: Arc<AtomicBool>,
     rate_limited: Arc<AtomicBool>,
+    user_requests: Arc<AtomicUsize>,
 }
 
 async fn spawn_mock_github() -> MockGithub {
@@ -272,6 +295,8 @@ async fn spawn_mock_github() -> MockGithub {
     let authorize = Arc::new(AtomicBool::new(false));
     let gist_scope = Arc::new(AtomicBool::new(true));
     let rate_limited = Arc::new(AtomicBool::new(false));
+    let user_requests = Arc::new(AtomicUsize::new(0));
+    let users = user_requests.clone();
     let flag = authorize.clone();
     let scope = gist_scope.clone();
     let limited = rate_limited.clone();
@@ -283,8 +308,9 @@ async fn spawn_mock_github() -> MockGithub {
             let flag = flag.clone();
             let scope = scope.clone();
             let limited = limited.clone();
+            let users = users.clone();
             tokio::spawn(async move {
-                let _ = serve_conn(stream, flag, scope, limited).await;
+                let _ = serve_conn(stream, flag, scope, limited, users).await;
             });
         }
     });
@@ -293,6 +319,7 @@ async fn spawn_mock_github() -> MockGithub {
         authorize,
         gist_scope,
         rate_limited,
+        user_requests,
     }
 }
 
@@ -303,6 +330,7 @@ async fn serve_conn(
     authorize: Arc<AtomicBool>,
     gist_scope: Arc<AtomicBool>,
     rate_limited: Arc<AtomicBool>,
+    user_requests: Arc<AtomicUsize>,
 ) -> std::io::Result<()> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 1024];
@@ -366,6 +394,7 @@ async fn serve_conn(
             "documentation_url": "https://docs.github.com/rest/overview/rate-limits-for-the-rest-api",
         })
     } else if method == "GET" && path == "/user" {
+        user_requests.fetch_add(1, Ordering::SeqCst);
         let scopes = if gist_scope.load(Ordering::SeqCst) {
             "repo, read:org, workflow, gist"
         } else {
@@ -441,10 +470,11 @@ async fn github_device_flow_full_lifecycle_over_wss() {
     let data_dir = data_dir_guard.path().to_path_buf();
     let secrets_file = data_dir.join("secrets.json");
     let secrets_s = secrets_file.to_string_lossy().to_string();
-    let env: [(&str, &str); 3] = [
+    let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_SECRETS_FILE", &secrets_s),
         ("INTENTD_GITHUB_LOGIN_BASE_URI", &mock.base_uri),
+        ("INTENTD_GITHUB_API_BASE_URI", &mock.base_uri),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon { child };
@@ -505,11 +535,11 @@ async fn github_device_flow_full_lifecycle_over_wss() {
 
     // 3. authStatus while pending → deviceFlow.status == "pending" and the
     //    verification uri doubles as oauthUrl for existing FE consumers.
-    //    (`isConfigured` is NOT asserted: the resolution chain can fall back
-    //    to a developer machine's authenticated `gh` CLI.)
+    //    No host credential may make the pending flow look authenticated.
     let v = wss_rpc(&mut rpc, 12, "github.authStatus", json!({})).await;
     let r = &v["result"];
-    assert!(r["isConfigured"].is_boolean(), "isConfigured present: {r}");
+    assert_eq!(r["isConfigured"], false, "pending flow is not configured");
+    assert_eq!(mock.user_requests.load(Ordering::SeqCst), 0);
     assert_eq!(r["deviceFlow"]["status"], json!("pending"));
     assert_eq!(r["deviceFlow"]["userCode"], json!(USER_CODE));
     assert_eq!(r["oauthUrl"], json!("https://github.com/login/device"));
@@ -530,10 +560,16 @@ async fn github_device_flow_full_lifecycle_over_wss() {
         "token persisted under the resolution-chain slot"
     );
 
-    // 6. The authorized transition cleared the flow slot: a cancel now has
-    //    nothing to cancel. (`github.authStatus` is deliberately NOT called
-    //    while the token is stored — its `GET /user` probe goes to the real
-    //    api.github.com, which would make this test network-dependent.)
+    // 6. The stored token authenticates against the local identity API.
+    // github.authStatus's legacy registry does not honor the API-base seam;
+    // only call that method while no token exists (pending / after revoke).
+    let before = mock.user_requests.load(Ordering::SeqCst);
+    let v = wss_rpc(&mut rpc, 16, "github.getUser", json!({})).await;
+    assert!(v.get("error").is_none(), "local getUser failed: {v}");
+    assert_eq!(v["result"]["user"]["login"], "octocat");
+    assert!(mock.user_requests.load(Ordering::SeqCst) > before);
+    assert!(!v.to_string().contains(ACCESS_TOKEN));
+    // The authorized transition cleared the flow slot: nothing to cancel.
     let v = wss_rpc(&mut rpc, 13, "github.cancelAuth", json!({})).await;
     assert_eq!(v["result"]["ok"], json!(true));
     assert_eq!(v["result"]["cancelled"], json!(false));
@@ -549,6 +585,10 @@ async fn github_device_flow_full_lifecycle_over_wss() {
         secrets.get("sourceControl.github.token").is_none(),
         "revoke removed the stored token: {secrets}"
     );
+
+    // No env or gh credential can keep auth configured after revoke.
+    let v = wss_rpc(&mut rpc, 17, "github.authStatus", json!({})).await;
+    assert_eq!(v["result"]["isConfigured"], false);
 
     // 8. cancelAuth with nothing in flight → idempotent no-op.
     let v = wss_rpc(&mut rpc, 15, "github.cancelAuth", json!({})).await;
@@ -570,10 +610,11 @@ async fn github_cancel_auth_stops_the_background_poll_over_wss() {
     let data_dir = data_dir_guard.path().to_path_buf();
     let secrets_file = data_dir.join("secrets.json");
     let secrets_s = secrets_file.to_string_lossy().to_string();
-    let env: [(&str, &str); 3] = [
+    let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_SECRETS_FILE", &secrets_s),
         ("INTENTD_GITHUB_LOGIN_BASE_URI", &mock.base_uri),
+        ("INTENTD_GITHUB_API_BASE_URI", &mock.base_uri),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon { child };
@@ -637,6 +678,7 @@ async fn github_cancel_auth_stops_the_background_poll_over_wss() {
 
     let v = wss_rpc(&mut rpc, 17, "github.authStatus", json!({})).await;
     assert_eq!(v["result"]["deviceFlow"], Value::Null);
+    assert_eq!(v["result"]["isConfigured"], false);
 
     // Authorize AFTER the cancel: the aborted poll task must never mint the
     // token. Give a would-be zombie poller ample time (interval is 1s).
@@ -647,6 +689,7 @@ async fn github_cancel_auth_stops_the_background_poll_over_wss() {
         !on_disk.contains(ACCESS_TOKEN),
         "cancelled flow must not persist a token"
     );
+    assert_eq!(mock.user_requests.load(Ordering::SeqCst), 0);
 }
 
 /// Gist identity proof over WSS (`github.identityProof.create` /
