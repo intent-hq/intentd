@@ -467,3 +467,518 @@ async fn member_scripts_respect_managed_helper_policy_and_keep_alternative_helpe
         );
     }
 }
+
+#[tokio::test]
+async fn member_provider_safe_reads_use_host_cache_and_preserve_administration_over_wss() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = temp_data_dir();
+    let ws = WorkspaceId::new();
+    let member = seed_member(dir.path(), &ws).await;
+    let gh = dir.path().join("empty-gh");
+    std::fs::create_dir_all(&gh).unwrap();
+    let probe = dir.path().join("fake-auggie");
+    let calls = dir.path().join("probe-calls");
+    let authorized = dir.path().join("authorized");
+    std::fs::write(&probe, format!("#!/bin/sh\nif [ \"$1\" = token ]; then\n echo probe >> '{}'\n if [ -f '{}' ]; then echo private-probe-secret; exit 0; fi\n exit 1\nfi\nexit 0\n", calls.display(), authorized.display())).unwrap();
+    std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        format!(
+            "[sourceControl.github]\ntokenSource = 'explicit'\n[providers.paths]\nauggie = '{}'\n",
+            probe.display()
+        ),
+    )
+    .unwrap();
+    let gh = gh.to_string_lossy();
+    let _daemon = Daemon {
+        child: spawn_serve(
+            dir.path(),
+            "both",
+            &[
+                ("INTENTD_AUTH_TOKEN", TOKEN),
+                ("GH_CONFIG_DIR", gh.as_ref()),
+                ("GITHUB_TOKEN", ""),
+                ("GH_TOKEN", ""),
+                ("GITLAB_TOKEN", ""),
+            ],
+        ),
+    };
+    let socket = dir.path().join("intentd.sock");
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    let mut owner = connect_ws(port, cfg.clone()).await;
+    let mut client = member_connection(port, cfg.clone()).await;
+    let mut observer = member_connection(port, cfg.clone()).await;
+    wss_rpc(
+        &mut observer,
+        1,
+        "events.subscribe",
+        json!({"eventTypes":["host:execution-context-changed","settings:changed"]}),
+    )
+    .await;
+    let settings_before = std::fs::read(dir.path().join("config.toml")).unwrap();
+    let context = wss_rpc(&mut client, 1, "host.executionContext", json!({})).await;
+    let discovery = wss_rpc(&mut client, 2, "host.providerDiscovery", json!({})).await;
+    assert!(discovery["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["id"] == "auggie" && p["installed"] == true));
+    assert!(!discovery.to_string().contains("private-probe-secret"));
+    assert_eq!(
+        std::fs::read(dir.path().join("config.toml")).unwrap(),
+        settings_before,
+        "member discovery must not heal host defaults"
+    );
+    let mut second = member_connection(port, cfg.clone()).await;
+    let (first, concurrent) = tokio::join!(
+        wss_rpc(
+            &mut client,
+            3,
+            "host.providerAuthStatus",
+            json!({"providerId":"auggie"})
+        ),
+        wss_rpc(
+            &mut second,
+            1,
+            "host.providerAuthStatus",
+            json!({"providerId":"auggie"})
+        )
+    );
+    for result in [first, concurrent] {
+        assert_eq!(
+            result,
+            json!({"providers":[{"id":"auggie","authenticated":false}]})
+        );
+    }
+    for id in 4..7 {
+        let result = wss_rpc(
+            &mut client,
+            id,
+            "host.providerAuthStatus",
+            json!({"providerId":"auggie"}),
+        )
+        .await;
+        assert_eq!(result["providers"][0]["authenticated"], false);
+    }
+    assert_eq!(
+        std::fs::read_to_string(&calls).unwrap().lines().count(),
+        1,
+        "concurrent and cached requests share a bounded probe"
+    );
+    let initial = wss_event(&mut observer, 10).await;
+    assert_eq!(
+        initial["params"]["event"]["type"],
+        "host:execution-context-changed"
+    );
+    assert_eq!(initial["params"]["event"]["data"], context);
+    std::fs::write(&authorized, "ready").unwrap();
+    let cached = wss_rpc(
+        &mut client,
+        7,
+        "host.providerAuthStatus",
+        json!({"providerId":"auggie"}),
+    )
+    .await;
+    assert_eq!(cached["providers"][0]["authenticated"], false);
+    let refreshed = wss_rpc(
+        &mut client,
+        8,
+        "host.providerAuthStatus",
+        json!({"providerId":"auggie","force":true}),
+    )
+    .await;
+    assert_eq!(
+        refreshed,
+        json!({"providers":[{"id":"auggie","authenticated":true}]})
+    );
+    assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 2);
+    let changed = wss_event(&mut observer, 10).await;
+    let event = &changed["params"]["event"];
+    assert_eq!(event["type"], "host:execution-context-changed");
+    assert_eq!(
+        event["data"], context,
+        "readiness changes do not expose the probe output"
+    );
+    assert!(!changed.to_string().contains("private-probe-secret"));
+    let store = Store::open(&dir.path().join("intentd.db")).await.unwrap();
+    let events = store
+        .query_events(&intent_store::EventQuery {
+            event_types: vec!["host:execution-context-changed".into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(events
+        .iter()
+        .any(|row| row.id.as_str() == event["id"].as_str().unwrap() && row.data == context));
+    for method in [
+        "settings.list",
+        "host.env",
+        "host.providerTestPrompt",
+        "prMonitor.flush",
+    ] {
+        let denied = wss_rpc_envelope(&mut client, 9, method, json!({})).await;
+        assert_eq!(denied["error"]["code"], -32003, "{method}: {denied}");
+    }
+    let owner_status = wss_rpc(
+        &mut owner,
+        1,
+        "host.providerAuthStatus",
+        json!({"providerId":"auggie"}),
+    )
+    .await;
+    assert_eq!(owner_status, refreshed);
+    let owner_discovery = wss_rpc(&mut owner, 2, "host.providerDiscovery", json!({})).await;
+    assert_eq!(owner_discovery["providers"], discovery["providers"]);
+    // Keep the credential and workspace row: the same socket's cached role
+    // must not preserve host safe-read authority after durable removal.
+    store
+        .add_workspace_member(&ws, &member, intent_core::WorkspaceRole::Collaborator)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM host_member WHERE principal_id = ?")
+        .bind(member.as_str())
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    for method in ["host.providerDiscovery", "host.providerAuthStatus"] {
+        let denied =
+            wss_rpc_envelope(&mut client, 10, method, json!({"providerId":"auggie"})).await;
+        assert_eq!(
+            denied["error"]["code"], -32003,
+            "revoked member {method}: {denied}"
+        );
+    }
+    assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 2);
+}
+
+async fn seed_linked_member_pr(data_dir: &Path, ws: &WorkspaceId) {
+    seed_member(data_dir, ws).await;
+    let store = Store::open(&data_dir.join("intentd.db")).await.unwrap();
+    sqlx::query("UPDATE workspace SET repository_owner = 'fake-org', repository_name = 'fake-repo', pr_number = 7 WHERE id = ?")
+        .bind(ws.as_str()).execute(store.write_pool()).await.unwrap();
+}
+
+#[tokio::test]
+async fn member_pr_status_missing_auth_does_not_consume_collaboration_credentials_over_wss() {
+    let dir = temp_data_dir();
+    let ws = WorkspaceId::new();
+    seed_linked_member_pr(dir.path(), &ws).await;
+    let gh = dir.path().join("empty-gh");
+    std::fs::create_dir_all(&gh).unwrap();
+    std::fs::write(
+        dir.path().join("secrets.json"),
+        json!({"collaboration.github.token":"private-identity-only-token"}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        "[sourceControl.github]\ntokenSource = 'explicit'\nexposeGitCredentialToChildren = false\n",
+    )
+    .unwrap();
+    let gh = gh.to_string_lossy();
+    let _daemon = Daemon {
+        child: spawn_serve(
+            dir.path(),
+            "both",
+            &[
+                ("INTENTD_AUTH_TOKEN", TOKEN),
+                ("GH_CONFIG_DIR", gh.as_ref()),
+                ("GITHUB_TOKEN", ""),
+                ("GH_TOKEN", ""),
+                ("GITLAB_TOKEN", ""),
+            ],
+        ),
+    };
+    let socket = dir.path().join("intentd.sock");
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    let mut owner = connect_ws(port, cfg.clone()).await;
+    let mut client = member_connection(port, cfg.clone()).await;
+    let mut observer = member_connection(port, cfg).await;
+    wss_rpc(
+        &mut observer,
+        1,
+        "events.subscribe",
+        json!({"eventTypes":["host:execution-context-changed"]}),
+    )
+    .await;
+    let context = wss_rpc(&mut client, 1, "host.executionContext", json!({})).await;
+    assert_eq!(context["repositoryConnections"][0]["configured"], false);
+    let reply = wss_rpc_envelope(&mut client, 2, "pr.status", json!({"workspaceId":ws})).await;
+    assert_eq!(reply["error"]["code"], -32603);
+    assert_eq!(
+        reply["error"]["data"],
+        json!({"code":"host-execution-authorization","executionAuthorization":{
+        "resource":"git","reason":"missing","providerId":"github","host":"github.com",
+        "recovery":{"actor":"host-owner","action":"check-git-authorization","setting":"sourceControl.github.exposeGitCredentialToChildren"}}})
+    );
+    for forbidden in [
+        "private-identity-only-token",
+        "gh auth login",
+        "sources tried",
+    ] {
+        assert!(!reply.to_string().contains(forbidden), "{reply}");
+    }
+    let event = wss_event(&mut observer, 10).await;
+    assert_eq!(event["params"]["event"]["data"], context);
+    let legacy = wss_rpc_envelope(&mut owner, 1, "pr.status", json!({"workspaceId":ws})).await;
+    assert_eq!(legacy["error"]["code"], -32603);
+    assert!(legacy["error"]["data"]["executionAuthorization"].is_null());
+    assert_eq!(legacy["error"]["message"], "Internal error");
+    assert!(legacy["error"]["data"]
+        .as_str()
+        .unwrap()
+        .starts_with("source control not configured: github: no token found"));
+    // A local Git operation still works on a host with no repository account.
+    let repo = dir.path().join("workspaces").join(ws.as_str());
+    assert!(Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(&repo)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .status()
+        .unwrap()
+        .success());
+    let local = wss_rpc_envelope(&mut client, 3, "git.status", json!({"workspaceId":ws})).await;
+    assert!(local.get("error").is_none(), "{local}");
+    let secrets: Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("secrets.json")).unwrap()).unwrap();
+    assert_eq!(
+        secrets,
+        json!({"collaboration.github.token":"private-identity-only-token"})
+    );
+}
+
+struct PrAuthServer {
+    task: tokio::task::JoinHandle<()>,
+    status: Arc<std::sync::atomic::AtomicU16>,
+    authorization: Arc<std::sync::Mutex<Vec<String>>>,
+    url: String,
+}
+
+impl Drop for PrAuthServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl PrAuthServer {
+    async fn start() -> Self {
+        use std::sync::atomic::{AtomicU16, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let status = Arc::new(AtomicU16::new(401));
+        let authorization = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (state, headers) = (status.clone(), authorization.clone());
+        let task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut bytes = Vec::new();
+                loop {
+                    let mut chunk = [0; 2048];
+                    let n = stream.read(&mut chunk).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&bytes);
+                if request.contains("/pulls/7 ") {
+                    headers.lock().unwrap().push(
+                        request
+                            .lines()
+                            .find(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+                            .unwrap_or("")
+                            .to_string(),
+                    );
+                }
+                let code = state.load(Ordering::SeqCst);
+                let message = match code {
+                    401 => "private-rejected-response",
+                    403 => "insufficient_scope private-scope-response",
+                    429 => "rate limit exceeded",
+                    404 => "missing repository",
+                    _ => "temporary network failure",
+                };
+                let body = json!({"message":message}).to_string();
+                let response = format!("HTTP/1.1 {code} Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        Self {
+            task,
+            status,
+            authorization,
+            url,
+        }
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn member_pr_status_typed_rejections_are_safe_and_non_auth_errors_stay_legacy_over_wss() {
+    use std::sync::atomic::Ordering;
+    let fake = PrAuthServer::start().await;
+    let dir = temp_data_dir();
+    let ws = WorkspaceId::new();
+    seed_linked_member_pr(dir.path(), &ws).await;
+    // Inject the production GitHub adapter with a local HTTP origin. The
+    // binary's fallback PR registry ignores its settings-file API override;
+    // this established composition seam guarantees no live forge traffic.
+    use intent_services::{EventBus, InMemorySecretStore, SecretStore, Services, SettingsRegistry};
+    use intent_transport::{AsyncTokenStore, TokenStore, WsApiServer, WsOptions};
+    struct OwnerToken;
+    impl TokenStore for OwnerToken {
+        fn load_token(&self) -> Option<String> {
+            Some(TOKEN.into())
+        }
+        fn store_token(&self, _token: &str) -> intent_core::Result<()> {
+            Ok(())
+        }
+    }
+    let secrets = Arc::new(InMemorySecretStore::default());
+    secrets
+        .store("sourceControl.github.token", "fake-repository-token")
+        .unwrap();
+    secrets
+        .store("collaboration.github.token", "private-identity-only-token")
+        .unwrap();
+    let registry = Arc::new(SettingsRegistry::load(dir.path().join("config.toml")).unwrap());
+    registry
+        .apply(&[
+            ("sourceControl.github.tokenSource".into(), json!("explicit")),
+            ("sourceControl.github.apiBaseUrl".into(), json!(fake.url)),
+            (
+                "sourceControl.github.exposeGitCredentialToChildren".into(),
+                json!(false),
+            ),
+        ])
+        .unwrap();
+    let store = Store::open(&dir.path().join("intentd.db")).await.unwrap();
+    let bus = EventBus::new(store.clone());
+    let github =
+        intent_sourcecontrol::GitHubSourceControl::new("fake-repository-token", Some(&fake.url))
+            .unwrap();
+    let services = Arc::new(
+        Services::new(store)
+            .with_workspaces_root(dir.path().join("workspaces"))
+            .with_settings_registry(registry)
+            .with_secret_store(secrets)
+            .with_event_bus(bus.clone())
+            .with_source_control(Arc::new(github)),
+    );
+    let worker = services.spawn_execution_context_loop();
+    let tls = intent_transport::ensure_tls_certificate(dir.path()).unwrap();
+    let tokens = Arc::new(AsyncTokenStore::new(Arc::new(OwnerToken)));
+    let server = WsApiServer::new(
+        services,
+        bus,
+        &tls,
+        &tokens,
+        WsOptions {
+            base_port: 0,
+            bind_addresses: vec![std::net::Ipv4Addr::LOCALHOST.into()],
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap();
+    let port = server.start().await.unwrap();
+    let cfg = client_config(&tls.fingerprint256);
+    let mut owner = connect_ws(port, cfg.clone()).await;
+    let mut client = member_connection(port, cfg.clone()).await;
+    let mut observer = member_connection(port, cfg).await;
+    wss_rpc(
+        &mut observer,
+        1,
+        "events.subscribe",
+        json!({"eventTypes":["host:execution-context-changed"]}),
+    )
+    .await;
+    let context = wss_rpc(&mut client, 1, "host.executionContext", json!({})).await;
+    assert_eq!(context["repositoryConnections"][0]["configured"], true);
+    for (code, reason) in [
+        (401, Some("rejected")),
+        (403, Some("insufficient-scope")),
+        (429, None),
+        (404, None),
+        (500, None),
+    ] {
+        fake.status.store(code, Ordering::SeqCst);
+        let before_owner = fake.authorization.lock().unwrap().len();
+        let legacy = wss_rpc_envelope(&mut owner, 2, "pr.status", json!({"workspaceId":ws})).await;
+        let before_member = fake.authorization.lock().unwrap().len();
+        assert!(
+            before_member > before_owner,
+            "owner PR read must reach the local forge"
+        );
+        assert_eq!(legacy["error"]["code"], -32603, "{legacy}");
+        assert!(legacy["error"]["data"]["executionAuthorization"].is_null());
+        if reason.is_some() {
+            assert_eq!(legacy["error"]["message"], "Internal error");
+            assert_eq!(
+                legacy["error"]["data"],
+                match code {
+                    401 => "source control auth error: private-rejected-response",
+                    403 => "source control auth error: insufficient_scope private-scope-response",
+                    _ => unreachable!(),
+                }
+            );
+            let owner_event = wss_event(&mut observer, 10).await;
+            assert_eq!(owner_event["params"]["event"]["data"], context);
+        }
+        let reply = wss_rpc_envelope(&mut client, 2, "pr.status", json!({"workspaceId":ws})).await;
+        assert!(
+            fake.authorization.lock().unwrap().len() > before_member,
+            "member PR read must reach the local forge"
+        );
+        assert_eq!(reply["error"]["code"], -32603);
+        if let Some(reason) = reason {
+            assert_eq!(
+                reply["error"]["data"],
+                json!({"code":"host-execution-authorization","executionAuthorization":{
+                "resource":"git","reason":reason,"providerId":"github","host":"127.0.0.1",
+                "recovery":{"actor":"host-owner","action":"check-git-authorization"}}})
+            );
+            assert!(!reply.to_string().contains("private-"), "{reply}");
+            let notification = wss_event(&mut observer, 10).await;
+            let event = &notification["params"]["event"];
+            assert_eq!(event["data"], context);
+            let store = Store::open(&dir.path().join("intentd.db")).await.unwrap();
+            let rows = store
+                .query_events(&intent_store::EventQuery {
+                    event_types: vec!["host:execution-context-changed".into()],
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert!(rows
+                .iter()
+                .any(|row| row.id.as_str() == event["id"].as_str().unwrap()));
+        } else {
+            assert_eq!(reply["error"], legacy["error"]);
+            assert!(try_wss_event(&mut observer, Duration::from_millis(50))
+                .await
+                .is_none());
+        }
+    }
+    server.stop().await;
+    worker.abort();
+    let _ = worker.await;
+    let headers = fake.authorization.lock().unwrap();
+    // The production adapter may retry transient HTTP responses.
+    assert!(headers.len() >= 10);
+    assert!(
+        headers
+            .iter()
+            .all(|h| h.contains("fake-repository-token") && !h.contains("identity-only")),
+        "repository clients must not consume collaboration credentials"
+    );
+}

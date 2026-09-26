@@ -229,21 +229,35 @@ pub(crate) async fn handle_with_host_environment(
         id_echo,
         params,
     } = req;
-    // Owner-only host surface (multiplayer w3): a non-administrator connection
-    // may only reach the two display probes the desktop needs to render
-    // (`host.status`, `host.toolAvailability` — no paths, nothing runs); every
-    // other `host.*` method gets `-32003`. The allowlist in `process_frame`
-    // refuses these first; this is the defence-in-depth gate at the surface.
+    // Preserve the guest display probes and owner host controls. The two
+    // shared provider reads additionally admit current durable host members;
+    // cached admission roles never grant this exception after revocation.
     if crate::context::is_non_administrator_caller()
         && !matches!(method, HostMethod::Status | HostMethod::ToolAvailability)
     {
-        return id_present.then(|| {
-            error_frame(
-                &id_echo,
-                crate::catalog::FORBIDDEN_ERROR_CODE,
-                crate::catalog::FORBIDDEN_ERROR_MESSAGE,
-            )
-        });
+        let member_read = matches!(
+            method,
+            HostMethod::ProviderDiscovery | HostMethod::ProviderAuthStatus
+        ) && match crate::context::current_caller()
+            .and_then(|caller| caller.principal_id().cloned())
+        {
+            Some(id) => api.principal_host_role(id).await.is_ok_and(|role| {
+                matches!(
+                    role,
+                    intent_core::HostRole::Owner | intent_core::HostRole::Member
+                )
+            }),
+            None => false,
+        };
+        if !member_read {
+            return id_present.then(|| {
+                error_frame(
+                    &id_echo,
+                    crate::catalog::FORBIDDEN_ERROR_CODE,
+                    crate::catalog::FORBIDDEN_ERROR_MESSAGE,
+                )
+            });
+        }
     }
     let frame = match method {
         HostMethod::Status => {

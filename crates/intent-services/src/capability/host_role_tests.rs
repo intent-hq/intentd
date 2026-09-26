@@ -496,6 +496,21 @@ async fn workspace_guests_unknown_and_unbound_cannot_gain_host_capabilities() {
     ) {
         return;
     }
+    async fn assert_execution_reads_refused(svc: &Services) {
+        let errors = [
+            svc.host_execution_context().await.unwrap_err(),
+            svc.execution_provider_paths().await.unwrap_err(),
+            svc.observe_execution_readiness(json!({"providers":[]}))
+                .await
+                .unwrap_err(),
+        ];
+        for error in errors {
+            assert!(
+                matches!(error, Error::Forbidden(_) | Error::NotFound(_)),
+                "{error}"
+            );
+        }
+    }
     let tmp = TempDb::new();
     let (svc, _, member) = fixture(&tmp).await;
     let shared = WorkspaceId::from("shared");
@@ -510,6 +525,7 @@ async fn workspace_guests_unknown_and_unbound_cannot_gain_host_capabilities() {
         .unwrap();
     // Deliberately retain the old admitted member role: only durable grants count.
     with_caller(caller(&member), async {
+        assert_execution_reads_refused(&svc).await;
         let rows = svc.list_workspaces(true).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, shared);
@@ -545,6 +561,7 @@ async fn workspace_guests_unknown_and_unbound_cannot_gain_host_capabilities() {
     })
     .await;
     with_caller(caller(&PrincipalId::new()), async {
+        assert_execution_reads_refused(&svc).await;
         assert!(svc.list_workspaces(true).await.is_err());
         assert!(svc.principal_me().await.is_err());
         assert!(svc
@@ -566,6 +583,7 @@ async fn workspace_guests_unknown_and_unbound_cannot_gain_host_capabilities() {
         svc.require_workspace_creator("workspace.create").await,
         Err(Error::Forbidden(_))
     ));
+    assert_execution_reads_refused(&svc).await;
     svc.principal_me()
         .await
         .expect_err("principal discovery requires a bound caller");
@@ -1350,4 +1368,222 @@ async fn member_mcp_toggle_is_workspace_scoped_and_global_setup_stays_owner_only
         ));
     })
     .await;
+}
+
+/// Exercise the public service entries, rather than supplying the missing
+/// execution scope in the test. Monitor flush intentionally remains owner-only
+/// on WSS; its already-shared service entry is tested separately here.
+fn take_execution_invalidation(svc: &Services) -> bool {
+    let notification = svc.execution_invalidation.notified();
+    tokio::pin!(notification);
+    std::future::Future::poll(
+        notification.as_mut(),
+        &mut std::task::Context::from_waker(std::task::Waker::noop()),
+    )
+    .is_ready()
+}
+
+async fn assert_member_pr_authorization_entry(flush: bool) {
+    use crate::tests::pr::StubForge;
+    use intent_core::execution::ExecutionAuthorizationReason as Reason;
+    use intent_sourcecontrol::Error as ScError;
+    use std::sync::Arc;
+
+    for retained_guest in [false, true] {
+        let tmp = TempDb::new();
+        let (svc, owner, member) = fixture(&tmp).await;
+        let ws = WorkspaceId::new();
+        let mut row = workspace(&ws);
+        row.repository_owner = Some("o".into());
+        row.repository_name = Some("r".into());
+        row.pr_number = Some(42);
+        svc.store.insert_workspace(&row).await.unwrap();
+        if retained_guest {
+            svc.store
+                .add_workspace_member(&ws, &member, WorkspaceRole::Collaborator)
+                .await
+                .unwrap();
+        }
+        let member_caller = Caller::Wire {
+            principal_id: member,
+            host_role: if retained_guest {
+                intent_core::HostRole::Guest
+            } else {
+                intent_core::HostRole::Member
+            },
+        };
+        let owner_caller = Caller::Wire {
+            principal_id: owner,
+            host_role: intent_core::HostRole::Owner,
+        };
+        let svc = svc.with_source_control(Arc::new(StubForge::default()));
+        let monitor = if flush {
+            let agent = with_caller(
+                owner_caller.clone(),
+                svc.agent_create(
+                    ws.clone(),
+                    None,
+                    Some("test".into()),
+                    None,
+                    None,
+                    None,
+                    intent_core::AgentCreateExtra {
+                        provider: Some("codex".into()),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+            let agent = AgentId::from(agent["agent"]["id"].as_str().unwrap());
+            let value = with_caller(
+                owner_caller.clone(),
+                svc.pr_monitor_start(ws.clone(), agent, 42, None),
+            )
+            .await
+            .unwrap();
+            Some(intent_core::PrMonitorId::from(
+                value["monitor"]["monitorId"].as_str().unwrap(),
+            ))
+        } else {
+            None
+        };
+        let cases: [(fn() -> ScError, Option<Reason>); 6] = [
+            (
+                || ScError::NotConfigured("private-missing".into()),
+                Some(Reason::Missing),
+            ),
+            (
+                || ScError::Auth("private-rejected".into()),
+                Some(Reason::Rejected),
+            ),
+            (
+                || ScError::Auth("insufficient_scope private-scopes".into()),
+                Some(Reason::InsufficientScope),
+            ),
+            (|| ScError::Api("network failure".into()), None),
+            (|| ScError::RateLimited("quota exhausted".into()), None),
+            (|| ScError::NotFound("missing repository".into()), None),
+        ];
+        for (make_error, reason) in cases {
+            let svc = svc
+                .clone()
+                .with_source_control(Arc::new(StubForge::with_get_pr_error(make_error)));
+            let invoke = || async {
+                if let Some(id) = &monitor {
+                    svc.pr_monitor_flush_pending(ws.clone(), id.clone(), true)
+                        .await
+                } else {
+                    svc.pr_status(ws.clone()).await
+                }
+            };
+            let legacy = with_caller(owner_caller.clone(), invoke())
+                .await
+                .unwrap_err();
+            assert!(legacy.execution_authorization().is_none());
+            let expected = if flush && matches!(make_error(), ScError::NotFound(_)) {
+                "internal error: PR #42 not found in o/r".to_string()
+            } else if matches!(make_error(), ScError::RateLimited(_)) {
+                make_error().to_string()
+            } else {
+                format!("internal error: {}", make_error())
+            };
+            assert_eq!(legacy.to_string(), expected);
+            // Consume the owner's notification before checking the member call.
+            let _ = take_execution_invalidation(&svc);
+            let error = with_caller(member_caller.clone(), invoke())
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), legacy.code());
+            if let Some(reason) = reason {
+                let auth = error
+                    .execution_authorization()
+                    .expect("member entry must classify authorization");
+                assert_eq!(auth.reason, reason);
+                assert_eq!(auth.provider_id.as_deref(), Some("stub"));
+                assert_eq!(auth.host, None);
+                assert_eq!(auth.recovery.actor, "host-owner");
+                assert_eq!(auth.recovery.action, "check-git-authorization");
+                assert!(error.to_string().contains("connected host"));
+                assert!(!error.to_string().contains("private-"));
+                assert!(!json!(auth).to_string().contains("private-"));
+                assert!(take_execution_invalidation(&svc));
+                if let Some(id) = &monitor {
+                    let saved = svc.store.get_pr_monitor(id).await.unwrap();
+                    assert!(!saved.last_error.unwrap().contains("private-"));
+                }
+            } else {
+                assert!(error.execution_authorization().is_none());
+                assert_eq!(error.to_string(), legacy.to_string());
+                assert!(!take_execution_invalidation(&svc));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn member_pr_status_entry_classifies_authorization_and_preserves_controls() {
+    assert_member_pr_authorization_entry(false).await;
+}
+
+#[tokio::test]
+async fn member_pr_monitor_flush_service_entry_classifies_authorization_and_preserves_controls() {
+    assert_member_pr_authorization_entry(true).await;
+}
+
+#[tokio::test]
+async fn member_pr_status_rejection_publishes_durable_safe_context() {
+    use crate::events::{EventBus, SubscriptionFilter};
+    use crate::tests::pr::StubForge;
+    use intent_core::events::HOST_EXECUTION_CONTEXT_CHANGED;
+    use std::{sync::Arc, time::Duration};
+    let tmp = TempDb::new();
+    let (svc, _, member) = fixture(&tmp).await;
+    let ws = WorkspaceId::new();
+    let mut row = workspace(&ws);
+    row.repository_owner = Some("o".into());
+    row.repository_name = Some("r".into());
+    row.pr_number = Some(42);
+    svc.store.insert_workspace(&row).await.unwrap();
+    let bus = EventBus::new(svc.store.clone());
+    let svc = svc
+        .with_event_bus(bus.clone())
+        .with_source_control(Arc::new(StubForge::with_get_pr_error(|| {
+            intent_sourcecontrol::Error::Auth("private-response".into())
+        })));
+    let registry =
+        Arc::new(crate::SettingsRegistry::load(tmp.path.with_extension("toml")).unwrap());
+    registry
+        .apply(&[("sourceControl.github.tokenSource".into(), json!("explicit"))])
+        .unwrap();
+    let svc = svc.with_settings_registry(registry);
+    let mut events = bus.subscribe(SubscriptionFilter {
+        event_types: vec![HOST_EXECUTION_CONTEXT_CHANGED.into()],
+        ..Default::default()
+    });
+    let worker = svc.spawn_execution_context_loop();
+    let before = svc.execution_context_snapshot().await.unwrap();
+    let _error = with_caller(caller(&member), svc.pr_status(ws))
+        .await
+        .unwrap_err();
+    let received = tokio::time::timeout(Duration::from_secs(2), events.recv()).await;
+    worker.abort();
+    let _ = worker.await;
+    let batch = received
+        .expect("classified PR rejection must invalidate readiness")
+        .unwrap();
+    assert_eq!(batch[0].data, json!(before));
+    assert_eq!(batch[0].data.as_object().unwrap().len(), 4);
+    assert!(!batch[0].data.to_string().contains("private-response"));
+    let stored = svc
+        .store
+        .query_events(&intent_store::EventQuery {
+            event_types: vec![HOST_EXECUTION_CONTEXT_CHANGED.into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(stored
+        .iter()
+        .any(|e| e.id == batch[0].id && e.data == batch[0].data));
 }

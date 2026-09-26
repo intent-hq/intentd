@@ -30448,7 +30448,7 @@ impl WorkspaceApi for Services {
     fn pr_status(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         let injected = self.source_control.clone();
-        Box::pin(async move {
+        self.execution_call(async move {
             self.require_member(&workspace_id).await?;
             let ws = load_ws_for_pr(&store, &workspace_id).await?;
             let repo_ref = pr_ops::repo_of(&ws)?;
@@ -33638,7 +33638,7 @@ impl WorkspaceApi for Services {
         monitor_id: intent_core::PrMonitorId,
         check: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
+        self.execution_call(async move {
             self.require_workspace_manager(&workspace_id, "prMonitor.flush")
                 .await?;
             self.pr_monitor_flush_op(&workspace_id, &monitor_id, check)

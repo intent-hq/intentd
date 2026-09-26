@@ -17481,6 +17481,7 @@ pub(crate) mod pr {
         /// signal-bearing fold while a REST refresh's read is in flight
         /// (intent-hq/intent#5654).
         pub(crate) get_pr_park: Option<std::sync::Arc<GetPrPark>>,
+        get_pr_error: Option<fn() -> ScError>,
     }
 
     /// One-shot park for [`StubForge::get_pr`]: `entered` fires when the
@@ -17493,6 +17494,13 @@ pub(crate) mod pr {
     }
 
     impl StubForge {
+        pub(crate) fn with_get_pr_error(error: fn() -> ScError) -> Self {
+            Self {
+                get_pr_error: Some(error),
+                ..Default::default()
+            }
+        }
+
         /// A forge whose `check_auth` reports `authenticated: false` and
         /// whose `get_user` rejects the credential (`Auth`), as the real
         /// client does on a 401.
@@ -17766,6 +17774,9 @@ pub(crate) mod pr {
         }
         async fn get_pr(&self, _: &RepoRef, number: u64) -> ScResult<PullRequest> {
             self.seen_get_pr.lock().unwrap().push(number);
+            if let Some(error) = self.get_pr_error {
+                return Err(error());
+            }
             if self.rate_limited {
                 return Err(ScError::RateLimited(
                     "API rate limit exceeded for user ID 526899.".into(),
