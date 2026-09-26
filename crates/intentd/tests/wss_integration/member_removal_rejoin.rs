@@ -246,7 +246,7 @@ async fn postcommit_rejoin(self_revoke: bool) {
             )
             .await;
         let nonce = challenge["result"]["nonce"].as_str().unwrap().to_owned();
-        *forge.nonce.lock().unwrap() = nonce.clone();
+        forge.nonce.lock().unwrap().clone_from(&nonce);
         let prove = tokio::spawn(async move {
             join.call("invite.prove", json!({"inviteId":id,"secret":secret,"nonce":nonce,"scope":scope,"provider":"github","gistId":"r11","login":"guest"})).await
         });
