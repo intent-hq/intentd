@@ -1341,6 +1341,7 @@ fn to_exit(result: anyhow::Result<()>) -> ExitCode {
 }
 
 fn init_tracing() {
+    use std::io::IsTerminal;
     use tracing_subscriber::{
         fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
     };
@@ -1394,9 +1395,13 @@ fn init_tracing() {
         || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     // Set up dual output: stderr (for interactive use) and optionally file (for diagnostics)
-    let stderr_layer = fmt::layer()
-        .with_writer(std::io::stderr)
-        .with_filter(output_filter());
+    let mut stderr_layer = fmt::layer().with_writer(std::io::stderr);
+    // Preserve fmt's NO_COLOR policy on terminals, but never emit ANSI to
+    // redirected diagnostics (including ordinary SQLx warnings).
+    if !std::io::stderr().is_terminal() {
+        stderr_layer = stderr_layer.with_ansi(false);
+    }
+    let stderr_layer = stderr_layer.with_filter(output_filter());
 
     // Per-RPC statement-count / duration WARN profiling (expensive-RPC
     // guardrail); its warns flow through the output layers above.
