@@ -1634,7 +1634,7 @@ jobs:
       - name: Test ci-target-slot.sh
         run: ./scripts/test-ci-target-slot.sh
       - name: Test changed-tests.sh
-        run: ./scripts/test-changed-tests.sh
+        run: python3 -S scripts/test-changed-tests-stdin.py
       - name: Test the Makefile gate forwarder
         run: ./scripts/test-makefile-forwarder.sh
       - name: Test the Codex ACP rolling pin PR automation
