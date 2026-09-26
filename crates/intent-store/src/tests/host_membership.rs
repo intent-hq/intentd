@@ -96,7 +96,7 @@ async fn upgrade_preserves_legacy_identity_grants_credentials_invites_and_owner_
 
     let store = Store::open(&tmp.path)
         .await
-        .expect("upgrade through 0130-0132");
+        .expect("upgrade through identity and host membership migrations");
     let primary = store.get_primary_principal().await.unwrap();
     assert_eq!(primary.id.0, owner);
     assert!(
@@ -175,6 +175,153 @@ async fn upgrade_preserves_legacy_identity_grants_credentials_invites_and_owner_
         credentials
     );
     assert!(restarted.migration_status().await.unwrap().is_current());
+}
+
+#[tokio::test]
+async fn upgrade_from_landed_effort_schema_preserves_baseline_and_sharing() {
+    let tmp = TempDb::new();
+    let pool = SqlitePool::connect_with(
+        SqliteConnectOptions::new()
+            .filename(&tmp.path)
+            .create_if_missing(true),
+    )
+    .await
+    .unwrap();
+    Migrator {
+        migrations: Cow::Owned(
+            crate::MIGRATOR
+                .iter()
+                .filter(|migration| migration.version <= 132)
+                .cloned()
+                .collect(),
+        ),
+        ..Migrator::DEFAULT
+    }
+    .run(&pool)
+    .await
+    .expect("landed effort schema, before host membership");
+    let ledger: Vec<(i64, Vec<u8>)> =
+        sqlx::query_as("SELECT version, checksum FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(ledger.last().unwrap().0, 132);
+    let owner: String = sqlx::query_scalar("SELECT id FROM principal WHERE is_primary = 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    for sql in [
+        "INSERT INTO workspace (id,title,branch,status,created_at,updated_at) VALUES ('landed','Existing','main','Active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+        "INSERT INTO principal (id,github_user_id,login,identity_provider,instance_host,external_user_id,is_primary,created_at,updated_at) VALUES ('landed-guest',42,'guest','github','github.com','42',0,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+        "INSERT INTO workspace_member VALUES ('landed','landed-guest','collaborator','2026-01-01T00:00:00Z')",
+        "INSERT INTO principal_credential (token_hash,principal_id,created_at) VALUES ('landed-token','landed-guest','2026-01-01T00:00:00Z')",
+        "INSERT INTO note (id,workspace_id,title,content,created_at,updated_at) VALUES ('landed-note','landed','Keep','Existing work','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+        "INSERT INTO workspace_invite (id,workspace_id,secret_hash,secret,created_by_principal_id,pin_github_user_id,pin_login,pin_identity_provider,pin_instance_host,pin_external_user_id,created_at,expires_at) SELECT 'landed-invite','landed','landed-hash','landed-secret',id,42,'guest','github','github.com','42','2026-01-01T00:00:00Z','2099-01-01T00:00:00Z' FROM principal WHERE is_primary=1",
+    ] {
+        sqlx::query(sql).execute(&pool).await.unwrap();
+    }
+    let effort = crate::AgentTurnEffort {
+        effort: None,
+        default_value: "medium".into(),
+        provider: "mock".into(),
+        model: Some("saved-model".into()),
+    };
+    let effort_json = serde_json::to_string(&effort).unwrap();
+    sqlx::query("INSERT INTO agent_session (id,workspace_id,name,status,created_at,updated_at,reasoning_effort,last_turn_effort) VALUES ('landed-agent','landed','Existing agent','idle','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','high',?)")
+        .bind(&effort_json).execute(&pool).await.unwrap();
+    pool.close().await;
+
+    let store = Store::open(&tmp.path).await.expect("upgrade landed schema");
+    let unchanged_ledger: Vec<(i64, Vec<u8>)> = sqlx::query_as(
+        "SELECT version, checksum FROM _sqlx_migrations WHERE version <= 132 ORDER BY version",
+    )
+    .fetch_all(store.read_pool())
+    .await
+    .unwrap();
+    assert_eq!(unchanged_ledger, ledger, "landed checksums stay intact");
+    assert!(store.migration_status().await.unwrap().is_current());
+    let ws = WorkspaceId::from("landed");
+    let agent = AgentId::from("landed-agent");
+    let primary = store.get_primary_principal().await.unwrap();
+    assert_eq!(primary.id.as_str(), owner);
+    assert_eq!(
+        store.get_workspace_owner_principal_id(&ws).await.unwrap(),
+        Some(primary.id.clone())
+    );
+    assert_eq!(
+        store.host_membership_state().await.unwrap(),
+        HostMembershipState::default()
+    );
+    let guest = store
+        .find_principal_by_identity(&PrincipalIdentity::github(42))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(guest.id.as_str(), "landed-guest");
+    assert_eq!(
+        store.get_host_role(&guest.id).await.unwrap(),
+        HostRole::Guest
+    );
+    assert_eq!(
+        store.list_principal_credentials(&guest.id).await.unwrap()[0].token_hash,
+        "landed-token"
+    );
+    let summary = store
+        .workspace_membership_summaries(Some(&guest.id), std::slice::from_ref(&ws))
+        .await
+        .unwrap();
+    assert_eq!(summary[&ws].member_count, 2);
+    assert_eq!(summary[&ws].open_invite_count, 1);
+    let invite = store
+        .get_workspace_invite("landed-invite")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(invite.pin_identity, Some(PrincipalIdentity::github(42)));
+    assert_eq!(invite.secret.as_deref(), Some("landed-secret"));
+    assert_eq!(invite.redemption_count, 0);
+    assert_eq!(invite.expires_at, "2099-01-01T00:00:00Z");
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT content FROM note WHERE id='landed-note'")
+            .fetch_one(store.read_pool())
+            .await
+            .unwrap(),
+        "Existing work"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT last_turn_effort FROM agent_session WHERE id='landed-agent'"
+        )
+        .fetch_one(store.read_pool())
+        .await
+        .unwrap(),
+        effort_json
+    );
+    assert_eq!(
+        store
+            .get_agent_session(&agent)
+            .await
+            .unwrap()
+            .reasoning_effort
+            .as_deref(),
+        Some("high")
+    );
+    assert_eq!(
+        store
+            .get_agent_session_last_turn_effort(&ws, &agent)
+            .await
+            .unwrap(),
+        Some(effort.clone())
+    );
+    store.close().await;
+    let reopened = Store::open(&tmp.path).await.unwrap();
+    assert_eq!(
+        reopened
+            .get_agent_session_last_turn_effort(&ws, &agent)
+            .await
+            .unwrap(),
+        Some(effort)
+    );
 }
 
 #[tokio::test]

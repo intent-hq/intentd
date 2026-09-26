@@ -795,6 +795,16 @@ mod tests {
         let src = Store::open(&src_db.path).await.expect("open source");
         seed(&src, "ws-rt").await;
         let ws = WorkspaceId("ws-rt".to_string());
+        let agent_id = intent_core::AgentId::from("agent-ws-rt");
+        let effort = crate::AgentTurnEffort {
+            effort: None,
+            default_value: "medium".into(),
+            provider: "mock".into(),
+            model: None,
+        };
+        src.set_agent_session_last_turn_effort(&ws, &agent_id, &effort)
+            .await
+            .unwrap();
 
         let mut exported = src.transfer_export_rows(&ws).await.expect("export");
         assert_eq!(exported.len(), TRANSFER_TABLES.len());
@@ -817,6 +827,12 @@ mod tests {
         let dst_db = TempDb::new();
         let dst = Store::open(&dst_db.path).await.expect("open target");
         let inserted = dst.transfer_import_rows(&exported).await.expect("import");
+        assert_eq!(
+            dst.get_agent_session_last_turn_effort(&ws, &agent_id)
+                .await
+                .unwrap(),
+            Some(effort)
+        );
         assert_eq!(inserted, total);
 
         let mut re_exported = dst.transfer_export_rows(&ws).await.expect("re-export");
@@ -838,6 +854,23 @@ mod tests {
             }
         }
         assert_eq!(exported, re_exported, "round-trip must be lossless");
+        // Archives made before the effort baseline column remain importable;
+        // desired reasoning_effort is not evidence of a previously used level.
+        for (table, rows) in &mut exported {
+            if table == "agent_session" {
+                for row in rows {
+                    row.as_object_mut().unwrap().remove("last_turn_effort");
+                }
+            }
+        }
+        let legacy_db = TempDb::new();
+        let legacy = Store::open(&legacy_db.path).await.unwrap();
+        legacy.transfer_import_rows(&exported).await.unwrap();
+        assert!(legacy
+            .get_agent_session_last_turn_effort(&ws, &agent_id)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     /// Regression for intent-hq/intent#4876: the export reads every table
@@ -1060,7 +1093,7 @@ note_version: note_id, workspace_id, v, date, author_id, author_name, author_typ
 note_line_attribution: note_id, workspace_id, computed_at, attributions_json
 comment: id, thread_id, note_id, workspace_id, kind, content, author, author_type, status, parent_id, anchor_json, anchor_text, extra_json, created_at, updated_at
 draft: workspace_id, agent_id, client_id, text, updated_at, attachments
-agent_session: id, workspace_id, backend_session_id, acp_session_id, name, name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, token_usage, token_usage_baseline, resolved_model, last_turn_model, last_turn_provider, last_assistant_preview, last_user_preview, attention_request_kind, attention_request_reason, attention_request_timestamp, last_message_role, stop_reason_timestamp, reasoning_effort, effort_levels, last_message_id, file_blocks, task_graph_enabled, harness_version, harness_features, last_tool_use_preview, retired_at, message_count, assistant_message_count, conversation_bytes, notifications_muted
+agent_session: id, workspace_id, backend_session_id, acp_session_id, name, name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, token_usage, token_usage_baseline, resolved_model, last_turn_model, last_turn_provider, last_assistant_preview, last_user_preview, attention_request_kind, attention_request_reason, attention_request_timestamp, last_message_role, stop_reason_timestamp, reasoning_effort, effort_levels, last_message_id, file_blocks, task_graph_enabled, harness_version, harness_features, last_tool_use_preview, retired_at, message_count, assistant_message_count, conversation_bytes, notifications_muted, last_turn_effort
 agent_message: id, agent_id, seq, role, content, created_at, metadata, thumbnails
 agent_message_payload: message_id, agent_id, block_ordinal, kind, encoding, body
 agent_queue: id, agent_id, position, payload, created_at, turn_id

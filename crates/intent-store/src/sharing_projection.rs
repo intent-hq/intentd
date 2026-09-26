@@ -1,4 +1,4 @@
-//! Sharing counters are maintained by 0133's triggers. Time passage is not a
+//! Sharing counters are maintained by 0134's triggers. Time passage is not a
 //! mutation: before exposing a count, reconcile due invitation reservations at
 //! one observation time. The ordinary path holds a read snapshot and only probes
 //! the (`workspace_id`, `expires_at`) index. If due rows exist, restart under the write

@@ -335,7 +335,7 @@ async fn sharing_legacy_backfill_preserves_members_and_closed_invites() {
         migrations: Cow::Owned(
             crate::MIGRATOR
                 .iter()
-                .filter(|m| m.version <= 132)
+                .filter(|m| m.version <= 133)
                 .cloned()
                 .collect(),
         ),

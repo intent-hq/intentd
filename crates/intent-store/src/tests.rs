@@ -8140,7 +8140,7 @@ async fn primary_principal_is_minted_once() {
     assert_eq!(store.list_principals().await.expect("list").len(), 1);
 }
 
-/// Remove derived 0133 state before a fixture rewinds its source schema. The
+/// Remove derived 0134 state before a fixture rewinds its source schema. The
 /// real migration must replay after the legacy rows have been seeded.
 async fn rewind_sharing_projection(store: &Store) {
     for sql in [
@@ -8157,7 +8157,7 @@ async fn rewind_sharing_projection(store: &Store) {
         "DROP TRIGGER sharing_invite_seat_ad",
         "DROP TABLE workspace_invite_seat",
         "DROP TABLE workspace_sharing_summary",
-        "DELETE FROM _sqlx_migrations WHERE version = 133",
+        "DELETE FROM _sqlx_migrations WHERE version = 134",
     ] {
         sqlx::query(sql)
             .execute(store.write_pool())
@@ -8178,11 +8178,11 @@ async fn principals_migration_backfills_existing_workspaces() {
     {
         let store = Store::open(&tmp.path).await.expect("open store");
         rewind_sharing_projection(&store).await;
-        // 0130 re-widens the recreated principal/invite tables; 0132 adds
+        // 0130 re-widens the recreated principal/invite tables; 0133 adds
         // host tables and triggers referencing principal. Rewind both before
         // removing the principal table, then let the real migrations replay.
         for sql in [
-            "DELETE FROM _sqlx_migrations WHERE version IN (125, 126, 130, 132)",
+            "DELETE FROM _sqlx_migrations WHERE version IN (125, 126, 130, 133)",
             "DROP TABLE host_invite",
             "DROP TABLE host_member",
             "DROP TABLE principal_revocation",
