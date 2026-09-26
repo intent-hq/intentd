@@ -1,4 +1,4 @@
-//! Device attribution through real pinned TLS, admission, services and SQLite.
+//! Device attribution through real pinned TLS, admission, services and `SQLite`.
 use super::*;
 use serde_json::json;
 

@@ -251,7 +251,7 @@ impl Store {
         Ok(out)
     }
 
-    /// Cached device profiles and effective roles from the same SQLite snapshot,
+    /// Cached device profiles and effective roles from the same `SQLite` snapshot,
     /// batched by returned principals rather than scanning the host directory.
     ///
     /// # Errors
