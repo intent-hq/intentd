@@ -10448,6 +10448,69 @@ async fn wss_providers_catalog_round_trip() {
     srv.ws.stop().await;
 }
 
+/// Legacy identity metadata is independent of the configured default, disabled
+/// providers, authentication, installation and model discovery. This harness has
+/// no `AgentManager` or provider discovery attached; the static catalog still
+/// reports the resolver's aliases over the production TLS/JSON-RPC path.
+#[intent_test_macros::daemon_test]
+async fn wss_providers_catalog_legacy_aliases_ignore_settings() {
+    let srv = start(WsOptions::default()).await;
+    let mut first_catalog = None;
+    for (default, enabled) in [
+        (Value::Null, serde_json::json!({})),
+        (
+            serde_json::json!("codex"),
+            serde_json::json!({"auggie": true, "codex": false}),
+        ),
+        (
+            serde_json::json!("claude-code"),
+            serde_json::json!({"auggie": false, "claude-code": true}),
+        ),
+        (
+            serde_json::json!("auggie"),
+            serde_json::json!({"auggie": false}),
+        ),
+        (serde_json::json!("nope"), serde_json::json!({})),
+        (serde_json::json!(""), serde_json::json!({})),
+    ] {
+        srv.set_setting("model.defaultProvider", default.clone());
+        srv.set_setting("providers.enabled", enabled.clone());
+        let resp = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            r#"{"jsonrpc":"2.0","id":1,"method":"providers.catalog","params":{}}"#,
+        )
+        .await;
+        eprintln!("providers.catalog wire: {resp}");
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(resp["id"], 1);
+        assert!(resp.get("error").is_none(), "{resp}");
+        let providers = resp["result"]["providers"].as_array().unwrap();
+        let auggie = providers.iter().find(|p| p["id"] == "auggie").unwrap();
+        assert_eq!(
+            auggie["legacyAliases"],
+            serde_json::json!(["default", "acp", "augment"]),
+            "default={default}, enabled={enabled}"
+        );
+        for p in providers.iter().filter(|p| p["id"] != "auggie") {
+            assert!(
+                p.get("legacyAliases").is_none(),
+                "{} has no aliases",
+                p["id"]
+            );
+        }
+        if let Some(first) = &first_catalog {
+            assert_eq!(
+                &resp["result"], first,
+                "settings must not change any catalog metadata"
+            );
+        } else {
+            first_catalog = Some(resp["result"].clone());
+        }
+    }
+    srv.ws.stop().await;
+}
+
 /// `unsloth.status` / `unsloth.stop` (monorepo#878 follow-up): no params, no
 /// workspaceId — the managed Unsloth server is daemon-global. This harness's
 /// `Services` is never attached to a real `AgentManager`

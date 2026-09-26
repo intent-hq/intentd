@@ -696,6 +696,22 @@ pub fn find_provider_or_legacy_alias(provider_id: &str) -> Option<&'static Provi
     })
 }
 
+/// Historical aliases that resolve to this exact registered provider. This is
+/// the reverse of [`find_provider_or_legacy_alias`], not the unknown-id fallback
+/// in [`provider_config`]. Registered IDs take precedence over alias membership.
+/// Identity is compiled registry data, independent of settings or availability.
+#[must_use]
+pub fn legacy_aliases_for_provider(provider_id: &str) -> Vec<&'static str> {
+    DEFAULT_PROVIDER_ALIASES
+        .iter()
+        .copied()
+        .filter(|alias| {
+            *alias != provider_id
+                && find_provider_or_legacy_alias(alias).is_some_and(|p| p.id == provider_id)
+        })
+        .collect()
+}
+
 /// Resolve a provider by id, falling back to the first registered provider
 /// when unknown. Unknown ids warn (see [`warns_on_unknown_provider`]) so
 /// registry gaps surface in logs instead of silently spawning the fallback
