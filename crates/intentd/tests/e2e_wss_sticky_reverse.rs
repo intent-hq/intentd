@@ -52,7 +52,8 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use intent_core::{
-    AgentReverseDispatch, ClientId, ReverseDispatchError, ReverseTarget, WorkspaceApi, WorkspaceId,
+    AgentReverseDispatch, ClientId, PrincipalId, ReverseDispatchError, ReverseTarget, WorkspaceApi,
+    WorkspaceId,
 };
 use intent_services::{EventBus, Services};
 use intent_store::Store;
@@ -73,6 +74,7 @@ struct Fixture {
     /// test can poll `len()` until the closing client's guard has actually
     /// dropped, instead of waiting on an arbitrary sleep.
     registry: Arc<PrimaryReverseRegistry>,
+    owner_id: PrincipalId,
     _dir: tempfile::TempDir,
 }
 
@@ -86,6 +88,7 @@ async fn boot_with(opts: WsOptions) -> Fixture {
     let dir_guard = common::test_tempdir("intentd-sticky-");
     let dir = dir_guard.path().to_path_buf();
     let store = Store::open(&dir.join("intentd.db")).await.expect("store");
+    let owner_id = store.get_primary_principal().await.expect("primary").id;
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic root");
@@ -108,6 +111,7 @@ async fn boot_with(opts: WsOptions) -> Fixture {
         api,
         port,
         registry,
+        owner_id,
         _dir: dir_guard,
     }
 }
@@ -798,7 +802,6 @@ async fn pinned_target_offline_reports_typed_error_without_fallback() {
 #[intent_test_macros::daemon_test]
 async fn client_connected_and_disconnected_events_are_published_per_logical_client() {
     let fx = boot().await;
-    let owner = fx.api.principal_me().await.unwrap();
     let mut sub = connect(fx.port).await;
     let ack = wss_rpc(
         &mut sub,
@@ -819,7 +822,7 @@ async fn client_connected_and_disconnected_events_are_published_per_logical_clie
             "clientId": "desktop-a",
             "name": "Intent Desktop @ desktop-a",
             "capabilities": { "browserExec": true },
-            "principalId": owner["id"], "hostRole": "owner",
+            "principalId": fx.owner_id, "hostRole": "owner",
             "login": null, "displayName": null, "avatarUrl": null,
         })
     );
@@ -871,7 +874,6 @@ async fn heartbeat_abort_publishes_client_disconnected() {
         ..WsOptions::default()
     })
     .await;
-    let owner = fx.api.principal_me().await.unwrap();
     let mut sub = connect(fx.port).await;
     let ack = wss_rpc(
         &mut sub,
@@ -913,7 +915,7 @@ async fn heartbeat_abort_publishes_client_disconnected() {
             "clientId": "desktop-a",
             "name": "Intent Desktop @ desktop-a",
             "capabilities": { "browserExec": true },
-            "principalId": owner["id"], "hostRole": "owner",
+            "principalId": fx.owner_id, "hostRole": "owner",
             "login": null, "displayName": null, "avatarUrl": null,
         })
     );
