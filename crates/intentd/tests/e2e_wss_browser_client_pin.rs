@@ -14,8 +14,11 @@
 
 mod common;
 
+#[path = "e2e_wss_browser_client_pin/identity_isolation.rs"]
+mod identity_isolation;
+
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -54,14 +57,14 @@ fn scratch_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-wss-bcpin-")
 }
 
-fn spawn_serve(data_dir: &Path) -> Child {
+fn spawn_serve(data_dir: &Path, mut command: Command) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     common::enable_ws_api(data_dir);
-    let mut command = common::serve_command();
     common::hermetic_github_identity(&mut command, data_dir);
     command
+        .env_remove("GITLAB_TOKEN")
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
@@ -87,9 +90,13 @@ async fn await_uds(socket: &Path) -> bool {
 }
 
 async fn boot(root: &Path) -> (Daemon, u16, Arc<ClientConfig>) {
+    boot_with_command(root, common::serve_command()).await
+}
+
+async fn boot_with_command(root: &Path, command: Command) -> (Daemon, u16, Arc<ClientConfig>) {
     let data_dir = root.join("data");
     std::fs::create_dir_all(&data_dir).expect("mkdir data");
-    let child = spawn_serve(&data_dir);
+    let child = spawn_serve(&data_dir, command);
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
