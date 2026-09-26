@@ -18614,3 +18614,6 @@ async fn kill_on_interrupt_quirk_fences_zombie_chunks_over_wss() {
         "follow-up prompt is the FRESH child's turn 1 (teardown happened): {entries:?}"
     );
 }
+
+#[path = "e2e_wss_agent_lifecycle/member_tools.rs"]
+mod member_tools;

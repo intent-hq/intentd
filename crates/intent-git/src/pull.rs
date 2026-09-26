@@ -42,22 +42,44 @@ pub fn pull_branch(
     branch_name: &str,
     token: Option<&str>,
 ) -> Result<GitPullResult> {
+    pull_branch_inner(repo_path, branch_name, token, false)
+}
+
+/// Preserve typed fetch authorization failures for the service's member
+/// diagnostic boundary. All other expected pull failures retain their result.
+///
+/// # Errors
+/// Returns repository-open errors and typed fetch authorization failures.
+pub fn pull_branch_classified(
+    repo_path: &Path,
+    branch_name: &str,
+    token: Option<&str>,
+) -> Result<GitPullResult> {
+    pull_branch_inner(repo_path, branch_name, token, true)
+}
+
+fn pull_branch_inner(
+    repo_path: &Path,
+    branch_name: &str,
+    token: Option<&str>,
+    classify_auth: bool,
+) -> Result<GitPullResult> {
     let mut repo = Repository::open(repo_path).map_err(map_git_err)?;
     let current = crate::status::current_branch(&repo);
 
     // Branch not checked out → update the remote-tracking ref only (the TS
     // "fetch instead of pull" path used during workspace creation).
     if current != branch_name {
-        return Ok(match fetch(repo_path, "origin", branch_name, token) {
-            Ok(()) => success(),
-            Err(e) => failure(error_message(e)),
-        });
+        return match fetch(repo_path, "origin", branch_name, token) {
+            Ok(()) => Ok(success()),
+            Err(e) => fetch_failure(e, classify_auth),
+        };
     }
 
     // `git pull --rebase origin <branch>` ≡ fetch then rebase HEAD onto the
     // updated remote-tracking ref.
     if let Err(e) = fetch(repo_path, "origin", branch_name, token) {
-        return Ok(failure(error_message(e)));
+        return fetch_failure(e, classify_auth);
     }
 
     // Auto-stash bookend: the TS handler retries the pull after stashing when
@@ -126,6 +148,14 @@ pub fn pull_branch(
     Ok(success())
 }
 
+fn fetch_failure(error: Error, classify_auth: bool) -> Result<GitPullResult> {
+    if classify_auth && matches!(error, Error::GitAuthorization(_)) {
+        Err(error)
+    } else {
+        Ok(failure(error_message(error)))
+    }
+}
+
 /// `git stash pop` CLI parity: apply the most recent stash, and drop it only
 /// when the apply produced no conflicts (the CLI keeps the stash entry on a
 /// conflicted pop; libgit2's `stash_pop` would drop it after writing conflict
@@ -157,7 +187,7 @@ fn failure(error: String) -> GitPullResult {
 /// field (avoids the `internal error:` display prefix).
 fn error_message(e: Error) -> String {
     match e {
-        Error::Internal(m) => m,
+        Error::Internal(m) | Error::GitAuthorization(m) => m,
         other => other.to_string(),
     }
 }
@@ -169,6 +199,27 @@ mod tests {
         checkout_branch, commit_file, create_branch, init_repo, write_file, TempDir,
     };
     use std::path::PathBuf;
+
+    #[test]
+    fn authorization_classification_preserves_legacy_pull_failures() {
+        assert_eq!(
+            fetch_failure(Error::GitAuthorization("denied".into()), false)
+                .unwrap()
+                .error
+                .as_deref(),
+            Some("denied")
+        );
+        assert!(matches!(
+            fetch_failure(Error::GitAuthorization("denied".into()), true),
+            Err(Error::GitAuthorization(_))
+        ));
+        for classified in [false, true] {
+            let result =
+                fetch_failure(Error::Internal("network error".into()), classified).unwrap();
+            assert!(!result.ok);
+            assert_eq!(result.error.as_deref(), Some("network error"));
+        }
+    }
 
     /// Seed a repo with one commit, push it into a fresh bare `origin`, and
     /// return `(worktree, bare_dir, branch)`.

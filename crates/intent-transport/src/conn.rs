@@ -422,7 +422,19 @@ pub(crate) async fn process_frame(
             && crate::context::is_non_administrator_caller()
             && !catalog::collaborator_may_call(&method)
         {
-            return refuse_forbidden(&method, rpc_id, out_tx).await;
+            let member =
+                match crate::context::current_caller().and_then(|c| c.principal_id().cloned()) {
+                    Some(id) => api.principal_host_role(id).await.is_ok_and(|role| {
+                        matches!(
+                            role,
+                            intent_core::HostRole::Owner | intent_core::HostRole::Member
+                        )
+                    }),
+                    None => false,
+                };
+            if !member || !catalog::member_may_call(&method) {
+                return refuse_forbidden(&method, rpc_id, out_tx).await;
+            }
         }
         if let Some(control) = control {
             if let Some(req) = control::classify(value) {
@@ -940,6 +952,7 @@ pub(crate) async fn handle_fast_path(
                     workspace_id,
                     batch_window: None,
                     collaborator_only: gate.is_some(),
+                    member_execution_events: true,
                     exclude_channel_only: true,
                     ..Default::default()
                 });
@@ -1329,6 +1342,7 @@ pub(crate) async fn handle_sub_fast_path(
                     workspace_id: None,
                     batch_window: None,
                     collaborator_only: gate.is_some(),
+                    member_execution_events: true,
                     ..Default::default()
                 });
                 let subscription_id = events::next_subscription_id();

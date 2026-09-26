@@ -80,6 +80,10 @@ pub(crate) const DEFAULT_BATCH_WINDOW: Duration = Duration::from_millis(500);
 /// Criteria a [`super::bus::Subscription`] matches events against. Empty
 /// collections / `None` fields are ignored (AND-combined like the TS filter).
 #[derive(Debug, Clone, Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "orthogonal subscription filters compose independently; member delivery still rechecks durable authority"
+)]
 pub struct SubscriptionFilter {
     /// Event-type patterns; empty matches every type. Each entry is an exact
     /// type or a `prefix:*` wildcard (see [`event_type_matches`]).
@@ -107,6 +111,9 @@ pub struct SubscriptionFilter {
     /// before the pattern check, so a `terminal:*` or `client:*` pattern is
     /// accepted at subscribe time but stays silent.
     pub collaborator_only: bool,
+    /// Admit the safe member execution/prompt additions, subject to the
+    /// transport's delivery-time durable role and workspace check.
+    pub member_execution_events: bool,
     /// When set, types on [`is_channel_only_event_type`] never match — the
     /// match-time guard for the raw `events.subscribe` firehose (owner and
     /// collaborator alike), which keeps `note:presence` on the lease-gated
@@ -202,7 +209,11 @@ pub(crate) fn event_matches(filter: &SubscriptionFilter, event: &Event) -> bool 
     if filter.exclude_agent_events && is_agent_restricted_event_type(&event.event_type) {
         return false;
     }
-    if filter.collaborator_only && !is_collaborator_event_type(&event.event_type) {
+    if filter.collaborator_only
+        && !is_collaborator_event_type(&event.event_type)
+        && !(filter.member_execution_events
+            && intent_core::events::is_member_execution_event_type(&event.event_type))
+    {
         return false;
     }
     if filter.exclude_channel_only && is_channel_only_event_type(&event.event_type) {

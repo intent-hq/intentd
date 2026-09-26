@@ -86,7 +86,30 @@ fn not_found(message: impl Into<String>) -> RpcErr {
 /// surface as `-32603 "Internal error"` carrying the original cause in `data`.
 fn domain_to_rpc(e: Error) -> RpcErr {
     match e {
-        Error::Internal(msg) => RpcErr {
+        Error::ExecutionAuthorization {
+            source,
+            authorization,
+        } => {
+            let code = match source.as_ref() {
+                Error::CloneFailed { .. } | Error::SourceControlUnauthorized { .. } => {
+                    source.code()
+                }
+                _ => -32603,
+            };
+            let data_code = match source.as_ref() {
+                Error::CloneFailed { category, .. } => category.as_str(),
+                Error::SourceControlUnauthorized { .. } => "source-control-unauthorized",
+                _ => "host-execution-authorization",
+            };
+            RpcErr {
+                code,
+                message: authorization.message(),
+                data: Some(json!({
+                    "code": data_code, "executionAuthorization": authorization,
+                })),
+            }
+        }
+        Error::Internal(msg) | Error::GitAuthorization(msg) => RpcErr {
             code: -32603,
             message: "Internal error".to_string(),
             data: Some(Value::String(msg)),
@@ -729,6 +752,7 @@ async fn dispatch(
         // (it wraps the secret into the `intent://invite` link with the
         // listener's own hosts/port); only list/revoke route here.
         "host.members.list" => api.host_members_list().await.map_err(domain_to_rpc),
+        "host.executionContext" => api.host_execution_context().await.map_err(domain_to_rpc),
         "host.invite.list" => api.host_invite_list().await.map_err(domain_to_rpc),
         "host.invite.revoke" => api
             .host_invite_revoke(require_str_param(params, "inviteId")?)

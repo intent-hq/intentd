@@ -25,6 +25,7 @@ pub mod config;
 pub mod discovery_cache;
 pub mod error;
 pub mod events;
+pub mod execution;
 pub mod git_remote_url;
 pub mod host_membership;
 pub mod ids;

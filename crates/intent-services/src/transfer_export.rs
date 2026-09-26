@@ -80,6 +80,7 @@ pub(crate) enum ExportState {
 /// calls. Lives in `Services::transfer_exports`; in-memory only — a daemon
 /// restart drops sessions and the boot sweep clears their staging dirs.
 pub(crate) struct ExportSession {
+    pub initiator: Option<intent_core::PrincipalId>,
     pub workspace_id: WorkspaceId,
     /// `<workspaces_root>/.export-staging/<exportId>/`.
     pub staging_dir: PathBuf,
@@ -141,6 +142,8 @@ impl Services {
             exports.insert(
                 export_id.clone(),
                 ExportSession {
+                    initiator: intent_core::current_caller()
+                        .and_then(|c| c.principal_id().cloned()),
                     workspace_id: id.clone(),
                     staging_dir: staging_dir.clone(),
                     state: ExportState::Building { aborted: false },
@@ -1892,6 +1895,7 @@ mod tests {
             .insert(
                 "export-live".to_string(),
                 ExportSession {
+                    initiator: None,
                     workspace_id: WorkspaceId("ws-live".to_string()),
                     staging_dir: root.join("export-live"),
                     state: ExportState::Building { aborted: false },

@@ -101,6 +101,32 @@ impl MembershipGate {
     /// Whether the subscriber may receive `event`.
     pub(crate) async fn allows(&mut self, event: &Event) -> bool {
         let workspace_id = event.workspace_id.as_str();
+        if intent_core::events::is_member_execution_event_type(&event.event_type) {
+            // Prompt/context events never use the cached visibility verdict.
+            // Revocation takes effect before a socket is physically closed.
+            if !self
+                .api
+                .principal_host_role(self.principal_id.clone())
+                .await
+                .is_ok_and(|role| {
+                    matches!(
+                        role,
+                        intent_core::HostRole::Owner | intent_core::HostRole::Member
+                    )
+                })
+            {
+                return false;
+            }
+            if event.event_type == intent_core::events::HOST_EXECUTION_CONTEXT_CHANGED {
+                return workspace_id.is_empty();
+            }
+            return !workspace_id.is_empty()
+                && self
+                    .api
+                    .get_workspace(WorkspaceId::from(workspace_id))
+                    .await
+                    .is_ok();
+        }
         if workspace_id.is_empty() {
             // Every collaborator-visible type is workspace-scoped; a global
             // event reaching here has nothing to authorize against.

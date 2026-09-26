@@ -174,6 +174,7 @@ pub(crate) struct ScriptManager {
     /// Test park seams for the `script.*` race windows; all `None` in
     /// production wiring.
     parks: ScriptParks,
+    settings: Option<Arc<crate::SettingsRegistry>>,
 }
 
 /// Test seam for a race window: lets a test hold a task inside a window
@@ -251,7 +252,13 @@ impl ScriptManager {
             bootstrap_locks,
             too_fast_ms,
             parks,
+            settings: None,
         }
+    }
+
+    pub(crate) fn with_settings(mut self, settings: Option<Arc<crate::SettingsRegistry>>) -> Self {
+        self.settings = settings;
+        self
     }
 
     /// `script.create`: register (or upsert) a definition, persist it, and
@@ -988,7 +995,7 @@ impl ScriptManager {
                 return Err(e);
             }
         };
-        let pty_id = match self.pty.spawn(Self::build_spec(&ws, &def, cwd.as_ref())) {
+        let pty_id = match self.pty.spawn(self.build_spec(&ws, &def, cwd.as_ref())) {
             Ok(id) => id,
             Err(e) => {
                 reservation.armed = false;
@@ -1089,7 +1096,7 @@ impl ScriptManager {
             if let Some(old) = prev.take() {
                 self.pty.kill(old).await;
             }
-            let pty_id = match self.pty.spawn(Self::build_spec(&ws, &def, cwd.as_ref())) {
+            let pty_id = match self.pty.spawn(self.build_spec(&ws, &def, cwd.as_ref())) {
                 Ok(id) => id,
                 Err(e) => {
                     self.fail(&ws, &script_id, generation, &e.to_string(), restoring)
@@ -1560,12 +1567,19 @@ impl ScriptManager {
     /// enhanced-PATH + commit-identity + script env overlay, with an inherited
     /// `npm_config_prefix` scrubbed so nvm's login-shell init succeeds. An
     /// explicit script env value is preserved.
-    fn build_spec(ws: &WorkspaceId, def: &Script, cwd: Option<&PathBuf>) -> SpawnSpec {
+    fn build_spec(&self, ws: &WorkspaceId, def: &Script, cwd: Option<&PathBuf>) -> SpawnSpec {
         let shell = default_shell();
         let mut spec = SpawnSpec::new(ws.as_str(), shell.clone());
         spec.args = shell_args(&shell, &def.command);
         spec.cwd = cwd.cloned();
-        spec.env = spawn_env_overlay(cwd.map(PathBuf::as_path), def.env.as_ref());
+        spec.env = crate::terminal_ops::git_credential_env(
+            self.settings.as_deref(),
+            cwd.map(PathBuf::as_path),
+        );
+        spec.env.extend(spawn_env_overlay(
+            cwd.map(PathBuf::as_path),
+            def.env.as_ref(),
+        ));
         spec.env_remove = scrubbed_env_vars_except(&spec.env);
         spec.listed = false;
         spec

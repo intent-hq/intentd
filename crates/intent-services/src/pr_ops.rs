@@ -34,13 +34,7 @@ pub(crate) const NO_ACTIVE_PR: &str = "No active PR";
 /// code) so the background sweeps can detect quota exhaustion and pause
 /// instead of misreporting it as an auth/internal error (monorepo#2961).
 pub(crate) fn map_sc_err(e: intent_sourcecontrol::Error) -> Error {
-    match e {
-        intent_sourcecontrol::Error::Unsupported(msg) => {
-            Error::Internal(format!("unsupported by provider: {msg}"))
-        }
-        intent_sourcecontrol::Error::RateLimited(msg) => Error::RateLimited(msg),
-        other => Error::Internal(other.to_string()),
-    }
+    crate::host_execution::forge_error(e)
 }
 
 /// Resolve the active [`SourceControl`]: the injected handle (tests / explicit

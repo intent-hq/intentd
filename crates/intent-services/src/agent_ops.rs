@@ -1090,10 +1090,14 @@ pub(crate) fn ensure_provider_authenticated(
     if auth_verdict != Some(false) {
         return Ok(());
     }
-    Err(Error::InvalidParams(format!(
-        "{method}: {}",
-        crate::provider_auth::not_authenticated_message(provider_id)
-    )))
+    Err(crate::host_execution::ai_authorization_error(
+        Error::InvalidParams(format!(
+            "{method}: {}",
+            crate::provider_auth::not_authenticated_message(provider_id)
+        )),
+        provider_id,
+        intent_core::execution::ExecutionAuthorizationReason::Missing,
+    ))
 }
 
 /// The runnability half of [`ensure_provider_available`], with the npx probe

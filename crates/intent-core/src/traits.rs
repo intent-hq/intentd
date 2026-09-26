@@ -5013,6 +5013,57 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Owner/member allowlisted execution defaults and credential policy.
+    fn host_execution_context(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::host_execution_context not implemented".into(),
+            ))
+        })
+    }
+
+    /// Internal discovery input: connected-host paths without exposing settings.*.
+    /// Not a wire method. The default supports legacy/test API compositions.
+    fn execution_provider_paths(
+        &self,
+    ) -> BoxFuture<'_, Result<std::collections::HashMap<String, String>>> {
+        Box::pin(async move {
+            let mut paths = std::collections::HashMap::new();
+            if let Ok(value) = self.settings_get("providers.paths".into()).await {
+                if let Some(map) = value.get("value").and_then(serde_json::Value::as_object) {
+                    for (key, value) in map {
+                        if let Some(path) = value.as_str().filter(|s| !s.trim().is_empty()) {
+                            paths.insert(key.clone(), path.to_string());
+                        }
+                    }
+                }
+            }
+            if let Ok(value) = self.settings_get("context.auggiePath".into()).await {
+                if let Some(path) = value
+                    .get("value")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                {
+                    paths.insert("auggie".into(), path.into());
+                }
+            }
+            Ok(paths)
+        })
+    }
+
+    /// Internal owner setup invalidation; never carries setup details on the wire.
+    fn notify_execution_setup_changed(&self) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Internal bounded probe observation; no provider metadata is broadcast.
+    fn observe_execution_readiness(
+        &self,
+        _readiness: serde_json::Value,
+    ) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Owner-only open host invitations, ordered by createdAt / id.
     /// URLs require both a stored secret and an available tunnel envelope.
     fn host_invite_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {

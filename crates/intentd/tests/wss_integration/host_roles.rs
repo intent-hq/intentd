@@ -108,3 +108,103 @@ async fn owner_device_credential_keeps_owner_identity_and_administration() {
     drop(device);
     srv.ws.stop().await;
 }
+
+#[tokio::test]
+async fn member_workspace_tools_and_safe_context_over_wss() {
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("sourceControl.github.tokenSource", json!("explicit"));
+    srv.set_setting(
+        "sourceControl.github.exposeGitCredentialToChildren",
+        json!(false),
+    );
+    srv.set_setting("model.defaultProvider", json!("codex"));
+    let mut member = Guest::connect(&srv, &"fe".repeat(32)).await;
+    assert_eq!(
+        member.call("host.executionContext", json!({})).await["error"]["code"],
+        -32003
+    );
+    sqlx::query("INSERT INTO host_member(principal_id,added_at) VALUES (?,?)")
+        .bind(member.principal.id.as_str())
+        .bind(now_iso())
+        .execute(srv.store.write_pool())
+        .await
+        .unwrap();
+    let ws = WorkspaceId::new();
+    srv.store
+        .insert_workspace(&fixture_workspace(&ws))
+        .await
+        .unwrap();
+    let agent = intent_core::with_caller(
+        intent_core::Caller::Daemon,
+        srv.api.agent_create(
+            ws.clone(),
+            None,
+            Some("gpt-test".into()),
+            None,
+            None,
+            None,
+            intent_core::AgentCreateExtra {
+                provider: Some("codex".into()),
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    let agent_id = agent["agent"]["id"].as_str().unwrap();
+    let context = member.call("host.executionContext", json!({})).await;
+    assert_eq!(context["result"]["defaultProviderId"], "codex");
+    assert_eq!(
+        context["result"]["gitCredentialPolicy"]["managedHelperEnabled"],
+        false
+    );
+    assert_eq!(context["result"].as_object().unwrap().len(), 4);
+    for (method, params) in [
+        ("terminal.list", json!({"workspaceId":ws})),
+        ("script.list", json!({"workspaceId":ws})),
+        ("agent.pendingPermissions", json!({"agentId":agent_id})),
+        ("agent.delete", json!({"agentId":agent_id})),
+        ("repo.list", json!({})),
+    ] {
+        let reply = member.call(method, params).await;
+        assert!(reply.get("error").is_none(), "{method}: {reply}");
+    }
+    for (method, params) in [
+        ("settings.list", json!({})),
+        ("repo.remove", json!({"path":"/tmp/foreign"})),
+        (
+            "agent.replaceMessages",
+            json!({"agentId":agent_id,"messages":[]}),
+        ),
+        (
+            "system.gitCredential",
+            json!({"protocol":"https","host":"github.com"}),
+        ),
+        (
+            "mcp.servers.toggle",
+            json!({"serverId":"missing","enabled":true}),
+        ),
+    ] {
+        assert_eq!(
+            member.call(method, params).await["error"]["code"],
+            -32003,
+            "{method}"
+        );
+    }
+    srv.store
+        .remove_host_member(&member.principal.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        member.call("host.executionContext", json!({})).await["error"]["code"],
+        -32003
+    );
+    assert_eq!(
+        member
+            .call("terminal.list", json!({"workspaceId":ws}))
+            .await["error"]["code"],
+        -32003
+    );
+    drop(member);
+    srv.ws.stop().await;
+}

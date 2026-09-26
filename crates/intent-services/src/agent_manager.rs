@@ -7851,18 +7851,24 @@ impl AgentManager {
         }
         let mgr = self.clone();
         let id = agent_id.clone();
-        let handle = intent_core::spawn_daemon(async move {
-            // Clear the durable stop-redelivery mirror before the turn runs
-            // (intent-hq/monorepo#1899): the payload was consumed into this
-            // turn's prompt above, so a restart after this point must not
-            // rehydrate — and redeliver — it a second time. The sync re-reads
-            // the map, so a repeat stop that re-armed in the gap upserts the
-            // new payload instead of deleting.
-            if consumed_redelivery {
-                mgr.sync_stop_redelivery(&id).await;
-            }
-            run_message_worker(mgr, id, workspace_id, content, options, user_persisted).await;
-        });
+        let execution = mgr.services.clone();
+        let principal = intent_core::lift_from_principal_id(options.message_metadata.as_ref());
+        let handle = intent_core::spawn_daemon(crate::host_execution::background_execution(
+            execution,
+            principal,
+            async move {
+                // Clear the durable stop-redelivery mirror before the turn runs
+                // (intent-hq/monorepo#1899): the payload was consumed into this
+                // turn's prompt above, so a restart after this point must not
+                // rehydrate — and redeliver — it a second time. The sync re-reads
+                // the map, so a repeat stop that re-armed in the gap upserts the
+                // new payload instead of deleting.
+                if consumed_redelivery {
+                    mgr.sync_stop_redelivery(&id).await;
+                }
+                run_message_worker(mgr, id, workspace_id, content, options, user_persisted).await;
+            },
+        ));
         self.workers.lock().unwrap().insert(agent_id, handle);
     }
 
@@ -12229,9 +12235,13 @@ fn antigravity_setup_error(method: &str, error: &intent_acp::AcpError, rejection
                 "Antigravity {method}: agent stdout closed; no prompt was sent"
             ))
         }
-        AcpError::Auth(_) => Error::InvalidParams(crate::provider_auth::not_authenticated_message(
+        AcpError::Auth(_) => crate::host_execution::ai_authorization_error(
+            Error::InvalidParams(crate::provider_auth::not_authenticated_message(
+                "antigravity",
+            )),
             "antigravity",
-        )),
+            intent_core::execution::ExecutionAuthorizationReason::Rejected,
+        ),
         _ => Error::InvalidParams(rejection),
     }
 }
@@ -12498,6 +12508,7 @@ async fn publish_terminal_failure_events(
     error_msg: &str,
     turn_id: Option<&str>,
     provider_source: FailedProviderSource,
+    authorization: Option<&intent_core::execution::ExecutionAuthorizationFailure>,
 ) {
     use intent_core::events::{AGENT_FAILED, AGENT_STREAM_END};
 
@@ -12510,6 +12521,9 @@ async fn publish_terminal_failure_events(
         "failed",
     );
     let mut failed_data = json!({ "agentId": agent_id.0, "error": error_msg });
+    if let Some(auth) = authorization {
+        failed_data["executionAuthorization"] = json!(auth);
+    }
     let mut end_data = json!({ "agentId": agent_id.0 });
     if let Some(tid) = turn_id {
         failed_data["turnId"] = json!(tid);
@@ -13030,6 +13044,7 @@ async fn handle_terminal_spawn_failure(
         &error_text,
         options.turn_id.as_deref(),
         FailedProviderSource::SpawnAttempt,
+        error.execution_authorization(),
     )
     .await;
     publish_error_status_and_requeue(
@@ -13076,6 +13091,7 @@ async fn handle_drain_persist_failure(
         &error_text,
         options.turn_id.as_deref(),
         FailedProviderSource::CommittedTurn,
+        None,
     )
     .await;
     publish_error_status_and_requeue(
@@ -13608,6 +13624,7 @@ async fn handle_terminal_turn_failure(
             &error_text,
             options.turn_id.as_deref(),
             FailedProviderSource::CommittedTurn,
+            error.execution_authorization(),
         )
         .await;
     }

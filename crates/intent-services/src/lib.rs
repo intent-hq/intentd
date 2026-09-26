@@ -91,6 +91,7 @@ mod git_status_cache;
 mod git_status_singleflight;
 pub mod host_exec;
 pub mod host_exec_stream;
+mod host_execution;
 mod workspace_mutations;
 
 mod github_ops;
@@ -1280,6 +1281,9 @@ pub struct Services {
     /// restart drops pending imports (staging dirs are swept lazily by the
     /// next `begin`), and the FE simply restarts the upload.
     transfer_imports: Arc<Mutex<HashMap<String, transfer_import::ImportSession>>>,
+    /// Coalesced safe-context invalidations and bounded provider verdicts.
+    execution_invalidation: Arc<tokio::sync::Notify>,
+    execution_readiness: Arc<Mutex<HashMap<String, Option<bool>>>>,
     /// In-flight staged attachment uploads (`file.attachmentUpload.*`, keyed
     /// by `uploadId`): destination + declared size/sha + chunk cursor
     /// between `begin` and `commit`/`abort`. Shared across clones so chunks
@@ -1510,6 +1514,8 @@ impl Services {
             #[cfg(test)]
             workspace_delete_test_gate: tests::workspace_delete::DeleteGate::default(),
             pending_agent_deletes: delete_grace::PendingDeletes::default(),
+            execution_invalidation: Arc::new(tokio::sync::Notify::new()),
+            execution_readiness: Arc::new(Mutex::new(HashMap::new())),
             transfer_imports: Arc::new(Mutex::new(HashMap::new())),
             attachment_uploads: Arc::new(Mutex::new(HashMap::new())),
             attachment_idempotency_inflight: Arc::new(Mutex::new(HashMap::new())),
@@ -2148,6 +2154,7 @@ impl Services {
             self.script_too_fast_ms,
             self.script_parks.clone(),
         )
+        .with_settings(self.settings_registry.clone())
     }
 
     /// Test seam: raise the `script.*` too-fast-exit floor so the no-restart
@@ -16883,6 +16890,74 @@ impl WorkspaceApi for Services {
         Box::pin(async move { Ok(provider_catalog::build_providers_catalog()) })
     }
 
+    fn host_execution_context(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_host_execution("host.executionContext").await?;
+            serde_json::to_value(self.execution_context_snapshot().await?)
+                .map_err(|e| Error::Internal(e.to_string()))
+        })
+    }
+
+    fn execution_provider_paths(&self) -> BoxFuture<'_, Result<HashMap<String, String>>> {
+        Box::pin(async move {
+            self.require_host_execution("host.providerDiscovery")
+                .await?;
+            let settings = self.effective_settings();
+            let mut paths: HashMap<String, String> = settings
+                .providers
+                .paths
+                .into_iter()
+                .filter(|(_, path)| !path.trim().is_empty())
+                .collect();
+            if let Some(path) = settings
+                .context
+                .auggie_path
+                .filter(|p| !p.trim().is_empty())
+            {
+                paths.insert("auggie".into(), path);
+            }
+            Ok(paths)
+        })
+    }
+
+    fn notify_execution_setup_changed(&self) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            Self::require_administrator("provider setup")?;
+            self.execution_invalidation.notify_one();
+            Ok(())
+        })
+    }
+
+    fn observe_execution_readiness(
+        &self,
+        readiness: serde_json::Value,
+    ) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            self.require_host_execution("host.providerAuthStatus")
+                .await?;
+            let changed = {
+                let mut prior = self
+                    .execution_readiness
+                    .lock()
+                    .expect("execution readiness poisoned");
+                let mut changed = false;
+                if let Some(rows) = readiness["providers"].as_array() {
+                    for row in rows {
+                        if let Some(id) = row["id"].as_str() {
+                            let verdict = row["authenticated"].as_bool();
+                            changed |= prior.insert(id.into(), verdict) != Some(verdict);
+                        }
+                    }
+                }
+                changed
+            };
+            if changed {
+                self.execution_invalidation.notify_one();
+            }
+            Ok(())
+        })
+    }
+
     fn unsloth_status(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             let Some(manager) = self.agent_manager() else {
@@ -17298,32 +17373,33 @@ impl WorkspaceApi for Services {
         workspace_id: Option<WorkspaceId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            Self::require_administrator("mcp.serversToggle")?;
-            match workspace_id {
-                Some(ws) => {
-                    let out = self
-                        .mcp_servers_service()
-                        .toggle_workspace(ws.as_str(), &server_id, enabled)
-                        .await?;
-                    // Self-sufficient `workspace:updated` delta (§6.5) so live
-                    // clients mirror the workspace-scoped toggle without a
-                    // follow-up read.
-                    publish_event(
-                        self.event_bus.as_ref(),
-                        workspace_updated_event(
-                            &ws,
-                            &serde_json::json!({
-                                "mcpServerToggled": {
-                                    "serverId": server_id,
-                                    "workspaceDisabled": !enabled,
-                                }
-                            }),
-                        ),
-                    )
-                    .await;
-                    Ok(out)
-                }
-                None => self.mcp_servers_service().toggle(&server_id, enabled).await,
+            if let Some(ws) = workspace_id {
+                self.require_workspace_manager(&ws, "mcp.serversToggle")
+                    .await?;
+                let out = self
+                    .mcp_servers_service()
+                    .toggle_workspace(ws.as_str(), &server_id, enabled)
+                    .await?;
+                // Self-sufficient `workspace:updated` delta (§6.5) so live
+                // clients mirror the workspace-scoped toggle without a
+                // follow-up read.
+                publish_event(
+                    self.event_bus.as_ref(),
+                    workspace_updated_event(
+                        &ws,
+                        &serde_json::json!({
+                            "mcpServerToggled": {
+                                "serverId": server_id,
+                                "workspaceDisabled": !enabled,
+                            }
+                        }),
+                    ),
+                )
+                .await;
+                Ok(out)
+            } else {
+                Self::require_administrator("mcp.serversToggle")?;
+                self.mcp_servers_service().toggle(&server_id, enabled).await
             }
         })
     }
@@ -17416,7 +17492,10 @@ impl WorkspaceApi for Services {
         workspace_id: Option<WorkspaceId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            Self::require_administrator("mcp.listServers")?;
+            self.require_host_execution("mcp.listServers").await?;
+            if let Some(ws) = workspace_id.as_ref() {
+                self.require_member(ws).await?;
+            }
             self.mcp_servers_service()
                 .agent_list_servers(workspace_id.as_ref().map(WorkspaceId::as_str))
                 .await
@@ -17429,7 +17508,10 @@ impl WorkspaceApi for Services {
         workspace_id: Option<WorkspaceId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            Self::require_administrator("mcp.listTools")?;
+            self.require_host_execution("mcp.listTools").await?;
+            if let Some(ws) = workspace_id.as_ref() {
+                self.require_member(ws).await?;
+            }
             self.mcp_servers_service()
                 .agent_list_tools(workspace_id.as_ref().map(WorkspaceId::as_str), &server_id)
                 .await
@@ -17445,7 +17527,10 @@ impl WorkspaceApi for Services {
         workspace_id: Option<WorkspaceId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            Self::require_administrator("mcp.callTool")?;
+            self.require_host_execution("mcp.callTool").await?;
+            if let Some(ws) = workspace_id.as_ref() {
+                self.require_member(ws).await?;
+            }
             self.mcp_servers_service()
                 .agent_call_tool(
                     workspace_id.as_ref().map(WorkspaceId::as_str),
@@ -17768,8 +17853,9 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let settings = self.settings_registry.clone();
         Box::pin(async move {
-            // `terminal.*` is host reach: owner-only in the matrix.
-            self.require_owner(&workspace_id, "terminal.create").await?;
+            // Workspace terminals use the host owner's execution setup.
+            self.require_workspace_manager(&workspace_id, "terminal.create")
+                .await?;
             terminal_ops::create(
                 pty,
                 bus,
@@ -17793,9 +17879,9 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let pty = self.pty.clone();
         Box::pin(async move {
-            // Terminal-id keyed (no workspace to resolve a role against): a
-            // collaborator caller never reaches a PTY.
-            Self::require_administrator("terminal.write")?;
+            // Resolve the terminal's actual workspace before authorizing it.
+            self.require_terminal_manager(&terminal_id, "terminal.write")
+                .await?;
             terminal_ops::write(&pty, &terminal_id, &data)
         })
     }
@@ -17808,7 +17894,8 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let pty = self.pty.clone();
         Box::pin(async move {
-            Self::require_administrator("terminal.resize")?;
+            self.require_terminal_manager(&terminal_id, "terminal.resize")
+                .await?;
             terminal_ops::resize(&pty, &terminal_id, cols, rows)
         })
     }
@@ -17816,7 +17903,8 @@ impl WorkspaceApi for Services {
     fn terminal_kill(&self, terminal_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
         let pty = self.pty.clone();
         Box::pin(async move {
-            Self::require_administrator("terminal.kill")?;
+            self.require_terminal_manager(&terminal_id, "terminal.kill")
+                .await?;
             terminal_ops::kill(&pty, &terminal_id).await
         })
     }
@@ -17828,7 +17916,8 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let pty = self.pty.clone();
         Box::pin(async move {
-            Self::require_administrator("terminal.getBuffer")?;
+            self.require_terminal_manager(&terminal_id, "terminal.getBuffer")
+                .await?;
             terminal_ops::get_buffer(&pty, &terminal_id, max_bytes)
         })
     }
@@ -17837,7 +17926,8 @@ impl WorkspaceApi for Services {
         let pty = self.pty.clone();
         let boot_id = self.daemon_boot_id.clone();
         Box::pin(async move {
-            self.require_owner(&workspace_id, "terminal.list").await?;
+            self.require_workspace_manager(&workspace_id, "terminal.list")
+                .await?;
             terminal_ops::list(&pty, &workspace_id, &boot_id)
         })
     }
@@ -17852,7 +17942,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let pty = self.pty.clone();
         Box::pin(async move {
-            self.require_owner(&workspace_id, "terminal.readOutput")
+            self.require_workspace_manager(&workspace_id, "terminal.readOutput")
                 .await?;
             terminal_ops::read_output(
                 &pty,
@@ -18592,7 +18682,8 @@ impl WorkspaceApi for Services {
     fn script_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_owner(&workspace_id, "script.list").await?;
+            self.require_workspace_manager(&workspace_id, "script.list")
+                .await?;
             mgr.list(&workspace_id).await
         })
     }
@@ -18604,7 +18695,8 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_owner(&workspace_id, "script.create").await?;
+            self.require_workspace_manager(&workspace_id, "script.create")
+                .await?;
             mgr.create(workspace_id, params).await
         })
     }
@@ -18616,7 +18708,8 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_owner(&workspace_id, "script.remove").await?;
+            self.require_workspace_manager(&workspace_id, "script.remove")
+                .await?;
             mgr.remove(&workspace_id, &script_id).await
         })
     }
@@ -18628,7 +18721,8 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_owner(&workspace_id, "script.start").await?;
+            self.require_workspace_manager(&workspace_id, "script.start")
+                .await?;
             mgr.start(&workspace_id, &script_id)
         })
     }
@@ -18640,7 +18734,8 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_owner(&workspace_id, "script.stop").await?;
+            self.require_workspace_manager(&workspace_id, "script.stop")
+                .await?;
             mgr.stop(&workspace_id, &script_id).await
         })
     }
@@ -18652,7 +18747,8 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_owner(&workspace_id, "script.restart").await?;
+            self.require_workspace_manager(&workspace_id, "script.restart")
+                .await?;
             mgr.restart(&workspace_id, &script_id).await
         })
     }
@@ -18667,7 +18763,8 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_owner(&workspace_id, "script.output").await?;
+            self.require_workspace_manager(&workspace_id, "script.output")
+                .await?;
             mgr.output(
                 &workspace_id,
                 &script_id,
@@ -18685,7 +18782,8 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_owner(&workspace_id, "script.status").await?;
+            self.require_workspace_manager(&workspace_id, "script.status")
+                .await?;
             mgr.status(&workspace_id, &script_id)
         })
     }
@@ -18699,7 +18797,8 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_owner(&workspace_id, "script.run").await?;
+            self.require_workspace_manager(&workspace_id, "script.run")
+                .await?;
             mgr.run(&workspace_id, &script_id, max_lines, timeout_seconds)
                 .await
         })
@@ -18871,7 +18970,8 @@ impl WorkspaceApi for Services {
         id: WorkspaceId,
     ) -> BoxFuture<'_, Result<intent_core::transfer::TransferPlan>> {
         Box::pin(async move {
-            self.require_owner(&id, "workspace.transferPlan").await?;
+            self.require_workspace_manager(&id, "workspace.transferPlan")
+                .await?;
             self.workspace_transfer_plan_op(id).await
         })
     }
@@ -18883,7 +18983,7 @@ impl WorkspaceApi for Services {
         archive_sha256: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            Self::require_administrator("workspace.importBegin")?;
+            self.require_host_execution("workspace.importBegin").await?;
             self.workspace_import_begin_op(manifest, archive_size_bytes, archive_sha256)
                 .await
         })
@@ -18896,7 +18996,8 @@ impl WorkspaceApi for Services {
         data: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            Self::require_administrator("workspace.importChunk")?;
+            self.require_import_actor(&import_id, "workspace.importChunk")
+                .await?;
             self.workspace_import_chunk_op(import_id, seq, data).await
         })
     }
@@ -18906,7 +19007,8 @@ impl WorkspaceApi for Services {
         import_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            Self::require_administrator("workspace.importCommit")?;
+            self.require_import_actor(&import_id, "workspace.importCommit")
+                .await?;
             self.workspace_import_commit_op(import_id).await
         })
     }
@@ -18916,14 +19018,16 @@ impl WorkspaceApi for Services {
         import_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            Self::require_administrator("workspace.importAbort")?;
+            self.require_import_actor(&import_id, "workspace.importAbort")
+                .await?;
             self.workspace_import_abort_op(import_id).await
         })
     }
 
     fn workspace_export_start(&self, id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.require_owner(&id, "workspace.export.start").await?;
+            self.require_workspace_manager(&id, "workspace.export.start")
+                .await?;
             self.workspace_export_start_op(id).await
         })
     }
@@ -18933,7 +19037,11 @@ impl WorkspaceApi for Services {
         export_id: String,
         seq: u64,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.workspace_export_read_op(export_id, seq).await })
+        Box::pin(async move {
+            self.require_export_actor(&export_id, "workspace.export.read")
+                .await?;
+            self.workspace_export_read_op(export_id, seq).await
+        })
     }
 
     fn workspace_export_finalize(
@@ -18943,6 +19051,8 @@ impl WorkspaceApi for Services {
         final_status_message: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_export_actor(&export_id, "workspace.export.finalize")
+                .await?;
             self.workspace_export_finalize_op(export_id, archive_source, final_status_message)
                 .await
         })
@@ -18952,7 +19062,11 @@ impl WorkspaceApi for Services {
         &self,
         export_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.workspace_export_abort_op(export_id).await })
+        Box::pin(async move {
+            self.require_export_actor(&export_id, "workspace.export.abort")
+                .await?;
+            self.workspace_export_abort_op(export_id).await
+        })
     }
 
     fn create_workspace(
@@ -18979,12 +19093,13 @@ impl WorkspaceApi for Services {
             .as_deref()
             .and_then(|r| r.origin("workspaces.root"))
             == Some(SettingOrigin::Flag);
-        Box::pin(async move {
+        self.execution_call(async move {
             // Creation is host-wide and must also work before any workspace exists.
             services
                 .require_workspace_creator("workspace.create")
                 .await?;
             // Clone fields for logging (input moves into the closure below).
+            let execution_origin = input.github_url.clone();
             let log_repo_path = input.repository_path.clone();
             let log_branch = input.branch.clone();
 
@@ -21151,7 +21266,7 @@ impl WorkspaceApi for Services {
                     "workspace.create failed"
                 );
             }
-            let mut result = result?;
+            let mut result = result.map_err(|e| host_execution::git_error(e, execution_origin.as_deref()))?;
             self.attach_workspace_membership(&mut result.workspace)
                 .await;
             Ok(result)
@@ -23045,6 +23160,8 @@ impl WorkspaceApi for Services {
 
     fn find_repositories(&self, directory: String) -> BoxFuture<'_, Result<Vec<String>>> {
         Box::pin(async move {
+            self.require_host_execution("workspace.findRepositories")
+                .await?;
             let requested = PathBuf::from(&directory);
             // Normalize a relative `directory` to an absolute base against the
             // daemon's cwd before scanning so the response matches the
@@ -23076,6 +23193,8 @@ impl WorkspaceApi for Services {
 
     fn initialize_repository(&self, path: String) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
+            self.require_host_execution("workspace.initializeRepository")
+                .await?;
             let repo_path = PathBuf::from(&path);
             tokio::task::spawn_blocking(move || initialize_repository_blocking(&repo_path))
                 .await
@@ -27222,7 +27341,7 @@ impl WorkspaceApi for Services {
         let locks = self.worktree_locks.clone();
         let registry = self.settings_registry.clone();
         let status_cache = self.git_status_invalidator();
-        Box::pin(async move {
+        self.execution_call(async move {
             self.require_member(&workspace_id).await?;
             let ws = store
                 .get_workspace(&workspace_id)
@@ -27259,7 +27378,16 @@ impl WorkspaceApi for Services {
                         &branch,
                         force,
                         token.as_deref(),
-                    )?;
+                    )
+                    .map_err(|e| {
+                        host_execution::git_error(
+                            e,
+                            intent_git::remote::origin_url(&worktree)
+                                .ok()
+                                .flatten()
+                                .as_deref(),
+                        )
+                    })?;
                     // The remote-tracking ref advanced → the cached scan's
                     // ahead/behind is stale (monorepo#1648).
                     status_cache.invalidate(&worktree);
@@ -27289,7 +27417,7 @@ impl WorkspaceApi for Services {
         let locks = self.worktree_locks.clone();
         let registry = self.settings_registry.clone();
         let status_cache = self.git_status_invalidator();
-        Box::pin(async move {
+        self.execution_call(async move {
             self.require_member(&workspace_id).await?;
             let ws = store
                 .get_workspace(&workspace_id)
@@ -27317,7 +27445,16 @@ impl WorkspaceApi for Services {
                                     .to_string(),
                             )
                         })?;
-                    intent_git::fetch::fetch(&worktree, "origin", &branch, token.as_deref())?;
+                    intent_git::fetch::fetch(&worktree, "origin", &branch, token.as_deref())
+                        .map_err(|e| {
+                            host_execution::git_error(
+                                e,
+                                intent_git::remote::origin_url(&worktree)
+                                    .ok()
+                                    .flatten()
+                                    .as_deref(),
+                            )
+                        })?;
                     // Remote-tracking refs moved → cached ahead/behind is
                     // stale (monorepo#1648).
                     status_cache.invalidate(&worktree);
@@ -27565,7 +27702,7 @@ impl WorkspaceApi for Services {
         let event_bus = self.event_bus.clone();
         let registry = self.settings_registry.clone();
         let status_cache = self.git_status_invalidator();
-        Box::pin(async move {
+        self.execution_call(async move {
             // Path-based like `git_get_branches`: the workspace-create auto-pull
             // runs *before* the repo is registered, so any existing local git
             // repo is accepted; nonexistent / non-git paths are `-32602`
@@ -27588,10 +27725,31 @@ impl WorkspaceApi for Services {
             let token =
                 github_git_token(registry.as_deref(), std::path::Path::new(&repo_path)).await;
             let outcome = git_pull_bounded(
-                move || intent_git::pull::pull_branch(&pull_path, &pull_branch, token.as_deref()),
+                move || {
+                    intent_git::pull::pull_branch_classified(
+                        &pull_path,
+                        &pull_branch,
+                        token.as_deref(),
+                    )
+                },
                 GIT_PULL_TIMEOUT,
             )
-            .await?;
+            .await;
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let origin = intent_git::remote::origin_url(std::path::Path::new(&repo_path))
+                        .ok()
+                        .flatten();
+                    match host_execution::git_error(error, origin.as_deref()) {
+                        Error::GitAuthorization(message) => intent_core::GitPullResult {
+                            ok: false,
+                            error: Some(message),
+                        },
+                        error => return Err(error),
+                    }
+                }
+            };
             // Merged commits moved HEAD and possibly the tree
             // (monorepo#1648). Invalidated regardless of whether a workspace
             // row resolves below (the cache is worktree-keyed) and regardless
@@ -27635,8 +27793,8 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let bus = self.event_bus.clone();
         let registry = self.settings_registry.clone();
-        Box::pin(async move {
-            Self::require_administrator("git.clone")?;
+        self.execution_call(async move {
+            self.require_host_execution("git.clone").await?;
             if url.trim().is_empty() {
                 return Err(Error::InvalidParams("url is required".to_string()));
             }
@@ -27663,21 +27821,37 @@ impl WorkspaceApi for Services {
             // `gh` lookups can take a few seconds.
             let spawn_request_id = request_id.clone();
             let spawn_target = target.clone();
-            intent_core::spawn_daemon(async move {
-                let token = github_git_token_for_url(registry.as_deref(), &url).await;
-                clone_ops::spawn_clone(clone_ops::CloneJob {
-                    request_id: spawn_request_id,
-                    workspace_id: None,
-                    url,
-                    target_path: spawn_target,
-                    token,
-                    bus,
-                    progress: None,
-                    // Standalone `git.clone` keeps its historical plain
-                    // (non-recursive) clone.
-                    recurse_submodules: false,
-                });
-            });
+            intent_core::spawn_daemon(host_execution::background_execution(
+                self.clone(),
+                None,
+                async move {
+                    let token = github_git_token_for_url(registry.as_deref(), &url).await;
+                    let result = clone_ops::perform_clone(clone_ops::CloneJob {
+                        request_id: spawn_request_id,
+                        workspace_id: None,
+                        url: url.clone(),
+                        target_path: spawn_target,
+                        token,
+                        bus,
+                        progress: None,
+                        // Standalone `git.clone` keeps its historical plain
+                        // (non-recursive) clone.
+                        recurse_submodules: false,
+                    })
+                    .await;
+                    if let Err(failure) = result {
+                        let _ = host_execution::git_error(
+                            Error::CloneFailed {
+                                category: failure
+                                    .category
+                                    .unwrap_or(intent_core::CloneErrorCategory::Other),
+                                detail: failure.detail,
+                            },
+                            Some(&url),
+                        );
+                    }
+                },
+            ));
             Ok(serde_json::json!({
                 "requestId": request_id,
                 "targetPath": target.to_string_lossy(),
@@ -27690,6 +27864,7 @@ impl WorkspaceApi for Services {
         let boot_root = self.workspaces_root.clone();
         let worktrees_location = self.configured_worktrees_location();
         Box::pin(async move {
+            self.require_host_execution("repo.list").await?;
             // Return the known repos immediately — don't block on the sync.
             let repos = store.list_known_repos().await?;
             // One-time background sync: register repos from existing workspaces
@@ -27746,7 +27921,7 @@ impl WorkspaceApi for Services {
             .as_deref()
             .and_then(|r| r.origin("workspaces.root"))
             == Some(SettingOrigin::Flag);
-        Box::pin(async move {
+        self.execution_call(async move {
             // RAII clear for the single-flight slot: `Drop` runs even when
             // the detached task panics mid-ensure, so the flag can never
             // leak into a permanently-busy state. Poisoned locks recover via
@@ -27762,7 +27937,7 @@ impl WorkspaceApi for Services {
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
                 }
             }
-            Self::require_administrator("repo.warmCache")?;
+            self.require_host_execution("repo.warmCache").await?;
             let url = github_url.trim().to_string();
             let Some(RepoRef { owner, name: repo }) =
                 GitRemoteUrl::parse(&url).and_then(|u| u.repo_slug())
@@ -27816,32 +27991,35 @@ impl WorkspaceApi for Services {
             // serializes behind this ensure on the per-repo cache lock.
             let task_owner = owner.clone();
             let task_repo = repo.clone();
-            intent_core::spawn_daemon(async move {
-                let _clear_on_drop = clear_on_drop;
-                let token = github_git_token_for_url(registry.as_deref(), &url).await;
-                let result = intent_git::repo_cache::ensure_cached_repo(
-                    &cache_root,
-                    &url,
-                    &task_owner,
-                    &task_repo,
-                    token.as_deref(),
-                )
-                .await;
-                match result {
-                    Ok(path) => tracing::info!(
-                        owner = %task_owner,
-                        repo = %task_repo,
-                        path = %path.display(),
-                        "opportunistic repo cache warm completed"
-                    ),
-                    Err(e) => tracing::warn!(
-                        owner = %task_owner,
-                        repo = %task_repo,
-                        error = %e,
-                        "opportunistic repo cache warm failed"
-                    ),
-                }
-            });
+            intent_core::spawn_daemon(host_execution::background_execution(
+                self.clone(),
+                None,
+                async move {
+                    let _clear_on_drop = clear_on_drop;
+                    let token = github_git_token_for_url(registry.as_deref(), &url).await;
+                    let result = intent_git::repo_cache::ensure_cached_repo(
+                        &cache_root,
+                        &url,
+                        &task_owner,
+                        &task_repo,
+                        token.as_deref(),
+                    )
+                    .await;
+                    match result {
+                        Ok(path) => tracing::info!(
+                            owner = %task_owner,
+                            repo = %task_repo,
+                            path = %path.display(),
+                            "opportunistic repo cache warm completed"
+                        ),
+                        Err(e) => {
+                            let error = host_execution::git_error(e, Some(&url));
+                            tracing::warn!(owner = %task_owner, repo = %task_repo, error = %error,
+                            "opportunistic repo cache warm failed");
+                        }
+                    }
+                },
+            ));
             Ok(serde_json::json!({ "started": true, "owner": owner, "repo": repo }))
         })
     }
@@ -28695,7 +28873,7 @@ impl WorkspaceApi for Services {
         input: AgentDelegateInput,
         parent_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
+        self.execution_call(async move {
             self.require_member(&workspace_id).await?;
             if let Some(model) = input.model.as_deref() {
                 reject_compound_model("model", model)?;
@@ -28992,7 +29170,7 @@ impl WorkspaceApi for Services {
         idempotency_key: Option<String>,
         extra: intent_core::AgentCreateExtra,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
+        self.execution_call(async move {
             self.require_member(&workspace_id).await?;
             if let Some(model) = model.as_deref() {
                 reject_compound_model("model", model)?;
@@ -29068,7 +29246,7 @@ impl WorkspaceApi for Services {
         message_metadata: Option<serde_json::Value>,
         origin: intent_core::MessageOrigin,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
+        self.execution_call(async move {
             self.require_agent_member_in(&agent_id, &workspace_id)
                 .await?;
             // intent-hq/intent#5669: an agent may not message itself. Checked
@@ -29164,7 +29342,7 @@ impl WorkspaceApi for Services {
         agent_id: AgentId,
         message_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
+        self.execution_call(async move {
             self.require_agent_member_in(&agent_id, &workspace_id)
                 .await?;
             // Ownership (multiplayer): a guest collaborator force-sends only
@@ -29242,7 +29420,7 @@ impl WorkspaceApi for Services {
         file_blocks: Option<serde_json::Value>,
         model: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
+        self.execution_call(async move {
             self.require_agent_member_in(&agent_id, &workspace_id)
                 .await?;
             if let Some(model) = model.as_deref() {
@@ -29417,7 +29595,7 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         agent_id: AgentId,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
+        self.execution_call(async move {
             self.require_agent_member(&agent_id).await?;
             if let Some(manager) = self.agent_manager() {
                 manager.agent_retry(agent_id, workspace_id).await
@@ -29434,7 +29612,7 @@ impl WorkspaceApi for Services {
         model_id: String,
         provider_id: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
+        self.execution_call(async move {
             self.require_agent_member(&agent_id).await?;
             reject_compound_model("modelId", &model_id)?;
             self.agent_set_model_op(agent_id, model_id, provider_id)
@@ -29552,7 +29730,7 @@ impl WorkspaceApi for Services {
             })?;
             // Multiplayer w3: the prompt is answered on behalf of the owner
             // (the agent runs with the owner's capabilities), so a collaborator
-            // must own the prompting agent's workspace. The caller gate runs
+            // must manage the prompting agent's workspace. The caller gate runs
             // before the manager lookup so an unbound context is `Forbidden`
             // on the no-manager path too, never a successful early return.
             let constrained = capability::collaborator_caller()?.is_some();
@@ -29605,7 +29783,7 @@ impl WorkspaceApi for Services {
             } else {
                 // Multiplayer w3: the unfiltered registry spans every
                 // workspace; a collaborator keeps only prompts it may answer
-                // (agents in workspaces it owns — see `agent_respond_permission`).
+                // (manageable workspaces — see `agent_respond_permission`).
                 self.retain_owned_agent_prompts(&mut requests).await?;
             }
             Ok(serde_json::json!({ "requests": requests }))
@@ -30283,7 +30461,7 @@ impl WorkspaceApi for Services {
 
     fn pr_refresh(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         let this = self.clone();
-        Box::pin(async move {
+        self.execution_call(async move {
             self.require_member(&workspace_id).await?;
             // `refresh_workspace_pr` owns persistence and the
             // `pr:linked`/`pr:updated`/`pr:unlinked` emission — no duplicate
@@ -30310,7 +30488,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         let this = self.clone();
-        Box::pin(async move {
+        self.execution_call(async move {
             self.require_member(&workspace_id).await?;
             let ws = load_ws_for_pr(&store, &workspace_id).await?;
             // Cross-repo override (`{ repo: "owner/name" }`) wins over the
@@ -30441,8 +30619,8 @@ impl WorkspaceApi for Services {
         draft: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
-        Box::pin(async move {
-            Self::require_administrator("github.pullsCreate")?;
+        self.execution_call(async move {
+            self.require_host_execution("github.pullsCreate").await?;
             let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             // `head` is forwarded VERBATIM (no `owner:branch` login prefix) —
@@ -30471,8 +30649,8 @@ impl WorkspaceApi for Services {
         repo: String,
         number: u64,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            Self::require_administrator("github.pullsGet")?;
+        self.execution_call(async move {
+            self.require_host_execution("github.pullsGet").await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             // Served from the shared PR cache (§5.27): no forge call while
             // the entry is younger than `prCache.maxAgeSeconds`, else one
@@ -30501,8 +30679,8 @@ impl WorkspaceApi for Services {
         next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
-        Box::pin(async move {
-            Self::require_administrator("github.pullsList")?;
+        self.execution_call(async move {
+            self.require_host_execution("github.pullsList").await?;
             let state = github_ops::parse_pr_state(state.as_deref())?;
             let limit = github_ops::clamp_limit(limit);
             let cursor = github_ops::decode_next_token(next_token.as_deref());
@@ -30545,8 +30723,8 @@ impl WorkspaceApi for Services {
         next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
-        Box::pin(async move {
-            Self::require_administrator("github.pullsSearch")?;
+        self.execution_call(async move {
+            self.require_host_execution("github.pullsSearch").await?;
             let involvement = github_ops::parse_pr_involvement(filter.as_deref())?;
             let search = github_ops::normalize_search_query(query);
             // Search defaults to open PRs (FE `searchGitHubPullRequests`); a
@@ -30606,8 +30784,8 @@ impl WorkspaceApi for Services {
         commit_message: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
-        Box::pin(async move {
-            Self::require_administrator("github.pullsMerge")?;
+        self.execution_call(async move {
+            self.require_host_execution("github.pullsMerge").await?;
             let method = pr_ops::validate_merge_method(merge_method.as_deref())?;
             let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
@@ -30646,8 +30824,8 @@ impl WorkspaceApi for Services {
         next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
-        Box::pin(async move {
-            Self::require_administrator("github.reposList")?;
+        self.execution_call(async move {
+            self.require_host_execution("github.reposList").await?;
             let limit = github_ops::clamp_limit(limit);
             let cursor = github_ops::decode_next_token(next_token.as_deref());
             let sc = pr_ops::resolve_source_control(injected).await?;
@@ -30670,8 +30848,9 @@ impl WorkspaceApi for Services {
         expected_head_sha: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
-        Box::pin(async move {
-            Self::require_administrator("github.pullsUpdateBranch")?;
+        self.execution_call(async move {
+            self.require_host_execution("github.pullsUpdateBranch")
+                .await?;
             // `expectedHeadSha` is accepted for FE shape parity; the engine
             // `update_branch` does not take a race guard, so it is unused.
             let _ = expected_head_sha;
@@ -30694,8 +30873,8 @@ impl WorkspaceApi for Services {
         next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
-        Box::pin(async move {
-            Self::require_administrator("github.reposSearch")?;
+        self.execution_call(async move {
+            self.require_host_execution("github.reposSearch").await?;
             let limit = github_ops::clamp_limit(limit);
             let cursor = github_ops::decode_next_token(next_token.as_deref());
             let sc = pr_ops::resolve_source_control(injected).await?;
@@ -30716,8 +30895,8 @@ impl WorkspaceApi for Services {
         repo: String,
         number: u64,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            Self::require_administrator("github.issuesGet")?;
+        self.execution_call(async move {
+            self.require_host_execution("github.issuesGet").await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             // Served from the issue cache within `prCache.maxAgeSeconds`;
             // a miss costs one `get_issue` and seeds the next read.
@@ -30738,8 +30917,8 @@ impl WorkspaceApi for Services {
         next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
-        Box::pin(async move {
-            Self::require_administrator("github.issuesList")?;
+        self.execution_call(async move {
+            self.require_host_execution("github.issuesList").await?;
             let state = github_ops::parse_issue_state(state.as_deref())?;
             let limit = github_ops::clamp_limit(limit);
             let cursor = github_ops::decode_next_token(next_token.as_deref());
@@ -30783,8 +30962,8 @@ impl WorkspaceApi for Services {
         next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
-        Box::pin(async move {
-            Self::require_administrator("github.issuesSearch")?;
+        self.execution_call(async move {
+            self.require_host_execution("github.issuesSearch").await?;
             // Validate `filter` against the issues value set from PROTOCOL §5
             // (no PR-only `review-requested`). The host-agnostic engine
             // cannot express `@me` involvement for issues (v1 limitation —
@@ -30842,8 +31021,9 @@ impl WorkspaceApi for Services {
         next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
-        Box::pin(async move {
-            Self::require_administrator("github.listReviewComments")?;
+        self.execution_call(async move {
+            self.require_host_execution("github.listReviewComments")
+                .await?;
             let limit = github_ops::clamp_limit(limit);
             let cursor = github_ops::decode_next_token(next_token.as_deref());
             let sc = pr_ops::resolve_source_control(injected).await?;
@@ -30877,8 +31057,9 @@ impl WorkspaceApi for Services {
         body: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
-        Box::pin(async move {
-            Self::require_administrator("github.replyReviewComment")?;
+        self.execution_call(async move {
+            self.require_host_execution("github.replyReviewComment")
+                .await?;
             let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let rc = sc
@@ -30898,8 +31079,9 @@ impl WorkspaceApi for Services {
         next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
-        Box::pin(async move {
-            Self::require_administrator("github.getReviewThreads")?;
+        self.execution_call(async move {
+            self.require_host_execution("github.getReviewThreads")
+                .await?;
             let limit = github_ops::clamp_limit(limit);
             let cursor = github_ops::decode_next_token(next_token.as_deref());
             let sc = pr_ops::resolve_source_control(injected).await?;
@@ -30926,8 +31108,8 @@ impl WorkspaceApi for Services {
 
     fn github_resolve_thread(&self, thread_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
-        Box::pin(async move {
-            Self::require_administrator("github.resolveThread")?;
+        self.execution_call(async move {
+            self.require_host_execution("github.resolveThread").await?;
             let sc = pr_ops::resolve_source_control(injected).await?;
             let is_resolved = sc
                 .resolve_thread(&thread_id)
@@ -30942,8 +31124,9 @@ impl WorkspaceApi for Services {
         thread_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
-        Box::pin(async move {
-            Self::require_administrator("github.unresolveThread")?;
+        self.execution_call(async move {
+            self.require_host_execution("github.unresolveThread")
+                .await?;
             let sc = pr_ops::resolve_source_control(injected).await?;
             let is_resolved = sc
                 .unresolve_thread(&thread_id)
@@ -30959,8 +31142,8 @@ impl WorkspaceApi for Services {
         repo: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
-        Box::pin(async move {
-            Self::require_administrator("github.reposGet")?;
+        self.execution_call(async move {
+            self.require_host_execution("github.reposGet").await?;
             let sc = pr_ops::resolve_source_control(injected).await?;
             match sc.get_repo(&owner, &repo).await {
                 Ok(r) => Ok(serde_json::json!({ "repo": github_browse_ops::repo_to_wire(&r) })),
@@ -30983,8 +31166,8 @@ impl WorkspaceApi for Services {
         next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
-        Box::pin(async move {
-            Self::require_administrator("github.branchesList")?;
+        self.execution_call(async move {
+            self.require_host_execution("github.branchesList").await?;
             let limit = github_ops::clamp_limit(limit);
             let cursor = github_ops::decode_next_token(next_token.as_deref());
             // A blank/whitespace `prefix` keeps the unfiltered listing
@@ -31024,8 +31207,9 @@ impl WorkspaceApi for Services {
             .unwrap_or_else(default_workspaces_root);
         let registry = self.settings_registry.clone();
         let ls_remote_base = self.branches_ls_remote_base.clone();
-        Box::pin(async move {
-            Self::require_administrator("github.branchesListCached")?;
+        self.execution_call(async move {
+            self.require_host_execution("github.branchesListCached")
+                .await?;
             let cache_root = intent_git::repo_cache::cache_root_for(&cache_parent);
             if let Some(cached) =
                 intent_git::repo_cache::list_cached_branches(&cache_root, &owner, &repo).await?
@@ -31086,8 +31270,8 @@ impl WorkspaceApi for Services {
         git_ref: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
-        Box::pin(async move {
-            Self::require_administrator("github.repoConfigGet")?;
+        self.execution_call(async move {
+            self.require_host_execution("github.repoConfigGet").await?;
             let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner.clone(), repo.clone());
             let source = format!(
@@ -31140,8 +31324,9 @@ impl WorkspaceApi for Services {
         git_ref: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
-        Box::pin(async move {
-            Self::require_administrator("github.relatedReposList")?;
+        self.execution_call(async move {
+            self.require_host_execution("github.relatedReposList")
+                .await?;
             let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner.clone(), repo.clone());
             // Missing `.gitmodules` → { repos: [] }. A mis-shaped contents
@@ -31383,8 +31568,8 @@ impl WorkspaceApi for Services {
         limit: Option<i64>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
-        Box::pin(async move {
-            Self::require_administrator("github.users.search")?;
+        self.execution_call(async move {
+            self.require_host_execution("github.users.search").await?;
             let query = query.trim();
             if query.is_empty() {
                 return Ok(serde_json::json!({ "users": [] }));
@@ -32139,7 +32324,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
-            Self::require_administrator("linear.listIssues")?;
+            self.require_host_execution("linear.listIssues").await?;
             let filter = linear_ops::parse_filter(filter.as_deref())?;
             let cursor = github_ops::decode_next_token(next_token.as_deref());
             let engine = linear_ops::resolve_engine(injected).await?;
@@ -32164,7 +32349,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
-            Self::require_administrator("linear.searchIssues")?;
+            self.require_host_execution("linear.searchIssues").await?;
             let cursor = github_ops::decode_next_token(next_token.as_deref());
             let engine = linear_ops::resolve_engine(injected).await?;
             let page = engine
@@ -32186,7 +32371,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
-            Self::require_administrator("linear.getIssue")?;
+            self.require_host_execution("linear.getIssue").await?;
             let engine = linear_ops::resolve_engine(injected).await?;
             let issue = engine
                 .get_issue(&id_or_identifier)
@@ -32200,7 +32385,7 @@ impl WorkspaceApi for Services {
     fn linear_viewer(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
-            Self::require_administrator("linear.viewer")?;
+            self.require_host_execution("linear.viewer").await?;
             let engine = linear_ops::resolve_engine(injected).await?;
             let user = engine
                 .viewer()
@@ -32214,7 +32399,7 @@ impl WorkspaceApi for Services {
     fn linear_list_teams(&self, limit: Option<i64>) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
-            Self::require_administrator("linear.listTeams")?;
+            self.require_host_execution("linear.listTeams").await?;
             let engine = linear_ops::resolve_engine(injected).await?;
             let teams = engine
                 .list_teams(linear_ops::wire_limit(limit))
@@ -32231,7 +32416,8 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
-            Self::require_administrator("linear.listWorkflowStates")?;
+            self.require_host_execution("linear.listWorkflowStates")
+                .await?;
             let engine = linear_ops::resolve_engine(injected).await?;
             let states = engine
                 .list_workflow_states(linear_ops::wire_limit(limit))
@@ -32245,7 +32431,7 @@ impl WorkspaceApi for Services {
     fn linear_list_projects(&self, limit: Option<i64>) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
-            Self::require_administrator("linear.listProjects")?;
+            self.require_host_execution("linear.listProjects").await?;
             let engine = linear_ops::resolve_engine(injected).await?;
             let projects = engine
                 .list_projects(linear_ops::wire_limit(limit))
@@ -32259,7 +32445,7 @@ impl WorkspaceApi for Services {
     fn linear_list_labels(&self, limit: Option<i64>) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
-            Self::require_administrator("linear.listLabels")?;
+            self.require_host_execution("linear.listLabels").await?;
             let engine = linear_ops::resolve_engine(injected).await?;
             let labels = engine
                 .list_labels(linear_ops::wire_limit(limit))
@@ -32276,7 +32462,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
-            Self::require_administrator("linear.createIssue")?;
+            self.require_host_execution("linear.createIssue").await?;
             let req = linear_ops::parse_create_issue(request)?;
             let engine = linear_ops::resolve_engine(injected).await?;
             let issue = engine
@@ -32294,7 +32480,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
-            Self::require_administrator("linear.updateIssue")?;
+            self.require_host_execution("linear.updateIssue").await?;
             let req = linear_ops::parse_update_issue(request)?;
             let engine = linear_ops::resolve_engine(injected).await?;
             let issue = engine
@@ -32339,7 +32525,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.sentry_engine.clone();
         Box::pin(async move {
-            Self::require_administrator("sentry.listIssues")?;
+            self.require_host_execution("sentry.listIssues").await?;
             let status = sentry_ops::parse_status(status.as_deref())?;
             let cursor = github_ops::decode_next_token(next_token.as_deref());
             let engine = sentry_ops::resolve_engine(injected).await?;
@@ -32372,7 +32558,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.sentry_engine.clone();
         Box::pin(async move {
-            Self::require_administrator("sentry.searchIssues")?;
+            self.require_host_execution("sentry.searchIssues").await?;
             let cursor = github_ops::decode_next_token(next_token.as_deref());
             let engine = sentry_ops::resolve_engine(injected).await?;
             let page = engine
@@ -32396,7 +32582,7 @@ impl WorkspaceApi for Services {
     fn sentry_list_projects(&self, limit: Option<i64>) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.sentry_engine.clone();
         Box::pin(async move {
-            Self::require_administrator("sentry.listProjects")?;
+            self.require_host_execution("sentry.listProjects").await?;
             let engine = sentry_ops::resolve_engine(injected).await?;
             let projects = engine
                 .list_projects(sentry_ops::wire_limit(limit))
@@ -32410,7 +32596,7 @@ impl WorkspaceApi for Services {
     fn sentry_get_issue(&self, id_or_short_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.sentry_engine.clone();
         Box::pin(async move {
-            Self::require_administrator("sentry.getIssue")?;
+            self.require_host_execution("sentry.getIssue").await?;
             let engine = sentry_ops::resolve_engine(injected).await?;
             let issue = engine
                 .get_issue(&id_or_short_id)
@@ -32424,7 +32610,7 @@ impl WorkspaceApi for Services {
     fn sentry_resolve_issue(&self, id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.sentry_engine.clone();
         Box::pin(async move {
-            Self::require_administrator("sentry.resolveIssue")?;
+            self.require_host_execution("sentry.resolveIssue").await?;
             let engine = sentry_ops::resolve_engine(injected).await?;
             let issue = engine
                 .resolve_issue(&id)
@@ -32438,7 +32624,7 @@ impl WorkspaceApi for Services {
     fn sentry_ignore_issue(&self, id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.sentry_engine.clone();
         Box::pin(async move {
-            Self::require_administrator("sentry.ignoreIssue")?;
+            self.require_host_execution("sentry.ignoreIssue").await?;
             let engine = sentry_ops::resolve_engine(injected).await?;
             let issue = engine
                 .ignore_issue(&id)
@@ -32456,7 +32642,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.sentry_engine.clone();
         Box::pin(async move {
-            Self::require_administrator("sentry.assignIssue")?;
+            self.require_host_execution("sentry.assignIssue").await?;
             let engine = sentry_ops::resolve_engine(injected).await?;
             let issue = engine
                 .assign_issue(&id, assigned_to.as_deref())
@@ -33284,7 +33470,7 @@ impl WorkspaceApi for Services {
         params: serde_json::Value,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            Self::require_administrator("host.exec")?;
+            self.require_host_execution("host.exec").await?;
             host_exec::run_for_workspace(self, workspace_id, params).await
         })
     }
@@ -33344,7 +33530,8 @@ impl WorkspaceApi for Services {
         caller: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.require_owner(&workspace_id, "hook.cancel").await?;
+            self.require_workspace_manager(&workspace_id, "hook.cancel")
+                .await?;
             self.hook_cancel_op(&workspace_id, &hook_id, caller.as_ref())
                 .await
         })
@@ -33357,7 +33544,8 @@ impl WorkspaceApi for Services {
         hook_id: intent_core::HookId,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.require_owner(&workspace_id, "hook.runNow").await?;
+            self.require_workspace_manager(&workspace_id, "hook.runNow")
+                .await?;
             self.hook_run_now_op(&workspace_id, &hook_id).await
         })
     }
@@ -33414,7 +33602,7 @@ impl WorkspaceApi for Services {
         monitor_id: intent_core::PrMonitorId,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.require_owner(&workspace_id, "prMonitor.cancel")
+            self.require_workspace_manager(&workspace_id, "prMonitor.cancel")
                 .await?;
             self.pr_monitor_cancel_by_id_op(&workspace_id, &monitor_id)
                 .await
@@ -33430,7 +33618,8 @@ impl WorkspaceApi for Services {
         check: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.require_owner(&workspace_id, "prMonitor.flush").await?;
+            self.require_workspace_manager(&workspace_id, "prMonitor.flush")
+                .await?;
             self.pr_monitor_flush_op(&workspace_id, &monitor_id, check)
                 .await
         })

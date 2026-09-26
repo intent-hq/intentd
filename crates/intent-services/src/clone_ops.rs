@@ -212,19 +212,8 @@ pub(crate) struct CloneJob {
     pub recurse_submodules: bool,
 }
 
-/// Kick off a streaming clone on a background task and return immediately. The
-/// task publishes `git:clone:progress` frames as they are parsed and one
-/// terminal `git:clone:done` when the child exits, times out, or fails to
-/// spawn. Never returns an error — spawn failures are surfaced on the terminal
-/// event so the caller only correlates by `requestId`.
-pub(crate) fn spawn_clone(job: CloneJob) {
-    intent_core::spawn_daemon(async move {
-        let _ = run_clone(job).await;
-    });
-}
-
-/// Same pipeline as [`spawn_clone`] but runs on the current task and returns
-/// the clone outcome. Used by `workspace.create` (`githubUrl` orchestration,
+/// Streaming clone on the current task, returning the classified outcome.
+/// Used by the detached `git.clone` worker and `workspace.create` (`githubUrl` orchestration,
 /// PROTOCOL §5.1): the caller needs to fail the whole create atomically when
 /// the clone fails, and needs to know the target checkout succeeded before
 /// promoting it to `repositoryPath`. The terminal `git:clone:done` frame is

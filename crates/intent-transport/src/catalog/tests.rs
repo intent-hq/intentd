@@ -181,12 +181,12 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// (`sourceControl.identityProof.create` / `delete`, the GitHub gist or
 /// GitLab snippet proof by `provider`); the `github.identityProof.*` pair
 /// stays as byte-identical aliases.
-const EXPECTED_TOTAL_METHODS: usize = 404;
+const EXPECTED_TOTAL_METHODS: usize = 405;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 345;
+const EXPECTED_ROUTER_METHODS: usize = 346;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 57;
@@ -667,6 +667,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "host.execStream",
     "host.execStream.cancel",
     "host.execStream.write",
+    "host.executionContext",
     "host.findApp",
     "host.findBinary",
     "host.invite.create",
@@ -1233,6 +1234,7 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "host.execStream",
     "host.execStream.cancel",
     "host.execStream.write",
+    "host.executionContext",
     "host.findApp",
     "host.findBinary",
     "host.invite.create",
@@ -1630,19 +1632,11 @@ mod unbound_owner_only_methods {
         /// `require_agent_member` runs only when the optional `agentId` is
         /// given.
         AgentId,
-        /// The gated calls (`update_workspace` for `finalStatusMessage`,
-        /// `archive_workspace` for `archiveSource`) run only once the
-        /// `exportId` resolves to a Ready session **and** the option is
-        /// given; an unknown id returns at the lookup, and a Ready session
-        /// finalized with neither option runs no gated call at all — it
-        /// only retires the session. That live unarmed mode is pinned `ok`
-        /// by the armed test, not left implicit.
-        ReadyExport,
     }
 
     /// Golden: owner-only router methods whose service-layer gate is
-    /// **conditional** — on an optional scope argument, or on the export
-    /// session the id names — so the sweep's minimal call never reaches it.
+    /// **conditional** on an optional scope argument, so the sweep's minimal
+    /// call never reaches it. Transfers have an unconditional actor gate.
     /// Each row is `(method, unarmed outcome, what arms the gate)`. The
     /// unarmed outcome is pinned here so the sweep sees it as classified,
     /// not as ungated; the unarmed mode is owner-only by the transport
@@ -1659,11 +1653,6 @@ mod unbound_owner_only_methods {
         // Unscoped, the call proceeds to the worktree lookup (Internal here).
         ("git.agentCommit", "-32603", Arming::AgentId),
         ("rules.list", "ok", Arming::WorkspaceId),
-        // Unknown `exportId`: NotFound at the registry lookup (`-32602`,
-        // `not-found`), ahead of both gated mutations. The other unarmed
-        // mode — a Ready session with neither option, which retires the
-        // session ungated — is asserted `ok` by the armed test.
-        ("workspace.export.finalize", "-32602", Arming::ReadyExport),
     ];
 
     /// Golden: owner-only router methods whose service method has **no
@@ -1683,8 +1672,6 @@ mod unbound_owner_only_methods {
         ("debug.sampleStacks", "ok"),
         // No gate: daemon-wide metrics read.
         ("metrics.getAllWorkspaceStats", "ok"),
-        // No gate: known-repo registry read.
-        ("repo.list", "ok"),
         // No gate: `_workspace_id` is unused; reads the global rule row.
         ("rules.get", "ok"),
         // No gate: no-manager early return `{ running: false }`.
@@ -1693,16 +1680,6 @@ mod unbound_owner_only_methods {
         ("unsloth.stop", "ok"),
         // No gate: proceeds to provider selection (Internal without an engine).
         ("voice.transcribe", "-32603"),
-        // No gate: export sessions are keyed by the `exportId` handed out by
-        // the gated `workspace.export.start`, and neither method mutates the
-        // workspace; an unknown id is a no-op / -32602. (`finalize` does
-        // mutate and is classified above.)
-        ("workspace.export.abort", "ok"),
-        ("workspace.export.read", "-32602"),
-        // No gate: host filesystem scan under `directory`.
-        ("workspace.findRepositories", "ok"),
-        // No gate: `git init` at `path` on the host.
-        ("workspace.initializeRepository", "ok"),
     ];
 
     struct Fixture {
@@ -1860,6 +1837,7 @@ mod unbound_owner_only_methods {
             ("github.users.search", json!({ "query": "q" })),
             ("hook.cancel", json!({ "workspaceId": ws, "hookId": "h1" })),
             ("hook.runNow", json!({ "workspaceId": ws, "hookId": "h1" })),
+            ("host.executionContext", json!({})),
             ("host.invite.list", json!({})),
             ("host.invite.revoke", json!({ "inviteId": "missing" })),
             ("host.members.list", json!({})),
@@ -2287,6 +2265,33 @@ mod unbound_owner_only_methods {
     /// `Forbidden` — so a router arm that starts forwarding `agentId` fails
     /// here and moves the cell onto the router path.
     #[tokio::test]
+    async fn ready_export_requires_bound_caller_without_finalize_options() {
+        if reran_unarmed("ready_export_requires_bound_caller_without_finalize_options") {
+            return;
+        }
+        let f = fixture().await;
+        let export_id = ready_export(&f).await;
+        for method in [
+            "workspace.export.read",
+            "workspace.export.abort",
+            "workspace.export.finalize",
+        ] {
+            let params = json!({"exportId":export_id,"seq":0});
+            assert_eq!(
+                dispatch_unbound(&f.services, method, &params).await,
+                "-32003"
+            );
+        }
+        let response = dispatch_as_daemon(
+            &f.services,
+            "workspace.export.read",
+            &json!({"exportId":export_id,"seq":0}),
+        )
+        .await;
+        assert!(response.get("error").is_none(), "{response}");
+    }
+
+    #[tokio::test]
     async fn armed_conditional_gates_are_forbidden_unbound() {
         if reran_unarmed("armed_conditional_gates_are_forbidden_unbound") {
             return;
@@ -2298,50 +2303,6 @@ mod unbound_owner_only_methods {
             let (scope, scope_value) = match arming {
                 Arming::WorkspaceId => ("workspaceId", f.ws.as_str().to_string()),
                 Arming::AgentId => ("agentId", "a1".to_string()),
-                Arming::ReadyExport => {
-                    let export_id = ready_export(&f).await;
-                    for armed in [
-                        json!({ "exportId": export_id, "finalStatusMessage": "done" }),
-                        json!({ "exportId": export_id, "archiveSource": true }),
-                    ] {
-                        let outcome = dispatch_unbound(&f.services, method, &armed).await;
-                        assert_eq!(
-                            outcome, "-32003",
-                            "{method} on a Ready export with {armed} must reach its \
-                             capability gate unbound"
-                        );
-                    }
-                    let still_ready = dispatch_as_daemon(
-                        &f.services,
-                        "workspace.export.read",
-                        &json!({ "exportId": export_id, "seq": 0 }),
-                    )
-                    .await;
-                    assert!(
-                        still_ready.get("error").is_none(),
-                        "a refused finalize must leave the export intact: {still_ready}"
-                    );
-                    let bare = json!({ "exportId": export_id });
-                    let outcome = dispatch_unbound(&f.services, method, &bare).await;
-                    assert_eq!(
-                        outcome, "ok",
-                        "{method} on a Ready export with neither option runs no gated \
-                         call today; if this is now -32003 the gate stopped being \
-                         conditional — move the row into the sweep"
-                    );
-                    let retired = dispatch_as_daemon(
-                        &f.services,
-                        "workspace.export.read",
-                        &json!({ "exportId": export_id, "seq": 0 }),
-                    )
-                    .await;
-                    assert_eq!(
-                        retired["error"]["data"]["code"],
-                        json!("not-found"),
-                        "the bare finalize must have retired the session: {retired}"
-                    );
-                    continue;
-                }
             };
             assert!(
                 params.get(scope).is_none(),

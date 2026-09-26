@@ -1056,6 +1056,20 @@ mod tests {
             .store
             .store(github_auth_ops::SECRET_ACCOUNT, "identity-only")
             .unwrap();
+        // The safe execution read uses repository-purpose stores, even
+        // when the host has a real collaboration-purpose credential file.
+        let registry =
+            Arc::new(crate::SettingsRegistry::load(tmp.path.with_extension("toml")).unwrap());
+        registry
+            .apply(&[("sourceControl.github.tokenSource".into(), json!("explicit"))])
+            .unwrap();
+        let execution = service
+            .clone()
+            .with_settings_registry(registry)
+            .with_secret_store(Arc::new(crate::settings::InMemorySecretStore::default()));
+        let context = execution.host_execution_context().await.unwrap();
+        assert_eq!(context["repositoryConnections"][0]["configured"], false);
+        assert!(!context.to_string().contains("identity-only"));
         assert!(service
             .gitlab_secret_store
             .load(github_auth_ops::SECRET_ACCOUNT)

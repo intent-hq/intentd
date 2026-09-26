@@ -174,6 +174,9 @@ pub(crate) const PROMPT_AUTH_REQUIRED_MARKER: &str = ") is not authenticated";
 /// payload — mid-string mentions, the disabled-provider rejection, and other
 /// `InvalidParams` shapes never classify.
 pub(crate) fn prompt_auth_required_turn_error(err: &Error) -> bool {
+    if let Error::ExecutionAuthorization { source, .. } = err {
+        return prompt_auth_required_turn_error(source);
+    }
     matches!(
         err,
         Error::InvalidParams(msg)
@@ -194,6 +197,9 @@ pub(crate) const LOAD_AUTH_REQUIRED_PREFIX: &str = "session/load: provider \"";
 /// succeed while logged out — deferring the actionable login error to a
 /// later opaque prompt failure.
 pub(crate) fn load_auth_required_error(err: &Error) -> bool {
+    if let Error::ExecutionAuthorization { source, .. } = err {
+        return load_auth_required_error(source);
+    }
     matches!(err, Error::InvalidParams(msg) if msg.starts_with(LOAD_AUTH_REQUIRED_PREFIX))
 }
 
@@ -1574,10 +1580,14 @@ fn is_acp_auth_required(e: &AcpError) -> bool {
 fn map_acp_session_error(context: &str, e: &AcpError, provider_id: &str) -> Error {
     if is_acp_auth_required(e) {
         crate::provider_auth::demote_auth_verdict(provider_id);
-        return Error::InvalidParams(format!(
-            "{context}: {}",
-            crate::provider_auth::not_authenticated_message(provider_id)
-        ));
+        return crate::host_execution::ai_authorization_error(
+            Error::InvalidParams(format!(
+                "{context}: {}",
+                crate::provider_auth::not_authenticated_message(provider_id)
+            )),
+            provider_id,
+            intent_core::execution::ExecutionAuthorizationReason::Rejected,
+        );
     }
     Error::Internal(format!("{context} failed: {e}"))
 }
@@ -3881,7 +3891,7 @@ impl Services {
         // fast at the create/delegate gate instead of dying on their first
         // turn. Falls back to the opaque wrapper when the agent's provider
         // cannot be resolved from the session row.
-        let prompt_auth_message = match &result {
+        let prompt_auth_error = match &result {
             Err(e)
                 if !pre_output_transport_failure
                     && !prompt_idle_timeout
@@ -3898,9 +3908,13 @@ impl Services {
                     )
                     .map(|provider_id| {
                         crate::provider_auth::demote_auth_verdict(&provider_id);
-                        format!(
-                            "session/prompt: {}",
-                            crate::provider_auth::not_authenticated_message(&provider_id)
+                        crate::host_execution::ai_authorization_error(
+                            Error::InvalidParams(format!(
+                                "session/prompt: {}",
+                                crate::provider_auth::not_authenticated_message(&provider_id)
+                            )),
+                            &provider_id,
+                            intent_core::execution::ExecutionAuthorizationReason::Rejected,
                         )
                     }),
                     Err(e) => {
@@ -3941,11 +3955,9 @@ impl Services {
         };
         if let Err(e) = &result {
             if !pre_output_transport_failure && !prompt_idle_timeout {
-                let wrapped = match prompt_auth_message.as_deref() {
-                    Some(msg) => Error::InvalidParams(msg.to_string()),
-                    None => Error::Internal(format!("session/prompt failed: {e}")),
-                };
-                if !crate::agent_manager::prompt_cancellation_error(&wrapped) {
+                let fallback = Error::Internal(format!("session/prompt failed: {e}"));
+                let wrapped = prompt_auth_error.as_ref().unwrap_or(&fallback);
+                if !crate::agent_manager::prompt_cancellation_error(wrapped) {
                     let persist = crate::agent_manager::persist_terminal_error_status_via_services(
                         self,
                         agent_id,
@@ -4185,8 +4197,20 @@ impl Services {
                 // Auth-required mapping (intent-hq/intent#3941): the event
                 // carries the same actionable message as the persisted
                 // stop_reason and returned error, not the raw adapter error.
-                let error_text = prompt_auth_message.clone().unwrap_or_else(|| e.to_string());
+                let error_text = prompt_auth_error.as_ref().map_or_else(
+                    || e.to_string(),
+                    |error| match error {
+                        Error::InvalidParams(message) => message.clone(),
+                        error => error.to_string(),
+                    },
+                );
                 let mut data = json!({ "agentId": agent_id.0, "error": error_text });
+                if let Some(auth) = prompt_auth_error
+                    .as_ref()
+                    .and_then(Error::execution_authorization)
+                {
+                    data["executionAuthorization"] = json!(auth);
+                }
                 if let Some(tid) = turn_id {
                     data["turnId"] = json!(tid);
                 }
@@ -4216,10 +4240,10 @@ impl Services {
                 Error::Internal(format!(
                     "session/prompt failed: {e} {PROMPT_IDLE_TIMEOUT_STREAMED_SUFFIX}"
                 ))
-            } else if let Some(msg) = prompt_auth_message {
+            } else if let Some(error) = prompt_auth_error {
                 // Auth-required failure: identical message to the persisted
                 // stop_reason above (intent-hq/intent#3941).
-                Error::InvalidParams(msg)
+                error
             } else {
                 Error::Internal(format!("session/prompt failed: {e}"))
             }

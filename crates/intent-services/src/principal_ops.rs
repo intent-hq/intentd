@@ -357,8 +357,8 @@ fn is_collaborator_class_caller() -> bool {
 impl Services {
     /// The collaborator sender preamble for a human message into
     /// `workspace_id` (multiplayer): `Some(text)` only when the bound caller
-    /// is a per-principal wire connection whose membership role there is
-    /// `collaborator`. The owner (any role `owner`, the administrator, UDS
+    /// is a durable host member in an ordinary workspace or a guest whose
+    /// explicit workspace role is `collaborator`. The owner (the administrator, UDS
     /// and legacy-token callers), agents, the daemon and an absent caller
     /// get `None`. The text is
     /// [`crate::harness::Harness::collaborator_sender_preamble`] rendered
@@ -375,12 +375,24 @@ impl Services {
         else {
             return Ok(None);
         };
-        let role = self
-            .store
-            .get_workspace_member_role(workspace_id, &principal_id)
-            .await?;
-        if role != Some(intent_core::WorkspaceRole::Collaborator) {
-            return Ok(None);
+        match self.store.get_host_role(&principal_id).await {
+            Ok(intent_core::HostRole::Member) => {
+                if workspace_id.is_chief() {
+                    return Ok(None);
+                }
+                self.store.get_workspace(workspace_id).await?;
+            }
+            Ok(intent_core::HostRole::Guest) => {
+                let role = self
+                    .store
+                    .get_workspace_member_role(workspace_id, &principal_id)
+                    .await?;
+                if role != Some(intent_core::WorkspaceRole::Collaborator) {
+                    return Ok(None);
+                }
+            }
+            Ok(intent_core::HostRole::Owner) | Err(Error::NotFound(_)) => return Ok(None),
+            Err(error) => return Err(error),
         }
         let (login, display_name) = match self.store.get_principal(&principal_id).await {
             Ok(principal) => (principal.login, principal.display_name),

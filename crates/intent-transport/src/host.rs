@@ -427,7 +427,7 @@ pub(crate) async fn handle_with_host_environment(
                         .collect()
                 })
                 .unwrap_or_default();
-            if !installed.is_empty() {
+            if !installed.is_empty() && !crate::context::is_non_administrator_caller() {
                 if let Err(e) = api.settings_heal_default_provider(installed).await {
                     tracing::warn!(error = %e, "default-provider settings self-heal failed");
                 }
@@ -469,10 +469,7 @@ pub(crate) async fn handle_with_host_environment(
             // (monorepo#1086). auggie follows the `host.checkAuggie`
             // precedence: `context.auggiePath` wins over
             // `providers.paths.auggie`.
-            let mut provider_paths = read_provider_paths(api).await;
-            if let Some(p) = read_setting_string(api, "context.auggiePath").await {
-                provider_paths.insert("auggie".to_string(), p);
-            }
+            let provider_paths = read_provider_paths(api).await;
             match intent_services::provider_auth::provider_auth_status(
                 provider_id.as_deref(),
                 force,
@@ -480,7 +477,10 @@ pub(crate) async fn handle_with_host_environment(
             )
             .await
             {
-                Ok(result) => success_frame(&id_echo, &result),
+                Ok(result) => {
+                    let _ = api.observe_execution_readiness(result.clone()).await;
+                    success_frame(&id_echo, &result)
+                }
                 Err(msg) => error_frame(&id_echo, -32602, &msg),
             }
         }
@@ -737,38 +737,14 @@ fn parse_write_stdin(params: &Map<String, Value>) -> Result<Option<Vec<u8>>, Str
 /// `None` when neither is set (the caller then uses
 /// `intent_services::auggie_discovery::find_auggie`).
 async fn configured_auggie_path(api: &dyn WorkspaceApi) -> Option<String> {
-    if let Some(v) = read_setting_string(api, "context.auggiePath").await {
-        return Some(v);
-    }
-    if let Ok(payload) = api.settings_get("providers.paths".to_string()).await {
-        if let Some(map) = payload.get("value").and_then(Value::as_object) {
-            if let Some(s) = map.get("auggie").and_then(Value::as_str) {
-                if !s.trim().is_empty() {
-                    return Some(s.to_string());
-                }
-            }
-        }
-    }
-    None
+    api.execution_provider_paths().await.ok()?.remove("auggie")
 }
 
 /// Read the full `providers.paths` settings map (provider key → configured
 /// binary path), skipping blank values. Empty when unset or when the lookup
 /// fails — discovery then behaves exactly as before (auto-detection only).
 async fn read_provider_paths(api: &dyn WorkspaceApi) -> std::collections::HashMap<String, String> {
-    let mut paths = std::collections::HashMap::new();
-    if let Ok(payload) = api.settings_get("providers.paths".to_string()).await {
-        if let Some(map) = payload.get("value").and_then(Value::as_object) {
-            for (key, value) in map {
-                if let Some(s) = value.as_str() {
-                    if !s.trim().is_empty() {
-                        paths.insert(key.clone(), s.to_string());
-                    }
-                }
-            }
-        }
-    }
-    paths
+    api.execution_provider_paths().await.unwrap_or_default()
 }
 
 /// Read a single string-valued setting; returns `None` for missing / null /

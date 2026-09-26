@@ -8,6 +8,13 @@
 /// Domain error type for intentd.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// Safe member recovery for a classified execution authorization error.
+    /// The source preserves the owner's established error contract internally.
+    #[error("{}", authorization.message())]
+    ExecutionAuthorization {
+        source: Box<Error>,
+        authorization: Box<crate::execution::ExecutionAuthorizationFailure>,
+    },
     /// The verified account or selection changed during collaboration sign-in.
     #[error("collaboration identity does not match the selected account")]
     IdentityMismatch,
@@ -21,6 +28,11 @@ pub enum Error {
     /// A requested entity does not exist.
     #[error("not found: {0}")]
     NotFound(String),
+
+    /// libgit2 classified an authentication failure. Legacy wire rendering
+    /// matches Internal; shared execution may attach safe recovery.
+    #[error("internal error: {0}")]
+    GitAuthorization(String),
 
     /// An unexpected internal failure (I/O, persistence, serialization).
     #[error("internal error: {0}")]
@@ -493,10 +505,25 @@ impl CloneErrorCategory {
 }
 
 impl Error {
+    #[must_use]
+    pub fn execution_authorization(
+        &self,
+    ) -> Option<&crate::execution::ExecutionAuthorizationFailure> {
+        match self {
+            Self::ExecutionAuthorization { authorization, .. } => Some(authorization),
+            _ => None,
+        }
+    }
+
     /// JSON-RPC 2.0 numeric error code for this error (PROTOCOL §9).
     #[must_use]
     pub fn code(&self) -> i32 {
         match self {
+            Error::ExecutionAuthorization { source, .. } => match source.as_ref() {
+                Error::CloneFailed { .. } | Error::SourceControlUnauthorized { .. } => source.code(),
+                _ => -32603,
+            },
+
             Error::IdentityMismatch
             | Error::IdentityInUse
             | Error::InvalidParams(_)
@@ -516,6 +543,7 @@ impl Error {
                 | CloneErrorCategory::Other => -32603,
             },
             Error::Internal(_)
+            | Error::GitAuthorization(_)
             | Error::VoiceNotConfigured { .. }
             | Error::ListenerDown
             | Error::TunnelDown

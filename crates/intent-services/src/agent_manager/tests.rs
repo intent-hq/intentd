@@ -7535,6 +7535,7 @@ async fn terminal_failure_events_carry_turn_id() {
         "boom",
         Some("turn-tfe-1"),
         super::FailedProviderSource::CommittedTurn,
+        None,
     )
     .await;
 
@@ -7563,6 +7564,7 @@ async fn terminal_failure_events_carry_turn_id() {
         "boom2",
         None,
         super::FailedProviderSource::CommittedTurn,
+        None,
     )
     .await;
     let mut events = Vec::new();
@@ -7582,6 +7584,51 @@ async fn terminal_failure_events_carry_turn_id() {
     }
 }
 
+#[tokio::test]
+async fn member_async_failure_keeps_safe_authorization_and_workspace_scope() {
+    use intent_core::execution::{
+        ExecutionAuthorizationFailure, ExecutionAuthorizationReason, ExecutionResource,
+    };
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let (ws, id) = (WorkspaceId::from("member-auth-failure"), AgentId::new());
+    seed_agent(&mgr, &ws, &id).await;
+    let auth = ExecutionAuthorizationFailure::new(
+        ExecutionResource::Ai,
+        ExecutionAuthorizationReason::Rejected,
+        Some("mock".into()),
+        None,
+    );
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        workspace_id: Some(ws.0.clone()),
+        ..Default::default()
+    });
+    super::publish_terminal_failure_events(
+        &mgr,
+        &id,
+        &ws,
+        &auth.message(),
+        Some("member-turn"),
+        super::FailedProviderSource::CommittedTurn,
+        Some(&auth),
+    )
+    .await;
+    let events = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let failed = events
+        .iter()
+        .find(|e| e.event_type == "agent:failed")
+        .unwrap();
+    assert_eq!(failed.workspace_id, ws);
+    assert_eq!(failed.data["executionAuthorization"], json!(auth));
+    assert_eq!(failed.data["turnId"], "member-turn");
+    assert!(failed.data["error"]
+        .as_str()
+        .unwrap()
+        .contains("connected host"));
+}
+
 /// Collect the `agent:failed` payload the terminal publisher emits for one
 /// quota-classified failure under the given provider source.
 async fn quota_failed_payload(
@@ -7599,6 +7646,7 @@ async fn quota_failed_payload(
         "session/new failed: rate_limit_error: usage limit reached",
         None,
         source,
+        None,
     )
     .await;
     let mut events = Vec::new();
@@ -7699,6 +7747,7 @@ async fn spawn_attempt_provider_never_outlives_its_attempt() {
         "session/new failed: internal error",
         None,
         super::FailedProviderSource::SpawnAttempt,
+        None,
     )
     .await;
     assert!(
@@ -11047,6 +11096,94 @@ fn prompt(request_id: &str, session_id: &str) -> PermissionRequestData {
         risk_level: RiskLevel::High,
         timestamp: 0,
     }
+}
+
+#[tokio::test]
+async fn member_permission_rpcs_resolve_another_persons_agent_and_recheck_authority() {
+    use intent_core::{with_caller, Caller, HostRole, PrincipalId, WorkspaceRole};
+    let (_tmp, mgr, _bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    let services = mgr.services.clone();
+    services.attach_agent_manager(&mgr);
+    let ws = WorkspaceId::new();
+    let id = AgentId::new();
+    seed_agent(&mgr, &ws, &id).await;
+    let mut member = services.store.get_primary_principal().await.unwrap();
+    member.id = PrincipalId::new();
+    member.is_primary = false;
+    services.store.upsert_principal(&member).await.unwrap();
+    sqlx::query("INSERT INTO host_member (principal_id,added_at) VALUES (?,?)")
+        .bind(member.id.as_str())
+        .bind(now_iso())
+        .execute(services.store.write_pool())
+        .await
+        .unwrap();
+    let caller = Caller::Wire {
+        principal_id: member.id.clone(),
+        host_role: HostRole::Guest,
+    };
+    // A previously admitted guest becomes a member without an explicit row.
+    let mut rx = mgr
+        .permissions
+        .register(prompt("member-prompt", id.as_str()));
+    with_caller(caller.clone(), async {
+        for filter in [None, Some(id.clone())] {
+            let requests = services.agent_pending_permissions(filter).await.unwrap();
+            assert_eq!(requests["requests"][0]["requestId"], "member-prompt");
+        }
+        let answer = services
+            .agent_respond_permission(
+                "member-prompt".into(),
+                json!({"outcome":"selected","optionId":"allow_once"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(answer["resolved"], true);
+    })
+    .await;
+    assert_eq!(
+        rx.try_recv().unwrap(),
+        PermissionOutcome::Selected {
+            option_id: "allow_once".into()
+        }
+    );
+    // A retained guest grant cannot answer or enumerate the next prompt.
+    services
+        .store
+        .add_workspace_member(&ws, &member.id, WorkspaceRole::Collaborator)
+        .await
+        .unwrap();
+    services.store.remove_host_member(&member.id).await.unwrap();
+    let mut rx = mgr
+        .permissions
+        .register(prompt("after-revoke", id.as_str()));
+    with_caller(caller, async {
+        assert_eq!(
+            services.agent_pending_permissions(None).await.unwrap()["requests"],
+            json!([])
+        );
+        assert!(services
+            .agent_pending_permissions(Some(id.clone()))
+            .await
+            .is_err());
+        assert!(services
+            .agent_respond_permission("after-revoke".into(), json!({"outcome":"cancelled"}))
+            .await
+            .is_err());
+    })
+    .await;
+    assert!(rx.try_recv().is_err());
+    // Fabricated callers never gain access through an outstanding request id.
+    let unknown = Caller::Wire {
+        principal_id: PrincipalId::new(),
+        host_role: HostRole::Member,
+    };
+    assert!(with_caller(
+        unknown,
+        services.agent_respond_permission("after-revoke".into(), json!({"outcome":"cancelled"}))
+    )
+    .await
+    .is_err());
 }
 
 #[tokio::test]

@@ -185,6 +185,7 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "hook.cancel",
     "hook.list",
     "hook.runNow",
+    "host.executionContext",
     "host.invite.list",
     "host.invite.revoke",
     "host.members.list",
@@ -724,4 +725,39 @@ pub(crate) fn collaborator_may_call(method: &str) -> bool {
     ALLOWED
         .get_or_init(|| COLLABORATOR_METHODS.iter().map(|(m, _)| *m).collect())
         .contains(canonical_method(method))
+}
+
+/// Service-backed member paths proved in the workspace-tools increment.
+/// Broader fast paths, previews and session reconciliation are independent.
+pub(crate) const MEMBER_METHODS: &[&str] = &[
+    "agent.cancelDelete",
+    "agent.create",
+    "agent.delegate",
+    "agent.delete",
+    "host.executionContext",
+    "host.providerAuthStatus",
+    "host.providerDiscovery",
+    "mcp.servers.toggle",
+    "repo.list",
+    "script.create",
+    "script.list",
+    "script.output",
+    "script.remove",
+    "script.restart",
+    "script.run",
+    "script.start",
+    "script.status",
+    "script.stop",
+    "terminal.create",
+    "terminal.getBuffer",
+    "terminal.kill",
+    "terminal.list",
+    "terminal.readOutput",
+    "terminal.resize",
+    "terminal.write",
+    "workspace.delete",
+];
+
+pub(crate) fn member_may_call(method: &str) -> bool {
+    collaborator_may_call(method) || MEMBER_METHODS.contains(&canonical_method(method))
 }

@@ -482,6 +482,7 @@ pub const IDENTITY_AUTH_CHANGED: &str = "identity:auth-changed";
 // login? }`; owner-only, like `sourceControl:auth-changed`.
 pub const HOST_MEMBERS_CHANGED: &str = "host:members-changed";
 pub const HOST_INVITES_CHANGED: &str = "host:invites-changed";
+pub const HOST_EXECUTION_CONTEXT_CHANGED: &str = "host:execution-context-changed";
 
 pub const PRINCIPAL_IDENTITY_CHANGED: &str = "principal:identity-changed";
 
@@ -673,6 +674,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     PRINCIPAL_IDENTITY_CHANGED,
     HOST_MEMBERS_CHANGED,
     HOST_INVITES_CHANGED,
+    HOST_EXECUTION_CONTEXT_CHANGED,
     APP_UI_NAVIGATE,
     APP_UI_HIGHLIGHT,
     APP_WORKSPACE_OPEN,
@@ -920,4 +922,14 @@ pub fn is_collaborator_event_type(event_type: &str) -> bool {
     ALLOWED
         .get_or_init(|| COLLABORATOR_EVENT_TYPES.iter().map(|(t, _)| *t).collect())
         .contains(event_type)
+}
+
+/// Narrow member additions needed by execution context and live permissions.
+/// Guest classification is unchanged. Delivery also rechecks durable authority.
+#[must_use]
+pub fn is_member_execution_event_type(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        HOST_EXECUTION_CONTEXT_CHANGED | AGENT_PERMISSION_REQUEST | AGENT_PERMISSION_RESOLVED
+    )
 }
