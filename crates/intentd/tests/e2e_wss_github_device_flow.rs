@@ -63,7 +63,11 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     }
     let mut cmd = common::serve_command();
     common::hermetic_github_identity(&mut cmd, data_dir);
-    cmd.env("INTENTD_DATA_DIR", data_dir)
+    // gh auth token can otherwise select an inherited enterprise credential.
+    cmd.env_remove("GH_HOST")
+        .env_remove("GH_ENTERPRISE_TOKEN")
+        .env_remove("GITHUB_ENTERPRISE_TOKEN")
+        .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -88,12 +92,18 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
         .is_some_and(|v| v.starts_with("http://127.0.0.1:"));
     let owned_secrets = explicit_env.get(std::ffi::OsStr::new("INTENTD_SECRETS_FILE"))
         == Some(&Some(data_dir.join("secrets.json").as_os_str()));
-    let no_env_tokens = ["GITHUB_TOKEN", "GH_TOKEN"]
-        .iter()
-        .all(|key| explicit_env.get(std::ffi::OsStr::new(key)) == Some(&None));
+    let no_host_auth_env = [
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "GH_HOST",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+    ]
+    .iter()
+    .all(|key| explicit_env.get(std::ffi::OsStr::new(key)) == Some(&None));
     assert!(
-        isolated_gh && local_login && local_api && owned_secrets && no_env_tokens,
-        "device-auth fixture isolation: disposable GH_CONFIG_DIR={isolated_gh}, local login={local_login}, local API={local_api}, owned secrets={owned_secrets}, removed env tokens={no_env_tokens}"
+        isolated_gh && local_login && local_api && owned_secrets && no_host_auth_env,
+        "device-auth fixture isolation: disposable GH_CONFIG_DIR={isolated_gh}, local login={local_login}, local API={local_api}, owned secrets={owned_secrets}, removed credential env={no_host_auth_env}"
     );
     cmd.spawn().expect("spawn intentd serve")
 }

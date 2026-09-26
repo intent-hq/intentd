@@ -301,7 +301,11 @@ async fn shutdown_reaps_provider_child_and_grandchild() {
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     let mut cmd = common::serve_command();
     common::hermetic_github_identity(&mut cmd, &data_dir);
-    cmd.env("INTENTD_DATA_DIR", &data_dir)
+    // gh auth token can otherwise select an inherited enterprise credential.
+    cmd.env_remove("GH_HOST")
+        .env_remove("GH_ENTERPRISE_TOKEN")
+        .env_remove("GITHUB_ENTERPRISE_TOKEN")
+        .env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -325,12 +329,18 @@ async fn shutdown_reaps_provider_child_and_grandchild() {
         == Some(&Some(data_dir.join("secrets.json").as_os_str()));
     let isolated_gh = explicit_env.get(std::ffi::OsStr::new("GH_CONFIG_DIR"))
         == Some(&Some(data_dir.join("gh-config").as_os_str()));
-    let no_env_tokens = ["GITHUB_TOKEN", "GH_TOKEN"]
-        .iter()
-        .all(|key| explicit_env.get(std::ffi::OsStr::new(key)) == Some(&None));
+    let no_host_auth_env = [
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "GH_HOST",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+    ]
+    .iter()
+    .all(|key| explicit_env.get(std::ffi::OsStr::new(key)) == Some(&None));
     assert!(
-        owned_workspaces && owned_secrets && isolated_gh && no_env_tokens,
-        "shutdown fixture isolation: owned workspaces={owned_workspaces}, owned secrets={owned_secrets}, disposable GH_CONFIG_DIR={isolated_gh}, removed env tokens={no_env_tokens}"
+        owned_workspaces && owned_secrets && isolated_gh && no_host_auth_env,
+        "shutdown fixture isolation: owned workspaces={owned_workspaces}, owned secrets={owned_secrets}, disposable GH_CONFIG_DIR={isolated_gh}, removed credential env={no_host_auth_env}"
     );
     let child = cmd.spawn().expect("spawn intentd serve");
     let mut daemon = DaemonGuard::process_only(child);
