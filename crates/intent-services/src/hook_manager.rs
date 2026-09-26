@@ -1015,6 +1015,8 @@ impl Services {
             is_sub_agent,
         )
         .await;
+        let _mutation = self.workspace_mutations.enter(workspace_id)?;
+        self.store.get_workspace(workspace_id).await?;
         match outcome {
             RunOutcome::Failed { error, .. } => Err(Error::InvalidParams(format!(
                 "hook.schedule: first run failed: {error}"

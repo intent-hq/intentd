@@ -15,6 +15,8 @@ use intent_store::Store;
 
 use crate::{repository_backfill_probe_count, BackfillCandidate, Services};
 
+pub(crate) mod workspace_delete;
+
 /// Runs before `main()` — and therefore before any test threads exist, making
 /// `set_var` race-free. Node children spawned by lib tests (e.g. the real
 /// `auggie` CLI in `auto_commit` tests) inherit this and skip
@@ -18228,6 +18230,7 @@ pub(crate) mod pr {
                         started_at: None,
                     },
                 ],
+                checks_head_sha: None,
                 checks_known: true,
                 branch_rules: Some(BranchRules {
                     required_approving_review_count: Some(2),

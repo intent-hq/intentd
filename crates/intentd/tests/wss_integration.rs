@@ -8,6 +8,8 @@
 //! plain-`ws://` accept path serves JSON-RPC with no TLS and no bearer token.
 
 mod common;
+#[path = "wss_integration/workspace_delete.rs"]
+mod workspace_delete;
 
 use std::fmt::Write as _;
 use std::net::{Ipv4Addr, TcpListener as StdTcpListener};

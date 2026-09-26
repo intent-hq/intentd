@@ -18,7 +18,7 @@
 
 use std::sync::Arc;
 
-use intent_core::{AgentCreateExtra, AgentDelegateInput, AgentId, WorkspaceId};
+use intent_core::{AgentCreateExtra, AgentDelegateInput, AgentId, WorkspaceApi, WorkspaceId};
 use intent_store::Store;
 use serde_json::json;
 use tempfile::TempDir;
@@ -136,6 +136,140 @@ async fn effort_of(svc: &Services, id: AgentId) -> Option<String> {
         .await
         .expect("get session")
         .reasoning_effort
+}
+
+/// The wire field must reach the creation plan before the initial prompt is
+/// delivered; applying it with a later agent.update is too late.
+#[intent_test_macros::daemon_test]
+async fn workspace_initial_agent_effort_persisted_with_prompt() {
+    let (_t, svc, _ws, _spec, cfg) = setup().await;
+    let svc = svc.with_workspaces_root(cfg.path().join("workspaces"));
+    seed_catalog(&svc);
+    let input = serde_json::from_value(json!({
+        "title": "Initial effort",
+        "initialAgent": {
+            "model": "fable-5", "reasoningEffort": "low", "prompt": "first turn"
+        }
+    }))
+    .expect("workspace.create request");
+    let created = svc.create_workspace(input, None).await.expect("create");
+    let agent = created.initial_agent.expect("initial agent");
+    assert_eq!(
+        agent["reasoningEffort"], "low",
+        "creation response: {agent}"
+    );
+    let session = svc
+        .agent_get_session_op(AgentId::from(agent["id"].as_str().unwrap()))
+        .await
+        .expect("session");
+    assert_eq!(session.reasoning_effort.as_deref(), Some("low"));
+    assert_eq!(session.initial_message.as_deref(), Some("first turn"));
+}
+
+#[intent_test_macros::daemon_test]
+async fn workspace_initial_agent_effort_uses_existing_resolution_chain() {
+    let (_t, svc, _ws, spec, cfg) = setup().await;
+    let svc = svc.with_workspaces_root(cfg.path().join("workspaces"));
+    seed_catalog(&svc);
+    set(&svc, "model.default", json!("fable-5"));
+    set(&svc, "model.defaultReasoningEffort", json!("high"));
+    write_specialist(spec.path(), "fm", "reasoningEffort: \"low\"\n");
+    write_specialist(
+        spec.path(),
+        "opt",
+        "reasoningEffort: \"high\"\nmodelOptions:\n  - model: \"fable-5\"\n    reasoningEffort: \"low\"\n",
+    );
+
+    for (index, (agent, expected)) in [
+        (json!({}), Some("high")),
+        (json!({ "reasoningEffort": null }), Some("high")),
+        (json!({ "model": "fable-5" }), None),
+        (json!({ "specialist": "fm" }), Some("low")),
+        (json!({ "specialist": "opt" }), Some("low")),
+        (json!({ "reasoningEffort": "LOW" }), Some("LOW")),
+        (
+            json!({ "specialist": "fm", "reasoningEffort": "high" }),
+            Some("high"),
+        ),
+        (json!({ "specialist": "opt", "reasoningEffort": "" }), None),
+        (
+            json!({ "specialist": "fm", "reasoningEffort": " \t " }),
+            None,
+        ),
+        (json!({ "reasoningEffort": "" }), None),
+        // A model with no effort-level evidence preserves the caller's spelling.
+        (
+            json!({ "model": "sonnet5", "reasoningEffort": "custom" }),
+            Some("custom"),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let created = svc
+            .create_workspace(
+                serde_json::from_value(json!({
+                    "title": format!("Effort resolution {index}"), "initialAgent": agent
+                }))
+                .unwrap(),
+                None,
+            )
+            .await
+            .expect("create");
+        let result = created.initial_agent.expect("idle initial agent");
+        assert_eq!(result["reasoningEffort"].as_str(), expected, "{agent}");
+        if expected.is_none() {
+            assert!(result.get("reasoningEffort").is_none(), "{result}");
+        }
+        let id = AgentId::from(result["id"].as_str().unwrap());
+        assert_eq!(
+            effort_of(&svc, id.clone()).await.as_deref(),
+            expected,
+            "{agent}"
+        );
+        assert!(svc
+            .store()
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn workspace_initial_agent_invalid_effort_precedes_provisioning() {
+    let (_t, svc, _ws, _spec, cfg) = setup().await;
+    let root = cfg.path().join("workspaces");
+    let repository = cfg.path().join("new-project");
+    let svc = svc.with_workspaces_root(root.clone());
+    seed_catalog(&svc);
+    // Read rows directly: workspace.list prewarms a CoW probe that may create
+    // the root independently of the workspace.create request under test.
+    let before = svc.store().list_workspaces(true).await.unwrap().len();
+    let err = svc
+        .create_workspace(
+            serde_json::from_value(json!({
+                "title": "Invalid effort", "repositoryPath": repository, "isNewRepo": true,
+                "initialAgent": { "model": "fable-5", "reasoningEffort": "xhigh", "prompt": "go" }
+            }))
+            .unwrap(),
+            None,
+        )
+        .await
+        .expect_err("unsupported effort must reject");
+    assert!(matches!(err, intent_core::Error::InvalidParams(_)), "{err}");
+    assert!(
+        err.to_string()
+            .contains("reasoningEffort xhigh is not supported"),
+        "{err}"
+    );
+    assert_eq!(
+        svc.store().list_workspaces(true).await.unwrap().len(),
+        before
+    );
+    assert!(svc.store().list_all_notes().await.unwrap().is_empty());
+    assert!(!repository.exists(), "git init must not run");
+    assert!(!root.exists(), "workspace provisioning must not run");
 }
 
 /// The settings default effort is pinned when nothing more specific decided

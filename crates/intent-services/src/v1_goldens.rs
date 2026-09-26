@@ -798,6 +798,10 @@ pub(crate) fn pr_snapshot(state: &str) -> crate::pr_monitor::PrMonitorSnapshot {
         review_comment_count: 1,
         requirements: merge_requirements(state, 0, 1),
         ejection_tracked: true,
+        checks_unobserved: false,
+        checks_seed_pending: false,
+        status_checks: Some(Vec::new()),
+        required_check_names: None,
         observed_at: None,
     }
 }

@@ -512,6 +512,11 @@ pub struct MergeRequirementSignals {
     /// Whether the rollup's `isRequired` flags are trustworthy — `false` when
     /// the host did not report the rollup at all.
     pub checks_known: bool,
+    /// Internal observation identity, when the host supplies one. The service
+    /// must not combine these checks with a PR read for a different head.
+    /// This is adapter bookkeeping, not an addition to the public wire payload.
+    #[serde(skip)]
+    pub checks_head_sha: Option<String>,
     /// Base-branch rules, or `None` when they are unreadable (missing scope,
     /// unsupported endpoint) — a degraded but non-fatal probe. Quota
     /// exhaustion on that read is never folded into `None`; it fails the

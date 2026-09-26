@@ -2,6 +2,39 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.110] - 2026-09-25
+
+### 🐛 Bug Fixes
+
+- Apply initial-agent reasoning effort before first turn ([#5948](https://github.com/intent-hq/intentd/pull/5948)) ([#2125](https://github.com/intent-hq/intentd/pull/2125))
+
+
+## [0.9.109] - 2026-09-25
+
+### 🐛 Bug Fixes
+
+- Keep workspace deletion responsive with bounded cleanup ([#2121](https://github.com/intent-hq/intentd/pull/2121))
+- Keep PR check observations complete and stable ([#2123](https://github.com/intent-hq/intentd/pull/2123))
+
+
+## [0.9.108] - 2026-09-25
+
+### 🚀 Features
+
+- Enable peer agents by default ([#2118](https://github.com/intent-hq/intentd/pull/2118))
+- Report effective Codex runtime and catalogs in doctor ([#2117](https://github.com/intent-hq/intentd/pull/2117))
+
+### 🐛 Bug Fixes
+
+- Use the enabled GitLab OAuth application by default ([#2120](https://github.com/intent-hq/intentd/pull/2120))
+- Honor specialist provider pins in create and previews ([#2116](https://github.com/intent-hq/intentd/pull/2116))
+- *(settings)* Validate config before committing writes ([#2119](https://github.com/intent-hq/intentd/pull/2119))
+
+### 🧪 Testing
+
+- Assert sender-attributed peer kickoff over WSS ([#2115](https://github.com/intent-hq/intentd/pull/2115))
+
+
 ## [0.9.107] - 2026-09-25
 
 ### 🐛 Bug Fixes

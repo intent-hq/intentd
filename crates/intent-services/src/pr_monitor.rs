@@ -67,7 +67,7 @@
 //! refreshes what the next hover serves and a hover seeds what the next
 //! hover serves.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -437,6 +437,25 @@ pub(crate) struct PrMonitorSnapshot {
     /// silently instead of emitting a false post-upgrade wake.
     #[serde(default)]
     pub ejection_tracked: bool,
+    /// No authoritative checks have been observed for this head yet. Internal
+    /// persisted bookkeeping only; old snapshots retain their known baseline.
+    #[serde(default)]
+    pub checks_unobserved: bool,
+    /// Only the first unreadable registration may adopt checks silently.
+    /// An unreadable head change after monitoring began must still report
+    /// failures/completion when that head's checks become observable.
+    #[serde(default)]
+    pub checks_seed_pending: bool,
+    /// Retained legacy statuses, or a frozen copy of the possible legacy checks
+    /// from an older snapshot. Never absorbs later REST outcomes. Empty on a
+    /// new head; absent only before upgrading old provenance. Internal JSON only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_checks: Option<Vec<pr_ops::MergeRequirementCheck>>,
+    /// Names whose required flags are known, independently of new REST names
+    /// with unknown flags. Older snapshots fall back to `required_known`.
+    /// Internal persisted evidence only, omitted from public projections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_check_names: Option<BTreeSet<String>>,
     /// When the forge read that produced this snapshot SUCCEEDED (RFC 3339).
     /// The freshness anchor for superseding the snapshot with a workspace
     /// copy ([`superseded_by_terminal_copy`]): the row's `last_polled_at`
@@ -449,6 +468,18 @@ pub(crate) struct PrMonitorSnapshot {
 }
 
 impl PrMonitorSnapshot {
+    pub(crate) fn known_required_checks(&self) -> BTreeSet<String> {
+        self.required_check_names.clone().unwrap_or_else(|| {
+            self.requirements
+                .checks
+                .items
+                .iter()
+                .filter(|_| self.requirements.checks.required_known)
+                .map(|c| c.name.clone())
+                .collect()
+        })
+    }
+
     /// Whether the PR reached a terminal lifecycle (merged or closed) — the
     /// monitor's automatic-stop condition.
     fn is_terminal(&self) -> bool {
@@ -478,6 +509,8 @@ pub struct SharedPrSnapshot {
     /// review-decision, check-run or review-thread read leaves a default in
     /// the checklist that the forge may answer on the next read.
     requirements_complete: bool,
+    check_runs_known: bool,
+    status_checks: Option<Vec<pr_ops::MergeRequirementCheck>>,
     /// The host's merge-queue state as reported by this read
     /// ([`pr_ops::MergeRequirementsRead::merge_queue_reported`]) — what
     /// `github.pulls.get` carries as `isInMergeQueue` (`None` → key absent).
@@ -493,6 +526,54 @@ impl SharedPrSnapshot {
     /// monotonic — always reaches the wake — per intent-hq/monorepo#3479).
     pub(crate) fn materialize(&self, previous: Option<&PrMonitorSnapshot>) -> PrMonitorSnapshot {
         let mut requirements = self.requirements.clone();
+        let mut checks_unobserved = !self.check_runs_known;
+        let same_head = previous.filter(|p| {
+            self.head_sha.as_ref().is_some_and(|h| !h.is_empty()) && self.head_sha == p.head_sha
+        });
+        let status_checks = self.status_checks.clone().unwrap_or_else(|| {
+            same_head.map_or_else(Vec::new, |p| {
+                p.status_checks
+                    .clone()
+                    .unwrap_or_else(|| p.requirements.checks.items.clone())
+            })
+        });
+        let required_check_names = if self.requirements.checks.required_known {
+            self.requirements
+                .checks
+                .items
+                .iter()
+                .map(|c| c.name.clone())
+                .collect()
+        } else {
+            same_head
+                .map(PrMonitorSnapshot::known_required_checks)
+                .unwrap_or_default()
+        };
+        if checks_unobserved {
+            if let Some(prev) = same_head {
+                requirements.checks.clone_from(&prev.requirements.checks);
+                checks_unobserved = prev.checks_unobserved;
+            }
+        } else if self.status_checks.is_none() {
+            if let Some(prev) = same_head.filter(|p| !p.checks_unobserved) {
+                requirements.checks.retain_status_evidence(
+                    &prev.requirements.checks,
+                    &status_checks,
+                    &required_check_names,
+                );
+            }
+        }
+        let checks_seed_pending = checks_unobserved
+            && (previous.is_none() || same_head.is_some_and(|p| p.checks_seed_pending));
+        let required_check_names = Some(
+            requirements
+                .checks
+                .items
+                .iter()
+                .filter(|c| required_check_names.contains(&c.name))
+                .map(|c| c.name.clone())
+                .collect(),
+        );
         let ejection_tracked = if self.ejection_known {
             true
         } else {
@@ -515,6 +596,10 @@ impl SharedPrSnapshot {
             review_comment_count: self.review_comment_count,
             requirements,
             ejection_tracked,
+            checks_unobserved,
+            checks_seed_pending,
+            status_checks: Some(status_checks),
+            required_check_names,
             observed_at: None,
         }
     }
@@ -872,6 +957,8 @@ async fn shared_snapshot_from_observation(
         requirements: read.requirements,
         ejection_known: read.ejection_known,
         requirements_complete: read.complete,
+        check_runs_known: read.check_runs_known,
+        status_checks: read.status_checks,
         merge_queue_reported: read.merge_queue_reported,
     };
     Ok((observation.pr, snapshot))
@@ -1063,6 +1150,8 @@ async fn finish_shared_snapshot(
         requirements: read.requirements,
         ejection_known: read.ejection_known,
         requirements_complete: read.complete,
+        check_runs_known: read.check_runs_known,
+        status_checks: read.status_checks,
         merge_queue_reported: read.merge_queue_reported,
     };
     Ok((pr, snapshot))
@@ -1974,6 +2063,7 @@ impl Services {
         repo_name: &str,
         pr_number: u64,
     ) -> Result<PrMonitorRegistration> {
+        let _mutation = self.workspace_mutations.enter(workspace_id)?;
         let existing = self
             .store
             .find_active_pr_monitor(agent_id, repo_owner, repo_name, pr_number.cast_signed())
@@ -3152,6 +3242,10 @@ impl Services {
         let now = now_iso();
         let mut fresh = shared.materialize(previous.as_ref());
         fresh.observed_at = Some(now.clone());
+        // Older monitors may already have silently learned a passing name in
+        // the last poll only. Recover that evidence before learning this poll's
+        // values, which may have changed again in the meantime.
+        let last_observed = previous.clone();
 
         // Upgrade backfill: an anchor persisted before ejection tracking
         // existed has no event field at all, so the first tracked poll would
@@ -3161,6 +3255,85 @@ impl Services {
         // write-back below) — only ejections observed after tracking began
         // are reportable.
         let backfill = |s: &mut PrMonitorSnapshot| {
+            // Freeze old combined evidence before adopting any fresh signals.
+            // Both persisted anchors must retain their own original subset.
+            if s.status_checks.is_none() {
+                s.status_checks = Some(s.requirements.checks.items.clone());
+            }
+            // An initial unreadable result is not an observed empty suite.
+            // Adopt its first complete checks silently, just like registration.
+            if !fresh.checks_unobserved && s.checks_seed_pending && s.head_sha == fresh.head_sha {
+                s.requirements.checks.clone_from(&fresh.requirements.checks);
+                s.checks_unobserved = false;
+                s.checks_seed_pending = false;
+                s.status_checks.clone_from(&fresh.status_checks);
+                s.required_check_names
+                    .clone_from(&fresh.required_check_names);
+            }
+            if fresh.head_sha.as_ref().is_some_and(|h| !h.is_empty())
+                && s.head_sha == fresh.head_sha
+            {
+                // Learning a formerly unknown flag is silent. Store that first
+                // known value in the emit anchor too, so a later real flip is
+                // reportable even if no unrelated wake advanced the anchor.
+                let mut known = s.known_required_checks();
+                for observed in last_observed
+                    .as_ref()
+                    .filter(|p| p.head_sha == fresh.head_sha)
+                    .into_iter()
+                    .chain(std::iter::once(&fresh))
+                {
+                    let observed_known = observed.known_required_checks();
+                    // A check first seen passing is silent too. Retain it even
+                    // while its flag is unknown. Copy only missing passing
+                    // names, keeping failures/removals pending for delivery.
+                    let names: HashSet<_> = s
+                        .requirements
+                        .checks
+                        .items
+                        .iter()
+                        .map(|c| c.name.clone())
+                        .collect();
+                    s.requirements.checks.items.extend(
+                        observed
+                            .requirements
+                            .checks
+                            .items
+                            .iter()
+                            .filter(|c| c.status == "passed" && !names.contains(&c.name))
+                            .cloned(),
+                    );
+                    let by_name: HashMap<_, _> = observed
+                        .requirements
+                        .checks
+                        .items
+                        .iter()
+                        .map(|c| (&c.name, c.required))
+                        .collect();
+                    for check in &mut s.requirements.checks.items {
+                        if !known.contains(&check.name) && observed_known.contains(&check.name) {
+                            if let Some(&required) = by_name.get(&check.name) {
+                                check.required = required;
+                                known.insert(check.name.clone());
+                            }
+                        }
+                    }
+                }
+                let required_known = if s.requirements.checks.items.is_empty() {
+                    s.requirements.checks.required_known
+                } else {
+                    s.requirements
+                        .checks
+                        .items
+                        .iter()
+                        .all(|c| known.contains(&c.name))
+                };
+                s.requirements.checks = pr_ops::MergeRequirementsChecks::from_items(
+                    std::mem::take(&mut s.requirements.checks.items),
+                    required_known,
+                );
+                s.required_check_names = Some(known);
+            }
             if fresh.ejection_tracked && !s.ejection_tracked {
                 s.requirements
                     .merge_queue_ejection
@@ -4026,6 +4199,7 @@ impl Services {
 
 #[cfg(test)]
 mod tests {
+    mod qwen_regression;
     use std::path::PathBuf;
 
     use async_trait::async_trait;
@@ -4258,6 +4432,7 @@ mod tests {
                 merge_state_status: Some(self.mergeable_state.to_uppercase()),
                 review_decision: (!self.approvals.is_empty()).then_some(ReviewDecision::Approved),
                 checks: self.checks.clone(),
+                checks_head_sha: None,
                 checks_known: true,
                 branch_rules: None,
                 is_in_merge_queue: self.in_merge_queue,
@@ -4905,6 +5080,10 @@ mod tests {
                 merge_queue_ejection: None,
             },
             ejection_tracked: true,
+            checks_unobserved: false,
+            checks_seed_pending: false,
+            status_checks: Some(Vec::new()),
+            required_check_names: None,
             observed_at: None,
         };
         f(&mut s);
@@ -5400,6 +5579,8 @@ mod tests {
             requirements: s.requirements.clone(),
             ejection_known,
             requirements_complete: ejection_known,
+            check_runs_known: true,
+            status_checks: s.status_checks.clone(),
             merge_queue_reported: s.requirements.is_in_merge_queue,
         }
     }

@@ -4565,6 +4565,10 @@ impl Services {
         workspace_id: WorkspaceId,
         snapshot_wp: Option<PathBuf>,
     ) -> std::result::Result<Value, AgentPersistError> {
+        let _mutation = self
+            .workspace_mutations
+            .enter(&workspace_id)
+            .map_err(AgentPersistError::store)?;
         let AgentCreatePlan {
             method,
             parent_agent_id,
@@ -5871,7 +5875,23 @@ impl Services {
         content: Value,
         metadata: Option<Value>,
     ) -> Result<Value> {
+        crate::workspace_mutations::boxed(
+            self.agent_append_message_op_admitted(agent_id, role, content, metadata),
+        )
+        .await
+    }
+
+    async fn agent_append_message_op_admitted(
+        &self,
+        agent_id: AgentId,
+        role: String,
+        content: Value,
+        metadata: Option<Value>,
+    ) -> Result<Value> {
         let session = self.store.get_agent_session(&agent_id).await?;
+        // Own admission through transcript persistence, events and derived state.
+        // Nested drain helpers reuse this permit even if deletion is queued.
+        let _mutation = self.workspace_mutations.enter(&session.workspace_id)?;
         if self.agent_is_busy(agent_id.clone()) {
             return Err(Error::InvalidParams(format!(
                 "agent.appendMessage: session {} is busy — cannot mutate transcript during an active turn",
@@ -5960,6 +5980,17 @@ impl Services {
         agent_id: AgentId,
         messages: Value,
     ) -> Result<Value> {
+        crate::workspace_mutations::boxed(
+            self.agent_replace_messages_op_admitted(agent_id, messages),
+        )
+        .await
+    }
+
+    async fn agent_replace_messages_op_admitted(
+        &self,
+        agent_id: AgentId,
+        messages: Value,
+    ) -> Result<Value> {
         struct Parsed {
             role: String,
             content: Value,
@@ -5967,6 +5998,7 @@ impl Services {
             created_at: String,
         }
         let session = self.store.get_agent_session(&agent_id).await?;
+        let _mutation = self.workspace_mutations.enter(&session.workspace_id)?;
         if self.agent_is_busy(agent_id.clone()) {
             return Err(Error::InvalidParams(format!(
                 "agent.replaceMessages: session {} is busy — cannot mutate transcript during an active turn",
@@ -6381,6 +6413,7 @@ impl Services {
         // truncated/mistyped id would otherwise create a queue entry that
         // never drains (same fail-closed contract as `agent.sendMessage`).
         let session = self.require_agent_session(&agent_id).await?;
+        let _mutation = self.workspace_mutations.enter(&session.workspace_id)?;
         self.validate_image_block_refs("agent.queueMessage", image_blocks.as_ref())
             .await?;
         let (queued, position) = self.enqueue_message(
@@ -6923,6 +6956,7 @@ impl Services {
         // the auto-queue fallback below is for store-append failures on a
         // REAL agent, not a phantom queue for an id that will never drain.
         let session = self.require_agent_session(&agent_id).await?;
+        let _mutation = self.workspace_mutations.enter(&session.workspace_id)?;
         // Image references must name registered attachments
         // (monorepo#3338) — rejected before any state change.
         self.validate_image_block_refs("agent.sendMessage", image_blocks.as_ref())
@@ -7056,6 +7090,7 @@ impl Services {
         // Fail closed on a nonexistent target BEFORE touching the queue
         // (monorepo#564).
         let session = self.require_agent_session(&agent_id).await?;
+        let _mutation = self.workspace_mutations.enter(&session.workspace_id)?;
         let workspace_id = session.workspace_id.clone();
         let gate = self.queue_entry_gate(&agent_id, false).await?;
         self.park_queue_mutation_gate(gate.as_ref()).await;
@@ -8861,6 +8896,22 @@ impl Services {
         reason: String,
         caller_agent_id: Option<AgentId>,
     ) -> Result<Value> {
+        crate::workspace_mutations::boxed(self.agent_request_attention_op_admitted(
+            workspace_id,
+            kind,
+            reason,
+            caller_agent_id,
+        ))
+        .await
+    }
+
+    async fn agent_request_attention_op_admitted(
+        &self,
+        workspace_id: WorkspaceId,
+        kind: String,
+        reason: String,
+        caller_agent_id: Option<AgentId>,
+    ) -> Result<Value> {
         let caller = caller_agent_id.ok_or_else(|| {
             Error::Internal("requestAttention is only available to agents".to_string())
         })?;
@@ -8892,6 +8943,7 @@ impl Services {
         if session.workspace_id != workspace_id {
             return Err(Error::NotFound(format!("agent session {caller}")));
         }
+        let _mutation = self.workspace_mutations.enter(&session.workspace_id)?;
         // 1. Persist the pending attention request on the session via the
         // narrow attention writer (with `clear_attention_request` the only
         // post-insert mutator of the attention columns — the full-row
@@ -9239,6 +9291,20 @@ impl Services {
         input: intent_core::AgentDelegateInput,
         parent_agent_id: Option<AgentId>,
     ) -> Result<Value> {
+        crate::workspace_mutations::scope(self.agent_delegate_op_admitted(
+            workspace_id,
+            input,
+            parent_agent_id,
+        ))
+        .await
+    }
+
+    async fn agent_delegate_op_admitted(
+        &self,
+        workspace_id: WorkspaceId,
+        input: intent_core::AgentDelegateInput,
+        parent_agent_id: Option<AgentId>,
+    ) -> Result<Value> {
         // Resolve the child's first message up front so it can be persisted as
         // `AgentSession.initial_message` on the created session (harvested from
         // the `metadata.initialMessage` create param; served by
@@ -9298,6 +9364,9 @@ impl Services {
                 .agent_delegate_batch_op(workspace_id, input, parent_agent_id)
                 .await;
         }
+        // Keep the child's creation, group enrollment and initial send on
+        // the same side of the workspace teardown snapshot.
+        let _mutation = self.workspace_mutations.enter(&workspace_id)?;
         let wait_mode = input.wait_mode.clone();
         // Persist the task linkage + skipAutoCommit on the session so the
         // auto-commit-on-idle subscriber (LNI-1) can resolve `Linked-Note-Id:`
@@ -9380,6 +9449,10 @@ impl Services {
             Some(parent) => self.store.get_agent_session(parent).await.ok(),
             None => None,
         };
+        let _parent_mutation = parent_session
+            .as_ref()
+            .map(|s| self.workspace_mutations.enter(&s.workspace_id))
+            .transpose()?;
         // Depth guard (port of `MAX_DELEGATION_DEPTH` in the reference
         // `agent-interaction-tools.ts`): a caller already at the max depth
         // cannot delegate further. Enforced only when a caller is present
@@ -11201,6 +11274,22 @@ impl Services {
         agent_ids: Vec<String>,
         wait_mode: Option<String>,
     ) -> Result<Value> {
+        crate::workspace_mutations::scope(self.app_agents_wait_op_admitted(
+            workspace_id,
+            caller_agent_id,
+            agent_ids,
+            wait_mode,
+        ))
+        .await
+    }
+
+    async fn app_agents_wait_op_admitted(
+        &self,
+        workspace_id: WorkspaceId,
+        caller_agent_id: AgentId,
+        agent_ids: Vec<String>,
+        wait_mode: Option<String>,
+    ) -> Result<Value> {
         let wait_mode = match wait_mode.as_deref() {
             None | Some("immediate") => "immediate",
             Some(WAIT_MODE_AFTER_ALL) => WAIT_MODE_AFTER_ALL,
@@ -11247,6 +11336,8 @@ impl Services {
         let caller_home_ws = resolved_home
             .clone()
             .unwrap_or_else(|| workspace_id.clone());
+        let _parent_mutation = self.workspace_mutations.enter(&caller_home_ws)?;
+        let mut target_mutations = Vec::with_capacity(targets.len());
         // Validate every target and run the scope gate BEFORE any
         // side-effectful registration (mirrors the delegate path's up-front
         // gate): a rejection is side-effect free — no group, no watches.
@@ -11274,6 +11365,7 @@ impl Services {
             // alone, so the idle-target guard below cannot leak a foreign
             // agent's idle/nothing-pending state.
             crate::agent_subscriptions::check_watch_scope(&caller_home_ws, &session.workspace_id)?;
+            target_mutations.push(self.workspace_mutations.enter(&session.workspace_id)?);
             // Idle-target guard (monorepo#2972): same up-front validation
             // loop as the scope gate, so a rejection is side-effect free.
             self.check_idle_target_watchable(&session).await?;
@@ -13356,6 +13448,22 @@ impl Services {
         content: &str,
         message_metadata: Option<&Value>,
     ) -> Result<Value> {
+        crate::workspace_mutations::boxed(self.deliver_wake_message_admitted(
+            workspace_id,
+            agent_id,
+            content,
+            message_metadata,
+        ))
+        .await
+    }
+
+    async fn deliver_wake_message_admitted(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        content: &str,
+        message_metadata: Option<&Value>,
+    ) -> Result<Value> {
         // Up-front vanished-session gate (intent-hq/monorepo#2762): reject
         // nonexistent targets BEFORE any state change (the monorepo#564
         // contract). This covers the enqueue-only routes below
@@ -13406,6 +13514,7 @@ impl Services {
             }
         };
         let workspace_id = &workspace_id;
+        let _mutation = self.workspace_mutations.enter(workspace_id)?;
         // A2A sender header (intent-hq/intent#3721, monorepo#1015): the wake front door — the
         // `agent.wakeOrCreate` context message carries the daemon-stamped
         // attribution, and this path persists/enqueues directly (it never
@@ -16129,6 +16238,10 @@ impl Services {
     ///
     /// Returns `Error::InvalidParams` if the agent is not in pending interrupted state (or was already resolved); `Error::Internal` if a store operation fails.
     pub async fn resume_interrupted_agent(&self, agent_id: &AgentId) -> Result<()> {
+        crate::workspace_mutations::boxed(self.resume_interrupted_agent_admitted(agent_id)).await
+    }
+
+    async fn resume_interrupted_agent_admitted(&self, agent_id: &AgentId) -> Result<()> {
         // Verify the agent is in pending interrupted state (O(1) query)
         let interrupted = self
             .store
@@ -16141,6 +16254,7 @@ impl Services {
             })?;
 
         let workspace_id = interrupted.workspace_id.clone();
+        let _mutation = self.workspace_mutations.enter(&workspace_id)?;
 
         // ATOMIC CLAIM: mark the row as resumed FIRST. If another process already claimed
         // it, set_interrupted_resolution returns false and we bail loudly. This prevents
@@ -16446,6 +16560,10 @@ impl Services {
     /// Abandon an interrupted agent (INT-41 phase 2): mark row `abandoned`, append
     /// a system interruption message to the log, emit chat/agent events for live UIs.
     pub(crate) async fn abandon_interrupted_agent(&self, agent_id: &AgentId) -> Result<()> {
+        crate::workspace_mutations::boxed(self.abandon_interrupted_agent_admitted(agent_id)).await
+    }
+
+    async fn abandon_interrupted_agent_admitted(&self, agent_id: &AgentId) -> Result<()> {
         // Verify the agent is in pending interrupted state (O(1) lookup)
         let interrupted = self
             .store
@@ -16458,6 +16576,7 @@ impl Services {
             })?;
 
         let workspace_id = interrupted.workspace_id.clone();
+        let _mutation = self.workspace_mutations.enter(&workspace_id)?;
 
         // Rehydrate delegation groups for this workspace (idempotent, best-effort).
         let _ = self.rehydrate_delegation_groups(&workspace_id).await;
