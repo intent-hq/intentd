@@ -630,6 +630,243 @@ async fn answer_reverse(ws: &mut common::TlsWs, method: &str, workspace: &Worksp
     .expect("authenticated browser reverse request");
 }
 
+async fn default_browser_round_trip(
+    srv: &Server,
+    receiver: &mut common::TlsWs,
+    workspace: &WorkspaceId,
+) {
+    let registry = srv.reverse_registry.clone();
+    let params = json!({"workspaceId":workspace,"actions":[{"action":"screenshot"}]});
+    let request = intent_core::spawn_daemon(async move {
+        registry
+            .dispatch("browser.exec", params, ReverseTarget::Default)
+            .await
+    });
+    answer_reverse(receiver, "browser.exec", workspace).await;
+    assert_eq!(request.await.unwrap().unwrap()["success"], true);
+}
+
+#[intent_test_macros::daemon_test]
+async fn member_transport_browser_guest_first_ignores_other_member_change() {
+    let srv = start(WsOptions::default()).await;
+    let mut guest = Guest::connect(&srv, &"d5".repeat(32)).await;
+    let guest_id = guest
+        .call(
+            "client.hello",
+            json!({"clientId":"guest-first","capabilities":{"browserExec":true}}),
+        )
+        .await["result"]["clientId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(srv.reverse_registry.live_clients().is_empty());
+    let mut member = Guest::connect(&srv, &"e6".repeat(32)).await;
+    promote(&srv, &member.principal).await;
+    let member_id = member
+        .call(
+            "client.hello",
+            json!({"clientId":"member-second","capabilities":{"browserExec":true}}),
+        )
+        .await["result"]["clientId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let ws = WorkspaceId::new();
+    srv.store
+        .insert_workspace(&fixture_workspace(&ws))
+        .await
+        .unwrap();
+    assert_eq!(srv.reverse_registry.live_clients().len(), 1);
+    assert_eq!(
+        srv.reverse_registry
+            .resolve(&ReverseTarget::Default)
+            .unwrap()
+            .client_id
+            .as_str(),
+        member_id
+    );
+    default_browser_round_trip(&srv, &mut member.ws, &ws).await;
+
+    publish(&srv, &WorkspaceId::from(""), HOST_MEMBERS_CHANGED, json!({"principalId":member.principal.id,"hostRole":"member","action":"added","revision":1})).await;
+    // Observe the forbidden transition without re-hello, which would mask it
+    // by reapplying the correct per-request guest authority.
+    let guest_appeared = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut poll = tokio::time::interval(Duration::from_millis(10));
+        loop {
+            poll.tick().await;
+            if srv
+                .reverse_registry
+                .live_clients()
+                .iter()
+                .any(|c| c.client_id.as_str() == guest_id)
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .is_ok();
+    assert_eq!(
+        guest.call("principal.me", json!({})).await["result"]["hostRole"],
+        "guest"
+    );
+    assert!(srv
+        .reverse_registry
+        .dispatch(
+            "browser.exec",
+            json!({"workspaceId":ws,"actions":[{"action":"screenshot"}]}),
+            ReverseTarget::Client(intent_core::ClientId::from(guest_id.clone()))
+        )
+        .await
+        .is_err());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), guest.ws.next())
+            .await
+            .is_err(),
+        "guest received unexpected browser payload"
+    );
+    assert!(
+        !guest_appeared,
+        "another principal's membership event admitted the unchanged guest"
+    );
+    assert_eq!(srv.reverse_registry.live_clients().len(), 1);
+    assert_eq!(
+        srv.reverse_registry
+            .resolve(&ReverseTarget::Default)
+            .unwrap()
+            .client_id
+            .as_str(),
+        member_id
+    );
+    default_browser_round_trip(&srv, &mut member.ws, &ws).await;
+    assert_eq!(
+        guest.call("settings.list", json!({})).await["error"]["code"],
+        -32003
+    );
+    srv.ws.stop().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn member_transport_browser_demotion_unbinds_and_keeps_default_controls() {
+    let srv = start(WsOptions::default()).await;
+    let mut member = Guest::connect(&srv, &"d6".repeat(32)).await;
+    let mut remaining = Guest::connect(&srv, &"e7".repeat(32)).await;
+    for client in [&mut member, &mut remaining] {
+        promote(&srv, &client.principal).await;
+    }
+    let member_id = member
+        .call(
+            "client.hello",
+            json!({"clientId":"member-first","capabilities":{"browserExec":true}}),
+        )
+        .await["result"]["clientId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let remaining_id = remaining
+        .call(
+            "client.hello",
+            json!({"clientId":"member-second","capabilities":{"browserExec":true}}),
+        )
+        .await["result"]["clientId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut owner = connect_ws(srv.port, srv.cfg.clone()).await;
+    hello_browser_host(&mut owner, "owner-control").await;
+    let ws = WorkspaceId::new();
+    srv.store
+        .insert_workspace(&fixture_workspace(&ws))
+        .await
+        .unwrap();
+    assert_eq!(
+        srv.reverse_registry
+            .resolve(&ReverseTarget::Default)
+            .unwrap()
+            .client_id
+            .as_str(),
+        member_id
+    );
+    default_browser_round_trip(&srv, &mut member.ws, &ws).await;
+    srv.store
+        .remove_host_member(&member.principal.id)
+        .await
+        .unwrap();
+    publish(&srv, &WorkspaceId::from(""), HOST_MEMBERS_CHANGED, json!({"principalId":member.principal.id,"hostRole":"guest","action":"removed","revision":2})).await;
+    assert_eq!(
+        member.call("principal.me", json!({})).await["result"]["hostRole"],
+        "guest"
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while srv
+            .reverse_registry
+            .live_clients()
+            .iter()
+            .any(|c| c.client_id.as_str() == member_id)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("demoted member must leave the browser registry");
+    assert_eq!(
+        srv.reverse_registry
+            .resolve(&ReverseTarget::Default)
+            .unwrap()
+            .client_id
+            .as_str(),
+        remaining_id
+    );
+    default_browser_round_trip(&srv, &mut remaining.ws, &ws).await;
+    assert!(srv
+        .reverse_registry
+        .dispatch(
+            "browser.exec",
+            json!({"workspaceId":ws,"actions":[{"action":"screenshot"}]}),
+            ReverseTarget::Client(intent_core::ClientId::from(member_id))
+        )
+        .await
+        .is_err());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), member.ws.next())
+            .await
+            .is_err(),
+        "demoted member received unexpected browser payload"
+    );
+    assert_eq!(
+        remaining.call("principal.me", json!({})).await["result"]["hostRole"],
+        "member"
+    );
+    assert_eq!(
+        member.call("settings.list", json!({})).await["error"]["code"],
+        -32003
+    );
+    default_browser_round_trip(&srv, &mut owner, &WorkspaceId::chief()).await;
+    drop(remaining);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while srv
+            .reverse_registry
+            .live_clients()
+            .iter()
+            .any(|c| c.client_id.as_str() == remaining_id)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("remaining member disconnects");
+    assert_eq!(
+        srv.reverse_registry
+            .resolve(&ReverseTarget::Default)
+            .unwrap()
+            .client_id
+            .as_str(),
+        "owner-control"
+    );
+    default_browser_round_trip(&srv, &mut owner, &ws).await;
+    srv.ws.stop().await;
+}
+
 #[intent_test_macros::daemon_test]
 async fn member_transport_browser_reverse_scope_and_live_upgrade() {
     let srv = start(WsOptions::default()).await;

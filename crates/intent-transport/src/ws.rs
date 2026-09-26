@@ -1354,7 +1354,14 @@ impl WsInner {
                         role_changes = None;
                         continue;
                     }
-                    let allowed = crate::context::may_manage_workspaces(self.api.as_ref()).await;
+                    // Notifications run outside the incoming-frame caller scope.
+                    // Reuse this connection's authenticated caller for the role check.
+                    let allowed = crate::context::with_request_context(
+                        true,
+                        caller.clone(),
+                        crate::context::may_manage_workspaces(self.api.as_ref()),
+                    )
+                    .await;
                     reverse.set_browser_member(allowed);
                     if allowed {
                         if let Some(identity) = subs.hello_identity.clone() {
