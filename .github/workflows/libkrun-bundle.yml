@@ -1,0 +1,330 @@
+# Builds and publishes the GPU-less libkrun bundle that intentd-microvm-helper
+# loads on end-user Macs (aarch64-apple-darwin only; libkrun supports
+# Hypervisor.framework on arm64 only).
+#
+# Why our own build: the libkrun/homebrew-krun tap compiles libkrun with
+# GPU=1, which is the only reason its dylib links libvirglrenderer + libepoxy
+# from /opt/homebrew — unloadable on a machine without the tap. The sandbox
+# has no GPU path, so this workflow builds the pinned containers/libkrun tag
+# with `make BLK=1 NET=1 TIMESYNC=1` (GPU off) and compiles libkrunfw from
+# upstream's prebuilt aarch64 kernel bundle. Pins live in
+# libkrun-bundle/versions.toml.
+#
+# Output: libkrun-bundle-aarch64-apple-darwin.tar.gz (+ .sha256) containing
+#   libkrun.<ver>.dylib            real file, install name @loader_path/libkrun.1.dylib
+#   libkrun.1.dylib, libkrun.dylib symlinks to libkrun.<ver>.dylib (upstream
+#                                  `make install` layout; the helper reads the
+#                                  version off the canonical file name)
+#   libkrunfw.5.dylib              real file, install name @loader_path/libkrunfw.5.dylib
+#   libkrunfw.dylib                symlink to libkrunfw.5.dylib
+#   LICENSES/                      libkrun (Apache-2.0), libkrunfw (LGPL-2.1),
+#                                  Linux kernel (GPL-2.0) + SOURCES.md pointer
+#   MANIFEST.json                  tags, build flags, sha256 per file
+# published on a GitHub Release tagged libkrun-bundle-v<libkrun>+<libkrunfw>
+# (never marked latest). The build fails if `otool -L` on either dylib
+# references /opt/homebrew, libvirglrenderer or libepoxy, and smoke-tests the
+# bundle with `intentd-microvm-helper --probe --libkrun-dir <bundle>` built
+# from this checkout. Both dylibs are ad-hoc signed (install_name_tool
+# invalidates the build signature and arm64 refuses unsigned images); the
+# cloudlands-fe macOS build re-signs them with its identity.
+#
+# pull_request runs (path-filtered) build + gate only; push to main,
+# workflow_dispatch and a pushed `libkrun-bundle-v*` tag also publish. The tag
+# push is the way to publish from a branch (workflow_dispatch resolves the
+# workflow file on the default branch only); the pushed tag must equal the tag
+# computed from versions.toml. Re-running for an existing tag re-uploads with
+# --clobber (Rust builds are not bit-reproducible; MANIFEST.json carries the
+# hashes of what was uploaded).
+name: libkrun bundle
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ["libkrun-bundle-v*"]
+    paths:
+      - libkrun-bundle/versions.toml
+      - .github/workflows/libkrun-bundle.yml
+  pull_request:
+    paths:
+      - libkrun-bundle/versions.toml
+      - .github/workflows/libkrun-bundle.yml
+
+permissions:
+  contents: write
+
+env:
+  TARGET: aarch64-apple-darwin
+  BUNDLE: libkrun-bundle-aarch64-apple-darwin
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 60
+    outputs:
+      tag: ${{ steps.pins.outputs.tag }}
+      libkrun_version: ${{ steps.pins.outputs.libkrun_version }}
+      libkrunfw_version: ${{ steps.pins.outputs.libkrunfw_version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Read pins
+        id: pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          pin() { # $1=section $2=key
+            sed -nE "/^\[$1\]/,/^\[/ s/^$2 = \"([^\"]+)\".*/\1/p" libkrun-bundle/versions.toml | head -n1
+          }
+          libkrun_tag=$(pin libkrun tag)
+          libkrunfw_tag=$(pin libkrunfw tag)
+          for v in "$libkrun_tag" "$libkrunfw_tag"; do
+            if [[ ! "$v" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::versions.toml tag '$v' is not vX.Y.Z"; exit 1
+            fi
+          done
+          tag="libkrun-bundle-${libkrun_tag}+${libkrunfw_tag#v}"
+          if [[ "$GITHUB_REF" == refs/tags/* && "${GITHUB_REF#refs/tags/}" != "$tag" ]]; then
+            echo "::error::pushed tag '${GITHUB_REF#refs/tags/}' does not match versions.toml ('$tag')"; exit 1
+          fi
+          {
+            echo "libkrun_tag=$libkrun_tag"
+            echo "libkrun_version=${libkrun_tag#v}"
+            echo "libkrun_url=$(pin libkrun source_url)"
+            echo "libkrun_sha256=$(pin libkrun source_sha256)"
+            echo "libkrunfw_tag=$libkrunfw_tag"
+            echo "libkrunfw_version=${libkrunfw_tag#v}"
+            echo "libkrunfw_url=$(pin libkrunfw prebuilt_url)"
+            echo "libkrunfw_sha256=$(pin libkrunfw prebuilt_sha256)"
+            echo "tag=$tag"
+          } | tee -a "$GITHUB_OUTPUT"
+      # lld: libkrun cross-compiles its guest init blob against a Debian
+      # sysroot with Apple clang + ld.lld; xz: the Makefile unpacks the
+      # sysroot's Packages.xz with xzcat. Both may already be on the image.
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          brew list lld >/dev/null 2>&1 || brew install lld
+          brew list xz >/dev/null 2>&1 || brew install xz
+          echo "$(brew --prefix lld)/bin" >> "$GITHUB_PATH"
+          rustup toolchain install stable --profile minimal --no-self-update
+      - name: Fetch pinned sources
+        shell: bash
+        env:
+          LIBKRUN_URL: ${{ steps.pins.outputs.libkrun_url }}
+          LIBKRUN_SHA256: ${{ steps.pins.outputs.libkrun_sha256 }}
+          LIBKRUNFW_URL: ${{ steps.pins.outputs.libkrunfw_url }}
+          LIBKRUNFW_SHA256: ${{ steps.pins.outputs.libkrunfw_sha256 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/src/libkrun" "$RUNNER_TEMP/src/fw"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/src/libkrun.tar.gz" "$LIBKRUN_URL"
+          echo "$LIBKRUN_SHA256  $RUNNER_TEMP/src/libkrun.tar.gz" | shasum -a 256 -c -
+          tar -xzf "$RUNNER_TEMP/src/libkrun.tar.gz" -C "$RUNNER_TEMP/src/libkrun" --strip-components=1
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/src/libkrunfw.tgz" "$LIBKRUNFW_URL"
+          echo "$LIBKRUNFW_SHA256  $RUNNER_TEMP/src/libkrunfw.tgz" | shasum -a 256 -c -
+          tar -xzf "$RUNNER_TEMP/src/libkrunfw.tgz" -C "$RUNNER_TEMP/src/fw"
+          test -f "$RUNNER_TEMP/src/fw/libkrunfw/kernel.c"
+      # libkrunfw's Makefile compiles the shipped kernel.c bundle into
+      # libkrunfw.5.dylib (the kernel.c rule that would rebuild the kernel is
+      # never triggered because the file already exists).
+      - name: Build libkrunfw
+        shell: bash
+        run: |
+          set -euo pipefail
+          make -C "$RUNNER_TEMP/src/fw/libkrunfw"
+          test -f "$RUNNER_TEMP/src/fw/libkrunfw/libkrunfw.5.dylib"
+      # GPU deliberately off (see header). TIMESYNC=1 mirrors the tap. The
+      # source tree lives outside this checkout so the repo's
+      # rust-toolchain.toml pin does not apply; libkrun builds on stable.
+      # FEATURE_FLAGS overrides the Makefile's `cargo build --release
+      # $(FEATURE_FLAGS)`: upstream builds the whole workspace, which compiles
+      # the GPU-only krun-display / krun-input members whose bindgen build
+      # script links libclang dynamically and aborts on the runner
+      # (`Library not loaded: @rpath/libclang.dylib`). `-p libkrun` builds
+      # only the library with the same blk + net feature set.
+      - name: Build libkrun (GPU off)
+        shell: bash
+        env:
+          RUSTUP_TOOLCHAIN: stable
+          LIBKRUN_VERSION: ${{ steps.pins.outputs.libkrun_version }}
+        run: |
+          set -euo pipefail
+          make -C "$RUNNER_TEMP/src/libkrun" BLK=1 NET=1 TIMESYNC=1 \
+            FEATURE_FLAGS="-p libkrun --features blk,net"
+          test -f "$RUNNER_TEMP/src/libkrun/target/release/libkrun.$LIBKRUN_VERSION.dylib"
+      # Install names become @loader_path-relative so the dylibs load from
+      # whatever directory they are staged in; install_name_tool invalidates
+      # the build's ad-hoc signature, so re-sign (arm64 refuses unsigned
+      # images). The versioned file is the real one and the soname / bare
+      # spellings are symlinks (upstream `make install` layout), so the
+      # helper's probe can report the version from the canonical name.
+      - name: Assemble bundle
+        shell: bash
+        env:
+          LIBKRUN_TAG: ${{ steps.pins.outputs.libkrun_tag }}
+          LIBKRUN_VERSION: ${{ steps.pins.outputs.libkrun_version }}
+          LIBKRUN_URL: ${{ steps.pins.outputs.libkrun_url }}
+          LIBKRUN_SHA256: ${{ steps.pins.outputs.libkrun_sha256 }}
+          LIBKRUNFW_TAG: ${{ steps.pins.outputs.libkrunfw_tag }}
+          LIBKRUNFW_VERSION: ${{ steps.pins.outputs.libkrunfw_version }}
+          LIBKRUNFW_URL: ${{ steps.pins.outputs.libkrunfw_url }}
+          LIBKRUNFW_SHA256: ${{ steps.pins.outputs.libkrunfw_sha256 }}
+          RELEASE_TAG: ${{ steps.pins.outputs.tag }}
+        run: |
+          set -euo pipefail
+          src="$RUNNER_TEMP/src"
+          out="staging/$BUNDLE"
+          mkdir -p "$out/LICENSES"
+          krun="libkrun.$LIBKRUN_VERSION.dylib"
+          cp "$src/libkrun/target/release/$krun" "$out/$krun"
+          cp "$src/fw/libkrunfw/libkrunfw.5.dylib" "$out/libkrunfw.5.dylib"
+          chmod 0755 "$out"/*.dylib
+          install_name_tool -id @loader_path/libkrun.1.dylib "$out/$krun"
+          install_name_tool -id @loader_path/libkrunfw.5.dylib "$out/libkrunfw.5.dylib"
+          codesign --force --sign - "$out/$krun" "$out/libkrunfw.5.dylib"
+          ln -s "$krun" "$out/libkrun.1.dylib"
+          ln -s "$krun" "$out/libkrun.dylib"
+          ln -s libkrunfw.5.dylib "$out/libkrunfw.dylib"
+
+          cp "$src/libkrun/LICENSE" "$out/LICENSES/libkrun.LICENSE"
+          cp "$src/fw/libkrunfw/LICENSE-LGPL-2.1-only" "$out/LICENSES/libkrunfw.LICENSE-LGPL-2.1-only"
+          cp "$src/fw/libkrunfw/LICENSE-GPL-2.0-only" "$out/LICENSES/linux.LICENSE-GPL-2.0-only"
+          kernel=$(sed -nE 's/^KERNEL_VERSION[[:space:]]*=[[:space:]]*(.*)$/\1/p' "$src/fw/libkrunfw/Makefile" | head -n1)
+          cat > "$out/LICENSES/SOURCES.md" <<EOF
+          # Third-party components in this bundle
+
+          - **libkrun $LIBKRUN_VERSION** (Apache-2.0) — https://github.com/containers/libkrun/tree/$LIBKRUN_TAG
+            Built from $LIBKRUN_URL with \`make BLK=1 NET=1 TIMESYNC=1 FEATURE_FLAGS="-p libkrun --features blk,net"\` (GPU off).
+          - **libkrunfw $LIBKRUNFW_VERSION** (LGPL-2.1-only) — https://github.com/containers/libkrunfw/tree/$LIBKRUNFW_TAG
+            Compiled from upstream's prebuilt bundle $LIBKRUNFW_URL
+          - **Linux kernel $kernel** (GPL-2.0-only), embedded in libkrunfw.5.dylib.
+            Kernel source: https://cdn.kernel.org/pub/linux/kernel/v6.x/$kernel.tar.xz with the
+            patches and config under https://github.com/containers/libkrunfw/tree/$LIBKRUNFW_TAG
+            (\`patches/\`, \`config-libkrunfw_aarch64\`). Written offer: the complete corresponding
+            source is available at those URLs and from intent-hq on request.
+          EOF
+
+          sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
+          files=$(cd "$out" && find . -type f ! -name MANIFEST.json | sed 's|^\./||' | sort)
+          files_json=$(for f in $files; do jq -n --arg k "$f" --arg v "$(sha "$out/$f")" '{($k): $v}'; done | jq -s 'add')
+          jq -n \
+            --arg target "$TARGET" \
+            --arg release_tag "$RELEASE_TAG" \
+            --arg libkrun_tag "$LIBKRUN_TAG" --arg libkrun_version "$LIBKRUN_VERSION" \
+            --arg libkrun_url "$LIBKRUN_URL" --arg libkrun_sha256 "$LIBKRUN_SHA256" \
+            --arg libkrunfw_tag "$LIBKRUNFW_TAG" --arg libkrunfw_version "$LIBKRUNFW_VERSION" \
+            --arg libkrunfw_url "$LIBKRUNFW_URL" --arg libkrunfw_sha256 "$LIBKRUNFW_SHA256" \
+            --arg kernel "$kernel" \
+            --arg libkrun_version_file "libkrun.$LIBKRUN_VERSION.dylib" \
+            --arg commit "$GITHUB_SHA" --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg built_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --argjson files "$files_json" \
+            '{
+              schema: 1, target: $target, release_tag: $release_tag,
+              libkrun: { tag: $libkrun_tag, version: $libkrun_version, build_flags: ["BLK=1","NET=1","TIMESYNC=1"], gpu: false,
+                         source_url: $libkrun_url, source_sha256: $libkrun_sha256 },
+              libkrunfw: { tag: $libkrunfw_tag, version: $libkrunfw_version, abi: 5, kernel: $kernel,
+                           prebuilt_url: $libkrunfw_url, prebuilt_sha256: $libkrunfw_sha256 },
+              install_names: { ($libkrun_version_file): "@loader_path/libkrun.1.dylib", "libkrunfw.5.dylib": "@loader_path/libkrunfw.5.dylib" },
+              symlinks: { "libkrun.1.dylib": $libkrun_version_file, "libkrun.dylib": $libkrun_version_file, "libkrunfw.dylib": "libkrunfw.5.dylib" },
+              files: $files,
+              build: { runner: "macos-14", source_commit: $commit, workflow_run: $run, built_at: $built_at }
+            }' > "$out/MANIFEST.json"
+          ls -la "$out" "$out/LICENSES"
+          cat "$out/MANIFEST.json"
+      - name: "Gate: no Homebrew / GPU dependencies"
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=0
+          for lib in libkrun.dylib libkrunfw.5.dylib; do
+            echo "== otool -L $lib ($(readlink "staging/$BUNDLE/$lib" || echo regular file))"
+            otool -L "staging/$BUNDLE/$lib" | tee "otool-$lib.txt"
+            if grep -qE '/opt/homebrew|libvirglrenderer|libepoxy' "otool-$lib.txt"; then
+              echo "::error::$lib references a Homebrew or GPU library"; status=1
+            fi
+            codesign --verify --verbose=2 "staging/$BUNDLE/$lib"
+          done
+          exit "$status"
+      # Same toolchain provisioning as release-sitter.yml (bare rustup with
+      # the rust-toolchain.toml channel, components skipped).
+      - name: Provision Rust toolchain for the helper
+        shell: bash
+        run: |
+          channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
+          rustup toolchain install "$channel" --profile minimal --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
+      # The consumer's own loadability check: resolves the bundle directory,
+      # dlopens libkrun, resolves the boot symbols, prints one JSON line.
+      - name: "Smoke: intentd-microvm-helper --probe against the bundle"
+        shell: bash
+        env:
+          LIBKRUN_VERSION: ${{ steps.pins.outputs.libkrun_version }}
+        run: |
+          set -euo pipefail
+          cargo build --release -p intentd-microvm-helper --target "$TARGET"
+          out=$(./target/"$TARGET"/release/intentd-microvm-helper --probe --libkrun-dir "$PWD/staging/$BUNDLE")
+          echo "$out"
+          echo "$out" | jq -e --arg v "$LIBKRUN_VERSION" '.status == "ok" and .libkrun_version == $v' >/dev/null
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -czf "$BUNDLE.tar.gz" -C staging "$BUNDLE"
+          shasum -a 256 -b "$BUNDLE.tar.gz" > "$BUNDLE.tar.gz.sha256"
+          cp "staging/$BUNDLE/MANIFEST.json" "$BUNDLE.MANIFEST.json"
+          tar -tzvf "$BUNDLE.tar.gz"
+          cat "$BUNDLE.tar.gz.sha256"
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.BUNDLE }}
+          path: |
+            ${{ env.BUNDLE }}.tar.gz
+            ${{ env.BUNDLE }}.tar.gz.sha256
+            ${{ env.BUNDLE }}.MANIFEST.json
+          if-no-files-found: error
+
+  # Publish on push/dispatch only; PR runs stop at the gate. The release is
+  # never marked latest so daemon releases keep `releases/latest` semantics.
+  publish:
+    if: ${{ github.event_name != 'pull_request' }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: intentd-libkrun-bundle-publish
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ needs.build.outputs.tag }}
+      LIBKRUN_VERSION: ${{ needs.build.outputs.libkrun_version }}
+      LIBKRUNFW_VERSION: ${{ needs.build.outputs.libkrunfw_version }}
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.BUNDLE }}
+          path: artifacts
+      - name: Create or update the GitHub Release
+        env:
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$RELEASE_COMMIT" \
+              --latest=false \
+              --title "libkrun bundle $LIBKRUN_VERSION + libkrunfw $LIBKRUNFW_VERSION" \
+              --notes "GPU-less libkrun $LIBKRUN_VERSION + libkrunfw $LIBKRUNFW_VERSION for aarch64-apple-darwin, loaded by intentd-microvm-helper (built by .github/workflows/libkrun-bundle.yml from libkrun-bundle/versions.toml). Assets: $BUNDLE.tar.gz (+ .sha256) and the bundle's MANIFEST.json. Install names are @loader_path-relative; dylibs are ad-hoc signed and must be re-signed when staged in a signed app."
+          fi
+          gh release upload "$TAG" artifacts/* --repo "$GITHUB_REPOSITORY" --clobber
+          {
+            echo "## libkrun bundle published: \`$TAG\`"
+            echo ""
+            echo "- $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG"
+            echo "- \`$(cat artifacts/"$BUNDLE".tar.gz.sha256)\`"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1144,6 +1144,7 @@ mod tests {
             display_status: None,
             waiting: false,
             checkout_mode: None,
+            execution_environment: None,
             disk_usage: None,
             pending_delete_at: None,
             membership: None,

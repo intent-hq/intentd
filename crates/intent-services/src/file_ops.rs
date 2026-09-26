@@ -12,6 +12,8 @@
 //! a symlink-aware canonicalization gate re-verifies containment before any
 //! IO ([`enforce_symlink_containment`]; intent-hq/intent#3847) — the lexical
 //! check alone cannot see a symlink inside the workspace pointing outside it.
+//! Exception: listing a nonexistent directory is a clean [`Error::NotFound`]
+//! naming the path, not a leaked raw `os error`.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -564,11 +566,19 @@ pub(crate) fn get_attachment(
     Ok(result)
 }
 
-/// `file.list` → bare array of `{ name, type }`.
+/// `file.list` → bare array of `{ name, type }`. A nonexistent path is a
+/// clean `NotFound` naming the requested path, not a raw
+/// `internal error: No such file or directory (os error 2)`.
 pub(crate) fn list(root: &str, path: &str) -> Result<Value> {
     let full = resolve_within(root, path)?;
     let mut entries = Vec::new();
-    for entry in std::fs::read_dir(&full).map_err(|e: std::io::Error| io_err(&e))? {
+    for entry in std::fs::read_dir(&full).map_err(|e: std::io::Error| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            Error::NotFound(format!("Directory not found: {path}"))
+        } else {
+            io_err(&e)
+        }
+    })? {
         let entry = entry.map_err(|e: std::io::Error| io_err(&e))?;
         let name = entry.file_name().to_string_lossy().into_owned();
         let kind = if entry
@@ -866,6 +876,23 @@ mod tests {
         write(&root, "only.txt", "x").unwrap();
         let items = list(&root, ".").unwrap();
         assert_eq!(items.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn list_nonexistent_path_is_clean_not_found() {
+        let t = TempRoot::new();
+        let root = t.root();
+        let err = list(&root, "no/such/dir").unwrap_err();
+        match err {
+            Error::NotFound(msg) => {
+                assert!(msg.contains("no/such/dir"), "message names the path: {msg}");
+                assert!(
+                    !msg.contains("os error"),
+                    "raw io error must not leak: {msg}"
+                );
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
     }
 
     #[test]

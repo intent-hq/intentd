@@ -181,6 +181,7 @@ fn workspace(id: &WorkspaceId, title: &str) -> Workspace {
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        execution_environment: None,
         membership: None,
     }
 }

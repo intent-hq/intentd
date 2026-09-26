@@ -7,7 +7,7 @@ use crate::workspace_repo::{
     DELETE_WORKSPACE_SQL,
 };
 use crate::Store;
-use intent_core::{ClientHostInfo, ClientId, Error};
+use intent_core::{ClientHostInfo, ClientId, Error, WorkspaceId};
 use sqlx::Row;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -454,8 +454,20 @@ async fn deletion_indexes_upgrade_preserves_existing_data() {
         read_pool: crate::connect_read(&tmp.path).await.unwrap(),
         browser_tab_displayed: crate::browser_tab_repo::DisplayedOverlay::default(),
     };
-    let doomed = seed_workspace(&store, "doomed").await;
-    let keeper = seed_workspace(&store, "keeper").await;
+    // Raw rows: the current `insert_workspace` writes columns added after
+    // 0130 (`execution_environment`, 0132), which this legacy schema lacks.
+    let doomed = WorkspaceId::from("doomed");
+    let keeper = WorkspaceId::from("keeper");
+    for id in [&doomed, &keeper] {
+        sqlx::query(
+            "INSERT INTO workspace (id, title, branch, status, created_at, updated_at) \
+             VALUES (?1, ?1, 'feature/test', 'Active', 't0', 't0')",
+        )
+        .bind(&id.0)
+        .execute(store.write_pool())
+        .await
+        .expect("seed legacy workspace");
+    }
     seed_unrelated_metadata(&store).await;
     seed_heavy_workspace_children(&store, &doomed, 3).await;
     seed_heavy_workspace_children(&store, &keeper, 3).await;

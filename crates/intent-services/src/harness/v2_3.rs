@@ -44,8 +44,16 @@ impl Harness for V2_3 {
         V1.sandboxed_implementor_hint(sandbox_path, sandbox_branch)
     }
 
-    fn coordinator_cow_hint(&self) -> String {
-        V1.coordinator_cow_hint()
+    fn microvm_isolation_hint(&self, guest_dir: &str) -> String {
+        V1.microvm_isolation_hint(guest_dir)
+    }
+
+    fn coordinator_cow_hint(
+        &self,
+        uniform_isolation: bool,
+        standalone_cow_checkout: bool,
+    ) -> String {
+        V1.coordinator_cow_hint(uniform_isolation, standalone_cow_checkout)
     }
 
     fn specialist_role_section(&self, behavior_prompt: &str) -> String {

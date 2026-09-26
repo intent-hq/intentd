@@ -592,6 +592,9 @@ mod tests {
             .expect("message");
         store
             .insert_sandbox(&Sandbox {
+                last_merged_commit_sha: None,
+                merge_on_turn_end: true,
+                conflicting_paths: vec![],
                 id: "sb-1".to_string(),
                 workspace_id: ws.clone(),
                 agent_id: agent.clone(),
@@ -939,8 +942,11 @@ mod tests {
                 branch: "sandbox/agent-1".to_string(),
                 base_commit_sha: "abc".to_string(),
                 snapshot_commit_sha: None,
+                last_merged_commit_sha: None,
                 status: SandboxStatus::Created,
                 retry_count: 0,
+                merge_on_turn_end: true,
+                conflicting_paths: Vec::new(),
                 created_at: intent_core::clock::now_iso(),
                 updated_at: intent_core::clock::now_iso(),
             })

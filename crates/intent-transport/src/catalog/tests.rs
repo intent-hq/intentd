@@ -180,12 +180,16 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// (`sourceControl.identityProof.create` / `delete`, the GitHub gist or
 /// GitLab snippet proof by `provider`); the `github.identityProof.*` pair
 /// stays as byte-identical aliases.
-const EXPECTED_TOTAL_METHODS: usize = 394;
+///
+/// Execution environments (protocol 10.9): +4 router methods
+/// (`sandbox.profiles.list` / `sandbox.profiles.update` / `sandbox.options` /
+/// `sandbox.image.check`) on top of the 10.8 catalog (394).
+const EXPECTED_TOTAL_METHODS: usize = 398;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 336;
+const EXPECTED_ROUTER_METHODS: usize = 340;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 56;
@@ -759,6 +763,10 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "rules.update",
     "sandbox.cow.discard",
     "sandbox.cow.merge",
+    "sandbox.image.check",
+    "sandbox.options",
+    "sandbox.profiles.list",
+    "sandbox.profiles.update",
     "script.create",
     "script.list",
     "script.output",
@@ -1279,6 +1287,10 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "rules.update",
     "sandbox.cow.discard",
     "sandbox.cow.merge",
+    "sandbox.image.check",
+    "sandbox.options",
+    "sandbox.profiles.list",
+    "sandbox.profiles.update",
     "script.create",
     "script.list",
     "script.output",
@@ -1918,6 +1930,13 @@ mod unbound_owner_only_methods {
                 "sandbox.cow.merge",
                 json!({ "workspaceId": ws, "agentId": "a1" }),
             ),
+            (
+                "sandbox.image.check",
+                json!({ "manifestUrl": "http://127.0.0.1:9/manifest.json" }),
+            ),
+            ("sandbox.options", json!({})),
+            ("sandbox.profiles.list", json!({})),
+            ("sandbox.profiles.update", json!({})),
             (
                 "script.create",
                 json!({ "workspaceId": ws, "name": "n", "command": "true", "mode": "command" }),

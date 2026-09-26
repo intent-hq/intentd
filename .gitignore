@@ -1,6 +1,8 @@
 /target
 /.transfer-selection-contract
 lcov.info
+/guest-image/out/
+*.rlib
 coverage-summary.txt
 /packaging/libexec/tailcat
 /packaging/libexec/tailcat.exe

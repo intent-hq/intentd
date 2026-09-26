@@ -3,7 +3,8 @@
 use super::{sample_agent_session, sample_workspace, TempDb};
 use crate::Store;
 use intent_core::{
-    AgentId, BrowserTabInput, BrowserTabVisibility, ClientHostInfo, ClientId, Error, WorkspaceId,
+    now_iso, AgentId, BrowserTabInput, BrowserTabVisibility, ClientHostInfo, ClientId, Error,
+    WorkspaceId,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -671,6 +672,56 @@ async fn workspace_delete_sweeps_accumulated_agent_children() {
             vec![("keeper-agent".to_string(), "keeper-agent".to_string())]
         );
     }
+    assert_deleted(&store, &doomed, 3).await;
+}
+
+async fn seed_sandbox(store: &Store, workspace: &WorkspaceId, agent: &AgentId) {
+    store
+        .insert_sandbox(&crate::Sandbox {
+            id: format!("sb-{}", agent.0),
+            workspace_id: workspace.clone(),
+            agent_id: agent.clone(),
+            path: format!("/tmp/{}", agent.0), // tmp-hygiene: allow — stored string only
+            branch: format!("sb/{}", agent.0),
+            base_commit_sha: "abc123".to_string(),
+            snapshot_commit_sha: None,
+            last_merged_commit_sha: Some("def456".to_string()),
+            status: crate::SandboxStatus::ConflictBounced,
+            retry_count: 0,
+            merge_on_turn_end: true,
+            conflicting_paths: vec!["src/lib.rs".to_string()],
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        })
+        .await
+        .expect("seed sandbox");
+}
+
+/// A workspace's `sandbox` rows (one per agent, including the conflict-path
+/// and last-merged-commit columns) leave with the agent-session sweep: the
+/// bounded deletion path must not orphan them.
+#[tokio::test]
+async fn workspace_delete_removes_sandbox_rows() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let doomed = seed_workspace(&store, "doomed").await;
+    let keeper = seed_workspace(&store, "keeper").await;
+    let doomed_agent = seed_history(&store, &doomed, "doomed-agent", 3).await;
+    let keeper_agent = seed_history(&store, &keeper, "keeper-agent", 3).await;
+    seed_sandbox(&store, &doomed, &doomed_agent).await;
+    seed_sandbox(&store, &keeper, &keeper_agent).await;
+
+    store.delete_workspace(&doomed).await.expect("delete");
+
+    let remaining: Vec<String> = sqlx::query_scalar("SELECT workspace_id FROM sandbox")
+        .fetch_all(store.read_pool())
+        .await
+        .unwrap();
+    assert_eq!(remaining, vec!["keeper".to_string()]);
+    let kept = store.list_sandboxes(&keeper).await.expect("list keeper");
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].conflicting_paths, vec!["src/lib.rs".to_string()]);
+    assert_eq!(kept[0].last_merged_commit_sha.as_deref(), Some("def456"));
     assert_deleted(&store, &doomed, 3).await;
 }
 

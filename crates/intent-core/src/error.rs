@@ -58,6 +58,22 @@ pub enum Error {
         detail: String,
     },
 
+    /// A `workspace.create` `executionEnvironment` selection names a type
+    /// that is disabled in settings or unavailable on this host. Surfaces as
+    /// `-32602` with machine-readable `error.data = { code:
+    /// "execution-environment-unavailable", environment, reason }` (PROTOCOL
+    /// §5.1/§9).
+    #[error("execution environment '{environment}' unavailable: {reason}")]
+    ExecutionEnvironmentUnavailable { environment: String, reason: String },
+
+    /// A `workspace.create` `executionEnvironment` selection names a type the
+    /// daemon recognizes but has not implemented yet (`microvm`). Surfaces as
+    /// `-32603` with `error.data = { code:
+    /// "execution-environment-not-implemented", environment }` (PROTOCOL
+    /// §5.1/§9).
+    #[error("execution environment '{environment}' is not implemented yet")]
+    ExecutionEnvironmentNotImplemented { environment: String },
+
     /// The `voice.transcribe` provider API key is missing. Surfaces as
     /// `-32603` with the same "Internal error" message as the plain
     /// `Internal` shape plus machine-readable
@@ -483,7 +499,8 @@ impl Error {
             | Error::NotFound(_)
             | Error::InvalidInput(_)
             | Error::BaseRefUnresolvable { .. }
-            | Error::NotAFile { .. } => -32602,
+            | Error::NotAFile { .. }
+            | Error::ExecutionEnvironmentUnavailable { .. } => -32602,
             Error::CloneFailed { category, .. } => match category {
                 CloneErrorCategory::PathInvalid | CloneErrorCategory::DestinationExistsNonEmpty => {
                     -32602
@@ -507,7 +524,8 @@ impl Error {
             | Error::IdentityProof(_)
             | Error::IdentityUnverifiable { .. }
             // Unsupported: map to internal error for now
-            | Error::Unsupported(_) => -32603,
+            | Error::Unsupported(_)
+            | Error::ExecutionEnvironmentNotImplemented { .. } => -32603,
             Error::Conflict { .. } => -32005,
             Error::Forbidden(_) => -32003,
             Error::Invite(kind) => kind.code(),

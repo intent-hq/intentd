@@ -1753,6 +1753,15 @@ async fn cmd_serve(
     intent_services::cleanup_retired_settings(&store)
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    // One-time migration of the legacy CoW opt-in into the execution
+    // environment group: `workspace.cowIsolation = true` with an untouched
+    // `sandbox.*` group seeds `sandbox.cow.enabled = true` +
+    // `sandbox.defaultType = "cow"` into config.toml. Best-effort — a failed
+    // seed (e.g. read-only file) is logged and startup continues; the next
+    // boot retries.
+    if let Err(e) = intent_services::migrate_cow_isolation_to_sandbox(&settings_registry) {
+        tracing::warn!(error = %e, "cowIsolation → sandbox settings migration failed; continuing");
+    }
     // One-time migration for the trimmed `voice.vocabulary` default: a stored
     // row that only ever persisted the retired 17-term seed default is
     // deleted so the new `["Intent"]` default applies; user-modified lists
@@ -1845,6 +1854,10 @@ async fn cmd_serve(
     // process-wide probe warms intent-git's low-level result; this detached
     // handoff makes workspace/list capability reads cache-only.
     services.prewarm_cow_supported();
+    // Same for the microVM host probe (`intentd-microvm-helper --probe`):
+    // one bounded helper run at startup so `microvmSupported` /
+    // `sandbox.options` never spawn on the read path.
+    services.prewarm_microvm_supported();
     // The AgentManager multiplexes spawned agent processes over the ACP client
     // (§6.8). Its concrete EventSink bridges the client-served fs/permission
     // events (M3.5) onto the same bus, and `run_turn` drives the streaming
@@ -1889,6 +1902,9 @@ async fn cmd_serve(
             }
             root
         })
+        // microVM sandboxes (monorepo#1120, EE-5): guest-image cache +
+        // per-VM state live under the data dir.
+        .with_data_dir(config.data_dir.clone())
         // STAB-50: chief provider children spawn in the dedicated, empty
         // `<data_dir>/chief-cwd` directory instead of `/tmp`. Swept at
         // startup (no chief child is live yet) so leftovers a provider
@@ -5676,8 +5692,12 @@ fn spawn_sandbox_merge_retry_loop(services: Services) -> tokio::task::JoinHandle
             // INFO only when the sweep attempted work; skip-only passes
             // (e.g. a permanently capped sandbox every tick) log at debug so
             // they do not spam the log forever.
-            let attempted =
-                summary.merged + summary.conflicts + summary.blocked + summary.errors > 0;
+            let attempted = summary.merged
+                + summary.conflicts
+                + summary.blocked
+                + summary.errors
+                + summary.timed_out_lanes
+                > 0;
             if attempted {
                 tracing::info!(
                     merged = summary.merged,
@@ -5687,6 +5707,7 @@ fn spawn_sandbox_merge_retry_loop(services: Services) -> tokio::task::JoinHandle
                     skipped_busy = summary.skipped_busy,
                     skipped_raced = summary.skipped_raced,
                     errors = summary.errors,
+                    timed_out_lanes = summary.timed_out_lanes,
                     "merge-pending retry sweep completed"
                 );
             } else if !summary.is_empty() {
@@ -6862,6 +6883,11 @@ fn report_host_capabilities() {
 /// the cache so later `cow_probe` calls for the same volume pair are instant. Best-effort;
 /// failures are silent (the probe will be retried on demand if needed).
 fn probe_cow_at_startup(config: &Config) {
+    // CoW sandboxes are temporarily locked to macOS (the service layer's
+    // choke point reports unsupported without probing) — nothing to warm.
+    if cfg!(not(target_os = "macos")) {
+        return;
+    }
     let workspaces_root = config.data_dir.join("workspaces");
     if std::fs::create_dir_all(&workspaces_root).is_ok() {
         // Probe and cache; ignore errors (doctor will report them if persistent)
@@ -6873,6 +6899,12 @@ fn probe_cow_at_startup(config: &Config) {
 /// Non-fatal — `CoW` isolation degrades gracefully when unsupported (shared mode).
 /// Uses the cached result if available (populated by `probe_cow_at_startup`).
 fn report_cow_support(config: &Config) {
+    // Temporarily locked to macOS — mirror the service layer's choke point
+    // (which reports unsupported on other OSes without probing).
+    if cfg!(not(target_os = "macos")) {
+        println!("[--] CoW isolation: temporarily locked to macOS");
+        return;
+    }
     let workspaces_root = config.data_dir.join("workspaces");
     // Create workspaces dir if it doesn't exist (probe needs it)
     if !workspaces_root.exists() {

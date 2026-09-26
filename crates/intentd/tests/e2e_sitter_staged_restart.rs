@@ -502,6 +502,7 @@ async fn seed_workspace(data_dir: &Path) -> String {
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        execution_environment: None,
         membership: None,
     };
     store

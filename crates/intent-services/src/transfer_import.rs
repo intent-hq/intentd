@@ -1121,6 +1121,7 @@ fn workspace_for_materialize(workspace_id: &WorkspaceId, row: &serde_json::Value
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
+        execution_environment: None,
         membership: None,
     }
 }
@@ -1144,8 +1145,11 @@ fn sandbox_for_materialize(row: &serde_json::Value) -> Sandbox {
         branch: s("branch"),
         base_commit_sha: s("base_commit_sha"),
         snapshot_commit_sha: None,
+        last_merged_commit_sha: None,
         status: SandboxStatus::Created,
         retry_count: 0,
+        merge_on_turn_end: true,
+        conflicting_paths: vec![],
         created_at: s("created_at"),
         updated_at: s("updated_at"),
     }
@@ -3090,6 +3094,9 @@ mod tests {
             w
         };
         let src_sb = Sandbox {
+            last_merged_commit_sha: None,
+            merge_on_turn_end: true,
+            conflicting_paths: vec![],
             id: "sb-1".to_string(),
             workspace_id: ws.clone(),
             agent_id: AgentId(agent.to_string()),
