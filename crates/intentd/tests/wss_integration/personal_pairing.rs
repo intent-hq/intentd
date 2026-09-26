@@ -1,4 +1,4 @@
-//! Personal pairing uses the actual TLS admission, router, services and SQLite store.
+//! Personal pairing uses the actual TLS admission, router, services and `SQLite` store.
 use super::*;
 use intent_transport::{PairingSnapshot, ServerPairingInfo};
 use serde_json::json;
@@ -575,9 +575,12 @@ async fn personal_pairing_removal_racing_pair_and_upgrade_cannot_restore_access(
                 assert_closed(&mut admitted_before_remove.ws).await;
             }
             Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
-                assert_eq!(response.status().as_u16(), 401)
+                assert_eq!(response.status().as_u16(), 401);
             }
-            Err(_) => panic!("unexpected upgrade failure"),
+            Err(error) => panic!(
+                "unexpected upgrade error class: {:?}",
+                std::mem::discriminant(&error)
+            ),
         }
         assert!(srv
             .store
