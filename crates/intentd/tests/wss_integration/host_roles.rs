@@ -169,6 +169,16 @@ async fn member_workspace_tools_and_safe_context_over_wss() {
         let reply = member.call(method, params).await;
         assert!(reply.get("error").is_none(), "{method}: {reply}");
     }
+    let missing_script = member
+        .call(
+            "script.create",
+            json!({"workspaceId":WorkspaceId::new(),"name":"Missing workspace","command":"true","mode":"command"}),
+        )
+        .await;
+    assert_eq!(
+        missing_script["error"]["data"]["code"], "not-found",
+        "{missing_script}"
+    );
     #[cfg(unix)]
     {
         let missing = WorkspaceId::new();

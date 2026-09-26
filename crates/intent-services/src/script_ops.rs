@@ -268,6 +268,24 @@ impl ScriptManager {
         workspace_id: WorkspaceId,
         params: ScriptCreateParams,
     ) -> Result<Value> {
+        self.create_with_scope(workspace_id, params, false).await
+    }
+
+    /// Wire non-administrators may replace only definitions in this workspace.
+    pub(crate) async fn create_in_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+        params: ScriptCreateParams,
+    ) -> Result<Value> {
+        self.create_with_scope(workspace_id, params, true).await
+    }
+
+    async fn create_with_scope(
+        &self,
+        workspace_id: WorkspaceId,
+        params: ScriptCreateParams,
+        scoped: bool,
+    ) -> Result<Value> {
         let id = params
             .script_id
             .filter(|s| !s.is_empty())
@@ -277,19 +295,41 @@ impl ScriptManager {
         // `updatedAt` stamped (FE parity), and — unlike the FE, whose manager
         // re-reads definitions from disk — the daemon must tear down the old
         // supervisor/PTY here so a running replaced script is never orphaned.
+        let (source, created_at, updated_at) = {
+            let scripts = self.scripts.lock().unwrap();
+            match scripts.get(&(workspace_id.clone(), id.clone())) {
+                Some(old) => (
+                    old.def.source.clone(),
+                    old.def.created_at.clone(),
+                    Some(now_iso()),
+                ),
+                None => ("user".to_string(), now_iso(), None),
+            }
+        };
+        let def = Script {
+            id: id.clone(),
+            workspace_id: workspace_id.as_str().to_string(),
+            name: params.name,
+            command: params.command,
+            cwd: params.cwd,
+            env: params.env,
+            mode: params.mode,
+            category: params.category,
+            source,
+            auto_start: params.auto_start,
+            created_at,
+            updated_at,
+        };
+        // Recheck scope atomically before runtime teardown: another request
+        // may have claimed this id since the service's preflight lookup.
+        if scoped {
+            self.store.upsert_script_in_workspace(&def).await?;
+        }
         let existing = self
             .scripts
             .lock()
             .unwrap()
             .remove(&(workspace_id.clone(), id.clone()));
-        let (source, created_at, updated_at) = match &existing {
-            Some(old) => (
-                old.def.source.clone(),
-                old.def.created_at.clone(),
-                Some(now_iso()),
-            ),
-            None => ("user".to_string(), now_iso(), None),
-        };
         let change = if existing.is_some() {
             "updated"
         } else {
@@ -311,23 +351,11 @@ impl ScriptManager {
                 }
             }
         }
-        let def = Script {
-            id: id.clone(),
-            workspace_id: workspace_id.as_str().to_string(),
-            name: params.name,
-            command: params.command,
-            cwd: params.cwd,
-            env: params.env,
-            mode: params.mode,
-            category: params.category,
-            source,
-            auto_start: params.auto_start,
-            created_at,
-            updated_at,
-        };
         // Persist first (FE `upsertScript` parity — definitions survive a
         // daemon restart); the runtime registry only registers what is durable.
-        self.store.upsert_script(&def).await?;
+        if !scoped {
+            self.store.upsert_script(&def).await?;
+        }
         self.scripts.lock().unwrap().insert(
             (workspace_id.clone(), id),
             ManagedScript {
@@ -3718,6 +3746,51 @@ mod tests {
             0,
             "removed script is unpersisted"
         );
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn scoped_script_upsert_refuses_scope_race_without_stopping_running_predecessor() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let id = create_simple(&h, "Original", SERVICE_CMD, ScriptMode::Service).await;
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .unwrap();
+        let running = await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+        let pid = running["data"]["pid"].clone();
+
+        // Model another request claiming the durable id after the service's
+        // preflight. Invoke the scoped manager directly to test its final fence.
+        let mut claimed = h.services.store.list_all_scripts().await.unwrap().remove(0);
+        claimed.workspace_id = WorkspaceId::chief().to_string();
+        h.services.store.upsert_script(&claimed).await.unwrap();
+        let result = h
+            .services
+            .script_manager()
+            .create_in_workspace(
+                h.ws.clone(),
+                ScriptCreateParams {
+                    name: "Replacement".into(),
+                    command: "echo replacement".into(),
+                    script_id: Some(id.clone()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(Error::NotFound(_))), "{result:?}");
+        let state = h
+            .services
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .unwrap();
+        assert_eq!(state["status"], "running");
+        assert_eq!(state["pid"], pid);
+        assert_eq!(
+            h.services.store.script_workspace(&id).await.unwrap(),
+            Some(WorkspaceId::chief())
+        );
+        h.services.script_stop(h.ws.clone(), id).await.unwrap();
     }
 
     /// Regression: `script.create` upserting an id whose script is running

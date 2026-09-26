@@ -18700,6 +18700,22 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_workspace_manager(&workspace_id, "script.create")
                 .await?;
+            // Script definitions have no workspace foreign key; refuse member
+            // creation for a missing workspace before persisting or registering.
+            self.require_member(&workspace_id).await?;
+            if capability::gated_collaborator_caller("script.create")?.is_some() {
+                if let Some(id) = params.script_id.as_deref() {
+                    if self
+                        .store
+                        .script_workspace(id)
+                        .await?
+                        .is_some_and(|actual| actual != workspace_id)
+                    {
+                        return Err(Error::NotFound(format!("script {id}")));
+                    }
+                }
+                return mgr.create_in_workspace(workspace_id, params).await;
+            }
             mgr.create(workspace_id, params).await
         })
     }

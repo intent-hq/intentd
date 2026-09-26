@@ -158,6 +158,89 @@ async fn member_tools_script_and_terminal_lists_admit_host_members() {
 }
 
 #[tokio::test]
+async fn member_script_create_refuses_missing_workspace_without_persisting() {
+    let tmp = TempDb::new();
+    let (svc, _, member) = fixture(&tmp).await;
+    let missing = WorkspaceId::new();
+    let result = with_caller(
+        caller(&member),
+        svc.script_create(
+            missing.clone(),
+            intent_core::ScriptCreateParams {
+                name: "Missing workspace".into(),
+                command: "true".into(),
+                mode: intent_core::ScriptMode::Command,
+                ..Default::default()
+            },
+        ),
+    )
+    .await;
+    assert!(matches!(result, Err(Error::NotFound(_))), "{result:?}");
+    assert!(svc.store.list_all_scripts().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn member_script_create_cannot_replace_definition_from_another_workspace() {
+    let tmp = TempDb::new();
+    let (svc, _, member) = fixture(&tmp).await;
+    let target = WorkspaceId::new();
+    svc.store
+        .insert_workspace(&workspace(&target))
+        .await
+        .unwrap();
+    for source in [WorkspaceId::chief(), WorkspaceId::new()] {
+        let original = with_caller(
+            Caller::Daemon,
+            svc.script_create(
+                source.clone(),
+                intent_core::ScriptCreateParams {
+                    name: "Owner script".into(),
+                    command: "original command".into(),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let id = original["id"].as_str().unwrap();
+        let replaced = with_caller(
+            caller(&member),
+            svc.script_create(
+                target.clone(),
+                intent_core::ScriptCreateParams {
+                    name: "Replacement".into(),
+                    command: "replacement command".into(),
+                    script_id: Some(id.into()),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await;
+        assert!(matches!(replaced, Err(Error::NotFound(_))), "{replaced:?}");
+        let scripts = svc.store.list_all_scripts().await.unwrap();
+        let saved = scripts.iter().find(|s| s.id == id).unwrap();
+        assert_eq!(saved.workspace_id, source.as_str());
+        assert_eq!(saved.command, "original command");
+
+        // Exercise the atomic write guard independently of the service's
+        // preflight, covering an id claimed between the lookup and insert.
+        let mut moved = saved.clone();
+        moved.workspace_id = target.to_string();
+        moved.command = "replacement command".into();
+        assert!(matches!(
+            svc.store.upsert_script_in_workspace(&moved).await,
+            Err(Error::NotFound(_))
+        ));
+        assert_eq!(svc.store.script_workspace(id).await.unwrap(), Some(source));
+        // Preserve the owner/internal store API; subsequent updates within
+        // that workspace remain legal through the scoped entry point too.
+        svc.store.upsert_script(&moved).await.unwrap();
+        moved.name = "Scoped update".into();
+        svc.store.upsert_script_in_workspace(&moved).await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn member_tools_share_configured_mcp_without_admin_authority() {
     let tmp = TempDb::new();
     let (svc, _, member) = fixture(&tmp).await;

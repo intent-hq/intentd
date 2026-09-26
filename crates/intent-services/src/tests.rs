@@ -18711,9 +18711,8 @@ pub(crate) mod pr {
         assert!(forge.seen_user_searches.lock().unwrap().is_empty());
     }
 
-    /// `github.users.search` is administrator-only: a collaborator wire
-    /// caller is refused `-32003` before the forge is reached (default-deny,
-    /// the method is not in `COLLABORATOR_METHODS`).
+    /// Shared forge search admits host members, but a known workspace guest
+    /// is refused before the forge is reached. Unknown principals also refuse.
     #[tokio::test]
     async fn github_users_search_refuses_collaborator_caller() {
         let forge = Arc::new(StubForge::default());
@@ -18722,6 +18721,17 @@ pub(crate) mod pr {
             principal_id: intent_core::PrincipalId::new(),
             host_role: intent_core::HostRole::Guest,
         };
+        let unknown = intent_core::with_caller(
+            collaborator.clone(),
+            svc.github_users_search("octo".into(), None),
+        )
+        .await
+        .expect_err("unknown principal must be refused");
+        assert!(matches!(unknown, Error::NotFound(_)), "{unknown:?}");
+        let mut guest = svc.store.get_primary_principal().await.unwrap();
+        guest.id = collaborator.principal_id().unwrap().clone();
+        guest.is_primary = false;
+        svc.store.upsert_principal(&guest).await.unwrap();
         let err =
             intent_core::with_caller(collaborator, svc.github_users_search("octo".into(), None))
                 .await
