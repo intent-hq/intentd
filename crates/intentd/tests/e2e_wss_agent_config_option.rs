@@ -258,6 +258,63 @@ where
     panic!("no agent:stream:end for {agent_id}");
 }
 
+/// Follow ordinary id-only message notifications to the persisted rows,
+/// matching the live client's conversation refresh path.
+async fn effort_notices_until_end<S>(
+    sub: &mut WebSocketStream<S>,
+    rpc: &mut WebSocketStream<S>,
+    workspace_id: &str,
+    agent_id: &str,
+) -> Vec<Value>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut message_ids = Vec::new();
+    for _ in 0..120 {
+        let frame = wss_event(sub, 30).await;
+        assert_eq!(frame["jsonrpc"], "2.0");
+        let event = &frame["params"]["event"];
+        if event["data"]["agentId"].as_str() != Some(agent_id) {
+            continue;
+        }
+        if event["type"] == "agent:message" && event["data"]["role"] == "system" {
+            message_ids.push(
+                event["data"]["messageId"]
+                    .as_str()
+                    .expect("message id")
+                    .to_string(),
+            );
+        }
+        if event["type"] == "agent:stream:end" {
+            let history = wss_rpc(
+                rpc,
+                900,
+                "agent.getConversation",
+                json!({
+                    "workspaceId": workspace_id, "agentId": agent_id,
+                }),
+            )
+            .await;
+            let messages = history["messages"].as_array().expect("conversation rows");
+            return message_ids
+                .iter()
+                .filter_map(|id| {
+                    let row = messages
+                        .iter()
+                        .find(|m| m["id"] == *id)
+                        .expect("event identifies a persisted row");
+                    (row["metadata"]["type"] == "effort_changed").then(|| {
+                        json!({
+                            "messageId": id, "role": row["role"], "metadata": row["metadata"],
+                        })
+                    })
+                })
+                .collect();
+        }
+    }
+    panic!("no agent:stream:end for {agent_id}");
+}
+
 /// Mock-agent gate (parity with the WSS lifecycle suite).
 fn gate() -> Option<String> {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
@@ -1779,7 +1836,11 @@ async fn reasoning_effort_applied_and_reapplied_over_wss() {
     )
     .await;
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
-    await_stream_end(&mut sub, &agent_id).await;
+    assert!(
+        effort_notices_until_end(&mut sub, &mut rpc, &ws_id, &agent_id)
+            .await
+            .is_empty()
+    );
 
     // One call, under the adapter's own config id, with the stored effort.
     let log = read_config_log(&config_log);
@@ -1796,7 +1857,11 @@ async fn reasoning_effort_applied_and_reapplied_over_wss() {
     )
     .await;
     assert_eq!(sent2["success"], true, "second sendMessage ok: {sent2}");
-    await_stream_end(&mut sub, &agent_id).await;
+    assert!(
+        effort_notices_until_end(&mut sub, &mut rpc, &ws_id, &agent_id)
+            .await
+            .is_empty()
+    );
     assert_eq!(
         read_config_log(&config_log).len(),
         1,
@@ -1826,7 +1891,31 @@ async fn reasoning_effort_applied_and_reapplied_over_wss() {
     )
     .await;
     assert_eq!(sent3["success"], true, "third sendMessage ok: {sent3}");
-    await_stream_end(&mut sub, &agent_id).await;
+    let notices = effort_notices_until_end(&mut sub, &mut rpc, &ws_id, &agent_id).await;
+    assert_eq!(notices.len(), 1, "one applied effort notice: {notices:?}");
+    assert_eq!(
+        notices[0]["metadata"],
+        json!({
+            "type": "effort_changed", "from": "high", "to": "low",
+        })
+    );
+    let history = wss_rpc(
+        &mut rpc,
+        15,
+        "agent.getConversation",
+        json!({
+            "workspaceId": ws_id, "agentId": agent_id,
+        }),
+    )
+    .await;
+    let saved = history["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["metadata"]["type"] == "effort_changed")
+        .expect("saved notice");
+    assert_eq!(saved["id"], notices[0]["messageId"]);
+    assert_eq!(saved["metadata"], notices[0]["metadata"]);
 
     let log = read_config_log(&config_log);
     assert_eq!(log.len(), 2, "the change was applied: {log:?}");
@@ -1836,6 +1925,34 @@ async fn reasoning_effort_applied_and_reapplied_over_wss() {
         "the adapter's own spelling is sent, not the caller's: {:?}",
         log[1]
     );
+    // Casing-only selections and changes reverted before a prompt remain silent.
+    for effort in ["HIGH", "LoW"] {
+        wss_rpc(
+            &mut rpc,
+            16,
+            "agent.update",
+            json!({
+                "workspaceId": ws_id, "agentId": agent_id,
+                "changes": {"reasoningEffort": effort},
+            }),
+        )
+        .await;
+    }
+    wss_rpc(
+        &mut rpc,
+        17,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id, "agentId": agent_id, "content": "reverted selection",
+        }),
+    )
+    .await;
+    assert!(
+        effort_notices_until_end(&mut sub, &mut rpc, &ws_id, &agent_id)
+            .await
+            .is_empty()
+    );
+    assert_eq!(read_config_log(&config_log).len(), 2);
 }
 
 /// Pi 0.0.34 returns thinking options for the effective model. Opening on a
@@ -2262,11 +2379,286 @@ async fn reasoning_effort_is_a_no_op_without_a_thought_level_option() {
     )
     .await;
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
-    await_stream_end(&mut sub, &agent_id).await;
+    assert!(
+        effort_notices_until_end(&mut sub, &mut rpc, &ws_id, &agent_id)
+            .await
+            .is_empty()
+    );
 
     assert!(
         read_config_log(&config_log).is_empty(),
         "no config option advertised → nothing sent: {:?}",
         read_config_log(&config_log)
     );
+}
+
+/// The running turn retains its applied setting; the next turn publishes
+/// one durable notice. Auto then restores the original default after either
+/// cold session/load (which reports the last override) or session/new replay.
+async fn effort_notice_restart_case(load: bool) {
+    let Some(script) = gate() else { return };
+    let dir = temp_data_dir();
+    let prompt_log = dir.path().join("effort-prompts.jsonl");
+    let config_log = dir.path().join("effort-config.jsonl");
+    let mut behavior = json!({
+        "blockUntilCancel": true,
+        "advertiseLoadSession": load,
+        "loadedEffort": "low",
+        "rejectEffortValues": ["ultra"],
+        "modelSelection": {
+            "defaultModel": "reasoner", "models": ["reasoner"],
+            "thinking": {"reasoner": {"current": "medium", "values": ["none", "low", "medium", "high", "ultra"]}},
+        },
+    });
+    let launch = |behavior: &Value| {
+        spawn_serve(
+            dir.path(),
+            "both",
+            &[
+                ("INTENTD_AUTH_TOKEN", TOKEN),
+                ("MOCK_AGENT_SCRIPT_PATH", &script),
+                ("MOCK_AGENT_BEHAVIOR", &behavior.to_string()),
+                ("MOCK_AGENT_PROMPT_LOG", &prompt_log.to_string_lossy()),
+                ("MOCK_AGENT_CONFIG_LOG", &config_log.to_string_lossy()),
+            ],
+        )
+    };
+    let mut daemon = Daemon {
+        child: launch(&behavior),
+    };
+    let socket = dir.path().join("intentd.sock");
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let mut sub = connect_ws(port, cfg).await;
+    let workspace = wss_rpc(
+        &mut rpc,
+        1,
+        "workspace.create",
+        json!({"title":"Effort restart", "noPrompt":true}),
+    )
+    .await;
+    let ws_id = workspace["workspace"]["id"].as_str().unwrap();
+    wss_rpc(
+        &mut sub,
+        2,
+        "events.subscribe",
+        json!({"workspaceId":ws_id,"eventTypes":["agent:*"]}),
+    )
+    .await;
+    let created = wss_rpc(
+        &mut rpc,
+        3,
+        "agent.create",
+        json!({
+            "workspaceId":ws_id,"name":"Effort restart","provider":"mock","reasoningEffort":"high",
+        }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap();
+    wss_rpc(
+        &mut rpc,
+        4,
+        "agent.sendMessage",
+        json!({"workspaceId":ws_id,"agentId":agent_id,"content":"first turn"}),
+    )
+    .await;
+    // The fixture's first prompt parks after a real assistant chunk.
+    loop {
+        let frame = wss_event(&mut sub, 30).await;
+        assert!(
+            !frame.to_string().contains("effort_changed"),
+            "initial baseline is silent"
+        );
+        if frame.to_string().contains("streaming-before-cancel") {
+            break;
+        }
+    }
+    wss_rpc(
+        &mut rpc,
+        5,
+        "agent.update",
+        json!({"workspaceId":ws_id,"agentId":agent_id,"changes":{"reasoningEffort":"low"}}),
+    )
+    .await;
+    let history = wss_rpc(
+        &mut rpc,
+        6,
+        "agent.getConversation",
+        json!({"workspaceId":ws_id,"agentId":agent_id}),
+    )
+    .await;
+    assert!(
+        !history.to_string().contains("effort_changed"),
+        "no premature row"
+    );
+    assert_eq!(
+        read_config_log(&config_log).len(),
+        1,
+        "active turn did not reapply effort"
+    );
+    assert_eq!(read_config_log(&prompt_log)[0]["effectiveEffort"], "high");
+    wss_rpc(
+        &mut rpc,
+        7,
+        "agent.stop",
+        json!({"workspaceId":ws_id,"agentId":agent_id}),
+    )
+    .await;
+    assert!(
+        effort_notices_until_end(&mut sub, &mut rpc, ws_id, agent_id)
+            .await
+            .is_empty()
+    );
+    wss_rpc(
+        &mut rpc,
+        8,
+        "agent.sendMessage",
+        json!({"workspaceId":ws_id,"agentId":agent_id,"content":"second turn"}),
+    )
+    .await;
+    let notices = effort_notices_until_end(&mut sub, &mut rpc, ws_id, agent_id).await;
+    assert_eq!(notices.len(), 1);
+    assert_eq!(
+        notices[0]["metadata"],
+        json!({"type":"effort_changed","from":"high","to":"low"})
+    );
+    assert_eq!(read_config_log(&prompt_log)[1]["effectiveEffort"], "low");
+
+    daemon.child.kill().unwrap();
+    daemon.child.wait().unwrap();
+    behavior["blockUntilCancel"] = json!(false);
+    daemon.child = launch(&behavior);
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    rpc = connect_ws(port, cfg.clone()).await;
+    sub = connect_ws(port, cfg).await;
+    wss_rpc(
+        &mut sub,
+        9,
+        "events.subscribe",
+        json!({"workspaceId":ws_id,"eventTypes":["agent:*"]}),
+    )
+    .await;
+    wss_rpc(
+        &mut rpc,
+        10,
+        "agent.update",
+        json!({"workspaceId":ws_id,"agentId":agent_id,"changes":{"reasoningEffort":null}}),
+    )
+    .await;
+    wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({"workspaceId":ws_id,"agentId":agent_id,"content":"after restart"}),
+    )
+    .await;
+    let after = effort_notices_until_end(&mut sub, &mut rpc, ws_id, agent_id).await;
+    assert_eq!(after.len(), 1, "one notice after restart: {after:?}");
+    assert_eq!(
+        after[0]["metadata"],
+        json!({"type":"effort_changed","from":"low","to":null})
+    );
+    let prompts = read_config_log(&prompt_log);
+    assert_eq!(
+        prompts[2]["effectiveEffort"], "medium",
+        "Auto must not become the loaded low override"
+    );
+    assert!(
+        !prompts[2]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Effort changed"),
+        "not replayed to provider"
+    );
+    if !load {
+        assert!(prompts[2]["text"]
+            .as_str()
+            .unwrap()
+            .contains("<supervisor>"));
+    }
+    let history = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getConversation",
+        json!({"workspaceId":ws_id,"agentId":agent_id}),
+    )
+    .await;
+    let saved: Vec<_> = history["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["metadata"]["type"] == "effort_changed")
+        .collect();
+    assert_eq!(saved.len(), 2);
+    assert_eq!(saved[0]["id"], notices[0]["messageId"]);
+    assert_eq!(saved[1]["id"], after[0]["messageId"]);
+    wss_rpc(
+        &mut rpc,
+        13,
+        "agent.sendMessage",
+        json!({"workspaceId":ws_id,"agentId":agent_id,"content":"still auto"}),
+    )
+    .await;
+    assert!(
+        effort_notices_until_end(&mut sub, &mut rpc, ws_id, agent_id)
+            .await
+            .is_empty()
+    );
+    // An advertised but rejected effort still completes on the old setting,
+    // without a live notice or an additional persisted row.
+    wss_rpc(
+        &mut rpc,
+        14,
+        "agent.update",
+        json!({"workspaceId":ws_id,"agentId":agent_id,"changes":{"reasoningEffort":"ultra"}}),
+    )
+    .await;
+    wss_rpc(
+        &mut rpc,
+        15,
+        "agent.sendMessage",
+        json!({"workspaceId":ws_id,"agentId":agent_id,"content":"rejected effort"}),
+    )
+    .await;
+    assert!(
+        effort_notices_until_end(&mut sub, &mut rpc, ws_id, agent_id)
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        read_config_log(&prompt_log).last().unwrap()["effectiveEffort"],
+        "medium"
+    );
+    let history = wss_rpc(
+        &mut rpc,
+        16,
+        "agent.getConversation",
+        json!({"workspaceId":ws_id,"agentId":agent_id}),
+    )
+    .await;
+    assert_eq!(
+        history["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["metadata"]["type"] == "effort_changed")
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn effort_notice_is_deferred_and_restores_auto_after_load() {
+    effort_notice_restart_case(true).await;
+}
+
+#[tokio::test]
+async fn effort_notice_is_deferred_and_excluded_from_recreated_history() {
+    effort_notice_restart_case(false).await;
 }
