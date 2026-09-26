@@ -688,10 +688,13 @@ async fn invite_link_identity_join_and_removal_over_wss() {
     let mut owner = connect_ws(port, cfg.clone(), TOKEN).await;
     // This fixture exercises legacy pin defaults from the cached primary.
     // Invite issuance no longer synchronously links a repository profile.
+    let expected_owner_id = OWNER_ID.to_string();
     timeout(Duration::from_secs(10), async {
         loop {
             let me = wss_rpc(&mut owner, 199, "principal.me", json!({})).await;
-            if me["result"]["identity"]["externalUserId"] == OWNER_ID.to_string() {
+            if me["result"]["identity"]["externalUserId"].as_str()
+                == Some(expected_owner_id.as_str())
+            {
                 break;
             }
             // timing-guard: wait for the configured fixture's startup profile refresh
