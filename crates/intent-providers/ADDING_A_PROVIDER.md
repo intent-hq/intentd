@@ -19,7 +19,7 @@ touch; treat the full list as the definition of done for a new provider.
       (`workspace_naming_tool_reference`, `crates/intent-services/src/agent_manager.rs`)
 - [ ] Tool-name/kind derivation extended from captured ACP traffic
       (`derive_tool_name` / `tool_kind_word`, `crates/intent-acp/src/session.rs`)
-- [x] Codex native-subagent denial through the selected npx runtime (§6)
+- [x] Codex native-subagent denial through the vendored adapter (§6)
 - [ ] Policy items for new providers: native-subagent denial, V8 heap cap (`runtime`), model-id resolution
 - [ ] Unit tests per area + WSS e2e (`crates/intentd/tests/`), gates green
       (`cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`)
@@ -70,7 +70,7 @@ needs. Fields that matter most:
   `auth_error_patterns` (stderr matching), `login_command_hint`, `login_docs_url`.
 - **npx fields** — `fallback_npx_package` (spawn `npx -y <pkg>` only when no local binary
   resolves) vs `npx_only_package` (spawn via npx with a version we pin, skipping
-  auto-discovery entirely; claude-code, codex, pi). The one npx-only exception, for providers
+  auto-discovery entirely; claude-code, pi). The one npx-only exception, for providers
   that opt in via `npx_only_honors_path_override` (claude-code), is a valid
   `providers.paths[id]` override (absolute + executable): it is exec'd directly in place
   of the pinned npx spawn (`resolve_npx_only_override`, intent-hq/monorepo#4352) and the
@@ -82,6 +82,24 @@ needs. Fields that matter most:
   compatible runtime and policy described in §6. Resolution:
   `resolve_npx_only` in `crates/intent-services/src/agent_manager.rs` and the
   `npx_fallback_*` fields on `SpawnOptions` (`crates/intent-acp/src/spawn.rs`).
+- **Codex adapter** — `crates/intent-providers/vendor/codex-acp` contains upstream source, its Apache license,
+  an npm lockfile, and `upstream.json` recording the imported commit and local changes.
+  Intent embeds the self-contained JavaScript bundle and runs it with host Node.js;
+  it does not install codex-acp from npm. The adapter itself resolves `codex` on the
+  enriched host PATH for app-server, login, and CLI operations. The `@openai/codex`
+  package dependency is removed. Node.js 22+ and a host Codex installation are required.
+  Model discovery still uses ACP `initialize` and `session/new` against this adapter.
+  Neither global codex-acp installations nor `providers.paths.codex` overrides replace
+  the shipped copy. Managed launches remove `CODEX_PATH` and replace `CODEX_CONFIG`
+  with the shared subagent denial policy described in §6.
+  Model caches include the host executable's resolved path, size, and modification
+  time. Custom launchers that change a runtime behind an unchanged script may need
+  a forced refresh. Existing sessions keep their running process until restarted.
+  To refresh the vendor, import a reviewed upstream source revision, retain the
+  `HostCodex` launch changes, and update `upstream.json`. Run `npm ci --ignore-scripts`,
+  `npm run typecheck`, `npm test`, and `npm run build` in `crates/intent-providers/vendor/codex-acp`, then commit
+  the source, lockfile, and `dist` assets together. CI rebuilds and compares the bundle.
+  Rust builds consume the checked-in assets and do not require npm or network access.
 
 **Binary discovery** — `find_provider_binary` (`crates/intent-providers/src/discover.rs`)
 resolves in precedence order: (1) explicit `providers.paths[id]` setting (must be absolute
@@ -213,8 +231,8 @@ certainly needs new normalization arms:
     `OPENCODE_CONFIG_CONTENT` (`build_provider_env`, `crates/intent-providers/src/args.rs`).
   - claude-code: `disallowedTools: ["Task"]` in the `session/new` `_meta`
     (`build_session_meta`, `crates/intent-services/src/agent_session.rs`).
-  - codex: every daemon entrypoint selects the reviewed `CODEX_ACP_NPX_PACKAGE`
-    from `crates/intent-providers/src/config.rs` through `npx -y`, including
+  - codex: every daemon entrypoint selects the vendored adapter in
+    `crates/intent-providers/vendor/codex-acp` through host Node.js, including
     persistent agents, model probes, one-shot requests, and test prompts.
     Installed native or JS `codex-acp` binaries and `providers.paths.codex`
     overrides are bypassed.
@@ -224,12 +242,12 @@ certainly needs new normalization arms:
     `{"agents":{"enabled":false},"features":{"multi_agent_v2":false}}`.
     Both values are JSON booleans: the V2 feature setting can otherwise
     override the agents setting. Native `-c agents.enabled=false` is not a
-    compatible substitute. Node.js and npm/npx are required even on hosts
-    with a native adapter; missing prerequisites produce an actionable error.
+    compatible substitute. Node.js 22+ and the device Codex CLI are required;
+    missing prerequisites produce an actionable error.
     The unchanged frontend may still offer Codex on a native-only host; the
-    daemon launch error explains the missing toolchain. The adapter package
-    is pinned, but its Codex dependency permits patch updates, so validation
-    records the actual installed Codex version. Existing children acquire
+    daemon launch error explains the missing toolchain. The adapter follows
+    the device Codex installation, so validation records the actual installed
+    Codex version. Existing children acquire
     this policy on their next normal restart or relaunch. New, recreated,
     and resumed sessions must keep Intent tools and prior conversation
     context; cross-adapter continuity requires live resume or history-replay

@@ -1,0 +1,1184 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import * as acp from "@agentclientprotocol/sdk";
+import type { McpServerElicitationRequestParams, ToolRequestUserInputParams } from '../../app-server/v2';
+import { createCodexMockTestFixture, createTestSessionState, type CodexMockTestFixture } from '../acp-test-utils';
+import type { SessionState } from '../../CodexAcpServer';
+import { AgentMode } from "../../AgentMode";
+import { McpApprovalOptionId } from "../../permissions/option-ids";
+import type { ServerNotification } from "../../app-server";
+
+describe('Elicitation Events', () => {
+    let fixture: CodexMockTestFixture;
+    const sessionId = 'test-session-id';
+
+    beforeEach(() => {
+        fixture = createCodexMockTestFixture();
+        vi.clearAllMocks();
+    });
+
+    function setupSessionWithPendingPrompt() {
+        const codexAcpAgent = fixture.getCodexAcpAgent();
+
+        let resolveTurnCompleted: (value: { threadId: string; turn: { id: string; items: never[]; status: string; error: null } }) => void;
+        const turnCompletedPromise = new Promise<{ threadId: string; turn: { id: string; items: never[]; status: string; error: null } }>((resolve) => {
+            resolveTurnCompleted = resolve;
+        });
+
+        fixture.getCodexAppServerClient().turnStart = vi.fn().mockResolvedValue({
+            turn: { id: "turn-id", items: [], status: "inProgress", error: null }
+        });
+        fixture.getCodexAppServerClient().awaitTurnCompleted = vi.fn().mockReturnValue(turnCompletedPromise);
+
+        const sessionState: SessionState = createTestSessionState({
+            sessionId,
+            currentModelId: 'model-id[effort]',
+            agentMode: AgentMode.DEFAULT_AGENT_MODE
+        });
+        vi.spyOn(codexAcpAgent, 'getSessionState').mockReturnValue(sessionState);
+
+        const promptPromise = codexAcpAgent.prompt({
+            sessionId,
+            prompt: [{ type: 'text', text: 'Test prompt' }]
+        });
+
+        return {
+            promptPromise,
+            completeTurn: () => resolveTurnCompleted!({
+                threadId: sessionId,
+                turn: { id: "turn-id", items: [], status: "completed", error: null }
+            })
+        };
+    }
+
+    async function setupSessionWithPendingPromptAndCapabilities(clientCapabilities: acp.ClientCapabilities) {
+        await fixture.getCodexAcpAgent().initialize({
+            protocolVersion: acp.PROTOCOL_VERSION,
+            clientCapabilities,
+        });
+        return setupSessionWithPendingPrompt();
+    }
+
+    describe('Form mode elicitation', () => {
+        it('should use ACP form elicitation when the client supports it', async () => {
+            const { promptPromise, completeTurn } = await setupSessionWithPendingPromptAndCapabilities({
+                elicitation: { form: {} },
+            });
+            fixture.setElicitationResponse({
+                action: 'accept',
+                content: { username: 'octocat' },
+                _meta: { source: 'client' },
+            });
+
+            const params: McpServerElicitationRequestParams = {
+                threadId: sessionId, turnId: 'turn-1', serverName: 'test-server',
+                mode: 'form', _meta: null, message: 'Please provide your username',
+                requestedSchema: { type: 'object', properties: { username: { type: 'string' } }, required: ['username'] },
+            };
+
+            const response = await fixture.sendServerRequest('mcpServer/elicitation/request', params);
+            expect(response).toEqual({ action: 'accept', content: { username: 'octocat' }, _meta: { source: 'client' } });
+
+            const [elicitationEvent] = fixture.getAcpConnectionEvents([]);
+            expect(elicitationEvent).toEqual({
+                method: 'createElicitation',
+                args: [{
+                    sessionId,
+                    mode: 'form',
+                    message: 'Please provide your username',
+                    requestedSchema: {
+                        type: 'object',
+                        properties: { username: { type: 'string' } },
+                        required: ['username'],
+                    },
+                    _meta: null,
+                }],
+            });
+
+            completeTurn();
+            await promptPromise;
+        });
+
+        it('should normalize legacy enumNames schemas for ACP form elicitation', async () => {
+            const { promptPromise, completeTurn } = await setupSessionWithPendingPromptAndCapabilities({
+                elicitation: { form: {} },
+            });
+            fixture.setElicitationResponse({
+                action: 'accept',
+                content: { color: 'blue' },
+            });
+
+            const params: McpServerElicitationRequestParams = {
+                threadId: sessionId, turnId: 'turn-1', serverName: 'test-server',
+                mode: 'form', _meta: null, message: 'Pick a color',
+                requestedSchema: {
+                    type: 'object',
+                    properties: {
+                        color: {
+                            type: 'string',
+                            enum: ['red', 'blue'],
+                            enumNames: ['Red', 'Blue'],
+                        },
+                    },
+                    required: ['color'],
+                },
+            };
+
+            await fixture.sendServerRequest('mcpServer/elicitation/request', params);
+
+            const [elicitationEvent] = fixture.getAcpConnectionEvents([]);
+            expect(elicitationEvent?.args[0].requestedSchema.properties.color).toEqual({
+                type: 'string',
+                oneOf: [
+                    { const: 'red', title: 'Red' },
+                    { const: 'blue', title: 'Blue' },
+                ],
+            });
+
+            completeTurn();
+            await promptPromise;
+        });
+
+        it('should map custom ACP elicitation actions to cancel', async () => {
+            const { promptPromise, completeTurn } = await setupSessionWithPendingPromptAndCapabilities({
+                elicitation: { form: {} },
+            });
+            fixture.setElicitationResponse({
+                action: 'defer',
+                _meta: { source: 'client' },
+            });
+
+            const params: McpServerElicitationRequestParams = {
+                threadId: sessionId, turnId: 'turn-1', serverName: 'test-server',
+                mode: 'form', _meta: null, message: 'Please provide your username',
+                requestedSchema: { type: 'object', properties: { username: { type: 'string' } }, required: ['username'] },
+            };
+
+            const response = await fixture.sendServerRequest('mcpServer/elicitation/request', params);
+            expect(response).toEqual({ action: 'cancel', content: null, _meta: null });
+
+            completeTurn();
+            await promptPromise;
+        });
+
+        it('should not treat malformed ACP elicitation accept responses as accepted', async () => {
+            const { promptPromise, completeTurn } = await setupSessionWithPendingPromptAndCapabilities({
+                elicitation: { form: {} },
+            });
+            fixture.setElicitationResponse({
+                action: 'accept',
+                content: { username: { nested: 'invalid' } },
+            } as acp.CreateElicitationResponse);
+
+            const params: McpServerElicitationRequestParams = {
+                threadId: sessionId, turnId: 'turn-1', serverName: 'test-server',
+                mode: 'form', _meta: null, message: 'Please provide your username',
+                requestedSchema: { type: 'object', properties: { username: { type: 'string' } }, required: ['username'] },
+            };
+
+            const response = await fixture.sendServerRequest('mcpServer/elicitation/request', params);
+            expect(response).toEqual({ action: 'cancel', content: null, _meta: null });
+
+            completeTurn();
+            await promptPromise;
+        });
+
+        it('should cancel a structured form when the client lacks ACP form support', async () => {
+            const { promptPromise, completeTurn } = setupSessionWithPendingPrompt();
+            fixture.setPermissionResponse({ outcome: { outcome: 'selected', optionId: 'accept' } });
+
+            const params: McpServerElicitationRequestParams = {
+                threadId: sessionId, turnId: 'turn-1', serverName: 'test-server',
+                mode: 'form', _meta: null, message: 'Please provide your username',
+                requestedSchema: { type: 'object', properties: { username: { type: 'string' } }, required: ['username'] },
+            };
+
+            const response = await fixture.sendServerRequest('mcpServer/elicitation/request', params);
+            expect(response).toEqual({ action: 'cancel', content: null, _meta: null });
+            expect(fixture.getAcpConnectionEvents([])).toEqual([]);
+
+            completeTurn();
+            await promptPromise;
+        });
+
+        it('should map decline to decline', async () => {
+            const { promptPromise, completeTurn } = setupSessionWithPendingPrompt();
+            fixture.setPermissionResponse({ outcome: { outcome: 'selected', optionId: 'decline' } });
+
+            const params: McpServerElicitationRequestParams = {
+                threadId: sessionId, turnId: 'turn-1', serverName: 'test-server',
+                mode: 'form', _meta: null, message: 'Please provide info',
+                requestedSchema: { type: 'object', properties: {} },
+            };
+
+            const response = await fixture.sendServerRequest('mcpServer/elicitation/request', params);
+            expect(response).toEqual({ action: 'decline', content: null, _meta: null });
+
+            completeTurn();
+            await promptPromise;
+        });
+
+        it('should map the explicit non-tool Cancel option to cancel', async () => {
+            const { promptPromise, completeTurn } = setupSessionWithPendingPrompt();
+            fixture.setPermissionResponse({ outcome: { outcome: 'selected', optionId: 'cancel' } });
+            const params: McpServerElicitationRequestParams = {
+                threadId: sessionId, turnId: 'turn-1', serverName: 'test-server',
+                mode: 'form', _meta: null, message: 'Please provide info',
+                requestedSchema: { type: 'object', properties: {} },
+            };
+            expect(await fixture.sendServerRequest('mcpServer/elicitation/request', params))
+                .toEqual({ action: 'cancel', content: null, _meta: null });
+            const sessionUpdates = fixture.getAcpConnectionEvents([])
+                .filter(event => event.method === 'sessionUpdate')
+                .map(event => event.args[0].update);
+            expect(sessionUpdates).toEqual([
+                expect.objectContaining({ sessionUpdate: 'tool_call_update', status: 'completed', rawOutput: { action: 'cancel' } }),
+            ]);
+            completeTurn();
+            await promptPromise;
+        });
+
+        it('should return cancel when user dismisses dialog', async () => {
+            const { promptPromise, completeTurn } = setupSessionWithPendingPrompt();
+            fixture.setPermissionResponse({ outcome: { outcome: 'cancelled' } });
+
+            const params: McpServerElicitationRequestParams = {
+                threadId: sessionId, turnId: 'turn-1', serverName: 'test-server',
+                mode: 'form', _meta: null, message: 'Please provide info',
+                requestedSchema: { type: 'object', properties: {} },
+            };
+
+            const response = await fixture.sendServerRequest('mcpServer/elicitation/request', params);
+            expect(response).toEqual({ action: 'cancel', content: null, _meta: null });
+
+            completeTurn();
+            await promptPromise;
+        });
+
+        it('should return cancel when no handler registered', async () => {
+            const params: McpServerElicitationRequestParams = {
+                threadId: 'non-existent-session', turnId: null, serverName: 'test-server',
+                mode: 'form', _meta: null, message: 'Please provide info',
+                requestedSchema: { type: 'object', properties: {} },
+            };
+
+            const response = await fixture.sendServerRequest('mcpServer/elicitation/request', params);
+            expect(response).toEqual({ action: 'cancel', content: null, _meta: null });
+        });
+
+        it('should not replace unsupported required form fields with permission buttons', async () => {
+            const { promptPromise, completeTurn } = setupSessionWithPendingPrompt();
+            fixture.setPermissionResponse({ outcome: { outcome: 'selected', optionId: 'accept' } });
+
+            const params: McpServerElicitationRequestParams = {
+                threadId: sessionId, turnId: 'turn-1', serverName: 'my-mcp-server',
+                mode: 'form', _meta: null, message: 'Please provide your GitHub username',
+                requestedSchema: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] },
+            };
+
+            expect(await fixture.sendServerRequest('mcpServer/elicitation/request', params))
+                .toEqual({action: 'cancel', content: null, _meta: null});
+            expect(fixture.getAcpConnectionEvents([])).toEqual([]);
+
+            completeTurn();
+            await promptPromise;
+        });
+    });
+
+    describe('MCP tool call approval elicitation', () => {
+        it('should preserve the native permission options even when ACP form elicitation is supported', async () => {
+            const { promptPromise, completeTurn } = await setupSessionWithPendingPromptAndCapabilities({
+                elicitation: { form: {} },
+            });
+            fixture.setPermissionResponse({
+                outcome: {outcome: 'selected', optionId: McpApprovalOptionId.AllowAlways},
+            });
+
+            fixture.sendServerNotification({
+                method: 'item/started',
+                params: {
+                    threadId: sessionId,
+                    turnId: 'turn-1',
+                    startedAtMs: 0,
+                    item: {
+                        type: "mcpToolCall",
+                        id: "call-id",
+                        server: "tool-server",
+                        tool: "tool-name",
+                        status: "inProgress",
+                        arguments: { argument: "example" },
+                        appContext: null,
+                        mcpAppUi: null,
+                        readOnlyHint: null,
+                        pluginId: null,
+                        result: null,
+                        error: null,
+                        durationMs: null,
+                    },
+                },
+            });
+            await fixture.getCodexAcpClient().waitForSessionNotifications(sessionId);
+            fixture.clearAcpConnectionDump();
+
+            const params: McpServerElicitationRequestParams = {
+                threadId: sessionId, turnId: 'turn-1', serverName: 'tool-server',
+                mode: 'form',
+                _meta: { codex_approval_kind: 'mcp_tool_call', persist: ['session', 'always'] },
+                message: 'Allow tool call?',
+                requestedSchema: { type: 'object', properties: {} },
+            };
+
+            const response = await fixture.sendServerRequest('mcpServer/elicitation/request', params);
+            expect(response).toEqual({ action: 'accept', content: null, _meta: { persist: 'always' } });
+
+            const events = fixture.getAcpConnectionEvents(['_meta']);
+            expect(events[0]).toMatchObject({
+                method: 'requestPermission',
+                args: [{
+                    sessionId,
+                    toolCall: {toolCallId: 'call-id', kind: 'execute', status: 'pending'},
+                }],
+            });
+            expect(events[0]!.args[0].options.map((option: {name: string}) => option.name)).toEqual([
+                'Allow', 'Allow for this session', 'Always allow', 'Cancel',
+            ]);
+            expect(events[1]).toEqual({
+                method: 'sessionUpdate',
+                args: [{
+                    sessionId,
+                    update: { sessionUpdate: 'tool_call_update', toolCallId: 'call-id', status: 'in_progress' },
+                }],
+            });
+
+            completeTurn();
+            await promptPromise;
+        });
+
+        it('should not apply message-only tool approval semantics to a structured form', async () => {
+            const { promptPromise, completeTurn } = await setupSessionWithPendingPromptAndCapabilities({
+                elicitation: { form: {} },
+            });
+            fixture.setElicitationResponse({action: 'decline'});
+            const params: McpServerElicitationRequestParams = {
+                threadId: sessionId, turnId: 'turn-1', serverName: 'tool-server',
+                mode: 'form',
+                _meta: {codex_approval_kind: 'mcp_tool_call'},
+                message: 'Collect fields',
+                requestedSchema: {type: 'object', properties: {value: {type: 'string'}}},
+            };
+            expect(await fixture.sendServerRequest('mcpServer/elicitation/request', params))
+                .toEqual({action: 'decline', content: null, _meta: null});
+            completeTurn();
+            await promptPromise;
+        });
+
+        it('should show the native Allow/session/always/Cancel options when all persist values are advertised', async () => {
+            const { promptPromise, completeTurn } = setupSessionWithPendingPrompt();
+            fixture.setPermissionResponse({ outcome: { outcome: 'selected', optionId: McpApprovalOptionId.AllowOnce } });
+
+            const params: McpServerElicitationRequestParams = {
+                threadId: sessionId, turnId: 'turn-1', serverName: 'tool-server',
+                mode: 'form',
+                _meta: { codex_approval_kind: 'mcp_tool_call', persist: ['session', 'always'] },
+                message: 'Allow tool call?',
+                requestedSchema: { type: 'object', properties: {} },
+            };
+
+            await fixture.sendServerRequest('mcpServer/elicitation/request', params);
+            await expect(fixture.getAcpConnectionDump(['_meta'])).toMatchFileSnapshot('data/elicitation-tool-approval-all-persist.json');
+
+            completeTurn();
+            await promptPromise;
+        });
+
+        it('should map allow_once to accept with null meta', async () => {
+            const { promptPromise, completeTurn } = setupSessionWithPendingPrompt();
+            fixture.setPermissionResponse({ outcome: { outcome: 'selected', optionId: McpApprovalOptionId.AllowOnce } });
+
+            const params: McpServerElicitationRequestParams = {
+                threadId: sessionId, turnId: 'turn-1', serverName: 'tool-server',
+                mode: 'form',
+                _meta: { codex_approval_kind: 'mcp_tool_call', persist: ['session', 'always'] },
+                message: 'Allow tool call?',
+                requestedSchema: { type: 'object', properties: {} },
+            };
+
+            const response = await fixture.sendServerRequest('mcpServer/elicitation/request', params);
+            expect(response).toEqual({ action: 'accept', content: null, _meta: null });
+
+            completeTurn();
+            await promptPromise;
+        });
+
+        it('should map allow_session to accept with persist:session meta', async () => {
+            const { promptPromise, completeTurn } = setupSessionWithPendingPrompt();
+            fixture.setPermissionResponse({ outcome: { outcome: 'selected', optionId: McpApprovalOptionId.AllowSession } });
+
+            const params: McpServerElicitationRequestParams = {
+                threadId: sessionId, turnId: 'turn-1', serverName: 'tool-server',
+                mode: 'form',
+                _meta: { codex_approval_kind: 'mcp_tool_call', persist: ['session', 'always'] },
+                message: 'Allow tool call?',
+                requestedSchema: { type: 'object', properties: {} },
+            };
+
+            const response = await fixture.sendServerRequest('mcpServer/elicitation/request', params);
+            expect(response).toEqual({ action: 'accept', content: null, _meta: { persist: 'session' } });
+
+            completeTurn();
+            await promptPromise;
+        });
+
+        it('should map allow_always to accept with persist:always meta', async () => {
+            const { promptPromise, completeTurn } = setupSessionWithPendingPrompt();
+            fixture.setPermissionResponse({ outcome: { outcome: 'selected', optionId: McpApprovalOptionId.AllowAlways } });
+
+            const params: McpServerElicitationRequestParams = {
+                threadId: sessionId, turnId: 'turn-1', serverName: 'tool-server',
+                mode: 'form',
+                _meta: { codex_approval_kind: 'mcp_tool_call', persist: ['session', 'always'] },
+                message: 'Allow tool call?',
+                requestedSchema: { type: 'object', properties: {} },
+            };
+
+            const response = await fixture.sendServerRequest('mcpServer/elicitation/request', params);
+            expect(response).toEqual({ action: 'accept', content: null, _meta: { persist: 'always' } });
+
+            completeTurn();
+            await promptPromise;
+        });
+
+        it('should cancel a durable permission response that Codex did not offer', async () => {
+            const { promptPromise, completeTurn } = setupSessionWithPendingPrompt();
+            fixture.setPermissionResponse({ outcome: { outcome: 'selected', optionId: McpApprovalOptionId.AllowAlways } });
+            const params: McpServerElicitationRequestParams = {
+                threadId: sessionId, turnId: 'turn-1', serverName: 'tool-server',
+                mode: 'form',
+                _meta: { codex_approval_kind: 'mcp_tool_call' },
+                message: 'Allow tool call?',
+                requestedSchema: { type: 'object', properties: {} },
+            };
+            expect(await fixture.sendServerRequest('mcpServer/elicitation/request', params))
+                .toEqual({ action: 'cancel', content: null, _meta: null });
+            const toolStatuses = fixture.getAcpConnectionEvents([])
+                .filter(event => event.method === 'sessionUpdate')
+                .map(event => event.args[0].update.status);
+            expect(toolStatuses).not.toContain('in_progress');
+            completeTurn();
+            await promptPromise;
+        });
+
+        it('should cancel an ACP form persist value that Codex did not offer', async () => {
+            const { promptPromise, completeTurn } = await setupSessionWithPendingPromptAndCapabilities({
+                elicitation: { form: {} },
+            });
+            fixture.setElicitationResponse({ action: 'accept', content: { persist: 'always' } });
+            const params: McpServerElicitationRequestParams = {
+                threadId: sessionId, turnId: 'turn-1', serverName: 'tool-server',
+                mode: 'form',
+                _meta: { codex_approval_kind: 'mcp_tool_call' },
+                message: 'Allow tool call?',
+                requestedSchema: { type: 'object', properties: {} },
+            };
+            expect(await fixture.sendServerRequest('mcpServer/elicitation/request', params))
+                .toEqual({ action: 'cancel', content: null, _meta: null });
+            completeTurn();
+            await promptPromise;
+        });
+
+        it('should only show session option when persist is "session"', async () => {
+            const { promptPromise, completeTurn } = setupSessionWithPendingPrompt();
+            fixture.setPermissionResponse({ outcome: { outcome: 'selected', optionId: McpApprovalOptionId.AllowOnce } });
+
+            const params: McpServerElicitationRequestParams = {
+                threadId: sessionId, turnId: 'turn-1', serverName: 'tool-server',
+                mode: 'form',
+                _meta: { codex_approval_kind: 'mcp_tool_call', persist: 'session' },
+                message: 'Allow tool call?',
+                requestedSchema: { type: 'object', properties: {} },
+            };
+
+            await fixture.sendServerRequest('mcpServer/elicitation/request', params);
+            await expect(fixture.getAcpConnectionDump(['_meta'])).toMatchFileSnapshot('data/elicitation-tool-approval-session-only.json');
+
+            completeTurn();
+            await promptPromise;
+        });
+
+        it('should show only Allow and Cancel when no persist options', async () => {
+            const { promptPromise, completeTurn } = setupSessionWithPendingPrompt();
+            fixture.setPermissionResponse({ outcome: { outcome: 'selected', optionId: McpApprovalOptionId.AllowOnce } });
+
+            const params: McpServerElicitationRequestParams = {
+                threadId: sessionId, turnId: 'turn-1', serverName: 'tool-server',
+                mode: 'form',
+                _meta: { codex_approval_kind: 'mcp_tool_call' },
+                message: 'Allow tool call?',
+                requestedSchema: { type: 'object', properties: {} },
+            };
+
+            await fixture.sendServerRequest('mcpServer/elicitation/request', params);
+            await expect(fixture.getAcpConnectionDump(['_meta'])).toMatchFileSnapshot('data/elicitation-tool-approval-no-persist.json');
+
+            completeTurn();
+            await promptPromise;
+        });
+
+        it('should map explicit tool approval Cancel to cancel without marking the tool in progress', async () => {
+            const { promptPromise, completeTurn } = setupSessionWithPendingPrompt();
+            fixture.setPermissionResponse({ outcome: { outcome: 'selected', optionId: McpApprovalOptionId.Cancel } });
+            const params: McpServerElicitationRequestParams = {
+                threadId: sessionId, turnId: 'turn-1', serverName: 'tool-server',
+                mode: 'form',
+                _meta: { codex_approval_kind: 'mcp_tool_call' },
+                message: 'Allow tool call?',
+                requestedSchema: { type: 'object', properties: {} },
+            };
+            expect(await fixture.sendServerRequest('mcpServer/elicitation/request', params))
+                .toEqual({ action: 'cancel', content: null, _meta: null });
+            const toolStatuses = fixture.getAcpConnectionEvents([])
+                .filter(event => event.method === 'sessionUpdate')
+                .map(event => event.args[0].update.status);
+            expect(toolStatuses).not.toContain('in_progress');
+            completeTurn();
+            await promptPromise;
+        });
+
+        it('should render an ambiguous concurrent same-server approval as a standalone request', async () => {
+            const { promptPromise, completeTurn } = setupSessionWithPendingPrompt();
+            fixture.setPermissionResponse({ outcome: { outcome: 'selected', optionId: McpApprovalOptionId.Cancel } });
+            for (const id of ['call-a', 'call-b']) {
+                fixture.sendServerNotification({
+                    method: 'item/started',
+                    params: {
+                        threadId: sessionId,
+                        turnId: 'turn-1',
+                        startedAtMs: 0,
+                        item: {
+                            type: 'mcpToolCall', id, server: 'tool-server', tool: 'tool-name',
+                            status: 'inProgress', arguments: {id}, appContext: null, readOnlyHint: null,
+                            pluginId: null, result: null, error: null, durationMs: null,
+                        },
+                    },
+                });
+            }
+            await fixture.getCodexAcpClient().waitForSessionNotifications(sessionId);
+            fixture.clearAcpConnectionDump();
+            const params: McpServerElicitationRequestParams = {
+                threadId: sessionId, turnId: 'turn-1', serverName: 'tool-server',
+                mode: 'form', _meta: {codex_approval_kind: 'mcp_tool_call'},
+                message: 'Allow one of the concurrent calls?',
+                requestedSchema: {type: 'object', properties: {}},
+            };
+            expect(await fixture.sendServerRequest('mcpServer/elicitation/request', params))
+                .toEqual({action: 'cancel', content: null, _meta: null});
+            const request = fixture.getAcpConnectionEvents([]).find(event => event.method === 'requestPermission');
+            expect(request?.args[0].toolCall).toMatchObject({
+                toolCallId: 'elicitation:test-session-id:tool-server:1',
+                content: [{type: 'content', content: {type: 'text', text: 'Allow one of the concurrent calls?'}}],
+                rawInput: {serverName: 'tool-server', schema: {type: 'object', properties: {}}},
+            });
+            expect(request?.args[0].toolCall.toolCallId).not.toBe('call-a');
+            expect(request?.args[0].toolCall.toolCallId).not.toBe('call-b');
+            completeTurn();
+            await promptPromise;
+        });
+
+        it('should not reuse a completed auto-approved call id for a later approval request', async () => {
+            const { promptPromise, completeTurn } = setupSessionWithPendingPrompt();
+            fixture.setPermissionResponse({ outcome: { outcome: 'selected', optionId: McpApprovalOptionId.AllowOnce } });
+
+            const startedNotification: ServerNotification = {
+                method: 'item/started',
+                params: {
+                    threadId: sessionId,
+                    turnId: 'turn-1',
+                    startedAtMs: 0,
+                    item: {
+                        type: "mcpToolCall",
+                        id: "completed-call-id",
+                        server: "tool-server",
+                        tool: "tool-name",
+                        status: "inProgress",
+                        arguments: { argument: "example" },
+                        appContext: null,
+                        mcpAppUi: null,
+                        readOnlyHint: null,
+                        pluginId: null,
+                        result: null,
+                        error: null,
+                        durationMs: null,
+                    },
+                },
+            };
+            const completedNotification: ServerNotification = {
+                method: 'item/completed',
+                params: {
+                    threadId: sessionId,
+                    turnId: 'turn-1',
+                    completedAtMs: 0,
+                    item: {
+                        type: "mcpToolCall",
+                        id: "completed-call-id",
+                        server: "tool-server",
+                        tool: "tool-name",
+                        status: "completed",
+                        arguments: { argument: "example" },
+                        appContext: null,
+                        mcpAppUi: null,
+                        readOnlyHint: null,
+                        pluginId: null,
+                        result: { content: [], structuredContent: null, _meta: null },
+                        error: null,
+                        durationMs: 15,
+                    },
+                },
+            };
+
+            fixture.sendServerNotification(startedNotification);
+            fixture.sendServerNotification(completedNotification);
+            await fixture.getCodexAcpClient().waitForSessionNotifications(sessionId);
+            fixture.clearAcpConnectionDump();
+
+            const params: McpServerElicitationRequestParams = {
+                threadId: sessionId, turnId: 'turn-2', serverName: 'tool-server',
+                mode: 'form',
+                _meta: { codex_approval_kind: 'mcp_tool_call', persist: ['session', 'always'] },
+                message: 'Allow tool call?',
+                requestedSchema: { type: 'object', properties: {} },
+            };
+
+            await fixture.sendServerRequest('mcpServer/elicitation/request', params);
+
+            const [requestPermissionEvent] = fixture.getAcpConnectionEvents(['_meta']);
+            expect(requestPermissionEvent?.method).toBe('requestPermission');
+            expect(requestPermissionEvent?.args[0].toolCall.toolCallId).toBe('elicitation:test-session-id:tool-server:1');
+
+            completeTurn();
+            await promptPromise;
+        });
+
+        it('should not reuse a stale call id after serverRequest/resolved clears interrupted approval state', async () => {
+            const { promptPromise, completeTurn } = setupSessionWithPendingPrompt();
+            fixture.setPermissionResponse({ outcome: { outcome: 'selected', optionId: McpApprovalOptionId.AllowOnce } });
+
+            const startedNotification: ServerNotification = {
+                method: 'item/started',
+                params: {
+                    threadId: sessionId,
+                    turnId: 'turn-1',
+                    startedAtMs: 0,
+                    item: {
+                        type: "mcpToolCall",
+                        id: "interrupted-call-id",
+                        server: "tool-server",
+                        tool: "tool-name",
+                        status: "inProgress",
+                        arguments: { argument: "example" },
+                        appContext: null,
+                        mcpAppUi: null,
+                        readOnlyHint: null,
+                        pluginId: null,
+                        result: null,
+                        error: null,
+                        durationMs: null,
+                    },
+                },
+            };
+            const resolvedNotification: ServerNotification = {
+                method: 'serverRequest/resolved',
+                params: {
+                    threadId: sessionId,
+                    requestId: 'request-1',
+                },
+            };
+
+            fixture.sendServerNotification(startedNotification);
+            fixture.sendServerNotification(resolvedNotification);
+            await fixture.getCodexAcpClient().waitForSessionNotifications(sessionId);
+            fixture.clearAcpConnectionDump();
+
+            const params: McpServerElicitationRequestParams = {
+                threadId: sessionId, turnId: 'turn-2', serverName: 'tool-server',
+                mode: 'form',
+                _meta: { codex_approval_kind: 'mcp_tool_call', persist: ['session', 'always'] },
+                message: 'Allow tool call?',
+                requestedSchema: { type: 'object', properties: {} },
+            };
+
+            await fixture.sendServerRequest('mcpServer/elicitation/request', params);
+
+            const [requestPermissionEvent] = fixture.getAcpConnectionEvents(['_meta']);
+            expect(requestPermissionEvent?.method).toBe('requestPermission');
+            expect(requestPermissionEvent?.args[0].toolCall.toolCallId).toBe('elicitation:test-session-id:tool-server:1');
+
+            completeTurn();
+            await promptPromise;
+        });
+    });
+
+    describe('URL mode elicitation', () => {
+        it('maps MCP OAuth login to ACP URL elicitation and completes it', async () => {
+            const agent = fixture.getCodexAcpAgent();
+            const codexClient = fixture.getCodexAcpClient();
+            await agent.initialize({
+                protocolVersion: acp.PROTOCOL_VERSION,
+                clientCapabilities: { elicitation: { url: {} } },
+            });
+            fixture.setElicitationResponse({action: 'accept'});
+            const oauthLogin = vi.spyOn(codexClient, 'mcpServerOauthLogin').mockResolvedValue({
+                authorizationUrl: 'https://example.com/oauth/authorize',
+            });
+            vi.spyOn(codexClient, 'awaitMcpServerOauthLoginCompleted').mockResolvedValue({
+                name: 'linear',
+                threadId: sessionId,
+                success: true,
+            });
+
+            await expect((agent as any).authenticateMcpServer(sessionId, 'linear')).resolves.toBe(true);
+
+            expect(oauthLogin).toHaveBeenCalledWith({name: 'linear', threadId: sessionId});
+            const events = fixture.getAcpConnectionEvents([]);
+            expect(events[0]).toMatchObject({
+                method: 'createElicitation',
+                args: [{
+                    mode: 'url',
+                    sessionId,
+                    message: 'Authenticate with MCP server linear',
+                    url: 'https://example.com/oauth/authorize',
+                }],
+            });
+            expect(events[1]).toMatchObject({
+                method: 'completeElicitation',
+                args: [{elicitationId: expect.stringMatching(/^mcp-oauth-/)}],
+            });
+        });
+
+        it('should use ACP URL elicitation when the client supports it', async () => {
+            const { promptPromise, completeTurn } = await setupSessionWithPendingPromptAndCapabilities({
+                elicitation: { url: {} },
+            });
+            fixture.setElicitationResponse({ action: 'accept', _meta: { source: 'client' } });
+
+            const params: McpServerElicitationRequestParams = {
+                threadId: sessionId, turnId: 'turn-1', serverName: 'auth-server',
+                mode: 'url', _meta: null, message: 'Please authorize access',
+                url: 'https://example.com/authorize', elicitationId: 'elicit-123',
+            };
+
+            const response = await fixture.sendServerRequest('mcpServer/elicitation/request', params);
+            expect(response).toEqual({ action: 'accept', content: null, _meta: { source: 'client' } });
+
+            const [elicitationEvent] = fixture.getAcpConnectionEvents([]);
+            expect(elicitationEvent).toEqual({
+                method: 'createElicitation',
+                args: [{
+                    sessionId,
+                    mode: 'url',
+                    message: 'Please authorize access',
+                    url: 'https://example.com/authorize',
+                    elicitationId: 'elicit-123',
+                    _meta: null,
+                }],
+            });
+
+            fixture.sendServerNotification({
+                method: 'serverRequest/resolved',
+                params: {
+                    threadId: sessionId,
+                    requestId: 'request-1',
+                },
+            });
+            await fixture.getCodexAcpClient().waitForSessionNotifications(sessionId);
+
+            const [, completeElicitationEvent] = fixture.getAcpConnectionEvents([]);
+            expect(completeElicitationEvent).toEqual({
+                method: 'completeElicitation',
+                args: [{ elicitationId: 'elicit-123' }],
+            });
+
+            completeTurn();
+            await promptPromise;
+        });
+
+        it('should map accept to accept for URL mode', async () => {
+            const { promptPromise, completeTurn } = setupSessionWithPendingPrompt();
+            fixture.setPermissionResponse({ outcome: { outcome: 'selected', optionId: 'accept' } });
+
+            const params: McpServerElicitationRequestParams = {
+                threadId: sessionId, turnId: 'turn-1', serverName: 'auth-server',
+                mode: 'url', _meta: null, message: 'Please authorize access',
+                url: 'https://example.com/authorize', elicitationId: 'elicit-123',
+            };
+
+            const response = await fixture.sendServerRequest('mcpServer/elicitation/request', params);
+            expect(response).toEqual({ action: 'accept', content: null, _meta: null });
+
+            completeTurn();
+            await promptPromise;
+        });
+
+        it('should return cancel when user dismisses URL mode dialog', async () => {
+            const { promptPromise, completeTurn } = setupSessionWithPendingPrompt();
+            fixture.setPermissionResponse({ outcome: { outcome: 'cancelled' } });
+
+            const params: McpServerElicitationRequestParams = {
+                threadId: sessionId, turnId: null, serverName: 'auth-server',
+                mode: 'url', _meta: null, message: 'Authorization required',
+                url: 'https://example.com/authorize', elicitationId: 'elicit-456',
+            };
+
+            const response = await fixture.sendServerRequest('mcpServer/elicitation/request', params);
+            expect(response).toEqual({ action: 'cancel', content: null, _meta: null });
+
+            completeTurn();
+            await promptPromise;
+        });
+
+        it('should build correct ACP permission request for URL mode', async () => {
+            const { promptPromise, completeTurn } = setupSessionWithPendingPrompt();
+            fixture.setPermissionResponse({ outcome: { outcome: 'selected', optionId: 'accept' } });
+
+            const params: McpServerElicitationRequestParams = {
+                threadId: sessionId, turnId: 'turn-1', serverName: 'auth-server',
+                mode: 'url', _meta: null,
+                message: 'Please authorize access to your GitHub account',
+                url: 'https://example.com/authorize?id=elicit-789',
+                elicitationId: 'elicit-789',
+            };
+
+            await fixture.sendServerRequest('mcpServer/elicitation/request', params);
+            await expect(fixture.getAcpConnectionDump(['_meta'])).toMatchFileSnapshot('data/elicitation-url-accept.json');
+
+            completeTurn();
+            await promptPromise;
+        });
+    });
+
+    describe('Codex request_user_input', () => {
+        it('should use ACP form elicitation for request_user_input when supported', async () => {
+            const { promptPromise, completeTurn } = await setupSessionWithPendingPromptAndCapabilities({
+                elicitation: { form: {} },
+            });
+            fixture.setElicitationResponse({
+                action: 'accept',
+                content: {
+                    next_step: 'Run tests',
+                    notes: 'Focus auth',
+                },
+            });
+
+            const params: ToolRequestUserInputParams = {
+                threadId: sessionId,
+                turnId: 'turn-1',
+                itemId: 'request-user-input-1',
+                autoResolutionMs: 60000,
+                isBlocking: true,
+                questions: [
+                    {
+                        id: 'next_step',
+                        header: 'Next step',
+                        question: 'What should I do next?',
+                        isOther: true,
+                        isSecret: false,
+                        options: [
+                            { label: 'Run tests', description: 'Run the focused test suite.' },
+                            { label: 'Stop', description: 'Stop and report current status.' },
+                        ],
+                    },
+                    {
+                        id: 'notes',
+                        header: 'Notes',
+                        question: 'Any extra instructions?',
+                        isOther: false,
+                        isSecret: false,
+                        options: null,
+                    },
+                ],
+            };
+
+            const response = await fixture.sendServerRequest('item/tool/requestUserInput', params);
+            expect(response).toEqual({
+                answers: {
+                    next_step: { answers: ['Run tests'] },
+                    notes: { answers: ['Focus auth'] },
+                },
+            });
+
+            expect(fixture.getAcpConnectionEvents([])).toEqual([{
+                method: 'createElicitation',
+                args: [{
+                    sessionId,
+                    toolCallId: 'request-user-input-1',
+                    mode: 'form',
+                    message: 'Codex needs your input to continue.',
+                    requestedSchema: {
+                        type: 'object',
+                        properties: {
+                            next_step: {
+                                type: 'string',
+                                title: 'What should I do next?',
+                                description: 'Next step',
+                                oneOf: [
+                                    { const: 'Run tests', title: 'Run tests', description: 'Run the focused test suite.' },
+                                    { const: 'Stop', title: 'Stop', description: 'Stop and report current status.' },
+                                    {
+                                        const: 'None of the above',
+                                        title: 'None of the above',
+                                        description: 'Provide a different answer in the note field.',
+                                    },
+                                ],
+                                _meta: {
+                                    codex: { isOther: true, isSecret: false },
+                                },
+                            },
+                            next_step_note: {
+                                type: 'string',
+                                title: 'Additional answer or note',
+                                _meta: {
+                                    codex: { questionId: 'next_step', role: 'user_note', isSecret: false },
+                                },
+                            },
+                            notes: {
+                                type: 'string',
+                                title: 'Any extra instructions?',
+                                description: 'Notes',
+                                _meta: {
+                                    codex: { isOther: false, isSecret: false },
+                                },
+                            },
+                        },
+                        required: ['next_step', 'notes'],
+                    },
+                    _meta: {
+                        codex: { autoResolutionMs: 60000 },
+                    },
+                }],
+            }]);
+
+            completeTurn();
+            await promptPromise;
+        });
+
+        it('should return the Other choice and its note using Codex answer conventions', async () => {
+            const { promptPromise, completeTurn } = await setupSessionWithPendingPromptAndCapabilities({
+                elicitation: { form: {} },
+            });
+            fixture.setElicitationResponse({
+                action: 'accept',
+                content: {
+                    next_step: 'None of the above',
+                    next_step_note: 'Inspect flaky logs',
+                },
+            });
+
+            const params: ToolRequestUserInputParams = {
+                threadId: sessionId,
+                turnId: 'turn-1',
+                itemId: 'request-user-input-1',
+                autoResolutionMs: null,
+                isBlocking: true,
+                questions: [{
+                    id: 'next_step',
+                    header: 'Next step',
+                    question: 'What should I do next?',
+                    isOther: true,
+                    isSecret: false,
+                    options: [
+                        { label: 'Run tests', description: 'Run the focused test suite.' },
+                        { label: 'Stop', description: 'Stop and report current status.' },
+                    ],
+                }],
+            };
+
+            const response = await fixture.sendServerRequest('item/tool/requestUserInput', params);
+            expect(response).toEqual({
+                answers: {
+                    next_step: { answers: ['None of the above', 'user_note: Inspect flaky logs'] },
+                },
+            });
+
+            completeTurn();
+            await promptPromise;
+        });
+
+        it.each(['before', 'after'] as const)(
+            'should preserve questions with note field IDs when they appear %s the choice',
+            async (order) => {
+                const { promptPromise, completeTurn } = await setupSessionWithPendingPromptAndCapabilities({
+                    elicitation: { form: {} },
+                });
+                fixture.setElicitationResponse({
+                    action: 'accept',
+                    content: {
+                        choice: 'Run tests',
+                        choice_note: 'Follow project conventions',
+                        choice_note1: 'Private context',
+                        choice_note2: '  Run the focused suite first  ',
+                    },
+                });
+
+                const choice: ToolRequestUserInputParams['questions'][number] = {
+                    id: 'choice',
+                    header: 'Next step',
+                    question: 'What should I do next?',
+                    isOther: true,
+                    isSecret: true,
+                    options: [
+                        { label: 'Run tests', description: 'Run the focused test suite.' },
+                        { label: 'Stop', description: 'Stop and report current status.' },
+                    ],
+                };
+                const otherQuestions: ToolRequestUserInputParams['questions'] = [
+                    {
+                        id: 'choice_note',
+                        header: 'Constraints',
+                        question: 'Which constraints should I follow?',
+                        isOther: false,
+                        isSecret: false,
+                        options: null,
+                    },
+                    {
+                        id: 'choice_note1',
+                        header: 'Private',
+                        question: 'What private context should I consider?',
+                        isOther: false,
+                        isSecret: true,
+                        options: null,
+                    },
+                ];
+                const params: ToolRequestUserInputParams = {
+                    threadId: sessionId,
+                    turnId: 'turn-1',
+                    itemId: 'request-user-input-1',
+                    autoResolutionMs: null,
+                    isBlocking: true,
+                    questions: order === 'before' ? [...otherQuestions, choice] : [choice, ...otherQuestions],
+                };
+
+                const response = await fixture.sendServerRequest('item/tool/requestUserInput', params);
+                expect(response).toEqual({
+                    answers: {
+                        choice: { answers: ['Run tests', 'user_note: Run the focused suite first'] },
+                        choice_note: { answers: ['Follow project conventions'] },
+                        choice_note1: { answers: ['Private context'] },
+                    },
+                });
+                await expect(fixture.getAcpConnectionDump([])).toMatchFileSnapshot(
+                    `data/elicitation-user-input-note-collision-${order}.json`,
+                );
+
+                completeTurn();
+                await promptPromise;
+            },
+        );
+
+        it('should keep an existing None of the above choice selectable without duplicating it', async () => {
+            const { promptPromise, completeTurn } = await setupSessionWithPendingPromptAndCapabilities({
+                elicitation: { form: {} },
+            });
+            fixture.setElicitationResponse({
+                action: 'accept',
+                content: { next_step: 'None of the above' },
+            });
+
+            const params: ToolRequestUserInputParams = {
+                threadId: sessionId,
+                turnId: 'turn-1',
+                itemId: 'request-user-input-1',
+                autoResolutionMs: null,
+                isBlocking: true,
+                questions: [{
+                    id: 'next_step',
+                    header: 'Next step',
+                    question: 'What should I do next?',
+                    isOther: true,
+                    isSecret: false,
+                    options: [
+                        { label: 'Run tests', description: 'Run the focused test suite.' },
+                        { label: 'None of the above', description: 'Use a different approach.' },
+                    ],
+                }],
+            };
+
+            const response = await fixture.sendServerRequest('item/tool/requestUserInput', params);
+            expect(response).toEqual({
+                answers: { next_step: { answers: ['None of the above'] } },
+            });
+            const [elicitationEvent] = fixture.getAcpConnectionEvents([]);
+            const options = elicitationEvent!.args[0].requestedSchema.properties.next_step.oneOf;
+            expect(options.filter((option: { const: string }) => option.const === 'None of the above')).toHaveLength(1);
+            await expect(fixture.getAcpConnectionDump([])).toMatchFileSnapshot(
+                'data/elicitation-user-input-existing-other.json',
+            );
+
+            completeTurn();
+            await promptPromise;
+        });
+
+        it('should auto-resolve request_user_input when the client does not answer in time', async () => {
+            const { promptPromise, completeTurn } = await setupSessionWithPendingPromptAndCapabilities({
+                elicitation: { form: {} },
+            });
+            fixture.setElicitationResponse(new Promise(() => {}));
+
+            const params: ToolRequestUserInputParams = {
+                threadId: sessionId,
+                turnId: 'turn-1',
+                itemId: 'request-user-input-1',
+                autoResolutionMs: 1,
+                isBlocking: true,
+                questions: [{
+                    id: 'next_step',
+                    header: 'Next step',
+                    question: 'What should I do next?',
+                    isOther: false,
+                    isSecret: false,
+                    options: null,
+                }],
+            };
+
+            const response = await fixture.sendServerRequest('item/tool/requestUserInput', params);
+            expect(response).toEqual({ answers: {} });
+
+            const [elicitationEvent] = fixture.getAcpConnectionEvents(['_meta']);
+            expect(elicitationEvent).toMatchObject({
+                method: 'createElicitation',
+                args: [{
+                    sessionId,
+                    toolCallId: 'request-user-input-1',
+                    mode: 'form',
+                }],
+            });
+
+            completeTurn();
+            await promptPromise;
+        });
+
+        it('should not call ACP elicitation for request_user_input without form support', async () => {
+            const { promptPromise, completeTurn } = setupSessionWithPendingPrompt();
+
+            const params: ToolRequestUserInputParams = {
+                threadId: sessionId,
+                turnId: 'turn-1',
+                itemId: 'request-user-input-1',
+                autoResolutionMs: null,
+                isBlocking: true,
+                questions: [{
+                    id: 'next_step',
+                    header: 'Next step',
+                    question: 'What should I do next?',
+                    isOther: false,
+                    isSecret: false,
+                    options: null,
+                }],
+            };
+
+            const response = await fixture.sendServerRequest('item/tool/requestUserInput', params);
+            expect(response).toEqual({ answers: {} });
+            expect(fixture.getAcpConnectionEvents(['_meta'])).toEqual([]);
+
+            completeTurn();
+            await promptPromise;
+        });
+    });
+});

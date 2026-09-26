@@ -431,6 +431,106 @@ fn seed_catalog_workspace(dir: &Path) {
     std::fs::write(dir.join(".npmrc"), "registry=http://127.0.0.1:9/\n").expect("write .npmrc");
 }
 
+#[tokio::test]
+async fn vendored_codex_adapter_refreshes_models_after_host_cli_upgrade() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(script) = gate("WSS host Codex E2E") else {
+        return;
+    };
+    let data = temp_data_dir();
+    let bin = data.path().join("bin");
+    let home = data.path().join("home");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let report = data.path().join("runtime-report");
+    let npx = write_fake_npx(&bin, &report, &script);
+    std::fs::write(&npx, "#!/bin/sh\nexit 99\n").unwrap();
+    let adapter = bin.join("codex-acp");
+    std::fs::write(&adapter, "#!/bin/sh\nexit 99\n").unwrap();
+    std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let node = intent_providers::resolve_on_path("node").unwrap();
+    let mock = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../intent-providers/vendor/codex-acp/test/mock-codex.mjs");
+    let codex = bin.join("codex");
+    let install = |model: &str| {
+        std::fs::write(
+            &codex,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = app-server ] || exit 17\n[ -z \"${{CODEX_PATH+x}}\" ] || exit 18\nexec '{}' '{}' app-server '{}'\n",
+                node.display(),
+                mock.display(),
+                model
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    install("host-original");
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    let child = spawn_serve(
+        data.path(),
+        &[
+            ("INTENTD_AUTH_TOKEN", TOKEN),
+            ("PATH", &path),
+            ("HOME", home.to_str().unwrap()),
+            ("SHELL", "/bin/sh"),
+            ("CODEX_PATH", "/stale/override"),
+            ("CODEX_CONFIG", "custom config"),
+            ("MOCK_CODEX_REPORT", report.to_str().unwrap()),
+        ],
+    );
+    let socket = data.path().join("intentd.sock");
+    let _daemon = Daemon {
+        child,
+        data_dir: data,
+    };
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    let mut rpc = connect_ws(port, cfg).await;
+    for (id, model) in [
+        (1, "host-original"),
+        (2, "host-original"),
+        (3, "host-upgraded-new"),
+    ] {
+        if id == 3 {
+            install(model);
+        }
+        let result = wss_rpc(&mut rpc, id, "models.list", json!({"providerId": "codex"})).await;
+        assert_eq!(result["source"], "codex", "{result}");
+        assert_eq!(result["models"][0]["id"], model, "{result}");
+        let launches = std::fs::read_to_string(&report).unwrap();
+        let calls: Vec<Value> = launches
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call["method"] == "initialize")
+                .count(),
+            if id == 3 { 2 } else { 1 }
+        );
+        assert!(calls
+            .iter()
+            .any(|call| call["method"] == "model/list" && call["model"] == model));
+        assert!(calls
+            .iter()
+            .any(|call| call["method"] == "thread/start" && call["model"] == model));
+        for call in calls.iter().filter(|call| call["method"] == "thread/start") {
+            assert_eq!(
+                call["params"]["config"]["agents"]["enabled"], false,
+                "{call}"
+            );
+            assert_eq!(
+                call["params"]["config"]["features"]["multi_agent_v2"], false,
+                "{call}"
+            );
+        }
+    }
+}
+
 /// Turn the daemon data dir — the ancestor of its `agent-configs` npx launch
 /// root — into the verifier's fixture: a `catalog:` manifest whose
 /// `workspaces` glob matches every launch dir, plus a `.npmrc` naming a

@@ -54,7 +54,7 @@ async fn command_isolation_replaces_inherited_configuration_and_preloads() {
     let launch = CodexLaunch {
         selection: ProviderLaunch::Managed {
             npx: root.path().join("npx"),
-            package: intent_providers::config::CODEX_ACP_NPX_PACKAGE,
+            package: crate::codex_diagnostics::TEST_CODEX_PACKAGE,
         },
         path: root.path().as_os_str().to_owned(),
         codex_path: None,
@@ -159,7 +159,7 @@ mod unix {
                     ),
                 );
             }
-            let pin = intent_providers::config::CODEX_ACP_NPX_PACKAGE
+            let pin = crate::codex_diagnostics::TEST_CODEX_PACKAGE
                 .rsplit_once('@')
                 .unwrap()
                 .1;
@@ -208,7 +208,7 @@ child.on('exit',code=>process.exit(code||0));
                 selection: if managed {
                     ProviderLaunch::Managed {
                         npx: self.root.path().join("bin/npx"),
-                        package: intent_providers::config::CODEX_ACP_NPX_PACKAGE,
+                        package: crate::codex_diagnostics::TEST_CODEX_PACKAGE,
                     }
                 } else {
                     ProviderLaunch::Local(ProviderBinary {
@@ -407,7 +407,7 @@ child.on('exit',code=>process.exit(code||0));
             json!([
                 "--workspaces=false",
                 "-y",
-                intent_providers::config::CODEX_ACP_NPX_PACKAGE
+                crate::codex_diagnostics::TEST_CODEX_PACKAGE
             ])
         );
         fixture.assert_clean();
@@ -859,16 +859,13 @@ child.on('exit',code=>process.exit(code||0));
     async fn missing_prerequisites_never_fall_back_to_a_local_adapter() {
         let fixture = Fixture::new(&json!({}));
         let mut launch = fixture.launch(false);
-        launch.selection = ProviderLaunch::Bare { command: "npx" };
+        launch.selection = ProviderLaunch::Bare { command: "node" };
         let inspection = launch.inspect_local().await;
         assert_eq!(inspection.report.launch_source, LaunchSource::Unresolved);
         assert_eq!(
             inspection.report.runtime_version,
             VersionMeasurement::Unknown(UnknownReason::AdapterNotFound)
         );
-        assert!(UnknownReason::AdapterNotFound
-            .message()
-            .contains("Node.js with npx"));
         let report = launch
             .catalogs_with_auth(Ok(fixture.auth().await), Limits::default())
             .await;

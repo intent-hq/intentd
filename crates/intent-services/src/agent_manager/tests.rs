@@ -2,7 +2,7 @@
 //! [`AgentManager`] multiplexing/teardown — parity-checked against
 //! `agent-process-registry`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use intent_acp::permission::{PermissionOptionView, RiskLevel};
@@ -24,10 +24,10 @@ use tokio::time::{timeout, Duration};
 use super::{
     budget_admits, charged_bytes, compute_process_cap, derive_agent_type, derive_is_orchestrator,
     is_cancel_transport_closed, pop_and_wake_waiter, recommended_memory_budget_bytes,
-    resolve_npx_only, resolve_spawn, settle_stale_waiter, text_prompt, AgentHandle, AgentManager,
-    BusEventSink, KillFn, ProcessRegistry, RegistryInner, ResolvedSpawn, TreeMemoryProbe,
-    TreeSample, DEFAULT_AGENT_TYPE, HOST_MEMORY_RESERVE_BYTES, PROVISIONAL_AGENT_BYTES,
-    REASON_MEMORY_BUDGET, REASON_SLOTS,
+    resolve_npx_only, resolve_spawn, resolve_spawn_with_codex_node, settle_stale_waiter,
+    text_prompt, AgentHandle, AgentManager, BusEventSink, KillFn, ProcessRegistry, RegistryInner,
+    ResolvedSpawn, TreeMemoryProbe, TreeSample, DEFAULT_AGENT_TYPE, HOST_MEMORY_RESERVE_BYTES,
+    PROVISIONAL_AGENT_BYTES, REASON_MEMORY_BUDGET, REASON_SLOTS,
 };
 use crate::agent_ops::user_message_blocks;
 use crate::events::{EventBus, SubscriptionFilter};
@@ -16125,11 +16125,20 @@ async fn resolve_spawn_session_provider_with_bare_model() {
     let mut session = session_with_specialist(None);
     session.provider = Some("codex".to_string());
     session.model = Some("gpt-5.3-codex/high".to_string());
-    let resolved =
-        resolve_spawn(&session, None, &settings, None).expect("session provider resolves");
+    let resolved = resolve_spawn_with_codex_node(&session, None, &settings, None, || {
+        Some(PathBuf::from("/fixture/node"))
+    })
+    .expect("session provider resolves");
     assert_eq!(resolved.provider.id, "codex");
     assert_eq!(resolved.model.as_deref(), Some("gpt-5.3-codex"));
     assert_eq!(resolved.reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(
+        resolved.bundled_codex_node.as_deref(),
+        Some(Path::new("/fixture/node"))
+    );
+    let missing = resolve_spawn_with_codex_node(&session, None, &settings, None, || None);
+    assert!(matches!(missing, Err(Error::InvalidInput(ref message))
+        if message == intent_providers::CODEX_ACP_PREREQUISITE_ERROR));
 }
 
 /// A workspace whose `path` exists on disk becomes the spawn cwd; a missing
@@ -20527,6 +20536,7 @@ mod model_change_notice_tests {
 
     fn resolved(provider_id: &str, model: Option<&str>) -> ResolvedSpawn {
         ResolvedSpawn {
+            bundled_codex_node: None,
             provider: *intent_providers::provider_config(provider_id),
             model: model.map(str::to_string),
             reasoning_effort: None,

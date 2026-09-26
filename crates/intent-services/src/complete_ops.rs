@@ -251,7 +251,7 @@ fn resolve_quick_action_model(
 pub(crate) fn one_shot_launch(
     provider: &intent_providers::ProviderConfig,
     resolved_bin: Option<PathBuf>,
-    npx: Option<PathBuf>,
+    fallback_runtime: Option<PathBuf>,
     model: Option<&str>,
 ) -> Option<OneShotCommand> {
     let inputs = intent_providers::ArgInputs {
@@ -259,21 +259,20 @@ pub(crate) fn one_shot_launch(
         ..Default::default()
     };
     let args = intent_providers::build_provider_args(provider, &inputs);
-    let resolved_bin = resolved_bin
-        .filter(|_| provider.npx_only_package.is_none() || provider.npx_only_honors_path_override);
+    let resolved_bin = resolved_bin.filter(|_| {
+        provider.id != "codex"
+            && (provider.npx_only_package.is_none() || provider.npx_only_honors_path_override)
+    });
     let via_npx = resolved_bin.is_none();
     let mut cmd = if let Some(bin) = resolved_bin {
         OneShotCommand::binary(bin, args)
+    } else if provider.id == "codex" {
+        OneShotCommand::bundled_codex(fallback_runtime?)
     } else if let Some(pkg) = provider.npx_only_package {
-        OneShotCommand::npx(npx?, pkg).args(args)
+        OneShotCommand::npx(fallback_runtime?, pkg).args(args)
     } else {
         let pkg = provider.fallback_npx_package?;
-        // The daemon-managed npx fallback: keep a stray env override from
-        // redirecting the adapter (mirrors the codex probe launch, #555).
-        OneShotCommand::npx(npx?, pkg)
-            .args(args)
-            .env_remove("CODEX_PATH")
-            .env_remove("CODEX_CONFIG")
+        OneShotCommand::npx(fallback_runtime?, pkg).args(args)
     };
     if provider.id == "codex" {
         // Share persistent-session mode policy without importing unrelated
@@ -327,7 +326,9 @@ pub(crate) fn resolve_one_shot_binary(
     provider: &intent_providers::ProviderConfig,
     explicit_path: Option<&str>,
 ) -> Option<PathBuf> {
-    if provider.npx_only_package.is_some() {
+    if provider.id == "codex" {
+        None
+    } else if provider.npx_only_package.is_some() {
         intent_providers::resolve_npx_only_override(provider, explicit_path)
     } else {
         intent_providers::find_provider_binary(
@@ -549,7 +550,7 @@ impl Services {
         // hermetically on hosts where npx is installed.
         let npx = match &self.one_shot_npx {
             Some(pinned) => pinned.clone(),
-            None if provider_id == "codex" => intent_providers::find_codex_npx(),
+            None if provider_id == "codex" => intent_providers::find_codex_node(),
             None => intent_providers::find_npx(),
         };
         let Some(cmd) = one_shot_launch(provider, resolved_bin, npx, model) else {
@@ -810,7 +811,7 @@ rl.on('line', (line) => {
   if (msg.method === 'session/new') { sessionNew = msg.params; return send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 's1' } }); }
   if (msg.method === 'session/set_config_option') { selectedModel = msg.params.value; return send({ jsonrpc: '2.0', id: msg.id, result: {} }); }
   if (msg.method === 'session/prompt') {
-    const text = JSON.stringify({ sessionNew, prompt: msg.params.prompt[0].text, selectedModel, argv: process.argv.slice(2), config: process.argv.includes('--workspaces=false') ? process.env.CODEX_CONFIG : null, hasCodexPath: 'CODEX_PATH' in process.env });
+    const text = JSON.stringify({ sessionNew, prompt: msg.params.prompt[0].text, selectedModel, argv: process.argv.slice(2), config: process.env.CODEX_CONFIG, hasCodexPath: 'CODEX_PATH' in process.env });
     send({
       jsonrpc: '2.0',
       method: 'session/update',
@@ -1110,7 +1111,7 @@ rl.on('line', (line) => {
     }
 
     #[test]
-    fn one_shot_codex_uses_pinned_runtime_even_with_resolved_adapter() {
+    fn one_shot_codex_uses_bundled_runtime_even_with_resolved_adapter() {
         let codex = intent_providers::find_provider("codex").unwrap();
         let npx = PathBuf::from("/test/node/bin/npx");
         for model in [None, Some("gpt-5.5"), Some("gpt-5.5/high")] {
@@ -1157,13 +1158,13 @@ rl.on('line', (line) => {
                 .await
                 .unwrap();
                 let observed: Value = serde_json::from_str(&reply).unwrap();
+                let argv = observed["argv"].as_array().unwrap();
+                assert_eq!(argv.len(), 1);
                 assert_eq!(
-                    observed["argv"],
-                    json!([
-                        "--workspaces=false",
-                        "-y",
-                        intent_providers::config::CODEX_ACP_NPX_PACKAGE
-                    ])
+                    std::path::Path::new(argv[0].as_str().unwrap())
+                        .file_name()
+                        .unwrap(),
+                    "codex-acp.mjs"
                 );
                 assert_eq!(observed["hasCodexPath"], false);
                 let config: Value =
@@ -1182,7 +1183,7 @@ rl.on('line', (line) => {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn complete_once_codex_reports_missing_npx_despite_custom_adapter() {
+    async fn complete_once_codex_reports_missing_node_despite_custom_adapter() {
         let (_dir, adapter) = fake_acp_adapter("native-only", "must not run");
         let (_tmp, services) = services_with_settings(&[
             ("model.defaultProvider", json!("codex")),
@@ -1196,13 +1197,13 @@ rl.on('line', (line) => {
             .unwrap();
         assert_eq!(result["available"], false);
         let reason = result["reason"].as_str().unwrap();
-        for expected in ["Node.js", "npx", "Install"] {
+        for expected in ["Node.js", "Codex", "Install"] {
             assert!(reason.contains(expected), "{reason}");
         }
     }
 
     #[test]
-    fn one_shot_codex_requires_npx_even_with_resolved_adapter() {
+    fn one_shot_codex_requires_node_even_with_resolved_adapter() {
         let codex = intent_providers::find_provider("codex").unwrap();
         assert!(
             one_shot_launch(codex, Some(PathBuf::from("/custom/codex-acp")), None, None,).is_none()
@@ -1256,7 +1257,7 @@ rl.on('line', (line) => {
         assert_eq!(launch.program(), npx.as_path());
         assert!(one_shot_launch(claude, None, None, None).is_none());
 
-        // Codex ignores resolved adapters and always requires npx.
+        // Codex ignores resolved adapters and always requires the bundled runtime.
         let codex = intent_providers::find_provider("codex").unwrap();
         assert!(one_shot_launch(codex, Some(bin), None, None).is_none());
         assert!(one_shot_launch(codex, None, Some(npx), None).is_some());

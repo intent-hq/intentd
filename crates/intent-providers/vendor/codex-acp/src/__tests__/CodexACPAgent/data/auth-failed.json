@@ -1,0 +1,11 @@
+{
+  "eventType": "request",
+  "method": "account/read",
+  "params": {
+    "refreshToken": false
+  }
+}
+{
+  "eventType": "response",
+  "placeholder": "account/read"
+}

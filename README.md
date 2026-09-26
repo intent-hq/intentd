@@ -383,29 +383,25 @@ database (`intentd.db`) and the socket (`intentd.sock`).
 
 ### Codex diagnostics
 
-`intentd doctor` reports the pinned managed Codex ACP adapter and whether Node.js and
-npx are available on the daemon host. Both are required. Production selection ignores
+`intentd doctor` reports the vendored Codex ACP adapter and the Codex CLI installed
+on the daemon host. Node.js 22+ and the host CLI are required. Production selection ignores
 `providers.paths.codex`, local `codex-acp` installations on PATH, and `CODEX_PATH`.
 The adapter receives the daemon-owned, fixed `CODEX_CONFIG` policy that disables
 built-in subagents; inherited configuration is replaced, not merged.
 
-The configured managed package pin is configuration, not a measured version. Ordinary
-doctor does not resolve or install the package, so adapter and runtime versions remain
-unknown. Package metadata applies only to an established selected entrypoint: a declared
-package version is labeled **metadata, not measured** and does not prove the running
-adapter or bundled runtime version. On Linux and Windows, the opt-in check below measures
-adapter and runtime versions separately after verifying their package entrypoints;
-opaque wrappers, missing runtimes, and failed checks remain explicitly unknown. An
-unrelated `codex` on PATH never supplies evidence of the selected adapter's runtime.
+The adapter's content hash identifies the shipped bundle; it is not a measured
+version. On Linux and Windows, ordinary doctor measures the selected host CLI with
+an isolated, bounded `--version` call. Missing runtimes and failed checks remain
+explicitly unknown. Updating the host Codex CLI changes the runtime used by new
+ACP sessions and model discovery without installing another adapter package.
 
 On Linux, diagnostic process probes also require `/bin/bash` for private process
 supervision. If it is unavailable, probes report a failure and their results remain
 unknown; diagnostics do not install Bash or fall back to another shell. This requirement
 applies only to diagnostic probes, not normal provider launches.
 
-On macOS, diagnostics report the selected launch and configured managed pin without
-resolving the package or inspecting ignored local adapters. They do not execute Node,
-the adapter, or Codex, or infer a runtime from PATH or neighboring packages.
+On macOS, diagnostics report the vendored bundle identity and resolved host CLI path
+without inspecting ignored local adapters. They do not execute Node, the adapter, or Codex.
 Version and catalog process probes are explicitly unsupported because detached-child
 cleanup cannot be guaranteed. Even with `--codex-models`, macOS performs no diagnostic
 authentication capture, npm resolution, or temporary probe setup; catalog comparison
@@ -418,7 +414,7 @@ compare fresh catalogs with:
 intentd doctor --codex-models
 ```
 
-This opt-in can resolve/download the selected managed npm package. It reports ACP
+This opt-in runs the shipped adapter without npm downloads. It reports ACP
 advertisements and the verified runtime's `model/list` separately, preserving original
 IDs, raw model aliases, hidden flags, and each row's source. ACP choices may be
 synthesized by the adapter. Missing advertisements, explicitly empty catalogs, withheld

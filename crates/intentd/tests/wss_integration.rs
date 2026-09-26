@@ -12339,7 +12339,7 @@ fn fake_acp_adapter_script(tag: &str, behavior: &str) -> (tempfile::TempDir, std
 #[cfg(unix)]
 #[intent_test_macros::daemon_test]
 async fn wss_agent_complete_once_routes_non_auggie_provider_via_ephemeral_acp() {
-    if common::codex_npx::in_subprocess(
+    if common::codex_runtime::in_subprocess(
         "wss_agent_complete_once_routes_non_auggie_provider_via_ephemeral_acp",
     ) {
         return;
@@ -12357,7 +12357,7 @@ async fn wss_agent_complete_once_routes_non_auggie_provider_via_ephemeral_acp() 
         fake_acp_adapter_script("complete", r#"{"response":"🤖\nfix-login-flow"}"#);
     let srv = start(WsOptions::default()).await;
     srv.set_setting("model.defaultProvider", serde_json::json!("codex"));
-    common::codex_npx::select_adapter(&bin);
+    common::codex_runtime::select_adapter(&bin);
 
     let resp = wss_call(
         srv.port,
@@ -12458,7 +12458,7 @@ async fn wss_agent_complete_once_claude_code_sends_slimmed_session_meta() {
 #[cfg(unix)]
 #[intent_test_macros::daemon_test]
 async fn wss_agent_complete_once_acp_adapter_failure_is_internal_error() {
-    if common::codex_npx::in_subprocess(
+    if common::codex_runtime::in_subprocess(
         "wss_agent_complete_once_acp_adapter_failure_is_internal_error",
     ) {
         return;
@@ -12474,7 +12474,7 @@ async fn wss_agent_complete_once_acp_adapter_failure_is_internal_error() {
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
     let srv = start(WsOptions::default()).await;
     srv.set_setting("model.defaultProvider", serde_json::json!("codex"));
-    common::codex_npx::select_adapter(&bin);
+    common::codex_runtime::select_adapter(&bin);
 
     let resp = wss_call(
         srv.port,
@@ -12492,7 +12492,7 @@ async fn wss_agent_complete_once_acp_adapter_failure_is_internal_error() {
 #[cfg(unix)]
 #[intent_test_macros::daemon_test]
 async fn wss_host_provider_test_prompt_success_and_auth_required_paths() {
-    if common::codex_npx::in_subprocess(
+    if common::codex_runtime::in_subprocess(
         "wss_host_provider_test_prompt_success_and_auth_required_paths",
     ) {
         return;
@@ -12519,7 +12519,7 @@ async fn wss_host_provider_test_prompt_success_and_auth_required_paths() {
         r#"{"promptRpcError":{"code":-32000,"message":"Authentication required"}}"#,
     );
     let srv = start(WsOptions::default()).await;
-    common::codex_npx::select_adapter(&ok_bin);
+    common::codex_runtime::select_adapter(&ok_bin);
 
     let resp = wss_call(
         srv.port,
@@ -12546,7 +12546,7 @@ async fn wss_host_provider_test_prompt_success_and_auth_required_paths() {
 
     // Same provider, now behind an adapter that rejects the prompt with the
     // claude-code auth-required shape (-32000 + auth-pattern message).
-    common::codex_npx::select_adapter(&auth_bin);
+    common::codex_runtime::select_adapter(&auth_bin);
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -12740,7 +12740,7 @@ async fn wss_acp_node_max_old_space_mb_setting_reaches_provider_test_prompt_chil
 #[cfg(unix)]
 #[intent_test_macros::daemon_test]
 async fn wss_agent_complete_once_saturated_bound_returns_adapter_busy_and_queued_calls_complete() {
-    if common::codex_npx::in_subprocess(
+    if common::codex_runtime::in_subprocess(
         "wss_agent_complete_once_saturated_bound_returns_adapter_busy_and_queued_calls_complete",
     ) {
         return;
@@ -12794,7 +12794,7 @@ async fn wss_agent_complete_once_saturated_bound_returns_adapter_busy_and_queued
     };
     let srv = start(WsOptions::default()).await;
     srv.set_setting("model.defaultProvider", serde_json::json!("codex"));
-    common::codex_npx::select_adapter(&bin);
+    common::codex_runtime::select_adapter(&bin);
 
     // The bound is a process-global installed once; ask for 1 and fill
     // whatever is actually in force, so this holds under any test runner.
@@ -12899,12 +12899,12 @@ async fn wss_agent_complete_once_saturated_bound_returns_adapter_busy_and_queued
 #[intent_test_macros::daemon_test]
 async fn wss_agent_complete_once_unavailable_when_adapter_unresolvable() {
     // The resolution tier of the gate: a one-shot-capable provider whose
-    // adapter resolves to nothing (no Node/npx for the pinned
-    // package) returns `{ available: false, reason }`, never an error.
+    // adapter resolves to nothing (no Node or device Codex for the vendored
+    // adapter) returns `{ available: false, reason }`, never an error.
     // Environment-gated — missing prerequisites are covered hermetically
-    // by service tests; native codex-acp cannot substitute for Node/npx.
-    if intent_providers::find_codex_npx().is_some() {
-        eprintln!("skipping unresolvable-adapter e2e: Codex Node/npx is installed");
+    // by service tests; native codex-acp cannot substitute for Node and Codex.
+    if intent_providers::find_codex_node().is_some() {
+        eprintln!("skipping unresolvable-adapter e2e: Node and device Codex are installed");
         return;
     }
     let srv = start(WsOptions::default()).await;
@@ -13084,7 +13084,7 @@ async fn wss_agent_complete_once_resolves_quick_action_settings() {
 #[cfg(unix)]
 #[intent_test_macros::daemon_test]
 async fn wss_agent_complete_once_legacy_compound_quick_action_routes_to_its_provider() {
-    if common::codex_npx::in_subprocess(
+    if common::codex_runtime::in_subprocess(
         "wss_agent_complete_once_legacy_compound_quick_action_routes_to_its_provider",
     ) {
         return;
@@ -13101,7 +13101,7 @@ async fn wss_agent_complete_once_legacy_compound_quick_action_routes_to_its_prov
     }
     let (_adapter_dir, bin) =
         fake_acp_adapter_script("compound-quick", r#"{"response":"🤖\ncompound-routed"}"#);
-    common::codex_npx::select_adapter(&bin);
+    common::codex_runtime::select_adapter(&bin);
     let srv = start(WsOptions::default()).await;
     // Seed via reload() — the live-reload watcher path for an externally
     // edited config.toml — since settings.update rejects compound values.
@@ -19845,12 +19845,13 @@ async fn wss_workspace_import_lifecycle() {
 
     let srv = start(WsOptions::default()).await;
     srv.set_setting("providers.enabled", serde_json::json!({"auggie":false}));
+    // Import selects a provider but does not launch it; use a supported path override.
     srv.set_setting(
         "providers.paths",
-        serde_json::json!({"codex":std::env::current_exe().unwrap()}),
+        serde_json::json!({"claude-code":std::env::current_exe().unwrap()}),
     );
-    srv.set_setting("model.defaultProvider", serde_json::json!("codex"));
-    srv.set_setting("model.default", serde_json::json!("gpt-6-astra"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("claude-code"));
+    srv.set_setting("model.default", serde_json::json!("claude-sonnet-4"));
     srv.set_setting("model.defaultReasoningEffort", serde_json::json!("high"));
     let ws_id = "ws-wss-imported";
     let t = "2026-08-11T00:00:00Z";
@@ -20009,8 +20010,8 @@ async fn wss_workspace_import_lifecycle() {
     assert_eq!(selected["jsonrpc"], "2.0");
     assert_eq!(selected["id"], 60);
     let session = &selected["result"]["session"];
-    assert_eq!(session["provider"], "codex", "{selected}");
-    assert_eq!(session["model"], "gpt-6-astra", "{selected}");
+    assert_eq!(session["provider"], "claude-code", "{selected}");
+    assert_eq!(session["model"], "claude-sonnet-4", "{selected}");
     assert_eq!(session["reasoningEffort"], "high", "{selected}");
     assert!(session["effortLevels"].is_null(), "{selected}");
     assert!(session["acpSessionId"].is_null(), "{selected}");

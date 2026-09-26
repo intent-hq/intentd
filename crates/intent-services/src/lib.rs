@@ -500,6 +500,9 @@ pub struct Services {
     /// hermetically through the real discovery.
     #[expect(clippy::option_option)] // the nesting IS the no-override vs pinned distinction
     one_shot_npx: Option<Option<PathBuf>>,
+    #[cfg(test)]
+    import_provider_availability:
+        Option<Arc<HashMap<String, intent_providers::ProviderAvailability>>>,
     /// Test-only override (milliseconds) for the auto-commit message
     /// generation timeout. Production composition leaves this `None` and the
     /// idle auto-commit path uses its 60s default; tests compress it so the
@@ -1375,6 +1378,8 @@ impl Services {
             auggie_bin: None,
             branches_ls_remote_base: None,
             one_shot_npx: None,
+            #[cfg(test)]
+            import_provider_availability: None,
             auto_commit_timeout_ms: None,
             auto_commit_cooldown_ms: None,
             auto_commit_cooldowns: Arc::new(Mutex::new(HashMap::new())),

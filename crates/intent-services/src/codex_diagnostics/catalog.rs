@@ -214,7 +214,7 @@ impl Default for Limits {
 }
 
 impl CodexLaunch {
-    /// Explicit opt-in only: may download the selected managed npm package.
+    /// Explicit opt-in only: launches the vendored adapter and selected host runtime.
     /// Each catalog has a 30s deadline and 1 MiB limit per output stream; raw
     /// pagination is at most 10 pages/2000 rows. Existing bounded inspection
     /// and process cleanup have their own deadlines. No prompt/login is sent.
@@ -370,6 +370,10 @@ impl CodexLaunch {
         super::process::ensure_supported()?;
         let home = auth.home().await?;
         let path = home.path().to_owned();
+        if matches!(self.selection(), ProviderLaunch::VendoredCodex { .. }) {
+            intent_providers::codex::write_adapter(&path)
+                .map_err(|_| CatalogFailure::IsolationFailed)?;
+        }
         let mut command = intent_acp::spawn::build_command(&self.spawn_options());
         auth.isolate(&mut command, self, &path);
         // Isolation removes inherited/user configuration, including the env

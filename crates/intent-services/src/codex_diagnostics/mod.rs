@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use intent_acp::spawn::{build_command, SpawnOptions};
 use intent_core::settings_file::SettingsFile;
-use intent_providers::config::{CODEX_ACP_NPX_PACKAGE, CODEX_SUBAGENT_POLICY_CONFIG};
+use intent_providers::config::CODEX_SUBAGENT_POLICY_CONFIG;
 use intent_providers::discover::{ProviderBinarySource, ProviderLaunch};
 use serde::Serialize;
 use tokio::io::AsyncReadExt;
@@ -30,9 +30,13 @@ pub use catalog::{
 const LOCAL_TIMEOUT: Duration = Duration::from_secs(3);
 const OUTPUT_LIMIT: usize = 16 * 1024;
 
+#[cfg(test)]
+const TEST_CODEX_PACKAGE: &str = "@agentclientprotocol/codex-acp@1.13.1";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum LaunchSource {
+    Vendored,
     SettingsOverride,
     LocalDiscovery,
     ManagedNpm,
@@ -44,6 +48,7 @@ pub enum LaunchSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum UnknownReason {
+    BundledAdapterNotMeasured,
     ManagedPackageNotInspected,
     AdapterNotFound,
     NodeNotFound,
@@ -67,6 +72,7 @@ impl UnknownReason {
     #[must_use]
     pub fn message(self) -> &'static str {
         match self {
+            Self::BundledAdapterNotMeasured => "vendored build identified by its content hash",
             Self::ManagedPackageNotInspected => {
                 "selected npm package has not been inspected; no package was installed"
             }
@@ -108,6 +114,7 @@ pub enum VersionMeasurement {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RuntimeSource {
+    HostInstallation,
     AdapterDependency,
     EnvironmentOverride,
     Unknown,
@@ -135,7 +142,7 @@ pub struct CodexRuntimeReport {
 
 /// Executable identity for the later raw catalog probe. This is launch data,
 /// not rendering data. A dependency uses Node + its exact package entrypoint;
-/// it never uses an unrelated `codex` discovered on PATH.
+/// a vendored launch uses the selected host Codex executable directly.
 pub struct DiagnosticExecutable {
     pub program: PathBuf,
     pub args: Vec<OsString>,
@@ -166,19 +173,19 @@ pub struct CodexLaunch {
 }
 
 impl CodexLaunch {
-    /// Uses production's pinned npm selection and environment policy. Codex
+    /// Uses production's vendored adapter selection and environment policy. Codex
     /// ignores configured and discovered local adapters. Discovery may perform
     /// the existing bounded login-shell capture;
     /// async callers should perform this synchronous step off their executor.
     #[must_use]
     pub fn discover(_settings: &SettingsFile) -> Self {
-        let selection = intent_providers::find_codex_npx().map_or(
-            ProviderLaunch::Bare { command: "npx" },
-            |npx| ProviderLaunch::Managed {
-                npx,
-                package: CODEX_ACP_NPX_PACKAGE,
-            },
-        );
+        let selection = match (
+            intent_providers::find_node(),
+            intent_providers::codex::host_codex_path(),
+        ) {
+            (Some(node), Some(runtime)) => ProviderLaunch::VendoredCodex { node, runtime },
+            _ => ProviderLaunch::Bare { command: "node" },
+        };
         let command = build_command(&spawn_options(&selection));
         Self {
             selection,
@@ -211,6 +218,20 @@ impl CodexLaunch {
     /// packages, or asks a provider for models/account/auth information.
     pub async fn inspect_local(&self) -> CodexInspection {
         match &self.selection {
+            ProviderLaunch::VendoredCodex { runtime, .. } => {
+                let mut result = self.unknown(UnknownReason::BundledAdapterNotMeasured);
+                result.report.runtime_source = RuntimeSource::HostInstallation;
+                result.report.runtime_path = Some(safe_text(&runtime.to_string_lossy()));
+                let executable = DiagnosticExecutable {
+                    program: runtime.clone(),
+                    args: vec![],
+                };
+                result.report.runtime_version = self
+                    .version(executable.command(), VersionKind::Runtime, None)
+                    .await;
+                result.runtime = Some(executable);
+                result
+            }
             ProviderLaunch::Local(binary) => self.inspect(&binary.path, None, None).await,
             ProviderLaunch::Managed { .. } => {
                 self.unknown(UnknownReason::ManagedPackageNotInspected)
@@ -243,6 +264,9 @@ impl CodexLaunch {
 
     fn unknown(&self, reason: UnknownReason) -> CodexInspection {
         let (launch_source, program) = match &self.selection {
+            ProviderLaunch::VendoredCodex { node, .. } => {
+                (LaunchSource::Vendored, node.as_os_str())
+            }
             ProviderLaunch::Local(binary) => (
                 match binary.source {
                     ProviderBinarySource::SettingsOverride => LaunchSource::SettingsOverride,
@@ -257,7 +281,10 @@ impl CodexLaunch {
             report: CodexRuntimeReport {
                 launch_source,
                 launch_program: safe_text(&program.to_string_lossy()),
-                configured_package: CODEX_ACP_NPX_PACKAGE,
+                configured_package: match &self.selection {
+                    ProviderLaunch::Managed { package, .. } => package,
+                    _ => intent_providers::codex::ADAPTER_VERSION,
+                },
                 removes_codex_overrides: {
                     let command = build_command(&self.spawn_options());
                     effective_env(&command, "CODEX_PATH").is_none()
@@ -414,6 +441,7 @@ impl CodexLaunch {
 fn spawn_options(selection: &ProviderLaunch) -> SpawnOptions<'_> {
     let mut options = SpawnOptions::new(intent_providers::provider_config("codex"));
     match selection {
+        ProviderLaunch::VendoredCodex { node, .. } => options.bundled_codex_node = Some(node),
         ProviderLaunch::Local(binary) => options.provider_binary = Some(&binary.path),
         ProviderLaunch::Managed { npx, package } => {
             options.npx_fallback_binary = Some(npx);

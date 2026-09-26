@@ -143,10 +143,7 @@ fn registry_field_parity() {
 
     let codex = find_provider("codex").unwrap();
     assert_eq!(codex.auth_check_args, Some(&["login", "status"][..]));
-    assert_eq!(
-        codex.npx_only_package,
-        Some(crate::config::CODEX_ACP_NPX_PACKAGE)
-    );
+    assert_eq!(codex.npx_only_package, None);
     assert_eq!(codex.fallback_npx_package, None);
     assert!(!codex.npx_only_honors_path_override);
 

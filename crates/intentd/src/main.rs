@@ -111,18 +111,18 @@ enum Command {
     /// Diagnostics: data-dir writable, SQLite/migrations current, providers,
     /// ports free, cert validity, GitHub token, context engine, host caps (§5.7).
     Doctor {
-        /// Compare fresh ACP and selected-runtime model catalogs. May download
-        /// the managed npm package; uses existing file/environment authentication
+        /// Compare fresh ACP and host-runtime model catalogs with the vendored
+        /// adapter; uses existing file/environment authentication
         /// in isolated state, without prompts, login or token refresh. Each
         /// catalog allows 30 seconds, plus local inspection/startup/cleanup
         /// budgets. Missing models and partial failures remain advisory; catalog
         /// membership does not verify account entitlement. Without this flag,
-        /// Codex reports the pinned launch and Node.js/npx prerequisites without
-        /// resolving npm. Configured/PATH adapters and `CODEX_PATH` are ignored.
-        /// Package metadata is meaningful only for an established selected
-        /// entrypoint. On macOS, version and catalog process probes are unsupported,
-        /// because descendant cleanup cannot be guaranteed. No npm resolution
-        /// or diagnostic authentication capture occurs on macOS.
+        /// Codex reports the bundle identity and host CLI version without querying
+        /// models. The bundle hash is metadata, not a measured version.
+        /// Configured/PATH adapters and `CODEX_PATH` are ignored.
+        /// On macOS, version and catalog process probes are unsupported because
+        /// descendant cleanup cannot be guaranteed. No diagnostic authentication
+        /// capture occurs on macOS. No adapter package is downloaded.
         #[arg(long)]
         codex_models: bool,
     },
@@ -6934,21 +6934,7 @@ async fn report_provider_availability(config: &Config, codex_models: bool) {
             continue;
         }
         if provider.id == "codex" {
-            // Node+npx availability says nothing about the pinned package's
-            // runtime. Only the safe diagnostic report supplies that evidence;
-            // do not run an opaque adapter as a generic auth/version probe.
-            if provider.installed {
-                println!("  [ok] codex Node.js/npx prerequisites: available");
-            } else {
-                println!(
-                    "{}",
-                    npx_provider_availability_line(
-                        "codex",
-                        intent_providers::CODEX_ACP_NPX_PACKAGE,
-                        None
-                    )
-                );
-            }
+            println!("{}", codex_provider_availability_line(provider.installed));
             doctor_codex::report(settings.clone(), codex_models).await;
             continue;
         }
@@ -7039,14 +7025,21 @@ async fn report_provider_availability(config: &Config, codex_models: bool) {
     }
 }
 
+fn codex_provider_availability_line(installed: bool) -> String {
+    if installed {
+        "  [ok] codex via vendored adapter and device Codex CLI".to_string()
+    } else {
+        format!(
+            "  [--] codex unavailable ({})",
+            intent_providers::CODEX_ACP_PREREQUISITE_ERROR
+        )
+    }
+}
+
 /// Format the ordinary npx doctor line from discovery's result without probing again.
 fn npx_provider_availability_line(id: &str, package: &str, npx: Option<&Path>) -> String {
     match npx {
         Some(npx) => format!("  [ok] {id} via npx: {} -y {package}", npx.display()),
-        None if id == "codex" => format!(
-            "  [--] {id} unavailable ({})",
-            intent_providers::CODEX_ACP_PREREQUISITE_ERROR
-        ),
         None => format!(
             "  [--] {id} unavailable (npx not found — {} is required)",
             intent_providers::CLAUDE_AGENT_ACP_NODE_REQUIREMENT
@@ -7320,11 +7313,7 @@ mod tests {
 
     #[test]
     fn doctor_codex_unavailable_names_both_runtime_prerequisites() {
-        // Codex discovery returns None when Node is missing even if npx
-        // exists, as well as when npx or both are missing. The provider
-        // resolver tests cover that executable matrix without touching PATH.
-        let line =
-            npx_provider_availability_line("codex", intent_providers::CODEX_ACP_NPX_PACKAGE, None);
+        let line = codex_provider_availability_line(false);
         assert_eq!(
             line,
             format!(
@@ -7352,7 +7341,7 @@ mod tests {
     #[test]
     fn doctor_available_npx_provider_keeps_selected_package_and_path() {
         let npx = Path::new("/toolchain/npx");
-        for id in ["codex", "claude-code"] {
+        for id in ["pi", "claude-code"] {
             let package = intent_providers::find_provider(id)
                 .unwrap()
                 .npx_only_package

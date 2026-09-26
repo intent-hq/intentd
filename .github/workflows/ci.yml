@@ -1637,8 +1637,18 @@ jobs:
         run: ./scripts/test-changed-tests.sh
       - name: Test the Makefile gate forwarder
         run: ./scripts/test-makefile-forwarder.sh
-      - name: Test the Codex ACP rolling pin PR automation
-        run: python3 -S scripts/test-auto-pin-codex-acp.py
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      - name: Verify the vendored Codex ACP source and shipped bundle
+        working-directory: crates/intent-providers/vendor/codex-acp
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run typecheck
+          npm test
+          npm run build
+          node --test test/adapter-check.mjs
+          git diff --exit-code -- dist
       - name: Test the release-plz no-op baseline
         run: python3 -S scripts/test-release-plz-noop.py
 

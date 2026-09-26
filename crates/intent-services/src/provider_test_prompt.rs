@@ -145,7 +145,7 @@ pub async fn provider_test_prompt<S: std::hash::BuildHasher>(
     // runtime — thread the signal into the env builder (STAB-50 heap cap).
     let via_npx = resolved_bin.is_none();
     let npx = if provider_id == "codex" {
-        intent_providers::find_codex_npx()
+        intent_providers::find_codex_node()
     } else {
         intent_providers::find_npx()
     };

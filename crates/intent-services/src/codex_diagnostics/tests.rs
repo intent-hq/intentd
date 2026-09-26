@@ -134,7 +134,7 @@ mod unix {
             CodexLaunch {
                 selection: ProviderLaunch::Managed {
                     npx: self.root.path().join("bin/npx"),
-                    package: CODEX_ACP_NPX_PACKAGE,
+                    package: TEST_CODEX_PACKAGE,
                 },
                 path: self.path.clone(),
                 codex_path: None,
@@ -149,7 +149,10 @@ mod unix {
         let launch = local.local(ProviderBinarySource::SettingsOverride);
         let result = launch.inspect_local().await;
         assert_eq!(result.report.launch_source, LaunchSource::SettingsOverride);
-        assert_eq!(result.report.configured_package, CODEX_ACP_NPX_PACKAGE);
+        assert_eq!(
+            result.report.configured_package,
+            intent_providers::codex::ADAPTER_VERSION
+        );
         assert_eq!(
             result.report.adapter_version,
             VersionMeasurement::Measured("2.4.6".into())
@@ -165,7 +168,7 @@ mod unix {
         assert!(result.report.removes_codex_overrides);
         assert!(!local.path_marker.exists());
 
-        let pin = CODEX_ACP_NPX_PACKAGE.rsplit_once('@').unwrap().1;
+        let pin = TEST_CODEX_PACKAGE.rsplit_once('@').unwrap().1;
         let managed = Fixture::new(pin, "0.333.4");
         let launch = managed.managed();
         let cold = launch.inspect_local().await;
@@ -201,7 +204,7 @@ mod unix {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn package_metadata_is_not_a_measured_version() {
-        let pin = CODEX_ACP_NPX_PACKAGE.rsplit_once('@').unwrap().1;
+        let pin = TEST_CODEX_PACKAGE.rsplit_once('@').unwrap().1;
         let fixture = Fixture::new(pin, "0.333.4");
         executable(
             &fixture.adapter,
@@ -219,7 +222,7 @@ mod unix {
             .managed()
             .inspect_materialized(&fixture.adapter)
             .await;
-        assert_eq!(result.report.configured_package, CODEX_ACP_NPX_PACKAGE);
+        assert_eq!(result.report.configured_package, TEST_CODEX_PACKAGE);
         assert_eq!(
             result.report.adapter_version,
             VersionMeasurement::Measured("7.8.9".into())

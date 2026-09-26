@@ -24,6 +24,7 @@ fn disable_node_compile_cache() {
 
 pub mod antigravity;
 pub mod args;
+pub mod codex;
 pub mod config;
 pub mod discover;
 pub mod models;
@@ -38,19 +39,19 @@ pub use config::{
     first_provider_id, is_provider_authentication_error, login_command, provider_config,
     InjectionMechanism, ProviderConfig, ToolRemovalStyle, ACP_PROVIDERS, AUGGIE_CLI_MIN_VERSION,
     AUGGIE_CLI_REQUIREMENT, CLAUDE_AGENT_ACP_NODE_REQUIREMENT, CLAUDE_AGENT_ACP_NPX_PACKAGE,
-    CLAUDE_AGENT_ACP_VERSION, CODEX_ACP_NPX_PACKAGE, CODEX_ACP_PREREQUISITE_ERROR,
-    CODEX_SUBAGENT_POLICY_CONFIG, NPX_MIN_NPM_VERSION, NPX_NPM_REQUIREMENT, PI_ACP_NPX_PACKAGE,
-    PI_CLI_MIN_VERSION, PI_CLI_REQUIREMENT,
+    CLAUDE_AGENT_ACP_VERSION, CODEX_ACP_PREREQUISITE_ERROR, CODEX_SUBAGENT_POLICY_CONFIG,
+    NPX_MIN_NPM_VERSION, NPX_NPM_REQUIREMENT, PI_ACP_NPX_PACKAGE, PI_CLI_MIN_VERSION,
+    PI_CLI_REQUIREMENT,
 };
 #[cfg(test)]
 pub(crate) use config::{
     always_enabled_providers, disableable_providers, first_provider_config, ProviderRuntime,
 };
 pub use discover::{
-    discover_providers_with_overrides, find_auggie_candidates, find_codex_npx, find_node, find_npx,
-    find_pi_cli, find_provider_binary, gated_reason, gated_reason_with_env, not_installed_detail,
-    probe_npx, provider_availability_for, resolve_npx_only_override, resolve_on_path,
-    ProviderAvailability,
+    discover_providers_with_overrides, find_auggie_candidates, find_codex_node, find_node,
+    find_npx, find_pi_cli, find_provider_binary, gated_reason, gated_reason_with_env,
+    not_installed_detail, probe_npx, provider_availability_for, resolve_npx_only_override,
+    resolve_on_path, ProviderAvailability,
 };
 #[cfg(test)]
 pub(crate) use models::{

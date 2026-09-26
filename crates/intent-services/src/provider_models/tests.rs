@@ -1927,8 +1927,8 @@ async fn acp_probe_child_receives_env_overrides() {
 
 #[test]
 fn codex_probe_launch_enforces_both_subagent_settings() {
-    let cmd = super::codex_probe_launch(Some(std::path::PathBuf::from("/usr/local/bin/npx")))
-        .expect("npx must produce a probe command");
+    let cmd = super::codex_probe_launch(Some(std::path::PathBuf::from("/usr/local/bin/node")))
+        .expect("node must produce a probe command");
     let removed = cmd.removed_env_vars();
     assert!(removed.iter().any(|k| k == "CODEX_PATH"));
     assert!(!removed.iter().any(|k| k == "CODEX_CONFIG"));
@@ -1947,15 +1947,15 @@ fn codex_probe_launch_enforces_both_subagent_settings() {
 }
 
 #[test]
-fn codex_probe_launch_uses_selected_npx() {
-    let npx = std::path::PathBuf::from("/usr/local/bin/npx");
+fn codex_probe_launch_uses_selected_node() {
+    let node = std::path::PathBuf::from("/usr/local/bin/node");
     let cmd =
-        super::codex_probe_launch(Some(npx.clone())).expect("npx must produce a probe command");
-    assert_eq!(cmd.program(), npx.as_path());
+        super::codex_probe_launch(Some(node.clone())).expect("node must produce a probe command");
+    assert_eq!(cmd.program(), node.as_path());
 }
 
 #[test]
-fn codex_probe_launch_without_npx_is_none() {
+fn codex_probe_launch_without_node_is_none() {
     assert!(super::codex_probe_launch(None).is_none());
 }
 

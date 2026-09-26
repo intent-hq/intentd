@@ -192,6 +192,7 @@ pub(crate) struct AcpAdapterCommand {
     /// npx-run adapters get the longer cold-install timeout budget and start
     /// in a neutral [`NpxLaunchDir`] rather than `cwd`.
     via_npx: bool,
+    bundled_codex: bool,
     /// Parent of the per-launch [`NpxLaunchDir`]; `None` is the OS temp dir.
     npx_launch_root: Option<PathBuf>,
 }
@@ -223,6 +224,7 @@ impl AcpAdapterCommand {
             auth_required_stdout_marker: None,
             cwd: None,
             via_npx: true,
+            bundled_codex: false,
             npx_launch_root: None,
         }
     }
@@ -237,6 +239,7 @@ impl AcpAdapterCommand {
             auth_required_stdout_marker: None,
             cwd: None,
             via_npx: false,
+            bundled_codex: false,
             npx_launch_root: None,
         }
     }
@@ -282,6 +285,12 @@ impl AcpAdapterCommand {
     pub(crate) fn env_remove(mut self, key: impl Into<String>) -> Self {
         self.envs_removed.push(key.into());
         self
+    }
+
+    pub(crate) fn bundled_codex(node: PathBuf) -> Self {
+        let mut command = Self::binary(node, Vec::new());
+        command.bundled_codex = true;
+        command
     }
 
     /// Recognize the controlled browser helper's immediate auth signal.
@@ -530,7 +539,7 @@ fn spawn_admitted_adapter(
     cmd: &AcpAdapterCommand,
     slot: OwnedSemaphorePermit,
 ) -> Result<SpawnedAdapter, String> {
-    let npx_launch_dir = if cmd.via_npx {
+    let npx_launch_dir = if cmd.via_npx || cmd.bundled_codex {
         Some(
             NpxLaunchDir::create(cmd.npx_launch_root.as_deref())
                 .map_err(|e| format!("{}: npx launch dir: {e}", cmd.program.display()))?,
@@ -542,10 +551,23 @@ fn spawn_admitted_adapter(
         .as_ref()
         .map_or_else(|| cmd.working_dir(), |dir| dir.path().to_path_buf());
     let mut command = tokio::process::Command::new(&cmd.program);
+    if let Some(directory) = npx_launch_dir.as_ref().filter(|_| cmd.bundled_codex) {
+        command.arg(
+            intent_providers::codex::write_adapter(directory.path())
+                .map_err(|e| format!("cannot prepare vendored Codex ACP: {e}"))?,
+        );
+    }
     command
         .args(&cmd.args)
         .current_dir(process_cwd)
-        .env("PATH", enhanced_path(Some(&cmd.program)))
+        .env(
+            "PATH",
+            enhanced_path(if cmd.bundled_codex {
+                None
+            } else {
+                Some(&cmd.program)
+            }),
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

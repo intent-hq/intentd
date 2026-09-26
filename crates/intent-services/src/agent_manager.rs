@@ -4223,7 +4223,7 @@ impl AgentManager {
     /// `session/set_config_option { configId: "model" }` for providers that
     /// expose the model as a session config option
     /// (`supports_config_option_model`; claude-code, pi, and codex today —
-    /// codex's pinned npx adapter ignores `-c model=…` argv overrides and
+    /// codex's vendored adapter ignores `-c model=…` argv overrides and
     /// its `session/set_model` handler rejects our id formats, but it
     /// advertises a bare-id `configOptions[id="model"]` select). Compound ids
     /// are honored only when their provider prefix matches the running
@@ -9212,6 +9212,7 @@ impl AgentManager {
         // always launches bare `node`.
         if resolved.provider_binary.is_none()
             && resolved.npx_fallback_binary.is_none()
+            && resolved.bundled_codex_node.is_none()
             && resolved.provider.id != "mock"
         {
             let override_configured = read_provider_path_setting(
@@ -9234,6 +9235,7 @@ impl AgentManager {
         opts.provider_binary = resolved.provider_binary.as_deref();
         opts.npx_fallback_binary = resolved.npx_fallback_binary.as_deref();
         opts.npx_fallback_package = resolved.npx_fallback_package;
+        opts.bundled_codex_node = resolved.bundled_codex_node.as_deref();
         opts.extra_env = resolved.extra_env.clone();
         opts.unsloth_endpoint = resolved.unsloth_endpoint.as_ref();
         // monorepo#884 Phase 2.2: offer the daemon-backed
@@ -10445,6 +10447,7 @@ struct ResolvedSpawn {
     npx_fallback_binary: Option<PathBuf>,
     /// The package name to pass to npx when `npx_fallback_binary` is set.
     npx_fallback_package: Option<&'static str>,
+    bundled_codex_node: Option<PathBuf>,
     /// Unsloth-managed server endpoint for the `unsloth` provider, filled in
     /// by [`AgentManager::ensure_started`] via
     /// [`crate::unsloth_server::UnslothServerManager::ensure_endpoint`]
@@ -10459,7 +10462,10 @@ pub(crate) fn imported_spawn_selection_for_test(
     session: &AgentSession,
     settings: &intent_core::settings_file::SettingsFile,
 ) -> (String, Option<String>, Option<String>) {
-    let resolved = resolve_spawn(session, None, settings, None).expect("imported spawn resolves");
+    let resolved = resolve_spawn_with_codex_node(session, None, settings, None, || {
+        Some(PathBuf::from("/fixture/node"))
+    })
+    .expect("imported spawn resolves");
     (
         resolved.provider.id.to_string(),
         resolved.model,
@@ -10565,6 +10571,22 @@ fn resolve_spawn(
     workspace: Option<&intent_core::Workspace>,
     settings: &intent_core::settings_file::SettingsFile,
     chief_cwd_root: Option<&Path>,
+) -> Result<ResolvedSpawn> {
+    resolve_spawn_with_codex_node(
+        session,
+        workspace,
+        settings,
+        chief_cwd_root,
+        intent_providers::find_codex_node,
+    )
+}
+
+fn resolve_spawn_with_codex_node(
+    session: &AgentSession,
+    workspace: Option<&intent_core::Workspace>,
+    settings: &intent_core::settings_file::SettingsFile,
+    chief_cwd_root: Option<&Path>,
+    find_codex_node: impl FnOnce() -> Option<PathBuf>,
 ) -> Result<ResolvedSpawn> {
     let provider_id = session_provider_id(
         session,
@@ -10708,6 +10730,7 @@ fn resolve_spawn(
             extra_env,
             npx_fallback_binary: None,
             npx_fallback_package: None,
+            bundled_codex_node: None,
             unsloth_endpoint: None,
         });
     }
@@ -10755,14 +10778,11 @@ fn resolve_spawn(
                 extra_env,
                 npx_fallback_binary: None,
                 npx_fallback_package: None,
+                bundled_codex_node: None,
                 unsloth_endpoint,
             });
         }
-        let npx = if provider.id == "codex" {
-            intent_providers::find_codex_npx()
-        } else {
-            intent_providers::find_npx()
-        };
+        let npx = intent_providers::find_npx();
         let (npx_binary, npx_package) = resolve_npx_only(&provider, npx)?;
         return Ok(ResolvedSpawn {
             provider,
@@ -10773,6 +10793,7 @@ fn resolve_spawn(
             extra_env,
             npx_fallback_binary: Some(npx_binary),
             npx_fallback_package: Some(npx_package),
+            bundled_codex_node: None,
             unsloth_endpoint,
         });
     }
@@ -10786,7 +10807,9 @@ fn resolve_spawn(
     // managed-server lifecycle (`ensure_started`'s unsloth spawn gate).
     let binary_provider_id = provider.primary_binary_provider_id();
     let explicit_path = read_provider_path_setting(settings, binary_provider_id);
-    let (provider_binary, npx_fallback_binary, npx_fallback_package) =
+    let (provider_binary, npx_fallback_binary, npx_fallback_package) = if provider.id == "codex" {
+        (None, None, None)
+    } else {
         match intent_providers::discover::resolve_fallback_launch(
             &provider,
             explicit_path.as_deref(),
@@ -10795,13 +10818,21 @@ fn resolve_spawn(
                 (Some(binary.path), None, None)
             }
             intent_providers::discover::ProviderLaunch::Managed { npx, package } => {
-                tracing::info!(provider_id, npx_path = ?npx, package,
-                    "provider binary not found; falling back to npx");
+                tracing::info!(provider_id, npx_path = ?npx, package, "provider binary not found; falling back to npx");
                 (None, Some(npx), Some(package))
             }
-            intent_providers::discover::ProviderLaunch::Bare { .. } => (None, None, None),
-        };
+            intent_providers::discover::ProviderLaunch::Bare { .. }
+            | intent_providers::discover::ProviderLaunch::VendoredCodex { .. } => {
+                (None, None, None)
+            }
+        }
+    };
 
+    let bundled_codex_node = if provider.id == "codex" && provider_binary.is_none() {
+        Some(resolve_codex_node(find_codex_node())?)
+    } else {
+        None
+    };
     Ok(ResolvedSpawn {
         provider,
         model,
@@ -10811,8 +10842,13 @@ fn resolve_spawn(
         extra_env,
         npx_fallback_binary,
         npx_fallback_package,
+        bundled_codex_node,
         unsloth_endpoint,
     })
+}
+
+fn resolve_codex_node(node: Option<PathBuf>) -> Result<PathBuf> {
+    node.ok_or_else(|| Error::InvalidInput(intent_providers::CODEX_ACP_PREREQUISITE_ERROR.into()))
 }
 
 /// Resolve the npx spawn inputs for an npx-only provider. `npx_path` is the
@@ -10834,9 +10870,6 @@ fn resolve_npx_only(
         // InvalidInput (not Internal): this is an environment misconfiguration,
         // and its Display survives the JSON-RPC envelope (`domain_to_rpc` masks
         // Internal messages behind a literal "Internal error").
-        if provider.id == "codex" {
-            return Error::InvalidInput(intent_providers::CODEX_ACP_PREREQUISITE_ERROR.to_string());
-        }
         Error::InvalidInput(format!(
             "npx not found — {} is required to run {}. Install Node.js (which provides npx) and try again.",
             intent_providers::CLAUDE_AGENT_ACP_NODE_REQUIREMENT,
@@ -10864,22 +10897,10 @@ fn rebuild_spawn_opts<'a>(
     mcp_config_path: Option<&'a str>,
     env_mcp_config: Option<&'a str>,
 ) -> SpawnOptions<'a> {
-    let mut spawn_opts = SpawnOptions::new(opts.provider);
-    spawn_opts.model = opts.model;
-    spawn_opts.reasoning_effort = opts.reasoning_effort;
-    spawn_opts.cwd = opts.cwd;
+    let mut spawn_opts = opts.clone();
     spawn_opts.rules_file = opts.rules_file.or(rules_file_path);
-    spawn_opts.quiet = opts.quiet;
-    spawn_opts.provider_binary = opts.provider_binary;
-    spawn_opts.npx_fallback_binary = opts.npx_fallback_binary;
-    spawn_opts.npx_fallback_package = opts.npx_fallback_package;
-    spawn_opts.extra_env = opts.extra_env.clone();
-    spawn_opts.tools_to_remove.clone_from(&opts.tools_to_remove);
     spawn_opts.mcp_config_file = mcp_config_path;
     spawn_opts.env_mcp_config = env_mcp_config;
-    spawn_opts.unsloth_endpoint = opts.unsloth_endpoint;
-    spawn_opts.node_max_old_space_mb = opts.node_max_old_space_mb;
-    spawn_opts.npx_launch_root = opts.npx_launch_root;
     spawn_opts
 }
 
@@ -15973,7 +15994,7 @@ mod role_reminder_tests {
             None
         );
 
-        // Codex opted into the config-option path (its pinned npx adapter
+        // Codex opted into the config-option path (its vendored adapter
         // ignores `-c model=…` argv overrides, and its `session/set_model`
         // handler rejects both bare and `{base}/{effort}` ids). The
         // adapter's model select values are bare base ids, so a
@@ -17889,20 +17910,19 @@ mod rebuild_spawn_opts_tests {
     use super::*;
 
     #[test]
-    fn codex_npx_prerequisite_error_is_actionable() {
-        let provider = intent_providers::find_provider("codex").unwrap();
-        let error = resolve_npx_only(provider, None).unwrap_err();
+    fn codex_prerequisite_error_is_actionable() {
+        let error = resolve_codex_node(None).unwrap_err();
         let Error::InvalidInput(message) = error else {
             panic!("missing Codex prerequisites must be user-visible: {error}");
         };
-        for expected in ["Node.js", "npx", "Install"] {
+        for expected in ["Node.js", "Codex", "Install"] {
             assert!(message.contains(expected), "{message}");
         }
     }
 
     #[test]
     fn rebuild_preserves_npx_fallback_and_targets_npx() {
-        let provider = intent_providers::find_provider("codex").unwrap();
+        let provider = intent_providers::find_provider("claude-code").unwrap();
         let npx_path = PathBuf::from("/usr/local/bin/npx");
         let mut opts = SpawnOptions::new(provider);
         opts.npx_fallback_binary = Some(&npx_path);
@@ -17922,8 +17942,24 @@ mod rebuild_spawn_opts_tests {
         assert_eq!(args[1], "-y");
         assert_eq!(
             args[2],
-            provider.npx_only_package.expect("codex is npx-only")
+            provider
+                .npx_only_package
+                .expect("claude has an npx package")
         );
+    }
+
+    #[test]
+    fn rebuild_preserves_bundled_codex_launch() {
+        let provider = intent_providers::find_provider("codex").unwrap();
+        let mut opts = SpawnOptions::new(provider);
+        opts.bundled_codex_node = Some(Path::new("/runtime/node"));
+        let rebuilt = rebuild_spawn_opts(&opts, Some("/rules"), None, None);
+        let cmd = intent_acp::spawn::build_command(&rebuilt);
+        assert_eq!(cmd.as_std().get_program(), "/runtime/node");
+        assert!(cmd.as_std().get_args().any(|arg| Path::new(arg)
+            .file_name()
+            .is_some_and(|name| name == "codex-acp.mjs")));
+        assert!(!rebuilt.via_npx());
     }
 
     #[test]
@@ -18204,17 +18240,19 @@ mod provider_path_override_tests {
                 session.provider = Some("codex".to_string());
                 session.model = Some(model.to_string());
                 session.reasoning_effort = explicit.map(str::to_string);
-                let resolved = resolve_spawn(&session, None, &settings, None).unwrap();
+                let resolved =
+                    resolve_spawn_with_codex_node(&session, None, &settings, None, || {
+                        Some(PathBuf::from("/fixture/node"))
+                    })
+                    .unwrap();
                 assert_eq!(resolved.model.as_deref(), Some("gpt-5.5"));
                 assert_eq!(resolved.reasoning_effort.as_deref(), Some(expected));
                 assert!(
                     resolved.provider_binary.is_none(),
-                    "custom adapter cannot bypass npx"
+                    "custom adapter cannot bypass the vendored adapter"
                 );
-                assert_eq!(
-                    resolved.npx_fallback_package,
-                    Some(intent_providers::config::CODEX_ACP_NPX_PACKAGE)
-                );
+                assert!(resolved.npx_fallback_package.is_none());
+                assert!(resolved.bundled_codex_node.is_some());
                 let mut opts = SpawnOptions::new(&resolved.provider);
                 opts.model = resolved.model.as_deref();
                 opts.reasoning_effort = resolved.reasoning_effort.as_deref();

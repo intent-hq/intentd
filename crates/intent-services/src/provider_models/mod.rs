@@ -216,13 +216,16 @@ pub(crate) async fn fetch_claude_code_models() -> ProviderModelsFetch {
         );
     };
     let cmd = AcpProbeCommand::npx(npx, intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE);
+    if let Err(err) = cmd.check_npx_version().await {
+        return ProviderModelsFetch::unavailable("claude-code", err);
+    }
     finish(
         "claude-code",
         run_acp_probe(cmd, |v| parse::parse_acp_models(v, "claude-code")).await,
     )
 }
 
-/// codex: ACP probe via the pinned npx adapter.
+/// codex: ACP probe via the vendored adapter and device Codex CLI.
 /// Effort-capable base models carry `effortLevels` on one row.
 ///
 /// The probe child runs with an isolated `CODEX_HOME` (fresh per-probe temp
@@ -233,15 +236,12 @@ pub(crate) async fn fetch_claude_code_models() -> ProviderModelsFetch {
 /// only the user's configured `model` / `model_reasoning_effort` so that
 /// model appears in the reported catalog.
 pub(crate) async fn fetch_codex_models() -> ProviderModelsFetch {
-    let Some(cmd) = codex_probe_launch(intent_providers::find_codex_npx()) else {
+    let Some(cmd) = codex_probe_launch(intent_providers::find_codex_node()) else {
         return ProviderModelsFetch::unavailable(
             "codex",
             intent_providers::CODEX_ACP_PREREQUISITE_ERROR,
         );
     };
-    if let Err(err) = cmd.check_npx_version().await {
-        return ProviderModelsFetch::unavailable("codex", err);
-    }
     let (cmd, codex_home) = match with_isolated_codex_home(cmd) {
         Ok(pair) => pair,
         Err(e) => {
@@ -256,11 +256,11 @@ pub(crate) async fn fetch_codex_models() -> ProviderModelsFetch {
     finish("codex", outcome)
 }
 
-/// The same pinned launch and policy used by one-shot completions. No native
+/// The same vendored launch and policy used by one-shot completions. No native
 /// or configured adapter path is accepted by a Codex model probe.
-fn codex_probe_launch(npx: Option<PathBuf>) -> Option<AcpProbeCommand> {
+fn codex_probe_launch(node: Option<PathBuf>) -> Option<AcpProbeCommand> {
     let provider = intent_providers::find_provider("codex")?;
-    crate::complete_ops::one_shot_launch(provider, None, npx, None)
+    crate::complete_ops::one_shot_launch(provider, None, node, None)
 }
 
 /// Attach a freshly created isolated `CODEX_HOME` to an ephemeral codex

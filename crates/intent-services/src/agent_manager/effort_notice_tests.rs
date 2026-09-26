@@ -12,6 +12,7 @@ fn resolved() -> ResolvedSpawn {
         extra_env: std::collections::BTreeMap::default(),
         npx_fallback_binary: None,
         npx_fallback_package: None,
+        bundled_codex_node: None,
         unsloth_endpoint: None,
     }
 }

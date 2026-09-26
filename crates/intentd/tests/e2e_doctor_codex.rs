@@ -51,7 +51,13 @@ impl Fixture {
             let node =
                 fs::canonicalize(intent_providers::find_node().expect("Node required")).unwrap();
             // A symlink would make production pair this Node with the host's real npx.
-            fs::copy(&node, bin.join("node")).unwrap();
+            fs::copy(&node, bin.join("node-real")).unwrap();
+            executable(&bin.join("node"), &format!(
+                "#!/bin/sh\ncase \"$1\" in\n*/codex-acp.mjs) shift; exec '{}' '{}' \"$@\";;\n*) exec '{}' \"$@\";;\nesac\n",
+                bin.join("node-real").display(),
+                root.path().join("node_modules/@agentclientprotocol/codex-acp/dist/index.js").display(),
+                bin.join("node-real").display(),
+            ));
         }
         #[cfg(target_os = "macos")]
         executable(&bin.join("node"), &format!("#!/bin/sh\nprintf invoked > '{}'\nprintf 'credential-canary'\nprintf 'account-canary' >&2\nexit 93\n", root.path().join("node-ran").display()));
@@ -71,7 +77,7 @@ impl Fixture {
                 ),
             );
         }
-        let pin = intent_providers::config::CODEX_ACP_NPX_PACKAGE
+        let pin = "@agentclientprotocol/codex-acp@1.13.1"
             .rsplit_once('@')
             .unwrap()
             .1;
@@ -109,13 +115,7 @@ impl Fixture {
                 include_str!("fixtures/codex-doctor-npx.cjs")
             ),
         );
-        executable(
-            &bin.join("codex"),
-            &format!(
-                "#!/usr/bin/env node\nrequire('fs').writeFileSync({},'wrong');console.log('codex-cli 99.99.99');",
-                json!(root.path().join("path-codex-ran"))
-            ),
-        );
+        symlink(&runtime, bin.join("codex")).unwrap();
         let mut settings = SettingsFile::default();
         // Keep the pre-existing non-Codex provider probes off installed accounts.
         for provider in intent_providers::ACP_PROVIDERS {
@@ -319,39 +319,52 @@ fn fixture_launch_is_selected() {
     // fixture executable before doctor can run any provider check.
     let root = fs::canonicalize(config.parent().unwrap()).unwrap();
     match (expected.as_str(), launch.selection()) {
-        ("managed" | "override" | "discovered", ProviderLaunch::Managed { npx, .. }) => {
-            assert_eq!(fs::canonicalize(npx).unwrap(), root.join("bin/npx"));
+        (
+            "managed" | "override" | "discovered",
+            ProviderLaunch::VendoredCodex { node, runtime },
+        ) => {
+            assert_eq!(fs::canonicalize(node).unwrap(), root.join("bin/node"));
+            assert_eq!(
+                fs::canonicalize(runtime).unwrap(),
+                root.join("node_modules/@openai/codex/bin/codex.js")
+            );
         }
         _ => panic!("host provider resolution escaped the doctor fixture"),
     }
 }
 
 #[test]
-fn default_managed_reports_configuration_without_materializing_or_querying() {
+fn default_vendored_reports_identity_without_querying_catalogs() {
     let fixture = Fixture::new("managed", &json!({}));
     let stdout = fixture.run(false);
-    assert!(stdout.contains("selected adapter: managed npm package"));
-    assert!(stdout.contains(intent_providers::config::CODEX_ACP_NPX_PACKAGE));
-    assert!(stdout.contains("configured managed package (not a measured version)"));
-    assert!(stdout.contains("no package was installed"));
+    assert!(stdout.contains("selected adapter: vendored bundle"));
+    assert!(stdout.contains(intent_providers::codex::ADAPTER_VERSION));
+    assert!(stdout.contains("configured adapter identity (not a measured version)"));
+    assert!(stdout.contains("vendored build identified by its content hash"));
     if cfg!(target_os = "macos") {
         assert!(stdout.contains("version and fresh catalog probes are unsupported"));
     } else {
         assert!(stdout.contains("--codex-models"));
     }
-    assert!(fixture.events().is_empty());
+    assert!(fixture
+        .events()
+        .iter()
+        .all(|event| event["version"] == true && event["role"] == "raw"));
 }
 
 #[test]
 fn default_ignores_configured_adapter_without_measuring_its_dependency() {
     let fixture = Fixture::new("override", &json!({}));
     let stdout = fixture.run(false);
-    assert!(stdout.contains("selected adapter: managed npm package"));
+    assert!(stdout.contains("selected adapter: vendored bundle"));
     assert!(stdout.contains("local adapters and CODEX_PATH ignored"));
-    assert!(stdout.contains("no package was installed"));
-    assert!(!stdout.contains("[ok] measured"));
+    assert!(stdout.contains("vendored build identified by its content hash"));
+    assert!(!stdout.contains("measured adapter version"));
     assert!(!stdout.contains("99.99.99"));
-    assert!(fixture.events().is_empty());
+    assert!(fixture
+        .events()
+        .iter()
+        .all(|event| event["version"] == true && event["role"] == "raw"));
 }
 
 #[test]
@@ -359,13 +372,16 @@ fn default_ignores_path_adapter_without_materializing_or_querying() {
     let fixture = Fixture::new("discovered", &json!({}));
     assert!(fixture
         .run(false)
-        .contains("selected adapter: managed npm package"));
-    assert!(fixture.events().is_empty());
+        .contains("selected adapter: vendored bundle"));
+    assert!(fixture
+        .events()
+        .iter()
+        .all(|event| event["version"] == true && event["role"] == "raw"));
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn live_ignores_runtime_override_and_uses_the_pinned_adapter_dependency() {
+fn live_ignores_runtime_override_and_uses_host_codex() {
     let fixture = Fixture::new("override", &json!({}));
     let selected = fixture.root.path().join("override/bin/codex.js");
     executable(
@@ -382,7 +398,7 @@ fn live_ignores_runtime_override_and_uses_the_pinned_adapter_dependency() {
     command.env("CODEX_CONFIG", "credential-canary");
     let (success, stdout) = fixture.run_command(command);
     assert!(success);
-    assert!(stdout.contains("runtime source: selected adapter dependency"));
+    assert!(stdout.contains("runtime source: host Codex installation"));
     assert!(!stdout.contains("0.444.5"));
     assert!(stdout.contains("measured runtime version: 0.333.4"));
     assert!(stdout.contains("ACP catalog: advertised"));
@@ -407,14 +423,17 @@ fn default_ignores_opaque_local_adapter_without_execution() {
         ),
     );
     let stdout = fixture.run(false);
-    assert!(stdout.contains("selected adapter: managed npm package"));
-    assert!(stdout.contains("no package was installed"));
-    assert!(fixture.events().is_empty());
+    assert!(stdout.contains("selected adapter: vendored bundle"));
+    assert!(stdout.contains("vendored build identified by its content hash"));
+    assert!(fixture
+        .events()
+        .iter()
+        .all(|event| event["version"] == true && event["role"] == "raw"));
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn live_managed_uses_resolved_package_and_reports_original_catalog_fields() {
+fn live_vendored_reports_host_catalog_fields() {
     let fixture = Fixture::new("managed", &json!({}));
     let mut command = fixture.doctor_command(true);
     command.env("CODEX_PATH", fixture.root.path().join("bin/codex"));
@@ -433,22 +452,22 @@ fn live_managed_uses_resolved_package_and_reports_original_catalog_fields() {
     assert!(stdout.contains("fixture-model: ID observed in both catalogs"));
     assert!(stdout.contains("fixture-model-high: ID observed only in ACP"));
     assert!(stdout.contains("hidden-model: ID observed only in the selected runtime catalog"));
-    assert!(fixture.events().iter().any(|event| event["role"] == "npx"));
+    assert!(fixture.events().iter().all(|event| event["role"] != "npx"));
     println!("{stdout}");
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn missing_runtime_keeps_acp_success_and_an_advisory_raw_failure() {
+fn failed_runtime_keeps_acp_success_and_an_advisory_raw_failure() {
     let fixture = Fixture::new("override", &json!({}));
-    fs::remove_file(&fixture.runtime).unwrap();
+    executable(&fixture.runtime, "#!/bin/sh\nexit 1\n");
     let stdout = fixture.run(true);
-    assert!(stdout
-        .contains("runtime version: unknown (selected adapter's runtime could not be resolved)"));
+    assert!(
+        stdout.contains("runtime version: unknown (local version process exited unsuccessfully)")
+    );
     assert!(stdout.contains("ACP catalog: advertised"));
-    assert!(stdout.contains(
-        "raw runtime catalog: unavailable (selected adapter's runtime could not be verified)"
-    ));
+    assert!(stdout
+        .contains("raw runtime catalog: unavailable (provider closed the diagnostic connection)"));
 }
 
 #[cfg(target_os = "linux")]
@@ -503,7 +522,10 @@ fn unreadable_authentication_does_not_start_live_probes() {
             .count(),
         2
     );
-    assert!(fixture.events().is_empty());
+    assert!(fixture
+        .events()
+        .iter()
+        .all(|event| event["version"] == true && event["role"] == "raw"));
 }
 
 #[cfg(target_os = "linux")]
@@ -563,7 +585,9 @@ fn materialized_version_timeout_and_invalid_output_are_safe_unknowns() {
         &json!({"versionRaw":"timeout","versionAcp":"invalid"}),
     );
     let stdout = fixture.run(true);
-    assert!(stdout.contains("adapter version: unknown (local output was not a recognized version)"));
+    assert!(
+        stdout.contains("adapter version: unknown (vendored build identified by its content hash)")
+    );
     assert!(stdout.contains("runtime version: unknown (local check exceeded its deadline)"));
     assert!(fixture
         .events()
@@ -639,13 +663,16 @@ fn macos_ignored_local_adapters_never_execute_or_supply_metadata() {
     for selection in ["override", "discovered"] {
         let fixture = Fixture::new(selection, &json!({}));
         let stdout = fixture.run(false);
-        assert!(stdout.contains("selected adapter: managed npm package"));
+        assert!(stdout.contains("selected adapter: vendored bundle"));
         assert!(!stdout.contains("adapter package version"));
         assert!(stdout.contains("version and fresh catalog probes are unsupported"));
-        assert!(stdout.contains("runtime source: unknown"));
-        assert!(!stdout.contains("[ok] measured"));
+        assert!(stdout.contains("runtime source: host Codex installation"));
+        assert!(!stdout.contains("measured adapter version"));
         assert!(!stdout.contains("99.99.99"));
-        assert!(fixture.events().is_empty());
+        assert!(fixture
+            .events()
+            .iter()
+            .all(|event| event["version"] == true && event["role"] == "raw"));
     }
 }
 
@@ -677,7 +704,10 @@ fn macos_catalog_rejection_precedes_npm_authentication_and_probe_state() {
         assert!(!stdout.contains("catalog: advertised"));
         assert!(!stdout.contains("authentication is unavailable"));
         assert!(!stdout.contains("fresh catalogs: checking"));
-        assert!(fixture.events().is_empty());
+        assert!(fixture
+            .events()
+            .iter()
+            .all(|event| event["version"] == true && event["role"] == "raw"));
         fixture.assert_clean();
         println!("{stdout}");
     }
@@ -691,7 +721,10 @@ fn macos_ignored_adapter_metadata_is_not_reported_as_a_version_or_error_payload(
         json!({"name":"@agentclientprotocol/codex-acp", "version":"credential-canary", "bin":{"codex-acp":"dist/index.js"}}).to_string()).unwrap();
     let stdout = fixture.run(false);
     assert!(!stdout.contains("adapter package version"));
-    assert!(!stdout.contains("[ok] measured"));
+    assert!(!stdout.contains("measured adapter version"));
     assert!(stdout.contains("version and fresh catalog probes are unsupported"));
-    assert!(fixture.events().is_empty());
+    assert!(fixture
+        .events()
+        .iter()
+        .all(|event| event["version"] == true && event["role"] == "raw"));
 }

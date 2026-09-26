@@ -20,9 +20,7 @@ pub async fn report(settings: SettingsFile, live: bool) {
     };
     if live {
         if !cfg!(target_os = "macos") {
-            println!(
-                "  [--] codex fresh catalogs: checking (may download the managed npm package)"
-            );
+            println!("  [--] codex fresh catalogs: checking vendored adapter and host runtime");
         }
         let report = launch.fresh_catalogs().await;
         print!("{}", render_runtime(&report.runtime));
@@ -31,9 +29,9 @@ pub async fn report(settings: SettingsFile, live: bool) {
         let inspection = launch.inspect_local().await;
         print!("{}", render_runtime(&inspection.report));
         if cfg!(target_os = "macos") {
-            println!("    macOS diagnostics report the pinned launch without resolving its package; version and fresh catalog probes are unsupported.");
+            println!("    macOS diagnostics report the vendored launch and host runtime path; version and fresh catalog probes are unsupported.");
         } else {
-            println!("    Fresh catalogs not requested; use intentd doctor --codex-models (may download the managed package).");
+            println!("    Fresh catalogs not requested; use intentd doctor --codex-models.");
         }
     }
 }
@@ -41,6 +39,7 @@ pub async fn report(settings: SettingsFile, live: bool) {
 fn render_runtime(report: &CodexRuntimeReport) -> String {
     let mut text = String::from("  codex effective runtime:\n");
     let source = match report.launch_source {
+        LaunchSource::Vendored => "vendored bundle",
         LaunchSource::SettingsOverride => "providers.paths override",
         LaunchSource::LocalDiscovery => "local discovery",
         LaunchSource::ManagedNpm => "managed npm package",
@@ -50,7 +49,7 @@ fn render_runtime(report: &CodexRuntimeReport) -> String {
     writeln!(text, "    launch program: {}", report.launch_program).unwrap();
     writeln!(
         text,
-        "    configured managed package (not a measured version): {}",
+        "    configured adapter identity (not a measured version): {}",
         report.configured_package
     )
     .unwrap();
@@ -69,6 +68,7 @@ fn render_runtime(report: &CodexRuntimeReport) -> String {
     }
     render_version(&mut text, "adapter", &report.adapter_version);
     let runtime_source = match report.runtime_source {
+        RuntimeSource::HostInstallation => "host Codex installation",
         RuntimeSource::AdapterDependency => "selected adapter dependency",
         RuntimeSource::EnvironmentOverride => "effective CODEX_PATH override",
         RuntimeSource::Unknown => "unknown",
@@ -186,7 +186,7 @@ mod tests {
     #[test]
     fn configured_pin_never_becomes_a_measured_version() {
         let text = render_runtime(&runtime());
-        assert!(text.contains("configured managed package (not a measured version)"));
+        assert!(text.contains("configured adapter identity (not a measured version)"));
         assert!(text.contains("adapter version: unknown"));
         assert!(text.contains("runtime version: unknown"));
         assert!(!text.contains("[ok] measured"));
@@ -227,7 +227,7 @@ mod tests {
         report.runtime_path = Some("/fixture/override.js".into());
         report.runtime_version = VersionMeasurement::Measured("0.333.4".into());
         let text = render_runtime(&report);
-        assert!(text.contains("configured managed package (not a measured version)"));
+        assert!(text.contains("configured adapter identity (not a measured version)"));
         assert!(text.contains("runtime source: effective CODEX_PATH override"));
         assert!(text.contains("measured runtime version: 0.333.4"));
         assert!(!text.contains("launch policy:"));

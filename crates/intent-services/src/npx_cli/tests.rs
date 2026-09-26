@@ -127,12 +127,12 @@ fn paths(provider: &str) -> HashMap<String, String> {
     )])
 }
 
-async fn services(provider: &str) -> Services {
+async fn services(provider: &str, adapter_paths: &HashMap<String, String>) -> Services {
     let registry = Arc::new(SettingsRegistry::load(root().join("settings.toml")).unwrap());
     registry
         .apply(&[
             ("model.defaultProvider".to_string(), json!(provider)),
-            ("providers.paths".to_string(), json!(paths(provider))),
+            ("providers.paths".to_string(), json!(adapter_paths)),
         ])
         .unwrap();
     Services::new(Store::open(&root().join("store.db")).await.unwrap())
@@ -180,7 +180,9 @@ async fn stale_npx_completion_is_unavailable_without_package_launch() {
     ) {
         return;
     }
-    let result = completion(&services("codex").await).await.unwrap();
+    let result = completion(&services("claude-code", &HashMap::new()).await)
+        .await
+        .unwrap();
     eprintln!(
         "completion={result}; package launches={:?}",
         lines("packages")
@@ -197,13 +199,13 @@ async fn stale_npx_models_keep_static_warning_without_package_launch() {
     ) {
         return;
     }
-    let result = services("codex")
+    let result = services("claude-code", &HashMap::new())
         .await
-        .models_list(Some("codex".to_string()), true)
+        .models_list(Some("claude-code".to_string()), true)
         .await
         .unwrap();
     eprintln!("models={result}; package launches={:?}", lines("packages"));
-    assert_eq!(result["providerId"], "codex");
+    assert_eq!(result["providerId"], "claude-code");
     assert_eq!(result["source"], "static");
     assert_eq!(result["models"], json!([]));
     assert_stale(result["warning"].as_str().unwrap());
@@ -217,10 +219,14 @@ async fn stale_npx_test_prompt_is_not_installed_without_package_launch() {
     ) {
         return;
     }
-    let result =
-        crate::provider_test_prompt::provider_test_prompt("codex", None, &paths("codex"), None)
-            .await
-            .unwrap();
+    let result = crate::provider_test_prompt::provider_test_prompt(
+        "claude-code",
+        None,
+        &HashMap::new(),
+        None,
+    )
+    .await
+    .unwrap();
     eprintln!(
         "test prompt={result}; package launches={:?}",
         lines("packages")
@@ -231,16 +237,16 @@ async fn stale_npx_test_prompt_is_not_installed_without_package_launch() {
 }
 
 async fn assert_public_launches_succeed() {
-    let services = services("codex").await;
+    let services = services("claude-code", &HashMap::new()).await;
     assert_eq!(
         completion(&services).await.unwrap()["text"],
         "fixture reply"
     );
     let models = services
-        .models_list(Some("codex".to_string()), true)
+        .models_list(Some("claude-code".to_string()), true)
         .await
         .unwrap();
-    assert_eq!(models["source"], "codex", "{models}");
+    assert_eq!(models["source"], "claude-code", "{models}");
     assert!(
         models["models"]
             .as_array()
@@ -250,9 +256,14 @@ async fn assert_public_launches_succeed() {
         "{models}"
     );
     assert_eq!(
-        crate::provider_test_prompt::provider_test_prompt("codex", None, &paths("codex"), None)
-            .await
-            .unwrap(),
+        crate::provider_test_prompt::provider_test_prompt(
+            "claude-code",
+            None,
+            &HashMap::new(),
+            None
+        )
+        .await
+        .unwrap(),
         json!({"ok": true})
     );
     assert_eq!(
@@ -269,7 +280,7 @@ async fn assert_public_launches_succeed() {
         vec![
             format!(
                 "--workspaces=false -y {}",
-                intent_providers::CODEX_ACP_NPX_PACKAGE
+                intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE
             );
             4
         ]
@@ -326,7 +337,7 @@ async fn direct_adapter_skips_stale_npx_probe_and_package_launch() {
     ) {
         return;
     }
-    let services = services("claude-code").await;
+    let services = services("claude-code", &paths("claude-code")).await;
     assert_eq!(
         completion(&services).await.unwrap()["text"],
         "fixture reply"

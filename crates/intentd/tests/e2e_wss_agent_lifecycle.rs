@@ -16171,7 +16171,7 @@ async fn usage_update_cost_captured_over_wss() {
 /// Observe Codex's real child argv, including after an idle child is lost.
 /// Drive the selected npx package even when an explicit custom adapter and
 /// a PATH adapter are present. The fake npx captures the actual launch argv.
-async fn assert_codex_npx_subagent_policy_over_wss(advertise_load: bool) {
+async fn assert_codex_runtime_subagent_policy_over_wss(advertise_load: bool) {
     use std::os::unix::fs::PermissionsExt;
 
     let Some(script) = gate("WSS Codex selected npx subagent policy E2E") else {
@@ -16180,7 +16180,7 @@ async fn assert_codex_npx_subagent_policy_over_wss(advertise_load: bool) {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path();
     let ws_id = seed_workspace_only(data_dir).await;
-    let toolchain = common::codex_npx::install(data_dir, &script);
+    let toolchain = common::codex_runtime::install(data_dir, &script);
     let wrapper = data_dir.join("fake-codex-acp");
     std::fs::write(
         &wrapper,
@@ -16330,16 +16330,10 @@ async fn assert_codex_npx_subagent_policy_over_wss(advertise_load: bool) {
             !argv.iter().any(|arg| arg.starts_with("model=")),
             "launch must exercise the no-model path: {argv:?}"
         );
-        assert!(
-            argv.contains(&"-y"),
-            "npx must select the pinned package: {argv:?}"
-        );
+        assert_eq!(argv.len(), 1, "bundle argv: {argv:?}");
         assert_eq!(
-            argv.iter()
-                .filter(|arg| **arg == intent_providers::CODEX_ACP_NPX_PACKAGE)
-                .count(),
-            1,
-            "each launch must use the selected adapter exactly once: {argv:?}"
+            std::path::Path::new(argv[0]).file_name().unwrap(),
+            "codex-acp.mjs"
         );
         assert_eq!(
             session["codexPolicy"],
@@ -16388,13 +16382,13 @@ async fn assert_codex_npx_subagent_policy_over_wss(advertise_load: bool) {
 }
 
 #[intent_test_macros::daemon_test]
-async fn codex_npx_subagent_policy_without_model_survives_recreate_over_wss() {
-    assert_codex_npx_subagent_policy_over_wss(false).await;
+async fn codex_runtime_subagent_policy_without_model_survives_recreate_over_wss() {
+    assert_codex_runtime_subagent_policy_over_wss(false).await;
 }
 
 #[intent_test_macros::daemon_test]
-async fn codex_npx_subagent_policy_without_model_survives_resume_over_wss() {
-    assert_codex_npx_subagent_policy_over_wss(true).await;
+async fn codex_runtime_subagent_policy_without_model_survives_resume_over_wss() {
+    assert_codex_runtime_subagent_policy_over_wss(true).await;
 }
 
 /// Pin the `grok` provider binary to a wrapper around the mock ACP fixture
