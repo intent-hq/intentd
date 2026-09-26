@@ -2527,13 +2527,17 @@ async fn effort_notice_restart_case(load: bool) {
     );
     assert_eq!(read_config_log(&prompt_log)[1]["effectiveEffort"], "low");
 
-    // stream:end precedes the final idle write. Settle this turn before the
-    // restart so startup recovery cannot insert an extra turn (#6058).
+    // Both stream:end and agent:idle precede the final status write. Wait for
+    // the persisted idle status so startup recovery cannot add a turn (#6058).
     let mut idle = false;
     for _ in 0..120 {
         let frame = wss_event(&mut sub, 30).await;
         let event = &frame["params"]["event"];
-        if event["type"] == "agent:idle" && event["data"]["agentId"] == agent_id {
+        if event["type"] == "agent:status-changed"
+            && event["data"]["agentId"] == agent_id
+            && event["data"]["status"] == "idle"
+            && event["data"]["isActive"] == false
+        {
             idle = true;
             break;
         }
