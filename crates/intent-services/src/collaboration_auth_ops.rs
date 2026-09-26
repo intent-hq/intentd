@@ -215,17 +215,13 @@ fn flow_response(state: &State) -> Value {
 }
 
 impl Services {
-    pub(crate) fn collaboration_target(
-        &self,
-        provider: &str,
-        host: Option<&str>,
-    ) -> Result<Target> {
+    fn collaboration_target(provider: &str, host: Option<&str>) -> Result<Target> {
         let kind = Provider::parse(provider)?;
         repository::resolve_target(kind, host, "gitlab.com", None)
     }
 
     fn collaboration_connect_target(&self, provider: &str, host: Option<&str>) -> Result<Target> {
-        let mut target = self.collaboration_target(provider, host)?;
+        let mut target = Self::collaboration_target(provider, host)?;
         if let Target::Gitlab { host } = &mut target {
             // A configured API override belongs only to its bound instance.
             // The environment seam supports the hosted-instance hermetic tests.
@@ -491,7 +487,7 @@ impl Services {
         host: Option<&str>,
         only_user: bool,
     ) -> Result<Value> {
-        let target = self.collaboration_target(provider, host)?;
+        let target = Self::collaboration_target(provider, host)?;
         let entry = self.collaboration_credential(&target).await?;
         let lease: PersistenceLease = Arc::new(entry.gate.clone().lock_owned().await);
         let probed = self
@@ -521,7 +517,7 @@ impl Services {
         host: Option<&str>,
         flow_id: &str,
     ) -> Result<Value> {
-        let target = self.collaboration_target(provider, host)?;
+        let target = Self::collaboration_target(provider, host)?;
         let entry = self.collaboration_credential(&target).await?;
         let mut state = entry.state.lock().await;
         let cancelled = state
@@ -541,7 +537,7 @@ impl Services {
         provider: &str,
         host: Option<&str>,
     ) -> Result<Value> {
-        let target = self.collaboration_target(provider, host)?;
+        let target = Self::collaboration_target(provider, host)?;
         let entry = self.collaboration_credential(&target).await?;
         // Invalidate start/exchange immediately, then serialize deletion with IO.
         {
@@ -811,7 +807,7 @@ impl Services {
         host: Option<&str>,
         external_id: &str,
     ) -> Result<Value> {
-        let target = self.collaboration_target(provider, host)?;
+        let target = Self::collaboration_target(provider, host)?;
         let entry = self.collaboration_credential(&target).await?;
         // Reserve the explicit choice before a network probe. A later explicit
         // setting/select supersedes this request, including a failed newer choice.
@@ -859,7 +855,7 @@ impl Services {
     ) -> Result<(ProofProvider, CreatedProof)> {
         let nonce = github_auth_ops::proof_line_param("nonce", nonce)?;
         let label = github_auth_ops::proof_line_param("hostLabel", label)?;
-        let target = self.collaboration_target(provider, host)?;
+        let target = Self::collaboration_target(provider, host)?;
         if expected.provider != target.provider().as_wire() || expected.host != target.host() {
             return Err(Error::IdentityMismatch);
         }
@@ -923,7 +919,7 @@ impl Services {
         host: Option<&str>,
         proof_id: &str,
     ) -> Result<()> {
-        let target = self.collaboration_target(provider, host)?;
+        let target = Self::collaboration_target(provider, host)?;
         let proof = self.proof_provider(&target);
         if !proof.valid_proof_id(proof_id) {
             return Err(Error::InvalidParams("invalid proofId".into()));
@@ -1045,11 +1041,10 @@ mod tests {
             .collaboration_credential(&Target::Github)
             .await
             .unwrap();
-        let gl = service.collaboration_target("gitlab", None).unwrap();
+        let gl = Services::collaboration_target("gitlab", None).unwrap();
         let gitlab = service.collaboration_credential(&gl).await.unwrap();
-        let other_target = service
-            .collaboration_target("gitlab", Some("Other.Example:9443"))
-            .unwrap();
+        let other_target =
+            Services::collaboration_target("gitlab", Some("Other.Example:9443")).unwrap();
         let other = service
             .collaboration_credential(&other_target)
             .await
