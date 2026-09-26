@@ -56,6 +56,263 @@ async fn member_connection(
 }
 
 #[tokio::test]
+async fn member_provider_enablement_commits_safe_snapshots_over_wss_and_restart() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = temp_data_dir();
+    let ws = WorkspaceId::new();
+    seed_member(dir.path(), &ws).await;
+    let store = Store::open(&dir.path().join("intentd.db")).await.unwrap();
+    let guest_token = "ad".repeat(32);
+    let guest = Principal {
+        id: PrincipalId::new(),
+        identity: None,
+        github_user_id: None,
+        login: None,
+        display_name: None,
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    store.upsert_principal(&guest).await.unwrap();
+    let mut hash = String::with_capacity(64);
+    for byte in Sha256::digest(guest_token.as_bytes()) {
+        write!(hash, "{byte:02x}").unwrap();
+    }
+    store
+        .insert_principal_credential(&guest.id, &hash)
+        .await
+        .unwrap();
+    store
+        .add_workspace_member(&ws, &guest.id, intent_core::WorkspaceRole::Collaborator)
+        .await
+        .unwrap();
+    let probe = dir.path().join("fake-auggie");
+    let calls = dir.path().join("probe-calls");
+    std::fs::write(
+        &probe,
+        format!(
+            "#!/bin/sh\necho invoked >> '{}'\necho private-provider-body\nexit 1\n",
+            calls.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(&config, format!(
+        "[sourceControl.github]\ntokenSource = 'explicit'\napiBaseUrl = 'http://127.0.0.1:9'\n[providers.paths]\nauggie = '{}'\ncodex = '/private/uninstalled-provider'\n",
+        probe.display()
+    )).unwrap();
+    std::fs::write(
+        dir.path().join("secrets.json"),
+        r#"{"collaboration.github.token":"private-identity-only-token"}"#,
+    )
+    .unwrap();
+    let env = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("GITHUB_TOKEN", ""),
+        ("GH_TOKEN", ""),
+        ("GITLAB_TOKEN", ""),
+        ("INTENTD_GITHUB_API_BASE_URI", "http://127.0.0.1:9"),
+    ];
+    let daemon = Daemon {
+        child: spawn_serve(dir.path(), "both", &env),
+    };
+    let socket = dir.path().join("intentd.sock");
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    let mut owner = connect_ws(port, cfg.clone()).await;
+    let mut member = member_connection(port, cfg.clone()).await;
+    let mut observer = member_connection(port, cfg.clone()).await;
+    let mut owner_observer = connect_ws(port, cfg.clone()).await;
+    let mut guest_client = common::wss_connect_with_retry(
+        port,
+        cfg,
+        &format!("wss://localhost:{port}/ws?token={guest_token}"),
+    )
+    .await;
+    for client in [&mut observer, &mut owner_observer, &mut guest_client] {
+        wss_rpc(
+            client,
+            1,
+            "events.subscribe",
+            json!({"eventTypes":["host:execution-context-changed","settings:changed"]}),
+        )
+        .await;
+    }
+    let before_calls = std::fs::read(&calls).unwrap_or_default();
+    let mut all = intent_providers::all_provider_ids();
+    all.sort_unstable();
+    all.dedup();
+    let without_auggie: Vec<_> = all.iter().copied().filter(|id| *id != "auggie").collect();
+    let before = wss_rpc_envelope(&mut member, 2, "host.executionContext", json!({})).await;
+    assert_eq!(before["jsonrpc"], "2.0");
+    assert_eq!(before["id"], 2);
+    assert!(before.get("error").is_none(), "{before}");
+    assert_eq!(before["result"]["enabledProviderIds"], json!(all));
+    let before = before["result"].clone();
+    assert_eq!(
+        before,
+        wss_rpc(&mut owner, 2, "host.executionContext", json!({})).await
+    );
+    assert_eq!(
+        before["repositoryConnections"][0]["configured"], false,
+        "identity-only credentials do not configure execution"
+    );
+    for (method, params) in [
+        ("host.executionContext", json!({})),
+        ("settings.get", json!({"path":"providers.enabled"})),
+    ] {
+        let denied = wss_rpc_envelope(&mut guest_client, 3, method, params).await;
+        assert_eq!(denied["error"]["code"], -32003, "{denied}");
+    }
+    for (method, params) in [
+        ("settings.get", json!({"path":"providers.enabled"})),
+        (
+            "settings.update",
+            json!({"changes":[{"path":"providers.enabled","value":{}}]}),
+        ),
+        ("settings.reset", json!({"path":"providers.enabled"})),
+    ] {
+        let denied = wss_rpc_envelope(&mut member, 3, method, params).await;
+        assert_eq!(denied["error"]["code"], -32003, "{denied}");
+    }
+    let query = intent_store::EventQuery {
+        event_types: vec!["host:execution-context-changed".into()],
+        ..Default::default()
+    };
+    let mut delivered = Vec::new();
+    for (method, params, expected) in [
+        (
+            "settings.update",
+            json!({"changes":[{"path":"providers.enabled","value":{"auggie":false,"unknown-private":true,"augment":false}}]}),
+            json!(without_auggie),
+        ),
+        (
+            "settings.update",
+            json!({"changes":[{"path":"providers.enabled","value":{"auggie":true}}]}),
+            json!(all),
+        ),
+        (
+            "settings.update",
+            json!({"changes":[{"path":"providers.enabled","value":{"auggie":false}}]}),
+            json!(without_auggie),
+        ),
+        (
+            "settings.update",
+            json!({"changes":[{"path":"providers.enabled","value":{}}]}),
+            json!(all),
+        ),
+        (
+            "settings.update",
+            json!({"changes":[{"path":"providers.enabled","value":{"auggie":false}}]}),
+            json!(without_auggie),
+        ),
+        (
+            "settings.reset",
+            json!({"path":"providers.enabled"}),
+            json!(all),
+        ),
+        (
+            "settings.update",
+            json!({"changes":[{"path":"providers.enabled","value":{"auggie":false}}]}),
+            json!(without_auggie),
+        ),
+    ] {
+        wss_rpc(&mut owner, 4, method, params).await;
+        let frame = wss_event(&mut observer, 10).await;
+        assert_eq!(frame["jsonrpc"], "2.0");
+        let event = &frame["params"]["event"];
+        assert_eq!(event["type"], "host:execution-context-changed", "{frame}");
+        let mut expected_context = before.clone();
+        expected_context["enabledProviderIds"] = expected;
+        assert_eq!(
+            event["data"], expected_context,
+            "complete allowlisted snapshot"
+        );
+        assert_eq!(
+            wss_rpc(&mut member, 5, "host.executionContext", json!({})).await,
+            expected_context
+        );
+        for secret in [
+            "unknown-private",
+            "private-identity-only-token",
+            "/private/uninstalled-provider",
+            "private-provider-body",
+            probe.to_str().unwrap(),
+        ] {
+            assert!(!frame.to_string().contains(secret), "{frame}");
+        }
+        let owner_event = timeout(Duration::from_secs(10), async {
+            loop {
+                let frame = wss_event(&mut owner_observer, 10).await;
+                if frame["params"]["event"]["type"] == "host:execution-context-changed" {
+                    break frame;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(owner_event["params"]["event"], *event);
+        let rows = store.query_events(&query).await.unwrap();
+        assert!(
+            rows.iter()
+                .any(|row| row.id.as_str() == event["id"].as_str().unwrap()
+                    && row.data == expected_context),
+            "event committed before delivery"
+        );
+        delivered.push(event.clone());
+    }
+    assert!(
+        try_wss_event(&mut guest_client, Duration::from_millis(75))
+            .await
+            .is_none(),
+        "guest receives no host policy or settings events"
+    );
+    assert!(
+        try_wss_event(&mut observer, Duration::from_millis(75))
+            .await
+            .is_none(),
+        "member receives no raw settings events"
+    );
+    assert_eq!(
+        std::fs::read(&calls).unwrap_or_default(),
+        before_calls,
+        "enablement must not spawn a provider or probe auth"
+    );
+    drop(owner);
+    drop(owner_observer);
+    drop(member);
+    drop(observer);
+    drop(guest_client);
+    drop(daemon);
+    drop(store);
+    let daemon = Daemon {
+        child: spawn_serve(dir.path(), "both", &env),
+    };
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    let mut member = member_connection(port, cfg).await;
+    assert_eq!(
+        wss_rpc(&mut member, 6, "host.executionContext", json!({})).await,
+        delivered.last().unwrap()["data"]
+    );
+    let reopened = Store::open(&dir.path().join("intentd.db")).await.unwrap();
+    let rows = reopened.query_events(&query).await.unwrap();
+    for event in delivered {
+        assert!(rows.iter().any(
+            |row| row.id.as_str() == event["id"].as_str().unwrap() && row.data == event["data"]
+        ));
+    }
+    drop(member);
+    drop(daemon);
+}
+
+#[tokio::test]
 async fn member_ai_rejection_emits_safe_diagnostic_and_context_invalidation_over_wss() {
     let script = gate("member AI rejection").expect("mock provider prerequisite");
     let dir = temp_data_dir();
@@ -178,7 +435,24 @@ async fn member_ai_rejection_emits_safe_diagnostic_and_context_invalidation_over
         .expect("the delivered invalidation survives daemon shutdown");
     assert_eq!(restored.data, before);
     assert!(restored.workspace_id.as_str().is_empty());
-    assert_eq!(restored.data.as_object().unwrap().len(), 4);
+    assert_eq!(
+        restored
+            .data
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        [
+            "defaultModelId",
+            "defaultProviderId",
+            "enabledProviderIds",
+            "gitCredentialPolicy",
+            "repositoryConnections"
+        ]
+        .into_iter()
+        .collect()
+    );
     assert!(!restored
         .data
         .to_string()
@@ -310,7 +584,22 @@ async fn member_prompt_survives_sender_disconnect_and_safe_context_events_over_w
     );
     let safe = &event["params"]["event"]["data"];
     assert_eq!(safe["gitCredentialPolicy"]["managedHelperEnabled"], true);
-    assert_eq!(safe.as_object().unwrap().len(), 4);
+    assert_eq!(
+        safe.as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        [
+            "defaultModelId",
+            "defaultProviderId",
+            "enabledProviderIds",
+            "gitCredentialPolicy",
+            "repositoryConnections"
+        ]
+        .into_iter()
+        .collect()
+    );
 }
 
 #[tokio::test]

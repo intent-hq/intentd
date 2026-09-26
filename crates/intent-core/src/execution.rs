@@ -40,6 +40,8 @@ pub struct RepositoryConnection {
 pub struct HostExecutionContext {
     pub default_provider_id: Option<String>,
     pub default_model_id: Option<String>,
+    /// Canonical execution-policy IDs, independent of installation or readiness.
+    pub enabled_provider_ids: Vec<String>,
     pub repository_connections: Vec<RepositoryConnection>,
     pub git_credential_policy: GitCredentialPolicy,
 }

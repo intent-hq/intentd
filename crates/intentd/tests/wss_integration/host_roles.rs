@@ -158,7 +158,23 @@ async fn member_workspace_tools_and_safe_context_over_wss() {
         context["result"]["gitCredentialPolicy"]["managedHelperEnabled"],
         false
     );
-    assert_eq!(context["result"].as_object().unwrap().len(), 4);
+    assert_eq!(
+        context["result"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        [
+            "defaultModelId",
+            "defaultProviderId",
+            "enabledProviderIds",
+            "gitCredentialPolicy",
+            "repositoryConnections"
+        ]
+        .into_iter()
+        .collect()
+    );
     for (method, params) in [
         ("terminal.list", json!({"workspaceId":ws})),
         ("script.list", json!({"workspaceId":ws})),

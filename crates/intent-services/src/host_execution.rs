@@ -18,6 +18,15 @@ impl Services {
     /// collaboration-purpose credential slots here.
     pub(crate) async fn execution_context_snapshot(&self) -> Result<HostExecutionContext> {
         let settings = self.effective_settings();
+        let mut enabled_provider_ids: Vec<_> = intent_providers::all_provider_ids()
+            .into_iter()
+            .filter(|id| {
+                !crate::agent_ops::provider_is_disabled(id, settings.providers.enabled.as_ref())
+            })
+            .map(str::to_owned)
+            .collect();
+        enabled_provider_ids.sort_unstable();
+        enabled_provider_ids.dedup();
         let source = settings.source_control.github.token_source;
         let stored = if matches!(
             source,
@@ -59,6 +68,7 @@ impl Services {
         Ok(HostExecutionContext {
             default_provider_id: settings.model.default_provider,
             default_model_id: settings.model.default,
+            enabled_provider_ids,
             repository_connections,
             git_credential_policy: GitCredentialPolicy::github_https(
                 crate::terminal_ops::expose_git_credential(self.settings_registry.as_deref()),

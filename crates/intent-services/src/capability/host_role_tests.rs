@@ -781,7 +781,7 @@ async fn member_execution_context_is_allowlisted_and_uses_host_policy() {
     with_caller(caller(&member), async {
         let context = svc.host_execution_context().await.unwrap();
         let keys: std::collections::BTreeSet<_> = context.as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(keys, ["defaultModelId", "defaultProviderId", "gitCredentialPolicy", "repositoryConnections"].into_iter().collect());
+        assert_eq!(keys, ["defaultModelId", "defaultProviderId", "enabledProviderIds", "gitCredentialPolicy", "repositoryConnections"].into_iter().collect());
         assert_eq!(context["defaultProviderId"], "codex");
         assert_eq!(context["defaultModelId"], "host-model");
         assert_eq!(context["gitCredentialPolicy"], json!({
@@ -812,6 +812,242 @@ async fn member_execution_context_is_allowlisted_and_uses_host_policy() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn member_execution_enablement_projects_complete_canonical_policy() {
+    use crate::settings::{InMemorySecretStore, SecretStore};
+    use std::sync::Arc;
+    let tmp = TempDb::new();
+    let (svc, owner, member) = fixture(&tmp).await;
+    let registry =
+        Arc::new(crate::SettingsRegistry::load(tmp.path.with_extension("toml")).unwrap());
+    registry
+        .apply(&[("sourceControl.github.tokenSource".into(), json!("explicit"))])
+        .unwrap();
+    let forge = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    registry
+        .apply(&[(
+            "sourceControl.github.apiBaseUrl".into(),
+            json!(format!("http://{}", forge.local_addr().unwrap())),
+        )])
+        .unwrap();
+    let secrets = Arc::new(InMemorySecretStore::default());
+    secrets
+        .store(
+            "sourceControl.github.token",
+            "private-unverified-repository-token",
+        )
+        .unwrap();
+    let svc = svc
+        .with_settings_registry(registry.clone())
+        .with_secret_store(secrets);
+    let mut all = intent_providers::all_provider_ids();
+    all.sort_unstable();
+    all.dedup();
+    let without_codex: Vec<_> = all.iter().copied().filter(|id| *id != "codex").collect();
+    // Case variants and legacy aliases must neither disable the canonical
+    // provider nor manufacture extra IDs. Duplicate JSON keys collapse at parse.
+    let duplicate = serde_json::from_str::<serde_json::Value>(
+        r#"{"codex":true,"codex":false,"Codex":true,"augment":false,"acp":false,"default":false,"unknown":true}"#,
+    )
+    .unwrap();
+    for (map, expected) in [
+        (json!(null), json!(all)),
+        (json!({}), json!(all)),
+        (json!({"codex":false}), json!(without_codex)),
+        (json!({"codex":true}), json!(all)),
+        (duplicate, json!(without_codex)),
+        (
+            json!({"Codex":false,"augment":false,"unknown":true}),
+            json!(all),
+        ),
+    ] {
+        registry
+            .apply(&[("providers.enabled".into(), map)])
+            .unwrap();
+        for identity in [
+            Caller::Wire {
+                principal_id: owner.clone(),
+                host_role: intent_core::HostRole::Owner,
+            },
+            caller(&member),
+        ] {
+            let context = with_caller(identity, svc.host_execution_context())
+                .await
+                .unwrap();
+            assert_eq!(context["enabledProviderIds"], expected);
+            assert_eq!(context["repositoryConnections"][0]["configured"], true);
+            assert!(!context
+                .to_string()
+                .contains("private-unverified-repository-token"));
+        }
+    }
+    for provider in intent_providers::ACP_PROVIDERS {
+        registry
+            .apply(&[("providers.enabled".into(), json!({provider.id:false}))])
+            .unwrap();
+        let context = with_caller(caller(&member), svc.host_execution_context())
+            .await
+            .unwrap();
+        let expected: Vec<_> = all
+            .iter()
+            .copied()
+            .filter(|id| *id != provider.id || !provider.can_be_disabled)
+            .collect();
+        assert_eq!(
+            context["enabledProviderIds"],
+            json!(expected),
+            "{}",
+            provider.id
+        );
+    }
+    let disabled: std::collections::BTreeMap<_, _> = all.iter().map(|id| (*id, false)).collect();
+    registry
+        .apply(&[("providers.enabled".into(), json!(disabled))])
+        .unwrap();
+    let context = with_caller(caller(&member), svc.host_execution_context())
+        .await
+        .unwrap();
+    let always: Vec<_> = all
+        .iter()
+        .copied()
+        .filter(|id| !intent_providers::find_provider(id).unwrap().can_be_disabled)
+        .collect();
+    assert_eq!(
+        context["enabledProviderIds"],
+        json!(always),
+        "an empty effective list is still present"
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(25), forge.accept())
+            .await
+            .is_err(),
+        "policy/configured reads must not probe repository authorization"
+    );
+}
+
+#[tokio::test]
+async fn member_execution_enablement_events_follow_committed_changes_and_reset() {
+    use crate::events::{EventBus, SubscriptionFilter};
+    use intent_core::events::HOST_EXECUTION_CONTEXT_CHANGED;
+    use std::{sync::Arc, time::Duration};
+    let tmp = TempDb::new();
+    let (svc, _, member) = fixture(&tmp).await;
+    let path = tmp.path.with_extension("toml");
+    let registry = Arc::new(crate::SettingsRegistry::load(path.clone()).unwrap());
+    registry
+        .apply(&[("sourceControl.github.tokenSource".into(), json!("explicit"))])
+        .unwrap();
+    let bus = EventBus::new(svc.store.clone());
+    let svc = svc
+        .with_settings_registry(registry)
+        .with_event_bus(bus.clone());
+    let worker = svc.spawn_execution_context_loop();
+    let mut events = bus.subscribe(SubscriptionFilter {
+        event_types: vec![HOST_EXECUTION_CONTEXT_CHANGED.into()],
+        ..Default::default()
+    });
+    let mut all = intent_providers::all_provider_ids();
+    all.sort_unstable();
+    let disabled: Vec<_> = all.iter().copied().filter(|id| *id != "codex").collect();
+    let before = with_caller(caller(&member), svc.host_execution_context())
+        .await
+        .unwrap();
+    for (map, expected) in [
+        (json!({"codex":false}), json!(disabled)),
+        (json!({"codex":true}), json!(all)),
+        (json!({"codex":false}), json!(disabled)),
+        (json!({}), json!(all)),
+        (json!({"codex":false}), json!(disabled)),
+    ] {
+        let update = with_caller(
+            Caller::Daemon,
+            svc.settings_update(json!([{"path":"providers.enabled","value":map}])),
+        )
+        .await
+        .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .remove(0);
+        assert_eq!(event.data["enabledProviderIds"], expected);
+        assert_eq!(
+            event.data["repositoryConnections"],
+            before["repositoryConnections"]
+        );
+        assert_eq!(
+            event.data,
+            with_caller(caller(&member), svc.host_execution_context())
+                .await
+                .unwrap()
+        );
+        let rows = svc
+            .store
+            .query_events(&intent_store::EventQuery {
+                event_types: vec![HOST_EXECUTION_CONTEXT_CHANGED.into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(rows
+            .iter()
+            .any(|row| row.id == event.id && row.data == event.data));
+        let reloaded = Services::new(svc.store.clone()).with_settings_registry(Arc::new(
+            crate::SettingsRegistry::load(path.clone()).unwrap(),
+        ));
+        assert_eq!(
+            with_caller(caller(&member), reloaded.host_execution_context())
+                .await
+                .unwrap(),
+            event.data
+        );
+        let noop = with_caller(
+            Caller::Daemon,
+            svc.settings_update(json!([{"path":"providers.enabled","value":map}])),
+        )
+        .await
+        .unwrap();
+        assert_eq!(noop["revision"], update["revision"]);
+        assert_eq!(noop["applied"], json!([]));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), events.recv())
+                .await
+                .is_err()
+        );
+    }
+    let reset = with_caller(
+        Caller::Daemon,
+        svc.settings_reset("providers.enabled".into()),
+    )
+    .await
+    .unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .remove(0);
+    assert_eq!(event.data["enabledProviderIds"], json!(all));
+    // Resetting an already absent map and an empty update are true no-ops.
+    let noop = with_caller(
+        Caller::Daemon,
+        svc.settings_reset("providers.enabled".into()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(noop["revision"], reset["revision"]);
+    let noop = with_caller(Caller::Daemon, svc.settings_update(json!([])))
+        .await
+        .unwrap();
+    assert_eq!(noop["revision"], reset["revision"]);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(75), events.recv())
+            .await
+            .is_err()
+    );
+    worker.abort();
+    let _ = worker.await;
 }
 
 #[tokio::test]
@@ -1138,7 +1374,24 @@ async fn member_execution_context_event_is_durable_and_survives_store_reopen() {
     assert_eq!(restored.len(), 1);
     assert_eq!(restored[0].id, live.id);
     assert_eq!(restored[0].data, expected);
-    assert_eq!(restored[0].data.as_object().unwrap().len(), 4);
+    assert_eq!(
+        restored[0]
+            .data
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        [
+            "defaultModelId",
+            "defaultProviderId",
+            "enabledProviderIds",
+            "gitCredentialPolicy",
+            "repositoryConnections"
+        ]
+        .into_iter()
+        .collect()
+    );
     assert!(!restored[0]
         .data
         .to_string()
@@ -1575,7 +1828,24 @@ async fn member_pr_status_rejection_publishes_durable_safe_context() {
         .expect("classified PR rejection must invalidate readiness")
         .unwrap();
     assert_eq!(batch[0].data, json!(before));
-    assert_eq!(batch[0].data.as_object().unwrap().len(), 4);
+    assert_eq!(
+        batch[0]
+            .data
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        [
+            "defaultModelId",
+            "defaultProviderId",
+            "enabledProviderIds",
+            "gitCredentialPolicy",
+            "repositoryConnections"
+        ]
+        .into_iter()
+        .collect()
+    );
     assert!(!batch[0].data.to_string().contains("private-response"));
     let stored = svc
         .store

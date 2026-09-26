@@ -970,9 +970,15 @@ pub(crate) fn provider_is_disabled(
     provider_id: &str,
     enabled: Option<&std::collections::BTreeMap<String, bool>>,
 ) -> bool {
-    let disableable =
-        intent_providers::find_provider(provider_id).is_some_and(|p| p.can_be_disabled);
-    disableable && enabled.is_some_and(|m| m.get(provider_id) == Some(&false))
+    intent_providers::find_provider(provider_id)
+        .is_some_and(|provider| provider_config_is_disabled(provider, enabled))
+}
+
+fn provider_config_is_disabled(
+    provider: &intent_providers::ProviderConfig,
+    enabled: Option<&std::collections::BTreeMap<String, bool>>,
+) -> bool {
+    provider.can_be_disabled && enabled.is_some_and(|m| m.get(provider.id) == Some(&false))
 }
 
 /// Where a turn-start re-home lands (intent-hq/intent#5737): the target
