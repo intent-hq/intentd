@@ -11597,7 +11597,7 @@ async fn run_message_worker(
         // admission through selection and turn preparation, never through the
         // already-running provider turn above. Removal either sweeps first or
         // waits for this instruction to become admitted work.
-        let _instruction_authority = mgr.services.human_instruction_authority.read().await;
+        let instruction_authority = mgr.services.human_instruction_authority.read().await;
         if mgr
             .services
             .discard_revoked_instructions(&agent_id)
@@ -11738,7 +11738,7 @@ async fn run_message_worker(
                 None => (Vec::new(), None),
             };
         if raced.is_empty() {
-            drop(_instruction_authority);
+            drop(instruction_authority);
             // monorepo#1297: heal a busy-misclassified terminal idle. The
             // turn's `agent:idle` is published while this worker still holds
             // the busy slot (`end_turn` above runs after `run_prompt_turn`
@@ -11795,7 +11795,7 @@ async fn run_message_worker(
                         // pre-release archived arm above.
                         mgr.clear_worker(&agent_id);
                         mgr.end_turn(&agent_id).await;
-                        drop(_instruction_authority);
+                        drop(instruction_authority);
                         mgr.clone()
                             .try_drain_queue(agent_id.clone(), workspace_id.clone())
                             .await;
