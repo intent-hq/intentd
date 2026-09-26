@@ -388,8 +388,8 @@ fn run_with_terminal_stderr(fixture: &Fixture, no_color: Option<&str>) -> (Strin
             &raw mut master_fd,
             &raw mut slave_fd,
             std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
         )
     };
     assert_eq!(result, 0, "openpty: {}", io::Error::last_os_error());
