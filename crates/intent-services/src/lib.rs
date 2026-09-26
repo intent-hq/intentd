@@ -32023,22 +32023,43 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn host_members_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.host_members_list_op().await })
+    }
+
+    fn host_invite_create(
+        &self,
+        pin: intent_core::InvitePin,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.host_invite_create_op(pin).await })
+    }
+
+    fn host_invite_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.host_invite_list_op().await })
+    }
+
+    fn host_invite_revoke(&self, invite_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.host_invite_revoke_op(&invite_id).await })
+    }
+
     fn invite_inspect(
         &self,
         invite_id: String,
         secret: String,
+        scope: intent_core::InviteScope,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.invite_inspect_op(&invite_id, &secret).await })
+        Box::pin(async move { self.invite_inspect_op(&invite_id, &secret, scope).await })
     }
 
     fn invite_accept(
         &self,
         invite_id: String,
         secret: String,
+        scope: intent_core::InviteScope,
         credential: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.invite_accept_op(&invite_id, &secret, &credential)
+            self.invite_accept_op(&invite_id, &secret, &credential, scope)
                 .await
         })
     }
@@ -32047,19 +32068,21 @@ impl WorkspaceApi for Services {
         &self,
         invite_id: String,
         secret: String,
+        scope: intent_core::InviteScope,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.invite_challenge_op(&invite_id, &secret).await })
+        Box::pin(async move { self.invite_challenge_op(&invite_id, &secret, scope).await })
     }
 
     fn invite_prove(
         &self,
         invite_id: String,
         secret: String,
+        scope: intent_core::InviteScope,
         nonce: String,
         claim: intent_core::InviteProofClaim,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.invite_prove_op(&invite_id, &secret, &nonce, claim)
+            self.invite_prove_op(&invite_id, &secret, &nonce, claim, scope)
                 .await
         })
     }

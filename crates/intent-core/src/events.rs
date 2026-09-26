@@ -480,6 +480,9 @@ pub const IDENTITY_AUTH_CHANGED: &str = "identity:auth-changed";
 // change — never on the implicit refresh (the identity lock blocks those).
 // Payload `{ principalId, identity: { provider, host, externalUserId },
 // login? }`; owner-only, like `sourceControl:auth-changed`.
+pub const HOST_MEMBERS_CHANGED: &str = "host:members-changed";
+pub const HOST_INVITES_CHANGED: &str = "host:invites-changed";
+
 pub const PRINCIPAL_IDENTITY_CHANGED: &str = "principal:identity-changed";
 
 // App-UI events (new in intentd; daemon-owned UI-driving surface for the
@@ -668,6 +671,8 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     SOURCE_CONTROL_AUTH_CHANGED,
     IDENTITY_AUTH_CHANGED,
     PRINCIPAL_IDENTITY_CHANGED,
+    HOST_MEMBERS_CHANGED,
+    HOST_INVITES_CHANGED,
     APP_UI_NAVIGATE,
     APP_UI_HIGHLIGHT,
     APP_WORKSPACE_OPEN,

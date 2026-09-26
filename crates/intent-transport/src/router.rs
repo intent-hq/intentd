@@ -728,6 +728,12 @@ async fn dispatch(
         // `workspace.invite.create` is handled on the connection fast-path
         // (it wraps the secret into the `intent://invite` link with the
         // listener's own hosts/port); only list/revoke route here.
+        "host.members.list" => api.host_members_list().await.map_err(domain_to_rpc),
+        "host.invite.list" => api.host_invite_list().await.map_err(domain_to_rpc),
+        "host.invite.revoke" => api
+            .host_invite_revoke(require_str_param(params, "inviteId")?)
+            .await
+            .map_err(domain_to_rpc),
         "workspace.invite.list" => {
             let id = require_workspace_id(params)?;
             let r = api.workspace_invite_list(id).await.map_err(workspace_err)?;

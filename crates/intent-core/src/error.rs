@@ -279,7 +279,11 @@ pub enum InviteErrorKind {
     Revoked,
     /// The invite was already redeemed (single use).
     Redeemed,
-    /// The invite is pinned to another GitHub login.
+    /// The requested scope differs from the stored invitation.
+    ScopeMismatch,
+    /// The person was revoked after the proof challenge was issued.
+    AccessRevoked,
+    /// The invite is pinned to another forge account.
     PinMismatch,
     /// The pinned login does not name a GitHub account.
     PinUnknown,
@@ -332,6 +336,8 @@ impl InviteErrorKind {
     pub fn as_str(self) -> &'static str {
         match self {
             InviteErrorKind::NotFound => "invite-not-found",
+            InviteErrorKind::ScopeMismatch => "invite-scope-mismatch",
+            InviteErrorKind::AccessRevoked => "access-revoked",
             InviteErrorKind::Expired => "invite-expired",
             InviteErrorKind::Revoked => "invite-revoked",
             InviteErrorKind::Redeemed => "invite-redeemed",
@@ -356,6 +362,10 @@ impl InviteErrorKind {
     pub fn message(self) -> &'static str {
         match self {
             InviteErrorKind::NotFound => "invalid params: invite not found",
+            InviteErrorKind::ScopeMismatch => "invalid params: invitation scope does not match",
+            InviteErrorKind::AccessRevoked => {
+                "invalid params: access was revoked during proof; start a new join"
+            }
             InviteErrorKind::Expired => "invalid params: invite has expired",
             InviteErrorKind::Revoked => "invalid params: invite was revoked",
             InviteErrorKind::Redeemed => "invalid params: invite was already redeemed",
@@ -414,6 +424,8 @@ impl InviteErrorKind {
     pub fn code(self) -> i32 {
         match self {
             InviteErrorKind::NotFound
+            | InviteErrorKind::ScopeMismatch
+            | InviteErrorKind::AccessRevoked
             | InviteErrorKind::Expired
             | InviteErrorKind::Revoked
             | InviteErrorKind::Redeemed

@@ -1329,6 +1329,7 @@ impl Services {
     }
 
     /// [`Self::apply_primary_identity`] for an account on any forge.
+    #[cfg(test)]
     pub(crate) async fn apply_primary_forge_identity(
         &self,
         principal: Principal,

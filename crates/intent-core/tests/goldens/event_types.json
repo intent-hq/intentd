@@ -88,6 +88,8 @@
     "host:exec:exit",
     "host:exec:stderr",
     "host:exec:stdout",
+    "host:invites-changed",
+    "host:members-changed",
     "identity:auth-changed",
     "line-attribution:updated",
     "mcp.servers:status-changed",

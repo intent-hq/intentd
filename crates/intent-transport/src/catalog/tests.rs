@@ -80,6 +80,7 @@ fn extract_fastpath_methods() -> HashSet<String> {
         ("provider_setup.rs", "providers.setup."),
         ("invite.rs", "invite."),
         ("invite.rs", "workspace.invite."),
+        ("invite.rs", "host.invite."),
         ("presence.rs", "presence."),
         ("presence.rs", "note.presence."),
     ] {
@@ -180,15 +181,15 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// (`sourceControl.identityProof.create` / `delete`, the GitHub gist or
 /// GitLab snippet proof by `provider`); the `github.identityProof.*` pair
 /// stays as byte-identical aliases.
-const EXPECTED_TOTAL_METHODS: usize = 400;
+const EXPECTED_TOTAL_METHODS: usize = 404;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 342;
+const EXPECTED_ROUTER_METHODS: usize = 345;
 
 /// Golden count: fast-path methods (intercepted before router).
-const EXPECTED_FASTPATH_METHODS: usize = 56;
+const EXPECTED_FASTPATH_METHODS: usize = 57;
 
 /// Golden count: method aliases.
 const EXPECTED_ALIASES: usize = 2;
@@ -668,8 +669,12 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "host.execStream.write",
     "host.findApp",
     "host.findBinary",
+    "host.invite.create",
+    "host.invite.list",
+    "host.invite.revoke",
     "host.listDirectory",
     "host.listInstalledEditors",
+    "host.members.list",
     "host.openInEditor",
     "host.providerAuthStatus",
     "host.providerDiscovery",
@@ -1230,8 +1235,12 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "host.execStream.write",
     "host.findApp",
     "host.findBinary",
+    "host.invite.create",
+    "host.invite.list",
+    "host.invite.revoke",
     "host.listDirectory",
     "host.listInstalledEditors",
+    "host.members.list",
     "host.openInEditor",
     "host.providerAuthStatus",
     "host.providerDiscovery",
@@ -1851,6 +1860,9 @@ mod unbound_owner_only_methods {
             ("github.users.search", json!({ "query": "q" })),
             ("hook.cancel", json!({ "workspaceId": ws, "hookId": "h1" })),
             ("hook.runNow", json!({ "workspaceId": ws, "hookId": "h1" })),
+            ("host.invite.list", json!({})),
+            ("host.invite.revoke", json!({ "inviteId": "missing" })),
+            ("host.members.list", json!({})),
             ("linear.authStatus", json!({})),
             (
                 "linear.createIssue",

@@ -349,6 +349,9 @@ struct MockForge {
     private_snippets: Arc<AtomicBool>,
     /// When set, the GitLab snippet routes answer `503` to every read.
     snippet_server_error: Arc<AtomicBool>,
+    /// Nonzero status scripts public GitLab pin lookup failures (401 permits
+    /// same-instance authenticated fallback).
+    user_lookup_status: Arc<AtomicUsize>,
     /// The switches scripting github.com's `GET /user`.
     github_user: GithubUser,
     snippets: Snippets,
@@ -500,6 +503,8 @@ async fn spawn_mock_forge() -> MockForge {
     let private_snippets = Arc::new(AtomicBool::new(false));
     let snippet_server_error = Arc::new(AtomicBool::new(false));
     let github_user = GithubUser::new();
+    let user_lookup_status = Arc::new(AtomicUsize::new(0));
+    let lookup_status = user_lookup_status.clone();
     let snippets: Snippets = Arc::new(Mutex::new(Vec::new()));
     let authenticated_snippet_reads = Arc::new(AtomicUsize::new(0));
     let (private, snip_err, gh_user, snips, auth_reads) = (
@@ -522,8 +527,18 @@ async fn spawn_mock_forge() -> MockForge {
                 snips.clone(),
                 auth_reads.clone(),
             );
+            let lookup_status = lookup_status.clone();
             tokio::spawn(async move {
-                let _ = serve_conn(stream, private, snip_err, gh_user, snips, auth_reads).await;
+                let _ = serve_conn(
+                    stream,
+                    private,
+                    snip_err,
+                    gh_user,
+                    snips,
+                    auth_reads,
+                    lookup_status,
+                )
+                .await;
             });
         }
     });
@@ -532,6 +547,7 @@ async fn spawn_mock_forge() -> MockForge {
         requests,
         private_snippets,
         snippet_server_error,
+        user_lookup_status,
         github_user,
         snippets,
         authenticated_snippet_reads,
@@ -551,6 +567,7 @@ async fn serve_conn(
     github_user: GithubUser,
     snippets: Snippets,
     authenticated_snippet_reads: Arc<AtomicUsize>,
+    user_lookup_status: Arc<AtomicUsize>,
 ) -> std::io::Result<()> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 1024];
@@ -606,8 +623,14 @@ async fn serve_conn(
     };
     let (status, body) = if path_only == "/user" {
         github_user.answer(&bearer).await
+    } else if path_only == "/users/gh-guest" {
+        (200, Body::Json(gh_user_json("gh-guest", 9001)))
+    } else if let Some(id) = path_only.strip_prefix("/gists/") {
+        let rows = snippets.lock().unwrap();
+        rows.iter()
+            .find(|(key, _, _)| key == id)
+            .map_or_else(not_found, |(_, meta, _)| (200, Body::Json(meta.clone())))
     } else if path_only.starts_with("/users/") {
-        // github.com `GET /users/{login}`: nobody the tests pin lives there.
         (404, Body::Json(json!({ "message": "Not Found" })))
     } else if path_only == "/api/v4/user" {
         match gl_user_for_token(&bearer) {
@@ -615,12 +638,20 @@ async fn serve_conn(
             None => unauthorized(),
         }
     } else if path_only == "/api/v4/users" {
-        let username = query
-            .split('&')
-            .find_map(|kv| kv.strip_prefix("username="))
-            .unwrap_or_default();
-        let users: Vec<Value> = gl_user_for_username(username).into_iter().collect();
-        (200, Body::Json(Value::Array(users)))
+        let status = user_lookup_status.load(Ordering::SeqCst);
+        if status != 0 && !(status == 401 && gl_user_for_token(&bearer).is_some()) {
+            (
+                u16::try_from(status).unwrap(),
+                Body::Json(json!({"message":"lookup refused"})),
+            )
+        } else {
+            let username = query
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("username="))
+                .unwrap_or_default();
+            let users: Vec<Value> = gl_user_for_username(username).into_iter().collect();
+            (200, Body::Json(Value::Array(users)))
+        }
     } else if let Some(rest) = path_only.strip_prefix("/api/v4/snippets/") {
         match rest.strip_suffix("/raw") {
             Some(id) => snippet_read(id, true),
@@ -636,6 +667,7 @@ async fn serve_conn(
     let reason = match status {
         200 => "OK",
         401 => "Unauthorized",
+        429 => "Too Many Requests",
         503 => "Service Unavailable",
         _ => "Not Found",
     };
@@ -652,7 +684,7 @@ async fn serve_conn(
 /// A booted daemon reachable over WSS.
 struct Host {
     dir: tempfile::TempDir,
-    _daemon: Daemon,
+    daemon: Daemon,
     port: u16,
     cfg: Arc<ClientConfig>,
 }
@@ -686,9 +718,32 @@ async fn boot(mock: &MockForge, credentials: &[(&str, &str)]) -> Host {
         .expect("fingerprint")
         .to_string();
     let cfg = client_config(&fingerprint);
+    // Configured-host fixtures test cached profile behavior. Invitation creation
+    // no longer performs a synchronous refresh, so settle startup explicitly.
+    // Hosts with no repository accounts bypass this wait and remain unlinked.
+    if !credentials.is_empty() {
+        let expected = if credentials.iter().any(|(key, _)| *key == "GITHUB_TOKEN") {
+            github_identity(OWNER_GH_ID)
+        } else {
+            gitlab_identity(HOST_GL_ID)
+        };
+        let mut owner = connect_ws(port, cfg.clone(), TOKEN).await;
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let me = wss_rpc(&mut owner, 199, "principal.me", json!({})).await;
+                if me["result"]["identity"] == expected {
+                    break;
+                }
+                // timing-guard: synchronize the configured fixture's startup profile refresh
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("primary startup profile refresh");
+    }
     Host {
         dir,
-        _daemon: daemon,
+        daemon,
         port,
         cfg,
     }
@@ -893,6 +948,7 @@ async fn assert_preview_pin_identity_over_wss(method: &str) {
         );
         let mut expected_result = json!({
             "workspaceId": ws_id, "workspaceTitle": "Preview requirements",
+            "scope":"workspace", "role":"collaborator",
             "hostname": r["hostname"], "prettyHostname": r["prettyHostname"],
             "pinIdentity": expected,
         });
@@ -1084,8 +1140,8 @@ async fn gitlab_only_host_mints_invites_and_admits_gitlab_guest_over_wss() {
     let host = boot(&mock, &[("GITLAB_TOKEN", HOST_GL_PAT)]).await;
     let mut owner = connect_ws(host.port, host.cfg.clone(), TOKEN).await;
 
-    // Fresh daemon: the primary principal is not linked yet (`principal.me`
-    // serves the cached row and refreshes in the background).
+    // The configured fixture has settled its startup profile refresh;
+    // principal.me serves that cached row.
     let v = wss_rpc(&mut owner, 1, "principal.me", json!({})).await;
     assert!(v.get("error").is_none(), "principal.me: {v}");
     assert!(
@@ -1222,8 +1278,8 @@ async fn gitlab_only_host_mints_invites_and_admits_gitlab_guest_over_wss() {
 
     // 4b. Input contract (multiplayer.md §invite.prove): an omitted
     //     `provider` is github — never inferred from the GitLab pin — so
-    //     the guest's snippet id is looked up as a gist, which does not
-    //     exist → `proof-invalid`; and `proofId` + `gistId` together are
+    //     it is refused as the wrong pin provider before a gist lookup.
+    //     `proofId` + `gistId` together are
     //     `-32602` before any forge call, even spelling the same id.
     let nonce = challenge_nonce(&mut prover, 27, &pinned_id, &pinned_secret).await;
     let now = chrono::Utc::now().to_rfc3339();
@@ -1241,8 +1297,8 @@ async fn gitlab_only_host_mints_invites_and_admits_gitlab_guest_over_wss() {
     assert_eq!(v["error"]["code"], json!(-32602), "omitted provider: {v}");
     assert_eq!(
         v["error"]["data"]["code"],
-        json!("proof-invalid"),
-        "omitted provider is github, where no gist 4004 lives: {v}"
+        json!("invite-pin-mismatch"),
+        "omitted provider is github and differs from the GitLab pin: {v}"
     );
     let v = admitted_rpc(
         &mut prover,
@@ -1691,3 +1747,6 @@ async fn identity_provider_write_rekeys_the_primary_over_wss() {
     assert_eq!(v["result"]["identity"], gitlab_identity(HOST_GL_ID), "{v}");
     assert_eq!(v["result"]["login"], json!(HOST_GL_LOGIN), "{v}");
 }
+
+#[path = "invite_join/host.rs"]
+mod invite_host;

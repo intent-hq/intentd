@@ -483,7 +483,10 @@ pub(crate) async fn process_frame(
         // NOT served on authenticated connections — only on the `/invite`
         // endpoint.
         if let Some(req) = crate::invite::classify(value) {
-            if req.method == crate::invite::InviteMethod::Create {
+            if matches!(
+                req.method,
+                crate::invite::InviteMethod::Create | crate::invite::InviteMethod::HostCreate
+            ) {
                 let frame = panic_guard::guard_frame(
                     &method,
                     rpc_id.clone(),
