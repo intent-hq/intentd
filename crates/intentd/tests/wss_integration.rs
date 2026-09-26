@@ -10450,7 +10450,7 @@ async fn wss_providers_catalog_round_trip() {
 
 /// Legacy identity metadata is independent of the configured default, disabled
 /// providers, authentication, installation and model discovery. This harness has
-/// no AgentManager or provider discovery attached; the static catalog still
+/// no `AgentManager` or provider discovery attached; the static catalog still
 /// reports the resolver's aliases over the production TLS/JSON-RPC path.
 #[intent_test_macros::daemon_test]
 async fn wss_providers_catalog_legacy_aliases_ignore_settings() {
