@@ -241,6 +241,96 @@ async fn member_script_create_cannot_replace_definition_from_another_workspace()
 }
 
 #[tokio::test]
+async fn member_script_remove_preserves_a_protected_definition_and_runtime() {
+    use intent_core::{events::SCRIPT_CHANGED, ScriptCreateParams};
+    let tmp = TempDb::new();
+    let (svc, _, member) = fixture(&tmp).await;
+    let bus = crate::events::EventBus::new(svc.store.clone());
+    let svc = svc.with_event_bus(bus);
+    let target = WorkspaceId::new();
+    svc.store
+        .insert_workspace(&workspace(&target))
+        .await
+        .unwrap();
+    for (ws, command) in [
+        (target.clone(), "echo ordinary"),
+        (WorkspaceId::chief(), "echo protected"),
+    ] {
+        with_caller(
+            Caller::Daemon,
+            svc.script_create(
+                ws,
+                ScriptCreateParams {
+                    name: "dev".into(),
+                    command: command.into(),
+                    script_id: Some("dev".into()),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    }
+    let query = intent_store::EventQuery {
+        event_types: vec![SCRIPT_CHANGED.into()],
+        ..Default::default()
+    };
+    let before = svc.store.query_events(&query).await.unwrap().len();
+    let result = with_caller(
+        caller(&member),
+        svc.script_remove(target.clone(), "dev".into()),
+    )
+    .await;
+    assert!(matches!(result, Err(Error::NotFound(_))), "{result:?}");
+    assert_eq!(
+        svc.store.query_events(&query).await.unwrap().len(),
+        before,
+        "refusal publishes no removal"
+    );
+    with_caller(
+        caller(&member),
+        svc.script_status(target.clone(), "dev".into()),
+    )
+    .await
+    .unwrap();
+    let saved = svc.store.list_all_scripts().await.unwrap();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].workspace_id, WorkspaceId::chief().as_str());
+    assert_eq!(saved[0].command, "echo protected");
+
+    let restarted = Services::new(Store::open(&tmp.path).await.unwrap());
+    assert_eq!(restarted.hydrate_scripts().await.unwrap(), 1);
+    let restored = with_caller(Caller::Daemon, restarted.script_list(WorkspaceId::chief()))
+        .await
+        .unwrap();
+    assert_eq!(restored["scripts"][0]["command"], "echo protected");
+
+    with_caller(caller(&member), async {
+        let own = svc
+            .script_create(
+                target.clone(),
+                ScriptCreateParams {
+                    name: "valid".into(),
+                    command: "echo valid".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        svc.script_remove(target.clone(), own["id"].as_str().unwrap().into())
+            .await
+            .unwrap();
+    })
+    .await;
+    assert_eq!(svc.store.list_all_scripts().await.unwrap().len(), 1);
+    // The unrestricted owner path retains its legacy id-only delete semantics.
+    with_caller(Caller::Daemon, svc.script_remove(target, "dev".into()))
+        .await
+        .unwrap();
+    assert!(svc.store.list_all_scripts().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn member_tools_share_configured_mcp_without_admin_authority() {
     let tmp = TempDb::new();
     let (svc, _, member) = fixture(&tmp).await;

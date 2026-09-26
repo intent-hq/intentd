@@ -179,6 +179,62 @@ async fn member_workspace_tools_and_safe_context_over_wss() {
         missing_script["error"]["data"]["code"], "not-found",
         "{missing_script}"
     );
+    // Legacy owner entries can share a runtime id while only the newest
+    // workspace owns the durable row. A member must not delete that row.
+    for scope in [ws.clone(), WorkspaceId::chief()] {
+        intent_core::with_caller(
+            intent_core::Caller::Daemon,
+            srv.api.script_create(
+                scope,
+                intent_core::ScriptCreateParams {
+                    name: "Shared id".into(),
+                    command: "echo protected".into(),
+                    script_id: Some("protected-script".into()),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    }
+    let refused = member
+        .call(
+            "script.remove",
+            json!({
+                "workspaceId":ws,"scriptId":"protected-script"
+            }),
+        )
+        .await;
+    assert_eq!(refused["error"]["data"]["code"], "not-found", "{refused}");
+    assert_eq!(
+        srv.store
+            .script_workspace("protected-script")
+            .await
+            .unwrap(),
+        Some(WorkspaceId::chief())
+    );
+    let valid = member
+        .call(
+            "script.create",
+            json!({
+                "workspaceId":ws,"name":"Valid removal","command":"true","mode":"command"
+            }),
+        )
+        .await;
+    let valid_id = valid["result"]["id"].as_str().unwrap();
+    let removed = member
+        .call(
+            "script.remove",
+            json!({"workspaceId":ws,"scriptId":valid_id}),
+        )
+        .await;
+    assert_eq!(removed["result"]["ok"], true, "{removed}");
+    assert!(srv
+        .store
+        .script_workspace(valid_id)
+        .await
+        .unwrap()
+        .is_none());
     #[cfg(unix)]
     {
         let missing = WorkspaceId::new();

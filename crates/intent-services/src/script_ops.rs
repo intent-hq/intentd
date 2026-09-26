@@ -614,6 +614,41 @@ impl ScriptManager {
         workspace_id: &WorkspaceId,
         script_id: &str,
     ) -> Result<Value> {
+        self.remove_with_scope(workspace_id, script_id, false).await
+    }
+
+    /// Non-administrators may remove only the durable row in this workspace.
+    pub(crate) async fn remove_in_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+        script_id: &str,
+    ) -> Result<Value> {
+        self.remove_with_scope(workspace_id, script_id, true).await
+    }
+
+    async fn remove_with_scope(
+        &self,
+        workspace_id: &WorkspaceId,
+        script_id: &str,
+        scoped: bool,
+    ) -> Result<Value> {
+        let lock = self.locks.definition_lock(script_id);
+        let _guard = lock.lock().await;
+        if scoped {
+            if !self
+                .scripts
+                .lock()
+                .unwrap()
+                .contains_key(&(workspace_id.clone(), script_id.to_string()))
+            {
+                return Err(Error::NotFound(format!("script {script_id}")));
+            }
+            // Atomically refuse a foreign durable id before taking the local
+            // runtime entry, stopping its process, or publishing a change.
+            self.store
+                .remove_script_in_workspace(workspace_id, script_id)
+                .await?;
+        }
         let removed = self
             .scripts
             .lock()
@@ -626,8 +661,8 @@ impl ScriptManager {
         // *await* the supervisor instead of aborting it. An abort could land
         // in the pre-registration window (after `pty.spawn`, before
         // `mark_running` records the id) and orphan the fresh PTY; awaited,
-        // the supervisor sees the entry gone and reaps it itself. No lock is
-        // held across these awaits (the entry was already taken above).
+        // the supervisor sees the entry gone and reaps it itself. The registry
+        // mutex is released, while the definition lock fences creates/removes.
         let handle = managed.supervisor.take();
         if let Some(pty_id) = managed.pty_id {
             self.pty.kill(pty_id).await;
@@ -637,7 +672,9 @@ impl ScriptManager {
                 tracing::warn!(script = %script_id, error = %e, "script supervisor join failed during remove teardown");
             }
         }
-        self.store.remove_script(script_id).await?;
+        if !scoped {
+            self.store.remove_script(script_id).await?;
+        }
         publish_event(
             self.bus.as_ref(),
             script_event(
@@ -3799,6 +3836,12 @@ mod tests {
             )
             .await;
         assert!(matches!(result, Err(Error::NotFound(_))), "{result:?}");
+        let removed = h
+            .services
+            .script_manager()
+            .remove_in_workspace(&h.ws, &id)
+            .await;
+        assert!(matches!(removed, Err(Error::NotFound(_))), "{removed:?}");
         let state = h
             .services
             .script_status(h.ws.clone(), id.clone())
@@ -5811,6 +5854,126 @@ mod tests {
     {
         assert_concurrent_script_upserts_stay_consistent(true, false).await;
         assert_concurrent_script_upserts_stay_consistent(false, true).await;
+    }
+
+    async fn create_or_remove_script(
+        services: Services,
+        workspace: WorkspaceId,
+        id: String,
+        caller: intent_core::Caller,
+        remove: bool,
+    ) -> Result<Value> {
+        intent_core::with_caller(caller, async {
+            if remove {
+                services.script_remove(workspace, id).await
+            } else {
+                services
+                    .script_create(
+                        workspace,
+                        ScriptCreateParams {
+                            name: "replacement".into(),
+                            command: "echo replacement".into(),
+                            script_id: Some(id),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            }
+        })
+        .await
+    }
+
+    async fn assert_create_remove_ordering(first_remove: bool, first_member: bool) {
+        use intent_core::{Caller, HostRole, PrincipalId};
+        let h = harness().await;
+        let p = start_parked_service(&h).await;
+        let mut member = h.services.store.get_primary_principal().await.unwrap();
+        member.id = PrincipalId::new();
+        member.is_primary = false;
+        h.services.store.upsert_principal(&member).await.unwrap();
+        sqlx::query("INSERT INTO host_member(principal_id,added_at) VALUES (?,?)")
+            .bind(member.id.as_str())
+            .bind(now_iso())
+            .execute(h.services.store.write_pool())
+            .await
+            .unwrap();
+        let caller = |is_member| {
+            if is_member {
+                Caller::Wire {
+                    principal_id: member.id.clone(),
+                    host_role: HostRole::Member,
+                }
+            } else {
+                Caller::Daemon
+            }
+        };
+        let first = intent_core::spawn_daemon(create_or_remove_script(
+            p.services.clone(),
+            h.ws.clone(),
+            p.id.clone(),
+            caller(first_member),
+            first_remove,
+        ));
+        await_entry_taken(&h, &p, &first).await;
+        let mut second = intent_core::spawn_daemon(create_or_remove_script(
+            p.services.clone(),
+            h.ws.clone(),
+            p.id.clone(),
+            caller(!first_member),
+            !first_remove,
+        ));
+        let early_second = tokio::time::timeout(Duration::from_secs(1), &mut second).await;
+        tokio::time::timeout(LIVENESS, async {
+            let independent =
+                create_simple(&h, "independent", "echo independent", ScriptMode::Command).await;
+            h.services
+                .script_remove(h.ws.clone(), independent)
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("unrelated script mutations remain responsive");
+        p.park.release.notify_one();
+        tokio::time::timeout(LIVENESS, first)
+            .await
+            .expect("first mutation finishes")
+            .unwrap()
+            .unwrap();
+        let second = match early_second {
+            Ok(result) => result,
+            Err(_) => tokio::time::timeout(LIVENESS, second)
+                .await
+                .expect("second mutation finishes"),
+        };
+        assert_reaped(p.pid, "after overlapping create and remove").await;
+        second.unwrap().unwrap();
+        let live = h.services.script_list(h.ws.clone()).await.unwrap();
+        let persisted = h.services.store.list_all_scripts().await.unwrap();
+        let restarted = Services::new(h.services.store().clone());
+        restarted.hydrate_scripts().await.unwrap();
+        let restored = restarted.script_list(h.ws.clone()).await.unwrap();
+        if first_remove {
+            assert_eq!(persisted.len(), 1, "a later create must remain durable");
+            assert_eq!(persisted[0].command, "echo replacement");
+            assert_eq!(live["scripts"][0]["command"], "echo replacement");
+            assert_eq!(restored["scripts"][0]["command"], "echo replacement");
+        } else {
+            assert!(persisted.is_empty(), "a later remove must remain durable");
+            assert!(live["scripts"].as_array().unwrap().is_empty());
+            assert!(restored["scripts"].as_array().unwrap().is_empty());
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn member_remove_and_owner_create_preserve_mutation_order() {
+        assert_create_remove_ordering(true, true).await;
+        assert_create_remove_ordering(false, false).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn owner_remove_and_member_create_preserve_mutation_order() {
+        assert_create_remove_ordering(true, false).await;
+        assert_create_remove_ordering(false, true).await;
     }
 
     /// Two workspaces mint the same client-supplied `scriptId` concurrently

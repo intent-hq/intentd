@@ -155,6 +155,31 @@ impl Store {
         Ok(res.rows_affected() > 0)
     }
 
+    /// Delete only the definition in the admitted workspace. Scope validation
+    /// and deletion are one statement, including when an id was moved after
+    /// a caller's earlier runtime lookup.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` for an absent or foreign id, or
+    /// `Error::Internal` if the database operation fails.
+    pub async fn remove_script_in_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &str,
+    ) -> Result<()> {
+        let res = sqlx::query("DELETE FROM script WHERE id = ? AND workspace_id = ?")
+            .bind(id)
+            .bind(workspace_id.as_str())
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("remove script failed: {e}")))?;
+        if res.rows_affected() == 0 {
+            return Err(Error::NotFound(format!("script {id}")));
+        }
+        Ok(())
+    }
+
     /// List every persisted script definition (all workspaces), oldest first —
     /// the boot-time hydration read.
     ///

@@ -18727,6 +18727,10 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_workspace_manager(&workspace_id, "script.remove")
                 .await?;
+            self.require_member(&workspace_id).await?;
+            if capability::gated_collaborator_caller("script.remove")?.is_some() {
+                return mgr.remove_in_workspace(&workspace_id, &script_id).await;
+            }
             mgr.remove(&workspace_id, &script_id).await
         })
     }
