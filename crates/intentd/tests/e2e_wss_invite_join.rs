@@ -122,6 +122,9 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
     cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
+        // Keep heartbeat-reaper evidence in retained failure logs: a provider
+        // error and a later socket EOF do not establish the same cause.
+        .env("RUST_LOG", "info,intent_transport::ws=debug")
         .env_remove("GH_TOKEN")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
@@ -318,6 +321,7 @@ async fn prove(
 /// Pump a subscriber until a `workspace:updated` event whose `changes`
 /// satisfy `pred` arrives (bounded).
 async fn await_workspace_updated(ws: &mut Ws, what: &str, pred: impl Fn(&Value) -> bool) -> Value {
+    eprintln!("await workspace:updated ({what})");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let remaining = deadline
@@ -340,7 +344,7 @@ async fn await_workspace_updated(ws: &mut Ws, what: &str, pred: impl Fn(&Value) 
                 let _ = ws.send(Message::Pong(p)).await;
             }
             Some(Ok(_)) => {}
-            other => panic!("expected text frame, got {other:?}"),
+            other => panic!("workspace:updated ({what}): expected text frame, got {other:?}"),
         }
     }
 }

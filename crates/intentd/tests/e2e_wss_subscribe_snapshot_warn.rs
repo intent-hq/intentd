@@ -315,12 +315,8 @@ async fn await_profile_rows(log_path: &Path, offset: usize, methods: &[&str]) ->
     }
 }
 
-/// Statements `method`'s single profile row in `segment` attributes to the
-/// aggregate plan itself. The read pool grows lazily (min 0, max 32), so an
-/// aggregate fan-out may open new connections mid-dispatch; how many depends on
-/// scheduling, and each one runs sqlx's connection-setup PRAGMA statement
-/// inside the dispatch span. Those setup rows are subtracted so the budget
-/// measures the plan, not pool growth.
+/// The profiler already excludes lazy pool connection setup. Use its count
+/// unchanged: subtracting setup rows again would hide real handler work.
 fn plan_statements(segment: &str, method: &str) -> u64 {
     let rows = statement_counts(segment, method);
     assert_eq!(
@@ -328,16 +324,15 @@ fn plan_statements(segment: &str, method: &str) -> u64 {
         1,
         "one {method} profile row; segment:\n{segment}"
     );
-    let span = format!("rpc_dispatch{{method=\"{method}\"}}");
-    let connection_setup = strip_ansi(segment)
-        .lines()
-        .filter(|line| {
-            line.contains(&span)
-                && line.contains("sqlx::query")
-                && line.contains("summary=\"PRAGMA journal_mode = WAL;")
-        })
-        .count();
-    rows[0] - u64::try_from(connection_setup).unwrap()
+    rows[0]
+}
+
+#[test]
+fn profiled_plan_does_not_subtract_connection_setup_twice() {
+    let log = r#"DEBUG rpc_dispatch{method="workspace.list"}: sqlx::query: summary="PRAGMA journal_mode = WAL; …"
+WARN rpc dispatch exceeded SQL statement budget method=workspace.list statements=12
+"#;
+    assert_eq!(plan_statements(log, "workspace.list"), 12);
 }
 
 async fn wss_rpc<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: Value) -> Value
@@ -376,13 +371,16 @@ where
 /// grow SQL statement count.
 #[tokio::test]
 async fn workspace_list_and_subscribe_statement_counts_are_constant_over_wss() {
-    const MAX_STATEMENTS: u64 = 11;
+    // Ten bulk workspace/aggregate reads, one indexed invitation-expiry
+    // probe, and one scalar membership projection. No invitations are due
+    // in this fixture; expiry maintenance is covered by the store tests.
+    const MAX_STATEMENTS: u64 = 12;
     let (daemon, port, cfg, socket) = boot(
         "itd-wscost",
         &[
             ("INTENTD_RPC_STATEMENT_WARN_THRESHOLD", "0"),
-            // Surface every `sqlx::query` row so [`plan_statements`] can
-            // tell read-pool connection setup apart from the aggregate plan.
+            // Retain every query in assertion diagnostics so an added
+            // statement can be traced to its actual SQL.
             ("RUST_LOG", "info,sqlx::query=debug"),
         ],
     )
@@ -390,6 +388,7 @@ async fn workspace_list_and_subscribe_statement_counts_are_constant_over_wss() {
     let log_path = daemon.data_dir.path().join("daemon.log");
     let mut seeded = 0;
     let mut observed = Vec::new();
+    let mut segments = Vec::new();
 
     for target in [1, 10, 100] {
         while seeded < target {
@@ -449,21 +448,34 @@ async fn workspace_list_and_subscribe_statement_counts_are_constant_over_wss() {
         .await;
         let list_count = plan_statements(&segment, "workspace.list");
         let subscribe_count = plan_statements(&segment, "workspace.subscribe");
+        eprintln!("workspace cost: rows={target} list={list_count} subscribe={subscribe_count}");
+        observed.push((target, list_count, subscribe_count));
+        segments.push(segment);
+    }
+
+    for ((target, list_count, subscribe_count), segment) in observed.iter().zip(&segments) {
         assert!(
-            list_count <= MAX_STATEMENTS,
+            *list_count <= MAX_STATEMENTS,
             "{target} rows: {list_count}; log segment:\n{segment}"
         );
         assert!(
-            subscribe_count <= MAX_STATEMENTS,
+            *subscribe_count <= MAX_STATEMENTS,
             "{target} rows: {subscribe_count}; log segment:\n{segment}"
         );
-        observed.push((target, list_count, subscribe_count));
     }
 
     assert_eq!(
         observed.iter().map(|row| row.0).collect::<Vec<_>>(),
         [1, 10, 100]
     );
+    let (_, baseline_list, baseline_subscribe) = observed[0];
+    for (target, list_count, subscribe_count) in observed {
+        assert_eq!(
+            (list_count, subscribe_count),
+            (baseline_list, baseline_subscribe),
+            "statement counts must stay constant at {target} rows"
+        );
+    }
 }
 
 /// End-to-end: with the threshold lowered to 0, a real `note.subscribe` over
