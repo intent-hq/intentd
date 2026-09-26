@@ -15,6 +15,8 @@ mod sharing;
 
 #[path = "wss_integration/member_transport.rs"]
 mod member_transport;
+#[path = "wss_integration/personal_pairing.rs"]
+mod personal_pairing;
 #[path = "wss_integration/workspace_delete.rs"]
 mod workspace_delete;
 
