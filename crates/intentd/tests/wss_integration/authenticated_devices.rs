@@ -180,7 +180,7 @@ async fn own_event(client: &mut Guest, kind: &str, id: &str) -> Value {
                     }
                 }
                 Some(Ok(Message::Ping(bytes))) => {
-                    client.ws.send(Message::Pong(bytes)).await.unwrap()
+                    client.ws.send(Message::Pong(bytes)).await.unwrap();
                 }
                 other => panic!("expected device event: {other:?}"),
             }
@@ -301,7 +301,7 @@ async fn authenticated_devices_live_metadata_disconnect_reconnect_and_real_remov
             unaffected.call("principal.me", json!({})).await["result"]["id"],
             unaffected.principal.id.as_str()
         );
-        let updates = srv
+        let persisted = srv
             .store
             .query_events(&intent_store::EventQuery {
                 event_types: vec!["client:updated".into()],
@@ -309,7 +309,7 @@ async fn authenticated_devices_live_metadata_disconnect_reconnect_and_real_remov
             })
             .await
             .unwrap();
-        assert!(updates.is_empty(), "metadata updates must be transient");
+        assert!(persisted.is_empty(), "metadata updates must be transient");
         srv.ws.stop().await;
     }
 }
