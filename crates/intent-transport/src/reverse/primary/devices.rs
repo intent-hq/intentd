@@ -1,7 +1,16 @@
 //! Authenticated device presence shares connection lifetimes with reverse RPC,
 //! but guests appear here without ever becoming browser hosts.
-use super::*;
-use intent_core::{events::CLIENT_UPDATED, PrincipalId};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::Ordering;
+
+use intent_core::{
+    events::{CLIENT_CONNECTED, CLIENT_DISCONNECTED, CLIENT_UPDATED},
+    ClientHostInfo, PrincipalId, ReverseLiveClient,
+};
+use serde_json::Value;
+use tokio::sync::mpsc;
+
+use super::{ClientTransition, PrimaryReverseGuard, ReverseClientIdentity, State};
 
 pub(super) struct DeviceBinding {
     identity: ReverseClientIdentity,
@@ -11,7 +20,6 @@ pub(super) struct DeviceBinding {
 
 impl State {
     pub(super) fn queue_device(
-        &self,
         tx: &mpsc::UnboundedSender<ClientTransition>,
         event_type: &'static str,
         row: &ReverseLiveClient,
@@ -79,13 +87,13 @@ impl State {
         let new: HashSet<_> = rows.iter().map(key).collect();
         for row in &self.devices {
             if !new.contains(&key(row)) {
-                self.queue_device(tx, CLIENT_DISCONNECTED, row);
+                Self::queue_device(tx, CLIENT_DISCONNECTED, row);
             }
         }
         for row in &rows {
             match old.get(&key(row)) {
-                None => self.queue_device(tx, CLIENT_CONNECTED, row),
-                Some(previous) if *previous != row => self.queue_device(tx, CLIENT_UPDATED, row),
+                None => Self::queue_device(tx, CLIENT_CONNECTED, row),
+                Some(previous) if *previous != row => Self::queue_device(tx, CLIENT_UPDATED, row),
                 _ => {}
             }
         }
@@ -121,6 +129,8 @@ impl PrimaryReverseGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reverse::{PrimaryReverseRegistry, ReverseChannel, ReverseTransport};
+    use intent_core::{AgentReverseDispatch, ClientId};
     use serde_json::json;
 
     #[test]

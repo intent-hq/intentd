@@ -10,7 +10,7 @@
 //!   CLIs, dev tooling) and connections without the capability (FE auxiliary
 //!   `JsonRpcClient`s) are never candidates — this is what fixes the REV-1
 //!   misrouting where the first arrival won regardless of what it could do.
-//!   Guest hellos are not bound into the registry. Current members can host
+//!   Guest hellos enter only the device roster. Current members can host
 //!   ordinary workspace browsers; each dispatch rechecks their authority.
 //!   Chief and host reverse requests select only administrator connections.
 //! - [`ReverseTarget::Default`] → the **first-connected** eligible connection
@@ -53,7 +53,7 @@ use super::{request_timeout, ReverseChannel};
 /// Global events (empty `workspaceId`, like `settings:changed`) published
 /// when a logical client gains its first / loses its last live hello'd
 /// connection (REV-2, §6). Defined in the canonical taxonomy so the
-/// collaborator allowlist golden classifies them (owner-only, multiplayer w3).
+/// collaborator allowlist golden classifies them (guests receive only their own).
 pub use intent_core::events::{CLIENT_CONNECTED, CLIENT_DISCONNECTED};
 
 /// Which listener accepted a registered connection.
@@ -660,7 +660,7 @@ impl AgentReverseDispatch for PrimaryReverseRegistry {
             .iter()
             .filter(|row| row.principal_id.as_ref() == Some(principal))
         {
-            state.queue_device(
+            State::queue_device(
                 &self.inner.transitions,
                 intent_core::events::CLIENT_UPDATED,
                 row,
