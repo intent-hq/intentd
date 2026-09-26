@@ -1409,7 +1409,7 @@ async fn invite_link_identity_join_and_removal_over_wss() {
     let v = wss_rpc(&mut guest, 35, "principal.revokeSelf", json!({})).await;
     assert_eq!(
         v["result"],
-        json!({ "revoked": true, "credentials": 2, "workspaces": 2 }),
+        json!({ "revoked": true, "credentials": 2, "workspaces": 2, "hostMembershipRemoved": false }),
         "{v}"
     );
     let closed = timeout(Duration::from_secs(15), async {
