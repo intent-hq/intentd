@@ -8140,6 +8140,32 @@ async fn primary_principal_is_minted_once() {
     assert_eq!(store.list_principals().await.expect("list").len(), 1);
 }
 
+/// Remove derived 0133 state before a fixture rewinds its source schema. The
+/// real migration must replay after the legacy rows have been seeded.
+async fn rewind_sharing_projection(store: &Store) {
+    for sql in [
+        "DROP TRIGGER sharing_workspace_ai",
+        "DROP TRIGGER sharing_member_ai",
+        "DROP TRIGGER sharing_member_ad",
+        "DROP TRIGGER sharing_member_au",
+        "DROP TRIGGER sharing_host_member_ai",
+        "DROP TRIGGER sharing_host_member_ad",
+        "DROP TRIGGER sharing_host_member_au",
+        "DROP TRIGGER sharing_invite_ai",
+        "DROP TRIGGER sharing_invite_au",
+        "DROP TRIGGER sharing_invite_seat_ai",
+        "DROP TRIGGER sharing_invite_seat_ad",
+        "DROP TABLE workspace_invite_seat",
+        "DROP TABLE workspace_sharing_summary",
+        "DELETE FROM _sqlx_migrations WHERE version = 133",
+    ] {
+        sqlx::query(sql)
+            .execute(store.write_pool())
+            .await
+            .unwrap_or_else(|e| panic!("rewind `{sql}`: {e}"));
+    }
+}
+
 /// Migration 0125 applies cleanly on an existing, populated database: after
 /// rewinding to the 0124 schema with two workspaces present, reopening the
 /// store mints the primary principal and makes it owner (and legacy author)
@@ -8151,6 +8177,7 @@ async fn principals_migration_backfills_existing_workspaces() {
     let ws_b = WorkspaceId::from("ws-mig-b");
     {
         let store = Store::open(&tmp.path).await.expect("open store");
+        rewind_sharing_projection(&store).await;
         // 0130 re-widens the recreated principal/invite tables; 0132 adds
         // host tables and triggers referencing principal. Rewind both before
         // removing the principal table, then let the real migrations replay.
@@ -8213,6 +8240,12 @@ async fn principals_migration_backfills_existing_workspaces() {
         assert_eq!(members.len(), 1, "{ws} has exactly the owner membership");
         assert_eq!(members[0].principal_id, primary.id);
         assert_eq!(members[0].role, WorkspaceRole::Owner);
+        let summaries = store
+            .workspace_membership_summaries(Some(&primary.id), std::slice::from_ref(ws))
+            .await
+            .expect("sharing projection replayed");
+        assert_eq!(summaries[ws].member_count, 1);
+        assert_eq!(summaries[ws].open_invite_count, 0);
     }
 }
 
@@ -9505,6 +9538,7 @@ async fn principal_identity_migration_backfills_github_rows() {
     {
         let store = Store::open(&tmp.path).await.expect("open store");
         let primary = store.get_primary_principal().await.expect("primary").id;
+        rewind_sharing_projection(&store).await;
         for sql in [
             "DELETE FROM _sqlx_migrations WHERE version = 130",
             "DROP INDEX principal_identity_uq",
@@ -9615,6 +9649,16 @@ async fn principal_identity_migration_backfills_github_rows() {
         .expect("row");
     assert_eq!(open.pin_identity, None);
     assert!(open.is_reusable());
+    assert_eq!(
+        store
+            .count_workspace_guests(&ws)
+            .await
+            .expect("sharing projection replayed"),
+        crate::WorkspaceGuestCount {
+            collaborators: 0,
+            open_invites: 2
+        }
+    );
 
     // The partial unique index rejects a second row with the same triple,
     // whether it is given as the triple or as the bare github id.
