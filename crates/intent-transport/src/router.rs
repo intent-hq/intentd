@@ -182,6 +182,13 @@ fn domain_to_rpc(e: Error) -> RpcErr {
                 "host": host,
             })),
         },
+        ref e @ (Error::IdentityMismatch | Error::IdentityInUse) => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(
+                json!({ "code": if matches!(e, Error::IdentityMismatch) { "identity-mismatch" } else { "identity-in-use" } }),
+            ),
+        },
         ref e @ Error::SourceControlUnauthorized {
             ref provider,
             ref host,
@@ -3162,7 +3169,21 @@ async fn dispatch(
             let nonce = require_str_param(params, "nonce")?;
             let host_label = require_str_param(params, "hostLabel")?;
             let r = api
-                .source_control_identity_proof_create(provider, host, nonce, host_label)
+                .source_control_identity_proof_create(
+                    provider,
+                    host,
+                    nonce,
+                    host_label,
+                    opt_str_strict(params, "purpose")?,
+                    params
+                        .get("expectedIdentity")
+                        .filter(|v| !v.is_null())
+                        .map(|v| {
+                            serde_json::from_value(v.clone())
+                                .map_err(|_| invalid_params("invalid expectedIdentity"))
+                        })
+                        .transpose()?,
+                )
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -3172,7 +3193,12 @@ async fn dispatch(
             let host = opt_str_strict(params, "host")?;
             let proof_id = require_str_param(params, "proofId")?;
             let r = api
-                .source_control_identity_proof_delete(provider, host, proof_id)
+                .source_control_identity_proof_delete(
+                    provider,
+                    host,
+                    proof_id,
+                    opt_str_strict(params, "purpose")?,
+                )
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -3185,6 +3211,52 @@ async fn dispatch(
         // but a present non-string is `-32602` before the service runs — a
         // lax `host` would otherwise route `{"host": 123}` as host-omitted
         // and, on `revoke`, act on the bound credential instead of failing.
+        "identity.authStatus" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            api.identity_auth_status(provider, host)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "identity.connect" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let method = opt_str_strict(params, "method")?;
+            let token = opt_str_strict(params, "token")?;
+            api.identity_connect(provider, host, method, token)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "identity.cancelAuth" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let flow_id = require_str_param(params, "flowId")?;
+            api.identity_cancel_auth(provider, host, flow_id)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "identity.revoke" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            api.identity_revoke(provider, host)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "identity.getUser" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            api.identity_get_user(provider, host)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "identity.select" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let external_user_id = require_str_param(params, "externalUserId")?;
+            api.identity_select(provider, host, external_user_id)
+                .await
+                .map_err(domain_to_rpc)
+        }
         "sourceControl.authStatus" => {
             let provider = require_str_param(params, "provider")?;
             let host = opt_str_strict(params, "host")?;

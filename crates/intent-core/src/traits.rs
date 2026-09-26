@@ -4448,8 +4448,17 @@ pub trait WorkspaceApi: Send + Sync {
         host: Option<String>,
         nonce: String,
         host_label: String,
+        purpose: Option<String>,
+        expected_identity: Option<crate::PrincipalIdentity>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (provider, host, nonce, host_label);
+        let _ = (
+            provider,
+            host,
+            nonce,
+            host_label,
+            purpose,
+            expected_identity,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::source_control_identity_proof_create not implemented".to_string(),
@@ -4469,8 +4478,9 @@ pub trait WorkspaceApi: Send + Sync {
         provider: String,
         host: Option<String>,
         proof_id: String,
+        purpose: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (provider, host, proof_id);
+        let _ = (provider, host, proof_id, purpose);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::source_control_identity_proof_delete not implemented".to_string(),
@@ -4487,6 +4497,94 @@ pub trait WorkspaceApi: Send + Sync {
     // `getUser` quintet above is served as aliases of these with
     // `provider: "github"` pinned and the additive fields projected away.
     // ========================================================================
+
+    /// Collaboration-only `identity.authStatus`; administrator of the local signing-in daemon only.
+    fn identity_auth_status(
+        &self,
+        provider: String,
+        host: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host);
+        Box::pin(async {
+            Err(Error::Internal(
+                "collaboration identity not implemented".into(),
+            ))
+        })
+    }
+
+    /// Collaboration-only `identity.connect`; administrator of the local signing-in daemon only.
+    fn identity_connect(
+        &self,
+        provider: String,
+        host: Option<String>,
+        method: Option<String>,
+        token: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host, method, token);
+        Box::pin(async {
+            Err(Error::Internal(
+                "collaboration identity not implemented".into(),
+            ))
+        })
+    }
+
+    /// Collaboration-only `identity.cancelAuth`; administrator of the local signing-in daemon only.
+    fn identity_cancel_auth(
+        &self,
+        provider: String,
+        host: Option<String>,
+        flow_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host, flow_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "collaboration identity not implemented".into(),
+            ))
+        })
+    }
+
+    /// Collaboration-only `identity.revoke`; administrator of the local signing-in daemon only.
+    fn identity_revoke(
+        &self,
+        provider: String,
+        host: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host);
+        Box::pin(async {
+            Err(Error::Internal(
+                "collaboration identity not implemented".into(),
+            ))
+        })
+    }
+
+    /// Collaboration-only `identity.getUser`; administrator of the local signing-in daemon only.
+    fn identity_get_user(
+        &self,
+        provider: String,
+        host: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host);
+        Box::pin(async {
+            Err(Error::Internal(
+                "collaboration identity not implemented".into(),
+            ))
+        })
+    }
+
+    /// Collaboration-only `identity.select`; administrator of the local signing-in daemon only.
+    fn identity_select(
+        &self,
+        provider: String,
+        host: Option<String>,
+        external_user_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host, external_user_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "collaboration identity not implemented".into(),
+            ))
+        })
+    }
 
     /// `sourceControl.authStatus { provider, host? }`: the `github.authStatus`
     /// shape plus additive `provider`, `host`, `method`

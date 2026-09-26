@@ -242,6 +242,7 @@ const COLLABORATOR_REFUSED_EVENT_TYPES: &[&str] = &[
     "host:exec:exit",
     "host:exec:stderr",
     "host:exec:stdout",
+    "identity:auth-changed",
     "mcp.servers:status-changed",
     "mcp:notification",
     "principal:identity-changed",

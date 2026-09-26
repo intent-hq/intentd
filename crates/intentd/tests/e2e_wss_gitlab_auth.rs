@@ -15,6 +15,11 @@
 
 mod common;
 
+#[path = "collaboration_identity/github.rs"]
+mod collaboration_github;
+#[path = "collaboration_identity/gitlab.rs"]
+mod collaboration_identity;
+
 use std::net::Ipv4Addr;
 use std::path::Path;
 use std::process::Stdio;

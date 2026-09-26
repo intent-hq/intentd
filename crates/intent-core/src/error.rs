@@ -8,6 +8,12 @@
 /// Domain error type for intentd.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// The verified account or selection changed during collaboration sign-in.
+    #[error("collaboration identity does not match the selected account")]
+    IdentityMismatch,
+    /// Explicit selection cannot merge independently admitted people.
+    #[error("collaboration identity is already bound to another principal")]
+    IdentityInUse,
     /// A required parameter was missing or malformed.
     #[error("invalid params: {0}")]
     InvalidParams(String),
@@ -479,7 +485,9 @@ impl Error {
     #[must_use]
     pub fn code(&self) -> i32 {
         match self {
-            Error::InvalidParams(_)
+            Error::IdentityMismatch
+            | Error::IdentityInUse
+            | Error::InvalidParams(_)
             | Error::NotFound(_)
             | Error::InvalidInput(_)
             | Error::BaseRefUnresolvable { .. }

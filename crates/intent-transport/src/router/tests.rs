@@ -1351,6 +1351,8 @@ impl WorkspaceApi for FakeApi {
         host: Option<String>,
         nonce: String,
         host_label: String,
+        _purpose: Option<String>,
+        _expected_identity: Option<intent_core::PrincipalIdentity>,
     ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             // Sentinel nonces exercise the two typed refusals' wire shapes.
@@ -1380,6 +1382,7 @@ impl WorkspaceApi for FakeApi {
         provider: String,
         host: Option<String>,
         proof_id: String,
+        _purpose: Option<String>,
     ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             Ok(serde_json::json!({

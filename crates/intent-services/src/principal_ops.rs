@@ -859,19 +859,12 @@ impl Services {
     /// [`Self::resolve_identity_forge`] selects and persist it. Returns the
     /// (possibly unchanged) row; fails when no forge is connected.
     ///
-    /// Reconnect guard (multiplayer w4): once other principals or open
-    /// invites exist, the primary identity is load-bearing — invites were
-    /// minted from it and collaborators joined *this* person's daemon — so a
-    /// fetch that names a **different** account (the user reconnected the
-    /// forge as another account) leaves the cached identity untouched and
-    /// fails with [`InviteErrorKind::IdentityLocked`]. The one admitted
-    /// change while locked is the explicit re-key: the `identity.provider`
-    /// setting names the fetched forge and the cached identity is on another
-    /// one. While the daemon is still single-user the switch is applied as
-    /// before — unless a `github.connect` switch landed while this fetch
-    /// was in flight, in which case the fetched profile describes the old
-    /// account and is dropped in favour of the current row
-    /// ([`Self::apply_primary_forge_identity_locked`]).
+    /// An existing identity is refreshed only from the same provider,
+    /// instance and account. Repository reconnection is not an identity
+    /// choice; a different account leaves the cached row intact even on a
+    /// single-user daemon. An unlinked legacy principal may still acquire
+    /// its initial identity. Explicit choices use `identity.select` or the
+    /// `identity.provider` write hook, with the same generation fence.
     pub(crate) async fn refresh_primary_identity(&self, principal: Principal) -> Result<Principal> {
         let generation = self.identity_rekey_generation.load(Ordering::SeqCst);
         self.refresh_primary_identity_at(principal, generation)
@@ -899,6 +892,10 @@ impl Services {
         .ok_or_else(|| Error::Internal("no forge identity is connected".to_string()))?;
         let _transition = self.identity_transition.lock().await;
         self.check_rekey_current(generation, setting.as_deref())?;
+        let current = self.store.get_principal(&principal.id).await?;
+        if current.identity_key().is_some() && current.identity_key() != fetched.identity {
+            return Ok(current);
+        }
         self.apply_primary_forge_identity_locked(principal, &fetched)
             .await
     }
@@ -1027,9 +1024,8 @@ impl Services {
     /// (`[{ path, value, .. }]`, as `settings:changed` carries it) moved the
     /// setting, re-key the primary principal per
     /// [`Self::rekey_primary_identity_from_setting`] right away, detached
-    /// from the write (best-effort — a forge that cannot be reached leaves
-    /// the row as is, and the next refresh, seeing the setting, performs
-    /// the re-key).
+    /// from the write (best-effort — an unreachable forge leaves the row
+    /// as is; retry the explicit choice once it becomes reachable).
     pub(crate) fn on_settings_applied(&self, applied: &[Value]) {
         let changed = applied
             .iter()
@@ -1067,7 +1063,7 @@ impl Services {
     /// connected** leaves the primary unlinked — the cached triple is
     /// cleared and `principal:identity-changed { identity: null }` is
     /// published — until it connects. A forge that merely cannot be
-    /// reached defers the re-key (the row stays; the next refresh retries),
+    /// reached defers the re-key (the row stays; an explicit retry is needed),
     /// so a transient outage never unlinks anyone. Unset (`null`) is the
     /// implied resolution, i.e. an ordinary [`Self::refresh_primary_identity`].
     ///
@@ -1112,11 +1108,58 @@ impl Services {
         self.check_rekey_current(generation, Some(&setting))?;
         match connected {
             Some(user) => self
-                .apply_primary_forge_identity_locked(principal, &user)
+                .select_primary_forge_identity_locked(principal, &user)
                 .await
                 .map(|_| ()),
             None => self.unlink_primary_identity_locked(principal).await,
         }
+    }
+
+    /// Explicit identity choice; unlike a repository refresh it may replace
+    /// the triple, but never merge a different local principal or rotate sessions.
+    pub(crate) async fn select_primary_forge_identity_locked(
+        &self,
+        mut primary: Principal,
+        user: &ForgeUser,
+    ) -> Result<Principal> {
+        let identity = user.identity.clone().ok_or(Error::IdentityMismatch)?;
+        if self
+            .store
+            .find_principal_by_identity(&identity)
+            .await?
+            .is_some_and(|p| p.id != primary.id)
+        {
+            return Err(Error::IdentityInUse);
+        }
+        let previous = primary.identity_key();
+        primary.set_identity(identity.clone());
+        primary.login = Some(user.login.clone());
+        primary.display_name = user.display_name.clone();
+        primary.avatar_url = user.avatar_url.clone();
+        primary.updated_at = now_iso();
+        if let Err(e) = self.store.upsert_principal(&primary).await {
+            // Invite redemption can bind this account while the provider
+            // probe is in flight. The unique index prevents any merge; keep
+            // the same typed refusal if it wins after our initial lookup.
+            if self
+                .store
+                .find_principal_by_identity(&identity)
+                .await?
+                .is_some_and(|p| p.id != primary.id)
+            {
+                return Err(Error::IdentityInUse);
+            }
+            return Err(e);
+        }
+        self.presence_profile_changed(&primary).await;
+        if previous.as_ref() != Some(&identity) {
+            crate::publish_event(
+                self.event_bus.as_ref(),
+                crate::principal_identity_changed_event(&primary.id, Some(&identity)),
+            )
+            .await;
+        }
+        Ok(primary)
     }
 
     /// Unlink the primary principal: clear its identity triple (and the
@@ -1157,16 +1200,14 @@ impl Services {
 
     /// The pre-persist hook `github.connect` installs on its device flow
     /// (multiplayer w4): the granted token's account is resolved through
-    /// the token-bound client and applied via
-    /// [`Self::apply_primary_identity_locked`] *before* the engine writes
-    /// the token, so a reconnect as a different account is refused (the
-    /// stored credential and cached identity stay) while the identity is
-    /// locked. When the daemon is still single-user the switch is applied
-    /// and the token persisted as before. A failed `GET /user` refuses the
+    /// the token-bound client before the engine writes the token. An
+    /// existing identity stays selected; the legacy same-provider account
+    /// swap guard still refuses another account while the identity is
+    /// locked. A previously unlinked primary may acquire its initial
+    /// identity. A failed `GET /user` refuses the
     /// grant only while locked: unverifiable is unsafe exactly when there is
     /// something to protect. Every other failure — the lock state or the
-    /// principal row unreadable, the apply failing — refuses too: the token
-    /// is only persisted once the identity has been positively applied.
+    /// principal row unreadable, the initial apply failing — refuses too.
     ///
     /// The whole decision runs under the [`IdentityTransitionLock`], and an
     /// admission hands that lock back to the flow as its
@@ -1193,6 +1234,21 @@ impl Services {
                         Box::new(transition);
                     match client.get_user().await {
                         Ok(user) => {
+                            if let Some(current) = primary.identity_key() {
+                                // Repository reconnection does not select a new
+                                // collaboration identity. Retain the existing
+                                // same-forge reconnect refusal while load-bearing.
+                                if current.provider == "github"
+                                    && Some(current) != ForgeUser::github(&user).identity
+                                    && this
+                                        .primary_identity_locked()
+                                        .await
+                                        .map_err(|e| e.to_string())?
+                                {
+                                    return Err("repository account differs from the locked primary identity".into());
+                                }
+                                return Ok(lease);
+                            }
                             match this.apply_primary_identity_locked(primary, &user).await {
                                 Ok(_) => Ok(lease),
                                 Err(Error::Invite(InviteErrorKind::IdentityLocked)) => {

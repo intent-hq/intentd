@@ -13,7 +13,8 @@
 //! Only a *public* OAuth App `client_id` is needed (no client secret, no
 //! callback URL). 🔒 The `access_token` and `device_code` are secrets: they
 //! are never logged, never carried in any `Debug`/`Serialize` shape, and the
-//! token never leaves this module — callers only see [`PollStatus`].
+//! token never leaves this module — callers see [`PollStatus`] or an opaque
+//! [`GithubGrant`] that they can verify before committing to their own store.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -44,7 +45,10 @@ const SLOW_DOWN_BUMP_SECS: u64 = 5;
 /// cancelled — `spawn_blocking` closures cannot be interrupted).
 const SECRET_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Default scopes requested by the device flow (§spec: PR/issue/review work,
+/// Permissions for publishing a collaboration identity proof only.
+pub const COLLABORATION_SCOPES: &[&str] = &["gist"];
+
+/// Default scopes requested by the repository device flow (§spec: PR/issue/review work,
 /// org-repo listing, workflow-file pushes, and the secret proof gist of the
 /// gist identity-proof join flow — [`crate::identity_proof`]). Tokens granted
 /// before `gist` was added keep working; they only need a re-authorization
@@ -225,12 +229,48 @@ impl DeviceFlow {
     ///
     /// Returns an error when the token request fails, the response cannot be classified, or persisting the token to the secret store fails. Grant expiration and denial are not errors — they are reported as [`PollStatus::Expired`] and [`PollStatus::Denied`].
     pub async fn poll_once(&mut self) -> Result<PollStatus> {
-        // GitHub's device-token endpoint reports pending/slow_down/expired/
-        // denied as an `error` code in an HTTP 200 body. octocrab's
-        // `DeviceCodes::poll_once` (untagged `TokenResponse`) cannot represent
-        // the terminal errors — deserialization fails and the expired/denied
-        // distinction is lost — so we post the same grant ourselves through
-        // the same octocrab client and classify the raw body.
+        match self.exchange_once().await? {
+            GithubExchange::Authorized(grant) => {
+                let mut lease = None;
+                if let Some((api_base_uri, guard)) = &self.identity_guard {
+                    let client: Arc<dyn SourceControl> =
+                        Arc::new(crate::github::GitHubSourceControl::new(
+                            grant.access_token.expose_secret(),
+                            api_base_uri.as_deref(),
+                        )?);
+                    match guard(client).await {
+                        Ok(held) => lease = Some(held),
+                        Err(reason) => {
+                            tracing::warn!(
+                                reason,
+                                "github device flow grant refused by identity guard"
+                            );
+                            return Ok(PollStatus::Refused);
+                        }
+                    }
+                }
+                grant.commit(lease).await?;
+                Ok(PollStatus::Authorized)
+            }
+            GithubExchange::Pending => Ok(PollStatus::Pending),
+            GithubExchange::Expired => Ok(PollStatus::Expired),
+            GithubExchange::Denied => Ok(PollStatus::Denied),
+        }
+    }
+
+    /// Direct persistence to an isolated store without changing repository defaults.
+    #[must_use]
+    pub fn with_store(mut self, store: FileSecretStore) -> Self {
+        self.store = store;
+        self
+    }
+
+    /// Exchange without persisting: cancellation and account verification happen
+    /// before the caller commits the opaque grant.
+    ///
+    /// # Errors
+    /// Returns provider transport or malformed-response errors.
+    pub async fn exchange_once(&mut self) -> Result<GithubExchange> {
         let body: Value = self
             .crab
             .post(
@@ -244,37 +284,73 @@ impl DeviceFlow {
             .await?;
         match parse_poll_response(&body)? {
             PollResponse::Authorized { access_token } => {
-                let mut lease: Option<IdentityLease> = None;
-                if let Some((api_base_uri, guard)) = &self.identity_guard {
-                    let client: Arc<dyn SourceControl> =
-                        Arc::new(crate::github::GitHubSourceControl::new(
-                            access_token.expose_secret(),
-                            api_base_uri.as_deref(),
-                        )?);
-                    match guard(client).await {
-                        Ok(held) => lease = Some(held),
-                        Err(reason) => {
-                            drop(access_token);
-                            tracing::warn!(
-                                reason,
-                                "github device flow grant refused by identity guard"
-                            );
-                            return Ok(PollStatus::Refused);
-                        }
-                    }
-                }
-                persist_token(self.store.clone(), access_token, lease).await?;
-                Ok(PollStatus::Authorized)
+                Ok(GithubExchange::Authorized(GithubGrant {
+                    store: self.store.clone(),
+                    access_token,
+                    scopes: body.get("scope").and_then(Value::as_str).map(parse_scopes),
+                }))
             }
-            PollResponse::Pending => Ok(PollStatus::Pending),
+            PollResponse::Pending => Ok(GithubExchange::Pending),
             PollResponse::SlowDown { interval } => {
                 self.interval = next_interval(self.interval, interval);
-                Ok(PollStatus::Pending)
+                Ok(GithubExchange::Pending)
             }
-            PollResponse::Expired => Ok(PollStatus::Expired),
-            PollResponse::Denied => Ok(PollStatus::Denied),
+            PollResponse::Expired => Ok(GithubExchange::Expired),
+            PollResponse::Denied => Ok(GithubExchange::Denied),
         }
     }
+}
+
+/// Authorized tokens remain opaque until the caller commits or discards them.
+pub enum GithubExchange {
+    /// A verified device response, not yet persisted.
+    Authorized(GithubGrant),
+    /// Authorization has not completed.
+    Pending,
+    /// The device code expired.
+    Expired,
+    /// The person denied authorization.
+    Denied,
+}
+
+/// An uncommitted GitHub grant. Deliberately has no Debug/Serialize.
+pub struct GithubGrant {
+    store: FileSecretStore,
+    access_token: SecretString,
+    scopes: Option<Vec<String>>,
+}
+
+impl GithubGrant {
+    /// Verify the account using the new token, including observed permissions.
+    ///
+    /// # Errors
+    /// Returns the authenticated user lookup error.
+    pub async fn verify(
+        &self,
+        api_base: Option<&str>,
+    ) -> Result<(crate::UserIdentity, Option<Vec<String>>)> {
+        let (user, scopes) =
+            crate::github::GitHubSourceControl::new(self.access_token.expose_secret(), api_base)?
+                .get_user_with_scopes()
+                .await?;
+        Ok((user, scopes.or_else(|| self.scopes.clone())))
+    }
+
+    /// Commit while holding the caller's persistence lease through blocking IO.
+    ///
+    /// # Errors
+    /// Returns the bounded secret-store write error.
+    pub async fn commit(self, lease: Option<IdentityLease>) -> Result<()> {
+        persist_token(self.store, self.access_token, lease).await
+    }
+}
+
+pub(crate) fn parse_scopes(scopes: &str) -> Vec<String> {
+    scopes
+        .split(|c: char| c == ',' || c.is_ascii_whitespace())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Classified device-token poll response (crate-private: the authorized arm

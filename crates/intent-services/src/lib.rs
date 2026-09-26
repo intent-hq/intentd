@@ -95,6 +95,7 @@ mod workspace_mutations;
 
 mod github_ops;
 
+mod collaboration_auth_ops;
 mod github_auth_ops;
 mod github_browse_ops;
 mod source_control_auth_ops;
@@ -1019,6 +1020,7 @@ pub struct Services {
     /// returns the same codes. Shared across clones so the background poll
     /// task and every RPC handle observe the same slot.
     github_auth_flow: github_auth_ops::FlowState,
+    collaboration_auth: collaboration_auth_ops::AuthState,
     /// Test-only override for the GitHub login host the device flow talks to
     /// (`None` → `$INTENTD_GITHUB_LOGIN_BASE_URI` → `https://github.com`).
     /// Unit tests inject an invalid/mock URI so `github.connect` never
@@ -1454,6 +1456,7 @@ impl Services {
             invite_links: Arc::new(OnceLock::new()),
             token_usage_watermarks: Arc::new(Mutex::new(HashMap::new())),
             github_auth_flow: Arc::new(tokio::sync::Mutex::new(None)),
+            collaboration_auth: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             github_login_base_uri: None,
             gitlab_auth: source_control_auth_ops::new_gitlab_state(),
             gitlab_secret_store: intent_core::FileSecretStore::new(),
@@ -31434,15 +31437,33 @@ impl WorkspaceApi for Services {
         host: Option<String>,
         nonce: String,
         host_label: String,
+        purpose: Option<String>,
+        expected_identity: Option<intent_core::PrincipalIdentity>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         // 🔒 The token stays server-side; only the proof id and the owner's
         // identity as the forge reported it cross. A github proof also
         // carries the id under the legacy `gistId` key (§5.x compatibility).
         Box::pin(async move {
             Self::require_administrator("sourceControl.identityProof.create")?;
-            let (proof, created) = self
-                .identity_proof_create(&provider, host.as_deref(), &nonce, &host_label)
-                .await?;
+            let (proof, created) = match purpose.as_deref().unwrap_or("repository") {
+                "repository" => {
+                    self.identity_proof_create(&provider, host.as_deref(), &nonce, &host_label)
+                        .await?
+                }
+                "collaboration" => {
+                    self.collaboration_proof_create(
+                        &provider,
+                        host.as_deref(),
+                        &nonce,
+                        &host_label,
+                        expected_identity.ok_or_else(|| {
+                            Error::InvalidParams("expectedIdentity is required".into())
+                        })?,
+                    )
+                    .await?
+                }
+                _ => return Err(Error::InvalidParams("unknown proof purpose".into())),
+            };
             let mut result = serde_json::json!({
                 "proofId": created.proof_id,
                 "provider": proof.wire_name(),
@@ -31463,11 +31484,21 @@ impl WorkspaceApi for Services {
         provider: String,
         host: Option<String>,
         proof_id: String,
+        purpose: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             Self::require_administrator("sourceControl.identityProof.delete")?;
-            self.identity_proof_delete(&provider, host.as_deref(), "proofId", &proof_id)
-                .await?;
+            match purpose.as_deref().unwrap_or("repository") {
+                "repository" => {
+                    self.identity_proof_delete(&provider, host.as_deref(), "proofId", &proof_id)
+                        .await?;
+                }
+                "collaboration" => {
+                    self.collaboration_proof_delete(&provider, host.as_deref(), &proof_id)
+                        .await?;
+                }
+                _ => return Err(Error::InvalidParams("unknown proof purpose".into())),
+            }
             Ok(serde_json::json!({ "ok": true }))
         })
     }
@@ -31477,6 +31508,81 @@ impl WorkspaceApi for Services {
     // `source_control_auth_ops`. The `github.*` quintet above is the
     // byte-identical legacy projection of these with `provider: "github"`.
     // ========================================================================
+
+    fn identity_auth_status(
+        &self,
+        provider: String,
+        host: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            Self::require_administrator("identity.authStatus")?;
+            self.collaboration_status(&provider, host.as_deref(), false)
+                .await
+        })
+    }
+
+    fn identity_connect(
+        &self,
+        provider: String,
+        host: Option<String>,
+        method: Option<String>,
+        token: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            Self::require_administrator("identity.connect")?;
+            self.collaboration_connect(&provider, host.as_deref(), method.as_deref(), token)
+                .await
+        })
+    }
+
+    fn identity_cancel_auth(
+        &self,
+        provider: String,
+        host: Option<String>,
+        flow_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            Self::require_administrator("identity.cancelAuth")?;
+            self.collaboration_cancel(&provider, host.as_deref(), &flow_id)
+                .await
+        })
+    }
+
+    fn identity_revoke(
+        &self,
+        provider: String,
+        host: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            Self::require_administrator("identity.revoke")?;
+            self.collaboration_revoke(&provider, host.as_deref()).await
+        })
+    }
+
+    fn identity_get_user(
+        &self,
+        provider: String,
+        host: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            Self::require_administrator("identity.getUser")?;
+            self.collaboration_status(&provider, host.as_deref(), true)
+                .await
+        })
+    }
+
+    fn identity_select(
+        &self,
+        provider: String,
+        host: Option<String>,
+        external_user_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            Self::require_administrator("identity.select")?;
+            self.collaboration_select(&provider, host.as_deref(), &external_user_id)
+                .await
+        })
+    }
 
     fn source_control_auth_status(
         &self,

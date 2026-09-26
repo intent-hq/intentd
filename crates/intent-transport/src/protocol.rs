@@ -677,12 +677,18 @@
 //! read neither anonymously nor with its own connection to the same
 //! instance. No event is added. The catalog contains 336 router methods,
 //! 56 fast-path methods, and two aliases: 394 client-callable names.
+//!
+//! Version 10.9 adds the collaboration credential purpose: six owner-only
+//! `identity.*` methods, isolated credential/proof resolution and explicit
+//! identity selection, plus `identity:auth-changed`. The hello capability
+//! `collaborationIdentity: 1` gates purpose-aware proof calls. This does not
+//! advertise the separately implemented host-membership capability.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "10.8";
+pub const PROTOCOL_VERSION: &str = "10.9";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

@@ -471,8 +471,12 @@ pub const GITHUB_AUTH_CHANGED: &str = "github:auth-changed";
 // emit this event AND the unchanged `github:auth-changed`.
 pub const SOURCE_CONTROL_AUTH_CHANGED: &str = "sourceControl:auth-changed";
 
+/// Owner-only authentication transition for an isolated collaboration credential.
+/// Payload `{ provider, host, purpose: "collaboration", status, flowId? }`.
+pub const IDENTITY_AUTH_CHANGED: &str = "identity:auth-changed";
+
 // Primary-identity re-key (protocol 10.8). Emitted when the primary
-// principal's identity triple is replaced by an explicit `identity.provider`
+// principal's identity triple is replaced by `identity.select` or `identity.provider`
 // change — never on the implicit refresh (the identity lock blocks those).
 // Payload `{ principalId, identity: { provider, host, externalUserId },
 // login? }`; owner-only, like `sourceControl:auth-changed`.
@@ -662,6 +666,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     SETTINGS_CHANGED,
     GITHUB_AUTH_CHANGED,
     SOURCE_CONTROL_AUTH_CHANGED,
+    IDENTITY_AUTH_CHANGED,
     PRINCIPAL_IDENTITY_CHANGED,
     APP_UI_NAVIGATE,
     APP_UI_HIGHLIGHT,
@@ -801,7 +806,7 @@ pub fn is_known_event_type(event_type: &str) -> bool {
 /// progress), `gitRoot:*` (host paths), `test:*` / `build:*` (host process
 /// results), `app:*` (steers a client's UI; owner clients only, like reverse
 /// RPCs), `settings:changed`, `github:auth-changed`,
-/// `sourceControl:auth-changed`, `principal:identity-changed`, `mcp:*` /
+/// `sourceControl:auth-changed`, `identity:auth-changed`, `principal:identity-changed`, `mcp:*` /
 /// `mcp.servers:*`, and the agent-to-agent delivery bookkeeping events.
 pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (AGENT_ATTENTION_REQUESTED, "Agent lifecycle: an agent asked for input; { agentId, kind, reason }. Needed to render attention badges."),

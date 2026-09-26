@@ -180,12 +180,12 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// (`sourceControl.identityProof.create` / `delete`, the GitHub gist or
 /// GitLab snippet proof by `provider`); the `github.identityProof.*` pair
 /// stays as byte-identical aliases.
-const EXPECTED_TOTAL_METHODS: usize = 394;
+const EXPECTED_TOTAL_METHODS: usize = 400;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 336;
+const EXPECTED_ROUTER_METHODS: usize = 342;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 56;
@@ -676,6 +676,12 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "host.providerTestPrompt",
     "host.status",
     "host.toolAvailability",
+    "identity.authStatus",
+    "identity.cancelAuth",
+    "identity.connect",
+    "identity.getUser",
+    "identity.revoke",
+    "identity.select",
     "invite.accept",
     "invite.challenge",
     "invite.inspect",
@@ -1230,6 +1236,12 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "host.providerAuthStatus",
     "host.providerDiscovery",
     "host.providerTestPrompt",
+    "identity.authStatus",
+    "identity.cancelAuth",
+    "identity.connect",
+    "identity.getUser",
+    "identity.revoke",
+    "identity.select",
     "invite.accept",
     "invite.challenge",
     "invite.inspect",
@@ -1942,6 +1954,18 @@ mod unbound_owner_only_methods {
             ("settings.list", json!({})),
             ("settings.reset", json!({ "path": "model.defaultProvider" })),
             ("settings.update", json!({ "changes": {} })),
+            ("identity.authStatus", json!({"provider":"github"})),
+            (
+                "identity.cancelAuth",
+                json!({"provider":"github", "flowId":"f"}),
+            ),
+            ("identity.connect", json!({"provider":"github"})),
+            ("identity.getUser", json!({"provider":"github"})),
+            ("identity.revoke", json!({"provider":"github"})),
+            (
+                "identity.select",
+                json!({"provider":"github", "externalUserId":"1"}),
+            ),
             ("sourceControl.authStatus", json!({ "provider": "github" })),
             ("sourceControl.cancelAuth", json!({ "provider": "github" })),
             ("sourceControl.connect", json!({ "provider": "github" })),
