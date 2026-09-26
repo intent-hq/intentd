@@ -52,6 +52,8 @@ async fn member_transport_forward_revocation_stops_accepted_streams() {
     let token = "a8".repeat(32);
     let mut member = Guest::connect(&srv, &token).await;
     promote(&srv, &member.principal).await;
+    let mut other = Guest::connect(&srv, &"c8".repeat(32)).await;
+    promote(&srv, &other.principal).await;
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();
@@ -75,6 +77,16 @@ async fn member_transport_forward_revocation_stops_accepted_streams() {
     upstream.write_all(b"preview").await.unwrap();
     downstream.read_exact(&mut bytes).await.unwrap();
     assert_eq!(&bytes, b"preview");
+    let other_created = other
+        .call("forward.create", json!({"remotePort":port}))
+        .await;
+    assert!(other_created.get("error").is_none(), "{other_created}");
+    let other_port = u16::try_from(other_created["result"]["localPort"].as_u64().unwrap()).unwrap();
+    let mut other_downstream = TcpStream::connect(("127.0.0.1", other_port)).await.unwrap();
+    let (mut other_upstream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         member.call("principal.revokeSelf", json!({})).await["result"]["revoked"],
         true
@@ -90,6 +102,21 @@ async fn member_transport_forward_revocation_stops_accepted_streams() {
     assert!(TcpStream::connect(("127.0.0.1", forwarded_port))
         .await
         .is_err());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        other_downstream.write_all(b"stillok").await.unwrap();
+        other_upstream.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"stillok");
+        other_upstream.write_all(b"healthy").await.unwrap();
+        other_downstream.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"healthy");
+    })
+    .await
+    .expect("another member's accepted forward must survive");
+    assert!(TcpStream::connect(("127.0.0.1", other_port)).await.is_ok());
+    assert_eq!(
+        other.call("principal.me", json!({})).await["result"]["hostRole"],
+        "member"
+    );
     assert_eq!(
         status_code(
             &https_request(
@@ -112,6 +139,9 @@ async fn member_transport_tunnel_lifecycle_revocation_and_trust_guards() {
     let guest_token = "b9".repeat(32);
     let guest = Guest::connect(&srv, &guest_token).await;
     promote(&srv, &member.principal).await;
+    let other_token = "c9".repeat(32);
+    let mut other = Guest::connect(&srv, &other_token).await;
+    promote(&srv, &other.principal).await;
     assert_eq!(
         status_code(
             &https_request(
@@ -185,6 +215,15 @@ async fn member_transport_tunnel_lifecycle_revocation_and_trust_guards() {
         Frame::OpenOk { stream_id: 2 }
     );
     let (mut peer, _) = listener.accept().await.unwrap();
+    let other_url = format!("wss://localhost:{}/tunnel?token={other_token}", srv.port);
+    let mut other_tunnel =
+        common::wss_connect_with_retry(srv.port, srv.cfg.clone(), &other_url).await;
+    send_tunnel(&mut other_tunnel, Frame::Open { stream_id: 3, port }).await;
+    assert_eq!(
+        tunnel_frame(&mut other_tunnel).await,
+        Frame::OpenOk { stream_id: 3 }
+    );
+    let (mut other_peer, _) = listener.accept().await.unwrap();
     assert_eq!(
         member.call("principal.revokeSelf", json!({})).await["result"]["revoked"],
         true
@@ -197,6 +236,31 @@ async fn member_transport_tunnel_lifecycle_revocation_and_trust_guards() {
             .unwrap()
             .unwrap(),
         0
+    );
+    send_tunnel(
+        &mut other_tunnel,
+        Frame::Data {
+            stream_id: 3,
+            payload: b"alive".to_vec(),
+        },
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), other_peer.read_exact(&mut buf))
+        .await
+        .expect("another member's tunnel must survive")
+        .unwrap();
+    assert_eq!(&buf, b"alive");
+    other_peer.write_all(b"reply").await.unwrap();
+    assert_eq!(
+        tunnel_frame(&mut other_tunnel).await,
+        Frame::Data {
+            stream_id: 3,
+            payload: b"reply".to_vec()
+        }
+    );
+    assert_eq!(
+        other.call("principal.me", json!({})).await["result"]["hostRole"],
+        "member"
     );
     assert_eq!(
         status_code(
