@@ -38,7 +38,12 @@ fn scratch_dir(prefix: &str) -> tempfile::TempDir {
 /// Spawn `intentd serve` with a hermetic HOME so the user-tier specialists
 /// directory (`~/.intent/specialists`) never touches the real home.
 fn spawn_serve(data_dir: &Path, home_dir: &Path) -> Child {
-    let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
+    // Keep both boots' logs so restart teardown can be diagnosed.
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(data_dir.join("daemon.log"))
+        .expect("open daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     common::enable_ws_api(data_dir);
@@ -294,8 +299,8 @@ where
 
 /// Boot (or re-boot) a daemon over an existing data dir, returning the child
 /// and a pinned-TLS WSS client config for its live port.
-async fn boot(data_dir: &Path, home_dir: &Path) -> (Child, u16, Arc<ClientConfig>) {
-    let child = spawn_serve(data_dir, home_dir);
+async fn boot(data_dir: &Path, home_dir: &Path) -> (common::DaemonGuard, u16, Arc<ClientConfig>) {
+    let child = common::DaemonGuard::process_only(spawn_serve(data_dir, home_dir));
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -308,9 +313,23 @@ async fn boot(data_dir: &Path, home_dir: &Path) -> (Child, u16, Arc<ClientConfig
     (child, port, client_config(&fingerprint))
 }
 
-fn stop(mut child: Child) {
-    let _ = child.kill();
-    let _ = child.wait();
+async fn stop(mut daemon: common::DaemonGuard, socket: &Path) {
+    // Give the daemon's child processes a chance to finish and be reaped
+    // before restarting it; the guard remains a backstop if shutdown fails.
+    let shutdown = uds_rpc(socket, 4, "system.shutdown", json!({})).await;
+    assert_eq!(shutdown["result"]["ok"], true, "{shutdown}");
+    let status = timeout(common::test_timeout(Duration::from_secs(10)), async {
+        loop {
+            if let Some(status) = daemon.child_mut().try_wait().expect("wait for daemon") {
+                return status;
+            }
+            // timing-guard: poll the requested process exit within a fixed deadline.
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("daemon did not exit after system.shutdown");
+    assert!(status.success(), "daemon exited unsuccessfully: {status}");
 }
 
 fn specialist_md(name: &str, body: &str) -> String {
@@ -352,11 +371,10 @@ async fn specialist_file_change_emits_specialists_changed_over_wss() {
         .as_str()
         .expect("workspace id")
         .to_string();
-    stop(child);
+    stop(child, &socket).await;
 
     // Boot #2: the specialists watcher now covers the workspace's project tier.
-    let (child, port, cfg) = boot(&data_dir, &home_dir).await;
-    let _guard = common::DaemonGuard::process_only(child);
+    let (daemon, port, cfg) = boot(&data_dir, &home_dir).await;
 
     let mut sub = connect_ws(port, cfg.clone()).await;
     let sub_res = wss_rpc(
@@ -425,4 +443,6 @@ async fn specialist_file_change_emits_specialists_changed_over_wss() {
             "single specialist write must publish exactly one specialists:changed, first: {evt}, extra: {extra:?}"
         );
     }
+    drop(sub);
+    stop(daemon, &socket).await;
 }
