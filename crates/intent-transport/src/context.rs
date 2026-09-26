@@ -77,6 +77,23 @@ pub fn is_non_administrator_caller() -> bool {
     current_caller().is_some_and(|caller| !caller.is_administrator())
 }
 
+/// Current host execution authority, independent of the connection's role
+/// snapshot. Preserve the legacy unbound administrator test wiring.
+pub(crate) async fn may_manage_workspaces(api: &dyn intent_core::WorkspaceApi) -> bool {
+    if !is_non_administrator_caller() {
+        return true;
+    }
+    match current_caller().and_then(|caller| caller.principal_id().cloned()) {
+        Some(id) => api.principal_host_role(id).await.is_ok_and(|role| {
+            matches!(
+                role,
+                intent_core::HostRole::Owner | intent_core::HostRole::Member
+            )
+        }),
+        None => false,
+    }
+}
+
 /// Run a future within a connection-context scope. The `is_tcp` flag will be
 /// visible to all code running within `f` via `is_tcp_connection()`.
 ///

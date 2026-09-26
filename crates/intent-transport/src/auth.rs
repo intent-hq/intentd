@@ -415,17 +415,25 @@ impl ResolvedCredential {
             ResolvedCredential::Legacy => match api.primary_principal_id().await {
                 Ok(principal_id) => Some(Caller::Wire {
                     principal_id,
-                    is_administrator: true,
+                    host_role: intent_core::HostRole::Owner,
                 }),
                 Err(e) => {
                     tracing::debug!(error = %e, "legacy token admitted with no principal bound");
                     None
                 }
             },
-            ResolvedCredential::Principal(principal_id) => Some(Caller::Wire {
-                principal_id,
-                is_administrator: false,
-            }),
+            ResolvedCredential::Principal(principal_id) => {
+                match api.principal_host_role(principal_id.clone()).await {
+                    Ok(host_role) => Some(Caller::Wire {
+                        principal_id,
+                        host_role,
+                    }),
+                    Err(e) => {
+                        tracing::debug!(error = %e, "credential authority could not be resolved");
+                        None
+                    }
+                }
+            }
         }
     }
 }

@@ -234,8 +234,9 @@ pub(crate) fn principal_attribution_name(principal: &Principal) -> String {
 /// payload is persisted or enqueued, so direct persists, queue entries and
 /// their drain/redrive all carry the same [`FROM_PRINCIPAL_ID_KEY`]: a wire
 /// caller's principal overwrites whatever the client supplied; an agent /
-/// daemon / absent caller strips the key instead. Every other field passes
-/// through untouched. A non-object payload cannot carry the stamp and is
+/// daemon / absent caller strips the key instead. A human also cannot supply
+/// reserved agent-sender fields; unrelated metadata passes through untouched.
+/// A non-object payload cannot carry the stamp and is
 /// rejected with `InvalidParams` (the same rule `agent.queueMessage` and
 /// `userAppMessageId` already apply) — a human send must never be credited
 /// to the workspace fallback because its metadata had the wrong shape.
@@ -259,6 +260,8 @@ pub(crate) fn stamp_principal_attribution(
     };
     Ok(match (metadata, stamping_principal_id()) {
         (Some(mut obj), Some(principal_id)) => {
+            obj.remove("fromAgentId");
+            obj.remove("fromAgentName");
             obj.insert(
                 FROM_PRINCIPAL_ID_KEY.to_string(),
                 Value::String(principal_id.0),
@@ -340,25 +343,17 @@ pub(crate) fn prepend_collaborator_preamble_value(content: &mut Value, preamble:
     }
 }
 
-/// `true` when the bound caller is a per-principal (collaborator-class)
-/// wire connection — the only caller class that can carry the
-/// collaborator sender preamble. Cheap pre-check so the owner / agent /
-/// daemon paths never pay a store read for it.
-fn is_collaborator_class_caller() -> bool {
-    matches!(
-        current_caller(),
-        Some(Caller::Wire {
-            is_administrator: false,
-            ..
-        })
-    )
+/// Only a bound human wire caller can carry a human sender preamble.
+/// Current durable role, never a cached admission role, selects its text.
+fn is_human_wire_caller() -> bool {
+    matches!(current_caller(), Some(Caller::Wire { .. }))
 }
 
 impl Services {
     /// The collaborator sender preamble for a human message into
     /// `workspace_id` (multiplayer): `Some(text)` only when the bound caller
-    /// is a per-principal wire connection whose membership role there is
-    /// `collaborator`. The owner (any role `owner`, the administrator, UDS
+    /// is a durable host member in an ordinary workspace or a guest whose
+    /// explicit workspace role is `collaborator`. The owner (the administrator, UDS
     /// and legacy-token callers), agents, the daemon and an absent caller
     /// get `None`. The text is
     /// [`crate::harness::Harness::collaborator_sender_preamble`] rendered
@@ -368,28 +363,51 @@ impl Services {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Option<String>> {
-        let Some(Caller::Wire {
-            principal_id,
-            is_administrator: false,
-        }) = current_caller()
-        else {
+        let Some(Caller::Wire { principal_id, .. }) = current_caller() else {
             return Ok(None);
         };
-        let role = self
-            .store
-            .get_workspace_member_role(workspace_id, &principal_id)
-            .await?;
-        if role != Some(intent_core::WorkspaceRole::Collaborator) {
-            return Ok(None);
-        }
-        let (login, display_name) = match self.store.get_principal(&principal_id).await {
-            Ok(principal) => (principal.login, principal.display_name),
-            Err(Error::NotFound(_)) => (None, None),
+        let host_member = match self.store.get_host_role(&principal_id).await {
+            Ok(intent_core::HostRole::Member) => {
+                if workspace_id.is_chief() {
+                    return Ok(None);
+                }
+                self.store.get_workspace(workspace_id).await?;
+                true
+            }
+            Ok(intent_core::HostRole::Guest) => {
+                let role = self
+                    .store
+                    .get_workspace_member_role(workspace_id, &principal_id)
+                    .await?;
+                if role != Some(intent_core::WorkspaceRole::Collaborator) {
+                    return Ok(None);
+                }
+                false
+            }
+            Ok(intent_core::HostRole::Owner) | Err(Error::NotFound(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let principal = match self.store.get_principal(&principal_id).await {
+            Ok(principal) => Some(principal),
+            Err(Error::NotFound(_)) => None,
             Err(e) => return Err(e),
         };
+        let login = principal.as_ref().and_then(|p| p.login.as_deref());
+        let display_name = principal.as_ref().and_then(|p| p.display_name.as_deref());
+        if host_member {
+            let identity = principal.as_ref().and_then(Principal::identity_key);
+            return Ok(Some(crate::harness::latest().host_member_sender_preamble(
+                crate::harness::HostMemberSender {
+                    login,
+                    display_name,
+                    principal_id: principal_id.as_str(),
+                    identity: identity.as_ref(),
+                },
+            )));
+        }
         Ok(Some(crate::harness::latest().collaborator_sender_preamble(
-            login.as_deref(),
-            display_name.as_deref(),
+            login,
+            display_name,
             &principal_id.0,
         )))
     }
@@ -414,13 +432,13 @@ impl Services {
 
     /// [`Self::collaborator_sender_preamble`] keyed by the target agent
     /// (`agent.queueMessage`, `agent.editQueuedMessage`): resolves the
-    /// agent's workspace with one metadata-only read, collaborator-class
+    /// agent's workspace with one metadata-only read, bound human wire
     /// callers only.
     pub(crate) async fn collaborator_sender_preamble_for_agent(
         &self,
         agent_id: &intent_core::AgentId,
     ) -> Result<Option<String>> {
-        if !is_collaborator_class_caller() {
+        if !is_human_wire_caller() {
             return Ok(None);
         }
         let workspace_id = self.agent_workspace(agent_id).await?;
@@ -465,12 +483,16 @@ impl Services {
 /// `null` when the principal row is gone (the id is still what the row
 /// says).
 fn author_to_wire(principal_id: &PrincipalId, principal: Option<&Principal>) -> Value {
-    json!({
+    let row = json!({
         "principalId": principal_id,
         "login": principal.and_then(|p| p.login.clone()),
         "displayName": principal.and_then(|p| p.display_name.clone()),
         "avatarUrl": principal.and_then(|p| p.avatar_url.clone()),
-    })
+    });
+    match principal {
+        Some(p) => with_principal_identity(row, p),
+        None => row,
+    }
 }
 
 /// Serve-time author resolution for the user messages of one workspace
@@ -684,14 +706,20 @@ pub(crate) fn with_principal_identity(mut row: Value, p: &Principal) -> Value {
 }
 
 /// `principal.me` wire shape.
-pub(crate) fn principal_to_wire(p: &Principal, is_administrator: bool) -> Value {
+pub(crate) fn principal_to_wire(
+    p: &Principal,
+    host_role: intent_core::HostRole,
+    revision: u64,
+) -> Value {
     with_principal_identity(
         json!({
             "id": p.id,
             "login": p.login,
             "displayName": p.display_name,
             "avatarUrl": p.avatar_url,
-            "isAdministrator": is_administrator,
+            "isAdministrator": host_role == intent_core::HostRole::Owner,
+            "hostRole": host_role,
+            "hostMembershipRevision": revision,
         }),
         p,
     )
@@ -733,35 +761,41 @@ impl Services {
         if principal.is_primary {
             self.spawn_primary_identity_refresh(principal.clone()).await;
         }
-        let is_administrator = match caller {
-            Caller::Wire {
-                is_administrator, ..
-            } => is_administrator,
-            Caller::Agent { .. } | Caller::Daemon => principal.is_primary,
-        };
-        Ok(principal_to_wire(&principal, is_administrator))
+        // Fence the role with its durable revision. A removal between the
+        // reads must not pair an old member role with the new revision and
+        // leave a reconnecting client believing it is already up to date.
+        for _ in 0..3 {
+            let before = self.store.host_membership_state().await?;
+            let role = self.store.get_host_role(&principal.id).await?;
+            let after = self.store.host_membership_state().await?;
+            if before.revision == after.revision {
+                return Ok(principal_to_wire(&principal, role, after.revision));
+            }
+        }
+        Err(Error::Forbidden(
+            "host membership changed; retry principal.me".into(),
+        ))
     }
 
     /// `principal.list`: see [`intent_core::WorkspaceApi::principal_list`].
-    /// Owner-only via the administrator gate: the method is not scoped to a
-    /// workspace and the primary user owns every workspace (no transfer
-    /// RPC), so a per-principal wire caller is refused outright.
+    /// Sharing directory for the owner and active host members. Ordinary
+    /// guests cannot discover other people outside their workspace rosters.
     ///
-    /// Lists guests only. The primary row is read solely to decide whether
+    /// Lists credentialed non-primary people. The primary is read only to decide whether
     /// to spawn the off-path identity refresh: exactly one extra primary-row
     /// SELECT in the foreground, no network (intent-hq/intent#5534).
     pub(crate) async fn principal_list_op(&self) -> Result<Value> {
-        Self::require_administrator("principal.list")?;
+        self.require_host_execution("principal.list").await?;
         match self.store.get_primary_principal().await {
             Ok(primary) => self.refresh_primary_identity_if_unlinked(&primary).await,
             Err(e) => tracing::debug!(error = %e, "principal.list: primary row unavailable"),
         }
         let principals: Vec<Value> = self
             .store
-            .list_credentialed_guest_principals()
+            .list_sharing_principals()
             .await?
             .iter()
-            .map(|p| {
+            .map(|(p, host_role)| {
                 with_principal_identity(
                     json!({
                         "principalId": p.id,
@@ -769,6 +803,7 @@ impl Services {
                         "displayName": p.display_name,
                         "avatarUrl": p.avatar_url,
                         "githubUserId": p.github_user_id,
+                        "hostRole": host_role,
                     }),
                     p,
                 )
@@ -846,19 +881,12 @@ impl Services {
     /// [`Self::resolve_identity_forge`] selects and persist it. Returns the
     /// (possibly unchanged) row; fails when no forge is connected.
     ///
-    /// Reconnect guard (multiplayer w4): once other principals or open
-    /// invites exist, the primary identity is load-bearing — invites were
-    /// minted from it and collaborators joined *this* person's daemon — so a
-    /// fetch that names a **different** account (the user reconnected the
-    /// forge as another account) leaves the cached identity untouched and
-    /// fails with [`InviteErrorKind::IdentityLocked`]. The one admitted
-    /// change while locked is the explicit re-key: the `identity.provider`
-    /// setting names the fetched forge and the cached identity is on another
-    /// one. While the daemon is still single-user the switch is applied as
-    /// before — unless a `github.connect` switch landed while this fetch
-    /// was in flight, in which case the fetched profile describes the old
-    /// account and is dropped in favour of the current row
-    /// ([`Self::apply_primary_forge_identity_locked`]).
+    /// An existing identity is refreshed only from the same provider,
+    /// instance and account. Repository reconnection is not an identity
+    /// choice; a different account leaves the cached row intact even on a
+    /// single-user daemon. An unlinked legacy principal may still acquire
+    /// its initial identity. Explicit choices use `identity.select` or the
+    /// `identity.provider` write hook, with the same generation fence.
     pub(crate) async fn refresh_primary_identity(&self, principal: Principal) -> Result<Principal> {
         let generation = self.identity_rekey_generation.load(Ordering::SeqCst);
         self.refresh_primary_identity_at(principal, generation)
@@ -886,6 +914,10 @@ impl Services {
         .ok_or_else(|| Error::Internal("no forge identity is connected".to_string()))?;
         let _transition = self.identity_transition.lock().await;
         self.check_rekey_current(generation, setting.as_deref())?;
+        let current = self.store.get_principal(&principal.id).await?;
+        if current.identity_key().is_some() && current.identity_key() != fetched.identity {
+            return Ok(current);
+        }
         self.apply_primary_forge_identity_locked(principal, &fetched)
             .await
     }
@@ -1014,9 +1046,8 @@ impl Services {
     /// (`[{ path, value, .. }]`, as `settings:changed` carries it) moved the
     /// setting, re-key the primary principal per
     /// [`Self::rekey_primary_identity_from_setting`] right away, detached
-    /// from the write (best-effort — a forge that cannot be reached leaves
-    /// the row as is, and the next refresh, seeing the setting, performs
-    /// the re-key).
+    /// from the write (best-effort — an unreachable forge leaves the row
+    /// as is; retry the explicit choice once it becomes reachable).
     pub(crate) fn on_settings_applied(&self, applied: &[Value]) {
         let changed = applied
             .iter()
@@ -1054,7 +1085,7 @@ impl Services {
     /// connected** leaves the primary unlinked — the cached triple is
     /// cleared and `principal:identity-changed { identity: null }` is
     /// published — until it connects. A forge that merely cannot be
-    /// reached defers the re-key (the row stays; the next refresh retries),
+    /// reached defers the re-key (the row stays; an explicit retry is needed),
     /// so a transient outage never unlinks anyone. Unset (`null`) is the
     /// implied resolution, i.e. an ordinary [`Self::refresh_primary_identity`].
     ///
@@ -1099,11 +1130,58 @@ impl Services {
         self.check_rekey_current(generation, Some(&setting))?;
         match connected {
             Some(user) => self
-                .apply_primary_forge_identity_locked(principal, &user)
+                .select_primary_forge_identity_locked(principal, &user)
                 .await
                 .map(|_| ()),
             None => self.unlink_primary_identity_locked(principal).await,
         }
+    }
+
+    /// Explicit identity choice; unlike a repository refresh it may replace
+    /// the triple, but never merge a different local principal or rotate sessions.
+    pub(crate) async fn select_primary_forge_identity_locked(
+        &self,
+        mut primary: Principal,
+        user: &ForgeUser,
+    ) -> Result<Principal> {
+        let identity = user.identity.clone().ok_or(Error::IdentityMismatch)?;
+        if self
+            .store
+            .find_principal_by_identity(&identity)
+            .await?
+            .is_some_and(|p| p.id != primary.id)
+        {
+            return Err(Error::IdentityInUse);
+        }
+        let previous = primary.identity_key();
+        primary.set_identity(identity.clone());
+        primary.login = Some(user.login.clone());
+        primary.display_name = user.display_name.clone();
+        primary.avatar_url = user.avatar_url.clone();
+        primary.updated_at = now_iso();
+        if let Err(e) = self.store.upsert_principal(&primary).await {
+            // Invite redemption can bind this account while the provider
+            // probe is in flight. The unique index prevents any merge; keep
+            // the same typed refusal if it wins after our initial lookup.
+            if self
+                .store
+                .find_principal_by_identity(&identity)
+                .await?
+                .is_some_and(|p| p.id != primary.id)
+            {
+                return Err(Error::IdentityInUse);
+            }
+            return Err(e);
+        }
+        self.presence_profile_changed(&primary).await;
+        if previous.as_ref() != Some(&identity) {
+            crate::publish_event(
+                self.event_bus.as_ref(),
+                crate::principal_identity_changed_event(&primary.id, Some(&identity)),
+            )
+            .await;
+        }
+        Ok(primary)
     }
 
     /// Unlink the primary principal: clear its identity triple (and the
@@ -1144,16 +1222,14 @@ impl Services {
 
     /// The pre-persist hook `github.connect` installs on its device flow
     /// (multiplayer w4): the granted token's account is resolved through
-    /// the token-bound client and applied via
-    /// [`Self::apply_primary_identity_locked`] *before* the engine writes
-    /// the token, so a reconnect as a different account is refused (the
-    /// stored credential and cached identity stay) while the identity is
-    /// locked. When the daemon is still single-user the switch is applied
-    /// and the token persisted as before. A failed `GET /user` refuses the
+    /// the token-bound client before the engine writes the token. An
+    /// existing identity stays selected; the legacy same-provider account
+    /// swap guard still refuses another account while the identity is
+    /// locked. A previously unlinked primary may acquire its initial
+    /// identity. A failed `GET /user` refuses the
     /// grant only while locked: unverifiable is unsafe exactly when there is
     /// something to protect. Every other failure — the lock state or the
-    /// principal row unreadable, the apply failing — refuses too: the token
-    /// is only persisted once the identity has been positively applied.
+    /// principal row unreadable, the initial apply failing — refuses too.
     ///
     /// The whole decision runs under the [`IdentityTransitionLock`], and an
     /// admission hands that lock back to the flow as its
@@ -1180,6 +1256,21 @@ impl Services {
                         Box::new(transition);
                     match client.get_user().await {
                         Ok(user) => {
+                            if let Some(current) = primary.identity_key() {
+                                // Repository reconnection does not select a new
+                                // collaboration identity. Retain the existing
+                                // same-forge reconnect refusal while load-bearing.
+                                if current.provider == "github"
+                                    && Some(current) != ForgeUser::github(&user).identity
+                                    && this
+                                        .primary_identity_locked()
+                                        .await
+                                        .map_err(|e| e.to_string())?
+                                {
+                                    return Err("repository account differs from the locked primary identity".into());
+                                }
+                                return Ok(lease);
+                            }
                             match this.apply_primary_identity_locked(primary, &user).await {
                                 Ok(_) => Ok(lease),
                                 Err(Error::Invite(InviteErrorKind::IdentityLocked)) => {
@@ -1260,6 +1351,7 @@ impl Services {
     }
 
     /// [`Self::apply_primary_identity`] for an account on any forge.
+    #[cfg(test)]
     pub(crate) async fn apply_primary_forge_identity(
         &self,
         principal: Principal,
@@ -1402,7 +1494,7 @@ mod tests {
     fn wire(principal_id: &PrincipalId) -> Caller {
         Caller::Wire {
             principal_id: principal_id.clone(),
-            is_administrator: false,
+            host_role: intent_core::HostRole::Guest,
         }
     }
 
@@ -1426,10 +1518,10 @@ mod tests {
     /// (the store dual-writes the github triple for a `github_user_id`-only
     /// upsert), oldest first — while the primary
     /// principal and a guest whose credentials were all revoked are omitted.
-    /// A per-principal wire caller is `Forbidden`, whatever its workspace
-    /// roles; an agent passes like the daemon.
+    /// A guest wire caller is `Forbidden`, whatever its workspace roles;
+    /// an agent passes like the daemon.
     #[intent_test_macros::daemon_test]
-    async fn principal_list_is_owner_only_and_lists_credentialed_guests() {
+    async fn principal_list_lists_credentialed_people_and_refuses_guests() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let primary = store.get_primary_principal().await.expect("primary");
@@ -1468,6 +1560,7 @@ mod tests {
                 "displayName": "active name",
                 "avatarUrl": "https://example.test/active.png",
                 "githubUserId": 42,
+                "hostRole": "guest",
                 "identity": {
                     "provider": "github",
                     "host": "github.com",
@@ -1478,7 +1571,7 @@ mod tests {
 
         let administrator = Caller::Wire {
             principal_id: primary.id.clone(),
-            is_administrator: true,
+            host_role: intent_core::HostRole::Owner,
         };
         let as_admin = with_caller(administrator, services.principal_list_op()).await;
         assert_eq!(as_admin.expect("administrator lists"), listed);
@@ -1517,7 +1610,7 @@ mod tests {
     fn administrator(primary: &PrincipalId) -> Caller {
         Caller::Wire {
             principal_id: primary.clone(),
-            is_administrator: true,
+            host_role: intent_core::HostRole::Owner,
         }
     }
 
@@ -1930,7 +2023,11 @@ mod tests {
     /// client-supplied stamp is stripped and nothing is added.
     #[tokio::test]
     async fn stamp_strips_for_agent_daemon_and_unbound_callers() {
-        let spoofed = || Some(json!({ "fromPrincipalId": "someone-else", "kind": "reply" }));
+        let spoofed = || {
+            Some(
+                json!({ "fromPrincipalId": "someone-else", "kind": "reply", "fromAgentId":"agent-sender", "fromAgentName":"Sender" }),
+            )
+        };
         let agent = with_caller(
             Caller::Agent {
                 agent_id: AgentId::new(),
@@ -1944,7 +2041,13 @@ mod tests {
         .await;
         let unbound = stamp_principal_attribution(spoofed()).unwrap();
         for (label, got) in [("agent", agent), ("daemon", daemon), ("unbound", unbound)] {
-            assert_eq!(got, Some(json!({ "kind": "reply" })), "{label}");
+            assert_eq!(
+                got,
+                Some(
+                    json!({ "kind": "reply", "fromAgentId":"agent-sender", "fromAgentName":"Sender" })
+                ),
+                "{label}"
+            );
         }
         assert_eq!(
             with_caller(Caller::Daemon, async {
@@ -1955,7 +2058,9 @@ mod tests {
         );
         assert_eq!(
             strip_principal_attribution(spoofed()),
-            Some(json!({ "kind": "reply" }))
+            Some(
+                json!({ "kind": "reply", "fromAgentId":"agent-sender", "fromAgentName":"Sender" })
+            )
         );
     }
 

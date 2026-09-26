@@ -594,7 +594,7 @@ async fn agent_features_gate_new_sessions_only() {
             "full prompt missing {guidance}"
         );
     }
-    assert_eq!(session_a["result"]["session"]["harnessVersion"], "2.8");
+    assert_eq!(session_a["result"]["session"]["harnessVersion"], "2.9");
     let prompts = received_prompts(&prompt_log);
     assert_eq!(prompts.len(), 1);
     assert!(

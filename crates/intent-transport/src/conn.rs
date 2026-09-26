@@ -137,6 +137,9 @@ pub(crate) struct OutboundReceiver {
 }
 
 impl OutboundReceiver {
+    pub(crate) async fn recv_priority(&mut self) -> Option<String> {
+        self.priority.recv().await
+    }
     /// Next frame to write, priority lane first. Empties the priority lane
     /// before taking a bulk frame; when both lanes are idle, waits on both
     /// (biased toward priority). Returns `None` once every sender is dropped
@@ -235,6 +238,8 @@ impl Drop for ConnSub {
 pub(crate) struct ConnSubs {
     subs: HashMap<String, ConnSub>,
     setup: crate::provider_setup::Connection,
+    /// The server-bound hello used to refresh browser hosting on a live upgrade.
+    pub(crate) hello_identity: Option<crate::reverse::ReverseClientIdentity>,
     /// The connection's presence identity (multiplayer w5); dropping it with
     /// the registry publishes the offline transition and releases every
     /// `note.presence` lease — declared after `subs` so the forwarders'
@@ -422,7 +427,10 @@ pub(crate) async fn process_frame(
             && crate::context::is_non_administrator_caller()
             && !catalog::collaborator_may_call(&method)
         {
-            return refuse_forbidden(&method, rpc_id, out_tx).await;
+            let member = crate::context::may_manage_workspaces(api.as_ref()).await;
+            if !member || !catalog::member_may_call(&method) {
+                return refuse_forbidden(&method, rpc_id, out_tx).await;
+            }
         }
         if let Some(control) = control {
             if let Some(req) = control::classify(value) {
@@ -483,7 +491,10 @@ pub(crate) async fn process_frame(
         // NOT served on authenticated connections — only on the `/invite`
         // endpoint.
         if let Some(req) = crate::invite::classify(value) {
-            if req.method == crate::invite::InviteMethod::Create {
+            if matches!(
+                req.method,
+                crate::invite::InviteMethod::Create | crate::invite::InviteMethod::HostCreate
+            ) {
                 let frame = panic_guard::guard_frame(
                     &method,
                     rpc_id.clone(),
@@ -618,7 +629,7 @@ pub(crate) async fn process_frame(
             let frame = panic_guard::guard_frame(
                 &method,
                 rpc_id.clone(),
-                forward::handle(req, forwards, is_local),
+                forward::handle(req, forwards, is_local, api.as_ref()),
             )
             .await;
             return match frame {
@@ -647,6 +658,9 @@ pub(crate) async fn process_frame(
             // registry queues and publishes any `client:*` transition.
             let hello_ok = bound.is_some();
             if let Some(identity) = bound {
+                reverse
+                    .set_browser_member(crate::context::may_manage_workspaces(api.as_ref()).await);
+                subs.hello_identity = Some(identity.clone());
                 reverse_guard.bind(identity);
             }
             // Multiplayer w5: a hello'd connection is online for its
@@ -937,6 +951,7 @@ pub(crate) async fn handle_fast_path(
                     workspace_id,
                     batch_window: None,
                     collaborator_only: gate.is_some(),
+                    member_execution_events: true,
                     exclude_channel_only: true,
                     ..Default::default()
                 });
@@ -1326,6 +1341,7 @@ pub(crate) async fn handle_sub_fast_path(
                     workspace_id: None,
                     batch_window: None,
                     collaborator_only: gate.is_some(),
+                    member_execution_events: true,
                     ..Default::default()
                 });
                 let subscription_id = events::next_subscription_id();
@@ -1405,6 +1421,7 @@ pub(crate) async fn handle_sub_fast_path(
                         workspace_id: filter_ws,
                         batch_window: None,
                         collaborator_only: crate::context::is_non_administrator_caller(),
+                        member_execution_events: true,
                         ..Default::default()
                     });
                     // The global `workspace` channel re-reads its rows and
@@ -2143,6 +2160,48 @@ async fn forward_channel_subscription(
     let mut seq: u64 = 1;
     while let Some(batch) = recv_visible(&mut subscription, &mut membership).await {
         for event in batch {
+            if channel == Channel::Workspace
+                && event.event_type == intent_core::events::HOST_MEMBERS_CHANGED
+            {
+                let Ok(rows) = api.list_workspaces_lite(true).await else {
+                    continue;
+                };
+                let snapshot = serde_json::to_value(rows).unwrap_or_else(|_| json!([]));
+                let next = subscriptions::visible_workspace_ids(&snapshot);
+                let removed: Vec<String> = visible_workspaces
+                    .as_ref()
+                    .map(|old| old.difference(&next).cloned().collect())
+                    .unwrap_or_default();
+                let (added, updated): (Vec<_>, Vec<_>) = snapshot
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .partition(|row| {
+                        visible_workspaces.as_ref().is_some_and(|old| {
+                            row.get("id")
+                                .and_then(Value::as_str)
+                                .is_some_and(|id| !old.contains(id))
+                        })
+                    });
+                if let Some(visible) = visible_workspaces.as_mut() {
+                    *visible = next;
+                }
+                let delta = json!({"added":added,"updated":updated,"removedIds":removed});
+                if out_tx
+                    .send_bulk(subscriptions::build_delta_push(
+                        &subscription_id,
+                        seq,
+                        &delta,
+                    ))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                seq += 1;
+                continue;
+            }
             let delta = if channel == Channel::Task {
                 subscriptions::task_delta(api.as_ref(), &workspace_id, &event, &mut spec_links)
                     .await

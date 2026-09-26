@@ -5,12 +5,10 @@
 //! implementation, so the matrix is enforced here, keyed on the
 //! [`Caller`] bound to the request:
 //!
-//! - `Caller::Wire { is_administrator: false }` — a collaborator connection.
-//!   The only caller class the matrix constrains: it sees and touches only
-//!   the workspaces it is a member of, may not call Owner-only operations,
-//!   and never reaches administrator-only ones.
-//! - `Caller::Wire { is_administrator: true }` — the primary user, who owns
-//!   every workspace in v1 (no transfer RPC) and administers the daemon.
+//! - `Caller::Wire` binds the principal and its admitted `HostRole`.
+//!   Workspace access rechecks durable authority: host members inherit
+//!   ordinary workspaces; guests remain scoped to direct workspace grants.
+//!   Only the primary host owner administers the daemon.
 //! - `Caller::Agent` / `Caller::Daemon` — act with the owner's capabilities
 //!   (decided: an agent steered by a collaborator still runs `ws.host.exec`).
 //! - An unbound request (`current_caller() == None`) is **refused**
@@ -28,31 +26,33 @@
 //!   binding — even on a detached task nothing awaits — fails the e2e suite
 //!   instead of degrading a background path silently.
 //!
-//! Classes: *Member+* (Read / Steer & edit) → [`Services::require_member`];
-//! *Owner-only* (`workspace.delete` / `archive` / `export.*`,
-//! `workspace.members.add` / `remove`, `agent.delete`, `hook.runNow` / `cancel`,
-//! `prMonitor.cancel` / `flush`, settings writes) →
-//! [`Services::require_owner`]; *administrator-only* (`mcp.servers.*`,
-//! `host.listDirectory` / `env`, `git.clone`, `github.*` / `linear.*` /
-//! `sentry.*`, provider credentials) → [`Services::require_administrator`].
+//! Workspace reads use [`Services::require_member`]; workspace CRUD uses
+//! [`Services::require_workspace_manager`] and host-wide creation uses
+//! [`Services::require_workspace_creator`]. [`Services::require_owner`]
+//! remains the explicit-owner gate for guest sharing. Tooling and permission
+//! prompts use effective workspace management. Host administration remains
+//! separate via [`Services::require_administrator`].
 //! A non-member is answered `NotFound` (membership is not disclosed); a
 //! member lacking the capability gets [`Error::Forbidden`] (`-32003`, the
 //! same code as the transport's default-deny allowlist).
 //!
-//! Cost: every guard returns before touching the store unless the caller is
-//! a collaborator, so the administrator / agent / hook paths pay nothing.
+//! Cost: mutable host membership is rechecked once per gate, not per list
+//! row. Workspace summaries project durable grants in one bounded SQL query.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
 use intent_core::{
-    current_caller, lift_from_principal_id, AgentId, Caller, Error, PrincipalId, Result, Workspace,
-    WorkspaceId, WorkspaceRole,
+    current_caller, lift_from_principal_id, AgentId, Caller, Error, HostRole, PrincipalId, Result,
+    Workspace, WorkspaceId, WorkspaceRole,
 };
 use intent_store::{ArchivedGuestSweep, CollaboratorAddOutcome};
 use serde_json::{json, Value};
 
 use crate::Services;
+
+#[cfg(test)]
+mod host_role_tests;
 
 /// The log line an unbound gate evaluation emits (once per gate per process).
 pub const UNBOUND_GATE_LOG: &str = "capability gate evaluated without a bound Caller; refusing";
@@ -76,7 +76,7 @@ pub(crate) fn gated_collaborator_caller(gate: &str) -> Result<Option<PrincipalId
     match current_caller() {
         Some(Caller::Wire {
             principal_id,
-            is_administrator: false,
+            host_role: intent_core::HostRole::Member | intent_core::HostRole::Guest,
         }) => Ok(Some(principal_id)),
         Some(Caller::Wire { .. } | Caller::Agent { .. } | Caller::Daemon) => Ok(None),
         None => {
@@ -168,10 +168,70 @@ impl Services {
     /// Member+ gate for a workspace-scoped read / steer / edit. A
     /// collaborator who is not a member gets `NotFound`.
     pub(crate) async fn require_member(&self, workspace_id: &WorkspaceId) -> Result<()> {
+        if let Some(principal_id) = gated_collaborator_caller("member")? {
+            match self.store.get_host_role(&principal_id).await {
+                Ok(HostRole::Owner) => return Ok(()),
+                Ok(HostRole::Member) => {
+                    return if workspace_id.is_chief() {
+                        Err(not_a_member(workspace_id))
+                    } else {
+                        self.store.get_workspace(workspace_id).await.map(|_| ())
+                    }
+                }
+                Err(Error::NotFound(_)) => return Err(not_a_member(workspace_id)),
+                Err(e) => return Err(e),
+                _ => {}
+            }
+        }
         match self.collaborator_role(workspace_id, "member").await? {
             None | Some((_, Some(_))) => Ok(()),
             Some((_, None)) => Err(not_a_member(workspace_id)),
         }
+    }
+
+    /// Host owner/member capability for creating an ordinary workspace,
+    /// including on an empty host. Re-read durable membership on every call:
+    /// a connection's admitted role cannot survive removal as a cached grant.
+    pub(crate) async fn require_workspace_creator(&self, what: &str) -> Result<()> {
+        self.require_host_execution(what).await
+    }
+
+    /// Shared host execution and safe host reads. The current durable role,
+    /// not a repository identity or the role cached at admission, grants it.
+    pub(crate) async fn require_host_execution(&self, what: &str) -> Result<()> {
+        let Some(principal_id) = gated_collaborator_caller(what)? else {
+            return Ok(());
+        };
+        match self.store.get_host_role(&principal_id).await? {
+            HostRole::Owner | HostRole::Member => Ok(()),
+            HostRole::Guest => Err(Error::Forbidden(format!("{what} requires host membership"))),
+        }
+    }
+
+    /// Workspace management is independent of daemon administration. Keep
+    /// the existing explicit workspace-owner path; inherited host membership
+    /// applies only to ordinary workspaces and overrides retained guest rows.
+    pub(crate) async fn require_workspace_manager(
+        &self,
+        workspace_id: &WorkspaceId,
+        what: &str,
+    ) -> Result<()> {
+        if let Some(principal_id) = gated_collaborator_caller(what)? {
+            match self.store.get_host_role(&principal_id).await {
+                Ok(HostRole::Owner) => return Ok(()),
+                Ok(HostRole::Member) => {
+                    return if workspace_id.is_chief() {
+                        Err(not_a_member(workspace_id))
+                    } else {
+                        Ok(())
+                    }
+                }
+                Err(Error::NotFound(_)) => return Err(not_a_member(workspace_id)),
+                Err(e) => return Err(e),
+                _ => {}
+            }
+        }
+        self.require_owner(workspace_id, what).await
     }
 
     /// Owner-only gate. A collaborator member gets `Forbidden`; a non-member
@@ -241,13 +301,74 @@ impl Services {
         self.require_member(&agent_workspace).await
     }
 
-    /// Owner-only gate keyed by agent (see [`Self::require_agent_member`]).
+    /// Effective management keyed by agent, including another person's agent.
+    /// Resolve the workspace too: an orphaned session cannot expose a prompt.
     pub(crate) async fn require_agent_owner(&self, agent_id: &AgentId, what: &str) -> Result<()> {
         if gated_collaborator_caller(what)?.is_none() {
             return Ok(());
         }
         let workspace_id = self.agent_workspace(agent_id).await?;
-        self.require_owner(&workspace_id, what).await
+        self.require_workspace_manager(&workspace_id, what).await?;
+        self.store.get_workspace(&workspace_id).await.map(|_| ())
+    }
+
+    /// PTY ids are host-global. Resolve their workspace before admitting a
+    /// member; an ACP session-scoped PTY is not a workspace terminal.
+    pub(crate) async fn require_terminal_manager(
+        &self,
+        terminal_id: &str,
+        what: &str,
+    ) -> Result<()> {
+        if gated_collaborator_caller(what)?.is_none() {
+            return Ok(());
+        }
+        let info = intent_pty::PtyId::parse(terminal_id)
+            .and_then(|id| self.pty.info(id))
+            .ok_or_else(|| Error::NotFound(format!("terminal {terminal_id}")))?;
+        let workspace_id = WorkspaceId::from(info.scope.as_str());
+        self.require_workspace_manager(&workspace_id, what).await?;
+        self.store.get_workspace(&workspace_id).await.map(|_| ())
+    }
+
+    /// Chunk/session handles never confer another authenticated person's
+    /// transfer authority. Reconnects retain access through the same principal.
+    pub(crate) async fn require_import_actor(&self, id: &str, what: &str) -> Result<()> {
+        self.require_host_execution(what).await?;
+        let Some(principal) = gated_collaborator_caller(what)? else {
+            return Ok(());
+        };
+        let imports = self
+            .transfer_imports
+            .lock()
+            .expect("transfer import registry poisoned");
+        if imports
+            .get(id)
+            .is_some_and(|s| s.initiator.as_ref() != Some(&principal))
+        {
+            return Err(Error::NotFound(format!("import {id}")));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn require_export_actor(&self, id: &str, what: &str) -> Result<()> {
+        let Some(principal) = gated_collaborator_caller(what)? else {
+            return Ok(());
+        };
+        let session = self
+            .transfer_exports
+            .lock()
+            .expect("transfer export registry poisoned")
+            .get(id)
+            .map(|s| (s.workspace_id.clone(), s.initiator.clone()));
+        let Some((workspace, initiator)) = session else {
+            self.require_host_execution(what).await?;
+            return Ok(());
+        };
+        self.require_workspace_manager(&workspace, what).await?;
+        if initiator.as_ref() != Some(&principal) {
+            return Err(Error::NotFound(format!("export {id}")));
+        }
+        Ok(())
     }
 
     /// Path-based `git.*` gate (`git.getBranches` / `branchStatus` / `pull` /
@@ -258,6 +379,16 @@ impl Services {
     /// pre-registration workspace-create flow keeps arbitrary paths for the
     /// administrator / agent / daemon callers.
     pub(crate) async fn require_member_repo_path(&self, repo_path: &str, what: &str) -> Result<()> {
+        if let Some(principal) = gated_collaborator_caller(what)? {
+            if matches!(
+                self.store.get_host_role(&principal).await?,
+                HostRole::Owner | HostRole::Member
+            ) {
+                // Creation/discovery can precede workspace registration. The
+                // host's repository connections still supply execution.
+                return Ok(());
+            }
+        }
         let Some(visible) = self.visible_workspace_ids().await? else {
             return Ok(());
         };
@@ -307,6 +438,19 @@ impl Services {
         let Some(principal_id) = collaborator_caller()? else {
             return Ok(None);
         };
+        match self.store.get_host_role(&principal_id).await? {
+            HostRole::Owner => return Ok(None),
+            HostRole::Member => {
+                return Ok(Some(
+                    self.store
+                        .ordinary_workspace_ids()
+                        .await?
+                        .into_iter()
+                        .collect(),
+                ))
+            }
+            HostRole::Guest => {}
+        }
         Ok(Some(
             self.store
                 .list_principal_memberships(&principal_id)
@@ -317,12 +461,25 @@ impl Services {
         ))
     }
 
-    /// The workspace ids a collaborator caller *owns*, or `None` when the
-    /// caller is unconstrained.
+    /// The workspace ids a caller may manage, or `None` when unconstrained.
+    /// Guests retain their old explicit-owner boundary.
     pub(crate) async fn owned_workspace_ids(&self) -> Result<Option<HashSet<WorkspaceId>>> {
         let Some(principal_id) = collaborator_caller()? else {
             return Ok(None);
         };
+        match self.store.get_host_role(&principal_id).await? {
+            HostRole::Owner => return Ok(None),
+            HostRole::Member => {
+                return Ok(Some(
+                    self.store
+                        .ordinary_workspace_ids()
+                        .await?
+                        .into_iter()
+                        .collect(),
+                ))
+            }
+            HostRole::Guest => {}
+        }
         Ok(Some(
             self.store
                 .list_principal_memberships(&principal_id)
@@ -335,8 +492,7 @@ impl Services {
     }
 
     /// `agent.pendingPermissions` (unfiltered) for a collaborator: keep only
-    /// the prompts of agents in workspaces the caller owns — the same
-    /// owner-only boundary as `agent:permission:*` event delivery. One
+    /// the prompts of agents in workspaces the caller may manage. One
     /// metadata-only session read per distinct prompting agent (pending
     /// prompts are few); an agent that no longer resolves is dropped.
     pub(crate) async fn retain_owned_agent_prompts(
@@ -390,44 +546,30 @@ impl Services {
     ) -> Result<Value> {
         self.require_member(workspace_id).await?;
         self.store.get_workspace(workspace_id).await?;
-        let members = self.store.list_workspace_members(workspace_id).await?;
-        let guests = self.store.count_workspace_guests(workspace_id).await?;
-        let principals: HashMap<PrincipalId, intent_core::Principal> = self
+        let members = self
             .store
-            .list_principals()
-            .await?
-            .into_iter()
-            .map(|p| (p.id.clone(), p))
-            .collect();
-        if let Some(primary) = principals
-            .values()
-            .find(|p| p.is_primary && p.login.is_none())
-        {
-            let caller_is_primary = match current_caller() {
-                Some(Caller::Wire { principal_id, .. }) => principal_id == primary.id,
-                Some(Caller::Agent { .. } | Caller::Daemon) => true,
-                None => false,
-            };
-            if caller_is_primary {
-                self.spawn_primary_identity_refresh(primary.clone()).await;
-            }
+            .list_effective_workspace_members(workspace_id)
+            .await?;
+        let guests = self.store.count_workspace_guests(workspace_id).await?;
+        if let Some(primary) = members.iter().map(|m| &m.principal).find(|p| p.is_primary) {
+            self.refresh_primary_identity_if_unlinked(primary).await;
         }
         let rows: Vec<Value> = members
             .iter()
             .map(|m| {
-                let p = principals.get(&m.principal_id);
-                let row = json!({
-                    "principalId": m.principal_id,
-                    "login": p.and_then(|p| p.login.clone()),
-                    "displayName": p.and_then(|p| p.display_name.clone()),
-                    "avatarUrl": p.and_then(|p| p.avatar_url.clone()),
-                    "role": m.role,
-                    "addedAt": m.added_at,
-                });
-                match p {
-                    Some(p) => crate::principal_ops::with_principal_identity(row, p),
-                    None => row,
-                }
+                let p = &m.principal;
+                crate::principal_ops::with_principal_identity(
+                    json!({
+                        "principalId": p.id,
+                        "login": p.login,
+                        "displayName": p.display_name,
+                        "avatarUrl": p.avatar_url,
+                        "role": m.role,
+                        "hostRole": m.host_role,
+                        "addedAt": m.added_at,
+                    }),
+                    p,
+                )
             })
             .collect();
         Ok(json!({
@@ -438,7 +580,9 @@ impl Services {
     }
 
     /// `workspace.members.remove`: see
-    /// [`intent_core::WorkspaceApi::workspace_members_remove`]. Owner-only.
+    /// [`intent_core::WorkspaceApi::workspace_members_remove`]. Owner/member.
+    /// Active host members require host-membership removal; retained grants
+    /// survive the typed refusal under the store's write lock.
     /// Removing the owner is `InvalidParams`; removing a non-member is a
     /// no-op (`removed: false`). On removal the member's queued user
     /// messages on the workspace's agents are dropped and a
@@ -452,29 +596,21 @@ impl Services {
         workspace_id: &WorkspaceId,
         principal_id: &PrincipalId,
     ) -> Result<Value> {
-        self.require_owner(workspace_id, "workspace.members.remove")
+        self.require_workspace_manager(workspace_id, "workspace.members.remove")
             .await?;
         self.store.get_workspace(workspace_id).await?;
-        match self
+        let removed = self
             .store
-            .get_workspace_member_role(workspace_id, principal_id)
-            .await?
-        {
-            None => return Ok(json!({ "removed": false })),
-            Some(WorkspaceRole::Owner) => {
-                return Err(Error::InvalidParams(format!(
-                    "principal {principal_id} owns workspace {workspace_id} and cannot be removed"
-                )));
-            }
-            Some(WorkspaceRole::Collaborator) => {}
-        }
-        let removed = self.detach_collaborator(workspace_id, principal_id).await?;
+            .remove_workspace_guest(workspace_id, principal_id)
+            .await?;
+        self.finish_collaborator_removal(workspace_id, principal_id, removed)
+            .await?;
         Ok(json!({ "removed": removed }))
     }
 
     /// `workspace.members.add`: see
-    /// [`intent_core::WorkspaceApi::workspace_members_add`]. Owner-only. The
-    /// principal must be a credentialed guest — it exists, is not the primary
+    /// [`intent_core::WorkspaceApi::workspace_members_add`]. Owner/member. The
+    /// principal must be an active host member (a no-op) or a credentialed guest — it exists, is not the primary
     /// principal and holds at least one active credential, the same
     /// predicate `principal.list` rows satisfy — else `InvalidParams`. An
     /// existing member (either role) is answered `added: false` with nothing
@@ -494,7 +630,7 @@ impl Services {
         workspace_id: &WorkspaceId,
         principal_id: &PrincipalId,
     ) -> Result<Value> {
-        self.require_owner(workspace_id, "workspace.members.add")
+        self.require_workspace_manager(workspace_id, "workspace.members.add")
             .await?;
         self.store.get_workspace(workspace_id).await?;
         let principal = match self.store.get_principal(principal_id).await {
@@ -587,6 +723,17 @@ impl Services {
             .store
             .remove_workspace_member(workspace_id, principal_id)
             .await?;
+        self.finish_collaborator_removal(workspace_id, principal_id, removed)
+            .await?;
+        Ok(removed)
+    }
+
+    pub(crate) async fn finish_collaborator_removal(
+        &self,
+        workspace_id: &WorkspaceId,
+        principal_id: &PrincipalId,
+        removed: bool,
+    ) -> Result<bool> {
         if removed {
             self.drop_queued_messages_from(workspace_id, principal_id)
                 .await;
@@ -693,6 +840,9 @@ impl Services {
 }
 
 #[cfg(test)]
+mod sharing_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::tests::{workspace, TempDb};
@@ -793,7 +943,11 @@ mod tests {
         fn caller(&self, role: Role) -> Caller {
             let wire = |principal_id: &PrincipalId, is_administrator| Caller::Wire {
                 principal_id: principal_id.clone(),
-                is_administrator,
+                host_role: if is_administrator {
+                    intent_core::HostRole::Owner
+                } else {
+                    intent_core::HostRole::Guest
+                },
             };
             match role {
                 Role::Administrator => wire(&self.primary, true),
@@ -967,23 +1121,19 @@ mod tests {
     /// The unbound-refusal tests observe the production behaviour — the
     /// plain `Forbidden` — which the armed seam turns into an abort. CI's
     /// coverage jobs run the suite with [`ASSERT_BOUND_CALLER_ENV`] set, so
-    /// when it is, this re-runs `test` (a name under `capability::tests`) in
+    /// when it is, this re-runs `test` (its full test-harness name) in
     /// a copy of this binary with the variable removed, asserts that it
     /// passed, and answers `true` so the caller returns; unarmed (locally,
     /// and inside that child) it answers `false` and the caller runs its
     /// body inline. A re-exec rather than `remove_var`: the harness is
     /// multi-threaded.
-    fn reran_unarmed(test: &str) -> bool {
+    pub(super) fn reran_unarmed(test: &str) -> bool {
         if std::env::var_os(ASSERT_BOUND_CALLER_ENV).is_none() {
             return false;
         }
         let exe = std::env::current_exe().expect("test binary");
         let out = std::process::Command::new(exe)
-            .args([
-                "--exact",
-                &format!("capability::tests::{test}"),
-                "--nocapture",
-            ])
+            .args(["--exact", test, "--nocapture"])
             .env_remove(ASSERT_BOUND_CALLER_ENV)
             .output()
             .expect("run unarmed child");
@@ -1006,7 +1156,7 @@ mod tests {
     async fn unbound_caller_is_forbidden_on_every_gate() {
         // Unarmed: the production behaviour under test is the refusal, not
         // the test seam's abort.
-        if reran_unarmed("unbound_caller_is_forbidden_on_every_gate") {
+        if reran_unarmed("capability::tests::unbound_caller_is_forbidden_on_every_gate") {
             return;
         }
         let tmp = TempDb::new();
@@ -1120,7 +1270,9 @@ mod tests {
     /// `InvalidParams`; the collaborator passes the same calls.
     #[tokio::test]
     async fn presence_entry_points_fail_closed_unbound_and_refuse_non_members() {
-        if reran_unarmed("presence_entry_points_fail_closed_unbound_and_refuse_non_members") {
+        if reran_unarmed(
+            "capability::tests::presence_entry_points_fail_closed_unbound_and_refuse_non_members",
+        ) {
             return;
         }
         let tmp = TempDb::new();
@@ -1442,7 +1594,7 @@ mod tests {
                 with_caller(
                     Caller::Wire {
                         principal_id: primary.id.clone(),
-                        is_administrator: true,
+                        host_role: intent_core::HostRole::Owner,
                     },
                     services.workspace_members_list_op(ws),
                 ),

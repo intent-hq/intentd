@@ -1105,6 +1105,20 @@ impl Store {
         rows.iter().map(map_workspace_row).collect()
     }
 
+    /// Ordinary workspace keys for inherited host access, without hydrating
+    /// rows or issuing a role lookup per workspace. Includes archived rows.
+    ///
+    /// # Errors
+    /// Returns `Internal` on a database failure.
+    pub async fn ordinary_workspace_ids(&self) -> Result<Vec<WorkspaceId>> {
+        let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM workspace WHERE id <> ?")
+            .bind(CHIEF_WORKSPACE_ID)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("workspace keys failed: {e}")))?;
+        Ok(ids.into_iter().map(WorkspaceId).collect())
+    }
+
     /// Live (non-archived, non-remote) workspaces referencing a PR by URL —
     /// linked via `pr_url` or carrying a `pull_requests` pool entry with that
     /// URL — oldest first. Backs the passive `github.pulls.get` fold: the

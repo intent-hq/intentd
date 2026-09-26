@@ -8,6 +8,13 @@
 //! plain-`ws://` accept path serves JSON-RPC with no TLS and no bearer token.
 
 mod common;
+#[path = "wss_integration/host_roles.rs"]
+mod host_roles;
+#[path = "wss_integration/sharing.rs"]
+mod sharing;
+
+#[path = "wss_integration/member_transport.rs"]
+mod member_transport;
 #[path = "wss_integration/workspace_delete.rs"]
 mod workspace_delete;
 
@@ -3813,6 +3820,7 @@ async fn wss_principal_list_is_owner_only_and_omits_revoked_guests() {
                 "displayName": "older name",
                 "avatarUrl": "https://example.test/older.png",
                 "githubUserId": 11,
+                "hostRole": "guest",
                 "identity": { "provider": "github", "host": "github.com", "externalUserId": "11" },
             },
             {
@@ -3821,6 +3829,7 @@ async fn wss_principal_list_is_owner_only_and_omits_revoked_guests() {
                 "displayName": "newer name",
                 "avatarUrl": "https://example.test/newer.png",
                 "githubUserId": 12,
+                "hostRole": "guest",
                 "identity": { "provider": "github", "host": "github.com", "externalUserId": "12" },
             },
         ] }),
@@ -5182,7 +5191,7 @@ async fn wss_collaborator_steered_agent_runs_host_exec_with_owner_capabilities()
     let agent_typed = AgentId::from_string(agent_id.clone());
     let collaborator = Caller::Wire {
         principal_id: guest.principal.id.clone(),
-        is_administrator: false,
+        host_role: intent_core::HostRole::Guest,
     };
     let tool_call = json!({
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -5234,7 +5243,7 @@ async fn wss_collaborator_steered_agent_runs_host_exec_with_owner_capabilities()
         .as_str()
         .unwrap_or_else(|| panic!("tool text: {refused}"));
     assert!(
-        refused_text.contains("forbidden: host.exec requires the daemon administrator"),
+        refused_text.contains("forbidden: host.exec requires host membership"),
         "unbound bridge must surface the gate's refusal: {refused_text}"
     );
 
@@ -6867,7 +6876,7 @@ async fn wss_presence_channel_join_delta_leave_and_gating() {
     assert_eq!(
         ev["data"]["members"],
         json!([{ "principalId": alice.id.0, "login": "alice", "displayName": null,
-                 "avatarUrl": null, "focus": [], "typing": [] }]),
+                 "avatarUrl": null, "hostRole": "guest", "focus": [], "typing": [] }]),
         "{ev}"
     );
 
@@ -6909,7 +6918,7 @@ async fn wss_presence_channel_join_delta_leave_and_gating() {
     assert_eq!(
         p["snapshot"],
         json!({ "viewers": [{ "principalId": alice.id.0, "login": "alice", "displayName": null,
-                              "avatarUrl": null, "cursor": null }] }),
+                              "avatarUrl": null, "hostRole": "guest", "cursor": null }] }),
         "{p}"
     );
     let p = alice_c.push(&sub_a).await;
@@ -6999,7 +7008,7 @@ async fn wss_presence_channel_join_delta_leave_and_gating() {
     assert_eq!(
         p["delta"],
         json!({ "kind": "updated", "viewer": { "principalId": bob.id.0, "login": "bob",
-                "displayName": null, "avatarUrl": null,
+                "displayName": null, "avatarUrl": null, "hostRole": "guest",
                 "cursor": { "rev": 3, "anchor": 10, "head": 12 } } }),
         "{p}"
     );
@@ -7382,7 +7391,7 @@ async fn wss_presence_typing_sources_and_snapshot() {
     assert_eq!(
         alice_row(&json!({ "data": v["result"] })),
         json!({ "principalId": alice.id.0, "login": "alice", "displayName": null,
-                "avatarUrl": null, "focus": [], "typing": [] }),
+                "avatarUrl": null, "hostRole": "guest", "focus": [], "typing": [] }),
         "snapshot rows match the presence:changed member shape: {v}"
     );
 
@@ -13787,8 +13796,8 @@ async fn wss_workspace_update_status_image_asset_id_round_trip() {
         .await
         .expect("insert workspace");
 
-    // One persistent connection: subscribe first so the `workspace:updated`
-    // notification from the mutation below is delivered to this client.
+    // Subscribe before mutating. Use a separate RPC connection so waiting
+    // for the response cannot discard an event delivered ahead of it.
     let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
     let rpc = |id: i64, method: &str, params: Value| {
         serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
@@ -13813,9 +13822,10 @@ async fn wss_workspace_update_status_image_asset_id_round_trip() {
         "subscribe: {sub}"
     );
 
+    let mut rpc_ws = connect_ws(srv.port, srv.cfg.clone()).await;
     // Set: camelCase wire field lands on the row and echoes in the response.
     let resp = send_and_wait(
-        &mut ws,
+        &mut rpc_ws,
         rpc(
             2,
             "workspace.update",
@@ -13864,7 +13874,7 @@ async fn wss_workspace_update_status_image_asset_id_round_trip() {
 
     // Read-back proves persistence through the store.
     let got = send_and_wait(
-        &mut ws,
+        &mut rpc_ws,
         rpc(
             3,
             "workspace.get",
@@ -13881,7 +13891,7 @@ async fn wss_workspace_update_status_image_asset_id_round_trip() {
     // Clear: wire `null` (double-option `Some(None)`) empties the column and
     // the cleared field is omitted from the returned payload.
     let cleared = send_and_wait(
-        &mut ws,
+        &mut rpc_ws,
         rpc(
             4,
             "workspace.update",
@@ -13906,7 +13916,7 @@ async fn wss_workspace_update_status_image_asset_id_round_trip() {
         "cleared asset id must be omitted, not null: {cleared}"
     );
     let got = send_and_wait(
-        &mut ws,
+        &mut rpc_ws,
         rpc(
             5,
             "workspace.get",

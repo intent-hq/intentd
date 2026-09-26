@@ -32,6 +32,7 @@ pub(crate) struct MembershipGate {
     api: Arc<dyn WorkspaceApi>,
     principal_id: PrincipalId,
     verdicts: HashMap<String, (bool, Instant)>,
+    last_role: Option<intent_core::HostRole>,
 }
 
 impl MembershipGate {
@@ -43,11 +44,12 @@ impl MembershipGate {
         match crate::context::current_caller() {
             Some(Caller::Wire {
                 principal_id,
-                is_administrator: false,
+                host_role: intent_core::HostRole::Member | intent_core::HostRole::Guest,
             }) => Some(Self {
                 api: Arc::clone(api),
                 principal_id,
                 verdicts: HashMap::new(),
+                last_role: None,
             }),
             _ => None,
         }
@@ -86,6 +88,10 @@ impl MembershipGate {
     /// by the side subscription on `workspace:updated`, so a removal takes
     /// effect even when the subscriber's own patterns exclude that type.
     pub(crate) fn observe_membership_event(&mut self, event: &Event) {
+        if event.event_type == intent_core::events::HOST_MEMBERS_CHANGED {
+            self.verdicts.clear();
+            return;
+        }
         if !Self::is_membership_change(event) {
             return;
         }
@@ -101,10 +107,57 @@ impl MembershipGate {
     /// Whether the subscriber may receive `event`.
     pub(crate) async fn allows(&mut self, event: &Event) -> bool {
         let workspace_id = event.workspace_id.as_str();
+        let role = self
+            .api
+            .principal_host_role(self.principal_id.clone())
+            .await
+            .ok();
+        if self.last_role != role {
+            self.verdicts.clear();
+            self.last_role = role;
+        }
+        if event.event_type == intent_core::events::HOST_MEMBERS_CHANGED {
+            self.verdicts.clear();
+            return workspace_id.is_empty()
+                && (matches!(
+                    role,
+                    Some(intent_core::HostRole::Owner | intent_core::HostRole::Member)
+                ) || (event.data["principalId"].as_str() == Some(self.principal_id.as_str())
+                    && event.data["action"] == "removed"));
+        }
+        if intent_core::events::is_member_execution_event_type(&event.event_type) {
+            // Prompt/context events never use the cached visibility verdict.
+            // Revocation takes effect before a socket is physically closed.
+            if !matches!(
+                role,
+                Some(intent_core::HostRole::Owner | intent_core::HostRole::Member)
+            ) {
+                return false;
+            }
+            if event.event_type == intent_core::events::HOST_EXECUTION_CONTEXT_CHANGED {
+                return workspace_id.is_empty();
+            }
+            return !workspace_id.is_empty()
+                && self
+                    .api
+                    .get_workspace(WorkspaceId::from(workspace_id))
+                    .await
+                    .is_ok();
+        }
         if workspace_id.is_empty() {
             // Every collaborator-visible type is workspace-scoped; a global
             // event reaching here has nothing to authorize against.
             return false;
+        }
+        if role == Some(intent_core::HostRole::Member) {
+            if event.event_type == intent_core::events::WORKSPACE_DELETED {
+                return !WorkspaceId::from(workspace_id).is_chief();
+            }
+            return self
+                .api
+                .get_workspace(WorkspaceId::from(workspace_id))
+                .await
+                .is_ok();
         }
         if self.is_own_unshare(event) {
             // The removed member's own final notification.

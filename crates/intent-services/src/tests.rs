@@ -1002,7 +1002,7 @@ async fn worst_case_workspace_list_row() -> Workspace {
     let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
     let caller = intent_core::Caller::Wire {
         principal_id: primary.id,
-        is_administrator: true,
+        host_role: intent_core::HostRole::Owner,
     };
     let list = intent_core::with_caller(caller, svc.list_workspaces(true))
         .await
@@ -14008,7 +14008,7 @@ mod change_event_parity {
         use intent_core::WorkspaceCreate;
         let h = harness().await;
         let mut sub = h.bus.subscribe(SubscriptionFilter::default());
-        let created = h
+        let mut created = h
             .services
             .create_workspace(
                 WorkspaceCreate {
@@ -14024,6 +14024,15 @@ mod change_event_parity {
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &created.id.0, "workspace:created");
         assert_eq!(ev["data"]["workspaceId"], created.id.0);
+        // The response carries this caller's capabilities. The shared event
+        // must not broadcast the creator's role or management rights.
+        assert!(
+            created
+                .membership
+                .take()
+                .expect("caller membership")
+                .can_manage
+        );
         assert_eq!(
             ev["data"]["workspace"],
             serde_json::to_value(&created).expect("workspace json")
@@ -17472,6 +17481,7 @@ pub(crate) mod pr {
         /// signal-bearing fold while a REST refresh's read is in flight
         /// (intent-hq/intent#5654).
         pub(crate) get_pr_park: Option<std::sync::Arc<GetPrPark>>,
+        get_pr_error: Option<fn() -> ScError>,
     }
 
     /// One-shot park for [`StubForge::get_pr`]: `entered` fires when the
@@ -17484,6 +17494,13 @@ pub(crate) mod pr {
     }
 
     impl StubForge {
+        pub(crate) fn with_get_pr_error(error: fn() -> ScError) -> Self {
+            Self {
+                get_pr_error: Some(error),
+                ..Default::default()
+            }
+        }
+
         /// A forge whose `check_auth` reports `authenticated: false` and
         /// whose `get_user` rejects the credential (`Auth`), as the real
         /// client does on a 401.
@@ -17757,6 +17774,9 @@ pub(crate) mod pr {
         }
         async fn get_pr(&self, _: &RepoRef, number: u64) -> ScResult<PullRequest> {
             self.seen_get_pr.lock().unwrap().push(number);
+            if let Some(error) = self.get_pr_error {
+                return Err(error());
+            }
             if self.rate_limited {
                 return Err(ScError::RateLimited(
                     "API rate limit exceeded for user ID 526899.".into(),
@@ -18702,17 +18722,27 @@ pub(crate) mod pr {
         assert!(forge.seen_user_searches.lock().unwrap().is_empty());
     }
 
-    /// `github.users.search` is administrator-only: a collaborator wire
-    /// caller is refused `-32003` before the forge is reached (default-deny,
-    /// the method is not in `COLLABORATOR_METHODS`).
+    /// Shared forge search admits host members, but a known workspace guest
+    /// is refused before the forge is reached. Unknown principals also refuse.
     #[tokio::test]
     async fn github_users_search_refuses_collaborator_caller() {
         let forge = Arc::new(StubForge::default());
         let (_t, svc, _ws) = setup_with_shared(forge.clone(), false).await;
         let collaborator = intent_core::Caller::Wire {
             principal_id: intent_core::PrincipalId::new(),
-            is_administrator: false,
+            host_role: intent_core::HostRole::Guest,
         };
+        let unknown = intent_core::with_caller(
+            collaborator.clone(),
+            svc.github_users_search("octo".into(), None),
+        )
+        .await
+        .expect_err("unknown principal must be refused");
+        assert!(matches!(unknown, Error::NotFound(_)), "{unknown:?}");
+        let mut guest = svc.store.get_primary_principal().await.unwrap();
+        guest.id = collaborator.principal_id().unwrap().clone();
+        guest.is_primary = false;
+        svc.store.upsert_principal(&guest).await.unwrap();
         let err =
             intent_core::with_caller(collaborator, svc.github_users_search("octo".into(), None))
                 .await
@@ -29756,7 +29786,7 @@ mod rules {
         assert!(got["updatedAt"].as_i64().unwrap() > 0);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn get_absent_type_reads_disabled_empty() {
         let tree = worktree();
         let (_tmp, _store, svc, ws) = setup(&tree.0).await;

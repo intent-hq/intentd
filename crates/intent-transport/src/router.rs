@@ -86,7 +86,30 @@ fn not_found(message: impl Into<String>) -> RpcErr {
 /// surface as `-32603 "Internal error"` carrying the original cause in `data`.
 fn domain_to_rpc(e: Error) -> RpcErr {
     match e {
-        Error::Internal(msg) => RpcErr {
+        Error::ExecutionAuthorization {
+            source,
+            authorization,
+        } => {
+            let code = match source.as_ref() {
+                Error::CloneFailed { .. } | Error::SourceControlUnauthorized { .. } => {
+                    source.code()
+                }
+                _ => -32603,
+            };
+            let data_code = match source.as_ref() {
+                Error::CloneFailed { category, .. } => category.as_str(),
+                Error::SourceControlUnauthorized { .. } => "source-control-unauthorized",
+                _ => "host-execution-authorization",
+            };
+            RpcErr {
+                code,
+                message: authorization.message(),
+                data: Some(json!({
+                    "code": data_code, "executionAuthorization": authorization,
+                })),
+            }
+        }
+        Error::Internal(msg) | Error::GitAuthorization(msg) => RpcErr {
             code: -32603,
             message: "Internal error".to_string(),
             data: Some(Value::String(msg)),
@@ -181,6 +204,18 @@ fn domain_to_rpc(e: Error) -> RpcErr {
                 "provider": provider,
                 "host": host,
             })),
+        },
+        ref e @ Error::HostMembershipRequired => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": "host-membership-required" })),
+        },
+        ref e @ (Error::IdentityMismatch | Error::IdentityInUse) => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(
+                json!({ "code": if matches!(e, Error::IdentityMismatch) { "identity-mismatch" } else { "identity-in-use" } }),
+            ),
         },
         ref e @ Error::SourceControlUnauthorized {
             ref provider,
@@ -721,6 +756,13 @@ async fn dispatch(
         // `workspace.invite.create` is handled on the connection fast-path
         // (it wraps the secret into the `intent://invite` link with the
         // listener's own hosts/port); only list/revoke route here.
+        "host.members.list" => api.host_members_list().await.map_err(domain_to_rpc),
+        "host.executionContext" => api.host_execution_context().await.map_err(domain_to_rpc),
+        "host.invite.list" => api.host_invite_list().await.map_err(domain_to_rpc),
+        "host.invite.revoke" => api
+            .host_invite_revoke(require_str_param(params, "inviteId")?)
+            .await
+            .map_err(domain_to_rpc),
         "workspace.invite.list" => {
             let id = require_workspace_id(params)?;
             let r = api.workspace_invite_list(id).await.map_err(workspace_err)?;
@@ -3162,7 +3204,21 @@ async fn dispatch(
             let nonce = require_str_param(params, "nonce")?;
             let host_label = require_str_param(params, "hostLabel")?;
             let r = api
-                .source_control_identity_proof_create(provider, host, nonce, host_label)
+                .source_control_identity_proof_create(
+                    provider,
+                    host,
+                    nonce,
+                    host_label,
+                    opt_str_strict(params, "purpose")?,
+                    params
+                        .get("expectedIdentity")
+                        .filter(|v| !v.is_null())
+                        .map(|v| {
+                            serde_json::from_value(v.clone())
+                                .map_err(|_| invalid_params("invalid expectedIdentity"))
+                        })
+                        .transpose()?,
+                )
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -3172,7 +3228,12 @@ async fn dispatch(
             let host = opt_str_strict(params, "host")?;
             let proof_id = require_str_param(params, "proofId")?;
             let r = api
-                .source_control_identity_proof_delete(provider, host, proof_id)
+                .source_control_identity_proof_delete(
+                    provider,
+                    host,
+                    proof_id,
+                    opt_str_strict(params, "purpose")?,
+                )
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -3185,6 +3246,52 @@ async fn dispatch(
         // but a present non-string is `-32602` before the service runs — a
         // lax `host` would otherwise route `{"host": 123}` as host-omitted
         // and, on `revoke`, act on the bound credential instead of failing.
+        "identity.authStatus" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            api.identity_auth_status(provider, host)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "identity.connect" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let method = opt_str_strict(params, "method")?;
+            let token = opt_str_strict(params, "token")?;
+            api.identity_connect(provider, host, method, token)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "identity.cancelAuth" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let flow_id = require_str_param(params, "flowId")?;
+            api.identity_cancel_auth(provider, host, flow_id)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "identity.revoke" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            api.identity_revoke(provider, host)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "identity.getUser" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            api.identity_get_user(provider, host)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "identity.select" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let external_user_id = require_str_param(params, "externalUserId")?;
+            api.identity_select(provider, host, external_user_id)
+                .await
+                .map_err(domain_to_rpc)
+        }
         "sourceControl.authStatus" => {
             let provider = require_str_param(params, "provider")?;
             let host = opt_str_strict(params, "host")?;
@@ -3238,9 +3345,8 @@ async fn dispatch(
             let r = api.principal_me().await.map_err(domain_to_rpc)?;
             Ok(r)
         }
-        // `principal.list` (direct member add): the host's credentialed
-        // guests for the owner's share dialog; no params. Owner-only in the
-        // service layer (`-32003` for a collaborator).
+        // Credentialed sharing directory for owner/member callers; no params.
+        // The service reads current durable authority; guests are refused.
         "principal.list" => {
             let r = api.principal_list().await.map_err(domain_to_rpc)?;
             Ok(r)

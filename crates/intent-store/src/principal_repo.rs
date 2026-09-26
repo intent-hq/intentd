@@ -17,15 +17,15 @@ use intent_core::{
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
 
-use crate::{enum_from_db, enum_to_db, Store};
+use crate::{enum_from_db, enum_to_db, HostJoinCredential, Store};
 
-const PRINCIPAL_COLUMNS: &str = "id, github_user_id, login, display_name, avatar_url, \
+pub(crate) const PRINCIPAL_COLUMNS: &str = "id, github_user_id, login, display_name, avatar_url, \
      is_primary, created_at, updated_at, identity_provider, instance_host, external_user_id";
 
 /// The `ON CONFLICT(id)` clause shared by every principal upsert: identity
 /// (triple and github projection) and cached profile fields are overwritten
 /// and `updated_at` bumped; `is_primary` / `created_at` are never touched.
-const PRINCIPAL_UPSERT_SET: &str = "github_user_id = excluded.github_user_id, \
+pub(crate) const PRINCIPAL_UPSERT_SET: &str = "github_user_id = excluded.github_user_id, \
      login = excluded.login, \
      display_name = excluded.display_name, \
      avatar_url = excluded.avatar_url, \
@@ -48,7 +48,7 @@ pub(crate) const INVITE_COLUMNS: &str =
 /// row aliased `i`: not revoked, not expired (one `?` bound to now), and —
 /// for a pinned, single-use invite — not yet redeemed. An unpinned invite is
 /// reusable and stays open across redemptions (migration `0129`).
-const INVITE_OPEN: &str = "i.revoked_at IS NULL AND i.expires_at > ? \
+pub(crate) const INVITE_OPEN: &str = "i.revoked_at IS NULL AND i.expires_at > ? \
      AND ((i.pin_identity_provider IS NULL AND i.pin_github_user_id IS NULL) \
           OR i.redeemed_at IS NULL)";
 
@@ -82,10 +82,20 @@ pub struct WorkspaceAuthorFallback {
 /// on (see [`Store::count_workspace_guests`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WorkspaceGuestCount {
-    /// `collaborator` memberships (the owner is never a guest).
+    /// Direct collaborators who are not active host members.
     pub collaborators: u64,
-    /// Invites not yet redeemed, revoked or expired.
+    /// Unexpired, unrevoked invitations (reusable links may be redeemed).
     pub open_invites: u64,
+}
+
+/// One person in the effective workspace roster. Profiles and role come
+/// from the same database snapshot; retained guest rows never duplicate a member.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveWorkspaceMember {
+    pub principal: Principal,
+    pub role: WorkspaceRole,
+    pub host_role: intent_core::HostRole,
+    pub added_at: String,
 }
 
 impl WorkspaceGuestCount {
@@ -135,6 +145,10 @@ pub enum InviteInsertOutcome {
     /// The workspace is archived (checked inside the write transaction);
     /// nothing was written.
     WorkspaceArchived,
+    /// The issuer no longer has workspace management authority.
+    IssuerForbidden,
+    /// Committed guest seats already reach the requested cap.
+    WorkspaceFull,
 }
 
 /// Result of [`Store::join_workspace_by_invite`].
@@ -144,8 +158,8 @@ pub enum InviteJoinOutcome {
     /// joined one (existing row refreshed, or the minted one).
     Joined(Principal),
     /// The join committed for an account that was already a member of the
-    /// workspace: the principal row was refreshed, a fresh credential was
-    /// minted and the invite's last-redemption stamp moved, but no
+    /// workspace: the principal row was refreshed, the credential was reused
+    /// (or minted for a new proof) and the last-redemption stamp moved, but no
     /// membership was added and the redemption was not counted.
     Rejoined(Principal),
     /// The invite was no longer open at redemption; nothing was written.
@@ -153,11 +167,11 @@ pub enum InviteJoinOutcome {
     /// The workspace's collaborators already reach the guest cap; nothing
     /// was written and the invite stays open.
     WorkspaceFull,
-    /// `rotate_from_hash` was not an active credential of the joining
+    /// The presented bearer was not an active credential of the joining
     /// principal at the moment of the join (unknown, revoked, or another
     /// principal's); nothing was written and the invite stays open.
     CredentialInvalid,
-    /// `identity.github_user_id` is the primary principal's own account: the
+    /// The full identity triple is the primary principal's own account: the
     /// host owner cannot join its own host as a guest, and no per-principal
     /// credential is minted for the primary row. Nothing was written and the
     /// invite stays open.
@@ -167,6 +181,10 @@ pub enum InviteJoinOutcome {
     /// closed the invite, so this is the guard behind the open check);
     /// nothing was written.
     WorkspaceArchived,
+    /// The stable pin changed or does not identify the joining person.
+    PinMismatch,
+    /// Revocation happened after the proof challenge.
+    AccessRevoked,
 }
 
 /// Whether `workspace_id` is archived, read on the transaction's own
@@ -324,6 +342,37 @@ impl Store {
         Ok(rows.iter().map(map_principal_row).collect())
     }
 
+    /// The safe sharing directory, excluding the primary and revoked people.
+    /// Role and profile are selected together without credential material.
+    ///
+    /// # Errors
+    /// Returns `Internal` on database failure.
+    pub async fn list_sharing_principals(&self) -> Result<Vec<(Principal, intent_core::HostRole)>> {
+        let rows = sqlx::query(
+            "SELECT p.*, h.principal_id IS NOT NULL AS is_host_member \
+             FROM principal p LEFT JOIN host_member h ON h.principal_id = p.id \
+             WHERE p.is_primary = 0 AND EXISTS (SELECT 1 FROM principal_credential c \
+                 WHERE c.principal_id = p.id AND c.revoked_at IS NULL) \
+             ORDER BY p.created_at, p.id",
+        )
+        .fetch_all(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("sharing directory failed: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    map_principal_row(r),
+                    if r.get::<bool, _>("is_host_member") {
+                        intent_core::HostRole::Member
+                    } else {
+                        intent_core::HostRole::Guest
+                    },
+                )
+            })
+            .collect())
+    }
+
     /// Insert or update a principal by id. On conflict the identity (triple
     /// and github projection, see [`principal_identity_columns`]) and cached
     /// profile fields are overwritten and `updated_at` bumped; `is_primary`
@@ -422,13 +471,14 @@ impl Store {
 
     /// Membership summaries for `workspace.get` / `workspace.list`
     /// (multiplayer w1): owner, member count and `viewer`'s role, computed
-    /// in SQL in ONE query scoped to exactly `workspace_ids` (the rows the
+    /// in one scalar projection scoped to exactly `workspace_ids` (the rows the
     /// caller is about to return — never the whole table, so archived or
     /// filtered-out workspaces cost nothing), keyed by workspace id. An empty
     /// `workspace_ids` short-circuits without touching the database.
     /// `viewer = None` yields no `my_role`. `open_invite_count` is `0` until
     /// invitations exist (a reusable invite counts as open while unexpired
-    /// and unrevoked, however often it was redeemed).
+    /// and unrevoked, however often it was redeemed). A separate indexed
+    /// deadline probe reconciles due reservations before that same snapshot.
     ///
     /// # Errors
     ///
@@ -441,26 +491,36 @@ impl Store {
         if workspace_ids.is_empty() {
             return Ok(HashMap::new());
         }
+        let mut tx = self.sharing_snapshot(workspace_ids, None).await?;
         let placeholders = vec!["?"; workspace_ids.len()].join(",");
         let sql = format!(
-            "SELECT w.id AS workspace_id, w.owner_principal_id, \
-                (SELECT COUNT(*) FROM workspace_member m WHERE m.workspace_id = w.id) AS member_count, \
-                (SELECT COUNT(*) FROM workspace_invite i WHERE i.workspace_id = w.id \
-                    AND {INVITE_OPEN}) AS open_invite_count, \
-                (SELECT m.role FROM workspace_member m \
-                    WHERE m.workspace_id = w.id AND m.principal_id = ?) AS my_role \
-             FROM workspace w WHERE w.id IN ({placeholders})"
+            "WITH viewer AS (SELECT p.id, p.is_primary, h.principal_id IS NOT NULL AS is_host_member \
+                FROM principal p LEFT JOIN host_member h ON h.principal_id = p.id WHERE p.id = ?) \
+             SELECT w.id AS workspace_id, w.owner_principal_id, \
+                COALESCE(v.is_primary OR (v.is_host_member AND w.id <> ?), 0) AS can_manage, \
+                CASE WHEN w.id = ? THEN s.direct_count ELSE s.non_host_count + h.member_count END AS member_count, \
+                s.open_invite_count, \
+                COALESCE(m.role, CASE WHEN v.is_host_member AND w.id <> ? THEN 'collaborator' END) AS my_role \
+             FROM workspace w JOIN workspace_sharing_summary s ON s.workspace_id = w.id \
+             CROSS JOIN host_membership_state h LEFT JOIN viewer v ON 1 = 1 \
+             LEFT JOIN workspace_member m ON m.workspace_id = w.id AND m.principal_id = v.id \
+             WHERE h.id = 1 AND w.id IN ({placeholders})"
         );
         let mut query = sqlx::query(&sql)
-            .bind(now_iso())
-            .bind(viewer.map(|p| p.0.as_str()));
+            .bind(viewer.map(|p| p.0.as_str()))
+            .bind(intent_core::CHIEF_WORKSPACE_ID)
+            .bind(intent_core::CHIEF_WORKSPACE_ID)
+            .bind(intent_core::CHIEF_WORKSPACE_ID);
         for id in workspace_ids {
             query = query.bind(&id.0);
         }
         let rows = query
-            .fetch_all(self.read_pool())
+            .fetch_all(&mut *tx)
             .await
             .map_err(|e| Error::Internal(format!("workspace membership summaries failed: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| Error::Internal(format!("sharing snapshot commit failed: {e}")))?;
         rows.iter()
             .map(|r| {
                 let my_role = r
@@ -470,6 +530,7 @@ impl Store {
                 Ok((
                     WorkspaceId(r.get("workspace_id")),
                     WorkspaceMembership {
+                        can_manage: r.get("can_manage"),
                         owner_principal_id: r
                             .get::<Option<String>, _>("owner_principal_id")
                             .map(PrincipalId),
@@ -502,6 +563,84 @@ impl Store {
             .await
             .map_err(|e| Error::Internal(format!("list workspace members failed: {e}")))?;
         rows.iter().map(map_member_row).collect()
+    }
+
+    /// Effective members of an existing workspace, owner first. The union
+    /// deduplicates by principal, never by a forge handle or numeric account ID.
+    /// Chief retains only its direct membership. Explicit roster reads load
+    /// profiles in this one query, not all host principals or per-person reads.
+    ///
+    /// # Errors
+    /// Returns `Internal` on database failure.
+    pub async fn list_effective_workspace_members(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<EffectiveWorkspaceMember>> {
+        let rows = sqlx::query(
+            "WITH people AS (SELECT principal_id FROM workspace_member WHERE workspace_id = ? \
+                 UNION SELECT principal_id FROM host_member WHERE ? <> ?) \
+             SELECT p.*, h.principal_id IS NOT NULL AS is_host_member, \
+                 CASE WHEN h.principal_id IS NOT NULL AND w.id <> ? THEN h.added_at \
+                      ELSE m.added_at END AS member_added_at \
+             FROM people x JOIN principal p ON p.id = x.principal_id \
+             JOIN workspace w ON w.id = ? \
+             LEFT JOIN workspace_member m ON m.workspace_id = w.id AND m.principal_id = p.id \
+             LEFT JOIN host_member h ON h.principal_id = p.id \
+             ORDER BY p.is_primary DESC, member_added_at, p.id",
+        )
+        .bind(workspace_id.as_str())
+        .bind(workspace_id.as_str())
+        .bind(intent_core::CHIEF_WORKSPACE_ID)
+        .bind(intent_core::CHIEF_WORKSPACE_ID)
+        .bind(workspace_id.as_str())
+        .fetch_all(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("effective workspace roster failed: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let principal = map_principal_row(r);
+                EffectiveWorkspaceMember {
+                    role: if principal.is_primary {
+                        WorkspaceRole::Owner
+                    } else {
+                        WorkspaceRole::Collaborator
+                    },
+                    host_role: if principal.is_primary {
+                        intent_core::HostRole::Owner
+                    } else if r.get::<bool, _>("is_host_member") {
+                        intent_core::HostRole::Member
+                    } else {
+                        intent_core::HostRole::Guest
+                    },
+                    principal,
+                    added_at: r.get("member_added_at"),
+                }
+            })
+            .collect())
+    }
+
+    /// IDs for presence fan-out. Members inherit ordinary workspaces; direct
+    /// guest grants remain scoped. This runs on presence changes, never lists.
+    ///
+    /// # Errors
+    /// Returns `Internal` on database failure.
+    pub async fn effective_principal_workspace_ids(
+        &self,
+        principal: &PrincipalId,
+    ) -> Result<Vec<WorkspaceId>> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT workspace_id FROM workspace_member WHERE principal_id = ? \
+             UNION SELECT w.id FROM workspace w WHERE w.id <> ? \
+             AND EXISTS(SELECT 1 FROM host_member WHERE principal_id = ?)",
+        )
+        .bind(principal.as_str())
+        .bind(intent_core::CHIEF_WORKSPACE_ID)
+        .bind(principal.as_str())
+        .fetch_all(self.read_pool())
+        .await
+        .map(|ids| ids.into_iter().map(WorkspaceId).collect())
+        .map_err(|e| Error::Internal(format!("effective presence workspaces failed: {e}")))
     }
 
     /// List every workspace id a principal is a member of, with the role.
@@ -602,8 +741,9 @@ impl Store {
     /// is inside its own write transaction — cannot both take the last
     /// seat, and a `revoke_all_principal_credentials` that committed
     /// before the transaction began is always observed (no seat for a
-    /// principal that can no longer authenticate). The credential predicate
-    /// is evaluated first, so a seated principal whose credentials are all
+    /// principal that can no longer authenticate). Active host members are
+    /// already effective members and bypass guest admission. For guests the
+    /// credential predicate is evaluated first, so a seated principal whose credentials are all
     /// revoked is `NoActiveCredential`, not `AlreadyMember`; an already
     /// seated credentialed principal takes no new seat and is reported
     /// without a write. An archived workspace is `WorkspaceArchived` (read
@@ -631,6 +771,12 @@ impl Store {
             .map_err(|e| Error::Internal(format!("capped member add begin failed: {e}")))?;
 
         let body_result: Result<CollaboratorAddOutcome> = async {
+            let inherited: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM host_member WHERE principal_id = ?) AND ? <> ?",
+            ).bind(principal_id.as_str()).bind(workspace_id.as_str()).bind(intent_core::CHIEF_WORKSPACE_ID)
+                .fetch_one(&mut *conn).await
+                .map_err(|e|Error::Internal(format!("capped member add host role failed: {e}")))?;
+            if inherited { return Ok(CollaboratorAddOutcome::AlreadyMember); }
             if workspace_archived_in_txn(&mut conn, workspace_id, "capped member add").await?
                 == Some(true)
             {
@@ -660,22 +806,10 @@ impl Store {
             if already_member.is_some() {
                 return Ok(CollaboratorAddOutcome::AlreadyMember);
             }
-            let sql = format!(
-                "SELECT \
-                    (SELECT COUNT(*) FROM workspace_member m \
-                        WHERE m.workspace_id = ? AND m.role = 'collaborator') + \
-                    (SELECT COUNT(*) FROM workspace_invite i WHERE i.workspace_id = ? \
-                        AND {INVITE_OPEN})"
-            );
-            let committed: i64 = sqlx::query_scalar(&sql)
-                .bind(&workspace_id.0)
-                .bind(&workspace_id.0)
-                .bind(now_iso())
-                .fetch_one(&mut *conn)
-                .await
-                .map_err(|e| {
-                    Error::Internal(format!("capped member add guest count failed: {e}"))
-                })?;
+            crate::sharing_projection::reconcile_invite_expiry(&mut conn, std::slice::from_ref(workspace_id), &now_iso()).await?;
+            let committed: i64 = sqlx::query_scalar("SELECT guest_count + open_invite_count FROM workspace_sharing_summary WHERE workspace_id = ?")
+                .bind(workspace_id.as_str()).fetch_one(&mut *conn).await
+                .map_err(|e| Error::Internal(format!("capped member add guest count failed: {e}")))?;
             if u64::try_from(committed).unwrap_or(u64::MAX) >= u64::from(max_guests) {
                 return Ok(CollaboratorAddOutcome::WorkspaceFull);
             }
@@ -773,6 +907,53 @@ impl Store {
             Ok(res.rows_affected() > 0)
         })
         .await
+    }
+
+    /// Remove a direct guest grant, refusing inherited access under the same
+    /// write lock as deletion. An upgrade racing removal cannot lose its
+    /// retained collaborator row. Host-wide revocation uses its own transaction.
+    ///
+    /// # Errors
+    /// Returns `HostMembershipRequired` for active members, `InvalidParams`
+    /// for an owner, and `Internal` on database failure.
+    pub async fn remove_workspace_guest(
+        &self,
+        workspace_id: &WorkspaceId,
+        principal_id: &PrincipalId,
+    ) -> Result<bool> {
+        let mut tx = self
+            .write_pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| Error::Internal(format!("remove guest begin failed: {e}")))?;
+        let inherited: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM host_member WHERE principal_id = ?)")
+                .bind(principal_id.as_str())
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("remove guest role failed: {e}")))?;
+        if inherited {
+            return Err(Error::HostMembershipRequired);
+        }
+        let owner:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM workspace_member WHERE workspace_id = ? AND principal_id = ? AND role = 'owner')")
+            .bind(workspace_id.as_str()).bind(principal_id.as_str()).fetch_one(&mut *tx).await
+            .map_err(|e|Error::Internal(format!("remove guest owner check failed: {e}")))?;
+        if owner {
+            return Err(Error::InvalidParams(
+                "the workspace owner cannot leave or be removed".into(),
+            ));
+        }
+        let deleted =
+            sqlx::query("DELETE FROM workspace_member WHERE workspace_id = ? AND principal_id = ?")
+                .bind(workspace_id.as_str())
+                .bind(principal_id.as_str())
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("remove guest failed: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| Error::Internal(format!("remove guest commit failed: {e}")))?;
+        Ok(deleted.rows_affected() > 0)
     }
 
     /// Record a bearer credential for a principal, keyed by `token_hash`
@@ -966,8 +1147,8 @@ impl Store {
         Ok(u64::try_from(n).unwrap_or(0))
     }
 
-    /// The guest-cap usage of one workspace: its `collaborator` memberships
-    /// and its open invites, in one round trip.
+    /// The guest-cap usage of one workspace: direct non-host collaborators
+    /// and open invites, from maintained scalars after indexed expiry reconciliation.
     ///
     /// # Errors
     ///
@@ -976,20 +1157,18 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<WorkspaceGuestCount> {
-        let sql = format!(
-            "SELECT \
-                (SELECT COUNT(*) FROM workspace_member m \
-                    WHERE m.workspace_id = ? AND m.role = 'collaborator') AS collaborators, \
-                (SELECT COUNT(*) FROM workspace_invite i WHERE i.workspace_id = ? \
-                    AND {INVITE_OPEN}) AS open_invites"
-        );
-        let row = sqlx::query(&sql)
-            .bind(&workspace_id.0)
-            .bind(&workspace_id.0)
-            .bind(now_iso())
-            .fetch_one(self.read_pool())
-            .await
+        let mut tx = self
+            .sharing_snapshot(std::slice::from_ref(workspace_id), None)
+            .await?;
+        let row = sqlx::query("SELECT guest_count AS collaborators, open_invite_count AS open_invites FROM workspace_sharing_summary WHERE workspace_id = ?")
+            .bind(workspace_id.as_str()).fetch_optional(&mut *tx).await
             .map_err(|e| Error::Internal(format!("count workspace guests failed: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| Error::Internal(format!("guest snapshot commit failed: {e}")))?;
+        let Some(row) = row else {
+            return Ok(WorkspaceGuestCount::default());
+        };
         Ok(WorkspaceGuestCount {
             collaborators: u64::try_from(row.get::<i64, _>("collaborators")).unwrap_or(0),
             open_invites: u64::try_from(row.get::<i64, _>("open_invites")).unwrap_or(0),
@@ -1011,6 +1190,29 @@ impl Store {
         &self,
         invite: &WorkspaceInvite,
     ) -> Result<InviteInsertOutcome> {
+        self.insert_workspace_invite_with_limit(invite, None).await
+    }
+
+    /// Mint a workspace invitation only if a guest seat remains. The limit,
+    /// expiry reconciliation, issuer and archive checks share the insert's
+    /// write transaction with direct guest admissions and invite joins.
+    ///
+    /// # Errors
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn insert_workspace_invite_within_cap(
+        &self,
+        invite: &WorkspaceInvite,
+        max_guests: u32,
+    ) -> Result<InviteInsertOutcome> {
+        self.insert_workspace_invite_with_limit(invite, Some(max_guests))
+            .await
+    }
+
+    async fn insert_workspace_invite_with_limit(
+        &self,
+        invite: &WorkspaceInvite,
+        max_guests: Option<u32>,
+    ) -> Result<InviteInsertOutcome> {
         let mut conn =
             self.write_pool().acquire().await.map_err(|e| {
                 Error::Internal(format!("insert workspace invite acquire failed: {e}"))
@@ -1026,6 +1228,22 @@ impl Store {
                 == Some(true)
             {
                 return Ok(InviteInsertOutcome::WorkspaceArchived);
+            }
+            let authorized: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM principal p WHERE p.id = ? AND (p.is_primary = 1 \
+                 OR EXISTS(SELECT 1 FROM host_member h WHERE h.principal_id = p.id) \
+                 OR EXISTS(SELECT 1 FROM workspace_member m WHERE m.principal_id = p.id AND m.workspace_id = ? AND m.role = 'owner')))"
+            ).bind(&invite.created_by_principal_id.0).bind(&invite.workspace_id.0)
+                .fetch_one(&mut *conn).await.map_err(|e| Error::Internal(format!("invite issuer check failed: {e}")))?;
+            if !authorized { return Ok(InviteInsertOutcome::IssuerForbidden); }
+            if let Some(max_guests) = max_guests {
+                crate::sharing_projection::reconcile_invite_expiry(&mut conn, std::slice::from_ref(&invite.workspace_id), &now_iso()).await?;
+                let committed: i64 = sqlx::query_scalar("SELECT guest_count + open_invite_count FROM workspace_sharing_summary WHERE workspace_id = ?")
+                    .bind(invite.workspace_id.as_str()).fetch_one(&mut *conn).await
+                    .map_err(|e| Error::Internal(format!("invite seat check failed: {e}")))?;
+                if u64::try_from(committed).unwrap_or(u64::MAX) >= u64::from(max_guests) {
+                    return Ok(InviteInsertOutcome::WorkspaceFull);
+                }
             }
             let sql = format!(
                 "INSERT INTO workspace_invite ({INVITE_COLUMNS}) \
@@ -1139,7 +1357,7 @@ impl Store {
 
     /// `workspace.archive`'s durable write: flip the row to Archived
     /// (scoped `status`/`archived`/`archived_at`/`updated_at` write), delete
-    /// every non-owner membership, revoke every open invite and count the
+    /// every direct guest membership, revoke every open invite and count the
     /// surviving members — in ONE `BEGIN IMMEDIATE` transaction, so the
     /// archive and the access revocation commit together or not at all.
     /// Under IMMEDIATE an `invite.accept` / capped member add (both write
@@ -1183,8 +1401,10 @@ impl Store {
                 return Err(Error::NotFound(format!("workspace {id}")));
             }
             let removed_collaborators: Vec<PrincipalId> = sqlx::query_scalar::<_, String>(
-                "SELECT principal_id FROM workspace_member \
-                 WHERE workspace_id = ? AND role <> 'owner' ORDER BY added_at, principal_id",
+                "SELECT principal_id FROM workspace_member m \
+                 WHERE workspace_id = ? AND role <> 'owner' \
+                 AND NOT EXISTS(SELECT 1 FROM host_member h WHERE h.principal_id = m.principal_id) \
+                 ORDER BY added_at, principal_id",
             )
             .bind(&id.0)
             .fetch_all(&mut *conn)
@@ -1194,7 +1414,8 @@ impl Store {
             .map(PrincipalId)
             .collect();
             let deleted = sqlx::query(
-                "DELETE FROM workspace_member WHERE workspace_id = ? AND role <> 'owner'",
+                "DELETE FROM workspace_member AS m WHERE workspace_id = ? AND role <> 'owner' \
+                 AND NOT EXISTS(SELECT 1 FROM host_member h WHERE h.principal_id = m.principal_id)",
             )
             .bind(&id.0)
             .execute(&mut *conn)
@@ -1219,7 +1440,8 @@ impl Store {
                 .await
                 .map_err(|e| Error::Internal(format!("archive invite revoke failed: {e}")))?;
             let remaining: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM workspace_member WHERE workspace_id = ?")
+                sqlx::query_scalar("SELECT CASE WHEN s.workspace_id = ? THEN s.direct_count ELSE s.non_host_count + h.member_count END FROM workspace_sharing_summary s CROSS JOIN host_membership_state h WHERE s.workspace_id = ? AND h.id = 1")
+                    .bind(intent_core::CHIEF_WORKSPACE_ID)
                     .bind(&id.0)
                     .fetch_one(&mut *conn)
                     .await
@@ -1268,68 +1490,27 @@ impl Store {
         Ok(res.rows_affected() > 0)
     }
 
-    /// The invite join as ONE write transaction (multiplayer w4): resolve or
-    /// mint the principal keyed by `identity`'s identity triple
-    /// ([`Principal::identity_key`] — the stored triple, or the github.com
-    /// one of a bare `github_user_id`; `github_user_id` is dual-written for
-    /// a github triple), apply the fetched profile, redeem the invite (the
-    /// conditional `UPDATE` is the single-use guard of a pinned invite; a
-    /// reusable one stays open), add the `collaborator` membership and
-    /// record the credential hash. Either every row lands or none does — a
-    /// credential insert failure cannot consume the link or leave a member
-    /// without a credential — and, under `BEGIN IMMEDIATE` on the
-    /// single-connection write pool, two first joins of the same account
-    /// cannot both miss the lookup and race a duplicate identity insert.
+    /// Admit a verified identity through one open workspace invitation transaction.
+    /// Resolve the full identity triple before inserting: an existing person keeps
+    /// its principal ID. Redeem the link, apply the profile and grant access together;
+    /// every refusal writes nothing and any failure rolls all changes back.
     ///
-    /// `identity.id` is used only when no principal has linked the account;
-    /// `identity.is_primary` / `created_at` likewise. Returns
-    /// [`InviteJoinOutcome::Joined`] with the principal (existing row
-    /// refreshed, or the minted one) when a membership was added, or
-    /// [`InviteJoinOutcome::Rejoined`] when the account was already a member
-    /// (so the caller can tell a membership change from a mere credential
-    /// mint); [`InviteJoinOutcome::Closed`] when the
-    /// invite was no longer open at redemption; or
-    /// [`InviteJoinOutcome::WorkspaceFull`] when the workspace already has
-    /// `max_guests` collaborators and the joining account is not one of them
-    /// (a returning collaborator re-joining takes no new seat, and its
-    /// re-join is idempotent: the membership is kept and the invite's
-    /// `redemption_count` does not grow); or
-    /// [`InviteJoinOutcome::OwnerSelfJoin`] when the account is the primary
-    /// principal's own (the owner never holds a per-principal credential).
-    /// Every refusal
-    /// (including [`InviteJoinOutcome::CredentialInvalid`] below) is decided
-    /// first, inside the transaction, so it writes nothing at all — and,
-    /// under `BEGIN IMMEDIATE`, two concurrent joins cannot both pass the cap
-    /// check and overshoot it.
-    ///
-    /// `rotate_from_hash` is the credential a returning guest presented as
-    /// its proof of identity (`invite.accept`): it is validated and consumed
-    /// inside this transaction — the revoke must flip exactly one
-    /// still-active row of the joining principal, otherwise the join is
-    /// refused as [`InviteJoinOutcome::CredentialInvalid`] before anything
-    /// is written. Under `BEGIN IMMEDIATE` that makes the presented
-    /// credential single-use across concurrent joins: of two accepts
-    /// presenting the same credential exactly one mints, and a revoke that
-    /// lands between the caller's lookup and the join refuses the mint.
-    ///
-    /// An archived workspace is [`InviteJoinOutcome::WorkspaceArchived`],
-    /// checked first on the same connection: an archive whose sweep
-    /// committed before this transaction began is always observed, so no
-    /// join lands on an archived workspace.
+    /// Existing credentials are rechecked and reused; proofs mint a credential only
+    /// if the challenge's authorization generation still permits the person.
+    /// Effective host members never spend a guest seat or gain a direct grant.
+    /// Pinned invitations remain single-use, including an existing member's join.
+    /// Rejoining a reusable invitation does not increase its redemption count.
     ///
     /// # Errors
     ///
-    /// Returns `Error::Internal` if the database operation fails (including
-    /// a duplicate credential hash, an unknown invite / workspace, or an
-    /// `identity` carrying no identity key) and `Error::InvalidInput` for a
-    /// one-owner violation on the membership.
+    /// Returns `Error::Internal` on storage failure or a missing identity key, and
+    /// `Error::InvalidInput` for an empty credential hash or a one-owner violation.
     pub async fn join_workspace_by_invite(
         &self,
         invite_id: &str,
         workspace_id: &WorkspaceId,
         identity: &Principal,
-        credential_hash: &str,
-        rotate_from_hash: Option<&str>,
+        credential: HostJoinCredential<'_>,
         max_guests: u32,
     ) -> Result<InviteJoinOutcome> {
         let identity_key = identity
@@ -1356,18 +1537,19 @@ impl Store {
             // writer can close it between here and the UPDATE below, so a
             // refused join commits a read-only transaction (no-op).
             let open_sql = format!(
-                "SELECT 1 FROM workspace_invite i \
+                "SELECT {INVITE_COLUMNS} FROM workspace_invite i \
                  WHERE i.id = ? AND i.workspace_id = ? AND {INVITE_OPEN}"
             );
-            let open: Option<i64> = sqlx::query_scalar(&open_sql)
+            let open = sqlx::query(&open_sql)
                 .bind(invite_id)
                 .bind(&workspace_id.0)
                 .bind(&now)
                 .fetch_optional(&mut *conn)
                 .await
                 .map_err(|e| Error::Internal(format!("invite join open check failed: {e}")))?;
-            if open.is_none() {
-                return Ok(InviteJoinOutcome::Closed);
+            let Some(open) = open else { return Ok(InviteJoinOutcome::Closed); };
+            if map_invite_row(&open).pin_identity_key().is_some_and(|pin| pin != identity_key) {
+                return Ok(InviteJoinOutcome::PinMismatch);
             }
             let lookup =
                 format!("SELECT {PRINCIPAL_COLUMNS} FROM principal WHERE {PRINCIPAL_BY_IDENTITY}");
@@ -1380,12 +1562,17 @@ impl Store {
             // The owner's own account resolves to the primary row: refuse
             // before any write, so the primary principal never gains a
             // per-principal credential or a redeemed invite.
-            if existing.as_ref().is_some_and(|p| p.is_primary) {
+            if identity.is_primary || existing.as_ref().is_some_and(|p| p.is_primary) {
                 return Ok(InviteJoinOutcome::OwnerSelfJoin);
             }
+            let effective_member = match &existing {
+                Some(p) => sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM host_member WHERE principal_id = ?)")
+                    .bind(&p.id.0).fetch_one(&mut *conn).await.map_err(|e| Error::Internal(format!("invite host role check failed: {e}")))?,
+                None => false,
+            };
             // Guest-cap check, same transaction as the membership insert: a
             // seat is only needed when the account is not already a member.
-            let already_member = match &existing {
+            let already_member = effective_member || match &existing {
                 Some(p) => sqlx::query_scalar::<_, i64>(
                     "SELECT 1 FROM workspace_member WHERE workspace_id = ? AND principal_id = ?",
                 )
@@ -1398,42 +1585,38 @@ impl Store {
                 None => false,
             };
             if !already_member {
-                let collaborators: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM workspace_member \
-                     WHERE workspace_id = ? AND role = 'collaborator'",
-                )
-                .bind(&workspace_id.0)
-                .fetch_one(&mut *conn)
-                .await
-                .map_err(|e| Error::Internal(format!("invite join guest count failed: {e}")))?;
+                let collaborators: i64 = sqlx::query_scalar("SELECT guest_count FROM workspace_sharing_summary WHERE workspace_id = ?")
+                    .bind(workspace_id.as_str()).fetch_one(&mut *conn).await
+                    .map_err(|e| Error::Internal(format!("invite join guest count failed: {e}")))?;
                 if u64::try_from(collaborators).unwrap_or(u64::MAX) >= u64::from(max_guests) {
                     return Ok(InviteJoinOutcome::WorkspaceFull);
                 }
             }
-            // Consume the presented credential before any write: a miss
-            // (unknown, revoked, foreign, or no principal for the account)
-            // refuses with nothing written; a hit is the single authoritative
-            // check that the credential was still active at join time.
-            if let Some(previous) = rotate_from_hash {
-                let Some(holder) = &existing else {
-                    return Ok(InviteJoinOutcome::CredentialInvalid);
-                };
-                let rotated = sqlx::query(
-                    "UPDATE principal_credential SET revoked_at = ? \
-                     WHERE token_hash = ? AND principal_id = ? AND revoked_at IS NULL",
-                )
-                .bind(&now)
-                .bind(previous)
-                .bind(&holder.id.0)
-                .execute(&mut *conn)
-                .await
-                .map_err(|e| {
-                    Error::Internal(format!("invite join rotate credential failed: {e}"))
-                })?;
-                if rotated.rows_affected() != 1 {
-                    return Ok(InviteJoinOutcome::CredentialInvalid);
+            let credential_hash = match credential {
+                HostJoinCredential::Existing { token_hash } => {
+                    let Some(holder) = &existing else { return Ok(InviteJoinOutcome::CredentialInvalid); };
+                    let active: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM principal_credential WHERE token_hash = ? AND principal_id = ? AND revoked_at IS NULL)")
+                        .bind(token_hash).bind(&holder.id.0).fetch_one(&mut *conn).await
+                        .map_err(|e| Error::Internal(format!("invite credential check failed: {e}")))?;
+                    if !active { return Ok(InviteJoinOutcome::CredentialInvalid); }
+                    token_hash
                 }
-            }
+                HostJoinCredential::Proof { token_hash, authorization_generation } => {
+                    let current: i64 = sqlx::query_scalar("SELECT authorization_generation FROM host_membership_state WHERE id = 1")
+                        .fetch_one(&mut *conn).await.map_err(|e| Error::Internal(format!("invite generation failed: {e}")))?;
+                    let revoked: Option<i64> = if let Some(person) = &existing {
+                        sqlx::query_scalar("SELECT generation FROM principal_revocation WHERE principal_id = ?")
+                            .bind(&person.id.0).fetch_optional(&mut *conn).await.map_err(|e| Error::Internal(format!("invite revocation failed: {e}")))?
+                    } else { None };
+                    if authorization_generation > u64::try_from(current).unwrap_or(0)
+                        || revoked.is_some_and(|r| u64::try_from(r).unwrap_or(u64::MAX) > authorization_generation) {
+                        return Ok(InviteJoinOutcome::AccessRevoked);
+                    }
+                    token_hash
+                }
+            };
+            if credential_hash.is_empty() { return Err(Error::InvalidInput("empty credential hash".into())); }
+            let was_existing = existing.is_some();
             let mut principal = existing.unwrap_or_else(|| identity.clone());
             principal.github_user_id = identity_key.github_user_id();
             principal.identity = Some(identity_key.clone());
@@ -1443,8 +1626,8 @@ impl Store {
             principal.updated_at.clone_from(&now);
 
             let upsert = format!(
-                "INSERT INTO principal ({PRINCIPAL_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?) \
-                 ON CONFLICT(id) DO UPDATE SET {PRINCIPAL_UPSERT_SET}"
+                "INSERT INTO principal ({PRINCIPAL_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?){}",
+                if was_existing { format!(" ON CONFLICT(id) DO UPDATE SET {PRINCIPAL_UPSERT_SET}") } else { String::new() }
             );
             bind_principal(sqlx::query(&upsert), &principal)
                 .execute(&mut *conn)
@@ -1476,29 +1659,32 @@ impl Store {
                 )));
             }
 
-            let member = format!(
-                "INSERT INTO workspace_member ({MEMBER_COLUMNS}) VALUES (?,?,?,?) \
-                 ON CONFLICT(workspace_id, principal_id) DO NOTHING"
-            );
-            sqlx::query(&member)
-                .bind(&workspace_id.0)
+            if !effective_member {
+                let member = format!(
+                    "INSERT INTO workspace_member ({MEMBER_COLUMNS}) VALUES (?,?,?,?) \
+                     ON CONFLICT(workspace_id, principal_id) DO NOTHING"
+                );
+                sqlx::query(&member)
+                    .bind(&workspace_id.0)
+                    .bind(&principal.id.0)
+                    .bind(WorkspaceRole::Collaborator.as_str())
+                    .bind(&now)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| map_owner_violation(&e, workspace_id, "invite join add member"))?;
+            }
+            if matches!(credential, HostJoinCredential::Proof { .. }) {
+                sqlx::query(
+                    "INSERT INTO principal_credential (token_hash, principal_id, created_at) \
+                     VALUES (?,?,?)",
+                )
+                .bind(credential_hash)
                 .bind(&principal.id.0)
-                .bind(WorkspaceRole::Collaborator.as_str())
                 .bind(&now)
                 .execute(&mut *conn)
                 .await
-                .map_err(|e| map_owner_violation(&e, workspace_id, "invite join add member"))?;
-
-            sqlx::query(
-                "INSERT INTO principal_credential (token_hash, principal_id, created_at) \
-                 VALUES (?,?,?)",
-            )
-            .bind(credential_hash)
-            .bind(&principal.id.0)
-            .bind(&now)
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| Error::Internal(format!("invite join insert credential failed: {e}")))?;
+                .map_err(|e| Error::Internal(format!("invite join insert credential failed: {e}")))?;
+            }
             Ok(if already_member {
                 InviteJoinOutcome::Rejoined(principal)
             } else {
@@ -1568,12 +1754,15 @@ async fn sync_workspace_owner(
 
 /// `WHERE` body selecting a principal by its identity triple; bind the three
 /// parts with [`bind_identity`].
-const PRINCIPAL_BY_IDENTITY: &str =
+pub(crate) const PRINCIPAL_BY_IDENTITY: &str =
     "identity_provider = ? AND instance_host = ? AND external_user_id = ?";
 
 type SqliteQuery<'q> = sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>;
 
-fn bind_identity<'q>(query: SqliteQuery<'q>, identity: &'q PrincipalIdentity) -> SqliteQuery<'q> {
+pub(crate) fn bind_identity<'q>(
+    query: SqliteQuery<'q>,
+    identity: &'q PrincipalIdentity,
+) -> SqliteQuery<'q> {
     query
         .bind(identity.provider.as_str())
         .bind(identity.host.as_str())
@@ -1583,7 +1772,7 @@ fn bind_identity<'q>(query: SqliteQuery<'q>, identity: &'q PrincipalIdentity) ->
 /// Bind a principal's values in `PRINCIPAL_COLUMNS` order for an insert /
 /// upsert, with the identity columns dual-written
 /// ([`principal_identity_columns`]).
-fn bind_principal<'q>(query: SqliteQuery<'q>, p: &'q Principal) -> SqliteQuery<'q> {
+pub(crate) fn bind_principal<'q>(query: SqliteQuery<'q>, p: &'q Principal) -> SqliteQuery<'q> {
     let (identity, github_user_id) = principal_identity_columns(p);
     query
         .bind(&p.id.0)
@@ -1616,7 +1805,7 @@ fn map_identity_columns(
     })
 }
 
-fn map_principal_row(r: &SqliteRow) -> Principal {
+pub(crate) fn map_principal_row(r: &SqliteRow) -> Principal {
     Principal {
         id: PrincipalId(r.get("id")),
         identity: map_identity_columns(r, "identity_provider", "instance_host", "external_user_id"),

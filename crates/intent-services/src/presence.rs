@@ -131,11 +131,19 @@ struct Profile {
     login: Option<String>,
     display_name: Option<String>,
     avatar_url: Option<String>,
+    identity: Option<intent_core::PrincipalIdentity>,
+    host_role: Option<intent_core::HostRole>,
 }
 
 impl From<Principal> for Profile {
     fn from(p: Principal) -> Self {
         Self {
+            identity: p.identity_key(),
+            host_role: Some(if p.is_primary {
+                intent_core::HostRole::Owner
+            } else {
+                intent_core::HostRole::Guest
+            }),
             login: p.login,
             display_name: p.display_name,
             avatar_url: p.avatar_url,
@@ -286,11 +294,16 @@ impl State {
     /// this workspace aggregated over connections and one typing entry
     /// `{ source, agentId, since, pulse }` per typing connection (never
     /// merged: two clients of one person stay two sources).
-    fn roster(&self, workspace_id: &str, members: &[PrincipalId]) -> Vec<Value> {
+    fn roster(
+        &self,
+        workspace_id: &str,
+        members: &[intent_store::EffectiveWorkspaceMember],
+    ) -> Vec<Value> {
         members
             .iter()
-            .filter(|p| self.is_online(p))
-            .map(|p| {
+            .filter(|m| self.is_online(&m.principal.id))
+            .map(|m| {
+                let p = &m.principal.id;
                 let mut focus: Vec<Focus> = Vec::new();
                 let mut typing: Vec<(&str, &Typing)> = Vec::new();
                 for c in self.conns.values().filter(|c| &c.principal == p) {
@@ -315,15 +328,20 @@ impl State {
                         })
                     })
                     .collect();
-                let profile = self.profile(p);
-                json!({
+                let profile = Profile::from(m.principal.clone());
+                let mut row = json!({
                     "principalId": p,
                     "login": profile.login,
                     "displayName": profile.display_name,
                     "avatarUrl": profile.avatar_url,
+                    "hostRole": m.host_role,
                     "focus": focus.iter().map(Focus::to_json).collect::<Vec<_>>(),
                     "typing": typing,
-                })
+                });
+                if let Some(identity) = &profile.identity {
+                    row["identity"] = json!(identity);
+                }
+                row
             })
             .collect()
     }
@@ -360,7 +378,7 @@ impl State {
 #[derive(Debug, Default)]
 pub struct PresenceRegistry {
     state: Mutex<State>,
-    /// Test seam: parks the next first-sight profile read between its store
+    /// Test seam: parks the next profile/role read between its store
     /// fetch and its cache install so a test can interleave an identity
     /// change deterministically. Consumed by the first read that hits it.
     #[cfg(test)]
@@ -411,13 +429,18 @@ fn presence_changed_event(workspace_id: &str, members: &[Value]) -> NewEvent {
 }
 
 fn viewer_row(principal: &PrincipalId, profile: &Profile, cursor: Option<&Value>) -> Value {
-    json!({
+    let mut row = json!({
         "principalId": principal,
         "login": profile.login,
         "displayName": profile.display_name,
         "avatarUrl": profile.avatar_url,
+        "hostRole": profile.host_role.unwrap_or(intent_core::HostRole::Guest),
         "cursor": cursor,
-    })
+    });
+    if let Some(identity) = &profile.identity {
+        row["identity"] = json!(identity);
+    }
+    row
 }
 
 fn note_presence_event(
@@ -517,15 +540,16 @@ impl Services {
     /// epoch and the install is retried from a fresh read whenever the
     /// epoch moved while the row was in flight.
     async fn ensure_profile(&self, principal: &PrincipalId) -> Result<()> {
-        let mut epoch = {
-            let state = self.presence.lock();
-            if state.profiles.contains_key(principal) {
-                return Ok(());
-            }
-            state.profile_epoch
-        };
         loop {
-            let profile = Profile::from(self.store.get_principal(principal).await?);
+            let (cached, epoch) = {
+                let state = self.presence.lock();
+                (state.profiles.get(principal).cloned(), state.profile_epoch)
+            };
+            let mut profile = match cached {
+                Some(profile) => profile,
+                None => Profile::from(self.store.get_principal(principal).await?),
+            };
+            profile.host_role = Some(self.store.get_host_role(principal).await?);
             #[cfg(test)]
             {
                 let pause = self.presence.profile_fetch_pause.lock().unwrap().take();
@@ -535,14 +559,10 @@ impl Services {
                 }
             }
             let mut state = self.presence.lock();
-            if state.profiles.contains_key(principal) {
-                return Ok(());
-            }
             if state.profile_epoch == epoch {
                 state.profiles.insert(principal.clone(), profile);
                 return Ok(());
             }
-            epoch = state.profile_epoch;
         }
     }
 
@@ -555,7 +575,11 @@ impl Services {
     /// current caret) for each note the principal views and
     /// `presence:changed` to each workspace it is online in.
     pub(crate) async fn presence_profile_changed(&self, principal: &Principal) {
-        let profile = Profile::from(principal.clone());
+        let mut profile = Profile::from(principal.clone());
+        let Ok(role) = self.store.get_host_role(&principal.id).await else {
+            return;
+        };
+        profile.host_role = Some(role);
         let (online, updated) = {
             let mut state = self.presence.lock();
             state.profile_epoch += 1;
@@ -597,12 +621,12 @@ impl Services {
     /// Publish `presence:changed` for `workspace_id` from the current table
     /// (one membership read).
     async fn emit_presence_changed(&self, workspace_id: &str) {
-        let members: Vec<PrincipalId> = match self
+        let members = match self
             .store
-            .list_workspace_members(&WorkspaceId::from(workspace_id))
+            .list_effective_workspace_members(&WorkspaceId::from(workspace_id))
             .await
         {
-            Ok(members) => members.into_iter().map(|m| m.principal_id).collect(),
+            Ok(members) => members,
             Err(e) => {
                 tracing::warn!(workspace_id, error = %e, "presence: membership read failed");
                 return;
@@ -615,7 +639,11 @@ impl Services {
     /// Publish `presence:changed` to every workspace `principal` belongs to
     /// (its online / offline transition).
     async fn emit_presence_for_memberships(&self, principal: &PrincipalId) {
-        let memberships = match self.store.list_principal_memberships(principal).await {
+        let memberships = match self
+            .store
+            .effective_principal_workspace_ids(principal)
+            .await
+        {
             Ok(rows) => rows,
             Err(e) => {
                 tracing::warn!(%principal, error = %e, "presence: memberships read failed");
@@ -623,7 +651,7 @@ impl Services {
             }
         };
         for m in memberships {
-            self.emit_presence_changed(m.workspace_id.as_str()).await;
+            self.emit_presence_changed(m.as_str()).await;
         }
     }
 
@@ -722,13 +750,10 @@ impl Services {
     pub(crate) async fn presence_snapshot_op(&self, workspace_id: WorkspaceId) -> Result<Value> {
         self.require_member(&workspace_id).await?;
         self.store.get_workspace(&workspace_id).await?;
-        let members: Vec<PrincipalId> = self
+        let members = self
             .store
-            .list_workspace_members(&workspace_id)
-            .await?
-            .into_iter()
-            .map(|m| m.principal_id)
-            .collect();
+            .list_effective_workspace_members(&workspace_id)
+            .await?;
         let roster = self.presence.lock().roster(workspace_id.as_str(), &members);
         Ok(json!({ "workspaceId": workspace_id.as_str(), "members": roster }))
     }
@@ -780,6 +805,18 @@ impl Services {
         let principal = wire_principal("note.presence.subscribe")?;
         self.require_member(&workspace_id).await?;
         self.ensure_profile(&principal).await?;
+        let profiles: HashMap<PrincipalId, Profile> = self
+            .store
+            .list_effective_workspace_members(&workspace_id)
+            .await?
+            .into_iter()
+            .map(|m| {
+                let id = m.principal.id.clone();
+                let mut profile = Profile::from(m.principal);
+                profile.host_role = Some(m.host_role);
+                (id, profile)
+            })
+            .collect();
         let key = (workspace_id, note_id);
         let (snapshot, joined) = {
             let mut guard = self.presence.lock();
@@ -800,9 +837,10 @@ impl Services {
             present.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
             let rows: Vec<Value> = present
                 .into_iter()
-                .map(|(p, v)| {
-                    let profile = state.profiles.get(p).cloned().unwrap_or_default();
-                    viewer_row(p, &profile, v.cursor.as_ref())
+                .filter_map(|(p, v)| {
+                    profiles
+                        .get(p)
+                        .map(|profile| viewer_row(p, profile, v.cursor.as_ref()))
                 })
                 .collect();
             let joined = joined.then(|| {
@@ -853,6 +891,7 @@ impl Services {
     ) -> Result<Value> {
         let principal = wire_principal("note.presence.update")?;
         self.require_member(&workspace_id).await?;
+        self.ensure_profile(&principal).await?;
         let cursor = parse_cursor(cursor)?;
         let key = (workspace_id, note_id);
         let publish = {

@@ -970,9 +970,15 @@ pub(crate) fn provider_is_disabled(
     provider_id: &str,
     enabled: Option<&std::collections::BTreeMap<String, bool>>,
 ) -> bool {
-    let disableable =
-        intent_providers::find_provider(provider_id).is_some_and(|p| p.can_be_disabled);
-    disableable && enabled.is_some_and(|m| m.get(provider_id) == Some(&false))
+    intent_providers::find_provider(provider_id)
+        .is_some_and(|provider| provider_config_is_disabled(provider, enabled))
+}
+
+fn provider_config_is_disabled(
+    provider: &intent_providers::ProviderConfig,
+    enabled: Option<&std::collections::BTreeMap<String, bool>>,
+) -> bool {
+    provider.can_be_disabled && enabled.is_some_and(|m| m.get(provider.id) == Some(&false))
 }
 
 /// Where a turn-start re-home lands (intent-hq/intent#5737): the target
@@ -1090,10 +1096,14 @@ pub(crate) fn ensure_provider_authenticated(
     if auth_verdict != Some(false) {
         return Ok(());
     }
-    Err(Error::InvalidParams(format!(
-        "{method}: {}",
-        crate::provider_auth::not_authenticated_message(provider_id)
-    )))
+    Err(crate::host_execution::ai_authorization_error(
+        Error::InvalidParams(format!(
+            "{method}: {}",
+            crate::provider_auth::not_authenticated_message(provider_id)
+        )),
+        provider_id,
+        intent_core::execution::ExecutionAuthorizationReason::Missing,
+    ))
 }
 
 /// The runnability half of [`ensure_provider_available`], with the npx probe
@@ -1177,7 +1187,7 @@ enum PopCommit {
 #[derive(Debug, Clone)]
 pub(crate) struct QueueEntryGate {
     principal_id: PrincipalId,
-    is_administrator: bool,
+    host_role: intent_core::HostRole,
     author_only: bool,
     fallback: Option<PrincipalId>,
 }
@@ -1192,7 +1202,7 @@ impl QueueEntryGate {
         );
         let caller = intent_core::Caller::Wire {
             principal_id: self.principal_id.clone(),
-            is_administrator: self.is_administrator,
+            host_role: self.host_role,
         };
         if !intent_core::queue_attribution_visible_to(&caller, &attribution) {
             return Err(Error::InvalidParams(format!(
@@ -6488,12 +6498,12 @@ impl Services {
     ) -> Result<Option<QueueEntryGate>> {
         let Some(intent_core::Caller::Wire {
             principal_id,
-            is_administrator,
+            host_role,
         }) = intent_core::current_caller()
         else {
             return Ok(None);
         };
-        if is_administrator && !author_only {
+        if host_role == intent_core::HostRole::Owner && !author_only {
             return Ok(None);
         }
         let workspace_id = self.agent_workspace(agent_id).await?;
@@ -6502,7 +6512,7 @@ impl Services {
             .await;
         Ok(Some(QueueEntryGate {
             principal_id,
-            is_administrator,
+            host_role,
             author_only,
             fallback,
         }))

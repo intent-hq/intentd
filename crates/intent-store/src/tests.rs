@@ -17,6 +17,8 @@ use sqlx::Row;
 
 use crate::{AgentQueueRow, AutoVacuumActivation, EventQuery, NewEvent, Store, MAX_NOTE_VERSIONS};
 
+mod host_membership;
+mod sharing;
 mod workspace_delete;
 
 /// A unique temp DB path inside an RAII temp dir: the dir (and with it the
@@ -8138,6 +8140,32 @@ async fn primary_principal_is_minted_once() {
     assert_eq!(store.list_principals().await.expect("list").len(), 1);
 }
 
+/// Remove derived 0134 state before a fixture rewinds its source schema. The
+/// real migration must replay after the legacy rows have been seeded.
+async fn rewind_sharing_projection(store: &Store) {
+    for sql in [
+        "DROP TRIGGER sharing_workspace_ai",
+        "DROP TRIGGER sharing_member_ai",
+        "DROP TRIGGER sharing_member_ad",
+        "DROP TRIGGER sharing_member_au",
+        "DROP TRIGGER sharing_host_member_ai",
+        "DROP TRIGGER sharing_host_member_ad",
+        "DROP TRIGGER sharing_host_member_au",
+        "DROP TRIGGER sharing_invite_ai",
+        "DROP TRIGGER sharing_invite_au",
+        "DROP TRIGGER sharing_invite_seat_ai",
+        "DROP TRIGGER sharing_invite_seat_ad",
+        "DROP TABLE workspace_invite_seat",
+        "DROP TABLE workspace_sharing_summary",
+        "DELETE FROM _sqlx_migrations WHERE version = 134",
+    ] {
+        sqlx::query(sql)
+            .execute(store.write_pool())
+            .await
+            .unwrap_or_else(|e| panic!("rewind `{sql}`: {e}"));
+    }
+}
+
 /// Migration 0125 applies cleanly on an existing, populated database: after
 /// rewinding to the 0124 schema with two workspaces present, reopening the
 /// store mints the primary principal and makes it owner (and legacy author)
@@ -8149,10 +8177,17 @@ async fn principals_migration_backfills_existing_workspaces() {
     let ws_b = WorkspaceId::from("ws-mig-b");
     {
         let store = Store::open(&tmp.path).await.expect("open store");
-        // 0130 re-widens the recreated `principal` (and `workspace_invite`),
-        // so it is rewound too.
+        rewind_sharing_projection(&store).await;
+        // 0130 re-widens the recreated principal/invite tables; 0133 adds
+        // host tables and triggers referencing principal. Rewind both before
+        // removing the principal table, then let the real migrations replay.
         for sql in [
-            "DELETE FROM _sqlx_migrations WHERE version IN (125, 126, 130)",
+            "DELETE FROM _sqlx_migrations WHERE version IN (125, 126, 130, 133)",
+            "DROP TABLE host_invite",
+            "DROP TABLE host_member",
+            "DROP TABLE principal_revocation",
+            "DROP TABLE host_membership_state",
+            "DROP INDEX workspace_invite_issuer_idx",
             "ALTER TABLE workspace_invite DROP COLUMN pin_identity_provider",
             "ALTER TABLE workspace_invite DROP COLUMN pin_instance_host",
             "ALTER TABLE workspace_invite DROP COLUMN pin_external_user_id",
@@ -8205,6 +8240,12 @@ async fn principals_migration_backfills_existing_workspaces() {
         assert_eq!(members.len(), 1, "{ws} has exactly the owner membership");
         assert_eq!(members[0].principal_id, primary.id);
         assert_eq!(members[0].role, WorkspaceRole::Owner);
+        let summaries = store
+            .workspace_membership_summaries(Some(&primary.id), std::slice::from_ref(ws))
+            .await
+            .expect("sharing projection replayed");
+        assert_eq!(summaries[ws].member_count, 1);
+        assert_eq!(summaries[ws].open_invite_count, 0);
     }
 }
 
@@ -9443,7 +9484,16 @@ async fn invite_reusable_migration_keeps_pre_upgrade_redeemed_links_exhausted() 
     assert_eq!(open_ids, ["pre-open"]);
     assert_eq!(
         store
-            .join_workspace_by_invite("pre-unpinned", &ws, &guest_identity(78), "cred-78", None, 8)
+            .join_workspace_by_invite(
+                "pre-unpinned",
+                &ws,
+                &guest_identity(78),
+                crate::HostJoinCredential::Proof {
+                    token_hash: "cred-78",
+                    authorization_generation: 0
+                },
+                8
+            )
             .await
             .expect("join"),
         crate::InviteJoinOutcome::Closed,
@@ -9451,7 +9501,16 @@ async fn invite_reusable_migration_keeps_pre_upgrade_redeemed_links_exhausted() 
     );
     assert!(matches!(
         store
-            .join_workspace_by_invite("pre-open", &ws, &guest_identity(78), "cred-78", None, 8)
+            .join_workspace_by_invite(
+                "pre-open",
+                &ws,
+                &guest_identity(78),
+                crate::HostJoinCredential::Proof {
+                    token_hash: "cred-78",
+                    authorization_generation: 0
+                },
+                8
+            )
             .await
             .expect("join"),
         crate::InviteJoinOutcome::Joined(_)
@@ -9479,6 +9538,7 @@ async fn principal_identity_migration_backfills_github_rows() {
     {
         let store = Store::open(&tmp.path).await.expect("open store");
         let primary = store.get_primary_principal().await.expect("primary").id;
+        rewind_sharing_projection(&store).await;
         for sql in [
             "DELETE FROM _sqlx_migrations WHERE version = 130",
             "DROP INDEX principal_identity_uq",
@@ -9589,6 +9649,16 @@ async fn principal_identity_migration_backfills_github_rows() {
         .expect("row");
     assert_eq!(open.pin_identity, None);
     assert!(open.is_reusable());
+    assert_eq!(
+        store
+            .count_workspace_guests(&ws)
+            .await
+            .expect("sharing projection replayed"),
+        crate::WorkspaceGuestCount {
+            collaborators: 0,
+            open_invites: 2
+        }
+    );
 
     // The partial unique index rejects a second row with the same triple,
     // whether it is given as the triple or as the bare github id.
@@ -9654,7 +9724,16 @@ async fn principal_identity_migration_backfills_github_rows() {
         .await
         .expect("insert invite");
     let joined = store
-        .join_workspace_by_invite("inv-join", &ws, &gitlab, "cred-lab", None, 8)
+        .join_workspace_by_invite(
+            "inv-join",
+            &ws,
+            &gitlab,
+            crate::HostJoinCredential::Proof {
+                token_hash: "cred-lab",
+                authorization_generation: 0,
+            },
+            8,
+        )
         .await
         .expect("join");
     assert!(
@@ -9698,8 +9777,10 @@ async fn join_workspace_by_invite_enforces_the_guest_cap_in_transaction() {
                     &invite,
                     &ws,
                     &guest_identity(github_user_id),
-                    &format!("cred-{invite}-{github_user_id}"),
-                    None,
+                    crate::HostJoinCredential::Proof {
+                        token_hash: &format!("cred-{invite}-{github_user_id}"),
+                        authorization_generation: 0,
+                    },
                     cap,
                 )
                 .await
@@ -9840,6 +9921,9 @@ async fn join_workspace_by_invite_enforces_the_guest_cap_in_transaction() {
             }
             crate::InviteJoinOutcome::WorkspaceArchived => {
                 panic!("an active workspace was reported archived")
+            }
+            crate::InviteJoinOutcome::AccessRevoked | crate::InviteJoinOutcome::PinMismatch => {
+                panic!("unexpected admission refusal")
             }
         }
     }
@@ -10024,8 +10108,10 @@ async fn add_workspace_collaborator_within_cap_is_atomic() {
                     "race",
                     &ws,
                     &guest_identity(500 + n),
-                    &format!("cred-race-{n}"),
-                    None,
+                    crate::HostJoinCredential::Proof {
+                        token_hash: &format!("cred-race-{n}"),
+                        authorization_generation: 0,
+                    },
                     4,
                 )
                 .await
@@ -10149,7 +10235,16 @@ async fn archived_workspace_refuses_member_add_invite_mint_and_join() {
     let before = store.count_principals().await.expect("count");
     assert_eq!(
         store
-            .join_workspace_by_invite("smuggled", &ws, &guest_identity(502), "cred-502", None, 8)
+            .join_workspace_by_invite(
+                "smuggled",
+                &ws,
+                &guest_identity(502),
+                crate::HostJoinCredential::Proof {
+                    token_hash: "cred-502",
+                    authorization_generation: 0
+                },
+                8
+            )
             .await
             .expect("join"),
         crate::InviteJoinOutcome::WorkspaceArchived
@@ -10184,7 +10279,16 @@ async fn archived_workspace_refuses_member_add_invite_mint_and_join() {
     );
     assert!(matches!(
         store
-            .join_workspace_by_invite("smuggled", &ws, &guest_identity(502), "cred-502", None, 8)
+            .join_workspace_by_invite(
+                "smuggled",
+                &ws,
+                &guest_identity(502),
+                crate::HostJoinCredential::Proof {
+                    token_hash: "cred-502",
+                    authorization_generation: 0
+                },
+                8
+            )
             .await
             .expect("join"),
         crate::InviteJoinOutcome::Joined(_)
@@ -10323,7 +10427,16 @@ async fn join_workspace_by_invite_refuses_the_primary_principals_account() {
     let before = store.count_principals().await.expect("count");
 
     let outcome = store
-        .join_workspace_by_invite("self", &ws, &guest_identity(7), "cred-self", None, 8)
+        .join_workspace_by_invite(
+            "self",
+            &ws,
+            &guest_identity(7),
+            crate::HostJoinCredential::Proof {
+                token_hash: "cred-self",
+                authorization_generation: 0,
+            },
+            8,
+        )
         .await
         .expect("join");
     assert_eq!(outcome, crate::InviteJoinOutcome::OwnerSelfJoin);
@@ -10370,159 +10483,46 @@ async fn join_workspace_by_invite_refuses_the_primary_principals_account() {
     );
 }
 
-/// A join that names `rotate_from_hash` consumes that credential in the same
-/// transaction as the new one lands, and only when it is an active
-/// credential of the joining principal: a foreign hash refuses the join as
-/// `CredentialInvalid` (nothing written, foreign row untouched), and a
-/// refused join (closed invite) revokes nothing.
+/// Returning admission reuses its active credential; a revoked bearer grants
+/// no new workspace access and leaves the next invitation open.
 #[tokio::test]
-async fn join_workspace_by_invite_rotates_the_presented_credential() {
+async fn join_workspace_by_invite_reuses_and_rechecks_the_presented_credential() {
     let tmp = TempDb::new();
-    let store = Store::open(&tmp.path).await.expect("open store");
-    let (ws, other) = (WorkspaceId::new(), WorkspaceId::new());
-    for id in [&ws, &other] {
-        store
-            .insert_workspace(&sample_workspace(id, "Rotating", false))
-            .await
-            .expect("insert ws");
-    }
-    let primary = store.get_primary_principal().await.expect("primary").id;
-    for id in ["first", "second", "third", "closed"] {
-        store
-            .insert_workspace_invite(&guest_invite(id, &ws, &primary))
-            .await
-            .expect("insert invite");
-    }
+    let store = Store::open(&tmp.path).await.unwrap();
+    let primary = store.get_primary_principal().await.unwrap();
+    let person = guest_identity(42);
+    store.upsert_principal(&person).await.unwrap();
     store
-        .insert_workspace_invite(&guest_invite("elsewhere", &other, &primary))
+        .insert_principal_credential(&person.id, "kept")
         .await
-        .expect("insert invite");
-
-    let join = |invite: &str, github_user_id: i64, cred: &str, rotate: Option<&str>| {
-        let (store, invite, cred) = (store.clone(), invite.to_string(), cred.to_string());
-        let rotate = rotate.map(str::to_string);
-        let ws = ws.clone();
-        async move {
-            store
-                .join_workspace_by_invite(
-                    &invite,
-                    &ws,
-                    &guest_identity(github_user_id),
-                    &cred,
-                    rotate.as_deref(),
-                    8,
-                )
-                .await
-                .expect("join")
-        }
-    };
-    let is_active = |hash: &str| {
-        let (store, hash) = (store.clone(), hash.to_string());
-        async move {
-            store
-                .lookup_principal_credential(&hash)
-                .await
-                .expect("lookup")
-                .expect("credential row")
-                .is_active()
-        }
-    };
-
-    // First join: nothing to rotate from.
-    let crate::InviteJoinOutcome::Joined(guest) = join("first", 1, "cred-a", None).await else {
-        panic!("first join");
-    };
-    // Another account's credential, to prove a foreign hash is untouched.
-    let crate::InviteJoinOutcome::Joined(_) = store
-        .join_workspace_by_invite(
-            "elsewhere",
-            &other,
-            &guest_identity(2),
-            "cred-foreign",
-            None,
-            8,
-        )
-        .await
-        .expect("join")
-    else {
-        panic!("foreign join");
-    };
-
-    // Returning join presenting `cred-a`: `cred-b` lands and `cred-a` flips
-    // in one transaction; the outcome says no membership was added.
-    let crate::InviteJoinOutcome::Rejoined(again) =
-        join("second", 1, "cred-b", Some("cred-a")).await
-    else {
-        panic!("second join");
-    };
-    assert_eq!(again.id, guest.id);
-    assert!(!is_active("cred-a").await, "presented credential revoked");
-    assert!(is_active("cred-b").await, "fresh credential active");
-    assert_eq!(
+        .unwrap();
+    for n in 0..2 {
+        let ws = WorkspaceId::new();
         store
-            .list_principal_credentials(&guest.id)
+            .insert_workspace(&sample_workspace(&ws, "Shared", false))
             .await
-            .expect("list")
-            .iter()
-            .filter(|c| c.is_active())
-            .count(),
-        1,
-        "exactly one active credential after the rotation"
-    );
-
-    // A hash of another principal is not this guest's to consume: the join
-    // is refused, the foreign row stays active, the invite stays open and no
-    // credential is minted.
-    assert_eq!(
-        join("third", 1, "cred-x", Some("cred-foreign")).await,
-        crate::InviteJoinOutcome::CredentialInvalid
-    );
-    assert!(
-        is_active("cred-foreign").await,
-        "foreign credential untouched"
-    );
-    assert_eq!(
+            .unwrap();
+        let id = format!("join-{n}");
         store
-            .lookup_principal_credential("cred-x")
+            .insert_workspace_invite(&guest_invite(&id, &ws, &primary.id))
             .await
-            .expect("lookup"),
-        None
-    );
-    assert!(store
-        .get_workspace_invite("third")
-        .await
-        .expect("get")
-        .expect("row")
-        .redeemed_at
-        .is_none());
-    // The same invite still admits the guest with its live credential.
-    let crate::InviteJoinOutcome::Rejoined(_) = join("third", 1, "cred-c", Some("cred-b")).await
-    else {
-        panic!("third join");
-    };
-    assert!(!is_active("cred-b").await);
-    assert!(is_active("cred-c").await);
-
-    // A refused join rotates nothing.
-    assert!(store
-        .revoke_workspace_invite("closed")
-        .await
-        .expect("revoke"));
-    assert_eq!(
-        join("closed", 1, "cred-d", Some("cred-c")).await,
-        crate::InviteJoinOutcome::Closed
-    );
-    assert!(
-        is_active("cred-c").await,
-        "refused join keeps the credential"
-    );
-    assert_eq!(
-        store
-            .lookup_principal_credential("cred-d")
+            .unwrap();
+        let result = store
+            .join_workspace_by_invite(
+                &id,
+                &ws,
+                &person,
+                crate::HostJoinCredential::Existing { token_hash: "kept" },
+                8,
+            )
             .await
-            .expect("lookup"),
-        None
-    );
+            .unwrap();
+        assert!(matches!(result, crate::InviteJoinOutcome::Joined(_)));
+    }
+    let rows = store.list_principal_credentials(&person.id).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].is_active());
+    assert_eq!(rows[0].token_hash, "kept");
 }
 
 /// The presented credential is validated inside the join transaction, not
@@ -10555,7 +10555,16 @@ async fn join_workspace_by_invite_refuses_a_credential_revoked_before_the_join()
             .expect("insert invite");
     }
     let crate::InviteJoinOutcome::Joined(guest) = store
-        .join_workspace_by_invite("first", &ws, &guest_identity(1), "cred-a", None, 8)
+        .join_workspace_by_invite(
+            "first",
+            &ws,
+            &guest_identity(1),
+            crate::HostJoinCredential::Proof {
+                token_hash: "cred-a",
+                authorization_generation: 0,
+            },
+            8,
+        )
         .await
         .expect("first join")
     else {
@@ -10581,9 +10590,10 @@ async fn join_workspace_by_invite_refuses_a_credential_revoked_before_the_join()
                 "returning",
                 &other,
                 &guest_identity(1),
-                "cred-b",
-                Some("cred-a"),
-                8,
+                crate::HostJoinCredential::Existing {
+                    token_hash: "cred-a"
+                },
+                8
             )
             .await
             .expect("join"),
@@ -10630,9 +10640,10 @@ async fn join_workspace_by_invite_refuses_a_credential_revoked_before_the_join()
                 "unknown",
                 &other,
                 &guest_identity(1),
-                "cred-c",
-                Some("cred-never"),
-                8,
+                crate::HostJoinCredential::Existing {
+                    token_hash: "cred-never"
+                },
+                8
             )
             .await
             .expect("join"),
@@ -10645,9 +10656,10 @@ async fn join_workspace_by_invite_refuses_a_credential_revoked_before_the_join()
                 "fresh-account",
                 &other,
                 &guest_identity(2),
-                "cred-d",
-                Some("cred-a"),
-                8,
+                crate::HostJoinCredential::Existing {
+                    token_hash: "cred-a"
+                },
+                8
             )
             .await
             .expect("join"),
@@ -10662,122 +10674,49 @@ async fn join_workspace_by_invite_refuses_a_credential_revoked_before_the_join()
 /// credential is minted, exactly one active credential remains and the
 /// loser's invite stays open. Repeated to cover both orderings.
 #[tokio::test]
-async fn join_workspace_by_invite_consumes_the_presented_credential_once_under_contention() {
+async fn join_workspace_by_invite_concurrent_accepts_keep_the_shared_bearer() {
     let tmp = TempDb::new();
-    let store = Store::open(&tmp.path).await.expect("open store");
-    let primary = store.get_primary_principal().await.expect("primary").id;
-    let ws = WorkspaceId::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let primary = store.get_primary_principal().await.unwrap();
+    let person = guest_identity(42);
+    store.upsert_principal(&person).await.unwrap();
     store
-        .insert_workspace(&sample_workspace(&ws, "Home", false))
+        .insert_principal_credential(&person.id, "kept")
         .await
-        .expect("insert ws");
-    store
-        .insert_workspace_invite(&guest_invite("first", &ws, &primary))
-        .await
-        .expect("insert invite");
-    let crate::InviteJoinOutcome::Joined(guest) = store
-        .join_workspace_by_invite("first", &ws, &guest_identity(1), "cred-0", None, 8)
-        .await
-        .expect("first join")
-    else {
-        panic!("first join");
-    };
-    let active = |store: &Store| {
-        let (store, guest) = (store.clone(), guest.id.clone());
-        async move {
+        .unwrap();
+    let mut joins = Vec::new();
+    for n in 0..8 {
+        let ws = WorkspaceId::new();
+        store
+            .insert_workspace(&sample_workspace(&ws, "Concurrent", false))
+            .await
+            .unwrap();
+        let id = format!("join-{n}");
+        store
+            .insert_workspace_invite(&guest_invite(&id, &ws, &primary.id))
+            .await
+            .unwrap();
+        let (store, person) = (store.clone(), person.clone());
+        joins.push(tokio::spawn(async move {
             store
-                .list_principal_credentials(&guest)
+                .join_workspace_by_invite(
+                    &id,
+                    &ws,
+                    &person,
+                    crate::HostJoinCredential::Existing { token_hash: "kept" },
+                    8,
+                )
                 .await
-                .expect("list")
-                .into_iter()
-                .filter(intent_core::PrincipalCredential::is_active)
-                .map(|c| c.token_hash)
-                .collect::<Vec<_>>()
-        }
-    };
-    let mut presented = "cred-0".to_string();
-    for round in 0..8 {
-        let (a, b) = (WorkspaceId::new(), WorkspaceId::new());
-        let (inv_a, inv_b) = (format!("a{round}"), format!("b{round}"));
-        for (ws, inv) in [(&a, &inv_a), (&b, &inv_b)] {
-            store
-                .insert_workspace(&sample_workspace(ws, "Contended", false))
-                .await
-                .expect("insert ws");
-            store
-                .insert_workspace_invite(&guest_invite(inv, ws, &primary))
-                .await
-                .expect("insert invite");
-        }
-        let (fresh_a, fresh_b) = (format!("fresh-a{round}"), format!("fresh-b{round}"));
-        let join = |inv: String, ws: WorkspaceId, fresh: String| {
-            let (store, presented) = (store.clone(), presented.clone());
-            tokio::spawn(async move {
-                store
-                    .join_workspace_by_invite(
-                        &inv,
-                        &ws,
-                        &guest_identity(1),
-                        &fresh,
-                        Some(&presented),
-                        8,
-                    )
-                    .await
-                    .expect("join")
-            })
-        };
-        let (ra, rb) = tokio::join!(
-            join(inv_a.clone(), a.clone(), fresh_a.clone()),
-            join(inv_b.clone(), b.clone(), fresh_b.clone())
-        );
-        let outcomes = [
-            (ra.expect("task a"), &inv_a, &a, &fresh_a),
-            (rb.expect("task b"), &inv_b, &b, &fresh_b),
-        ];
-        let winners = outcomes
-            .iter()
-            .filter(|(o, ..)| matches!(o, crate::InviteJoinOutcome::Joined(_)))
-            .count();
-        let losers = outcomes
-            .iter()
-            .filter(|(o, ..)| *o == crate::InviteJoinOutcome::CredentialInvalid)
-            .count();
-        assert_eq!((winners, losers), (1, 1), "round {round}: {outcomes:?}");
-        for (outcome, inv, ws, fresh) in &outcomes {
-            let joined = matches!(outcome, crate::InviteJoinOutcome::Joined(_));
-            assert_eq!(
-                store
-                    .lookup_principal_credential(fresh)
-                    .await
-                    .expect("lookup")
-                    .is_some(),
-                joined,
-                "round {round}: only the winner mints"
-            );
-            assert_eq!(
-                store
-                    .get_workspace_invite(inv)
-                    .await
-                    .expect("get")
-                    .expect("row")
-                    .redeemed_at
-                    .is_some(),
-                joined,
-                "round {round}: only the winner redeems"
-            );
-            assert_eq!(
-                store
-                    .get_workspace_member_role(ws, &guest.id)
-                    .await
-                    .expect("role")
-                    .is_some(),
-                joined,
-                "round {round}: only the winner joins"
-            );
-        }
-        let remaining = active(&store).await;
-        assert_eq!(remaining.len(), 1, "round {round}: {remaining:?}");
-        assert_ne!(remaining[0], presented, "round {round}: presented consumed");
-        presented = remaining.into_iter().next().expect("one active");
+                .unwrap()
+        }));
     }
+    for join in joins {
+        assert!(matches!(
+            join.await.unwrap(),
+            crate::InviteJoinOutcome::Joined(_)
+        ));
+    }
+    let rows = store.list_principal_credentials(&person.id).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].is_active());
 }

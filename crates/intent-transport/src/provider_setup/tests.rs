@@ -37,6 +37,7 @@ async fn every_action_rejects_remote_and_non_app_connections_before_work() {
             let mut connection = Connection {
                 authorized,
                 operation: None,
+                last_status: None,
             };
             let result = call(
                 &mut connection,
@@ -58,6 +59,7 @@ async fn status_has_no_side_effects_and_operation_ids_cannot_cross_connections()
     let mut connection = Connection {
         authorized: true,
         operation: None,
+        last_status: None,
     };
     let result = call(
         &mut connection,
@@ -86,6 +88,7 @@ async fn notifications_do_not_start_setup() {
     let mut connection = Connection {
         authorized: true,
         operation: None,
+        last_status: None,
     };
     let req=classify(&json!({"jsonrpc":"2.0","method":"providers.setup.start","params":{"providerId":"antigravity"}})).unwrap();
     let (tx, _) = tokio::sync::mpsc::channel(1);

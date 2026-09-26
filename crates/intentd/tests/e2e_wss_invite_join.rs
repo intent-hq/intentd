@@ -8,7 +8,7 @@
 //! GitHub identity and `workspace.get` the collaborator role → the same
 //! guest previews a second workspace's link with `invite.inspect` and joins
 //! it with `invite.accept` on that credential (no GitHub call; the presented
-//! credential is rotated out) → a third workspace is joined by gist proof
+//! credential is reused) → a third workspace is joined by gist proof
 //! again, exercising every proof refusal → the owner's `github.connect`
 //! authorised as a different account is refused (`identity-locked`) while
 //! the guest depends on the primary identity → the owner removes the member →
@@ -122,6 +122,9 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
     cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
+        // Keep heartbeat-reaper evidence in retained failure logs: a provider
+        // error and a later socket EOF do not establish the same cause.
+        .env("RUST_LOG", "info,intent_transport::ws=debug")
         .env_remove("GH_TOKEN")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
@@ -318,6 +321,7 @@ async fn prove(
 /// Pump a subscriber until a `workspace:updated` event whose `changes`
 /// satisfy `pred` arrives (bounded).
 async fn await_workspace_updated(ws: &mut Ws, what: &str, pred: impl Fn(&Value) -> bool) -> Value {
+    eprintln!("await workspace:updated ({what})");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let remaining = deadline
@@ -340,7 +344,7 @@ async fn await_workspace_updated(ws: &mut Ws, what: &str, pred: impl Fn(&Value) 
                 let _ = ws.send(Message::Pong(p)).await;
             }
             Some(Ok(_)) => {}
-            other => panic!("expected text frame, got {other:?}"),
+            other => panic!("workspace:updated ({what}): expected text frame, got {other:?}"),
         }
     }
 }
@@ -686,6 +690,23 @@ async fn invite_link_identity_join_and_removal_over_wss() {
 
     // OWNER: a workspace, plus a subscriber connection on workspace:updated.
     let mut owner = connect_ws(port, cfg.clone(), TOKEN).await;
+    // This fixture exercises legacy pin defaults from the cached primary.
+    // Invite issuance no longer synchronously links a repository profile.
+    let expected_owner_id = OWNER_ID.to_string();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let me = wss_rpc(&mut owner, 199, "principal.me", json!({})).await;
+            if me["result"]["identity"]["externalUserId"].as_str()
+                == Some(expected_owner_id.as_str())
+            {
+                break;
+            }
+            // timing-guard: wait for the configured fixture's startup profile refresh
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("primary startup profile refresh");
     let v = wss_rpc(
         &mut owner,
         1,
@@ -950,9 +971,8 @@ async fn invite_link_identity_join_and_removal_over_wss() {
     //     `invite.accept` on the credential minted in 5 — no GitHub call at
     //     all: the mock's flow counter stays where step 5 left it. A bogus
     //     credential is `credential-invalid`. The result is the phase-2
-    //     shape with a fresh credential for the same principal; the
-    //     presented credential is rotated out (it no longer upgrades, while
-    //     the connection it already opened stays bound), and the owner's
+    //     shape with the same credential and principal; the bearer still
+    //     upgrades and the connection it already opened stays bound. The owner's
     //     subscriber sees the membership change on the second workspace.
     let flows_before = mock.flows.load(Ordering::SeqCst);
     let v = wss_rpc(
@@ -1034,7 +1054,7 @@ async fn invite_link_identity_join_and_removal_over_wss() {
     assert_eq!(r["workspaceId"], json!(second_ws));
     let guest_token_2 = r["token"].as_str().expect("credential").to_string();
     assert_eq!(guest_token_2.len(), 64);
-    assert_ne!(guest_token_2, guest_token);
+    assert_eq!(guest_token_2, guest_token);
     assert!(r.get("hostname").is_none(), "{r}");
     assert_eq!(
         mock.flows.load(Ordering::SeqCst),
@@ -1049,12 +1069,11 @@ async fn invite_link_identity_join_and_removal_over_wss() {
     assert_eq!(ev["data"]["workspaceId"], json!(second_ws));
     assert_eq!(ev["data"]["changes"]["members"], json!(true));
 
-    // The fresh credential connects; the rotated-out one no longer upgrades,
-    // but the connection it already opened is still bound.
+    // The reused credential connects and its existing connection stays bound.
     let line = upgrade_status_line(port, cfg.clone(), &guest_token).await;
     assert!(
-        line.starts_with("HTTP/1.1 401"),
-        "rotated-out credential upgrade: {line}"
+        line.starts_with("HTTP/1.1 101"),
+        "reused credential upgrade: {line}"
     );
     let mut guest2 = connect_ws(port, cfg.clone(), &guest_token_2).await;
     let v = wss_rpc(&mut guest2, 70, "principal.me", json!({})).await;
@@ -1383,8 +1402,8 @@ async fn invite_link_identity_join_and_removal_over_wss() {
     assert_eq!(remaining, expected, "the second and third remain: {v}");
 
     // 8. principal.revokeSelf: both live credentials (the one `invite.accept`
-    //    rotated in and the one `invite.prove` minted in 6c — the one minted
-    //    in 5 was rotated out in 6a) are revoked, the remaining memberships (the
+    //    reused from 5 and the one `invite.prove` minted in 6c) are revoked,
+    //    the remaining memberships (the
     //    second and third workspaces) are left, the connection is closed by
     //    the daemon (policy close), and no token authenticates an upgrade.
     let v = wss_rpc(&mut guest, 35, "principal.revokeSelf", json!({})).await;

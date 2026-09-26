@@ -528,7 +528,9 @@ mod tests {
     #[test]
     fn discussion_guidance_preserves_previous_doctrine_and_unrelated_sections() {
         let previous = crate::harness::resolve_entry("2.7");
-        let current = crate::harness::latest_entry();
+        // This regression compares the v2.8 doctrine change with v2.7,
+        // independently of later harness versions and their text surfaces.
+        let current = crate::harness::resolve_entry("2.8");
         assert_eq!(current.version, "2.8");
         assert_eq!(
             previous.doctrine.instructions.common,

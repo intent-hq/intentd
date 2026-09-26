@@ -181,6 +181,14 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
          the owner from the target's primary principal",
     ),
     (
+        "workspace_sharing_summary",
+        "derived sharing counters; the target's grant/invitation triggers rebuild them",
+    ),
+    (
+        "workspace_invite_seat",
+        "derived daemon-local invitation reservations; no invitations transfer",
+    ),
+    (
         "workspace_member",
         "rows FK onto daemon-local `principal` ids; the target's workspace insert \
          trigger recreates the owner membership for its own primary principal",
@@ -193,6 +201,22 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
         "workspace_invite",
         "invite links FK onto daemon-local `principal` ids and hash secrets minted \
          against THIS daemon; an open invite is meaningless on the target",
+    ),
+    (
+        "host_member",
+        "host authority never transfers with a workspace",
+    ),
+    (
+        "host_membership_state",
+        "host-local authority counters and revocation clock",
+    ),
+    (
+        "principal_revocation",
+        "host-local principal revocation generations",
+    ),
+    (
+        "host_invite",
+        "host-local invitations and secrets, unrelated to workspace transfer",
     ),
     (
         "agent_message_fts",

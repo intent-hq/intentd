@@ -135,10 +135,9 @@ pub(crate) fn classify(value: &Value) -> Option<BrowserRequest> {
 /// envelope, forwards via the reverse channel, and shapes the FE's reply; the
 /// registry methods run against `tabs` (persistence + the connection's host
 /// identity). Returns `None` for a notification (no `id`), which gets no
-/// response. Browser tabs are owner-only (multiplayer w3): a non-administrator
-/// connection gets `-32003` for every `browser.*` method, `listTabs`
-/// included — the allowlist in `process_frame` refuses these first; this is
-/// the defence-in-depth gate at the surface itself.
+/// response. Browser access requires current host management authority.
+/// Guests are refused at both the catalog and this surface; member requests
+/// also resolve the actual workspace, keeping Chief private.
 pub(crate) async fn handle(
     req: BrowserRequest,
     reverse: &ReverseChannel,
@@ -150,7 +149,7 @@ pub(crate) async fn handle(
         id_echo,
         params,
     } = req;
-    if crate::context::is_non_administrator_caller() {
+    if !crate::context::may_manage_workspaces(tabs.api).await {
         return id_present.then(|| {
             error_frame(
                 &id_echo,
@@ -158,6 +157,20 @@ pub(crate) async fn handle(
                 crate::catalog::FORBIDDEN_ERROR_MESSAGE,
             )
         });
+    }
+    if matches!(method, BrowserMethod::Exec) && crate::context::is_non_administrator_caller() {
+        let access = match required_str(&params, "workspaceId") {
+            Ok(ws) => tabs
+                .api
+                .get_workspace(WorkspaceId::from(ws))
+                .await
+                .map(|_| ())
+                .map_err(|e| domain_err(&e)),
+            Err(e) => Err(e),
+        };
+        if let Err(error) = access {
+            return id_present.then(|| browser_error_frame(&id_echo, error));
+        }
     }
     let frame = match method {
         BrowserMethod::Exec => match exec(&params, reverse).await {
@@ -177,22 +190,36 @@ pub(crate) async fn handle(
     Some(frame)
 }
 
-fn frame_result(id_echo: &Value, result: Result<Value, (i32, String)>) -> String {
-    match result {
-        Ok(v) => success_frame(id_echo, &v),
-        Err((code, message)) => error_frame(id_echo, code, &message),
+fn browser_error_frame(id: &Value, (code, message, data): (i32, String, Option<Value>)) -> String {
+    match data {
+        Some(data) => crate::events::error_frame_with_data(id, code, &message, &data),
+        None => error_frame(id, code, &message),
     }
 }
 
-fn invalid(message: impl Into<String>) -> (i32, String) {
-    (browser_ops::INVALID_PARAMS, message.into())
+fn frame_result(id_echo: &Value, result: Result<Value, (i32, String, Option<Value>)>) -> String {
+    match result {
+        Ok(v) => success_frame(id_echo, &v),
+        Err(error) => browser_error_frame(id_echo, error),
+    }
 }
 
-fn domain_err(e: &intent_core::Error) -> (i32, String) {
-    (e.code(), e.to_string())
+fn invalid(message: impl Into<String>) -> (i32, String, Option<Value>) {
+    (browser_ops::INVALID_PARAMS, message.into(), None)
 }
 
-fn required_str<'a>(params: &'a Map<String, Value>, name: &str) -> Result<&'a str, (i32, String)> {
+fn domain_err(e: &intent_core::Error) -> (i32, String, Option<Value>) {
+    (
+        e.code(),
+        e.to_string(),
+        matches!(e, intent_core::Error::NotFound(_)).then(|| json!({"code":"not-found"})),
+    )
+}
+
+fn required_str<'a>(
+    params: &'a Map<String, Value>,
+    name: &str,
+) -> Result<&'a str, (i32, String, Option<Value>)> {
     params
         .get(name)
         .and_then(Value::as_str)
@@ -202,7 +229,10 @@ fn required_str<'a>(params: &'a Map<String, Value>, name: &str) -> Result<&'a st
 
 /// The host-only methods require a hello'd connection: the reporting host is
 /// the connection's logical `clientId`, never a wire parameter.
-fn require_host(method: &str, tabs: &TabContext<'_>) -> Result<ClientId, (i32, String)> {
+fn require_host(
+    method: &str,
+    tabs: &TabContext<'_>,
+) -> Result<ClientId, (i32, String, Option<Value>)> {
     tabs.client_id.cloned().ok_or_else(|| {
         invalid(format!(
             "{method}: client.hello is required before hosting tabs"
@@ -217,7 +247,7 @@ fn parse_tab_input(
     value: &Value,
     workspace_id: Option<&str>,
     what: &str,
-) -> Result<BrowserTabInput, (i32, String)> {
+) -> Result<BrowserTabInput, (i32, String, Option<Value>)> {
     let Some(obj) = value.as_object() else {
         return Err(invalid(format!(
             "Invalid parameter: {what} must be an object"
@@ -253,7 +283,7 @@ fn parse_tab_input(
 async fn list_tabs(
     params: &Map<String, Value>,
     tabs: &TabContext<'_>,
-) -> Result<Value, (i32, String)> {
+) -> Result<Value, (i32, String, Option<Value>)> {
     let workspace_id = required_str(params, "workspaceId")?;
     let rows = tabs
         .api
@@ -288,7 +318,7 @@ fn decorate_tab(tab: &BrowserTab, presence: &HashMap<ClientId, ClientPresence>) 
 async fn upsert_tab(
     params: &Map<String, Value>,
     tabs: &TabContext<'_>,
-) -> Result<Value, (i32, String)> {
+) -> Result<Value, (i32, String, Option<Value>)> {
     let host = require_host("browser.upsertTab", tabs)?;
     let workspace_id = required_str(params, "workspaceId")?;
     let tab = params
@@ -307,7 +337,7 @@ async fn upsert_tab(
 async fn remove_tab(
     params: &Map<String, Value>,
     tabs: &TabContext<'_>,
-) -> Result<Value, (i32, String)> {
+) -> Result<Value, (i32, String, Option<Value>)> {
     let host = require_host("browser.removeTab", tabs)?;
     let tab_id = required_str(params, "tabId")?;
     tabs.api
@@ -321,7 +351,7 @@ async fn remove_tab(
 async fn sync_tabs(
     params: &Map<String, Value>,
     tabs: &TabContext<'_>,
-) -> Result<Value, (i32, String)> {
+) -> Result<Value, (i32, String, Option<Value>)> {
     let host = require_host("browser.syncTabs", tabs)?;
     let snapshot = params
         .get("tabs")
@@ -345,7 +375,7 @@ async fn sync_tabs(
 async fn navigate_tab(
     params: &Map<String, Value>,
     tabs: &TabContext<'_>,
-) -> Result<Value, (i32, String)> {
+) -> Result<Value, (i32, String, Option<Value>)> {
     let tab_id = required_str(params, "tabId")?;
     let url = required_str(params, "url")?;
     tabs.api
@@ -358,7 +388,7 @@ async fn navigate_tab(
 async fn close_tab(
     params: &Map<String, Value>,
     tabs: &TabContext<'_>,
-) -> Result<Value, (i32, String)> {
+) -> Result<Value, (i32, String, Option<Value>)> {
     let tab_id = required_str(params, "tabId")?;
     let force = match params.get("force") {
         None | Some(Value::Null) => false,

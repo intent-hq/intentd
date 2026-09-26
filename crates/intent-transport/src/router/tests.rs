@@ -19,6 +19,61 @@ use super::handle_message;
 
 struct FakeApi;
 
+#[test]
+fn execution_authorization_errors_preserve_typed_codes_and_drop_provider_bodies() {
+    use intent_core::execution::{
+        ExecutionAuthorizationFailure, ExecutionAuthorizationReason, ExecutionResource,
+    };
+    for (source, code, data_code) in [
+        (
+            Error::CloneFailed {
+                category: intent_core::CloneErrorCategory::AuthRequired,
+                detail: "https://secret@forge/private response".into(),
+            },
+            -32603,
+            "auth-required",
+        ),
+        (
+            Error::SourceControlUnauthorized {
+                provider: "github".into(),
+                host: "github.com".into(),
+            },
+            -32603,
+            "source-control-unauthorized",
+        ),
+        (
+            Error::Internal("private provider body".into()),
+            -32603,
+            "host-execution-authorization",
+        ),
+    ] {
+        let authorization = ExecutionAuthorizationFailure::new(
+            ExecutionResource::Git,
+            ExecutionAuthorizationReason::Rejected,
+            Some("github".into()),
+            Some("github.com".into()),
+        );
+        let rpc = super::domain_to_rpc(Error::ExecutionAuthorization {
+            source: Box::new(source),
+            authorization: Box::new(authorization),
+        });
+        assert_eq!(rpc.code, code);
+        let data = rpc.data.unwrap();
+        assert_eq!(data["code"], data_code);
+        assert_eq!(
+            data["executionAuthorization"]["recovery"]["actor"],
+            "host-owner"
+        );
+        assert!(!data.to_string().contains("private"));
+        assert!(!data.to_string().contains("secret@"));
+        assert!(!rpc.message.contains("private"));
+    }
+    let legacy = super::domain_to_rpc(Error::Internal("original".into()));
+    assert_eq!(legacy.data, Some(Value::String("original".into())));
+    let legacy = super::domain_to_rpc(Error::GitAuthorization("original".into()));
+    assert_eq!(legacy.data, Some(Value::String("original".into())));
+}
+
 fn sample_ws() -> Workspace {
     Workspace {
         id: WorkspaceId::from("ws-1"),
@@ -1351,6 +1406,8 @@ impl WorkspaceApi for FakeApi {
         host: Option<String>,
         nonce: String,
         host_label: String,
+        _purpose: Option<String>,
+        _expected_identity: Option<intent_core::PrincipalIdentity>,
     ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             // Sentinel nonces exercise the two typed refusals' wire shapes.
@@ -1380,6 +1437,7 @@ impl WorkspaceApi for FakeApi {
         provider: String,
         host: Option<String>,
         proof_id: String,
+        _purpose: Option<String>,
     ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             Ok(serde_json::json!({

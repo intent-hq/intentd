@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use intent_core::{Error, Result, Script};
+use intent_core::{Error, Result, Script, WorkspaceId};
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
 
@@ -17,6 +17,21 @@ const SCRIPT_COLUMNS: &str = "id, workspace_id, name, command, cwd, env, mode, c
     source, auto_start, created_at, updated_at";
 
 impl Store {
+    /// Resolve a script's durable scope without reading its command or environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database read fails.
+    pub async fn script_workspace(&self, id: &str) -> Result<Option<WorkspaceId>> {
+        let workspace =
+            sqlx::query_scalar::<_, String>("SELECT workspace_id FROM script WHERE id = ?")
+                .bind(id)
+                .fetch_optional(self.read_pool())
+                .await
+                .map_err(|e| Error::Internal(format!("get script workspace failed: {e}")))?;
+        Ok(workspace.map(WorkspaceId::from))
+    }
+
     /// Insert or replace a script definition, keyed on `id` (mirrors the FE
     /// `upsertScript`: an existing id is fully replaced). The replace resets
     /// the `was_running` marker to its default (cleared) — an upserted
@@ -26,10 +41,26 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_script(&self, s: &Script) -> Result<()> {
+        self.upsert_script_with_scope(s, false).await
+    }
+
+    /// Upsert a definition only if its id is new or already belongs to this
+    /// workspace. The scope check and write use a single atomic statement.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` for an id in another workspace, or
+    /// `Error::Internal` if the database operation fails.
+    pub async fn upsert_script_in_workspace(&self, s: &Script) -> Result<()> {
+        self.upsert_script_with_scope(s, true).await
+    }
+
+    async fn upsert_script_with_scope(&self, s: &Script, scoped: bool) -> Result<()> {
         let sql = format!(
-            "INSERT OR REPLACE INTO script ({SCRIPT_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
+            "INSERT OR REPLACE INTO script ({SCRIPT_COLUMNS}) SELECT ?,?,?,?,?,?,?,?,?,?,?,? \
+             WHERE ? = 0 OR NOT EXISTS (SELECT 1 FROM script WHERE id = ? AND workspace_id != ?)"
         );
-        sqlx::query(&sql)
+        let result = sqlx::query(&sql)
             .bind(&s.id)
             .bind(&s.workspace_id)
             .bind(&s.name)
@@ -42,9 +73,15 @@ impl Store {
             .bind(s.auto_start.map(i64::from))
             .bind(&s.created_at)
             .bind(&s.updated_at)
+            .bind(scoped)
+            .bind(&s.id)
+            .bind(&s.workspace_id)
             .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("upsert script failed: {e}")))?;
+        if result.rows_affected() == 0 {
+            return Err(Error::NotFound(format!("script {}", s.id)));
+        }
         Ok(())
     }
 
@@ -116,6 +153,31 @@ impl Store {
             .await
             .map_err(|e| Error::Internal(format!("remove script failed: {e}")))?;
         Ok(res.rows_affected() > 0)
+    }
+
+    /// Delete only the definition in the admitted workspace. Scope validation
+    /// and deletion are one statement, including when an id was moved after
+    /// a caller's earlier runtime lookup.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` for an absent or foreign id, or
+    /// `Error::Internal` if the database operation fails.
+    pub async fn remove_script_in_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &str,
+    ) -> Result<()> {
+        let res = sqlx::query("DELETE FROM script WHERE id = ? AND workspace_id = ?")
+            .bind(id)
+            .bind(workspace_id.as_str())
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("remove script failed: {e}")))?;
+        if res.rows_affected() == 0 {
+            return Err(Error::NotFound(format!("script {id}")));
+        }
+        Ok(())
     }
 
     /// List every persisted script definition (all workspaces), oldest first —

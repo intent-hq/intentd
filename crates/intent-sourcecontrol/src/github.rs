@@ -110,6 +110,23 @@ impl GitHubSourceControl {
         })
     }
 
+    /// Read the authenticated account and actual OAuth grant from the same response.
+    /// An omitted scope header is unknown, not an empty or requested grant.
+    ///
+    /// # Errors
+    /// Returns the same typed API/auth/rate-limit errors as `get_user`.
+    pub async fn get_user_with_scopes(&self) -> Result<(UserIdentity, Option<Vec<String>>)> {
+        use octocrab::FromResponse;
+        let response = octocrab::map_github_error(self.client._get("/user").await?).await?;
+        let scopes = response
+            .headers()
+            .get("x-oauth-scopes")
+            .and_then(|v| v.to_str().ok())
+            .map(crate::device_flow::parse_scopes);
+        let value = Value::from_response(response).await?;
+        Ok((map_user_identity(value)?, scopes))
+    }
+
     /// Build a client with **no** credential (same base URI and timeouts as
     /// [`Self::new`]): the host's fallback for reading a guest's public or
     /// secret proof gist when it holds no GitHub token of its own. Every

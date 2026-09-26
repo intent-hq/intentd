@@ -92,6 +92,16 @@ async fn loaded_bulk_delete_keeps_other_clients_writable_and_events_persisted() 
     let a = seed(&srv, &mut deleting, "loaded deletion a", 3).await;
     let b = seed(&srv, &mut deleting, "loaded deletion b", 3).await;
     let keeper = seed(&srv, &mut probing, "surviving workspace", 0).await;
+    // Seed as the owner, then exercise the same partial/retry/concurrency
+    // lifecycle as an authorized member with no explicit workspace grant.
+    let member = Guest::connect(&srv, &"c7".repeat(32)).await;
+    sqlx::query("INSERT INTO host_member(principal_id,added_at) VALUES (?,?)")
+        .bind(member.principal.id.as_str())
+        .bind(now_iso())
+        .execute(srv.store.write_pool())
+        .await
+        .unwrap();
+    deleting = member.ws;
     let initial_note_events = srv
         .store
         .events_by_workspace(&WorkspaceId::from(keeper.as_str()), 100)

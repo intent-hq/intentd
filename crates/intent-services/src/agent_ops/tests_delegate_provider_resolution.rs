@@ -707,6 +707,25 @@ fn enabled_gate_rejects_explicitly_disabled_providers() {
         .expect("absent map means enabled");
 }
 
+#[test]
+fn enabled_gate_preserves_non_disableable_provider_policy() {
+    // Every current registry entry can be disabled. Exercise the same predicate
+    // with a non-disableable config without changing the production registry.
+    let mut provider = *intent_providers::find_provider("codex").unwrap();
+    let disabled = [(provider.id.to_owned(), false)].into();
+    assert!(super::provider_config_is_disabled(
+        &provider,
+        Some(&disabled)
+    ));
+    provider.can_be_disabled = false;
+    assert!(!super::provider_config_is_disabled(
+        &provider,
+        Some(&disabled)
+    ));
+    assert!(!super::provider_config_is_disabled(&provider, None));
+    assert!(!super::provider_is_disabled("unknown", Some(&disabled)));
+}
+
 /// The turn-start re-home resolver (intent-hq/intent#5737): the
 /// settings-derived default is the target only when it passes the same
 /// availability funnel as the create/delegate front doors; the model is what

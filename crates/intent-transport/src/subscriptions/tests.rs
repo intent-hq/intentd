@@ -242,6 +242,13 @@ fn channel_event_types_are_all_collaborator_visible() {
         assert!(!types.is_empty(), "{channel:?} tails no types");
         let hidden: Vec<&String> = types
             .iter()
+            // A workspace channel consumes the global role invalidation
+            // internally and re-reads caller-scoped rows; it never forwards
+            // the event payload (including the unrelated principal id).
+            .filter(|t| {
+                !(channel == Channel::Workspace
+                    && t.as_str() == intent_core::events::HOST_MEMBERS_CHANGED)
+            })
             .filter(|t| !intent_core::events::is_collaborator_event_type(t))
             .collect();
         assert!(
@@ -820,10 +827,11 @@ fn channel_event_types_full_matrix() {
         "pr:linked",
         "pr:updated",
         "pr:unlinked",
+        "host:members-changed",
     ] {
         assert!(ws.iter().any(|s| s == t), "workspace missing {t}");
     }
-    assert_eq!(ws.len(), 10);
+    assert_eq!(ws.len(), 11);
     // Comment channel — single type.
     assert_eq!(
         channel_event_types(Channel::Comment),
@@ -5063,7 +5071,7 @@ mod channel_membership {
         let principal_id = PrincipalId::new();
         let caller = Caller::Wire {
             principal_id: principal_id.clone(),
-            is_administrator: false,
+            host_role: intent_core::HostRole::Guest,
         };
         (principal_id, caller)
     }
@@ -5125,7 +5133,7 @@ mod channel_membership {
 
         let owner = Caller::Wire {
             principal_id: PrincipalId::new(),
-            is_administrator: true,
+            host_role: intent_core::HostRole::Owner,
         };
         let admin = subscribe(owner, &[STORE_DOWN], chat_subscribe("agent-1")).await;
         assert_eq!(
@@ -5230,7 +5238,7 @@ mod channel_membership {
         let principal_id = PrincipalId::new();
         let owner = Caller::Wire {
             principal_id: principal_id.clone(),
-            is_administrator: true,
+            host_role: intent_core::HostRole::Owner,
         };
         let mut h = subscribe(owner, &[], chat_subscribe("agent-2")).await;
         h.bus
@@ -5478,7 +5486,7 @@ mod channel_membership {
     async fn workspace_administrator_receives_every_tombstone() {
         let owner = Caller::Wire {
             principal_id: PrincipalId::new(),
-            is_administrator: true,
+            host_role: intent_core::HostRole::Owner,
         };
         let mut h = subscribe(owner, &["ws-1"], workspace_subscribe()).await;
         h.bus

@@ -126,6 +126,17 @@ struct OneCredential {
 }
 
 impl WorkspaceApi for OneCredential {
+    fn principal_host_role(
+        &self,
+        principal_id: intent_core::PrincipalId,
+    ) -> intent_core::BoxFuture<'_, Result<intent_core::HostRole>> {
+        let role = if principal_id.0 == "primary" {
+            intent_core::HostRole::Owner
+        } else {
+            intent_core::HostRole::Guest
+        };
+        Box::pin(async move { Ok(role) })
+    }
     fn primary_principal_id(&self) -> intent_core::BoxFuture<'_, Result<intent_core::PrincipalId>> {
         Box::pin(async { Ok(intent_core::PrincipalId("primary".into())) })
     }
@@ -225,7 +236,7 @@ async fn resolved_credential_binds_caller() {
         ResolvedCredential::Legacy.into_caller(&api).await,
         Some(Caller::Wire {
             principal_id: intent_core::PrincipalId("primary".into()),
-            is_administrator: true,
+            host_role: intent_core::HostRole::Owner,
         })
     );
     assert_eq!(
@@ -234,12 +245,20 @@ async fn resolved_credential_binds_caller() {
             .await,
         Some(Caller::Wire {
             principal_id: intent_core::PrincipalId("p-collab".into()),
-            is_administrator: false,
+            host_role: intent_core::HostRole::Guest,
         })
     );
     // No principal store: the legacy token is admitted with no caller bound.
     assert_eq!(
         ResolvedCredential::Legacy.into_caller(&NoPrincipals).await,
+        None
+    );
+    // Even a previously resolved credential is not a caller when durable
+    // authority is now unavailable. The upgrade path rejects this case.
+    assert_eq!(
+        ResolvedCredential::Principal(intent_core::PrincipalId("vanished".into()))
+            .into_caller(&NoPrincipals)
+            .await,
         None
     );
 }

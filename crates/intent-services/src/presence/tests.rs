@@ -167,7 +167,7 @@ async fn member_services(
         .with_event_bus(crate::events::EventBus::new(store.clone()));
     let caller = Caller::Wire {
         principal_id: principal.id,
-        is_administrator: false,
+        host_role: intent_core::HostRole::Guest,
     };
     (store, services, ws, caller)
 }

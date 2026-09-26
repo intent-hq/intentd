@@ -28,6 +28,7 @@ mod draft_repo;
 mod event_repo;
 mod event_subscription_repo;
 mod hook_repo;
+mod host_membership_repo;
 mod idempotency_repo;
 mod known_repo_repo;
 mod mcp_oauth_repo;
@@ -42,6 +43,7 @@ mod principal_repo;
 mod sandbox_repo;
 mod script_repo;
 mod settings_repo;
+mod sharing_projection;
 mod stop_redelivery_repo;
 mod task_agent_link_repo;
 mod tracked_changes_repo;
@@ -68,6 +70,9 @@ pub use delegation_group_repo::PersistedDelegationGroup;
 pub use diffs_repo::NewDiff;
 pub use event_repo::{EventQuery, NewEvent};
 pub use event_subscription_repo::PersistedEventSubscription;
+pub use host_membership_repo::{
+    HostInviteJoinOutcome, HostJoinCredential, HostMemberRemoval, HostMembersSnapshot,
+};
 pub use metrics_repo::{AgentMetricsRow, WorkspaceMetricsRow};
 #[cfg(test)]
 pub(crate) use note_version_repo::MAX_NOTE_VERSIONS;
@@ -76,8 +81,8 @@ pub use pr_monitor_repo::{
     PR_MONITOR_PAUSE_MARKER,
 };
 pub use principal_repo::{
-    ArchivedGuestSweep, CollaboratorAddOutcome, InviteInsertOutcome, InviteJoinOutcome,
-    WorkspaceAuthorFallback, WorkspaceGuestCount,
+    ArchivedGuestSweep, CollaboratorAddOutcome, EffectiveWorkspaceMember, InviteInsertOutcome,
+    InviteJoinOutcome, WorkspaceAuthorFallback, WorkspaceGuestCount,
 };
 pub use sandbox_repo::{Sandbox, SandboxStatus};
 pub use tracked_changes_repo::{NewTrackedChange, TrackedChangeRow};

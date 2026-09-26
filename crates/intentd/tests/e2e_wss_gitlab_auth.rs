@@ -15,6 +15,13 @@
 
 mod common;
 
+#[path = "collaboration_identity/binding.rs"]
+mod collaboration_binding;
+#[path = "collaboration_identity/github.rs"]
+mod collaboration_github;
+#[path = "collaboration_identity/gitlab.rs"]
+mod collaboration_identity;
+
 use std::net::Ipv4Addr;
 use std::path::Path;
 use std::process::Stdio;
@@ -305,6 +312,7 @@ fn read_secrets(path: &Path) -> Value {
 
 #[derive(Default)]
 struct MockFlags {
+    requests: Mutex<Vec<Value>>,
     authorize: AtomicBool,
     unsupported: AtomicBool,
     short_lived: AtomicBool,
@@ -436,6 +444,10 @@ async fn serve_conn(mut stream: TcpStream, flags: Arc<MockFlags>) -> std::io::Re
         || bearer == READ_ONLY_PAT
         || (bearer == ROTATED_ACCESS_TOKEN && !flags.reject_rotated.load(Ordering::SeqCst));
     let route = path.split('?').next().unwrap_or_default();
+    flags.requests.lock().unwrap().push(json!({
+        "method": method, "route": route, "bearer": bearer,
+        "clientId": form_field("client_id"), "grantType": form_field("grant_type")
+    }));
     if method == "GET" && route == "/api/v4/user" {
         flags.user_requests.fetch_add(1, Ordering::SeqCst);
         flags.user_hit.notify_one();
@@ -585,8 +597,8 @@ async fn serve_conn(mut stream: TcpStream, flags: Arc<MockFlags>) -> std::io::Re
 
 /// A booted daemon pointed at `mock`, with the WSS port + pinned client config.
 struct Harness {
-    _data_dir: tempfile::TempDir,
-    _daemon: Daemon,
+    data_dir: tempfile::TempDir,
+    daemon: Daemon,
     secrets_file: std::path::PathBuf,
     /// The daemon's stderr (tracing at `info`).
     log_file: std::path::PathBuf,
@@ -624,8 +636,8 @@ async fn boot_with_env(mock: &MockGitlab, extra_env: &[(&str, &str)]) -> Harness
         .to_string();
     Harness {
         log_file: data_dir.join("daemon.log"),
-        _data_dir: data_dir_guard,
-        _daemon: daemon,
+        data_dir: data_dir_guard,
+        daemon,
         secrets_file,
         port,
         cfg: client_config(&fingerprint),

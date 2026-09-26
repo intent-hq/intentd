@@ -4448,8 +4448,17 @@ pub trait WorkspaceApi: Send + Sync {
         host: Option<String>,
         nonce: String,
         host_label: String,
+        purpose: Option<String>,
+        expected_identity: Option<crate::PrincipalIdentity>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (provider, host, nonce, host_label);
+        let _ = (
+            provider,
+            host,
+            nonce,
+            host_label,
+            purpose,
+            expected_identity,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::source_control_identity_proof_create not implemented".to_string(),
@@ -4469,8 +4478,9 @@ pub trait WorkspaceApi: Send + Sync {
         provider: String,
         host: Option<String>,
         proof_id: String,
+        purpose: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (provider, host, proof_id);
+        let _ = (provider, host, proof_id, purpose);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::source_control_identity_proof_delete not implemented".to_string(),
@@ -4487,6 +4497,94 @@ pub trait WorkspaceApi: Send + Sync {
     // `getUser` quintet above is served as aliases of these with
     // `provider: "github"` pinned and the additive fields projected away.
     // ========================================================================
+
+    /// Collaboration-only `identity.authStatus`; administrator of the local signing-in daemon only.
+    fn identity_auth_status(
+        &self,
+        provider: String,
+        host: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host);
+        Box::pin(async {
+            Err(Error::Internal(
+                "collaboration identity not implemented".into(),
+            ))
+        })
+    }
+
+    /// Collaboration-only `identity.connect`; administrator of the local signing-in daemon only.
+    fn identity_connect(
+        &self,
+        provider: String,
+        host: Option<String>,
+        method: Option<String>,
+        token: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host, method, token);
+        Box::pin(async {
+            Err(Error::Internal(
+                "collaboration identity not implemented".into(),
+            ))
+        })
+    }
+
+    /// Collaboration-only `identity.cancelAuth`; administrator of the local signing-in daemon only.
+    fn identity_cancel_auth(
+        &self,
+        provider: String,
+        host: Option<String>,
+        flow_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host, flow_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "collaboration identity not implemented".into(),
+            ))
+        })
+    }
+
+    /// Collaboration-only `identity.revoke`; administrator of the local signing-in daemon only.
+    fn identity_revoke(
+        &self,
+        provider: String,
+        host: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host);
+        Box::pin(async {
+            Err(Error::Internal(
+                "collaboration identity not implemented".into(),
+            ))
+        })
+    }
+
+    /// Collaboration-only `identity.getUser`; administrator of the local signing-in daemon only.
+    fn identity_get_user(
+        &self,
+        provider: String,
+        host: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host);
+        Box::pin(async {
+            Err(Error::Internal(
+                "collaboration identity not implemented".into(),
+            ))
+        })
+    }
+
+    /// Collaboration-only `identity.select`; administrator of the local signing-in daemon only.
+    fn identity_select(
+        &self,
+        provider: String,
+        host: Option<String>,
+        external_user_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host, external_user_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "collaboration identity not implemented".into(),
+            ))
+        })
+    }
 
     /// `sourceControl.authStatus { provider, host? }`: the `github.authStatus`
     /// shape plus additive `provider`, `host`, `method`
@@ -4592,13 +4690,13 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `principal.list` (direct member add): the host's credentialed guests
+    /// `principal.list` (direct guest add): the host's credentialed people
     /// → `{ principals: [{ principalId, login?, displayName?, avatarUrl?,
-    /// githubUserId? }] }` — every non-primary principal holding at least
+    /// githubUserId?, identity?, hostRole }] }` — every non-primary principal holding at least
     /// one active (non-revoked) credential, by `createdAt`; a guest that
     /// revoked itself is omitted (it cannot connect). No params.
-    /// Owner-only: a per-principal (collaborator) wire caller is
-    /// `Forbidden`; the administrator, agents and the daemon pass.
+    /// Available to the owner and active host members; workspace guests
+    /// are `Forbidden`. Trusted agents and the daemon retain their access.
     fn principal_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async {
             Err(Error::Internal(
@@ -4835,9 +4933,8 @@ pub trait WorkspaceApi: Send + Sync {
     /// next to its hash (migration `0128`) so the owner can copy the link
     /// again later, but it never serialises as a field: this result carries
     /// it exactly once, and afterwards it reaches the wire only inside the
-    /// rebuilt `url` of `workspace_invite_list`. Owner-only.
-    /// Refused with `InviteErrorKind::GithubIdentityRequired` unless the
-    /// owner carries a linked forge identity (github or gitlab); `pin` names
+    /// rebuilt `url` of `workspace_invite_list`. Workspace-manager-only.
+    /// Intent workspace management authority suffices without a forge connection; `pin` names
     /// the login to pin to on `pin.provider` / `pin.host` (both default to
     /// the owner's own identity forge), resolved to its account and stored
     /// as the pin triple (`InviteErrorKind::PinUnknown` when it names no
@@ -4865,7 +4962,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// the additive `url`, the invite's `intent://invite?…` link rebuilt from
     /// the stored secret; `url` is omitted when the row predates the stored
     /// secret or no link can be built right now (listener down, tunnel
-    /// down — invite links are tunnel-only). Owner-only.
+    /// down — invite links are tunnel-only). Workspace-manager-only.
     fn workspace_invite_list(
         &self,
         workspace_id: WorkspaceId,
@@ -4880,7 +4977,7 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `workspace.invite.revoke` (multiplayer w4): revoke an open invite of
     /// `workspace_id` → `{ revoked: bool }` (`false` when already closed).
-    /// Owner-only; an invite of another workspace is `NotFound`.
+    /// Workspace-manager-only; an invite of another workspace is `NotFound`.
     fn workspace_invite_revoke(
         &self,
         workspace_id: WorkspaceId,
@@ -4894,12 +4991,107 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Owner-only roster: primary first, then members by addedAt / principalId.
+    /// Returns `{ members: HostMember[], revision }`, excluding workspace guests.
+    fn host_members_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::host_members_list not implemented".into(),
+            ))
+        })
+    }
+
+    /// Owner-only, pinned, single-use host membership invitation, lasting seven days.
+    /// Provider and nonblank login are required; the transport resolves the tunnel
+    /// envelope before this operation persists anything.
+    fn host_invite_create(&self, pin: InvitePin) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = pin;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::host_invite_create not implemented".into(),
+            ))
+        })
+    }
+
+    /// Owner/member allowlisted execution defaults and credential policy.
+    fn host_execution_context(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::host_execution_context not implemented".into(),
+            ))
+        })
+    }
+
+    /// Internal discovery input: connected-host paths without exposing settings.*.
+    /// Not a wire method. The default supports legacy/test API compositions.
+    fn execution_provider_paths(
+        &self,
+    ) -> BoxFuture<'_, Result<std::collections::HashMap<String, String>>> {
+        Box::pin(async move {
+            let mut paths = std::collections::HashMap::new();
+            if let Ok(value) = self.settings_get("providers.paths".into()).await {
+                if let Some(map) = value.get("value").and_then(serde_json::Value::as_object) {
+                    for (key, value) in map {
+                        if let Some(path) = value.as_str().filter(|s| !s.trim().is_empty()) {
+                            paths.insert(key.clone(), path.to_string());
+                        }
+                    }
+                }
+            }
+            if let Ok(value) = self.settings_get("context.auggiePath".into()).await {
+                if let Some(path) = value
+                    .get("value")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                {
+                    paths.insert("auggie".into(), path.into());
+                }
+            }
+            Ok(paths)
+        })
+    }
+
+    /// Internal owner setup invalidation; never carries setup details on the wire.
+    fn notify_execution_setup_changed(&self) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Internal bounded probe observation; no provider metadata is broadcast.
+    fn observe_execution_readiness(
+        &self,
+        _readiness: serde_json::Value,
+    ) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Owner-only open host invitations, ordered by createdAt / id.
+    /// URLs require both a stored secret and an available tunnel envelope.
+    fn host_invite_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::host_invite_list not implemented".into(),
+            ))
+        })
+    }
+
+    /// Owner-only host invite revocation; closed rows return `{ revoked: false }`.
+    /// Unknown or workspace-scoped IDs return `Error::NotFound`.
+    fn host_invite_revoke(&self, invite_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = invite_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::host_invite_revoke not implemented".into(),
+            ))
+        })
+    }
+
     /// `invite.inspect` (multiplayer w4, unauthenticated `/invite`
-    /// endpoint): validate `(invite_id, secret)` — the
+    /// endpoint): validate `(invite_id, secret, scope)` — the
     /// [`crate::InviteErrorKind`] refusals for an unknown / expired /
     /// revoked / (pinned and) redeemed link — and answer
-    /// `{ workspaceId, workspaceTitle, pinIdentity }` without contacting a
-    /// forge or issuing a nonce. `pinIdentity` is the required
+    /// `{ scope, role, pinIdentity }` without contacting a forge or issuing
+    /// a nonce. Workspace previews also carry `workspaceId` / `workspaceTitle`;
+    /// host previews have role `member` and no workspace. `pinIdentity` is the
     /// `{ provider, host, externalUserId }` triple (including legacy GitHub
     /// pins), or explicit `null` for an unpinned link; older daemons omit it.
     /// Errors disclose no pin. The `/invite` transport
@@ -4911,8 +5103,9 @@ pub trait WorkspaceApi: Send + Sync {
         &self,
         invite_id: String,
         secret: String,
+        scope: crate::InviteScope,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (invite_id, secret);
+        let _ = (invite_id, secret, scope);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::invite_inspect not implemented".to_string(),
@@ -4929,18 +5122,18 @@ pub trait WorkspaceApi: Send + Sync {
     /// owner's own account) is [`crate::InviteErrorKind::OwnerSelfJoin`]
     /// (`owner-self-join`). The invite is then validated like
     /// [`Self::invite_inspect`], a pin is checked against the
-    /// principal's stored `github_user_id` (`invite-pin-mismatch`), and the
-    /// join commits with the stored identity (no GitHub call, no profile
-    /// refresh) → the [`Self::invite_prove`] shape
-    /// `{ status: "authorized", token, principalId, login, workspaceId }`
-    /// with a fresh credential.
+    /// principal's stored full identity (`invite-pin-mismatch`), and the join
+    /// commits without a forge call or profile refresh. Returns the same
+    /// scoped authorization as [`Self::invite_prove`] with the presented bearer
+    /// unchanged. Scope defaults to workspace on the wire.
     fn invite_accept(
         &self,
         invite_id: String,
         secret: String,
+        scope: crate::InviteScope,
         credential: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (invite_id, secret, credential);
+        let _ = (invite_id, secret, scope, credential);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::invite_accept not implemented".to_string(),
@@ -4949,10 +5142,10 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `invite.challenge` (gist identity-proof join, unauthenticated
-    /// `/invite` endpoint): validate `(invite_id, secret)` exactly like
+    /// `/invite` endpoint): validate `(invite_id, secret, scope)` exactly like
     /// [`Self::invite_inspect`] and issue a single-use nonce bound to the
-    /// invite → `{ workspaceId, workspaceTitle, pinIdentity, nonce, nonceExpiresAt }`.
-    /// `pinIdentity` has the same triple-or-null semantics as `inspect`.
+    /// invite and scope. Returns its scoped preview plus `nonce` / `nonceExpiresAt`.
+    /// Captures the authorization generation for the proof commit's revocation guard.
     /// The nonce is 32 random bytes (base64url, unpadded), lives 10 minutes
     /// and is consumed by the first [`Self::invite_prove`] that names it.
     /// No forge is contacted. The `/invite` transport extends the result
@@ -4961,8 +5154,9 @@ pub trait WorkspaceApi: Send + Sync {
         &self,
         invite_id: String,
         secret: String,
+        scope: crate::InviteScope,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (invite_id, secret);
+        let _ = (invite_id, secret, scope);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::invite_challenge not implemented".to_string(),
@@ -4979,8 +5173,9 @@ pub trait WorkspaceApi: Send + Sync {
     /// (case-insensitively), the proof file to start with the nonce and the
     /// proof to have been created no earlier than the nonce was issued; then
     /// resolves the account and commits the join → `{ status: "authorized",
-    /// token, principalId, login, workspaceId }`; the joined principal
-    /// carries the forge's identity triple. Refusals:
+    /// token, principalId, login, identity, hostRole, scope }`, adding `workspaceId`
+    /// only for workspace scope. Identity is the full forge triple, and hostRole
+    /// is effective authority. Refusals:
     /// [`crate::InviteErrorKind::ProofInvalid`]
     /// (any mismatch, an unknown proof, or a nonce not issued for this invite
     /// / already consumed), [`crate::InviteErrorKind::ProofExpired`],
@@ -4997,10 +5192,11 @@ pub trait WorkspaceApi: Send + Sync {
         &self,
         invite_id: String,
         secret: String,
+        scope: crate::InviteScope,
         nonce: String,
         claim: InviteProofClaim,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (invite_id, secret, nonce, claim);
+        let _ = (invite_id, secret, scope, nonce, claim);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::invite_prove not implemented".to_string(),
@@ -5030,6 +5226,17 @@ pub trait WorkspaceApi: Send + Sync {
     ) -> BoxFuture<'_, Result<Option<PrincipalId>>> {
         let _ = token_hash;
         Box::pin(async { Ok(None) })
+    }
+
+    /// Transport seam: resolve a credential-bound principal's current host
+    /// authority. Never infer a role from credential storage or client input.
+    /// Unknown principals and unavailable authority fail closed.
+    fn principal_host_role(
+        &self,
+        principal_id: PrincipalId,
+    ) -> BoxFuture<'_, Result<crate::HostRole>> {
+        let _ = principal_id;
+        Box::pin(async { Err(Error::Forbidden("host authority unavailable".into())) })
     }
 
     /// `linear.authStatus`: validate the resolved Linear API key via the GraphQL

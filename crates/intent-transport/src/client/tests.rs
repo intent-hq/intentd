@@ -231,7 +231,11 @@ async fn notification_has_no_response_but_sets_binding() {
 async fn non_administrator_client_ids_are_scoped_to_their_principal() {
     let wire = |principal: &str, is_administrator: bool| Caller::Wire {
         principal_id: PrincipalId::from_string(principal),
-        is_administrator,
+        host_role: if is_administrator {
+            intent_core::HostRole::Owner
+        } else {
+            intent_core::HostRole::Guest
+        },
     };
     let hello = |id: i64, client_id: &str| {
         classify(&json!({

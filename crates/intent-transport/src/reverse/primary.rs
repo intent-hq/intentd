@@ -10,10 +10,9 @@
 //!   CLIs, dev tooling) and connections without the capability (FE auxiliary
 //!   `JsonRpcClient`s) are never candidates — this is what fixes the REV-1
 //!   misrouting where the first arrival won regardless of what it could do.
-//!   A connection bound to a non-administrator principal is never a
-//!   candidate either (multiplayer w3; [`super::ReverseChannel::is_administrator`]):
-//!   its `client.hello` is not bound onto the entry, so it is also absent from
-//!   the presence projections and the `client:*` transitions.
+//!   Guest hellos are not bound into the registry. Current members can host
+//!   ordinary workspace browsers; each dispatch rechecks their authority.
+//!   Chief and host reverse requests select only administrator connections.
 //! - [`ReverseTarget::Default`] → the **first-connected** eligible connection
 //!   (unchanged single-desktop behaviour); none → `NoClient`.
 //! - [`ReverseTarget::Client`] / [`ReverseTarget::Pinned`] → the **newest**
@@ -310,12 +309,10 @@ struct Entry {
 }
 
 impl Entry {
-    /// An eligible reverse target advertised `browserExec` **and** is the
-    /// administrator's connection (multiplayer w3): a connection bound to a
-    /// non-administrator principal never hosts tabs or serves reverse RPCs,
-    /// whatever its hello claims.
+    /// Browser targets need both the advertised capability and independently
+    /// authenticated owner/member authority. Request dispatch rechecks members.
     fn is_eligible(&self) -> bool {
-        self.channel.is_administrator()
+        self.channel.may_host_browser()
             && self
                 .identity
                 .as_ref()
@@ -360,15 +357,23 @@ fn resolve_entry<'a>(
     entries: &'a VecDeque<Entry>,
     target: &ReverseTarget,
 ) -> Result<&'a Entry, ReverseDispatchError> {
+    resolve_entry_matching(entries, target, |_| true)
+}
+
+fn resolve_entry_matching<'a>(
+    entries: &'a VecDeque<Entry>,
+    target: &ReverseTarget,
+    allowed: impl Fn(&Entry) -> bool,
+) -> Result<&'a Entry, ReverseDispatchError> {
     match target {
         ReverseTarget::Default => entries
             .iter()
-            .find(|e| e.is_eligible())
+            .find(|e| e.is_eligible() && allowed(e))
             .ok_or(ReverseDispatchError::NoClient),
         ReverseTarget::Client(client_id) | ReverseTarget::Pinned(client_id) => entries
             .iter()
             .rev()
-            .find(|e| e.is_eligible() && e.has_client(client_id))
+            .find(|e| e.is_eligible() && e.has_client(client_id) && allowed(e))
             .ok_or_else(|| ReverseDispatchError::ClientOffline {
                 client_id: client_id.clone(),
                 name: entries
@@ -621,7 +626,14 @@ impl AgentReverseDispatch for PrimaryReverseRegistry {
         params: Value,
         target: ReverseTarget,
     ) -> BoxFuture<'a, Result<Value, ReverseDispatchError>> {
-        let channel = resolve_entry(&self.inner.lock().entries, &target).map(|e| e.channel.clone());
+        let member_scope = method == "browser.exec"
+            && params["workspaceId"]
+                .as_str()
+                .is_some_and(|ws| !ws.is_empty() && !intent_core::WorkspaceId::from(ws).is_chief());
+        let channel = resolve_entry_matching(&self.inner.lock().entries, &target, |entry| {
+            member_scope || entry.channel.is_administrator()
+        })
+        .map(|e| e.channel.clone());
         Box::pin(async move {
             let channel = channel?;
             let timeout = request_timeout(method, &params);
@@ -695,8 +707,7 @@ impl PrimaryReverseGuard {
     /// connection was the last of, then a `Connected` for a new `clientId`
     /// with no other live connection) under the registry lock.
     ///
-    /// A non-administrator connection's hello is not bound at all (multiplayer
-    /// w3): the entry keeps no identity, so it never appears in
+    /// A guest connection's hello is not bound at all: the entry keeps no identity, so it never appears in
     /// [`PrimaryReverseRegistry::live_clients`] / `host_presence`, never
     /// reports as a tab host, and never queues a `client:*` transition —
     /// whatever `clientId` or `browserExec` it advertised.
@@ -712,7 +723,7 @@ impl PrimaryReverseGuard {
         let Some(pos) = state.entries.iter().position(|e| e.id == self.id) else {
             return;
         };
-        if !state.entries[pos].channel.is_administrator() {
+        if !state.entries[pos].channel.may_host_browser() {
             return;
         }
         state.entries[pos].hello_seq = inner.next_hello_seq.fetch_add(1, Ordering::Relaxed) + 1;
@@ -740,6 +751,28 @@ impl PrimaryReverseGuard {
             let _ = inner
                 .transitions
                 .send(ClientTransition::Connected(identity));
+        }
+    }
+}
+
+impl PrimaryReverseGuard {
+    /// Withdraw browser hosting after an authority change, retaining the
+    /// registration so a later legitimate role upgrade can bind it again.
+    pub(crate) fn unbind(&self) {
+        let Some(inner) = &self.registry else { return };
+        let mut state = inner.lock();
+        let Some(entry) = state.entries.iter_mut().find(|e| e.id == self.id) else {
+            return;
+        };
+        let Some(identity) = entry.identity.take() else {
+            return;
+        };
+        state.bound.remove(&self.id);
+        state.presence_remove(&identity.client_id);
+        if !state.presence.contains_key(&identity.client_id) {
+            let _ = inner
+                .transitions
+                .send(ClientTransition::Disconnected(identity));
         }
     }
 }

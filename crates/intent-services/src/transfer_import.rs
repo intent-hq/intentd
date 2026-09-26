@@ -43,6 +43,7 @@ pub(crate) const IMPORT_MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 /// One in-flight staged import: everything `chunk`/`commit`/`abort` need
 /// between calls. Lives in [`Services::transfer_imports`]; in-memory only.
 pub(crate) struct ImportSession {
+    pub initiator: Option<intent_core::PrincipalId>,
     pub manifest: TransferManifest,
     pub workspace_id: WorkspaceId,
     /// `<workspaces_root>/.import-staging/<importId>/`.
@@ -152,6 +153,7 @@ impl Services {
                 )));
             }
             let session = ImportSession {
+                initiator: intent_core::current_caller().and_then(|c| c.principal_id().cloned()),
                 workspace_id: manifest.workspace_id.clone(),
                 manifest,
                 staging_dir: staging_dir.clone(),
@@ -3832,6 +3834,7 @@ mod tests {
         svc.transfer_imports.lock().unwrap().insert(
             "import-live".to_string(),
             super::ImportSession {
+                initiator: None,
                 manifest: manifest(&ws),
                 workspace_id: ws.clone(),
                 staging_dir: live_dir.clone(),

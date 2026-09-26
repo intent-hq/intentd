@@ -394,21 +394,61 @@ struct OutboundFrame {
 /// spawn/feed per-stream relay tasks, drain their outbound frames to the
 /// socket, answer pings, and honour heartbeat/shutdown control commands.
 /// All remaining stream tasks are aborted when the connection ends.
+pub(crate) struct MemberAuthority {
+    pub api: Arc<dyn intent_core::WorkspaceApi>,
+    pub principal_id: intent_core::PrincipalId,
+    pub revocations: Option<tokio::sync::broadcast::Receiver<intent_core::PrincipalId>>,
+}
+
 pub(crate) async fn run_tunnel_connection<S>(
     ws: WebSocketStream<S>,
     mut cmd_rx: mpsc::Receiver<ConnCmd>,
     last_pong: Arc<AtomicI64>,
     limits: TunnelLimits,
+    mut authority: Option<MemberAuthority>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    enum Input {
+        Revoked(Result<intent_core::PrincipalId, ()>),
+        Incoming(Option<Result<Message, tokio_tungstenite::tungstenite::Error>>),
+        Outbound(OutboundFrame),
+        Command(Option<ConnCmd>),
+    }
+
     let (mut sink, mut stream) = ws.split();
     let (out_tx, mut out_rx) = mpsc::channel::<OutboundFrame>(OUTBOUND_QUEUE_FRAMES);
     let mut streams: HashMap<u32, StreamHandle> = HashMap::new();
     let inbound_budget = Arc::new(Semaphore::new(INBOUND_BYTES_PER_CONNECTION));
     loop {
-        tokio::select! {
-            incoming = stream.next() => match incoming {
+        // Revocation wins over ready work. Ordinary input/output/heartbeats
+        // retain fair scheduling: prioritizing a burst of input can overflow
+        // a stream's queue before its relay gets to drain it.
+        let input = tokio::select! {
+            biased;
+            revoked = async { crate::ws::recv_revocation(&mut authority.as_mut().expect("guarded").revocations).await }, if authority.is_some() => Input::Revoked(revoked),
+            input = async {
+                tokio::select! {
+                    incoming = stream.next() => Input::Incoming(incoming),
+                    Some(frame) = out_rx.recv() => Input::Outbound(frame),
+                    cmd = cmd_rx.recv() => Input::Command(cmd),
+                }
+            } => input,
+        };
+        match input {
+            Input::Revoked(revoked) => {
+                if revoked.is_ok_and(|id| id != authority.as_ref().expect("guarded").principal_id) {
+                    continue;
+                }
+                let _ = sink
+                    .send(Message::Close(Some(CloseFrame {
+                        code: CloseCode::Policy,
+                        reason: "credential revoked".into(),
+                    })))
+                    .await;
+                break;
+            }
+            Input::Incoming(incoming) => match incoming {
                 Some(Err(e)) => {
                     // Over-limit inbound message/frame: tell the client why
                     // with a 1009 close, mirroring the `/ws` connection loop.
@@ -431,6 +471,24 @@ pub(crate) async fn run_tunnel_connection<S>(
                             break;
                         }
                     };
+                    if matches!(frame, Frame::Open { .. }) {
+                        if let Some(authority) = &authority {
+                            if !authority
+                                .api
+                                .principal_host_role(authority.principal_id.clone())
+                                .await
+                                .is_ok_and(|role| role == intent_core::HostRole::Member)
+                            {
+                                let _ = sink
+                                    .send(Message::Close(Some(CloseFrame {
+                                        code: CloseCode::Policy,
+                                        reason: "host membership required".into(),
+                                    })))
+                                    .await;
+                                break;
+                            }
+                        }
+                    }
                     if !handle_frame(
                         frame,
                         &mut sink,
@@ -457,12 +515,12 @@ pub(crate) async fn run_tunnel_connection<S>(
                 }
                 Some(Ok(Message::Frame(_))) => {}
             },
-            Some(frame) = out_rx.recv() => {
+            Input::Outbound(frame) => {
                 if !send_outbound_frame(&mut sink, &mut streams, frame).await {
                     break;
                 }
             }
-            cmd = cmd_rx.recv() => match cmd {
+            Input::Command(cmd) => match cmd {
                 None => break,
                 Some(ConnCmd::Ping) => {
                     if sink.send(Message::Ping(Bytes::new())).await.is_err() {
@@ -478,7 +536,7 @@ pub(crate) async fn run_tunnel_connection<S>(
                         .await;
                     break;
                 }
-            }
+            },
         }
     }
     for (_, handle) in streams.drain() {
