@@ -18,12 +18,12 @@ fn credential_store(h: &Harness) -> FileSecretStore {
 }
 
 async fn restart(h: &mut Harness, mock: &MockGitlab) {
-    h._daemon.child.kill().unwrap();
-    h._daemon.child.wait().unwrap();
+    h.daemon.child.kill().unwrap();
+    h.daemon.child.wait().unwrap();
     let secrets = h.secrets_file.to_string_lossy().to_string();
-    h._daemon = Daemon {
+    h.daemon = Daemon {
         child: spawn_serve(
-            h._data_dir.path(),
+            h.data_dir.path(),
             &[
                 ("INTENTD_AUTH_TOKEN", TOKEN),
                 ("INTENTD_SECRETS_FILE", &secrets),
@@ -31,7 +31,7 @@ async fn restart(h: &mut Harness, mock: &MockGitlab) {
             ],
         ),
     };
-    let socket = h._data_dir.path().join("intentd.sock");
+    let socket = h.data_dir.path().join("intentd.sock");
     assert!(await_uds(&socket).await);
     let status = common::await_wss_status(&socket).await;
     h.port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();

@@ -597,8 +597,8 @@ async fn serve_conn(mut stream: TcpStream, flags: Arc<MockFlags>) -> std::io::Re
 
 /// A booted daemon pointed at `mock`, with the WSS port + pinned client config.
 struct Harness {
-    _data_dir: tempfile::TempDir,
-    _daemon: Daemon,
+    data_dir: tempfile::TempDir,
+    daemon: Daemon,
     secrets_file: std::path::PathBuf,
     /// The daemon's stderr (tracing at `info`).
     log_file: std::path::PathBuf,
@@ -636,8 +636,8 @@ async fn boot_with_env(mock: &MockGitlab, extra_env: &[(&str, &str)]) -> Harness
         .to_string();
     Harness {
         log_file: data_dir.join("daemon.log"),
-        _data_dir: data_dir_guard,
-        _daemon: daemon,
+        data_dir: data_dir_guard,
+        daemon,
         secrets_file,
         port,
         cfg: client_config(&fingerprint),
