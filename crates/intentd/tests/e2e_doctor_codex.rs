@@ -342,6 +342,157 @@ fn default_managed_reports_configuration_without_materializing_or_querying() {
     assert!(fixture.events().is_empty());
 }
 
+fn ordinary_warning_fixture() -> Fixture {
+    let fixture = Fixture::new("managed", &json!({}));
+    let config_path = fixture.root.path().join("config.toml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    // A relative override deterministically emits an ordinary tracing warning;
+    // discovery falls back to the fixture's stub, without a slow SQL query.
+    let config = config.replace(
+        &json!(fixture.root.path().join("bin/grok")).to_string(),
+        "\"relative-grok-warning-fixture\"",
+    );
+    fs::write(config_path, config).unwrap();
+    fixture
+}
+
+fn assert_ordinary_warning(stderr: &str) {
+    assert!(stderr.contains("WARN"));
+    assert!(stderr.contains("must be absolute and executable"));
+    assert!(stderr.contains("relative-grok-warning-fixture"));
+}
+
+#[test]
+fn redirected_stderr_keeps_ordinary_warnings_plain() {
+    let fixture = ordinary_warning_fixture();
+    let stdout = fixture.run(false);
+    assert!(stdout.contains("[ok] sqlite openable:"));
+    assert!(stdout.contains("no package was installed"));
+    let stderr = fs::read_to_string(fixture.root.path().join("stderr.log")).unwrap();
+    assert_ordinary_warning(&stderr);
+    assert!(fixture.events().is_empty());
+}
+
+fn run_with_terminal_stderr(fixture: &Fixture, no_color: Option<&str>) -> (String, String) {
+    use std::io::{self, Read};
+    use std::os::fd::FromRawFd;
+    use std::time::Instant;
+
+    use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
+
+    let (mut master_fd, mut slave_fd) = (-1, -1);
+    // SAFETY: openpty writes two owned descriptors into valid pointers. Null
+    // optional arguments request the default terminal settings and size.
+    let result = unsafe {
+        libc::openpty(
+            &raw mut master_fd,
+            &raw mut slave_fd,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(result, 0, "openpty: {}", io::Error::last_os_error());
+    // SAFETY: openpty succeeded, and each descriptor is transferred once.
+    let (mut master, slave) = unsafe {
+        (
+            fs::File::from_raw_fd(master_fd),
+            fs::File::from_raw_fd(slave_fd),
+        )
+    };
+    // Only the child's stderr should inherit a PTY descriptor, even if another
+    // test spawns a process concurrently in this test binary.
+    fcntl(&master, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).unwrap();
+    fcntl(&slave, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).unwrap();
+    fcntl(&master, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).unwrap();
+    let stdout_path = fixture.root.path().join("terminal-stdout.log");
+    let mut command = fixture.doctor_command(false);
+    command
+        .stdin(Stdio::null())
+        .stdout(fs::File::create(&stdout_path).unwrap())
+        .stderr(slave)
+        .env("TERM", "xterm-256color");
+    if let Some(value) = no_color {
+        command.env("NO_COLOR", value);
+    }
+    let mut child = GuardedChild::spawn(&mut command).unwrap();
+    drop(command);
+    let deadline = Instant::now() + common::test_timeout(Duration::from_secs(150));
+    let mut stderr = Vec::new();
+    let mut exited = false;
+    loop {
+        match master.read_to_end(&mut stderr) {
+            Ok(_) => {}
+            // Linux reports EIO after the last slave closes; macOS returns EOF.
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.raw_os_error() == Some(libc::EIO) => {
+            }
+            Err(e) => panic!("read terminal stderr: {e}"),
+        }
+        if exited {
+            break;
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "doctor failed: {status}");
+            // Drain once more after exit to capture the final writes.
+            exited = true;
+            continue;
+        }
+        assert!(Instant::now() < deadline, "doctor exceeded its deadline");
+        // timing-guard: poll interval
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    (
+        fs::read_to_string(stdout_path).unwrap(),
+        String::from_utf8(stderr).unwrap(),
+    )
+}
+
+#[test]
+fn terminal_stderr_honors_no_color_and_file_logs_stay_plain() {
+    for (no_color, expect_ansi) in [
+        (None, true),
+        (Some(""), true),
+        (Some("1"), false),
+        (Some("0"), false),
+    ] {
+        let fixture = ordinary_warning_fixture();
+        let (stdout, stderr) = run_with_terminal_stderr(&fixture, no_color);
+        assert_ordinary_warning(&stderr);
+        assert_eq!(
+            stderr.contains('\u{1b}'),
+            expect_ansi,
+            "NO_COLOR={no_color:?}"
+        );
+        assert!(stdout.contains("[ok] sqlite openable:"));
+        assert!(stdout.contains("no package was installed"));
+        assert!(!stdout.contains('\u{1b}'));
+        for canary in CANARIES {
+            assert!(
+                !stdout.contains(canary),
+                "stdout leaked a private fixture value"
+            );
+            assert!(
+                !stderr.contains(canary),
+                "stderr leaked a private fixture value"
+            );
+        }
+        let file_logs: String = fs::read_dir(fixture.root.path().join("data"))
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| {
+                entry.file_name().to_string_lossy().starts_with("intentd.")
+                    && entry.path().extension().is_some_and(|ext| ext == "log")
+            })
+            .map(|entry| fs::read_to_string(entry.path()).unwrap())
+            .collect();
+        assert_ordinary_warning(&file_logs);
+        assert!(!file_logs.contains('\u{1b}'));
+        fixture.assert_clean();
+        assert!(fixture.events().is_empty());
+    }
+}
+
 #[test]
 fn default_ignores_configured_adapter_without_measuring_its_dependency() {
     let fixture = Fixture::new("override", &json!({}));
