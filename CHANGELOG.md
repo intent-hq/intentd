@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.111] - 2026-09-26
+
+### 🚀 Features
+
+- Persist confirmed effort changes at turn start ([#2136](https://github.com/intent-hq/intentd/pull/2136))
+
+
 ## [0.9.110] - 2026-09-25
 
 ### 🐛 Bug Fixes
