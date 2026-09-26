@@ -5,7 +5,7 @@ fn identity() -> Value {
     json!({"provider":"gitlab","host":HOST,"externalUserId":"4242"})
 }
 
-async fn connected(h: &Harness, rpc: &mut Ws) {
+pub(super) async fn connected(h: &Harness, rpc: &mut Ws) {
     let v = wss_rpc(
         rpc,
         1,
@@ -234,7 +234,7 @@ async fn collaboration_cancel_is_flow_and_instance_scoped_over_wss() {
     assert!(read_secrets(&h.secrets_file)["sourceControl.gitlab.token"].is_null());
 }
 
-async fn collaboration_subscriber(h: &Harness) -> Ws {
+pub(super) async fn collaboration_subscriber(h: &Harness) -> Ws {
     let mut sub = connect_ws(h.port, h.cfg.clone()).await;
     let v = wss_rpc(
         &mut sub,
@@ -481,7 +481,15 @@ async fn collaboration_auth_is_owner_only_and_repository_disconnect_keeps_member
                 .execute(store.write_pool())
                 .await
                 .unwrap();
+            // Re-admit this socket as a member instead of repeating the guest test.
+            guest = common::wss_connect_with_retry(h.port, h.cfg.clone(), &url).await;
         }
+        let bound = wss_rpc(&mut guest, 0, "principal.me", json!({})).await;
+        assert_eq!(
+            bound["result"]["hostRole"],
+            if member { "member" } else { "guest" },
+            "{bound}"
+        );
         for method in [
             "identity.authStatus",
             "identity.connect",

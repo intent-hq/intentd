@@ -15,6 +15,8 @@
 
 mod common;
 
+#[path = "collaboration_identity/binding.rs"]
+mod collaboration_binding;
 #[path = "collaboration_identity/github.rs"]
 mod collaboration_github;
 #[path = "collaboration_identity/gitlab.rs"]
@@ -310,6 +312,7 @@ fn read_secrets(path: &Path) -> Value {
 
 #[derive(Default)]
 struct MockFlags {
+    requests: Mutex<Vec<Value>>,
     authorize: AtomicBool,
     unsupported: AtomicBool,
     short_lived: AtomicBool,
@@ -441,6 +444,10 @@ async fn serve_conn(mut stream: TcpStream, flags: Arc<MockFlags>) -> std::io::Re
         || bearer == READ_ONLY_PAT
         || (bearer == ROTATED_ACCESS_TOKEN && !flags.reject_rotated.load(Ordering::SeqCst));
     let route = path.split('?').next().unwrap_or_default();
+    flags.requests.lock().unwrap().push(json!({
+        "method": method, "route": route, "bearer": bearer,
+        "clientId": form_field("client_id"), "grantType": form_field("grant_type")
+    }));
     if method == "GET" && route == "/api/v4/user" {
         flags.user_requests.fetch_add(1, Ordering::SeqCst);
         flags.user_hit.notify_one();

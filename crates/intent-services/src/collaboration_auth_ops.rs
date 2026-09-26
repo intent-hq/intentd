@@ -53,6 +53,16 @@ struct Account {
     generation: String,
     method: String,
     scopes: Option<Vec<String>>,
+    #[serde(default)]
+    gitlab_binding: Option<GitlabBinding>,
+}
+
+/// The endpoint and public application that actually authorized this credential.
+/// Repository settings are consulted only when starting a new sign-in.
+#[derive(Clone, Serialize, Deserialize)]
+struct GitlabBinding {
+    base_url: String,
+    client_id: Option<String>,
 }
 
 impl Account {
@@ -69,7 +79,46 @@ impl Account {
             generation: uuid::Uuid::new_v4().to_string(),
             method: method.to_string(),
             scopes,
+            gitlab_binding: None,
         })
+    }
+
+    fn device_client_id(&self) -> Result<&str> {
+        self.gitlab_binding
+            .as_ref()
+            .and_then(|binding| binding.client_id.as_deref())
+            .filter(|id| !id.trim().is_empty())
+            .ok_or(Error::IdentityMismatch)
+    }
+
+    fn bound_target(&self, requested: &Target) -> Result<Target> {
+        if self.identity.provider != requested.provider().as_wire()
+            || self.identity.host != requested.host()
+        {
+            return Err(Error::IdentityMismatch);
+        }
+        match requested {
+            Target::Github => Ok(Target::Github),
+            Target::Gitlab { host } => {
+                let binding = self
+                    .gitlab_binding
+                    .as_ref()
+                    .ok_or(Error::IdentityMismatch)?;
+                match self.method.as_str() {
+                    "device" => {
+                        self.device_client_id()?;
+                    }
+                    "pat" => {}
+                    _ => return Err(Error::IdentityMismatch),
+                }
+                Ok(Target::Gitlab {
+                    host: host
+                        .clone()
+                        .with_api_origin(&binding.base_url)
+                        .map_err(|_| Error::IdentityMismatch)?,
+                })
+            }
+        }
     }
 }
 
@@ -125,10 +174,7 @@ async fn io<T: Send + 'static>(
 fn account(store: &FileSecretStore) -> Result<Option<Account>> {
     store
         .load(ACCOUNT)?
-        .map(|s| {
-            serde_json::from_str(&s)
-                .map_err(|_| Error::Internal("invalid collaboration account record".into()))
-        })
+        .map(|s| serde_json::from_str(&s).map_err(|_| Error::IdentityMismatch))
         .transpose()
 }
 
@@ -175,7 +221,11 @@ impl Services {
         host: Option<&str>,
     ) -> Result<Target> {
         let kind = Provider::parse(provider)?;
-        let mut target = repository::resolve_target(kind, host, "gitlab.com", None)?;
+        repository::resolve_target(kind, host, "gitlab.com", None)
+    }
+
+    fn collaboration_connect_target(&self, provider: &str, host: Option<&str>) -> Result<Target> {
+        let mut target = self.collaboration_target(provider, host)?;
         if let Target::Gitlab { host } = &mut target {
             // A configured API override belongs only to its bound instance.
             // The environment seam supports the hosted-instance hermetic tests.
@@ -297,12 +347,17 @@ impl Services {
                 let (user, scopes) = gitlab_auth::validate_pat_with_scopes(host, token)
                     .await
                     .map_err(|e| map_auth_error(target, e))?;
-                Account::new(
+                let mut account = Account::new(
                     ForgeUser::gitlab(host.host(), &user),
                     repository::gitlab_user_to_wire(&user),
                     method,
                     scopes,
-                )
+                )?;
+                account.gitlab_binding = Some(GitlabBinding {
+                    base_url: host.base_url().into(),
+                    client_id: None,
+                });
+                Ok(account)
             }
         }
     }
@@ -312,18 +367,14 @@ impl Services {
         entry: &Credential,
         lease: PersistenceLease,
         target: &Target,
+        client_id: &str,
     ) -> Result<bool> {
         let Target::Gitlab { host } = target else {
             return Ok(false);
         };
-        let Some(client_id) = self.collaboration_client_id(target) else {
-            clear(entry, lease, target).await?;
-            self.collaboration_event(target, "expired", None).await;
-            return Ok(false);
-        };
         match gitlab_auth::refresh_access_token_with_lease(
             host,
-            &client_id,
+            client_id,
             entry.store.clone(),
             Some(lease.clone()),
         )
@@ -352,10 +403,14 @@ impl Services {
         entry: &Credential,
         lease: PersistenceLease,
         target: &Target,
-    ) -> Result<Option<(Account, String)>> {
+    ) -> Result<Option<(Account, String, Target)>> {
         let Some(mut saved) = io(&entry.store, lease.clone(), |s| account(&s)).await? else {
             return Ok(None);
         };
+        // Restore and validate the original binding before reading/sending a
+        // token. Missing metadata needs explicit reauthorization, never a guess
+        // from mutable repository configuration or destructive expiry handling.
+        let target = saved.bound_target(target)?;
         let credential = if matches!(target, Target::Gitlab { .. }) {
             gitlab_auth::stored_credential(entry.store.clone())
                 .await
@@ -365,7 +420,7 @@ impl Services {
         };
         let refreshed = if credential.needs_refresh() {
             if !self
-                .collaboration_refresh(entry, lease.clone(), target)
+                .collaboration_refresh(entry, lease.clone(), &target, saved.device_client_id()?)
                 .await?
             {
                 return Ok(None);
@@ -383,7 +438,7 @@ impl Services {
                 return Ok(None);
             };
             match self
-                .collaboration_verify(target, &token, &saved.method)
+                .collaboration_verify(&target, &token, &saved.method)
                 .await
             {
                 Ok(observed) => {
@@ -395,9 +450,9 @@ impl Services {
                     // A fresh provider report wins; otherwise retain the actual
                     // grant observed during authorization, never requested scopes.
                     saved.scopes = observed.scopes.or(saved.scopes);
-                    check_scopes(target, saved.scopes.as_deref())?;
+                    check_scopes(&target, saved.scopes.as_deref())?;
                     save_account(entry, lease, &saved).await?;
-                    return Ok(Some((saved, token)));
+                    return Ok(Some((saved, token, target)));
                 }
                 Err(Error::SourceControlUnauthorized { .. })
                     if attempt == 0
@@ -405,7 +460,12 @@ impl Services {
                         && matches!(credential, StoredCredential::Device { .. }) =>
                 {
                     if !self
-                        .collaboration_refresh(entry, lease.clone(), target)
+                        .collaboration_refresh(
+                            entry,
+                            lease.clone(),
+                            &target,
+                            saved.device_client_id()?,
+                        )
                         .await?
                     {
                         return Ok(None);
@@ -415,8 +475,8 @@ impl Services {
                         .ok_or_else(|| target.not_connected())?;
                 }
                 Err(Error::SourceControlUnauthorized { .. }) => {
-                    clear(entry, lease, target).await?;
-                    self.collaboration_event(target, "expired", None).await;
+                    clear(entry, lease, &target).await?;
+                    self.collaboration_event(&target, "expired", None).await;
                     return Ok(None);
                 }
                 Err(e) => return Err(e),
@@ -438,20 +498,20 @@ impl Services {
             .collaboration_probe(&entry, lease.clone(), &target)
             .await?;
         if only_user {
-            return Ok(json!({"user":probed.map(|(a,_)|a.user)}));
+            return Ok(json!({"user":probed.map(|(a,_,_)|a.user)}));
         }
         let state = entry.state.lock().await;
         let mut wire = repository::auth_status_to_wire(
             github_auth_ops::auth_status_to_wire(probed.is_some(), state.flow.as_ref()),
             target.provider(),
             target.host(),
-            probed.as_ref().map(|(a, _)| a.method.as_str()),
-            probed.as_ref().map(|(a, _)| a.user.clone()),
+            probed.as_ref().map(|(a, _, _)| a.method.as_str()),
+            probed.as_ref().map(|(a, _, _)| a.user.clone()),
             !state.unsupported && self.collaboration_client_id(&target).is_some(),
         );
         wire["purpose"] = json!("collaboration");
         wire["requestedScopes"] = json!(target.scopes());
-        wire["grantedScopes"] = json!(probed.and_then(|(a, _)| a.scopes));
+        wire["grantedScopes"] = json!(probed.and_then(|(a, _, _)| a.scopes));
         Ok(wire)
     }
 
@@ -503,7 +563,7 @@ impl Services {
         method: Option<&str>,
         token: Option<String>,
     ) -> Result<Value> {
-        let target = self.collaboration_target(provider, host)?;
+        let target = self.collaboration_connect_target(provider, host)?;
         let entry = self.collaboration_credential(&target).await?;
         let method = method.unwrap_or("device");
         if !matches!(method, "device" | "pat") {
@@ -588,7 +648,7 @@ impl Services {
                             a.verification_uri_complete.unwrap_or(a.verification_uri),
                             a.expires_in,
                             a.interval,
-                            Flow::Gitlab(f),
+                            Flow::Gitlab(f, client_id.clone()),
                         )
                     })
             }
@@ -726,15 +786,20 @@ impl Services {
                     scopes,
                 )
             }
-            (Target::Gitlab { host }, Grant::Gitlab(g)) => {
+            (Target::Gitlab { host }, Grant::Gitlab(g, client_id)) => {
                 let (user, scopes) = g.verify(host).await.map_err(crate::pr_ops::map_sc_err)?;
                 check_scopes(target, scopes.as_deref())?;
-                Account::new(
+                let mut account = Account::new(
                     ForgeUser::gitlab(host.host(), &user),
                     repository::gitlab_user_to_wire(&user),
                     "device",
                     scopes,
-                )
+                )?;
+                account.gitlab_binding = Some(GitlabBinding {
+                    base_url: host.base_url().into(),
+                    client_id: Some(client_id.clone()),
+                });
+                Ok(account)
             }
             _ => Err(Error::IdentityMismatch),
         }
@@ -756,7 +821,7 @@ impl Services {
             + 1;
         let lease: PersistenceLease = Arc::new(entry.gate.clone().lock_owned().await);
         let credential_generation = entry.state.lock().await.generation;
-        let (account, _) = self
+        let (account, _, _) = self
             .collaboration_probe(&entry, lease.clone(), &target)
             .await?
             .ok_or_else(|| target.not_connected())?;
@@ -802,7 +867,7 @@ impl Services {
         let entry = self.collaboration_credential(&target).await?;
         let lease: PersistenceLease = Arc::new(entry.gate.clone().lock_owned().await);
         let credential_generation = entry.state.lock().await.generation;
-        let (account, token) = self
+        let (account, token, target) = self
             .collaboration_probe(&entry, lease.clone(), &target)
             .await?
             .ok_or_else(|| target.not_connected())?;
@@ -865,10 +930,11 @@ impl Services {
         }
         let entry = self.collaboration_credential(&target).await?;
         let lease: PersistenceLease = Arc::new(entry.gate.clone().lock_owned().await);
-        let (account, token) = self
+        let (account, token, target) = self
             .collaboration_probe(&entry, lease.clone(), &target)
             .await?
             .ok_or_else(|| target.not_connected())?;
+        let proof = self.proof_provider(&target);
         let key = format!("identity.proof.{proof_id}");
         let receipt_key = key.clone();
         let receipt = io(&entry.store, lease.clone(), move |s| s.load(&receipt_key)).await?;
@@ -901,11 +967,11 @@ fn check_scopes(target: &Target, scopes: Option<&[String]>) -> Result<()> {
 
 enum Flow {
     Github(DeviceFlow),
-    Gitlab(GitlabDeviceFlow),
+    Gitlab(GitlabDeviceFlow, String),
 }
 enum Grant {
     Github(GithubGrant),
-    Gitlab(GitlabGrant),
+    Gitlab(GitlabGrant, String),
 }
 enum Exchange {
     Grant(Grant),
@@ -916,7 +982,7 @@ impl Flow {
     fn interval(&self) -> u64 {
         match self {
             Self::Github(f) => f.interval_secs(),
-            Self::Gitlab(f) => f.interval_secs(),
+            Self::Gitlab(f, _) => f.interval_secs(),
         }
     }
     async fn exchange(&mut self) -> intent_sourcecontrol::Result<Exchange> {
@@ -927,8 +993,10 @@ impl Flow {
                 GithubExchange::Expired => Exchange::Terminal(FlowPhase::Expired),
                 GithubExchange::Denied => Exchange::Terminal(FlowPhase::Denied),
             },
-            Self::Gitlab(f) => match f.exchange_once().await? {
-                GitlabExchange::Authorized(g) => Exchange::Grant(Grant::Gitlab(g)),
+            Self::Gitlab(f, client_id) => match f.exchange_once().await? {
+                GitlabExchange::Authorized(g) => {
+                    Exchange::Grant(Grant::Gitlab(g, client_id.clone()))
+                }
                 GitlabExchange::Pending => Exchange::Pending,
                 GitlabExchange::Expired => Exchange::Terminal(FlowPhase::Expired),
                 GitlabExchange::Denied => Exchange::Terminal(FlowPhase::Denied),
@@ -940,7 +1008,7 @@ impl Grant {
     async fn commit(self, lease: PersistenceLease) -> intent_sourcecontrol::Result<()> {
         match self {
             Self::Github(g) => g.commit(Some(Box::new(lease))).await,
-            Self::Gitlab(g) => g.commit_with_lease(Some(lease)).await,
+            Self::Gitlab(g, _) => g.commit_with_lease(Some(lease)).await,
         }
     }
 }
