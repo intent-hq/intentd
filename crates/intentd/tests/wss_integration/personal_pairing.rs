@@ -952,9 +952,9 @@ async fn member_removal_connection_admission_both_linearizations_cannot_reopen_a
                 release: wait,
             };
             if admitted_first {
-                *gate.after.lock().unwrap() = Some(pause)
+                *gate.after.lock().unwrap() = Some(pause);
             } else {
-                *gate.before.lock().unwrap() = Some(pause)
+                *gate.before.lock().unwrap() = Some(pause);
             }
             let tls = tls_connect(srv.port, srv.cfg.clone()).await;
             let url = format!("wss://localhost:{}{path}?token={token}", srv.port);
