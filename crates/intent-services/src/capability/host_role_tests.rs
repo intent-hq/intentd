@@ -491,11 +491,6 @@ async fn host_member_lifecycle_uses_existing_archive_and_incremental_delete() {
 
 #[tokio::test]
 async fn workspace_guests_unknown_and_unbound_cannot_gain_host_capabilities() {
-    if super::tests::reran_unarmed(
-        "capability::host_role_tests::workspace_guests_unknown_and_unbound_cannot_gain_host_capabilities",
-    ) {
-        return;
-    }
     async fn assert_execution_reads_refused(svc: &Services) {
         let errors = [
             svc.host_execution_context().await.unwrap_err(),
@@ -510,6 +505,11 @@ async fn workspace_guests_unknown_and_unbound_cannot_gain_host_capabilities() {
                 "{error}"
             );
         }
+    }
+    if super::tests::reran_unarmed(
+        "capability::host_role_tests::workspace_guests_unknown_and_unbound_cannot_gain_host_capabilities",
+    ) {
+        return;
     }
     let tmp = TempDb::new();
     let (svc, _, member) = fixture(&tmp).await;
@@ -1389,6 +1389,8 @@ async fn assert_member_pr_authorization_entry(flush: bool) {
     use intent_sourcecontrol::Error as ScError;
     use std::sync::Arc;
 
+    type ErrorCase = (fn() -> ScError, Option<Reason>);
+
     for retained_guest in [false, true] {
         let tmp = TempDb::new();
         let (svc, owner, member) = fixture(&tmp).await;
@@ -1448,7 +1450,7 @@ async fn assert_member_pr_authorization_entry(flush: bool) {
         } else {
             None
         };
-        let cases: [(fn() -> ScError, Option<Reason>); 6] = [
+        let cases: [ErrorCase; 6] = [
             (
                 || ScError::NotConfigured("private-missing".into()),
                 Some(Reason::Missing),

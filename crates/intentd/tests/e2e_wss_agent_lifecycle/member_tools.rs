@@ -824,16 +824,9 @@ impl PrAuthServer {
 
 #[intent_test_macros::daemon_test]
 async fn member_pr_status_typed_rejections_are_safe_and_non_auth_errors_stay_legacy_over_wss() {
-    use std::sync::atomic::Ordering;
-    let fake = PrAuthServer::start().await;
-    let dir = temp_data_dir();
-    let ws = WorkspaceId::new();
-    seed_linked_member_pr(dir.path(), &ws).await;
-    // Inject the production GitHub adapter with a local HTTP origin. The
-    // binary's fallback PR registry ignores its settings-file API override;
-    // this established composition seam guarantees no live forge traffic.
     use intent_services::{EventBus, InMemorySecretStore, SecretStore, Services, SettingsRegistry};
     use intent_transport::{AsyncTokenStore, TokenStore, WsApiServer, WsOptions};
+    use std::sync::atomic::Ordering;
     struct OwnerToken;
     impl TokenStore for OwnerToken {
         fn load_token(&self) -> Option<String> {
@@ -843,6 +836,13 @@ async fn member_pr_status_typed_rejections_are_safe_and_non_auth_errors_stay_leg
             Ok(())
         }
     }
+    let fake = PrAuthServer::start().await;
+    let dir = temp_data_dir();
+    let ws = WorkspaceId::new();
+    seed_linked_member_pr(dir.path(), &ws).await;
+    // Inject the production GitHub adapter with a local HTTP origin. The
+    // binary's fallback PR registry ignores its settings-file API override;
+    // this established composition seam guarantees no live forge traffic.
     let secrets = Arc::new(InMemorySecretStore::default());
     secrets
         .store("sourceControl.github.token", "fake-repository-token")
