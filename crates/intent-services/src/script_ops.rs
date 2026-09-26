@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -126,15 +126,16 @@ fn next_generation() -> u64 {
 /// by any number of workspaces without collision or cross-workspace mutation.
 pub(crate) type ScriptRegistry = Arc<Mutex<HashMap<(WorkspaceId, String), ManagedScript>>>;
 
-/// Per-workspace async-mutex map for script bootstrap operations. Prevents
-/// concurrent `script.list` calls from creating duplicate repo-config scripts.
-/// Modeled after `intent-git::WorktreeLocks`.
+/// Shared async locks for workspace bootstrap and script definition updates.
+/// Bootstrap is workspace-scoped; updates use the durable script id across
+/// all workspaces, matching the store's primary key and legacy owner moves.
 #[derive(Clone, Default)]
-pub(crate) struct WorkspaceScriptLocks {
-    locks: Arc<Mutex<HashMap<WorkspaceId, Arc<AsyncMutex<()>>>>>,
+pub(crate) struct ScriptLocks {
+    workspaces: Arc<Mutex<HashMap<WorkspaceId, Arc<AsyncMutex<()>>>>>,
+    definitions: Arc<Mutex<HashMap<String, Weak<AsyncMutex<()>>>>>,
 }
 
-impl WorkspaceScriptLocks {
+impl ScriptLocks {
     /// Create an empty lock registry.
     pub(crate) fn new() -> Self {
         Self::default()
@@ -142,8 +143,21 @@ impl WorkspaceScriptLocks {
 
     /// Resolve (or create) the lock for a workspace.
     fn lock_for(&self, workspace_id: &WorkspaceId) -> Arc<AsyncMutex<()>> {
-        let mut map = self.locks.lock().expect("script lock map poisoned");
+        let mut map = self.workspaces.lock().expect("script lock map poisoned");
         map.entry(workspace_id.clone()).or_default().clone()
+    }
+
+    /// Keep a lock alive while any update holds or waits for it. Reclaim
+    /// inactive ids so arbitrary script ids do not accumulate forever.
+    fn definition_lock(&self, script_id: &str) -> Arc<AsyncMutex<()>> {
+        let mut map = self.definitions.lock().expect("script lock map poisoned");
+        map.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = map.get(script_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(AsyncMutex::new(()));
+        map.insert(script_id.to_owned(), Arc::downgrade(&lock));
+        lock
     }
 
     /// Run `f` while holding the per-workspace script lock.
@@ -167,7 +181,7 @@ pub(crate) struct ScriptManager {
     bus: Option<EventBus>,
     store: Store,
     scripts: ScriptRegistry,
-    bootstrap_locks: WorkspaceScriptLocks,
+    locks: ScriptLocks,
     /// The too-fast-exit floor in milliseconds ([`TOO_FAST_MS`] in production;
     /// tests inject a larger floor so the decision is load-independent).
     too_fast_ms: u128,
@@ -240,7 +254,7 @@ impl ScriptManager {
         bus: Option<EventBus>,
         store: Store,
         scripts: ScriptRegistry,
-        bootstrap_locks: WorkspaceScriptLocks,
+        locks: ScriptLocks,
         too_fast_ms: u128,
         parks: ScriptParks,
     ) -> Self {
@@ -249,7 +263,7 @@ impl ScriptManager {
             bus,
             store,
             scripts,
-            bootstrap_locks,
+            locks,
             too_fast_ms,
             parks,
             settings: None,
@@ -290,6 +304,12 @@ impl ScriptManager {
             .script_id
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        // Persist, tear down, and register one replacement as a unit. This
+        // lock is shared by scoped and owner/internal calls, so a later
+        // successful update cannot be overwritten only in the live registry
+        // while this call awaits its predecessor's supervisor.
+        let lock = self.locks.definition_lock(&id);
+        let _guard = lock.lock().await;
         // Upsert of an existing id (`ws.script.create` with `scriptId`):
         // the definition is replaced with `source`/`createdAt` preserved and
         // `updatedAt` stamped (FE parity), and — unlike the FE, whose manager
@@ -474,7 +494,7 @@ impl ScriptManager {
         // Bootstrap from repo config if workspace has no scripts.
         // Use a per-workspace async lock to prevent concurrent bootstrap attempts
         // from creating duplicate script rows (modeled after intent-git::WorktreeLocks).
-        self.bootstrap_locks
+        self.locks
             .with_lock(workspace_id, || async {
                 // Re-check after acquiring the lock — another caller may have bootstrapped
                 {
@@ -5663,6 +5683,134 @@ mod tests {
             .await
             .expect("status");
         assert_eq!(st["status"], "idle", "fresh entry starts idle");
+    }
+
+    async fn assert_concurrent_script_upserts_stay_consistent(
+        first_scoped: bool,
+        second_scoped: bool,
+    ) {
+        let h = harness().await;
+        let p = start_parked_service(&h).await;
+        let services = p.services.clone();
+        let ws = h.ws.clone();
+        let sid = p.id.clone();
+        let first = intent_core::spawn_daemon(async move {
+            services
+                .script_manager()
+                .create_with_scope(
+                    ws,
+                    ScriptCreateParams {
+                        name: "first replacement".into(),
+                        command: "echo first".into(),
+                        script_id: Some(sid),
+                        ..Default::default()
+                    },
+                    first_scoped,
+                )
+                .await
+        });
+        await_entry_taken(&h, &p, &first).await;
+
+        let services = p.services.clone();
+        let ws = h.ws.clone();
+        let sid = p.id.clone();
+        let mut second = intent_core::spawn_daemon(async move {
+            services
+                .script_manager()
+                .create_with_scope(
+                    ws,
+                    ScriptCreateParams {
+                        name: "second replacement".into(),
+                        command: "echo second".into(),
+                        script_id: Some(sid),
+                        ..Default::default()
+                    },
+                    second_scoped,
+                )
+                .await
+        });
+        // Before serialization the second update completes while the first
+        // awaits its predecessor; the first then overwrites only live state.
+        // A serialized second update remains pending until we release the park.
+        let early_second = tokio::time::timeout(Duration::from_secs(1), &mut second).await;
+
+        // A different script in the same workspace must remain writable while
+        // replacement waits for a supervisor, rather than taking a global lock.
+        tokio::time::timeout(
+            LIVENESS,
+            h.services.script_create(
+                h.ws.clone(),
+                ScriptCreateParams {
+                    name: "independent".into(),
+                    command: "echo independent".into(),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("another script stays writable")
+        .unwrap();
+        p.park.release.notify_one();
+        tokio::time::timeout(LIVENESS, first)
+            .await
+            .expect("first update finishes")
+            .unwrap()
+            .unwrap();
+        match early_second {
+            Ok(result) => result.unwrap().unwrap(),
+            Err(_) => tokio::time::timeout(LIVENESS, second)
+                .await
+                .expect("second update finishes")
+                .unwrap()
+                .unwrap(),
+        };
+        assert_reaped(p.pid, "after overlapping script replacements").await;
+        let listed = h.services.script_list(h.ws.clone()).await.unwrap();
+        let live = listed["scripts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|script| script["id"] == p.id)
+            .unwrap();
+        let persisted = h
+            .services
+            .store
+            .list_all_scripts()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|script| script.id == p.id)
+            .unwrap();
+        assert_eq!(live["command"], persisted.command);
+        assert_eq!(live["command"], "echo second");
+        assert_eq!(live["name"], persisted.name);
+        assert_eq!(live["createdAt"], persisted.created_at);
+        assert_eq!(live["updatedAt"], json!(persisted.updated_at));
+
+        let restarted = Services::new(h.services.store().clone());
+        assert_eq!(restarted.hydrate_scripts().await.unwrap(), 2);
+        let hydrated = restarted.script_list(h.ws.clone()).await.unwrap();
+        let restored = hydrated["scripts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|script| script["id"] == p.id)
+            .unwrap();
+        for field in ["command", "name", "createdAt", "updatedAt"] {
+            assert_eq!(restored[field], live[field], "hydrated {field}");
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn concurrent_member_script_upserts_keep_saved_and_live_definitions_consistent() {
+        assert_concurrent_script_upserts_stay_consistent(true, true).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn concurrent_owner_and_member_script_upserts_keep_saved_and_live_definitions_consistent()
+    {
+        assert_concurrent_script_upserts_stay_consistent(true, false).await;
+        assert_concurrent_script_upserts_stay_consistent(false, true).await;
     }
 
     /// Two workspaces mint the same client-supplied `scriptId` concurrently

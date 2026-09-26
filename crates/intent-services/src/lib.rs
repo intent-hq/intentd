@@ -742,11 +742,9 @@ pub struct Services {
     /// keyed by script id. Scripts run on the same [`pty`](Self::pty) host as
     /// `terminal.*`, so a terminal can attach to a running script (§12.2).
     scripts: script_ops::ScriptRegistry,
-    /// Per-workspace async-mutex map for script bootstrap operations, preventing
-    /// concurrent `script.list` calls from creating duplicate repo-config scripts.
-    /// Shared across clones so all `ScriptManager` instances serialize bootstrap
-    /// per workspace (modeled after `intent-git::WorktreeLocks`).
-    script_bootstrap_locks: script_ops::WorkspaceScriptLocks,
+    /// Shared across clones and manager views: bootstrap serializes per
+    /// workspace; definition replacement serializes per durable script id.
+    script_locks: script_ops::ScriptLocks,
     /// The `script.*` too-fast-exit floor in milliseconds
     /// ([`script_ops::TOO_FAST_MS`] in production). Tests raise it via the
     /// `#[cfg(test)]`-only `with_script_too_fast_ms` seam so the no-restart
@@ -1415,7 +1413,7 @@ impl Services {
             pty: Arc::new(intent_pty::PtyHost::new()),
             daemon_boot_id: uuid::Uuid::new_v4().to_string(),
             scripts: Arc::new(Mutex::new(HashMap::new())),
-            script_bootstrap_locks: script_ops::WorkspaceScriptLocks::new(),
+            script_locks: script_ops::ScriptLocks::new(),
             script_too_fast_ms: script_ops::TOO_FAST_MS,
             script_parks: script_ops::ScriptParks::default(),
             completion_classify_park: None,
@@ -2150,7 +2148,7 @@ impl Services {
             self.event_bus.clone(),
             self.store.clone(),
             self.scripts.clone(),
-            self.script_bootstrap_locks.clone(),
+            self.script_locks.clone(),
             self.script_too_fast_ms,
             self.script_parks.clone(),
         )
