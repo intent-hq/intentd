@@ -4434,6 +4434,15 @@ impl Services {
         // Harvest the persistence-gap fields the FE writer kept under
         // `metadata` (P3-1.2b). Top-level params win over the metadata copy.
         let meta = metadata.as_ref().and_then(Value::as_object);
+        if metadata.as_ref().is_some_and(|m| {
+            m.get(intent_core::CHIEF_PROMPT_VERSION_KEY)
+                .is_some_and(|v| !v.is_null())
+                && intent_core::chief_prompt_version(m).is_none()
+        }) {
+            return Err(Error::InvalidParams(format!(
+                "{method}: `metadata.chiefPromptVersion` must be a positive integer (1..4294967295)"
+            )));
+        }
         let meta_get = |key: &str| meta.and_then(|m| m.get(key)).cloned();
         let delegation_depth = meta_get("delegationDepth").and_then(|v| v.as_i64());
         let initial_message = meta_get("initialMessage")
@@ -5546,6 +5555,8 @@ impl Services {
         let mut session = self.store.get_agent_session(&agent_id).await?;
         let prior_model = session.model.clone();
         let prior_muted = session.notifications_muted;
+        let prior_system_prompt = session.system_prompt.clone();
+        let prior_specialist = session.specialist.clone();
         let allowed = [
             "status",
             "isActive",
@@ -5769,6 +5780,11 @@ impl Services {
                 _ => unreachable!("guarded by allow-list above"),
             }
         }
+        if session.system_prompt != prior_system_prompt || session.specialist != prior_specialist {
+            if let Some(metadata) = session.metadata.as_mut().and_then(Value::as_object_mut) {
+                metadata.remove(intent_core::CHIEF_PROMPT_VERSION_KEY);
+            }
+        }
         session.updated_at = now_iso();
         let workspace_id = session.workspace_id.clone();
         // Muting drops the session out of the workspace unread derivation
@@ -5848,6 +5864,27 @@ impl Services {
         if let Some(before) = unread_before {
             self.settle_workspace_unread_after_seen(&workspace_id, before)
                 .await;
+        }
+        // The atomic store guard may have removed a stale marker during a
+        // concurrent identity edit. Do not echo that marker from our old
+        // in-memory snapshot after persistence correctly rejected it.
+        if session
+            .metadata
+            .as_ref()
+            .and_then(intent_core::chief_prompt_version)
+            .is_some()
+        {
+            let stored = self.store.get_agent_session_summary(&agent_id).await?;
+            if stored
+                .metadata
+                .as_ref()
+                .and_then(intent_core::chief_prompt_version)
+                .is_none()
+            {
+                if let Some(metadata) = session.metadata.as_mut().and_then(Value::as_object_mut) {
+                    metadata.remove(intent_core::CHIEF_PROMPT_VERSION_KEY);
+                }
+            }
         }
         let lite = self.project_lite_with_flags(session);
         Ok(json!({ "success": true, "agent": lite }))
@@ -11101,12 +11138,12 @@ impl Services {
     ) -> Result<Value> {
         if !workspace_id.is_chief() {
             return Err(Error::InvalidParams(
-                "ws.app.* is only available in the Chief of Staff workspace".to_string(),
+                "ws.app.* is only available in the Assistant workspace".to_string(),
             ));
         }
         if caller_agent_id == target_agent_id {
             return Err(Error::InvalidParams(
-                "Chief of Staff cannot send a message to itself".to_string(),
+                "Assistant cannot send a message to itself".to_string(),
             ));
         }
 
@@ -11118,13 +11155,13 @@ impl Services {
             || !caller.workspace_id.is_chief()
         {
             return Err(Error::InvalidParams(format!(
-                "caller agent {} is not an active Chief of Staff agent",
+                "caller agent {} is not an active Assistant agent",
                 caller_agent_id.0
             )));
         }
         let source_message_id = caller.last_message_id.ok_or_else(|| {
             Error::InvalidParams(
-                "Chief conversation has no persisted source message to link".to_string(),
+                "Assistant conversation has no persisted source message to link".to_string(),
             )
         })?;
 
@@ -11137,7 +11174,8 @@ impl Services {
         }
         if target.workspace_id.is_chief() {
             return Err(Error::InvalidParams(
-                "Chief messages can only target agents outside the Chief workspace".to_string(),
+                "Assistant messages can only target agents outside the Assistant workspace"
+                    .to_string(),
             ));
         }
 
@@ -11148,7 +11186,7 @@ impl Services {
         let metadata = json!({
             "type": "chief_message",
             "fromAgentId": caller_agent_id.0,
-            "fromAgentName": "Chief of Staff",
+            "fromAgentName": "Assistant",
             "fromWorkspaceId": workspace_id.0,
             "sourceMessageId": source_message_id,
             "sourceUrl": source_url,
@@ -11199,7 +11237,7 @@ impl Services {
     ) -> Result<Value> {
         if !workspace_id.is_chief() {
             return Err(Error::InvalidParams(
-                "ws.app.* is only available in the Chief of Staff workspace".to_string(),
+                "ws.app.* is only available in the Assistant workspace".to_string(),
             ));
         }
         let caller = self.require_agent_session(&caller_agent_id).await?;
@@ -11216,7 +11254,9 @@ impl Services {
             .get("workspaceId")
             .and_then(Value::as_str)
             .map(WorkspaceId::from)
-            .ok_or_else(|| Error::Internal("Chief send omitted target workspace".to_string()))?;
+            .ok_or_else(|| {
+                Error::Internal("Assistant send omitted target workspace".to_string())
+            })?;
         let subscription_id = self
             .register_completion_watch_strict_durable(
                 &workspace_id,
@@ -11237,7 +11277,7 @@ impl Services {
         let target_name = sent
             .get("agentName")
             .and_then(Value::as_str)
-            .ok_or_else(|| Error::Internal("Chief send omitted target name".to_string()))?
+            .ok_or_else(|| Error::Internal("Assistant send omitted target name".to_string()))?
             .to_string();
         Ok(json!({
             "ok": true,

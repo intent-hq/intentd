@@ -738,7 +738,7 @@ pub const CHIEF_WORKSPACE_TIMESTAMP: &str = "2026-01-01T00:00:00.000Z";
 pub fn chief_workspace() -> Workspace {
     Workspace {
         id: WorkspaceId::chief(),
-        title: "Chief of Staff".to_string(),
+        title: "Assistant".to_string(),
         branch: String::new(),
         base_ref: None,
         base_commit_sha: None,
@@ -3476,6 +3476,7 @@ pub const AGENT_LIST_ROW_METADATA_KEYS: &[&str] = &[
     "lastSeenMessageId",
     "isInitialAgent",
     "sponsorAgentId",
+    "chiefPromptVersion",
 ];
 
 /// Serialized-size attribution of one JSON object for list-row budget
@@ -3701,6 +3702,19 @@ pub(crate) const IS_INITIAL_AGENT_KEY: &str = "isInitialAgent";
 /// (no schema migration), like [`IS_INITIAL_AGENT_KEY`]. Read back by
 /// [`AgentSession::sponsor_agent_id`].
 pub(crate) const SPONSOR_AGENT_ID_KEY: &str = "sponsorAgentId";
+
+/// Client-supplied version of the Assistant prompt frozen at creation.
+/// Never inferred from specialist identity or creation time.
+pub const CHIEF_PROMPT_VERSION_KEY: &str = "chiefPromptVersion";
+
+/// Read a positive JSON integer version; malformed legacy values fail closed.
+pub fn chief_prompt_version(metadata: &serde_json::Value) -> Option<u32> {
+    metadata
+        .get(CHIEF_PROMPT_VERSION_KEY)
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|n| *n > 0)
+}
 
 /// Who originated an `agent.sendMessage`-shaped delivery (PROTOCOL §5.5).
 /// `User` marks the explicit user-action front doors — the FE
@@ -4207,6 +4221,10 @@ pub struct AgentMetadata {
     /// [`IS_INITIAL_AGENT_KEY`]); omitted for non-peer agents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sponsor_agent_id: Option<String>,
+    /// Explicit creation-time Assistant prompt version. Missing/invalid legacy
+    /// markers are omitted; prompt or specialist changes invalidate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chief_prompt_version: Option<u32>,
 }
 
 /// Lightweight `agent.list` / `agent.get` projection (PROTOCOL §5.5). Mirrors
@@ -4446,6 +4464,7 @@ impl AgentLite {
         let last_seen_message_id = session.last_seen_message_id().map(str::to_string);
         let is_initial_agent = session.is_initial_agent().then_some(true);
         let sponsor_agent_id = session.sponsor_agent_id().map(str::to_string);
+        let chief_prompt_version = session.metadata.as_ref().and_then(chief_prompt_version);
         let metadata = AgentMetadata {
             is_background: session.is_background,
             specialist: session.specialist,
@@ -4467,6 +4486,7 @@ impl AgentLite {
             last_seen_message_id,
             is_initial_agent,
             sponsor_agent_id,
+            chief_prompt_version,
         };
         Self {
             id: session.id,
@@ -8348,6 +8368,27 @@ mod tests {
         // Only the JSON boolean `true` surfaces the flag.
         let v = project(Some(json!({ IS_INITIAL_AGENT_KEY: true })));
         assert_eq!(v["metadata"]["isInitialAgent"], true);
+
+        for version in [json!(1), json!(3), json!(u32::MAX)] {
+            let v = project(Some(json!({ CHIEF_PROMPT_VERSION_KEY: version })));
+            assert_eq!(v["metadata"][CHIEF_PROMPT_VERSION_KEY], version);
+        }
+        for version in [
+            json!(null),
+            json!(0),
+            json!(-1),
+            json!(3.0),
+            json!(1.5),
+            json!("3"),
+            json!(true),
+            json!({}),
+            json!([]),
+            json!(u64::MAX),
+        ] {
+            let v = project(Some(json!({ CHIEF_PROMPT_VERSION_KEY: version })));
+            assert!(v["metadata"].get(CHIEF_PROMPT_VERSION_KEY).is_none());
+        }
+        assert!(legacy["metadata"].get(CHIEF_PROMPT_VERSION_KEY).is_none());
     }
 
     /// `AgentSession` serializes to the camelCase `agent-session.ts` wire shape:

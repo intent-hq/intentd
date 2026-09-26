@@ -305,6 +305,193 @@ where
     }
 }
 
+async fn chief_collection_push<S>(ws: &mut WebSocketStream<S>) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    timeout(Duration::from_secs(15), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).unwrap();
+                    if v["method"] == "subscription.push" {
+                        return v["params"].clone();
+                    }
+                }
+                Some(Ok(Message::Ping(p))) => {
+                    ws.send(Message::Pong(p)).await.unwrap();
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected collection push, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("collection push timed out")
+}
+
+#[tokio::test]
+async fn chief_prompt_version_wss_restart_roundtrip_and_collection_invalidation() {
+    let data = temp_data_dir();
+    let env = [("INTENTD_AUTH_TOKEN", TOKEN)];
+    let daemon = Daemon {
+        child: spawn_serve(data.path(), "both", &env),
+    };
+    let socket = data.path().join("intentd.sock");
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let mut events = connect_ws(port, cfg).await;
+    let sub = wss_rpc_envelope(
+        &mut events,
+        1,
+        "events.subscribe",
+        json!({
+            "workspaceId": CHIEF_WORKSPACE_ID, "eventTypes": ["agent:created"]
+        }),
+    )
+    .await;
+    assert!(sub["result"]["subscriptionId"].is_string());
+    let invalid = wss_rpc_envelope(
+        &mut rpc,
+        2,
+        "agent.create",
+        json!({
+            "workspaceId": CHIEF_WORKSPACE_ID, "provider": "mock", "model": "default",
+            "metadata": {"chiefPromptVersion": "3"}
+        }),
+    )
+    .await;
+    assert_eq!(invalid["id"], 2);
+    assert_eq!(invalid["jsonrpc"], "2.0");
+    assert_eq!(invalid["error"]["code"], -32602);
+    assert!(invalid.get("result").is_none());
+
+    let mut agents = Vec::new();
+    for metadata in [
+        json!({}),
+        json!({"chiefPromptVersion": null}),
+        json!({"chiefPromptVersion": 2}),
+        json!({"chiefPromptVersion": 3}),
+    ] {
+        let expected = metadata
+            .get("chiefPromptVersion")
+            .filter(|v| !v.is_null())
+            .cloned();
+        let created = wss_rpc_envelope(
+            &mut rpc,
+            3,
+            "agent.create",
+            json!({
+                "workspaceId": CHIEF_WORKSPACE_ID, "name": "My saved Assistant chat",
+                "provider": "mock", "model": "default", "specialistId": "chief-of-staff",
+                "metadata": metadata
+            }),
+        )
+        .await;
+        assert_eq!(created["jsonrpc"], "2.0");
+        assert_eq!(created["id"], 3);
+        assert!(created.get("error").is_none(), "{created}");
+        let row = &created["result"]["agent"];
+        assert_eq!(row["metadata"].get("chiefPromptVersion").cloned(), expected);
+        let id = row["id"].as_str().unwrap().to_string();
+        let event = wss_event(&mut events, 15).await;
+        assert_eq!(event["params"]["event"]["type"], "agent:created");
+        assert_eq!(event["params"]["event"]["data"]["agentId"], id);
+        agents.push((id, expected));
+    }
+    drop(rpc);
+    drop(events);
+    drop(daemon);
+
+    // Reopen the same database with a new daemon process and new WSS connection.
+    let _daemon = Daemon {
+        child: spawn_serve(data.path(), "both", &env),
+    };
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let listed = wss_rpc_envelope(
+        &mut rpc,
+        4,
+        "agent.list",
+        json!({"workspaceId": CHIEF_WORKSPACE_ID}),
+    )
+    .await;
+    assert_eq!(listed["id"], 4);
+    assert_eq!(listed["jsonrpc"], "2.0");
+    assert!(listed.get("error").is_none());
+    let rows = listed["result"]["agents"].as_array().unwrap();
+    assert_eq!(rows.len(), agents.len());
+    for (id, expected) in &agents {
+        let got = wss_rpc_envelope(&mut rpc, 5, "agent.get", json!({"agentId": id})).await;
+        assert_eq!(got["id"], 5);
+        assert_eq!(got["jsonrpc"], "2.0");
+        assert!(got.get("error").is_none());
+        for row in [
+            &got["result"]["agent"],
+            rows.iter().find(|r| r["id"] == *id).unwrap(),
+        ] {
+            assert_eq!(row["metadata"].get("chiefPromptVersion"), expected.as_ref());
+            assert_eq!(row["name"], "My saved Assistant chat");
+            assert_eq!(row["messageCount"], 0);
+        }
+    }
+
+    let mut collection = connect_ws(port, cfg).await;
+    let subscribed = wss_rpc_envelope(
+        &mut collection,
+        6,
+        "agent.subscribe",
+        json!({"workspaceId": CHIEF_WORKSPACE_ID}),
+    )
+    .await;
+    assert_eq!(subscribed["jsonrpc"], "2.0");
+    assert!(subscribed["result"]["subscriptionId"].is_string());
+    let snapshot = chief_collection_push(&mut collection).await;
+    assert_eq!(snapshot["kind"], "snapshot");
+    assert_eq!(snapshot["seq"], 0);
+    for (id, expected) in &agents {
+        let row = snapshot["snapshot"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == *id)
+            .unwrap();
+        assert_eq!(row["metadata"].get("chiefPromptVersion"), expected.as_ref());
+    }
+    let (id, _) = agents.last().unwrap();
+    for (changes, expected) in [
+        (json!({"name": "Custom thread name"}), Some(json!(3))),
+        (json!({"systemPrompt": "Custom replacement prompt"}), None),
+    ] {
+        let updated = wss_rpc_envelope(
+            &mut rpc,
+            7,
+            "agent.update",
+            json!({"agentId": id, "changes": changes}),
+        )
+        .await;
+        assert_eq!(updated["jsonrpc"], "2.0");
+        assert_eq!(updated["id"], 7);
+        assert!(updated.get("error").is_none(), "{updated}");
+        assert_eq!(
+            updated["result"]["agent"]["metadata"].get("chiefPromptVersion"),
+            expected.as_ref()
+        );
+        let delta = chief_collection_push(&mut collection).await;
+        assert_eq!(delta["kind"], "delta");
+        let row = &delta["delta"]["updated"][0];
+        assert_eq!(row["id"], *id);
+        assert_eq!(row["metadata"].get("chiefPromptVersion"), expected.as_ref());
+        assert_eq!(row["name"], "Custom thread name");
+    }
+}
+
 /// Full Chief-workspace slice over the real WSS transport. Asserts every
 /// envelope on the wire matches the JSON-RPC contract (`id`, `jsonrpc`, no
 /// `error`, exact `result` payload) so an FE regressing against the
@@ -344,7 +531,7 @@ async fn chief_workspace_over_wss() {
     assert!(resp.get("error").is_none(), "workspace.get errored: {resp}");
     let chief = &resp["result"]["workspace"];
     assert_eq!(chief["id"], json!(CHIEF_WORKSPACE_ID));
-    assert_eq!(chief["title"], json!("Chief of Staff"));
+    assert_eq!(chief["title"], json!("Assistant"));
     assert_eq!(chief["branch"], json!(""));
     assert_eq!(chief["status"], json!("Active"));
     assert_eq!(chief["attention"], json!("none"));
@@ -2042,7 +2229,7 @@ async fn non_chief_waitfor_gated_over_wss() {
     );
     let error_msg = gate_result["error"].as_str().expect("error string");
     assert!(
-        error_msg.contains("ws.app.* is only available in the Chief of Staff workspace"),
+        error_msg.contains("ws.app.* is only available in the Assistant workspace"),
         "clear chief-gating error, got: {error_msg}"
     );
 
@@ -2323,7 +2510,7 @@ async fn chief_workspace_archive_gated_over_wss() {
         );
         let msg = outcome["error"].as_str().expect("error string");
         assert!(
-            msg.contains("chief-of-staff"),
+            msg.contains("Assistant workspace"),
             "clear chief-gating error for {method}, got: {msg}"
         );
     }
@@ -2462,7 +2649,7 @@ async fn chief_agent_send_cross_workspace_over_wss() {
     assert_eq!(
         delivered["contentBlocks"][0]["text"],
         json!(format!(
-            "[MESSAGE FROM AGENT Chief of Staff ({chief_id})]\n\nPlease report your status"
+            "[MESSAGE FROM AGENT Assistant ({chief_id})]\n\nPlease report your status"
         ))
     );
     assert_eq!(
@@ -2470,7 +2657,7 @@ async fn chief_agent_send_cross_workspace_over_wss() {
         json!({
             "type": "chief_message",
             "fromAgentId": chief_id,
-            "fromAgentName": "Chief of Staff",
+            "fromAgentName": "Assistant",
             "fromWorkspaceId": CHIEF_WORKSPACE_ID,
             "sourceMessageId": source_message_id,
             "sourceUrl": source_url,

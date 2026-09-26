@@ -10362,6 +10362,7 @@ mod wsapi4_bindings_tests {
                 last_seen_message_id: None,
                 is_initial_agent: None,
                 sponsor_agent_id: None,
+                chief_prompt_version: None,
             },
         }
     }
@@ -13694,6 +13695,7 @@ mod workspace_apply_proposal_tests {
                 last_seen_message_id: None,
                 is_initial_agent: None,
                 sponsor_agent_id: None,
+                chief_prompt_version: None,
             },
         }
     }
