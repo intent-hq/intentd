@@ -5236,7 +5236,7 @@ async fn wss_collaborator_steered_agent_runs_host_exec_with_owner_capabilities()
         .as_str()
         .unwrap_or_else(|| panic!("tool text: {refused}"));
     assert!(
-        refused_text.contains("forbidden: host.exec requires the daemon administrator"),
+        refused_text.contains("forbidden: host.exec requires host membership"),
         "unbound bridge must surface the gate's refusal: {refused_text}"
     );
 
