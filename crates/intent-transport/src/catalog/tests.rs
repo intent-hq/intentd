@@ -1181,7 +1181,6 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "browser.removeTab",
     "browser.syncTabs",
     "browser.upsertTab",
-    "client.list",
     "debug.sampleStacks",
     "file-tracking.getAgentLocks",
     "file-tracking.getChanges",
@@ -1668,8 +1667,6 @@ mod unbound_owner_only_methods {
         // No gate: daemon-wide per-agent memory read; no-manager early
         // return `{ sampledAt: null, totalBytes: null, agents: [] }`.
         ("agent.memoryUsage", "ok"),
-        // No gate: daemon-wide reverse-client listing.
-        ("client.list", "ok"),
         // No gate: process-wide stack sampler.
         ("debug.sampleStacks", "ok"),
         // No gate: daemon-wide metrics read.
@@ -1775,7 +1772,6 @@ mod unbound_owner_only_methods {
                 "agent.wakeOrCreate",
                 json!({ "workspaceId": ws, "taskNoteId": "t1", "contextMessage": "c" }),
             ),
-            ("client.list", json!({})),
             ("debug.sampleStacks", json!({ "durationMs": 1 })),
             ("file-tracking.getAgentLocks", json!({ "workspaceId": ws })),
             ("file-tracking.getChanges", json!({ "workspaceId": ws })),
@@ -2414,7 +2410,6 @@ fn member_methods_and_administrator_remainder_are_classified() {
         "agent.memoryUsage",
         "agent.replaceMessages",
         "agent.reportToParent",
-        "client.list",
         "debug.sampleStacks",
         "github.authStatus",
         "github.cancelAuth",

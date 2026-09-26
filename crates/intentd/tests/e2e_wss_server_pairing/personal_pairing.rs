@@ -52,6 +52,50 @@ fn spawn_personal(dir: &Path, sidecar: &Path, run: u8) -> GuardedChild {
     .unwrap()
 }
 
+async fn assert_authenticated_uds_device(socket: &Path, owner: &PrincipalId) {
+    let stream = tokio::net::UnixStream::connect(socket).await.unwrap();
+    let (read, mut write) = stream.into_split();
+    let mut lines = tokio::io::BufReader::new(read).lines();
+    for (id, method, params) in [
+        (
+            1,
+            "client.hello",
+            json!({"clientId":"uds-device","name":"Local desktop","principalId":"forged","hostRole":"guest"}),
+        ),
+        (2, "client.list", json!({})),
+    ] {
+        let frame = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
+        write
+            .write_all(format!("{frame}\n").as_bytes())
+            .await
+            .unwrap();
+        let line = timeout(common::rpc_read_timeout(), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let reply: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(reply["jsonrpc"], "2.0");
+        assert_eq!(reply["id"], id);
+        assert!(reply.get("error").is_none(), "{reply}");
+        if id == 2 {
+            let row = reply["result"]["clients"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["clientId"] == "uds-device")
+                .unwrap();
+            assert_eq!(row["principalId"], owner.as_str());
+            assert_eq!(row["hostRole"], "owner");
+            assert_eq!(row["transports"], json!(["uds"]));
+            assert_eq!(row["connections"], 1);
+            for key in ["login", "displayName", "avatarUrl"] {
+                assert_eq!(row.get(key), Some(&Value::Null));
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn personal_pairing_reuses_uds_owner_member_guest_credentials_after_daemon_restart() {
     use std::os::unix::fs::PermissionsExt;
@@ -106,6 +150,7 @@ async fn personal_pairing_reuses_uds_owner_member_guest_credentials_after_daemon
             &dir.path().join(format!("personal-{run}.log")),
         )
         .await;
+        assert_authenticated_uds_device(&socket, &owner.id).await;
         let status = common::await_wss_status(&socket).await;
         let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
         let info = uds_rpc(&socket, 1, "pairing.getSelfInfo", json!({})).await;
@@ -234,7 +279,7 @@ async fn member_removal_real_uds_operation_rejects_old_devices_after_restart() {
         .await;
         let status = common::await_wss_status(&socket).await;
         let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
-        let hello=uds_rpc(&socket,0,"client.hello",json!({"capabilities":{"hostMembership":false,"personalPairing":999,"authenticatedDevices":1}})).await;
+        let hello=uds_rpc(&socket,0,"client.hello",json!({"capabilities":{"hostMembership":false,"personalPairing":999,"authenticatedDevices":999}})).await;
         assert_eq!(
             hello["result"]["server"]["capabilities"]["hostMembership"],
             1
@@ -243,9 +288,10 @@ async fn member_removal_real_uds_operation_rejects_old_devices_after_restart() {
             hello["result"]["server"]["capabilities"]["personalPairing"],
             1
         );
-        assert!(hello["result"]["server"]["capabilities"]
-            .get("authenticatedDevices")
-            .is_none());
+        assert_eq!(
+            hello["result"]["server"]["capabilities"]["authenticatedDevices"],
+            1
+        );
         assert_eq!(
             hello["result"]["server"]["buildCommit"].as_str(),
             intent_transport::BUILD_COMMIT

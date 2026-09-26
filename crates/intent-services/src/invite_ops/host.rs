@@ -114,6 +114,9 @@ impl Services {
         }
         #[cfg(test)]
         self.member_removal_publication_pause.pause().await;
+        if let Some(devices) = &self.reverse_dispatch {
+            devices.client_principal_removed(principal);
+        }
         // All authorization reads already see the committed state. Close
         // transports even if an unrelated workspace disappears during egress.
         let final_event = self.host_membership_event(intent_core::events::HOST_MEMBERS_CHANGED,

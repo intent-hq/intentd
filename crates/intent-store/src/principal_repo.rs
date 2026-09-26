@@ -251,6 +251,49 @@ impl Store {
         Ok(out)
     }
 
+    /// Cached device profiles and effective roles from the same SQLite snapshot,
+    /// batched by returned principals rather than scanning the host directory.
+    ///
+    /// # Errors
+    /// Returns an internal error if the database read fails.
+    pub async fn get_device_principals(
+        &self,
+        ids: &[PrincipalId],
+        viewer: Option<&PrincipalId>,
+    ) -> Result<Vec<(Principal, intent_core::HostRole)>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(32_000) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let mut sql = format!("SELECT {PRINCIPAL_COLUMNS}, EXISTS(SELECT 1 FROM host_member h WHERE h.principal_id = principal.id) AS is_member FROM principal WHERE id IN ({placeholders})");
+            if viewer.is_some() {
+                sql.push_str(" AND (id = ? OR EXISTS(SELECT 1 FROM principal v WHERE v.id = ? AND (v.is_primary = 1 OR EXISTS(SELECT 1 FROM host_member h WHERE h.principal_id = v.id))))");
+            }
+            let mut query = sqlx::query(&sql);
+            for id in chunk {
+                query = query.bind(id.as_str());
+            }
+            if let Some(viewer) = viewer {
+                query = query.bind(viewer.as_str()).bind(viewer.as_str());
+            }
+            let rows = query
+                .fetch_all(self.read_pool())
+                .await
+                .map_err(|e| Error::Internal(format!("read device principals: {e}")))?;
+            for row in rows {
+                let person = map_principal_row(&row);
+                let role = if person.is_primary {
+                    intent_core::HostRole::Owner
+                } else if row.get::<bool, _>("is_member") {
+                    intent_core::HostRole::Member
+                } else {
+                    intent_core::HostRole::Guest
+                };
+                out.push((person, role));
+            }
+        }
+        Ok(out)
+    }
+
     /// The daemon's primary principal (the original single user, minted by
     /// migration `0125_principals`).
     ///

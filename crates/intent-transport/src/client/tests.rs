@@ -102,7 +102,7 @@ fn shared_host_capabilities_are_independent_of_client_authority() {
         let server = server_json(false, "linux", "x86_64", "test", None, local);
         assert_eq!(server["capabilities"]["hostMembership"], 1);
         assert_eq!(server["capabilities"]["personalPairing"], 1);
-        assert!(server["capabilities"].get("authenticatedDevices").is_none());
+        assert_eq!(server["capabilities"]["authenticatedDevices"], 1);
     }
 }
 

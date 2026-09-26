@@ -224,7 +224,7 @@ async fn personal_pairing_returns_only_admitted_person() {
     let (srv, _info) = start_pairing().await;
     let owner = srv.store.get_primary_principal().await.unwrap();
     let mut owner_socket = reconnect(&srv, &owner, TOKEN).await;
-    let hello=owner_socket.call("client.hello",json!({"capabilities":{"hostMembership":false,"personalPairing":999,"authenticatedDevices":1}})).await;
+    let hello=owner_socket.call("client.hello",json!({"capabilities":{"hostMembership":false,"personalPairing":999,"authenticatedDevices":false}})).await;
     assert_shared_capabilities(&hello);
     assert_pairing(
         &owner_socket.call("pairing.getSelfInfo", json!({})).await,
@@ -242,7 +242,7 @@ async fn personal_pairing_returns_only_admitted_person() {
                 .await
                 .unwrap();
         }
-        let hello=person.call("client.hello",json!({"capabilities":{"hostMembership":false,"personalPairing":999,"authenticatedDevices":1}})).await;
+        let hello=person.call("client.hello",json!({"capabilities":{"hostMembership":false,"personalPairing":999,"authenticatedDevices":false}})).await;
         assert_shared_capabilities(&hello);
         let role = if member { "member" } else { "guest" };
         let response = person.call("pairing.getSelfInfo", json!({})).await;
@@ -1183,7 +1183,7 @@ fn assert_shared_capabilities(hello: &Value) {
     let capabilities = &hello["result"]["server"]["capabilities"];
     assert_eq!(capabilities["hostMembership"], 1);
     assert_eq!(capabilities["personalPairing"], 1);
-    assert!(capabilities.get("authenticatedDevices").is_none());
+    assert_eq!(capabilities["authenticatedDevices"], 1);
 }
 
 #[path = "member_removal_rejoin.rs"]

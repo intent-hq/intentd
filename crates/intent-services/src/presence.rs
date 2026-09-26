@@ -580,6 +580,9 @@ impl Services {
             return;
         };
         profile.host_role = Some(role);
+        if let Some(devices) = &self.reverse_dispatch {
+            devices.client_profile_changed(&principal.id);
+        }
         let (online, updated) = {
             let mut state = self.presence.lock();
             state.profile_epoch += 1;

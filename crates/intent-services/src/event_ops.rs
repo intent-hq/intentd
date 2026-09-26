@@ -75,10 +75,14 @@ impl crate::Services {
     ) -> intent_core::Result<bool> {
         let member = match intent_core::current_caller() {
             Some(Caller::Wire { principal_id, .. }) if is_collaborator_caller() => {
-                matches!(
+                let member = matches!(
                     self.store.get_host_role(&principal_id).await?,
                     intent_core::HostRole::Member | intent_core::HostRole::Owner
-                )
+                );
+                if !member {
+                    q.client_principal_id = Some(principal_id);
+                }
+                member
             }
             _ => false,
         };

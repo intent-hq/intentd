@@ -39354,6 +39354,12 @@ mod browser_client_pin {
             self.clients
                 .iter()
                 .map(|(id, name, eligible)| ReverseLiveClient {
+                    principal_id: None,
+                    host_role: None,
+                    login: None,
+                    display_name: None,
+                    avatar_url: None,
+                    identity: None,
                     client_id: id.clone(),
                     name: name.clone(),
                     capabilities: json!({ "browserExec": eligible }),
@@ -39429,11 +39435,13 @@ mod browser_client_pin {
             json!([
                 {
                     "clientId": "desktop-a", "name": "Desktop A",
+                    "login": null, "displayName": null, "avatarUrl": null,
                     "capabilities": { "browserExec": true }, "connections": 1,
                     "transports": ["wss"], "connectedAt": "2026-09-06T00:00:00Z"
                 },
                 {
                     "clientId": "aux",
+                    "login": null, "displayName": null, "avatarUrl": null,
                     "capabilities": { "browserExec": false }, "connections": 1,
                     "transports": ["wss"], "connectedAt": "2026-09-06T00:00:00Z"
                 }

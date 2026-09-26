@@ -1418,6 +1418,7 @@ impl WsInner {
                     } else {
                         reverse_guard.unbind();
                     }
+                    reverse_guard.refresh_devices();
                 }
                 Input::Incoming(incoming) => match incoming {
                     Some(Err(e)) => {

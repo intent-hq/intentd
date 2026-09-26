@@ -7958,6 +7958,19 @@ pub struct ResolvedClient {
 #[serde(rename_all = "camelCase")]
 pub struct ReverseLiveClient {
     pub client_id: ClientId,
+    /// Admission-bound identity. Absent only on legacy/internal registry adapters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_id: Option<crate::PrincipalId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_role: Option<crate::HostRole>,
+    #[serde(default)]
+    pub login: Option<String>,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub avatar_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<crate::PrincipalIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub capabilities: serde_json::Value,
@@ -8018,6 +8031,18 @@ pub trait AgentReverseDispatch: Send + Sync {
     fn live_clients(&self) -> Vec<ReverseLiveClient> {
         Vec::new()
     }
+
+    /// All hello'd devices, including guests that cannot host a browser.
+    /// Services apply current person/role projection and caller visibility.
+    fn authenticated_clients(&self) -> Vec<ReverseLiveClient> {
+        self.live_clients()
+    }
+
+    /// Queue full device updates after a durable person/role mutation.
+    fn client_profile_changed(&self, _principal: &crate::PrincipalId) {}
+
+    /// Remove the revoked person's devices before allowing fresh admission.
+    fn client_principal_removed(&self, _principal: &crate::PrincipalId) {}
 
     /// Dispatch a reverse JSON-RPC request to the client `target` resolves to
     /// and await its response.

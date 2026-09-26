@@ -121,6 +121,11 @@ pub enum ClientTransition {
     /// re-hello under another `clientId`, panic, or task abort
     /// (⇒ `client:disconnected`).
     Disconnected(ReverseClientIdentity),
+    /// Authenticated roster transition; independent of browser eligibility.
+    Device {
+        event_type: &'static str,
+        data: Value,
+    },
 }
 
 impl ClientTransition {
@@ -130,16 +135,25 @@ impl ClientTransition {
         match self {
             ClientTransition::Connected(_) => CLIENT_CONNECTED,
             ClientTransition::Disconnected(_) => CLIENT_DISCONNECTED,
+            ClientTransition::Device { event_type, .. } => event_type,
         }
     }
 
     /// The identity carried by the transition.
     #[must_use]
-    pub fn identity(&self) -> &ReverseClientIdentity {
+    pub fn identity(&self) -> Option<&ReverseClientIdentity> {
         match self {
             ClientTransition::Connected(identity) | ClientTransition::Disconnected(identity) => {
-                identity
+                Some(identity)
             }
+            ClientTransition::Device { .. } => None,
+        }
+    }
+
+    fn data(&self) -> Value {
+        match self {
+            Self::Device { data, .. } => data.clone(),
+            Self::Connected(identity) | Self::Disconnected(identity) => identity.event_data(),
         }
     }
 }
@@ -171,6 +185,12 @@ impl LiveClient {
     #[must_use]
     pub fn to_wire(&self) -> ReverseLiveClient {
         ReverseLiveClient {
+            principal_id: None,
+            host_role: None,
+            login: None,
+            display_name: None,
+            avatar_url: None,
+            identity: None,
             client_id: self.client_id.clone(),
             name: self.name.clone(),
             capabilities: self.capabilities.clone(),
@@ -217,6 +237,8 @@ struct State {
     /// host-identity lookup on the `browser.*` write path) so it never walks
     /// `entries`. Maintained by `bind` / removal alongside `presence`.
     bound: HashMap<u64, ClientId>,
+    /// Maintained on mutation, so roster reads clone only the returned rows.
+    devices: Vec<ReverseLiveClient>,
 }
 
 impl State {
@@ -306,6 +328,8 @@ struct Entry {
     /// (`0` before the first hello). Orders hellos across connections so
     /// "newest hello wins" keys on hello order, not registration order.
     hello_seq: u64,
+    device: Option<devices::DeviceBinding>,
+    device_managed: bool,
 }
 
 impl Entry {
@@ -338,10 +362,13 @@ impl Inner {
         let mut state = self.lock();
         let pos = state.entries.iter().position(|e| e.id == id)?;
         let entry = state.entries.remove(pos)?;
+        if entry.device_managed {
+            state.refresh_devices(&self.transitions);
+        }
         state.bound.remove(&id);
         if let Some(identity) = entry.identity {
             state.presence_remove(&identity.client_id);
-            if !state.presence.contains_key(&identity.client_id) {
+            if !entry.device_managed && !state.presence.contains_key(&identity.client_id) {
                 let _ = self
                     .transitions
                     .send(ClientTransition::Disconnected(identity));
@@ -416,6 +443,8 @@ impl PrimaryReverseRegistry {
             connected_at: now_iso(),
             identity: None,
             hello_seq: 0,
+            device: None,
+            device_managed: false,
         });
         PrimaryReverseGuard {
             registry: Some(self.inner.clone()),
@@ -620,6 +649,39 @@ impl AgentReverseDispatch for PrimaryReverseRegistry {
             .collect()
     }
 
+    fn authenticated_clients(&self) -> Vec<ReverseLiveClient> {
+        self.inner.lock().devices.clone()
+    }
+
+    fn client_profile_changed(&self, principal: &intent_core::PrincipalId) {
+        let state = self.inner.lock();
+        for row in state
+            .devices
+            .iter()
+            .filter(|row| row.principal_id.as_ref() == Some(principal))
+        {
+            state.queue_device(
+                &self.inner.transitions,
+                intent_core::events::CLIENT_UPDATED,
+                row,
+            );
+        }
+    }
+
+    fn client_principal_removed(&self, principal: &intent_core::PrincipalId) {
+        let mut state = self.inner.lock();
+        for entry in &mut state.entries {
+            if entry
+                .device
+                .as_ref()
+                .is_some_and(|d| &d.principal_id == principal)
+            {
+                entry.device = None;
+            }
+        }
+        state.refresh_devices(&self.inner.transitions);
+    }
+
     fn dispatch<'a>(
         &'a self,
         method: &'a str,
@@ -664,7 +726,7 @@ async fn publish_client_event(api: &dyn WorkspaceApi, transition: &ClientTransit
         .publish_event(intent_core::PublishEvent {
             workspace_id: WorkspaceId::from_string(String::new()),
             event_type: event_type.to_string(),
-            data: transition.identity().event_data(),
+            data: transition.data(),
         })
         .await
     {
@@ -726,6 +788,7 @@ impl PrimaryReverseGuard {
         if !state.entries[pos].channel.may_host_browser() {
             return;
         }
+        let device_managed = state.entries[pos].device_managed;
         state.entries[pos].hello_seq = inner.next_hello_seq.fetch_add(1, Ordering::Relaxed) + 1;
         let previous = state.entries[pos].identity.replace(identity.clone());
         state.bound.insert(self.id, identity.client_id.clone());
@@ -739,7 +802,7 @@ impl PrimaryReverseGuard {
         }
         if let Some(previous) = previous {
             state.presence_remove(&previous.client_id);
-            if !state.presence.contains_key(&previous.client_id) {
+            if !device_managed && !state.presence.contains_key(&previous.client_id) {
                 let _ = inner
                     .transitions
                     .send(ClientTransition::Disconnected(previous));
@@ -747,7 +810,7 @@ impl PrimaryReverseGuard {
         }
         let first_connection = !state.presence.contains_key(&identity.client_id);
         state.presence_add(&identity);
-        if first_connection {
+        if first_connection && !device_managed {
             let _ = inner
                 .transitions
                 .send(ClientTransition::Connected(identity));
@@ -767,13 +830,15 @@ impl PrimaryReverseGuard {
         let Some(identity) = entry.identity.take() else {
             return;
         };
+        let device_managed = entry.device_managed;
         state.bound.remove(&self.id);
         state.presence_remove(&identity.client_id);
-        if !state.presence.contains_key(&identity.client_id) {
+        if !device_managed && !state.presence.contains_key(&identity.client_id) {
             let _ = inner
                 .transitions
                 .send(ClientTransition::Disconnected(identity));
         }
+        state.refresh_devices(&inner.transitions);
     }
 }
 
@@ -789,3 +854,5 @@ impl Drop for PrimaryReverseGuard {
 
 #[cfg(test)]
 mod tests;
+
+mod devices;

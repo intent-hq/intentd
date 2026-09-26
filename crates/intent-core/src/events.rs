@@ -528,10 +528,22 @@ pub const BROWSER_TAB_CLOSED: &str = "browser:tab-closed";
 // transport's primary reverse registry). Global (empty `workspaceId`, like
 // `settings:changed`): `client:connected` when a `clientId` gains its first
 // live hello'd connection, `client:disconnected` when it loses its last.
-// Payload `{ clientId, name?, capabilities }` — the owner's device identity,
-// so the pair is owner-only (see [`COLLABORATOR_EVENT_TYPES`]).
+// Payload keeps `{ clientId, name?, capabilities }` and adds the admitted
+// principal projection. Updates carry the full row. Owner/member see the host
+// roster; guests see only their own principal (live and durable reads).
 pub const CLIENT_CONNECTED: &str = "client:connected";
 pub const CLIENT_DISCONNECTED: &str = "client:disconnected";
+pub const CLIENT_UPDATED: &str = "client:updated";
+pub const CLIENT_EVENT_TYPES: &[&str] = &[CLIENT_CONNECTED, CLIENT_DISCONNECTED, CLIENT_UPDATED];
+
+/// Device audiences are checked separately from workspace membership.
+#[must_use]
+pub fn is_client_event_type(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        CLIENT_CONNECTED | CLIENT_DISCONNECTED | CLIENT_UPDATED
+    )
+}
 
 /// Every canonical event-type string in the taxonomy above. Useful for
 /// validation and the filter/subscription wiring added in later M2 tasks.
@@ -685,6 +697,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     BROWSER_TAB_CLOSED,
     CLIENT_CONNECTED,
     CLIENT_DISCONNECTED,
+    CLIENT_UPDATED,
 ];
 
 /// How an [`EventDiscriminator`]'s `values` relate to the field at its `path`.
@@ -806,8 +819,7 @@ pub fn is_known_event_type(event_type: &str) -> bool {
 ///
 /// Owner-only by design (never listed): `terminal:*` (raw PTY bytes),
 /// `host:exec:*` (host command output), `script:*` (host process output /
-/// state), `browser:*` (the owner's tabs), `client:*` (the owner's device
-/// identity and host info), `hook:run-*` (hook code and carried state),
+/// state), `browser:*` (the owner's tabs), `hook:run-*` (hook code and carried state),
 /// `agent:permission:*` (tool-permission prompts are the owner's to answer),
 /// `workspace:transfer:*` and `git:clone:*` (host paths / transfer
 /// progress), `gitRoot:*` (host paths), `test:*` / `build:*` (host process
@@ -852,6 +864,9 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (CHANGES_METRICS_CHANGED, "Changes: line-count metrics of tracked changes."),
     (CHANGES_TRACKED, "Changes: a file change was attributed to an agent; workspace-relative path."),
     (CHAT_STREAM_DELTA, "Chat channel: incremental transcript content of a conversation the guest can read; scoped per agent by the chat forwarder."),
+    (CLIENT_CONNECTED, "Authenticated devices: host-wide for owner/member, own principal only for guests; delivery and durable reads enforce the audience."),
+    (CLIENT_DISCONNECTED, "Authenticated devices: same audience as client.list; final connection departed."),
+    (CLIENT_UPDATED, "Authenticated devices: full row after metadata, profile or role changes; same audience as client.list."),
     (COMMENT_ADDED, "Comment: a comment landed on a note."),
     (COMMENT_RESOLVED, "Comment: a thread was resolved."),
     (DRAFT_CHANGED, "Draft: a client's composer draft exists or was cleared; { workspaceId, agentId, clientId, hasDraft } — never the text."),

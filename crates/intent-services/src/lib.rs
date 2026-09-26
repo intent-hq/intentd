@@ -77,6 +77,7 @@ mod conditional_write_precedence_tests;
 mod config_watcher;
 mod create_progress;
 mod delete_grace;
+mod device_ops;
 mod discovery_cache;
 mod disk_usage;
 mod drafts;
@@ -17766,11 +17767,12 @@ impl WorkspaceApi for Services {
                     events.retain(|ev| {
                         visible.contains(&ev.workspace_id)
                             || (ev.workspace_id.as_str().is_empty()
-                                && matches!(
-                                    ev.event_type.as_str(),
-                                    intent_core::events::HOST_MEMBERS_CHANGED
-                                        | intent_core::events::HOST_EXECUTION_CONTEXT_CHANGED
-                                ))
+                                && (intent_core::events::is_client_event_type(&ev.event_type)
+                                    || matches!(
+                                        ev.event_type.as_str(),
+                                        intent_core::events::HOST_MEMBERS_CHANGED
+                                            | intent_core::events::HOST_EXECUTION_CONTEXT_CHANGED
+                                    )))
                     });
                 }
             }
@@ -23400,6 +23402,10 @@ impl WorkspaceApi for Services {
 
         let bus = self.event_bus.clone();
         Box::pin(async move {
+            let mut data = event.data;
+            if intent_core::events::is_client_event_type(&event.event_type) {
+                self.project_device_event(&mut data).await?;
+            }
             let new_event = NewEvent {
                 workspace_id: event.workspace_id,
                 timestamp: now_iso(),
@@ -23409,9 +23415,15 @@ impl WorkspaceApi for Services {
                 correlation_id: None,
                 parent_event_id: None,
                 metadata: None,
-                data: event.data,
+                data,
             };
-            publish_event(bus.as_ref(), new_event).await;
+            if new_event.event_type == intent_core::events::CLIENT_UPDATED {
+                if let Some(bus) = &bus {
+                    let _ = bus.publish_transient(&new_event);
+                }
+            } else {
+                publish_event(bus.as_ref(), new_event).await;
+            }
             Ok(())
         })
     }
@@ -23485,12 +23497,7 @@ impl WorkspaceApi for Services {
     }
 
     fn client_list(&self) -> BoxFuture<'_, Result<Vec<ReverseLiveClient>>> {
-        let clients = self
-            .reverse_dispatch
-            .as_ref()
-            .map(|d| d.live_clients())
-            .unwrap_or_default();
-        Box::pin(async move { Ok(clients) })
+        Box::pin(async move { self.authenticated_device_list().await })
     }
 
     fn get_workspace_browser_client(

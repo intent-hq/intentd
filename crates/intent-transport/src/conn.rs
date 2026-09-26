@@ -686,6 +686,11 @@ pub(crate) async fn process_frame(
             if let Some(identity) = bound {
                 reverse
                     .set_browser_member(crate::context::may_manage_workspaces(api.as_ref()).await);
+                if let Some(principal) = crate::context::current_caller()
+                    .and_then(|caller| caller.principal_id().cloned())
+                {
+                    reverse_guard.bind_device(identity.clone(), principal);
+                }
                 subs.hello_identity = Some(identity.clone());
                 reverse_guard.bind(identity);
             }

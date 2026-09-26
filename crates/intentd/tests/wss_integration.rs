@@ -13,6 +13,8 @@ mod host_roles;
 #[path = "wss_integration/sharing.rs"]
 mod sharing;
 
+#[path = "wss_integration/authenticated_devices.rs"]
+mod authenticated_devices;
 #[path = "wss_integration/member_transport.rs"]
 mod member_transport;
 #[path = "wss_integration/personal_pairing.rs"]

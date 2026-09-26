@@ -59,6 +59,7 @@
     "chat:stream:delta",
     "client:connected",
     "client:disconnected",
+    "client:updated",
     "comment:added",
     "comment:resolved",
     "draft:changed",

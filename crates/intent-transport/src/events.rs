@@ -116,6 +116,14 @@ impl MembershipGate {
             self.verdicts.clear();
             self.last_role = role;
         }
+        if intent_core::events::is_client_event_type(&event.event_type) {
+            return workspace_id.is_empty()
+                && (matches!(
+                    role,
+                    Some(intent_core::HostRole::Owner | intent_core::HostRole::Member)
+                ) || (role == Some(intent_core::HostRole::Guest)
+                    && event.data["principalId"].as_str() == Some(self.principal_id.as_str())));
+        }
         if event.event_type == intent_core::events::HOST_MEMBERS_CHANGED {
             self.verdicts.clear();
             return workspace_id.is_empty()

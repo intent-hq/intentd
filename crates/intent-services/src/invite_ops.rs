@@ -685,6 +685,9 @@ impl Services {
             self.finish_host_member_removal(&principal_id, &removal, changed)
                 .await;
         } else {
+            if let Some(devices) = &self.reverse_dispatch {
+                devices.client_principal_removed(&principal_id);
+            }
             let _ = self.principal_revocations.send(principal_id.clone().into());
             for agent in changed {
                 self.publish_queue_updated(&agent).await;
@@ -1217,6 +1220,7 @@ impl Services {
                 return Err(Error::Invite(InviteErrorKind::PinMismatch))
             }
         };
+        self.presence_profile_changed(&principal).await;
         let member_count = self.member_count(&invite.workspace_id).await?;
         let changes = if member_added {
             json!({

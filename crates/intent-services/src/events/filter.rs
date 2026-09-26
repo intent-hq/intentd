@@ -396,14 +396,14 @@ mod tests {
     #[test]
     fn collaborator_only_guards_match_time() {
         // A non-administrator's subscription may NAME owner-only patterns
-        // (`terminal:*`, `client:connected`, even an empty filter = all
+        // (`terminal:*`, `settings:changed`, even an empty filter = all
         // types); none of them ever deliver an off-allowlist event, while
         // allowlisted types under the same patterns still match.
         let f = SubscriptionFilter {
             event_types: vec![
                 "terminal:*".to_string(),
                 "note:*".to_string(),
-                "client:connected".to_string(),
+                "settings:changed".to_string(),
                 "host:exec:stdout".to_string(),
             ],
             collaborator_only: true,
@@ -411,7 +411,7 @@ mod tests {
         };
         for denied in [
             "terminal:data",
-            "client:connected",
+            "settings:changed",
             "host:exec:stdout",
             "note:bogus",
         ] {
@@ -435,7 +435,7 @@ mod tests {
         ));
         assert!(!event_matches(
             &all,
-            &event("client:disconnected", None, ActorType::System)
+            &event("settings:changed", None, ActorType::System)
         ));
         assert!(event_matches(
             &all,
