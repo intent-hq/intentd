@@ -2726,6 +2726,9 @@ async fn effort_notice_auto_restores_new_model_default_after_load() {
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap();
+    let store = intent_store::Store::open(&dir.path().join("intentd.db"))
+        .await
+        .unwrap();
     for (turn, model) in ["reasoner-a", "reasoner-b", "reasoner-b"]
         .into_iter()
         .enumerate()
@@ -2771,6 +2774,23 @@ async fn effort_notice_auto_restores_new_model_default_after_load() {
             prompts[turn]["effectiveEffort"],
             if turn == 2 { "low" } else { "high" },
             "Auto restores reasoner-b's confirmed default after model switch and load"
+        );
+        let baseline = store
+            .get_agent_session_last_turn_effort(
+                &intent_core::WorkspaceId::from(ws_id),
+                &intent_core::AgentId::from(agent_id),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(baseline.model.as_deref(), Some(model));
+        assert_eq!(
+            baseline.default_value,
+            if turn == 0 { "medium" } else { "low" }
+        );
+        assert_eq!(
+            baseline.effort.as_deref(),
+            if turn == 2 { None } else { Some("high") }
         );
         if turn == 2 {
             assert_eq!(notices.len(), 1);
