@@ -10,7 +10,7 @@ use intent_sourcecontrol::token::{self, TokenSource};
 use intent_store::NewEvent;
 use serde_json::Value;
 
-use crate::{events::SubscriptionFilter, publish_event_transient, system_actor, Services};
+use crate::{events::SubscriptionFilter, publish_event, system_actor, Services};
 
 impl Services {
     /// Presence only, with no forge request or AI provider spawn. The CLI
@@ -71,9 +71,9 @@ impl Services {
             return;
         };
         if let Ok(snapshot) = self.execution_context_snapshot().await {
-            publish_event_transient(
+            publish_event(
                 Some(bus),
-                &NewEvent {
+                NewEvent {
                     workspace_id: WorkspaceId::from(""),
                     timestamp: now_iso(),
                     event_type: HOST_EXECUTION_CONTEXT_CHANGED.into(),
@@ -84,7 +84,8 @@ impl Services {
                     metadata: None,
                     data: serde_json::to_value(snapshot).expect("execution context serializes"),
                 },
-            );
+            )
+            .await;
         } else {
             tracing::warn!("safe execution context unavailable during invalidation");
         }

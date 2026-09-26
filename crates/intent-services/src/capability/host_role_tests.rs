@@ -952,6 +952,92 @@ async fn member_execution_errors_are_classified_and_sanitized_without_changing_o
 }
 
 #[tokio::test]
+async fn member_execution_context_event_is_durable_and_survives_store_reopen() {
+    use crate::events::{EventBus, SubscriptionFilter};
+    use intent_core::events::HOST_EXECUTION_CONTEXT_CHANGED;
+    use intent_store::EventQuery;
+    use std::{sync::Arc, time::Duration};
+
+    let tmp = TempDb::new();
+    let (svc, owner, member) = fixture(&tmp).await;
+    let registry =
+        Arc::new(crate::SettingsRegistry::load(tmp.path.with_extension("toml")).unwrap());
+    registry
+        .apply(&[
+            ("sourceControl.github.tokenSource".into(), json!("explicit")),
+            ("model.defaultProvider".into(), json!("codex")),
+        ])
+        .unwrap();
+    let bus = EventBus::new(svc.store.clone());
+    let svc = svc
+        .with_settings_registry(registry)
+        .with_event_bus(bus.clone());
+    let worker = svc.spawn_execution_context_loop();
+    let mut events = bus.subscribe(SubscriptionFilter {
+        event_types: vec![HOST_EXECUTION_CONTEXT_CHANGED.into()],
+        ..Default::default()
+    });
+    let expected = with_caller(caller(&member), svc.host_execution_context())
+        .await
+        .unwrap();
+    with_caller(
+        caller(&member),
+        svc.observe_execution_readiness(json!({"providers":[{
+            "id":"codex","authenticated":false,"secret":"private-readiness-body"
+        }]})),
+    )
+    .await
+    .unwrap();
+    let live = tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .remove(0);
+    worker.abort();
+    let _ = worker.await;
+    assert_eq!(live.data, expected);
+    assert!(live.workspace_id.as_str().is_empty());
+    let query = EventQuery {
+        event_types: vec![HOST_EXECUTION_CONTEXT_CHANGED.into()],
+        ..Default::default()
+    };
+    let persisted = svc.store.query_events(&query).await.unwrap();
+    assert_eq!(persisted.len(), 1, "live delivery must follow persistence");
+    assert_eq!(persisted[0].id, live.id);
+    assert_eq!(persisted[0].data, expected);
+
+    let owner_history = with_caller(
+        Caller::Wire {
+            principal_id: owner,
+            host_role: intent_core::HostRole::Owner,
+        },
+        svc.event_query(
+            WorkspaceId::from(""),
+            intent_core::EventQueryParams {
+                event_type: Some(HOST_EXECUTION_CONTEXT_CHANGED.into()),
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(owner_history[0]["data"], expected);
+    drop(events);
+    drop(bus);
+    drop(svc);
+    let reopened = Store::open(&tmp.path).await.unwrap();
+    let restored = reopened.query_events(&query).await.unwrap();
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].id, live.id);
+    assert_eq!(restored[0].data, expected);
+    assert_eq!(restored[0].data.as_object().unwrap().len(), 4);
+    assert!(!restored[0]
+        .data
+        .to_string()
+        .contains("private-readiness-body"));
+}
+
+#[tokio::test]
 async fn member_execution_context_events_cover_policy_setup_and_unchanged_configured_rejection() {
     use crate::events::{EventBus, SubscriptionFilter};
     use intent_core::events::HOST_EXECUTION_CONTEXT_CHANGED;

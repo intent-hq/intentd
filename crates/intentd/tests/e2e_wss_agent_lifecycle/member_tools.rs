@@ -77,7 +77,7 @@ async fn member_ai_rejection_emits_safe_diagnostic_and_context_invalidation_over
         ("GH_TOKEN", ""),
         ("GITLAB_TOKEN", ""),
     ];
-    let _daemon = Daemon {
+    let daemon = Daemon {
         child: spawn_serve(dir.path(), "both", &env),
     };
     let socket = dir.path().join("intentd.sock");
@@ -111,8 +111,9 @@ async fn member_ai_rejection_emits_safe_diagnostic_and_context_invalidation_over
         json!({"agentId":id,"workspaceId":ws,"content":"exercise classified auth rejection"}),
     )
     .await;
-    timeout(Duration::from_secs(30), async {
+    let invalidation = timeout(Duration::from_secs(30), async {
         let (mut failed, mut invalidated) = (false, false);
+        let mut invalidation = Value::Null;
         while !failed || !invalidated {
             let frame = wss_event(&mut observer, 30).await;
             let event = &frame["params"]["event"];
@@ -143,14 +144,45 @@ async fn member_ai_rejection_emits_safe_diagnostic_and_context_invalidation_over
                         event["data"], before,
                         "rejection invalidates without changing configured flags"
                     );
+                    invalidation = event.clone();
                     invalidated = true;
                 }
                 other => panic!("unexpected member event {other}"),
             }
         }
+        invalidation
     })
     .await
     .expect("safe rejection and context invalidation");
+    // Delivery must follow durable insertion, and killing the actual daemon
+    // must not erase the sanitized invalidation needed for later history reads.
+    let query = intent_store::EventQuery {
+        event_types: vec!["host:execution-context-changed".into()],
+        ..Default::default()
+    };
+    let db = dir.path().join("intentd.db");
+    let store = Store::open(&db).await.unwrap();
+    let rows = store.query_events(&query).await.unwrap();
+    let delivered_id = invalidation["id"].as_str().unwrap();
+    assert!(rows.iter().any(|event| event.id.as_str() == delivered_id));
+    drop(store);
+    drop(owner);
+    drop(observer);
+    drop(sender);
+    drop(daemon);
+    let reopened = Store::open(&db).await.unwrap();
+    let rows = reopened.query_events(&query).await.unwrap();
+    let restored = rows
+        .iter()
+        .find(|event| event.id.as_str() == delivered_id)
+        .expect("the delivered invalidation survives daemon shutdown");
+    assert_eq!(restored.data, before);
+    assert!(restored.workspace_id.as_str().is_empty());
+    assert_eq!(restored.data.as_object().unwrap().len(), 4);
+    assert!(!restored
+        .data
+        .to_string()
+        .contains("private-provider-response"));
 }
 
 #[tokio::test]
