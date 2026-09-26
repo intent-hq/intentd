@@ -1,12 +1,13 @@
-//! `pairing.getInfo` fast-path: the structured QR pairing payload (§5.2).
+//! Pairing fast paths: the structured QR pairing payload (§5.2, §5.49).
 //!
 //! Returns the `intent://pair?…` payload URI plus its component fields so GUI
 //! clients can render their own QR code and the `intentd pair` CLI can print
 //! one in the terminal. Reuses the exact host/fingerprint/token sources as
 //! `server.pairingInfo` via the shared [`ServerPairingInfo`] provider wired by
-//! the composition root. LOCAL-ONLY, mirroring `server.*`: the payload embeds
-//! the long-lived bearer token (Decision 4), so remote (TCP) callers get a
-//! -32001 auth error regardless of the `--mode` locality flag.
+//! the composition root. `pairing.getInfo` stays local-only, mirroring
+//! `server.*`: TCP callers get -32001 regardless of the locality override.
+//! `pairing.getSelfInfo` is authenticated self-service: it reuses only the
+//! connection's admitted bearer after checking current credential and authority.
 
 use std::fmt::Write as _;
 use std::sync::Arc;

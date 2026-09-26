@@ -7,14 +7,27 @@ use std::pin::Pin;
 
 struct PairingInfo {
     snapshot: Mutex<PairingSnapshot>,
+    barrier: Mutex<Option<SnapshotBarrier>>,
     dir: std::path::PathBuf,
     tokens: Arc<AsyncTokenStore>,
+}
+
+struct SnapshotBarrier {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
 }
 
 impl ServerPairingInfo for PairingInfo {
     fn pairing_snapshot(&self) -> Pin<Box<dyn Future<Output = PairingSnapshot> + Send + '_>> {
         let snapshot = self.snapshot.lock().unwrap().clone();
-        Box::pin(async move { snapshot })
+        let barrier = self.barrier.lock().unwrap().take();
+        Box::pin(async move {
+            if let Some(barrier) = barrier {
+                let _ = barrier.entered.send(());
+                let _ = barrier.release.await;
+            }
+            snapshot
+        })
     }
     fn host_environment(&self) -> intent_transport::host_env::HostEnvironment {
         intent_transport::host_env::HostEnvironment {
@@ -38,6 +51,7 @@ async fn start_pairing() -> (Server, Arc<PairingInfo>) {
     let tokens = Arc::new(AsyncTokenStore::new(Arc::new(MemTokenStore::default())));
     tokens.store_token(TOKEN).await.unwrap();
     let info = Arc::new(PairingInfo {
+        barrier: Mutex::new(None),
         snapshot: Mutex::new(PairingSnapshot {
             port: None,
             bind_addresses: Some(vec![Ipv4Addr::LOCALHOST.into()]),
@@ -78,6 +92,55 @@ async fn start_pairing() -> (Server, Arc<PairingInfo>) {
         },
         info,
     )
+}
+
+#[tokio::test]
+async fn personal_pairing_inflight_revalidation_orders_real_revocation_and_removal() {
+    let (srv, info) = start_pairing().await;
+    for remove in [false, true] {
+        let token = if remove { "a5" } else { "b5" }.repeat(32);
+        let mut person = Guest::connect(&srv, &token).await;
+        sqlx::query("INSERT INTO host_member (principal_id, added_at) VALUES (?, ?)")
+            .bind(&person.principal.id.0)
+            .bind(now_iso())
+            .execute(srv.store.write_pool())
+            .await
+            .unwrap();
+        let mut second = reconnect(&srv, &person.principal, &token).await;
+        let id = person.principal.id.clone();
+        let (entered, arrived) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        *info.barrier.lock().unwrap() = Some(SnapshotBarrier {
+            entered,
+            release: wait,
+        });
+        let pairing = tokio::spawn(async move {
+            let result = person.call("pairing.getSelfInfo", json!({})).await;
+            (result, person)
+        });
+        tokio::time::timeout(Duration::from_secs(5), arrived)
+            .await
+            .unwrap()
+            .unwrap();
+        // The first credential check succeeded. Commit actual invalidation
+        // before permitting the route/profile/final-check portion to complete.
+        if remove {
+            assert!(srv.store.remove_host_member(&id).await.unwrap().removed);
+        } else {
+            assert_eq!(
+                second.call("principal.revokeSelf", json!({})).await["result"]["revoked"],
+                true
+            );
+            assert_closed(&mut second.ws).await;
+        }
+        release.send(()).unwrap();
+        let (result, mut person) = pairing.await.unwrap();
+        assert_eq!(result["error"]["data"]["code"], "access-revoked");
+        assert!(result.get("result").is_none());
+        assert!(!result.to_string().contains(&token));
+        assert_closed(&mut person.ws).await;
+    }
+    srv.ws.stop().await;
 }
 
 async fn reconnect(srv: &Server, principal: &intent_core::Principal, token: &str) -> Guest {

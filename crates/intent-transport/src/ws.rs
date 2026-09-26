@@ -1235,6 +1235,10 @@ impl WsInner {
     /// Drive one WebSocket connection: dispatch incoming text via the shared
     /// router, push outbound frames, answer pings, and honour control commands.
     /// On exit, subscriptions are dropped and the socket is closed.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "keep the private admitted credential scoped to this connection"
+    )]
     async fn connection_loop<S>(
         self: Arc<Self>,
         id: u64,
