@@ -234,8 +234,9 @@ pub(crate) fn principal_attribution_name(principal: &Principal) -> String {
 /// payload is persisted or enqueued, so direct persists, queue entries and
 /// their drain/redrive all carry the same [`FROM_PRINCIPAL_ID_KEY`]: a wire
 /// caller's principal overwrites whatever the client supplied; an agent /
-/// daemon / absent caller strips the key instead. Every other field passes
-/// through untouched. A non-object payload cannot carry the stamp and is
+/// daemon / absent caller strips the key instead. A human also cannot supply
+/// reserved agent-sender fields; unrelated metadata passes through untouched.
+/// A non-object payload cannot carry the stamp and is
 /// rejected with `InvalidParams` (the same rule `agent.queueMessage` and
 /// `userAppMessageId` already apply) — a human send must never be credited
 /// to the workspace fallback because its metadata had the wrong shape.
@@ -259,6 +260,8 @@ pub(crate) fn stamp_principal_attribution(
     };
     Ok(match (metadata, stamping_principal_id()) {
         (Some(mut obj), Some(principal_id)) => {
+            obj.remove("fromAgentId");
+            obj.remove("fromAgentName");
             obj.insert(
                 FROM_PRINCIPAL_ID_KEY.to_string(),
                 Value::String(principal_id.0),
@@ -340,18 +343,10 @@ pub(crate) fn prepend_collaborator_preamble_value(content: &mut Value, preamble:
     }
 }
 
-/// `true` when the bound caller is a per-principal (collaborator-class)
-/// wire connection — the only caller class that can carry the
-/// collaborator sender preamble. Cheap pre-check so the owner / agent /
-/// daemon paths never pay a store read for it.
-fn is_collaborator_class_caller() -> bool {
-    matches!(
-        current_caller(),
-        Some(Caller::Wire {
-            host_role: intent_core::HostRole::Member | intent_core::HostRole::Guest,
-            ..
-        })
-    )
+/// Only a bound human wire caller can carry a human sender preamble.
+/// Current durable role, never a cached admission role, selects its text.
+fn is_human_wire_caller() -> bool {
+    matches!(current_caller(), Some(Caller::Wire { .. }))
 }
 
 impl Services {
@@ -368,19 +363,16 @@ impl Services {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Option<String>> {
-        let Some(Caller::Wire {
-            principal_id,
-            host_role: intent_core::HostRole::Member | intent_core::HostRole::Guest,
-        }) = current_caller()
-        else {
+        let Some(Caller::Wire { principal_id, .. }) = current_caller() else {
             return Ok(None);
         };
-        match self.store.get_host_role(&principal_id).await {
+        let host_member = match self.store.get_host_role(&principal_id).await {
             Ok(intent_core::HostRole::Member) => {
                 if workspace_id.is_chief() {
                     return Ok(None);
                 }
                 self.store.get_workspace(workspace_id).await?;
+                true
             }
             Ok(intent_core::HostRole::Guest) => {
                 let role = self
@@ -390,18 +382,32 @@ impl Services {
                 if role != Some(intent_core::WorkspaceRole::Collaborator) {
                     return Ok(None);
                 }
+                false
             }
             Ok(intent_core::HostRole::Owner) | Err(Error::NotFound(_)) => return Ok(None),
             Err(error) => return Err(error),
-        }
-        let (login, display_name) = match self.store.get_principal(&principal_id).await {
-            Ok(principal) => (principal.login, principal.display_name),
-            Err(Error::NotFound(_)) => (None, None),
+        };
+        let principal = match self.store.get_principal(&principal_id).await {
+            Ok(principal) => Some(principal),
+            Err(Error::NotFound(_)) => None,
             Err(e) => return Err(e),
         };
+        let login = principal.as_ref().and_then(|p| p.login.as_deref());
+        let display_name = principal.as_ref().and_then(|p| p.display_name.as_deref());
+        if host_member {
+            let identity = principal.as_ref().and_then(Principal::identity_key);
+            return Ok(Some(crate::harness::latest().host_member_sender_preamble(
+                crate::harness::HostMemberSender {
+                    login,
+                    display_name,
+                    principal_id: principal_id.as_str(),
+                    identity: identity.as_ref(),
+                },
+            )));
+        }
         Ok(Some(crate::harness::latest().collaborator_sender_preamble(
-            login.as_deref(),
-            display_name.as_deref(),
+            login,
+            display_name,
             &principal_id.0,
         )))
     }
@@ -426,13 +432,13 @@ impl Services {
 
     /// [`Self::collaborator_sender_preamble`] keyed by the target agent
     /// (`agent.queueMessage`, `agent.editQueuedMessage`): resolves the
-    /// agent's workspace with one metadata-only read, collaborator-class
+    /// agent's workspace with one metadata-only read, bound human wire
     /// callers only.
     pub(crate) async fn collaborator_sender_preamble_for_agent(
         &self,
         agent_id: &intent_core::AgentId,
     ) -> Result<Option<String>> {
-        if !is_collaborator_class_caller() {
+        if !is_human_wire_caller() {
             return Ok(None);
         }
         let workspace_id = self.agent_workspace(agent_id).await?;
@@ -477,12 +483,16 @@ impl Services {
 /// `null` when the principal row is gone (the id is still what the row
 /// says).
 fn author_to_wire(principal_id: &PrincipalId, principal: Option<&Principal>) -> Value {
-    json!({
+    let row = json!({
         "principalId": principal_id,
         "login": principal.and_then(|p| p.login.clone()),
         "displayName": principal.and_then(|p| p.display_name.clone()),
         "avatarUrl": principal.and_then(|p| p.avatar_url.clone()),
-    })
+    });
+    match principal {
+        Some(p) => with_principal_identity(row, p),
+        None => row,
+    }
 }
 
 /// Serve-time author resolution for the user messages of one workspace
@@ -768,25 +778,24 @@ impl Services {
     }
 
     /// `principal.list`: see [`intent_core::WorkspaceApi::principal_list`].
-    /// Owner-only via the administrator gate: the method is not scoped to a
-    /// workspace and the primary user owns every workspace (no transfer
-    /// RPC), so a per-principal wire caller is refused outright.
+    /// Sharing directory for the owner and active host members. Ordinary
+    /// guests cannot discover other people outside their workspace rosters.
     ///
-    /// Lists guests only. The primary row is read solely to decide whether
+    /// Lists credentialed non-primary people. The primary is read only to decide whether
     /// to spawn the off-path identity refresh: exactly one extra primary-row
     /// SELECT in the foreground, no network (intent-hq/intent#5534).
     pub(crate) async fn principal_list_op(&self) -> Result<Value> {
-        Self::require_administrator("principal.list")?;
+        self.require_host_execution("principal.list").await?;
         match self.store.get_primary_principal().await {
             Ok(primary) => self.refresh_primary_identity_if_unlinked(&primary).await,
             Err(e) => tracing::debug!(error = %e, "principal.list: primary row unavailable"),
         }
         let principals: Vec<Value> = self
             .store
-            .list_credentialed_guest_principals()
+            .list_sharing_principals()
             .await?
             .iter()
-            .map(|p| {
+            .map(|(p, host_role)| {
                 with_principal_identity(
                     json!({
                         "principalId": p.id,
@@ -794,6 +803,7 @@ impl Services {
                         "displayName": p.display_name,
                         "avatarUrl": p.avatar_url,
                         "githubUserId": p.github_user_id,
+                        "hostRole": host_role,
                     }),
                     p,
                 )
@@ -1508,10 +1518,10 @@ mod tests {
     /// (the store dual-writes the github triple for a `github_user_id`-only
     /// upsert), oldest first — while the primary
     /// principal and a guest whose credentials were all revoked are omitted.
-    /// A per-principal wire caller is `Forbidden`, whatever its workspace
-    /// roles; an agent passes like the daemon.
+    /// A guest wire caller is `Forbidden`, whatever its workspace roles;
+    /// an agent passes like the daemon.
     #[intent_test_macros::daemon_test]
-    async fn principal_list_is_owner_only_and_lists_credentialed_guests() {
+    async fn principal_list_lists_credentialed_people_and_refuses_guests() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let primary = store.get_primary_principal().await.expect("primary");
@@ -1550,6 +1560,7 @@ mod tests {
                 "displayName": "active name",
                 "avatarUrl": "https://example.test/active.png",
                 "githubUserId": 42,
+                "hostRole": "guest",
                 "identity": {
                     "provider": "github",
                     "host": "github.com",
@@ -2012,7 +2023,11 @@ mod tests {
     /// client-supplied stamp is stripped and nothing is added.
     #[tokio::test]
     async fn stamp_strips_for_agent_daemon_and_unbound_callers() {
-        let spoofed = || Some(json!({ "fromPrincipalId": "someone-else", "kind": "reply" }));
+        let spoofed = || {
+            Some(
+                json!({ "fromPrincipalId": "someone-else", "kind": "reply", "fromAgentId":"agent-sender", "fromAgentName":"Sender" }),
+            )
+        };
         let agent = with_caller(
             Caller::Agent {
                 agent_id: AgentId::new(),
@@ -2026,7 +2041,13 @@ mod tests {
         .await;
         let unbound = stamp_principal_attribution(spoofed()).unwrap();
         for (label, got) in [("agent", agent), ("daemon", daemon), ("unbound", unbound)] {
-            assert_eq!(got, Some(json!({ "kind": "reply" })), "{label}");
+            assert_eq!(
+                got,
+                Some(
+                    json!({ "kind": "reply", "fromAgentId":"agent-sender", "fromAgentName":"Sender" })
+                ),
+                "{label}"
+            );
         }
         assert_eq!(
             with_caller(Caller::Daemon, async {
@@ -2037,7 +2058,9 @@ mod tests {
         );
         assert_eq!(
             strip_principal_attribution(spoofed()),
-            Some(json!({ "kind": "reply" }))
+            Some(
+                json!({ "kind": "reply", "fromAgentId":"agent-sender", "fromAgentName":"Sender" })
+            )
         );
     }
 

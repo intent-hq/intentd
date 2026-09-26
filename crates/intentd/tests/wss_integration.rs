@@ -10,6 +10,8 @@
 mod common;
 #[path = "wss_integration/host_roles.rs"]
 mod host_roles;
+#[path = "wss_integration/sharing.rs"]
+mod sharing;
 #[path = "wss_integration/workspace_delete.rs"]
 mod workspace_delete;
 
@@ -3815,6 +3817,7 @@ async fn wss_principal_list_is_owner_only_and_omits_revoked_guests() {
                 "displayName": "older name",
                 "avatarUrl": "https://example.test/older.png",
                 "githubUserId": 11,
+                "hostRole": "guest",
                 "identity": { "provider": "github", "host": "github.com", "externalUserId": "11" },
             },
             {
@@ -3823,6 +3826,7 @@ async fn wss_principal_list_is_owner_only_and_omits_revoked_guests() {
                 "displayName": "newer name",
                 "avatarUrl": "https://example.test/newer.png",
                 "githubUserId": 12,
+                "hostRole": "guest",
                 "identity": { "provider": "github", "host": "github.com", "externalUserId": "12" },
             },
         ] }),
@@ -6869,7 +6873,7 @@ async fn wss_presence_channel_join_delta_leave_and_gating() {
     assert_eq!(
         ev["data"]["members"],
         json!([{ "principalId": alice.id.0, "login": "alice", "displayName": null,
-                 "avatarUrl": null, "focus": [], "typing": [] }]),
+                 "avatarUrl": null, "hostRole": "guest", "focus": [], "typing": [] }]),
         "{ev}"
     );
 
@@ -6911,7 +6915,7 @@ async fn wss_presence_channel_join_delta_leave_and_gating() {
     assert_eq!(
         p["snapshot"],
         json!({ "viewers": [{ "principalId": alice.id.0, "login": "alice", "displayName": null,
-                              "avatarUrl": null, "cursor": null }] }),
+                              "avatarUrl": null, "hostRole": "guest", "cursor": null }] }),
         "{p}"
     );
     let p = alice_c.push(&sub_a).await;
@@ -7001,7 +7005,7 @@ async fn wss_presence_channel_join_delta_leave_and_gating() {
     assert_eq!(
         p["delta"],
         json!({ "kind": "updated", "viewer": { "principalId": bob.id.0, "login": "bob",
-                "displayName": null, "avatarUrl": null,
+                "displayName": null, "avatarUrl": null, "hostRole": "guest",
                 "cursor": { "rev": 3, "anchor": 10, "head": 12 } } }),
         "{p}"
     );
@@ -7384,7 +7388,7 @@ async fn wss_presence_typing_sources_and_snapshot() {
     assert_eq!(
         alice_row(&json!({ "data": v["result"] })),
         json!({ "principalId": alice.id.0, "login": "alice", "displayName": null,
-                "avatarUrl": null, "focus": [], "typing": [] }),
+                "avatarUrl": null, "hostRole": "guest", "focus": [], "typing": [] }),
         "snapshot rows match the presence:changed member shape: {v}"
     );
 

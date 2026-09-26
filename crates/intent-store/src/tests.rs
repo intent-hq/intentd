@@ -18,6 +18,7 @@ use sqlx::Row;
 use crate::{AgentQueueRow, AutoVacuumActivation, EventQuery, NewEvent, Store, MAX_NOTE_VERSIONS};
 
 mod host_membership;
+mod sharing;
 mod workspace_delete;
 
 /// A unique temp DB path inside an RAII temp dir: the dir (and with it the

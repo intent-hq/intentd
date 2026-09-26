@@ -580,13 +580,14 @@
 //! collaborator's `agent.editQueuedMessage` of an agent-authored (A2A /
 //! automatic) entry is not preambled — its sender stays the originating
 //! agent's header; the edit is recorded by the stamp only. Also within
-//! 10.3, direct member add (additive): `principal.list` (owner-only, no
+//! 10.3, direct member add (additive; sharing access extended to active host
+//! members by shared-host-membership §5.49): `principal.list` (no
 //! params) → `{ principals: [{ principalId, login?, displayName?,
-//! avatarUrl?, githubUserId? }] }`, every non-primary principal holding at
+//! avatarUrl?, githubUserId?, identity?, hostRole }] }`, every non-primary principal holding at
 //! least one active (non-revoked) credential, by creation time; a guest
-//! that revoked itself is omitted. A per-principal (collaborator) caller
-//! is `-32003`. `workspace.members.add { workspaceId, principalId }`
-//! (owner-only) → `{ added, memberCount }`: attaches such a guest as a
+//! that revoked itself is omitted. A workspace guest is `-32003`.
+//! `workspace.members.add { workspaceId, principalId }`
+//! (owner/member) → `{ added, memberCount }`: attaches such a guest as a
 //! collaborator; `added: false` when already a member (idempotent, nothing
 //! published); `-32602` for an unknown principal, the primary principal, a
 //! principal without an active credential (`invalid-params`) or a spent

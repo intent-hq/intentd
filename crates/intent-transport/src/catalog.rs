@@ -738,6 +738,7 @@ pub(crate) const MEMBER_METHODS: &[&str] = &[
     "host.providerAuthStatus",
     "host.providerDiscovery",
     "mcp.servers.toggle",
+    "principal.list",
     "repo.list",
     "script.create",
     "script.list",
@@ -756,6 +757,11 @@ pub(crate) const MEMBER_METHODS: &[&str] = &[
     "terminal.resize",
     "terminal.write",
     "workspace.delete",
+    "workspace.invite.create",
+    "workspace.invite.list",
+    "workspace.invite.revoke",
+    "workspace.members.add",
+    "workspace.members.remove",
 ];
 
 pub(crate) fn member_may_call(method: &str) -> bool {

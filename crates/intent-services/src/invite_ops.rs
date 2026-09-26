@@ -530,12 +530,6 @@ impl Services {
                     "the inviting identity changed while minting; retry".to_string(),
                 ));
             }
-            // Mints are serialised by this lock, so the recount here is what
-            // keeps two concurrent mints from both taking the last seat.
-            if self.store.count_workspace_guests(&ws.id).await?.committed() >= u64::from(max_guests)
-            {
-                return Err(Error::Invite(InviteErrorKind::GuestLimit));
-            }
             // The first invite of a workspace pins its legacy author:
             // content authored before anyone else could have joined is the
             // owner's. Pinned *before* the insert — the secret travels only
@@ -549,10 +543,13 @@ impl Services {
                         .await?;
                 }
             }
-            // The archived check rides the insert's own write transaction:
-            // an archive that committed first closed every open invite and
-            // must not be followed by a fresh one.
-            match self.store.insert_workspace_invite(&invite).await? {
+            // Direct grants and joins use this same database write boundary;
+            // the identity lock alone does not serialize their seat checks.
+            match self
+                .store
+                .insert_workspace_invite_within_cap(&invite, max_guests)
+                .await?
+            {
                 InviteInsertOutcome::Inserted => {}
                 InviteInsertOutcome::WorkspaceArchived => {
                     return Err(Error::Invite(InviteErrorKind::WorkspaceArchived))
@@ -561,6 +558,9 @@ impl Services {
                     return Err(Error::Forbidden(
                         "inviter no longer manages this workspace".into(),
                     ))
+                }
+                InviteInsertOutcome::WorkspaceFull => {
+                    return Err(Error::Invite(InviteErrorKind::GuestLimit))
                 }
             }
         }
@@ -631,6 +631,11 @@ impl Services {
         workspace_id: &WorkspaceId,
     ) -> Result<Value> {
         let (principal_id, _) = self.self_principal().await?;
+        self.require_member(workspace_id).await?;
+        self.store.get_workspace(workspace_id).await?;
+        if self.store.get_host_role(&principal_id).await? == HostRole::Member {
+            return Err(Error::HostMembershipRequired);
+        }
         match self
             .store
             .get_workspace_member_role(workspace_id, &principal_id)
@@ -644,7 +649,10 @@ impl Services {
             ))),
             Some(WorkspaceRole::Collaborator) => {
                 let left = self
-                    .detach_collaborator(workspace_id, &principal_id)
+                    .store
+                    .remove_workspace_guest(workspace_id, &principal_id)
+                    .await?;
+                self.finish_collaborator_removal(workspace_id, &principal_id, left)
                     .await?;
                 Ok(json!({ "left": left }))
             }

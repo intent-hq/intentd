@@ -98,7 +98,7 @@ pub(crate) const COLLABORATOR_SENDER_PREAMBLE_PREFIX: &str = "Message from ";
 /// Collapse control characters in a caller-visible display string to single
 /// spaces and drop a string that sanitizes to empty, so a hostile name
 /// cannot inject header-like lines into a single-line note.
-fn single_line_name(name: Option<&str>) -> Option<String> {
+pub(super) fn single_line_name(name: Option<&str>) -> Option<String> {
     name.map(|n| {
         n.chars()
             .map(|c| if c.is_control() { ' ' } else { c })

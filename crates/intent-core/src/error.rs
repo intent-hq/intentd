@@ -21,6 +21,9 @@ pub enum Error {
     /// Explicit selection cannot merge independently admitted people.
     #[error("collaboration identity is already bound to another principal")]
     IdentityInUse,
+    /// Workspace access is inherited from active host membership.
+    #[error("workspace access is inherited; change host membership instead")]
+    HostMembershipRequired,
     /// A required parameter was missing or malformed.
     #[error("invalid params: {0}")]
     InvalidParams(String),
@@ -526,6 +529,7 @@ impl Error {
 
             Error::IdentityMismatch
             | Error::IdentityInUse
+            | Error::HostMembershipRequired
             | Error::InvalidParams(_)
             | Error::NotFound(_)
             | Error::InvalidInput(_)

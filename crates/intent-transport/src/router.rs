@@ -205,6 +205,11 @@ fn domain_to_rpc(e: Error) -> RpcErr {
                 "host": host,
             })),
         },
+        ref e @ Error::HostMembershipRequired => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": "host-membership-required" })),
+        },
         ref e @ (Error::IdentityMismatch | Error::IdentityInUse) => RpcErr {
             code: e.code(),
             message: e.to_string(),
@@ -3340,9 +3345,8 @@ async fn dispatch(
             let r = api.principal_me().await.map_err(domain_to_rpc)?;
             Ok(r)
         }
-        // `principal.list` (direct member add): the host's credentialed
-        // guests for the owner's share dialog; no params. Owner-only in the
-        // service layer (`-32003` for a collaborator).
+        // Credentialed sharing directory for owner/member callers; no params.
+        // The service reads current durable authority; guests are refused.
         "principal.list" => {
             let r = api.principal_list().await.map_err(domain_to_rpc)?;
             Ok(r)

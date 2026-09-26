@@ -194,6 +194,7 @@ impl Services {
                 }))
             }
         };
+        self.presence_profile_changed(&principal).await;
         if added {
             self.host_membership_event(intent_core::events::HOST_MEMBERS_CHANGED,
                 json!({"revision":revision,"principalId":principal.id,"hostRole":"member","action":"added"})).await;

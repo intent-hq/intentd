@@ -4690,13 +4690,13 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `principal.list` (direct member add): the host's credentialed guests
+    /// `principal.list` (direct guest add): the host's credentialed people
     /// → `{ principals: [{ principalId, login?, displayName?, avatarUrl?,
-    /// githubUserId? }] }` — every non-primary principal holding at least
+    /// githubUserId?, identity?, hostRole }] }` — every non-primary principal holding at least
     /// one active (non-revoked) credential, by `createdAt`; a guest that
     /// revoked itself is omitted (it cannot connect). No params.
-    /// Owner-only: a per-principal (collaborator) wire caller is
-    /// `Forbidden`; the administrator, agents and the daemon pass.
+    /// Available to the owner and active host members; workspace guests
+    /// are `Forbidden`. Trusted agents and the daemon retain their access.
     fn principal_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async {
             Err(Error::Internal(

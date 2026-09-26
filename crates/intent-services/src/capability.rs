@@ -546,44 +546,30 @@ impl Services {
     ) -> Result<Value> {
         self.require_member(workspace_id).await?;
         self.store.get_workspace(workspace_id).await?;
-        let members = self.store.list_workspace_members(workspace_id).await?;
-        let guests = self.store.count_workspace_guests(workspace_id).await?;
-        let principals: HashMap<PrincipalId, intent_core::Principal> = self
+        let members = self
             .store
-            .list_principals()
-            .await?
-            .into_iter()
-            .map(|p| (p.id.clone(), p))
-            .collect();
-        if let Some(primary) = principals
-            .values()
-            .find(|p| p.is_primary && p.login.is_none())
-        {
-            let caller_is_primary = match current_caller() {
-                Some(Caller::Wire { principal_id, .. }) => principal_id == primary.id,
-                Some(Caller::Agent { .. } | Caller::Daemon) => true,
-                None => false,
-            };
-            if caller_is_primary {
-                self.spawn_primary_identity_refresh(primary.clone()).await;
-            }
+            .list_effective_workspace_members(workspace_id)
+            .await?;
+        let guests = self.store.count_workspace_guests(workspace_id).await?;
+        if let Some(primary) = members.iter().map(|m| &m.principal).find(|p| p.is_primary) {
+            self.refresh_primary_identity_if_unlinked(primary).await;
         }
         let rows: Vec<Value> = members
             .iter()
             .map(|m| {
-                let p = principals.get(&m.principal_id);
-                let row = json!({
-                    "principalId": m.principal_id,
-                    "login": p.and_then(|p| p.login.clone()),
-                    "displayName": p.and_then(|p| p.display_name.clone()),
-                    "avatarUrl": p.and_then(|p| p.avatar_url.clone()),
-                    "role": m.role,
-                    "addedAt": m.added_at,
-                });
-                match p {
-                    Some(p) => crate::principal_ops::with_principal_identity(row, p),
-                    None => row,
-                }
+                let p = &m.principal;
+                crate::principal_ops::with_principal_identity(
+                    json!({
+                        "principalId": p.id,
+                        "login": p.login,
+                        "displayName": p.display_name,
+                        "avatarUrl": p.avatar_url,
+                        "role": m.role,
+                        "hostRole": m.host_role,
+                        "addedAt": m.added_at,
+                    }),
+                    p,
+                )
             })
             .collect();
         Ok(json!({
@@ -594,7 +580,9 @@ impl Services {
     }
 
     /// `workspace.members.remove`: see
-    /// [`intent_core::WorkspaceApi::workspace_members_remove`]. Owner-only.
+    /// [`intent_core::WorkspaceApi::workspace_members_remove`]. Owner/member.
+    /// Active host members require host-membership removal; retained grants
+    /// survive the typed refusal under the store's write lock.
     /// Removing the owner is `InvalidParams`; removing a non-member is a
     /// no-op (`removed: false`). On removal the member's queued user
     /// messages on the workspace's agents are dropped and a
@@ -608,29 +596,21 @@ impl Services {
         workspace_id: &WorkspaceId,
         principal_id: &PrincipalId,
     ) -> Result<Value> {
-        self.require_owner(workspace_id, "workspace.members.remove")
+        self.require_workspace_manager(workspace_id, "workspace.members.remove")
             .await?;
         self.store.get_workspace(workspace_id).await?;
-        match self
+        let removed = self
             .store
-            .get_workspace_member_role(workspace_id, principal_id)
-            .await?
-        {
-            None => return Ok(json!({ "removed": false })),
-            Some(WorkspaceRole::Owner) => {
-                return Err(Error::InvalidParams(format!(
-                    "principal {principal_id} owns workspace {workspace_id} and cannot be removed"
-                )));
-            }
-            Some(WorkspaceRole::Collaborator) => {}
-        }
-        let removed = self.detach_collaborator(workspace_id, principal_id).await?;
+            .remove_workspace_guest(workspace_id, principal_id)
+            .await?;
+        self.finish_collaborator_removal(workspace_id, principal_id, removed)
+            .await?;
         Ok(json!({ "removed": removed }))
     }
 
     /// `workspace.members.add`: see
-    /// [`intent_core::WorkspaceApi::workspace_members_add`]. Owner-only. The
-    /// principal must be a credentialed guest — it exists, is not the primary
+    /// [`intent_core::WorkspaceApi::workspace_members_add`]. Owner/member. The
+    /// principal must be an active host member (a no-op) or a credentialed guest — it exists, is not the primary
     /// principal and holds at least one active credential, the same
     /// predicate `principal.list` rows satisfy — else `InvalidParams`. An
     /// existing member (either role) is answered `added: false` with nothing
@@ -650,7 +630,7 @@ impl Services {
         workspace_id: &WorkspaceId,
         principal_id: &PrincipalId,
     ) -> Result<Value> {
-        self.require_owner(workspace_id, "workspace.members.add")
+        self.require_workspace_manager(workspace_id, "workspace.members.add")
             .await?;
         self.store.get_workspace(workspace_id).await?;
         let principal = match self.store.get_principal(principal_id).await {
@@ -743,6 +723,17 @@ impl Services {
             .store
             .remove_workspace_member(workspace_id, principal_id)
             .await?;
+        self.finish_collaborator_removal(workspace_id, principal_id, removed)
+            .await?;
+        Ok(removed)
+    }
+
+    pub(crate) async fn finish_collaborator_removal(
+        &self,
+        workspace_id: &WorkspaceId,
+        principal_id: &PrincipalId,
+        removed: bool,
+    ) -> Result<bool> {
         if removed {
             self.drop_queued_messages_from(workspace_id, principal_id)
                 .await;
@@ -847,6 +838,9 @@ impl Services {
         }
     }
 }
+
+#[cfg(test)]
+mod sharing_tests;
 
 #[cfg(test)]
 mod tests {

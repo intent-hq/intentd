@@ -82,10 +82,20 @@ pub struct WorkspaceAuthorFallback {
 /// on (see [`Store::count_workspace_guests`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WorkspaceGuestCount {
-    /// `collaborator` memberships (the owner is never a guest).
+    /// Direct collaborators who are not active host members.
     pub collaborators: u64,
-    /// Invites not yet redeemed, revoked or expired.
+    /// Unexpired, unrevoked invitations (reusable links may be redeemed).
     pub open_invites: u64,
+}
+
+/// One person in the effective workspace roster. Profiles and role come
+/// from the same database snapshot; retained guest rows never duplicate a member.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveWorkspaceMember {
+    pub principal: Principal,
+    pub role: WorkspaceRole,
+    pub host_role: intent_core::HostRole,
+    pub added_at: String,
 }
 
 impl WorkspaceGuestCount {
@@ -137,6 +147,8 @@ pub enum InviteInsertOutcome {
     WorkspaceArchived,
     /// The issuer no longer has workspace management authority.
     IssuerForbidden,
+    /// Committed guest seats already reach the requested cap.
+    WorkspaceFull,
 }
 
 /// Result of [`Store::join_workspace_by_invite`].
@@ -330,6 +342,37 @@ impl Store {
         Ok(rows.iter().map(map_principal_row).collect())
     }
 
+    /// The safe sharing directory, excluding the primary and revoked people.
+    /// Role and profile are selected together without credential material.
+    ///
+    /// # Errors
+    /// Returns `Internal` on database failure.
+    pub async fn list_sharing_principals(&self) -> Result<Vec<(Principal, intent_core::HostRole)>> {
+        let rows = sqlx::query(
+            "SELECT p.*, h.principal_id IS NOT NULL AS is_host_member \
+             FROM principal p LEFT JOIN host_member h ON h.principal_id = p.id \
+             WHERE p.is_primary = 0 AND EXISTS (SELECT 1 FROM principal_credential c \
+                 WHERE c.principal_id = p.id AND c.revoked_at IS NULL) \
+             ORDER BY p.created_at, p.id",
+        )
+        .fetch_all(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("sharing directory failed: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    map_principal_row(r),
+                    if r.get::<bool, _>("is_host_member") {
+                        intent_core::HostRole::Member
+                    } else {
+                        intent_core::HostRole::Guest
+                    },
+                )
+            })
+            .collect())
+    }
+
     /// Insert or update a principal by id. On conflict the identity (triple
     /// and github projection, see [`principal_identity_columns`]) and cached
     /// profile fields are overwritten and `updated_at` bumped; `is_primary`
@@ -428,13 +471,14 @@ impl Store {
 
     /// Membership summaries for `workspace.get` / `workspace.list`
     /// (multiplayer w1): owner, member count and `viewer`'s role, computed
-    /// in SQL in ONE query scoped to exactly `workspace_ids` (the rows the
+    /// in one scalar projection scoped to exactly `workspace_ids` (the rows the
     /// caller is about to return — never the whole table, so archived or
     /// filtered-out workspaces cost nothing), keyed by workspace id. An empty
     /// `workspace_ids` short-circuits without touching the database.
     /// `viewer = None` yields no `my_role`. `open_invite_count` is `0` until
     /// invitations exist (a reusable invite counts as open while unexpired
-    /// and unrevoked, however often it was redeemed).
+    /// and unrevoked, however often it was redeemed). A separate indexed
+    /// deadline probe reconciles due reservations before that same snapshot.
     ///
     /// # Errors
     ///
@@ -447,32 +491,36 @@ impl Store {
         if workspace_ids.is_empty() {
             return Ok(HashMap::new());
         }
+        let mut tx = self.sharing_snapshot(workspace_ids, None).await?;
         let placeholders = vec!["?"; workspace_ids.len()].join(",");
         let sql = format!(
             "WITH viewer AS (SELECT p.id, p.is_primary, h.principal_id IS NOT NULL AS is_host_member \
                 FROM principal p LEFT JOIN host_member h ON h.principal_id = p.id WHERE p.id = ?) \
              SELECT w.id AS workspace_id, w.owner_principal_id, \
                 COALESCE(v.is_primary OR (v.is_host_member AND w.id <> ?), 0) AS can_manage, \
-                (SELECT COUNT(*) FROM workspace_member m WHERE m.workspace_id = w.id) AS member_count, \
-                (SELECT COUNT(*) FROM workspace_invite i WHERE i.workspace_id = w.id \
-                    AND {INVITE_OPEN}) AS open_invite_count, \
-                COALESCE((SELECT m.role FROM workspace_member m \
-                    WHERE m.workspace_id = w.id AND m.principal_id = v.id), \
-                    CASE WHEN v.is_host_member AND w.id <> ? THEN 'collaborator' END) AS my_role \
-             FROM workspace w LEFT JOIN viewer v ON 1 = 1 WHERE w.id IN ({placeholders})"
+                CASE WHEN w.id = ? THEN s.direct_count ELSE s.non_host_count + h.member_count END AS member_count, \
+                s.open_invite_count, \
+                COALESCE(m.role, CASE WHEN v.is_host_member AND w.id <> ? THEN 'collaborator' END) AS my_role \
+             FROM workspace w JOIN workspace_sharing_summary s ON s.workspace_id = w.id \
+             CROSS JOIN host_membership_state h LEFT JOIN viewer v ON 1 = 1 \
+             LEFT JOIN workspace_member m ON m.workspace_id = w.id AND m.principal_id = v.id \
+             WHERE h.id = 1 AND w.id IN ({placeholders})"
         );
         let mut query = sqlx::query(&sql)
             .bind(viewer.map(|p| p.0.as_str()))
             .bind(intent_core::CHIEF_WORKSPACE_ID)
-            .bind(now_iso())
+            .bind(intent_core::CHIEF_WORKSPACE_ID)
             .bind(intent_core::CHIEF_WORKSPACE_ID);
         for id in workspace_ids {
             query = query.bind(&id.0);
         }
         let rows = query
-            .fetch_all(self.read_pool())
+            .fetch_all(&mut *tx)
             .await
             .map_err(|e| Error::Internal(format!("workspace membership summaries failed: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| Error::Internal(format!("sharing snapshot commit failed: {e}")))?;
         rows.iter()
             .map(|r| {
                 let my_role = r
@@ -515,6 +563,84 @@ impl Store {
             .await
             .map_err(|e| Error::Internal(format!("list workspace members failed: {e}")))?;
         rows.iter().map(map_member_row).collect()
+    }
+
+    /// Effective members of an existing workspace, owner first. The union
+    /// deduplicates by principal, never by a forge handle or numeric account ID.
+    /// Chief retains only its direct membership. Explicit roster reads load
+    /// profiles in this one query, not all host principals or per-person reads.
+    ///
+    /// # Errors
+    /// Returns `Internal` on database failure.
+    pub async fn list_effective_workspace_members(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<EffectiveWorkspaceMember>> {
+        let rows = sqlx::query(
+            "WITH people AS (SELECT principal_id FROM workspace_member WHERE workspace_id = ? \
+                 UNION SELECT principal_id FROM host_member WHERE ? <> ?) \
+             SELECT p.*, h.principal_id IS NOT NULL AS is_host_member, \
+                 CASE WHEN h.principal_id IS NOT NULL AND w.id <> ? THEN h.added_at \
+                      ELSE m.added_at END AS member_added_at \
+             FROM people x JOIN principal p ON p.id = x.principal_id \
+             JOIN workspace w ON w.id = ? \
+             LEFT JOIN workspace_member m ON m.workspace_id = w.id AND m.principal_id = p.id \
+             LEFT JOIN host_member h ON h.principal_id = p.id \
+             ORDER BY p.is_primary DESC, member_added_at, p.id",
+        )
+        .bind(workspace_id.as_str())
+        .bind(workspace_id.as_str())
+        .bind(intent_core::CHIEF_WORKSPACE_ID)
+        .bind(intent_core::CHIEF_WORKSPACE_ID)
+        .bind(workspace_id.as_str())
+        .fetch_all(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("effective workspace roster failed: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let principal = map_principal_row(r);
+                EffectiveWorkspaceMember {
+                    role: if principal.is_primary {
+                        WorkspaceRole::Owner
+                    } else {
+                        WorkspaceRole::Collaborator
+                    },
+                    host_role: if principal.is_primary {
+                        intent_core::HostRole::Owner
+                    } else if r.get::<bool, _>("is_host_member") {
+                        intent_core::HostRole::Member
+                    } else {
+                        intent_core::HostRole::Guest
+                    },
+                    principal,
+                    added_at: r.get("member_added_at"),
+                }
+            })
+            .collect())
+    }
+
+    /// IDs for presence fan-out. Members inherit ordinary workspaces; direct
+    /// guest grants remain scoped. This runs on presence changes, never lists.
+    ///
+    /// # Errors
+    /// Returns `Internal` on database failure.
+    pub async fn effective_principal_workspace_ids(
+        &self,
+        principal: &PrincipalId,
+    ) -> Result<Vec<WorkspaceId>> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT workspace_id FROM workspace_member WHERE principal_id = ? \
+             UNION SELECT w.id FROM workspace w WHERE w.id <> ? \
+             AND EXISTS(SELECT 1 FROM host_member WHERE principal_id = ?)",
+        )
+        .bind(principal.as_str())
+        .bind(intent_core::CHIEF_WORKSPACE_ID)
+        .bind(principal.as_str())
+        .fetch_all(self.read_pool())
+        .await
+        .map(|ids| ids.into_iter().map(WorkspaceId).collect())
+        .map_err(|e| Error::Internal(format!("effective presence workspaces failed: {e}")))
     }
 
     /// List every workspace id a principal is a member of, with the role.
@@ -615,8 +741,9 @@ impl Store {
     /// is inside its own write transaction — cannot both take the last
     /// seat, and a `revoke_all_principal_credentials` that committed
     /// before the transaction began is always observed (no seat for a
-    /// principal that can no longer authenticate). The credential predicate
-    /// is evaluated first, so a seated principal whose credentials are all
+    /// principal that can no longer authenticate). Active host members are
+    /// already effective members and bypass guest admission. For guests the
+    /// credential predicate is evaluated first, so a seated principal whose credentials are all
     /// revoked is `NoActiveCredential`, not `AlreadyMember`; an already
     /// seated credentialed principal takes no new seat and is reported
     /// without a write. An archived workspace is `WorkspaceArchived` (read
@@ -644,6 +771,12 @@ impl Store {
             .map_err(|e| Error::Internal(format!("capped member add begin failed: {e}")))?;
 
         let body_result: Result<CollaboratorAddOutcome> = async {
+            let inherited: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM host_member WHERE principal_id = ?) AND ? <> ?",
+            ).bind(principal_id.as_str()).bind(workspace_id.as_str()).bind(intent_core::CHIEF_WORKSPACE_ID)
+                .fetch_one(&mut *conn).await
+                .map_err(|e|Error::Internal(format!("capped member add host role failed: {e}")))?;
+            if inherited { return Ok(CollaboratorAddOutcome::AlreadyMember); }
             if workspace_archived_in_txn(&mut conn, workspace_id, "capped member add").await?
                 == Some(true)
             {
@@ -673,22 +806,10 @@ impl Store {
             if already_member.is_some() {
                 return Ok(CollaboratorAddOutcome::AlreadyMember);
             }
-            let sql = format!(
-                "SELECT \
-                    (SELECT COUNT(*) FROM workspace_member m \
-                        WHERE m.workspace_id = ? AND m.role = 'collaborator') + \
-                    (SELECT COUNT(*) FROM workspace_invite i WHERE i.workspace_id = ? \
-                        AND {INVITE_OPEN})"
-            );
-            let committed: i64 = sqlx::query_scalar(&sql)
-                .bind(&workspace_id.0)
-                .bind(&workspace_id.0)
-                .bind(now_iso())
-                .fetch_one(&mut *conn)
-                .await
-                .map_err(|e| {
-                    Error::Internal(format!("capped member add guest count failed: {e}"))
-                })?;
+            crate::sharing_projection::reconcile_invite_expiry(&mut conn, std::slice::from_ref(workspace_id), &now_iso()).await?;
+            let committed: i64 = sqlx::query_scalar("SELECT guest_count + open_invite_count FROM workspace_sharing_summary WHERE workspace_id = ?")
+                .bind(workspace_id.as_str()).fetch_one(&mut *conn).await
+                .map_err(|e| Error::Internal(format!("capped member add guest count failed: {e}")))?;
             if u64::try_from(committed).unwrap_or(u64::MAX) >= u64::from(max_guests) {
                 return Ok(CollaboratorAddOutcome::WorkspaceFull);
             }
@@ -786,6 +907,53 @@ impl Store {
             Ok(res.rows_affected() > 0)
         })
         .await
+    }
+
+    /// Remove a direct guest grant, refusing inherited access under the same
+    /// write lock as deletion. An upgrade racing removal cannot lose its
+    /// retained collaborator row. Host-wide revocation uses its own transaction.
+    ///
+    /// # Errors
+    /// Returns `HostMembershipRequired` for active members, `InvalidParams`
+    /// for an owner, and `Internal` on database failure.
+    pub async fn remove_workspace_guest(
+        &self,
+        workspace_id: &WorkspaceId,
+        principal_id: &PrincipalId,
+    ) -> Result<bool> {
+        let mut tx = self
+            .write_pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| Error::Internal(format!("remove guest begin failed: {e}")))?;
+        let inherited: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM host_member WHERE principal_id = ?)")
+                .bind(principal_id.as_str())
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("remove guest role failed: {e}")))?;
+        if inherited {
+            return Err(Error::HostMembershipRequired);
+        }
+        let owner:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM workspace_member WHERE workspace_id = ? AND principal_id = ? AND role = 'owner')")
+            .bind(workspace_id.as_str()).bind(principal_id.as_str()).fetch_one(&mut *tx).await
+            .map_err(|e|Error::Internal(format!("remove guest owner check failed: {e}")))?;
+        if owner {
+            return Err(Error::InvalidParams(
+                "the workspace owner cannot leave or be removed".into(),
+            ));
+        }
+        let deleted =
+            sqlx::query("DELETE FROM workspace_member WHERE workspace_id = ? AND principal_id = ?")
+                .bind(workspace_id.as_str())
+                .bind(principal_id.as_str())
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("remove guest failed: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| Error::Internal(format!("remove guest commit failed: {e}")))?;
+        Ok(deleted.rows_affected() > 0)
     }
 
     /// Record a bearer credential for a principal, keyed by `token_hash`
@@ -979,8 +1147,8 @@ impl Store {
         Ok(u64::try_from(n).unwrap_or(0))
     }
 
-    /// The guest-cap usage of one workspace: its `collaborator` memberships
-    /// and its open invites, in one round trip.
+    /// The guest-cap usage of one workspace: direct non-host collaborators
+    /// and open invites, from maintained scalars after indexed expiry reconciliation.
     ///
     /// # Errors
     ///
@@ -989,21 +1157,18 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<WorkspaceGuestCount> {
-        let sql = format!(
-            "SELECT \
-                (SELECT COUNT(*) FROM workspace_member m \
-                    WHERE m.workspace_id = ? AND m.role = 'collaborator' \
-                    AND NOT EXISTS (SELECT 1 FROM host_member h WHERE h.principal_id = m.principal_id)) AS collaborators, \
-                (SELECT COUNT(*) FROM workspace_invite i WHERE i.workspace_id = ? \
-                    AND {INVITE_OPEN}) AS open_invites"
-        );
-        let row = sqlx::query(&sql)
-            .bind(&workspace_id.0)
-            .bind(&workspace_id.0)
-            .bind(now_iso())
-            .fetch_one(self.read_pool())
-            .await
+        let mut tx = self
+            .sharing_snapshot(std::slice::from_ref(workspace_id), None)
+            .await?;
+        let row = sqlx::query("SELECT guest_count AS collaborators, open_invite_count AS open_invites FROM workspace_sharing_summary WHERE workspace_id = ?")
+            .bind(workspace_id.as_str()).fetch_optional(&mut *tx).await
             .map_err(|e| Error::Internal(format!("count workspace guests failed: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| Error::Internal(format!("guest snapshot commit failed: {e}")))?;
+        let Some(row) = row else {
+            return Ok(WorkspaceGuestCount::default());
+        };
         Ok(WorkspaceGuestCount {
             collaborators: u64::try_from(row.get::<i64, _>("collaborators")).unwrap_or(0),
             open_invites: u64::try_from(row.get::<i64, _>("open_invites")).unwrap_or(0),
@@ -1024,6 +1189,29 @@ impl Store {
     pub async fn insert_workspace_invite(
         &self,
         invite: &WorkspaceInvite,
+    ) -> Result<InviteInsertOutcome> {
+        self.insert_workspace_invite_with_limit(invite, None).await
+    }
+
+    /// Mint a workspace invitation only if a guest seat remains. The limit,
+    /// expiry reconciliation, issuer and archive checks share the insert's
+    /// write transaction with direct guest admissions and invite joins.
+    ///
+    /// # Errors
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn insert_workspace_invite_within_cap(
+        &self,
+        invite: &WorkspaceInvite,
+        max_guests: u32,
+    ) -> Result<InviteInsertOutcome> {
+        self.insert_workspace_invite_with_limit(invite, Some(max_guests))
+            .await
+    }
+
+    async fn insert_workspace_invite_with_limit(
+        &self,
+        invite: &WorkspaceInvite,
+        max_guests: Option<u32>,
     ) -> Result<InviteInsertOutcome> {
         let mut conn =
             self.write_pool().acquire().await.map_err(|e| {
@@ -1048,6 +1236,15 @@ impl Store {
             ).bind(&invite.created_by_principal_id.0).bind(&invite.workspace_id.0)
                 .fetch_one(&mut *conn).await.map_err(|e| Error::Internal(format!("invite issuer check failed: {e}")))?;
             if !authorized { return Ok(InviteInsertOutcome::IssuerForbidden); }
+            if let Some(max_guests) = max_guests {
+                crate::sharing_projection::reconcile_invite_expiry(&mut conn, std::slice::from_ref(&invite.workspace_id), &now_iso()).await?;
+                let committed: i64 = sqlx::query_scalar("SELECT guest_count + open_invite_count FROM workspace_sharing_summary WHERE workspace_id = ?")
+                    .bind(invite.workspace_id.as_str()).fetch_one(&mut *conn).await
+                    .map_err(|e| Error::Internal(format!("invite seat check failed: {e}")))?;
+                if u64::try_from(committed).unwrap_or(u64::MAX) >= u64::from(max_guests) {
+                    return Ok(InviteInsertOutcome::WorkspaceFull);
+                }
+            }
             let sql = format!(
                 "INSERT INTO workspace_invite ({INVITE_COLUMNS}) \
                  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
@@ -1160,7 +1357,7 @@ impl Store {
 
     /// `workspace.archive`'s durable write: flip the row to Archived
     /// (scoped `status`/`archived`/`archived_at`/`updated_at` write), delete
-    /// every non-owner membership, revoke every open invite and count the
+    /// every direct guest membership, revoke every open invite and count the
     /// surviving members — in ONE `BEGIN IMMEDIATE` transaction, so the
     /// archive and the access revocation commit together or not at all.
     /// Under IMMEDIATE an `invite.accept` / capped member add (both write
@@ -1204,8 +1401,10 @@ impl Store {
                 return Err(Error::NotFound(format!("workspace {id}")));
             }
             let removed_collaborators: Vec<PrincipalId> = sqlx::query_scalar::<_, String>(
-                "SELECT principal_id FROM workspace_member \
-                 WHERE workspace_id = ? AND role <> 'owner' ORDER BY added_at, principal_id",
+                "SELECT principal_id FROM workspace_member m \
+                 WHERE workspace_id = ? AND role <> 'owner' \
+                 AND NOT EXISTS(SELECT 1 FROM host_member h WHERE h.principal_id = m.principal_id) \
+                 ORDER BY added_at, principal_id",
             )
             .bind(&id.0)
             .fetch_all(&mut *conn)
@@ -1215,7 +1414,8 @@ impl Store {
             .map(PrincipalId)
             .collect();
             let deleted = sqlx::query(
-                "DELETE FROM workspace_member WHERE workspace_id = ? AND role <> 'owner'",
+                "DELETE FROM workspace_member AS m WHERE workspace_id = ? AND role <> 'owner' \
+                 AND NOT EXISTS(SELECT 1 FROM host_member h WHERE h.principal_id = m.principal_id)",
             )
             .bind(&id.0)
             .execute(&mut *conn)
@@ -1240,7 +1440,8 @@ impl Store {
                 .await
                 .map_err(|e| Error::Internal(format!("archive invite revoke failed: {e}")))?;
             let remaining: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM workspace_member WHERE workspace_id = ?")
+                sqlx::query_scalar("SELECT CASE WHEN s.workspace_id = ? THEN s.direct_count ELSE s.non_host_count + h.member_count END FROM workspace_sharing_summary s CROSS JOIN host_membership_state h WHERE s.workspace_id = ? AND h.id = 1")
+                    .bind(intent_core::CHIEF_WORKSPACE_ID)
                     .bind(&id.0)
                     .fetch_one(&mut *conn)
                     .await
@@ -1384,15 +1585,9 @@ impl Store {
                 None => false,
             };
             if !already_member {
-                let collaborators: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM workspace_member m \
-                     WHERE workspace_id = ? AND role = 'collaborator' \
-                     AND NOT EXISTS (SELECT 1 FROM host_member h WHERE h.principal_id = m.principal_id)",
-                )
-                .bind(&workspace_id.0)
-                .fetch_one(&mut *conn)
-                .await
-                .map_err(|e| Error::Internal(format!("invite join guest count failed: {e}")))?;
+                let collaborators: i64 = sqlx::query_scalar("SELECT guest_count FROM workspace_sharing_summary WHERE workspace_id = ?")
+                    .bind(workspace_id.as_str()).fetch_one(&mut *conn).await
+                    .map_err(|e| Error::Internal(format!("invite join guest count failed: {e}")))?;
                 if u64::try_from(collaborators).unwrap_or(u64::MAX) >= u64::from(max_guests) {
                     return Ok(InviteJoinOutcome::WorkspaceFull);
                 }
