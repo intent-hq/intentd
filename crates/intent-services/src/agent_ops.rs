@@ -1415,9 +1415,14 @@ impl QueuedMessage {
     }
 
     /// The ready-to-send predicate shared by every drain path and idle gate
-    /// (PROTOCOL §5.5/§6.5): not under edit and not held.
+    /// (PROTOCOL §5.5/§6.5): not under edit, held, or awaiting a destination
+    /// owner's explicit authorization for an imported human instruction.
     pub(crate) fn ready_to_send(&self) -> bool {
-        !self.editing && !self.is_held()
+        !self.editing
+            && !self.is_held()
+            && !intent_core::human_author::is_unbound_historical_human(
+                self.message_metadata.as_ref(),
+            )
     }
 }
 
@@ -6036,7 +6041,11 @@ impl Services {
                 })?;
             let metadata = match obj.get("metadata") {
                 Some(Value::Null) | None => None,
-                Some(v) => Some(v.clone()),
+                Some(v) => {
+                    let mut metadata = v.clone();
+                    intent_core::human_author::strip_historical_human_author(&mut metadata);
+                    Some(metadata)
+                }
             };
             let created_at = match obj.get("timestamp").or_else(|| obj.get("createdAt")) {
                 Some(Value::String(s)) => s.clone(),
@@ -6516,6 +6525,17 @@ impl Services {
             author_only,
             fallback,
         }))
+    }
+
+    /// Resolve an affirmative current human owner, not the absence of a
+    /// restricted queue gate (which also admits agents and daemon work).
+    /// Public send-now holds instruction admission across this read and pop.
+    pub(crate) async fn destination_owner_queue_authorization(&self) -> Result<bool> {
+        let Some(intent_core::Caller::Wire { principal_id, .. }) = intent_core::current_caller()
+        else {
+            return Ok(false);
+        };
+        Ok(self.store.get_host_role(&principal_id).await? == intent_core::HostRole::Owner)
     }
 
     /// Test seam (intentd#2068): park a GATED per-id queue mutation between
@@ -7093,12 +7113,18 @@ impl Services {
         let _mutation = self.workspace_mutations.enter(&session.workspace_id)?;
         let workspace_id = session.workspace_id.clone();
         let gate = self.queue_entry_gate(&agent_id, false).await?;
+        let destination_owner = self.destination_owner_queue_authorization().await?;
         self.park_queue_mutation_gate(gate.as_ref()).await;
         // Atomic dequeue; the entry stays listed in queue snapshots (§6.5
         // drain ordering) until `draining` is dropped right before the shrunk
         // publish below.
         let (mut entry, draining) = self
-            .take_queued_message_draining_gated(&agent_id, &message_id, gate.as_ref())?
+            .take_queued_message_draining_gated(
+                &agent_id,
+                &message_id,
+                gate.as_ref(),
+                destination_owner,
+            )?
             .ok_or_else(|| {
                 Error::InvalidParams(format!("queued message not found: {message_id}"))
             })?;
@@ -15105,7 +15131,7 @@ impl Services {
         agent_id: &AgentId,
         message_id: &str,
     ) -> Option<(QueuedMessage, DrainingGuard)> {
-        self.take_queued_message_draining_gated(agent_id, message_id, None)
+        self.take_queued_message_draining_gated(agent_id, message_id, None, false)
             .ok()
             .flatten()
     }
@@ -15121,12 +15147,14 @@ impl Services {
     /// against the entry INSIDE the pop's critical section (draining overlay
     /// lock → `agent_queues` lock): a refused entry is left in place untouched
     /// and the refusal surfaces as `Err`; `Ok(None)` is the ordinary absent
-    /// id. `None` for `gate` pops unconditionally.
+    /// id. Historical unbound humans additionally require an affirmative
+    /// current destination owner; an absent gate never grants that authority.
     pub(crate) fn take_queued_message_draining_gated(
         &self,
         agent_id: &AgentId,
         message_id: &str,
         gate: Option<&QueueEntryGate>,
+        destination_owner: bool,
     ) -> Result<Option<(QueuedMessage, DrainingGuard)>> {
         let mut refused = None;
         let popped = self.pop_draining(
@@ -15143,6 +15171,15 @@ impl Services {
                         refused = Some(e);
                         return None;
                     }
+                }
+                if intent_core::human_author::is_unbound_historical_human(
+                    queue[idx].message_metadata.as_ref(),
+                ) && !destination_owner
+                {
+                    refused = Some(Error::Forbidden(
+                        "imported human instruction requires the destination owner".into(),
+                    ));
+                    return None;
                 }
                 Some(queue.remove(idx))
             },

@@ -10089,6 +10089,108 @@ async fn send_queued_message_now_persist_failure_requeues_front() {
     assert!(!mgr.is_busy(&id), "the slot was released");
 }
 
+#[tokio::test]
+async fn transfer_human_runtime_force_and_handback_keep_original_author() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-historical"),
+        AgentId::from("historical"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    let owner = mgr.services.store.get_primary_principal().await.unwrap();
+    let caller = intent_core::Caller::Wire {
+        principal_id: owner.id,
+        host_role: intent_core::HostRole::Owner,
+    };
+    let entry = crate::human_attribution_tests::imported_pending("historical-input");
+    mgr.services
+        .agent_queues
+        .lock()
+        .unwrap()
+        .insert(id.clone(), vec![entry.clone()]);
+    assert!(intent_core::with_caller(
+        intent_core::Caller::Daemon,
+        mgr.send_queued_message_now(id.clone(), ws.clone(), entry.id.clone())
+    )
+    .await
+    .is_err());
+    assert!(mgr.try_begin(&id, &ws).await);
+    let parked = intent_core::with_caller(
+        caller.clone(),
+        mgr.send_queued_message_now(id.clone(), ws.clone(), entry.id.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(parked["queued"], true);
+    let restored = mgr.services.find_queued_message(&id, &entry.id).unwrap();
+    assert_eq!(
+        restored.message_metadata.as_ref().unwrap()["humanAuthor"],
+        entry.message_metadata.as_ref().unwrap()["humanAuthor"]
+    );
+    assert!(!restored.ready_to_send());
+    mgr.end_turn(&id).await;
+    mgr.redrive_parked_recovery_send(&id, &ws).await;
+    assert!(
+        !mgr.is_busy(&id),
+        "slot release cannot authorize imported input"
+    );
+    assert!(mgr.services.find_queued_message(&id, &entry.id).is_some());
+    sqlx::query("CREATE TRIGGER fail_historical_append BEFORE INSERT ON agent_message BEGIN SELECT RAISE(ABORT,'test append failure'); END").execute(mgr.services.store.write_pool()).await.unwrap();
+    let failed = intent_core::with_caller(
+        caller.clone(),
+        mgr.send_queued_message_now(id.clone(), ws.clone(), entry.id.clone()),
+    )
+    .await;
+    assert!(failed.is_err());
+    assert!(!mgr.is_busy(&id));
+    let restored = mgr.services.find_queued_message(&id, &entry.id).unwrap();
+    assert_eq!(
+        restored.message_metadata.as_ref().unwrap()["humanAuthor"],
+        entry.message_metadata.as_ref().unwrap()["humanAuthor"]
+    );
+    assert!(!restored.ready_to_send());
+    sqlx::query("DROP TRIGGER fail_historical_append")
+        .execute(mgr.services.store.write_pool())
+        .await
+        .unwrap();
+    let script = mock_agent_script();
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+    set_session_provider(&mgr, &ws, &id, "mock").await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+    mgr.handles
+        .lock()
+        .unwrap()
+        .get_mut(&id)
+        .unwrap()
+        .spawned_provider = "node".into();
+    let sent = intent_core::with_caller(
+        caller,
+        mgr.send_queued_message_now(id.clone(), ws, entry.id.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(sent["queued"], false);
+    assert!(mgr.services.find_queued_message(&id, &entry.id).is_none());
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap();
+    let row = messages.iter().find(|m| m.id == entry.id).unwrap();
+    assert_eq!(
+        row.metadata.as_ref().unwrap()["humanAuthor"],
+        entry.message_metadata.as_ref().unwrap()["humanAuthor"]
+    );
+    assert!(row
+        .metadata
+        .as_ref()
+        .unwrap()
+        .get("fromPrincipalId")
+        .is_none());
+}
+
 /// monorepo#840 quarantine gate: `send_queued_message_now` on a poisoned
 /// session (Error + session-fatal provider block) must NOT redrive — the
 /// entry stays in the queue and the result reports

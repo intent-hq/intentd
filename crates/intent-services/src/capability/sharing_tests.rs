@@ -428,7 +428,10 @@ async fn sharing_bound_humans_keep_authorship_and_preambles_against_forged_metad
                 .attribute_comment_author(Some("owner".into()), Some("agent".into()))
                 .await
                 .unwrap();
-            assert_eq!(author, (Some("same-handle".into()), Some("user".into())));
+            assert_eq!(author.author, Some("same-handle".into()));
+            assert_eq!(author.author_type, Some("user".into()));
+            assert_eq!(author.principal_id.as_ref(), Some(&p.id));
+            assert_eq!(author.identity, p.identity_key());
             assert!(f
                 .svc
                 .collaborator_sender_preamble(&f.ws)

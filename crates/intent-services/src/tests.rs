@@ -5729,6 +5729,8 @@ async fn delete_note_cascades_comments_and_unlinks_children() {
         content: format!("{id} body"),
         author: "alice".to_string(),
         author_type: AuthorType::User,
+        author_principal_id: None,
+        author_identity: None,
         status: CommentStatus::Open,
         parent_id: None,
         anchor: Some(CommentAnchor {
@@ -8765,6 +8767,8 @@ fn anchored_root_comment(
         content: format!("{comment_id} body"),
         author: "User".to_string(),
         author_type: intent_core::AuthorType::User,
+        author_principal_id: None,
+        author_identity: None,
         status: CommentStatus::Open,
         parent_id: None,
         anchor: Some(CommentAnchor {
@@ -9631,6 +9635,8 @@ async fn comment_respond_rejects_cross_workspace_comment_id_probe() {
         content: "ws_a original".to_string(),
         author: "A".to_string(),
         author_type: AuthorType::User,
+        author_principal_id: None,
+        author_identity: None,
         status: CommentStatus::Open,
         parent_id: None,
         anchor: Some(CommentAnchor {
@@ -14967,6 +14973,8 @@ mod change_event_parity {
             content: "hi".to_string(),
             author: "user".to_string(),
             author_type: AuthorType::User,
+            author_principal_id: None,
+            author_identity: None,
             status: CommentStatus::Open,
             parent_id: None,
             anchor: Some(CommentAnchor {

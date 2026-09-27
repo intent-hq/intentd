@@ -7362,6 +7362,10 @@ impl AgentManager {
         // checked inside the pop's critical section against the entry found
         // there — a guest force-sends only what its `agent.getQueue` shows it.
         let gate = self.services.queue_entry_gate(&agent_id, false).await?;
+        let destination_owner = self
+            .services
+            .destination_owner_queue_authorization()
+            .await?;
         self.services.park_queue_mutation_gate(gate.as_ref()).await;
         // Quarantine gate (monorepo#840): a provably-poisoned session must
         // not be redriven by delivery — every replay deterministically
@@ -7402,7 +7406,12 @@ impl AgentManager {
         // snapshots (§6.5 drain ordering) until `draining` is dropped.
         let (mut entry, draining) = self
             .services
-            .take_queued_message_draining_gated(&agent_id, &message_id, gate.as_ref())?
+            .take_queued_message_draining_gated(
+                &agent_id,
+                &message_id,
+                gate.as_ref(),
+                destination_owner,
+            )?
             .ok_or_else(|| {
                 Error::InvalidParams(format!("queued message not found: {message_id}"))
             })?;

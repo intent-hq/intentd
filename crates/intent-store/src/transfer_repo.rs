@@ -412,6 +412,15 @@ impl Store {
             }
             out.push(((*table).to_string(), objects));
         }
+        #[cfg(test)]
+        {
+            let barrier = self.export_author_barrier.lock().unwrap().take();
+            if let Some(barrier) = barrier {
+                barrier.entered.notify_one();
+                barrier.release.notified().await;
+            }
+        }
+        crate::transfer_authorship::capture(&mut tx, &mut out).await?;
         tx.commit()
             .await
             .map_err(|e| Error::Internal(format!("transfer export commit failed: {e}")))?;

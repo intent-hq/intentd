@@ -172,6 +172,9 @@ pub fn queue_attribution_with(
     metadata: Option<&serde_json::Value>,
     fallback: Option<&PrincipalId>,
 ) -> QueueAttribution {
+    if crate::human_author::is_unbound_historical_human(metadata) {
+        return QueueAttribution::UnknownHuman;
+    }
     match crate::lift_from_principal_id(metadata) {
         Some(id) => QueueAttribution::Principal(id),
         None if is_human_authored_metadata(metadata) => fallback

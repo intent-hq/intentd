@@ -10,6 +10,8 @@
 mod common;
 #[path = "wss_integration/host_roles.rs"]
 mod host_roles;
+#[path = "wss_integration/human_attribution.rs"]
+mod human_attribution;
 #[path = "wss_integration/sharing.rs"]
 mod sharing;
 

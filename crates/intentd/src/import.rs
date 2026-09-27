@@ -374,6 +374,8 @@ async fn import_comments(
     summary: &mut ImportSummary,
 ) {
     for mut obj in load_objects(dir, summary) {
+        obj.remove("authorPrincipalId");
+        obj.remove("authorIdentity");
         fill_defaults(
             &mut obj,
             &[

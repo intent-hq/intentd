@@ -106,6 +106,8 @@ mod agent_list_cache;
 mod harness;
 mod history_xml;
 mod hook_manager;
+#[cfg(test)]
+mod human_attribution_tests;
 mod image_dimensions;
 mod invite_ops;
 mod issue_cache;
@@ -145,6 +147,7 @@ mod task_effort;
 mod terminal_ops;
 pub mod tool_block;
 mod transfer;
+mod transfer_authorship;
 mod transfer_export;
 pub mod transfer_git;
 mod transfer_import;
@@ -25956,7 +25959,12 @@ impl WorkspaceApi for Services {
             self.require_member(&workspace_id).await?;
             // A collaborator's comment is attributed by the daemon, not the
             // client (multiplayer w4).
-            let (author, author_type) = self.attribute_comment_author(author, author_type).await?;
+            let principal_ops::CommentAuthor {
+                author,
+                author_type,
+                principal_id: author_principal_id,
+                identity: author_identity,
+            } = self.attribute_comment_author(author, author_type).await?;
             let ws_scope = workspace_id.0.clone();
             let op_store = store.clone();
             let warn_note_id = note_id.clone();
@@ -26110,6 +26118,8 @@ impl WorkspaceApi for Services {
                         content: comment.clone(),
                         author: comment_author.clone(),
                         author_type,
+                        author_principal_id: author_principal_id.clone(),
+                        author_identity: author_identity.clone(),
                         status: CommentStatus::Open,
                         parent_id: None,
                         anchor: Some(CommentAnchor {
@@ -26322,6 +26332,8 @@ impl WorkspaceApi for Services {
                     last_activity,
                     latest_comment_author: latest.author.clone(),
                     latest_comment_author_type: latest.author_type,
+                    latest_comment_author_principal_id: latest.author_principal_id.clone(),
+                    latest_comment_author_identity: latest.author_identity.clone(),
                     latest_comment_at: latest.updated_at.clone(),
                     comment_count: group.len(),
                     comments: comment_wires,
@@ -26430,7 +26442,12 @@ impl WorkspaceApi for Services {
             self.require_member(&workspace_id).await?;
             // A collaborator's reply is attributed by the daemon, not the
             // client (multiplayer w4).
-            let (author, author_type) = self.attribute_comment_author(author, author_type).await?;
+            let principal_ops::CommentAuthor {
+                author,
+                author_type,
+                principal_id: author_principal_id,
+                identity: author_identity,
+            } = self.attribute_comment_author(author, author_type).await?;
             if thread_id.is_none() && comment_id.is_none() {
                 return Err(Error::InvalidParams(
                     "Either threadId or commentId must be provided".to_string(),
@@ -26505,6 +26522,8 @@ impl WorkspaceApi for Services {
                     .to_string()
                 }),
                 author_type,
+                author_principal_id,
+                author_identity,
                 status: CommentStatus::Open,
                 parent_id: Some(parent.id.clone()),
                 // Replies never anchor independently — they anchor via their

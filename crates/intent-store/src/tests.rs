@@ -18,6 +18,7 @@ use sqlx::Row;
 use crate::{AgentQueueRow, AutoVacuumActivation, EventQuery, NewEvent, Store, MAX_NOTE_VERSIONS};
 
 mod host_membership;
+mod human_attribution;
 mod sharing;
 mod workspace_delete;
 
@@ -2045,6 +2046,8 @@ async fn adopt_stray_spec_with_dependents_commits_cleanly() {
         content: "hi".to_string(),
         author: "user".to_string(),
         author_type: AuthorType::User,
+        author_principal_id: None,
+        author_identity: None,
         status: CommentStatus::Open,
         parent_id: None,
         anchor: Some(CommentAnchor {
@@ -2241,6 +2244,8 @@ fn sample_comment(note_id: &NoteId, thread_id: &str, id: &str) -> Comment {
         content: "please rename".to_string(),
         author: "alice".to_string(),
         author_type: AuthorType::User,
+        author_principal_id: None,
+        author_identity: None,
         status: CommentStatus::Open,
         parent_id: None,
         anchor: Some(CommentAnchor {
@@ -7244,6 +7249,7 @@ async fn append_agent_message_survives_write_pool_acquire_timeout() {
             .await
             .expect("open read pool"),
         browser_tab_displayed: crate::browser_tab_repo::DisplayedOverlay::default(),
+        export_author_barrier: Default::default(),
     };
     let ws = WorkspaceId::new();
     store

@@ -802,6 +802,8 @@ impl WorkspaceApi for FakeApi {
                 content: "please change".to_string(),
                 author: "Agent".to_string(),
                 author_type: AuthorType::Agent,
+                author_principal_id: None,
+                author_identity: None,
                 status: CommentStatus::Open,
                 parent_id: Some("c1".to_string()),
                 // Replies carry no anchor of their own (monorepo#729).

@@ -47,6 +47,7 @@ mod sharing_projection;
 mod stop_redelivery_repo;
 mod task_agent_link_repo;
 mod tracked_changes_repo;
+mod transfer_authorship;
 mod transfer_repo;
 mod usage_rate_repo;
 mod usage_stats_repo;
@@ -326,6 +327,10 @@ pub struct Store {
     /// Process-local `displayed` overlay of the browser tab registry; see
     /// `browser_tab_repo::DisplayedOverlay`.
     browser_tab_displayed: browser_tab_repo::DisplayedOverlay,
+    #[cfg(test)]
+    export_author_barrier: std::sync::Arc<
+        std::sync::Mutex<Option<std::sync::Arc<transfer_authorship::ExportAuthorBarrier>>>,
+    >,
 }
 
 impl Store {
@@ -370,6 +375,8 @@ impl Store {
             write_pool,
             read_pool,
             browser_tab_displayed: browser_tab_repo::DisplayedOverlay::default(),
+            #[cfg(test)]
+            export_author_barrier: Default::default(),
         })
     }
 

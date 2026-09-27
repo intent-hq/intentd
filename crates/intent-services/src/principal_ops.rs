@@ -251,7 +251,10 @@ pub(crate) fn stamp_principal_attribution(
 ) -> Result<Option<Value>> {
     let metadata = match message_metadata {
         None => None,
-        Some(Value::Object(obj)) => Some(obj),
+        Some(Value::Object(mut obj)) => {
+            obj.remove(intent_core::human_author::HUMAN_AUTHOR_KEY);
+            Some(obj)
+        }
         Some(_) => {
             return Err(Error::InvalidParams(
                 "messageMetadata must be an object".to_string(),
@@ -292,6 +295,7 @@ pub(crate) fn strip_principal_attribution(message_metadata: Option<Value>) -> Op
     match message_metadata {
         Some(Value::Object(mut obj)) => {
             obj.remove(FROM_PRINCIPAL_ID_KEY);
+            obj.remove(intent_core::human_author::HUMAN_AUTHOR_KEY);
             Some(Value::Object(obj))
         }
         other => other,
@@ -607,9 +611,13 @@ impl<'a> MessageAuthorResolver<'a> {
     /// `author.principalId`, so a transient store fault must never render a
     /// stamped entry as author-less (which would expose it to every guest).
     pub(crate) async fn resolve(&mut self, metadata: Option<&Value>) -> Option<Value> {
+        if let Some(author) = intent_core::human_author::historical_human_author(metadata) {
+            return Some(author.to_wire());
+        }
         let principal_id = match lift_from_principal_id(metadata) {
             Some(id) => id,
-            None => self.fallback_principal_id().await?,
+            None if is_human_authored_metadata(metadata) => self.fallback_principal_id().await?,
+            None => return None,
         };
         if !self.principals.contains_key(&principal_id) {
             #[cfg(test)]
@@ -656,11 +664,25 @@ impl<'a> MessageAuthorResolver<'a> {
             .filter_map(|(i, e)| {
                 let md = e.get("messageMetadata");
                 let stamp = lift_from_principal_id(md);
-                (stamp.is_some() || is_human_authored_metadata(md)).then_some((i, stamp))
+                (stamp.is_some()
+                    || intent_core::human_author::historical_human_author(md).is_some()
+                    || is_human_authored_metadata(md))
+                .then_some((i, stamp))
             })
             .collect();
-        self.prefetch(candidates.iter().map(|(_, s)| s.clone()).collect())
-            .await;
+        self.prefetch(
+            candidates
+                .iter()
+                .filter(|(i, _)| {
+                    intent_core::human_author::historical_human_author(
+                        entries[*i].get("messageMetadata"),
+                    )
+                    .is_none()
+                })
+                .map(|(_, s)| s.clone())
+                .collect(),
+        )
+        .await;
         for entry in entries.iter_mut() {
             if let Some(obj) = entry.as_object_mut() {
                 obj.insert("author".to_string(), Value::Null);
@@ -682,6 +704,13 @@ impl<'a> MessageAuthorResolver<'a> {
         let stamps = messages
             .iter()
             .filter(|m| m.role == "user")
+            .filter(|m| {
+                lift_from_principal_id(m.metadata.as_ref()).is_some()
+                    || is_human_authored_metadata(m.metadata.as_ref())
+            })
+            .filter(|m| {
+                intent_core::human_author::historical_human_author(m.metadata.as_ref()).is_none()
+            })
             .map(|m| lift_from_principal_id(m.metadata.as_ref()))
             .collect();
         self.prefetch(stamps).await;
@@ -725,6 +754,13 @@ pub(crate) fn principal_to_wire(
     )
 }
 
+pub(crate) struct CommentAuthor {
+    pub author: Option<String>,
+    pub author_type: Option<String>,
+    pub principal_id: Option<PrincipalId>,
+    pub identity: Option<intent_core::PrincipalIdentity>,
+}
+
 impl Services {
     /// Authoritative `(author, authorType)` for a comment written by a
     /// bound wire principal: its attribution name and `"user"`, replacing
@@ -737,18 +773,31 @@ impl Services {
         &self,
         author: Option<String>,
         author_type: Option<String>,
-    ) -> Result<(Option<String>, Option<String>)> {
+    ) -> Result<CommentAuthor> {
         let Some(principal_id) = attributed_caller_id() else {
-            return Ok((author, author_type));
+            return Ok(CommentAuthor {
+                author,
+                author_type,
+                principal_id: None,
+                identity: None,
+            });
         };
         let principal = self.store.get_principal(&principal_id).await?;
-        if principal.is_primary && principal.login.is_none() {
-            return Ok((author, author_type));
-        }
-        Ok((
-            Some(principal_attribution_name(&principal)),
-            Some("user".to_string()),
-        ))
+        let (author, author_type) = if principal.is_primary && principal.login.is_none() {
+            (author, author_type)
+        } else {
+            (
+                Some(principal_attribution_name(&principal)),
+                Some("user".to_string()),
+            )
+        };
+        let human = author_type.as_deref() == Some("user");
+        Ok(CommentAuthor {
+            author,
+            author_type,
+            principal_id: human.then_some(principal_id),
+            identity: human.then(|| principal.identity_key()).flatten(),
+        })
     }
 
     /// `principal.me`: see [`intent_core::WorkspaceApi::principal_me`].

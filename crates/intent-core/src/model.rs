@@ -1678,6 +1678,10 @@ pub struct Comment {
     pub content: String,
     pub author: String,
     pub author_type: AuthorType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_principal_id: Option<PrincipalId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_identity: Option<PrincipalIdentity>,
     pub status: CommentStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
@@ -2385,6 +2389,10 @@ pub struct CommentWire {
     pub content: String,
     pub author: String,
     pub author_type: AuthorType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_principal_id: Option<PrincipalId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_identity: Option<PrincipalIdentity>,
     pub status: CommentStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
@@ -2433,6 +2441,8 @@ impl CommentWire {
             content: c.content.clone(),
             author: c.author.clone(),
             author_type: c.author_type,
+            author_principal_id: c.author_principal_id.clone(),
+            author_identity: c.author_identity.clone(),
             status: c.status,
             parent_id: c.parent_id.clone(),
             anchor: c.anchor.clone(),
@@ -2484,6 +2494,10 @@ pub struct CommentThreadSummary {
     pub last_activity: String,
     pub latest_comment_author: String,
     pub latest_comment_author_type: AuthorType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_comment_author_principal_id: Option<PrincipalId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_comment_author_identity: Option<PrincipalIdentity>,
     pub latest_comment_at: String,
     pub comment_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6893,6 +6907,8 @@ mod tests {
             content: "hello".to_string(),
             author: "Agent".to_string(),
             author_type: AuthorType::Agent,
+            author_principal_id: None,
+            author_identity: None,
             status: CommentStatus::Open,
             parent_id: None,
             anchor: Some(CommentAnchor {
@@ -6946,6 +6962,8 @@ mod tests {
             content: "try this".to_string(),
             author: "Agent".to_string(),
             author_type: AuthorType::Agent,
+            author_principal_id: None,
+            author_identity: None,
             status: CommentStatus::Open,
             parent_id: Some("c1".to_string()),
             anchor: None,

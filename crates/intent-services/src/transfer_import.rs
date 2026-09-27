@@ -99,7 +99,7 @@ impl Services {
     ) -> Result<serde_json::Value> {
         let manifest: TransferManifest = serde_json::from_value(manifest)
             .map_err(|e| Error::InvalidParams(format!("invalid transfer manifest: {e}")))?;
-        if manifest.format_version != TRANSFER_FORMAT_VERSION {
+        if !matches!(manifest.format_version, 1 | TRANSFER_FORMAT_VERSION) {
             return Err(Error::InvalidParams(format!(
                 "unsupported transfer format version {} (this daemon supports {})",
                 manifest.format_version, TRANSFER_FORMAT_VERSION
@@ -454,11 +454,12 @@ impl Services {
 
         // Load rows/<table>.jsonl (unknown files — including event.jsonl —
         // are skipped defensively; the store layer would reject them anyway).
-        let rows = load_row_files(&extracted_dir.join("rows")).await?;
+        let mut rows = load_row_files(&extracted_dir.join("rows")).await?;
         // Every row must be scoped to the manifest's workspace — collision
         // validation only ran for that id, so smuggled rows for other
         // workspaces (or agents outside the archive) fail the commit.
         validate_row_scope(&rows, &workspace_id)?;
+        crate::transfer_authorship::prepare_import(&mut rows, manifest.format_version)?;
 
         // Transform: path rewrites against OUR workspaces root, session-id
         // clearing, in-flight → interrupted, drafts dropped.
@@ -2941,6 +2942,106 @@ mod tests {
             svc.workspace_import_commit_op(import_id).await,
             Err(Error::NotFound(_))
         ));
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn transfer_human_legacy_archive_import_is_unknown_even_with_colliding_ids() {
+        use intent_core::WorkspaceApi;
+        let root = TempDir::new("legacy-authors");
+        let svc = fresh_services(&root.0.join("workspaces"), &root.0.join("assets")).await;
+        let owner = svc.store.get_primary_principal().await.unwrap();
+        let ws = WorkspaceId::new();
+        let mut m = manifest(&ws);
+        m.format_version = 1;
+        let mut rows = fixture_rows(&ws);
+        rows.retain(|(t, _)| matches!(*t, "workspace" | "agent_session" | "agent_message"));
+        let messages = &mut rows
+            .iter_mut()
+            .find(|(t, _)| *t == "agent_message")
+            .unwrap()
+            .1;
+        messages[0]["metadata"]=serde_json::json!({"fromPrincipalId":owner.id,"humanAuthor":{"login":"planted","displayName":null,"avatarUrl":null},"keep":42}).to_string().into();
+        let archive = build_archive(&m, &rows);
+        let begin = svc
+            .workspace_import_begin_op(
+                serde_json::to_value(&m).unwrap(),
+                archive.len() as u64,
+                sha256_hex(&archive),
+            )
+            .await
+            .unwrap();
+        let import = begin["importId"].as_str().unwrap().to_string();
+        svc.workspace_import_chunk_op(import.clone(), 0, b64(&archive))
+            .await
+            .unwrap();
+        svc.workspace_import_commit_op(import).await.unwrap();
+        let view = svc
+            .agent_get_conversation(
+                AgentId::from("agent-live"),
+                None,
+                Some(ws.clone()),
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let human = &view["messages"][0];
+        assert_eq!(
+            human["author"],
+            serde_json::json!({"principalId":null,"login":null,"displayName":null,"avatarUrl":null})
+        );
+        assert_eq!(human["metadata"]["keep"], 42);
+        assert!(human["metadata"].get("fromPrincipalId").is_none());
+        assert!(view["messages"][1].get("author").is_none());
+        let exported = svc.store.transfer_export_rows(&ws).await.unwrap();
+        let row = exported
+            .iter()
+            .find(|(t, _)| t == "agent_message")
+            .unwrap()
+            .1
+            .iter()
+            .find(|r| r["id"] == "m-1")
+            .unwrap();
+        let md: serde_json::Value =
+            serde_json::from_str(row["metadata"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            md["humanAuthor"],
+            serde_json::json!({"login":null,"displayName":null,"avatarUrl":null})
+        );
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn transfer_human_invalid_v2_author_rejects_before_workspace_visibility() {
+        let root = TempDir::new("invalid-authors");
+        let svc = fresh_services(&root.0.join("workspaces"), &root.0.join("assets")).await;
+        let ws = WorkspaceId::new();
+        let m = manifest(&ws);
+        let mut rows = fixture_rows(&ws);
+        rows.retain(|(t, _)| matches!(*t, "workspace" | "agent_session" | "agent_message"));
+        rows.iter_mut().find(|(t,_)|*t=="agent_message").unwrap().1[0]["metadata"]=serde_json::json!({"humanAuthor":{"login":"bad","displayName":null,"avatarUrl":null,"identity":{"provider":"gitlab","host":"https://gitlab.com/","externalUserId":"42"}}}).to_string().into();
+        let archive = build_archive(&m, &rows);
+        let begin = svc
+            .workspace_import_begin_op(
+                serde_json::to_value(&m).unwrap(),
+                archive.len() as u64,
+                sha256_hex(&archive),
+            )
+            .await
+            .unwrap();
+        let import = begin["importId"].as_str().unwrap().to_string();
+        svc.workspace_import_chunk_op(import.clone(), 0, b64(&archive))
+            .await
+            .unwrap();
+        assert!(svc.workspace_import_commit_op(import).await.is_err());
+        assert!(svc.store.get_workspace(&ws).await.is_err());
+        assert!(svc
+            .store
+            .get_agent_session(&AgentId::from("agent-live"))
+            .await
+            .is_err());
     }
 
     // ---- git materialization e2e ----------------------------------------

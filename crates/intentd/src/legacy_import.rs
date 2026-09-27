@@ -1373,6 +1373,8 @@ fn comment_from_legacy_json(
         content,
         author,
         author_type,
+        author_principal_id: None,
+        author_identity: None,
         status,
         parent_id,
         anchor,
@@ -1810,6 +1812,7 @@ fn message_from_legacy_json(raw: Value) -> Result<(String, Value, Option<Value>,
         }
         _ => Map::new(),
     };
+    metadata.remove(intent_core::human_author::HUMAN_AUTHOR_KEY);
     if legacy_role != role {
         metadata.insert("legacyRole".to_string(), json!(legacy_role));
     }
