@@ -236,7 +236,7 @@ async fn scoped_owner_permission_recovery_keeps_transport_denials_and_revocation
     timeout(Duration::from_secs(15), async {
         loop {
             match guest_events.next().await {
-                None | Some(Ok(Message::Close(_))) | Some(Err(_)) => break,
+                None | Some(Ok(Message::Close(_)) | Err(_)) => break,
                 Some(Ok(Message::Ping(p))) => {
                     let _ = guest_events.send(Message::Pong(p)).await;
                 }
