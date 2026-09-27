@@ -1419,6 +1419,7 @@ impl Store {
         id: &WorkspaceId,
         archived_at: &str,
     ) -> Result<ArchivedGuestSweep> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
         let mut conn = self
             .write_pool()
             .acquire()
@@ -1430,6 +1431,12 @@ impl Store {
             .map_err(|e| Error::Internal(format!("archive workspace begin failed: {e}")))?;
 
         let body_result: Result<ArchivedGuestSweep> = async {
+            let archived: Option<bool> = sqlx::query_scalar("SELECT archived FROM workspace WHERE id=?")
+                .bind(&id.0).fetch_optional(&mut *conn).await
+                .map_err(|e| Error::Internal(format!("read archive binding failed: {e}")))?;
+            if archived == Some(false) {
+                lifecycle.begin(&[crate::RepositoryLifecycleKey::Workspace(id.clone())])?;
+            }
             let flipped = sqlx::query(
                 "UPDATE workspace SET status=?, archived=1, archived_at=?, updated_at=? \
                  WHERE id=?",
@@ -1498,8 +1505,10 @@ impl Store {
         }
         .await;
 
-        crate::commit_with_rollback_guard(conn, body_result, "archive workspace commit failed")
-            .await
+        let result =
+            crate::commit_with_rollback_guard(conn, body_result, "archive workspace commit failed")
+                .await;
+        lifecycle.finish(result)
     }
 
     /// Record a redemption of an **open** invite by `principal_id`: stamps

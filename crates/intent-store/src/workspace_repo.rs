@@ -73,11 +73,12 @@ impl Store {
         ws: &Workspace,
         auto_commit: Option<bool>,
     ) -> Result<()> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
         let sql = format!(
             "INSERT INTO workspace ({WORKSPACE_COLUMNS}, auto_commit_enabled) VALUES \
              (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
-        sqlx::query(&sql)
+        let query = sqlx::query(&sql)
             .bind(&ws.id.0)
             .bind(&ws.title)
             .bind(&ws.branch)
@@ -112,10 +113,13 @@ impl Store {
             .bind(setup_script_to_db(ws)?)
             .bind(checkout_mode_to_db(ws)?)
             .bind(ws.browser_client_id.as_ref().map(|c| c.0.clone()))
-            .bind(auto_commit.map(i64::from))
+            .bind(auto_commit.map(i64::from));
+        lifecycle.begin(&[crate::RepositoryLifecycleKey::Workspace(ws.id.clone())])?;
+        query
             .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("insert workspace failed: {e}")))?;
+        lifecycle.settle();
         Ok(())
     }
 
@@ -178,6 +182,18 @@ impl Store {
         ws: &Workspace,
         branch: Option<&str>,
     ) -> Result<String> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        let current = self.get_workspace(&ws.id).await?;
+        if current.path != ws.path
+            || current.repository_path != ws.repository_path
+            || current.worktree_path != ws.worktree_path
+            || current.scope != ws.scope
+            || current.skip_worktree != ws.skip_worktree
+            || current.is_remote != ws.is_remote
+            || branch.is_some_and(|branch| current.branch != branch)
+        {
+            lifecycle.begin(&[crate::RepositoryLifecycleKey::Workspace(ws.id.clone())])?;
+        }
         let status = enum_to_db(&ws.status)?;
         let row = sqlx::query(
             "UPDATE workspace SET title=?, branch=COALESCE(?, branch), base_ref=?, base_commit_sha=?, \
@@ -230,6 +246,7 @@ impl Store {
         .fetch_optional(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("update workspace failed: {e}")))?;
+        lifecycle.settle();
         match row {
             Some(row) => col(&row, "branch"),
             None => Err(Error::NotFound(format!("workspace {}", ws.id))),
@@ -246,6 +263,18 @@ impl Store {
         expected: &Workspace,
         branch: &str,
     ) -> Result<bool> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        let changes: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM workspace WHERE id=? AND branch=? AND branch<>? AND worktree_path IS ? AND repository_path IS ? AND is_remote=0)",
+        ).bind(&expected.id.0).bind(&expected.branch).bind(branch)
+            .bind(&expected.worktree_path).bind(&expected.repository_path)
+            .fetch_one(self.read_pool()).await
+            .map_err(|e| Error::Internal(format!("read branch binding failed: {e}")))?;
+        if changes {
+            lifecycle.begin(&[crate::RepositoryLifecycleKey::Workspace(
+                expected.id.clone(),
+            )])?;
+        }
         let result = sqlx::query(
             "UPDATE workspace SET branch = ?, branch_auto_generated = 0 \
              WHERE id = ? AND branch = ? AND branch <> ? \
@@ -260,6 +289,7 @@ impl Store {
         .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("reconcile workspace branch failed: {e}")))?;
+        lifecycle.settle();
         Ok(result.rows_affected() != 0)
     }
 
@@ -651,6 +681,16 @@ impl Store {
         id: &WorkspaceId,
         updated_at: &str,
     ) -> Result<bool> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        let archived: Option<bool> =
+            sqlx::query_scalar("SELECT archived FROM workspace WHERE id=?")
+                .bind(&id.0)
+                .fetch_optional(self.read_pool())
+                .await
+                .map_err(|e| Error::Internal(format!("read archive binding failed: {e}")))?;
+        if archived == Some(true) {
+            lifecycle.begin(&[crate::RepositoryLifecycleKey::Workspace(id.clone())])?;
+        }
         let res = sqlx::query(
             "UPDATE workspace SET status=?, archived=0, archived_at=NULL, updated_at=? \
              WHERE id=? AND archived=1",
@@ -662,6 +702,7 @@ impl Store {
         .await
         .map_err(|e| Error::Internal(format!("conditional unarchive failed: {e}")))?;
         if res.rows_affected() > 0 {
+            lifecycle.settle();
             return Ok(true);
         }
         // Zero rows: either the row is already active (no flip) or the
@@ -677,6 +718,7 @@ impl Store {
         if col::<i64>(&row, "present")? == 0 {
             return Err(Error::NotFound(format!("workspace {id}")));
         }
+        lifecycle.settle();
         Ok(false)
     }
 
@@ -762,6 +804,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn delete_workspace(&self, id: &WorkspaceId) -> Result<()> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
         // In particular, a missing workspace must not delete opaque draft
         // keys. The final transaction also checks existence for racing deletes.
         let exists: bool =
@@ -773,6 +816,11 @@ impl Store {
         if !exists {
             return Err(Error::NotFound(format!("workspace {id}")));
         }
+
+        lifecycle.begin(&[crate::RepositoryLifecycleKey::Workspace(id.clone())])?;
+        // Preserve the existing bounded sweep's writer interleaving and nested
+        // agent deletion; the original barrier remains owned through completion.
+        lifecycle.release_serialization();
 
         // IDs only: never hydrate sessions or their transcripts. Each session
         // uses the same bounded payload/message cleanup as agent.delete.
@@ -867,9 +915,12 @@ impl Store {
         // must survive cancellation at the commit boundary for the same reason.
         let store = self.clone();
         let id = id.clone();
-        tokio::spawn(async move { store.finish_workspace_delete(&id).await })
-            .await
-            .map_err(|e| Error::Internal(format!("delete workspace final task failed: {e}")))?
+        tokio::spawn(async move {
+            let result = store.finish_workspace_delete(&id).await;
+            lifecycle.finish(result)
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("delete workspace final task failed: {e}")))?
     }
 
     async fn finish_workspace_delete(&self, id: &WorkspaceId) -> Result<()> {
