@@ -1502,47 +1502,46 @@ impl ChatDeltaState {
                     res_added,
                     self.entity(&message_id, result_block, None, None, false),
                 );
-                // §7.1: the same standalone resource block(s) the persisted
-                // transcript appends right after the `tool_result`. The
-                // registry-claimed canonical batch carried on the event
-                // (`registeredAttachments`, deterministic attach) wins;
-                // otherwise fall back to lifting a proposal-MIME resource
-                // item out of a successful call's echoed output. A failed
-                // call may still carry a trusted card registered before a
-                // later JS error (matching `record_tool`). Each item is paired positionally
-                // with the id `record_tool` gave the block it wrote for that
-                // same item; an item without an id (the event carried none —
-                // nothing was materialized for it) is skipped.
-                let registered = d.get("registeredAttachments").and_then(Value::as_array);
-                if status == "completed" || registered.is_some_and(|items| !items.is_empty()) {
-                    let items: Vec<Value> = d
-                        .get("registeredAttachments")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            intent_services::tool_block::lift_proposal_resource(output)
-                                .into_iter()
-                                .collect()
-                        });
-                    let attach_ids: Vec<&str> = d
-                        .get("proposalBlockIds")
-                        .and_then(Value::as_array)
-                        .map(|ids| ids.iter().filter_map(Value::as_str).collect())
-                        .unwrap_or_default();
-                    for (item, attach_id) in items.iter().zip(attach_ids) {
-                        let attach_block =
-                            intent_services::tool_block::build_proposal_resource_block(
-                                attach_id, item,
-                            );
-                        let attach_added = self.note_block(attach_id);
-                        self.remember_block(attach_id, &attach_block);
-                        push_entity(
-                            &mut added,
-                            &mut updated,
-                            attach_added,
-                            self.entity(&message_id, attach_block, None, None, false),
-                        );
-                    }
+            }
+            // §7.1: the same standalone resource block(s) the persisted
+            // transcript appends, even without a `tool_result`. The
+            // registry-claimed canonical batch carried on the event
+            // (`registeredAttachments`, deterministic attach) wins;
+            // otherwise fall back to lifting a proposal-MIME resource
+            // item out of a successful call's echoed output. A failed
+            // call may still carry a trusted card registered before a
+            // later JS error (matching `record_tool`). Each item is paired positionally
+            // with the id `record_tool` gave the block it wrote for that
+            // same item; an item without an id (the event carried none —
+            // nothing was materialized for it) is skipped.
+            let registered = d.get("registeredAttachments").and_then(Value::as_array);
+            if status == "completed" || registered.is_some_and(|items| !items.is_empty()) {
+                let items: Vec<Value> = d
+                    .get("registeredAttachments")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        d.get("output")
+                            .and_then(intent_services::tool_block::lift_proposal_resource)
+                            .into_iter()
+                            .collect()
+                    });
+                let attach_ids: Vec<&str> = d
+                    .get("proposalBlockIds")
+                    .and_then(Value::as_array)
+                    .map(|ids| ids.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                for (item, attach_id) in items.iter().zip(attach_ids) {
+                    let attach_block =
+                        intent_services::tool_block::build_proposal_resource_block(attach_id, item);
+                    let attach_added = self.note_block(attach_id);
+                    self.remember_block(attach_id, &attach_block);
+                    push_entity(
+                        &mut added,
+                        &mut updated,
+                        attach_added,
+                        self.entity(&message_id, attach_block, None, None, false),
+                    );
                 }
             }
         }

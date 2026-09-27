@@ -615,8 +615,9 @@ impl Transcript {
     /// `registered` is the canonical resource-item batch claimed from the
     /// turn-attachment registry (§7.1 deterministic attach) for this
     /// terminal call, if any. On a registry hit the batch is attached even
-    /// after a later JS error and echo parsing is skipped; otherwise only a
-    /// successful call's legacy lift/wrap-repair inspects the echoed output.
+    /// after a later JS error or a status-only update, and echo parsing is
+    /// skipped; otherwise only a successful call's legacy lift/wrap-repair
+    /// inspects the echoed output.
     fn record_tool(
         &mut self,
         tc: &MappedToolCall,
@@ -744,53 +745,55 @@ impl Transcript {
                         .insert(tc.tool_call_id.clone(), rindex);
                     result_index = Some(rindex);
                 }
-                // §7.1: attach the standalone resource block(s) so the FE can
-                // render them directly (the items also stay in
-                // `tool_result.output` when the provider echoed them). The
-                // registry-claimed canonical batch wins (deterministic attach —
-                // no echo parsing); otherwise fall back to lifting a
-                // proposal-MIME resource item out of the echoed output.
-                // An errored tool may attach an already-created, registered
-                // proposal (the JS can throw after the binding succeeds), but
-                // must never lift an actionable card from an error's echo.
-                // Asymmetry: a re-completion whose
-                // output DROPS the item leaves a previously appended block in
-                // place (the transcript is append-only; index-derived ids
-                // preclude removal).
-                if tc.status == "completed" || !registered.is_empty() {
-                    let items = if registered.is_empty() {
-                        crate::tool_block::lift_proposal_resource(output)
-                            .into_iter()
-                            .collect()
+            }
+            // §7.1: attach the standalone resource block(s) so the FE can
+            // render them directly (the items also stay in
+            // `tool_result.output` when the provider echoed them). The
+            // registry-claimed canonical batch wins (deterministic attach —
+            // no echo parsing); otherwise fall back to lifting a
+            // proposal-MIME resource item out of the echoed output.
+            // An errored tool may attach an already-created, registered
+            // proposal (the JS can throw after the binding succeeds), but
+            // must never lift an actionable card from an error's echo.
+            // Asymmetry: a re-completion whose
+            // output DROPS the item leaves a previously appended block in
+            // place (the transcript is append-only; index-derived ids
+            // preclude removal).
+            if tc.status == "completed" || !registered.is_empty() {
+                let items = if registered.is_empty() {
+                    tc.output
+                        .as_ref()
+                        .and_then(crate::tool_block::lift_proposal_resource)
+                        .into_iter()
+                        .collect()
+                } else {
+                    registered
+                };
+                for (i, item) in items.into_iter().enumerate() {
+                    // The first item upserts via `proposal_index` (patch
+                    // on re-completion); batch extras append. A claim
+                    // consumes its registry batch, so extras cannot
+                    // re-attach on a re-completion echo.
+                    if let Some(&pi) = (i == 0)
+                        .then(|| self.proposal_index.get(&tc.tool_call_id))
+                        .flatten()
+                    {
+                        let id = self.block_id(pi);
+                        self.blocks[pi] =
+                            crate::tool_block::build_proposal_resource_block(&id, &item);
+                        proposal_indices.push(pi);
                     } else {
-                        registered
-                    };
-                    for (i, item) in items.into_iter().enumerate() {
-                        // The first item upserts via `proposal_index` (patch
-                        // on re-completion); batch extras append. A claim
-                        // consumes its registry batch, so extras cannot
-                        // re-attach on a re-completion echo.
-                        if let Some(&pi) = (i == 0)
-                            .then(|| self.proposal_index.get(&tc.tool_call_id))
-                            .flatten()
-                        {
-                            let id = self.block_id(pi);
-                            self.blocks[pi] =
-                                crate::tool_block::build_proposal_resource_block(&id, &item);
-                            proposal_indices.push(pi);
-                        } else {
-                            self.flush_text();
-                            let pindex = self.blocks.len();
-                            let pid = self.block_id(pindex);
-                            self.blocks
-                                .push(crate::tool_block::build_proposal_resource_block(
-                                    &pid, &item,
-                                ));
-                            if i == 0 {
-                                self.proposal_index.insert(tc.tool_call_id.clone(), pindex);
-                            }
-                            proposal_indices.push(pindex);
+                        self.flush_text();
+                        let pindex = self.blocks.len();
+                        let pid = self.block_id(pindex);
+                        self.blocks
+                            .push(crate::tool_block::build_proposal_resource_block(
+                                &pid, &item,
+                            ));
+                        if i == 0 {
+                            self.proposal_index.insert(tc.tool_call_id.clone(), pindex);
                         }
+                        proposal_indices.push(pindex);
                     }
                 }
             }

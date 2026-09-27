@@ -1306,6 +1306,53 @@ fn chat_tool_delta_error_preserves_registered_proposal_with_persisted_identity()
 }
 
 #[test]
+fn chat_tool_delta_status_only_preserves_registered_batch() {
+    for status in ["error", "completed"] {
+        for registered in [false, true] {
+            let mut state = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
+            let first = proposal_output_item();
+            let mut second = first.clone();
+            second["resource"]["uri"] = json!("intent-proposal://settings-change/second");
+            let items = vec![first, second];
+            let mut event = tool_event_with_ids(
+                "msg-e",
+                "msg-e:0",
+                "tc-e",
+                status,
+                None,
+                None,
+                vec!["msg-e:3".to_string(), "msg-e:4".to_string()],
+            );
+            if registered {
+                event.data["registeredAttachments"] = json!(items);
+            }
+            let delta = state.tool_delta(&event).unwrap();
+            let added = delta["added"].as_array().unwrap();
+            assert_eq!(added.len(), if registered { 3 } else { 1 });
+            assert!(!added.iter().any(|e| e["block"]["type"] == "tool_result"));
+            if registered {
+                for (i, item) in items.iter().enumerate() {
+                    let persisted = intent_services::tool_block::build_proposal_resource_block(
+                        &format!("msg-e:{}", i + 3),
+                        item,
+                    );
+                    assert_eq!(added[i + 1]["block"], persisted);
+                }
+                // Canonical items without persisted IDs cannot fabricate live blocks.
+                event
+                    .data
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("proposalBlockIds");
+                let delta = state.tool_delta(&event).unwrap();
+                assert!(delta["added"].as_array().unwrap().is_empty());
+                assert_eq!(delta["updated"].as_array().unwrap().len(), 1);
+            }
+        }
+    }
+}
+
+#[test]
 fn chat_tool_delta_no_proposal_in_output_emits_no_extra_block() {
     let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
     let d = s

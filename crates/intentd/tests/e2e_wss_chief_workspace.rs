@@ -1055,6 +1055,15 @@ fn tool_result_jsons(messages: &Value) -> Vec<Value> {
 /// resources over WSS while the source agent and dirty worktree stay untouched.
 #[tokio::test]
 async fn chief_workspace_transfer_proposal_readonly_over_wss() {
+    assert_transfer_proposal_readonly_over_wss(false).await;
+}
+
+#[tokio::test]
+async fn chief_workspace_transfer_status_only_failure_over_wss() {
+    assert_transfer_proposal_readonly_over_wss(true).await;
+}
+
+async fn assert_transfer_proposal_readonly_over_wss(omit_tool_output: bool) {
     async fn chat_push<S>(ws: &mut WebSocketStream<S>) -> Value
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -1114,6 +1123,7 @@ async fn chief_workspace_transfer_proposal_readonly_over_wss() {
     ]);
     std::fs::write(source.join("work.txt"), "unfinished work\n").unwrap();
     let head_before = git(&["rev-parse", "HEAD"]);
+    let branch_before = git(&["symbolic-ref", "--short", "HEAD"]);
     let status_before = git(&["status", "--porcelain"]);
     let release_file = data_dir.join("release-source");
     let js = r"
@@ -1150,7 +1160,7 @@ async fn chief_workspace_transfer_proposal_readonly_over_wss() {
                     "code": "const workspace = (await ws.app.workspaces.list({})).find(w => w.title === 'Transfer Source'); await ws.app.workspaces.transfer(workspace.id, {destination: 'After exception'}); throw new Error('intentional failure after proposal');",
                     "summary": "Keep transfer card after a later JavaScript error"
                 }
-            }, "emitToolBlocks": true }
+            }, "emitToolBlocks": true, "omitToolOutput": omit_tool_output }
         ]
     }).to_string();
     let child = spawn_serve(
@@ -1245,13 +1255,28 @@ async fn chief_workspace_transfer_proposal_readonly_over_wss() {
     })
     .await
     .expect("source agent running");
-    let before = wss_rpc_envelope(
-        &mut rpc,
-        7,
-        "workspace.get",
-        json!({"workspaceId": workspace_id}),
-    )
-    .await;
+    // This fixture supplies an existing worktree without a branch parameter.
+    // Creation seeds a generated branch; the watcher started at setup completion
+    // reconciles it to HEAD after its first debounced refresh. Capture the
+    // baseline only after that initialization, before requesting any proposals.
+    let before = timeout(Duration::from_secs(20), async {
+        loop {
+            let current = wss_rpc_envelope(
+                &mut rpc,
+                7,
+                "workspace.get",
+                json!({"workspaceId": workspace_id}),
+            )
+            .await;
+            assert!(current.get("error").is_none(), "{current}");
+            if current["result"]["workspace"]["branch"] == branch_before.trim() {
+                break current;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("source workspace branch metadata reconciled to Git HEAD");
     let sent = wss_rpc_envelope(
         &mut rpc,
         8,
@@ -1368,7 +1393,7 @@ async fn chief_workspace_transfer_proposal_readonly_over_wss() {
     })
     .await
     .expect("live proposal after JavaScript error");
-    let after_exception = poll_conversation(
+    let (after_exception, failed_blocks) = poll_conversation(
         &mut rpc,
         400,
         &chief,
@@ -1378,16 +1403,26 @@ async fn chief_workspace_transfer_proposal_readonly_over_wss() {
                 .as_array()?
                 .iter()
                 .filter_map(|m| m["contentBlocks"].as_array())
-                .flatten()
-                .filter(|b| {
-                    b["type"] == "resource"
-                        && b["resource"]["mimeType"] == "application/vnd.intent.proposal+json"
+                .find_map(|blocks| {
+                    blocks
+                        .iter()
+                        .find(|b| b["id"] == live_block["id"])
+                        .map(|b| (b.clone(), blocks.clone()))
                 })
-                .find(|b| b["id"] == live_block["id"])
-                .cloned()
         },
     )
     .await;
+    assert!(failed_blocks
+        .iter()
+        .any(|b| b["type"] == "tool_use" && b["metadata"]["status"] == "error"));
+    assert_eq!(
+        failed_blocks
+            .iter()
+            .filter(|b| b["type"] == "tool_result")
+            .count(),
+        usize::from(!omit_tool_output),
+        "status-only failures must not fabricate echoed output"
+    );
     assert_eq!(
         after_exception, live_block,
         "live delta equals persisted block"
@@ -1446,6 +1481,7 @@ async fn chief_workspace_transfer_proposal_readonly_over_wss() {
         "source agent was stopped: {active}"
     );
     assert_eq!(git(&["rev-parse", "HEAD"]), head_before);
+    assert_eq!(git(&["symbolic-ref", "--short", "HEAD"]), branch_before);
     assert_eq!(git(&["status", "--porcelain"]), status_before);
     assert_eq!(
         std::fs::read_to_string(source.join("work.txt")).unwrap(),
