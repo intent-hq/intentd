@@ -23,6 +23,7 @@ pub const PROPOSAL_RESOURCE_MIME_TYPE: &str = "application/vnd.intent.proposal+j
 /// Valid proposal kinds (parity with TS `PROPOSAL_KINDS`).
 pub(crate) const PROPOSAL_KINDS: &[&str] = &[
     "workspace-create",
+    "workspace-transfer",
     "settings-change",
     "specialist-edit",
     "bulk-op",
@@ -123,7 +124,7 @@ fn show(args: &Value) -> Result<Value, String> {
         .ok_or_else(|| "`proposal` is required".to_string())?;
 
     if !is_valid_proposal(proposal) {
-        return Err("Invalid proposal: must have `kind` (one of workspace-create, settings-change, specialist-edit, bulk-op), `preview.title`, and `payload`".to_string());
+        return Err("Invalid proposal: must have `kind` (one of workspace-create, workspace-transfer, settings-change, specialist-edit, bulk-op), `preview.title`, and `payload`".to_string());
     }
 
     // Build resource name from preview.title
@@ -180,6 +181,32 @@ mod tests {
     #[test]
     fn is_valid_proposal_accepts_valid_proposal() {
         assert!(is_valid_proposal(&valid_proposal()));
+    }
+
+    #[test]
+    fn transfer_proposal_round_trips_through_show() {
+        let proposal = json!({
+            "kind": "workspace-transfer",
+            "applyToolCallId": "workspace-transfer-unique",
+            "preview": { "title": "Transfer Project" },
+            "payload": {
+                "operation": "workspace.transfer",
+                "workspaceId": "project",
+                "sourceWorkspacePath": "/workspaces/project",
+                "destination": "Laptop"
+            }
+        });
+        let result = show(&json!({ "proposal": proposal })).unwrap();
+        assert_eq!(result["proposal"], proposal);
+        let resource = &result["__mcpContentItems"][1]["resource"];
+        assert_eq!(
+            resource["uri"],
+            "intent-proposal://workspace-transfer/workspace-transfer-unique"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(resource["text"].as_str().unwrap()).unwrap(),
+            proposal
+        );
     }
 
     #[test]

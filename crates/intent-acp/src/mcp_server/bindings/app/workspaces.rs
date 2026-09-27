@@ -20,6 +20,10 @@ pub(crate) const PRELUDE: &str = r"
     ws.app.workspaces = {
         list: (options) => host({ method: 'app.workspaces.list', args: options || {} }),
         get: (id) => host({ method: 'app.workspaces.get', args: { id } }),
+        transfer: (id, options) => {
+            if (options !== undefined && (options === null || typeof options !== 'object' || Array.isArray(options))) throw new Error('transfer options must be an object');
+            return host({ method: 'app.workspaces.transfer', args: { ...(options || {}), id } });
+        },
         create: (params) => host({ method: 'app.workspaces.create', args: params || {} }),
         archive: (id) => host({ method: 'app.workspaces.archive', args: { id } }),
         delete: (id) => host({ method: 'app.workspaces.delete', args: { id } }),
@@ -44,6 +48,7 @@ pub(crate) async fn dispatch(
     match method {
         "list" => list(api, args).await,
         "get" => get(api, args).await,
+        "transfer" => transfer(api, args).await,
         "create" => create(api, args).await,
         "archive" => archive(api, args).await,
         "delete" => delete(api, args).await,
@@ -191,6 +196,91 @@ async fn get(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String>
     }
 
     Ok(summarize_workspace(&workspace))
+}
+
+/// Read-only proposal creation. Export and agent teardown belong to the
+/// desktop's existing transfer relay, after the user approves the card.
+async fn transfer(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String> {
+    let params = args
+        .as_object()
+        .ok_or_else(|| "transfer arguments must be an object".to_string())?;
+    if let Some(key) = params
+        .keys()
+        .find(|key| !matches!(key.as_str(), "id" | "destination"))
+    {
+        return Err(format!("Unknown transfer option: {key}"));
+    }
+    let id = args
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| "id must be a non-empty string".to_string())?;
+    assert_mutable_workspace_id(id)?;
+    let destination = args
+        .get("destination")
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "destination must be a non-empty string".to_string())
+        })
+        .transpose()?;
+    let workspace_id = WorkspaceId::from_string(id);
+    let workspace = api
+        .get_workspace(workspace_id.clone())
+        .await
+        .map_err(map_err)?;
+    if workspace.status == WorkspaceStatus::Deleted || workspace.pending_delete_at.is_some() {
+        return Err(
+            "Deleted workspaces or workspaces pending deletion cannot be transferred".to_string(),
+        );
+    }
+    let source_path = workspace
+        .worktree_path
+        .as_deref()
+        .or(workspace.repository_path.as_deref())
+        .filter(|path| !path.trim().is_empty())
+        .ok_or_else(|| "Workspace has no source path to transfer".to_string())?;
+    let plan = api
+        .workspace_transfer_plan(workspace_id)
+        .await
+        .map_err(map_err)?;
+    let mut warnings: Vec<String> = plan
+        .warnings
+        .into_iter()
+        .map(|warning| warning.message)
+        .collect();
+    warnings.push("The source workspace will be archived after a successful transfer.".to_string());
+    warnings.push("Agents will not restart automatically on the destination.".to_string());
+    let title = if workspace.title.is_empty() {
+        id
+    } else {
+        &workspace.title
+    };
+    let mut payload = json!({
+        "operation": "workspace.transfer",
+        "workspaceId": id,
+        "sourceWorkspacePath": source_path,
+    });
+    if let Some(destination) = destination {
+        payload["destination"] = json!(destination);
+    }
+    proposal_result(&json!({
+        "kind": "workspace-transfer",
+        "applyToolCallId": format!("workspace-transfer-{}", uuid::Uuid::new_v4()),
+        "payload": payload,
+        "preview": {
+            "title": format!("Transfer {title}"),
+            "summary": format!("Transfer {title} from {source_path}. Review the destination before approving."),
+            "applyLabel": "Transfer",
+            "warnings": warnings,
+            "fields": [
+                { "key": "workspaceTitle", "label": "Project", "value": title, "editable": false },
+                { "key": "sourceWorkspacePath", "label": "Source path", "value": source_path, "editable": false },
+            ],
+        },
+    }))
 }
 
 /// Applies the `repositoryOwner` / `repositoryName` filters through [`RepoRef`]
@@ -1105,6 +1195,8 @@ mod tests {
     struct FakeApi {
         workspaces: Arc<Mutex<Vec<Workspace>>>,
         events: Arc<Mutex<Vec<PublishEvent>>>,
+        plan_calls: Arc<Mutex<Vec<WorkspaceId>>>,
+        plan_error: bool,
     }
 
     impl FakeApi {
@@ -1137,6 +1229,29 @@ mod tests {
             Box::pin(async move {
                 events.lock().unwrap().push(event);
                 Ok(())
+            })
+        }
+
+        fn workspace_transfer_plan(
+            &self,
+            id: WorkspaceId,
+        ) -> BoxFuture<'_, Result<intent_core::transfer::TransferPlan>> {
+            self.plan_calls.lock().unwrap().push(id.clone());
+            Box::pin(async move {
+                if self.plan_error {
+                    return Err(Error::Internal("transfer plan unavailable".to_string()));
+                }
+                Ok(serde_json::from_value(json!({
+                    "manifest": {
+                        "formatVersion": 1, "creatingIntentdVersion": "test",
+                        "workspaceId": id, "createdAt": "2026-01-01T00:00:00Z",
+                        "tables": [], "assets": [], "attachments": [],
+                        "git": { "hasRepository": true, "dirtyFiles": ["file.txt"], "sandboxBranches": [] }
+                    },
+                    "totalSizeBytes": 0, "dbRowBytes": 0, "assetBytes": 0,
+                    "attachmentBytes": 0, "estimatedGitBundleBytes": 0,
+                    "warnings": [{ "code": "uncommitted-changes", "message": "Uncommitted file will be snapshotted." }]
+                })).unwrap())
             })
         }
     }
@@ -1201,6 +1316,197 @@ mod tests {
             result.unwrap_err(),
             "ws.app.* is only available in the Chief of Staff workspace"
         );
+    }
+
+    #[tokio::test]
+    async fn transfer_rejects_non_chief_and_bad_arguments_before_planning() {
+        let fake = Arc::new(FakeApi::default());
+        let api: Arc<dyn WorkspaceApi> = fake.clone();
+        let denied = dispatch(
+            &api,
+            &WorkspaceId::new(),
+            "transfer",
+            &json!({"id": "ws-1"}),
+        )
+        .await
+        .unwrap_err();
+        assert!(denied.contains("only available in the Chief"));
+        for args in [
+            json!(null),
+            json!({}),
+            json!({"id": 4}),
+            json!({"id": "  "}),
+            json!({"id": "__chief__"}),
+            json!({"id": "ws-1", "destination": null}),
+            json!({"id": "ws-1", "destination": 3}),
+            json!({"id": "ws-1", "destination": " "}),
+            json!({"id": "ws-1", "archiveSource": false}),
+        ] {
+            assert!(
+                dispatch(&api, &WorkspaceId::chief(), "transfer", &args)
+                    .await
+                    .is_err(),
+                "{args}"
+            );
+        }
+        assert!(fake.plan_calls.lock().unwrap().is_empty());
+        assert!(fake.published_events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn transfer_rejects_ineligible_workspaces_before_planning() {
+        let fake = Arc::new(FakeApi::default());
+        let mut deleted = make_workspace("deleted", "Deleted");
+        deleted.status = WorkspaceStatus::Deleted;
+        let mut pending = make_workspace("pending", "Pending");
+        pending.pending_delete_at = Some("2026-01-01T00:00:00Z".into());
+        let mut pathless = make_workspace("pathless", "Pathless");
+        pathless.repository_path = None;
+        fake.workspaces
+            .lock()
+            .unwrap()
+            .extend([deleted, pending, pathless]);
+        let api: Arc<dyn WorkspaceApi> = fake.clone();
+        for (id, message) in [
+            ("missing", "not found"),
+            ("deleted", "cannot be transferred"),
+            ("pending", "cannot be transferred"),
+            ("pathless", "no source path"),
+        ] {
+            let error = dispatch(&api, &WorkspaceId::chief(), "transfer", &json!({"id": id}))
+                .await
+                .unwrap_err();
+            assert!(error.contains(message), "{error}");
+        }
+        assert!(fake.plan_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn transfer_returns_unique_readonly_proposals_with_plan_warnings() {
+        let fake = Arc::new(FakeApi::default());
+        let mut workspace = make_workspace("ws-1", "Project One");
+        workspace.worktree_path = Some("/repo/worktrees/project-one".into());
+        fake.workspaces.lock().unwrap().push(workspace.clone());
+        let before = serde_json::to_value(&workspace).unwrap();
+        let api: Arc<dyn WorkspaceApi> = fake.clone();
+        let first = dispatch(
+            &api,
+            &WorkspaceId::chief(),
+            "transfer",
+            &json!({"id": "ws-1", "destination": "  Laptop  "}),
+        )
+        .await
+        .unwrap();
+        let second = dispatch(
+            &api,
+            &WorkspaceId::chief(),
+            "transfer",
+            &json!({"id": "ws-1"}),
+        )
+        .await
+        .unwrap();
+        let proposal = &first["proposal"];
+        assert_eq!(proposal["kind"], "workspace-transfer");
+        assert_eq!(
+            proposal["payload"],
+            json!({"operation": "workspace.transfer", "workspaceId": "ws-1", "sourceWorkspacePath": "/repo/worktrees/project-one", "destination": "Laptop"})
+        );
+        assert_eq!(proposal["preview"]["title"], "Transfer Project One");
+        assert_eq!(
+            proposal["preview"]["fields"][0],
+            json!({
+                "key": "workspaceTitle", "label": "Project", "value": "Project One", "editable": false
+            })
+        );
+        assert_eq!(
+            proposal["preview"]["fields"][1]["value"],
+            "/repo/worktrees/project-one"
+        );
+        assert!(proposal["preview"]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("/repo/worktrees/project-one"));
+        assert_eq!(
+            proposal["preview"]["warnings"][0],
+            "Uncommitted file will be snapshotted."
+        );
+        assert!(proposal["preview"]["warnings"][1]
+            .as_str()
+            .unwrap()
+            .contains("archived"));
+        assert!(proposal["preview"]["warnings"][2]
+            .as_str()
+            .unwrap()
+            .contains("not restart"));
+        assert!(second["proposal"]["payload"].get("destination").is_none());
+        assert_ne!(
+            proposal["applyToolCallId"],
+            second["proposal"]["applyToolCallId"]
+        );
+        assert!(super::super::proposal::is_valid_proposal(proposal));
+        let resource = &first["__mcpContentItems"][1]["resource"];
+        assert_eq!(resource["mimeType"], "application/vnd.intent.proposal+json");
+        assert_eq!(
+            resource["uri"],
+            format!(
+                "intent-proposal://workspace-transfer/{}",
+                proposal["applyToolCallId"].as_str().unwrap()
+            )
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(resource["text"].as_str().unwrap()).unwrap(),
+            *proposal
+        );
+        assert_eq!(fake.plan_calls.lock().unwrap().len(), 2);
+        assert_eq!(
+            serde_json::to_value(&fake.workspaces.lock().unwrap()[0]).unwrap(),
+            before
+        );
+        assert!(fake.published_events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn transfer_supports_archived_workspace_and_repository_path_fallback() {
+        let fake = Arc::new(FakeApi::default());
+        let mut workspace = make_workspace("ws-1", "Archived project");
+        workspace.status = WorkspaceStatus::Archived;
+        workspace.archived = true;
+        fake.workspaces.lock().unwrap().push(workspace);
+        let api: Arc<dyn WorkspaceApi> = fake;
+        let result = dispatch(
+            &api,
+            &WorkspaceId::chief(),
+            "transfer",
+            &json!({"id": "ws-1"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result["proposal"]["payload"]["sourceWorkspacePath"],
+            "/repo"
+        );
+    }
+
+    #[tokio::test]
+    async fn transfer_propagates_plan_failure_without_proposal() {
+        let fake = Arc::new(FakeApi {
+            plan_error: true,
+            ..Default::default()
+        });
+        fake.workspaces
+            .lock()
+            .unwrap()
+            .push(make_workspace("ws-1", "Project One"));
+        let api: Arc<dyn WorkspaceApi> = fake;
+        let error = dispatch(
+            &api,
+            &WorkspaceId::chief(),
+            "transfer",
+            &json!({"id": "ws-1"}),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("transfer plan unavailable"));
     }
 
     #[tokio::test]

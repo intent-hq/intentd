@@ -431,6 +431,7 @@ API:
     `branch`/`baseRef` is the EXISTING base ref to branch FROM (e.g. a PR head branch or a branch the user named) — NOT a name for the new working branch. Omit it and the daemon defaults it to the repository's default branch; a non-existent ref fails at apply with a `cannot resolve base ref '<ref>'` error.
   ws.app.workspaces.delete(id) → ProposalCard  // Chief workspace only. Proposes delete of a single workspace via ws.app.proposal.show; the user confirms before applying.
   ws.app.workspaces.get(id) → workspace  // Chief workspace only. Get one workspace metadata summary.
+  ws.app.workspaces.transfer(id, { destination? }?) → ProposalCard  // Chief workspace only. Proposes a project transfer to another device; reads metadata and transfer warnings without exporting or stopping agents. `destination` is a saved device name or connection ID hint; omit it to let the user choose. The desktop shows the actual source and destination for approval or cancellation. After approval, agents stop for export; success archives the source without restarting agents on the destination.
   ws.app.workspaces.list({ filter?, sort? }) → workspaces[]  // Chief workspace only. Cross-workspace metadata list with query/status/repository/tags filtering.
   ws.app.workspaces.open(id, { openInNewWindow? }?) → { ok, queued }  // Chief workspace only. Opens a workspace through workspace-operations-saga. Pass `{ openInNewWindow: true }` to open in a new window.
 
@@ -1814,6 +1815,21 @@ mod tests {
                 "ws.help(\"agent\") (is_chief={is_chief}) must include listSpecialists"
             );
         }
+    }
+
+    #[test]
+    fn transfer_is_documented_in_chief_help() {
+        let help = help_namespace(
+            true,
+            &AgentFeaturesSettings::default(),
+            false,
+            "app.workspaces",
+        )
+        .unwrap();
+        assert!(help.contains("ws.app.workspaces.transfer(id, { destination? }?)"));
+        assert!(help.contains("without exporting or stopping agents"));
+        assert!(WORKSPACE_API_DESCRIPTION_CHIEF.contains("ws.app.workspaces.transfer("));
+        assert!(!WORKSPACE_API_DESCRIPTION.contains("ws.app.workspaces.transfer("));
     }
 
     // The compact description is a pure derivation of the full assembly: the
