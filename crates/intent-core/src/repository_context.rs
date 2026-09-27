@@ -12,6 +12,32 @@ use serde::{Deserialize, Serialize};
 
 use crate::{WorkspaceGitRootId, WorkspaceId};
 
+// These new opaque counters must retain every bit across JavaScript transports.
+// Numeric JSON and noncanonical decimal spellings are deliberately rejected.
+mod decimal_u64 {
+    use serde::{de::Error, Deserialize, Deserializer, Serializer};
+
+    #[expect(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "serde(with) requires a reference to the field"
+    )]
+    pub fn serialize<S: Serializer>(value: &u64, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(value)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        if value.is_empty()
+            || value.len() > 20
+            || (value.len() > 1 && value.starts_with('0'))
+            || !value.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(D::Error::custom("expected a canonical decimal u64 string"));
+        }
+        value.parse().map_err(D::Error::custom)
+    }
+}
+
 /// Forge implementation; namespace spelling never chooses a provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -63,6 +89,8 @@ pub struct ReviewTarget {
 pub struct ExecutionScope {
     pub daemon_id: String,
     pub authority_scope_id: String,
+    /// Canonical decimal string on the wire, preserving the full `u64` range.
+    #[serde(with = "decimal_u64")]
     pub authority_generation: u64,
 }
 
@@ -72,6 +100,8 @@ pub struct ExecutionScope {
 pub struct RepositoryConnectionScope {
     pub connection_id: String,
     pub account_id: String,
+    /// Canonical decimal string on the wire, preserving the full `u64` range.
+    #[serde(with = "decimal_u64")]
     pub connection_generation: u64,
 }
 
@@ -79,11 +109,13 @@ pub struct RepositoryConnectionScope {
 ///
 /// Producers advance the sequence on observed context changes and replace the
 /// epoch at restart. Consumers must use `compare_in_scopes`, not order serialized
-/// tokens or treat revision freshness as authorization.
+/// tokens or treat revision freshness as authorization. The sequence serializes
+/// as a canonical decimal string so JavaScript transports cannot round it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RepositoryContextRevision {
     epoch: String,
+    #[serde(with = "decimal_u64")]
     sequence: u64,
 }
 
@@ -819,6 +851,120 @@ mod tests {
     }
 
     #[test]
+    fn new_counters_serialize_as_canonical_decimal_strings() {
+        for value in [0, 1, 9_007_199_254_740_993, u64::MAX] {
+            let revision = RepositoryContextRevision::new("boot", value);
+            let mut execution = scope();
+            execution.authority_generation = value;
+            let connection = RepositoryConnectionScope {
+                connection_id: "gl".into(),
+                account_id: "account-A".into(),
+                connection_generation: value,
+            };
+            let expected_revision = json!({"epoch":"boot","sequence":value.to_string()});
+            let expected_execution = json!({
+                "daemonId":"daemon-A","authorityScopeId":"caller-workspace-1",
+                "authorityGeneration":value.to_string()
+            });
+            let expected_connection = json!({
+                "connectionId":"gl","accountId":"account-A",
+                "connectionGeneration":value.to_string()
+            });
+            assert_eq!(serde_json::to_value(&revision).unwrap(), expected_revision);
+            assert_eq!(
+                serde_json::to_value(&execution).unwrap(),
+                expected_execution
+            );
+            assert_eq!(
+                serde_json::to_value(&connection).unwrap(),
+                expected_connection
+            );
+            assert_eq!(
+                serde_json::from_value::<RepositoryContextRevision>(expected_revision).unwrap(),
+                revision
+            );
+            assert_eq!(
+                serde_json::from_value::<ExecutionScope>(expected_execution).unwrap(),
+                execution
+            );
+            assert_eq!(
+                serde_json::from_value::<RepositoryConnectionScope>(expected_connection).unwrap(),
+                connection
+            );
+        }
+    }
+
+    #[test]
+    fn new_counters_reject_numbers_noncanonical_strings_and_overflow() {
+        for invalid in [
+            json!(0),
+            json!(1),
+            json!(9_007_199_254_740_993_u64),
+            json!(null),
+            json!(false),
+            json!(""),
+            json!("+1"),
+            json!("-1"),
+            json!("01"),
+            json!("00"),
+            json!(" 1"),
+            json!("1 "),
+            json!("1.0"),
+            json!("1e3"),
+            json!("1_000"),
+            json!("١"),
+            json!("18446744073709551616"),
+        ] {
+            assert!(
+                serde_json::from_value::<RepositoryContextRevision>(json!({
+                    "epoch":"boot","sequence":invalid
+                }))
+                .is_err(),
+                "revision accepted {invalid}"
+            );
+            assert!(serde_json::from_value::<ExecutionScope>(json!({
+                "daemonId":"daemon-A","authorityScopeId":"caller-workspace-1","authorityGeneration":invalid
+            })).is_err(), "authority accepted {invalid}");
+            assert!(
+                serde_json::from_value::<RepositoryConnectionScope>(json!({
+                    "connectionId":"gl","accountId":"account-A","connectionGeneration":invalid
+                }))
+                .is_err(),
+                "connection accepted {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn decimal_counter_ordering_keeps_adjacent_values_above_js_safe_integer() {
+        let before: RepositoryContextRevision = serde_json::from_value(json!({
+            "epoch":"boot","sequence":"9007199254740992"
+        }))
+        .unwrap();
+        let after: RepositoryContextRevision = serde_json::from_value(json!({
+            "epoch":"boot","sequence":"9007199254740993"
+        }))
+        .unwrap();
+        assert_ne!(before, after);
+        assert_eq!(
+            before.compare_in_scopes(&scope(), &after, &scope()),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            after.compare_in_scopes(&scope(), &before, &scope()),
+            Some(Ordering::Greater)
+        );
+        let mut before_scope = scope();
+        before_scope.authority_generation = 9_007_199_254_740_992;
+        let mut after_scope = before_scope.clone();
+        after_scope.authority_generation += 1;
+        assert_eq!(
+            before.compare_in_scopes(&before_scope, &after, &after_scope),
+            None
+        );
+    }
+
+    #[test]
     fn resource_and_connection_scope_json_keep_kind_account_and_generation() {
         let review = ReviewTarget {
             repository: gitlab(),
@@ -847,7 +993,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(current).unwrap(),
-            json!({"connectionId":"gl","accountId":"A","connectionGeneration":1})
+            json!({"connectionId":"gl","accountId":"A","connectionGeneration":"1"})
         );
     }
 
@@ -914,6 +1060,8 @@ mod tests {
     #[test]
     fn repository_context_matches_the_shared_consumer_fixture() {
         let target = gitlab();
+        let mut execution_scope = scope();
+        execution_scope.authority_generation = 9_007_199_254_740_995;
         let mut origin = remote("origin", &target);
         origin.push.push(RepositoryRemoteEndpoint {
             url: "git@git.example:team/sub/app.git".into(),
@@ -921,9 +1069,11 @@ mod tests {
                 target: target.clone(),
             },
         });
+        let github_target = github("team/app");
+        let remotes = vec![origin, remote("upstream", &github_target)];
         let context = RepositoryContext {
-            revision: RepositoryContextRevision::new("daemon-boot-1", 12),
-            scope: scope(),
+            revision: RepositoryContextRevision::new("daemon-boot-1", 9_007_199_254_740_993),
+            scope: execution_scope,
             roots: vec![RepositoryRootContext {
                 root: RepositoryRootId {
                     workspace_id: WorkspaceId::from("workspace-1"),
@@ -931,41 +1081,53 @@ mod tests {
                 },
                 branch: Some("feature".into()),
                 head_sha: Some("local-B".into()),
-                review_selection: resolve_review_selection(
-                    &selected("origin"),
-                    &[origin.clone()],
-                    None,
-                ),
-                remotes: vec![origin],
-                targets: vec![RepositoryTargetContext {
-                    target,
-                    provider_project_id: Some("42".into()),
-                    connection: Some(RepositoryConnectionScope {
-                        connection_id: "gitlab-connection".into(),
-                        account_id: "account-A".into(),
-                        connection_generation: 3,
-                    }),
-                    availability: RepositoryAvailability::Connected,
-                    capabilities: vec![
-                        RepositoryCapability {
+                review_selection: resolve_review_selection(&selected("origin"), &remotes, None),
+                remotes,
+                targets: vec![
+                    RepositoryTargetContext {
+                        target,
+                        provider_project_id: Some("42".into()),
+                        connection: Some(RepositoryConnectionScope {
+                            connection_id: "gitlab-connection".into(),
+                            account_id: "account-A".into(),
+                            connection_generation: u64::MAX,
+                        }),
+                        availability: RepositoryAvailability::Connected,
+                        capabilities: vec![
+                            RepositoryCapability {
+                                operation: RepositoryOperation::ReadReview,
+                                state: RepositoryCapabilityState::Available,
+                            },
+                            RepositoryCapability {
+                                operation: RepositoryOperation::CreateReview,
+                                state: RepositoryCapabilityState::Unknown,
+                            },
+                        ],
+                    },
+                    RepositoryTargetContext {
+                        target: github_target,
+                        provider_project_id: Some("github-project-1".into()),
+                        connection: Some(RepositoryConnectionScope {
+                            connection_id: "github-connection".into(),
+                            account_id: "account-GH".into(),
+                            connection_generation: 4,
+                        }),
+                        availability: RepositoryAvailability::Connected,
+                        capabilities: vec![RepositoryCapability {
                             operation: RepositoryOperation::ReadReview,
                             state: RepositoryCapabilityState::Available,
-                        },
-                        RepositoryCapability {
-                            operation: RepositoryOperation::CreateReview,
-                            state: RepositoryCapabilityState::Unknown,
-                        },
-                    ],
-                }],
+                        }],
+                    },
+                ],
             }],
         };
         let fixture = json!({
-            "revision":{"epoch":"daemon-boot-1","sequence":12},
-            "scope":{"daemonId":"daemon-A","authorityScopeId":"caller-workspace-1","authorityGeneration":7},
+            "revision":{"epoch":"daemon-boot-1","sequence":"9007199254740993"},
+            "scope":{"daemonId":"daemon-A","authorityScopeId":"caller-workspace-1","authorityGeneration":"9007199254740995"},
             "roots":[{
                 "root":{"workspaceId":"workspace-1","kind":"primary"},"branch":"feature","headSha":"local-B",
-                "remotes":[{"name":"origin","fetch":[{"url":"https://git.example:8443/gitlab/team/sub/app.git","resolution":{"state":"resolved","target":{"provider":"gitlab","instanceBaseUrl":"https://git.example:8443/gitlab","projectPath":"team/sub/app"}}}],"push":[{"url":"git@git.example:team/sub/app.git","resolution":{"state":"resolved","target":{"provider":"gitlab","instanceBaseUrl":"https://git.example:8443/gitlab","projectPath":"team/sub/app"}}}]}],
-                "targets":[{"target":{"provider":"gitlab","instanceBaseUrl":"https://git.example:8443/gitlab","projectPath":"team/sub/app"},"providerProjectId":"42","connection":{"connectionId":"gitlab-connection","accountId":"account-A","connectionGeneration":3},"availability":"connected","capabilities":[{"operation":"read-review","state":"available"},{"operation":"create-review","state":"unknown"}]}],
+                "remotes":[{"name":"origin","fetch":[{"url":"https://git.example:8443/gitlab/team/sub/app.git","resolution":{"state":"resolved","target":{"provider":"gitlab","instanceBaseUrl":"https://git.example:8443/gitlab","projectPath":"team/sub/app"}}}],"push":[{"url":"git@git.example:team/sub/app.git","resolution":{"state":"resolved","target":{"provider":"gitlab","instanceBaseUrl":"https://git.example:8443/gitlab","projectPath":"team/sub/app"}}}]},{"name":"upstream","fetch":[{"url":"https://github.com/team/app.git","resolution":{"state":"resolved","target":{"provider":"github","instanceBaseUrl":"https://github.com","projectPath":"team/app"}}}],"push":[]}],
+                "targets":[{"target":{"provider":"gitlab","instanceBaseUrl":"https://git.example:8443/gitlab","projectPath":"team/sub/app"},"providerProjectId":"42","connection":{"connectionId":"gitlab-connection","accountId":"account-A","connectionGeneration":"18446744073709551615"},"availability":"connected","capabilities":[{"operation":"read-review","state":"available"},{"operation":"create-review","state":"unknown"}]},{"target":{"provider":"github","instanceBaseUrl":"https://github.com","projectPath":"team/app"},"providerProjectId":"github-project-1","connection":{"connectionId":"github-connection","accountId":"account-GH","connectionGeneration":"4"},"availability":"connected","capabilities":[{"operation":"read-review","state":"available"}]}],
                 "reviewSelection":{"saved":{"mode":"explicit-remote","remoteName":"origin"},"noRemotes":false,"outcome":{"state":"resolved","target":{"provider":"gitlab","instanceBaseUrl":"https://git.example:8443/gitlab","projectPath":"team/sub/app"},"source":"explicit-remote"}}
             }]
         });
