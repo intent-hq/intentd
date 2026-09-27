@@ -13,6 +13,12 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::{Error, Result, Store};
 
+pub(crate) mod initialization;
+pub use initialization::{
+    RepositoryAcpInitialization, RepositoryInitializationBinding, RepositoryInitializationClaim,
+    RepositoryInitializationConfirmation, RepositoryInitializationTicket,
+};
+
 /// Invalidation coordinates, not identities supplied as permission claims.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RepositoryLifecycleKey {
@@ -45,6 +51,23 @@ pub trait RepositoryLifecycleObserver: Send + Sync {
         &self,
         keys: &[RepositoryLifecycleKey],
     ) -> Result<Box<dyn RepositoryLifecycleMutationTicket>>;
+
+    /// Authenticate and consume an original pending physical owner's proof.
+    /// Atomically block its keys, retire every prior live origin and competing
+    /// pending attempt, and preserve only the original attempt as installing.
+    /// This also applies to an original successful load without a row change.
+    /// No registry lock may be retained across asynchronous Store work.
+    ///
+    /// # Errors
+    /// Denies by default; implementations must reject forged, stale or rebound
+    /// proof. IDs and a canonical session string never establish ownership.
+    fn begin_initialization(
+        &self,
+        _original_owner: Box<dyn std::any::Any + Send>,
+        _binding: &RepositoryInitializationBinding,
+    ) -> Result<Box<dyn RepositoryInitializationTicket>> {
+        Err(lifecycle_error("original initialization is unavailable"))
+    }
 }
 
 #[derive(Default)]

@@ -3373,78 +3373,16 @@ impl Store {
             .await
             .map_err(|e| Error::Internal(format!("replace acp session id begin failed: {e}")))?;
 
-        let body_result = async {
-            let row = sqlx::query(
-                "SELECT acp_session_id, token_usage, token_usage_baseline FROM agent_session \
-                 WHERE id=? AND workspace_id=?",
-            )
-            .bind(&id.0)
-            .bind(&workspace_id.0)
-            .fetch_optional(&mut *conn)
-            .await
-            .map_err(|e| Error::Internal(format!("replace acp session id read failed: {e}")))?;
-            let stored_id = row
-                .as_ref()
-                .and_then(|r| r.get::<Option<String>, _>("acp_session_id"));
-            if stored_id.as_deref() != expected_old {
-                // The stored id changed between the caller's CAS read and this
-                // transaction: treat it as a CAS loss and keep the canonical
-                // value (falling back to the fresh id only if the row
-                // vanished). Nothing has been written, so committing below is
-                // a no-op close of a read-only transaction.
-                return Ok(stored_id.unwrap_or_else(|| acp_session_id.to_string()));
-            }
-            let row_exists = row.is_some();
-            let (snapshot, baseline): (Option<TokenUsageTotals>, Option<TokenUsageTotals>) = row
-                .map_or((None, None), |r| {
-                    (
-                        r.get::<Option<String>, _>("token_usage")
-                            .and_then(|s| serde_json::from_str(&s).ok()),
-                        r.get::<Option<String>, _>("token_usage_baseline")
-                            .and_then(|s| serde_json::from_str(&s).ok()),
-                    )
-                });
-            let folded = match (&baseline, &snapshot) {
-                (None, None) => None,
-                (b, s) => {
-                    let b = b.clone().unwrap_or_default();
-                    let s = s.clone().unwrap_or_default();
-                    Some(TokenUsageTotals {
-                        input_tokens: b.input_tokens.saturating_add(s.input_tokens),
-                        output_tokens: b.output_tokens.saturating_add(s.output_tokens),
-                        cache_read_tokens: b.cache_read_tokens.saturating_add(s.cache_read_tokens),
-                        cache_creation_tokens: b
-                            .cache_creation_tokens
-                            .saturating_add(s.cache_creation_tokens),
-                        thought_tokens: b.thought_tokens.saturating_add(s.thought_tokens),
-                        // Cost is cumulative per ACP session exactly like the
-                        // counters, so the fold banks it the same way (§5.23).
-                        cost: UsageCost::merge(b.cost.as_ref(), s.cost.as_ref()),
-                    })
-                }
-            };
-            let folded_json = folded
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()
-                .map_err(|e| Error::Internal(format!("encode token_usage_baseline failed: {e}")))?;
-            if expected_old != Some(acp_session_id) && row_exists {
-                lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(id.clone())])?;
-            }
-            sqlx::query(
-                "UPDATE agent_session SET acp_session_id=?, token_usage_baseline=?, \
-                 token_usage=NULL WHERE id=? AND workspace_id=?",
-            )
-            .bind(acp_session_id)
-            .bind(folded_json)
-            .bind(&id.0)
-            .bind(&workspace_id.0)
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| Error::Internal(format!("replace acp session id failed: {e}")))?;
-            Ok(acp_session_id.to_string())
-        }
-        .await;
+        let body_result = Self::write_acp_session_id_in_transaction(
+            &mut conn,
+            workspace_id,
+            id,
+            expected_old,
+            acp_session_id,
+            || lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(id.clone())]),
+        )
+        .await
+        .map(|outcome| outcome.canonical);
 
         let result = crate::commit_with_rollback_guard(
             conn,
@@ -3453,6 +3391,96 @@ impl Store {
         )
         .await;
         lifecycle.finish(result)
+    }
+
+    /// Shared transaction body; the caller owns serialization and commit/rollback.
+    /// The hook runs only before an actual changing, existing-row write. Legacy
+    /// callers retain their canonical fallback; strict callers inspect the count.
+    pub(crate) async fn write_acp_session_id_in_transaction(
+        conn: &mut sqlx::SqliteConnection,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        expected_old: Option<&str>,
+        acp_session_id: &str,
+        before_write: impl FnOnce() -> Result<()>,
+    ) -> Result<crate::repository_lifecycle::initialization::AcpSessionWriteOutcome> {
+        use crate::repository_lifecycle::initialization::AcpSessionWriteOutcome;
+        let row = sqlx::query(
+            "SELECT acp_session_id, token_usage, token_usage_baseline FROM agent_session \
+             WHERE id=? AND workspace_id=?",
+        )
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| Error::Internal(format!("replace acp session id read failed: {e}")))?;
+        let stored_id = row
+            .as_ref()
+            .and_then(|r| r.get::<Option<String>, _>("acp_session_id"));
+        if stored_id.as_deref() != expected_old {
+            // The stored id changed between the caller's CAS read and this
+            // transaction: treat it as a CAS loss and keep the canonical
+            // value (falling back to the fresh id only if the row
+            // vanished). Nothing has been written, so committing below is
+            // a no-op close of a read-only transaction.
+            return Ok(AcpSessionWriteOutcome {
+                canonical: stored_id.unwrap_or_else(|| acp_session_id.to_string()),
+                rows_affected: 0,
+            });
+        }
+        let row_exists = row.is_some();
+        let (snapshot, baseline): (Option<TokenUsageTotals>, Option<TokenUsageTotals>) = row
+            .map_or((None, None), |r| {
+                (
+                    r.get::<Option<String>, _>("token_usage")
+                        .and_then(|s| serde_json::from_str(&s).ok()),
+                    r.get::<Option<String>, _>("token_usage_baseline")
+                        .and_then(|s| serde_json::from_str(&s).ok()),
+                )
+            });
+        let folded = match (&baseline, &snapshot) {
+            (None, None) => None,
+            (b, s) => {
+                let b = b.clone().unwrap_or_default();
+                let s = s.clone().unwrap_or_default();
+                Some(TokenUsageTotals {
+                    input_tokens: b.input_tokens.saturating_add(s.input_tokens),
+                    output_tokens: b.output_tokens.saturating_add(s.output_tokens),
+                    cache_read_tokens: b.cache_read_tokens.saturating_add(s.cache_read_tokens),
+                    cache_creation_tokens: b
+                        .cache_creation_tokens
+                        .saturating_add(s.cache_creation_tokens),
+                    thought_tokens: b.thought_tokens.saturating_add(s.thought_tokens),
+                    // Cost is cumulative per ACP session exactly like the
+                    // counters, so the fold banks it the same way (§5.23).
+                    cost: UsageCost::merge(b.cost.as_ref(), s.cost.as_ref()),
+                })
+            }
+        };
+        let folded_json = folded
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| Error::Internal(format!("encode token_usage_baseline failed: {e}")))?;
+        if expected_old != Some(acp_session_id) && row_exists {
+            before_write()?;
+        }
+        let rows_affected = sqlx::query(
+            "UPDATE agent_session SET acp_session_id=?, token_usage_baseline=?, \
+             token_usage=NULL WHERE id=? AND workspace_id=?",
+        )
+        .bind(acp_session_id)
+        .bind(folded_json)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| Error::Internal(format!("replace acp session id failed: {e}")))?
+        .rows_affected();
+        Ok(AcpSessionWriteOutcome {
+            canonical: acp_session_id.to_string(),
+            rows_affected,
+        })
     }
 
     /// Delete an agent session and its message log (the `agent_message` rows
