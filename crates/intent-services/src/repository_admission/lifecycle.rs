@@ -21,6 +21,7 @@ struct State {
     subscriptions: HashMap<u64, Subscription>,
     retiring: HashMap<u64, Subscription>,
     origins: HashMap<u64, Origin>,
+    creations: HashMap<u64, physical_owner::Pending>,
 }
 
 impl State {
@@ -88,8 +89,8 @@ pub(crate) struct RepositoryLifecycleRegistry {
     state: Arc<Mutex<State>>,
 }
 
-/// The physical owner supplies this original allocation. No production
-/// constructor exists in this increment: a current AgentId/row is insufficient.
+/// The physical owner supplies this original allocation after its one-use
+/// initialization confirmation. A current agent ID or row is insufficient.
 #[derive(Clone)]
 pub(crate) struct RepositoryPhysicalOrigin {
     registry: Weak<RepositoryLifecycleRegistry>,
@@ -322,6 +323,14 @@ impl RepositoryLifecycleMutationTicket for Mutation {
 // No Drop settlement: cancellation or an unknown outcome keeps these keys
 // blocked. Reconciliation requires a later original-owner integration.
 impl RepositoryLifecycleObserver for RepositoryLifecycleRegistry {
+    fn begin_initialization(
+        &self,
+        original_owner: Box<dyn std::any::Any + Send>,
+        binding: &intent_store::RepositoryInitializationBinding,
+    ) -> intent_core::Result<Box<dyn intent_store::RepositoryInitializationTicket>> {
+        physical_owner::begin_initialization(self, original_owner, binding)
+    }
+
     fn begin_mutation(
         &self,
         keys: &[RepositoryLifecycleKey],
@@ -334,6 +343,7 @@ impl RepositoryLifecycleObserver for RepositoryLifecycleRegistry {
         let mut state = self.state.lock().map_err(|_| denied())?;
         let id = state.next().map_err(|_| denied())?;
         state.pending.insert(id, keys.clone());
+        physical_owner::invalidate_pending(&mut state, &keys, None);
         let mut origins = HashSet::new();
         for (origin_id, origin) in &mut state.origins {
             if overlaps(&keys, &origin.keys) {
@@ -425,3 +435,6 @@ impl Drop for FixtureOriginOwner {
 #[cfg(test)]
 #[path = "lifecycle/tests.rs"]
 mod tests;
+
+#[path = "lifecycle/physical_owner.rs"]
+pub(crate) mod physical_owner;

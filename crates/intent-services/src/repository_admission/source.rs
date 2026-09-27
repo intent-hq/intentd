@@ -818,4 +818,93 @@ mod captured_scope_tests {
         )
         .await;
     }
+
+    #[tokio::test]
+    async fn original_initialized_owner_composes_actual_store_git_and_source_lock_lifetime() {
+        use crate::repository_admission::lifecycle::physical_owner::{
+            RepositoryCreationIntent, RepositoryCreationOwner,
+        };
+        let fixture = Fixture::new().await;
+        let f = &fixture;
+        let agent_id = tests::agent(f).await;
+        let caller = Caller::Agent {
+            agent_id: agent_id.clone(),
+        };
+        let services = Services::new(f.store.clone());
+        let registry = Arc::new(RepositoryLifecycleRegistry::default());
+        registry.install(&f.store).await.unwrap();
+        let creator = RepositoryCreationOwner::allocate(
+            &registry,
+            &f.store,
+            f.workspace.id.clone(),
+            agent_id,
+            RepositoryCreationIntent::Loaded {
+                session_id: "original-acp".into(),
+            },
+        )
+        .unwrap();
+        let pending = creator.callback().capture();
+        // This completed producer future is a fixture, not manager integration.
+        // Store confirmation, R original ownership and subsequent source are real.
+        let owner = creator
+            .initialize(&f.store, || async { Ok("original-acp".into()) })
+            .await
+            .unwrap();
+        let callback = owner.callback();
+        let scope = McpRequestContext::capture(&callback);
+        let mut escaped = None;
+        with_caller(
+            caller.clone(),
+            scope.scope(Box::pin(async {
+                assert!(matches!(
+                    pending.source_lifetime(),
+                    Err(AdmissionError::Unavailable)
+                ));
+                escaped = Some(
+                    with_captured_repository_source(
+                        &services,
+                        tests::internal(caller.clone()).await,
+                        "initialized-owner".into(),
+                        vec![NativeReviewStage::Commit],
+                        tests::input(f),
+                        |admission| async move {
+                            revalidate_repository_stage(&admission, NativeReviewStage::Commit).await
+                        },
+                    )
+                    .await
+                    .unwrap(),
+                );
+            })),
+        )
+        .await;
+        assert!(matches!(
+            begin_repository_stage(escaped.unwrap()),
+            Err(AdmissionError::Retired)
+        ));
+        with_caller(
+            caller.clone(),
+            scope.scope(Box::pin(async {
+                with_captured_repository_source(
+                    &services,
+                    tests::internal(caller.clone()).await,
+                    "initialized-preparation".into(),
+                    vec![NativeReviewStage::Commit],
+                    tests::input(f),
+                    |_| async { Ok(()) },
+                )
+                .await
+                .unwrap();
+            })),
+        )
+        .await;
+        let request = callback.capture();
+        drop(owner);
+        with_caller(caller, async {
+            assert!(matches!(
+                request.source_lifetime(),
+                Err(AdmissionError::Retired)
+            ));
+        })
+        .await;
+    }
 }
