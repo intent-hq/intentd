@@ -6681,19 +6681,15 @@ impl PresenceClient {
             .expect("send");
     }
 
-    /// The reply to request `id`; pushes and events arriving first are
-    /// skipped.
+    /// The reply to request `id`; retain unmatched pushes and events.
     async fn reply(&mut self, id: u64, method: &str) -> Value {
-        loop {
-            let v = self
-                .next_within(Duration::from_secs(10))
-                .await
-                .unwrap_or_else(|| panic!("no reply to {method} #{id} within 10s"));
-            if v["id"] == id {
-                return v;
-            }
-            self.skipped.push(v);
-        }
+        presence_matching_frame(
+            &mut self.rx,
+            &mut self.skipped,
+            |v| v["id"] == id,
+            &format!("reply to {method} #{id}"),
+        )
+        .await
     }
 
     /// Round-trip one request; pushes and events arriving first are skipped.
@@ -6702,33 +6698,28 @@ impl PresenceClient {
         self.reply(id, method).await
     }
 
-    /// The params of the next `subscription.push` on `sub` (other frames are
-    /// skipped).
+    /// The params of the next `subscription.push` on `sub`; retain other frames.
     async fn push(&mut self, sub: &str) -> Value {
-        loop {
-            let v = self
-                .next_within(Duration::from_secs(10))
-                .await
-                .unwrap_or_else(|| panic!("no push on {sub} within 10s"));
-            if v["method"] == "subscription.push" && v["params"]["subscriptionId"] == sub {
-                return v["params"].clone();
-            }
-            self.skipped.push(v);
-        }
+        presence_matching_frame(
+            &mut self.rx,
+            &mut self.skipped,
+            |v| v["method"] == "subscription.push" && v["params"]["subscriptionId"] == sub,
+            &format!("push on {sub}"),
+        )
+        .await["params"]
+            .clone()
     }
 
-    /// The next `events.event` of `event_type` (other frames are skipped).
+    /// The next `events.event` of `event_type`; retain other frames.
     async fn event(&mut self, event_type: &str) -> Value {
-        loop {
-            let v = self
-                .next_within(Duration::from_secs(10))
-                .await
-                .unwrap_or_else(|| panic!("no {event_type} event within 10s"));
-            if v["method"] == "events.event" && v["params"]["event"]["type"] == event_type {
-                return v["params"]["event"].clone();
-            }
-            self.skipped.push(v);
-        }
+        presence_matching_frame(
+            &mut self.rx,
+            &mut self.skipped,
+            |v| v["method"] == "events.event" && v["params"]["event"]["type"] == event_type,
+            &format!("{event_type} event"),
+        )
+        .await["params"]["event"]
+            .clone()
     }
 
     /// Every frame already delivered plus whatever arrives in a short grace
@@ -6763,6 +6754,140 @@ impl PresenceClient {
     /// so only the daemon's heartbeat reaper can end the connection.
     fn go_silent(&mut self) {
         self.reader.abort();
+    }
+}
+
+/// Match the reader's frames without losing messages for another waiter.
+async fn presence_matching_frame(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<Value>,
+    skipped: &mut Vec<Value>,
+    matches: impl Fn(&Value) -> bool,
+    description: &str,
+) -> Value {
+    if let Some(index) = skipped.iter().position(&matches) {
+        return skipped.remove(index);
+    }
+    loop {
+        let v = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| panic!("no {description} within 10s"));
+        if matches(&v) {
+            return v;
+        }
+        skipped.push(v);
+    }
+}
+
+#[cfg(test)]
+mod presence_dispatcher {
+    use super::*;
+    use serde_json::json;
+
+    fn event(sequence: u64) -> Value {
+        json!({ "method": "events.event", "params": {
+            "event": { "type": "presence:changed", "sequence": sequence }
+        } })
+    }
+
+    fn push() -> Value {
+        json!({ "method": "subscription.push", "params": {
+            "subscriptionId": "note", "delta": { "kind": "left" }
+        } })
+    }
+
+    fn frames(values: Vec<Value>) -> tokio::sync::mpsc::UnboundedReceiver<Value> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        for value in values {
+            tx.send(value).expect("queue frame");
+        }
+        // Closing the sender makes a missed buffered frame fail immediately.
+        rx
+    }
+
+    async fn next(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<Value>,
+        skipped: &mut Vec<Value>,
+        method: &str,
+    ) -> Value {
+        presence_matching_frame(rx, skipped, |v| v["method"] == method, method).await
+    }
+
+    #[tokio::test]
+    async fn event_before_push_is_still_available_after_push() {
+        let event = event(1);
+        let push = push();
+        let unrelated = json!({ "id": 9, "result": { "ok": true } });
+        let mut rx = frames(vec![unrelated.clone(), event.clone(), push.clone()]);
+        let mut skipped = Vec::new();
+        assert_eq!(next(&mut rx, &mut skipped, "subscription.push").await, push);
+        assert_eq!(skipped, vec![unrelated.clone(), event.clone()]);
+        assert_eq!(next(&mut rx, &mut skipped, "events.event").await, event);
+        assert_eq!(skipped, vec![unrelated]);
+    }
+
+    #[tokio::test]
+    async fn push_before_event_is_still_available_after_event() {
+        let event = event(1);
+        let push = push();
+        let unrelated = json!({ "method": "other.notification" });
+        let mut rx = frames(vec![unrelated.clone(), push.clone(), event.clone()]);
+        let mut skipped = Vec::new();
+        assert_eq!(next(&mut rx, &mut skipped, "events.event").await, event);
+        assert_eq!(skipped, vec![unrelated.clone(), push.clone()]);
+        assert_eq!(next(&mut rx, &mut skipped, "subscription.push").await, push);
+        assert_eq!(skipped, vec![unrelated]);
+    }
+
+    #[tokio::test]
+    async fn reply_wait_preserves_events_and_other_replies() {
+        let event = event(1);
+        let first_reply = json!({ "id": 1, "result": { "ok": true } });
+        let second_reply = json!({ "id": 2, "result": { "ok": true } });
+        let mut rx = frames(vec![
+            event.clone(),
+            first_reply.clone(),
+            second_reply.clone(),
+        ]);
+        let mut skipped = Vec::new();
+        assert_eq!(
+            presence_matching_frame(&mut rx, &mut skipped, |v| v["id"] == 2, "reply #2").await,
+            second_reply
+        );
+        assert_eq!(next(&mut rx, &mut skipped, "events.event").await, event);
+        assert_eq!(
+            presence_matching_frame(&mut rx, &mut skipped, |v| v["id"] == 1, "reply #1").await,
+            first_reply
+        );
+        assert!(skipped.is_empty());
+    }
+
+    #[tokio::test]
+    async fn buffered_matches_keep_arrival_order_and_are_consumed_once() {
+        let mut rx = frames(vec![event(3)]);
+        let unrelated = json!({ "method": "other.notification" });
+        let mut skipped = vec![event(1), unrelated.clone(), event(2)];
+        for sequence in 1..=3 {
+            assert_eq!(
+                next(&mut rx, &mut skipped, "events.event").await,
+                event(sequence)
+            );
+        }
+        assert_eq!(skipped, vec![unrelated]);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn matching_frames_in_wait_order_leave_unrelated_frames_for_negative_checks() {
+        let event = event(1);
+        let push = push();
+        let unrelated = json!({ "method": "other.notification" });
+        let mut rx = frames(vec![unrelated.clone(), push.clone(), event.clone()]);
+        let mut skipped = Vec::new();
+        assert_eq!(next(&mut rx, &mut skipped, "subscription.push").await, push);
+        assert_eq!(next(&mut rx, &mut skipped, "events.event").await, event);
+        assert_eq!(skipped, vec![unrelated]);
     }
 }
 
