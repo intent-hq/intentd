@@ -4,20 +4,18 @@ use super::{
     Method, NewPullRequest, ProviderFailureKind, PullRequest, RepoRef, Result,
     ReviewBranchIdentity, ReviewDetails,
 };
-use super::{Purpose, RequestScope};
+use super::{provenance::ConfirmedProject, Purpose, RequestProvenance, RequestScope};
 use crate::model::{ConfirmedReviewState, ReviewCreateOutcome, ReviewCreateResult};
 
 impl GitLabSourceControl {
-    async fn confirmed_project(&self, repo: &RepoRef) -> Result<(u64, String)> {
+    async fn confirmed_project<'a>(&self, repo: &'a RepoRef) -> Result<ConfirmedProject<'a>> {
         let value = self.get_project(repo).await?;
-        let id = number(&value, "id")?;
-        let path = string(&value, "path_with_namespace")?;
-        if id == 0 || path != format!("{}/{}", repo.owner, repo.name) {
-            return Err(Error::Conflict(
-                "GitLab project identity is unconfirmed or changed".into(),
-            ));
-        }
-        Ok((id, path))
+        // Preserve the existing decode classification for malformed responses.
+        number(&value, "id")?;
+        string(&value, "path_with_namespace")?;
+        ConfirmedProject::from_response(repo, &value).ok_or_else(|| {
+            Error::Conflict("GitLab project identity is unconfirmed or changed".into())
+        })
     }
 
     /// Search only the addressed project's open branch pair. Incomplete metadata
@@ -125,7 +123,8 @@ impl GitLabSourceControl {
                 "GitLab submitted branch pair or title is invalid".into(),
             ));
         }
-        let (id, path) = self.confirmed_project(repo).await?;
+        let confirmed = self.confirmed_project(repo).await?;
+        let (id, path) = (confirmed.id(), confirmed.path());
         if source.project_id != id
             || target.project_id != id
             || source.project_path.as_ref().is_some_and(|p| p != &path)
@@ -152,7 +151,10 @@ impl GitLabSourceControl {
                     None,
                     RequestScope {
                         purpose: Purpose::Primary,
-                        project: Some(repo),
+                        provenance: RequestProvenance::Branch {
+                            project: confirmed,
+                            branch,
+                        },
                     },
                 )
                 .await?;
@@ -175,7 +177,7 @@ impl GitLabSourceControl {
                 })),
                 RequestScope {
                     purpose: Purpose::Primary,
-                    project: Some(repo),
+                    provenance: RequestProvenance::ReviewCreate(confirmed),
                 },
             )
             .await?;
@@ -206,7 +208,8 @@ impl GitLabSourceControl {
         if input.draft {
             return unsupported_write();
         }
-        let (id, path) = self.confirmed_project(repo).await?;
+        let confirmed = self.confirmed_project(repo).await?;
+        let (id, path) = (confirmed.id(), confirmed.path());
         let source = ReviewBranchIdentity {
             instance_base_url: self.descriptor.instance().as_str().into(),
             project_id: id,
