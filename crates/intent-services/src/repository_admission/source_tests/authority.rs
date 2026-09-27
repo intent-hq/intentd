@@ -46,7 +46,7 @@ async fn wire(
     .await
 }
 
-async fn owner(f: &Fixture, personal: bool) -> OriginalRepositoryCaller {
+pub(super) async fn owner(f: &Fixture, personal: bool) -> OriginalRepositoryCaller {
     let principal = f.store.get_primary_principal().await.unwrap();
     if personal {
         f.store
@@ -81,7 +81,7 @@ async fn guest(f: &Fixture) -> Principal {
     person
 }
 
-fn input(f: &Fixture) -> RepositorySourceInput {
+pub(super) fn input(f: &Fixture) -> RepositorySourceInput {
     let context = Fixture::input(f.root(), &f.path);
     let read =
         read_repository_context_with_resolver(&context, &resolver(), &f.environment()).unwrap();
@@ -545,7 +545,7 @@ async fn closed_store_is_local_unavailable_without_a_provider_auth_failure() {
     .unwrap();
 }
 
-async fn internal(caller: Caller) -> OriginalRepositoryCaller {
+pub(super) async fn internal(caller: Caller) -> OriginalRepositoryCaller {
     let entry = match caller {
         Caller::Agent { .. } => RepositoryEntry::AgentCallback,
         Caller::Daemon => RepositoryEntry::DaemonTask,
@@ -560,7 +560,7 @@ async fn internal(caller: Caller) -> OriginalRepositoryCaller {
     .await
 }
 
-async fn agent(f: &Fixture) -> AgentId {
+pub(super) async fn agent(f: &Fixture) -> AgentId {
     let id = AgentId::new();
     let session: intent_core::AgentSession = serde_json::from_value(serde_json::json!({
         "id":id,"workspaceId":f.workspace.id,"name":"source fixture","status":"active",

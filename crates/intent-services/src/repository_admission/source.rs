@@ -11,6 +11,9 @@ use std::sync::Arc;
 use intent_core::caller::{Caller, WireCredential};
 use intent_core::{BoxFuture, NativeReviewStage, WorkspaceId};
 use intent_sourcecontrol::remote_project::CanonicalRemoteResolver;
+use intent_store::RepositoryLifecycleKey;
+
+use crate::repository_admission::lifecycle::RepositorySourceLifetime;
 
 use crate::repository_admission::{
     capture_repository_operation, AdmissionError, AdmissionResult, OriginalRepositoryCaller,
@@ -366,7 +369,7 @@ impl RepositoryOperationSource for RepositorySource {
 /// Admission remains confined to the Services-owned lock and one request.
 /// The caller supplies the original entry before any spawn/queue. This function
 /// neither dispatches an effect nor upgrades a read/child request into a write.
-pub(crate) async fn with_repository_source<T, F, Fut>(
+async fn with_repository_source<T, F, Fut>(
     services: &Services,
     original: OriginalRepositoryCaller,
     request_id: String,
@@ -422,6 +425,52 @@ where
     .await
 }
 
+/// The callable source boundary requires the actual installed Store observer
+/// and an original physical-owner handle before ANY awaited authority/root read.
+/// Neither the keys nor that handle replaces the existing original-caller gates.
+pub(crate) async fn with_repository_lifecycle_source<T, F, Fut>(
+    services: &Services,
+    original: OriginalRepositoryCaller,
+    request_id: String,
+    stages: Vec<NativeReviewStage>,
+    input: RepositorySourceInput,
+    lifetime: RepositorySourceLifetime,
+    action: F,
+) -> AdmissionResult<T>
+where
+    F: FnOnce(RepositoryOperationAdmission) -> Fut,
+    Fut: Future<Output = AdmissionResult<T>>,
+{
+    let retirement = lifetime.retirement();
+    let _pending = RetireOnDrop(retirement.clone());
+    // This path is an original producer-qualified input, not canonicalized or
+    // reconstructed from a public DTO here. The actual source validates it.
+    if !input.facts.worktree_path.is_absolute() {
+        return Err(AdmissionError::Unavailable);
+    }
+    let root = &input.facts.preparation.root;
+    let mut keys = vec![
+        RepositoryLifecycleKey::Database,
+        RepositoryLifecycleKey::Workspace(root.workspace_id.clone()),
+        RepositoryLifecycleKey::Worktree(input.facts.worktree_path.clone()),
+    ];
+    if let intent_core::RepositoryRootKind::Registered { git_root_id } = &root.kind {
+        keys.push(RepositoryLifecycleKey::GitRoot(git_root_id.clone()));
+    }
+    if let Caller::Agent { agent_id } = original.caller() {
+        keys.push(RepositoryLifecycleKey::Agent(agent_id.clone()));
+    }
+    let _subscription = lifetime.subscribe(&services.store, original.caller(), &keys)?;
+    with_repository_source(
+        services, original, request_id, stages, input, retirement, action,
+    )
+    .await
+}
+
 #[cfg(test)]
 #[path = "source_tests/authority.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "lifecycle/source_tests.rs"]
+mod lifecycle_tests;

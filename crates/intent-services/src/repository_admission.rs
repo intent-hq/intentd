@@ -9,6 +9,8 @@
 mod authority;
 #[path = "repository_admission/credential_bridge.rs"]
 mod credential_bridge;
+#[path = "repository_admission/lifecycle.rs"]
+pub(crate) mod lifecycle;
 
 pub(crate) use authority::{
     OriginalRepositoryCaller, RepositoryAgentIdentity, RepositoryAuthorityFacts,
