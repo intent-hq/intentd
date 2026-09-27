@@ -2697,31 +2697,38 @@ impl Store {
         value: &str,
         updated_at: &str,
     ) -> Result<()> {
-        let rows = sqlx::query(
-            "UPDATE agent_session SET \
-             metadata = json_set(\
-                 CASE \
-                     WHEN metadata IS NULL THEN '{}' \
-                     WHEN json_type(metadata) = 'object' THEN metadata \
-                     ELSE json_object('priorNonObjectMetadata', json(metadata)) \
-                 END, \
-                 '$.' || ?, json(?)), \
-             updated_at = ? \
-             WHERE id = ? AND workspace_id = ?",
-        )
-        .bind(key)
-        .bind(value)
-        .bind(updated_at)
-        .bind(&id.0)
-        .bind(&workspace_id.0)
-        .execute(self.write_pool())
+        // The scoped single-key update is idempotent. Retry only this write;
+        // proposal notices and events remain outside the retry boundary.
+        crate::with_write_txn_retry(|| async {
+            let rows = sqlx::query(
+                "UPDATE agent_session SET \
+                 metadata = json_set(\
+                     CASE \
+                         WHEN metadata IS NULL THEN '{}' \
+                         WHEN json_type(metadata) = 'object' THEN metadata \
+                         ELSE json_object('priorNonObjectMetadata', json(metadata)) \
+                     END, \
+                     '$.' || ?, json(?)), \
+                 updated_at = ? \
+                 WHERE id = ? AND workspace_id = ?",
+            )
+            .bind(key)
+            .bind(value)
+            .bind(updated_at)
+            .bind(&id.0)
+            .bind(&workspace_id.0)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("set agent session metadata key json failed: {e}"))
+            })?
+            .rows_affected();
+            if rows == 0 {
+                return Err(Error::NotFound(format!("agent session {id}")));
+            }
+            Ok(())
+        })
         .await
-        .map_err(|e| Error::Internal(format!("set agent session metadata key json failed: {e}")))?
-        .rows_affected();
-        if rows == 0 {
-            return Err(Error::NotFound(format!("agent session {id}")));
-        }
-        Ok(())
     }
 
     /// CAS-set one session metadata key unless a later user row already
