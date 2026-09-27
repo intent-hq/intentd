@@ -376,7 +376,7 @@ impl Store {
             read_pool,
             browser_tab_displayed: browser_tab_repo::DisplayedOverlay::default(),
             #[cfg(test)]
-            export_author_barrier: Default::default(),
+            export_author_barrier: std::sync::Arc::default(),
         })
     }
 

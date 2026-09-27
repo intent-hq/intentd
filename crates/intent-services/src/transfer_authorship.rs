@@ -61,7 +61,7 @@ fn snapshot(value: &Value) -> Result<HumanAuthor> {
         }
     }
     if let Some(id) = object.get("sourcePrincipalId") {
-        if !id.as_str().is_some_and(|s| !s.is_empty()) {
+        if id.as_str().is_none_or(str::is_empty) {
             return Err(invalid("sourcePrincipalId must be a nonempty string"));
         }
     }

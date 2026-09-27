@@ -29,13 +29,20 @@ fn decode(value: Option<&Value>) -> Result<Option<Value>> {
     }
 }
 
-fn metadata(table: &str, row: &Value) -> Result<Option<Option<Value>>> {
+enum AuthorMetadata {
+    Unrelated,
+    Candidate(Option<Value>),
+}
+
+fn metadata(table: &str, row: &Value) -> Result<AuthorMetadata> {
     match table {
-        "agent_message" if row["role"] == "user" => Ok(Some(decode(row.get("metadata"))?)),
-        "agent_queue" => Ok(Some(
+        "agent_message" if row["role"] == "user" => {
+            Ok(AuthorMetadata::Candidate(decode(row.get("metadata"))?))
+        }
+        "agent_queue" => Ok(AuthorMetadata::Candidate(
             decode(row.get("payload"))?.and_then(|p| p.get("messageMetadata").cloned()),
         )),
-        _ => Ok(None),
+        _ => Ok(AuthorMetadata::Unrelated),
     }
 }
 
@@ -61,7 +68,7 @@ pub(crate) async fn capture(
     let mut ids = HashSet::new();
     for (table, objects) in rows.iter() {
         for row in objects {
-            if let Some(metadata) = metadata(table, row)? {
+            if let AuthorMetadata::Candidate(metadata) = metadata(table, row)? {
                 if needs_snapshot(metadata.as_ref()) {
                     if let Some(id) =
                         lift_from_principal_id(metadata.as_ref()).or_else(|| fallback.clone())
@@ -94,7 +101,7 @@ pub(crate) async fn capture(
     }
     for (table, objects) in rows.iter_mut() {
         for row in objects {
-            let Some(mut metadata) = metadata(table, row)? else {
+            let AuthorMetadata::Candidate(mut metadata) = metadata(table, row)? else {
                 continue;
             };
             if !needs_snapshot(metadata.as_ref()) {

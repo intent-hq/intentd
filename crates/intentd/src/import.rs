@@ -569,6 +569,30 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn qualified_comment_legacy_import_cannot_plant_reserved_fields() {
+        let source = write_fixture();
+        let file = source
+            .path()
+            .join("workspaces/ws-1/.workspace/comments/c1.json");
+        let mut data: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        data["authorPrincipalId"] = json!("forged");
+        data["authorIdentity"] =
+            json!({"provider":"github","host":"github.com","externalUserId":"42"});
+        std::fs::write(file, data.to_string()).unwrap();
+        let (store, _db) = open_store().await;
+        let summary = run(&store, source.path()).await.unwrap();
+        assert_eq!(summary.comments_imported, 1);
+        let comment = store
+            .list_comments(&NoteId::from("note-parent"))
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(comment.author, "User");
+        assert!(comment.author_principal_id.is_none());
+        assert!(comment.author_identity.is_none());
+    }
+
     /// Every imported note write (insert, re-import update, parent-link
     /// write) snapshots the note at its post-write `rev`, so the rev a client
     /// loads after an import resolves to the persisted content as a merge

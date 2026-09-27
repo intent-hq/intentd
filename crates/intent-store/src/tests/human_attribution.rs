@@ -120,8 +120,8 @@ async fn transfer_human_trust_migration_cleans_legacy_keys_once_and_fences_downg
     let store = Store {
         write_pool,
         read_pool: crate::connect_read(&tmp.path).await.unwrap(),
-        browser_tab_displayed: Default::default(),
-        export_author_barrier: Default::default(),
+        browser_tab_displayed: crate::browser_tab_repo::DisplayedOverlay::default(),
+        export_author_barrier: Arc::default(),
     };
     let (_ws, agent) = seed(&store).await;
     let old =

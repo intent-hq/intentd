@@ -414,7 +414,11 @@ impl Store {
         }
         #[cfg(test)]
         {
-            let barrier = self.export_author_barrier.lock().unwrap().take();
+            let barrier = self
+                .export_author_barrier
+                .lock()
+                .map_err(|_| Error::Internal("export test barrier poisoned".into()))?
+                .take();
             if let Some(barrier) = barrier {
                 barrier.entered.notify_one();
                 barrier.release.notified().await;

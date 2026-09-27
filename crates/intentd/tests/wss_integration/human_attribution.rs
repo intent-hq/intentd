@@ -136,6 +136,21 @@ async fn transfer_human_authors_comments_and_pending_queue_over_wss() {
         .call("agent.getConversation", json!({"agentId":agent}))
         .await;
     let rows = history["result"]["messages"].as_array().unwrap();
+    let slim = owner_b
+        .call(
+            "agent.getConversation",
+            json!({"agentId":agent,"projection":"slim"}),
+        )
+        .await;
+    for row in rows {
+        let slim_row = slim["result"]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == row["id"])
+            .unwrap();
+        assert_eq!(slim_row["author"], row["author"]);
+    }
     for (id, login) in [("legacy", "panghy"), ("other", "guest")] {
         let row = rows.iter().find(|r| r["id"] == id).unwrap();
         assert_eq!(row["author"]["login"], login, "{row}");
