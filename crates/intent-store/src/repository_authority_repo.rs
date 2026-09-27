@@ -39,6 +39,19 @@ pub struct RepositoryWorkspaceAuthority {
     pub owner_principal_id: Option<PrincipalId>,
 }
 
+/// Common durable facts with no human subject. This result neither queries nor
+/// defaults principal, membership or credential facts. In particular, the actual
+/// workspace owner column is not the caller's identity or authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepositoryWorkspaceAuthoritySnapshot {
+    /// The originally requested workspace, never a current/default workspace.
+    pub workspace_id: WorkspaceId,
+    /// Its actual incarnation/owner continuity, or explicit absence.
+    pub workspace: VersionedAuthority<RepositoryWorkspaceAuthority>,
+    /// Existing host revocation generation, independent of workspace continuity.
+    pub host_authorization_generation: u64,
+}
+
 /// Principal authority fields stored verbatim, without profile metadata.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepositoryPrincipalAuthority {
@@ -162,6 +175,25 @@ async fn principal(
 }
 
 impl Store {
+    /// Read common workspace/host facts without supplying or looking up a human
+    /// principal or credential. One consistent transaction is closed before
+    /// return. Missing workspace remains explicit absence; missing/invalid
+    /// provenance of a present workspace fails closed. This is evidence only:
+    /// services must still validate the original caller and operation policy,
+    /// including internal Agent/Daemon lifecycle, wire and root lifetimes.
+    ///
+    /// # Errors
+    /// Returns `Internal` on storage failure or missing/invalid provenance.
+    pub async fn repository_workspace_authority_snapshot(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<RepositoryWorkspaceAuthoritySnapshot> {
+        let mut tx = self.read_pool().begin().await.map_err(db_error)?;
+        let snapshot = read_workspace_snapshot(&mut tx, workspace_id).await?;
+        tx.commit().await.map_err(db_error)?;
+        Ok(snapshot)
+    }
+
     /// Read exact original workspace/principal/optional personal credential facts
     /// and independent ABA-resistant revisions in one read transaction, closed
     /// before returning. No tokens/hashes are copied into the result. `None` for
@@ -185,18 +217,16 @@ impl Store {
     }
 }
 
-async fn read_snapshot(
+async fn workspace_authority(
     conn: &mut SqliteConnection,
     workspace_id: &WorkspaceId,
-    principal_id: &PrincipalId,
-    original_token_hash: Option<&str>,
-) -> Result<RepositoryAuthoritySnapshot> {
+) -> Result<VersionedAuthority<RepositoryWorkspaceAuthority>> {
     let row = sqlx::query("SELECT owner_principal_id FROM workspace WHERE id = ?")
         .bind(workspace_id.as_str())
         .fetch_optional(&mut *conn)
         .await
         .map_err(db_error)?;
-    let workspace = versioned(
+    versioned(
         conn,
         "workspace",
         workspace_id.as_str(),
@@ -210,7 +240,37 @@ async fn read_snapshot(
         })
         .transpose()?,
     )
-    .await?;
+    .await
+}
+
+async fn host_generation(conn: &mut SqliteConnection) -> Result<u64> {
+    let raw: i64 = sqlx::query_scalar(
+        "SELECT authorization_generation FROM host_membership_state WHERE id = 1",
+    )
+    .fetch_one(conn)
+    .await
+    .map_err(db_error)?;
+    counter(raw, false)
+}
+
+async fn read_workspace_snapshot(
+    conn: &mut SqliteConnection,
+    workspace_id: &WorkspaceId,
+) -> Result<RepositoryWorkspaceAuthoritySnapshot> {
+    Ok(RepositoryWorkspaceAuthoritySnapshot {
+        workspace_id: workspace_id.clone(),
+        workspace: workspace_authority(conn, workspace_id).await?,
+        host_authorization_generation: host_generation(conn).await?,
+    })
+}
+
+async fn read_snapshot(
+    conn: &mut SqliteConnection,
+    workspace_id: &WorkspaceId,
+    principal_id: &PrincipalId,
+    original_token_hash: Option<&str>,
+) -> Result<RepositoryAuthoritySnapshot> {
+    let workspace = workspace_authority(conn, workspace_id).await?;
     let person = principal(conn, principal_id).await?;
     let primary_id: Option<String> =
         sqlx::query_scalar("SELECT id FROM principal WHERE is_primary = 1")
@@ -269,12 +329,7 @@ async fn read_snapshot(
     } else {
         None
     };
-    let host_generation: i64 = sqlx::query_scalar(
-        "SELECT authorization_generation FROM host_membership_state WHERE id = 1",
-    )
-    .fetch_one(&mut *conn)
-    .await
-    .map_err(db_error)?;
+    let host_authorization_generation = host_generation(conn).await?;
     let revocation: Option<i64> =
         sqlx::query_scalar("SELECT generation FROM principal_revocation WHERE principal_id = ?")
             .bind(principal_id.as_str())
@@ -290,7 +345,7 @@ async fn read_snapshot(
         host_member,
         workspace_grant,
         credential,
-        host_authorization_generation: counter(host_generation, false)?,
+        host_authorization_generation,
         principal_revocation_generation: revocation.map(|n| counter(n, true)).transpose()?,
     })
 }

@@ -89,7 +89,8 @@ pub use principal_repo::{
 };
 pub use repository_authority_repo::{
     AuthorityRevision, RepositoryAuthoritySnapshot, RepositoryCredentialAuthority,
-    RepositoryPrincipalAuthority, RepositoryWorkspaceAuthority, VersionedAuthority,
+    RepositoryPrincipalAuthority, RepositoryWorkspaceAuthority,
+    RepositoryWorkspaceAuthoritySnapshot, VersionedAuthority,
 };
 pub use sandbox_repo::{Sandbox, SandboxStatus};
 pub use tracked_changes_repo::{NewTrackedChange, TrackedChangeRow};

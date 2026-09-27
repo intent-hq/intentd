@@ -260,4 +260,3 @@ BEGIN
   SELECT 'credential', NEW.token_hash, '', 1
   WHERE NOT EXISTS (SELECT 1 FROM repository_authority_revision WHERE kind = 'credential' AND subject_id = NEW.token_hash AND member_id = '') AND (NEW.token_hash IS NOT OLD.token_hash);
 END;
-

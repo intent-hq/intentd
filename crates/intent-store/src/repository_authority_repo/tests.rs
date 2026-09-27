@@ -850,3 +850,255 @@ async fn corrupted_durable_counter_is_rejected_by_actual_snapshot_reader() {
         .await
         .is_err());
 }
+
+#[tokio::test]
+async fn workspace_only_tracks_absence_owner_aba_and_recreation() {
+    let f = Fixture::new().await;
+    let read = || {
+        f.store
+            .repository_workspace_authority_snapshot(&f.workspace)
+    };
+    let original = read().await.unwrap();
+    let human = f.snapshot().await;
+    assert_eq!(original.workspace, human.workspace);
+    assert_eq!(
+        original.host_authorization_generation,
+        human.host_authorization_generation
+    );
+    let unknown = WorkspaceId::new();
+    let absent = f
+        .store
+        .repository_workspace_authority_snapshot(&unknown)
+        .await
+        .unwrap();
+    assert_eq!(absent.workspace_id, unknown);
+    assert!(absent.workspace.value.is_none());
+    assert!(absent.workspace.revision.is_none());
+    let owner = f.store.get_primary_principal().await.unwrap();
+    f.store
+        .set_workspace_member_role(&f.workspace, &owner.id, WorkspaceRole::Collaborator)
+        .await
+        .unwrap();
+    f.store
+        .add_workspace_member(&f.workspace, &f.person, WorkspaceRole::Owner)
+        .await
+        .unwrap();
+    let changed = read().await.unwrap();
+    assert_eq!(
+        changed.workspace.value.unwrap().owner_principal_id,
+        Some(f.person.clone())
+    );
+    f.store
+        .set_workspace_member_role(&f.workspace, &f.person, WorkspaceRole::Collaborator)
+        .await
+        .unwrap();
+    f.store
+        .set_workspace_member_role(&f.workspace, &owner.id, WorkspaceRole::Owner)
+        .await
+        .unwrap();
+    let returned = read().await.unwrap();
+    assert_eq!(returned.workspace.value, original.workspace.value);
+    assert!(
+        returned.workspace.revision.unwrap().get() > original.workspace.revision.unwrap().get()
+    );
+    assert_eq!(returned.workspace, f.snapshot().await.workspace);
+    sqlx::query("DELETE FROM workspace WHERE id=?")
+        .bind(f.workspace.as_str())
+        .execute(f.store.write_pool())
+        .await
+        .unwrap();
+    let deleted = read().await.unwrap();
+    assert!(deleted.workspace.value.is_none());
+    assert!(deleted.workspace.revision.unwrap().get() > returned.workspace.revision.unwrap().get());
+    insert_workspace(&f.store, &f.workspace).await;
+    let recreated = read().await.unwrap();
+    assert_eq!(recreated.workspace.value, original.workspace.value);
+    assert!(
+        recreated.workspace.revision.unwrap().get() > deleted.workspace.revision.unwrap().get()
+    );
+    assert_eq!(recreated.workspace, f.snapshot().await.workspace);
+}
+
+#[tokio::test]
+async fn workspace_only_has_no_human_or_primary_requirement() {
+    let f = Fixture::new().await;
+    sqlx::query("DELETE FROM principal")
+        .execute(f.store.write_pool())
+        .await
+        .unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM principal")
+        .fetch_one(f.store.read_pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    let snapshot = f
+        .store
+        .repository_workspace_authority_snapshot(&f.workspace)
+        .await
+        .unwrap();
+    assert_eq!(snapshot.workspace_id, f.workspace);
+    assert!(snapshot.workspace.value.is_some());
+    // A dangling historical owner column stays only a fact; it is never replaced
+    // by a fabricated principal or used here to authorize an internal caller.
+    let human = f.snapshot().await;
+    assert!(human.principal.value.is_none());
+    assert!(human.primary_principal.value.is_none());
+    assert_eq!(snapshot.workspace, human.workspace);
+}
+
+#[tokio::test]
+async fn workspace_only_does_not_read_or_default_missing_human_provenance() {
+    let f = Fixture::new().await;
+    let before = f
+        .store
+        .repository_workspace_authority_snapshot(&f.workspace)
+        .await
+        .unwrap();
+    // Corrupt only human provenance in a disposable fixture. A hidden primary
+    // lookup would fail; an optional-human fallback would wrongly hide it.
+    sqlx::query("DROP TRIGGER repository_authority_revision_no_delete")
+        .execute(f.store.write_pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM repository_authority_revision WHERE kind='principal'")
+        .execute(f.store.write_pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        f.store
+            .repository_workspace_authority_snapshot(&f.workspace)
+            .await
+            .unwrap(),
+        before
+    );
+    assert!(f
+        .store
+        .repository_authority_snapshot(&f.workspace, &f.person, None)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn workspace_only_and_human_helpers_read_the_same_closed_snapshot() {
+    let f = Fixture::new().await;
+    f.add().await;
+    f.store
+        .insert_principal_credential(&f.person, "original-hash")
+        .await
+        .unwrap();
+    let before = f
+        .store
+        .repository_workspace_authority_snapshot(&f.workspace)
+        .await
+        .unwrap();
+    let human_before = f.snapshot().await;
+    let owner = f.store.get_primary_principal().await.unwrap();
+    let mut tx = f.store.read_pool().begin().await.unwrap();
+    sqlx::query("SELECT id FROM workspace")
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap();
+    f.store
+        .set_workspace_member_role(&f.workspace, &owner.id, WorkspaceRole::Collaborator)
+        .await
+        .unwrap();
+    f.store
+        .set_workspace_member_role(&f.workspace, &f.person, WorkspaceRole::Owner)
+        .await
+        .unwrap();
+    f.store.revoke_principal_access(&f.person).await.unwrap();
+    let common = read_workspace_snapshot(&mut tx, &f.workspace)
+        .await
+        .unwrap();
+    let human = read_snapshot(&mut tx, &f.workspace, &f.person, Some("original-hash"))
+        .await
+        .unwrap();
+    assert_eq!(common, before);
+    assert_eq!(human, human_before);
+    assert_eq!(common.workspace, human.workspace);
+    assert_eq!(
+        common.host_authorization_generation,
+        human.host_authorization_generation
+    );
+    tx.commit().await.unwrap();
+    let now = f
+        .store
+        .repository_workspace_authority_snapshot(&f.workspace)
+        .await
+        .unwrap();
+    assert_ne!(now.workspace, before.workspace);
+    assert!(now.host_authorization_generation > before.host_authorization_generation);
+    let human_now = f.snapshot().await;
+    assert_eq!(now.workspace, human_now.workspace);
+    assert_eq!(
+        now.host_authorization_generation,
+        human_now.host_authorization_generation
+    );
+    assert!(human_now.credential.unwrap().value.unwrap().revoked);
+}
+
+#[tokio::test]
+async fn workspace_only_rejects_missing_and_invalid_workspace_provenance() {
+    for missing in [true, false] {
+        let f = Fixture::new().await;
+        let mut writer = f.store.write_pool().acquire().await.unwrap();
+        if missing {
+            sqlx::query("DROP TRIGGER repository_authority_revision_no_delete")
+                .execute(&mut *writer)
+                .await
+                .unwrap();
+            sqlx::query(
+                "DELETE FROM repository_authority_revision WHERE kind='workspace' AND subject_id=?",
+            )
+            .bind(f.workspace.as_str())
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        } else {
+            sqlx::query("DROP TRIGGER repository_authority_revision_monotonic")
+                .execute(&mut *writer)
+                .await
+                .unwrap();
+            sqlx::query("PRAGMA ignore_check_constraints=ON")
+                .execute(&mut *writer)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE repository_authority_revision SET revision=-1 WHERE kind='workspace' AND subject_id=?")
+                .bind(f.workspace.as_str()).execute(&mut *writer).await.unwrap();
+            sqlx::query("PRAGMA ignore_check_constraints=OFF")
+                .execute(&mut *writer)
+                .await
+                .unwrap();
+        }
+        drop(writer);
+        assert!(f
+            .store
+            .repository_workspace_authority_snapshot(&f.workspace)
+            .await
+            .is_err());
+        assert!(f
+            .store
+            .repository_authority_snapshot(&f.workspace, &f.person, None)
+            .await
+            .is_err());
+    }
+}
+
+#[tokio::test]
+async fn workspace_only_does_not_invent_missing_host_generation() {
+    let f = Fixture::new().await;
+    sqlx::query("DELETE FROM host_membership_state")
+        .execute(f.store.write_pool())
+        .await
+        .unwrap();
+    assert!(f
+        .store
+        .repository_workspace_authority_snapshot(&f.workspace)
+        .await
+        .is_err());
+    assert!(f
+        .store
+        .repository_authority_snapshot(&f.workspace, &f.person, None)
+        .await
+        .is_err());
+}
