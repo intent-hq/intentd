@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.112] - 2026-09-27
+
+### 🚀 Features
+
+- Advertise authoritative legacy provider aliases ([#2132](https://github.com/intent-hq/intentd/pull/2132))
+
+### 🐛 Bug Fixes
+
+- Keep redirected diagnostic warnings plain ([#2130](https://github.com/intent-hq/intentd/pull/2130))
+- Isolate device-auth and shutdown WSS fixtures ([#2131](https://github.com/intent-hq/intentd/pull/2131))
+- *(test)* Isolate tempdir retention assertions ([#5929](https://github.com/intent-hq/intentd/pull/5929)) ([#2133](https://github.com/intent-hq/intentd/pull/2133))
+- Publish specialist WSS fixtures atomically ([#2134](https://github.com/intent-hq/intentd/pull/2134))
+
+
 ## [0.9.111] - 2026-09-26
 
 ### 🚀 Features
