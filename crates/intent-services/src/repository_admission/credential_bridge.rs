@@ -11,6 +11,11 @@ use intent_core::RepositoryProvider;
 
 use super::*;
 
+#[cfg(test)]
+tokio::task_local! {
+    static CREDENTIAL_FENCE_PROBE: (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
+}
+
 fn request_stage(request: &RepositoryAuthorityRequest) -> Option<NativeReviewStage> {
     match request.use_kind {
         RepositoryCredentialUse::NativePush => Some(NativeReviewStage::Push),
@@ -96,6 +101,17 @@ struct ActiveAuthority {
 }
 
 impl RepositoryDispatchStamp {
+    #[cfg(test)]
+    pub(crate) async fn probe_credential_fence<T>(
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        operation: impl std::future::Future<Output = T>,
+    ) -> T {
+        CREDENTIAL_FENCE_PROBE
+            .scope((entered, release), operation)
+            .await
+    }
+
     /// Capture from the active private stage, never from a public preparation.
     /// Commit cannot mint forge credentials. Reads made as create prerequisites
     /// retain the create purpose, rather than upgrading a read-only handle.
@@ -153,6 +169,11 @@ impl RepositoryAuthority for ActiveAuthority {
             });
             if checked == Err(AdmissionError::BindingChanged) {
                 self.inner.retirement.retire();
+            }
+            #[cfg(test)]
+            if let Ok((entered, release)) = CREDENTIAL_FENCE_PROBE.try_with(Clone::clone) {
+                entered.notify_one();
+                release.notified().await;
             }
             Ok(Box::new(ActiveFence {
                 inner: self.inner.clone(),

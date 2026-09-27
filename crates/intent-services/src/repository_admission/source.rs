@@ -500,6 +500,10 @@ mod tests;
 mod lifecycle_tests;
 
 #[cfg(test)]
+#[path = "source_tests/reader.rs"]
+mod reader_tests;
+
+#[cfg(test)]
 mod captured_scope_tests {
     use intent_acp::mcp_server::request_context::McpRequestContext;
     use intent_core::caller::with_caller;
