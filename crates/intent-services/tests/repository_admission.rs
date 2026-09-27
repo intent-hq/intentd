@@ -3,3 +3,6 @@
 
 #[path = "../src/repository_admission.rs"]
 mod repository_admission;
+
+#[path = "../src/repository_credentials.rs"]
+mod repository_credentials;

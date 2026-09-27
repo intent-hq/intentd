@@ -90,8 +90,12 @@ fn bound_facts() -> RepositoryOperationFacts {
             "ssh://git@git.example/team/sub/app.git".to_owned(),
             "ssh://backup/team/sub/app.git".to_owned(),
         ],
+        credential_requests: Vec::new(),
     }
 }
+
+#[path = "credential_bridge_tests.rs"]
+mod credential_bridge_tests;
 
 impl Rig {
     fn new(role: HostRole, workspace_role: Option<WorkspaceRole>) -> Self {

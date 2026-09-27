@@ -7,6 +7,8 @@
 
 #[path = "repository_admission/authority.rs"]
 mod authority;
+#[path = "repository_admission/credential_bridge.rs"]
+mod credential_bridge;
 
 pub(crate) use authority::{
     OriginalRepositoryCaller, RepositoryAuthorityFacts, RepositoryAuthoritySource, RepositoryEntry,
@@ -16,6 +18,7 @@ pub(crate) use authority::{
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use crate::repository_credentials::RepositoryAuthorityRequest;
 use intent_core::caller::CredentialLease;
 use intent_core::{
     BoxFuture, NativeReviewDetails, NativeReviewExecution, NativeReviewGitReceipt,
@@ -51,6 +54,9 @@ pub(crate) struct RepositoryOperationFacts {
     pub staging_fingerprint: Option<String>,
     pub fetch_destinations: Vec<String>,
     pub push_destinations: Vec<String>,
+    /// Exact server-admitted requests, including the approved API transport.
+    /// These are private input facts, never reconstructed from display URLs.
+    pub credential_requests: Vec<RepositoryAuthorityRequest>,
 }
 
 impl RepositoryOperationFacts {
@@ -61,6 +67,7 @@ impl RepositoryOperationFacts {
             && self.git_dir.is_absolute()
             && self.common_dir.is_absolute()
             && !self.source_ref.is_empty()
+            && credential_bridge::valid_requests(self)
     }
 
     fn matches(&self, observed: &Self, progress: &OperationState) -> bool {
@@ -228,6 +235,34 @@ pub(crate) async fn revalidate_repository_stage(
     }
     // Queued work calls here after entering its actual worker/worktree lock,
     // not before a potentially unbounded queue wait.
+    let (observed, legacy) = observe_authority(inner, stage).await?;
+    let index = inner.retirement.dispatch(|| {
+        let mut progress = inner.progress.lock().map_err(|_| AdmissionError::Retired)?;
+        check_stage(&progress, inner, stage)?;
+        if !inner.facts.matches(&observed, &progress) {
+            return Err(AdmissionError::BindingChanged);
+        }
+        progress.last_revision = observed.preparation.context_revision.clone();
+        Ok(progress.next)
+    });
+    if index == Err(AdmissionError::BindingChanged) {
+        inner.retirement.retire();
+    }
+    Ok(CheckedRepositoryStage {
+        inner: inner.clone(),
+        stage,
+        index: index?,
+        _legacy: legacy,
+    })
+}
+
+/// Shared original-caller and root read for stage admission and every credential
+/// release within that stage. No state lock crosses the async reads; the original
+/// legacy admission is retained through the later dispatch fence.
+async fn observe_authority(
+    inner: &OperationInner,
+    stage: NativeReviewStage,
+) -> AdmissionResult<(RepositoryOperationFacts, Option<CredentialLease>)> {
     let observed = inner.source.observe(&inner.facts).await?;
     let legacy = retire_denied(inner, inner.original.legacy_lease().await)?;
     let facts = retire_denied(
@@ -247,24 +282,7 @@ pub(crate) async fn revalidate_repository_stage(
         inner.retirement.retire();
         return Err(AdmissionError::Denied);
     }
-    let index = inner.retirement.dispatch(|| {
-        let mut progress = inner.progress.lock().map_err(|_| AdmissionError::Retired)?;
-        check_stage(&progress, inner, stage)?;
-        if !inner.facts.matches(&observed, &progress) {
-            return Err(AdmissionError::BindingChanged);
-        }
-        progress.last_revision = observed.preparation.context_revision.clone();
-        Ok(progress.next)
-    });
-    if index == Err(AdmissionError::BindingChanged) {
-        inner.retirement.retire();
-    }
-    Ok(CheckedRepositoryStage {
-        inner: inner.clone(),
-        stage,
-        index: index?,
-        _legacy: legacy,
-    })
+    Ok((observed, legacy))
 }
 
 fn retire_denied<T>(inner: &OperationInner, result: AdmissionResult<T>) -> AdmissionResult<T> {
