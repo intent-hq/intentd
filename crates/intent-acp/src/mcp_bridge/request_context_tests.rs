@@ -145,15 +145,19 @@ impl ProbeApi {
 }
 
 impl WorkspaceApi for ProbeApi {
+    fn git_root_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            assert_eq!(workspace_id, WorkspaceId::from("workspace-1"));
+            let _ = self.entered.send(seen());
+            if let Some(gate) = &self.gate {
+                gate.acquire().await.unwrap().forget();
+            }
+            Ok(json!({"gitRoots":[{"operation":"original-result"}]}))
+        })
+    }
+
     fn settings_get(&self, path: String) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
-            if path == "probe" {
-                let _ = self.entered.send(seen());
-                if let Some(gate) = &self.gate {
-                    gate.acquire().await.unwrap().forget();
-                }
-                return Ok(json!({"operation":"original-result"}));
-            }
             Ok(json!({"value":match path.as_str() {
                 "workspaceApi.toonOutput" => json!(false),
                 "workspaceApi.maxOutputChars" => json!(100_000),
@@ -209,7 +213,7 @@ fn server(api: Arc<ProbeApi>, context: Option<Arc<Context>>) -> WorkspaceMcpServ
 fn call(id: u64) -> Value {
     json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{
         "name":"workspace_api","arguments":{
-            "code":"return await ws.settings.get('probe');","summary":"Context fixture"
+            "code":"return (await ws.git.listRoots())[0];","summary":"Context fixture"
         }
     }})
 }
