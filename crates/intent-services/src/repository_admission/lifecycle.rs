@@ -102,6 +102,10 @@ pub(crate) struct RepositorySourceLifetime {
     registry: Arc<RepositoryLifecycleRegistry>,
     origin: Option<RepositoryPhysicalOrigin>,
     retirement: RepositoryRetirement,
+    request: Option<(
+        RepositoryRetirement,
+        Arc<Mutex<Vec<RepositorySubscription>>>,
+    )>,
 }
 
 impl RepositorySourceLifetime {
@@ -114,6 +118,21 @@ impl RepositorySourceLifetime {
             registry,
             origin,
             retirement,
+            request: None,
+        }
+    }
+
+    pub(super) fn for_captured_request(
+        registry: Arc<RepositoryLifecycleRegistry>,
+        origin: RepositoryPhysicalOrigin,
+        request: RepositoryRetirement,
+        subscriptions: Arc<Mutex<Vec<RepositorySubscription>>>,
+    ) -> Self {
+        Self {
+            registry,
+            origin: Some(origin),
+            retirement: request.source_child(),
+            request: Some((request, subscriptions)),
         }
     }
 
@@ -131,12 +150,20 @@ impl RepositorySourceLifetime {
         if !store.has_repository_lifecycle_observer(&observer) {
             return Err(AdmissionError::Unavailable);
         }
-        self.registry.subscribe(
-            self.origin.as_ref().ok_or(AdmissionError::Unavailable)?,
-            caller,
-            keys,
-            self.retirement.clone(),
-        )
+        let origin = self.origin.as_ref().ok_or(AdmissionError::Unavailable)?;
+        if let Some((request, subscriptions)) = &self.request {
+            // Keep original root coverage across normal source completion and
+            // later preparation. Only the operation's child lease ends here.
+            let subscription = self
+                .registry
+                .subscribe(origin, caller, keys, request.clone())?;
+            subscriptions
+                .lock()
+                .map_err(|_| AdmissionError::Retired)?
+                .push(subscription);
+        }
+        self.registry
+            .subscribe(origin, caller, keys, self.retirement.clone())
     }
 }
 
@@ -157,7 +184,12 @@ impl Drop for RepositorySubscription {
                 state.retiring.insert(self.id, entry);
             }
         }
-        finish_retirement(&self.state, &[(self.id, self.retirement.clone())]);
+        self.retirement.end_scope();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.retiring.remove(&self.id);
     }
 }
 

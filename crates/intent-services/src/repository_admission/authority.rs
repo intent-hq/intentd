@@ -219,11 +219,36 @@ pub(crate) trait RepositoryAuthoritySource: Send + Sync {
 #[derive(Clone, Default)]
 pub(crate) struct RepositoryRetirement {
     state: Arc<Mutex<bool>>,
+    ancestors: Vec<Arc<Mutex<bool>>>,
 }
 
 impl RepositoryRetirement {
+    /// A lock session may end without ending its retained request. Dispatch
+    /// still consumes every original ancestor fence before this local leaf.
+    pub(super) fn source_child(&self) -> Self {
+        let mut ancestors = self.ancestors.clone();
+        ancestors.push(self.state.clone());
+        Self {
+            state: Arc::new(Mutex::new(false)),
+            ancestors,
+        }
+    }
+
     pub(crate) fn retire(&self) {
-        // Poison is already fail-closed in dispatch/check_current.
+        // A permanent denial observed by one source also retires its original
+        // request. Poison already excludes dispatch. No child lock precedes a
+        // parent lock, including while retirement waits for an admitted start.
+        for parent in &self.ancestors {
+            if let Ok(mut retired) = parent.lock() {
+                *retired = true;
+            }
+        }
+        self.end_scope();
+    }
+
+    /// Normal lock/subscription cleanup ends only its local operation scope.
+    /// Cancellation and permanent authority changes must use `retire` instead.
+    pub(crate) fn end_scope(&self) {
         if let Ok(mut retired) = self.state.lock() {
             *retired = true;
         }
@@ -237,12 +262,20 @@ impl RepositoryRetirement {
         &self,
         action: impl FnOnce() -> AdmissionResult<T>,
     ) -> AdmissionResult<T> {
+        let ancestors = self
+            .ancestors
+            .iter()
+            .map(|parent| parent.lock().map_err(|_| AdmissionError::Retired))
+            .collect::<AdmissionResult<Vec<_>>>()?;
+        if ancestors.iter().any(|retired| **retired) {
+            return Err(AdmissionError::Retired);
+        }
         let retired = self.state.lock().map_err(|_| AdmissionError::Retired)?;
         if *retired {
             return Err(AdmissionError::Retired);
         }
-        // Leaf only. Actions may acquire the P directory fence after this one,
-        // never the reverse. No await, durable read, Git or network under here.
+        // Original request -> lock-session child -> operation -> P directory.
+        // Never reverse that order or await/read durable state/do I/O here.
         action()
     }
 }

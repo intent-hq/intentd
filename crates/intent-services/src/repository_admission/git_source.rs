@@ -105,7 +105,7 @@ struct RetireOnDrop(RepositoryRetirement);
 
 impl Drop for RetireOnDrop {
     fn drop(&mut self) {
-        self.0.retire();
+        self.0.end_scope();
     }
 }
 

@@ -4,7 +4,7 @@
 //! an origin after initialization. Existing caller and Store gates still own
 //! permission; this context only retains and retires the original request leaf.
 
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
 use intent_acp::mcp_server::request_context::{
     McpContextFuture, McpRequestContext, McpRequestScope,
@@ -47,7 +47,7 @@ impl RepositoryCallbackContext {
                 registry,
                 origin,
                 caller,
-                _subscription: subscription,
+                subscriptions: Arc::new(Mutex::new(vec![subscription])),
             })
         })();
         Arc::new(RepositoryCapturedRequest {
@@ -114,11 +114,22 @@ pub(crate) fn current_source_lifetime() -> AdmissionResult<RepositorySourceLifet
         .map_err(|_| AdmissionError::Unavailable)?
 }
 
+/// Permanent observed denial ends this original request, not just one lock
+/// session. Transient source unavailability leaves later preparation possible.
+pub(crate) fn retire_current_request_on_denial(error: AdmissionError) {
+    if matches!(
+        error,
+        AdmissionError::Denied | AdmissionError::Retired | AdmissionError::BindingChanged
+    ) {
+        let _ = CAPTURED_REQUEST.try_with(|request| request.retirement.retire());
+    }
+}
+
 struct Captured {
     registry: Arc<RepositoryLifecycleRegistry>,
     origin: RepositoryPhysicalOrigin,
     caller: Caller,
-    _subscription: RepositorySubscription,
+    subscriptions: Arc<Mutex<Vec<RepositorySubscription>>>,
 }
 
 pub(crate) struct RepositoryCapturedRequest {
@@ -137,10 +148,11 @@ impl RepositoryCapturedRequest {
             return Err(AdmissionError::Denied);
         }
         self.retirement.check_current()?;
-        Ok(RepositorySourceLifetime::new(
+        Ok(RepositorySourceLifetime::for_captured_request(
             captured.registry.clone(),
-            Some(captured.origin.clone()),
+            captured.origin.clone(),
             self.retirement.clone(),
+            captured.subscriptions.clone(),
         ))
     }
 }

@@ -44,7 +44,7 @@ struct RetireOnDrop(RepositoryRetirement);
 
 impl Drop for RetireOnDrop {
     fn drop(&mut self) {
-        self.0.retire();
+        self.0.end_scope();
     }
 }
 
@@ -445,6 +445,9 @@ where
         services, original, request_id, stages, input, lifetime, action,
     )
     .await
+    .inspect_err(|error| {
+        crate::repository_admission::request_context::retire_current_request_on_denial(*error);
+    })
 }
 
 /// The original producer or captured scope supplies this lifetime; serialized
@@ -573,5 +576,246 @@ mod captured_scope_tests {
         )
         .await;
         assert!(entered);
+    }
+
+    #[tokio::test]
+    async fn normal_source_completion_keeps_original_scope_for_preparation_but_retires_escaped_admission(
+    ) {
+        let fixture = Fixture::new().await;
+        let f = &fixture;
+        let caller = Caller::Agent {
+            agent_id: tests::agent(f).await,
+        };
+        let services = Services::new(f.store.clone());
+        let registry = Arc::new(RepositoryLifecycleRegistry::default());
+        registry.install(&f.store).await.unwrap();
+        let owner = FixtureOriginOwner::new(&registry, caller.clone()).unwrap();
+        let callback = RepositoryCallbackContext::new(&registry, Some(owner.origin()));
+        let scope = McpRequestContext::capture(&callback);
+        let mut escaped = None;
+        with_caller(
+            caller.clone(),
+            scope.scope(Box::pin(async {
+                escaped = Some(
+                    with_captured_repository_source(
+                        &services,
+                        tests::internal(caller.clone()).await,
+                        "operation".into(),
+                        vec![NativeReviewStage::Commit],
+                        tests::input(f),
+                        |admission| async move {
+                            let checked =
+                                revalidate_repository_stage(&admission, NativeReviewStage::Commit)
+                                    .await?;
+                            Ok((admission, checked))
+                        },
+                    )
+                    .await
+                    .unwrap(),
+                );
+            })),
+        )
+        .await;
+        let (admission, checked) = escaped.unwrap();
+        assert!(matches!(
+            begin_repository_stage(checked),
+            Err(AdmissionError::Retired)
+        ));
+        assert!(matches!(
+            revalidate_repository_stage(&admission, NativeReviewStage::Commit).await,
+            Err(AdmissionError::Retired)
+        ));
+        let mut prepared = false;
+        with_caller(
+            caller.clone(),
+            scope.scope(Box::pin(async {
+                with_captured_repository_source(
+                    &services,
+                    tests::internal(caller.clone()).await,
+                    "preparation".into(),
+                    vec![NativeReviewStage::Commit],
+                    tests::input(f),
+                    |admission| async move {
+                        revalidate_repository_stage(&admission, NativeReviewStage::Commit).await?;
+                        Ok(())
+                    },
+                )
+                .await
+                .expect(
+                    "normal source return must preserve the SAME original request for preparation",
+                );
+                prepared = true;
+            })),
+        )
+        .await;
+        assert!(prepared);
+    }
+
+    #[tokio::test]
+    async fn observed_source_denial_retires_parent_even_if_action_handles_error_but_unavailable_recovers(
+    ) {
+        for change in 0..3 {
+            let fixture = Fixture::new().await;
+            let f = &fixture;
+            let caller = Caller::Agent {
+                agent_id: tests::agent(f).await,
+            };
+            let services = Services::new(f.store.clone());
+            let service = &services;
+            let registry = Arc::new(RepositoryLifecycleRegistry::default());
+            registry.install(&f.store).await.unwrap();
+            let owner = FixtureOriginOwner::new(&registry, caller.clone()).unwrap();
+            let callback = RepositoryCallbackContext::new(&registry, Some(owner.origin()));
+            let scope = McpRequestContext::capture(&callback);
+            with_caller(
+                caller.clone(),
+                scope.scope(Box::pin(async {
+                    with_captured_repository_source(
+                        service,
+                        tests::internal(caller.clone()).await,
+                        "observe".into(),
+                        vec![NativeReviewStage::Commit],
+                        tests::input(f),
+                        |admission| async move {
+                            let config = f.path.join(".git/config");
+                            let prior = std::fs::read(&config).unwrap();
+                            match change {
+                                0 => {
+                                    service.pending_workspace_deletes.schedule(
+                                        f.workspace.id.to_string(),
+                                        "2026-09-27T01:00:00Z".into(),
+                                        |_| tokio::spawn(async {}),
+                                    );
+                                }
+                                1 => {
+                                    f.git(&f.path, &["checkout", "--detach", "main"]);
+                                }
+                                _ => std::fs::write(&config, "[malformed\n").unwrap(),
+                            }
+                            let observed =
+                                revalidate_repository_stage(&admission, NativeReviewStage::Commit)
+                                    .await;
+                            match change {
+                                0 => {
+                                    service
+                                        .pending_workspace_deletes
+                                        .cancel(f.workspace.id.as_str());
+                                    assert!(matches!(observed, Err(AdmissionError::Denied)));
+                                }
+                                1 => {
+                                    f.git(&f.path, &["checkout", "main"]);
+                                    assert!(matches!(
+                                        observed,
+                                        Err(AdmissionError::BindingChanged)
+                                    ));
+                                }
+                                _ => {
+                                    std::fs::write(&config, prior).unwrap();
+                                    assert!(matches!(observed, Err(AdmissionError::Unavailable)));
+                                }
+                            }
+                            Ok(())
+                        },
+                    )
+                    .await
+                    .unwrap();
+                })),
+            )
+            .await;
+            with_caller(
+                caller.clone(),
+                scope.scope(Box::pin(async {
+                    let later = with_captured_repository_source(
+                        service,
+                        tests::internal(caller.clone()).await,
+                        "same-after-restore".into(),
+                        vec![NativeReviewStage::Commit],
+                        tests::input(f),
+                        |_| async { Ok(()) },
+                    )
+                    .await;
+                    if change == 2 {
+                        assert_eq!(later, Ok(()));
+                    } else {
+                        assert_eq!(later, Err(AdmissionError::Retired));
+                    }
+                })),
+            )
+            .await;
+            let fresh = McpRequestContext::capture(&callback);
+            with_caller(
+                caller.clone(),
+                fresh.scope(Box::pin(async {
+                    with_captured_repository_source(
+                        service,
+                        tests::internal(caller.clone()).await,
+                        "fresh-after-restore".into(),
+                        vec![NativeReviewStage::Commit],
+                        tests::input(f),
+                        |_| async { Ok(()) },
+                    )
+                    .await
+                    .unwrap();
+                })),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn root_writer_after_normal_source_return_still_retires_original_preparation() {
+        let fixture = Fixture::new().await;
+        let f = &fixture;
+        let caller = Caller::Agent {
+            agent_id: tests::agent(f).await,
+        };
+        let services = Services::new(f.store.clone());
+        let registry = Arc::new(RepositoryLifecycleRegistry::default());
+        registry.install(&f.store).await.unwrap();
+        let owner = FixtureOriginOwner::new(&registry, caller.clone()).unwrap();
+        let callback = RepositoryCallbackContext::new(&registry, Some(owner.origin()));
+        let scope = McpRequestContext::capture(&callback);
+        with_caller(
+            caller.clone(),
+            scope.scope(Box::pin(async {
+                with_captured_repository_source(
+                    &services,
+                    tests::internal(caller.clone()).await,
+                    "before-writer".into(),
+                    vec![NativeReviewStage::Commit],
+                    tests::input(f),
+                    |_| async { Ok(()) },
+                )
+                .await
+                .unwrap();
+            })),
+        )
+        .await;
+        f.store
+            .archive_workspace_detaching_guests(&f.workspace.id, "2026-09-27T01:00:00Z")
+            .await
+            .unwrap();
+        f.store
+            .unarchive_workspace_if_archived(&f.workspace.id, "2026-09-27T01:01:00Z")
+            .await
+            .unwrap();
+        with_caller(
+            caller.clone(),
+            scope.scope(Box::pin(async {
+                assert_eq!(
+                    with_captured_repository_source(
+                        &services,
+                        tests::internal(caller.clone()).await,
+                        "after-writer".into(),
+                        vec![NativeReviewStage::Commit],
+                        tests::input(f),
+                        |_| async { Ok(()) },
+                    )
+                    .await,
+                    Err(AdmissionError::Retired)
+                );
+            })),
+        )
+        .await;
     }
 }

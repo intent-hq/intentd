@@ -242,3 +242,64 @@ async fn dropping_an_unpolled_or_pending_acp_scope_retires_escaped_request_clone
         .await;
     }
 }
+
+#[tokio::test]
+async fn source_cleanup_retires_only_its_child_and_parent_retirement_fences_every_child() {
+    let (registry, owner, caller) = fixture();
+    let captured = RepositoryCallbackContext::new(&registry, Some(owner.origin())).capture();
+    with_caller(caller, async {
+        let first = captured.source_lifetime().unwrap();
+        let sibling = captured.source_lifetime().unwrap();
+        first.retirement().end_scope();
+        assert!(sibling.retirement().check_current().is_ok());
+        assert!(captured.source_lifetime().is_ok());
+        captured.retirement.retire();
+        assert_eq!(
+            sibling
+                .retirement()
+                .dispatch(|| panic!("retired request dispatched a child")),
+            Err::<(), _>(AdmissionError::Retired)
+        );
+        assert!(matches!(
+            captured.source_lifetime(),
+            Err(AdmissionError::Retired)
+        ));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn request_retirement_waits_for_its_original_child_consuming_fence() {
+    let (registry, owner, caller) = fixture();
+    let captured = RepositoryCallbackContext::new(&registry, Some(owner.origin())).capture();
+    let child = with_caller(caller, async {
+        captured.source_lifetime().unwrap().retirement()
+    })
+    .await;
+    let (entered, inside) = std::sync::mpsc::channel();
+    let (release, hold) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        child.dispatch(|| {
+            entered.send(()).unwrap();
+            hold.recv().unwrap();
+            Ok(())
+        })
+    });
+    inside.recv().unwrap();
+    let parent = captured.retirement.clone();
+    let (started, waiting) = std::sync::mpsc::channel();
+    let (done, retired) = std::sync::mpsc::channel();
+    let retirement = std::thread::spawn(move || {
+        started.send(()).unwrap();
+        parent.retire();
+        done.send(()).unwrap();
+    });
+    waiting.recv().unwrap();
+    assert!(retired
+        .recv_timeout(std::time::Duration::from_millis(40))
+        .is_err());
+    release.send(()).unwrap();
+    assert_eq!(worker.join().unwrap(), Ok(()));
+    retirement.join().unwrap();
+    retired.recv().unwrap();
+}
