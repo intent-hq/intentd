@@ -28,6 +28,7 @@ pub mod events;
 pub mod git_remote_url;
 pub mod ids;
 pub mod model;
+pub mod native_review;
 pub mod path_utils;
 #[doc(hidden)]
 pub mod queue_visibility_contract;
@@ -140,6 +141,12 @@ pub use model::{
 pub use model::{
     WORKSPACE_LIST_PR_CAP, WORKSPACE_LIST_PR_KEYS, WORKSPACE_LIST_ROW_BUDGET_BYTES,
     WORKSPACE_LIST_ROW_KEYS,
+};
+pub use native_review::{
+    NativeReviewBranchIdentity, NativeReviewBranchTarget, NativeReviewDetails,
+    NativeReviewExecuteExtension, NativeReviewExecution, NativeReviewGitReceipt,
+    NativeReviewOutcome, NativeReviewPreparation, NativeReviewPrepareExtension,
+    NativeReviewPublication, NativeReviewStage, NativeReviewState, NativeReviewTransport,
 };
 pub use path_utils::prewarm_login_shell_path;
 pub use repo_ref::RepoRef;
