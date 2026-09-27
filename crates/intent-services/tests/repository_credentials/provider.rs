@@ -1,4 +1,5 @@
 use std::sync::atomic::Ordering;
+use std::{future::Future, pin::Pin};
 
 use intent_sourcecontrol::{
     error::ProviderFailureKind, gitlab::GitlabCredentialRequest, Error, GitlabInstance,
@@ -388,4 +389,401 @@ async fn bound_fork_review_allows_corroborated_pipeline_project_follow_up() {
         .unwrap()
         .iter()
         .any(|(line, _)| line.contains("projects/82/pipelines/9/jobs")));
+}
+
+#[tokio::test]
+async fn bound_pipeline_rejects_unrelated_or_unconfirmed_provenance_without_follow_up() {
+    for case in 0..12 {
+        let server = Server::new().await;
+        *server.handler.lock().unwrap() = Box::new(move |_, path| {
+            if path.ends_with("/merge_requests/4") {
+                let mut body = mr();
+                body["source_project_id"] = json!(82);
+                body["head_pipeline"] = json!({"id":9,"project_id":82,"status":"success"});
+                match case {
+                    0 => body["head_pipeline"]["project_id"] = json!(99),
+                    1 => body["source_project_id"] = Value::Null,
+                    2 => body["target_project_id"] = Value::Null,
+                    3 => body["target_project_id"] = json!(99),
+                    4 => body["iid"] = json!(5),
+                    5 => body["head_pipeline"]["project_id"] = Value::Null,
+                    6 => body["head_pipeline"]["project_id"] = json!("82"),
+                    7 => body["project_id"] = json!(99),
+                    8 => body["head_pipeline"]["id"] = json!(0),
+                    _ => {}
+                }
+                return Reply::ok(body);
+            }
+            if path.ends_with("team%2Fsub%2Fproject") {
+                let mut body = project();
+                match case {
+                    9 => body["path_with_namespace"] = json!("elsewhere/project"),
+                    10 => body["id"] = json!(99),
+                    11 => body["id"] = Value::Null,
+                    _ => {}
+                }
+                return Reply::ok(body);
+            }
+            if path.ends_with("/approvals") {
+                return Reply::ok(
+                    json!({"approvals_required":0,"approvals_left":0,"approved_by":[]}),
+                );
+            }
+            Reply::ok(json!([]))
+        });
+        let result = server
+            .provider(RepositoryCredentialUse::NativeRead)
+            .observe_review(&repo(), 4)
+            .await;
+        let seen = server.seen.lock().unwrap();
+        assert!(
+            !seen.iter().any(|(line, _)| line.contains("/jobs")),
+            "case {case} sent an unconfirmed follow-up"
+        );
+        assert_eq!(
+            server.test.secrets.calls.load(Ordering::SeqCst),
+            seen.len(),
+            "case {case} released a token without a request"
+        );
+        match result {
+            Err(Error::AdmissionUnavailable(_)) => assert_eq!(seen.len(), 3, "case {case}"),
+            Ok(observation) => assert_eq!(
+                observation.availability.checks,
+                intent_sourcecontrol::model::ProviderAvailability::Unknown,
+                "case {case}"
+            ),
+            other => panic!("unexpected provenance outcome for case {case}: {other:?}"),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AlterRequest {
+    BranchProject,
+    BranchName,
+    BranchWrite,
+    BranchEndpoint,
+    CreateProject,
+    PipelineProject,
+    PipelineId,
+    PipelineWrite,
+    PipelineProof,
+}
+struct AlteredCredentials {
+    bound: BoundGitlabRequestCredentials,
+    alter: AlterRequest,
+}
+impl GitlabRequestCredentials for AlteredCredentials {
+    fn token_for<'s, 'i, 'f>(
+        &'s self,
+        instance: &'i GitlabInstance,
+    ) -> Pin<Box<dyn Future<Output = intent_sourcecontrol::Result<SecretString>> + Send + 'f>>
+    where
+        's: 'f,
+        'i: 'f,
+        Self: 'f,
+    {
+        self.bound.token_for(instance)
+    }
+    fn token_for_request<'s, 'i, 'r, 'f>(
+        &'s self,
+        instance: &'i GitlabInstance,
+        mut request: GitlabCredentialRequest<'r>,
+    ) -> Pin<Box<dyn Future<Output = intent_sourcecontrol::Result<SecretString>> + Send + 'f>>
+    where
+        's: 'f,
+        'i: 'f,
+        'r: 'f,
+        Self: 'f,
+    {
+        match self.alter {
+            AlterRequest::BranchProject if request.path.contains("/repository/branches/") => {
+                request.path = "projects/99/repository/branches/feature";
+            }
+            AlterRequest::BranchName if request.path.contains("/repository/branches/") => {
+                request.path = "projects/41/repository/branches/other";
+            }
+            AlterRequest::BranchWrite if request.path.contains("/repository/branches/") => {
+                request.path = "projects/41/merge_requests";
+                request.writing = true;
+            }
+            AlterRequest::BranchEndpoint if request.path.contains("/repository/branches/") => {
+                request.path = "projects/41/issues";
+            }
+            AlterRequest::CreateProject if request.writing => {
+                request.path = "projects/99/merge_requests";
+            }
+            AlterRequest::PipelineProject if request.path.contains("/pipelines/") => {
+                request.path = "projects/99/pipelines/9/jobs";
+            }
+            AlterRequest::PipelineId if request.path.contains("/pipelines/") => {
+                request.path = "projects/82/pipelines/10/jobs";
+            }
+            AlterRequest::PipelineWrite if request.path.contains("/pipelines/") => {
+                request.path = "projects/82/merge_requests";
+                request.writing = true;
+            }
+            AlterRequest::PipelineProof if request.path.contains("/pipelines/") => {
+                request = GitlabCredentialRequest::direct(
+                    request.descriptor,
+                    request.path,
+                    request.writing,
+                );
+            }
+            _ => {}
+        }
+        self.bound.token_for_request(instance, request)
+    }
+}
+
+#[tokio::test]
+async fn bound_branch_read_proof_is_exact_and_never_grants_a_write() {
+    for alter in [
+        AlterRequest::BranchName,
+        AlterRequest::BranchWrite,
+        AlterRequest::BranchEndpoint,
+    ] {
+        let server = Server::new().await;
+        *server.handler.lock().unwrap() = Box::new(|_, path| {
+            if path.ends_with("team%2Fsub%2Fproject") {
+                Reply::ok(project())
+            } else if path.contains("/repository/branches/") {
+                Reply::ok(
+                    json!({"name":path.rsplit('/').next().unwrap(),"commit":{"id":"actual-sha"}}),
+                )
+            } else {
+                Reply::ok(json!([]))
+            }
+        });
+        let result = altered_provider(&server, alter)
+            .create_same_project(
+                &repo(),
+                NewPullRequest {
+                    title: "actual title".into(),
+                    body: None,
+                    source_branch: "feature".into(),
+                    target_branch: "main".into(),
+                    draft: false,
+                },
+                &pair("feature"),
+                &pair("main"),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(Error::AdmissionUnavailable(_))),
+            "{result:?}"
+        );
+        assert_eq!(server.test.secrets.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(server.seen.lock().unwrap().len(), 2);
+    }
+}
+fn altered_provider(
+    server: &Server,
+    alter: AlterRequest,
+) -> intent_sourcecontrol::GitLabSourceControl {
+    let bound = BoundGitlabRequestCredentials::new(
+        server.test.directory.clone(),
+        server
+            .test
+            .admit(RepositoryCredentialUse::NativeReviewCreate),
+        server.test.secrets.clone(),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    intent_sourcecontrol::GitLabSourceControl::new(
+        server.test.verified.descriptor.clone(),
+        Arc::new(AlteredCredentials { bound, alter }),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn bound_numeric_create_rejects_changed_project_before_secret_or_dispatch() {
+    for alter in [AlterRequest::BranchProject, AlterRequest::CreateProject] {
+        let server = Server::new().await;
+        *server.handler.lock().unwrap() = Box::new(|_, path| {
+            if path.ends_with("team%2Fsub%2Fproject") {
+                Reply::ok(project())
+            } else if path.contains("/repository/branches/") {
+                Reply::ok(
+                    json!({"name":path.rsplit('/').next().unwrap(),"commit":{"id":"actual-sha"}}),
+                )
+            } else {
+                Reply::ok(json!([]))
+            }
+        });
+        let error = altered_provider(&server, alter)
+            .create_same_project(
+                &repo(),
+                NewPullRequest {
+                    title: "actual title".into(),
+                    body: None,
+                    source_branch: "feature".into(),
+                    target_branch: "main".into(),
+                    draft: false,
+                },
+                &pair("feature"),
+                &pair("main"),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::AdmissionUnavailable(_)), "{error:?}");
+        let expected = if matches!(alter, AlterRequest::BranchProject) {
+            2
+        } else {
+            4
+        };
+        assert_eq!(server.test.secrets.calls.load(Ordering::SeqCst), expected);
+        assert_eq!(server.seen.lock().unwrap().len(), expected);
+    }
+}
+
+#[tokio::test]
+async fn bound_pipeline_proof_cannot_grant_another_project_pipeline_or_write() {
+    for alter in [
+        AlterRequest::PipelineProject,
+        AlterRequest::PipelineId,
+        AlterRequest::PipelineWrite,
+        AlterRequest::PipelineProof,
+    ] {
+        let server = Server::new().await;
+        *server.handler.lock().unwrap() = Box::new(|_, path| {
+            if path.ends_with("/merge_requests/4") {
+                let mut body = mr();
+                body["source_project_id"] = json!(82);
+                body["head_pipeline"] = json!({"id":9,"project_id":82,"status":"success"});
+                Reply::ok(body)
+            } else if path.ends_with("team%2Fsub%2Fproject") {
+                Reply::ok(project())
+            } else if path.ends_with("/approvals") {
+                Reply::ok(json!({"approvals_required":0,"approvals_left":0,"approved_by":[]}))
+            } else {
+                Reply::ok(json!([]))
+            }
+        });
+        let error = altered_provider(&server, alter)
+            .observe_review(&repo(), 4)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::AdmissionUnavailable(_)), "{error:?}");
+        assert_eq!(server.test.secrets.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(server.seen.lock().unwrap().len(), 3);
+    }
+}
+
+#[tokio::test]
+async fn bound_numeric_create_returns_the_confirmed_result() {
+    let server = Server::new().await;
+    *server.handler.lock().unwrap() = Box::new(|method, path| {
+        if method == "POST" {
+            return Reply::ok(mr());
+        }
+        if path.ends_with("team%2Fsub%2Fproject") {
+            return Reply::ok(project());
+        }
+        if path.contains("/repository/branches/") {
+            return Reply::ok(
+                json!({"name":path.rsplit('/').next().unwrap(),"commit":{"id":"actual-sha"}}),
+            );
+        }
+        Reply::ok(json!([]))
+    });
+    let created = server
+        .provider(RepositoryCredentialUse::NativeReviewCreate)
+        .create_same_project(
+            &repo(),
+            NewPullRequest {
+                title: "requested title".into(),
+                body: None,
+                source_branch: "feature".into(),
+                target_branch: "main".into(),
+                draft: false,
+            },
+            &pair("feature"),
+            &pair("main"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        created.outcome,
+        intent_sourcecontrol::model::ReviewCreateOutcome::Created
+    );
+    assert_eq!(created.details.review.title, "actual title");
+    assert_eq!(
+        created.details.source.unwrap().project_path.as_deref(),
+        Some(PROJECT)
+    );
+    assert_eq!(created.details.target.unwrap().project_id, 41);
+    let seen = server.seen.lock().unwrap();
+    assert_eq!(seen.len(), 5);
+    assert!(seen[2]
+        .0
+        .contains("/projects/41/repository/branches/feature"));
+    assert!(seen[3].0.contains("/projects/41/repository/branches/main"));
+    assert!(seen[4]
+        .0
+        .starts_with("POST /fixture/api/v4/projects/41/merge_requests "));
+    assert_eq!(server.test.secrets.calls.load(Ordering::SeqCst), 5);
+    assert!(server
+        .test
+        .authority
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|r| r.use_kind == RepositoryCredentialUse::NativeReviewCreate));
+}
+
+#[tokio::test]
+async fn bound_target_pipeline_keeps_optional_restrictions_separate_from_denial() {
+    use intent_sourcecontrol::model::ProviderAvailability;
+    for (status, expected) in [
+        (200, Some(ProviderAvailability::Available)),
+        (403, Some(ProviderAvailability::Restricted)),
+        (404, Some(ProviderAvailability::Unavailable)),
+        (401, None),
+    ] {
+        let server = Server::new().await;
+        *server.handler.lock().unwrap() = Box::new(move |_, path| {
+            if path.ends_with("/merge_requests/4") {
+                let mut body = mr();
+                body["source_project_id"] = json!(82);
+                body["head_pipeline"] = json!({"id":9,"project_id":41,"status":"success"});
+                return Reply::ok(body);
+            }
+            if path.ends_with("team%2Fsub%2Fproject") {
+                return Reply::ok(project());
+            }
+            if path.ends_with("/approvals") {
+                return Reply::ok(
+                    json!({"approvals_required":0,"approvals_left":0,"approved_by":[]}),
+                );
+            }
+            if path.contains("/pipelines/") {
+                return Reply {
+                    status,
+                    body: json!([]),
+                    next: None,
+                };
+            }
+            Reply::ok(json!([]))
+        });
+        let result = server
+            .provider(RepositoryCredentialUse::NativeRead)
+            .observe_review(&repo(), 4)
+            .await;
+        if let Some(expected) = expected {
+            assert_eq!(result.unwrap().availability.checks, expected);
+        } else {
+            assert!(
+                matches!(result,Err(Error::Provider(p)) if p.kind==ProviderFailureKind::CredentialRejected)
+            );
+        }
+        assert!(server
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(line, _)| line.contains("/projects/41/pipelines/9/jobs")));
+    }
 }

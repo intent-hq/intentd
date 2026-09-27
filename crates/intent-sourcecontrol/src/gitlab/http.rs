@@ -1,7 +1,8 @@
 //! Request boundary: injected credentials per request, no redirects or body-bearing errors.
 use super::{
     project, Error, ExposeSecret, GitLabSourceControl, HeaderMap, Method, ProviderAvailability,
-    ProviderFailure, ProviderFailureKind, RepoRef, Result, Value, MAX_RESPONSE_BYTES,
+    ProviderFailure, ProviderFailureKind, RepoRef, RequestProvenance, Result, Value,
+    MAX_RESPONSE_BYTES,
 };
 
 #[derive(Clone, Copy)]
@@ -15,14 +16,13 @@ pub(super) enum Purpose {
 #[derive(Clone, Copy)]
 pub(super) struct RequestScope<'a> {
     pub purpose: Purpose,
-    /// Only for a numeric endpoint corroborated by the addressed project/MR.
-    pub project: Option<&'a RepoRef>,
+    pub provenance: RequestProvenance<'a>,
 }
 impl From<Purpose> for RequestScope<'_> {
     fn from(purpose: Purpose) -> Self {
         Self {
             purpose,
-            project: None,
+            provenance: RequestProvenance::Direct,
         }
     }
 }
@@ -88,7 +88,7 @@ impl GitLabSourceControl {
                     descriptor: &self.descriptor,
                     path,
                     writing: method != Method::GET,
-                    logical_project: scope.project,
+                    provenance: scope.provenance,
                 },
             )
             .await?;

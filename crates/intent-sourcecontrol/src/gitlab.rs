@@ -34,6 +34,8 @@ use crate::{
 
 mod http;
 use http::{failure, Purpose, RequestScope};
+mod provenance;
+use provenance::RequestProvenance;
 mod creation;
 mod observation;
 mod search;
@@ -70,8 +72,8 @@ pub struct GitlabCredentialRequest<'a> {
     /// Provider-generated relative REST path, with the project encoded once.
     pub path: &'a str,
     pub writing: bool,
-    // Only the provider can attest a numeric follow-up to a verified project/MR.
-    pub(crate) logical_project: Option<&'a RepoRef>,
+    // Only the provider can construct evidence for a numeric project/pipeline.
+    provenance: RequestProvenance<'a>,
 }
 
 impl GitlabCredentialRequest<'_> {
@@ -86,26 +88,14 @@ impl GitlabCredentialRequest<'_> {
             descriptor,
             path,
             writing,
-            logical_project: None,
+            provenance: RequestProvenance::Direct,
         }
     }
     /// Exact project and path-component match; never a host-only credential match.
     #[must_use]
     pub fn is_for_project(self, project_path: &str) -> bool {
-        if let Some(project) = self.logical_project {
-            return project_path == format!("{}/{}", project.owner, project.name)
-                && self
-                    .path
-                    .strip_prefix("projects/")
-                    .and_then(|s| s.split('/').next())
-                    .is_some_and(|id| id.parse::<u64>().is_ok_and(|id| id > 0));
-        }
-        let prefix = format!("projects/{}", encode(project_path));
-        self.path == prefix
-            || self
-                .path
-                .strip_prefix(&prefix)
-                .is_some_and(|s| s.starts_with('/'))
+        self.provenance
+            .allows(project_path, self.path, self.writing)
     }
 
     /// The single native API write admitted by the current GitLab implementation.

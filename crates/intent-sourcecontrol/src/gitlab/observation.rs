@@ -1,5 +1,5 @@
 //! Optional policy/CI/discussion signals cannot masquerade as primary-resource denial.
-use super::RequestScope;
+use super::{RequestProvenance, RequestScope};
 use crate::model::ConfirmedReviewState;
 
 use super::{
@@ -50,7 +50,7 @@ impl GitLabSourceControl {
     async fn optional_all(
         &self,
         path: &str,
-        project: Option<&RepoRef>,
+        provenance: RequestProvenance<'_>,
     ) -> Result<(Option<Vec<Value>>, ProviderAvailability)> {
         match self
             .all_scoped(
@@ -58,7 +58,7 @@ impl GitLabSourceControl {
                 vec![],
                 RequestScope {
                     purpose: Purpose::Optional,
-                    project,
+                    provenance,
                 },
             )
             .await
@@ -72,6 +72,7 @@ impl GitLabSourceControl {
     async fn mr_checks(
         &self,
         repo: &RepoRef,
+        number: u64,
         head: &Value,
         policy: Option<&Value>,
     ) -> Result<(Vec<RollupCheck>, ProviderAvailability)> {
@@ -111,7 +112,7 @@ impl GitLabSourceControl {
         let (jobs, availability) = self
             .optional_all(
                 &format!("{pipeline_project}/pipelines/{id}/jobs"),
-                pipeline["project_id"].as_u64().map(|_| repo),
+                RequestProvenance::review_pipeline(repo, number, head, policy),
             )
             .await?;
         let mut checks = vec![pipeline_check(pipeline, policy)];
@@ -156,7 +157,7 @@ impl GitLabSourceControl {
         let (approvals, mut approvals_state) = self
             .optional_get(&format!("{}/approvals", mr(repo, number)))
             .await?;
-        let (checks, checks_state) = self.mr_checks(repo, &head, policy.as_ref()).await?;
+        let (checks, checks_state) = self.mr_checks(repo, number, &head, policy.as_ref()).await?;
         let reviews = approvals.as_ref().and_then(|v| {
             if let Ok(reviews) = approval_reviews(v) {
                 Some(reviews)
@@ -203,7 +204,10 @@ impl GitLabSourceControl {
             ..MergeRequirementSignals::default()
         };
         let (discussions, mut discussions_state) = self
-            .optional_all(&format!("{}/discussions", mr(repo, number)), None)
+            .optional_all(
+                &format!("{}/discussions", mr(repo, number)),
+                RequestProvenance::Direct,
+            )
             .await?;
         let counts = discussions.as_ref().and_then(|v| {
             if let Ok(counts) = discussion_tally(v) {
