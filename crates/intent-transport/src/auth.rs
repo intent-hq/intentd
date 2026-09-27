@@ -240,6 +240,12 @@ impl AsyncTokenStore {
             self.warn_timeout("secret-store write admission timed out");
             return Err(Error::Internal("secret-store write timed out".into()));
         };
+        // Tokio polls the inner future before its timer. A newly ready lock
+        // must not admit a write when this waiter already missed its deadline.
+        if tokio::time::Instant::now() >= deadline {
+            self.warn_timeout("secret-store write admission timed out");
+            return Err(Error::Internal("secret-store write timed out".into()));
+        }
         let store = self.clone();
         let value_owned = token.to_string();
         let handle = tokio::task::spawn_blocking(move || {
@@ -494,8 +500,14 @@ impl intent_core::caller::LegacyCredentialAuthority for LegacyAdmission {
         &self,
     ) -> intent_core::BoxFuture<'_, Result<intent_core::caller::CredentialLease>> {
         Box::pin(async move {
+            let deadline = tokio::time::Instant::now() + self.store.load_timeout;
             let admission = async {
                 let lease = self.store.admission.clone().read_owned().await;
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(Error::Forbidden(
+                        "admitted credential could not be revalidated".into(),
+                    ));
+                }
                 if !self
                     .store
                     .load_token()
@@ -506,9 +518,16 @@ impl intent_core::caller::LegacyCredentialAuthority for LegacyAdmission {
                         "admitted credential is no longer valid".into(),
                     ));
                 }
+                // Loading can also become ready after the outer timeout's
+                // deadline, so recheck before returning usable authority.
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(Error::Forbidden(
+                        "admitted credential could not be revalidated".into(),
+                    ));
+                }
                 Ok(Box::new(lease) as intent_core::caller::CredentialLease)
             };
-            timeout(self.store.load_timeout, admission)
+            tokio::time::timeout_at(deadline, admission)
                 .await
                 .map_err(|_| {
                     Error::Forbidden("admitted credential could not be revalidated".into())
