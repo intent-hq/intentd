@@ -115,7 +115,7 @@ impl GitLabSourceControl {
         let details = self.details(head.clone())?;
         // Policy fields are optional; access to the parent project is not.
         let (policy, mut policy_state) = self
-            .optional_get_for(&project(repo), Purpose::Primary)
+            .optional_get_for(&project(repo), Purpose::Project)
             .await?;
         if policy.as_ref().is_some_and(|p| {
             !p["only_allow_merge_if_pipeline_succeeds"].is_boolean()

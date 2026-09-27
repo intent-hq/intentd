@@ -1,12 +1,14 @@
 //! Request boundary: injected credentials per request, no redirects or body-bearing errors.
 use super::{
-    Error, ExposeSecret, GitLabSourceControl, HeaderMap, Method, ProviderAvailability,
-    ProviderFailure, ProviderFailureKind, Result, Value, MAX_RESPONSE_BYTES,
+    project, Error, ExposeSecret, GitLabSourceControl, HeaderMap, Method, ProviderAvailability,
+    ProviderFailure, ProviderFailureKind, RepoRef, Result, Value, MAX_RESPONSE_BYTES,
 };
 
 #[derive(Clone, Copy)]
 pub(super) enum Purpose {
     Primary,
+    /// Only the addressed project resource, not a branch or MR within it.
+    Project,
     Optional,
 }
 
@@ -94,6 +96,7 @@ impl GitLabSourceControl {
                     return Err(Error::RateLimited("GitLab request quota exhausted".into()))
                 }
                 (401, _) => ProviderFailureKind::CredentialRejected,
+                (403 | 404, Purpose::Project) => ProviderFailureKind::ProjectDenied,
                 (403 | 404, Purpose::Primary) => ProviderFailureKind::ResourceDenied,
                 (403, Purpose::Optional) => ProviderFailureKind::OptionalRestricted,
                 (404 | 405 | 501, Purpose::Optional) => ProviderFailureKind::OptionalUnavailable,
@@ -137,6 +140,12 @@ impl GitLabSourceControl {
 
     pub(super) async fn get(&self, path: &str) -> Result<Value> {
         self.request(Method::GET, path, &[], None)
+            .await
+            .map(|r| r.0)
+    }
+
+    pub(super) async fn get_project(&self, repo: &RepoRef) -> Result<Value> {
+        self.request_for(Method::GET, &project(repo), &[], None, Purpose::Project)
             .await
             .map(|r| r.0)
     }

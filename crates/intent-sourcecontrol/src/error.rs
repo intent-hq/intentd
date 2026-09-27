@@ -10,7 +10,11 @@
 pub enum ProviderFailureKind {
     /// The upstream rejected this connection's credential, regardless of endpoint purpose.
     CredentialRejected,
-    /// A primary resource rejected access, including an access-hiding 404.
+    /// The addressed project rejected access, including an access-hiding 404.
+    /// Consumers invalidate that project within the admitted connection scope.
+    ProjectDenied,
+    /// An item or endpoint rejected access, including an access-hiding 404.
+    /// This is not evidence that access to its parent project was lost.
     ResourceDenied,
     /// An optional signal was readable only with additional permission.
     OptionalRestricted,

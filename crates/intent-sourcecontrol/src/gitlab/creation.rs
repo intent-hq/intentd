@@ -8,7 +8,7 @@ use crate::model::{ReviewCreateOutcome, ReviewCreateResult};
 
 impl GitLabSourceControl {
     async fn confirmed_project(&self, repo: &RepoRef) -> Result<(u64, String)> {
-        let value = self.get(&project(repo)).await?;
+        let value = self.get_project(repo).await?;
         let id = number(&value, "id")?;
         let path = string(&value, "path_with_namespace")?;
         if id == 0 || path != format!("{}/{}", repo.owner, repo.name) {

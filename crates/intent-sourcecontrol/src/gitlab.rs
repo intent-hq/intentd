@@ -663,7 +663,7 @@ impl SourceControl for GitLabSourceControl {
     }
 
     async fn get_repo(&self, owner: &str, name: &str) -> Result<Repo> {
-        to_repo(self.get(&project(&RepoRef::new(owner, name))).await?)
+        to_repo(self.get_project(&RepoRef::new(owner, name)).await?)
     }
 
     async fn list_remote_branches(
@@ -1016,9 +1016,7 @@ impl SourceControl for GitLabSourceControl {
             .review_decision)
     }
     async fn branch_rules(&self, repo: &RepoRef, _branch: &str) -> Result<BranchRules> {
-        let (value, _) = self
-            .request_for(Method::GET, &project(repo), &[], None, Purpose::Primary)
-            .await?;
+        let value = self.get_project(repo).await?;
         Ok(project_rules(&value))
     }
     async fn merge_requirements(

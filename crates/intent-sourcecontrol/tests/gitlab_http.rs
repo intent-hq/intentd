@@ -1028,8 +1028,8 @@ async fn optional_authentication_rejection_fails_the_aggregate_after_primary_suc
 async fn parent_project_denial_cannot_hide_as_missing_optional_policy() {
     for (status, kind) in [
         (401, ProviderFailureKind::CredentialRejected),
-        (403, ProviderFailureKind::ResourceDenied),
-        (404, ProviderFailureKind::ResourceDenied),
+        (403, ProviderFailureKind::ProjectDenied),
+        (404, ProviderFailureKind::ProjectDenied),
     ] {
         let f = Fixture::new(move |r| {
             if r.path.ends_with("Team%2FSub%2FProject") {
@@ -1047,6 +1047,76 @@ async fn parent_project_denial_cannot_hide_as_missing_optional_policy() {
         assert!(matches!(sc.branch_rules(&repo(), "main").await,
             Err(Error::Provider(ProviderFailure{kind:k,..})) if k==kind));
         assert!(f.requests().iter().all(|r| !r.path.contains("/approvals")));
+    }
+}
+
+#[tokio::test]
+async fn project_denial_during_lookup_or_create_retains_project_scope() {
+    for (status, kind) in [
+        (401, ProviderFailureKind::CredentialRejected),
+        (403, ProviderFailureKind::ProjectDenied),
+        (404, ProviderFailureKind::ProjectDenied),
+    ] {
+        let f = Fixture::new(move |_| reply(status, Value::Null)).await;
+        let sc = f.provider();
+        let errors = [
+            sc.get_repo("Team/Sub", "Project").await.unwrap_err(),
+            sc.create_same_project(&repo(), input(), &identity("feature"), &identity("main"))
+                .await
+                .unwrap_err(),
+        ];
+        for error in errors {
+            assert!(
+                matches!(error, Error::Provider(ProviderFailure{kind:k,status:Some(s)}) if k==kind && s==status),
+                "{error}"
+            );
+        }
+        assert_eq!(f.requests().len(), 2);
+        assert!(f.requests().iter().all(
+            |r| r.method == "GET" && r.path == "/fixture/api/v4/projects/Team%2FSub%2FProject"
+        ));
+    }
+}
+
+#[tokio::test]
+async fn primary_review_denial_does_not_imply_parent_project_denial() {
+    for (status, kind) in [
+        (401, ProviderFailureKind::CredentialRejected),
+        (403, ProviderFailureKind::ResourceDenied),
+        (404, ProviderFailureKind::ResourceDenied),
+    ] {
+        let f = Fixture::new(move |_| reply(status, Value::Null)).await;
+        let error = f.provider().observe_review(&repo(), 7).await.unwrap_err();
+        assert!(
+            matches!(error, Error::Provider(ProviderFailure{kind:k,status:Some(s)}) if k==kind && s==status),
+            "{error}"
+        );
+        assert_eq!(f.requests().len(), 1);
+        assert!(f.requests()[0].path.ends_with("/merge_requests/7"));
+    }
+}
+
+#[tokio::test]
+async fn remote_branch_denial_before_create_does_not_imply_project_denial() {
+    for status in [403, 404] {
+        let f = Fixture::new(move |r| {
+            if r.path.contains("/repository/branches/") {
+                reply(status, Value::Null)
+            } else {
+                create_reply(r)
+            }
+        })
+        .await;
+        let error = f
+            .provider()
+            .create_same_project(&repo(), input(), &identity("feature"), &identity("main"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Provider(ProviderFailure {
+            kind: ProviderFailureKind::ResourceDenied, status: Some(s),
+        }) if s == status));
+        assert!(f.requests()[0].path.ends_with("Team%2FSub%2FProject"));
+        assert!(f.requests().iter().all(|r| r.method == "GET"));
     }
 }
 
