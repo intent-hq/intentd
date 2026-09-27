@@ -57,6 +57,15 @@ pub enum Error {
     DeviceGrantUnsupported(String),
 }
 
+impl Error {
+    /// A scope rejection already classified as a forge authorization error.
+    /// Preserve the legacy Auth variant for existing account/proof consumers.
+    #[must_use]
+    pub fn is_insufficient_scope(&self) -> bool {
+        matches!(self, Self::Auth(message) if message.contains("insufficient_scope") || message.contains("requires a token with"))
+    }
+}
+
 /// Result alias used throughout the crate.
 pub type Result<T> = std::result::Result<T, Error>;
 

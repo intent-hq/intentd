@@ -6,7 +6,7 @@ use intent_core::{current_caller, with_caller, Caller, PrincipalId};
 fn wire(principal: &str) -> Caller {
     Caller::Wire {
         principal_id: PrincipalId(principal.into()),
-        is_administrator: false,
+        host_role: intent_core::HostRole::Guest,
     }
 }
 

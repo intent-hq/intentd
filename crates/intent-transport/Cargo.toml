@@ -39,7 +39,7 @@ semver = "1.0.28"
 libc = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 serde_json = { workspace = true }
 tempfile = "3"
 ctor = "1.0.10"

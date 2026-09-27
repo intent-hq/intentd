@@ -229,21 +229,35 @@ pub(crate) async fn handle_with_host_environment(
         id_echo,
         params,
     } = req;
-    // Owner-only host surface (multiplayer w3): a non-administrator connection
-    // may only reach the two display probes the desktop needs to render
-    // (`host.status`, `host.toolAvailability` — no paths, nothing runs); every
-    // other `host.*` method gets `-32003`. The allowlist in `process_frame`
-    // refuses these first; this is the defence-in-depth gate at the surface.
+    // Preserve the guest display probes and owner host controls. The two
+    // shared provider reads additionally admit current durable host members;
+    // cached admission roles never grant this exception after revocation.
     if crate::context::is_non_administrator_caller()
         && !matches!(method, HostMethod::Status | HostMethod::ToolAvailability)
     {
-        return id_present.then(|| {
-            error_frame(
-                &id_echo,
-                crate::catalog::FORBIDDEN_ERROR_CODE,
-                crate::catalog::FORBIDDEN_ERROR_MESSAGE,
-            )
-        });
+        let member_read = matches!(
+            method,
+            HostMethod::ProviderDiscovery | HostMethod::ProviderAuthStatus
+        ) && match crate::context::current_caller()
+            .and_then(|caller| caller.principal_id().cloned())
+        {
+            Some(id) => api.principal_host_role(id).await.is_ok_and(|role| {
+                matches!(
+                    role,
+                    intent_core::HostRole::Owner | intent_core::HostRole::Member
+                )
+            }),
+            None => false,
+        };
+        if !member_read {
+            return id_present.then(|| {
+                error_frame(
+                    &id_echo,
+                    crate::catalog::FORBIDDEN_ERROR_CODE,
+                    crate::catalog::FORBIDDEN_ERROR_MESSAGE,
+                )
+            });
+        }
     }
     let frame = match method {
         HostMethod::Status => {
@@ -427,7 +441,7 @@ pub(crate) async fn handle_with_host_environment(
                         .collect()
                 })
                 .unwrap_or_default();
-            if !installed.is_empty() {
+            if !installed.is_empty() && !crate::context::is_non_administrator_caller() {
                 if let Err(e) = api.settings_heal_default_provider(installed).await {
                     tracing::warn!(error = %e, "default-provider settings self-heal failed");
                 }
@@ -469,10 +483,7 @@ pub(crate) async fn handle_with_host_environment(
             // (monorepo#1086). auggie follows the `host.checkAuggie`
             // precedence: `context.auggiePath` wins over
             // `providers.paths.auggie`.
-            let mut provider_paths = read_provider_paths(api).await;
-            if let Some(p) = read_setting_string(api, "context.auggiePath").await {
-                provider_paths.insert("auggie".to_string(), p);
-            }
+            let provider_paths = read_provider_paths(api).await;
             match intent_services::provider_auth::provider_auth_status(
                 provider_id.as_deref(),
                 force,
@@ -480,7 +491,10 @@ pub(crate) async fn handle_with_host_environment(
             )
             .await
             {
-                Ok(result) => success_frame(&id_echo, &result),
+                Ok(result) => {
+                    let _ = api.observe_execution_readiness(result.clone()).await;
+                    success_frame(&id_echo, &result)
+                }
                 Err(msg) => error_frame(&id_echo, -32602, &msg),
             }
         }
@@ -737,38 +751,14 @@ fn parse_write_stdin(params: &Map<String, Value>) -> Result<Option<Vec<u8>>, Str
 /// `None` when neither is set (the caller then uses
 /// `intent_services::auggie_discovery::find_auggie`).
 async fn configured_auggie_path(api: &dyn WorkspaceApi) -> Option<String> {
-    if let Some(v) = read_setting_string(api, "context.auggiePath").await {
-        return Some(v);
-    }
-    if let Ok(payload) = api.settings_get("providers.paths".to_string()).await {
-        if let Some(map) = payload.get("value").and_then(Value::as_object) {
-            if let Some(s) = map.get("auggie").and_then(Value::as_str) {
-                if !s.trim().is_empty() {
-                    return Some(s.to_string());
-                }
-            }
-        }
-    }
-    None
+    api.execution_provider_paths().await.ok()?.remove("auggie")
 }
 
 /// Read the full `providers.paths` settings map (provider key → configured
 /// binary path), skipping blank values. Empty when unset or when the lookup
 /// fails — discovery then behaves exactly as before (auto-detection only).
 async fn read_provider_paths(api: &dyn WorkspaceApi) -> std::collections::HashMap<String, String> {
-    let mut paths = std::collections::HashMap::new();
-    if let Ok(payload) = api.settings_get("providers.paths".to_string()).await {
-        if let Some(map) = payload.get("value").and_then(Value::as_object) {
-            for (key, value) in map {
-                if let Some(s) = value.as_str() {
-                    if !s.trim().is_empty() {
-                        paths.insert(key.clone(), s.to_string());
-                    }
-                }
-            }
-        }
-    }
-    paths
+    api.execution_provider_paths().await.unwrap_or_default()
 }
 
 /// Read a single string-valued setting; returns `None` for missing / null /

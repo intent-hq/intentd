@@ -409,6 +409,10 @@ pub struct Workspace {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceMembership {
+    /// Effective management authority for the current caller. Host members
+    /// inherit this on ordinary workspaces without becoming their owner.
+    #[serde(default)]
+    pub can_manage: bool,
     /// The workspace's owner; `None` only for a row whose principal columns
     /// were nulled by transfer import and not yet re-derived.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -488,9 +492,9 @@ pub const WORKSPACE_LIST_PR_CAP: usize = 5;
 /// `diskUsage`) are deliberately absent; `pullRequestsTotal` is the one
 /// list-only key (set by the [`WORKSPACE_LIST_PR_CAP`] truncation, never on
 /// `workspace.get`). The flattened [`WorkspaceMembership`] keys
-/// (`ownerPrincipalId`, `myRole`, `memberCount`, `openInviteCount`) are
-/// list-relevant (role badge / member count in the sidebar), small, and
-/// rung 1: one bulk membership query per list, persisted counts. Adding a
+/// (`ownerPrincipalId`, `myRole`, `canManage`, `memberCount`, `openInviteCount`)
+/// are list-relevant (role badge, management actions and member count), small,
+/// and rung 1: persisted authority projected in one bulk membership query. Adding a
 /// key here is a
 /// wire-contract change — update `docs/protocol/methods/workspace.md` in
 /// the same commit and state which rung of the derived-field ladder the
@@ -538,6 +542,7 @@ pub const WORKSPACE_LIST_ROW_KEYS: &[&str] = &[
     "pendingDeleteAt",
     "ownerPrincipalId",
     "myRole",
+    "canManage",
     "memberCount",
     "openInviteCount",
 ];
@@ -1673,6 +1678,10 @@ pub struct Comment {
     pub content: String,
     pub author: String,
     pub author_type: AuthorType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_principal_id: Option<PrincipalId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_identity: Option<PrincipalIdentity>,
     pub status: CommentStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
@@ -2380,6 +2389,10 @@ pub struct CommentWire {
     pub content: String,
     pub author: String,
     pub author_type: AuthorType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_principal_id: Option<PrincipalId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_identity: Option<PrincipalIdentity>,
     pub status: CommentStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
@@ -2428,6 +2441,8 @@ impl CommentWire {
             content: c.content.clone(),
             author: c.author.clone(),
             author_type: c.author_type,
+            author_principal_id: c.author_principal_id.clone(),
+            author_identity: c.author_identity.clone(),
             status: c.status,
             parent_id: c.parent_id.clone(),
             anchor: c.anchor.clone(),
@@ -2479,6 +2494,10 @@ pub struct CommentThreadSummary {
     pub last_activity: String,
     pub latest_comment_author: String,
     pub latest_comment_author_type: AuthorType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_comment_author_principal_id: Option<PrincipalId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_comment_author_identity: Option<PrincipalIdentity>,
     pub latest_comment_at: String,
     pub comment_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3607,7 +3626,7 @@ pub fn lift_from_principal_id(metadata: Option<&serde_json::Value>) -> Option<Pr
 /// defaults change materially; existing sessions keep their stamped version
 /// for life (no upgrade/migration path). Pre-feature rows backfill to "1.0"
 /// (migration 0096).
-pub const CURRENT_HARNESS_VERSION: &str = "2.8";
+pub const CURRENT_HARNESS_VERSION: &str = "2.9";
 
 /// Serde default for [`AgentSession::harness_version`]: payloads persisted or
 /// exported before harness versioning existed deserialize as "1.0", matching
@@ -6888,6 +6907,8 @@ mod tests {
             content: "hello".to_string(),
             author: "Agent".to_string(),
             author_type: AuthorType::Agent,
+            author_principal_id: None,
+            author_identity: None,
             status: CommentStatus::Open,
             parent_id: None,
             anchor: Some(CommentAnchor {
@@ -6941,6 +6962,8 @@ mod tests {
             content: "try this".to_string(),
             author: "Agent".to_string(),
             author_type: AuthorType::Agent,
+            author_principal_id: None,
+            author_identity: None,
             status: CommentStatus::Open,
             parent_id: Some("c1".to_string()),
             anchor: None,
