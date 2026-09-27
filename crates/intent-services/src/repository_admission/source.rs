@@ -428,6 +428,27 @@ where
 /// The callable source boundary requires the actual installed Store observer
 /// and an original physical-owner handle before ANY awaited authority/root read.
 /// Neither the keys nor that handle replaces the existing original-caller gates.
+pub(crate) async fn with_captured_repository_source<T, F, Fut>(
+    services: &Services,
+    original: OriginalRepositoryCaller,
+    request_id: String,
+    stages: Vec<NativeReviewStage>,
+    input: RepositorySourceInput,
+    action: F,
+) -> AdmissionResult<T>
+where
+    F: FnOnce(RepositoryOperationAdmission) -> Fut,
+    Fut: Future<Output = AdmissionResult<T>>,
+{
+    let lifetime = crate::repository_admission::request_context::current_source_lifetime()?;
+    with_repository_lifecycle_source(
+        services, original, request_id, stages, input, lifetime, action,
+    )
+    .await
+}
+
+/// The original producer or captured scope supplies this lifetime; serialized
+/// request fields and current session lookups cannot manufacture it.
 pub(crate) async fn with_repository_lifecycle_source<T, F, Fut>(
     services: &Services,
     original: OriginalRepositoryCaller,
@@ -474,3 +495,83 @@ mod tests;
 #[cfg(test)]
 #[path = "lifecycle/source_tests.rs"]
 mod lifecycle_tests;
+
+#[cfg(test)]
+mod captured_scope_tests {
+    use intent_acp::mcp_server::request_context::McpRequestContext;
+    use intent_core::caller::with_caller;
+
+    use super::*;
+    use crate::repository_admission::lifecycle::{FixtureOriginOwner, RepositoryLifecycleRegistry};
+    use crate::repository_admission::request_context::RepositoryCallbackContext;
+    use crate::repository_admission::{begin_repository_stage, revalidate_repository_stage};
+    use crate::repository_admission_source_tests::fixtures::Fixture;
+
+    #[tokio::test]
+    async fn original_acp_scope_enters_real_sources_and_store_retirement_reaches_checked_stage() {
+        let fixture = Fixture::new().await;
+        let f = &fixture;
+        let agent_id = tests::agent(f).await;
+        let caller = Caller::Agent {
+            agent_id: agent_id.clone(),
+        };
+        let services = Services::new(f.store.clone());
+        let registry = Arc::new(RepositoryLifecycleRegistry::default());
+        registry.install(&f.store).await.unwrap();
+        // The transport scope is real; physical creation remains an explicit
+        // fixture until the original Store initialization proof is composed.
+        let owner = FixtureOriginOwner::new(&registry, caller.clone()).unwrap();
+        let callback = RepositoryCallbackContext::new(&registry, Some(owner.origin()));
+        let scope = McpRequestContext::capture(&callback);
+        let absent = with_captured_repository_source(
+            &services,
+            tests::internal(caller.clone()).await,
+            "absent".into(),
+            vec![NativeReviewStage::Commit],
+            tests::input(f),
+            |_| async { panic!("missing original scope entered") },
+        )
+        .await;
+        assert!(matches!(absent, Err::<(), _>(AdmissionError::Unavailable)));
+        let mut entered = false;
+        with_caller(
+            caller.clone(),
+            scope.scope(Box::pin(async {
+                let entered = &mut entered;
+                let agent_id = &agent_id;
+                with_captured_repository_source(
+                    &services,
+                    tests::internal(caller).await,
+                    "original".into(),
+                    vec![NativeReviewStage::Commit],
+                    tests::input(f),
+                    |admission| async move {
+                        *entered = true;
+                        let checked =
+                            revalidate_repository_stage(&admission, NativeReviewStage::Commit)
+                                .await
+                                .unwrap();
+                        f.store
+                            .replace_acp_session_id(
+                                &f.workspace.id,
+                                agent_id,
+                                "original-acp",
+                                "replacement-acp",
+                            )
+                            .await
+                            .unwrap();
+                        assert!(matches!(
+                            begin_repository_stage(checked),
+                            Err(AdmissionError::Retired)
+                        ));
+                        Ok(())
+                    },
+                )
+                .await
+                .unwrap();
+            })),
+        )
+        .await;
+        assert!(entered);
+    }
+}

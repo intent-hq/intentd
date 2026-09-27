@@ -176,6 +176,46 @@ fn finish_retirement(state: &Mutex<State>, leaves: &[(u64, RepositoryRetirement)
 }
 
 impl RepositoryLifecycleRegistry {
+    pub(super) fn capture_request(
+        self: &Arc<Self>,
+        origin: &RepositoryPhysicalOrigin,
+        retirement: RepositoryRetirement,
+    ) -> AdmissionResult<(Caller, RepositorySubscription)> {
+        let (caller, keys) = {
+            let state = self.state.lock().map_err(|_| AdmissionError::Retired)?;
+            let physical = state
+                .origins
+                .get(&origin.id)
+                .ok_or(AdmissionError::Retired)?;
+            (
+                physical.caller.clone(),
+                physical.keys.iter().cloned().collect::<Vec<_>>(),
+            )
+        };
+        let subscription = self.subscribe(origin, &caller, &keys, retirement)?;
+        Ok((caller, subscription))
+    }
+
+    /// Interrupt the requests already captured by this allocation. A later
+    /// request may use the same live physical allocation after normal Idle.
+    pub(super) fn cancel_origin_requests(&self, origin: &RepositoryPhysicalOrigin) {
+        let retire = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(physical) = state.origins.get(&origin.id) else {
+                return;
+            };
+            if !Weak::ptr_eq(&physical.token, &origin.token) {
+                return;
+            }
+            state.detach(|entry| entry.origin == origin.id);
+            state.pending_leaves(|entry| entry.origin == origin.id)
+        };
+        finish_retirement(&self.state, &retire);
+    }
+
     pub(crate) async fn install(self: &Arc<Self>, store: &Store) -> AdmissionResult<()> {
         store
             .install_repository_lifecycle_observer(self.clone())
