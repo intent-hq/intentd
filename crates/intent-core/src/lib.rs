@@ -33,6 +33,7 @@ pub mod path_utils;
 pub mod queue_visibility_contract;
 pub mod replay_preview;
 pub mod repo_ref;
+pub mod repository_context;
 pub mod secrets;
 pub mod server_control;
 pub mod settings_file;
@@ -142,6 +143,16 @@ pub use model::{
 };
 pub use path_utils::prewarm_login_shell_path;
 pub use repo_ref::RepoRef;
+pub use repository_context::{
+    resolve_review_selection, ExecutionScope, HistoricalTargetProvenance, HistoricalTargetSource,
+    RepositoryAvailability, RepositoryCapability, RepositoryCapabilityState,
+    RepositoryConnectionScope, RepositoryContext, RepositoryContextRevision,
+    RepositoryEndpointResolution, RepositoryOperation, RepositoryProvider, RepositoryRemote,
+    RepositoryRemoteEndpoint, RepositoryResourceKind, RepositoryRootContext, RepositoryRootId,
+    RepositoryRootKind, RepositoryTarget, RepositoryTargetContext, RepositoryUnavailableReason,
+    RepositoryUnresolvedReason, ReviewSelectionOutcome, ReviewSelectionRequiredReason,
+    ReviewSelectionResolution, ReviewSelectionSource, ReviewTarget, SavedReviewSelection,
+};
 pub use secrets::{create_dir_private, write_private, write_private_hidden, FileSecretStore};
 pub use server_control::{
     InviteLinkBuilder, InviteLinkEnvelope, ResolvedInviteLinkEnvelope, ServerControl,
