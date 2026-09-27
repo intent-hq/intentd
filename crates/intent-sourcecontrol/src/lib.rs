@@ -14,11 +14,14 @@ pub mod device_flow;
 pub mod error;
 pub mod gh_sync;
 pub mod github;
+pub mod gitlab;
 pub mod gitlab_auth;
 pub mod gitlab_token;
 pub mod identity_proof;
+pub mod instance;
 pub mod model;
 pub mod registry;
+pub mod remote_project;
 pub mod token;
 
 use async_trait::async_trait;
@@ -26,11 +29,13 @@ use async_trait::async_trait;
 pub use device_flow::{DeviceFlow, PollStatus};
 pub use error::{Error, Result};
 pub use github::GitHubSourceControl;
+pub use gitlab::{GitLabSourceControl, GitlabRequestCredentials};
 pub use gitlab_auth::{
     GitlabDeviceAuthorization, GitlabDeviceFlow, GitlabExchange, GitlabGrant, GitlabHost,
     GitlabPollStatus, GitlabUser, StoredCredential,
 };
 pub use gitlab_token::GitlabTokenSource;
+pub use instance::{GitlabDescriptor, GitlabInstance};
 pub use model::{
     AuthStatus, Branch, BranchRules, CheckRun, CheckState, Comment, CommentAnchor, Issue,
     IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeQueueRemoval,
@@ -38,6 +43,10 @@ pub use model::{
     PrObservation, PrPatch, PrQuery, PrState, PullRequest, RateLimitStatus, Repo, RepoRef, Review,
     ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment, ReviewThreadTally,
     ReviewVerdict, RollupCheck, RollupCheckKind, ScCapabilities, UserIdentity,
+};
+pub use model::{
+    ConfirmedReviewState, ProviderAvailability, ReviewAvailability, ReviewBranchIdentity,
+    ReviewCreateOutcome, ReviewCreateResult, ReviewDetails, ReviewObservation,
 };
 pub use registry::{GithubSettings, GitlabSettings, SourceControlRegistry, SourceControlSettings};
 /// Re-exported so callers can hand [`gitlab_auth::persist_gitlab_token`] a
@@ -159,6 +168,23 @@ pub trait SourceControl: Send + Sync {
 
     /// Fetch a single pull request by number.
     async fn get_pr(&self, repo: &RepoRef, number: u64) -> Result<PullRequest>;
+
+    /// Additive detail with provider-confirmed metadata where available.
+    /// This legacy wrapper leaves confirmation unknown; normalized fields are not raw evidence.
+    async fn review_details(&self, repo: &RepoRef, number: u64) -> Result<ReviewDetails> {
+        Ok(ReviewDetails {
+            review: self.get_pr(repo, number).await?,
+            source: None,
+            target: None,
+            confirmed_draft: None,
+            confirmed_state: None,
+        })
+    }
+
+    /// Qualified observation whose optional-field failures remain explicit.
+    async fn review_observation(&self, _repo: &RepoRef, _number: u64) -> Result<ReviewObservation> {
+        Err(Error::Unsupported("qualified review observation".into()))
+    }
 
     /// List pull requests matching `query`, one §5.5 page at a time (the page
     /// cursor / size travel in `query`). Backs `github.pulls.list/search`.
