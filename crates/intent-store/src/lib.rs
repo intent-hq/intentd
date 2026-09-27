@@ -61,8 +61,10 @@ mod workspace_ui_context_repo;
 
 pub use repository_lifecycle::{
     RepositoryAcpInitialization, RepositoryInitializationBinding, RepositoryInitializationClaim,
-    RepositoryInitializationConfirmation, RepositoryInitializationTicket, RepositoryLifecycleKey,
-    RepositoryLifecycleMutationTicket, RepositoryLifecycleObserver,
+    RepositoryInitializationConfirmation, RepositoryInitializationObservation,
+    RepositoryInitializationOutcome, RepositoryInitializationPersistence,
+    RepositoryInitializationTicket, RepositoryLifecycleKey, RepositoryLifecycleMutationTicket,
+    RepositoryLifecycleObserver,
 };
 
 pub use agent_flipped_completion_repo::AGENT_FLIPPED_COMPLETIONS_CAP;

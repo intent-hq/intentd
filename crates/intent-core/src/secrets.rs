@@ -155,6 +155,19 @@ impl FileSecretStore {
         self.read_map_strict().map(|mut map| map.remove(account))
     }
 
+    /// Read selected accounts from one strict file snapshot, in input order.
+    /// Repeated names return the same value; empty values follow `load` semantics.
+    ///
+    /// # Errors
+    /// Returns the same IO or parse error as [`Self::load`].
+    pub fn load_many(&self, accounts: &[&str]) -> Result<Vec<Option<String>>> {
+        let map = self.read_map_strict()?;
+        Ok(accounts
+            .iter()
+            .map(|account| map.get(*account).cloned())
+            .collect())
+    }
+
     /// Persist `value` for `account`, replacing any existing secret.
     ///
     /// # Errors
@@ -543,6 +556,40 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn selected_secrets_preserve_order_duplicates_and_missing_values() {
+        let tmp = TempDir::new();
+        let store = tmp.store();
+        assert_eq!(store.load_many(&["a", "b"]).unwrap(), vec![None, None]);
+        std::fs::write(
+            store.path(),
+            r#"{"a":"first","b":"second","empty":"","unselected":"private"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .load_many(&["b", "a", "b", "missing", "empty"])
+                .unwrap(),
+            vec![
+                Some("second".into()),
+                Some("first".into()),
+                Some("second".into()),
+                None,
+                None
+            ]
+        );
+        assert!(store.load_many(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn selected_secrets_reject_corrupt_snapshot_without_rewriting_it() {
+        let tmp = TempDir::new();
+        let store = tmp.store();
+        std::fs::write(store.path(), "not a map").unwrap();
+        assert!(store.load_many(&["a", "b"]).is_err());
+        assert_eq!(std::fs::read_to_string(store.path()).unwrap(), "not a map");
     }
 
     #[test]

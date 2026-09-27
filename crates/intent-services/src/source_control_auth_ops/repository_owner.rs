@@ -5,6 +5,7 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
 mod adoption;
+mod secret_reader;
 pub(crate) use adoption::{logical_instance, RepositorySettingsWrite};
 
 use intent_sourcecontrol::gitlab_auth::{
@@ -45,6 +46,7 @@ struct RepositoryOwner {
     writers: RepositoryCredentialWriters,
     descriptor: Mutex<Option<GitlabDescriptor>>,
     settings: OnceLock<adoption::SettingsAttachment>,
+    evidence: secret_reader::SourceEvidence,
     #[cfg(test)]
     write_probe: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
@@ -77,6 +79,7 @@ impl GitlabCredentialGate {
                 directory,
                 descriptor: Mutex::new(descriptor),
                 settings: OnceLock::new(),
+                evidence: secret_reader::SourceEvidence::new(),
                 #[cfg(test)]
                 write_probe: Mutex::new(None),
             }))
@@ -142,6 +145,7 @@ impl GitlabCredentialGate {
                 disconnected: kind == RepositoryMutationKind::Disconnect,
                 publication_confirmed: kind != RepositoryMutationKind::Replace,
                 persisted: false,
+                candidate: None,
             }),
         })
     }
@@ -182,6 +186,7 @@ struct WriteState {
     disconnected: bool,
     publication_confirmed: bool,
     persisted: bool,
+    candidate: Option<secret_reader::SourceFingerprint>,
 }
 
 impl RepositoryWrite {
@@ -200,6 +205,7 @@ impl RepositoryWrite {
             state.mutation = reservation
                 .begin(|| Ok(RepositoryWriterPreflight::Change))
                 .map_err(map_owner_error)?;
+            self.owner.evidence.invalidate().map_err(map_owner_error)?;
         }
         state
             .mutation
@@ -264,8 +270,21 @@ impl RepositoryWrite {
         } else {
             SettledCredentialState::Indeterminate
         };
-        if let Err(error) = mutation.completion().complete(outcome) {
-            tracing::warn!(%error, "repository credential settlement remains unavailable");
+        match mutation.completion().complete(outcome) {
+            Ok(Some(binding)) => {
+                if let Some((descriptor, fingerprint)) =
+                    self.descriptor.as_ref().zip(state.candidate)
+                {
+                    if let Err(error) = self.owner.publish_source(&binding, descriptor, fingerprint)
+                    {
+                        tracing::debug!(%error, "repository source evidence remains unavailable");
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%error, "repository credential settlement remains unavailable");
+            }
         }
     }
 }
@@ -283,6 +302,17 @@ impl GitlabWriteObserver for RepositoryWrite {
     fn verified_user(&self, user: Option<GitlabUser>) {
         if let Ok(mut state) = self.state.lock() {
             state.user = user;
+        }
+    }
+
+    fn persisted_credential(&self, access: &str, refresh: Option<&str>, expires_at: Option<u64>) {
+        if let Ok(mut state) = self.state.lock() {
+            let expiry = expires_at.map(|value| value.to_string());
+            state.candidate = Some(self.owner.evidence.fingerprint(
+                Some(access),
+                refresh,
+                expiry.as_deref(),
+            ));
         }
     }
 

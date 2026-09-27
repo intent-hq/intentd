@@ -26,6 +26,42 @@ pub struct RepositoryInitializationConfirmation {
     completion: Box<dyn Any + Send>,
 }
 
+/// Original persistence facts, separate from the one-use owner confirmation.
+/// A failed confirmation never erases a known committed database effect.
+/// Neither these facts nor a canonical competing ID grant physical ownership.
+pub struct RepositoryInitializationOutcome {
+    pub persistence: RepositoryInitializationPersistence,
+    pub confirmation: Result<RepositoryInitializationConfirmation>,
+}
+
+/// What this attempt established about ACP-ID/accounting persistence only.
+/// No variant settles an observer ticket or authorizes a retry on its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RepositoryInitializationPersistence {
+    /// Rejected before the original Store transaction began.
+    NotAttempted,
+    /// No ACP-ID/accounting DML was dispatched by this transaction. This is
+    /// also the successful Loaded path; its confirmation is independent.
+    NoEffect {
+        observed: RepositoryInitializationObservation,
+    },
+    /// The original winner checks passed and its COMMIT was acknowledged.
+    /// Later rejection of ownership cannot undo this historical fact.
+    Committed { session_id: String },
+    /// DML may have run without acknowledged original completion. A generic
+    /// rollback error, later row read or timeout cannot supply a canonical ID.
+    Unknown,
+}
+
+/// Scoped row facts actually read in this attempt's serialized transaction.
+/// These are historical observations, never current authority or caller data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RepositoryInitializationObservation {
+    NotRead,
+    Missing,
+    Present { session_id: Option<String> },
+}
+
 /// Exact original intent, not caller-supplied authority.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepositoryInitializationBinding {
@@ -135,6 +171,36 @@ impl Store {
         claim: RepositoryInitializationClaim,
         binding: RepositoryInitializationBinding,
     ) -> Result<RepositoryInitializationConfirmation> {
+        self.initialize_repository_acp_session_outcome(claim, binding)
+            .await
+            .confirmation
+    }
+
+    /// Preserve original persistence facts even when owner confirmation fails.
+    /// Executes the same strict transaction once; no fallback read or write is
+    /// used to recover a canonical ID. A canceled future yields no receipt and
+    /// retains the existing unknown-worker protection.
+    pub async fn initialize_repository_acp_session_outcome(
+        &self,
+        claim: RepositoryInitializationClaim,
+        binding: RepositoryInitializationBinding,
+    ) -> RepositoryInitializationOutcome {
+        let mut persistence = RepositoryInitializationPersistence::NotAttempted;
+        let confirmation = self
+            .initialize_repository_acp_session_inner(claim, binding, &mut persistence)
+            .await;
+        RepositoryInitializationOutcome {
+            persistence,
+            confirmation,
+        }
+    }
+
+    async fn initialize_repository_acp_session_inner(
+        &self,
+        claim: RepositoryInitializationClaim,
+        binding: RepositoryInitializationBinding,
+        persistence: &mut RepositoryInitializationPersistence,
+    ) -> Result<RepositoryInitializationConfirmation> {
         if !Arc::ptr_eq(&claim.domain, &self.repository_lifecycle)
             || !self.has_repository_lifecycle_observer(&claim.observer)
         {
@@ -158,6 +224,9 @@ impl Store {
             .execute(&mut *conn)
             .await
             .map_err(|e| lifecycle_error(&format!("initialization begin failed: {e}")))?;
+        *persistence = RepositoryInitializationPersistence::NoEffect {
+            observed: RepositoryInitializationObservation::NotRead,
+        };
         let mut ticket = None;
         let body = async {
             let stored: Option<Option<String>> = sqlx::query_scalar(
@@ -168,6 +237,14 @@ impl Store {
             .fetch_optional(&mut *conn)
             .await
             .map_err(|e| lifecycle_error(&format!("initialization read failed: {e}")))?;
+            *persistence = RepositoryInitializationPersistence::NoEffect {
+                observed: stored.as_ref().map_or(
+                    RepositoryInitializationObservation::Missing,
+                    |session_id| RepositoryInitializationObservation::Present {
+                        session_id: session_id.clone(),
+                    },
+                ),
+            };
             let stored = stored.ok_or_else(|| lifecycle_error("initialization agent is absent"))?;
             let matches = match &binding.action {
                 RepositoryAcpInitialization::FirstSet { .. } => stored.is_none(),
@@ -185,6 +262,11 @@ impl Store {
                     claim.original_owner,
                     &binding,
                 )?);
+                if !matches!(binding.action, RepositoryAcpInitialization::Loaded { .. }) {
+                    // Before handing DML to SQLx: cancellation or a generic
+                    // rollback result must never masquerade as a no-op.
+                    *persistence = RepositoryInitializationPersistence::Unknown;
+                }
                 Ok(())
             };
             let won = match &binding.action {
@@ -240,6 +322,11 @@ impl Store {
         }
         .await;
         crate::commit_with_rollback_guard(conn, body, "initialization commit failed").await?;
+        if !matches!(binding.action, RepositoryAcpInitialization::Loaded { .. }) {
+            *persistence = RepositoryInitializationPersistence::Committed {
+                session_id: session_id.clone(),
+            };
+        }
         let ticket = ticket.ok_or_else(|| lifecycle_error("initialization was not observed"))?;
         let completion = ticket.finish_confirmed();
         lifecycle.settle();

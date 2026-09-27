@@ -16,7 +16,9 @@ use crate::{Error, Result, Store};
 pub(crate) mod initialization;
 pub use initialization::{
     RepositoryAcpInitialization, RepositoryInitializationBinding, RepositoryInitializationClaim,
-    RepositoryInitializationConfirmation, RepositoryInitializationTicket,
+    RepositoryInitializationConfirmation, RepositoryInitializationObservation,
+    RepositoryInitializationOutcome, RepositoryInitializationPersistence,
+    RepositoryInitializationTicket,
 };
 
 /// Invalidation coordinates, not identities supplied as permission claims.

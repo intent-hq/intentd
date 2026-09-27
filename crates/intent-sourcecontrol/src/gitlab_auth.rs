@@ -299,8 +299,8 @@ pub enum GitlabWriteOutcome {
     Uncertain,
 }
 
-/// A private owner fence around the existing persistence operation. No token is
-/// exported and this observer performs no persistence or compensation itself.
+/// An owner fence around the existing persistence operation. Comparison material
+/// is borrowed within that operation; observers perform no persistence or compensation.
 pub trait GitlabWriteObserver: Send + Sync {
     /// Validate original ownership and retire admissions before the first write.
     ///
@@ -309,6 +309,16 @@ pub trait GitlabWriteObserver: Send + Sync {
     fn before_write(&self) -> Result<()>;
     /// Account evidence from the newly exchanged refresh token, when available.
     fn verified_user(&self, user: Option<GitlabUser>);
+    /// Borrow the exact selected tuple after ALL original sibling writes succeed.
+    /// This is candidate comparison material, not a settlement or authority grant.
+    /// Implementations must not retain or expose the borrowed credentials.
+    fn persisted_credential(
+        &self,
+        _access: &str,
+        _refresh: Option<&str>,
+        _expires_at: Option<u64>,
+    ) {
+    }
     /// Called by the actual blocking writer while its persistence lease is held.
     fn settled(&self, outcome: GitlabWriteOutcome);
 }
@@ -1177,17 +1187,26 @@ async fn persist_tokens_observed(
     lease: Option<PersistenceLease>,
     observer: Option<std::sync::Arc<dyn GitlabWriteObserver>>,
 ) -> Result<()> {
+    let credential_observer = observer.clone();
     run_blocking_observed(
         move || {
             store.store(SECRET_ACCOUNT, token.expose_secret())?;
-            match refresh_token {
+            match refresh_token.as_ref() {
                 Some(refresh) => store.store(REFRESH_SECRET_ACCOUNT, refresh.expose_secret())?,
                 None => store.delete(REFRESH_SECRET_ACCOUNT)?,
             }
             match expires_at {
                 Some(at) => store.store(EXPIRES_AT_SECRET_ACCOUNT, &at.to_string()),
                 None => store.delete(EXPIRES_AT_SECRET_ACCOUNT),
+            }?;
+            if let Some(observer) = credential_observer {
+                observer.persisted_credential(
+                    token.expose_secret(),
+                    refresh_token.as_ref().map(ExposeSecret::expose_secret),
+                    expires_at,
+                );
             }
+            Ok(())
         },
         "persist",
         SECRET_WRITE_TIMEOUT,
@@ -2057,5 +2076,117 @@ mod tests {
         assert_eq!(store.load(REFRESH_SECRET_ACCOUNT).unwrap(), None);
         assert_eq!(store.load(EXPIRES_AT_SECRET_ACCOUNT).unwrap(), None);
         assert_eq!(store.load(crate::token::SECRET_ACCOUNT).unwrap(), None);
+    }
+}
+
+#[cfg(test)]
+mod persisted_credential_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex, Weak};
+
+    struct Observer {
+        store: FileSecretStore,
+        lease: Weak<()>,
+        events: Mutex<Vec<&'static str>>,
+    }
+    impl GitlabWriteObserver for Observer {
+        fn before_write(&self) -> Result<()> {
+            self.events.lock().unwrap().push("before");
+            Ok(())
+        }
+        fn verified_user(&self, _: Option<GitlabUser>) {}
+        fn persisted_credential(&self, access: &str, refresh: Option<&str>, expiry: Option<u64>) {
+            assert!(
+                self.lease.upgrade().is_some(),
+                "original persistence lease is held"
+            );
+            let tuple = self
+                .store
+                .load_many(&[
+                    SECRET_ACCOUNT,
+                    REFRESH_SECRET_ACCOUNT,
+                    EXPIRES_AT_SECRET_ACCOUNT,
+                ])
+                .unwrap();
+            assert_eq!(
+                tuple,
+                [
+                    Some(access.into()),
+                    refresh.map(str::to_string),
+                    expiry.map(|value| value.to_string())
+                ]
+            );
+            self.events.lock().unwrap().push("candidate");
+        }
+        fn settled(&self, outcome: GitlabWriteOutcome) {
+            assert!(self.lease.upgrade().is_some());
+            self.events.lock().unwrap().push(match outcome {
+                GitlabWriteOutcome::Persisted => "persisted",
+                GitlabWriteOutcome::Uncertain => "uncertain",
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn persisted_tuple_callback_follows_all_effects_and_precedes_settlement() {
+        for oauth in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = FileSecretStore::with_path(dir.path().join("secrets.json"));
+            store
+                .store(REFRESH_SECRET_ACCOUNT, "stale-sibling")
+                .unwrap();
+            store.store(EXPIRES_AT_SECRET_ACCOUNT, "1").unwrap();
+            let lease = Arc::new(());
+            let observer = Arc::new(Observer {
+                store: store.clone(),
+                lease: Arc::downgrade(&lease),
+                events: Mutex::new(Vec::new()),
+            });
+            persist_tokens_observed(
+                store.clone(),
+                SecretString::from("exact-access"),
+                oauth.then(|| SecretString::from("exact-refresh")),
+                oauth.then_some(42),
+                Some(lease.clone()),
+                Some(observer.clone()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                *observer.events.lock().unwrap(),
+                ["before", "candidate", "persisted"]
+            );
+            revoke_gitlab_token_observed(store, lease, observer.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                *observer.events.lock().unwrap(),
+                ["before", "candidate", "persisted", "before", "persisted"],
+                "deletion has no credential candidate"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn persisted_tuple_callback_is_absent_when_original_store_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-a-file");
+        std::fs::create_dir(&path).unwrap();
+        let store = FileSecretStore::with_path(path);
+        let lease = Arc::new(());
+        let observer = Arc::new(Observer {
+            store: store.clone(),
+            lease: Arc::downgrade(&lease),
+            events: Mutex::new(Vec::new()),
+        });
+        assert!(persist_gitlab_token_observed(
+            store,
+            SecretString::from("unwritten"),
+            lease,
+            observer.clone()
+        )
+        .await
+        .is_err());
+        assert_eq!(*observer.events.lock().unwrap(), ["before", "uncertain"]);
     }
 }

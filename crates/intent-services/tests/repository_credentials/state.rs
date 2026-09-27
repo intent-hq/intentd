@@ -1275,3 +1275,93 @@ async fn quota_during_refresh_rejects_foreign_replaced_child_and_shutdown_stamps
         assert_eq!(test.directory.lock().unwrap().backoff_until, None);
     }
 }
+
+#[test]
+fn selected_source_projection_uses_actual_ready_revision_without_mutation() {
+    let test = Test::new();
+    let binding = test.directory.binding().unwrap();
+    let before = test.directory.selected_secret_request(&binding).unwrap();
+    assert_eq!(before.source, RepositoryCredentialSource::GitlabSecretSlot);
+    test.directory.set_child_policy(&binding, true).unwrap();
+    test.directory.set_child_policy(&binding, false).unwrap();
+    assert_eq!(
+        test.directory.selected_secret_request(&binding).unwrap(),
+        before
+    );
+    let refresh = test
+        .directory
+        .reserve_mutation(RepositoryMutationKind::Refresh)
+        .unwrap();
+    assert_eq!(
+        test.directory.selected_secret_request(&binding).unwrap(),
+        before
+    );
+    test.directory.begin_mutation(&refresh).unwrap();
+    assert_eq!(
+        test.directory.selected_secret_request(&binding),
+        Err(RepositoryCredentialError::Mutating)
+    );
+    test.directory
+        .finish_mutation(&refresh, SettledCredentialState::Indeterminate)
+        .unwrap();
+    assert_eq!(
+        test.directory.selected_secret_request(&binding),
+        Err(RepositoryCredentialError::Indeterminate)
+    );
+    test.directory
+        .finish_mutation(
+            &refresh,
+            SettledCredentialState::Verified(test.verified.clone()),
+        )
+        .unwrap();
+    let after = test.directory.selected_secret_request(&binding).unwrap();
+    assert_eq!(after.binding, before.binding);
+    assert!(after.secret_revision > before.secret_revision);
+    assert_eq!(
+        test.directory.selected_secret_request(&binding).unwrap(),
+        after
+    );
+}
+
+#[test]
+fn selected_source_projection_rejects_foreign_and_unavailable_bindings() {
+    let test = Test::new();
+    let binding = test.directory.binding().unwrap();
+    for field in 0..6 {
+        let mut foreign = binding.clone();
+        match field {
+            0 => foreign.daemon_id = "other".into(),
+            1 => foreign.account.instance_base_url.push_str("/other"),
+            2 => foreign.account.account_id = "other".into(),
+            3 => foreign.scope.connection_id = "other".into(),
+            4 => foreign.scope.connection_generation += 1,
+            _ => foreign.scope.account_id = "other".into(),
+        }
+        assert_eq!(
+            test.directory.selected_secret_request(&foreign),
+            Err(RepositoryCredentialError::Retired)
+        );
+    }
+    let disconnected = test
+        .directory
+        .reserve_mutation(RepositoryMutationKind::Disconnect)
+        .unwrap();
+    test.directory.begin_mutation(&disconnected).unwrap();
+    test.directory
+        .finish_mutation(&disconnected, SettledCredentialState::Disconnected)
+        .unwrap();
+    assert_eq!(
+        test.directory.selected_secret_request(&binding),
+        Err(RepositoryCredentialError::Disconnected)
+    );
+    let unknown = RepositoryConnectionDirectory::new("fresh".into());
+    assert_eq!(
+        unknown.selected_secret_request(&binding),
+        Err(RepositoryCredentialError::Unverified)
+    );
+    unknown.retire().unwrap();
+    assert_eq!(
+        unknown.selected_secret_request(&binding),
+        Err(RepositoryCredentialError::Retired)
+    );
+}

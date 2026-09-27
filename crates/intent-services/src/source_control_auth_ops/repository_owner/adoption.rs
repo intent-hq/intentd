@@ -6,6 +6,7 @@ use intent_core::{Error, FileSecretStore, Result};
 use intent_sourcecontrol::{GitlabInstance, StoredCredential};
 use serde_json::Value;
 
+use super::secret_reader::load_material;
 use super::{
     matches_host, Arc, GitlabCredentialGate, GitlabCredentialGuard, GitlabDescriptor, GitlabHost,
     GitlabWriteObserver, Mutex, PersistenceLease, RepositoryCredentialSource,
@@ -16,8 +17,9 @@ use crate::settings_registry::{SettingsRegistry, SettingsSnapshot};
 
 pub(crate) struct SettingsAttachment {
     pub(super) config: Mutex<GitlabSettings>,
-    fixture: Option<GitlabDescriptor>,
+    pub(super) fixture: Option<GitlabDescriptor>,
     pub(super) source: Option<std::path::PathBuf>,
+    pub(super) store: Option<FileSecretStore>,
     source_descriptor: Mutex<Option<GitlabDescriptor>>,
 }
 
@@ -54,7 +56,7 @@ pub(crate) fn logical_instance(config: &GitlabSettings) -> Result<GitlabInstance
     Ok(instance)
 }
 
-fn approved_descriptor(
+pub(super) fn approved_descriptor(
     config: &GitlabSettings,
     fixture: Option<&GitlabDescriptor>,
 ) -> Option<GitlabDescriptor> {
@@ -104,6 +106,7 @@ impl GitlabCredentialGate {
             .set(SettingsAttachment {
                 config: Mutex::new(config),
                 fixture,
+                store: source.as_ref().map(|_| store.clone()),
                 source,
                 source_descriptor: Mutex::new(descriptor.clone()),
             })
@@ -469,7 +472,7 @@ impl crate::Services {
             .reserve(&host, RepositoryMutationKind::Replace)
             .map_err(crate::pr_ops::map_sc_err)?
             .ok_or_else(unavailable)?;
-        self.verify_stored_repository_account(&host, &write, None)
+        self.verify_stored_repository_account(&host, &write, None, guard.lease())
             .await
     }
 
@@ -502,7 +505,7 @@ impl crate::Services {
             &self.gitlab_secret_store,
             allow_new,
         )?;
-        self.verify_stored_repository_account(&host, &write.write, Some(compensated))
+        self.verify_stored_repository_account(&host, &write.write, Some(compensated), write.lease())
             .await
     }
 
@@ -511,26 +514,36 @@ impl crate::Services {
         host: &GitlabHost,
         write: &RepositoryWrite,
         compensated: Option<bool>,
+        lease: PersistenceLease,
     ) -> Result<()> {
         let registry = self.settings_registry.as_deref().ok_or_else(unavailable)?;
         let snapshot = registry.snapshot();
-        let token = super::super::stored_access_token(&self.gitlab_secret_store).await?;
-        let Some(token) = token else {
-            if compensated.is_some() {
-                write.begin().map_err(crate::pr_ops::map_sc_err)?;
-                write.complete_settings(SettledCredentialState::Disconnected)?;
+        let settings = write.owner.settings.get().ok_or_else(unavailable)?;
+        let store = settings.store.clone().ok_or_else(unavailable)?;
+        let material = load_material(store.clone(), lease.clone())
+            .await
+            .map_err(|_| unavailable())?;
+        let token = match material.access() {
+            Ok(token) => token.trim(),
+            Err(super::RepositoryCredentialError::Missing) => {
+                if compensated.is_some() {
+                    write.begin().map_err(crate::pr_ops::map_sc_err)?;
+                    write.complete_settings(SettledCredentialState::Disconnected)?;
+                }
+                return Ok(());
             }
-            return Ok(());
+            Err(_) => return Err(unavailable()),
         };
-        let user = intent_sourcecontrol::gitlab_auth::validate_pat(host, &token)
+        let fingerprint = material.fingerprint(&write.owner.evidence);
+        let user = intent_sourcecontrol::gitlab_auth::validate_pat(host, token)
             .await
             .map_err(crate::pr_ops::map_sc_err)?;
+        let after = load_material(store, lease)
+            .await
+            .map_err(|_| unavailable())?;
         if snapshot.effective.source_control.gitlab
             != registry.snapshot().effective.source_control.gitlab
-            || super::super::stored_access_token(&self.gitlab_secret_store)
-                .await?
-                .as_deref()
-                != Some(&token)
+            || after.fingerprint(&write.owner.evidence) != fingerprint
         {
             return Err(unavailable());
         }
@@ -547,11 +560,17 @@ impl crate::Services {
         )
         .map_err(|_| unavailable())?;
         write.begin().map_err(crate::pr_ops::map_sc_err)?;
-        write.complete_settings(if compensated == Some(true) {
-            SettledCredentialState::Compensated(account)
-        } else {
-            SettledCredentialState::Verified(account)
-        })?;
+        let binding = write
+            .complete_settings(if compensated == Some(true) {
+                SettledCredentialState::Compensated(account)
+            } else {
+                SettledCredentialState::Verified(account)
+            })?
+            .ok_or_else(unavailable)?;
+        write
+            .owner
+            .publish_source(&binding, &descriptor, fingerprint)
+            .map_err(|_| unavailable())?;
         *settings
             .source_descriptor
             .lock()
@@ -561,7 +580,10 @@ impl crate::Services {
 }
 
 impl RepositoryWrite {
-    fn complete_settings(&self, outcome: SettledCredentialState) -> Result<()> {
+    fn complete_settings(
+        &self,
+        outcome: SettledCredentialState,
+    ) -> Result<Option<crate::repository_credentials::RepositoryConnectionBinding>> {
         let state = self.state.lock().map_err(|_| unavailable())?;
         state
             .mutation
@@ -569,7 +591,6 @@ impl RepositoryWrite {
             .ok_or_else(unavailable)?
             .completion()
             .complete(outcome)
-            .map(|_| ())
             .map_err(|_| unavailable())
     }
 }

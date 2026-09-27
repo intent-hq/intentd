@@ -226,6 +226,23 @@ impl RepositoryConnectionDirectory {
         Ok(state.ready()?.binding.clone())
     }
 
+    /// Read the actual settled source revision. This projection grants no authority.
+    pub(crate) fn selected_secret_request(
+        &self,
+        binding: &RepositoryConnectionBinding,
+    ) -> Result<RepositorySecretRequest> {
+        let state = self.lock()?;
+        let published = state.ready()?;
+        if &published.binding != binding {
+            return Err(RepositoryCredentialError::Retired);
+        }
+        Ok(RepositorySecretRequest {
+            binding: published.binding.clone(),
+            secret_revision: state.secret_revision,
+            source: published.verified.source,
+        })
+    }
+
     /// A proved authoritative write, including a same-value write, supersedes
     /// pending child work. Rejected/no-op preflight must not call this method.
     pub(crate) fn set_child_policy(

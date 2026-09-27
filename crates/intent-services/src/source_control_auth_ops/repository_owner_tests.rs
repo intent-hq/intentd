@@ -19,6 +19,7 @@ pub(super) struct Control {
     pub(super) denied_user: Mutex<Option<&'static str>>,
     pub(super) requests: Mutex<Vec<String>>,
     pub(super) exchanges: AtomicUsize,
+    pub(super) expected_project_token: Mutex<Option<&'static str>>,
     pub(super) directory: Mutex<Option<Arc<RepositoryConnectionDirectory>>>,
 }
 pub(super) struct Server {
@@ -129,6 +130,20 @@ impl Server {
                                 42
                             };
                             (200, json!({"id":id,"username":"fixture", "name":"Fixture"}))
+                        }
+                    } else if path == "/api/v4/projects/group%2Fproject" {
+                        let expected = *control.expected_project_token.lock().unwrap();
+                        if expected.is_some_and(|token| {
+                            request.lines().any(|line| {
+                                line.eq_ignore_ascii_case(&format!("authorization: Bearer {token}"))
+                            })
+                        }) {
+                            (
+                                200,
+                                json!({"id":42,"name":"project","path":"project","path_with_namespace":"group/project","web_url":"https://gitlab.test/forge/group/project","visibility":"private","default_branch":"main"}),
+                            )
+                        } else {
+                            (401, json!({"message":"unexpected fixture credential"}))
                         }
                     } else {
                         (404, json!({}))

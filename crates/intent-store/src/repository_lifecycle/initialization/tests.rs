@@ -956,3 +956,305 @@ async fn legacy_same_value_replace_keeps_accounting_behavior_without_lifecycle_c
     assert!(old.load(Ordering::SeqCst));
     assert_eq!(f.owner.state.lock().unwrap().starts, 0);
 }
+
+async fn outcome(
+    f: &Fixture,
+    action: RepositoryAcpInitialization,
+) -> RepositoryInitializationOutcome {
+    let binding = f.binding(action);
+    f.store
+        .initialize_repository_acp_session_outcome(f.claim(&binding), binding)
+        .await
+}
+
+fn observed_session(id: Option<&str>) -> RepositoryInitializationPersistence {
+    RepositoryInitializationPersistence::NoEffect {
+        observed: RepositoryInitializationObservation::Present {
+            session_id: id.map(str::to_owned),
+        },
+    }
+}
+
+#[tokio::test]
+async fn outcome_cas_loser_preserves_transaction_canonical_without_write_or_owner() {
+    let f = Fixture::new().await;
+    f.store
+        .set_acp_session_id(&f.workspace.id, &f.agent.id, "canonical")
+        .await
+        .unwrap();
+    sqlx::query("CREATE TRIGGER forbid_outcome_write BEFORE UPDATE ON agent_session BEGIN SELECT RAISE(ABORT,'unexpected loser write'); END")
+        .execute(f.store.write_pool()).await.unwrap();
+    let old = f.owner.leaf();
+    let result = outcome(&f, replace(Some("stale"), "fresh")).await;
+    assert_eq!(result.persistence, observed_session(Some("canonical")));
+    assert!(result.confirmation.is_err());
+    assert_eq!(f.owner.state.lock().unwrap().starts, 0);
+    assert!(old.load(Ordering::SeqCst));
+    sqlx::query("DROP TRIGGER forbid_outcome_write")
+        .execute(f.store.write_pool())
+        .await
+        .unwrap();
+    f.store
+        .replace_acp_session_id(&f.workspace.id, &f.agent.id, "canonical", "later")
+        .await
+        .unwrap();
+    assert_eq!(f.id().await.as_deref(), Some("later"));
+    // This receipt is the original transaction's observation, not a late reread.
+    assert_eq!(result.persistence, observed_session(Some("canonical")));
+}
+
+#[tokio::test]
+async fn outcome_first_set_same_value_and_load_mismatch_are_not_owned_writes() {
+    let f = Fixture::new().await;
+    f.store
+        .set_acp_session_id(&f.workspace.id, &f.agent.id, "A")
+        .await
+        .unwrap();
+    for action in [first("A"), first("B"), loaded("B")] {
+        let result = outcome(&f, action).await;
+        assert_eq!(result.persistence, observed_session(Some("A")));
+        assert!(result.confirmation.is_err());
+    }
+    assert_eq!(f.owner.state.lock().unwrap().starts, 0);
+    // The legacy same-value setter keeps its existing successful no-op behavior.
+    f.store
+        .set_acp_session_id(&f.workspace.id, &f.agent.id, "A")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn outcome_missing_scoped_row_is_distinct_from_present_null() {
+    let f = Fixture::new().await;
+    for action in [loaded("A"), replace(Some("old"), "A")] {
+        let result = outcome(&f, action).await;
+        assert_eq!(result.persistence, observed_session(None));
+        assert!(result.confirmation.is_err());
+    }
+    for wrong_workspace in [false, true] {
+        let mut binding = f.binding(first("A"));
+        if wrong_workspace {
+            binding.workspace_id = WorkspaceId("other-workspace".into());
+        } else {
+            binding.agent_id = AgentId("absent-agent".into());
+        }
+        let result = f
+            .store
+            .initialize_repository_acp_session_outcome(f.claim(&binding), binding)
+            .await;
+        assert_eq!(
+            result.persistence,
+            RepositoryInitializationPersistence::NoEffect {
+                observed: RepositoryInitializationObservation::Missing,
+            }
+        );
+        assert!(result.confirmation.is_err());
+    }
+    assert_eq!(f.owner.state.lock().unwrap().starts, 0);
+}
+
+#[tokio::test]
+async fn outcome_first_load_and_replace_preserve_confirmation_and_accounting() {
+    let f = Fixture::new().await;
+    let totals = intent_core::TokenUsageTotals {
+        input_tokens: 19,
+        ..Default::default()
+    };
+    f.store
+        .set_agent_session_token_usage(&f.workspace.id, &f.agent.id, &totals)
+        .await
+        .unwrap();
+    let first = outcome(&f, first("A")).await;
+    assert_eq!(
+        first.persistence,
+        RepositoryInitializationPersistence::Committed {
+            session_id: "A".into()
+        }
+    );
+    assert!(f.consume(first.confirmation.unwrap()));
+    let loaded = outcome(&f, loaded("A")).await;
+    assert_eq!(loaded.persistence, observed_session(Some("A")));
+    assert!(f.consume(loaded.confirmation.unwrap()));
+    let rows = f
+        .store
+        .get_workspace_agent_usage_data(&f.workspace.id)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].2.as_ref(), Some(&totals));
+    assert!(rows[0].3.is_none());
+    let replaced = outcome(&f, replace(Some("A"), "B")).await;
+    assert_eq!(
+        replaced.persistence,
+        RepositoryInitializationPersistence::Committed {
+            session_id: "B".into()
+        }
+    );
+    assert!(f.consume(replaced.confirmation.unwrap()));
+    let rows = f
+        .store
+        .get_workspace_agent_usage_data(&f.workspace.id)
+        .await
+        .unwrap();
+    assert!(rows[0].2.is_none());
+    assert_eq!(rows[0].3.as_ref(), Some(&totals));
+}
+
+#[tokio::test]
+async fn outcome_committed_effect_survives_denied_completion_or_later_consumption() {
+    let f = Fixture::new().await;
+    f.owner.reject_completion.store(true, Ordering::SeqCst);
+    let denied = outcome(&f, first("A")).await;
+    assert_eq!(
+        denied.persistence,
+        RepositoryInitializationPersistence::Committed {
+            session_id: "A".into()
+        }
+    );
+    assert!(denied.confirmation.is_err());
+    assert_eq!(f.id().await.as_deref(), Some("A"));
+    assert_eq!(f.owner.state.lock().unwrap().blocked, 0);
+    f.owner.reject_completion.store(false, Ordering::SeqCst);
+    let changed = outcome(&f, replace(Some("A"), "B")).await;
+    f.store
+        .replace_acp_session_id(&f.workspace.id, &f.agent.id, "B", "C")
+        .await
+        .unwrap();
+    assert!(!f.consume(changed.confirmation.unwrap()));
+    assert_eq!(
+        changed.persistence,
+        RepositoryInitializationPersistence::Committed {
+            session_id: "B".into()
+        }
+    );
+}
+
+#[tokio::test]
+async fn outcome_foreign_domain_empty_binding_and_closed_pool_are_not_attempted() {
+    let f = Fixture::new().await;
+    let other = Fixture::new().await;
+    let binding = f.binding(first("A"));
+    let foreign = other
+        .store
+        .initialize_repository_acp_session_outcome(f.claim(&binding), binding)
+        .await;
+    assert_eq!(
+        foreign.persistence,
+        RepositoryInitializationPersistence::NotAttempted
+    );
+    assert!(foreign.confirmation.is_err());
+    let empty = outcome(&f, first("")).await;
+    assert_eq!(
+        empty.persistence,
+        RepositoryInitializationPersistence::NotAttempted
+    );
+    assert!(empty.confirmation.is_err());
+    f.store.write_pool().close().await;
+    let closed = outcome(&f, first("A")).await;
+    assert_eq!(
+        closed.persistence,
+        RepositoryInitializationPersistence::NotAttempted
+    );
+    assert!(closed.confirmation.is_err());
+}
+
+#[tokio::test]
+async fn outcome_retired_owner_after_read_has_no_effect_and_no_confirmation() {
+    let f = Fixture::new().await;
+    let binding = f.binding(first("A"));
+    let proof = f.owner.proof(binding.clone());
+    *proof.attempt.phase.lock().unwrap() = Phase::Retired;
+    let claim = f
+        .store
+        .bind_repository_initialization_claim(f.observer.clone(), Box::new(proof))
+        .unwrap();
+    let result = f
+        .store
+        .initialize_repository_acp_session_outcome(claim, binding)
+        .await;
+    assert_eq!(result.persistence, observed_session(None));
+    assert!(result.confirmation.is_err());
+    assert_eq!(f.id().await, None);
+    assert_eq!(f.owner.state.lock().unwrap().starts, 0);
+}
+
+#[tokio::test]
+async fn outcome_trigger_rollback_or_changed_winner_remains_unknown_not_no_effect() {
+    for trigger in [
+        "CREATE TRIGGER outcome_fault BEFORE UPDATE OF acp_session_id ON agent_session BEGIN UPDATE agent_session SET name='side effect' WHERE id=OLD.id; SELECT RAISE(IGNORE); END",
+        "CREATE TRIGGER outcome_fault AFTER UPDATE OF acp_session_id ON agent_session BEGIN SELECT RAISE(ROLLBACK,'fixture abort'); END",
+        "CREATE TRIGGER outcome_fault AFTER UPDATE OF acp_session_id ON agent_session WHEN NEW.acp_session_id='A' BEGIN UPDATE agent_session SET acp_session_id='different' WHERE id=NEW.id; END",
+    ] {
+        let f = Fixture::new().await;
+        sqlx::query(trigger).execute(f.store.write_pool()).await.unwrap();
+        let result = outcome(&f, first("A")).await;
+        assert_eq!(result.persistence, RepositoryInitializationPersistence::Unknown);
+        assert!(result.confirmation.is_err());
+        assert_eq!(f.id().await, None);
+        assert_eq!(f.owner.state.lock().unwrap().blocked, 1);
+        assert_eq!(f.store.get_agent_session(&f.agent.id).await.unwrap().name, f.agent.name);
+    }
+}
+
+#[tokio::test]
+async fn outcome_rejected_commit_stays_unknown_and_retains_barrier() {
+    let f = Fixture::new().await;
+    let mut conn = f.store.write_pool().acquire().await.unwrap();
+    conn.lock_handle().await.unwrap().set_commit_hook(|| false);
+    drop(conn);
+    let result = outcome(&f, first("A")).await;
+    assert_eq!(
+        result.persistence,
+        RepositoryInitializationPersistence::Unknown
+    );
+    assert!(result.confirmation.is_err());
+    assert_eq!(f.owner.state.lock().unwrap().blocked, 1);
+    assert_eq!(f.id().await, None);
+}
+
+#[tokio::test]
+async fn outcome_same_id_and_null_expectation_do_not_claim_legacy_effects() {
+    let f = Fixture::new().await;
+    let null = outcome(&f, replace(Some("old"), "A")).await;
+    assert_eq!(null.persistence, observed_session(None));
+    assert!(null.confirmation.is_err());
+    // Ordinary replacement still accepts its established current-NULL fallback.
+    assert_eq!(
+        f.store
+            .replace_acp_session_id(&f.workspace.id, &f.agent.id, "old", "A")
+            .await
+            .unwrap(),
+        "A"
+    );
+    let totals = intent_core::TokenUsageTotals {
+        input_tokens: 23,
+        ..Default::default()
+    };
+    f.store
+        .set_agent_session_token_usage(&f.workspace.id, &f.agent.id, &totals)
+        .await
+        .unwrap();
+    let same = outcome(&f, replace(Some("A"), "A")).await;
+    assert_eq!(same.persistence, observed_session(Some("A")));
+    assert!(same.confirmation.is_err());
+    let rows = f
+        .store
+        .get_workspace_agent_usage_data(&f.workspace.id)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].2.as_ref(), Some(&totals));
+    assert!(rows[0].3.is_none());
+    assert_eq!(
+        f.store
+            .replace_acp_session_id(&f.workspace.id, &f.agent.id, "A", "A")
+            .await
+            .unwrap(),
+        "A"
+    );
+    let rows = f
+        .store
+        .get_workspace_agent_usage_data(&f.workspace.id)
+        .await
+        .unwrap();
+    assert!(rows[0].2.is_none());
+    assert_eq!(rows[0].3.as_ref(), Some(&totals));
+}

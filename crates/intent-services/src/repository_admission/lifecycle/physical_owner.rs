@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex, Weak};
 use intent_core::{AgentId, WorkspaceId};
 use intent_store::{
     RepositoryAcpInitialization, RepositoryInitializationBinding, RepositoryInitializationClaim,
-    RepositoryInitializationConfirmation, RepositoryInitializationTicket,
+    RepositoryInitializationConfirmation, RepositoryInitializationOutcome,
+    RepositoryInitializationPersistence, RepositoryInitializationTicket,
 };
 
 use super::{
@@ -26,6 +27,15 @@ pub(crate) enum RepositoryCreationIntent {
     FirstSet,
     Loaded { session_id: String },
     Replace { expected: Option<String> },
+}
+
+/// The actual producer result and original transaction receipt survive even
+/// when the separately checked owner cannot be confirmed. No field authorizes
+/// a retry, canonical fallback or pending callback upgrade.
+pub(crate) struct RepositoryCreationOutcome<T, E> {
+    pub producer: Result<T, E>,
+    pub persistence: RepositoryInitializationPersistence,
+    pub owner: AdmissionResult<RepositoryPhysicalOwner>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -53,6 +63,62 @@ pub(crate) struct RepositoryCreationOwner {
     workspace: WorkspaceId,
     agent: AgentId,
     intent: RepositoryCreationIntent,
+    retirement: Arc<CreationAllocation>,
+}
+
+#[derive(Default)]
+struct CreationRetirementState {
+    retired: bool,
+    confirmed: Option<RepositoryPhysicalRetirement>,
+}
+
+struct CreationAllocation {
+    registry: Weak<RepositoryLifecycleRegistry>,
+    token: Weak<()>,
+    id: u64,
+    state: Mutex<CreationRetirementState>,
+}
+
+/// A pre-abort projection of this original attempt. It owns no physical
+/// lifetime and cannot recover an allocation from an agent or session ID.
+#[derive(Clone)]
+pub(crate) struct RepositoryCreationRetirement {
+    allocation: Weak<CreationAllocation>,
+}
+
+impl RepositoryCreationRetirement {
+    pub(crate) fn retire(&self) {
+        let Some(allocation) = self.allocation.upgrade() else {
+            return;
+        };
+        let Some(registry) = allocation.registry.upgrade() else {
+            return;
+        };
+        let confirmed = {
+            // Consume takes these locks in the same order. A confirmation
+            // cannot be published between pending retirement and this lookup.
+            let mut retirement = allocation
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            retirement.retired = true;
+            let mut state = registry
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(pending) = state.creations.get_mut(&allocation.id) {
+                if Weak::ptr_eq(&pending.token, &allocation.token) {
+                    pending.phase = Phase::Retired;
+                }
+            }
+            retirement.confirmed.clone()
+        };
+        if let Some(confirmed) = confirmed {
+            // Every caller joins an already-confirmed original leaf without
+            // holding the creation or registry mutex over the leaf wait.
+            confirmed.retire();
+        }
+    }
 }
 
 fn unavailable() -> intent_core::Error {
@@ -101,6 +167,12 @@ impl RepositoryCreationOwner {
             },
         );
         drop(state);
+        let retirement = Arc::new(CreationAllocation {
+            registry: Arc::downgrade(registry),
+            token: Arc::downgrade(&token),
+            id,
+            state: Mutex::default(),
+        });
         Ok(Self {
             registry: registry.clone(),
             store: store.clone(),
@@ -109,12 +181,19 @@ impl RepositoryCreationOwner {
             workspace,
             agent,
             intent,
+            retirement,
         })
     }
 
     /// This projection remains unavailable forever, including after success.
     pub(crate) fn callback(&self) -> RepositoryCallbackContext {
         RepositoryCallbackContext::new(&self.registry, None)
+    }
+
+    pub(crate) fn retirement(&self) -> RepositoryCreationRetirement {
+        RepositoryCreationRetirement {
+            allocation: Arc::downgrade(&self.retirement),
+        }
     }
 
     /// Own the original producer future and its exact intent across the await.
@@ -129,13 +208,71 @@ impl RepositoryCreationOwner {
         F: FnOnce() -> Fut,
         Fut: Future<Output = AdmissionResult<String>>,
     {
-        let session = operation().await?;
-        let (claim, binding) = self.claim_after_success(session)?;
-        let confirmation = store
-            .initialize_repository_acp_session(claim, binding)
-            .await
-            .map_err(|_| AdmissionError::Unavailable)?;
-        self.consume(store, confirmation)
+        let outcome = self
+            .initialize_with_outcome(store, || async move {
+                operation().await.map(|session| (session, ()))
+            })
+            .await;
+        match outcome.producer {
+            Ok(()) => outcome.owner,
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Run the original producer exactly once and retain its owned payload or
+    /// error. The session comes from that producer; Store facts and ownership
+    /// stay separate. This uses the strict initialization transaction and does
+    /// not claim the ordinary legacy writer's excluded accounting effects.
+    pub(crate) async fn initialize_with_outcome<T, E, F, Fut>(
+        self,
+        store: &Store,
+        operation: F,
+    ) -> RepositoryCreationOutcome<T, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<(String, T), E>>,
+    {
+        let (session, payload) = match operation().await {
+            Ok(produced) => produced,
+            Err(error) => {
+                return RepositoryCreationOutcome {
+                    producer: Err(error),
+                    persistence: RepositoryInitializationPersistence::NotAttempted,
+                    owner: Err(AdmissionError::Unavailable),
+                };
+            }
+        };
+        let (claim, binding) = match self.claim_after_success(session) {
+            Ok(claim) => claim,
+            Err(error) => {
+                return RepositoryCreationOutcome {
+                    producer: Ok(payload),
+                    persistence: RepositoryInitializationPersistence::NotAttempted,
+                    owner: Err(error),
+                };
+            }
+        };
+        let outcome = store
+            .initialize_repository_acp_session_outcome(claim, binding)
+            .await;
+        self.complete_outcome(store, payload, outcome)
+    }
+
+    fn complete_outcome<T, E>(
+        self,
+        store: &Store,
+        payload: T,
+        outcome: RepositoryInitializationOutcome,
+    ) -> RepositoryCreationOutcome<T, E> {
+        let owner = outcome
+            .confirmation
+            .map_err(|_| AdmissionError::Unavailable)
+            .and_then(|confirmation| self.consume(store, confirmation));
+        RepositoryCreationOutcome {
+            producer: Ok(payload),
+            persistence: outcome.persistence,
+            owner,
+        }
     }
 
     fn claim_after_success(
@@ -227,6 +364,14 @@ impl RepositoryCreationOwner {
         {
             return Err(AdmissionError::Denied);
         }
+        let mut retirement = self
+            .retirement
+            .state
+            .lock()
+            .map_err(|_| AdmissionError::Retired)?;
+        if retirement.retired {
+            return Err(AdmissionError::Retired);
+        }
         let token = Arc::new(());
         let mut state = self
             .registry
@@ -259,12 +404,16 @@ impl RepositoryCreationOwner {
             },
         );
         proof.consumed = true;
-        drop(state);
-        Ok(RepositoryPhysicalOwner {
+        let owner = RepositoryPhysicalOwner {
             registry: self.registry.clone(),
             token,
             id,
-        })
+            _creation_retirement: self.retirement.clone(),
+        };
+        retirement.confirmed = Some(owner.retirement());
+        drop(state);
+        drop(retirement);
+        Ok(owner)
     }
 }
 
@@ -452,6 +601,9 @@ pub(crate) struct RepositoryPhysicalOwner {
     registry: Arc<RepositoryLifecycleRegistry>,
     token: Arc<()>,
     id: u64,
+    // The original pending retirement handle stays weak, but can follow the
+    // confirmed allocation for as long as the actual physical owner exists.
+    _creation_retirement: Arc<CreationAllocation>,
 }
 
 #[derive(Clone)]

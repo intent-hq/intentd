@@ -7,7 +7,7 @@ use intent_core::{chief_workspace, AgentSession, Workspace};
 use super::*;
 
 struct Fixture {
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
     store: Store,
     workspace: Workspace,
     registry: Arc<RepositoryLifecycleRegistry>,
@@ -30,7 +30,7 @@ impl Fixture {
         let registry = Arc::new(RepositoryLifecycleRegistry::default());
         registry.install(&store).await.unwrap();
         Self {
-            _dir: dir,
+            dir,
             store,
             workspace,
             registry,
@@ -481,4 +481,478 @@ async fn original_allocation_cannot_initialize_another_database_with_the_same_ob
         .await
         .unwrap();
     assert!(current(&original.callback().capture(), f.caller()).await);
+}
+
+#[tokio::test]
+async fn pending_retirement_during_original_producer_wait_blocks_late_initialization() {
+    let f = Fixture::new(None).await;
+    let creator = f.creator(RepositoryCreationIntent::FirstSet);
+    let pending = creator.callback();
+    let retirement = creator.retirement();
+    let (entered, entering) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let mut future = Box::pin(creator.initialize(&f.store, || async move {
+        entered.send(()).unwrap();
+        released.await.unwrap();
+        Ok("created".into())
+    }));
+    tokio::select! {
+        result = &mut future => panic!("producer returned before release: {}", result.is_ok()),
+        result = entering => result.unwrap(),
+    }
+    retirement.retire();
+    release.send(()).unwrap();
+    assert!(matches!(future.await, Err(AdmissionError::Retired)));
+    assert!(!current(&pending.capture(), f.caller()).await);
+    assert!(f
+        .store
+        .get_agent_session(&f.agent)
+        .await
+        .unwrap()
+        .acp_session_id
+        .is_none());
+    assert!(f.registry.state.lock().unwrap().pending.is_empty());
+}
+
+#[tokio::test]
+async fn pending_retirement_after_commit_preserves_effect_without_live_confirmation() {
+    let f = Fixture::new(None).await;
+    let creator = f.creator(RepositoryCreationIntent::FirstSet);
+    let retirement = creator.retirement();
+    let (claim, binding) = creator.claim_after_success("committed".into()).unwrap();
+    let confirmation = f
+        .store
+        .initialize_repository_acp_session(claim, binding)
+        .await
+        .unwrap();
+    retirement.retire();
+    assert!(matches!(
+        creator.consume(&f.store, confirmation),
+        Err(AdmissionError::Retired)
+    ));
+    assert_eq!(
+        f.store
+            .get_agent_session(&f.agent)
+            .await
+            .unwrap()
+            .acp_session_id
+            .as_deref(),
+        Some("committed")
+    );
+    assert!(f.registry.state.lock().unwrap().origins.is_empty());
+    assert!(f.registry.state.lock().unwrap().pending.is_empty());
+}
+
+#[tokio::test]
+async fn pending_retirement_never_settles_an_unknown_initialization_barrier() {
+    let f = Fixture::new(None).await;
+    let creator = f.creator(RepositoryCreationIntent::FirstSet);
+    let retirement = creator.retirement();
+    // This fixture begins only the observer ticket, never a claimed SQL effect.
+    drop(begin_fixture(&creator));
+    retirement.retire();
+    drop(creator);
+    retirement.retire();
+    assert_eq!(f.registry.state.lock().unwrap().pending.len(), 1);
+    assert!(RepositoryCreationOwner::allocate(
+        &f.registry,
+        &f.store,
+        f.workspace.id.clone(),
+        f.agent.clone(),
+        RepositoryCreationIntent::FirstSet
+    )
+    .is_err());
+}
+
+#[tokio::test]
+async fn pending_retirement_is_weak_and_cannot_target_a_replacement_by_agent_id() {
+    let f = Fixture::new(None).await;
+    let creator = f.creator(RepositoryCreationIntent::FirstSet);
+    let id = creator.id;
+    let retirement = creator.retirement();
+    drop(creator);
+    assert!(retirement.allocation.upgrade().is_none());
+    assert!(!f.registry.state.lock().unwrap().creations.contains_key(&id));
+    let replacement = f
+        .creator(RepositoryCreationIntent::FirstSet)
+        .initialize(&f.store, || async { Ok("replacement".into()) })
+        .await
+        .unwrap();
+    retirement.retire();
+    assert!(current(&replacement.callback().capture(), f.caller()).await);
+    let creator = f.creator(RepositoryCreationIntent::Loaded {
+        session_id: "replacement".into(),
+    });
+    let pending = creator.retirement();
+    let physical = creator
+        .initialize(&f.store, || async { Ok("replacement".into()) })
+        .await
+        .unwrap();
+    let callback = physical.callback();
+    assert!(pending.allocation.upgrade().is_some());
+    drop(physical);
+    assert!(pending.allocation.upgrade().is_none());
+    assert!(!current(&callback.capture(), f.caller()).await);
+}
+
+#[tokio::test]
+async fn every_pending_retirement_caller_joins_the_confirmed_original_leaf() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let f = Fixture::new(None).await;
+    let creator = f.creator(RepositoryCreationIntent::FirstSet);
+    let pending = creator.retirement();
+    let owner = creator
+        .initialize(&f.store, || async { Ok("original".into()) })
+        .await
+        .unwrap();
+    let leaf = crate::repository_admission::RepositoryRetirement::default();
+    let _subscription = f
+        .registry
+        .subscribe(
+            &owner.origin(),
+            &f.caller(),
+            &[RepositoryLifecycleKey::Database],
+            leaf.clone(),
+        )
+        .unwrap();
+    let (entered, entering) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let active = leaf.clone();
+    let worker = std::thread::spawn(move || {
+        active.dispatch(|| {
+            entered.send(()).unwrap();
+            released.recv().unwrap();
+            Ok(())
+        })
+    });
+    entering.recv_timeout(Duration::from_secs(5)).unwrap();
+    let first = pending.clone();
+    let first_worker = std::thread::spawn(move || first.retire());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while f
+        .registry
+        .state
+        .lock()
+        .unwrap()
+        .origins
+        .contains_key(&owner.id)
+    {
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert!(f.registry.state.try_lock().is_ok());
+    assert!(pending
+        .allocation
+        .upgrade()
+        .unwrap()
+        .state
+        .try_lock()
+        .is_ok());
+    f.registry
+        .begin_mutation(&[RepositoryLifecycleKey::GitRoot(
+            intent_core::WorkspaceGitRootId::new(),
+        )])
+        .unwrap()
+        .settle_confirmed();
+    let (started, starting) = mpsc::channel();
+    let (done, returned) = mpsc::channel();
+    let second_worker = std::thread::spawn(move || {
+        started.send(()).unwrap();
+        pending.retire();
+        done.send(()).unwrap();
+    });
+    starting.recv_timeout(Duration::from_secs(5)).unwrap();
+    let premature = returned.recv_timeout(Duration::from_millis(50)).is_ok();
+    release.send(()).unwrap();
+    assert!(worker.join().unwrap().is_ok());
+    first_worker.join().unwrap();
+    second_worker.join().unwrap();
+    assert!(
+        !premature,
+        "pending pre-abort caller returned before original leaf retirement"
+    );
+    assert_eq!(leaf.check_current(), Err(AdmissionError::Retired));
+    assert!(!current(&owner.callback().capture(), f.caller()).await);
+}
+
+#[tokio::test]
+async fn outcome_retains_nonclone_producer_payload_and_original_commit() {
+    struct Payload(Arc<()>);
+    let f = Fixture::new(None).await;
+    let marker = Arc::new(());
+    let payload = Payload(marker.clone());
+    let executions = std::sync::atomic::AtomicUsize::new(0);
+    let count = &executions;
+    let outcome = f
+        .creator(RepositoryCreationIntent::FirstSet)
+        .initialize_with_outcome(&f.store, || async move {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok::<_, AdmissionError>(("created".into(), payload))
+        })
+        .await;
+    assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(Arc::ptr_eq(&outcome.producer.unwrap().0, &marker));
+    assert_eq!(
+        outcome.persistence,
+        RepositoryInitializationPersistence::Committed {
+            session_id: "created".into()
+        }
+    );
+    let owner = outcome.owner.unwrap();
+    assert!(current(&owner.callback().capture(), f.caller()).await);
+}
+
+#[tokio::test]
+async fn outcome_preserves_original_producer_error_without_attempting_store() {
+    #[derive(Debug)]
+    struct ProducerError(&'static str);
+    let f = Fixture::new(None).await;
+    let result = f
+        .creator(RepositoryCreationIntent::FirstSet)
+        .initialize_with_outcome(&f.store, || async {
+            Err::<(String, ()), _>(ProducerError("original provider failure"))
+        })
+        .await;
+    assert_eq!(result.producer.unwrap_err().0, "original provider failure");
+    assert_eq!(
+        result.persistence,
+        RepositoryInitializationPersistence::NotAttempted
+    );
+    assert!(matches!(result.owner, Err(AdmissionError::Unavailable)));
+    assert!(f
+        .store
+        .get_agent_session(&f.agent)
+        .await
+        .unwrap()
+        .acp_session_id
+        .is_none());
+    assert!(f.registry.state.lock().unwrap().pending.is_empty());
+}
+
+#[tokio::test]
+async fn outcome_preserves_producer_success_after_pending_retirement_without_repairing_claim() {
+    let f = Fixture::new(None).await;
+    let creator = f.creator(RepositoryCreationIntent::FirstSet);
+    let retirement = creator.retirement();
+    let result = creator
+        .initialize_with_outcome(&f.store, || async {
+            retirement.retire();
+            Ok::<_, AdmissionError>(("produced".into(), "original response"))
+        })
+        .await;
+    assert_eq!(result.producer.unwrap(), "original response");
+    assert_eq!(
+        result.persistence,
+        RepositoryInitializationPersistence::NotAttempted
+    );
+    assert!(matches!(result.owner, Err(AdmissionError::Retired)));
+    assert!(f
+        .store
+        .get_agent_session(&f.agent)
+        .await
+        .unwrap()
+        .acp_session_id
+        .is_none());
+}
+
+#[tokio::test]
+async fn outcome_keeps_actual_committed_effect_when_finish_or_consume_rejects_owner() {
+    for retire_during_commit in [true, false] {
+        let f = Fixture::new(None).await;
+        let creator = f.creator(RepositoryCreationIntent::FirstSet);
+        let retirement = creator.retirement();
+        let result: RepositoryCreationOutcome<&str, AdmissionError> = if retire_during_commit {
+            let mut conn = f.store.write_pool().acquire().await.unwrap();
+            conn.lock_handle().await.unwrap().set_commit_hook(move || {
+                retirement.retire();
+                true
+            });
+            drop(conn);
+            creator
+                .initialize_with_outcome(&f.store, || async {
+                    Ok(("committed".into(), "actual response"))
+                })
+                .await
+        } else {
+            // Actual transaction receipt, then retirement before its one-use
+            // consumption. This deliberately exercises the narrow completion edge.
+            let (claim, binding) = creator.claim_after_success("committed".into()).unwrap();
+            let receipt = f
+                .store
+                .initialize_repository_acp_session_outcome(claim, binding)
+                .await;
+            retirement.retire();
+            creator.complete_outcome(&f.store, "actual response", receipt)
+        };
+        assert_eq!(result.producer.unwrap(), "actual response");
+        assert_eq!(
+            result.persistence,
+            RepositoryInitializationPersistence::Committed {
+                session_id: "committed".into()
+            }
+        );
+        assert!(result.owner.is_err());
+        assert_eq!(
+            f.store
+                .get_agent_session(&f.agent)
+                .await
+                .unwrap()
+                .acp_session_id
+                .as_deref(),
+            Some("committed")
+        );
+        assert!(f.registry.state.lock().unwrap().pending.is_empty());
+        assert!(f.registry.state.lock().unwrap().origins.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn outcome_no_effect_preserves_only_transaction_observations_and_strict_behavior() {
+    use intent_store::RepositoryInitializationObservation;
+    for (stored, intent, missing, confirmed) in [
+        (
+            Some("winner"),
+            RepositoryCreationIntent::FirstSet,
+            false,
+            false,
+        ),
+        (
+            Some("winner"),
+            RepositoryCreationIntent::Replace {
+                expected: Some("old".into()),
+            },
+            false,
+            false,
+        ),
+        (
+            None,
+            RepositoryCreationIntent::Replace {
+                expected: Some("old".into()),
+            },
+            false,
+            false,
+        ),
+        (
+            Some("fresh"),
+            RepositoryCreationIntent::Replace {
+                expected: Some("fresh".into()),
+            },
+            false,
+            false,
+        ),
+        (
+            Some("fresh"),
+            RepositoryCreationIntent::Loaded {
+                session_id: "fresh".into(),
+            },
+            false,
+            true,
+        ),
+        (None, RepositoryCreationIntent::FirstSet, true, false),
+    ] {
+        let mut f = Fixture::new(stored).await;
+        if missing {
+            f.agent = AgentId::new();
+        }
+        let result = f
+            .creator(intent)
+            .initialize_with_outcome(&f.store, || async {
+                Ok::<_, AdmissionError>(("fresh".into(), "original response"))
+            })
+            .await;
+        assert_eq!(result.producer.unwrap(), "original response");
+        assert_eq!(
+            result.persistence,
+            RepositoryInitializationPersistence::NoEffect {
+                observed: if missing {
+                    RepositoryInitializationObservation::Missing
+                } else {
+                    RepositoryInitializationObservation::Present {
+                        session_id: stored.map(str::to_owned),
+                    }
+                }
+            }
+        );
+        assert_eq!(result.owner.is_ok(), confirmed);
+        if !missing {
+            assert_eq!(
+                f.store
+                    .get_agent_session(&f.agent)
+                    .await
+                    .unwrap()
+                    .acp_session_id
+                    .as_deref(),
+                stored
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn outcome_after_actual_sql_failure_remains_unknown_and_retains_original_barrier() {
+    let f = Fixture::new(None).await;
+    sqlx::query("CREATE TRIGGER reject_initialization AFTER UPDATE OF acp_session_id ON agent_session BEGIN SELECT RAISE(ROLLBACK,'fixture failure'); END")
+        .execute(f.store.write_pool()).await.unwrap();
+    let result = f
+        .creator(RepositoryCreationIntent::FirstSet)
+        .initialize_with_outcome(&f.store, || async {
+            Ok::<_, AdmissionError>(("attempted".into(), "original response"))
+        })
+        .await;
+    assert_eq!(result.producer.unwrap(), "original response");
+    assert_eq!(
+        result.persistence,
+        RepositoryInitializationPersistence::Unknown
+    );
+    assert!(result.owner.is_err());
+    assert!(f
+        .store
+        .get_agent_session(&f.agent)
+        .await
+        .unwrap()
+        .acp_session_id
+        .is_none());
+    assert_eq!(f.registry.state.lock().unwrap().pending.len(), 1);
+    assert!(RepositoryCreationOwner::allocate(
+        &f.registry,
+        &f.store,
+        f.workspace.id.clone(),
+        f.agent.clone(),
+        RepositoryCreationIntent::FirstSet
+    )
+    .is_err());
+}
+
+#[tokio::test]
+async fn outcome_rejects_foreign_store_without_losing_the_actual_producer_result() {
+    let f = Fixture::new(None).await;
+    let foreign = Store::open(&f.dir.path().join("foreign.db")).await.unwrap();
+    foreign.insert_workspace(&f.workspace).await.unwrap();
+    foreign
+        .insert_agent_session(&f.store.get_agent_session(&f.agent).await.unwrap())
+        .await
+        .unwrap();
+    f.registry.install(&foreign).await.unwrap();
+    let result = f
+        .creator(RepositoryCreationIntent::FirstSet)
+        .initialize_with_outcome(&foreign, || async {
+            Ok::<_, AdmissionError>(("produced".into(), "original response"))
+        })
+        .await;
+    assert_eq!(result.producer.unwrap(), "original response");
+    assert_eq!(
+        result.persistence,
+        RepositoryInitializationPersistence::NotAttempted
+    );
+    assert!(result.owner.is_err());
+    for store in [&f.store, &foreign] {
+        assert!(store
+            .get_agent_session(&f.agent)
+            .await
+            .unwrap()
+            .acp_session_id
+            .is_none());
+    }
 }

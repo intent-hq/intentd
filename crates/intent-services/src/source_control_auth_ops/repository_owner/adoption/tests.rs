@@ -102,6 +102,16 @@ impl Fixture {
         f
     }
 
+    async fn assert_readable(&self) -> crate::repository_credentials::RepositorySecretRequest {
+        let expected = self
+            .directory
+            .selected_secret_request(&self.directory.binding().unwrap())
+            .unwrap();
+        let reader = self.services.gitlab_repository_secret_reader().unwrap();
+        let snapshot = reader.load(&expected).await.unwrap();
+        assert_eq!(snapshot.request, expected);
+        expected
+    }
     fn service(&self, write: Arc<RepositorySettingsWrite>) -> crate::settings::SettingsService<'_> {
         self.services
             .settings_service()
@@ -406,6 +416,7 @@ async fn first_pat_adoption_uses_verified_account_without_rewriting_the_secret()
         server.control.requests.lock().unwrap().as_slice(),
         ["/api/v4/user", "/api/v4/personal_access_tokens/self"]
     );
+    f.assert_readable().await;
 }
 
 #[intent_test_macros::daemon_test]
@@ -463,6 +474,12 @@ async fn unproven_transport_and_mixed_store_never_dispatch_a_managed_token() {
             .reconcile_gitlab_repository_binding()
             .await
             .is_err());
+        if mixed {
+            assert!(matches!(
+                f.services.gitlab_repository_secret_reader(),
+                Err(RepositoryCredentialError::Unverified)
+            ));
+        }
         assert!(server.control.requests.lock().unwrap().is_empty());
         assert_eq!(
             f.directory.binding().unwrap_err(),
@@ -530,6 +547,10 @@ async fn actual_settings_pat_replacement_verifies_only_after_full_batch() {
     let next = f.directory.binding().unwrap();
     assert_eq!(next.account.account_id, "43");
     assert_ne!(prior.scope, next.scope);
+    drop(service);
+    drop(write);
+    drop(guard);
+    f.assert_readable().await;
 }
 
 #[intent_test_macros::daemon_test]
@@ -571,6 +592,8 @@ async fn identical_pat_placeholder_and_rejected_preflight_do_not_retire() {
             .as_deref(),
         Some("stored-pat")
     );
+    drop(guard);
+    f.assert_readable().await;
 }
 
 #[intent_test_macros::daemon_test]
@@ -878,10 +901,8 @@ async fn attached_same_account_refresh_preserves_real_ticket_quota_and_rejects_o
     use crate::repository_credentials::authority::{
         RepositoryAuthorityRequest, RepositoryCredentialTransport,
     };
-    use crate::repository_credentials::{RepositoryCredentialUse, RepositorySecretReader};
-    use crate::source_control_auth_ops::repository_owner_tests::{
-        FixtureAuthority, FixtureSecretReader,
-    };
+    use crate::repository_credentials::RepositoryCredentialUse;
+    use crate::source_control_auth_ops::repository_owner_tests::FixtureAuthority;
     use intent_sourcecontrol::gitlab_token::{EXPIRES_AT_SECRET_ACCOUNT, REFRESH_SECRET_ACCOUNT};
     use std::time::{Duration, Instant};
     let server = Server::new().await;
@@ -915,14 +936,10 @@ async fn attached_same_account_refresh_preserves_real_ticket_quota_and_rejects_o
             Arc::new(FixtureAuthority),
         )
         .unwrap();
-    let reader = FixtureSecretReader(f.services.gitlab_secret_store.clone());
+    let reader = f.services.gitlab_repository_secret_reader().unwrap();
     let ticket = f
         .directory
-        .acquire_exact(
-            &admission,
-            &reader as &dyn RepositorySecretReader,
-            Duration::from_secs(2),
-        )
+        .acquire_exact(&admission, reader.as_ref(), Duration::from_secs(2))
         .await
         .unwrap();
     f.services
@@ -961,10 +978,11 @@ async fn attached_same_account_refresh_preserves_real_ticket_quota_and_rejects_o
         .unwrap());
     assert!(matches!(
         f.directory
-            .acquire_exact(&admission, &reader, Duration::from_secs(2))
+            .acquire_exact(&admission, reader.as_ref(), Duration::from_secs(2))
             .await,
         Err(RepositoryCredentialError::Backoff)
     ));
+    f.assert_readable().await;
 }
 
 #[test]
@@ -1060,6 +1078,8 @@ async fn services_settings_update_and_reset_settle_the_original_directory() {
     let replacement = f.directory.binding().unwrap();
     assert_eq!(replacement.account.account_id, "43");
     assert_ne!(replacement.scope, prior.scope);
+    let expected = f.assert_readable().await;
+    let reader = f.services.gitlab_repository_secret_reader().unwrap();
     f.services
         .settings_reset(SECRET_ACCOUNT.into())
         .await
@@ -1071,6 +1091,10 @@ async fn services_settings_update_and_reset_settle_the_original_directory() {
     assert_eq!(
         f.services.gitlab_secret_store.load(SECRET_ACCOUNT).unwrap(),
         None
+    );
+    assert_eq!(
+        reader.load(&expected).await.unwrap_err(),
+        RepositoryCredentialError::Disconnected
     );
 }
 
@@ -1119,6 +1143,7 @@ async fn services_confirmed_no_effect_config_failure_restores_a_verified_generat
     );
     assert_eq!(restored.account, original.account);
     assert_ne!(restored.scope, original.scope);
+    f.assert_readable().await;
 }
 
 #[intent_test_macros::daemon_test]
@@ -1129,6 +1154,8 @@ async fn services_partial_ordinary_failure_cannot_claim_whole_batch_compensation
         .reconcile_gitlab_repository_binding()
         .await
         .unwrap();
+    let expected = f.assert_readable().await;
+    let reader = f.services.gitlab_repository_secret_reader().unwrap();
     sqlx::query("CREATE TRIGGER reject_workspace_rules BEFORE INSERT ON settings WHEN new.key = 'workspaceRules' BEGIN SELECT RAISE(FAIL, 'fixture refusal'); END")
         .execute(f.services.store.write_pool()).await.unwrap();
     assert!(f
@@ -1164,6 +1191,10 @@ async fn services_partial_ordinary_failure_cannot_claim_whole_batch_compensation
     );
     assert_eq!(
         f.directory.binding().unwrap_err(),
+        RepositoryCredentialError::Indeterminate
+    );
+    assert_eq!(
+        reader.load(&expected).await.unwrap_err(),
         RepositoryCredentialError::Indeterminate
     );
 }
