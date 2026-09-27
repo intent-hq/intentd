@@ -69,6 +69,41 @@ fn unknown_provider_fallback_warn_gate() {
 }
 
 #[test]
+fn legacy_alias_metadata_is_the_reverse_of_the_strict_resolver() {
+    for id in all_provider_ids() {
+        // Exact canonical identities keep their own registry row, regardless of
+        // the recognized aliases pointing elsewhere.
+        assert!(std::ptr::eq(
+            find_provider_or_legacy_alias(id).unwrap(),
+            find_provider(id).unwrap()
+        ));
+        let aliases = legacy_aliases_for_provider(id);
+        for alias in ["default", "acp", "augment"] {
+            assert_eq!(
+                aliases.contains(&alias),
+                alias != id && find_provider_or_legacy_alias(alias).unwrap().id == id,
+                "{alias} advertised on {id}"
+            );
+        }
+        assert_eq!(aliases.len(), if id == "auggie" { 3 } else { 0 });
+    }
+    // The reverse lookup accepts only canonical IDs, and never borrows the
+    // separate permissive fallback for empty or arbitrary unknown identities.
+    for id in [
+        "default",
+        "acp",
+        "augment",
+        "",
+        "nope",
+        "ACP",
+        " acp",
+        "codex-typo",
+    ] {
+        assert!(legacy_aliases_for_provider(id).is_empty(), "{id}");
+    }
+}
+
+#[test]
 fn claude_agent_acp_pin_is_single_sourced() {
     assert!(!CLAUDE_AGENT_ACP_VERSION.is_empty());
     assert_eq!(

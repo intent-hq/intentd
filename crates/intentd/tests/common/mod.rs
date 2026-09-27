@@ -1090,51 +1090,166 @@ mod tests {
         let _ = std::panic::catch_unwind(|| panic!("intentional: exercise retention hook"));
     }
 
+    // Hold a unique parent until every original/retained-path assertion is done.
+    // A panic frees the original child name, so another test can reuse it while
+    // the failed-* sibling still belongs to the earlier test. The parent is
+    // registered on the assertion thread to retain diagnostics on a real failure.
+    fn with_retention_test_root(base: &Path, f: impl FnOnce(PathBuf)) {
+        let root = test_tempdir_in(base.to_str().expect("UTF-8 temp root"), "itd-retain-case-");
+        f(root.path().to_path_buf());
+    }
+
+    #[test]
+    fn retention_checks_isolate_reused_names() {
+        // Force the same candidate name, without depending on random collisions.
+        fn fixed_tempdir(base: &Path) -> tempfile::TempDir {
+            let mut dir = tempfile::Builder::new()
+                .prefix("itd-retain-reused")
+                .rand_bytes(0)
+                .tempdir_in(base)
+                .expect("create fixed-name test dir");
+            if keep_tmp_requested() {
+                dir.disable_cleanup(true);
+            }
+            register_for_failure_retention(dir.path());
+            dir
+        }
+
+        let namespace = test_tempdir("itd-retain-reuse-");
+        with_retention_test_root(namespace.path(), |failing_root| {
+            with_retention_test_root(namespace.path(), |passing_root| {
+                let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                let failing = std::thread::spawn(move || {
+                    let dir = fixed_tempdir(&failing_root);
+                    let original = dir.path().to_path_buf();
+                    let retained = retained_path_for(&original);
+                    let owner = format!(
+                        "pid={} tid={:?}",
+                        std::process::id(),
+                        std::thread::current().id()
+                    );
+                    std::fs::write(dir.path().join("daemon.log"), &owner).expect("write owner");
+                    caught_panic();
+                    ready_tx.send((original, retained, owner)).expect("ready");
+                    release_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("release");
+                });
+                let (failed_original, failed_retained, failed_owner) = ready_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("retained");
+                // KEEP_TMP intentionally leaves the original occupied, so name
+                // reuse only applies to the ordinary rename-on-panic policy.
+                if keep_tmp_requested() {
+                    release_tx.send(()).expect("release");
+                    failing.join().expect("failing owner finished");
+                    assert_eq!(
+                        std::fs::read_to_string(failed_original.join("daemon.log")).unwrap(),
+                        failed_owner
+                    );
+                    std::fs::remove_dir_all(failed_original).expect("clean up kept dir");
+                    return;
+                }
+                let (original, retained, passing_owner, retained_exists) =
+                    on_fresh_thread(move || {
+                        let dir = fixed_tempdir(&passing_root);
+                        let original = dir.path().to_path_buf();
+                        let retained = retained_path_for(&original);
+                        let owner = std::thread::current().id();
+                        drop(dir);
+                        let exists = retained.exists();
+                        (original, retained, owner, exists)
+                    });
+                release_tx.send(()).expect("release");
+                failing.join().expect("failing owner finished");
+                let diagnostics = std::fs::read_to_string(failed_retained.join("daemon.log"))
+                    .expect("retained diagnostics");
+                assert_eq!(
+                    diagnostics, failed_owner,
+                    "failed diagnostics are preserved"
+                );
+                assert_eq!(original.file_name(), failed_original.file_name());
+                assert!(
+                    !original.exists(),
+                    "passing owner removed {}",
+                    original.display()
+                );
+                assert!(
+                    !retained_exists,
+                    "no failed-* sibling for passing pid={} tid={passing_owner:?}: original={} retained={}; failed owner {failed_owner}: original={} retained={}",
+                    std::process::id(), original.display(), retained.display(),
+                    failed_original.display(), failed_retained.display()
+                );
+            });
+        });
+    }
+
     #[test]
     fn tempdir_is_retained_when_creating_thread_panics() {
-        let (original, retained) = on_fresh_thread(|| {
-            let dir = test_tempdir("itd-retain-");
-            std::fs::write(dir.path().join("daemon.log"), "line\n".repeat(3)).expect("write log");
-            let original = dir.path().to_path_buf();
-            let retained = retained_path_for(&original);
-            assert_eq!(
-                retained.file_name().unwrap().to_string_lossy(),
-                format!("failed-{}", original.file_name().unwrap().to_string_lossy())
+        with_retention_test_root(&std::env::temp_dir(), |base| {
+            let (original, retained) = on_fresh_thread(move || {
+                let dir = test_tempdir_in(base.to_str().expect("UTF-8 temp root"), "itd-retain-");
+                std::fs::write(dir.path().join("daemon.log"), "line\n".repeat(3))
+                    .expect("write log");
+                let original = dir.path().to_path_buf();
+                let retained = retained_path_for(&original);
+                assert_eq!(
+                    retained.file_name().unwrap().to_string_lossy(),
+                    format!("failed-{}", original.file_name().unwrap().to_string_lossy())
+                );
+                caught_panic();
+                (original, retained)
+            });
+            if keep_tmp_requested() {
+                assert!(original.is_dir(), "KEEP_TMP keeps the dir in place");
+                let _ = std::fs::remove_dir_all(&original);
+                return;
+            }
+            assert!(!original.exists(), "original swept after retention");
+            assert!(
+                retained.is_dir(),
+                "retained dir exists at {}",
+                retained.display()
             );
-            caught_panic();
-            (original, retained)
+            assert!(
+                retained.join("daemon.log").is_file(),
+                "daemon.log travelled with the dir"
+            );
+            std::fs::remove_dir_all(&retained).expect("clean up retained dir");
         });
-        if keep_tmp_requested() {
-            assert!(original.is_dir(), "KEEP_TMP keeps the dir in place");
-            let _ = std::fs::remove_dir_all(&original);
-            return;
-        }
-        assert!(!original.exists(), "original swept after retention");
-        assert!(
-            retained.is_dir(),
-            "retained dir exists at {}",
-            retained.display()
-        );
-        assert!(
-            retained.join("daemon.log").is_file(),
-            "daemon.log travelled with the dir"
-        );
-        std::fs::remove_dir_all(&retained).expect("clean up retained dir");
     }
 
     #[test]
     fn tempdir_is_not_retained_on_success() {
-        let (original, retained) = on_fresh_thread(|| {
-            let dir = test_tempdir("itd-retain-");
-            let original = dir.path().to_path_buf();
-            (original.clone(), retained_path_for(&original))
+        with_retention_test_root(&std::env::temp_dir(), |base| {
+            let (original, retained, owner) = on_fresh_thread(move || {
+                let dir = test_tempdir_in(base.to_str().expect("UTF-8 temp root"), "itd-retain-");
+                let original = dir.path().to_path_buf();
+                (
+                    original.clone(),
+                    retained_path_for(&original),
+                    std::thread::current().id(),
+                )
+            });
+            if keep_tmp_requested() {
+                let _ = std::fs::remove_dir_all(&original);
+            } else {
+                assert!(
+                    !original.exists(),
+                    "passing thread {owner:?} sweeps {} (pid={})",
+                    original.display(),
+                    std::process::id()
+                );
+            }
+            assert!(
+                !retained.exists(),
+                "no failed-* sibling without a panic: pid={} tid={owner:?} original={} retained={}",
+                std::process::id(),
+                original.display(),
+                retained.display()
+            );
         });
-        if keep_tmp_requested() {
-            let _ = std::fs::remove_dir_all(&original);
-        } else {
-            assert!(!original.exists(), "passing thread sweeps its dir");
-        }
-        assert!(!retained.exists(), "no failed-* sibling without a panic");
     }
 
     #[test]
@@ -1180,77 +1295,83 @@ mod tests {
 
     #[test]
     fn suppressed_thread_keeps_normal_cleanup_on_caught_panic() {
-        let (original, retained) = on_fresh_thread(|| {
-            let dir = test_tempdir("itd-retain-");
-            let original = dir.path().to_path_buf();
-            {
-                let _suppress = suppress_failure_retention();
+        with_retention_test_root(&std::env::temp_dir(), |base| {
+            let (original, retained) = on_fresh_thread(move || {
+                let dir = test_tempdir_in(base.to_str().expect("UTF-8 temp root"), "itd-retain-");
+                let original = dir.path().to_path_buf();
+                {
+                    let _suppress = suppress_failure_retention();
+                    caught_panic();
+                }
+                assert!(original.is_dir(), "suppressed: dir untouched by the hook");
                 caught_panic();
+                assert!(
+                    !original.exists(),
+                    "retention is back once the guard is dropped"
+                );
+                (original.clone(), retained_path_for(&original))
+            });
+            if keep_tmp_requested() {
+                let _ = std::fs::remove_dir_all(&original);
+                return;
             }
-            assert!(original.is_dir(), "suppressed: dir untouched by the hook");
-            caught_panic();
-            assert!(
-                !original.exists(),
-                "retention is back once the guard is dropped"
-            );
-            (original.clone(), retained_path_for(&original))
+            assert!(retained.is_dir(), "renamed by the post-guard panic");
+            std::fs::remove_dir_all(&retained).expect("clean up retained dir");
         });
-        if keep_tmp_requested() {
-            let _ = std::fs::remove_dir_all(&original);
-            return;
-        }
-        assert!(retained.is_dir(), "renamed by the post-guard panic");
-        std::fs::remove_dir_all(&retained).expect("clean up retained dir");
     }
 
     #[test]
     fn real_failure_inside_suppression_window_still_retains() {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let outcome = std::thread::spawn(move || {
-            let dir = test_tempdir("itd-retain-");
-            let original = dir.path().to_path_buf();
-            tx.send((original.clone(), retained_path_for(&original)))
-                .expect("send paths");
-            let _suppress = suppress_failure_retention();
-            caught_panic();
-            assert!(original.is_dir(), "caught panic under the guard: untouched");
-            panic!("intentional: uncaught failure while suppressed");
-        })
-        .join();
-        assert!(outcome.is_err(), "thread must have failed");
-        let (original, retained) = rx.recv().expect("paths");
-        if keep_tmp_requested() {
-            let _ = std::fs::remove_dir_all(&original);
-            return;
-        }
-        assert!(!original.exists(), "original swept after retention");
-        assert!(
-            retained.is_dir(),
-            "guard dropped during unwinding retained {}",
-            retained.display()
-        );
-        std::fs::remove_dir_all(&retained).expect("clean up retained dir");
+        with_retention_test_root(&std::env::temp_dir(), |base| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let outcome = std::thread::spawn(move || {
+                let dir = test_tempdir_in(base.to_str().expect("UTF-8 temp root"), "itd-retain-");
+                let original = dir.path().to_path_buf();
+                tx.send((original.clone(), retained_path_for(&original)))
+                    .expect("send paths");
+                let _suppress = suppress_failure_retention();
+                caught_panic();
+                assert!(original.is_dir(), "caught panic under the guard: untouched");
+                panic!("intentional: uncaught failure while suppressed");
+            })
+            .join();
+            assert!(outcome.is_err(), "thread must have failed");
+            let (original, retained) = rx.recv().expect("paths");
+            if keep_tmp_requested() {
+                let _ = std::fs::remove_dir_all(&original);
+                return;
+            }
+            assert!(!original.exists(), "original swept after retention");
+            assert!(
+                retained.is_dir(),
+                "guard dropped during unwinding retained {}",
+                retained.display()
+            );
+            std::fs::remove_dir_all(&retained).expect("clean up retained dir");
+        });
     }
 
     #[test]
     fn sibling_thread_panic_does_not_retain_my_dir() {
-        let (original, retained) = on_fresh_thread(|| {
-            let dir = test_tempdir("itd-retain-");
-            let original = dir.path().to_path_buf();
-            on_fresh_thread(caught_panic);
+        with_retention_test_root(&std::env::temp_dir(), |base| {
+            let (original, retained) = on_fresh_thread(move || {
+                let dir = test_tempdir_in(base.to_str().expect("UTF-8 temp root"), "itd-retain-");
+                let original = dir.path().to_path_buf();
+                on_fresh_thread(caught_panic);
+                assert!(
+                    original.is_dir(),
+                    "another thread's panic leaves my dir alone"
+                );
+                (original.clone(), retained_path_for(&original))
+            });
+            if keep_tmp_requested() {
+                let _ = std::fs::remove_dir_all(&original);
+            }
             assert!(
-                original.is_dir(),
-                "another thread's panic leaves my dir alone"
+                !retained.exists(),
+                "retention is scoped to the panicking thread"
             );
-            (original.clone(), retained_path_for(&original))
         });
-        if keep_tmp_requested() {
-            let _ = std::fs::remove_dir_all(&original);
-        }
-        assert!(
-            !retained.exists(),
-            "retention is scoped to the panicking thread"
-        );
     }
 
     /// A synthetic `agent.getConversation` page whose `user` row carries the
