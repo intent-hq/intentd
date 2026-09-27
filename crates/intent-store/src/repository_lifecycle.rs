@@ -56,6 +56,7 @@ struct DomainState {
 }
 
 pub(crate) struct LifecycleDomain {
+    identity: DatabaseIdentity,
     state: Mutex<DomainState>,
     writers: Arc<AsyncMutex<()>>,
     // Keep the file incarnation alive even after one Store closes its pools;
@@ -75,16 +76,21 @@ enum DatabaseIdentity {
 struct Domains {
     files: HashMap<DatabaseIdentity, Weak<LifecycleDomain>>,
     paths: HashMap<PathBuf, (DatabaseIdentity, Weak<LifecycleDomain>)>,
+    // An installed observer, unresolved writer or retired incarnation must not
+    // disappear when the last Store drops: its SQLite worker may still be live.
+    retained: HashMap<DatabaseIdentity, Arc<LifecycleDomain>>,
 }
+
+static DOMAINS: OnceLock<Mutex<Domains>> = OnceLock::new();
 
 fn lifecycle_error(message: &str) -> Error {
     Error::Internal(format!("repository lifecycle: {message}"))
 }
 
 /// All managed opens of the same file share an observer, including opens before
-/// installation. Weak entries never keep a closed daemon lifetime alive.
+/// installation. Only confirmed, unobserved domains may be reclaimed; protected
+/// domains retain their actual file incarnation until this process exits.
 pub(crate) fn domain_for(path: &Path) -> Result<Arc<LifecycleDomain>> {
-    static DOMAINS: OnceLock<Mutex<Domains>> = OnceLock::new();
     let database_file = std::fs::File::open(path)
         .map_err(|e| lifecycle_error(&format!("database handle unavailable: {e}")))?;
     let canonical = std::fs::canonicalize(path)
@@ -119,6 +125,7 @@ pub(crate) fn domain_for(path: &Path) -> Result<Arc<LifecycleDomain>> {
                     state.invalidated = true;
                     state.observer.clone()
                 };
+                domain.retain_for_process();
                 if let Some(observer) = observer {
                     // The original database has been replaced outside Store.
                     // Never settle this retirement or hand out a fresh domain.
@@ -137,6 +144,7 @@ pub(crate) fn domain_for(path: &Path) -> Result<Arc<LifecycleDomain>> {
         return Ok(domain);
     }
     let domain = Arc::new(LifecycleDomain {
+        identity: identity.clone(),
         state: Mutex::default(),
         writers: Arc::default(),
         _database_file: database_file,
@@ -149,6 +157,20 @@ pub(crate) fn domain_for(path: &Path) -> Result<Arc<LifecycleDomain>> {
 }
 
 impl LifecycleDomain {
+    fn retain_for_process(self: &Arc<Self>) {
+        // domain_for releases the registry lock before taking any domain lock.
+        // Preserve protection even if the registry was poisoned; ordinary
+        // lookup still rejects that poisoned registry instead of admitting work.
+        let mut domains = DOMAINS
+            .get_or_init(Mutex::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        domains
+            .retained
+            .entry(self.identity.clone())
+            .or_insert_with(|| self.clone());
+    }
+
     pub(crate) async fn write(self: &Arc<Self>) -> Result<LifecycleWrite> {
         let serial = self.writers.clone().lock_owned().await;
         let mut state = self
@@ -231,6 +253,9 @@ impl Drop for LifecycleWrite {
                 state.unconfirmed_without_observer = true;
             }
         }
+        if self.begun && !self.confirmed {
+            self.domain.retain_for_process();
+        }
         // A service ticket deliberately drops without confirmation here.
     }
 }
@@ -274,6 +299,7 @@ impl Store {
                 "an earlier writer has not confirmed settlement",
             ));
         }
+        self.repository_lifecycle.retain_for_process();
         state.observer = Some(observer);
         Ok(())
     }

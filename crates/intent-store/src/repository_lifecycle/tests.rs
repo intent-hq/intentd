@@ -743,3 +743,148 @@ async fn branch_reconcile_winning_change_retires_and_known_cas_loss_preserves() 
     assert!(old.load(Ordering::SeqCst));
     assert_eq!(f.probe.starts(), starts);
 }
+
+#[tokio::test]
+async fn unconfirmed_owner_survives_last_store_drop_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.db");
+    let store = Store::open(&path).await.unwrap();
+    let mut owner = store.repository_lifecycle_write().await.unwrap();
+    owner.begin(&[RepositoryLifecycleKey::Database]).unwrap();
+    drop(owner);
+    drop(store);
+
+    let reopened = Store::open(&path).await.unwrap();
+    let observer: Arc<dyn RepositoryLifecycleObserver> = Arc::new(Probe::default());
+    assert!(
+        reopened
+            .install_repository_lifecycle_observer(observer)
+            .await
+            .is_err(),
+        "last-handle drop must not erase an unconfirmed writer"
+    );
+}
+
+#[tokio::test]
+async fn installed_observer_survives_last_store_drop_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.db");
+    let store = Store::open(&path).await.unwrap();
+    let probe = Arc::new(Probe::default());
+    let observer: Arc<dyn RepositoryLifecycleObserver> = probe.clone();
+    store
+        .install_repository_lifecycle_observer(observer.clone())
+        .await
+        .unwrap();
+    let mut owner = store.repository_lifecycle_write().await.unwrap();
+    owner.begin(&[RepositoryLifecycleKey::Database]).unwrap();
+    drop(owner);
+    drop(store);
+
+    let reopened = Store::open(&path).await.unwrap();
+    assert!(reopened.has_repository_lifecycle_observer(&observer));
+    assert!(probe
+        .capture(vec![RepositoryLifecycleKey::Database])
+        .is_none());
+    let replacement: Arc<dyn RepositoryLifecycleObserver> = Arc::new(Probe::default());
+    assert!(reopened
+        .install_repository_lifecycle_observer(replacement)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn confirmed_unobserved_domain_can_be_reclaimed_after_last_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.db");
+    let store = Store::open(&path).await.unwrap();
+    let domain = Arc::downgrade(&store.repository_lifecycle);
+    let mut owner = store.repository_lifecycle_write().await.unwrap();
+    owner.begin(&[RepositoryLifecycleKey::Database]).unwrap();
+    owner.settle();
+    drop(store);
+    assert!(domain.upgrade().is_none());
+
+    let reopened = Store::open(&path).await.unwrap();
+    let observer: Arc<dyn RepositoryLifecycleObserver> = Arc::new(Probe::default());
+    reopened
+        .install_repository_lifecycle_observer(observer.clone())
+        .await
+        .unwrap();
+    assert!(reopened.has_repository_lifecycle_observer(&observer));
+}
+
+#[tokio::test]
+async fn queued_sqlite_write_outlives_last_owner_without_resetting_admission() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.db");
+    let store = Store::open(&path).await.unwrap();
+    let workspace: Workspace = serde_json::from_value(serde_json::json!({
+        "id":"ws-pending", "title":"Pending", "branch":"main", "status":"Active",
+        "activity":"idle", "attention":"none", "createdAt":"same-time", "updatedAt":"same-time",
+        "tags":[], "skipWorktree":false, "isRemote":false, "archived":false
+    }))
+    .unwrap();
+    let workspace_id = workspace.id.clone();
+    let pool = store.write_pool().clone();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let notify = started.clone();
+    let (release, blocked) = std::sync::mpsc::sync_channel(1);
+    let mut blocked = Some(blocked);
+    let mut connection = pool.acquire().await.unwrap();
+    connection
+        .lock_handle()
+        .await
+        .unwrap()
+        .set_update_hook(move |update| {
+            if update.table == "workspace" {
+                if let Some(blocked) = blocked.take() {
+                    notify.notify_one();
+                    blocked
+                        .recv_timeout(std::time::Duration::from_secs(20))
+                        .unwrap();
+                }
+            }
+        });
+    drop(connection);
+
+    // Only the request owns Store; the pool/SQLite worker carries no domain Arc.
+    let task = tokio::spawn(async move { store.insert_workspace(&workspace).await });
+    started.notified().await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    // Release the actual in-flight SQLite write after its caller and last Store
+    // disappeared. Drain its connection before opening the next managed Store.
+    release.send(()).unwrap();
+    let mut connection = pool.acquire().await.unwrap();
+    connection.lock_handle().await.unwrap().remove_update_hook();
+    drop(connection);
+
+    let reopened = Store::open(&path).await.unwrap();
+    assert!(reopened.get_workspace(&workspace_id).await.is_ok());
+    let observer: Arc<dyn RepositoryLifecycleObserver> = Arc::new(Probe::default());
+    assert!(
+        reopened
+            .install_repository_lifecycle_observer(observer)
+            .await
+            .is_err(),
+        "a later observed commit does not settle the vanished original owner"
+    );
+}
+
+#[tokio::test]
+async fn retired_file_incarnation_survives_last_store_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.db");
+    let store = Store::open(&path).await.unwrap();
+    store.close().await;
+    let previous = dir.path().join("previous.db");
+    std::fs::rename(&path, &previous).unwrap();
+    std::fs::copy(&previous, &path).unwrap();
+    assert!(Store::open(&path).await.is_err());
+    drop(store);
+    assert!(
+        Store::open(&path).await.is_err(),
+        "dropping the last Store must not erase a retired live incarnation"
+    );
+}
