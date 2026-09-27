@@ -92,6 +92,8 @@ pub struct AsyncTokenStore {
     write_timeout: Duration,
     cache_ttl: Duration,
     warn_interval: Duration,
+    changes: watch::Sender<Option<String>>,
+    admission: Arc<tokio::sync::RwLock<()>>,
 }
 
 /// Combined async state: the single cache slot, timeout-warn rate-limit
@@ -153,6 +155,8 @@ impl AsyncTokenStore {
     ) -> Self {
         Self {
             inner,
+            changes: watch::channel(None).0,
+            admission: Arc::default(),
             state: Arc::new(Mutex::new(TokenState {
                 entry: None,
                 last_warn: None,
@@ -226,19 +230,37 @@ impl AsyncTokenStore {
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn store_token(&self, token: &str) -> Result<()> {
-        let inner = self.inner.clone();
+        // Keep exclusion and publication in the non-cancellable blocking job:
+        // timeout/caller cancellation cannot let a late durable write bypass a
+        // lease or leave the cache/watch at the previous credential.
+        let deadline = tokio::time::Instant::now() + self.write_timeout;
+        let Ok(admission) =
+            tokio::time::timeout_at(deadline, self.admission.clone().write_owned()).await
+        else {
+            self.warn_timeout("secret-store write admission timed out");
+            return Err(Error::Internal("secret-store write timed out".into()));
+        };
+        // Tokio polls the inner future before its timer. A newly ready lock
+        // must not admit a write when this waiter already missed its deadline.
+        if tokio::time::Instant::now() >= deadline {
+            self.warn_timeout("secret-store write admission timed out");
+            return Err(Error::Internal("secret-store write timed out".into()));
+        }
+        let store = self.clone();
         let value_owned = token.to_string();
-        let handle = tokio::task::spawn_blocking(move || inner.store_token(&value_owned));
-        match timeout(self.write_timeout, handle).await {
-            Ok(Ok(Ok(()))) => {
-                let mut guard = self.state.lock().unwrap();
-                guard.entry = Some(Entry::Cached {
-                    value: Some(token.to_string()),
-                    expires_at: Instant::now() + self.cache_ttl,
-                });
-                Ok(())
-            }
-            Ok(Ok(Err(e))) => Err(e),
+        let handle = tokio::task::spawn_blocking(move || {
+            let _admission = admission;
+            store.inner.store_token(&value_owned)?;
+            let mut state = store.state.lock().unwrap();
+            state.entry = Some(Entry::Cached {
+                value: Some(value_owned.clone()),
+                expires_at: Instant::now() + store.cache_ttl,
+            });
+            store.changes.send_replace(Some(hash_token(&value_owned)));
+            Ok(())
+        });
+        match tokio::time::timeout_at(deadline, handle).await {
+            Ok(Ok(result)) => result,
             Ok(Err(join_err)) => Err(Error::Internal(format!(
                 "secret-store write task panicked: {join_err}"
             ))),
@@ -347,6 +369,173 @@ impl AsyncTokenStore {
     }
 }
 
+/// Connection-owned bearer material. Deliberately neither Debug nor serializable:
+/// only the personal pairing fast path may copy it into an authenticated reply.
+pub(crate) struct AdmittedCredential {
+    pub(crate) resolved: ResolvedCredential,
+    token: String,
+    pub(crate) rotation: Option<LegacyRotation>,
+}
+
+/// A secret-free change watch for the legacy owner credential. Subscribe before
+/// admission; comparing hashes also handles a rotation racing the upgrade.
+pub(crate) struct LegacyRotation {
+    expected: String,
+    changes: watch::Receiver<Option<String>>,
+}
+
+impl LegacyRotation {
+    pub(crate) fn new(store: &AsyncTokenStore, token: &str) -> Self {
+        Self {
+            expected: hash_token(token),
+            changes: store.changes.subscribe(),
+        }
+    }
+
+    pub(crate) async fn revoked(&mut self) {
+        loop {
+            if self
+                .changes
+                .borrow_and_update()
+                .as_ref()
+                .is_some_and(|hash| hash != &self.expected)
+            {
+                return;
+            }
+            if self.changes.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+pub(crate) async fn await_rotation(rotation: &mut Option<LegacyRotation>) {
+    match rotation {
+        Some(rotation) => rotation.revoked().await,
+        None => std::future::pending().await,
+    }
+}
+
+impl AdmittedCredential {
+    pub(crate) fn new(
+        resolved: ResolvedCredential,
+        token: String,
+        rotation: LegacyRotation,
+    ) -> Self {
+        let rotation = matches!(resolved, ResolvedCredential::Legacy).then_some(rotation);
+        Self {
+            resolved,
+            token,
+            rotation,
+        }
+    }
+
+    pub(crate) fn binding(
+        &self,
+        store: &AsyncTokenStore,
+        caller: &Caller,
+    ) -> Option<intent_core::caller::WireCredential> {
+        use intent_core::caller::WireCredential;
+        let principal_id = caller.principal_id()?.clone();
+        Some(match &self.resolved {
+            ResolvedCredential::Legacy => WireCredential::Legacy {
+                principal_id,
+                authority: Arc::new(LegacyAdmission {
+                    store: store.clone(),
+                    token: self.token.clone(),
+                }),
+            },
+            ResolvedCredential::Principal(admitted) => WireCredential::Principal {
+                principal_id: admitted.clone(),
+                token_hash: hash_token(&self.token),
+            },
+        })
+    }
+
+    pub(crate) fn token(&self) -> &str {
+        &self.token
+    }
+
+    /// Recheck the exact admission binding, never allow a bearer to resolve to
+    /// a different person (or change from a personal token to the global token).
+    pub(crate) async fn valid_for(
+        &self,
+        store: &AsyncTokenStore,
+        api: &dyn WorkspaceApi,
+        caller: &Caller,
+    ) -> bool {
+        let Some(id) = caller.principal_id() else {
+            return false;
+        };
+        match &self.resolved {
+            ResolvedCredential::Legacy => {
+                api.primary_principal_id()
+                    .await
+                    .is_ok_and(|primary| &primary == id)
+                    && store
+                        .load_token()
+                        .await
+                        .is_some_and(|stored| token_matches(&stored, &self.token))
+            }
+            ResolvedCredential::Principal(admitted) => {
+                admitted == id
+                    && api.principal_host_role(id.clone()).await.is_ok()
+                    && api
+                        .resolve_principal_credential(hash_token(&self.token))
+                        .await
+                        .is_ok_and(|resolved| resolved.as_ref() == Some(id))
+            }
+        }
+    }
+}
+
+/// Private transport-owned bearer; only an opaque lease crosses into services.
+struct LegacyAdmission {
+    store: AsyncTokenStore,
+    token: String,
+}
+
+impl intent_core::caller::LegacyCredentialAuthority for LegacyAdmission {
+    fn authorize(
+        &self,
+    ) -> intent_core::BoxFuture<'_, Result<intent_core::caller::CredentialLease>> {
+        Box::pin(async move {
+            let deadline = tokio::time::Instant::now() + self.store.load_timeout;
+            let admission = async {
+                let lease = self.store.admission.clone().read_owned().await;
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(Error::Forbidden(
+                        "admitted credential could not be revalidated".into(),
+                    ));
+                }
+                if !self
+                    .store
+                    .load_token()
+                    .await
+                    .is_some_and(|token| token_matches(&token, &self.token))
+                {
+                    return Err(Error::Forbidden(
+                        "admitted credential is no longer valid".into(),
+                    ));
+                }
+                // Loading can also become ready after the outer timeout's
+                // deadline, so recheck before returning usable authority.
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(Error::Forbidden(
+                        "admitted credential could not be revalidated".into(),
+                    ));
+                }
+                Ok(Box::new(lease) as intent_core::caller::CredentialLease)
+            };
+            tokio::time::timeout_at(deadline, admission)
+                .await
+                .map_err(|_| {
+                    Error::Forbidden("admitted credential could not be revalidated".into())
+                })?
+        })
+    }
+}
+
 /// Internal choice returned by the entry probe in [`AsyncTokenStore::load_token`].
 #[expect(clippy::option_option)] // watch payload: unpublished vs loaded-None (see `Entry`)
 enum LoadAction {
@@ -415,17 +604,25 @@ impl ResolvedCredential {
             ResolvedCredential::Legacy => match api.primary_principal_id().await {
                 Ok(principal_id) => Some(Caller::Wire {
                     principal_id,
-                    is_administrator: true,
+                    host_role: intent_core::HostRole::Owner,
                 }),
                 Err(e) => {
                     tracing::debug!(error = %e, "legacy token admitted with no principal bound");
                     None
                 }
             },
-            ResolvedCredential::Principal(principal_id) => Some(Caller::Wire {
-                principal_id,
-                is_administrator: false,
-            }),
+            ResolvedCredential::Principal(principal_id) => {
+                match api.principal_host_role(principal_id.clone()).await {
+                    Ok(host_role) => Some(Caller::Wire {
+                        principal_id,
+                        host_role,
+                    }),
+                    Err(e) => {
+                        tracing::debug!(error = %e, "credential authority could not be resolved");
+                        None
+                    }
+                }
+            }
         }
     }
 }

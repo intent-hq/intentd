@@ -677,6 +677,7 @@ pub(crate) fn channel_event_types(channel: Channel) -> Vec<String> {
             AGENT_DELETED,
         ],
         Channel::Workspace => &[
+            intent_core::events::HOST_MEMBERS_CHANGED,
             WORKSPACE_CREATED,
             WORKSPACE_UPDATED,
             WORKSPACE_DELETED,

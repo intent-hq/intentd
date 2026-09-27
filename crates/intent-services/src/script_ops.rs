@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -126,15 +126,16 @@ fn next_generation() -> u64 {
 /// by any number of workspaces without collision or cross-workspace mutation.
 pub(crate) type ScriptRegistry = Arc<Mutex<HashMap<(WorkspaceId, String), ManagedScript>>>;
 
-/// Per-workspace async-mutex map for script bootstrap operations. Prevents
-/// concurrent `script.list` calls from creating duplicate repo-config scripts.
-/// Modeled after `intent-git::WorktreeLocks`.
+/// Shared async locks for workspace bootstrap and script definition updates.
+/// Bootstrap is workspace-scoped; updates use the durable script id across
+/// all workspaces, matching the store's primary key and legacy owner moves.
 #[derive(Clone, Default)]
-pub(crate) struct WorkspaceScriptLocks {
-    locks: Arc<Mutex<HashMap<WorkspaceId, Arc<AsyncMutex<()>>>>>,
+pub(crate) struct ScriptLocks {
+    workspaces: Arc<Mutex<HashMap<WorkspaceId, Arc<AsyncMutex<()>>>>>,
+    definitions: Arc<Mutex<HashMap<String, Weak<AsyncMutex<()>>>>>,
 }
 
-impl WorkspaceScriptLocks {
+impl ScriptLocks {
     /// Create an empty lock registry.
     pub(crate) fn new() -> Self {
         Self::default()
@@ -142,8 +143,21 @@ impl WorkspaceScriptLocks {
 
     /// Resolve (or create) the lock for a workspace.
     fn lock_for(&self, workspace_id: &WorkspaceId) -> Arc<AsyncMutex<()>> {
-        let mut map = self.locks.lock().expect("script lock map poisoned");
+        let mut map = self.workspaces.lock().expect("script lock map poisoned");
         map.entry(workspace_id.clone()).or_default().clone()
+    }
+
+    /// Keep a lock alive while any update holds or waits for it. Reclaim
+    /// inactive ids so arbitrary script ids do not accumulate forever.
+    fn definition_lock(&self, script_id: &str) -> Arc<AsyncMutex<()>> {
+        let mut map = self.definitions.lock().expect("script lock map poisoned");
+        map.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = map.get(script_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(AsyncMutex::new(()));
+        map.insert(script_id.to_owned(), Arc::downgrade(&lock));
+        lock
     }
 
     /// Run `f` while holding the per-workspace script lock.
@@ -167,13 +181,14 @@ pub(crate) struct ScriptManager {
     bus: Option<EventBus>,
     store: Store,
     scripts: ScriptRegistry,
-    bootstrap_locks: WorkspaceScriptLocks,
+    locks: ScriptLocks,
     /// The too-fast-exit floor in milliseconds ([`TOO_FAST_MS`] in production;
     /// tests inject a larger floor so the decision is load-independent).
     too_fast_ms: u128,
     /// Test park seams for the `script.*` race windows; all `None` in
     /// production wiring.
     parks: ScriptParks,
+    settings: Option<Arc<crate::SettingsRegistry>>,
 }
 
 /// Test seam for a race window: lets a test hold a task inside a window
@@ -239,7 +254,7 @@ impl ScriptManager {
         bus: Option<EventBus>,
         store: Store,
         scripts: ScriptRegistry,
-        bootstrap_locks: WorkspaceScriptLocks,
+        locks: ScriptLocks,
         too_fast_ms: u128,
         parks: ScriptParks,
     ) -> Self {
@@ -248,10 +263,16 @@ impl ScriptManager {
             bus,
             store,
             scripts,
-            bootstrap_locks,
+            locks,
             too_fast_ms,
             parks,
+            settings: None,
         }
+    }
+
+    pub(crate) fn with_settings(mut self, settings: Option<Arc<crate::SettingsRegistry>>) -> Self {
+        self.settings = settings;
+        self
     }
 
     /// `script.create`: register (or upsert) a definition, persist it, and
@@ -261,28 +282,74 @@ impl ScriptManager {
         workspace_id: WorkspaceId,
         params: ScriptCreateParams,
     ) -> Result<Value> {
+        self.create_with_scope(workspace_id, params, false).await
+    }
+
+    /// Wire non-administrators may replace only definitions in this workspace.
+    pub(crate) async fn create_in_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+        params: ScriptCreateParams,
+    ) -> Result<Value> {
+        self.create_with_scope(workspace_id, params, true).await
+    }
+
+    async fn create_with_scope(
+        &self,
+        workspace_id: WorkspaceId,
+        params: ScriptCreateParams,
+        scoped: bool,
+    ) -> Result<Value> {
         let id = params
             .script_id
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        // Persist, tear down, and register one replacement as a unit. This
+        // lock is shared by scoped and owner/internal calls, so a later
+        // successful update cannot be overwritten only in the live registry
+        // while this call awaits its predecessor's supervisor.
+        let lock = self.locks.definition_lock(&id);
+        let _guard = lock.lock().await;
         // Upsert of an existing id (`ws.script.create` with `scriptId`):
         // the definition is replaced with `source`/`createdAt` preserved and
         // `updatedAt` stamped (FE parity), and — unlike the FE, whose manager
         // re-reads definitions from disk — the daemon must tear down the old
         // supervisor/PTY here so a running replaced script is never orphaned.
+        let (source, created_at, updated_at) = {
+            let scripts = self.scripts.lock().unwrap();
+            match scripts.get(&(workspace_id.clone(), id.clone())) {
+                Some(old) => (
+                    old.def.source.clone(),
+                    old.def.created_at.clone(),
+                    Some(now_iso()),
+                ),
+                None => ("user".to_string(), now_iso(), None),
+            }
+        };
+        let def = Script {
+            id: id.clone(),
+            workspace_id: workspace_id.as_str().to_string(),
+            name: params.name,
+            command: params.command,
+            cwd: params.cwd,
+            env: params.env,
+            mode: params.mode,
+            category: params.category,
+            source,
+            auto_start: params.auto_start,
+            created_at,
+            updated_at,
+        };
+        // Recheck scope atomically before runtime teardown: another request
+        // may have claimed this id since the service's preflight lookup.
+        if scoped {
+            self.store.upsert_script_in_workspace(&def).await?;
+        }
         let existing = self
             .scripts
             .lock()
             .unwrap()
             .remove(&(workspace_id.clone(), id.clone()));
-        let (source, created_at, updated_at) = match &existing {
-            Some(old) => (
-                old.def.source.clone(),
-                old.def.created_at.clone(),
-                Some(now_iso()),
-            ),
-            None => ("user".to_string(), now_iso(), None),
-        };
         let change = if existing.is_some() {
             "updated"
         } else {
@@ -304,23 +371,11 @@ impl ScriptManager {
                 }
             }
         }
-        let def = Script {
-            id: id.clone(),
-            workspace_id: workspace_id.as_str().to_string(),
-            name: params.name,
-            command: params.command,
-            cwd: params.cwd,
-            env: params.env,
-            mode: params.mode,
-            category: params.category,
-            source,
-            auto_start: params.auto_start,
-            created_at,
-            updated_at,
-        };
         // Persist first (FE `upsertScript` parity — definitions survive a
         // daemon restart); the runtime registry only registers what is durable.
-        self.store.upsert_script(&def).await?;
+        if !scoped {
+            self.store.upsert_script(&def).await?;
+        }
         self.scripts.lock().unwrap().insert(
             (workspace_id.clone(), id),
             ManagedScript {
@@ -439,7 +494,7 @@ impl ScriptManager {
         // Bootstrap from repo config if workspace has no scripts.
         // Use a per-workspace async lock to prevent concurrent bootstrap attempts
         // from creating duplicate script rows (modeled after intent-git::WorktreeLocks).
-        self.bootstrap_locks
+        self.locks
             .with_lock(workspace_id, || async {
                 // Re-check after acquiring the lock — another caller may have bootstrapped
                 {
@@ -559,6 +614,41 @@ impl ScriptManager {
         workspace_id: &WorkspaceId,
         script_id: &str,
     ) -> Result<Value> {
+        self.remove_with_scope(workspace_id, script_id, false).await
+    }
+
+    /// Non-administrators may remove only the durable row in this workspace.
+    pub(crate) async fn remove_in_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+        script_id: &str,
+    ) -> Result<Value> {
+        self.remove_with_scope(workspace_id, script_id, true).await
+    }
+
+    async fn remove_with_scope(
+        &self,
+        workspace_id: &WorkspaceId,
+        script_id: &str,
+        scoped: bool,
+    ) -> Result<Value> {
+        let lock = self.locks.definition_lock(script_id);
+        let _guard = lock.lock().await;
+        if scoped {
+            if !self
+                .scripts
+                .lock()
+                .unwrap()
+                .contains_key(&(workspace_id.clone(), script_id.to_string()))
+            {
+                return Err(Error::NotFound(format!("script {script_id}")));
+            }
+            // Atomically refuse a foreign durable id before taking the local
+            // runtime entry, stopping its process, or publishing a change.
+            self.store
+                .remove_script_in_workspace(workspace_id, script_id)
+                .await?;
+        }
         let removed = self
             .scripts
             .lock()
@@ -571,8 +661,8 @@ impl ScriptManager {
         // *await* the supervisor instead of aborting it. An abort could land
         // in the pre-registration window (after `pty.spawn`, before
         // `mark_running` records the id) and orphan the fresh PTY; awaited,
-        // the supervisor sees the entry gone and reaps it itself. No lock is
-        // held across these awaits (the entry was already taken above).
+        // the supervisor sees the entry gone and reaps it itself. The registry
+        // mutex is released, while the definition lock fences creates/removes.
         let handle = managed.supervisor.take();
         if let Some(pty_id) = managed.pty_id {
             self.pty.kill(pty_id).await;
@@ -582,7 +672,9 @@ impl ScriptManager {
                 tracing::warn!(script = %script_id, error = %e, "script supervisor join failed during remove teardown");
             }
         }
-        self.store.remove_script(script_id).await?;
+        if !scoped {
+            self.store.remove_script(script_id).await?;
+        }
         publish_event(
             self.bus.as_ref(),
             script_event(
@@ -988,7 +1080,7 @@ impl ScriptManager {
                 return Err(e);
             }
         };
-        let pty_id = match self.pty.spawn(Self::build_spec(&ws, &def, cwd.as_ref())) {
+        let pty_id = match self.pty.spawn(self.build_spec(&ws, &def, cwd.as_ref())) {
             Ok(id) => id,
             Err(e) => {
                 reservation.armed = false;
@@ -1089,7 +1181,7 @@ impl ScriptManager {
             if let Some(old) = prev.take() {
                 self.pty.kill(old).await;
             }
-            let pty_id = match self.pty.spawn(Self::build_spec(&ws, &def, cwd.as_ref())) {
+            let pty_id = match self.pty.spawn(self.build_spec(&ws, &def, cwd.as_ref())) {
                 Ok(id) => id,
                 Err(e) => {
                     self.fail(&ws, &script_id, generation, &e.to_string(), restoring)
@@ -1560,12 +1652,19 @@ impl ScriptManager {
     /// enhanced-PATH + commit-identity + script env overlay, with an inherited
     /// `npm_config_prefix` scrubbed so nvm's login-shell init succeeds. An
     /// explicit script env value is preserved.
-    fn build_spec(ws: &WorkspaceId, def: &Script, cwd: Option<&PathBuf>) -> SpawnSpec {
+    fn build_spec(&self, ws: &WorkspaceId, def: &Script, cwd: Option<&PathBuf>) -> SpawnSpec {
         let shell = default_shell();
         let mut spec = SpawnSpec::new(ws.as_str(), shell.clone());
         spec.args = shell_args(&shell, &def.command);
         spec.cwd = cwd.cloned();
-        spec.env = spawn_env_overlay(cwd.map(PathBuf::as_path), def.env.as_ref());
+        spec.env = crate::terminal_ops::git_credential_env(
+            self.settings.as_deref(),
+            cwd.map(PathBuf::as_path),
+        );
+        spec.env.extend(spawn_env_overlay(
+            cwd.map(PathBuf::as_path),
+            def.env.as_ref(),
+        ));
         spec.env_remove = scrubbed_env_vars_except(&spec.env);
         spec.listed = false;
         spec
@@ -3706,6 +3805,57 @@ mod tests {
         );
     }
 
+    #[intent_test_macros::daemon_test]
+    async fn scoped_script_upsert_refuses_scope_race_without_stopping_running_predecessor() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let id = create_simple(&h, "Original", SERVICE_CMD, ScriptMode::Service).await;
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .unwrap();
+        let running = await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+        let pid = running["data"]["pid"].clone();
+
+        // Model another request claiming the durable id after the service's
+        // preflight. Invoke the scoped manager directly to test its final fence.
+        let mut claimed = h.services.store.list_all_scripts().await.unwrap().remove(0);
+        claimed.workspace_id = WorkspaceId::chief().to_string();
+        h.services.store.upsert_script(&claimed).await.unwrap();
+        let result = h
+            .services
+            .script_manager()
+            .create_in_workspace(
+                h.ws.clone(),
+                ScriptCreateParams {
+                    name: "Replacement".into(),
+                    command: "echo replacement".into(),
+                    script_id: Some(id.clone()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(Error::NotFound(_))), "{result:?}");
+        let removed = h
+            .services
+            .script_manager()
+            .remove_in_workspace(&h.ws, &id)
+            .await;
+        assert!(matches!(removed, Err(Error::NotFound(_))), "{removed:?}");
+        let state = h
+            .services
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .unwrap();
+        assert_eq!(state["status"], "running");
+        assert_eq!(state["pid"], pid);
+        assert_eq!(
+            h.services.store.script_workspace(&id).await.unwrap(),
+            Some(WorkspaceId::chief())
+        );
+        h.services.script_stop(h.ws.clone(), id).await.unwrap();
+    }
+
     /// Regression: `script.create` upserting an id whose script is running
     /// must stop the old supervisor/PTY (no orphaned process), preserve the
     /// original `createdAt`/`source`, stamp `updatedAt`, and reset the
@@ -5576,6 +5726,254 @@ mod tests {
             .await
             .expect("status");
         assert_eq!(st["status"], "idle", "fresh entry starts idle");
+    }
+
+    async fn assert_concurrent_script_upserts_stay_consistent(
+        first_scoped: bool,
+        second_scoped: bool,
+    ) {
+        let h = harness().await;
+        let p = start_parked_service(&h).await;
+        let services = p.services.clone();
+        let ws = h.ws.clone();
+        let sid = p.id.clone();
+        let first = intent_core::spawn_daemon(async move {
+            services
+                .script_manager()
+                .create_with_scope(
+                    ws,
+                    ScriptCreateParams {
+                        name: "first replacement".into(),
+                        command: "echo first".into(),
+                        script_id: Some(sid),
+                        ..Default::default()
+                    },
+                    first_scoped,
+                )
+                .await
+        });
+        await_entry_taken(&h, &p, &first).await;
+
+        let services = p.services.clone();
+        let ws = h.ws.clone();
+        let sid = p.id.clone();
+        let mut second = intent_core::spawn_daemon(async move {
+            services
+                .script_manager()
+                .create_with_scope(
+                    ws,
+                    ScriptCreateParams {
+                        name: "second replacement".into(),
+                        command: "echo second".into(),
+                        script_id: Some(sid),
+                        ..Default::default()
+                    },
+                    second_scoped,
+                )
+                .await
+        });
+        // Before serialization the second update completes while the first
+        // awaits its predecessor; the first then overwrites only live state.
+        // A serialized second update remains pending until we release the park.
+        let early_second = tokio::time::timeout(Duration::from_secs(1), &mut second).await;
+
+        // A different script in the same workspace must remain writable while
+        // replacement waits for a supervisor, rather than taking a global lock.
+        tokio::time::timeout(
+            LIVENESS,
+            h.services.script_create(
+                h.ws.clone(),
+                ScriptCreateParams {
+                    name: "independent".into(),
+                    command: "echo independent".into(),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("another script stays writable")
+        .unwrap();
+        p.park.release.notify_one();
+        tokio::time::timeout(LIVENESS, first)
+            .await
+            .expect("first update finishes")
+            .unwrap()
+            .unwrap();
+        match early_second {
+            Ok(result) => result.unwrap().unwrap(),
+            Err(_) => tokio::time::timeout(LIVENESS, second)
+                .await
+                .expect("second update finishes")
+                .unwrap()
+                .unwrap(),
+        };
+        assert_reaped(p.pid, "after overlapping script replacements").await;
+        let listed = h.services.script_list(h.ws.clone()).await.unwrap();
+        let live = listed["scripts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|script| script["id"] == p.id)
+            .unwrap();
+        let persisted = h
+            .services
+            .store
+            .list_all_scripts()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|script| script.id == p.id)
+            .unwrap();
+        assert_eq!(live["command"], persisted.command);
+        assert_eq!(live["command"], "echo second");
+        assert_eq!(live["name"], persisted.name);
+        assert_eq!(live["createdAt"], persisted.created_at);
+        assert_eq!(live["updatedAt"], json!(persisted.updated_at));
+
+        let restarted = Services::new(h.services.store().clone());
+        assert_eq!(restarted.hydrate_scripts().await.unwrap(), 2);
+        let hydrated = restarted.script_list(h.ws.clone()).await.unwrap();
+        let restored = hydrated["scripts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|script| script["id"] == p.id)
+            .unwrap();
+        for field in ["command", "name", "createdAt", "updatedAt"] {
+            assert_eq!(restored[field], live[field], "hydrated {field}");
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn concurrent_member_script_upserts_keep_saved_and_live_definitions_consistent() {
+        assert_concurrent_script_upserts_stay_consistent(true, true).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn concurrent_owner_and_member_script_upserts_keep_saved_and_live_definitions_consistent()
+    {
+        assert_concurrent_script_upserts_stay_consistent(true, false).await;
+        assert_concurrent_script_upserts_stay_consistent(false, true).await;
+    }
+
+    async fn create_or_remove_script(
+        services: Services,
+        workspace: WorkspaceId,
+        id: String,
+        caller: intent_core::Caller,
+        remove: bool,
+    ) -> Result<Value> {
+        intent_core::with_caller(caller, async {
+            if remove {
+                services.script_remove(workspace, id).await
+            } else {
+                services
+                    .script_create(
+                        workspace,
+                        ScriptCreateParams {
+                            name: "replacement".into(),
+                            command: "echo replacement".into(),
+                            script_id: Some(id),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            }
+        })
+        .await
+    }
+
+    async fn assert_create_remove_ordering(first_remove: bool, first_member: bool) {
+        use intent_core::{Caller, HostRole, PrincipalId};
+        let h = harness().await;
+        let p = start_parked_service(&h).await;
+        let mut member = h.services.store.get_primary_principal().await.unwrap();
+        member.id = PrincipalId::new();
+        member.is_primary = false;
+        h.services.store.upsert_principal(&member).await.unwrap();
+        sqlx::query("INSERT INTO host_member(principal_id,added_at) VALUES (?,?)")
+            .bind(member.id.as_str())
+            .bind(now_iso())
+            .execute(h.services.store.write_pool())
+            .await
+            .unwrap();
+        let caller = |is_member| {
+            if is_member {
+                Caller::Wire {
+                    principal_id: member.id.clone(),
+                    host_role: HostRole::Member,
+                }
+            } else {
+                Caller::Daemon
+            }
+        };
+        let first = intent_core::spawn_daemon(create_or_remove_script(
+            p.services.clone(),
+            h.ws.clone(),
+            p.id.clone(),
+            caller(first_member),
+            first_remove,
+        ));
+        await_entry_taken(&h, &p, &first).await;
+        let mut second = intent_core::spawn_daemon(create_or_remove_script(
+            p.services.clone(),
+            h.ws.clone(),
+            p.id.clone(),
+            caller(!first_member),
+            !first_remove,
+        ));
+        let early_second = tokio::time::timeout(Duration::from_secs(1), &mut second).await;
+        tokio::time::timeout(LIVENESS, async {
+            let independent =
+                create_simple(&h, "independent", "echo independent", ScriptMode::Command).await;
+            h.services
+                .script_remove(h.ws.clone(), independent)
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("unrelated script mutations remain responsive");
+        p.park.release.notify_one();
+        tokio::time::timeout(LIVENESS, first)
+            .await
+            .expect("first mutation finishes")
+            .unwrap()
+            .unwrap();
+        let second = match early_second {
+            Ok(result) => result,
+            Err(_) => tokio::time::timeout(LIVENESS, second)
+                .await
+                .expect("second mutation finishes"),
+        };
+        assert_reaped(p.pid, "after overlapping create and remove").await;
+        second.unwrap().unwrap();
+        let live = h.services.script_list(h.ws.clone()).await.unwrap();
+        let persisted = h.services.store.list_all_scripts().await.unwrap();
+        let restarted = Services::new(h.services.store().clone());
+        restarted.hydrate_scripts().await.unwrap();
+        let restored = restarted.script_list(h.ws.clone()).await.unwrap();
+        if first_remove {
+            assert_eq!(persisted.len(), 1, "a later create must remain durable");
+            assert_eq!(persisted[0].command, "echo replacement");
+            assert_eq!(live["scripts"][0]["command"], "echo replacement");
+            assert_eq!(restored["scripts"][0]["command"], "echo replacement");
+        } else {
+            assert!(persisted.is_empty(), "a later remove must remain durable");
+            assert!(live["scripts"].as_array().unwrap().is_empty());
+            assert!(restored["scripts"].as_array().unwrap().is_empty());
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn member_remove_and_owner_create_preserve_mutation_order() {
+        assert_create_remove_ordering(true, true).await;
+        assert_create_remove_ordering(false, false).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn owner_remove_and_member_create_preserve_mutation_order() {
+        assert_create_remove_ordering(true, false).await;
+        assert_create_remove_ordering(false, true).await;
     }
 
     /// Two workspaces mint the same client-supplied `scriptId` concurrently

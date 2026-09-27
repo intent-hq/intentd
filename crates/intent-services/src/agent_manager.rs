@@ -6960,12 +6960,38 @@ impl AgentManager {
     /// exactly the marked entry, bypassing the batch flush and the head pop;
     /// every other gate — busy, ready-to-send, archived, quarantine, retired
     /// — still applies.
-    async fn try_drain_queue_inner(
+    fn try_drain_queue_inner(
+        self: Arc<Self>,
+        agent_id: AgentId,
+        workspace_id: WorkspaceId,
+        redrive_error_park: bool,
+    ) -> intent_core::BoxFuture<'static, ()> {
+        Box::pin(async move {
+            let services = self.services.clone();
+            services
+                .instruction_admission(self.try_drain_queue_authorized(
+                    agent_id,
+                    workspace_id,
+                    redrive_error_park,
+                ))
+                .await;
+        })
+    }
+
+    async fn try_drain_queue_authorized(
         self: Arc<Self>,
         agent_id: AgentId,
         workspace_id: WorkspaceId,
         redrive_error_park: bool,
     ) {
+        if self
+            .services
+            .discard_revoked_instructions(&agent_id)
+            .await
+            .is_err()
+        {
+            return;
+        }
         let Ok(_mutation) = self.services.workspace_mutations.enter(&workspace_id) else {
             return;
         };
@@ -7321,6 +7347,9 @@ impl AgentManager {
     ) -> Result<Value> {
         // monorepo#564: fail closed on a nonexistent target BEFORE touching
         // the queue.
+        self.services
+            .discard_revoked_instructions(&agent_id)
+            .await?;
         let session = self.services.require_agent_session(&agent_id).await?;
         // Bind the activation to the target's OWN session workspace
         // (intent-hq/intent#5017): the router forwards the CALLER's
@@ -7368,15 +7397,25 @@ impl AgentManager {
                 "queuedMessage": entry,
             }));
         }
+        let destination_owner = self
+            .services
+            .destination_owner_queue_authorization(&agent_id, &message_id)
+            .await?;
         // Atomic dequeue under the queue lock: no concurrent drain can
         // deliver the same entry twice. The entry stays listed in queue
         // snapshots (§6.5 drain ordering) until `draining` is dropped.
         let (mut entry, draining) = self
             .services
-            .take_queued_message_draining_gated(&agent_id, &message_id, gate.as_ref())?
+            .take_queued_message_draining_gated(
+                &agent_id,
+                &message_id,
+                gate.as_ref(),
+                destination_owner.as_ref(),
+            )?
             .ok_or_else(|| {
                 Error::InvalidParams(format!("queued message not found: {message_id}"))
             })?;
+        drop(destination_owner);
         // Stale-redrive parity with the drain paths (#576): a delegated
         // agent's entry that predates the delivered completion report is
         // annotated and keeps the report queryable.
@@ -7982,18 +8021,24 @@ impl AgentManager {
         }
         let mgr = self.clone();
         let id = agent_id.clone();
-        let handle = intent_core::spawn_daemon(async move {
-            // Clear the durable stop-redelivery mirror before the turn runs
-            // (intent-hq/monorepo#1899): the payload was consumed into this
-            // turn's prompt above, so a restart after this point must not
-            // rehydrate — and redeliver — it a second time. The sync re-reads
-            // the map, so a repeat stop that re-armed in the gap upserts the
-            // new payload instead of deleting.
-            if consumed_redelivery {
-                mgr.sync_stop_redelivery(&id).await;
-            }
-            run_message_worker(mgr, id, workspace_id, content, options, user_persisted).await;
-        });
+        let execution = mgr.services.clone();
+        let principal = intent_core::lift_from_principal_id(options.message_metadata.as_ref());
+        let handle = intent_core::spawn_daemon(crate::host_execution::background_execution(
+            execution,
+            principal,
+            async move {
+                // Clear the durable stop-redelivery mirror before the turn runs
+                // (intent-hq/monorepo#1899): the payload was consumed into this
+                // turn's prompt above, so a restart after this point must not
+                // rehydrate — and redeliver — it a second time. The sync re-reads
+                // the map, so a repeat stop that re-armed in the gap upserts the
+                // new payload instead of deleting.
+                if consumed_redelivery {
+                    mgr.sync_stop_redelivery(&id).await;
+                }
+                run_message_worker(mgr, id, workspace_id, content, options, user_persisted).await;
+            },
+        ));
         self.workers.lock().unwrap().insert(agent_id, handle);
     }
 
@@ -11558,6 +11603,22 @@ async fn run_message_worker(
                 }
             }
         }
+        // This is a separate drain from the explicit send/kick paths. Hold
+        // admission through selection and turn preparation, never through the
+        // already-running provider turn above. Removal either sweeps first or
+        // waits for this instruction to become admitted work.
+        let instruction_authority = mgr.services.human_instruction_authority.read().await;
+        if mgr
+            .services
+            .discard_revoked_instructions(&agent_id)
+            .await
+            .is_err()
+        {
+            mgr.release_in_flight_slot(&agent_id);
+            break 'outer;
+        }
+        #[cfg(test)]
+        mgr.services.queue_drain_commit_pause.pause().await;
         // Batch flush (`agents.flushQueuedMessages`): same contract as the
         // `try_drain_queue` flush arm — ≥2 ready entries drain into one
         // combined provider turn; otherwise the single-entry arm below runs
@@ -11687,6 +11748,7 @@ async fn run_message_worker(
                 None => (Vec::new(), None),
             };
         if raced.is_empty() {
+            drop(instruction_authority);
             // monorepo#1297: heal a busy-misclassified terminal idle. The
             // turn's `agent:idle` is published while this worker still holds
             // the busy slot (`end_turn` above runs after `run_prompt_turn`
@@ -11743,6 +11805,7 @@ async fn run_message_worker(
                         // pre-release archived arm above.
                         mgr.clear_worker(&agent_id);
                         mgr.end_turn(&agent_id).await;
+                        drop(instruction_authority);
                         mgr.clone()
                             .try_drain_queue(agent_id.clone(), workspace_id.clone())
                             .await;
@@ -12450,9 +12513,13 @@ fn antigravity_setup_error(method: &str, error: &intent_acp::AcpError, rejection
                 "Antigravity {method}: agent stdout closed; no prompt was sent"
             ))
         }
-        AcpError::Auth(_) => Error::InvalidParams(crate::provider_auth::not_authenticated_message(
+        AcpError::Auth(_) => crate::host_execution::ai_authorization_error(
+            Error::InvalidParams(crate::provider_auth::not_authenticated_message(
+                "antigravity",
+            )),
             "antigravity",
-        )),
+            intent_core::execution::ExecutionAuthorizationReason::Rejected,
+        ),
         _ => Error::InvalidParams(rejection),
     }
 }
@@ -12719,6 +12786,7 @@ async fn publish_terminal_failure_events(
     error_msg: &str,
     turn_id: Option<&str>,
     provider_source: FailedProviderSource,
+    authorization: Option<&intent_core::execution::ExecutionAuthorizationFailure>,
 ) {
     use intent_core::events::{AGENT_FAILED, AGENT_STREAM_END};
 
@@ -12731,6 +12799,9 @@ async fn publish_terminal_failure_events(
         "failed",
     );
     let mut failed_data = json!({ "agentId": agent_id.0, "error": error_msg });
+    if let Some(auth) = authorization {
+        failed_data["executionAuthorization"] = json!(auth);
+    }
     let mut end_data = json!({ "agentId": agent_id.0 });
     if let Some(tid) = turn_id {
         failed_data["turnId"] = json!(tid);
@@ -13251,6 +13322,7 @@ async fn handle_terminal_spawn_failure(
         &error_text,
         options.turn_id.as_deref(),
         FailedProviderSource::SpawnAttempt,
+        error.execution_authorization(),
     )
     .await;
     publish_error_status_and_requeue(
@@ -13297,6 +13369,7 @@ async fn handle_drain_persist_failure(
         &error_text,
         options.turn_id.as_deref(),
         FailedProviderSource::CommittedTurn,
+        None,
     )
     .await;
     publish_error_status_and_requeue(
@@ -13829,6 +13902,7 @@ async fn handle_terminal_turn_failure(
             &error_text,
             options.turn_id.as_deref(),
             FailedProviderSource::CommittedTurn,
+            error.execution_authorization(),
         )
         .await;
     }

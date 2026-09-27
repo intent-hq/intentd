@@ -34,7 +34,7 @@
 //! Each version also owns a [`Doctrine`] — its bundled instruction/specialist
 //! markdown set under `resources/agent-instructions/<ver>/` and
 //! `resources/specialists/<ver>/` — and the [`REGISTRY`] maps the stamped
-//! session `harnessVersion` (`"1.0"` through `"2.8"`) to the pair, so a session
+//! session `harnessVersion` (`"1.0"` through `"2.9"`) to the pair, so a session
 //! keeps assembling the exact doctrine
 //! it was created with even after the binary ships a newer set. All past
 //! versions stay bundled.
@@ -50,10 +50,20 @@ pub(crate) mod v2_5;
 pub(crate) mod v2_6;
 pub(crate) mod v2_7;
 pub(crate) mod v2_8;
+pub(crate) mod v2_9;
 
 use crate::agent_ops::ready_delta::UnblockedTask;
 use crate::pr_monitor::PrMonitorSnapshot;
 use intent_core::settings_file::AgentFeaturesSettings;
+
+/// Authenticated host-member data for the versioned human sender preamble.
+/// Service callers resolve role and identity from durable principal state.
+pub(crate) struct HostMemberSender<'a> {
+    pub login: Option<&'a str>,
+    pub display_name: Option<&'a str>,
+    pub principal_id: &'a str,
+    pub identity: Option<&'a intent_core::PrincipalIdentity>,
+}
 
 /// Typed inputs for [`Harness::compose_turn_prompt`]: the per-turn envelope
 /// layers, outermost-first. Each optional layer is either raw data the
@@ -218,6 +228,12 @@ pub(crate) trait Harness: Send + Sync {
         display_name: Option<&str>,
         principal_id: &str,
     ) -> String;
+    /// Qualified member sender attribution introduced in v2.9. Historical
+    /// harnesses retain their original collaborator surface; new inputs use
+    /// the latest harness, so stored historical messages are never rewritten.
+    fn host_member_sender_preamble(&self, sender: HostMemberSender<'_>) -> String {
+        self.collaborator_sender_preamble(sender.login, sender.display_name, sender.principal_id)
+    }
     /// Human-readable wait for [`Harness::dequeue_wait_note`]: `Ns` under a
     /// minute, then `Nm Ss`, then `Nh Mm`; negative waits clamp to `0s`.
     fn wait_duration(&self, secs: i64) -> String;
@@ -497,6 +513,7 @@ static REGISTRY: &[&HarnessEntry] = &[
     &v2_6::ENTRY,
     &v2_7::ENTRY,
     &v2_8::ENTRY,
+    &v2_9::ENTRY,
 ];
 
 /// The registry row for [`LATEST_VERSION`]. A unit test pins that the row
@@ -553,7 +570,7 @@ mod tests {
     fn registry_resolves_stamped_current_version() {
         let entry = resolve_entry(intent_core::CURRENT_HARNESS_VERSION);
         assert_eq!(entry.version, intent_core::CURRENT_HARNESS_VERSION);
-        assert_eq!(entry.version, "2.8");
+        assert_eq!(entry.version, "2.9");
         assert_eq!(next_steps(entry.harness), next_steps(&v2_4::V2_4));
         assert_ne!(next_steps(entry.harness), next_steps(&v2_3::V2_3));
         assert_ne!(next_steps(entry.harness), next_steps(&v1::V1));

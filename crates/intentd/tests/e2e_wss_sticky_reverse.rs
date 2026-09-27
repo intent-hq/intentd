@@ -52,7 +52,8 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use intent_core::{
-    AgentReverseDispatch, ClientId, ReverseDispatchError, ReverseTarget, WorkspaceApi, WorkspaceId,
+    AgentReverseDispatch, ClientId, PrincipalId, ReverseDispatchError, ReverseTarget, WorkspaceApi,
+    WorkspaceId,
 };
 use intent_services::{EventBus, Services};
 use intent_store::Store;
@@ -73,6 +74,7 @@ struct Fixture {
     /// test can poll `len()` until the closing client's guard has actually
     /// dropped, instead of waiting on an arbitrary sleep.
     registry: Arc<PrimaryReverseRegistry>,
+    owner_id: PrincipalId,
     _dir: tempfile::TempDir,
 }
 
@@ -86,6 +88,7 @@ async fn boot_with(opts: WsOptions) -> Fixture {
     let dir_guard = common::test_tempdir("intentd-sticky-");
     let dir = dir_guard.path().to_path_buf();
     let store = Store::open(&dir.join("intentd.db")).await.expect("store");
+    let owner_id = store.get_primary_principal().await.expect("primary").id;
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic root");
@@ -108,6 +111,7 @@ async fn boot_with(opts: WsOptions) -> Fixture {
         api,
         port,
         registry,
+        owner_id,
         _dir: dir_guard,
     }
 }
@@ -792,7 +796,7 @@ async fn pinned_target_offline_reports_typed_error_without_fallback() {
 
 /// `client:connected` / `client:disconnected` (global, no `workspaceId`)
 /// reach an `events.subscribe` subscriber with
-/// `data: { clientId, name?, capabilities }` — once per logical client, not
+/// the device fields and server-bound person — once per logical client, not
 /// per connection: a second connection of the same `clientId` is silent, and
 /// `client:disconnected` fires only when the last one goes away.
 #[intent_test_macros::daemon_test]
@@ -818,6 +822,8 @@ async fn client_connected_and_disconnected_events_are_published_per_logical_clie
             "clientId": "desktop-a",
             "name": "Intent Desktop @ desktop-a",
             "capabilities": { "browserExec": true },
+            "principalId": fx.owner_id, "hostRole": "owner",
+            "login": null, "displayName": null, "avatarUrl": null,
         })
     );
 
@@ -909,6 +915,8 @@ async fn heartbeat_abort_publishes_client_disconnected() {
             "clientId": "desktop-a",
             "name": "Intent Desktop @ desktop-a",
             "capabilities": { "browserExec": true },
+            "principalId": fx.owner_id, "hostRole": "owner",
+            "login": null, "displayName": null, "avatarUrl": null,
         })
     );
     await_registry_len(&fx.registry, 1).await;

@@ -12,6 +12,117 @@ use super::*;
 use crate::auth::TokenStore;
 use crate::server::PairingSnapshot;
 
+struct SelfApi {
+    valid: std::sync::atomic::AtomicBool,
+    revoke_on_profile: bool,
+}
+
+impl WorkspaceApi for SelfApi {
+    fn primary_principal_id(&self) -> intent_core::BoxFuture<'_, Result<intent_core::PrincipalId>> {
+        Box::pin(async { Ok(intent_core::PrincipalId::from("owner")) })
+    }
+    fn principal_host_role(
+        &self,
+        _id: intent_core::PrincipalId,
+    ) -> intent_core::BoxFuture<'_, Result<intent_core::HostRole>> {
+        Box::pin(async { Ok(intent_core::HostRole::Guest) })
+    }
+    fn resolve_principal_credential(
+        &self,
+        hash: String,
+    ) -> intent_core::BoxFuture<'_, Result<Option<intent_core::PrincipalId>>> {
+        Box::pin(async move {
+            Ok((self.valid.load(std::sync::atomic::Ordering::SeqCst)
+                && hash == crate::hash_token("personal"))
+            .then(|| intent_core::PrincipalId::from("person")))
+        })
+    }
+    fn principal_me(&self) -> intent_core::BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            if self.revoke_on_profile {
+                self.valid.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(json!({"id":"person","hostRole":"guest"}))
+        })
+    }
+}
+
+#[tokio::test]
+async fn self_pairing_revalidates_after_profile_and_never_falls_back() {
+    use intent_core::{AgentId, HostRole, PrincipalId};
+    let (provider, _dir) = provider(Some(5181), "personal_refusals", "owner-secret");
+    let api: Arc<dyn WorkspaceApi> = Arc::new(SelfApi {
+        valid: true.into(),
+        revoke_on_profile: true,
+    });
+    let person = Caller::Wire {
+        principal_id: PrincipalId::from("person"),
+        host_role: HostRole::Guest,
+    };
+    let mut connection = ConnectionPairing {
+        admitted: Some(crate::auth::AdmittedCredential::new(
+            crate::auth::ResolvedCredential::Principal(PrincipalId::from("person")),
+            "personal".into(),
+            crate::auth::LegacyRotation::new(provider.token_store(), "personal"),
+        )),
+        revoked: false,
+    };
+    let req =
+        || classify_self(&json!({"jsonrpc":"2.0","id":1,"method":"pairing.getSelfInfo"})).unwrap();
+    let reply = crate::context::with_request_context(
+        true,
+        Some(person.clone()),
+        handle_self(req(), &provider, &api, &mut connection),
+    )
+    .await
+    .unwrap();
+    let value: Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(value["error"]["code"], -32003);
+    assert_eq!(value["error"]["data"]["code"], "access-revoked");
+    assert!(connection.revoked);
+    assert!(!reply.contains("owner-secret") && !reply.contains("personal"));
+    for (tcp, caller) in [
+        (true, Some(person.clone())),
+        (false, Some(person)),
+        (
+            false,
+            Some(Caller::Agent {
+                agent_id: AgentId::new(),
+            }),
+        ),
+        (false, Some(Caller::Daemon)),
+        (false, None),
+    ] {
+        let mut absent = ConnectionPairing::default();
+        let reply = crate::context::with_request_context(
+            tcp,
+            caller,
+            handle_self(req(), &provider, &api, &mut absent),
+        )
+        .await
+        .unwrap();
+        let value: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(value["error"]["data"]["code"], "access-revoked");
+        assert!(absent.revoked);
+        assert!(!reply.contains("owner-secret"));
+    }
+}
+
+#[tokio::test]
+async fn self_pairing_notifications_validate_and_close_without_a_reply() {
+    let (provider, _dir) = provider(Some(5181), "personal_notification", "owner-secret");
+    let api: Arc<dyn WorkspaceApi> = Arc::new(SelfApi {
+        valid: false.into(),
+        revoke_on_profile: false,
+    });
+    let mut state = ConnectionPairing::default();
+    let req = classify_self(&json!({"jsonrpc":"2.0","method":"pairing.getSelfInfo"})).unwrap();
+    assert!(handle_self(req, &provider, &api, &mut state)
+        .await
+        .is_none());
+    assert!(state.revoked);
+}
+
 /// In-memory token store for tests.
 #[derive(Default, Clone)]
 struct MemoryStore {

@@ -1471,3 +1471,61 @@ async fn equivalent_transcript_writers_reject_closed_admission_without_side_effe
         "unguarded transcript writers: {bypasses:?}"
     );
 }
+
+#[intent_test_macros::daemon_test]
+async fn member_removal_overlaps_one_workspace_deletion_without_reopening_or_stopping_others() {
+    use intent_core::{with_caller, Caller, HostRole, PrincipalId};
+    for deletion_first in [true, false] {
+        let h = Harness::new().await;
+        let (deleting_ws, _) = h.workspace("member-removal-delete", 1).await;
+        let (kept_ws, kept_agents) = h.workspace("member-removal-keep", 1).await;
+        let person = PrincipalId::new();
+        sqlx::query(
+            "INSERT INTO principal (id,is_primary,created_at,updated_at) VALUES (?,0,'t0','t0')",
+        )
+        .bind(&person.0)
+        .execute(h.store.write_pool())
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO host_member (principal_id,added_at) VALUES (?,'t0')")
+            .bind(&person.0)
+            .execute(h.store.write_pool())
+            .await
+            .unwrap();
+        h.store
+            .insert_principal_credential(&person, "member-removal-delete-test")
+            .await
+            .unwrap();
+        let (reached, release) = h.svc.workspace_delete_test_gate.arm(deleting_ws.clone());
+        let mut deletion = h.svc.delete_workspace(deleting_ws.clone());
+        if deletion_first {
+            tokio::select! {
+                () = reached.notified() => {},
+                result = &mut deletion => panic!("delete escaped barrier: {result:?}"),
+            }
+        }
+        assert_eq!(
+            h.svc.host_members_remove(person.clone()).await.unwrap()["removed"],
+            true
+        );
+        assert_eq!(
+            h.store.get_host_role(&person).await.unwrap(),
+            HostRole::Guest
+        );
+        assert!(with_caller(
+            Caller::Wire {
+                principal_id: person,
+                host_role: HostRole::Member
+            },
+            h.svc.get_workspace(kept_ws.clone())
+        )
+        .await
+        .is_err());
+        release.notify_one();
+        deletion.await.unwrap();
+        assert!(h.store.get_workspace(&deleting_ws).await.is_err());
+        assert!(h.store.get_workspace(&kept_ws).await.is_ok());
+        assert!(h.store.get_agent_session(&kept_agents[0]).await.is_ok());
+        assert_eq!(h.remaining(&kept_ws).await, ROWS);
+    }
+}

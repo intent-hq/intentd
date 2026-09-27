@@ -1299,3 +1299,72 @@ async fn handle_open_in_editor_remote_round_trips_reverse_rpc() {
     assert_eq!(parsed["id"], 11);
     assert_eq!(parsed["result"]["ok"], true);
 }
+
+#[tokio::test]
+async fn provider_safe_read_gate_uses_durable_member_authority_only() {
+    use intent_core::{Caller, HostRole, PrincipalId};
+    struct AuthorityApi(Option<HostRole>);
+    impl WorkspaceApi for AuthorityApi {
+        fn principal_host_role(
+            &self,
+            _: PrincipalId,
+        ) -> BoxFuture<'_, intent_core::Result<HostRole>> {
+            Box::pin(async move {
+                self.0
+                    .ok_or_else(|| intent_core::Error::NotFound("unknown principal".into()))
+            })
+        }
+    }
+    for (cached, current, allowed) in [
+        (HostRole::Member, Some(HostRole::Member), true),
+        (HostRole::Guest, Some(HostRole::Member), true),
+        (HostRole::Member, Some(HostRole::Guest), false),
+        (HostRole::Guest, Some(HostRole::Guest), false),
+        (HostRole::Member, None, false),
+    ] {
+        let req = classify(&json!({"jsonrpc":"2.0","id":1,"method":"host.providerAuthStatus","params":{"providerId":42}})).unwrap();
+        let frame = intent_core::with_caller(
+            Caller::Wire {
+                principal_id: PrincipalId::new(),
+                host_role: cached,
+            },
+            handle(req, &AuthorityApi(current), None, false, &idle_reverse()),
+        )
+        .await
+        .unwrap();
+        let reply: Value = serde_json::from_str(&frame).unwrap();
+        // Parameter validation proves admission without spawning a real CLI.
+        assert_eq!(
+            reply["error"]["code"],
+            if allowed { -32602 } else { -32003 },
+            "{cached:?}/{current:?}: {reply}"
+        );
+    }
+    for method in [
+        "host.env",
+        "host.createDirectory",
+        "host.findBinary",
+        "host.providerTestPrompt",
+        "host.exec",
+        "host.execStream",
+    ] {
+        let req = classify(&json!({"jsonrpc":"2.0","id":2,"method":method})).unwrap();
+        let frame = intent_core::with_caller(
+            Caller::Wire {
+                principal_id: PrincipalId::new(),
+                host_role: HostRole::Member,
+            },
+            handle(
+                req,
+                &AuthorityApi(Some(HostRole::Member)),
+                None,
+                false,
+                &idle_reverse(),
+            ),
+        )
+        .await
+        .unwrap();
+        let reply: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(reply["error"]["code"], -32003, "{method}: {reply}");
+    }
+}
