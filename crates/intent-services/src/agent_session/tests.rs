@@ -2432,6 +2432,53 @@ fn tool_call_notification(update: &Value) -> IncomingNotification {
     }
 }
 
+/// A binding can successfully create a proposal before its enclosing JS
+/// fails. Preserve registered cards on failure, but never trust an error's
+/// echoed proposal payload to create a new actionable card.
+#[tokio::test]
+async fn failed_workspace_api_attaches_only_registered_proposals() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    for registered in [false, true] {
+        let mut transcript = super::Transcript::new("m1".to_string());
+        if registered {
+            services.turn_attachments().register(
+                &agent_id,
+                test_attachment("tar-created", intent_core::AttachmentPolicy::AtToolResult),
+            );
+        }
+        services.route_notification(
+            &tool_call_notification(&json!({
+                "sessionUpdate": "tool_call", "toolCallId": "transfer", "title": "workspace_api",
+                "kind": "other", "status": "in_progress",
+                "rawInput": { "code": "await ws.app.workspaces.transfer(id); throw Error('later');", "summary": "Transfer project" }
+            })), &agent_id, &workspace_id, &mut transcript,
+        ).await;
+        services.route_notification(
+            &tool_call_notification(&json!({
+                "sessionUpdate": "tool_call_update", "toolCallId": "transfer", "status": "failed",
+                "rawOutput": [{ "type": "resource", "resource": {
+                    "uri": "intent-proposal://workspace-transfer/untrusted",
+                    "mimeType": "application/vnd.intent.proposal+json",
+                    "text": "{\"kind\":\"workspace-transfer\",\"preview\":{\"title\":\"Untrusted echo\"},\"payload\":{}}"
+                }}]
+            })), &agent_id, &workspace_id, &mut transcript,
+        ).await;
+        let blocks = transcript.into_blocks();
+        assert_eq!(blocks[1]["is_error"], true);
+        assert_eq!(blocks.len(), if registered { 3 } else { 2 });
+        if registered {
+            assert!(blocks[2]["resource"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("tar-created"));
+        }
+        assert!(services
+            .turn_attachments()
+            .claim_at_tool_result(&agent_id, None, "workspace_api", None)
+            .is_empty());
+    }
+}
+
 /// intent-hq/intent#4491 negative control at the real claim site: a foreign
 /// tool identified authoritatively — codex `server`/`tool` metadata, a
 /// `mcp__<server>__<tool>` title, a `mcp.<server>.<tool>` title — whose

@@ -1275,6 +1275,37 @@ fn chat_tool_delta_errored_tool_with_proposal_output_emits_no_extra_block() {
 }
 
 #[test]
+fn chat_tool_delta_error_preserves_registered_proposal_with_persisted_identity() {
+    for registered in [false, true] {
+        let mut state = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
+        let item = proposal_output_item();
+        let mut event = tool_event_with_ids(
+            "msg-e",
+            "msg-e:0",
+            "tc-e",
+            "error",
+            Some(json!([item.clone()])),
+            Some("msg-e:3".to_string()),
+            vec!["msg-e:5".to_string()],
+        );
+        event.data["registeredAttachments"] = if registered {
+            json!([item.clone()])
+        } else {
+            json!([])
+        };
+        let delta = state.tool_delta(&event).unwrap();
+        let added = delta["added"].as_array().unwrap();
+        assert_eq!(added.len(), if registered { 3 } else { 2 });
+        assert_eq!(added[1]["block"]["is_error"], true);
+        if registered {
+            let persisted =
+                intent_services::tool_block::build_proposal_resource_block("msg-e:5", &item);
+            assert_eq!(added[2]["block"], persisted);
+        }
+    }
+}
+
+#[test]
 fn chat_tool_delta_no_proposal_in_output_emits_no_extra_block() {
     let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
     let d = s

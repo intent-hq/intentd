@@ -854,7 +854,7 @@ async function handlePrompt(id, params) {
           update: {
             sessionUpdate: 'tool_call_update',
             toolCallId,
-            status: result.isError ? 'error' : 'completed',
+            status: result.isError ? 'failed' : 'completed',
             rawOutput,
           },
         });

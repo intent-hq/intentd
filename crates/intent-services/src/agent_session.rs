@@ -614,9 +614,9 @@ impl Transcript {
     ///
     /// `registered` is the canonical resource-item batch claimed from the
     /// turn-attachment registry (§7.1 deterministic attach) for this
-    /// completed call, if any. On a registry hit the batch is attached
-    /// directly and echo parsing is skipped; otherwise the legacy
-    /// lift/wrap-repair fallback inspects the echoed output.
+    /// terminal call, if any. On a registry hit the batch is attached even
+    /// after a later JS error and echo parsing is skipped; otherwise only a
+    /// successful call's legacy lift/wrap-repair inspects the echoed output.
     fn record_tool(
         &mut self,
         tc: &MappedToolCall,
@@ -750,12 +750,14 @@ impl Transcript {
                 // registry-claimed canonical batch wins (deterministic attach —
                 // no echo parsing); otherwise fall back to lifting a
                 // proposal-MIME resource item out of the echoed output.
-                // Gated on `completed` only — an errored tool must not surface
-                // an actionable ProposalCard. Asymmetry: a re-completion whose
+                // An errored tool may attach an already-created, registered
+                // proposal (the JS can throw after the binding succeeds), but
+                // must never lift an actionable card from an error's echo.
+                // Asymmetry: a re-completion whose
                 // output DROPS the item leaves a previously appended block in
                 // place (the transcript is append-only; index-derived ids
                 // preclude removal).
-                if tc.status == "completed" {
+                if tc.status == "completed" || !registered.is_empty() {
                     let items = if registered.is_empty() {
                         crate::tool_block::lift_proposal_resource(output)
                             .into_iter()
@@ -5281,7 +5283,7 @@ impl Services {
             }
             MappedUpdate::ToolCall(tc) => {
                 // §7.1 deterministic attach: claim the pending `AtToolResult`
-                // registry batch for this completed call (nonce match against
+                // registry batch for this terminal call (nonce match against
                 // the echoed output, `workspace_api` FIFO fallback). A hit
                 // yields the canonical resource items to attach — no echo
                 // parsing; a miss falls back to the legacy lift inside
@@ -5291,7 +5293,7 @@ impl Services {
                 // freshest input — withheld once the call was identified
                 // authoritatively (intent-hq/intent#4491).
                 let known = transcript.tool_name_for(&tc.tool_call_id).is_some();
-                let registered: Vec<Value> = if tc.status == "completed" {
+                let registered: Vec<Value> = if matches!(tc.status, "completed" | "error") {
                     let name = transcript
                         .tool_name_for(&tc.tool_call_id)
                         .unwrap_or(&tc.tool_name)

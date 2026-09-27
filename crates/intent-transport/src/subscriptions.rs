@@ -1507,13 +1507,14 @@ impl ChatDeltaState {
                 // registry-claimed canonical batch carried on the event
                 // (`registeredAttachments`, deterministic attach) wins;
                 // otherwise fall back to lifting a proposal-MIME resource
-                // item out of the echoed output. Gated on `completed` only
-                // (matching `record_tool`) — an errored tool must not surface
-                // an actionable ProposalCard. Each item is paired positionally
+                // item out of a successful call's echoed output. A failed
+                // call may still carry a trusted card registered before a
+                // later JS error (matching `record_tool`). Each item is paired positionally
                 // with the id `record_tool` gave the block it wrote for that
                 // same item; an item without an id (the event carried none —
                 // nothing was materialized for it) is skipped.
-                if status == "completed" {
+                let registered = d.get("registeredAttachments").and_then(Value::as_array);
+                if status == "completed" || registered.is_some_and(|items| !items.is_empty()) {
                     let items: Vec<Value> = d
                         .get("registeredAttachments")
                         .and_then(Value::as_array)
