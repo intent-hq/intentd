@@ -85,6 +85,26 @@ impl GitLabSourceControl {
             rate_limit: RwLock::default(),
         })
     }
+
+    /// Legacy aggregates cannot carry per-field availability; any consumed quota
+    /// failure must propagate instead of being projected into successful data.
+    async fn legacy_observation(&self, repo: &RepoRef, number: u64) -> Result<ReviewObservation> {
+        let observation = self.observe_review(repo, number).await?;
+        if [
+            observation.availability.policy,
+            observation.availability.approvals,
+            observation.availability.checks,
+            observation.availability.discussions,
+        ]
+        .contains(&ProviderAvailability::RateLimited)
+        {
+            return Err(Error::RateLimited(
+                "GitLab optional signal rate limited".into(),
+            ));
+        }
+        Ok(observation)
+    }
+
     fn observe_rate_limit(&self, headers: &HeaderMap, throttled: bool) {
         let header_number = |name: &str| headers.get(name)?.to_str().ok()?.parse::<u64>().ok();
         let now = SystemTime::now()
@@ -1010,7 +1030,7 @@ impl SourceControl for GitLabSourceControl {
     }
     async fn review_decision(&self, repo: &RepoRef, number: u64) -> Result<Option<ReviewDecision>> {
         Ok(self
-            .observe_review(repo, number)
+            .legacy_observation(repo, number)
             .await?
             .signals
             .review_decision)
@@ -1024,35 +1044,11 @@ impl SourceControl for GitLabSourceControl {
         repo: &RepoRef,
         number: u64,
     ) -> Result<MergeRequirementSignals> {
-        let observation = self.observe_review(repo, number).await?;
-        // Legacy consumers understand RateLimited but not the additive availability envelope.
-        if [
-            observation.availability.policy,
-            observation.availability.approvals,
-            observation.availability.checks,
-        ]
-        .contains(&ProviderAvailability::RateLimited)
-        {
-            return Err(Error::RateLimited(
-                "GitLab optional signal rate limited".into(),
-            ));
-        }
+        let observation = self.legacy_observation(repo, number).await?;
         Ok(observation.signals)
     }
     async fn pr_observation(&self, repo: &RepoRef, number: u64) -> Result<Option<PrObservation>> {
-        let o = self.observe_review(repo, number).await?;
-        if [
-            o.availability.policy,
-            o.availability.approvals,
-            o.availability.checks,
-            o.availability.discussions,
-        ]
-        .contains(&ProviderAvailability::RateLimited)
-        {
-            return Err(Error::RateLimited(
-                "GitLab optional signal rate limited".into(),
-            ));
-        }
+        let o = self.legacy_observation(repo, number).await?;
         // The legacy count is not nullable, so an unknown count must fail this projection.
         let count = o
             .conversation_count
@@ -1066,7 +1062,7 @@ impl SourceControl for GitLabSourceControl {
         }))
     }
     async fn mergeability(&self, repo: &RepoRef, number: u64) -> Result<Mergeability> {
-        let observation = self.observe_review(repo, number).await?;
+        let observation = self.legacy_observation(repo, number).await?;
         let signals = &observation.signals;
         Ok(Mergeability {
             mergeable: observation.details.review.mergeable,

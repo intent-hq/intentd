@@ -1391,6 +1391,128 @@ async fn optional_rate_limit_retains_retry_after_despite_later_success_headers()
     ));
 }
 
+#[derive(Clone, Copy, Debug)]
+enum LegacyProjection {
+    ReviewDecision,
+    MergeRequirements,
+    Observation,
+    Mergeability,
+}
+
+async fn legacy_projection(
+    sc: &GitLabSourceControl,
+    entry: LegacyProjection,
+) -> intent_sourcecontrol::Result<()> {
+    match entry {
+        LegacyProjection::ReviewDecision => sc.review_decision(&repo(), 7).await.map(|_| ()),
+        LegacyProjection::MergeRequirements => sc.merge_requirements(&repo(), 7).await.map(|_| ()),
+        LegacyProjection::Observation => sc.pr_observation(&repo(), 7).await.map(|_| ()),
+        LegacyProjection::Mergeability => sc.mergeability(&repo(), 7).await.map(|_| ()),
+    }
+}
+
+async fn assert_legacy_optional_quota(entry: LegacyProjection) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    for endpoint in [
+        "/discussions",
+        "/pipelines/19/jobs",
+        "/approvals",
+        "Team%2FSub%2FProject",
+    ] {
+        let start = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let f = Fixture::new(move |r| {
+            if r.path.split('?').next().unwrap().ends_with(endpoint) {
+                let mut response = reply(429, Value::Null);
+                response.headers = vec![
+                    ("retry-after".into(), "120".into()),
+                    ("ratelimit-reset".into(), (start + 5).to_string()),
+                ];
+                response
+            } else {
+                let mut response = observation_reply(r);
+                response.headers = vec![
+                    ("ratelimit-remaining".into(), "500".into()),
+                    ("ratelimit-reset".into(), (start + 5).to_string()),
+                ];
+                response
+            }
+        })
+        .await;
+        let sc = f.provider();
+        let partial = sc.review_observation(&repo(), 7).await.unwrap();
+        let available = match endpoint {
+            "/discussions" => partial.availability.discussions,
+            "/pipelines/19/jobs" => partial.availability.checks,
+            "/approvals" => partial.availability.approvals,
+            _ => partial.availability.policy,
+        };
+        assert_eq!(available, ProviderAvailability::RateLimited, "{endpoint}");
+        assert!(
+            matches!(
+                legacy_projection(&sc, entry).await,
+                Err(Error::RateLimited(_))
+            ),
+            "{entry:?}: {endpoint}"
+        );
+        let quota = sc.rate_limit_status().await.unwrap();
+        assert_eq!(quota.remaining, Some(0));
+        assert!(quota.reset_at.is_some_and(|at| at >= start + 120));
+    }
+}
+
+#[tokio::test]
+async fn legacy_review_decision_propagates_each_optional_quota() {
+    assert_legacy_optional_quota(LegacyProjection::ReviewDecision).await;
+}
+
+#[tokio::test]
+async fn legacy_merge_requirements_propagates_each_optional_quota() {
+    assert_legacy_optional_quota(LegacyProjection::MergeRequirements).await;
+}
+
+#[tokio::test]
+async fn legacy_observation_propagates_each_optional_quota() {
+    assert_legacy_optional_quota(LegacyProjection::Observation).await;
+}
+
+#[tokio::test]
+async fn legacy_mergeability_propagates_each_optional_quota() {
+    assert_legacy_optional_quota(LegacyProjection::Mergeability).await;
+}
+
+#[tokio::test]
+async fn legacy_optional_restriction_is_not_a_quota_denial() {
+    let f = Fixture::new(|r| {
+        if r.path.ends_with("/approvals") {
+            reply(403, Value::Null)
+        } else {
+            observation_reply(r)
+        }
+    })
+    .await;
+    let sc = f.provider();
+    assert_eq!(
+        sc.review_observation(&repo(), 7)
+            .await
+            .unwrap()
+            .availability
+            .approvals,
+        ProviderAvailability::Restricted
+    );
+    for entry in [
+        LegacyProjection::ReviewDecision,
+        LegacyProjection::MergeRequirements,
+        LegacyProjection::Observation,
+        LegacyProjection::Mergeability,
+    ] {
+        assert!(legacy_projection(&sc, entry).await.is_ok(), "{entry:?}");
+    }
+    assert_eq!(sc.rate_limit_status().await.unwrap().remaining, None);
+}
+
 #[tokio::test]
 async fn optional_admission_rejection_propagates_without_an_upstream_request() {
     let credentials = Arc::new(Mutex::new(None::<Arc<Credentials>>));
