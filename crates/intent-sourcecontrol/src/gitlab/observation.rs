@@ -1,4 +1,5 @@
 //! Optional policy/CI/discussion signals cannot masquerade as primary-resource denial.
+use super::RequestScope;
 use crate::model::ConfirmedReviewState;
 
 use super::{
@@ -46,8 +47,22 @@ impl GitLabSourceControl {
         })
     }
 
-    async fn optional_all(&self, path: &str) -> Result<(Option<Vec<Value>>, ProviderAvailability)> {
-        match self.all_for(path, vec![], Purpose::Optional).await {
+    async fn optional_all(
+        &self,
+        path: &str,
+        project: Option<&RepoRef>,
+    ) -> Result<(Option<Vec<Value>>, ProviderAvailability)> {
+        match self
+            .all_scoped(
+                path,
+                vec![],
+                RequestScope {
+                    purpose: Purpose::Optional,
+                    project,
+                },
+            )
+            .await
+        {
             Ok(values) => Ok((Some(values), ProviderAvailability::Available)),
             Err(error) if http::optional_failure(&error) => Ok((None, http::availability(&error))),
             Err(error) => Err(error),
@@ -94,7 +109,10 @@ impl GitLabSourceControl {
             .as_u64()
             .map_or_else(|| project(repo), |id| format!("projects/{id}"));
         let (jobs, availability) = self
-            .optional_all(&format!("{pipeline_project}/pipelines/{id}/jobs"))
+            .optional_all(
+                &format!("{pipeline_project}/pipelines/{id}/jobs"),
+                pipeline["project_id"].as_u64().map(|_| repo),
+            )
             .await?;
         let mut checks = vec![pipeline_check(pipeline, policy)];
         if let Some(jobs) = jobs {
@@ -185,7 +203,7 @@ impl GitLabSourceControl {
             ..MergeRequirementSignals::default()
         };
         let (discussions, mut discussions_state) = self
-            .optional_all(&format!("{}/discussions", mr(repo, number)))
+            .optional_all(&format!("{}/discussions", mr(repo, number)), None)
             .await?;
         let counts = discussions.as_ref().and_then(|v| {
             if let Ok(counts) = discussion_tally(v) {

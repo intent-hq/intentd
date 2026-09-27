@@ -36,10 +36,35 @@ pub struct ProviderFailure {
     pub status: Option<u16>,
 }
 
+/// Local admission availability, never evidence that the upstream denied access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionUnavailable {
+    Missing,
+    Unverified,
+    Disconnected,
+    ChildDisabled,
+    Mutating,
+    Indeterminate,
+    AuthorityDenied,
+    AuthorityUnavailable,
+    BoundaryMismatch,
+    SecretChanged,
+    TimedOut,
+    Backoff,
+}
+
 /// Errors surfaced by [`crate::SourceControl`] implementations and the
 /// [`crate::SourceControlRegistry`].
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// A previously captured local grant retired; never an upstream auth failure.
+    #[error("repository admission retired")]
+    AdmissionRetired,
+
+    /// The local request cannot acquire a credential; does not trigger logout.
+    #[error("repository admission unavailable ({0:?})")]
+    AdmissionUnavailable(AdmissionUnavailable),
+
     /// Structured provider denial/availability/uncertain-write classification.
     #[error(transparent)]
     Provider(#[from] ProviderFailure),

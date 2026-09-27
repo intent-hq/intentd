@@ -4,6 +4,7 @@ use super::{
     Method, NewPullRequest, ProviderFailureKind, PullRequest, RepoRef, Result,
     ReviewBranchIdentity, ReviewDetails,
 };
+use super::{Purpose, RequestScope};
 use crate::model::{ConfirmedReviewState, ReviewCreateOutcome, ReviewCreateResult};
 
 impl GitLabSourceControl {
@@ -143,11 +144,17 @@ impl GitLabSourceControl {
         // Both branch lookups are under the confirmed target project. Reading a
         // local HEAD or a same-named branch in a fork cannot satisfy this check.
         for branch in [&source.branch, &target.branch] {
-            let value = self
-                .get(&format!(
-                    "projects/{id}/repository/branches/{}",
-                    encode(branch)
-                ))
+            let (value, _) = self
+                .request_scoped(
+                    Method::GET,
+                    &format!("projects/{id}/repository/branches/{}", encode(branch)),
+                    &[],
+                    None,
+                    RequestScope {
+                        purpose: Purpose::Primary,
+                        project: Some(repo),
+                    },
+                )
                 .await?;
             if value["name"].as_str() != Some(branch.as_str())
                 || value["commit"]["id"].as_str().is_none_or(str::is_empty)
@@ -158,7 +165,7 @@ impl GitLabSourceControl {
             }
         }
         let (value, _) = self
-            .request(
+            .request_scoped(
                 Method::POST,
                 &format!("projects/{id}/merge_requests"),
                 &[],
@@ -166,6 +173,10 @@ impl GitLabSourceControl {
                     "title": input.title, "description": input.body,
                     "source_branch": source.branch, "target_branch": target.branch,
                 })),
+                RequestScope {
+                    purpose: Purpose::Primary,
+                    project: Some(repo),
+                },
             )
             .await?;
         let mut details = self

@@ -12,6 +12,21 @@ pub(super) enum Purpose {
     Optional,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct RequestScope<'a> {
+    pub purpose: Purpose,
+    /// Only for a numeric endpoint corroborated by the addressed project/MR.
+    pub project: Option<&'a RepoRef>,
+}
+impl From<Purpose> for RequestScope<'_> {
+    fn from(purpose: Purpose) -> Self {
+        Self {
+            purpose,
+            project: None,
+        }
+    }
+}
+
 pub(super) fn failure(kind: ProviderFailureKind, status: Option<u16>) -> Error {
     ProviderFailure { kind, status }.into()
 }
@@ -36,6 +51,18 @@ impl GitLabSourceControl {
         body: Option<Value>,
         purpose: Purpose,
     ) -> Result<(Value, HeaderMap)> {
+        self.request_scoped(method, path, query, body, purpose.into())
+            .await
+    }
+
+    pub(super) async fn request_scoped(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(String, String)],
+        body: Option<Value>,
+        scope: RequestScope<'_>,
+    ) -> Result<(Value, HeaderMap)> {
         let url = self
             .api
             .join(path)
@@ -55,7 +82,15 @@ impl GitLabSourceControl {
         // in the HTTP client or retry a write after the callback returns another token.
         let token = self
             .credentials
-            .token_for(self.descriptor.instance())
+            .token_for_request(
+                self.descriptor.instance(),
+                super::GitlabCredentialRequest {
+                    descriptor: &self.descriptor,
+                    path,
+                    writing: method != Method::GET,
+                    logical_project: scope.project,
+                },
+            )
             .await?;
         if token.expose_secret().trim().is_empty() {
             return Err(Error::NotConfigured("GitLab credential is absent".into()));
@@ -91,7 +126,7 @@ impl GitLabSourceControl {
         self.observe_rate_limit(&headers, status.as_u16() == 429);
         if !status.is_success() {
             let code = status.as_u16();
-            let kind = match (code, purpose) {
+            let kind = match (code, scope.purpose) {
                 (429, _) => {
                     return Err(Error::RateLimited("GitLab request quota exhausted".into()))
                 }

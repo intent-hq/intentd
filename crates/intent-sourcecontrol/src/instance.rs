@@ -45,7 +45,7 @@ impl GitlabInstance {
 /// Production construction uses the logical root. The only override in this
 /// increment is an explicit loopback fixture; deployment bindings remain owned
 /// by the settings/auth integration and are not inferred from legacy host fields.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitlabDescriptor {
     instance: GitlabInstance,
     endpoint: Url,

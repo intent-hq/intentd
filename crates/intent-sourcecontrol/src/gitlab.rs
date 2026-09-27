@@ -33,7 +33,7 @@ use crate::{
 };
 
 mod http;
-use http::{failure, Purpose};
+use http::{failure, Purpose, RequestScope};
 mod creation;
 mod observation;
 mod search;
@@ -49,6 +49,73 @@ const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 pub trait GitlabRequestCredentials: Send + Sync {
     /// Obtain the current token for this logical instance, or reject a retired scope.
     async fn token_for(&self, instance: &GitlabInstance) -> Result<SecretString>;
+
+    /// Revalidate the actual request before releasing its token. The default
+    /// preserves older injected callbacks; qualified adapters override this.
+    async fn token_for_request(
+        &self,
+        instance: &GitlabInstance,
+        request: GitlabCredentialRequest<'_>,
+    ) -> Result<SecretString> {
+        let _ = request;
+        self.token_for(instance).await
+    }
+}
+
+/// Credential-boundary metadata, separate from HTTP error classification.
+#[derive(Debug, Clone, Copy)]
+pub struct GitlabCredentialRequest<'a> {
+    /// Exact approved logical/transport descriptor of this HTTP client.
+    pub descriptor: &'a GitlabDescriptor,
+    /// Provider-generated relative REST path, with the project encoded once.
+    pub path: &'a str,
+    pub writing: bool,
+    // Only the provider can attest a numeric follow-up to a verified project/MR.
+    pub(crate) logical_project: Option<&'a RepoRef>,
+}
+
+impl GitlabCredentialRequest<'_> {
+    /// An ordinary path-addressed request with no corroborated numeric alias.
+    #[must_use]
+    pub fn direct<'a>(
+        descriptor: &'a GitlabDescriptor,
+        path: &'a str,
+        writing: bool,
+    ) -> GitlabCredentialRequest<'a> {
+        GitlabCredentialRequest {
+            descriptor,
+            path,
+            writing,
+            logical_project: None,
+        }
+    }
+    /// Exact project and path-component match; never a host-only credential match.
+    #[must_use]
+    pub fn is_for_project(self, project_path: &str) -> bool {
+        if let Some(project) = self.logical_project {
+            return project_path == format!("{}/{}", project.owner, project.name)
+                && self
+                    .path
+                    .strip_prefix("projects/")
+                    .and_then(|s| s.split('/').next())
+                    .is_some_and(|id| id.parse::<u64>().is_ok_and(|id| id > 0));
+        }
+        let prefix = format!("projects/{}", encode(project_path));
+        self.path == prefix
+            || self
+                .path
+                .strip_prefix(&prefix)
+                .is_some_and(|s| s.starts_with('/'))
+    }
+
+    /// The single native API write admitted by the current GitLab implementation.
+    #[must_use]
+    pub fn is_review_create(self, project_path: &str) -> bool {
+        self.writing
+            && self.is_for_project(project_path)
+            && self.path.split('/').count() == 3
+            && self.path.ends_with("/merge_requests")
+    }
 }
 
 /// One injected connection scope. HTTP pools contain no persistent auth header.
@@ -150,9 +217,19 @@ impl GitLabSourceControl {
     async fn page_for(
         &self,
         path: &str,
-        mut query: Vec<(String, String)>,
+        query: Vec<(String, String)>,
         page: PageParams,
         purpose: Purpose,
+    ) -> Result<Page<Value>> {
+        self.page_scoped(path, query, page, purpose.into()).await
+    }
+
+    async fn page_scoped(
+        &self,
+        path: &str,
+        mut query: Vec<(String, String)>,
+        page: PageParams,
+        request_scope: RequestScope<'_>,
     ) -> Result<Page<Value>> {
         let limit = page.limit.clamp(1, 100);
         let scope =
@@ -176,7 +253,7 @@ impl GitLabSourceControl {
         query.push(("page".into(), current.to_string()));
         query.push(("per_page".into(), limit.to_string()));
         let (value, headers) = self
-            .request_for(Method::GET, path, &query, None, purpose)
+            .request_scoped(Method::GET, path, &query, None, request_scope)
             .await?;
         let items = value
             .as_array()
@@ -257,10 +334,19 @@ impl GitLabSourceControl {
         query: Vec<(String, String)>,
         purpose: Purpose,
     ) -> Result<Vec<Value>> {
+        self.all_scoped(path, query, purpose.into()).await
+    }
+
+    async fn all_scoped(
+        &self,
+        path: &str,
+        query: Vec<(String, String)>,
+        scope: RequestScope<'_>,
+    ) -> Result<Vec<Value>> {
         let mut output = Vec::new();
         let mut page = PageParams::first(100);
         loop {
-            let result = self.page_for(path, query.clone(), page, purpose).await?;
+            let result = self.page_scoped(path, query.clone(), page, scope).await?;
             output.extend(result.items);
             let Some(cursor) = result.next_cursor else {
                 return Ok(output);
