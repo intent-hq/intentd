@@ -120,7 +120,17 @@ mod repository_admission_durable_source;
 mod repository_admission_git_source;
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "Physical manager integration remains pending")
+    expect(
+        clippy::allow_attributes,
+        reason = "The private installation API is optional in isolated manager compositions"
+    )
+)]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "The private installation API is consumed by separately composed manager integration"
+    )
 )]
 #[path = "repository_admission/installation.rs"]
 mod repository_admission_installation;
