@@ -102,23 +102,37 @@ mod github_auth_ops;
 mod github_browse_ops;
 mod source_control_auth_ops;
 
-// Compile the inactive repository sources against real private Services gates.
-// No entrypoint, watcher, native pipeline or authority writer is registered.
-#[cfg(test)]
+// Repository sources use the original Services instance and private gates.
+// Entry and dispatch integration remain separate from observer installation.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        unused_imports,
+        clippy::wildcard_imports,
+        reason = "Physical producer and repository dispatch integration remain pending"
+    )
+)]
 mod repository_admission;
-#[cfg(test)]
 #[path = "repository_admission/durable_source.rs"]
 mod repository_admission_durable_source;
-#[cfg(test)]
 #[path = "repository_admission/git_source.rs"]
 mod repository_admission_git_source;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Physical manager integration remains pending")
+)]
+#[path = "repository_admission/installation.rs"]
+mod repository_admission_installation;
 #[cfg(test)]
 #[path = "repository_admission/source_tests.rs"]
 mod repository_admission_source_tests;
-#[cfg(test)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Repository entry integration remains pending")
+)]
 #[path = "repository_admission/source.rs"]
 mod repository_admission_sources;
-#[cfg(test)]
 mod repository_context_reader;
 #[expect(
     dead_code,
@@ -1090,6 +1104,10 @@ pub struct Services {
     /// The one repository credential directory for this server incarnation.
     /// Clones share it; construction alone leaves the connection unverified.
     repository_connection_directory: Arc<repository_credentials::RepositoryConnectionDirectory>,
+    /// Original invalidation owner for this Services instance. Clones share it;
+    /// Store must accept this exact observer before it can be used.
+    repository_lifecycle_registry:
+        Arc<repository_admission::lifecycle::RepositoryLifecycleRegistry>,
     /// When the primary principal's GitHub profile was last refreshed from
     /// `GET /user` on a `principal.me` read (multiplayer w1); shared across
     /// clones so the rate limit spans every RPC handle.
@@ -1552,6 +1570,7 @@ impl Services {
             gitlab_secret_store,
             gitlab_credential_gate: source_control_auth_ops::new_gitlab_credential_gate(),
             repository_connection_directory,
+            repository_lifecycle_registry: Arc::default(),
             principal_identity_refreshed_at: Arc::new(tokio::sync::Mutex::new(None)),
             identity_transition: Arc::new(tokio::sync::Mutex::new(())),
             identity_rekey_generation: Arc::new(AtomicU64::new(0)),
