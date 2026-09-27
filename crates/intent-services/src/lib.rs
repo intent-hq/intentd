@@ -102,6 +102,21 @@ mod github_auth_ops;
 mod github_browse_ops;
 mod source_control_auth_ops;
 
+// Compile the inactive repository sources against real private Services gates.
+// No entrypoint, watcher, native pipeline or authority writer is registered.
+#[cfg(test)]
+mod repository_admission;
+#[cfg(test)]
+#[path = "repository_admission/durable_source.rs"]
+mod repository_admission_durable_source;
+#[cfg(test)]
+#[path = "repository_admission/source_tests.rs"]
+mod repository_admission_source_tests;
+#[cfg(test)]
+mod repository_context_reader;
+#[cfg(test)]
+mod repository_credentials;
+
 mod agent_list_cache;
 mod harness;
 mod history_xml;

@@ -30,6 +30,60 @@ const A: &str = "https://github.com/team/a.git";
 const B: &str = "https://github.com/team/b.git";
 const GL: &str = "https://git.example:8443/gitlab/team/sub/app.git";
 
+#[test]
+fn private_inventory_retains_all_original_transports_without_changing_public_projection() {
+    let f = Fixture::new();
+    let raw =
+        "https://fixture-user:fixture-secret@github.com/team/a.git?private-query=fixture-query";
+    f.config("remote.origin.url", raw);
+    f.config("remote.origin.pushurl", "git@unmapped:team/a.git");
+    f.git(
+        &f.path,
+        &[
+            "config",
+            "--add",
+            "remote.origin.pushurl",
+            "file:///fixture/local.git",
+        ],
+    );
+    let output =
+        read_repository_context_with_resolver(&f.input(), &canonical_resolver(), &f.env).unwrap();
+    assert_eq!(output.private_roots.len(), 1);
+    assert_eq!(output.private_roots[0].root, f.input().roots[0].root);
+    assert_eq!(
+        output.private_roots[0].source_ref.as_deref(),
+        Some("refs/heads/main")
+    );
+    let private = &output.private_roots[0].remotes[0];
+    assert_eq!(private.name, "origin");
+    assert_eq!(private.fetch, [raw]);
+    assert_eq!(
+        private.push,
+        ["git@unmapped:team/a.git", "file:///fixture/local.git"]
+    );
+    assert!(output.context.roots[0].remotes[0]
+        .fetch
+        .iter()
+        .chain(&output.context.roots[0].remotes[0].push)
+        .all(|endpoint| matches!(
+            endpoint.resolution,
+            RepositoryEndpointResolution::Unresolved { .. }
+        )));
+    let public = serde_json::to_string(&output.context).unwrap();
+    for secret in [
+        "fixture-secret",
+        "fixture-query",
+        "privateRoots",
+        "private_roots",
+    ] {
+        assert!(!public.contains(secret));
+    }
+    assert_eq!(
+        serde_json::from_str::<intent_core::RepositoryContext>(&public).unwrap(),
+        output.context
+    );
+}
+
 struct Fixture {
     guard: tempfile::TempDir,
     path: PathBuf,

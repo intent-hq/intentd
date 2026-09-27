@@ -62,6 +62,23 @@ pub struct GitConfigEnvironment {
 pub struct RepositoryContextRead {
     pub context: RepositoryContext,
     pub change_inputs: Vec<RepositoryChangeInputs>,
+    /// Internal original transport facts. Never serialize or log this member.
+    pub(crate) private_roots: Vec<RepositoryPrivateRoot>,
+}
+
+/// Original effective values from the same consistency-checked Git read.
+/// Deliberately neither Debug nor Serde. These observations grant no authority.
+pub(crate) struct RepositoryPrivateRoot {
+    pub root: RepositoryRootId,
+    /// Exact symbolic ref; the public shortened branch name is display only.
+    pub source_ref: Option<String>,
+    pub remotes: Vec<RepositoryPrivateRemote>,
+}
+
+pub(crate) struct RepositoryPrivateRemote {
+    pub name: String,
+    pub fetch: Vec<String>,
+    pub push: Vec<String>,
 }
 
 /// Local change sources, not a claim that watchers are installed or exhaustive
@@ -93,14 +110,16 @@ pub fn read_repository_context(
     let mut seen = Vec::new();
     let mut roots = Vec::new();
     let mut change_inputs = Vec::new();
+    let mut private_roots = Vec::new();
     for root in &input.roots {
         if seen.contains(&root.root) {
             return Err(invalid("duplicate admitted root"));
         }
         seen.push(root.root.clone());
-        let (context, changes) = read_root(root, resolve, environment)?;
+        let (context, changes, private) = read_root(root, resolve, environment)?;
         roots.push(context);
         change_inputs.push(changes);
+        private_roots.push(private);
     }
     Ok(RepositoryContextRead {
         context: RepositoryContext {
@@ -109,6 +128,7 @@ pub fn read_repository_context(
             roots,
         },
         change_inputs,
+        private_roots,
     })
 }
 
@@ -305,7 +325,11 @@ fn read_root(
     input: &AdmittedRepositoryRoot,
     resolve: &impl Fn(&str) -> RepositoryEndpointResolution,
     environment: &GitConfigEnvironment,
-) -> Result<(RepositoryRootContext, RepositoryChangeInputs)> {
+) -> Result<(
+    RepositoryRootContext,
+    RepositoryChangeInputs,
+    RepositoryPrivateRoot,
+)> {
     let path = input
         .path
         .canonicalize()
@@ -328,6 +352,7 @@ fn read_root(
     let common_dir = PathBuf::from(git.required(&common_dir_args)?);
     let before = git.config()?;
     let head = git.head()?;
+    let source_ref = git.line(&["symbolic-ref", "--quiet", "HEAD"], true)?;
     let mut config_files =
         BTreeSet::from([common_dir.join("config"), git_dir.join("config.worktree")]);
     config_files.extend(environment.extra_config_paths.iter().cloned());
@@ -380,6 +405,7 @@ fn read_root(
         }
     }
     let mut remotes = Vec::new();
+    let mut private_remotes = Vec::new();
     let mut push_urls = git.push_urls()?;
     for name in &remote_names {
         let fetch = fetch_configured
@@ -393,6 +419,11 @@ fn read_root(
             name: name.clone(),
             fetch: fetch.iter().map(|url| endpoint(url, resolve)).collect(),
             push: push.iter().map(|url| endpoint(url, resolve)).collect(),
+        });
+        private_remotes.push(RepositoryPrivateRemote {
+            name: name.clone(),
+            fetch,
+            push,
         });
     }
     let selection = resolve_review_selection(
@@ -428,6 +459,7 @@ fn read_root(
     // Do not return a torn read or silently advance the caller's revision.
     if before != git.config()?
         || head != git.head()?
+        || source_ref != git.line(&["symbolic-ref", "--quiet", "HEAD"], true)?
         || Path::new(&git.required(&git_dir_args)?) != git_dir
         || Path::new(&git.required(&common_dir_args)?) != common_dir
     {
@@ -463,6 +495,11 @@ fn read_root(
             review_selection: selection,
         },
         changes,
+        RepositoryPrivateRoot {
+            root: input.root.clone(),
+            source_ref,
+            remotes: private_remotes,
+        },
     ))
 }
 
