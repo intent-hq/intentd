@@ -571,9 +571,10 @@ pub(crate) async fn process_frame(
             let reverse = reverse.clone();
             let is_tcp = crate::context::is_tcp_connection();
             let caller = crate::context::current_caller();
+            let credential = intent_core::caller::current_wire_credential();
             let (rpc_id, method) = (rpc_id.clone(), method.clone());
             tokio::spawn(async move {
-                crate::context::with_request_context(is_tcp, caller, async {
+                crate::context::with_credential_context(is_tcp, caller, credential, async {
                     finish_slow_path_rpc(
                         permit,
                         panic_guard::guard_frame(
@@ -628,9 +629,10 @@ pub(crate) async fn process_frame(
             let registry = reverse_guard.registry();
             let is_tcp = crate::context::is_tcp_connection();
             let caller = crate::context::current_caller();
+            let credential = intent_core::caller::current_wire_credential();
             let (rpc_id, method) = (rpc_id.clone(), method.clone());
             tokio::spawn(async move {
-                crate::context::with_request_context(is_tcp, caller, async {
+                crate::context::with_credential_context(is_tcp, caller, credential, async {
                     let tabs = browser::TabContext {
                         api: api.as_ref(),
                         client_id: host_client_id.as_ref(),
@@ -803,8 +805,9 @@ pub(crate) async fn process_frame(
     let raw = raw.to_string();
     let is_tcp = crate::context::is_tcp_connection();
     let caller = crate::context::current_caller();
+    let credential = intent_core::caller::current_wire_credential();
     tokio::spawn(async move {
-        crate::context::with_request_context(is_tcp, caller, async {
+        crate::context::with_credential_context(is_tcp, caller, credential, async {
             finish_slow_path_rpc(
                 permit,
                 panic_guard::guard_frame(&method, rpc_id, handle_message(api.as_ref(), &raw)),
@@ -1537,8 +1540,9 @@ where
 {
     let is_tcp = crate::context::is_tcp_connection();
     let caller = crate::context::current_caller();
-    tokio::spawn(crate::context::with_request_context(
-        is_tcp, caller, forwarder,
+    let credential = intent_core::caller::current_wire_credential();
+    tokio::spawn(crate::context::with_credential_context(
+        is_tcp, caller, credential, forwarder,
     ))
 }
 

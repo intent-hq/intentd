@@ -73,6 +73,7 @@ pub use event_repo::{EventQuery, NewEvent};
 pub use event_subscription_repo::PersistedEventSubscription;
 pub use host_membership_repo::{
     HostInviteJoinOutcome, HostJoinCredential, HostMemberRemoval, HostMembersSnapshot,
+    OwnerQueuePermit,
 };
 pub use metrics_repo::{AgentMetricsRow, WorkspaceMetricsRow};
 #[cfg(test)]

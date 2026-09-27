@@ -7362,10 +7362,6 @@ impl AgentManager {
         // checked inside the pop's critical section against the entry found
         // there — a guest force-sends only what its `agent.getQueue` shows it.
         let gate = self.services.queue_entry_gate(&agent_id, false).await?;
-        let destination_owner = self
-            .services
-            .destination_owner_queue_authorization()
-            .await?;
         self.services.park_queue_mutation_gate(gate.as_ref()).await;
         // Quarantine gate (monorepo#840): a provably-poisoned session must
         // not be redriven by delivery — every replay deterministically
@@ -7401,6 +7397,10 @@ impl AgentManager {
                 "queuedMessage": entry,
             }));
         }
+        let destination_owner = self
+            .services
+            .destination_owner_queue_authorization(&agent_id, &message_id)
+            .await?;
         // Atomic dequeue under the queue lock: no concurrent drain can
         // deliver the same entry twice. The entry stays listed in queue
         // snapshots (§6.5 drain ordering) until `draining` is dropped.
@@ -7410,11 +7410,12 @@ impl AgentManager {
                 &agent_id,
                 &message_id,
                 gate.as_ref(),
-                destination_owner,
+                destination_owner.as_ref(),
             )?
             .ok_or_else(|| {
                 Error::InvalidParams(format!("queued message not found: {message_id}"))
             })?;
+        drop(destination_owner);
         // Stale-redrive parity with the drain paths (#576): a delegated
         // agent's entry that predates the delivered completion report is
         // annotated and keeps the report queryable.

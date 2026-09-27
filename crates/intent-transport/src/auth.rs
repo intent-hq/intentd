@@ -93,6 +93,7 @@ pub struct AsyncTokenStore {
     cache_ttl: Duration,
     warn_interval: Duration,
     changes: watch::Sender<Option<String>>,
+    admission: Arc<tokio::sync::RwLock<()>>,
 }
 
 /// Combined async state: the single cache slot, timeout-warn rate-limit
@@ -155,6 +156,7 @@ impl AsyncTokenStore {
         Self {
             inner,
             changes: watch::channel(None).0,
+            admission: Arc::default(),
             state: Arc::new(Mutex::new(TokenState {
                 entry: None,
                 last_warn: None,
@@ -228,20 +230,25 @@ impl AsyncTokenStore {
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn store_token(&self, token: &str) -> Result<()> {
-        let inner = self.inner.clone();
+        // Keep exclusion and publication in the non-cancellable blocking job:
+        // timeout/caller cancellation cannot let a late durable write bypass a
+        // lease or leave the cache/watch at the previous credential.
+        let admission = self.admission.clone().write_owned().await;
+        let store = self.clone();
         let value_owned = token.to_string();
-        let handle = tokio::task::spawn_blocking(move || inner.store_token(&value_owned));
+        let handle = tokio::task::spawn_blocking(move || {
+            let _admission = admission;
+            store.inner.store_token(&value_owned)?;
+            let mut state = store.state.lock().unwrap();
+            state.entry = Some(Entry::Cached {
+                value: Some(value_owned.clone()),
+                expires_at: Instant::now() + store.cache_ttl,
+            });
+            store.changes.send_replace(Some(hash_token(&value_owned)));
+            Ok(())
+        });
         match timeout(self.write_timeout, handle).await {
-            Ok(Ok(Ok(()))) => {
-                let mut guard = self.state.lock().unwrap();
-                guard.entry = Some(Entry::Cached {
-                    value: Some(token.to_string()),
-                    expires_at: Instant::now() + self.cache_ttl,
-                });
-                self.changes.send_replace(Some(hash_token(token)));
-                Ok(())
-            }
-            Ok(Ok(Err(e))) => Err(e),
+            Ok(Ok(result)) => result,
             Ok(Err(join_err)) => Err(Error::Internal(format!(
                 "secret-store write task panicked: {join_err}"
             ))),
@@ -411,6 +418,28 @@ impl AdmittedCredential {
         }
     }
 
+    pub(crate) fn binding(
+        &self,
+        store: &AsyncTokenStore,
+        caller: &Caller,
+    ) -> Option<intent_core::caller::WireCredential> {
+        use intent_core::caller::WireCredential;
+        let principal_id = caller.principal_id()?.clone();
+        Some(match &self.resolved {
+            ResolvedCredential::Legacy => WireCredential::Legacy {
+                principal_id,
+                authority: Arc::new(LegacyAdmission {
+                    store: store.clone(),
+                    token: self.token.clone(),
+                }),
+            },
+            ResolvedCredential::Principal(admitted) => WireCredential::Principal {
+                principal_id: admitted.clone(),
+                token_hash: hash_token(&self.token),
+            },
+        })
+    }
+
     pub(crate) fn token(&self) -> &str {
         &self.token
     }
@@ -445,6 +474,33 @@ impl AdmittedCredential {
                         .is_ok_and(|resolved| resolved.as_ref() == Some(id))
             }
         }
+    }
+}
+
+/// Private transport-owned bearer; only an opaque lease crosses into services.
+struct LegacyAdmission {
+    store: AsyncTokenStore,
+    token: String,
+}
+
+impl intent_core::caller::LegacyCredentialAuthority for LegacyAdmission {
+    fn authorize(
+        &self,
+    ) -> intent_core::BoxFuture<'_, Result<intent_core::caller::CredentialLease>> {
+        Box::pin(async move {
+            let lease = self.store.admission.clone().read_owned().await;
+            if !self
+                .store
+                .load_token()
+                .await
+                .is_some_and(|token| token_matches(&token, &self.token))
+            {
+                return Err(Error::Forbidden(
+                    "admitted credential is no longer valid".into(),
+                ));
+            }
+            Ok(Box::new(lease) as intent_core::caller::CredentialLease)
+        })
     }
 }
 

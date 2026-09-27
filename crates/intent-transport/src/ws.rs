@@ -1265,6 +1265,9 @@ impl WsInner {
         // so responses overtake queued bulk traffic on a saturated link.
         let (app_tx, mut app_rx) = conn::outbound_channel();
         let mut subs = ConnSubs::default();
+        let credential_binding = admitted
+            .as_ref()
+            .and_then(|admitted| admitted.binding(self.token_store.as_ref()?, caller.as_ref()?));
         let mut rotation = admitted.as_mut().and_then(|c| c.rotation.take());
         subs.pairing.admitted = admitted;
         let mut forwards = ForwardRegistry::default();
@@ -1446,7 +1449,8 @@ impl WsInner {
                         // Wrap in connection context (is_tcp=true for WSS) so server.*
                         // RPCs gate on real origin, not the locality flag (§5.2), and
                         // bind the caller resolved at upgrade (multiplayer w1).
-                        let frame_ok =
+                        let frame_ok = intent_core::caller::with_wire_credential(
+                            credential_binding.clone(),
                             crate::context::with_request_context(true, caller.clone(), async {
                                 conn::process_frame(
                                     &text,
@@ -1464,8 +1468,9 @@ impl WsInner {
                                     &self.rpc_limiter,
                                 )
                                 .await
-                            })
-                            .await;
+                            }),
+                        )
+                        .await;
                         if !frame_ok {
                             break;
                         }

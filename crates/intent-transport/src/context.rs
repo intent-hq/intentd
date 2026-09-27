@@ -125,3 +125,16 @@ where
     };
     with_connection_context(is_tcp, inner)
 }
+
+/// Restore exact bearer admission when dispatch moves to a detached task.
+pub(crate) fn with_credential_context<F: Future>(
+    is_tcp: bool,
+    caller: Option<Caller>,
+    credential: Option<intent_core::caller::WireCredential>,
+    future: F,
+) -> impl Future<Output = F::Output> {
+    intent_core::caller::with_wire_credential(
+        credential,
+        with_request_context(is_tcp, caller, future),
+    )
+}

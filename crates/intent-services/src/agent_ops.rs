@@ -6527,15 +6527,54 @@ impl Services {
         }))
     }
 
-    /// Resolve an affirmative current human owner, not the absence of a
-    /// restricted queue gate (which also admits agents and daemon work).
-    /// Public send-now holds instruction admission across this read and pop.
-    pub(crate) async fn destination_owner_queue_authorization(&self) -> Result<bool> {
+    /// Resolve current owner/credential authority and retain both guards through
+    /// the imported entry's synchronous pop. Normal local/nonhuman entries keep
+    /// their existing path. An entry that appears later fails closed at pop.
+    pub(crate) async fn destination_owner_queue_authorization(
+        &self,
+        agent_id: &AgentId,
+        message_id: &str,
+    ) -> Result<Option<DestinationOwnerQueueAuthorization>> {
+        use intent_core::caller::{current_wire_credential, WireCredential};
+        if !self
+            .find_queued_message(agent_id, message_id)
+            .is_some_and(|entry| {
+                intent_core::human_author::is_unbound_historical_human(
+                    entry.message_metadata.as_ref(),
+                )
+            })
+        {
+            return Ok(None);
+        }
         let Some(intent_core::Caller::Wire { principal_id, .. }) = intent_core::current_caller()
         else {
-            return Ok(false);
+            return Ok(None);
         };
-        Ok(self.store.get_host_role(&principal_id).await? == intent_core::HostRole::Owner)
+        let credential = current_wire_credential();
+        if credential
+            .as_ref()
+            .is_some_and(|c| c.principal_id() != &principal_id)
+        {
+            return Err(Error::Forbidden(
+                "admitted credential principal mismatch".into(),
+            ));
+        }
+        let lease = match credential.as_ref() {
+            Some(WireCredential::Legacy { authority, .. }) => Some(authority.authorize().await?),
+            _ => None,
+        };
+        let token_hash = match credential.as_ref() {
+            Some(WireCredential::Principal { token_hash, .. }) => Some(token_hash.as_str()),
+            _ => None,
+        };
+        Ok(self
+            .store
+            .owner_queue_permit(&principal_id, token_hash)
+            .await?
+            .map(|owner| DestinationOwnerQueueAuthorization {
+                _owner: owner,
+                _credential: lease,
+            }))
     }
 
     /// Test seam (intentd#2068): park a GATED per-id queue mutation between
@@ -7113,8 +7152,10 @@ impl Services {
         let _mutation = self.workspace_mutations.enter(&session.workspace_id)?;
         let workspace_id = session.workspace_id.clone();
         let gate = self.queue_entry_gate(&agent_id, false).await?;
-        let destination_owner = self.destination_owner_queue_authorization().await?;
         self.park_queue_mutation_gate(gate.as_ref()).await;
+        let destination_owner = self
+            .destination_owner_queue_authorization(&agent_id, &message_id)
+            .await?;
         // Atomic dequeue; the entry stays listed in queue snapshots (§6.5
         // drain ordering) until `draining` is dropped right before the shrunk
         // publish below.
@@ -7123,11 +7164,12 @@ impl Services {
                 &agent_id,
                 &message_id,
                 gate.as_ref(),
-                destination_owner,
+                destination_owner.as_ref(),
             )?
             .ok_or_else(|| {
                 Error::InvalidParams(format!("queued message not found: {message_id}"))
             })?;
+        drop(destination_owner);
         // Identity link: parity with the runtime path.
         crate::agent_manager::stamp_queued_message_id(&mut entry);
         // Durable shrink now; the shrunk `agent:queue:updated` is published
@@ -15131,7 +15173,7 @@ impl Services {
         agent_id: &AgentId,
         message_id: &str,
     ) -> Option<(QueuedMessage, DrainingGuard)> {
-        self.take_queued_message_draining_gated(agent_id, message_id, None, false)
+        self.take_queued_message_draining_gated(agent_id, message_id, None, None)
             .ok()
             .flatten()
     }
@@ -15154,7 +15196,7 @@ impl Services {
         agent_id: &AgentId,
         message_id: &str,
         gate: Option<&QueueEntryGate>,
-        destination_owner: bool,
+        destination_owner: Option<&DestinationOwnerQueueAuthorization>,
     ) -> Result<Option<(QueuedMessage, DrainingGuard)>> {
         let mut refused = None;
         let popped = self.pop_draining(
@@ -15174,7 +15216,7 @@ impl Services {
                 }
                 if intent_core::human_author::is_unbound_historical_human(
                     queue[idx].message_metadata.as_ref(),
-                ) && !destination_owner
+                ) && destination_owner.is_none()
                 {
                     refused = Some(Error::Forbidden(
                         "imported human instruction requires the destination owner".into(),
@@ -16703,4 +16745,11 @@ impl Services {
 
         Ok(())
     }
+}
+
+/// Opaque positive authorization; only the durable role/credential validator can
+/// construct one, and its guards remain held while the queue lock is acquired.
+pub(crate) struct DestinationOwnerQueueAuthorization {
+    _owner: intent_store::OwnerQueuePermit,
+    _credential: Option<intent_core::caller::CredentialLease>,
 }

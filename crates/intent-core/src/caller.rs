@@ -100,6 +100,59 @@ where
     CALLER.scope(caller, f)
 }
 
+/// A short-lived authorization lease. The transport owns its implementation;
+/// services retain it only through an irreversible admission decision, never
+/// through a running agent turn. Neither credentials nor their hashes serialize.
+pub type CredentialLease = Box<dyn Send + Sync>;
+
+/// Revalidate a legacy credential and exclude rotation until the returned lease
+/// drops. Per-principal credentials are checked with durable role in the store.
+pub trait LegacyCredentialAuthority: Send + Sync {
+    fn authorize(&self) -> crate::BoxFuture<'_, crate::Result<CredentialLease>>;
+}
+
+/// Exact wire admission provenance, independent of the caller's role snapshot.
+/// UDS and explicitly unauthenticated local transports have no bearer binding.
+#[derive(Clone)]
+pub enum WireCredential {
+    Legacy {
+        principal_id: PrincipalId,
+        authority: std::sync::Arc<dyn LegacyCredentialAuthority>,
+    },
+    Principal {
+        principal_id: PrincipalId,
+        token_hash: String,
+    },
+}
+
+impl WireCredential {
+    #[must_use]
+    pub fn principal_id(&self) -> &PrincipalId {
+        match self {
+            Self::Legacy { principal_id, .. } | Self::Principal { principal_id, .. } => {
+                principal_id
+            }
+        }
+    }
+}
+
+tokio::task_local! {
+    static WIRE_CREDENTIAL: Option<WireCredential>;
+}
+
+#[must_use]
+pub fn current_wire_credential() -> Option<WireCredential> {
+    WIRE_CREDENTIAL.try_with(Clone::clone).ok().flatten()
+}
+
+/// Transport request spawns must capture and re-establish this alongside Caller.
+pub fn with_wire_credential<F: Future>(
+    credential: Option<WireCredential>,
+    future: F,
+) -> impl Future<Output = F::Output> {
+    WIRE_CREDENTIAL.scope(credential, future)
+}
+
 /// `tokio::spawn` for daemon-internal background work: the spawned task runs
 /// with [`Caller::Daemon`] bound, so the capability gates it reaches (event
 /// fan-out, refreshers, timers, finalisers) see the daemon rather than an

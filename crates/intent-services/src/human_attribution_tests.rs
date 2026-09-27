@@ -124,7 +124,7 @@ async fn transfer_human_store_send_requires_current_owner_and_preserves_failure(
         .await
         .unwrap();
         assert!(svc
-            .take_queued_message_draining_gated(&agent, &entry.id, gate.as_ref(), false)
+            .take_queued_message_draining_gated(&agent, &entry.id, gate.as_ref(), None)
             .is_err());
         let author_gate = with_caller(
             Caller::Wire {

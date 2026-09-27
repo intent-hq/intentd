@@ -596,3 +596,127 @@ async fn intervening_store_token_wins_over_slow_load() {
         "intervening store_token must win against a delayed load result"
     );
 }
+
+#[tokio::test]
+async fn imported_owner_credential_lease_orders_rotation_at_pop() {
+    use futures::FutureExt;
+    use intent_core::caller::LegacyCredentialAuthority;
+    let original = "ab".repeat(32);
+    let replacement = "cd".repeat(32);
+    let backing = Arc::new(MemoryStore::with(&original));
+    let store = async_of(backing.clone());
+    let authority = LegacyAdmission {
+        store: store.clone(),
+        token: original.clone(),
+    };
+    let lease = authority.authorize().await.unwrap();
+    let mut rotation = Box::pin(store.store_token(&replacement));
+    assert!((&mut rotation).now_or_never().is_none());
+    assert_eq!(
+        backing.load_token(),
+        Some(original.clone()),
+        "durable rotation cannot pass the authorized pop"
+    );
+    drop(lease);
+    rotation.await.unwrap();
+    assert!(authority.authorize().await.is_err());
+    let fresh = LegacyAdmission {
+        store: store.clone(),
+        token: replacement.clone(),
+    };
+    drop(fresh.authorize().await.unwrap());
+    store.store_token(&replacement).await.unwrap();
+    drop(fresh.authorize().await.unwrap());
+    store.store_token("").await.unwrap();
+    assert!(fresh.authorize().await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn imported_owner_credential_late_write_keeps_fence_after_timeout_or_cancellation() {
+    use futures::FutureExt;
+    use intent_core::caller::LegacyCredentialAuthority;
+    struct PausedWrite {
+        token: Mutex<Option<String>>,
+        entered: tokio::sync::Notify,
+        release: (Mutex<bool>, std::sync::Condvar),
+    }
+    impl TokenStore for PausedWrite {
+        fn load_token(&self) -> Option<String> {
+            self.token.lock().unwrap().clone()
+        }
+        fn store_token(&self, token: &str) -> Result<()> {
+            self.entered.notify_one();
+            let (lock, cv) = &self.release;
+            let (_released, timeout) = cv
+                .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(10), |v| !*v)
+                .unwrap();
+            assert!(!timeout.timed_out());
+            *self.token.lock().unwrap() = Some(token.to_owned());
+            Ok(())
+        }
+    }
+    for cancel in [false, true] {
+        let old = "ab".repeat(32);
+        let new = "cd".repeat(32);
+        let backing = Arc::new(PausedWrite {
+            token: Mutex::new(Some(old.clone())),
+            entered: tokio::sync::Notify::new(),
+            release: (Mutex::new(false), std::sync::Condvar::new()),
+        });
+        let store = AsyncTokenStore::with_timings(
+            backing.clone(),
+            Duration::from_secs(1),
+            if cancel {
+                Duration::from_secs(10)
+            } else {
+                Duration::from_millis(20)
+            },
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        assert_eq!(store.load_token().await, Some(old.clone()));
+        let writer = tokio::spawn({
+            let store = store.clone();
+            let new = new.clone();
+            async move { store.store_token(&new).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), backing.entered.notified())
+            .await
+            .unwrap();
+        if cancel {
+            writer.abort();
+            assert!(writer.await.unwrap_err().is_cancelled());
+        } else {
+            assert!(writer.await.unwrap().is_err());
+        }
+        let authority = LegacyAdmission {
+            store: store.clone(),
+            token: old,
+        };
+        let mut admission = Box::pin(authority.authorize());
+        assert!(
+            (&mut admission).now_or_never().is_none(),
+            "unfinished durable write retains exclusion after caller exits"
+        );
+        {
+            let (lock, cv) = &backing.release;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+        }
+        assert!(
+            admission.await.is_err(),
+            "late write publishes the new credential before releasing the fence"
+        );
+        assert_eq!(store.load_token().await, Some(new.clone()));
+        assert_eq!(
+            store.changes.borrow().as_deref(),
+            Some(hash_token(&new).as_str())
+        );
+        drop(
+            LegacyAdmission { store, token: new }
+                .authorize()
+                .await
+                .unwrap(),
+        );
+    }
+}

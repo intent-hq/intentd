@@ -12,6 +12,8 @@ mod common;
 mod host_roles;
 #[path = "wss_integration/human_attribution.rs"]
 mod human_attribution;
+#[path = "wss_integration/imported_queue_authorization.rs"]
+mod imported_queue_authorization;
 #[path = "wss_integration/sharing.rs"]
 mod sharing;
 

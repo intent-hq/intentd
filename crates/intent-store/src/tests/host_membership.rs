@@ -1241,3 +1241,100 @@ async fn open_invite_list_preserves_nanosecond_expiry_and_orders_equal_creation_
         .unwrap()
         .is_empty());
 }
+
+#[tokio::test]
+async fn imported_owner_permit_binds_exact_credential_and_excludes_authority_changes() {
+    use std::{
+        future::Future,
+        task::{Context, Waker},
+    };
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let owner = store.get_primary_principal().await.unwrap();
+    let member = guest_identity(8001);
+    let guest = guest_identity(8002);
+    join(&store, "queue-owner-member", &member, "member-key").await;
+    store.upsert_principal(&guest).await.unwrap();
+    store
+        .insert_principal_credential(&guest.id, "guest-key")
+        .await
+        .unwrap();
+    for person in [&member, &guest] {
+        assert!(store
+            .owner_queue_permit(&person.id, None)
+            .await
+            .unwrap()
+            .is_none());
+    }
+    for key in ["old-owner-key", "other-owner-key"] {
+        store
+            .insert_principal_credential(&owner.id, key)
+            .await
+            .unwrap();
+    }
+    assert!(store
+        .owner_queue_permit(&owner.id, Some("guest-key"))
+        .await
+        .unwrap()
+        .is_none());
+    assert!(store
+        .owner_queue_permit(&owner.id, Some("missing-key"))
+        .await
+        .unwrap()
+        .is_none());
+    let permit = store
+        .owner_queue_permit(&owner.id, Some("old-owner-key"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        store.write_pool().try_acquire().is_none(),
+        "permit keeps durable mutation excluded"
+    );
+    let mut revoke = Box::pin(store.revoke_principal_credential("old-owner-key"));
+    assert!(revoke
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+        .is_pending());
+    assert!(store
+        .lookup_principal_credential("old-owner-key")
+        .await
+        .unwrap()
+        .unwrap()
+        .is_active());
+    drop(permit);
+    assert!(revoke.await.unwrap());
+    assert!(
+        store
+            .owner_queue_permit(&owner.id, Some("old-owner-key"))
+            .await
+            .unwrap()
+            .is_none(),
+        "another live credential is not the admitted one"
+    );
+    let permit = store
+        .owner_queue_permit(&owner.id, Some("other-owner-key"))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut demote = Box::pin(
+        sqlx::query("UPDATE principal SET is_primary=0 WHERE id=?")
+            .bind(owner.id.as_str())
+            .execute(store.write_pool()),
+    );
+    assert!(demote
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+        .is_pending());
+    drop(permit);
+    assert_eq!(demote.await.unwrap().rows_affected(), 1);
+    assert!(
+        store
+            .owner_queue_permit(&owner.id, Some("other-owner-key"))
+            .await
+            .unwrap()
+            .is_none(),
+        "current role is checked even with a valid credential"
+    );
+    store.close().await;
+}

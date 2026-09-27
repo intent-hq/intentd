@@ -24,6 +24,12 @@ const HOST_INVITE_COLUMNS: &str = "id, secret_hash, secret, created_by_principal
 const HOST_INVITE_CANDIDATE: &str = "revoked_at IS NULL AND redeemed_at IS NULL \
     AND redemption_count = 0 AND julianday(expires_at) >= julianday(?)";
 
+/// A validated current owner, held through a synchronous queue pop. The write
+/// transaction excludes changes to both role and the exact personal credential.
+pub struct OwnerQueuePermit {
+    _transaction: sqlx::Transaction<'static, sqlx::Sqlite>,
+}
+
 /// A roster and its revision read from one `SQLite` snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostMembersSnapshot {
@@ -592,5 +598,29 @@ fn map_invite(row: &SqliteRow) -> HostInvite {
             .map(PrincipalId),
         revoked_at: row.get("revoked_at"),
         redemption_count: unsigned(row, "redemption_count"),
+    }
+}
+
+impl Store {
+    /// Validate owner and optional exact personal credential under the write
+    /// lock. Dropping the permit releases the read-only transaction; no queue
+    /// or authority row is changed. Keep it only through the atomic queue pop.
+    pub async fn owner_queue_permit(
+        &self,
+        principal_id: &PrincipalId,
+        token_hash: Option<&str>,
+    ) -> Result<Option<OwnerQueuePermit>> {
+        let mut transaction = self
+            .write_pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_error)?;
+        let authorized: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM principal p WHERE p.id = ? AND p.is_primary = 1 \
+             AND (? IS NULL OR EXISTS(SELECT 1 FROM principal_credential c WHERE c.principal_id = p.id AND c.token_hash = ? AND c.revoked_at IS NULL)))"
+        ).bind(principal_id.as_str()).bind(token_hash).bind(token_hash).fetch_one(&mut *transaction).await.map_err(db_error)?;
+        Ok(authorized.then_some(OwnerQueuePermit {
+            _transaction: transaction,
+        }))
     }
 }
