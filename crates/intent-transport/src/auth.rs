@@ -234,14 +234,12 @@ impl AsyncTokenStore {
         // timeout/caller cancellation cannot let a late durable write bypass a
         // lease or leave the cache/watch at the previous credential.
         let deadline = tokio::time::Instant::now() + self.write_timeout;
-        let admission =
-            match tokio::time::timeout_at(deadline, self.admission.clone().write_owned()).await {
-                Ok(lease) => lease,
-                Err(_) => {
-                    self.warn_timeout("secret-store write admission timed out");
-                    return Err(Error::Internal("secret-store write timed out".into()));
-                }
-            };
+        let Ok(admission) =
+            tokio::time::timeout_at(deadline, self.admission.clone().write_owned()).await
+        else {
+            self.warn_timeout("secret-store write admission timed out");
+            return Err(Error::Internal("secret-store write timed out".into()));
+        };
         let store = self.clone();
         let value_owned = token.to_string();
         let handle = tokio::task::spawn_blocking(move || {
