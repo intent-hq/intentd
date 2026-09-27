@@ -26,7 +26,14 @@ use tokio::sync::{mpsc, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 
+use crate::mcp_server::repository_guidance::{BridgeResponse, ConnectionLifetime, ConnectionToken};
 use crate::mcp_server::WorkspaceMcpServer;
+
+#[cfg(test)]
+mod guidance_tests;
+
+#[cfg(test)]
+mod request_context_tests;
 
 /// Per-connection cap on concurrently dispatched requests. Small on purpose:
 /// enough that a long `tools/call` never blocks a liveness ping behind it
@@ -68,6 +75,13 @@ pub(crate) trait BridgeDispatch: Send + Sync + 'static {
         self: Arc<Self>,
         message: Value,
     ) -> Pin<Box<dyn Future<Output = Option<Value>> + Send>>;
+
+    fn dispatch_for_bridge(
+        self: Arc<Self>,
+        message: Value,
+    ) -> Pin<Box<dyn Future<Output = Option<BridgeResponse>> + Send>> {
+        Box::pin(async move { self.dispatch(message).await.map(BridgeResponse::plain) })
+    }
 }
 
 impl BridgeDispatch for WorkspaceMcpServer {
@@ -77,6 +91,14 @@ impl BridgeDispatch for WorkspaceMcpServer {
     ) -> Pin<Box<dyn Future<Output = Option<Value>> + Send>> {
         Box::pin(async move { self.handle_message(&message).await })
     }
+
+    fn dispatch_for_bridge(
+        self: Arc<Self>,
+        message: Value,
+    ) -> Pin<Box<dyn Future<Output = Option<BridgeResponse>> + Send>> {
+        let context = self.capture_request_context();
+        Box::pin(async move { self.handle_message_for_bridge(&message, context).await })
+    }
 }
 
 /// A running per-agent MCP TCP endpoint. Dropping the handle aborts the accept
@@ -84,6 +106,7 @@ impl BridgeDispatch for WorkspaceMcpServer {
 pub struct McpBridge {
     addr: SocketAddr,
     task: JoinHandle<()>,
+    guidance_endpoint: ConnectionToken,
 }
 
 impl McpBridge {
@@ -109,6 +132,7 @@ impl McpBridge {
 
 impl Drop for McpBridge {
     fn drop(&mut self) {
+        self.guidance_endpoint.retire();
         self.task.abort();
     }
 }
@@ -145,13 +169,19 @@ pub(crate) async fn serve_mcp_tcp_with_timeout<S: BridgeDispatch>(
 ) -> std::io::Result<McpBridge> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let addr = listener.local_addr()?;
+    let endpoint = ConnectionLifetime::new();
+    let guidance_endpoint = endpoint.token();
+    // The captured guard also retires guidance if the accept loop exits on its own.
     let task = tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((stream, _peer)) => {
                     let server = server.clone();
+                    let connection = ConnectionLifetime::for_endpoint(&endpoint.token());
                     tokio::spawn(async move {
-                        if let Err(e) = serve_connection(server, stream, dispatch_timeout).await {
+                        if let Err(e) =
+                            serve_connection(server, stream, dispatch_timeout, connection).await
+                        {
                             tracing::debug!(error = %e, "mcp bridge connection ended");
                         }
                     });
@@ -163,7 +193,11 @@ pub(crate) async fn serve_mcp_tcp_with_timeout<S: BridgeDispatch>(
             }
         }
     });
-    Ok(McpBridge { addr, task })
+    Ok(McpBridge {
+        addr,
+        task,
+        guidance_endpoint,
+    })
 }
 
 /// Serve one accepted MCP connection: read request lines and dispatch each one
@@ -198,16 +232,11 @@ async fn serve_connection<S: BridgeDispatch>(
     server: Arc<S>,
     stream: TcpStream,
     dispatch_timeout: Duration,
+    connection: ConnectionLifetime,
 ) -> std::io::Result<()> {
-    let (read, mut write) = stream.into_split();
-    let (response_tx, mut response_rx) = mpsc::channel::<String>(RESPONSE_CHANNEL_CAPACITY);
-    let writer = tokio::spawn(async move {
-        while let Some(line) = response_rx.recv().await {
-            if write.write_all(line.as_bytes()).await.is_err() || write.flush().await.is_err() {
-                break;
-            }
-        }
-    });
+    let (read, write) = stream.into_split();
+    let (response_tx, response_rx) = mpsc::channel::<BridgeResponse>(RESPONSE_CHANNEL_CAPACITY);
+    let writer = tokio::spawn(write_responses(write, response_rx, connection.token()));
 
     let limiter = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS));
     let mut in_flight = JoinSet::new();
@@ -228,12 +257,24 @@ async fn serve_connection<S: BridgeDispatch>(
                     let Ok(message) = serde_json::from_str::<Value>(&line) else {
                         continue;
                     };
+                    let id = if message.get("method").is_some() {
+                        message.get("id").cloned()
+                    } else {
+                        None
+                    };
+                    let method = message
+                        .get("method")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    // Constructing the future captures context, but must not
+                    // poll the operation or begin its watchdog before admission.
+                    let dispatch_future = server.clone().dispatch_for_bridge(message);
                     let permit = limiter
                         .clone()
                         .acquire_owned()
                         .await
                         .expect("bridge semaphore is never closed");
-                    let server = server.clone();
                     let response_tx = response_tx.clone();
                     in_flight.spawn(async move {
                         let _permit = permit;
@@ -241,26 +282,20 @@ async fn serve_connection<S: BridgeDispatch>(
                         // `id`, including `null`, counting — matching the
                         // stdio proxy's `request_id`, so a wedged null-id
                         // request still gets its synthesized error line.
-                        let id = if message.get("method").is_some() {
-                            message.get("id").cloned()
-                        } else {
-                            None
-                        };
-                        let method = message
-                            .get("method")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string();
                         let started = Instant::now();
                         // The dispatch runs in its own task so the watchdog
                         // below still gets polled when the dispatch future
                         // wedges inside a synchronous poll; the guard aborts
                         // it if this request task is itself torn down.
-                        let mut dispatch = AbortOnDrop(tokio::spawn(server.dispatch(message)));
+                        let mut dispatch = AbortOnDrop(tokio::spawn(dispatch_future));
                         tokio::select! {
                             joined = &mut dispatch.0 => match joined {
                                 Ok(Some(response)) => {
-                                    let _ = response_tx.send(format!("{response}\n")).await;
+                                    // Dispatch is complete: its watchdog must
+                                    // never replace this original result while
+                                    // optional guidance is being prepared.
+                                    let response = response.prepare_guidance().await;
+                                    let _ = response_tx.send(response).await;
                                 }
                                 Ok(None) => {}
                                 Err(e) => {
@@ -284,7 +319,7 @@ async fn serve_connection<S: BridgeDispatch>(
                                             "data": { "retryable": false },
                                         },
                                     });
-                                    let _ = response_tx.send(format!("{response}\n")).await;
+                                    let _ = response_tx.send(BridgeResponse::plain(response)).await;
                                 }
                             }
                         }
@@ -297,6 +332,7 @@ async fn serve_connection<S: BridgeDispatch>(
     };
     // Connection teardown: abort in-flight request tasks, then let the writer
     // drain and exit once every sender is gone.
+    connection.retire();
     in_flight.shutdown().await;
     drop(response_tx);
     let _ = writer.await;
@@ -306,11 +342,26 @@ async fn serve_connection<S: BridgeDispatch>(
 /// Aborts the wrapped dispatch task on drop, so a per-request task torn down
 /// at connection teardown (or by the watchdog path exiting) never leaks a
 /// still-running dispatch: dropping a bare `JoinHandle` would detach it.
-struct AbortOnDrop(JoinHandle<Option<Value>>);
+struct AbortOnDrop(JoinHandle<Option<BridgeResponse>>);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+/// Finalize only the optional guidance at the real writer, after queueing and
+/// immediately before serialization/write. Ordinary operation results are kept.
+async fn write_responses<W: AsyncWrite + Unpin>(
+    mut write: W,
+    mut responses: mpsc::Receiver<BridgeResponse>,
+    connection: ConnectionToken,
+) {
+    while let Some(response) = responses.recv().await {
+        let line = response.into_line(&connection);
+        if write.write_all(line.as_bytes()).await.is_err() || write.flush().await.is_err() {
+            break;
+        }
     }
 }
 

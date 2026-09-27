@@ -18,7 +18,12 @@ use crate::tool_restrictions::get_tool_denylist_for_agent_type;
 
 pub(crate) mod bindings;
 mod dispatch;
+pub mod repository_guidance;
+pub mod request_context;
 mod tools;
+
+use repository_guidance::{BridgeResponse, GuidanceBinding, RepositoryGuidanceSource};
+use request_context::{CapturedRequestContext, McpRequestContext};
 
 pub(crate) use tools::ToolDef;
 pub use tools::{
@@ -105,6 +110,10 @@ pub struct WorkspaceMcpServer {
     /// every non-flagged provider keeps today's full description
     /// byte-identical.
     compact_tool_descriptions: bool,
+    /// Optional trusted producer; disabled for all existing construction paths.
+    repository_guidance: Option<GuidanceBinding>,
+    /// Original endpoint context; no runtime construction path installs it yet.
+    request_context: Option<Arc<dyn McpRequestContext>>,
 }
 
 impl WorkspaceMcpServer {
@@ -125,6 +134,8 @@ impl WorkspaceMcpServer {
             specialist_model_options: Vec::new(),
             is_sub_agent: false,
             compact_tool_descriptions: false,
+            repository_guidance: None,
+            request_context: None,
         }
     }
 
@@ -161,6 +172,42 @@ impl WorkspaceMcpServer {
     #[must_use]
     pub fn with_caller_agent_id(mut self, caller: Option<AgentId>) -> Self {
         self.caller_agent_id = caller;
+        self
+    }
+
+    /// Attach the trusted original endpoint context without granting access.
+    /// Each request captures it before any transport queue or spawned dispatch.
+    #[must_use]
+    pub fn with_request_context(mut self, context: Arc<dyn McpRequestContext>) -> Self {
+        self.request_context = Some(context);
+        self
+    }
+
+    pub(crate) fn capture_request_context(&self) -> CapturedRequestContext {
+        let caller = self
+            .caller_agent_id
+            .clone()
+            .map(|agent_id| intent_core::Caller::Agent { agent_id })
+            .or_else(intent_core::current_caller);
+        CapturedRequestContext::capture(caller, self.request_context.as_deref())
+    }
+
+    /// Opt in a verified immutable session to the optional transport sidecar.
+    /// The source must independently admit each bound caller/context read; a
+    /// matching session ID is only a delivery correlation check, not permission.
+    /// No current runtime construction path enables this inactive integration.
+    #[must_use]
+    pub fn with_repository_guidance(
+        mut self,
+        session: &intent_core::AgentSession,
+        source: Arc<dyn RepositoryGuidanceSource>,
+    ) -> Self {
+        self.repository_guidance = GuidanceBinding::new(
+            session,
+            &self.workspace_id,
+            self.caller_agent_id.as_ref(),
+            source,
+        );
         self
     }
 
@@ -314,15 +361,49 @@ impl WorkspaceMcpServer {
     /// on a fresh task, which would otherwise arrive unbound. A bridge with no
     /// caller agent leaves whatever caller the enclosing scope bound.
     pub async fn handle_message(&self, message: &Value) -> Option<Value> {
+        self.handle_message_response(message, false, self.capture_request_context())
+            .await
+            .map(|response| response.value)
+    }
+
+    pub(crate) async fn handle_message_for_bridge(
+        &self,
+        message: &Value,
+        context: CapturedRequestContext,
+    ) -> Option<BridgeResponse> {
+        self.handle_message_response(message, true, context).await
+    }
+
+    async fn handle_message_response(
+        &self,
+        message: &Value,
+        sidecar: bool,
+        context: CapturedRequestContext,
+    ) -> Option<BridgeResponse> {
         let method = message.get("method").and_then(Value::as_str)?;
         let id = message.get("id").cloned()?;
-        let handled = self.handle_request(&id, method, message);
-        let response = match self.caller_agent_id.clone() {
-            Some(agent_id) => {
-                intent_core::with_caller(intent_core::Caller::Agent { agent_id }, handled).await
+        let handled = async {
+            let value = self.handle_request(&id, method, message).await;
+            let mut response = BridgeResponse::plain(value);
+            if sidecar
+                && method == "tools/call"
+                && message.pointer("/params/name").and_then(Value::as_str) == Some("workspace_api")
+                && response
+                    .value
+                    .pointer("/result/content")
+                    .is_some_and(Value::is_array)
+            {
+                if let Some(binding) = &self.repository_guidance {
+                    response.guidance_request =
+                        binding.capture(&self.workspace_id, self.caller_agent_id.as_ref());
+                    if let Some(request) = &mut response.guidance_request {
+                        request.set_context(context.clone());
+                    }
+                }
             }
-            None => handled.await,
+            response
         };
+        let response = context.run(handled).await;
         Some(response)
     }
 
