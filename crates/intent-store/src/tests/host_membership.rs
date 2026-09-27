@@ -138,7 +138,7 @@ async fn scoped_owner_capability_follows_durable_workspace_role() {
         .await
         .unwrap();
     let rows = store
-        .workspace_membership_summaries(Some(&member.id), &[chief.clone()])
+        .workspace_membership_summaries(Some(&member.id), std::slice::from_ref(&chief))
         .await
         .unwrap();
     assert_eq!(rows[&chief].my_role, Some(WorkspaceRole::Owner));
