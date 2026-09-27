@@ -4,6 +4,9 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
+mod adoption;
+pub(crate) use adoption::{logical_instance, RepositorySettingsWrite};
+
 use intent_sourcecontrol::gitlab_auth::{
     GitlabWriteObserver, GitlabWriteOutcome, PersistenceLease,
 };
@@ -27,6 +30,7 @@ pub(crate) struct GitlabCredentialGate {
 }
 
 pub(crate) struct GitlabCredentialGuard {
+    mutex: Arc<tokio::sync::Mutex<()>>,
     lease: PersistenceLease,
 }
 
@@ -39,7 +43,8 @@ impl GitlabCredentialGuard {
 struct RepositoryOwner {
     directory: Arc<RepositoryConnectionDirectory>,
     writers: RepositoryCredentialWriters,
-    descriptor: Option<GitlabDescriptor>,
+    descriptor: Mutex<Option<GitlabDescriptor>>,
+    settings: OnceLock<adoption::SettingsAttachment>,
     #[cfg(test)]
     write_probe: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
@@ -54,19 +59,13 @@ impl GitlabCredentialGate {
 
     pub(crate) async fn lock(&self) -> GitlabCredentialGuard {
         GitlabCredentialGuard {
+            mutex: self.mutex.clone(),
             lease: Arc::new(self.mutex.clone().lock_owned().await),
         }
     }
 
     /// The constructor owner supplies the SAME directory used by admission and
     /// its explicitly approved descriptor. This is not a settings/adoption API.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "constructor wiring remains a separate integration"
-        )
-    )]
     pub(crate) fn attach_repository(
         &self,
         directory: Arc<RepositoryConnectionDirectory>,
@@ -76,7 +75,8 @@ impl GitlabCredentialGate {
             .set(Arc::new(RepositoryOwner {
                 writers: RepositoryCredentialWriters::new(directory.clone()),
                 directory,
-                descriptor,
+                descriptor: Mutex::new(descriptor),
+                settings: OnceLock::new(),
                 #[cfg(test)]
                 write_probe: Mutex::new(None),
             }))
@@ -100,9 +100,14 @@ impl GitlabCredentialGate {
         };
         let descriptor = owner
             .descriptor
+            .lock()
+            .map_err(|_| map_owner_error(RepositoryCredentialError::Indeterminate))?
             .as_ref()
             .filter(|d| matches_host(d, host))
             .cloned();
+        if owner.settings.get().is_some() && descriptor.is_none() {
+            return Err(map_owner_error(RepositoryCredentialError::BoundaryMismatch));
+        }
         // An unadopted legacy refresh cannot claim continuity with a connection.
         let kind = if kind == RepositoryMutationKind::Refresh {
             match owner.directory.binding() {
@@ -116,10 +121,20 @@ impl GitlabCredentialGate {
             kind
         };
         let reservation = owner.writers.reserve(kind).map_err(map_owner_error)?;
-        Ok(Some(Arc::new(RepositoryWrite {
+        Ok(Some(Self::new_write(owner, descriptor, reservation, kind)))
+    }
+
+    fn new_write(
+        owner: &Arc<RepositoryOwner>,
+        descriptor: Option<GitlabDescriptor>,
+        reservation: RepositoryWriterReservation,
+        kind: RepositoryMutationKind,
+    ) -> Arc<RepositoryWrite> {
+        Arc::new(RepositoryWrite {
             descriptor,
             #[cfg(test)]
             write_probe: owner.write_probe.lock().unwrap().clone(),
+            owner: owner.clone(),
             state: Mutex::new(WriteState {
                 reservation: Some(reservation),
                 mutation: None,
@@ -128,7 +143,7 @@ impl GitlabCredentialGate {
                 publication_confirmed: kind != RepositoryMutationKind::Replace,
                 persisted: false,
             }),
-        })))
+        })
     }
 }
 
@@ -153,7 +168,8 @@ fn map_owner_error(error: RepositoryCredentialError) -> intent_sourcecontrol::Er
 
 /// No credential is stored here. Drop retains uncertainty through the existing
 /// mutation guard. Only the actual persistence owner can report completion.
-pub(super) struct RepositoryWrite {
+pub(crate) struct RepositoryWrite {
+    owner: Arc<RepositoryOwner>,
     descriptor: Option<GitlabDescriptor>,
     #[cfg(test)]
     write_probe: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -228,6 +244,14 @@ impl RepositoryWrite {
                 .as_ref()
                 .zip(state.user.as_ref())
                 .and_then(|(descriptor, user)| {
+                    if self
+                        .owner
+                        .settings
+                        .get()
+                        .is_some_and(|s| s.source.is_none())
+                    {
+                        return None;
+                    }
                     VerifiedRepositoryAccount::from_verified_user(
                         descriptor.clone(),
                         user.id,

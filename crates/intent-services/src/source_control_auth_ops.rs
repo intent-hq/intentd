@@ -32,7 +32,7 @@ use crate::events::EventBus;
 use crate::github_auth_ops::{self, FlowPhase, FlowSlot, MAX_CONSECUTIVE_POLL_ERRORS};
 use crate::{publish_event, system_actor};
 
-mod repository_owner;
+pub(crate) mod repository_owner;
 use crate::repository_credentials::RepositoryMutationKind;
 pub(crate) use repository_owner::GitlabCredentialGate;
 use repository_owner::{GitlabCredentialGuard, RepositoryWrite};
@@ -353,7 +353,7 @@ pub(crate) async fn run_gitlab_poll_loop(
                 }
                 guard.flow = None;
                 drop(guard);
-                let bound = bind_gitlab_host(registry.as_deref(), &host);
+                let bound = bind_gitlab_host_owned(registry.as_deref(), &host, write.as_deref());
                 if let Some(write) = &write {
                     write.confirm_publication(bound);
                 }
@@ -392,7 +392,11 @@ pub(crate) async fn run_gitlab_poll_loop(
 /// Persist `host` as `sourceControl.gitlab.host` (the bound instance) after a
 /// successful connect. Fail-soft: a pinned key or a missing registry
 /// (read-only wiring) only logs — the credential is already stored.
-pub(crate) fn bind_gitlab_host(registry: Option<&crate::SettingsRegistry>, host: &str) -> bool {
+fn bind_gitlab_host_owned(
+    registry: Option<&crate::SettingsRegistry>,
+    host: &str,
+    write: Option<&RepositoryWrite>,
+) -> bool {
     let Some(registry) = registry else {
         return false;
     };
@@ -403,7 +407,11 @@ pub(crate) fn bind_gitlab_host(registry: Option<&crate::SettingsRegistry>, host:
     {
         return true;
     }
-    if let Err(e) = registry.apply(&[("sourceControl.gitlab.host".to_string(), json!(host))]) {
+    if let Err(e) = registry.apply_with_repository_write(
+        &[("sourceControl.gitlab.host".to_string(), json!(host))],
+        None,
+        write,
+    ) {
         tracing::warn!(error = %e, host, "could not persist sourceControl.gitlab.host");
         return false;
     }
@@ -831,7 +839,24 @@ impl crate::Services {
             .map(str::trim)
             .filter(|o| !o.is_empty())
             .or(env_origin.as_deref());
-        resolve_target(provider, host, &gitlab.host, api_origin)
+        let target = resolve_target(provider, host, &gitlab.host, api_origin)?;
+        if let Target::Gitlab { host: resolved } = &target {
+            if gitlab.instance_base_url.is_some()
+                && parse_gitlab_host(&gitlab.host)
+                    .is_ok_and(|bound| bound.host() == resolved.host())
+            {
+                let instance = repository_owner::logical_instance(&gitlab)?;
+                let mut root =
+                    GitlabHost::parse(instance.as_str()).map_err(crate::pr_ops::map_sc_err)?;
+                if let Some(endpoint) = api_origin {
+                    root = root
+                        .with_api_origin(endpoint)
+                        .map_err(crate::pr_ops::map_sc_err)?;
+                }
+                return Ok(Target::Gitlab { host: root });
+            }
+        }
+        Ok(target)
     }
 
     /// Whether `host` is the bound instance (`sourceControl.gitlab.host`)
@@ -1082,7 +1107,11 @@ impl crate::Services {
             guard.flow = None;
             guard.starting = None;
         }
-        let bound = bind_gitlab_host(self.settings_registry.as_deref(), host.host());
+        let bound = bind_gitlab_host_owned(
+            self.settings_registry.as_deref(),
+            host.host(),
+            write.as_deref(),
+        );
         if let Some(write) = &write {
             write.confirm_publication(bound);
         }

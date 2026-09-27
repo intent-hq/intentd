@@ -39,6 +39,9 @@ pub struct GithubSettings {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GitlabSettings {
+    /// Logical instance identity, independently configured from API transport.
+    #[serde(default)]
+    pub instance_base_url: Option<String>,
     /// Instance host or URL (`gitlab.com`, `https://gitlab.acme.internal`);
     /// normalized by [`GitlabHost::parse`].
     #[serde(default = "default_gitlab_host")]
@@ -63,6 +66,7 @@ impl Default for GitlabSettings {
     fn default() -> Self {
         Self {
             host: default_gitlab_host(),
+            instance_base_url: None,
             oauth_client_id: String::new(),
             api_base_url: None,
         }
@@ -167,6 +171,26 @@ async fn resolve_github_token(github: &GithubSettings) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gitlab_logical_instance_settings_preserve_port_prefix_and_legacy_defaults() {
+        let legacy: GitlabSettings = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(legacy.instance_base_url, None);
+        let json = serde_json::json!({
+            "host": "forge.test:8443",
+            "instanceBaseUrl": "https://forge.test:8443/Group/Forge",
+            "apiBaseUrl": "http://127.0.0.1:4321"
+        });
+        let parsed: GitlabSettings = serde_json::from_value(json.clone()).unwrap();
+        let serialized = serde_json::to_value(parsed).unwrap();
+        for field in ["host", "instanceBaseUrl", "apiBaseUrl"] {
+            assert_eq!(serialized[field], json[field]);
+        }
+        assert!(serde_json::from_value::<GitlabSettings>(serde_json::json!({
+            "instanceBaseUrl": false
+        }))
+        .is_err());
+    }
 
     #[tokio::test]
     async fn unknown_provider_is_config_error() {

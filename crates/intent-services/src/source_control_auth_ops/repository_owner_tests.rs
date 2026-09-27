@@ -11,20 +11,20 @@ use tokio::sync::Notify;
 use tokio::time::timeout;
 
 #[derive(Default)]
-struct Control {
-    pause: Mutex<Option<&'static str>>,
-    entered: Notify,
-    release: Notify,
-    token_reply: Mutex<Option<(u16, Value)>>,
-    denied_user: Mutex<Option<&'static str>>,
-    requests: Mutex<Vec<String>>,
-    exchanges: AtomicUsize,
-    directory: Mutex<Option<Arc<RepositoryConnectionDirectory>>>,
+pub(super) struct Control {
+    pub(super) pause: Mutex<Option<&'static str>>,
+    pub(super) entered: Notify,
+    pub(super) release: Notify,
+    pub(super) token_reply: Mutex<Option<(u16, Value)>>,
+    pub(super) denied_user: Mutex<Option<&'static str>>,
+    pub(super) requests: Mutex<Vec<String>>,
+    pub(super) exchanges: AtomicUsize,
+    pub(super) directory: Mutex<Option<Arc<RepositoryConnectionDirectory>>>,
 }
-struct Server {
-    host: GitlabHost,
-    descriptor: GitlabDescriptor,
-    control: Arc<Control>,
+pub(super) struct Server {
+    pub(super) host: GitlabHost,
+    pub(super) descriptor: GitlabDescriptor,
+    pub(super) control: Arc<Control>,
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for Server {
@@ -33,7 +33,7 @@ impl Drop for Server {
     }
 }
 impl Server {
-    async fn new() -> Self {
+    pub(super) async fn new() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let host = GitlabHost::parse("gitlab.test")
@@ -121,7 +121,9 @@ impl Server {
                         {
                             (401, json!({"message":"rejected"}))
                         } else {
-                            let id = if request.contains("pat-second") {
+                            let id = if request.contains("zero-account") {
+                                0
+                            } else if request.contains("pat-second") {
                                 43
                             } else {
                                 42
@@ -144,7 +146,7 @@ impl Server {
             task,
         }
     }
-    async fn entered(&self) {
+    pub(super) async fn entered(&self) {
         timeout(Duration::from_secs(5), self.control.entered.notified())
             .await
             .unwrap();
@@ -177,18 +179,15 @@ impl Fixture {
             .unwrap();
         let secrets = FileSecretStore::with_path(dir.path().join("secrets.json"));
         let svc = Arc::new(
-            crate::Services::new(store)
-                .with_settings_registry(registry)
-                .with_gitlab_secret_store(secrets)
-                .with_workspaces_root(dir.path().join("workspaces")),
-        );
-        let directory = Arc::new(RepositoryConnectionDirectory::new("fixture-daemon".into()));
-        svc.gitlab_credential_gate
-            .attach_repository(
-                directory.clone(),
+            crate::Services::new_repository_fixture(
+                store,
+                secrets,
                 approved.then(|| server.descriptor.clone()),
             )
-            .unwrap();
+            .with_settings_registry(registry)
+            .with_workspaces_root(dir.path().join("workspaces")),
+        );
+        let directory = svc.repository_connection_directory();
         *server.control.directory.lock().unwrap() = Some(directory.clone());
         Self {
             tempdir: dir,
@@ -294,7 +293,7 @@ async fn pending_owner_cannot_be_rebound_to_a_replacement_directory_attachment()
     server.control.release.notify_one();
     pending.await.unwrap().unwrap();
     let binding = f.directory.binding().unwrap();
-    assert_eq!(binding.daemon_id, "fixture-daemon");
+    assert_eq!(binding.daemon_id, f.svc.daemon_boot_id);
     assert_eq!(
         binding.account.instance_base_url,
         "https://gitlab.test/forge"
@@ -628,7 +627,7 @@ use crate::repository_credentials::{
     RepositorySecretRequest, RepositorySecretSnapshot,
 };
 
-struct FixtureAuthority;
+pub(super) struct FixtureAuthority;
 impl RepositoryAuthority for FixtureAuthority {
     fn revalidate<'a>(
         &'a self,
@@ -645,7 +644,7 @@ impl RepositoryAuthorityFence for FixtureAuthority {
         action()
     }
 }
-struct FixtureSecretReader(FileSecretStore);
+pub(super) struct FixtureSecretReader(pub(super) FileSecretStore);
 impl RepositorySecretReader for FixtureSecretReader {
     fn load<'a>(
         &'a self,
@@ -669,7 +668,7 @@ impl Fixture {
                 &binding,
                 RepositoryAuthorityRequest {
                     execution: intent_core::ExecutionScope {
-                        daemon_id: "fixture-daemon".into(),
+                        daemon_id: binding.daemon_id.clone(),
                         authority_scope_id: "fixture-authority".into(),
                         authority_generation: 1,
                     },

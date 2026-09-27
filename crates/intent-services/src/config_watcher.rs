@@ -75,7 +75,7 @@ pub(crate) enum ReloadOutcome {
 /// it can be unit-tested deterministically: read the config file, suppress
 /// self-writes, and strictly reload the registry. Never panics or drops
 /// settings — every failure path keeps last-good values and logs a WARN.
-pub(crate) fn process_config_change(registry: &SettingsRegistry) -> ReloadOutcome {
+fn read_config_text(registry: &SettingsRegistry) -> std::result::Result<String, ReloadOutcome> {
     let path = registry.config_path();
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -85,7 +85,7 @@ pub(crate) fn process_config_change(registry: &SettingsRegistry) -> ReloadOutcom
                 error = %e,
                 "config.toml missing or unreadable; keeping last-good settings"
             );
-            return ReloadOutcome::Missing;
+            return Err(ReloadOutcome::Missing);
         }
     };
     if registry.is_self_write(&text) {
@@ -93,8 +93,17 @@ pub(crate) fn process_config_change(registry: &SettingsRegistry) -> ReloadOutcom
             file = %path.display(),
             "config.toml event matches our own write-back; skipping reload"
         );
-        return ReloadOutcome::SelfWrite;
+        return Err(ReloadOutcome::SelfWrite);
     }
+    Ok(text)
+}
+
+pub(crate) fn process_config_change(registry: &SettingsRegistry) -> ReloadOutcome {
+    let text = match read_config_text(registry) {
+        Ok(text) => text,
+        Err(outcome) => return outcome,
+    };
+    let path = registry.config_path();
     match registry.reload(&text) {
         Ok(notice) if notice.changed.is_empty() => ReloadOutcome::Unchanged,
         Ok(notice) => {
@@ -111,6 +120,30 @@ pub(crate) fn process_config_change(registry: &SettingsRegistry) -> ReloadOutcom
                 error = %e,
                 "invalid config.toml edit ignored; keeping last-good settings"
             );
+            ReloadOutcome::Invalid
+        }
+    }
+}
+
+type PreparedReload = Arc<
+    dyn Fn(String) -> std::pin::Pin<Box<dyn Future<Output = Result<SettingsChanged>> + Send>>
+        + Send
+        + Sync,
+>;
+
+async fn process_prepared_config_change(
+    registry: &SettingsRegistry,
+    reload: &PreparedReload,
+) -> ReloadOutcome {
+    let text = match read_config_text(registry) {
+        Ok(text) => text,
+        Err(outcome) => return outcome,
+    };
+    match reload(text).await {
+        Ok(notice) if notice.changed.is_empty() => ReloadOutcome::Unchanged,
+        Ok(notice) => ReloadOutcome::Applied(notice),
+        Err(error) => {
+            tracing::warn!(%error, "prepared config reload rejected; keeping last-good settings");
             ReloadOutcome::Invalid
         }
     }
@@ -166,6 +199,40 @@ impl ConfigWatcher {
         F: Fn(SettingsChanged) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
+        Self::start_with_reload(hub, registry, revision_gate, on_change, None)
+    }
+
+    /// Start with an original settings owner that acquires its credential gate
+    /// BEFORE the revision gate, validates the captured candidate, and publishes
+    /// the existing change notification. No lock is held while calling it here.
+    ///
+    /// # Errors
+    /// Returns an error when the configuration path has no parent or filename.
+    pub fn start_prepared_reload<F, Fut>(
+        hub: &Arc<SharedWatchHub>,
+        registry: Arc<SettingsRegistry>,
+        revision_gate: Arc<tokio::sync::RwLock<()>>,
+        reload: F,
+    ) -> Result<Self>
+    where
+        F: Fn(String) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<SettingsChanged>> + Send + 'static,
+    {
+        let reload: PreparedReload = Arc::new(move |text| Box::pin(reload(text)));
+        Self::start_with_reload(hub, registry, revision_gate, |_| async {}, Some(reload))
+    }
+
+    fn start_with_reload<F, Fut>(
+        hub: &Arc<SharedWatchHub>,
+        registry: Arc<SettingsRegistry>,
+        revision_gate: Arc<tokio::sync::RwLock<()>>,
+        on_change: F,
+        prepared_reload: Option<PreparedReload>,
+    ) -> Result<Self>
+    where
+        F: Fn(SettingsChanged) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
         let path = registry.config_path().to_path_buf();
         let dir = path
             .parent()
@@ -190,6 +257,7 @@ impl ConfigWatcher {
             Arc::clone(&sub),
             raw_rx,
             on_change,
+            prepared_reload,
         ));
         Ok(Self { sub, task })
     }
@@ -239,6 +307,7 @@ async fn watch_loop<F, Fut>(
     sub: Arc<Mutex<Option<SubHandle>>>,
     mut raw_rx: mpsc::UnboundedReceiver<notify::Event>,
     mut on_change: F,
+    prepared_reload: Option<PreparedReload>,
 ) where
     F: Fn(SettingsChanged) -> Fut,
     Fut: Future<Output = ()>,
@@ -258,6 +327,7 @@ async fn watch_loop<F, Fut>(
                 &file_name,
                 &mut raw_rx,
                 &mut on_change,
+                prepared_reload.as_ref(),
             )
             .await;
             "config directory watch lost; re-registering"
@@ -293,6 +363,7 @@ async fn debounce<F, Fut>(
     file_name: &std::ffi::OsStr,
     raw_rx: &mut mpsc::UnboundedReceiver<notify::Event>,
     on_change: &mut F,
+    prepared_reload: Option<&PreparedReload>,
 ) where
     F: Fn(SettingsChanged) -> Fut,
     Fut: Future<Output = ()>,
@@ -320,9 +391,13 @@ async fn debounce<F, Fut>(
             },
             () = sleep_until(deadline), if deadline.is_some() => {
                 deadline = None;
-                let _revision_guard = revision_gate.write().await;
-                if let ReloadOutcome::Applied(notice) = process_config_change(registry) {
-                    on_change(notice).await;
+                if let Some(reload) = prepared_reload {
+                    process_prepared_config_change(registry, reload).await;
+                } else {
+                    let _revision_guard = revision_gate.write().await;
+                    if let ReloadOutcome::Applied(notice) = process_config_change(registry) {
+                        on_change(notice).await;
+                    }
                 }
             }
         }
@@ -349,6 +424,91 @@ mod tests {
         }
         let reg = Arc::new(SettingsRegistry::load(&path).expect("load"));
         (dir, reg)
+    }
+
+    #[tokio::test]
+    async fn prepared_watcher_callback_owns_revision_and_publication() {
+        let (_dir, registry) = temp_registry(Some("[git]\nautoCommit = true\n"));
+        let revision = Arc::new(tokio::sync::RwLock::new(()));
+        let notice = registry.subscribe();
+        std::fs::write(registry.config_path(), "[git]\nautoCommit = false\n").unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let finished = Arc::new(Mutex::new(Some(tx)));
+        let reload: PreparedReload = Arc::new({
+            let registry = registry.clone();
+            let revision = revision.clone();
+            move |text| {
+                let registry = registry.clone();
+                let revision = revision.clone();
+                let finished = finished.clone();
+                Box::pin(async move {
+                    assert_eq!(registry.get("git.autoCommit"), Some(json!(true)));
+                    let candidate = registry.prepare_repository_reload(&text)?;
+                    let guard = revision
+                        .try_write()
+                        .expect("watcher must not acquire revision before the prepared owner");
+                    let notice = registry.publish_repository_reload(candidate, None)?;
+                    drop(guard);
+                    drop(finished.lock().unwrap().take());
+                    Ok(notice)
+                })
+            }
+        });
+        let mut legacy = |_| async { panic!("prepared reload owns its notification") };
+        tokio::time::timeout(
+            crate::events::LIVENESS,
+            debounce(
+                &registry,
+                &revision,
+                std::ffi::OsStr::new("config.toml"),
+                &mut rx,
+                &mut legacy,
+                Some(&reload),
+            ),
+        )
+        .await
+        .expect("prepared callback must finish without a revision deadlock");
+        assert_eq!(registry.get("git.autoCommit"), Some(json!(false)));
+        assert!(notice.has_changed().unwrap());
+    }
+
+    #[tokio::test]
+    async fn prepared_watcher_preserves_self_write_missing_and_invalid_outcomes() {
+        let (_dir, registry) = temp_registry(None);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reload: PreparedReload = Arc::new({
+            let registry = registry.clone();
+            let calls = calls.clone();
+            move |text| {
+                let registry = registry.clone();
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async move {
+                    let candidate = registry.prepare_repository_reload(&text)?;
+                    registry.publish_repository_reload(candidate, None)
+                })
+            }
+        });
+        registry
+            .apply(&[("rtk.enabled".into(), json!(true))])
+            .unwrap();
+        let snapshot = registry.snapshot();
+        assert!(matches!(
+            process_prepared_config_change(&registry, &reload).await,
+            ReloadOutcome::SelfWrite
+        ));
+        std::fs::remove_file(registry.config_path()).unwrap();
+        assert!(matches!(
+            process_prepared_config_change(&registry, &reload).await,
+            ReloadOutcome::Missing
+        ));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        std::fs::write(registry.config_path(), "[git]\nautoCommit = 'invalid'\n").unwrap();
+        assert!(matches!(
+            process_prepared_config_change(&registry, &reload).await,
+            ReloadOutcome::Invalid
+        ));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(Arc::ptr_eq(&snapshot, &registry.snapshot()));
     }
 
     #[test]

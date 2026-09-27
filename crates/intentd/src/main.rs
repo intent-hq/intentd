@@ -1819,6 +1819,9 @@ async fn cmd_serve(
         .with_reverse_dispatch(reverse_registry.clone())
         .with_settings_registry(settings_registry.clone())
         .with_hooks_max_per_agent(config.hooks_max_per_agent);
+    if let Err(error) = services.initialize_gitlab_repository_binding().await {
+        tracing::debug!(%error, "repository GitLab binding remains unavailable at startup");
+    }
     // Inject the suspend-overlap query so Task C can recognize sleep-induced
     // turn failures and enroll them for wake-resume. Left unset when wakeResume
     // is disabled, keeping today's terminal behavior for transient disconnects.
@@ -5801,13 +5804,13 @@ fn spawn_config_watcher_init(
 ) -> tokio::task::JoinHandle<()> {
     intent_core::spawn_daemon(async move {
         let watcher_services = services.clone();
-        let started = intent_services::ConfigWatcher::start(
+        let started = intent_services::ConfigWatcher::start_prepared_reload(
             &hub,
             registry,
             watcher_services.settings_revision_gate(),
-            move |notice| {
+            move |text| {
                 let services = watcher_services.clone();
-                async move { services.apply_external_settings_change(&notice).await }
+                async move { services.apply_prepared_settings_reload(text).await }
             },
         );
         let watcher = match started {

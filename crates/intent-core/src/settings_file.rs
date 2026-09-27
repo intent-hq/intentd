@@ -518,6 +518,9 @@ pub const DEFAULT_GITLAB_HOST: &str = "gitlab.com";
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct GitlabSettings {
+    /// Explicit canonical HTTPS instance root, including its installation prefix.
+    /// Transport overrides never supply this logical identity.
+    pub instance_base_url: Option<String>,
     /// `sourceControl.gitlab.host` — the bound instance as a bare
     /// `host[:port]` (no scheme). Written by a successful
     /// `sourceControl.connect { provider: "gitlab" }`.
@@ -536,6 +539,7 @@ impl Default for GitlabSettings {
     fn default() -> Self {
         Self {
             host: DEFAULT_GITLAB_HOST.to_string(),
+            instance_base_url: None,
             oauth_client_id: String::new(),
             api_base_url: None,
         }
@@ -1780,6 +1784,8 @@ oauthClientId = "Ov23li8bvmPsd4B4pW38"
 exposeGitCredentialToChildren = true
 
 [sourceControl.gitlab]
+# Explicit logical HTTPS root for installations with a port or path prefix.
+# instanceBaseUrl = "https://gitlab.com"
 # GitLab host -- the bound instance as a bare host[:port], no scheme. Written
 # by a successful sourceControl.connect { provider: "gitlab" }.
 host = "gitlab.com"
@@ -2050,6 +2056,24 @@ mod tests {
     }
 
     #[test]
+    fn gitlab_instance_base_url_is_optional_and_structurally_typed() {
+        let settings = SettingsFile::parse_str(
+            "[sourceControl.gitlab]\ninstanceBaseUrl = \"https://forge.test:8443/gitlab\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            settings.source_control.gitlab.instance_base_url.as_deref(),
+            Some("https://forge.test:8443/gitlab")
+        );
+        let encoded = serde_json::to_value(&settings).unwrap();
+        assert_eq!(
+            encoded["sourceControl"]["gitlab"]["instanceBaseUrl"],
+            "https://forge.test:8443/gitlab"
+        );
+        assert!(SettingsFile::parse_str("[sourceControl.gitlab]\ninstanceBaseUrl = 42\n").is_err());
+    }
+
+    #[test]
     fn empty_file_yields_defaults() {
         let parsed = SettingsFile::parse_str("").expect("empty file parses");
         assert_eq!(parsed, SettingsFile::default());
@@ -2111,6 +2135,7 @@ mod tests {
         assert_eq!(d.source_control.gitlab.host, DEFAULT_GITLAB_HOST);
         assert!(d.source_control.gitlab.oauth_client_id.is_empty());
         assert_eq!(d.source_control.gitlab.api_base_url, None);
+        assert_eq!(d.source_control.gitlab.instance_base_url, None);
         assert_eq!(d.accounts.sentry.organization, None);
         assert_eq!(d.voice.provider, VoiceProvider::Elevenlabs);
         assert_eq!(d.voice.language, None);
