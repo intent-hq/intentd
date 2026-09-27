@@ -720,3 +720,59 @@ async fn imported_owner_credential_late_write_keeps_fence_after_timeout_or_cance
         );
     }
 }
+
+#[tokio::test]
+async fn imported_owner_credential_wait_is_bounded_by_load_timeout() {
+    use intent_core::caller::LegacyCredentialAuthority;
+    let token = "ab".repeat(32);
+    let store = AsyncTokenStore::with_timings(
+        Arc::new(MemoryStore::with(&token)),
+        Duration::from_millis(10),
+        Duration::from_millis(10),
+        Duration::from_secs(60),
+        Duration::from_secs(60),
+    );
+    let authority = LegacyAdmission {
+        store: store.clone(),
+        token,
+    };
+    let writer = store.admission.write().await;
+    let result = tokio::time::timeout(Duration::from_millis(500), authority.authorize()).await;
+    drop(writer);
+    assert!(
+        matches!(result, Ok(Err(_))),
+        "authorization must refuse within its own bound while durable rotation is outstanding"
+    );
+    drop(authority.authorize().await.unwrap());
+}
+
+#[tokio::test]
+async fn imported_owner_credential_write_wait_is_bounded_by_write_timeout() {
+    use intent_core::caller::LegacyCredentialAuthority;
+    let token = "ab".repeat(32);
+    let backing = Arc::new(MemoryStore::with(&token));
+    let store = AsyncTokenStore::with_timings(
+        backing.clone(),
+        Duration::from_millis(10),
+        Duration::from_millis(10),
+        Duration::from_secs(60),
+        Duration::from_secs(60),
+    );
+    let authority = LegacyAdmission {
+        store: store.clone(),
+        token: token.clone(),
+    };
+    let lease = authority.authorize().await.unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_millis(500),
+        store.store_token(&"cd".repeat(32)),
+    )
+    .await;
+    drop(lease);
+    assert!(
+        matches!(result, Ok(Err(_))),
+        "waiting for an admitted pop must share the token write deadline"
+    );
+    assert_eq!(backing.load_token(), Some(token));
+    drop(authority.authorize().await.unwrap());
+}

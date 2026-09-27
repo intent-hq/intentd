@@ -233,7 +233,15 @@ impl AsyncTokenStore {
         // Keep exclusion and publication in the non-cancellable blocking job:
         // timeout/caller cancellation cannot let a late durable write bypass a
         // lease or leave the cache/watch at the previous credential.
-        let admission = self.admission.clone().write_owned().await;
+        let deadline = tokio::time::Instant::now() + self.write_timeout;
+        let admission =
+            match tokio::time::timeout_at(deadline, self.admission.clone().write_owned()).await {
+                Ok(lease) => lease,
+                Err(_) => {
+                    self.warn_timeout("secret-store write admission timed out");
+                    return Err(Error::Internal("secret-store write timed out".into()));
+                }
+            };
         let store = self.clone();
         let value_owned = token.to_string();
         let handle = tokio::task::spawn_blocking(move || {
@@ -247,7 +255,7 @@ impl AsyncTokenStore {
             store.changes.send_replace(Some(hash_token(&value_owned)));
             Ok(())
         });
-        match timeout(self.write_timeout, handle).await {
+        match tokio::time::timeout_at(deadline, handle).await {
             Ok(Ok(result)) => result,
             Ok(Err(join_err)) => Err(Error::Internal(format!(
                 "secret-store write task panicked: {join_err}"
@@ -488,18 +496,25 @@ impl intent_core::caller::LegacyCredentialAuthority for LegacyAdmission {
         &self,
     ) -> intent_core::BoxFuture<'_, Result<intent_core::caller::CredentialLease>> {
         Box::pin(async move {
-            let lease = self.store.admission.clone().read_owned().await;
-            if !self
-                .store
-                .load_token()
+            let admission = async {
+                let lease = self.store.admission.clone().read_owned().await;
+                if !self
+                    .store
+                    .load_token()
+                    .await
+                    .is_some_and(|token| token_matches(&token, &self.token))
+                {
+                    return Err(Error::Forbidden(
+                        "admitted credential is no longer valid".into(),
+                    ));
+                }
+                Ok(Box::new(lease) as intent_core::caller::CredentialLease)
+            };
+            timeout(self.store.load_timeout, admission)
                 .await
-                .is_some_and(|token| token_matches(&token, &self.token))
-            {
-                return Err(Error::Forbidden(
-                    "admitted credential is no longer valid".into(),
-                ));
-            }
-            Ok(Box::new(lease) as intent_core::caller::CredentialLease)
+                .map_err(|_| {
+                    Error::Forbidden("admitted credential could not be revalidated".into())
+                })?
         })
     }
 }

@@ -18,7 +18,7 @@ impl TokenStore for DurableToken {
 }
 
 /// Pause the first real SQL read after dispatch, before any dequeue. The
-/// destructor always releases SQLite, even if the async assertion panics.
+/// destructor always releases `SQLite`, even if the async assertion panics.
 struct ReadBarrier {
     reached: Arc<tokio::sync::Notify>,
     release: Arc<(Mutex<bool>, Condvar)>,
@@ -242,7 +242,7 @@ async fn imported_owner_case(change: Change, runtime: bool) {
             tokio::time::timeout(Duration::from_secs(5), tokens.store_token(&fresh_token))
                 .await
                 .expect("credential lease released at pop, before persistence")
-                .unwrap()
+                .unwrap();
         }
         Change::Remove => tokens.store_token("").await.unwrap(),
         Change::RevokePersonal => {
