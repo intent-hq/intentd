@@ -240,7 +240,22 @@ async fn transfer_human_trust_migration_cleans_legacy_keys_once_and_fences_downg
         browser_tab_displayed: crate::browser_tab_repo::DisplayedOverlay::default(),
         export_author_barrier: Arc::default(),
     };
-    let (_ws, agent) = seed(&store).await;
+    // This fixture predates execution_environment (0136), so seed only
+    // columns present in the legacy schema instead of today's workspace writer.
+    let ws = WorkspaceId::new();
+    let agent = AgentId::new();
+    sqlx::query(
+        "INSERT INTO workspace (id, title, branch, status, created_at, updated_at) \
+         VALUES (?, 'Transfer', 'feature/test', 'Active', 't0', 't0')",
+    )
+    .bind(&ws.0)
+    .execute(store.write_pool())
+    .await
+    .unwrap();
+    store
+        .insert_agent_session(&sample_agent_session(&agent, &ws))
+        .await
+        .unwrap();
     let old =
         json!({"humanAuthor":{"login":"planted"},"fromPrincipalId":"real-source","keep":{"x":7}});
     store

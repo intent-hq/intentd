@@ -460,3 +460,172 @@ async fn member_workspace_tools_and_safe_context_over_wss() {
     drop(member);
     srv.ws.stop().await;
 }
+
+/// Host membership grants ordinary-workspace `CoW` operations, not access to
+/// the chief workspace; a caller-supplied workspace cannot hide an agent's scope.
+#[tokio::test]
+async fn sandbox_cow_authorization_preserves_owner_member_and_guest_boundaries() {
+    use intent_core::AgentId;
+    use intent_store::{Sandbox, SandboxStatus};
+
+    let srv = start(WsOptions::default()).await;
+    let ordinary = WorkspaceId::from("cow-members");
+    let chief = WorkspaceId::chief();
+    let ordinary_agent = AgentId::from("ordinary-agent");
+    let chief_agent = AgentId::from("chief-agent");
+    srv.store
+        .insert_workspace(&fixture_workspace(&ordinary))
+        .await
+        .unwrap();
+    srv.store
+        .get_workspace(&chief)
+        .await
+        .expect("startup seeds the chief workspace");
+    for (workspace, agent) in [(&ordinary, &ordinary_agent), (&chief, &chief_agent)] {
+        sqlx::query(
+            "INSERT INTO agent_session (id, workspace_id, name, status, created_at, updated_at) \
+             VALUES (?1, ?2, ?1, 'idle', 't0', 't0')",
+        )
+        .bind(&agent.0)
+        .bind(&workspace.0)
+        .execute(srv.store.write_pool())
+        .await
+        .unwrap();
+        let path = srv.dir.path().join(agent.as_str());
+        std::fs::create_dir(&path).unwrap();
+        srv.store
+            .insert_sandbox(&Sandbox {
+                id: format!("sandbox-{}", agent.0),
+                workspace_id: workspace.clone(),
+                agent_id: agent.clone(),
+                path: path.to_string_lossy().into_owned(),
+                branch: format!("sb/{}", agent.0),
+                base_commit_sha: "base".into(),
+                snapshot_commit_sha: None,
+                last_merged_commit_sha: None,
+                // The real merge acknowledgement exercises authorization without
+                // launching a merge worker or requiring a platform-specific clone.
+                status: SandboxStatus::Merging,
+                retry_count: 0,
+                merge_on_turn_end: true,
+                conflicting_paths: vec![],
+                created_at: now_iso(),
+                updated_at: now_iso(),
+            })
+            .await
+            .unwrap();
+        let owner = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            &json!({
+                "jsonrpc":"2.0", "id":1, "method":"sandbox.cow.merge",
+                "params":{"workspaceId":workspace,"agentId":agent},
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(owner["result"]["status"], "in_progress", "{owner}");
+    }
+
+    let mut member = Guest::connect(&srv, &"d8".repeat(32)).await;
+    srv.store
+        .add_workspace_member(&ordinary, &member.principal.id, WorkspaceRole::Collaborator)
+        .await
+        .unwrap();
+    let params = json!({"workspaceId":ordinary,"agentId":ordinary_agent});
+    for method in ["sandbox.cow.merge", "sandbox.cow.discard"] {
+        let refused = member.call(method, params.clone()).await;
+        assert_eq!(
+            refused["error"]["code"], -32003,
+            "guest {method}: {refused}"
+        );
+        assert!(refused.get("result").is_none(), "{refused}");
+    }
+    sqlx::query("INSERT INTO host_member (principal_id, added_at) VALUES (?, ?)")
+        .bind(&member.principal.id.0)
+        .bind(now_iso())
+        .execute(srv.store.write_pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM workspace_member WHERE workspace_id=? AND principal_id=?")
+        .bind(&ordinary.0)
+        .bind(&member.principal.id.0)
+        .execute(srv.store.write_pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        member.call("principal.me", json!({})).await["result"]["hostRole"],
+        "member"
+    );
+    let inherited = member
+        .call("workspace.get", json!({"workspaceId":ordinary}))
+        .await;
+    assert_eq!(
+        inherited["result"]["workspace"]["canManage"], true,
+        "{inherited}"
+    );
+    let allowed = member.call("sandbox.cow.merge", params.clone()).await;
+    assert_eq!(allowed["result"]["status"], "in_progress", "{allowed}");
+
+    // Both the real and a forged ordinary workspace id must be refused for
+    // the chief agent. Authorization resolves the agent's stored workspace.
+    for workspace in [&chief, &ordinary] {
+        for method in ["sandbox.cow.merge", "sandbox.cow.discard"] {
+            let refused = member
+                .call(
+                    method,
+                    json!({"workspaceId":workspace,"agentId":chief_agent}),
+                )
+                .await;
+            assert_eq!(
+                refused["error"]["data"]["code"], "not-found",
+                "{method}: {refused}"
+            );
+            assert!(refused.get("result").is_none(), "{refused}");
+        }
+    }
+    let kept = srv
+        .store
+        .get_sandbox(&chief, &chief_agent)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(kept.status, SandboxStatus::Merging);
+    assert!(Path::new(&kept.path).is_dir());
+
+    let discarded = member.call("sandbox.cow.discard", params).await;
+    assert_eq!(discarded["result"]["ok"], true, "{discarded}");
+    assert!(srv
+        .store
+        .get_sandbox(&ordinary, &ordinary_agent)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(!srv.dir.path().join(ordinary_agent.as_str()).exists());
+    assert!(srv
+        .store
+        .get_sandbox(&chief, &chief_agent)
+        .await
+        .unwrap()
+        .is_some());
+
+    let owner = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &json!({
+            "jsonrpc":"2.0", "id":2, "method":"sandbox.cow.discard",
+            "params":{"workspaceId":chief,"agentId":chief_agent},
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(owner["result"]["ok"], true, "{owner}");
+    assert!(srv
+        .store
+        .get_sandbox(&chief, &chief_agent)
+        .await
+        .unwrap()
+        .is_none());
+    drop(member);
+    srv.ws.stop().await;
+}
