@@ -38,6 +38,8 @@ pub mod queue_visibility_contract;
 pub mod replay_preview;
 pub mod repo_ref;
 pub mod repository_context;
+#[doc(hidden)]
+pub mod repository_request;
 pub mod secrets;
 pub mod server_control;
 pub mod settings_file;

@@ -44,6 +44,16 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// `intent-services` (§3.2 rule 3). The default bodies return an internal error
 /// so downstream stubs compile until they override these methods.
 pub trait WorkspaceApi: Send + Sync {
+    /// Capture a transport-owned repository read connection under its original
+    /// caller/credential binding. This carrier alone grants no read authority.
+    #[doc(hidden)]
+    fn repository_read_connection(
+        &self,
+        _entry: crate::repository_request::RepositoryWireEntry,
+    ) -> Option<std::sync::Arc<dyn crate::repository_request::RepositoryReadConnection>> {
+        None
+    }
+
     /// List workspaces, optionally including archived ones (PROTOCOL §5.1).
     fn list_workspaces(&self, include_archived: bool) -> BoxFuture<'_, Result<Vec<Workspace>>> {
         let _ = include_archived;

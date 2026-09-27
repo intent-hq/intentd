@@ -43,8 +43,12 @@
 
 use std::cell::RefCell;
 use std::future::Future;
+use std::sync::Arc;
 
 use futures::future::Either;
+use intent_core::repository_request::{
+    RepositoryReadConnection, RepositoryReadRequestScope, RepositoryWireEntry,
+};
 pub use intent_core::{current_caller, with_caller, Caller};
 
 tokio::task_local! {
@@ -52,6 +56,99 @@ tokio::task_local! {
     /// (UDS sets `false`, WSS sets `true`) before spawning the request handler.
     /// Queried by `ServerControl::is_tcp_connection()` to enforce safety guards.
     static IS_TCP: RefCell<bool>;
+    static READ_CONNECTION: Option<Arc<dyn RepositoryReadConnection>>;
+}
+
+/// Owned by each actual connection exit path, independently of client ids.
+/// Clones are only used by the local reader/writer owners; either exit retires
+/// the original cohort. Task-local clones carry the scope, not this guard.
+#[derive(Clone)]
+pub(crate) struct ReadConnectionGuard(Option<Arc<dyn RepositoryReadConnection>>);
+
+impl ReadConnectionGuard {
+    pub(crate) fn bind(api: &dyn intent_core::WorkspaceApi, entry: RepositoryWireEntry) -> Self {
+        Self(api.repository_read_connection(entry))
+    }
+
+    pub(crate) fn absent() -> Self {
+        Self(None)
+    }
+
+    pub(crate) fn retire(&self) {
+        if let Some(owner) = &self.0 {
+            owner.retire();
+        }
+    }
+
+    pub(crate) fn run<F: Future>(&self, body: F) -> impl Future<Output = F::Output> {
+        READ_CONNECTION.scope(self.0.clone(), body)
+    }
+}
+
+impl Drop for ReadConnectionGuard {
+    fn drop(&mut self) {
+        self.retire();
+    }
+}
+
+struct RequestCompletion(Arc<dyn RepositoryReadRequestScope>);
+
+impl Drop for RequestCompletion {
+    fn drop(&mut self) {
+        self.0.retire();
+    }
+}
+
+/// A transport-owned completion lease; an escaped Core scope cannot extend it.
+#[derive(Clone)]
+pub(crate) struct CapturedFrame {
+    is_tcp: bool,
+    caller: Option<Caller>,
+    credential: Option<intent_core::caller::WireCredential>,
+    completion: Option<Arc<RequestCompletion>>,
+}
+
+impl CapturedFrame {
+    /// This is synchronous, including construction of the completion guard.
+    pub(crate) fn capture() -> Self {
+        Self {
+            is_tcp: is_tcp_connection(),
+            caller: current_caller(),
+            credential: intent_core::caller::current_wire_credential(),
+            completion: READ_CONNECTION
+                .try_with(|owner| {
+                    owner
+                        .as_ref()
+                        .map(|owner| Arc::new(RequestCompletion(owner.capture())))
+                })
+                .ok()
+                .flatten(),
+        }
+    }
+
+    pub(crate) fn read_scope(&self) -> Option<&Arc<dyn RepositoryReadRequestScope>> {
+        self.completion.as_ref().map(|completion| &completion.0)
+    }
+
+    pub(crate) async fn run<T: Send>(&self, body: impl Future<Output = T> + Send) -> T {
+        with_credential_context(
+            self.is_tcp,
+            self.caller.clone(),
+            self.credential.clone(),
+            async {
+                if let Some(scope) = self.read_scope() {
+                    let mut result = None;
+                    scope
+                        .scope(Box::pin(async { result = Some(body.await) }))
+                        .await;
+                    result.expect("repository request scope must execute its body exactly once")
+                } else {
+                    body.await
+                }
+            },
+        )
+        .await
+    }
 }
 
 /// Whether the current request is over a TCP transport (WSS). Returns `true`

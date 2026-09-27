@@ -2286,6 +2286,9 @@ async fn forward_channel_subscription(
 }
 
 #[cfg(test)]
+pub(crate) mod read_delivery_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
