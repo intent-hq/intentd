@@ -1373,6 +1373,8 @@ fn comment_from_legacy_json(
         content,
         author,
         author_type,
+        author_principal_id: None,
+        author_identity: None,
         status,
         parent_id,
         anchor,
@@ -1810,6 +1812,7 @@ fn message_from_legacy_json(raw: Value) -> Result<(String, Value, Option<Value>,
         }
         _ => Map::new(),
     };
+    metadata.remove(intent_core::human_author::HUMAN_AUTHOR_KEY);
     if legacy_role != role {
         metadata.insert("legacyRole".to_string(), json!(legacy_role));
     }
@@ -3686,6 +3689,30 @@ mod tests {
         );
         let m2 = msgs[2].metadata.as_ref().unwrap();
         assert_eq!(m2["legacyRole"], json!("error"));
+    }
+
+    #[tokio::test]
+    async fn transfer_human_legacy_history_import_discards_untrusted_snapshot() {
+        let (root, _root_g) = temp_root("reserved-authors");
+        let ws = write_legacy_workspace(&root, "reserved-authors", &json!({}));
+        let mut fixture = legacy_agent_fixture();
+        fixture["messages"][0]["metadata"] = json!({"humanAuthor":{"login":"forged"},"keep":42});
+        write_legacy_agent(
+            &ws,
+            &format!("{LEGACY_AGENT_ID}.json"),
+            &fixture.to_string(),
+        );
+        let (store, _db) = open_store().await;
+        let report = run(&store, &opts(vec![root])).await.unwrap();
+        assert_eq!(report.agent_sessions_imported(), 1);
+        let session = store
+            .get_agent_session(&AgentId::from(LEGACY_AGENT_ID))
+            .await
+            .unwrap();
+        let metadata = session.messages[0].metadata.as_ref().unwrap();
+        assert!(metadata.get("humanAuthor").is_none());
+        assert_eq!(metadata["keep"], 42);
+        assert_eq!(session.messages[0].created_at, "2025-06-01T00:00:02Z");
     }
 
     #[tokio::test]

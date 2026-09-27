@@ -1341,6 +1341,7 @@ fn to_exit(result: anyhow::Result<()>) -> ExitCode {
 }
 
 fn init_tracing() {
+    use std::io::IsTerminal;
     use tracing_subscriber::{
         fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
     };
@@ -1394,9 +1395,13 @@ fn init_tracing() {
         || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     // Set up dual output: stderr (for interactive use) and optionally file (for diagnostics)
-    let stderr_layer = fmt::layer()
-        .with_writer(std::io::stderr)
-        .with_filter(output_filter());
+    let mut stderr_layer = fmt::layer().with_writer(std::io::stderr);
+    // Preserve fmt's NO_COLOR policy on terminals, but never emit ANSI to
+    // redirected diagnostics (including ordinary SQLx warnings).
+    if !std::io::stderr().is_terminal() {
+        stderr_layer = stderr_layer.with_ansi(false);
+    }
+    let stderr_layer = stderr_layer.with_filter(output_filter());
 
     // Per-RPC statement-count / duration WARN profiling (expensive-RPC
     // guardrail); its warns flow through the output layers above.
@@ -2142,6 +2147,7 @@ async fn cmd_serve(
     // per-workspace `changes:agent-locks` snapshot when it changes. No-op-safe
     // without an event bus. Aborted on clean shutdown.
     let agent_locks_loop = services.spawn_agent_locks_loop();
+    let execution_context_loop = services.spawn_execution_context_loop();
     // Idle agent reaping (§5.6/§6.7): periodically evict agents idle past the
     // configured TTL, killing each one's whole process group — and, when an
     // aggregate memory budget is installed (monorepo#2063), drain idle agents
@@ -2733,6 +2739,7 @@ async fn cmd_serve(
     completion_delivery.abort();
     auto_commit_loop.abort();
     agent_locks_loop.abort();
+    execution_context_loop.abort();
     if let Some(reap_task) = reap_task {
         reap_task.abort();
     }

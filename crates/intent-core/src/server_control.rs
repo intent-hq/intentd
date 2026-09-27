@@ -36,6 +36,20 @@ pub trait InviteLinkBuilder: Send + Sync {
 pub trait InviteLinkEnvelope: Send + Sync {
     /// The full `intent://invite?…` link for one invite.
     fn invite_url(&self, invite_id: &str, secret: &str) -> String;
+
+    /// Host links explicitly opt into broader scope; workspace links retain v1 bytes.
+    fn scoped_invite_url(
+        &self,
+        invite_id: &str,
+        secret: &str,
+        scope: crate::InviteScope,
+    ) -> String {
+        let mut url = self.invite_url(invite_id, secret);
+        if scope == crate::InviteScope::Host {
+            url.push_str("&scope=host");
+        }
+        url
+    }
 }
 
 /// Runtime control surface for the WSS listener, implemented by the

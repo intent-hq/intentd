@@ -13,6 +13,7 @@ set -euo pipefail
 # BASE=HEAD or DRY_RUN=1 exported would change every expected argv).
 unset BASE DRY_RUN BUILD_JOBS TEST_THREADS NEXTEST_SHOW_PROGRESS CARGO_TERM_PROGRESS_WHEN
 unset NEXTEST_RUNNER INTENTD_TEST_TIMEOUT_MULTIPLIER
+unset RUN_STDIN
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 script="$here/changed-tests.sh"
@@ -59,7 +60,7 @@ chmod +x "$bin_dir/git"
 cat >"$bin_dir/cargo" <<'SH'
 #!/usr/bin/env bash
 printf '%s: %s%s\n' "$PWD" "${INTENTD_TEST_TIMEOUT_MULTIPLIER:+INTENTD_TEST_TIMEOUT_MULTIPLIER=$INTENTD_TEST_TIMEOUT_MULTIPLIER }" "$*" >>"$CARGO_TEST_LOG"
-while IFS= read -r _; do :; done
+while IFS= read -r line; do printf '%s\n' "$line" >>"$CARGO_STDIN_LOG"; done
 exit "${CARGO_STUB_EXIT:-0}"
 SH
 chmod +x "$bin_dir/cargo"
@@ -130,6 +131,7 @@ reset_repo() {
   g reset -q --hard refs/remotes/origin/main
   g clean -fdq
   : >"$temp_dir/cargo.log"
+  : >"$temp_dir/cargo-stdin.log"
   : >"$temp_dir/runner.log"
   : >"$temp_dir/runner-cwd.log"
 }
@@ -146,17 +148,20 @@ commit_all() {
 # Env prefixes on the call (DRY_RUN=1 run_script ...) reach the script; the
 # inputs it reads default to unset here so the suite's own environment cannot
 # leak into the expected argv. The script runs from RUN_CWD (default: the
-# fixture checkout); it must find its repo root on its own.
+# fixture checkout); it must find its repo root on its own. Ordinary calls
+# get EOF, even when this suite inherits an open terminal. Only the explicit
+# stdin-drain control supplies finite input through RUN_STDIN.
 run_script() {
   set +e
   (
     cd "${RUN_CWD:-$repo}" &&
       PATH="$bin_dir" BASE="${BASE-}" BUILD_JOBS="${BUILD_JOBS-}" TEST_THREADS="${TEST_THREADS-}" \
         DRY_RUN="${DRY_RUN-}" NEXTEST_RUNNER="${NEXTEST_RUNNER-}" \
-        CARGO_TEST_LOG="$temp_dir/cargo.log" RUNNER_TEST_LOG="$temp_dir/runner.log" \
+        CARGO_TEST_LOG="$temp_dir/cargo.log" CARGO_STDIN_LOG="$temp_dir/cargo-stdin.log" \
+        RUNNER_TEST_LOG="$temp_dir/runner.log" \
         RUNNER_CWD_LOG="$temp_dir/runner-cwd.log" \
         "$script_bash" "$script" "$@"
-  ) >"$temp_dir/stdout" 2>"$temp_dir/stderr"
+  ) <"${RUN_STDIN:-/dev/null}" >"$temp_dir/stdout" 2>"$temp_dir/stderr"
   status=$?
   set -e
   stdout=$(<"$temp_dir/stdout")
@@ -380,6 +385,23 @@ edit crates/gamma/tests/smoke.rs
 run_script
 expect_ok
 expect_cargo "-p alpha --test one" "-p gamma --test smoke"
+
+case_name="cargo drains finite caller input without consuming later plans"
+reset_repo
+edit crates/alpha/tests/one.rs
+edit crates/gamma/tests/smoke.rs
+printf 'first input line\nsecond input line\n' >"$temp_dir/input"
+RUN_STDIN="$temp_dir/input" run_script
+expect_ok
+expect_cargo "-p alpha --test one" "-p gamma --test smoke"
+[[ "$(<"$temp_dir/cargo-stdin.log")" == "$(<"$temp_dir/input")" ]] || fail "$case_name: cargo did not receive exactly the caller input"
+
+: >"$temp_dir/cargo.log"
+: >"$temp_dir/cargo-stdin.log"
+RUN_STDIN="$temp_dir/input" run_script --instrumented
+expect_ok
+expect_cov "-p alpha --test one" "-p gamma --test smoke"
+[[ "$(<"$temp_dir/cargo-stdin.log")" == "$(<"$temp_dir/input")" ]] || fail "$case_name (instrumented): cargo did not receive exactly the caller input"
 
 case_name="build-jobs and test-threads are appended"
 reset_repo

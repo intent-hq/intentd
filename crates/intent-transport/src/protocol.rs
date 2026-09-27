@@ -580,13 +580,14 @@
 //! collaborator's `agent.editQueuedMessage` of an agent-authored (A2A /
 //! automatic) entry is not preambled — its sender stays the originating
 //! agent's header; the edit is recorded by the stamp only. Also within
-//! 10.3, direct member add (additive): `principal.list` (owner-only, no
+//! 10.3, direct member add (additive; sharing access extended to active host
+//! members by shared-host-membership §5.49): `principal.list` (no
 //! params) → `{ principals: [{ principalId, login?, displayName?,
-//! avatarUrl?, githubUserId? }] }`, every non-primary principal holding at
+//! avatarUrl?, githubUserId?, identity?, hostRole }] }`, every non-primary principal holding at
 //! least one active (non-revoked) credential, by creation time; a guest
-//! that revoked itself is omitted. A per-principal (collaborator) caller
-//! is `-32003`. `workspace.members.add { workspaceId, principalId }`
-//! (owner-only) → `{ added, memberCount }`: attaches such a guest as a
+//! that revoked itself is omitted. A workspace guest is `-32003`.
+//! `workspace.members.add { workspaceId, principalId }`
+//! (owner/member) → `{ added, memberCount }`: attaches such a guest as a
 //! collaborator; `added: false` when already a member (idempotent, nothing
 //! published); `-32602` for an unknown principal, the primary principal, a
 //! principal without an active credential (`invalid-params`) or a spent
@@ -678,22 +679,28 @@
 //! instance. No event is added. The catalog contains 336 router methods,
 //! 56 fast-path methods, and two aliases: 394 client-callable names.
 //!
-//! Version 10.9 is an additive minor bump over 10.8 that adds the
+//! Version 10.9 adds the collaboration credential purpose: six owner-only
+//! `identity.*` methods, isolated credential/proof resolution and explicit
+//! identity selection, plus `identity:auth-changed`. The hello capability
+//! `collaborationIdentity: 1` gates purpose-aware proof calls. This does not
+//! advertise the separately implemented host-membership capability.
+//!
+//! Version 10.10 is an additive minor bump over 10.9 that adds the
 //! execution-environment surface (§5.1, §5.5b): the `sandbox.profiles.list` /
 //! `sandbox.profiles.update` / `sandbox.options` / `sandbox.image.check`
 //! router methods, the `system.capabilities.microvmSupported` field (§5.7),
 //! the `workspace.create` `executionEnvironment` param with the persisted
 //! `Workspace.executionEnvironment` field, and the structured
 //! `execution-environment-unavailable` / `execution-environment-not-implemented`
-//! error payloads (§9). The catalog contains 340 router methods, 56
-//! fast-path methods, and two aliases: 398 client-callable names. The five
+//! error payloads (§9). The catalog contains 351 router methods, 58
+//! fast-path methods, and two aliases: 411 client-callable names. The five
 //! reverse methods are counted separately.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "10.9";
+pub const PROTOCOL_VERSION: &str = "10.10";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

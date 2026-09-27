@@ -20,6 +20,324 @@ use crate::test_support::test_tempdir;
 use crate::transfer_export::ExportState;
 use crate::Services;
 
+#[intent_test_macros::daemon_test]
+async fn transfer_human_authors_survive_member_export_and_return_without_grants() {
+    use intent_core::{
+        with_caller, Caller, HostRole, Principal, PrincipalId, PrincipalIdentity, WorkspaceApi,
+    };
+    use serde_json::json;
+    let a = TempDir::new("author-a");
+    let b = TempDir::new("author-b");
+    let source = fresh_services(&a.0, &a.0.join("workspaces"), &a.0.join("assets")).await;
+    let target = fresh_services(&b.0, &b.0.join("workspaces"), &b.0.join("assets")).await;
+    let mut owner_a = source.store.get_primary_principal().await.unwrap();
+    owner_a.login = Some("panghy".into());
+    owner_a.identity = Some(PrincipalIdentity::github(7));
+    source.store.upsert_principal(&owner_a).await.unwrap();
+    let mut owner_b = target.store.get_primary_principal().await.unwrap();
+    owner_b.login = Some("shared-instance-github-handle".into());
+    owner_b.identity = Some(PrincipalIdentity::github(8));
+    target.store.upsert_principal(&owner_b).await.unwrap();
+    let contributor = Principal {
+        id: PrincipalId::new(),
+        github_user_id: None,
+        identity: Some(PrincipalIdentity {
+            provider: "gitlab".into(),
+            host: "gitlab.example".into(),
+            external_user_id: "7".into(),
+        }),
+        login: Some("panghy".into()),
+        display_name: None,
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    source.store.upsert_principal(&contributor).await.unwrap();
+    source
+        .store
+        .insert_principal_credential(&contributor.id, "member-credential")
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO host_member(principal_id, added_at) VALUES (?,?)")
+        .bind(contributor.id.as_str())
+        .bind(now_iso())
+        .execute(source.store.write_pool())
+        .await
+        .unwrap();
+    let ws = WorkspaceId::new();
+    source
+        .store
+        .insert_workspace(&crate::tests::workspace(&ws))
+        .await
+        .unwrap();
+    let agent = AgentId::new();
+    source
+        .store
+        .insert_agent_session(&session(&agent, &ws, AgentStatus::RuntimeIdle))
+        .await
+        .unwrap();
+    for (id, metadata) in [
+        ("legacy-a", None),
+        ("stamped-a", Some(json!({"fromPrincipalId":owner_a.id}))),
+        (
+            "contributor",
+            Some(json!({"fromPrincipalId":contributor.id})),
+        ),
+        (
+            "missing-person",
+            Some(json!({"fromPrincipalId":"deleted-person"})),
+        ),
+    ] {
+        source
+            .store
+            .append_agent_message_with_id(
+                &agent,
+                id,
+                "user",
+                &json!([{"type":"text","text":id}]),
+                metadata.as_ref(),
+                "2026-09-20T00:00:00Z",
+            )
+            .await
+            .unwrap();
+    }
+    let originals = crate::human_attribution_tests::legacy_metadata_values();
+    let mut queued = Vec::new();
+    for (i, metadata) in originals.iter().enumerate() {
+        for role in ["user", "assistant"] {
+            source
+                .store
+                .append_agent_message_with_id(
+                    &agent,
+                    &format!("legacy-{role}-{i}"),
+                    role,
+                    &json!([{"type":"text","text":"retained"}]),
+                    metadata.as_ref(),
+                    "2020-01-01T00:00:00Z",
+                )
+                .await
+                .unwrap();
+        }
+        let id = format!("legacy-queue-{i}");
+        let mut payload = json!({"id":id,"content":"pending legacy input","queuedAt":"2020-01-01T00:00:00Z","userOrigin":true});
+        if let Some(metadata) = metadata {
+            payload["messageMetadata"] = metadata.clone();
+        }
+        queued.push(AgentQueueRow {
+            id: id.clone(),
+            agent_id: agent.clone(),
+            position: i64::try_from(i).unwrap(),
+            payload,
+            created_at: "2020-01-01T00:00:00Z".into(),
+            turn_id: id,
+        });
+    }
+    source
+        .store
+        .replace_agent_queue(&agent, &queued)
+        .await
+        .unwrap();
+    source
+        .store
+        .append_agent_message_with_id(
+            &agent,
+            "assistant",
+            "assistant",
+            &json!([{"type":"text","text":"reply"}]),
+            None,
+            "2026-09-20T00:00:01Z",
+        )
+        .await
+        .unwrap();
+    let exported = with_caller(
+        Caller::Wire {
+            principal_id: contributor.id.clone(),
+            host_role: HostRole::Member,
+        },
+        source.workspace_export_start(ws.clone()),
+    )
+    .await
+    .unwrap();
+    let export = exported["exportId"].as_str().unwrap();
+    assert!(wait_ready(&source, export).await);
+    let (size, sha, manifest) = ready_meta(&source, export);
+    let committed = relay(&source, &target, export, &manifest, size, &sha).await;
+    assert_eq!(committed["workspace"]["id"], ws.0);
+    // Reopen the destination database before reading or exporting its history.
+    drop(target);
+    let target = fresh_services(&b.0, &b.0.join("workspaces"), &b.0.join("assets")).await;
+    assert_eq!(
+        target.rehydrate_agent_queues().await.unwrap(),
+        originals.len()
+    );
+    let view = target
+        .agent_get_conversation(
+            agent.clone(),
+            None,
+            Some(ws.clone()),
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let rows = view["messages"].as_array().unwrap();
+    for (i, original) in originals.iter().enumerate() {
+        let id = format!("legacy-user-{i}");
+        let row = rows.iter().find(|r| r["id"] == id).unwrap();
+        assert_eq!(row["author"]["login"], "panghy");
+        let metadata = &row["metadata"];
+        match original {
+            Some(serde_json::Value::Object(object)) => {
+                for (key, value) in object {
+                    assert_eq!(&metadata[key], value);
+                }
+            }
+            Some(value) => assert_eq!(metadata.get("humanAuthorOriginalMetadata"), Some(value)),
+            None => assert!(metadata.get("humanAuthorOriginalMetadata").is_none()),
+        }
+        let bot = rows
+            .iter()
+            .find(|r| r["id"] == format!("legacy-assistant-{i}"))
+            .unwrap();
+        assert_eq!(
+            bot.get("metadata").filter(|v| !v.is_null()),
+            original.as_ref().filter(|v| !v.is_null())
+        );
+        assert!(bot.get("author").is_none());
+        let pending = target
+            .find_queued_message(&agent, &format!("legacy-queue-{i}"))
+            .unwrap();
+        assert_eq!(pending.message_metadata.as_ref(), Some(metadata));
+        assert!(!pending.ready_to_send());
+        assert_eq!(
+            intent_core::queue_attribution_with(
+                pending.message_metadata.as_ref(),
+                Some(&owner_b.id)
+            ),
+            intent_core::QueueAttribution::UnknownHuman
+        );
+    }
+    assert!(target.dequeue_message(&agent).is_none());
+    for id in ["legacy-a", "stamped-a"] {
+        let row = rows.iter().find(|r| r["id"] == id).unwrap();
+        assert_eq!(
+            row["author"]["login"], "panghy",
+            "source owner must survive: {row}"
+        );
+        assert_eq!(row["author"]["identity"]["provider"], "github");
+        assert!(row["author"]["principalId"].is_null());
+        assert!(row["metadata"].get("fromPrincipalId").is_none());
+    }
+    let other = rows.iter().find(|r| r["id"] == "contributor").unwrap();
+    assert_eq!(other["author"]["identity"]["host"], "gitlab.example");
+    let unknown = rows.iter().find(|r| r["id"] == "missing-person").unwrap();
+    assert!(unknown["author"]["login"].is_null());
+    assert!(unknown["metadata"].get("humanAuthor").is_some());
+    assert!(rows
+        .iter()
+        .find(|r| r["id"] == "assistant")
+        .unwrap()
+        .get("author")
+        .is_none());
+    assert!(target.store.get_principal(&contributor.id).await.is_err());
+    assert!(target
+        .store
+        .list_workspace_members(&ws)
+        .await
+        .unwrap()
+        .iter()
+        .all(|m| m.principal_id != contributor.id));
+    assert_eq!(manifest.format_version, 2);
+
+    target
+        .store
+        .append_agent_message_with_id(
+            &agent,
+            "new-b",
+            "user",
+            &json!([{"type":"text","text":"new-b"}]),
+            Some(&json!({"fromPrincipalId":owner_b.id})),
+            "2026-09-21T00:00:00Z",
+        )
+        .await
+        .unwrap();
+    target
+        .store
+        .append_agent_message_with_id(
+            &agent,
+            "new-b-array",
+            "user",
+            &json!([]),
+            Some(&json!(["B", null])),
+            "2026-09-21T00:00:01Z",
+        )
+        .await
+        .unwrap();
+    source
+        .workspace_export_abort_op(export.to_string())
+        .await
+        .unwrap();
+    source.store.delete_workspace(&ws).await.unwrap();
+    let exported = target.workspace_export_start_op(ws.clone()).await.unwrap();
+    let export = exported["exportId"].as_str().unwrap();
+    assert!(wait_ready(&target, export).await);
+    let (size, sha, manifest) = ready_meta(&target, export);
+    relay(&target, &source, export, &manifest, size, &sha).await;
+    target
+        .workspace_export_abort_op(export.to_string())
+        .await
+        .unwrap();
+    let returned = source
+        .agent_get_conversation(agent.clone(), None, Some(ws), None, None, None, None, false)
+        .await
+        .unwrap();
+    for original in rows {
+        let row = returned["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == original["id"])
+            .unwrap();
+        assert_eq!(row["author"], original["author"]);
+        assert_eq!(row["contentBlocks"], original["contentBlocks"]);
+        assert_eq!(row["timestamp"], original["timestamp"]);
+        assert_eq!(
+            row["metadata"], original["metadata"],
+            "re-export must not wrap again"
+        );
+    }
+    let new_b = returned["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == "new-b")
+        .unwrap();
+    assert_eq!(new_b["author"]["login"], "shared-instance-github-handle");
+    assert!(new_b["author"]["principalId"].is_null());
+    let new_b_array = returned["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == "new-b-array")
+        .unwrap();
+    assert_eq!(new_b_array["author"], new_b["author"]);
+    assert_eq!(
+        new_b_array["metadata"]["humanAuthorOriginalMetadata"],
+        json!(["B", null])
+    );
+    for i in 0..originals.len() {
+        let id = format!("legacy-queue-{i}");
+        let expected = target.find_queued_message(&agent, &id).unwrap();
+        let actual = source.find_queued_message(&agent, &id).unwrap();
+        assert_eq!(actual.message_metadata, expected.message_metadata);
+        assert!(!actual.ready_to_send());
+    }
+}
+
 /// Temp directory swept on drop (see [`test_tempdir`]).
 struct TempDir(PathBuf, #[expect(dead_code)] tempfile::TempDir);
 impl TempDir {

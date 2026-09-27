@@ -80,6 +80,7 @@ fn extract_fastpath_methods() -> HashSet<String> {
         ("provider_setup.rs", "providers.setup."),
         ("invite.rs", "invite."),
         ("invite.rs", "workspace.invite."),
+        ("invite.rs", "host.invite."),
         ("presence.rs", "presence."),
         ("presence.rs", "note.presence."),
     ] {
@@ -181,18 +182,18 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// GitLab snippet proof by `provider`); the `github.identityProof.*` pair
 /// stays as byte-identical aliases.
 ///
-/// Execution environments (protocol 10.9): +4 router methods
+/// Execution environments (protocol 10.10): +4 router methods
 /// (`sandbox.profiles.list` / `sandbox.profiles.update` / `sandbox.options` /
-/// `sandbox.image.check`) on top of the 10.8 catalog (394).
-const EXPECTED_TOTAL_METHODS: usize = 398;
+/// `sandbox.image.check`) on top of the 10.9 catalog (407).
+const EXPECTED_TOTAL_METHODS: usize = 411;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 340;
+const EXPECTED_ROUTER_METHODS: usize = 351;
 
 /// Golden count: fast-path methods (intercepted before router).
-const EXPECTED_FASTPATH_METHODS: usize = 56;
+const EXPECTED_FASTPATH_METHODS: usize = 58;
 
 /// Golden count: method aliases.
 const EXPECTED_ALIASES: usize = 2;
@@ -670,16 +671,28 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "host.execStream",
     "host.execStream.cancel",
     "host.execStream.write",
+    "host.executionContext",
     "host.findApp",
     "host.findBinary",
+    "host.invite.create",
+    "host.invite.list",
+    "host.invite.revoke",
     "host.listDirectory",
     "host.listInstalledEditors",
+    "host.members.list",
+    "host.members.remove",
     "host.openInEditor",
     "host.providerAuthStatus",
     "host.providerDiscovery",
     "host.providerTestPrompt",
     "host.status",
     "host.toolAvailability",
+    "identity.authStatus",
+    "identity.cancelAuth",
+    "identity.connect",
+    "identity.getUser",
+    "identity.revoke",
+    "identity.select",
     "invite.accept",
     "invite.challenge",
     "invite.inspect",
@@ -732,6 +745,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "note.update",
     "note.updateMetadata",
     "pairing.getInfo",
+    "pairing.getSelfInfo",
     "pr.refresh",
     "pr.status",
     "prMonitor.cancel",
@@ -1175,7 +1189,6 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "browser.removeTab",
     "browser.syncTabs",
     "browser.upsertTab",
-    "client.list",
     "debug.sampleStacks",
     "file-tracking.getAgentLocks",
     "file-tracking.getChanges",
@@ -1230,14 +1243,26 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "host.execStream",
     "host.execStream.cancel",
     "host.execStream.write",
+    "host.executionContext",
     "host.findApp",
     "host.findBinary",
+    "host.invite.create",
+    "host.invite.list",
+    "host.invite.revoke",
     "host.listDirectory",
     "host.listInstalledEditors",
+    "host.members.list",
+    "host.members.remove",
     "host.openInEditor",
     "host.providerAuthStatus",
     "host.providerDiscovery",
     "host.providerTestPrompt",
+    "identity.authStatus",
+    "identity.cancelAuth",
+    "identity.connect",
+    "identity.getUser",
+    "identity.revoke",
+    "identity.select",
     "invite.accept",
     "invite.challenge",
     "invite.inspect",
@@ -1621,19 +1646,11 @@ mod unbound_owner_only_methods {
         /// `require_agent_member` runs only when the optional `agentId` is
         /// given.
         AgentId,
-        /// The gated calls (`update_workspace` for `finalStatusMessage`,
-        /// `archive_workspace` for `archiveSource`) run only once the
-        /// `exportId` resolves to a Ready session **and** the option is
-        /// given; an unknown id returns at the lookup, and a Ready session
-        /// finalized with neither option runs no gated call at all — it
-        /// only retires the session. That live unarmed mode is pinned `ok`
-        /// by the armed test, not left implicit.
-        ReadyExport,
     }
 
     /// Golden: owner-only router methods whose service-layer gate is
-    /// **conditional** — on an optional scope argument, or on the export
-    /// session the id names — so the sweep's minimal call never reaches it.
+    /// **conditional** on an optional scope argument, so the sweep's minimal
+    /// call never reaches it. Transfers have an unconditional actor gate.
     /// Each row is `(method, unarmed outcome, what arms the gate)`. The
     /// unarmed outcome is pinned here so the sweep sees it as classified,
     /// not as ungated; the unarmed mode is owner-only by the transport
@@ -1645,16 +1662,10 @@ mod unbound_owner_only_methods {
     /// not something this table decides.
     const CONDITIONALLY_GATED_AT_SERVICE_LAYER: &[(&str, &str, Arming)] = &[
         ("agent.completeOnce", "ok", Arming::WorkspaceId),
-        ("agent.diagnostics", "ok", Arming::AgentId),
         ("agent.enhancePrompt", "ok", Arming::WorkspaceId),
         // Unscoped, the call proceeds to the worktree lookup (Internal here).
         ("git.agentCommit", "-32603", Arming::AgentId),
         ("rules.list", "ok", Arming::WorkspaceId),
-        // Unknown `exportId`: NotFound at the registry lookup (`-32602`,
-        // `not-found`), ahead of both gated mutations. The other unarmed
-        // mode — a Ready session with neither option, which retires the
-        // session ungated — is asserted `ok` by the armed test.
-        ("workspace.export.finalize", "-32602", Arming::ReadyExport),
     ];
 
     /// Golden: owner-only router methods whose service method has **no
@@ -1668,32 +1679,16 @@ mod unbound_owner_only_methods {
         // No gate: daemon-wide per-agent memory read; no-manager early
         // return `{ sampledAt: null, totalBytes: null, agents: [] }`.
         ("agent.memoryUsage", "ok"),
-        // No gate: daemon-wide reverse-client listing.
-        ("client.list", "ok"),
         // No gate: process-wide stack sampler.
         ("debug.sampleStacks", "ok"),
         // No gate: daemon-wide metrics read.
         ("metrics.getAllWorkspaceStats", "ok"),
-        // No gate: known-repo registry read.
-        ("repo.list", "ok"),
-        // No gate: `_workspace_id` is unused; reads the global rule row.
-        ("rules.get", "ok"),
         // No gate: no-manager early return `{ running: false }`.
         ("unsloth.status", "ok"),
         // No gate: no-manager early return `{ stopped: false }`.
         ("unsloth.stop", "ok"),
         // No gate: proceeds to provider selection (Internal without an engine).
         ("voice.transcribe", "-32603"),
-        // No gate: export sessions are keyed by the `exportId` handed out by
-        // the gated `workspace.export.start`, and neither method mutates the
-        // workspace; an unknown id is a no-op / -32602. (`finalize` does
-        // mutate and is classified above.)
-        ("workspace.export.abort", "ok"),
-        ("workspace.export.read", "-32602"),
-        // No gate: host filesystem scan under `directory`.
-        ("workspace.findRepositories", "ok"),
-        // No gate: `git init` at `path` on the host.
-        ("workspace.initializeRepository", "ok"),
     ];
 
     struct Fixture {
@@ -1789,7 +1784,6 @@ mod unbound_owner_only_methods {
                 "agent.wakeOrCreate",
                 json!({ "workspaceId": ws, "taskNoteId": "t1", "contextMessage": "c" }),
             ),
-            ("client.list", json!({})),
             ("debug.sampleStacks", json!({ "durationMs": 1 })),
             ("file-tracking.getAgentLocks", json!({ "workspaceId": ws })),
             ("file-tracking.getChanges", json!({ "workspaceId": ws })),
@@ -1851,6 +1845,11 @@ mod unbound_owner_only_methods {
             ("github.users.search", json!({ "query": "q" })),
             ("hook.cancel", json!({ "workspaceId": ws, "hookId": "h1" })),
             ("hook.runNow", json!({ "workspaceId": ws, "hookId": "h1" })),
+            ("host.executionContext", json!({})),
+            ("host.invite.list", json!({})),
+            ("host.invite.revoke", json!({ "inviteId": "missing" })),
+            ("host.members.list", json!({})),
+            ("host.members.remove", json!({"principalId":"missing"})),
             ("linear.authStatus", json!({})),
             (
                 "linear.createIssue",
@@ -1961,6 +1960,18 @@ mod unbound_owner_only_methods {
             ("settings.list", json!({})),
             ("settings.reset", json!({ "path": "model.defaultProvider" })),
             ("settings.update", json!({ "changes": {} })),
+            ("identity.authStatus", json!({"provider":"github"})),
+            (
+                "identity.cancelAuth",
+                json!({"provider":"github", "flowId":"f"}),
+            ),
+            ("identity.connect", json!({"provider":"github"})),
+            ("identity.getUser", json!({"provider":"github"})),
+            ("identity.revoke", json!({"provider":"github"})),
+            (
+                "identity.select",
+                json!({"provider":"github", "externalUserId":"1"}),
+            ),
             ("sourceControl.authStatus", json!({ "provider": "github" })),
             ("sourceControl.cancelAuth", json!({ "provider": "github" })),
             ("sourceControl.connect", json!({ "provider": "github" })),
@@ -2270,6 +2281,33 @@ mod unbound_owner_only_methods {
     /// `Forbidden` — so a router arm that starts forwarding `agentId` fails
     /// here and moves the cell onto the router path.
     #[tokio::test]
+    async fn ready_export_requires_bound_caller_without_finalize_options() {
+        if reran_unarmed("ready_export_requires_bound_caller_without_finalize_options") {
+            return;
+        }
+        let f = fixture().await;
+        let export_id = ready_export(&f).await;
+        for method in [
+            "workspace.export.read",
+            "workspace.export.abort",
+            "workspace.export.finalize",
+        ] {
+            let params = json!({"exportId":export_id,"seq":0});
+            assert_eq!(
+                dispatch_unbound(&f.services, method, &params).await,
+                "-32003"
+            );
+        }
+        let response = dispatch_as_daemon(
+            &f.services,
+            "workspace.export.read",
+            &json!({"exportId":export_id,"seq":0}),
+        )
+        .await;
+        assert!(response.get("error").is_none(), "{response}");
+    }
+
+    #[tokio::test]
     async fn armed_conditional_gates_are_forbidden_unbound() {
         if reran_unarmed("armed_conditional_gates_are_forbidden_unbound") {
             return;
@@ -2281,50 +2319,6 @@ mod unbound_owner_only_methods {
             let (scope, scope_value) = match arming {
                 Arming::WorkspaceId => ("workspaceId", f.ws.as_str().to_string()),
                 Arming::AgentId => ("agentId", "a1".to_string()),
-                Arming::ReadyExport => {
-                    let export_id = ready_export(&f).await;
-                    for armed in [
-                        json!({ "exportId": export_id, "finalStatusMessage": "done" }),
-                        json!({ "exportId": export_id, "archiveSource": true }),
-                    ] {
-                        let outcome = dispatch_unbound(&f.services, method, &armed).await;
-                        assert_eq!(
-                            outcome, "-32003",
-                            "{method} on a Ready export with {armed} must reach its \
-                             capability gate unbound"
-                        );
-                    }
-                    let still_ready = dispatch_as_daemon(
-                        &f.services,
-                        "workspace.export.read",
-                        &json!({ "exportId": export_id, "seq": 0 }),
-                    )
-                    .await;
-                    assert!(
-                        still_ready.get("error").is_none(),
-                        "a refused finalize must leave the export intact: {still_ready}"
-                    );
-                    let bare = json!({ "exportId": export_id });
-                    let outcome = dispatch_unbound(&f.services, method, &bare).await;
-                    assert_eq!(
-                        outcome, "ok",
-                        "{method} on a Ready export with neither option runs no gated \
-                         call today; if this is now -32003 the gate stopped being \
-                         conditional — move the row into the sweep"
-                    );
-                    let retired = dispatch_as_daemon(
-                        &f.services,
-                        "workspace.export.read",
-                        &json!({ "exportId": export_id, "seq": 0 }),
-                    )
-                    .await;
-                    assert_eq!(
-                        retired["error"]["data"]["code"],
-                        json!("not-found"),
-                        "the bare finalize must have retired the session: {retired}"
-                    );
-                    continue;
-                }
             };
             assert!(
                 params.get(scope).is_none(),
@@ -2425,5 +2419,128 @@ mod unbound_owner_only_methods {
             json!({ "resolved": false }),
             "daemon-bound agent.respondPermission: {bound}"
         );
+    }
+}
+
+/// Freeze a separate member remainder; the guest golden remains unchanged.
+#[test]
+fn member_methods_and_administrator_remainder_are_classified() {
+    const REFUSED: &[&str] = &[
+        "agent.memoryUsage",
+        "agent.replaceMessages",
+        "agent.reportToParent",
+        "debug.sampleStacks",
+        "github.authStatus",
+        "github.cancelAuth",
+        "github.connect",
+        "github.getUser",
+        "github.identityProof.create",
+        "github.identityProof.delete",
+        "github.revoke",
+        "host.checkAuggie",
+        "host.checkGh",
+        "host.checkGit",
+        "host.checkNode",
+        "host.createDirectory",
+        "host.directoryStatus",
+        "host.env",
+        "host.exec",
+        "host.execStream",
+        "host.execStream.cancel",
+        "host.execStream.write",
+        "host.findApp",
+        "host.findBinary",
+        "host.invite.create",
+        "host.invite.list",
+        "host.invite.revoke",
+        "host.listDirectory",
+        "host.listInstalledEditors",
+        "host.members.list",
+        "host.members.remove",
+        "host.openInEditor",
+        "host.providerTestPrompt",
+        "identity.authStatus",
+        "identity.cancelAuth",
+        "identity.connect",
+        "identity.getUser",
+        "identity.revoke",
+        "identity.select",
+        "invite.accept",
+        "invite.challenge",
+        "invite.inspect",
+        "invite.prove",
+        "linear.authStatus",
+        "mcp.oauth.delete",
+        "mcp.oauth.get",
+        "mcp.oauth.list",
+        "mcp.oauth.set",
+        "mcp.servers.create",
+        "mcp.servers.delete",
+        "mcp.servers.getStatus",
+        "mcp.servers.list",
+        "mcp.servers.restart",
+        "mcp.servers.update",
+        "mcp.testConnection",
+        "metrics.clearAgentStats",
+        "metrics.getAllWorkspaceStats",
+        "pairing.getInfo",
+        "providers.setup.cancel",
+        "providers.setup.login",
+        "providers.setup.start",
+        "providers.setup.status",
+        "repo.remove",
+        "rules.update",
+        "sentry.authStatus",
+        "server.pairingInfo",
+        "server.rotateToken",
+        "settings.get",
+        "settings.list",
+        "settings.reset",
+        "settings.update",
+        "sourceControl.authStatus",
+        "sourceControl.cancelAuth",
+        "sourceControl.connect",
+        "sourceControl.getUser",
+        "sourceControl.identityProof.create",
+        "sourceControl.identityProof.delete",
+        "sourceControl.revoke",
+        "specialist.create",
+        "specialist.delete",
+        "specialist.edit",
+        "system.gitCredential",
+        "system.importLegacy",
+        "system.requestUpdate",
+        "system.shutdown",
+        "unsloth.status",
+        "unsloth.stop",
+    ];
+    let universe: BTreeSet<_> = ROUTER_METHODS
+        .iter()
+        .chain(FASTPATH_METHODS)
+        .copied()
+        .collect();
+    let allowed: BTreeSet<_> = super::MEMBER_METHODS.iter().copied().collect();
+    assert_eq!(allowed.len(), super::MEMBER_METHODS.len());
+    assert!(allowed
+        .iter()
+        .all(|m| universe.contains(m) && !collaborator_may_call(m)));
+    assert_eq!(
+        allowed.iter().copied().collect::<Vec<_>>(),
+        super::MEMBER_METHODS
+    );
+    let refused: Vec<_> = universe
+        .into_iter()
+        .filter(|m| !super::member_may_call(m))
+        .collect();
+    assert_eq!(refused, REFUSED);
+    for (alias, canonical) in METHOD_ALIASES {
+        assert_eq!(
+            super::member_may_call(alias),
+            super::member_may_call(canonical)
+        );
+    }
+    assert!(!super::member_may_call("unknown.method"));
+    for method in REVERSE_METHODS {
+        assert_eq!(super::member_may_call(method), *method == "browser.exec");
     }
 }

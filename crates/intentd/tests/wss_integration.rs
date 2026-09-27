@@ -8,6 +8,21 @@
 //! plain-`ws://` accept path serves JSON-RPC with no TLS and no bearer token.
 
 mod common;
+#[path = "wss_integration/host_roles.rs"]
+mod host_roles;
+#[path = "wss_integration/human_attribution.rs"]
+mod human_attribution;
+#[path = "wss_integration/imported_queue_authorization.rs"]
+mod imported_queue_authorization;
+#[path = "wss_integration/sharing.rs"]
+mod sharing;
+
+#[path = "wss_integration/authenticated_devices.rs"]
+mod authenticated_devices;
+#[path = "wss_integration/member_transport.rs"]
+mod member_transport;
+#[path = "wss_integration/personal_pairing.rs"]
+mod personal_pairing;
 #[path = "wss_integration/workspace_delete.rs"]
 mod workspace_delete;
 
@@ -3816,6 +3831,7 @@ async fn wss_principal_list_is_owner_only_and_omits_revoked_guests() {
                 "displayName": "older name",
                 "avatarUrl": "https://example.test/older.png",
                 "githubUserId": 11,
+                "hostRole": "guest",
                 "identity": { "provider": "github", "host": "github.com", "externalUserId": "11" },
             },
             {
@@ -3824,6 +3840,7 @@ async fn wss_principal_list_is_owner_only_and_omits_revoked_guests() {
                 "displayName": "newer name",
                 "avatarUrl": "https://example.test/newer.png",
                 "githubUserId": 12,
+                "hostRole": "guest",
                 "identity": { "provider": "github", "host": "github.com", "externalUserId": "12" },
             },
         ] }),
@@ -5185,7 +5202,7 @@ async fn wss_collaborator_steered_agent_runs_host_exec_with_owner_capabilities()
     let agent_typed = AgentId::from_string(agent_id.clone());
     let collaborator = Caller::Wire {
         principal_id: guest.principal.id.clone(),
-        is_administrator: false,
+        host_role: intent_core::HostRole::Guest,
     };
     let tool_call = json!({
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -5237,7 +5254,7 @@ async fn wss_collaborator_steered_agent_runs_host_exec_with_owner_capabilities()
         .as_str()
         .unwrap_or_else(|| panic!("tool text: {refused}"));
     assert!(
-        refused_text.contains("forbidden: host.exec requires the daemon administrator"),
+        refused_text.contains("forbidden: host.exec requires host membership"),
         "unbound bridge must surface the gate's refusal: {refused_text}"
     );
 
@@ -6870,7 +6887,7 @@ async fn wss_presence_channel_join_delta_leave_and_gating() {
     assert_eq!(
         ev["data"]["members"],
         json!([{ "principalId": alice.id.0, "login": "alice", "displayName": null,
-                 "avatarUrl": null, "focus": [], "typing": [] }]),
+                 "avatarUrl": null, "hostRole": "guest", "focus": [], "typing": [] }]),
         "{ev}"
     );
 
@@ -6912,7 +6929,7 @@ async fn wss_presence_channel_join_delta_leave_and_gating() {
     assert_eq!(
         p["snapshot"],
         json!({ "viewers": [{ "principalId": alice.id.0, "login": "alice", "displayName": null,
-                              "avatarUrl": null, "cursor": null }] }),
+                              "avatarUrl": null, "hostRole": "guest", "cursor": null }] }),
         "{p}"
     );
     let p = alice_c.push(&sub_a).await;
@@ -7002,7 +7019,7 @@ async fn wss_presence_channel_join_delta_leave_and_gating() {
     assert_eq!(
         p["delta"],
         json!({ "kind": "updated", "viewer": { "principalId": bob.id.0, "login": "bob",
-                "displayName": null, "avatarUrl": null,
+                "displayName": null, "avatarUrl": null, "hostRole": "guest",
                 "cursor": { "rev": 3, "anchor": 10, "head": 12 } } }),
         "{p}"
     );
@@ -7385,7 +7402,7 @@ async fn wss_presence_typing_sources_and_snapshot() {
     assert_eq!(
         alice_row(&json!({ "data": v["result"] })),
         json!({ "principalId": alice.id.0, "login": "alice", "displayName": null,
-                "avatarUrl": null, "focus": [], "typing": [] }),
+                "avatarUrl": null, "hostRole": "guest", "focus": [], "typing": [] }),
         "snapshot rows match the presence:changed member shape: {v}"
     );
 
@@ -10484,13 +10501,13 @@ async fn wss_sandbox_image_check() {
 }
 
 /// The four `sandbox.*` methods are administrator-only (PROTOCOL §5.5b):
-/// a collaborator principal — even one holding a workspace membership — is
-/// refused with `-32003 Forbidden` before dispatch, and the refusal is a
+/// a workspace guest or host member is refused with `-32003 Forbidden`
+/// before dispatch, and the refusal is a
 /// pure error envelope (no `result`). The daemon-global settings surface
 /// they front (execution-environment defaults, guest-image resolution) is
 /// exactly what a non-admin must not steer.
 #[tokio::test]
-async fn wss_sandbox_methods_refuse_collaborator() {
+async fn wss_sandbox_methods_refuse_guests_and_host_members() {
     use intent_core::WorkspaceRole;
     use serde_json::json;
 
@@ -10526,25 +10543,45 @@ async fn wss_sandbox_methods_refuse_collaborator() {
         .await
         .expect("add collaborator");
 
-    for (method, params) in [
-        ("sandbox.profiles.list", json!({})),
-        (
-            "sandbox.profiles.update",
-            json!({ "profiles": { "cow": { "enabled": true } } }),
-        ),
-        ("sandbox.options", json!({})),
-        (
-            "sandbox.image.check",
-            json!({ "manifestUrl": "http://127.0.0.1:1/manifest.json" }),
-        ),
-    ] {
-        let refused = guest.call(method, params).await;
-        assert_eq!(refused["error"]["code"], -32003, "{method}: {refused}");
+    for role in ["guest", "member"] {
+        if role == "member" {
+            sqlx::query("INSERT INTO host_member (principal_id, added_at) VALUES (?, ?)")
+                .bind(&guest.principal.id.0)
+                .bind(now_iso())
+                .execute(srv.store.write_pool())
+                .await
+                .unwrap();
+        }
         assert_eq!(
-            refused["error"]["message"], "Forbidden",
-            "{method}: {refused}"
+            guest.call("principal.me", json!({})).await["result"]["hostRole"],
+            role
         );
-        assert!(refused.get("result").is_none(), "{method}: {refused}");
+        for (method, params) in [
+            ("sandbox.profiles.list", json!({})),
+            (
+                "sandbox.profiles.update",
+                json!({ "profiles": { "cow": { "enabled": true } } }),
+            ),
+            ("sandbox.options", json!({})),
+            (
+                "sandbox.image.check",
+                json!({ "manifestUrl": "http://127.0.0.1:1/manifest.json" }),
+            ),
+        ] {
+            let refused = guest.call(method, params).await;
+            assert_eq!(
+                refused["error"]["code"], -32003,
+                "{role} {method}: {refused}"
+            );
+            assert_eq!(
+                refused["error"]["message"], "Forbidden",
+                "{role} {method}: {refused}"
+            );
+            assert!(
+                refused.get("result").is_none(),
+                "{role} {method}: {refused}"
+            );
+        }
     }
 
     // Control: the refused update did not apply — the administrator still
@@ -10715,6 +10752,69 @@ async fn wss_providers_catalog_round_trip() {
         Some("MOCK_AGENT_SCRIPT_PATH")
     );
 
+    srv.ws.stop().await;
+}
+
+/// Legacy identity metadata is independent of the configured default, disabled
+/// providers, authentication, installation and model discovery. This harness has
+/// no `AgentManager` or provider discovery attached; the static catalog still
+/// reports the resolver's aliases over the production TLS/JSON-RPC path.
+#[intent_test_macros::daemon_test]
+async fn wss_providers_catalog_legacy_aliases_ignore_settings() {
+    let srv = start(WsOptions::default()).await;
+    let mut first_catalog = None;
+    for (default, enabled) in [
+        (Value::Null, serde_json::json!({})),
+        (
+            serde_json::json!("codex"),
+            serde_json::json!({"auggie": true, "codex": false}),
+        ),
+        (
+            serde_json::json!("claude-code"),
+            serde_json::json!({"auggie": false, "claude-code": true}),
+        ),
+        (
+            serde_json::json!("auggie"),
+            serde_json::json!({"auggie": false}),
+        ),
+        (serde_json::json!("nope"), serde_json::json!({})),
+        (serde_json::json!(""), serde_json::json!({})),
+    ] {
+        srv.set_setting("model.defaultProvider", default.clone());
+        srv.set_setting("providers.enabled", enabled.clone());
+        let resp = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            r#"{"jsonrpc":"2.0","id":1,"method":"providers.catalog","params":{}}"#,
+        )
+        .await;
+        eprintln!("providers.catalog wire: {resp}");
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(resp["id"], 1);
+        assert!(resp.get("error").is_none(), "{resp}");
+        let providers = resp["result"]["providers"].as_array().unwrap();
+        let auggie = providers.iter().find(|p| p["id"] == "auggie").unwrap();
+        assert_eq!(
+            auggie["legacyAliases"],
+            serde_json::json!(["default", "acp", "augment"]),
+            "default={default}, enabled={enabled}"
+        );
+        for p in providers.iter().filter(|p| p["id"] != "auggie") {
+            assert!(
+                p.get("legacyAliases").is_none(),
+                "{} has no aliases",
+                p["id"]
+            );
+        }
+        if let Some(first) = &first_catalog {
+            assert_eq!(
+                &resp["result"], first,
+                "settings must not change any catalog metadata"
+            );
+        } else {
+            first_catalog = Some(resp["result"].clone());
+        }
+    }
     srv.ws.stop().await;
 }
 
@@ -14058,8 +14158,8 @@ async fn wss_workspace_update_status_image_asset_id_round_trip() {
         .await
         .expect("insert workspace");
 
-    // One persistent connection: subscribe first so the `workspace:updated`
-    // notification from the mutation below is delivered to this client.
+    // Subscribe before mutating. Use a separate RPC connection so waiting
+    // for the response cannot discard an event delivered ahead of it.
     let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
     let rpc = |id: i64, method: &str, params: Value| {
         serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
@@ -14084,9 +14184,10 @@ async fn wss_workspace_update_status_image_asset_id_round_trip() {
         "subscribe: {sub}"
     );
 
+    let mut rpc_ws = connect_ws(srv.port, srv.cfg.clone()).await;
     // Set: camelCase wire field lands on the row and echoes in the response.
     let resp = send_and_wait(
-        &mut ws,
+        &mut rpc_ws,
         rpc(
             2,
             "workspace.update",
@@ -14135,7 +14236,7 @@ async fn wss_workspace_update_status_image_asset_id_round_trip() {
 
     // Read-back proves persistence through the store.
     let got = send_and_wait(
-        &mut ws,
+        &mut rpc_ws,
         rpc(
             3,
             "workspace.get",
@@ -14152,7 +14253,7 @@ async fn wss_workspace_update_status_image_asset_id_round_trip() {
     // Clear: wire `null` (double-option `Some(None)`) empties the column and
     // the cleared field is omitted from the returned payload.
     let cleared = send_and_wait(
-        &mut ws,
+        &mut rpc_ws,
         rpc(
             4,
             "workspace.update",
@@ -14177,7 +14278,7 @@ async fn wss_workspace_update_status_image_asset_id_round_trip() {
         "cleared asset id must be omitted, not null: {cleared}"
     );
     let got = send_and_wait(
-        &mut ws,
+        &mut rpc_ws,
         rpc(
             5,
             "workspace.get",
@@ -16790,6 +16891,7 @@ async fn wss_tls_capability_gating_and_client_lifecycle_events() {
         ..WsOptions::default()
     })
     .await;
+    let owner = srv.store.get_primary_principal().await.unwrap();
     let mut sub = connect_ws(srv.port, srv.cfg.clone()).await;
     sub.send(Message::Text(
         r#"{"jsonrpc":"2.0","id":"sub","method":"events.subscribe","params":{"eventTypes":["client:connected","client:disconnected"]}}"#
@@ -16825,7 +16927,9 @@ async fn wss_tls_capability_gating_and_client_lifecycle_events() {
     let ev = await_client_event(&mut sub, "client:connected", "tls-aux").await;
     assert_eq!(
         ev["data"],
-        serde_json::json!({ "clientId": "tls-aux", "capabilities": {} })
+        serde_json::json!({ "clientId": "tls-aux", "capabilities": {"browserExec": false},
+            "principalId": owner.id, "hostRole": "owner",
+            "login": null, "displayName": null, "avatarUrl": null })
     );
     assert!(
         !srv.reverse_registry.is_connected(),
@@ -16849,7 +16953,9 @@ async fn wss_tls_capability_gating_and_client_lifecycle_events() {
     assert_eq!(ev["workspaceId"], "");
     assert_eq!(
         ev["data"],
-        serde_json::json!({ "clientId": "tls-desktop", "capabilities": { "browserExec": true } })
+        serde_json::json!({ "clientId": "tls-desktop", "capabilities": { "browserExec": true },
+            "principalId": owner.id, "hostRole": "owner",
+            "login": null, "displayName": null, "avatarUrl": null })
     );
 
     // Leave `desktop` unpolled: no pongs, so the heartbeat reaper aborts its
@@ -16857,7 +16963,9 @@ async fn wss_tls_capability_gating_and_client_lifecycle_events() {
     let ev = await_client_event(&mut sub, "client:disconnected", "tls-desktop").await;
     assert_eq!(
         ev["data"],
-        serde_json::json!({ "clientId": "tls-desktop", "capabilities": { "browserExec": true } })
+        serde_json::json!({ "clientId": "tls-desktop", "capabilities": { "browserExec": true },
+            "principalId": owner.id, "hostRole": "owner",
+            "login": null, "displayName": null, "avatarUrl": null })
     );
     assert!(!srv.reverse_registry.is_connected());
     assert!(srv
@@ -19066,7 +19174,7 @@ async fn wss_workspace_transfer_plan_round_trip() {
     assert_eq!(resp["id"], 2, "envelope: {resp}");
     let plan = &resp["result"]["plan"];
     let manifest = &plan["manifest"];
-    assert_eq!(manifest["formatVersion"], 1, "{resp}");
+    assert_eq!(manifest["formatVersion"], 2, "{resp}");
     assert!(
         manifest["creatingIntentdVersion"].is_string(),
         "manifest records the creating daemon version: {resp}"

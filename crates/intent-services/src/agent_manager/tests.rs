@@ -7689,6 +7689,7 @@ async fn terminal_failure_events_carry_turn_id() {
         "boom",
         Some("turn-tfe-1"),
         super::FailedProviderSource::CommittedTurn,
+        None,
     )
     .await;
 
@@ -7717,6 +7718,7 @@ async fn terminal_failure_events_carry_turn_id() {
         "boom2",
         None,
         super::FailedProviderSource::CommittedTurn,
+        None,
     )
     .await;
     let mut events = Vec::new();
@@ -7736,6 +7738,51 @@ async fn terminal_failure_events_carry_turn_id() {
     }
 }
 
+#[tokio::test]
+async fn member_async_failure_keeps_safe_authorization_and_workspace_scope() {
+    use intent_core::execution::{
+        ExecutionAuthorizationFailure, ExecutionAuthorizationReason, ExecutionResource,
+    };
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let (ws, id) = (WorkspaceId::from("member-auth-failure"), AgentId::new());
+    seed_agent(&mgr, &ws, &id).await;
+    let auth = ExecutionAuthorizationFailure::new(
+        ExecutionResource::Ai,
+        ExecutionAuthorizationReason::Rejected,
+        Some("mock".into()),
+        None,
+    );
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        workspace_id: Some(ws.0.clone()),
+        ..Default::default()
+    });
+    super::publish_terminal_failure_events(
+        &mgr,
+        &id,
+        &ws,
+        &auth.message(),
+        Some("member-turn"),
+        super::FailedProviderSource::CommittedTurn,
+        Some(&auth),
+    )
+    .await;
+    let events = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let failed = events
+        .iter()
+        .find(|e| e.event_type == "agent:failed")
+        .unwrap();
+    assert_eq!(failed.workspace_id, ws);
+    assert_eq!(failed.data["executionAuthorization"], json!(auth));
+    assert_eq!(failed.data["turnId"], "member-turn");
+    assert!(failed.data["error"]
+        .as_str()
+        .unwrap()
+        .contains("connected host"));
+}
+
 /// Collect the `agent:failed` payload the terminal publisher emits for one
 /// quota-classified failure under the given provider source.
 async fn quota_failed_payload(
@@ -7753,6 +7800,7 @@ async fn quota_failed_payload(
         "session/new failed: rate_limit_error: usage limit reached",
         None,
         source,
+        None,
     )
     .await;
     let mut events = Vec::new();
@@ -7853,6 +7901,7 @@ async fn spawn_attempt_provider_never_outlives_its_attempt() {
         "session/new failed: internal error",
         None,
         super::FailedProviderSource::SpawnAttempt,
+        None,
     )
     .await;
     assert!(
@@ -10192,6 +10241,106 @@ async fn send_queued_message_now_persist_failure_requeues_front() {
     assert!(!mgr.is_busy(&id), "the slot was released");
 }
 
+#[tokio::test]
+async fn transfer_human_runtime_force_and_handback_keep_original_author() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-historical"),
+        AgentId::from("historical"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    let owner = mgr.services.store.get_primary_principal().await.unwrap();
+    let caller = intent_core::Caller::Wire {
+        principal_id: owner.id,
+        host_role: intent_core::HostRole::Owner,
+    };
+    let entry = crate::human_attribution_tests::imported_pending("historical-input");
+    mgr.services
+        .agent_queues
+        .lock()
+        .unwrap()
+        .insert(id.clone(), vec![entry.clone()]);
+    assert!(intent_core::with_caller(
+        intent_core::Caller::Daemon,
+        mgr.send_queued_message_now(id.clone(), ws.clone(), entry.id.clone())
+    )
+    .await
+    .is_err());
+    assert!(mgr.try_begin(&id, &ws).await);
+    let parked = intent_core::with_caller(
+        caller.clone(),
+        mgr.send_queued_message_now(id.clone(), ws.clone(), entry.id.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(parked["queued"], true);
+    let restored = mgr.services.find_queued_message(&id, &entry.id).unwrap();
+    crate::human_attribution_tests::assert_preserved_queue_metadata(&entry, &restored);
+    assert!(!restored.ready_to_send());
+    mgr.end_turn(&id).await;
+    mgr.redrive_parked_recovery_send(&id, &ws).await;
+    assert!(
+        !mgr.is_busy(&id),
+        "slot release cannot authorize imported input"
+    );
+    assert!(mgr.services.find_queued_message(&id, &entry.id).is_some());
+    sqlx::query("CREATE TRIGGER fail_historical_append BEFORE INSERT ON agent_message BEGIN SELECT RAISE(ABORT,'test append failure'); END").execute(mgr.services.store.write_pool()).await.unwrap();
+    let failed = intent_core::with_caller(
+        caller.clone(),
+        mgr.send_queued_message_now(id.clone(), ws.clone(), entry.id.clone()),
+    )
+    .await;
+    assert!(failed.is_err());
+    assert!(!mgr.is_busy(&id));
+    let restored = mgr.services.find_queued_message(&id, &entry.id).unwrap();
+    crate::human_attribution_tests::assert_preserved_queue_metadata(&entry, &restored);
+    assert!(!restored.ready_to_send());
+    sqlx::query("DROP TRIGGER fail_historical_append")
+        .execute(mgr.services.store.write_pool())
+        .await
+        .unwrap();
+    let script = mock_agent_script();
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+    set_session_provider(&mgr, &ws, &id, "mock").await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+    mgr.handles
+        .lock()
+        .unwrap()
+        .get_mut(&id)
+        .unwrap()
+        .spawned_provider = "node".into();
+    let sent = intent_core::with_caller(
+        caller,
+        mgr.send_queued_message_now(id.clone(), ws, entry.id.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(sent["queued"], false);
+    assert!(mgr.services.find_queued_message(&id, &entry.id).is_none());
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap();
+    let row = messages.iter().find(|m| m.id == entry.id).unwrap();
+    assert_eq!(
+        row.metadata.as_ref().unwrap()["humanAuthor"],
+        entry.message_metadata.as_ref().unwrap()["humanAuthor"]
+    );
+    assert_eq!(
+        row.metadata.as_ref().unwrap()["humanAuthorOriginalMetadata"],
+        entry.message_metadata.as_ref().unwrap()["humanAuthorOriginalMetadata"]
+    );
+    assert!(row
+        .metadata
+        .as_ref()
+        .unwrap()
+        .get("fromPrincipalId")
+        .is_none());
+}
+
 /// monorepo#840 quarantine gate: `send_queued_message_now` on a poisoned
 /// session (Error + session-fatal provider block) must NOT redrive — the
 /// entry stays in the queue and the result reports
@@ -11203,6 +11352,94 @@ fn prompt(request_id: &str, session_id: &str) -> PermissionRequestData {
         risk_level: RiskLevel::High,
         timestamp: 0,
     }
+}
+
+#[tokio::test]
+async fn member_permission_rpcs_resolve_another_persons_agent_and_recheck_authority() {
+    use intent_core::{with_caller, Caller, HostRole, PrincipalId, WorkspaceRole};
+    let (_tmp, mgr, _bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    let services = mgr.services.clone();
+    services.attach_agent_manager(&mgr);
+    let ws = WorkspaceId::new();
+    let id = AgentId::new();
+    seed_agent(&mgr, &ws, &id).await;
+    let mut member = services.store.get_primary_principal().await.unwrap();
+    member.id = PrincipalId::new();
+    member.is_primary = false;
+    services.store.upsert_principal(&member).await.unwrap();
+    sqlx::query("INSERT INTO host_member (principal_id,added_at) VALUES (?,?)")
+        .bind(member.id.as_str())
+        .bind(now_iso())
+        .execute(services.store.write_pool())
+        .await
+        .unwrap();
+    let caller = Caller::Wire {
+        principal_id: member.id.clone(),
+        host_role: HostRole::Guest,
+    };
+    // A previously admitted guest becomes a member without an explicit row.
+    let mut rx = mgr
+        .permissions
+        .register(prompt("member-prompt", id.as_str()));
+    with_caller(caller.clone(), async {
+        for filter in [None, Some(id.clone())] {
+            let requests = services.agent_pending_permissions(filter).await.unwrap();
+            assert_eq!(requests["requests"][0]["requestId"], "member-prompt");
+        }
+        let answer = services
+            .agent_respond_permission(
+                "member-prompt".into(),
+                json!({"outcome":"selected","optionId":"allow_once"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(answer["resolved"], true);
+    })
+    .await;
+    assert_eq!(
+        rx.try_recv().unwrap(),
+        PermissionOutcome::Selected {
+            option_id: "allow_once".into()
+        }
+    );
+    // A retained guest grant cannot answer or enumerate the next prompt.
+    services
+        .store
+        .add_workspace_member(&ws, &member.id, WorkspaceRole::Collaborator)
+        .await
+        .unwrap();
+    services.store.remove_host_member(&member.id).await.unwrap();
+    let mut rx = mgr
+        .permissions
+        .register(prompt("after-revoke", id.as_str()));
+    with_caller(caller, async {
+        assert_eq!(
+            services.agent_pending_permissions(None).await.unwrap()["requests"],
+            json!([])
+        );
+        assert!(services
+            .agent_pending_permissions(Some(id.clone()))
+            .await
+            .is_err());
+        assert!(services
+            .agent_respond_permission("after-revoke".into(), json!({"outcome":"cancelled"}))
+            .await
+            .is_err());
+    })
+    .await;
+    assert!(rx.try_recv().is_err());
+    // Fabricated callers never gain access through an outstanding request id.
+    let unknown = Caller::Wire {
+        principal_id: PrincipalId::new(),
+        host_role: HostRole::Member,
+    };
+    assert!(with_caller(
+        unknown,
+        services.agent_respond_permission("after-revoke".into(), json!({"outcome":"cancelled"}))
+    )
+    .await
+    .is_err());
 }
 
 #[tokio::test]
@@ -23395,5 +23632,195 @@ mod enqueue_origin_table {
                 row.door
             );
         }
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn member_removal_preserves_running_turn_and_automation_but_sweeps_human_queue() {
+    use intent_core::{with_caller, Caller, HostRole, PrincipalId};
+    for drain_first in [false, true] {
+        let (_tmp, mgr, _bus) = manager_with_bus().await;
+        let mgr = Arc::new(mgr);
+        mgr.services.attach_agent_manager(&mgr);
+        let ws = WorkspaceId::new();
+        let id = AgentId::new();
+        seed_agent(&mgr, &ws, &id).await;
+        let person = PrincipalId::new();
+        sqlx::query(
+            "INSERT INTO principal (id,is_primary,created_at,updated_at) VALUES (?,0,'t0','t0')",
+        )
+        .bind(&person.0)
+        .execute(mgr.services.store.write_pool())
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO host_member (principal_id,added_at) VALUES (?,'t0')")
+            .bind(&person.0)
+            .execute(mgr.services.store.write_pool())
+            .await
+            .unwrap();
+        mgr.services
+            .store
+            .insert_principal_credential(&person, "worker-removal-credential")
+            .await
+            .unwrap();
+        let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
+        let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
+        let (prompt_tx, mut prompts) = mpsc::unbounded_channel();
+        let (finish_first, mut finish) = mpsc::unbounded_channel::<()>();
+        let mock = tokio::spawn(async move {
+            let mut lines = BufReader::new(c2a_agent).lines();
+            let mut write = a2c_agent;
+            while let Ok(Some(line)) = lines.next_line().await {
+                let value: Value = serde_json::from_str(&line).unwrap();
+                let (Some(rpc_id), Some(method)) =
+                    (value.get("id"), value.get("method").and_then(Value::as_str))
+                else {
+                    continue;
+                };
+                let result = match method {
+                    "initialize" => {
+                        json!({"protocolVersion":1,"agentCapabilities":{"loadSession":false}})
+                    }
+                    "session/new" => {
+                        json!({"sessionId":MGR_ACP_SID,"modes":MockModes::with_bypass().to_json()})
+                    }
+                    "session/prompt" => {
+                        prompt_tx.send(value["params"].clone()).unwrap();
+                        finish.recv().await.unwrap();
+                        json!({"stopReason":"end_turn"})
+                    }
+                    _ => json!({}),
+                };
+                let response = json!({"jsonrpc":"2.0","id":rpc_id,"result":result});
+                write
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+                write.flush().await.unwrap();
+            }
+        });
+        let (note_tx, note_rx) = mpsc::unbounded_channel();
+        let connection = Arc::new(Connection::new(
+            c2a_client,
+            a2c_client,
+            None,
+            ConnectionHooks {
+                notifications: Some(note_tx),
+                ..ConnectionHooks::default()
+            },
+        ));
+        let mut handle = mock_handle();
+        handle.connection = connection;
+        handle.notifications = Arc::new(TokioMutex::new(note_rx));
+        mgr.handles.lock().unwrap().insert(id.clone(), handle);
+        mgr.registry.register(id.clone(), mgr.make_kill(id.clone()));
+        let caller = Caller::Wire {
+            principal_id: person.clone(),
+            host_role: HostRole::Member,
+        };
+        let sent = with_caller(
+            caller.clone(),
+            mgr.services.agent_send_message(
+                ws.clone(),
+                id.clone(),
+                "running human".into(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                MessageOrigin::User,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sent["queued"], false);
+        let first = timeout(Duration::from_secs(10), prompts.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(first.to_string().contains("running human"));
+        with_caller(
+            caller,
+            mgr.services.agent_queue_message(
+                id.clone(),
+                "pending human".into(),
+                None,
+                None,
+                Some(json!({"source":"system"})),
+            ),
+        )
+        .await
+        .unwrap();
+        if !drain_first {
+            mgr.services
+                .agent_queue_message(
+                    id.clone(),
+                    "automatic continuation".into(),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        if drain_first {
+            // Stop the actual worker inside admission, after its first turn.
+            let (reached, release) = mgr.services.queue_drain_commit_pause.arm();
+            finish_first.send(()).unwrap();
+            reached.await.unwrap();
+            let mut remove = mgr.services.host_members_remove(person.clone());
+            let pending =
+                std::future::poll_fn(|cx| std::task::Poll::Ready(remove.as_mut().poll(cx))).await;
+            assert!(
+                pending.is_pending(),
+                "removal must serialize with selected instructions"
+            );
+            release.send(()).unwrap();
+            remove.await.unwrap();
+            let second = timeout(Duration::from_secs(10), prompts.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(second.to_string().contains("pending human"));
+            mgr.services
+                .agent_queue_message(
+                    id.clone(),
+                    "automatic continuation".into(),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            // This turn was admitted before revocation, so it may finish.
+            finish_first.send(()).unwrap();
+        } else {
+            // Removal completes while the real provider prompt is still blocked.
+            mgr.services
+                .host_members_remove(person.clone())
+                .await
+                .unwrap();
+            assert!(mgr.contains(&id));
+            assert!(mgr.is_busy(&id));
+            finish_first.send(()).unwrap();
+        }
+        let automatic = timeout(Duration::from_secs(10), prompts.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(automatic.to_string().contains("automatic continuation"));
+        // History may contain the admitted first turn; no removed queued user
+        // row may appear when removal linearized first.
+        if !drain_first {
+            assert!(!automatic.to_string().contains("pending human"));
+        }
+        finish_first.send(()).unwrap();
+        mgr.stop(&id).await;
+        mock.abort();
+        let _ = mock.await;
     }
 }

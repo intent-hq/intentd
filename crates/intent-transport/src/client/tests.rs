@@ -97,6 +97,16 @@ async fn mints_client_id_when_omitted() {
 }
 
 #[test]
+fn shared_host_capabilities_are_independent_of_client_authority() {
+    for local in [true, false] {
+        let server = server_json(false, "linux", "x86_64", "test", None, local);
+        assert_eq!(server["capabilities"]["hostMembership"], 1);
+        assert_eq!(server["capabilities"]["personalPairing"], 1);
+        assert_eq!(server["capabilities"]["authenticatedDevices"], 1);
+    }
+}
+
+#[test]
 fn server_identity_omits_an_unknown_build_commit() {
     let server = server_json(true, "linux", "x86_64", "1.2.3", None, true);
     assert_eq!(server["version"], "1.2.3");
@@ -231,7 +241,11 @@ async fn notification_has_no_response_but_sets_binding() {
 async fn non_administrator_client_ids_are_scoped_to_their_principal() {
     let wire = |principal: &str, is_administrator: bool| Caller::Wire {
         principal_id: PrincipalId::from_string(principal),
-        is_administrator,
+        host_role: if is_administrator {
+            intent_core::HostRole::Owner
+        } else {
+            intent_core::HostRole::Guest
+        },
     };
     let hello = |id: i64, client_id: &str| {
         classify(&json!({

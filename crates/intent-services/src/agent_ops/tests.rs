@@ -13545,7 +13545,7 @@ async fn queue_reads_and_queue_updated_carry_resolved_author() {
     let queued = with_caller(
         Caller::Wire {
             principal_id: guest.clone(),
-            is_administrator: false,
+            host_role: intent_core::HostRole::Guest,
         },
         async {
             svc.agent_queue_message(id.clone(), "from guest".into(), None, None, None)
@@ -13663,11 +13663,11 @@ async fn get_queue_is_projected_to_the_calling_principal() {
         .expect("guest membership");
     let as_owner = Caller::Wire {
         principal_id: owner.clone(),
-        is_administrator: true,
+        host_role: intent_core::HostRole::Owner,
     };
     let as_guest = Caller::Wire {
         principal_id: guest.clone(),
-        is_administrator: false,
+        host_role: intent_core::HostRole::Guest,
     };
     let as_agent = Caller::Agent {
         agent_id: AgentId::from("agent-reader"),
@@ -13819,11 +13819,11 @@ async fn queue_mutations_enforce_entry_ownership() {
         .expect("guest membership");
     let as_admin = Caller::Wire {
         principal_id: owner.clone(),
-        is_administrator: true,
+        host_role: intent_core::HostRole::Owner,
     };
     let as_guest = Caller::Wire {
         principal_id: guest.clone(),
-        is_administrator: false,
+        host_role: intent_core::HostRole::Guest,
     };
     let as_agent = Caller::Agent {
         agent_id: AgentId::from("agent-peer"),
@@ -14097,11 +14097,11 @@ pub(super) async fn owner_and_guest_callers(
     (
         Caller::Wire {
             principal_id: owner,
-            is_administrator: true,
+            host_role: intent_core::HostRole::Owner,
         },
         Caller::Wire {
             principal_id: guest,
-            is_administrator: false,
+            host_role: intent_core::HostRole::Guest,
         },
     )
 }
@@ -15120,7 +15120,7 @@ async fn principal_stamp_overwrites_client_value_on_every_user_origin_entry_poin
     }
     let wire = |p: &PrincipalId| Caller::Wire {
         principal_id: p.clone(),
-        is_administrator: false,
+        host_role: intent_core::HostRole::Guest,
     };
     let spoof = || json!({ "fromPrincipalId": "spoof", "kind": "reply" });
     let stamp_of = |md: Option<&serde_json::Value>| {
@@ -15381,7 +15381,7 @@ async fn principal_stamp_overwrites_client_value_on_every_user_origin_entry_poin
     let drained = with_caller(
         Caller::Wire {
             principal_id: bob.clone(),
-            is_administrator: true,
+            host_role: intent_core::HostRole::Owner,
         },
         async {
             svc.agent_send_queued_message_now(ws.clone(), agent.clone(), queued_id.clone())
@@ -15513,7 +15513,7 @@ async fn principal_stamp_overwrites_client_value_on_every_user_origin_entry_poin
     let created_ws = with_caller(
         Caller::Wire {
             principal_id: bob.clone(),
-            is_administrator: true,
+            host_role: intent_core::HostRole::Owner,
         },
         async {
             WorkspaceApi::create_workspace(
@@ -15653,7 +15653,7 @@ async fn collaborator_sender_preamble_on_every_human_authored_entry_point() {
         .expect("guest membership");
     let wire = |p: &PrincipalId| Caller::Wire {
         principal_id: p.clone(),
-        is_administrator: false,
+        host_role: intent_core::HostRole::Guest,
     };
     let preamble = crate::harness::latest().collaborator_sender_preamble(
         Some("octocat"),
@@ -15745,7 +15745,7 @@ async fn collaborator_sender_preamble_on_every_human_authored_entry_point() {
     // agent caller, and a collaborator's non-user-origin send.
     let admin = Caller::Wire {
         principal_id: owner.clone(),
-        is_administrator: true,
+        host_role: intent_core::HostRole::Owner,
     };
     let peer = Caller::Agent {
         agent_id: AgentId::from("agent-peer"),
@@ -16025,7 +16025,7 @@ async fn collaborator_sender_preamble_on_delegate_free_text() {
         .expect("guest membership");
     let wire = |p: &PrincipalId| Caller::Wire {
         principal_id: p.clone(),
-        is_administrator: false,
+        host_role: intent_core::HostRole::Guest,
     };
     let preamble = crate::harness::latest().collaborator_sender_preamble(
         Some("octocat"),
@@ -16229,7 +16229,7 @@ async fn collaborator_sender_preamble_on_delegate_free_text() {
     // absent callers not); every control is served as the owner.
     let admin = Caller::Wire {
         principal_id: owner.clone(),
-        is_administrator: true,
+        host_role: intent_core::HostRole::Owner,
     };
     let peer = Caller::Agent {
         agent_id: AgentId::from("agent-peer"),
@@ -16310,7 +16310,7 @@ async fn collaborator_sender_preamble_on_append_message_user_rows() {
         .expect("guest membership");
     let wire = |p: &PrincipalId| Caller::Wire {
         principal_id: p.clone(),
-        is_administrator: false,
+        host_role: intent_core::HostRole::Guest,
     };
     let preamble = crate::harness::latest().collaborator_sender_preamble(
         Some("octocat"),
@@ -16409,7 +16409,7 @@ async fn collaborator_sender_preamble_on_append_message_user_rows() {
     }
     let admin = Caller::Wire {
         principal_id: owner.clone(),
-        is_administrator: true,
+        host_role: intent_core::HostRole::Owner,
     };
     let peer = Caller::Agent {
         agent_id: AgentId::from("agent-peer"),
@@ -16464,7 +16464,7 @@ async fn non_object_message_metadata_is_rejected_on_every_user_origin_entry_poin
         .expect("membership");
     let caller = Caller::Wire {
         principal_id: strict,
-        is_administrator: false,
+        host_role: intent_core::HostRole::Guest,
     };
     let is_invalid = |label: &str, r: Result<serde_json::Value, Error>| {
         assert!(
@@ -16605,7 +16605,7 @@ async fn edit_queued_message_restamp_rejection_leaves_entry_untouched() {
     let err = with_caller(
         Caller::Wire {
             principal_id: editor,
-            is_administrator: false,
+            host_role: intent_core::HostRole::Guest,
         },
         async {
             svc.agent_edit_queued_message(

@@ -453,9 +453,10 @@ async fn deletion_indexes_upgrade_preserves_existing_data() {
         write_pool: pool,
         read_pool: crate::connect_read(&tmp.path).await.unwrap(),
         browser_tab_displayed: crate::browser_tab_repo::DisplayedOverlay::default(),
+        export_author_barrier: std::sync::Arc::default(),
     };
     // Raw rows: the current `insert_workspace` writes columns added after
-    // 0130 (`execution_environment`, 0132), which this legacy schema lacks.
+    // 0130 (`execution_environment`, 0136), which this legacy schema lacks.
     let doomed = WorkspaceId::from("doomed");
     let keeper = WorkspaceId::from("keeper");
     for id in [&doomed, &keeper] {
