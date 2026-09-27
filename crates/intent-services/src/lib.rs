@@ -33169,7 +33169,7 @@ impl WorkspaceApi for Services {
         params: serde_json::Value,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let svc = self.clone();
-        Box::pin(async move {
+        self.execution_call(async move {
             self.require_member(&workspace_id).await?;
             svc.ac_execute(workspace_id, params).await
         })

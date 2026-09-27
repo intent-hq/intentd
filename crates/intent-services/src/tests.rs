@@ -17314,6 +17314,8 @@ mod drafts_events {
 // ============================================================================
 
 pub(crate) mod pr {
+    mod accept_member;
+
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -17482,6 +17484,8 @@ pub(crate) mod pr {
         /// (intent-hq/intent#5654).
         pub(crate) get_pr_park: Option<std::sync::Arc<GetPrPark>>,
         get_pr_error: Option<fn() -> ScError>,
+        create_pr_error: Option<fn() -> ScError>,
+        create_pr_calls: std::sync::atomic::AtomicU64,
     }
 
     /// One-shot park for [`StubForge::get_pr`]: `entered` fires when the
@@ -17747,6 +17751,11 @@ pub(crate) mod pr {
             Ok(self.file_content.clone())
         }
         async fn create_pr(&self, _: &RepoRef, input: NewPullRequest) -> ScResult<PullRequest> {
+            self.create_pr_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(error) = self.create_pr_error {
+                return Err(error());
+            }
             Ok(PullRequest {
                 number: 7,
                 url: "https://github.com/o/r/pull/7".into(),

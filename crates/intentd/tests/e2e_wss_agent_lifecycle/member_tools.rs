@@ -4,6 +4,9 @@ use intent_core::{now_iso, Principal, PrincipalId, WorkspaceId};
 use intent_store::Store;
 use std::fmt::Write as _;
 
+#[path = "member_tools/accept_changes.rs"]
+mod accept_changes;
+
 const MEMBER_TOKEN: &str = "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1";
 
 async fn seed_member(data_dir: &Path, ws: &WorkspaceId) -> PrincipalId {
