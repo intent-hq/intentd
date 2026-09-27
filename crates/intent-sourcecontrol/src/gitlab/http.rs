@@ -93,8 +93,9 @@ impl GitLabSourceControl {
                 (429, _) => {
                     return Err(Error::RateLimited("GitLab request quota exhausted".into()))
                 }
-                (401 | 403 | 404, Purpose::Primary) => ProviderFailureKind::ResourceDenied,
-                (401 | 403, Purpose::Optional) => ProviderFailureKind::OptionalRestricted,
+                (401, _) => ProviderFailureKind::CredentialRejected,
+                (403 | 404, Purpose::Primary) => ProviderFailureKind::ResourceDenied,
+                (403, Purpose::Optional) => ProviderFailureKind::OptionalRestricted,
                 (404 | 405 | 501, Purpose::Optional) => ProviderFailureKind::OptionalUnavailable,
                 (409 | 422 | 400, _) => return Err(Error::Conflict(format!("GitLab HTTP {code}"))),
                 (408 | 500..=599, _) if writing => ProviderFailureKind::WriteUncertain,
@@ -144,8 +145,16 @@ impl GitLabSourceControl {
         &self,
         path: &str,
     ) -> Result<(Option<Value>, ProviderAvailability)> {
+        self.optional_get_for(path, Purpose::Optional).await
+    }
+
+    pub(super) async fn optional_get_for(
+        &self,
+        path: &str,
+        purpose: Purpose,
+    ) -> Result<(Option<Value>, ProviderAvailability)> {
         match self
-            .request_for(Method::GET, path, &[], None, Purpose::Optional)
+            .request_for(Method::GET, path, &[], None, purpose)
             .await
         {
             Ok((v, _)) => Ok((Some(v), ProviderAvailability::Available)),

@@ -8,6 +8,8 @@
 /// Request-purpose-aware failure. No response body, URL or credential is retained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderFailureKind {
+    /// The upstream rejected this connection's credential, regardless of endpoint purpose.
+    CredentialRejected,
     /// A primary resource rejected access, including an access-hiding 404.
     ResourceDenied,
     /// An optional signal was readable only with additional permission.

@@ -87,16 +87,16 @@ impl GitLabSourceControl {
     }
     fn observe_rate_limit(&self, headers: &HeaderMap, throttled: bool) {
         let header_number = |name: &str| headers.get(name)?.to_str().ok()?.parse::<u64>().ok();
-        let reset_at = header_number("ratelimit-reset").or_else(|| {
-            if !throttled {
-                return None;
-            }
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .ok()?
-                .as_secs()
-                .checked_add(header_number("retry-after")?)
-        });
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|t| t.as_secs());
+        let retry_at = if throttled {
+            now.and_then(|now| now.checked_add(header_number("retry-after")?))
+        } else {
+            None
+        };
+        let reset_at = header_number("ratelimit-reset").max(retry_at);
         let remaining = if throttled {
             Some(0)
         } else {
@@ -105,6 +105,19 @@ impl GitLabSourceControl {
         let limit = header_number("ratelimit-limit");
         if reset_at.is_some() || remaining.is_some() || limit.is_some() {
             if let Ok(mut held) = self.rate_limit.write() {
+                // Another optional or concurrent response cannot shorten an active
+                // rejection window. Both Retry-After and quota reset are lower bounds.
+                if held.remaining == Some(0)
+                    && held
+                        .reset_at
+                        .is_some_and(|at| now.is_some_and(|now| at > now))
+                {
+                    if throttled {
+                        held.reset_at = held.reset_at.max(reset_at);
+                        held.limit = limit.or(held.limit);
+                    }
+                    return;
+                }
                 *held = RateLimitStatus {
                     reset_at,
                     remaining,
@@ -1004,7 +1017,7 @@ impl SourceControl for GitLabSourceControl {
     }
     async fn branch_rules(&self, repo: &RepoRef, _branch: &str) -> Result<BranchRules> {
         let (value, _) = self
-            .request_for(Method::GET, &project(repo), &[], None, Purpose::Optional)
+            .request_for(Method::GET, &project(repo), &[], None, Purpose::Primary)
             .await?;
         Ok(project_rules(&value))
     }

@@ -113,7 +113,10 @@ impl GitLabSourceControl {
     pub async fn observe_review(&self, repo: &RepoRef, number: u64) -> Result<ReviewObservation> {
         let head = self.get(&mr(repo, number)).await?;
         let details = self.details(head.clone())?;
-        let (policy, mut policy_state) = self.optional_get(&project(repo)).await?;
+        // Policy fields are optional; access to the parent project is not.
+        let (policy, mut policy_state) = self
+            .optional_get_for(&project(repo), Purpose::Primary)
+            .await?;
         if policy.as_ref().is_some_and(|p| {
             !p["only_allow_merge_if_pipeline_succeeds"].is_boolean()
                 || !p["only_allow_merge_if_all_discussions_are_resolved"].is_boolean()

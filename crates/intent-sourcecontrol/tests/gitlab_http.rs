@@ -278,14 +278,18 @@ async fn nested_projects_branches_and_credentials_use_the_right_endpoint() {
 
 #[tokio::test]
 async fn primary_denial_is_typed_and_never_includes_response_secrets() {
-    for status in [401, 403, 404] {
+    for (status, kind) in [
+        (401, ProviderFailureKind::CredentialRejected),
+        (403, ProviderFailureKind::ResourceDenied),
+        (404, ProviderFailureKind::ResourceDenied),
+    ] {
         let f = Fixture::new(move |_| {
             reply(status, json!({"message":"echo fixture-token private-body"}))
         })
         .await;
         let error = f.provider().get_pr(&repo(), 7).await.unwrap_err();
         assert!(
-            matches!(error,Error::Provider(ProviderFailure {kind:ProviderFailureKind::ResourceDenied,status:Some(s)}) if s==status)
+            matches!(error,Error::Provider(ProviderFailure {kind:k,status:Some(s)}) if s==status && k==kind)
         );
         assert!(!format!("{error:?}").contains("fixture-token"));
         assert!(!error.to_string().contains("private-body"));
@@ -984,4 +988,137 @@ async fn malformed_and_transient_primary_responses_do_not_invalidate_as_denial()
         let error = f.provider().get_pr(&repo(), 7).await.unwrap_err();
         assert!(matches!(error, Error::Provider(ProviderFailure{kind:k,..}) if k==kind));
     }
+}
+
+#[tokio::test]
+async fn optional_authentication_rejection_fails_the_aggregate_after_primary_success() {
+    for endpoint in ["/approvals", "/pipelines/19/jobs", "/discussions"] {
+        let f = Fixture::new(move |r| {
+            if r.path.split('?').next().unwrap().ends_with(endpoint) {
+                reply(401, json!({"message":"credential rejected"}))
+            } else {
+                observation_reply(r)
+            }
+        })
+        .await;
+        let sc = f.provider();
+        let error = sc.observe_review(&repo(), 7).await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                Error::Provider(ProviderFailure {
+                    kind: ProviderFailureKind::CredentialRejected,
+                    status: Some(401)
+                })
+            ),
+            "{endpoint}: {error}"
+        );
+        assert!(f.requests()[0].path.ends_with("/merge_requests/7"));
+        assert!(matches!(
+            sc.pr_observation(&repo(), 7).await,
+            Err(Error::Provider(ProviderFailure {
+                kind: ProviderFailureKind::CredentialRejected,
+                ..
+            }))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn parent_project_denial_cannot_hide_as_missing_optional_policy() {
+    for (status, kind) in [
+        (401, ProviderFailureKind::CredentialRejected),
+        (403, ProviderFailureKind::ResourceDenied),
+        (404, ProviderFailureKind::ResourceDenied),
+    ] {
+        let f = Fixture::new(move |r| {
+            if r.path.ends_with("Team%2FSub%2FProject") {
+                reply(status, Value::Null)
+            } else {
+                observation_reply(r)
+            }
+        })
+        .await;
+        let sc = f.provider();
+        let error = sc.observe_review(&repo(), 7).await.unwrap_err();
+        assert!(
+            matches!(error, Error::Provider(ProviderFailure{kind:k,status:Some(s)}) if k==kind && s==status)
+        );
+        assert!(matches!(sc.branch_rules(&repo(), "main").await,
+            Err(Error::Provider(ProviderFailure{kind:k,..})) if k==kind));
+        assert!(f.requests().iter().all(|r| !r.path.contains("/approvals")));
+    }
+}
+
+#[tokio::test]
+async fn optional_rate_limit_retains_retry_after_despite_later_success_headers() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let start = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let f = Fixture::new(move |r| {
+        if r.path.ends_with("/approvals") {
+            let mut response = reply(429, Value::Null);
+            response.headers = vec![
+                ("retry-after".into(), "120".into()),
+                ("ratelimit-reset".into(), (start + 5).to_string()),
+                ("ratelimit-limit".into(), "600".into()),
+            ];
+            response
+        } else {
+            let mut response = observation_reply(r);
+            response.headers = vec![
+                ("ratelimit-remaining".into(), "500".into()),
+                ("ratelimit-reset".into(), (start + 5).to_string()),
+            ];
+            response
+        }
+    })
+    .await;
+    let sc = f.provider();
+    let observation = sc.observe_review(&repo(), 7).await.unwrap();
+    assert_eq!(
+        observation.availability.approvals,
+        ProviderAvailability::RateLimited
+    );
+    let quota = sc.rate_limit_status().await.unwrap();
+    assert_eq!(quota.remaining, Some(0));
+    assert_eq!(quota.limit, Some(600));
+    assert!(quota.reset_at.is_some_and(|at| at >= start + 120));
+    assert!(matches!(
+        sc.merge_requirements(&repo(), 7).await,
+        Err(Error::RateLimited(_))
+    ));
+    assert!(matches!(
+        sc.pr_observation(&repo(), 7).await,
+        Err(Error::RateLimited(_))
+    ));
+}
+
+#[tokio::test]
+async fn optional_admission_rejection_propagates_without_an_upstream_request() {
+    let credentials = Arc::new(Mutex::new(None::<Arc<Credentials>>));
+    let captured = credentials.clone();
+    let f = Fixture::new(move |r| {
+        if r.path.ends_with("Team%2FSub%2FProject") {
+            *captured
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .token
+                .lock()
+                .unwrap() = None;
+        }
+        observation_reply(r)
+    })
+    .await;
+    *credentials.lock().unwrap() = Some(f.credentials.clone());
+    assert!(matches!(
+        f.provider().observe_review(&repo(), 7).await,
+        Err(Error::NotConfigured(_))
+    ));
+    assert_eq!(f.requests().len(), 2);
+    assert!(f.requests().iter().all(|r| !r.path.contains("/approvals")));
 }
