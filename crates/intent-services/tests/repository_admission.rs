@@ -10,4 +10,8 @@
 mod repository_admission;
 
 #[path = "../src/repository_credentials.rs"]
+#[expect(
+    dead_code,
+    reason = "test-local directory includes auth-writer seams exercised by owner tests"
+)]
 mod repository_credentials;

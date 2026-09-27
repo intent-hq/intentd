@@ -5,6 +5,274 @@ use tokio::sync::{Notify, Semaphore};
 use super::authority::{CredentialFuture, RepositoryAuthorityFence, RepositoryCredentialTransport};
 use super::*;
 
+#[test]
+fn child_policy_checkpoint_validates_the_whole_original_binding() {
+    let test = Test::new();
+    let binding = test.directory.binding().unwrap();
+    for field in 0..6 {
+        let mut foreign = binding.clone();
+        match field {
+            0 => foreign.daemon_id = "other-daemon".into(),
+            1 => foreign.account.instance_base_url = "https://git.example:8443/other".into(),
+            2 => foreign.account.account_id = "72".into(),
+            3 => foreign.scope.connection_id = "other-connection".into(),
+            4 => foreign.scope.account_id = "72".into(),
+            _ => foreign.scope.connection_generation += 1,
+        }
+        assert!(matches!(
+            test.directory.child_policy_checkpoint(foreign),
+            Err(RepositoryCredentialError::Retired)
+        ));
+    }
+    let checkpoint = test
+        .directory
+        .child_policy_checkpoint(binding.clone())
+        .unwrap();
+    let unchanged = test
+        .directory
+        .child_policy_checkpoint(binding.clone())
+        .unwrap();
+    assert_eq!(checkpoint.revision, unchanged.revision);
+    test.directory.set_child_policy(&binding, false).unwrap();
+    assert!(matches!(
+        test.directory.begin_child_policy(&checkpoint),
+        Err(RepositoryCredentialError::StaleMutation)
+    ));
+    assert!(!test.directory.lock().unwrap().child_enabled);
+}
+
+#[tokio::test]
+async fn child_policy_ticket_blocks_only_children_and_survives_exact_refresh() {
+    let test = Test::new();
+    let binding = test.directory.binding().unwrap();
+    test.directory.set_child_policy(&binding, true).unwrap();
+    let child = test.admit(RepositoryCredentialUse::ChildGit);
+    let native = test.admit(RepositoryCredentialUse::NativeRead);
+    let before = test.acquire(&native).await.unwrap().stamp;
+    let checkpoint = test
+        .directory
+        .child_policy_checkpoint(binding.clone())
+        .unwrap();
+    let ticket = test.directory.begin_child_policy(&checkpoint).unwrap();
+    assert_eq!(
+        test.directory.check_current(&child),
+        Err(RepositoryCredentialError::Retired)
+    );
+    let during = test.acquire(&native).await.unwrap().stamp;
+    assert_eq!(before.binding, during.binding);
+    assert_eq!(before.secret_revision, during.secret_revision);
+    assert!(matches!(
+        test.directory.child_policy_checkpoint(binding.clone()),
+        Err(RepositoryCredentialError::Mutating)
+    ));
+
+    let refresh = test
+        .directory
+        .reserve_mutation(RepositoryMutationKind::Refresh)
+        .unwrap();
+    test.directory.begin_mutation(&refresh).unwrap();
+    test.directory
+        .mark_child_policy_indeterminate(&ticket)
+        .unwrap();
+    assert_eq!(
+        test.directory.finish_child_policy(&ticket, true),
+        Err(RepositoryCredentialError::Mutating)
+    );
+    test.directory
+        .finish_mutation(
+            &refresh,
+            SettledCredentialState::Verified(test.verified.clone()),
+        )
+        .unwrap();
+    assert!(matches!(
+        test.directory.child_policy_checkpoint(binding.clone()),
+        Err(RepositoryCredentialError::Indeterminate)
+    ));
+    test.acquire(&native).await.unwrap();
+    test.directory.finish_child_policy(&ticket, true).unwrap();
+    assert_eq!(
+        test.directory.finish_child_policy(&ticket, false),
+        Err(RepositoryCredentialError::StaleMutation)
+    );
+    assert_eq!(
+        test.directory.mark_child_policy_indeterminate(&ticket),
+        Err(RepositoryCredentialError::StaleMutation)
+    );
+    assert_eq!(
+        test.directory.check_current(&child),
+        Err(RepositoryCredentialError::Retired)
+    );
+    test.acquire(&test.admit(RepositoryCredentialUse::ChildGit))
+        .await
+        .unwrap();
+}
+
+#[test]
+fn child_policy_ticket_cannot_revive_after_replacement_disconnect_or_compensation() {
+    for kind in [
+        RepositoryMutationKind::Replace,
+        RepositoryMutationKind::Disconnect,
+        RepositoryMutationKind::Refresh,
+    ] {
+        let test = Test::new();
+        let binding = test.directory.binding().unwrap();
+        let checkpoint = test
+            .directory
+            .child_policy_checkpoint(binding.clone())
+            .unwrap();
+        let ticket = test.directory.begin_child_policy(&checkpoint).unwrap();
+        let mutation = test.directory.reserve_mutation(kind).unwrap();
+        test.directory.begin_mutation(&mutation).unwrap();
+        let settled = match kind {
+            RepositoryMutationKind::Replace => {
+                SettledCredentialState::Verified(test.verified.clone())
+            }
+            RepositoryMutationKind::Disconnect => SettledCredentialState::Disconnected,
+            RepositoryMutationKind::Refresh => {
+                SettledCredentialState::Compensated(test.verified.clone())
+            }
+        };
+        test.directory.finish_mutation(&mutation, settled).unwrap();
+        if kind == RepositoryMutationKind::Disconnect {
+            test.replace(test.verified.clone());
+        }
+        assert_eq!(
+            test.directory.finish_child_policy(&ticket, true),
+            Err(RepositoryCredentialError::Retired)
+        );
+        assert_eq!(
+            test.directory.mark_child_policy_indeterminate(&ticket),
+            Err(RepositoryCredentialError::Retired)
+        );
+        assert!(matches!(
+            test.directory.begin_child_policy(&checkpoint),
+            Err(RepositoryCredentialError::Retired)
+        ));
+        assert!(!test.directory.lock().unwrap().child_enabled);
+        let fresh = test
+            .directory
+            .child_policy_checkpoint(test.directory.binding().unwrap())
+            .unwrap();
+        let fresh = test.directory.begin_child_policy(&fresh).unwrap();
+        test.directory.finish_child_policy(&fresh, true).unwrap();
+    }
+}
+
+#[test]
+fn child_policy_ticket_epoch_prevents_restart_aba_with_identical_public_binding() {
+    let test = Test::new();
+    let checkpoint = test
+        .directory
+        .child_policy_checkpoint(test.directory.binding().unwrap())
+        .unwrap();
+    let ticket = test.directory.begin_child_policy(&checkpoint).unwrap();
+    let restarted = RepositoryConnectionDirectory::new("daemon-A".into());
+    {
+        // Deliberately duplicate all public facts and counters to exercise the
+        // private epoch guard independently from random connection IDs.
+        let old = test.directory.lock().unwrap();
+        let mut new = restarted.lock().unwrap();
+        new.status = old.status;
+        new.published.clone_from(&old.published);
+        new.generation = old.generation;
+        new.secret_revision = old.secret_revision;
+        new.child_revision = old.child_revision;
+        new.child_active = Some(ChildPolicyMutation {
+            revision: old.child_revision,
+            indeterminate: false,
+        });
+    }
+    assert_eq!(
+        restarted.finish_child_policy(&ticket, true),
+        Err(RepositoryCredentialError::Retired)
+    );
+    assert_eq!(
+        restarted.mark_child_policy_indeterminate(&ticket),
+        Err(RepositoryCredentialError::Retired)
+    );
+    test.directory.retire().unwrap();
+    assert_eq!(
+        test.directory.finish_child_policy(&ticket, true),
+        Err(RepositoryCredentialError::Retired)
+    );
+    assert!(matches!(
+        test.directory.begin_child_policy(&checkpoint),
+        Err(RepositoryCredentialError::Retired)
+    ));
+}
+
+#[test]
+fn child_policy_counter_exhaustion_has_no_partial_authority_publication() {
+    for begin in [false, true] {
+        let test = Test::new();
+        let binding = test.directory.binding().unwrap();
+        let native = test.admit(RepositoryCredentialUse::NativeRead);
+        test.directory.lock().unwrap().child_revision = u64::MAX;
+        let checkpoint = test
+            .directory
+            .child_policy_checkpoint(binding.clone())
+            .unwrap();
+        let before = {
+            let state = test.directory.lock().unwrap();
+            (state.generation, state.secret_revision)
+        };
+        let result = if begin {
+            test.directory.begin_child_policy(&checkpoint).map(|_| ())
+        } else {
+            // A newer disable is still a mutation even if already disabled.
+            test.directory.set_child_policy(&binding, false)
+        };
+        assert_eq!(result, Err(RepositoryCredentialError::CounterExhausted));
+        assert_eq!(
+            test.directory.check_current(&native),
+            Err(RepositoryCredentialError::Retired)
+        );
+        let state = test.directory.lock().unwrap();
+        assert_eq!((state.generation, state.secret_revision), before);
+        assert_eq!(state.child_revision, u64::MAX);
+        assert!(state.child_active.is_none());
+        assert!(!state.child_enabled);
+    }
+}
+
+#[test]
+fn child_policy_completion_cannot_override_direct_writes_in_either_order() {
+    let test = Test::new();
+    let binding = test.directory.binding().unwrap();
+    for enabled in [false, true] {
+        let checkpoint = test
+            .directory
+            .child_policy_checkpoint(binding.clone())
+            .unwrap();
+        let ticket = test.directory.begin_child_policy(&checkpoint).unwrap();
+        test.directory.set_child_policy(&binding, enabled).unwrap();
+        assert_eq!(
+            test.directory.finish_child_policy(&ticket, !enabled),
+            Err(RepositoryCredentialError::StaleMutation)
+        );
+        assert_eq!(
+            test.directory.mark_child_policy_indeterminate(&ticket),
+            Err(RepositoryCredentialError::StaleMutation)
+        );
+        assert_eq!(test.directory.lock().unwrap().child_enabled, enabled);
+
+        let checkpoint = test
+            .directory
+            .child_policy_checkpoint(binding.clone())
+            .unwrap();
+        let ticket = test.directory.begin_child_policy(&checkpoint).unwrap();
+        test.directory
+            .finish_child_policy(&ticket, !enabled)
+            .unwrap();
+        test.directory.set_child_policy(&binding, enabled).unwrap();
+        assert_eq!(
+            test.directory.mark_child_policy_indeterminate(&ticket),
+            Err(RepositoryCredentialError::StaleMutation)
+        );
+        assert_eq!(test.directory.lock().unwrap().child_enabled, enabled);
+    }
+}
+
 pub(super) const INSTANCE: &str = "https://git.example:8443/forge";
 pub(super) const PROJECT: &str = "team/sub/project";
 

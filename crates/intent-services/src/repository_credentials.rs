@@ -133,6 +133,22 @@ pub(crate) struct RepositoryMutationTicket {
     kind: RepositoryMutationKind,
 }
 
+/// Opaque volatile checkpoint, captured before the policy writer's preflight.
+/// Capturing it neither authorizes a writer nor changes effective child policy.
+#[derive(Debug)]
+pub(crate) struct RepositoryChildPolicyCheckpoint {
+    epoch: Uuid,
+    binding: RepositoryConnectionBinding,
+    revision: u64,
+}
+
+/// Issued only after conditional child retirement under the directory lock.
+/// One terminal settlement consumes the matching directory mutation ownership.
+#[derive(Debug)]
+pub(crate) struct RepositoryChildPolicyTicket {
+    checkpoint: RepositoryChildPolicyCheckpoint,
+}
+
 /// Facts from the sole persistence/compensation owner AFTER it has settled.
 pub(crate) enum SettledCredentialState {
     Verified(VerifiedRepositoryAccount),
@@ -152,6 +168,10 @@ struct Mutation {
     previous: Option<Published>,
     previous_child_enabled: bool,
 }
+struct ChildPolicyMutation {
+    revision: u64,
+    indeterminate: bool,
+}
 struct State {
     status: RepositoryConnectionState,
     published: Option<Published>,
@@ -159,6 +179,7 @@ struct State {
     secret_revision: u64,
     child_revision: u64,
     child_enabled: bool,
+    child_active: Option<ChildPolicyMutation>,
     mutation_id: u64,
     reservation: Option<u64>,
     active: Option<Mutation>,
@@ -225,6 +246,12 @@ pub(crate) struct RepositoryDispatchStamp {
 pub(crate) struct RepositoryCredentialTicket {
     token: SecretString,
     stamp: RepositoryDispatchStamp,
+}
+#[cfg(test)]
+impl RepositoryCredentialTicket {
+    pub(crate) fn dispatch_stamp(&self) -> &RepositoryDispatchStamp {
+        &self.stamp
+    }
 }
 impl fmt::Debug for RepositoryCredentialTicket {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

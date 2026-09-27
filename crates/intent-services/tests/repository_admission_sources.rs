@@ -13,6 +13,10 @@ mod repository_admission_git_source;
 #[path = "../src/repository_context_reader.rs"]
 mod repository_context_reader;
 #[path = "../src/repository_credentials.rs"]
+#[expect(
+    dead_code,
+    reason = "test-local directory includes auth-writer seams exercised by owner tests"
+)]
 mod repository_credentials;
 #[path = "../src/repository_admission/source_tests.rs"]
 mod source_tests;

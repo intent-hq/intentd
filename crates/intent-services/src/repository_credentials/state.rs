@@ -12,6 +12,7 @@ impl RepositoryConnectionDirectory {
                 secret_revision: 0,
                 child_revision: 0,
                 child_enabled: false,
+                child_active: None,
                 mutation_id: 0,
                 reservation: None,
                 active: None,
@@ -71,6 +72,7 @@ impl RepositoryConnectionDirectory {
         if ticket.kind != RepositoryMutationKind::Refresh {
             let current = state.generation;
             state.generation = state.advance(current)?;
+            state.child_active = None;
         }
         state.active = Some(Mutation {
             id: ticket.id,
@@ -80,6 +82,25 @@ impl RepositoryConnectionDirectory {
         });
         state.reservation = None;
         state.status = RepositoryConnectionState::Mutating;
+        Ok(())
+    }
+
+    /// Revalidates the original, still-unsettled writer immediately before an
+    /// admitted effect. The existing writer retains its own gate through the
+    /// effect; this read-only check neither settles nor recalls admitted work.
+    pub(crate) fn check_mutation(&self, ticket: &RepositoryMutationTicket) -> Result<()> {
+        let state = self.lock()?;
+        if !matches!(
+            state.status,
+            RepositoryConnectionState::Mutating | RepositoryConnectionState::Indeterminate
+        ) || ticket.epoch != self.epoch
+            || !state
+                .active
+                .as_ref()
+                .is_some_and(|active| active.id == ticket.id && active.kind == ticket.kind)
+        {
+            return Err(RepositoryCredentialError::StaleMutation);
+        }
         Ok(())
     }
 
@@ -112,6 +133,7 @@ impl RepositoryConnectionDirectory {
                 state.child_revision = state.advance(current)?;
                 state.published = None;
                 state.child_enabled = false;
+                state.child_active = None;
                 state.status = RepositoryConnectionState::Disconnected;
                 state.backoff_until = None;
             }
@@ -176,6 +198,7 @@ impl RepositoryConnectionDirectory {
             let current = state.child_revision;
             state.child_revision = state.advance(current)?;
             state.child_enabled = same && previous_child_enabled;
+            state.child_active = None;
             RepositoryConnectionBinding {
                 daemon_id: self.daemon_id.clone(),
                 account: RepositoryAccountKey {
@@ -203,6 +226,8 @@ impl RepositoryConnectionDirectory {
         Ok(state.ready()?.binding.clone())
     }
 
+    /// A proved authoritative write, including a same-value write, supersedes
+    /// pending child work. Rejected/no-op preflight must not call this method.
     pub(crate) fn set_child_policy(
         &self,
         binding: &RepositoryConnectionBinding,
@@ -212,10 +237,113 @@ impl RepositoryConnectionDirectory {
         if &state.ready()?.binding != binding {
             return Err(RepositoryCredentialError::Retired);
         }
-        if state.child_enabled != enabled {
-            let current = state.child_revision;
-            state.child_revision = state.advance(current)?;
-            state.child_enabled = enabled;
+        let current = state.child_revision;
+        state.child_revision = state.advance(current)?;
+        state.child_enabled = enabled;
+        state.child_active = None;
+        Ok(())
+    }
+
+    pub(crate) fn child_policy_checkpoint(
+        &self,
+        binding: RepositoryConnectionBinding,
+    ) -> Result<RepositoryChildPolicyCheckpoint> {
+        let state = self.lock()?;
+        if state.ready()?.binding != binding {
+            return Err(RepositoryCredentialError::Retired);
+        }
+        state.child_idle()?;
+        Ok(RepositoryChildPolicyCheckpoint {
+            epoch: self.epoch,
+            binding,
+            revision: state.child_revision,
+        })
+    }
+
+    /// Conditional retirement precedes the existing owner's first policy effect.
+    /// Native admission, connection generation and secret revision are untouched.
+    pub(crate) fn begin_child_policy(
+        &self,
+        checkpoint: &RepositoryChildPolicyCheckpoint,
+    ) -> Result<RepositoryChildPolicyTicket> {
+        let mut state = self.lock()?;
+        self.check_child_checkpoint(&state, checkpoint)?;
+        state.ready()?;
+        state.child_idle()?;
+        let current = state.child_revision;
+        state.child_revision = state.advance(current)?;
+        state.child_enabled = false;
+        state.child_active = Some(ChildPolicyMutation {
+            revision: state.child_revision,
+            indeterminate: false,
+        });
+        Ok(RepositoryChildPolicyTicket {
+            checkpoint: RepositoryChildPolicyCheckpoint {
+                epoch: self.epoch,
+                binding: checkpoint.binding.clone(),
+                revision: state.child_revision,
+            },
+        })
+    }
+
+    /// Only the still-current writer can publish its proved settlement. An
+    /// indeterminate writer may later settle; a superseded one never can.
+    pub(crate) fn finish_child_policy(
+        &self,
+        ticket: &RepositoryChildPolicyTicket,
+        enabled: bool,
+    ) -> Result<()> {
+        let mut state = self.lock()?;
+        self.owns_child_policy(&state, ticket)?;
+        state.ready()?;
+        state.child_enabled = enabled;
+        state.child_active = None;
+        Ok(())
+    }
+
+    /// Dropped/detached work remains child-disabled, including during refresh.
+    /// A late drop cannot change a newer policy or connection lifetime.
+    pub(crate) fn mark_child_policy_indeterminate(
+        &self,
+        ticket: &RepositoryChildPolicyTicket,
+    ) -> Result<()> {
+        let mut state = self.lock()?;
+        self.owns_child_policy(&state, ticket)?;
+        if let Some(active) = &mut state.child_active {
+            active.indeterminate = true;
+        }
+        Ok(())
+    }
+
+    fn check_child_checkpoint(
+        &self,
+        state: &State,
+        checkpoint: &RepositoryChildPolicyCheckpoint,
+    ) -> Result<()> {
+        if checkpoint.epoch != self.epoch
+            || state.status == RepositoryConnectionState::Retired
+            || state.generation != checkpoint.binding.scope.connection_generation
+            || !state
+                .published
+                .as_ref()
+                .is_some_and(|p| p.binding == checkpoint.binding)
+        {
+            return Err(RepositoryCredentialError::Retired);
+        }
+        if state.child_revision != checkpoint.revision {
+            return Err(RepositoryCredentialError::StaleMutation);
+        }
+        Ok(())
+    }
+
+    fn owns_child_policy(&self, state: &State, ticket: &RepositoryChildPolicyTicket) -> Result<()> {
+        self.check_child_checkpoint(state, &ticket.checkpoint)?;
+        if state
+            .child_active
+            .as_ref()
+            .is_none_or(|a| a.revision != ticket.checkpoint.revision)
+        {
+            return Err(RepositoryCredentialError::StaleMutation);
         }
         Ok(())
     }
@@ -226,6 +354,7 @@ impl RepositoryConnectionDirectory {
         state.status = RepositoryConnectionState::Retired;
         state.reservation = None;
         state.active = None;
+        state.child_active = None;
         Ok(())
     }
 
@@ -243,6 +372,7 @@ impl RepositoryConnectionDirectory {
         state.generation = state.advance(current)?;
         state.status = RepositoryConnectionState::Disconnected;
         state.child_enabled = false;
+        state.child_active = None;
         state.reservation = None;
         Ok(true)
     }
@@ -303,6 +433,13 @@ impl RepositoryConnectionDirectory {
 }
 
 impl State {
+    fn child_idle(&self) -> Result<()> {
+        match &self.child_active {
+            Some(active) if active.indeterminate => Err(RepositoryCredentialError::Indeterminate),
+            Some(_) => Err(RepositoryCredentialError::Mutating),
+            None => Ok(()),
+        }
+    }
     fn unavailable(&self) -> RepositoryCredentialError {
         match self.status {
             RepositoryConnectionState::Unverified => RepositoryCredentialError::Unverified,
@@ -326,6 +463,7 @@ impl State {
             self.status = RepositoryConnectionState::Retired;
             self.reservation = None;
             self.active = None;
+            self.child_active = None;
             RepositoryCredentialError::CounterExhausted
         })
     }

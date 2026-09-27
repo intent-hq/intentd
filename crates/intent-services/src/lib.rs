@@ -120,7 +120,28 @@ mod repository_admission_source_tests;
 mod repository_admission_sources;
 #[cfg(test)]
 mod repository_context_reader;
-#[cfg(test)]
+#[expect(
+    dead_code,
+    unused_imports,
+    reason = "Settings and child-policy writer integration remains inactive"
+)]
+#[cfg_attr(
+    not(test),
+    expect(
+        clippy::wildcard_imports,
+        reason = "Preserve private writer imports while native and child-policy integration is pending"
+    )
+)]
+mod repository_credential_writers;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        unused_imports,
+        clippy::wildcard_imports,
+        reason = "Native credential consumers remain inactive; unit tests exercise their contracts"
+    )
+)]
 mod repository_credentials;
 
 mod agent_list_cache;
@@ -32027,6 +32048,10 @@ impl WorkspaceApi for Services {
                     // is cancelled; a terminal slot stays until the next
                     // connect replaces it (same rule as `github.cancelAuth`).
                     let mut guard = self.gitlab_auth.lock().await;
+                    let starting = guard
+                        .starting
+                        .as_ref()
+                        .is_some_and(|s| s.host == host.host());
                     let cancelled = matches!(
                         guard.flow.as_ref(),
                         Some(f) if f.host == host.host()
@@ -32035,7 +32060,10 @@ impl WorkspaceApi for Services {
                     if cancelled {
                         guard.flow = None;
                     }
-                    Ok(serde_json::json!({ "ok": true, "cancelled": cancelled }))
+                    if starting {
+                        guard.starting = None;
+                    }
+                    Ok(serde_json::json!({ "ok": true, "cancelled": cancelled || starting }))
                 }
             }
         })
@@ -32052,48 +32080,7 @@ impl WorkspaceApi for Services {
             match target {
                 source_control_auth_ops::Target::Github => self.github_revoke().await,
                 source_control_auth_ops::Target::Gitlab { host, .. } => {
-                    // Slot clear, binding read, credential read, delete and
-                    // event ride one hold of the gate: a device completion
-                    // in flight for another host cannot bind it and commit
-                    // between this call's checks, and subscribers observe
-                    // events in store order. The slot clear aborts a flow
-                    // for exactly this host (its poll task exits
-                    // cooperatively at its next tick).
-                    let _gate = self.gitlab_credential_gate.lock().await;
-                    {
-                        let mut guard = self.gitlab_auth.lock().await;
-                        if guard.flow.as_ref().is_some_and(|f| f.host == host.host()) {
-                            guard.flow = None;
-                        }
-                    }
-                    // Only the bound instance owns the stored token — read
-                    // NOW, under the gate, not at resolve time: revoking
-                    // another host is a successful no-op that never deletes
-                    // it and never emits `revoked` for it. With nothing
-                    // stored (never connected / already revoked) there is no
-                    // connection to end either: ok, no delete, no event.
-                    if self.gitlab_host_is_bound(&host) {
-                        let stored = intent_sourcecontrol::gitlab_auth::stored_credential(
-                            self.gitlab_secret_store.clone(),
-                        )
-                        .await
-                        .map_err(pr_ops::map_sc_err)?;
-                        if stored != intent_sourcecontrol::StoredCredential::None {
-                            intent_sourcecontrol::gitlab_auth::revoke_gitlab_token(
-                                self.gitlab_secret_store.clone(),
-                            )
-                            .await
-                            .map_err(pr_ops::map_sc_err)?;
-                            source_control_auth_ops::publish_auth_changed(
-                                self.event_bus.as_ref(),
-                                source_control_auth_ops::Provider::Gitlab,
-                                host.host(),
-                                "revoked",
-                            )
-                            .await;
-                        }
-                    }
-                    Ok(serde_json::json!({ "ok": true }))
+                    self.gitlab_revoke_owned(host).await
                 }
             }
         })

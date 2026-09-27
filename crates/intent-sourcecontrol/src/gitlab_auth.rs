@@ -290,6 +290,29 @@ pub async fn refresh_access_token(
 /// A caller-owned persistence lock retained by blocking writes even on timeout.
 pub type PersistenceLease = std::sync::Arc<dyn std::any::Any + Send + Sync>;
 
+/// The actual secret writer's completion, including all token siblings. A
+/// failed or panicked write may have changed part of the pair; it is not a
+/// rollback. Caller timeout is not a completion and never emits this outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitlabWriteOutcome {
+    Persisted,
+    Uncertain,
+}
+
+/// A private owner fence around the existing persistence operation. No token is
+/// exported and this observer performs no persistence or compensation itself.
+pub trait GitlabWriteObserver: Send + Sync {
+    /// Validate original ownership and retire admissions before the first write.
+    ///
+    /// # Errors
+    /// Rejects a retired original writer, before any secret effect.
+    fn before_write(&self) -> Result<()>;
+    /// Account evidence from the newly exchanged refresh token, when available.
+    fn verified_user(&self, user: Option<GitlabUser>);
+    /// Called by the actual blocking writer while its persistence lease is held.
+    fn settled(&self, outcome: GitlabWriteOutcome);
+}
+
 /// Refresh while retaining a caller's persistence lock until all writes finish.
 ///
 /// # Errors
@@ -299,6 +322,34 @@ pub async fn refresh_access_token_with_lease(
     client_id: &str,
     store: FileSecretStore,
     lease: Option<PersistenceLease>,
+) -> Result<Option<Vec<String>>> {
+    refresh_access_token_observed_inner(host, client_id, store, lease, None).await
+}
+
+/// Refresh using the existing exchange and persistence owner, with a fence that
+/// survives caller timeout. Verification failure leaves account evidence absent;
+/// it does not discard a newly rotated pair or invent an account binding.
+///
+/// # Errors
+/// As [`refresh_access_token_with_lease`], or the original writer's fence error.
+pub async fn refresh_access_token_observed(
+    host: &GitlabHost,
+    client_id: &str,
+    store: FileSecretStore,
+    lease: PersistenceLease,
+    observer: std::sync::Arc<dyn GitlabWriteObserver>,
+) -> Result<()> {
+    refresh_access_token_observed_inner(host, client_id, store, Some(lease), Some(observer))
+        .await
+        .map(|_| ())
+}
+
+async fn refresh_access_token_observed_inner(
+    host: &GitlabHost,
+    client_id: &str,
+    store: FileSecretStore,
+    lease: Option<PersistenceLease>,
+    observer: Option<std::sync::Arc<dyn GitlabWriteObserver>>,
 ) -> Result<Option<Vec<String>>> {
     let client_id = client_id.trim();
     if client_id.is_empty() {
@@ -336,6 +387,9 @@ pub async fn refresh_access_token_with_lease(
             }
         }
     };
+    if let Some(observer) = &observer {
+        observer.before_write()?;
+    }
     let client = http_client()?;
     let response = client
         .post(format!("{}/oauth/token", host.base_url()))
@@ -376,12 +430,16 @@ pub async fn refresh_access_token_with_lease(
         } => {
             // Doorkeeper always rotates; keep the old one only if the body
             // somehow omitted a replacement so the next refresh can still try.
-            persist_tokens_with_lease(
+            if let Some(observer) = &observer {
+                observer.verified_user(validate_pat(host, access_token.expose_secret()).await.ok());
+            }
+            persist_tokens_observed(
                 store,
                 access_token,
                 Some(rotated.unwrap_or(refresh_token)),
                 expires_in.map(|secs| unix_now().saturating_add(secs)),
                 lease,
+                observer,
             )
             .await?;
             Ok(body
@@ -533,6 +591,26 @@ impl GitlabGrant {
             self.refresh_token,
             self.expires_at,
             lease,
+        )
+        .await
+    }
+
+    /// Commit through the existing blocking writer with original-owner fencing.
+    ///
+    /// # Errors
+    /// Returns a stale-owner or bounded secret-write error.
+    pub async fn commit_observed(
+        self,
+        lease: PersistenceLease,
+        observer: std::sync::Arc<dyn GitlabWriteObserver>,
+    ) -> Result<()> {
+        persist_tokens_observed(
+            self.store,
+            self.access_token,
+            self.refresh_token,
+            self.expires_at,
+            Some(lease),
+            Some(observer),
         )
         .await
     }
@@ -1075,9 +1153,32 @@ async fn persist_tokens_with_lease(
     expires_at: Option<u64>,
     lease: Option<PersistenceLease>,
 ) -> Result<()> {
-    run_blocking(
+    persist_tokens_observed(store, token, refresh_token, expires_at, lease, None).await
+}
+
+/// Persist a validated PAT through the existing writer and its settled callback.
+///
+/// # Errors
+/// As [`persist_gitlab_token`], or the original writer's fence error.
+pub async fn persist_gitlab_token_observed(
+    store: FileSecretStore,
+    token: SecretString,
+    lease: PersistenceLease,
+    observer: std::sync::Arc<dyn GitlabWriteObserver>,
+) -> Result<()> {
+    persist_tokens_observed(store, token, None, None, Some(lease), Some(observer)).await
+}
+
+async fn persist_tokens_observed(
+    store: FileSecretStore,
+    token: SecretString,
+    refresh_token: Option<SecretString>,
+    expires_at: Option<u64>,
+    lease: Option<PersistenceLease>,
+    observer: Option<std::sync::Arc<dyn GitlabWriteObserver>>,
+) -> Result<()> {
+    run_blocking_observed(
         move || {
-            let _lease = lease;
             store.store(SECRET_ACCOUNT, token.expose_secret())?;
             match refresh_token {
                 Some(refresh) => store.store(REFRESH_SECRET_ACCOUNT, refresh.expose_secret())?,
@@ -1089,6 +1190,9 @@ async fn persist_tokens_with_lease(
             }
         },
         "persist",
+        SECRET_WRITE_TIMEOUT,
+        lease,
+        observer,
     )
     .await
 }
@@ -1102,24 +1206,91 @@ async fn persist_tokens_with_lease(
 ///
 /// Returns [`Error::Api`] when the delete fails or times out.
 pub async fn revoke_gitlab_token(store: FileSecretStore) -> Result<()> {
-    run_blocking(
+    revoke_gitlab_token_inner(store, None, None).await
+}
+
+/// Delete the stored pair while retaining the existing persistence lock.
+///
+/// # Errors
+/// As [`revoke_gitlab_token`].
+pub async fn revoke_gitlab_token_with_lease(
+    store: FileSecretStore,
+    lease: PersistenceLease,
+) -> Result<()> {
+    revoke_gitlab_token_inner(store, Some(lease), None).await
+}
+
+/// Delete the pair through the existing writer with original-owner fencing.
+///
+/// # Errors
+/// As [`revoke_gitlab_token`], or the original writer's fence error.
+pub async fn revoke_gitlab_token_observed(
+    store: FileSecretStore,
+    lease: PersistenceLease,
+    observer: std::sync::Arc<dyn GitlabWriteObserver>,
+) -> Result<()> {
+    revoke_gitlab_token_inner(store, Some(lease), Some(observer)).await
+}
+
+async fn revoke_gitlab_token_inner(
+    store: FileSecretStore,
+    lease: Option<PersistenceLease>,
+    observer: Option<std::sync::Arc<dyn GitlabWriteObserver>>,
+) -> Result<()> {
+    run_blocking_observed(
         move || {
             store.delete(SECRET_ACCOUNT)?;
             store.delete(REFRESH_SECRET_ACCOUNT)?;
             store.delete(EXPIRES_AT_SECRET_ACCOUNT)
         },
         "delete",
+        SECRET_WRITE_TIMEOUT,
+        lease,
+        observer,
     )
     .await
 }
 
-async fn run_blocking<F>(write: F, what: &str) -> Result<()>
+struct ObservedWrite {
+    observer: Option<std::sync::Arc<dyn GitlabWriteObserver>>,
+}
+impl Drop for ObservedWrite {
+    fn drop(&mut self) {
+        if let Some(observer) = self.observer.take() {
+            observer.settled(GitlabWriteOutcome::Uncertain);
+        }
+    }
+}
+
+async fn run_blocking_observed<F>(
+    write: F,
+    what: &'static str,
+    budget: std::time::Duration,
+    lease: Option<PersistenceLease>,
+    observer: Option<std::sync::Arc<dyn GitlabWriteObserver>>,
+) -> Result<()>
 where
     F: FnOnce() -> intent_core::Result<()> + Send + 'static,
 {
-    match timeout(SECRET_WRITE_TIMEOUT, tokio::task::spawn_blocking(write)).await {
+    let task = tokio::task::spawn_blocking(move || {
+        let _lease = lease;
+        if let Some(observer) = &observer {
+            observer.before_write()?;
+        }
+        let mut completion = ObservedWrite { observer };
+        let result = write();
+        if let Some(observer) = completion.observer.take() {
+            observer.settled(if result.is_ok() {
+                GitlabWriteOutcome::Persisted
+            } else {
+                GitlabWriteOutcome::Uncertain
+            });
+        }
+        result.map_err(|e| Error::Api(format!("could not {what} gitlab token: {e}")))
+    });
+    match timeout(budget, task).await {
         Ok(Ok(Ok(()))) => Ok(()),
-        Ok(Ok(Err(e))) => Err(Error::Api(format!("could not {what} gitlab token: {e}"))),
+        Ok(Ok(Err(e))) => Err(e),
         Ok(Err(join_err)) => Err(Error::Api(format!(
             "secret-store {what} task failed: {join_err}"
         ))),
@@ -1140,6 +1311,10 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
 
     use super::*;
+
+    mod write_observer_tests {
+        include!("gitlab_auth/write_observer_tests.rs");
+    }
 
     // ---- host normalization -------------------------------------------------
 
