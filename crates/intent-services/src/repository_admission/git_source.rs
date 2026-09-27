@@ -155,7 +155,14 @@ impl RepositoryGitSource {
 
     pub(super) async fn check_root(&self) -> AdmissionResult<()> {
         self.retirement.check_current()?;
-        if RootRecord::read(&self.store, &self.record.root).await? != self.record {
+        let current = RootRecord::read(&self.store, &self.record.root)
+            .await
+            .inspect_err(|error| {
+                if matches!(error, AdmissionError::Denied | AdmissionError::Retired) {
+                    self.retirement.retire();
+                }
+            })?;
+        if current != self.record {
             self.retirement.retire();
             return Err(AdmissionError::BindingChanged);
         }

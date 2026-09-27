@@ -712,3 +712,246 @@ async fn internal_workspace_recreation_is_detected_without_a_human_generation() 
     .await
     .unwrap();
 }
+
+async fn assert_observed_root_denial_is_permanent(pending_delete: bool) {
+    let f = Fixture::new().await;
+    let services = Services::new(f.store.clone());
+    let fixture = &f;
+    let service = &services;
+    with_repository_source(
+        &services,
+        owner(&f, false).await,
+        "root-denied".into(),
+        vec![NativeReviewStage::Commit],
+        input(&f),
+        RepositoryRetirement::default(),
+        |admission| async move {
+            let checked = revalidate_repository_stage(&admission, NativeReviewStage::Commit)
+                .await
+                .unwrap();
+            if pending_delete {
+                service.pending_workspace_deletes.schedule(
+                    fixture.workspace.id.to_string(),
+                    "2026-09-27T01:00:00Z".into(),
+                    |_| tokio::spawn(async {}),
+                );
+            } else {
+                fixture
+                    .store
+                    .archive_workspace_detaching_guests(
+                        &fixture.workspace.id,
+                        "2026-09-27T01:00:00Z",
+                    )
+                    .await
+                    .unwrap();
+            }
+            let observed = revalidate_repository_stage(&admission, NativeReviewStage::Commit).await;
+            if pending_delete {
+                assert!(service
+                    .pending_workspace_deletes
+                    .cancel(fixture.workspace.id.as_str()));
+            } else {
+                assert!(fixture
+                    .store
+                    .unarchive_workspace_if_archived(&fixture.workspace.id, "2026-09-27T01:01:00Z",)
+                    .await
+                    .unwrap());
+            }
+            assert!(matches!(observed, Err(AdmissionError::Denied)));
+            assert!(matches!(
+                revalidate_repository_stage(&admission, NativeReviewStage::Commit).await,
+                Err(AdmissionError::Retired)
+            ));
+            assert!(matches!(
+                begin_repository_stage(checked),
+                Err(AdmissionError::Retired)
+            ));
+            assert!(admission.execution().unwrap().git_receipts.is_empty());
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    // Restoration can admit a fresh request, never refresh the old lifetime.
+    with_repository_source(
+        &services,
+        owner(&f, false).await,
+        "fresh-after-root-restore".into(),
+        vec![NativeReviewStage::Commit],
+        input(&f),
+        RepositoryRetirement::default(),
+        |admission| async move {
+            assert!(
+                revalidate_repository_stage(&admission, NativeReviewStage::Commit)
+                    .await
+                    .is_ok()
+            );
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn observed_archive_denial_retires_same_request_and_checked_handle_after_restore() {
+    assert_observed_root_denial_is_permanent(false).await;
+}
+
+#[tokio::test]
+async fn observed_pending_delete_denial_retires_same_request_and_checked_handle_after_cancel() {
+    assert_observed_root_denial_is_permanent(true).await;
+}
+
+#[tokio::test]
+async fn observed_detached_ref_mismatch_retires_same_request_after_restore() {
+    let owned = Fixture::new().await;
+    let f = &owned;
+    let services = Services::new(f.store.clone());
+    with_repository_source(
+        &services,
+        owner(f, false).await,
+        "detached-ref".into(),
+        vec![NativeReviewStage::Commit],
+        input(f),
+        RepositoryRetirement::default(),
+        |admission| async move {
+            let checked = revalidate_repository_stage(&admission, NativeReviewStage::Commit)
+                .await
+                .unwrap();
+            f.git(&f.path, &["checkout", "--detach", "main"]);
+            let observed = revalidate_repository_stage(&admission, NativeReviewStage::Commit).await;
+            f.git(&f.path, &["checkout", "main"]);
+            assert!(matches!(observed, Err(AdmissionError::BindingChanged)));
+            assert!(matches!(
+                revalidate_repository_stage(&admission, NativeReviewStage::Commit).await,
+                Err(AdmissionError::Retired)
+            ));
+            assert!(matches!(
+                begin_repository_stage(checked),
+                Err(AdmissionError::Retired)
+            ));
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    with_repository_source(
+        &services,
+        owner(f, false).await,
+        "fresh-after-ref-restore".into(),
+        vec![NativeReviewStage::Commit],
+        input(f),
+        RepositoryRetirement::default(),
+        |admission| async move {
+            assert!(
+                revalidate_repository_stage(&admission, NativeReviewStage::Commit)
+                    .await
+                    .is_ok()
+            );
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn retryable_root_and_git_read_unavailability_preserves_same_request_after_recovery() {
+    for missing_path in [false, true] {
+        let f = Fixture::new().await;
+        let services = Services::new(f.store.clone());
+        let retirement = RepositoryRetirement::default();
+        with_repository_source(
+            &services,
+            owner(&f, false).await,
+            "unavailable".into(),
+            vec![NativeReviewStage::Commit],
+            input(&f),
+            retirement.clone(),
+            |admission| async move {
+                let config = f.path.join(".git/config");
+                let original = std::fs::read(&config).unwrap();
+                let moved = f.dir.path().join("temporarily-unavailable");
+                if missing_path {
+                    std::fs::rename(&f.path, &moved).unwrap();
+                } else {
+                    std::fs::write(&config, "[malformed\n").unwrap();
+                }
+                let observed =
+                    revalidate_repository_stage(&admission, NativeReviewStage::Commit).await;
+                if missing_path {
+                    std::fs::rename(&moved, &f.path).unwrap();
+                } else {
+                    std::fs::write(&config, original).unwrap();
+                }
+                assert!(matches!(observed, Err(AdmissionError::Unavailable)));
+                assert_eq!(retirement.check_current(), Ok(()));
+                assert!(
+                    revalidate_repository_stage(&admission, NativeReviewStage::Commit)
+                        .await
+                        .is_ok()
+                );
+                assert!(admission.execution().unwrap().git_receipts.is_empty());
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn completed_commit_survives_observed_archive_denial_without_publication() {
+    let f = Fixture::new().await;
+    let services = Services::new(f.store.clone());
+    with_repository_source(
+        &services,
+        owner(&f, false).await,
+        "commit-before-archive".into(),
+        vec![NativeReviewStage::Commit, NativeReviewStage::Push],
+        input(&f),
+        RepositoryRetirement::default(),
+        |admission| async move {
+            let stamp = begin_repository_stage(
+                revalidate_repository_stage(&admission, NativeReviewStage::Commit)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            let next = {
+                let repo = git2::Repository::open(&f.path).unwrap();
+                let parent = repo.head().unwrap().peel_to_commit().unwrap();
+                let signature = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
+                let tree = parent.tree().unwrap();
+                repo.commit(Some("HEAD"), &signature, &signature, "local fixture commit", &tree, &[&parent])
+                    .unwrap()
+                    .to_string()
+            };
+            classify_repository_completion(
+                stamp,
+                RepositoryCompletion::Committed { hash: next.clone(), staging_after: None },
+            )
+            .unwrap();
+            let checked = revalidate_repository_stage(&admission, NativeReviewStage::Push)
+                .await
+                .unwrap();
+            f.store.archive_workspace_detaching_guests(&f.workspace.id, "2026-09-27T01:00:00Z")
+                .await.unwrap();
+            assert!(matches!(
+                revalidate_repository_stage(&admission, NativeReviewStage::Push).await,
+                Err(AdmissionError::Denied)
+            ));
+            f.store.unarchive_workspace_if_archived(&f.workspace.id, "2026-09-27T01:01:00Z")
+                .await.unwrap();
+            assert!(matches!(begin_repository_stage(checked), Err(AdmissionError::Retired)));
+            let result = admission.fail_before_dispatch(NativeReviewStage::Push, AdmissionError::Denied).unwrap();
+            assert!(matches!(result.git_receipts.as_slice(), [NativeReviewGitReceipt::Commit { commit_hash }] if commit_hash == &next));
+            assert!(matches!(result.outcome, NativeReviewOutcome::Failed { stage: NativeReviewStage::Push, .. }));
+            assert!(matches!(result.publication, NativeReviewPublication::Unknown { local_head_sha: Some(ref sha), remote_source_sha: None } if sha == &next));
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+}

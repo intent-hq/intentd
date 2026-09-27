@@ -256,6 +256,24 @@ struct RepositorySource {
     environment: GitConfigEnvironment,
 }
 
+impl RepositorySource {
+    fn check_workspace_lifetime(&self) -> AdmissionResult<()> {
+        self.retirement.check_current()?;
+        // Pending deletion is a Services-owned observation; Store rows do not
+        // contain the projected deadline. Cancellation never revives this leaf.
+        if self
+            .services
+            .pending_workspace_deletes
+            .deadline(self.workspace.as_str())
+            .is_some()
+        {
+            self.retirement.retire();
+            return Err(AdmissionError::Denied);
+        }
+        Ok(())
+    }
+}
+
 impl RepositoryAuthoritySource for RepositorySource {
     fn read<'a>(
         &'a self,
@@ -263,6 +281,7 @@ impl RepositoryAuthoritySource for RepositorySource {
         workspace: &'a WorkspaceId,
     ) -> BoxFuture<'a, AdmissionResult<RepositoryAuthorityFacts>> {
         Box::pin(async move {
+            self.check_workspace_lifetime()?;
             if original.caller() != &self.caller
                 || workspace != &self.workspace
                 || !same_wire(original.wire_credential(), self.wire.as_ref())
@@ -288,6 +307,7 @@ impl RepositoryAuthoritySource for RepositorySource {
                 return Err(AdmissionError::Retired);
             }
             self.git.check_root().await?;
+            self.check_workspace_lifetime()?;
             Ok(facts)
         })
     }
@@ -299,6 +319,7 @@ impl RepositoryOperationSource for RepositorySource {
         original: &'a RepositoryOperationFacts,
     ) -> BoxFuture<'a, AdmissionResult<RepositoryOperationFacts>> {
         Box::pin(async move {
+            self.check_workspace_lifetime()?;
             let context = RepositoryContextInput {
                 scope: self.context.scope.clone(),
                 revision: self.context.revision.clone(),
@@ -320,9 +341,24 @@ impl RepositoryOperationSource for RepositorySource {
                 system_config: self.environment.system_config.clone(),
                 extra_config_paths: self.environment.extra_config_paths.clone(),
             };
-            self.git
+            let observed = self
+                .git
                 .observe_operation(original, context, self.resolver.clone(), environment)
                 .await
+                .inspect_err(|error| {
+                    // Early typed errors never reach the engine's full-facts
+                    // comparison. Preserve its permanent-binding semantics here.
+                    if matches!(
+                        error,
+                        AdmissionError::Denied
+                            | AdmissionError::Retired
+                            | AdmissionError::BindingChanged
+                    ) {
+                        self.retirement.retire();
+                    }
+                })?;
+            self.check_workspace_lifetime()?;
+            Ok(observed)
         })
     }
 }
