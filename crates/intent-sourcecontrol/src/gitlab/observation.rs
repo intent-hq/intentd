@@ -157,7 +157,13 @@ impl GitLabSourceControl {
         let (approvals, mut approvals_state) = self
             .optional_get(&format!("{}/approvals", mr(repo, number)))
             .await?;
-        let (checks, checks_state) = self.mr_checks(repo, number, &head, policy.as_ref()).await?;
+        let (checks, checks_state) = if policy_state == ProviderAvailability::RateLimited {
+            // Quota prevented project corroboration. Keep the partial observation
+            // without constructing a numeric pipeline request from missing proof.
+            (vec![], ProviderAvailability::RateLimited)
+        } else {
+            self.mr_checks(repo, number, &head, policy.as_ref()).await?
+        };
         let reviews = approvals.as_ref().and_then(|v| {
             if let Ok(reviews) = approval_reviews(v) {
                 Some(reviews)

@@ -2,6 +2,7 @@ use std::fmt::Write as _;
 use std::sync::atomic::Ordering;
 use std::{future::Future, pin::Pin};
 
+use intent_sourcecontrol::model::ProviderAvailability;
 use intent_sourcecontrol::{
     error::ProviderFailureKind, gitlab::GitlabCredentialRequest, Error, GitlabInstance,
     GitlabRequestCredentials, NewPullRequest, RepoRef, ReviewBranchIdentity, SourceControl,
@@ -1388,13 +1389,19 @@ async fn http_admission_early_optional_quota_blocks_follow_up_without_auth_denia
         }
     });
     let provider = server.provider(RepositoryCredentialUse::NativeReviewCreate);
-    let error = provider.observe_review(&repo(), 4).await.unwrap_err();
+    let result = provider.observe_review(&repo(), 4).await.unwrap();
     // Approval quota is observed before degradation. The later discussion request
-    // is locally refused; neither an extra HTTP attempt nor a logout is allowed.
-    assert!(matches!(
-        error,
-        Error::AdmissionUnavailable(intent_sourcecontrol::error::AdmissionUnavailable::Backoff)
-    ));
+    // is locally refused, while the fetched primary and policy remain available.
+    assert_eq!(result.details.review.title, "actual title");
+    assert!(result.signals.branch_rules.is_some());
+    assert_eq!(
+        result.availability.approvals,
+        ProviderAvailability::RateLimited
+    );
+    assert_eq!(
+        result.availability.discussions,
+        ProviderAvailability::RateLimited
+    );
     assert!(server
         .test
         .directory
@@ -1408,6 +1415,264 @@ async fn http_admission_early_optional_quota_blocks_follow_up_without_auth_denia
         provider.rate_limit_status().await.unwrap().remaining,
         Some(0)
     );
+}
+
+// These use the actual managed provider with the injected Test authority/reader.
+// Every MR has a valid numeric pipeline, including the policy-quota case where
+// its project corroboration is unavailable and no jobs request may be invented.
+fn optional_quota_reply(path: &str, quota_at: usize) -> Reply {
+    if path.ends_with("/merge_requests/4") {
+        let mut review = mr();
+        review["head_pipeline"] = json!({"id":9,"project_id":41,"status":"success"});
+        return Reply::ok(review);
+    }
+    let (index, body) = if path.ends_with("team%2Fsub%2Fproject") {
+        (0, project())
+    } else if path.ends_with("/approvals") {
+        (
+            1,
+            json!({"approvals_required":0,"approvals_left":0,"approved_by":[]}),
+        )
+    } else if path.contains("/projects/41/pipelines/9/jobs") {
+        (2, json!([]))
+    } else {
+        assert!(path.contains("/discussions"), "unexpected fixture endpoint");
+        (3, json!([]))
+    };
+    if index == quota_at {
+        Reply {
+            status: 429,
+            body: json!({}),
+            next: None,
+        }
+    } else {
+        Reply::ok(body)
+    }
+}
+
+async fn optional_quota_server(quota_at: usize) -> Server {
+    let server = Server::new().await;
+    server
+        .headers
+        .lock()
+        .unwrap()
+        .push(("retry-after".into(), "120".into()));
+    *server.handler.lock().unwrap() = Box::new(move |_, path| optional_quota_reply(path, quota_at));
+    server
+}
+
+async fn assert_optional_quota_partial(quota_at: usize) {
+    let server = optional_quota_server(quota_at).await;
+    let original_binding = server.test.directory.binding().unwrap();
+    let provider = server.provider(RepositoryCredentialUse::NativeReviewCreate);
+    let result = provider.observe_review(&repo(), 4).await.unwrap();
+    assert_eq!(result.details.review.title, "actual title");
+    assert_eq!(result.details.source.as_ref().unwrap().project_id, 41);
+    assert_eq!(result.details.target.as_ref().unwrap().project_id, 41);
+    assert_eq!(result.details.confirmed_draft, Some(false));
+    assert_eq!(
+        result.details.confirmed_state,
+        Some(intent_sourcecontrol::model::ConfirmedReviewState::Open)
+    );
+    for (index, availability) in [
+        result.availability.policy,
+        result.availability.approvals,
+        result.availability.checks,
+        result.availability.discussions,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(
+            availability,
+            if index < quota_at {
+                ProviderAvailability::Available
+            } else {
+                ProviderAvailability::RateLimited
+            }
+        );
+    }
+    assert_eq!(result.signals.branch_rules.is_some(), quota_at > 0);
+    assert_eq!(result.reviews.is_some(), quota_at > 1);
+    assert_eq!(result.signals.checks_known, quota_at > 2);
+    assert!(result.threads.is_none());
+    assert!(result.conversation_count.is_none());
+    let deadline = server.test.directory.lock().unwrap().backoff_until.unwrap();
+    assert!(deadline > Instant::now());
+    assert_eq!(server.test.directory.binding().unwrap(), original_binding);
+    assert_eq!(*server.test.secrets.value.lock().unwrap(), "token-old");
+    assert_eq!(server.seen.lock().unwrap().len(), quota_at + 2);
+    assert_eq!(
+        server.test.secrets.calls.load(Ordering::SeqCst),
+        quota_at + 2
+    );
+    assert_eq!(
+        provider.rate_limit_status().await.unwrap().remaining,
+        Some(0)
+    );
+    // A new primary read has no fetched data to preserve and remains a local refusal.
+    assert!(matches!(
+        provider.observe_review(&repo(), 4).await,
+        Err(Error::AdmissionUnavailable(
+            intent_sourcecontrol::error::AdmissionUnavailable::Backoff
+        ))
+    ));
+    assert_eq!(server.seen.lock().unwrap().len(), quota_at + 2);
+    assert_eq!(
+        server.test.directory.lock().unwrap().backoff_until,
+        Some(deadline)
+    );
+}
+
+#[tokio::test]
+async fn http_admission_optional_policy_quota_retains_partial_with_numeric_pipeline() {
+    assert_optional_quota_partial(0).await;
+}
+
+#[tokio::test]
+async fn http_admission_optional_approvals_quota_retains_partial_with_numeric_pipeline() {
+    assert_optional_quota_partial(1).await;
+}
+
+#[tokio::test]
+async fn http_admission_optional_checks_quota_retains_partial_with_numeric_pipeline() {
+    assert_optional_quota_partial(2).await;
+}
+
+#[tokio::test]
+async fn http_admission_optional_discussions_quota_retains_partial_with_numeric_pipeline() {
+    assert_optional_quota_partial(3).await;
+}
+
+#[tokio::test]
+async fn http_admission_optional_quota_legacy_projections_remain_rate_limited() {
+    for quota_at in 0..4 {
+        for projection in 0..4 {
+            let server = optional_quota_server(quota_at).await;
+            let provider = server.provider(RepositoryCredentialUse::NativeReviewCreate);
+            let result = match projection {
+                0 => provider.review_decision(&repo(), 4).await.map(|_| ()),
+                1 => provider.merge_requirements(&repo(), 4).await.map(|_| ()),
+                2 => provider.mergeability(&repo(), 4).await.map(|_| ()),
+                _ => provider.pr_observation(&repo(), 4).await.map(|_| ()),
+            };
+            assert!(
+                matches!(result, Err(Error::RateLimited(_))),
+                "quota endpoint {quota_at}, projection {projection}: {result:?}"
+            );
+            assert_eq!(server.seen.lock().unwrap().len(), quota_at + 2);
+            assert!(server.test.directory.binding().is_ok());
+            assert!(server
+                .test
+                .directory
+                .lock()
+                .unwrap()
+                .backoff_until
+                .is_some());
+        }
+    }
+}
+
+#[tokio::test]
+async fn http_admission_optional_quota_does_not_hide_retirement_or_replacement() {
+    for quota_at in 0..3 {
+        for replace in [false, true] {
+            let server = optional_quota_server(quota_at).await;
+            let test = server.test.clone();
+            *server.handler.lock().unwrap() = Box::new(move |_, path| {
+                let reply = optional_quota_reply(path, quota_at);
+                if reply.status == 429 {
+                    if replace {
+                        test.replace(test.verified.clone());
+                    } else {
+                        test.directory.retire().unwrap();
+                    }
+                }
+                reply
+            });
+            let error = server
+                .provider(RepositoryCredentialUse::NativeReviewCreate)
+                .observe_review(&repo(), 4)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::AdmissionRetired), "{error:?}");
+            assert_eq!(server.seen.lock().unwrap().len(), quota_at + 2);
+            assert_eq!(*server.test.secrets.value.lock().unwrap(), "token-old");
+            if replace {
+                assert!(server.test.directory.binding().is_ok());
+                assert!(server
+                    .test
+                    .directory
+                    .lock()
+                    .unwrap()
+                    .backoff_until
+                    .is_none());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn http_admission_optional_nonquota_policy_failure_still_requires_numeric_proof() {
+    let server = Server::new().await;
+    *server.handler.lock().unwrap() = Box::new(|_, path| {
+        if path.ends_with("team%2Fsub%2Fproject") {
+            return Reply {
+                status: 503,
+                body: json!({}),
+                next: None,
+            };
+        }
+        optional_quota_reply(path, usize::MAX)
+    });
+    let error = server
+        .provider(RepositoryCredentialUse::NativeReviewCreate)
+        .observe_review(&repo(), 4)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        Error::AdmissionUnavailable(
+            intent_sourcecontrol::error::AdmissionUnavailable::BoundaryMismatch
+        )
+    ));
+    // Missing policy from a non-quota failure is not an excuse to bypass proof.
+    assert_eq!(server.seen.lock().unwrap().len(), 3);
+    assert!(server.test.directory.binding().is_ok());
+    assert!(server
+        .test
+        .directory
+        .lock()
+        .unwrap()
+        .backoff_until
+        .is_none());
+}
+
+#[tokio::test]
+async fn http_admission_optional_authority_retirement_remains_fatal() {
+    let server = Server::new().await;
+    let authority = server.test.authority.clone();
+    *server.handler.lock().unwrap() = Box::new(move |_, path| {
+        if path.ends_with("team%2Fsub%2Fproject") {
+            *authority.revision.lock().unwrap() += 1;
+        }
+        optional_quota_reply(path, usize::MAX)
+    });
+    let error = server
+        .provider(RepositoryCredentialUse::NativeReviewCreate)
+        .observe_review(&repo(), 4)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::AdmissionRetired));
+    assert_eq!(server.seen.lock().unwrap().len(), 2);
+    assert!(server.test.directory.binding().is_ok());
+    assert!(server
+        .test
+        .directory
+        .lock()
+        .unwrap()
+        .backoff_until
+        .is_none());
 }
 
 struct FaultyAdmission {

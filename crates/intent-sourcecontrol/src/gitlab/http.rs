@@ -1,4 +1,6 @@
 //! Request boundary: injected credentials per request, no redirects or body-bearing errors.
+use crate::error::AdmissionUnavailable;
+
 use super::{
     project, Error, GitLabSourceControl, HeaderMap, Method, ProviderAvailability, ProviderFailure,
     ProviderFailureKind, RepoRef, RequestProvenance, Result, Value, MAX_RESPONSE_BYTES,
@@ -221,7 +223,9 @@ pub(super) fn availability(error: &Error) -> ProviderAvailability {
             kind: ProviderFailureKind::Transient,
             ..
         }) => ProviderAvailability::Transient,
-        Error::RateLimited(_) => ProviderAvailability::RateLimited,
+        Error::RateLimited(_) | Error::AdmissionUnavailable(AdmissionUnavailable::Backoff) => {
+            ProviderAvailability::RateLimited
+        }
         _ => ProviderAvailability::Unknown,
     }
 }
@@ -230,6 +234,7 @@ pub(super) fn optional_failure(error: &Error) -> bool {
     matches!(
         error,
         Error::RateLimited(_)
+            | Error::AdmissionUnavailable(AdmissionUnavailable::Backoff)
             | Error::Decode(_)
             | Error::Unsupported(_)
             | Error::Provider(ProviderFailure {
