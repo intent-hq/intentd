@@ -92,7 +92,7 @@ impl Fixture {
     }
 }
 
-pub(super) fn resolver() -> CanonicalRemoteResolver {
+pub(crate) fn resolver() -> CanonicalRemoteResolver {
     CanonicalRemoteResolver::new(vec![RemoteInstance::github_com()], Vec::new()).unwrap()
 }
 

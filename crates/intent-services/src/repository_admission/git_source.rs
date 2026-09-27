@@ -20,7 +20,9 @@ use crate::repository_context_reader::{
     RepositoryContextInput, RepositoryContextRead,
 };
 
-use super::{AdmissionError, AdmissionResult, RepositoryOperationFacts, RepositoryRetirement};
+use crate::repository_admission::{
+    AdmissionError, AdmissionResult, RepositoryOperationFacts, RepositoryRetirement,
+};
 
 /// Store identity used to detect changed records around waits and Git reads.
 /// Creation timestamps are compared as facts, not claimed to be ABA counters.
@@ -151,7 +153,7 @@ impl RepositoryGitSource {
         result
     }
 
-    async fn check_root(&self) -> AdmissionResult<()> {
+    pub(super) async fn check_root(&self) -> AdmissionResult<()> {
         self.retirement.check_current()?;
         if RootRecord::read(&self.store, &self.record.root).await? != self.record {
             self.retirement.retire();

@@ -9,5 +9,4 @@ use crate::repository_admission::{
 pub(crate) mod fixtures;
 #[path = "source_tests/git.rs"]
 mod git;
-#[path = "git_source.rs"]
-mod git_source;
+use crate::repository_admission_git_source as git_source;

@@ -10,7 +10,7 @@ use intent_core::caller::{
     current_caller, current_wire_credential, Caller, CredentialLease, WireCredential,
 };
 use intent_core::{
-    BoxFuture, HostRole, NativeReviewStage, PrincipalCredential, PrincipalId, WorkspaceId,
+    AgentId, BoxFuture, HostRole, NativeReviewStage, PrincipalCredential, PrincipalId, WorkspaceId,
     WorkspaceRole,
 };
 
@@ -64,7 +64,7 @@ impl OriginalRepositoryCaller {
         self.credential.as_ref()
     }
 
-    pub(super) async fn legacy_lease(&self) -> AdmissionResult<Option<CredentialLease>> {
+    pub(crate) async fn legacy_lease(&self) -> AdmissionResult<Option<CredentialLease>> {
         match self.credential.as_ref() {
             Some(WireCredential::Legacy { authority, .. }) => authority
                 .authorize()
@@ -80,7 +80,7 @@ impl OriginalRepositoryCaller {
         }
     }
 
-    pub(super) fn verify(
+    pub(crate) fn verify(
         &self,
         facts: &RepositoryAuthorityFacts,
         workspace: &WorkspaceId,
@@ -129,8 +129,31 @@ impl OriginalRepositoryCaller {
     }
 }
 
-/// A bounded store read, injected here. Generation must include durable removal
-/// and re-addition provenance; equality of current roles alone is insufficient.
+/// Private continuity evidence. Store revisions remain independent and retain
+/// tombstones; no process-local scalar, timestamp or hash substitutes for them.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum RepositoryAuthorityProvenance {
+    Store(Box<intent_store::RepositoryAuthoritySnapshot>),
+    Internal {
+        workspace: Box<intent_store::RepositoryWorkspaceAuthoritySnapshot>,
+        agent: Option<RepositoryAgentIdentity>,
+    },
+    #[cfg(test)]
+    Injected(u64),
+}
+
+/// Actual session identity, not a generation or permission grant. Agent writer
+/// hooks must retire the separately supplied lifetime even for an ABA change.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct RepositoryAgentIdentity {
+    pub id: AgentId,
+    pub workspace_id: WorkspaceId,
+    pub parent_agent_id: Option<AgentId>,
+    pub backend_session_id: Option<AgentId>,
+    pub acp_session_id: Option<String>,
+}
+
+/// Fresh bounded authority facts; current roles alone cannot prove continuity.
 #[derive(Clone)]
 pub(crate) struct RepositoryAuthorityFacts {
     pub caller: Caller,
@@ -139,7 +162,7 @@ pub(crate) struct RepositoryAuthorityFacts {
     pub primary_principal_id: Option<PrincipalId>,
     pub workspace_role: Option<WorkspaceRole>,
     pub credential: Option<PrincipalCredential>,
-    pub generation: u64,
+    pub provenance: RepositoryAuthorityProvenance,
     /// Explicit internal permissions, never borrowed from a human Owner caller.
     pub internal_stages: Vec<NativeReviewStage>,
 }
@@ -164,7 +187,7 @@ impl RepositoryAuthorityFacts {
             workspace: self.workspace.clone(),
             primary_principal_id: self.primary_principal_id.clone(),
             workspace_role: self.workspace_role,
-            generation: self.generation,
+            provenance: self.provenance.clone(),
             internal_stages: self.internal_stages.clone(),
         }
     }
@@ -176,7 +199,7 @@ pub(super) struct AuthorityIdentity {
     workspace: WorkspaceId,
     primary_principal_id: Option<PrincipalId>,
     workspace_role: Option<WorkspaceRole>,
-    generation: u64,
+    provenance: RepositoryAuthorityProvenance,
     internal_stages: Vec<NativeReviewStage>,
 }
 

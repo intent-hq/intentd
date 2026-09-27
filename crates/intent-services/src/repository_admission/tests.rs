@@ -122,7 +122,7 @@ impl Rig {
                 last_used_at: None,
                 revoked_at: None,
             }),
-            generation: 9_007_199_254_740_993,
+            provenance: RepositoryAuthorityProvenance::Injected(9_007_199_254_740_993),
             internal_stages: Vec::new(),
         };
         Self {
@@ -376,7 +376,7 @@ async fn role_changes_and_remove_readd_do_not_reuse_old_authority() {
                     host_role: HostRole::Owner,
                 }
             }
-            1 => facts.generation += 2,
+            1 => advance_injected_provenance(facts),
             _ => facts.workspace_role = Some(WorkspaceRole::Owner),
         });
         assert!(matches!(
@@ -915,4 +915,11 @@ async fn transient_durable_read_failure_is_not_provider_denial_or_logout() {
             .await
             .is_ok()
     );
+}
+
+fn advance_injected_provenance(facts: &mut RepositoryAuthorityFacts) {
+    let RepositoryAuthorityProvenance::Injected(value) = &mut facts.provenance else {
+        panic!("fixture expects injected provenance");
+    };
+    *value += 2;
 }

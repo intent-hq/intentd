@@ -11,7 +11,8 @@ mod authority;
 mod credential_bridge;
 
 pub(crate) use authority::{
-    OriginalRepositoryCaller, RepositoryAuthorityFacts, RepositoryAuthoritySource, RepositoryEntry,
+    OriginalRepositoryCaller, RepositoryAgentIdentity, RepositoryAuthorityFacts,
+    RepositoryAuthorityProvenance, RepositoryAuthoritySource, RepositoryEntry,
     RepositoryRetirement,
 };
 

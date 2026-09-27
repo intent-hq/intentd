@@ -1,8 +1,15 @@
 //! Actual Store and local Git source adapters, compiled without registration.
 //! No listener, provider, credential writer or native Git effect is started.
 
+#[expect(
+    dead_code,
+    unused_imports,
+    reason = "concrete Store provenance is exercised in the Services unit target; this harness retains injected engine coverage"
+)]
 #[path = "../src/repository_admission.rs"]
 mod repository_admission;
+#[path = "../src/repository_admission/git_source.rs"]
+mod repository_admission_git_source;
 #[path = "../src/repository_context_reader.rs"]
 mod repository_context_reader;
 #[path = "../src/repository_credentials.rs"]

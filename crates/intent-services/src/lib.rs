@@ -110,8 +110,14 @@ mod repository_admission;
 #[path = "repository_admission/durable_source.rs"]
 mod repository_admission_durable_source;
 #[cfg(test)]
+#[path = "repository_admission/git_source.rs"]
+mod repository_admission_git_source;
+#[cfg(test)]
 #[path = "repository_admission/source_tests.rs"]
 mod repository_admission_source_tests;
+#[cfg(test)]
+#[path = "repository_admission/source.rs"]
+mod repository_admission_sources;
 #[cfg(test)]
 mod repository_context_reader;
 #[cfg(test)]

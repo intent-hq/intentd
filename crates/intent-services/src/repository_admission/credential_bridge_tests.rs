@@ -283,7 +283,7 @@ async fn active_callback_stops_on_original_bearer_role_and_remove_readd_changes(
                     host_role: HostRole::Guest,
                 }
             }
-            _ => facts.generation += 2,
+            _ => advance_injected_provenance(facts),
         });
         assert!(matches!(
             bridge.token(&callback, false).await,
