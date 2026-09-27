@@ -1272,6 +1272,7 @@ async fn assert_transfer_proposal_readonly_over_wss(omit_tool_output: bool) {
             if current["result"]["workspace"]["branch"] == branch_before.trim() {
                 break current;
             }
+            // timing-guard: poll metadata reconciliation within the enclosing timeout.
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
