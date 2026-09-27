@@ -563,3 +563,104 @@ pub struct PrObservation {
     pub threads: Option<ReviewThreadTally>,
     pub conversation_count: i64,
 }
+
+/// Availability of one provider field; absent evidence is never a passing result.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderAvailability {
+    Available,
+    Restricted,
+    Unavailable,
+    Transient,
+    RateLimited,
+    #[default]
+    Unknown,
+}
+
+/// Provider-confirmed project and branch, within one logical instance.
+/// Missing identities stay `None` in the containing detail envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewBranchIdentity {
+    pub instance_base_url: String,
+    pub project_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_path: Option<String>,
+    pub branch: String,
+}
+
+/// Additive detail projection; the legacy `PullRequest` and GitHub shapes stay unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewDetails {
+    pub review: PullRequest,
+    pub source: Option<ReviewBranchIdentity>,
+    pub target: Option<ReviewBranchIdentity>,
+}
+impl ReviewDetails {
+    /// An open review is reusable only with exact provider-confirmed project/branch identities.
+    #[must_use]
+    pub fn matches_open(
+        &self,
+        source: &ReviewBranchIdentity,
+        target: &ReviewBranchIdentity,
+    ) -> bool {
+        let equal = |actual: &ReviewBranchIdentity, expected: &ReviewBranchIdentity| {
+            actual.instance_base_url == expected.instance_base_url
+                && actual.project_id == expected.project_id
+                && actual.branch == expected.branch
+                && match (&actual.project_path, &expected.project_path) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => true,
+                }
+        };
+        self.review.state == PrState::Open
+            && !source.instance_base_url.is_empty()
+            && source.instance_base_url == target.instance_base_url
+            && source.project_id > 0
+            && source.project_id == target.project_id
+            && !source.branch.is_empty()
+            && !target.branch.is_empty()
+            && source.branch != target.branch
+            && self.source.as_ref().is_some_and(|s| equal(s, source))
+            && self.target.as_ref().is_some_and(|t| equal(t, target))
+    }
+}
+
+/// Availability accompanying optional reads, separate from their legacy projections.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewAvailability {
+    pub policy: ProviderAvailability,
+    pub approvals: ProviderAvailability,
+    pub checks: ProviderAvailability,
+    pub discussions: ProviderAvailability,
+}
+
+/// Review observation with explicit unknown/restricted fields and confirmed identities.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewObservation {
+    pub details: ReviewDetails,
+    pub signals: MergeRequirementSignals,
+    pub reviews: Option<Vec<Review>>,
+    pub threads: Option<ReviewThreadTally>,
+    pub conversation_count: Option<i64>,
+    pub availability: ReviewAvailability,
+}
+
+/// Outcome of the API stage only; this says nothing about local commit publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReviewCreateOutcome {
+    Created,
+    Reused,
+}
+
+/// An actual API response or an existing open review, never synthesized request metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewCreateResult {
+    pub outcome: ReviewCreateOutcome,
+    pub details: ReviewDetails,
+}
