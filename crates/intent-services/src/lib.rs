@@ -28035,7 +28035,15 @@ impl WorkspaceApi for Services {
                     (filtered, true, true)
                 }
             };
-            if to_commit.is_empty() {
+            // An explicitly requested staged-only merge can record ancestry
+            // without changing HEAD's tree. Let the full-index commit path
+            // preserve its parents and attribution; empty automatic commits
+            // and ordinary empty checkpoints remain rejected.
+            if to_commit.is_empty()
+                && !(user_requested
+                    && !needs_stage
+                    && intent_git::commit::has_pending_merge(&worktree)?)
+            {
                 return Err(Error::Internal(if user_requested {
                     "No staged changes found to commit".to_string()
                 } else {
