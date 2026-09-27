@@ -767,3 +767,243 @@ fn boundary_and_secret_errors_are_safe_and_never_become_upstream_denials() {
         intent_sourcecontrol::Error::AdmissionRetired
     ));
 }
+
+#[tokio::test]
+async fn quota_during_refresh_preserves_longest_deadline_without_releasing_credentials() {
+    let test = Test::new();
+    let admission = test.admit(RepositoryCredentialUse::NativeRead);
+    let dispatched = test.acquire(&admission).await.unwrap();
+    let binding = test.directory.binding().unwrap();
+    let refresh = test
+        .directory
+        .reserve_mutation(RepositoryMutationKind::Refresh)
+        .unwrap();
+    test.directory.begin_mutation(&refresh).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    assert!(test
+        .directory
+        .record_backoff(&dispatched.stamp, deadline)
+        .unwrap());
+    assert!(test
+        .directory
+        .record_backoff(
+            &dispatched.stamp,
+            deadline.checked_sub(Duration::from_secs(30)).unwrap(),
+        )
+        .unwrap());
+    assert_eq!(test.directory.lock().unwrap().backoff_until, Some(deadline));
+    assert_eq!(
+        test.acquire(&admission).await.unwrap_err(),
+        RepositoryCredentialError::Mutating
+    );
+    assert_eq!(test.secrets.calls.load(Ordering::SeqCst), 1);
+    assert!(!test
+        .directory
+        .reject_current_credential(&dispatched.stamp)
+        .unwrap());
+    test.directory
+        .finish_mutation(
+            &refresh,
+            SettledCredentialState::Verified(test.verified.clone()),
+        )
+        .unwrap();
+    assert_eq!(test.directory.binding().unwrap(), binding);
+    assert_eq!(
+        test.acquire(&admission).await.unwrap_err(),
+        RepositoryCredentialError::Backoff
+    );
+    let extended = deadline + Duration::from_secs(60);
+    assert!(test
+        .directory
+        .record_backoff(&dispatched.stamp, extended)
+        .unwrap());
+    assert_eq!(test.directory.lock().unwrap().backoff_until, Some(extended));
+    assert_eq!(test.secrets.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn quota_during_refresh_rejects_unknown_receipts_and_clears_after_compensation() {
+    for compensate in [false, true] {
+        let test = Test::new();
+        let admission = test.admit(RepositoryCredentialUse::NativeRead);
+        let dispatched = test.acquire(&admission).await.unwrap();
+        let refresh = test
+            .directory
+            .reserve_mutation(RepositoryMutationKind::Refresh)
+            .unwrap();
+        test.directory.begin_mutation(&refresh).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(120);
+        assert!(test
+            .directory
+            .record_backoff(&dispatched.stamp, deadline)
+            .unwrap());
+        test.directory
+            .finish_mutation(&refresh, SettledCredentialState::Indeterminate)
+            .unwrap();
+        assert!(!test
+            .directory
+            .record_backoff(&dispatched.stamp, deadline + Duration::from_secs(60))
+            .unwrap());
+        assert_eq!(test.directory.lock().unwrap().backoff_until, Some(deadline));
+        assert_eq!(
+            test.acquire(&admission).await.unwrap_err(),
+            RepositoryCredentialError::Indeterminate
+        );
+        let settled = if compensate {
+            SettledCredentialState::Compensated(test.verified.clone())
+        } else {
+            SettledCredentialState::Verified(test.verified.clone())
+        };
+        test.directory.finish_mutation(&refresh, settled).unwrap();
+        if compensate {
+            assert_eq!(test.directory.lock().unwrap().backoff_until, None);
+            assert!(!test
+                .directory
+                .record_backoff(&dispatched.stamp, deadline)
+                .unwrap());
+            test.acquire(&test.admit(RepositoryCredentialUse::NativeRead))
+                .await
+                .unwrap();
+        } else {
+            assert_eq!(
+                test.acquire(&admission).await.unwrap_err(),
+                RepositoryCredentialError::Backoff
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn quota_during_refresh_cannot_contaminate_changed_account_descriptor_or_source() {
+    for changed_field in 0..4 {
+        let test = Test::new();
+        let admission = test.admit(RepositoryCredentialUse::NativeRead);
+        let dispatched = test.acquire(&admission).await.unwrap();
+        let refresh = test
+            .directory
+            .reserve_mutation(RepositoryMutationKind::Refresh)
+            .unwrap();
+        test.directory.begin_mutation(&refresh).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(120);
+        assert!(test
+            .directory
+            .record_backoff(&dispatched.stamp, deadline)
+            .unwrap());
+        let mut foreign = test.verified.clone();
+        match changed_field {
+            0 => foreign.account_id = "72".into(),
+            1 => {
+                foreign.descriptor = GitlabDescriptor::new(
+                    intent_sourcecontrol::GitlabInstance::parse("https://git.example:9443/other")
+                        .unwrap(),
+                );
+            }
+            2 => {
+                foreign.descriptor = GitlabDescriptor::with_loopback_endpoint(
+                    foreign.descriptor.instance().clone(),
+                    "http://127.0.0.1:9999",
+                )
+                .unwrap();
+            }
+            _ => foreign.source = RepositoryCredentialSource::GitlabEnvironment,
+        }
+        assert_eq!(
+            test.directory
+                .finish_mutation(&refresh, SettledCredentialState::Verified(foreign.clone())),
+            Err(RepositoryCredentialError::Unverified)
+        );
+        assert!(!test
+            .directory
+            .record_backoff(&dispatched.stamp, deadline)
+            .unwrap());
+        assert_eq!(
+            test.directory.binding().unwrap_err(),
+            RepositoryCredentialError::Indeterminate
+        );
+        test.directory
+            .finish_mutation(&refresh, SettledCredentialState::Disconnected)
+            .unwrap();
+        assert_eq!(test.directory.lock().unwrap().backoff_until, None);
+        test.replace(foreign);
+        assert!(!test
+            .directory
+            .record_backoff(&dispatched.stamp, deadline)
+            .unwrap());
+        assert_eq!(test.directory.lock().unwrap().backoff_until, None);
+    }
+}
+
+#[tokio::test]
+async fn quota_during_refresh_rejects_foreign_replaced_child_and_shutdown_stamps() {
+    let test = Test::new();
+    let old = test
+        .acquire(&test.admit(RepositoryCredentialUse::NativeRead))
+        .await
+        .unwrap();
+    let other = Test::new();
+    let foreign = other
+        .acquire(&other.admit(RepositoryCredentialUse::NativeRead))
+        .await
+        .unwrap();
+    test.replace(test.verified.clone());
+    let current = test
+        .acquire(&test.admit(RepositoryCredentialUse::NativeRead))
+        .await
+        .unwrap();
+    let binding = test.directory.binding().unwrap();
+    test.directory.set_child_policy(&binding, true).unwrap();
+    let child = test
+        .acquire(&test.admit(RepositoryCredentialUse::ChildGit))
+        .await
+        .unwrap();
+    test.directory.set_child_policy(&binding, false).unwrap();
+    let refresh = test
+        .directory
+        .reserve_mutation(RepositoryMutationKind::Refresh)
+        .unwrap();
+    test.directory.begin_mutation(&refresh).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    for stale in [&old.stamp, &foreign.stamp, &child.stamp] {
+        assert!(!test.directory.record_backoff(stale, deadline).unwrap());
+    }
+    assert!(test
+        .directory
+        .record_backoff(&current.stamp, deadline)
+        .unwrap());
+    test.directory
+        .finish_mutation(
+            &refresh,
+            SettledCredentialState::Verified(test.verified.clone()),
+        )
+        .unwrap();
+    test.directory.retire().unwrap();
+    assert!(!test
+        .directory
+        .record_backoff(&current.stamp, deadline)
+        .unwrap());
+
+    for kind in [
+        RepositoryMutationKind::Replace,
+        RepositoryMutationKind::Disconnect,
+    ] {
+        let test = Test::new();
+        let dispatched = test
+            .acquire(&test.admit(RepositoryCredentialUse::NativeRead))
+            .await
+            .unwrap();
+        let mutation = test.directory.reserve_mutation(kind).unwrap();
+        test.directory.begin_mutation(&mutation).unwrap();
+        assert!(!test
+            .directory
+            .record_backoff(&dispatched.stamp, deadline)
+            .unwrap());
+        test.directory
+            .finish_mutation(&mutation, SettledCredentialState::Disconnected)
+            .unwrap();
+        assert!(!test
+            .directory
+            .record_backoff(&dispatched.stamp, deadline)
+            .unwrap());
+        assert_eq!(test.directory.lock().unwrap().backoff_until, None);
+    }
+}
