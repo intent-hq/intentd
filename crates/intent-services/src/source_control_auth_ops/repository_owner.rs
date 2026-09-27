@@ -5,7 +5,10 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
 mod adoption;
+#[cfg(not(test))]
 mod secret_reader;
+#[cfg(test)]
+pub(crate) mod secret_reader;
 pub(crate) use adoption::{logical_instance, RepositorySettingsWrite};
 
 use intent_sourcecontrol::gitlab_auth::{

@@ -6,7 +6,7 @@ use crate::repository_credentials::authority::{
 use crate::repository_credentials::{
     BoundGitlabRequestCredentials, RepositoryCredentialAdmission, RepositoryCredentialUse,
 };
-use crate::source_control_auth_ops::repository_owner_tests::Server;
+pub(crate) use crate::source_control_auth_ops::repository_owner_tests::Server;
 use intent_sourcecontrol::{GitLabSourceControl, GitlabRequestCredentials, SourceControl};
 use serde_json::json;
 use std::time::Duration;
@@ -28,13 +28,13 @@ impl RepositoryAuthorityFence for Allowed {
     }
 }
 
-struct Fixture {
+pub(crate) struct Fixture {
     _dir: tempfile::TempDir,
-    service: Arc<crate::Services>,
-    registry: Arc<crate::SettingsRegistry>,
+    pub(crate) service: Arc<crate::Services>,
+    pub(crate) registry: Arc<crate::SettingsRegistry>,
 }
 impl Fixture {
-    async fn unadopted(server: &Server) -> Self {
+    pub(crate) async fn unadopted(server: &Server) -> Self {
         let dir = crate::test_support::test_tempdir("repository-secret-reader");
         let db = intent_store::Store::open(&dir.path().join("store.db"))
             .await
@@ -79,7 +79,7 @@ impl Fixture {
             registry,
         }
     }
-    async fn new(server: &Server) -> Self {
+    pub(crate) async fn new(server: &Server) -> Self {
         let f = Self::unadopted(server).await;
         f.service
             .reconcile_gitlab_repository_binding()
@@ -90,7 +90,7 @@ impl Fixture {
     fn reader(&self) -> Arc<dyn RepositorySecretReader> {
         self.service.gitlab_repository_secret_reader().unwrap()
     }
-    fn request(&self) -> RepositorySecretRequest {
+    pub(crate) fn request(&self) -> RepositorySecretRequest {
         let directory = self.service.repository_connection_directory();
         directory
             .selected_secret_request(&directory.binding().unwrap())
@@ -451,12 +451,12 @@ async fn reader_adoption_rejects_sibling_change_during_account_verification() {
     }
 }
 
-struct PausedRead {
+pub(crate) struct PausedRead {
     entered: Arc<tokio::sync::Notify>,
     release: Option<std::sync::mpsc::Sender<()>>,
 }
 impl PausedRead {
-    fn install(f: &Fixture) -> Self {
+    pub(crate) fn install(f: &Fixture) -> Self {
         let entered = Arc::new(tokio::sync::Notify::new());
         let signal = entered.clone();
         let (release, receive) = std::sync::mpsc::channel();
@@ -481,12 +481,12 @@ impl PausedRead {
             release: Some(release),
         }
     }
-    async fn entered(&self) {
+    pub(crate) async fn entered(&self) {
         tokio::time::timeout(Duration::from_secs(5), self.entered.notified())
             .await
             .unwrap();
     }
-    fn resume(&mut self) {
+    pub(crate) fn resume(&mut self) {
         if let Some(release) = self.release.take() {
             release.send(()).unwrap();
         }

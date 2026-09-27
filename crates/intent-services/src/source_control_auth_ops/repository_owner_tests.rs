@@ -11,21 +11,21 @@ use tokio::sync::Notify;
 use tokio::time::timeout;
 
 #[derive(Default)]
-pub(super) struct Control {
-    pub(super) pause: Mutex<Option<&'static str>>,
+pub(crate) struct Control {
+    pub(crate) pause: Mutex<Option<&'static str>>,
     pub(super) entered: Notify,
-    pub(super) release: Notify,
-    pub(super) token_reply: Mutex<Option<(u16, Value)>>,
-    pub(super) denied_user: Mutex<Option<&'static str>>,
-    pub(super) requests: Mutex<Vec<String>>,
-    pub(super) exchanges: AtomicUsize,
-    pub(super) expected_project_token: Mutex<Option<&'static str>>,
+    pub(crate) release: Notify,
+    pub(crate) token_reply: Mutex<Option<(u16, Value)>>,
+    pub(crate) denied_user: Mutex<Option<&'static str>>,
+    pub(crate) requests: Mutex<Vec<String>>,
+    pub(crate) exchanges: AtomicUsize,
+    pub(crate) expected_project_token: Mutex<Option<&'static str>>,
     pub(super) directory: Mutex<Option<Arc<RepositoryConnectionDirectory>>>,
 }
-pub(super) struct Server {
-    pub(super) host: GitlabHost,
-    pub(super) descriptor: GitlabDescriptor,
-    pub(super) control: Arc<Control>,
+pub(crate) struct Server {
+    pub(crate) host: GitlabHost,
+    pub(crate) descriptor: GitlabDescriptor,
+    pub(crate) control: Arc<Control>,
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for Server {
@@ -34,7 +34,7 @@ impl Drop for Server {
     }
 }
 impl Server {
-    pub(super) async fn new() -> Self {
+    pub(crate) async fn new() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let host = GitlabHost::parse("gitlab.test")
@@ -161,7 +161,7 @@ impl Server {
             task,
         }
     }
-    pub(super) async fn entered(&self) {
+    pub(crate) async fn entered(&self) {
         timeout(Duration::from_secs(5), self.control.entered.notified())
             .await
             .unwrap();

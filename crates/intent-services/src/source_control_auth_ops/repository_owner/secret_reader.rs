@@ -283,4 +283,4 @@ impl RepositorySecretReader for GitlabRepositorySecretReader {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
