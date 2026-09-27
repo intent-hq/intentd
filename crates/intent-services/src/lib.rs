@@ -185,6 +185,12 @@ mod nested_repos;
 mod note_merge;
 pub mod note_ops;
 mod npx_cli;
+#[expect(
+    dead_code,
+    reason = "qualified cache primitives await admitted caller-directory wiring"
+)]
+mod observation_adapter;
+mod observation_policy;
 mod one_shot_acp;
 pub mod pagination;
 pub mod pi_cli;

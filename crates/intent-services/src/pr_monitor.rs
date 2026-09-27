@@ -91,6 +91,14 @@ use crate::rate_limit::RATE_LIMIT_MAX_PAUSE;
 use crate::workspace_status::MonitorPrSignals;
 use crate::{publish_event, system_actor, Services};
 
+// Compiled storage/read primitives; the admitted caller directory wires these later.
+#[expect(
+    dead_code,
+    reason = "qualified reads await admitted caller-directory wiring"
+)]
+pub(crate) mod qualified_cache;
+use qualified_cache::{CacheKey, CacheSlot};
+
 use intent_core::config::{
     MAX_PR_CACHE_MAX_AGE_SECONDS, MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET,
     MAX_PR_MONITOR_QUOTA_SHARE_PERCENT, MIN_PR_CACHE_MAX_AGE_SECONDS,
@@ -760,20 +768,23 @@ impl PrCacheEntry {
 /// completed mid-sweep — and stored a NEWER snapshot — can never be
 /// shadowed by the sweep's older result on later reads.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct PrCacheSlot {
+pub(crate) struct LegacyPrCacheSlot {
     generation: u64,
     entry: Option<PrCacheEntry>,
 }
 
-/// The shared PR cache: every PR read's memory of its last full read, keyed
-/// like the in-sweep dedupe ([`PrKey`]). Written by the sweep's polls and by
+/// The shared PR cache: legacy GitHub reads use the in-sweep [`PrKey`];
+/// qualified reads include admitted authority, connection and full target.
+/// The representations share retention bounds but never share an entry.
+/// Written by the sweep's polls and by
 /// every on-demand read alike, so a monitor poll refreshes what the next
 /// on-demand read serves and an on-demand read on an unmonitored PR seeds
 /// the next one. Every write ends with the retention pass
 /// ([`retain_pr_cache`]), which the sweep also runs at the top of each tick
 /// to drop the entries of monitors that have since gone. In-memory only — a
 /// daemon restart starts cold. Shared across [`Services`] clones.
-pub(crate) type PrCache = Arc<Mutex<HashMap<PrKey, PrCacheSlot>>>;
+pub(crate) type PrCacheSlot = CacheSlot<LegacyPrCacheSlot, intent_sourcecontrol::ReviewObservation>;
+pub(crate) type PrCache = Arc<Mutex<HashMap<CacheKey<PrKey>, PrCacheSlot>>>;
 
 /// Store an on-demand full read and bump the slot's generation, so a sweep
 /// poll already in flight for the PR does not overwrite it with its
@@ -789,7 +800,11 @@ fn store_on_demand(
     let now = Instant::now();
     let entry = PrCacheEntry::new(pr, snapshot, now);
     let mut cache = cache.lock().unwrap();
-    let slot = cache.entry(key).or_default();
+    let slot = cache
+        .entry(CacheKey::Legacy(key))
+        .or_default()
+        .legacy_mut()
+        .expect("legacy key");
     slot.generation += 1;
     slot.entry = Some(entry.clone());
     retain_pr_cache(&mut cache, monitored, now);
@@ -806,34 +821,21 @@ fn store_on_demand(
 /// only in the sweep — is what makes the cap a hard bound: on-demand reads
 /// keep landing while the sweep is skipped by the forge rate-limit pause.
 fn retain_pr_cache(
-    cache: &mut HashMap<PrKey, PrCacheSlot>,
+    cache: &mut qualified_cache::CacheMap<
+        PrKey,
+        LegacyPrCacheSlot,
+        intent_sourcecontrol::ReviewObservation,
+    >,
     monitored: &HashSet<PrKey>,
     now: Instant,
 ) {
-    cache.retain(|key, slot| {
-        monitored.contains(key)
-            || slot.entry.as_ref().is_some_and(|entry| {
-                now.saturating_duration_since(entry.fetched_at) < PR_CACHE_MAX_IDLE
-            })
-    });
-    let mut unmonitored: Vec<(Instant, PrKey)> = cache
-        .iter()
-        .filter(|(key, _)| !monitored.contains(*key))
-        .map(|(key, slot)| {
-            (
-                slot.entry.as_ref().map_or(now, |entry| entry.fetched_at),
-                key.clone(),
-            )
-        })
-        .collect();
-    let excess = unmonitored.len().saturating_sub(PR_CACHE_MAX_ENTRIES);
-    if excess == 0 {
-        return;
-    }
-    unmonitored.sort();
-    for (_, key) in unmonitored.into_iter().take(excess) {
-        cache.remove(&key);
-    }
+    qualified_cache::retain(
+        cache,
+        |slot| slot.entry.as_ref().map(|e| e.fetched_at),
+        |key| monitored.contains(key),
+        (PR_CACHE_MAX_IDLE, PR_CACHE_MAX_ENTRIES),
+        now,
+    );
 }
 
 /// The sweep's retention pass: [`retain_pr_cache`] against the active
@@ -846,7 +848,7 @@ fn prune_pr_cache(cache: &PrCache, monitored: &HashSet<PrKey>) {
 #[cfg(test)]
 fn backdate_pr_cache(cache: &PrCache, by: Duration) {
     for slot in cache.lock().unwrap().values_mut() {
-        if let Some(entry) = slot.entry.as_mut() {
+        if let Some(entry) = slot.legacy_mut().and_then(|s| s.entry.as_mut()) {
             entry.fetched_at = entry.fetched_at.checked_sub(by).unwrap_or(entry.fetched_at);
             entry.refreshed_at = entry
                 .refreshed_at
@@ -862,7 +864,7 @@ fn pr_cache_len(cache: &PrCache) -> usize {
         .lock()
         .unwrap()
         .values()
-        .filter(|slot| slot.entry.is_some())
+        .filter(|slot| slot.legacy().is_some_and(|s| s.entry.is_some()))
         .count()
 }
 
@@ -1037,7 +1039,8 @@ fn cached_pr_within(cache: &PrCache, key: &PrKey, max_age: Duration) -> Option<P
     cache
         .lock()
         .unwrap()
-        .get(key)
+        .get(&CacheKey::Legacy(key.clone()))
+        .and_then(CacheSlot::legacy)
         .and_then(|slot| slot.entry.as_ref())
         .filter(|entry| now.saturating_duration_since(entry.refreshed_at) < max_age)
         .cloned()
@@ -1055,7 +1058,8 @@ async fn poll_pr(
     let generation = cache
         .lock()
         .unwrap()
-        .get(&key)
+        .get(&CacheKey::Legacy(key.clone()))
+        .and_then(CacheSlot::legacy)
         .map_or(0, |slot| slot.generation);
     let observation = observe_pr(sc, repo_ref, number).await?;
     let pr = match &observation {
@@ -1069,7 +1073,11 @@ async fn poll_pr(
     let now = Instant::now();
     let reused = {
         let mut cache = cache.lock().unwrap();
-        match cache.get_mut(&key).and_then(|slot| slot.entry.as_mut()) {
+        match cache
+            .get_mut(&CacheKey::Legacy(key.clone()))
+            .and_then(CacheSlot::legacy_mut)
+            .and_then(|slot| slot.entry.as_mut())
+        {
             Some(entry) if entry.reusable(&fingerprint, now) => {
                 entry.cheap_polls += 1;
                 entry.refreshed_at = now;
@@ -1094,7 +1102,11 @@ async fn poll_pr(
     };
     let entry = PrCacheEntry::new(pr, snapshot, now);
     let mut cache = cache.lock().unwrap();
-    let slot = cache.entry(key).or_default();
+    let slot = cache
+        .entry(CacheKey::Legacy(key))
+        .or_default()
+        .legacy_mut()
+        .expect("legacy key");
     if slot.generation == generation {
         slot.entry = Some(entry.clone());
     } else {
@@ -8158,7 +8170,10 @@ mod tests {
             .expect("poll");
         assert_ne!(polled.snapshot.conversation_count, Some(99));
         let guard = cache.lock().unwrap();
-        let slot = guard.get(&key).expect("slot");
+        let slot = guard
+            .get(&CacheKey::Legacy(key))
+            .and_then(CacheSlot::legacy)
+            .expect("slot");
         assert_eq!(slot.generation, 1);
         assert_eq!(
             slot.entry
@@ -8631,7 +8646,7 @@ mod tests {
             .pr_cache
             .lock()
             .unwrap()
-            .contains_key(&pr_key_for(&repo, 42)));
+            .contains_key(&CacheKey::Legacy(pr_key_for(&repo, 42))));
     }
 
     /// Retention: [`PR_CACHE_MAX_ENTRIES`] is a hard bound on the
@@ -8648,7 +8663,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|(key, slot)| *key != monitored && slot.entry.is_some())
+                .filter(|(key, slot)| {
+                    *key != &CacheKey::Legacy(monitored.clone())
+                        && slot.legacy().is_some_and(|s| s.entry.is_some())
+                })
                 .count()
         }
         let (_db, _root, svc, forge, ws, owner) = setup().await;
@@ -8690,16 +8708,19 @@ mod tests {
             let cache = svc.pr_cache.lock().unwrap();
             assert_eq!(cache.len(), PR_CACHE_MAX_ENTRIES + 1, "cap + monitored");
             assert!(
-                !cache.contains_key(&pr_key_for(&repo, oldest.cast_signed())),
+                !cache.contains_key(&CacheKey::Legacy(pr_key_for(&repo, oldest.cast_signed()))),
                 "the oldest full fetch went first"
             );
             for number in 1..=overflow as u64 {
                 assert!(
-                    !cache.contains_key(&pr_key_for(&repo, number.cast_signed())),
+                    !cache.contains_key(&CacheKey::Legacy(pr_key_for(&repo, number.cast_signed()))),
                     "#{number} was evicted in fetch order"
                 );
             }
-            assert!(cache.contains_key(&monitored_key), "monitored kept");
+            assert!(
+                cache.contains_key(&CacheKey::Legacy(monitored_key.clone())),
+                "monitored kept"
+            );
         }
         assert!(
             svc.sweep_rate_limit.paused_remaining().is_some(),
@@ -8716,10 +8737,10 @@ mod tests {
         let cache = svc.pr_cache.lock().unwrap();
         assert_eq!(cache.len(), 2, "the fresh write and the monitored entry");
         assert!(
-            cache.contains_key(&monitored_key),
+            cache.contains_key(&CacheKey::Legacy(monitored_key.clone())),
             "monitored survives expiry"
         );
-        assert!(cache.contains_key(&pr_key_for(&repo, oldest.cast_signed())));
+        assert!(cache.contains_key(&CacheKey::Legacy(pr_key_for(&repo, oldest.cast_signed()))));
     }
 
     /// A PR that outgrew the observation's windows falls back to the paged

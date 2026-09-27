@@ -12,13 +12,17 @@
 //! first), enforced on every write. In-memory only; a daemon restart starts
 //! cold. Shared across [`Services`] clones.
 
-use std::collections::HashMap;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use intent_core::Result;
 use intent_sourcecontrol::{Issue, RepoRef};
 
+use crate::pr_monitor::qualified_cache::{
+    self, CacheFailure, CacheKey, CacheMap, CacheRead, CacheRequest, CacheSlot, Freshness,
+    ProviderRead, Started,
+};
 use crate::pr_monitor::{PR_CACHE_MAX_ENTRIES, PR_CACHE_MAX_IDLE};
 use crate::{pr_ops, Services};
 
@@ -50,7 +54,7 @@ pub(crate) struct IssueCacheEntry {
 }
 
 /// The issue cache; see the module docs.
-pub(crate) type IssueCache = Arc<Mutex<HashMap<IssueKey, IssueCacheEntry>>>;
+pub(crate) type IssueCache = Arc<Mutex<CacheMap<IssueKey, IssueCacheEntry, Issue>>>;
 
 /// The cached issue for `key` when it was read less than `max_age` ago;
 /// `None` when the entry is absent or older.
@@ -59,7 +63,8 @@ fn cached_issue_within(cache: &IssueCache, key: &IssueKey, max_age: Duration) ->
     cache
         .lock()
         .unwrap()
-        .get(key)
+        .get(&CacheKey::Legacy(key.clone()))
+        .and_then(CacheSlot::legacy)
         .filter(|entry| now.saturating_duration_since(entry.fetched_at) < max_age)
         .map(|entry| entry.issue.clone())
 }
@@ -69,11 +74,11 @@ fn store_issue(cache: &IssueCache, key: IssueKey, issue: Issue) {
     let now = Instant::now();
     let mut cache = cache.lock().unwrap();
     cache.insert(
-        key,
-        IssueCacheEntry {
+        CacheKey::Legacy(key),
+        CacheSlot::Legacy(IssueCacheEntry {
             issue,
             fetched_at: now,
-        },
+        }),
     );
     retain_issue_cache(&mut cache, now);
 }
@@ -82,20 +87,57 @@ fn store_issue(cache: &IssueCache, key: IssueKey, issue: Issue) {
 /// read [`ISSUE_CACHE_MAX_IDLE`] ago or earlier are dropped, then the rest
 /// are bounded by [`ISSUE_CACHE_MAX_ENTRIES`], evicting the oldest
 /// `fetched_at` first.
-fn retain_issue_cache(cache: &mut HashMap<IssueKey, IssueCacheEntry>, now: Instant) {
-    cache.retain(|_, entry| now.saturating_duration_since(entry.fetched_at) < ISSUE_CACHE_MAX_IDLE);
-    let excess = cache.len().saturating_sub(ISSUE_CACHE_MAX_ENTRIES);
-    if excess == 0 {
-        return;
+fn retain_issue_cache(cache: &mut CacheMap<IssueKey, IssueCacheEntry, Issue>, now: Instant) {
+    qualified_cache::retain(
+        cache,
+        |entry| Some(entry.fetched_at),
+        |_| false,
+        (ISSUE_CACHE_MAX_IDLE, ISSUE_CACHE_MAX_ENTRIES),
+        now,
+    );
+}
+
+/// Request-scoped provider reads share the legacy issue map and retention cap.
+/// This is the admitted directory's internal seam, not a new RPC or resolver.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "qualified reads await admitted caller-directory wiring"
+    )
+)]
+pub(crate) async fn read_qualified_issue<F, Fut>(
+    cache: &IssueCache,
+    request: &CacheRequest<'_>,
+    max_age: Duration,
+    read: F,
+) -> std::result::Result<CacheRead<Issue>, CacheFailure>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = ProviderRead<Issue>>,
+{
+    if request.target.kind != intent_core::RepositoryResourceKind::Issue {
+        return Err(CacheFailure::ineligible(
+            crate::observation_policy::Ineligible::DifferentSlot,
+            intent_sourcecontrol::RateLimitStatus::default(),
+        ));
     }
-    let mut by_age: Vec<(Instant, IssueKey)> = cache
-        .iter()
-        .map(|(key, entry)| (entry.fetched_at, key.clone()))
-        .collect();
-    by_age.sort();
-    for (_, key) in by_age.into_iter().take(excess) {
-        cache.remove(&key);
-    }
+    let ticket = match qualified_cache::start(cache, request, max_age, |cache| {
+        retain_issue_cache(cache, Instant::now());
+    })? {
+        Started::Hit(hit) => return Ok(hit),
+        Started::Read { ticket, .. } => ticket,
+    };
+    let outcome = read().await;
+    qualified_cache::finish(
+        cache,
+        request,
+        ticket,
+        outcome,
+        |_| true,
+        Freshness::full(),
+        |cache| retain_issue_cache(cache, Instant::now()),
+    )
 }
 
 impl Services {
@@ -131,7 +173,9 @@ impl Services {
     #[cfg(test)]
     pub(crate) fn backdate_issue_cache(&self, by: Duration) {
         for entry in self.issue_cache.lock().unwrap().values_mut() {
-            entry.fetched_at = entry.fetched_at.checked_sub(by).unwrap_or(entry.fetched_at);
+            if let Some(entry) = entry.legacy_mut() {
+                entry.fetched_at = entry.fetched_at.checked_sub(by).unwrap_or(entry.fetched_at);
+            }
         }
     }
 
@@ -147,6 +191,6 @@ impl Services {
         self.issue_cache
             .lock()
             .unwrap()
-            .contains_key(&issue_key(repo_ref, number))
+            .contains_key(&CacheKey::Legacy(issue_key(repo_ref, number)))
     }
 }
