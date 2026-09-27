@@ -44,8 +44,8 @@ pub use model::{
     ReviewVerdict, RollupCheck, RollupCheckKind, ScCapabilities, UserIdentity,
 };
 pub use model::{
-    ProviderAvailability, ReviewAvailability, ReviewBranchIdentity, ReviewCreateOutcome,
-    ReviewCreateResult, ReviewDetails, ReviewObservation,
+    ConfirmedReviewState, ProviderAvailability, ReviewAvailability, ReviewBranchIdentity,
+    ReviewCreateOutcome, ReviewCreateResult, ReviewDetails, ReviewObservation,
 };
 pub use registry::{GithubSettings, GitlabSettings, SourceControlRegistry, SourceControlSettings};
 /// Re-exported so callers can hand [`gitlab_auth::persist_gitlab_token`] a
@@ -168,12 +168,15 @@ pub trait SourceControl: Send + Sync {
     /// Fetch a single pull request by number.
     async fn get_pr(&self, repo: &RepoRef, number: u64) -> Result<PullRequest>;
 
-    /// Additive detail with provider-confirmed source/target identity where available.
+    /// Additive detail with provider-confirmed metadata where available.
+    /// This legacy wrapper leaves confirmation unknown; normalized fields are not raw evidence.
     async fn review_details(&self, repo: &RepoRef, number: u64) -> Result<ReviewDetails> {
         Ok(ReviewDetails {
             review: self.get_pr(repo, number).await?,
             source: None,
             target: None,
+            confirmed_draft: None,
+            confirmed_state: None,
         })
     }
 

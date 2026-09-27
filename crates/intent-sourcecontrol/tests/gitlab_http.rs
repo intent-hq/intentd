@@ -5,9 +5,10 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use intent_sourcecontrol::{
     error::{ProviderFailure, ProviderFailureKind},
-    Error, GitLabSourceControl, GitlabDescriptor, GitlabInstance, GitlabRequestCredentials,
-    IssueQuery, NewPullRequest, PageParams, PrQuery, ProviderAvailability, RepoRef,
-    ReviewBranchIdentity, ReviewCreateOutcome, SourceControl,
+    ConfirmedReviewState, Error, GitLabSourceControl, GitlabDescriptor, GitlabInstance,
+    GitlabRequestCredentials, IssueQuery, NewPullRequest, PageParams, PrQuery,
+    ProviderAvailability, RepoRef, ReviewBranchIdentity, ReviewCreateOutcome, ReviewDetails,
+    SourceControl,
 };
 use secrecy::SecretString;
 use serde_json::{json, Value};
@@ -561,6 +562,11 @@ async fn create_uses_only_confirmed_same_project_remote_branches_and_reports_act
         .await
         .unwrap();
     assert_eq!(result.outcome, ReviewCreateOutcome::Created);
+    assert_eq!(
+        result.details.confirmed_state,
+        Some(ConfirmedReviewState::Open)
+    );
+    assert_eq!(result.details.confirmed_draft, Some(false));
     assert_eq!(result.details.review.head_sha.as_deref(), Some("remote-A"));
     let requests = f.requests();
     let writes: Vec<_> = requests.iter().filter(|r| r.method != "GET").collect();
@@ -589,6 +595,11 @@ async fn matching_open_review_is_reused_without_modifying_actual_title_body_or_d
         .await
         .unwrap();
     assert_eq!(result.outcome, ReviewCreateOutcome::Reused);
+    assert_eq!(
+        result.details.confirmed_state,
+        Some(ConfirmedReviewState::Open)
+    );
+    assert_eq!(result.details.confirmed_draft, Some(true));
     assert!(result.details.review.draft);
     assert_eq!(result.details.review.title, "Actual existing title");
     assert_eq!(result.details.review.body.as_deref(), Some("Actual body"));
@@ -970,6 +981,220 @@ async fn detail_identity_is_additive_and_absence_never_implies_reuse() {
     source.project_id = 0;
     target.project_id = 0;
     assert!(!details.matches_open(&source, &target));
+}
+
+fn review_with(field: &str, value: Option<&Value>) -> Value {
+    let mut review = mr();
+    if let Some(value) = value {
+        review[field] = value.clone();
+    } else {
+        review.as_object_mut().unwrap().remove(field);
+    }
+    review
+}
+
+fn ambiguous_review_fields() -> Vec<(&'static str, Option<Value>)> {
+    vec![
+        ("draft", None),
+        ("draft", Some(Value::Null)),
+        ("draft", Some(json!("false"))),
+        ("draft", Some(json!(0))),
+        ("state", None),
+        ("state", Some(Value::Null)),
+        ("state", Some(json!(false))),
+        ("state", Some(json!("unknown-state"))),
+        ("state", Some(json!("locked"))),
+    ]
+}
+
+#[tokio::test]
+async fn confirmed_review_metadata_preserves_states_draft_and_legacy_shape() {
+    for (state, confirmed) in [
+        ("opened", ConfirmedReviewState::Open),
+        ("locked", ConfirmedReviewState::Locked),
+        ("closed", ConfirmedReviewState::Closed),
+        ("merged", ConfirmedReviewState::Merged),
+    ] {
+        for draft in [false, true] {
+            let f = Fixture::new(move |_| {
+                let mut value = mr();
+                value["state"] = json!(state);
+                value["draft"] = json!(draft);
+                reply(200, value)
+            })
+            .await;
+            let sc = f.provider();
+            let details = sc.review_details(&repo(), 7).await.unwrap();
+            assert_eq!(details.confirmed_state, Some(confirmed));
+            assert_eq!(details.confirmed_draft, Some(draft));
+            let wire = serde_json::to_value(&details).unwrap();
+            assert_eq!(wire["confirmedDraft"], json!(draft));
+            assert_eq!(
+                wire["confirmedState"],
+                if state == "opened" { "open" } else { state }
+            );
+            let legacy = serde_json::to_value(sc.get_pr(&repo(), 7).await.unwrap()).unwrap();
+            assert_eq!(wire["review"], legacy);
+            assert!(legacy.get("confirmedDraft").is_none());
+            assert!(legacy.get("confirmedState").is_none());
+            assert_eq!(
+                details.matches_open(&identity("feature"), &identity("main")),
+                state == "opened"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn unknown_draft_metadata_never_establishes_reuse() {
+    for draft in [
+        None,
+        Some(Value::Null),
+        Some(json!("false")),
+        Some(json!(0)),
+    ] {
+        let f = Fixture::new(move |_| reply(200, review_with("draft", draft.as_ref()))).await;
+        let details = f.provider().review_details(&repo(), 7).await.unwrap();
+        assert!(!details.review.draft);
+        assert_eq!(details.confirmed_draft, None);
+        assert_eq!(details.confirmed_state, Some(ConfirmedReviewState::Open));
+        assert!(!details.matches_open(&identity("feature"), &identity("main")));
+        assert!(serde_json::to_value(&details).unwrap()["confirmedDraft"].is_null());
+    }
+}
+
+#[tokio::test]
+async fn unknown_review_state_metadata_fails_without_synthetic_open() {
+    for state in [
+        None,
+        Some(Value::Null),
+        Some(json!("unknown-state")),
+        Some(json!(false)),
+    ] {
+        let f = Fixture::new(move |_| reply(200, review_with("state", state.as_ref()))).await;
+        assert!(matches!(
+            f.provider().review_details(&repo(), 7).await,
+            Err(Error::Decode(_))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn ambiguous_review_metadata_blocks_reuse_and_duplicate_post() {
+    for (field, value) in ambiguous_review_fields() {
+        let f = Fixture::new(move |r| {
+            if r.path.contains("/merge_requests?") {
+                reply(200, json!([review_with(field, value.as_ref())]))
+            } else {
+                create_reply(r)
+            }
+        })
+        .await;
+        assert!(
+            f.provider()
+                .create_same_project(&repo(), input(), &identity("feature"), &identity("main"))
+                .await
+                .is_err(),
+            "{field}"
+        );
+        assert!(f.requests().iter().all(|r| r.method == "GET"));
+        assert!(f
+            .requests()
+            .iter()
+            .all(|r| !r.path.contains("/repository/branches/")));
+    }
+}
+
+#[tokio::test]
+async fn locked_review_metadata_blocks_reuse_and_duplicate_post() {
+    let f = Fixture::new(|r| {
+        if r.path.contains("/merge_requests?") {
+            reply(200, json!([review_with("state", Some(&json!("locked")))]))
+        } else {
+            create_reply(r)
+        }
+    })
+    .await;
+    assert!(matches!(
+        f.provider()
+            .create_same_project(&repo(), input(), &identity("feature"), &identity("main"))
+            .await,
+        Err(Error::Conflict(_))
+    ));
+    assert!(f.requests().iter().all(|r| r.method == "GET"));
+}
+
+#[tokio::test]
+async fn ambiguous_review_metadata_after_post_is_write_uncertain() {
+    for (field, value) in ambiguous_review_fields() {
+        let f = Fixture::new(move |r| {
+            if r.method == "POST" {
+                reply(201, review_with(field, value.as_ref()))
+            } else {
+                create_reply(r)
+            }
+        })
+        .await;
+        assert!(
+            matches!(
+                f.provider()
+                    .create_same_project(&repo(), input(), &identity("feature"), &identity("main"))
+                    .await,
+                Err(Error::Provider(ProviderFailure {
+                    kind: ProviderFailureKind::WriteUncertain,
+                    ..
+                }))
+            ),
+            "{field}"
+        );
+        assert_eq!(
+            f.requests().iter().filter(|r| r.method == "POST").count(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn confirmed_closed_or_merged_metadata_cannot_be_reused() {
+    for state in ["closed", "merged"] {
+        let f = Fixture::new(move |r| {
+            if r.path.contains("/merge_requests?") {
+                reply(200, json!([review_with("state", Some(&json!(state)))]))
+            } else {
+                create_reply(r)
+            }
+        })
+        .await;
+        let created = f
+            .provider()
+            .create_same_project(&repo(), input(), &identity("feature"), &identity("main"))
+            .await
+            .unwrap();
+        assert_eq!(created.outcome, ReviewCreateOutcome::Created);
+        assert_eq!(
+            created.details.confirmed_state,
+            Some(ConfirmedReviewState::Open)
+        );
+        assert_eq!(created.details.confirmed_draft, Some(false));
+        assert_eq!(
+            f.requests().iter().filter(|r| r.method == "POST").count(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn old_detail_metadata_cannot_establish_confirmed_reuse() {
+    let f = Fixture::new(|_| reply(200, mr())).await;
+    let details = f.provider().review_details(&repo(), 7).await.unwrap();
+    let mut old_wire = serde_json::to_value(&details).unwrap();
+    old_wire.as_object_mut().unwrap().remove("confirmedDraft");
+    old_wire.as_object_mut().unwrap().remove("confirmedState");
+    let decoded: ReviewDetails = serde_json::from_value(old_wire).unwrap();
+    assert_eq!(decoded.confirmed_draft, None);
+    assert_eq!(decoded.confirmed_state, None);
+    assert_eq!(decoded.review, details.review);
+    assert!(!decoded.matches_open(&identity("feature"), &identity("main")));
 }
 
 #[tokio::test]

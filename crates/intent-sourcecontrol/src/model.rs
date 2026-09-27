@@ -589,6 +589,16 @@ pub struct ReviewBranchIdentity {
     pub branch: String,
 }
 
+/// Positively observed provider state, independent of the legacy PR projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfirmedReviewState {
+    Open,
+    Locked,
+    Closed,
+    Merged,
+}
+
 /// Additive detail projection; the legacy `PullRequest` and GitHub shapes stay unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -596,9 +606,15 @@ pub struct ReviewDetails {
     pub review: PullRequest,
     pub source: Option<ReviewBranchIdentity>,
     pub target: Option<ReviewBranchIdentity>,
+    /// Actual provider boolean; absence or a malformed value cannot establish non-draft status.
+    #[serde(default)]
+    pub confirmed_draft: Option<bool>,
+    /// Actual provider state; consumers must not infer this from legacy `review.state`.
+    #[serde(default)]
+    pub confirmed_state: Option<ConfirmedReviewState>,
 }
 impl ReviewDetails {
-    /// An open review is reusable only with exact provider-confirmed project/branch identities.
+    /// Reuse requires positively open state, known draft status and exact project/branch identities.
     #[must_use]
     pub fn matches_open(
         &self,
@@ -614,7 +630,9 @@ impl ReviewDetails {
                     _ => true,
                 }
         };
-        self.review.state == PrState::Open
+        self.confirmed_state == Some(ConfirmedReviewState::Open)
+            && self.confirmed_draft.is_some()
+            && self.review.state == PrState::Open
             && !source.instance_base_url.is_empty()
             && source.instance_base_url == target.instance_base_url
             && source.project_id > 0

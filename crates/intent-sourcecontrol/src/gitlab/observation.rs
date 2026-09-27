@@ -1,4 +1,6 @@
 //! Optional policy/CI/discussion signals cannot masquerade as primary-resource denial.
+use crate::model::ConfirmedReviewState;
+
 use super::{
     approval_decision, approval_reviews, discussion_tally, http, job_state, known_check_status, mr,
     optional, pipeline_check, project, project_rules, string, to_pr, Error, GitLabSourceControl,
@@ -21,6 +23,14 @@ impl GitLabSourceControl {
         };
         let source = identity("source_project_id", "source_branch");
         let target = identity("target_project_id", "target_branch");
+        let confirmed_draft = value["draft"].as_bool();
+        let confirmed_state = match value["state"].as_str() {
+            Some("opened") => Some(ConfirmedReviewState::Open),
+            Some("locked") => Some(ConfirmedReviewState::Locked),
+            Some("closed") => Some(ConfirmedReviewState::Closed),
+            Some("merged") => Some(ConfirmedReviewState::Merged),
+            _ => None,
+        };
         let review = to_pr(value)?;
         if !self.descriptor.instance().contains_url(&review.url) {
             return Err(Error::Decode(
@@ -31,6 +41,8 @@ impl GitLabSourceControl {
             review,
             source,
             target,
+            confirmed_draft,
+            confirmed_state,
         })
     }
 

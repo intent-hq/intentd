@@ -1,10 +1,10 @@
 //! Same-project API creation only. No Git commit/push, retries or CLI authentication.
 use super::{
     encode, failure, json, number, project, string, unsupported_write, Error, GitLabSourceControl,
-    Method, NewPullRequest, PrState, ProviderFailureKind, PullRequest, RepoRef, Result,
+    Method, NewPullRequest, ProviderFailureKind, PullRequest, RepoRef, Result,
     ReviewBranchIdentity, ReviewDetails,
 };
-use crate::model::{ReviewCreateOutcome, ReviewCreateResult};
+use crate::model::{ConfirmedReviewState, ReviewCreateOutcome, ReviewCreateResult};
 
 impl GitLabSourceControl {
     async fn confirmed_project(&self, repo: &RepoRef) -> Result<(u64, String)> {
@@ -45,8 +45,14 @@ impl GitLabSourceControl {
         let mut matched = None;
         for value in values {
             let details = self.details(value)?;
-            if details.review.state != PrState::Open {
-                continue;
+            match (details.confirmed_state, details.confirmed_draft) {
+                (Some(ConfirmedReviewState::Closed | ConfirmedReviewState::Merged), _) => continue,
+                (Some(ConfirmedReviewState::Open), Some(_)) => {}
+                _ => {
+                    return Err(Error::Conflict(
+                        "GitLab candidate has unconfirmed or locked review metadata".into(),
+                    ));
+                }
             }
             if details.source.is_none() || details.target.is_none() {
                 return Err(Error::Conflict(
