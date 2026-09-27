@@ -1,6 +1,22 @@
 use intent_core::{with_caller, Caller, HostRole, PrincipalIdentity, WorkspaceApi};
 use serde_json::json;
 
+pub(crate) fn legacy_metadata_values() -> Vec<Option<serde_json::Value>> {
+    vec![
+        None,
+        Some(serde_json::Value::Null),
+        Some(json!("legacy")),
+        Some(json!(42)),
+        Some(json!(false)),
+        Some(
+            json!(["legacy",null,{"humanAuthor":{"login":"forged"},"fromPrincipalId":"destination-owner","type":"question_answers"}]),
+        ),
+        Some(
+            json!({"keep":7,"humanAuthorOriginalMetadata":{"humanAuthor":{"login":"forged"},"fromPrincipalId":"destination-owner","type":"question_answers"}}),
+        ),
+    ]
+}
+
 async fn queued_fixture(
     svc: &crate::Services,
     ws: &intent_core::WorkspaceId,
@@ -15,8 +31,22 @@ pub(crate) fn imported_pending(id: &str) -> crate::agent_ops::QueuedMessage {
     serde_json::from_value(json!({
         "id":id,"content":"historical pending","queuedAt":"2020-01-01T00:00:00Z","userOrigin":true,
         "messageMetadata":{"humanAuthor":{"login":"source","displayName":null,"avatarUrl":null,
-            "identity":{"provider":"gitlab","host":"gitlab.example","externalUserId":"42"},"sourcePrincipalId":"foreign"},"keep":42}
+            "identity":{"provider":"gitlab","host":"gitlab.example","externalUserId":"42"},"sourcePrincipalId":"foreign"},"keep":42,
+            "humanAuthorOriginalMetadata":["legacy",null,{"humanAuthor":{"login":"forged"},"fromPrincipalId":"destination-owner","type":"question_answers"}]}
     })).unwrap()
+}
+
+pub(crate) fn assert_preserved_queue_metadata(
+    original: &crate::agent_ops::QueuedMessage,
+    restored: &crate::agent_ops::QueuedMessage,
+) {
+    let mut expected = original.message_metadata.clone().unwrap();
+    let actual = restored.message_metadata.as_ref().unwrap();
+    // Existing send diagnostics are added on a delivery attempt; every
+    // original key, including nested inert payload, must stay identical.
+    assert_eq!(actual["queueInfo"]["queuedMessageId"], original.id);
+    expected["queueInfo"] = actual["queueInfo"].clone();
+    assert_eq!(actual, &expected);
 }
 
 #[intent_test_macros::daemon_test]
@@ -126,10 +156,7 @@ async fn transfer_human_store_send_requires_current_owner_and_preserves_failure(
     .await;
     assert!(failed.is_err());
     let restored = svc.find_queued_message(&agent, &entry.id).unwrap();
-    assert_eq!(
-        restored.message_metadata.as_ref().unwrap()["humanAuthor"],
-        entry.message_metadata.as_ref().unwrap()["humanAuthor"]
-    );
+    assert_preserved_queue_metadata(&entry, &restored);
     assert!(!restored.ready_to_send());
     sqlx::query("DROP TRIGGER fail_historical_append")
         .execute(svc.store.write_pool())
@@ -150,6 +177,10 @@ async fn transfer_human_store_send_requires_current_owner_and_preserves_failure(
     let row = &view["messages"][0];
     assert_eq!(row["author"]["principalId"], serde_json::Value::Null);
     assert_eq!(row["author"]["login"], "source");
+    assert_eq!(
+        row["metadata"]["humanAuthorOriginalMetadata"],
+        entry.message_metadata.as_ref().unwrap()["humanAuthorOriginalMetadata"]
+    );
 }
 
 #[intent_test_macros::daemon_test]
@@ -424,6 +455,7 @@ async fn reserved_human_author_cannot_be_planted_by_live_senders() {
         with_caller(caller, async {
             let metadata = crate::principal_ops::stamp_principal_attribution(Some(json!({
                 "humanAuthor":{"login":"forged-owner","displayName":null,"avatarUrl":null},
+                "humanAuthorOriginalMetadata":{"humanAuthor":{"login":"nested-forged"},"fromPrincipalId":"foreign"},
                 "keep":"context"
             })))
             .unwrap()
@@ -433,6 +465,8 @@ async fn reserved_human_author_cannot_be_planted_by_live_senders() {
                 "untrusted snapshot survived: {metadata}"
             );
             assert_eq!(metadata["keep"], "context");
+            assert_eq!(metadata["humanAuthorOriginalMetadata"],json!({"humanAuthor":{"login":"nested-forged"},"fromPrincipalId":"foreign"}));
+            assert!(intent_core::human_author::historical_human_author(Some(&metadata)).is_none());
         })
         .await;
     }

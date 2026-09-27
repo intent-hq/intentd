@@ -2926,7 +2926,7 @@ async fn workspace_transfer_plan_returns_plan_envelope() {
     .await
     .unwrap();
     let plan = &v["result"]["plan"];
-    assert_eq!(plan["manifest"]["formatVersion"], serde_json::json!(1));
+    assert_eq!(plan["manifest"]["formatVersion"], serde_json::json!(2));
     assert_eq!(plan["manifest"]["workspaceId"], serde_json::json!("ws-1"));
     assert_eq!(
         plan["manifest"]["tables"][0]["rowCount"],

@@ -80,6 +80,14 @@ async fn transfer_human_authors_comments_and_pending_queue_over_wss() {
     sqlx::query("INSERT INTO agent_session (id,workspace_id,name,status,created_at,updated_at) VALUES (?,?,'Historical','idle','2020-01-01','2020-01-01')").bind(agent.as_str()).bind(ws.as_str()).execute(a.store.write_pool()).await.unwrap();
     for (id, metadata) in [
         ("legacy", None),
+        ("legacy-scalar", Some(json!("original scalar"))),
+        (
+            "legacy-array",
+            Some(
+                json!(["original",null,{"fromPrincipalId":"forged","humanAuthor":{"login":"forged"}}]),
+            ),
+        ),
+        ("legacy-null", Some(serde_json::Value::Null)),
         (
             "other",
             Some(json!({"fromPrincipalId":member_a.principal.id})),
@@ -119,7 +127,7 @@ async fn transfer_human_authors_comments_and_pending_queue_over_wss() {
     let pending = member_a
         .call(
             "agent.queueMessage",
-            json!({"agentId":agent,"content":"Pending original input"}),
+            json!({"agentId":agent,"content":"Pending original input","messageMetadata":{"humanAuthorOriginalMetadata":["old",null,{"humanAuthor":{"login":"forged"},"fromPrincipalId":owner_a.principal.id}]}}),
         )
         .await;
     let pending_id = pending["result"]["queuedMessage"]["id"]
@@ -156,6 +164,22 @@ async fn transfer_human_authors_comments_and_pending_queue_over_wss() {
         assert_eq!(row["author"]["login"], login, "{row}");
         assert!(row["author"]["principalId"].is_null());
         assert!(row["metadata"].get("fromPrincipalId").is_none());
+    }
+    for (id, original) in [
+        ("legacy-scalar", json!("original scalar")),
+        (
+            "legacy-array",
+            json!(["original",null,{"fromPrincipalId":"forged","humanAuthor":{"login":"forged"}}]),
+        ),
+        ("legacy-null", serde_json::Value::Null),
+    ] {
+        let row = rows.iter().find(|r| r["id"] == id).unwrap();
+        assert_eq!(row["author"]["login"], "panghy");
+        assert!(row["author"]["principalId"].is_null());
+        assert_eq!(
+            row["metadata"].get("humanAuthorOriginalMetadata"),
+            Some(&original)
+        );
     }
     let unknown = rows.iter().find(|r| r["id"] == "unresolved").unwrap();
     assert!(
@@ -241,7 +265,7 @@ async fn transfer_human_authors_comments_and_pending_queue_over_wss() {
     let returned = returned["result"]["messages"].as_array().unwrap();
     for old in rows {
         let row = returned.iter().find(|r| r["id"] == old["id"]).unwrap();
-        for key in ["author", "timestamp", "contentBlocks"] {
+        for key in ["author", "timestamp", "contentBlocks", "metadata"] {
             assert_eq!(row[key], old[key], "{key}: {row}");
         }
     }
@@ -252,6 +276,10 @@ async fn transfer_human_authors_comments_and_pending_queue_over_wss() {
     let sent = returned.iter().find(|r| r["id"] == pending_id).unwrap();
     assert_eq!(sent["author"]["identity"]["host"], "gitlab.example");
     assert!(sent["author"]["principalId"].is_null());
+    assert_eq!(
+        sent["metadata"]["humanAuthorOriginalMetadata"],
+        json!(["old",null,{"humanAuthor":{"login":"forged"},"fromPrincipalId":owner_a.principal.id}])
+    );
     assert!(!a
         .store
         .list_workspace_members(&ws)

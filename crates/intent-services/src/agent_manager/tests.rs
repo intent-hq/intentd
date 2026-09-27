@@ -10124,10 +10124,7 @@ async fn transfer_human_runtime_force_and_handback_keep_original_author() {
     .unwrap();
     assert_eq!(parked["queued"], true);
     let restored = mgr.services.find_queued_message(&id, &entry.id).unwrap();
-    assert_eq!(
-        restored.message_metadata.as_ref().unwrap()["humanAuthor"],
-        entry.message_metadata.as_ref().unwrap()["humanAuthor"]
-    );
+    crate::human_attribution_tests::assert_preserved_queue_metadata(&entry, &restored);
     assert!(!restored.ready_to_send());
     mgr.end_turn(&id).await;
     mgr.redrive_parked_recovery_send(&id, &ws).await;
@@ -10145,10 +10142,7 @@ async fn transfer_human_runtime_force_and_handback_keep_original_author() {
     assert!(failed.is_err());
     assert!(!mgr.is_busy(&id));
     let restored = mgr.services.find_queued_message(&id, &entry.id).unwrap();
-    assert_eq!(
-        restored.message_metadata.as_ref().unwrap()["humanAuthor"],
-        entry.message_metadata.as_ref().unwrap()["humanAuthor"]
-    );
+    crate::human_attribution_tests::assert_preserved_queue_metadata(&entry, &restored);
     assert!(!restored.ready_to_send());
     sqlx::query("DROP TRIGGER fail_historical_append")
         .execute(mgr.services.store.write_pool())
@@ -10182,6 +10176,10 @@ async fn transfer_human_runtime_force_and_handback_keep_original_author() {
     assert_eq!(
         row.metadata.as_ref().unwrap()["humanAuthor"],
         entry.message_metadata.as_ref().unwrap()["humanAuthor"]
+    );
+    assert_eq!(
+        row.metadata.as_ref().unwrap()["humanAuthorOriginalMetadata"],
+        entry.message_metadata.as_ref().unwrap()["humanAuthorOriginalMetadata"]
     );
     assert!(row
         .metadata

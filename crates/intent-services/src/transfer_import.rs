@@ -2961,6 +2961,25 @@ mod tests {
             .unwrap()
             .1;
         messages[0]["metadata"]=serde_json::json!({"fromPrincipalId":owner.id,"humanAuthor":{"login":"planted","displayName":null,"avatarUrl":null},"keep":42}).to_string().into();
+        let originals = crate::human_attribution_tests::legacy_metadata_values();
+        let prototype = messages[0].clone();
+        let mut queue = Vec::new();
+        for (i, metadata) in originals.iter().enumerate() {
+            let mut row = prototype.clone();
+            row["id"] = serde_json::json!(format!("old-human-{i}"));
+            row["seq"] = serde_json::json!(i + 3);
+            row["metadata"] = metadata.as_ref().map_or(serde_json::Value::Null, |v| {
+                serde_json::json!(v.to_string())
+            });
+            messages.push(row);
+            let id = format!("old-pending-{i}");
+            let mut payload = serde_json::json!({"id":id,"content":"old input","queuedAt":"2020-01-01T00:00:00Z"});
+            if let Some(value) = metadata {
+                payload["messageMetadata"] = value.clone();
+            }
+            queue.push(serde_json::json!({"id":id,"agent_id":"agent-live","position":i,"payload":payload.to_string(),"created_at":"2020-01-01T00:00:00Z","turn_id":id}));
+        }
+        rows.push(("agent_queue", queue));
         let archive = build_archive(&m, &rows);
         let begin = svc
             .workspace_import_begin_op(
@@ -2996,6 +3015,37 @@ mod tests {
         assert_eq!(human["metadata"]["keep"], 42);
         assert!(human["metadata"].get("fromPrincipalId").is_none());
         assert!(view["messages"][1].get("author").is_none());
+        for (i, original) in originals.iter().enumerate() {
+            let human = view["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["id"] == format!("old-human-{i}"))
+                .unwrap();
+            assert_eq!(
+                human["author"],
+                serde_json::json!({"principalId":null,"login":null,"displayName":null,"avatarUrl":null})
+            );
+            match original {
+                Some(serde_json::Value::Object(object)) => {
+                    for (key, value) in object {
+                        assert_eq!(&human["metadata"][key], value);
+                    }
+                }
+                Some(value) => assert_eq!(
+                    human["metadata"].get("humanAuthorOriginalMetadata"),
+                    Some(value)
+                ),
+                None => assert!(human["metadata"]
+                    .get("humanAuthorOriginalMetadata")
+                    .is_none()),
+            }
+            let pending = svc
+                .find_queued_message(&AgentId::from("agent-live"), &format!("old-pending-{i}"))
+                .unwrap();
+            assert_eq!(pending.message_metadata.as_ref(), Some(&human["metadata"]));
+            assert!(!pending.ready_to_send());
+        }
         let exported = svc.store.transfer_export_rows(&ws).await.unwrap();
         let row = exported
             .iter()
@@ -3011,6 +3061,29 @@ mod tests {
             md["humanAuthor"],
             serde_json::json!({"login":null,"displayName":null,"avatarUrl":null})
         );
+        for (i, _) in originals.iter().enumerate() {
+            let id = format!("old-human-{i}");
+            let row = exported
+                .iter()
+                .find(|(t, _)| t == "agent_message")
+                .unwrap()
+                .1
+                .iter()
+                .find(|r| r["id"] == id)
+                .unwrap();
+            let metadata: serde_json::Value =
+                serde_json::from_str(row["metadata"].as_str().unwrap()).unwrap();
+            let projected = view["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"] == id)
+                .unwrap();
+            assert_eq!(
+                metadata, projected["metadata"],
+                "unknown and original payload survive re-export"
+            );
+        }
     }
 
     #[intent_test_macros::daemon_test]

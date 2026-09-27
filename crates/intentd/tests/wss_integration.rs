@@ -18818,7 +18818,7 @@ async fn wss_workspace_transfer_plan_round_trip() {
     assert_eq!(resp["id"], 2, "envelope: {resp}");
     let plan = &resp["result"]["plan"];
     let manifest = &plan["manifest"];
-    assert_eq!(manifest["formatVersion"], 1, "{resp}");
+    assert_eq!(manifest["formatVersion"], 2, "{resp}");
     assert!(
         manifest["creatingIntentdVersion"].is_string(),
         "manifest records the creating daemon version: {resp}"

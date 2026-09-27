@@ -101,7 +101,7 @@ pub(crate) async fn capture(
     }
     for (table, objects) in rows.iter_mut() {
         for row in objects {
-            let AuthorMetadata::Candidate(mut metadata) = metadata(table, row)? else {
+            let AuthorMetadata::Candidate(metadata) = metadata(table, row)? else {
                 continue;
             };
             if !needs_snapshot(metadata.as_ref()) {
@@ -110,14 +110,14 @@ pub(crate) async fn capture(
             let id = lift_from_principal_id(metadata.as_ref()).or_else(|| fallback.clone());
             let snapshot =
                 HumanAuthor::from_source(id.clone(), id.as_ref().and_then(|id| people.get(id)));
-            let value = metadata.get_or_insert_with(|| serde_json::json!({}));
-            let object = value.as_object_mut().ok_or_else(|| {
-                Error::InvalidParams(
-                    "human message metadata must be an object to preserve transfer attribution"
-                        .into(),
-                )
-            })?;
-            object.insert(HUMAN_AUTHOR_KEY.into(), serde_json::json!(snapshot));
+            let mut value = match metadata {
+                Some(Value::Object(object)) => Value::Object(object),
+                None => serde_json::json!({}),
+                Some(original) => serde_json::json!({"humanAuthorOriginalMetadata":original}),
+            };
+            // The preservation member is inert data. Existing objects (even
+            // those with a same-named member) keep their unrelated contents.
+            value[HUMAN_AUTHOR_KEY] = serde_json::json!(snapshot);
             if table == "agent_message" {
                 row["metadata"] = Value::String(value.to_string());
             } else {
@@ -126,7 +126,7 @@ pub(crate) async fn capture(
                 let object = payload.as_object_mut().ok_or_else(|| {
                     Error::InvalidParams("queued payload must be an object".into())
                 })?;
-                object.insert("messageMetadata".into(), value.clone());
+                object.insert("messageMetadata".into(), value);
                 row["payload"] = Value::String(payload.to_string());
             }
         }

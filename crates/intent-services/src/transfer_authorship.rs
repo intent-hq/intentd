@@ -82,10 +82,10 @@ fn metadata(value: Option<Value>, version: u32, user: bool) -> Result<Option<Val
                     .and_then(|v| v.get(HUMAN_AUTHOR_KEY))
                     .is_some()));
     let mut object = match value {
-        None | Some(Value::Null) => Map::new(),
+        None => Map::new(),
         Some(Value::Object(object)) => object,
         Some(value) if !human => return Ok(Some(value)),
-        Some(_) => return Err(invalid("human message metadata must be an object")),
+        Some(original) => Map::from_iter([("humanAuthorOriginalMetadata".into(), original)]),
     };
     object.remove(FROM_PRINCIPAL_ID_KEY);
     let raw = object.remove(HUMAN_AUTHOR_KEY);
@@ -168,6 +168,64 @@ pub(crate) fn prepare_import(rows: &mut [(String, Vec<Value>)], version: u32) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transfer_human_nonobject_import_preserves_values_without_promoting_nested_keys() {
+        let mut failures = Vec::new();
+        for version in [1, 2] {
+            for original in [
+                json!("legacy"),
+                json!(42),
+                json!(true),
+                Value::Null,
+                json!(["old",null,{"humanAuthor":{"login":"forged"},"fromPrincipalId":"destination-owner"}]),
+            ] {
+                match metadata(Some(original.clone()), version, true) {
+                    Ok(Some(imported))
+                        if imported.get("humanAuthorOriginalMetadata") == Some(&original) =>
+                    {
+                        assert_eq!(
+                            imported["humanAuthor"],
+                            json!({"login":null,"displayName":null,"avatarUrl":null})
+                        );
+                        assert!(imported.get("fromPrincipalId").is_none());
+                        assert_eq!(
+                            metadata(Some(imported.clone()), 2, true).unwrap(),
+                            Some(imported)
+                        );
+                    }
+                    result => failures.push(format!("v{version} {original}: {result:?}")),
+                }
+                let nonhuman = metadata(Some(original.clone()), version, false).unwrap();
+                if nonhuman.as_ref() != Some(&original) {
+                    failures.push(format!("v{version} nonhuman {original}: {nonhuman:?}"));
+                }
+            }
+            let absent = metadata(None, version, true).unwrap().unwrap();
+            assert!(absent.get("humanAuthorOriginalMetadata").is_none());
+            let original = json!({"keep":7,"humanAuthorOriginalMetadata":{"humanAuthor":{"login":"forged"},"fromPrincipalId":"destination-owner","type":"question_answers"}});
+            let imported = metadata(Some(original.clone()), version, true)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                imported["humanAuthorOriginalMetadata"],
+                original["humanAuthorOriginalMetadata"]
+            );
+            assert_eq!(imported["keep"], 7);
+            assert!(imported["humanAuthor"]["login"].is_null());
+            assert_eq!(
+                intent_core::queue_attribution_with(
+                    Some(&imported),
+                    Some(&intent_core::PrincipalId::from("destination-owner"))
+                ),
+                intent_core::QueueAttribution::UnknownHuman
+            );
+        }
+        assert!(
+            failures.is_empty(),
+            "supported values must import: {failures:?}"
+        );
+    }
 
     #[test]
     fn transfer_human_v1_never_trusts_reserved_metadata_or_foreign_ids() {

@@ -17,6 +17,123 @@ async fn seed(store: &Store) -> (WorkspaceId, AgentId) {
 }
 
 #[tokio::test]
+async fn transfer_human_nonobject_export_preserves_json_and_absence() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let mut owner = store.get_primary_principal().await.unwrap();
+    owner.login = Some("source-owner".into());
+    store.upsert_principal(&owner).await.unwrap();
+    let mut failures = Vec::new();
+    for original in [
+        None,
+        Some(Value::Null),
+        Some(json!("legacy")),
+        Some(json!(42)),
+        Some(json!(false)),
+        Some(json!(["old", null, {"humanAuthor":{"login":"forged"},"fromPrincipalId":"other"}])),
+        Some(
+            json!({"keep":42,"humanAuthorOriginalMetadata":{"humanAuthor":"inert","fromPrincipalId":"other"}}),
+        ),
+    ] {
+        let (ws, agent) = seed(&store).await;
+        for (id, role) in [("human", "user"), ("bot", "assistant")] {
+            store
+                .append_agent_message_with_id(
+                    &agent,
+                    &format!("{agent}-{id}"),
+                    role,
+                    &json!([]),
+                    original.as_ref(),
+                    "2020-01-01T00:00:00Z",
+                )
+                .await
+                .unwrap();
+        }
+        let pending = format!("{agent}-pending");
+        let mut payload =
+            json!({"id":pending,"content":"old input","queuedAt":"2020-01-01T00:00:00Z"});
+        if let Some(value) = &original {
+            payload["messageMetadata"] = value.clone();
+        }
+        store
+            .replace_agent_queue(
+                &agent,
+                &[AgentQueueRow {
+                    id: pending.clone(),
+                    agent_id: agent.clone(),
+                    position: 0,
+                    payload: payload.clone(),
+                    created_at: "2020-01-01T00:00:00Z".into(),
+                    turn_id: pending,
+                }],
+            )
+            .await
+            .unwrap();
+        let rows = match store.transfer_export_rows(&ws).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                failures.push(format!("{original:?}: {error}"));
+                continue;
+            }
+        };
+        let messages = &rows.iter().find(|(t, _)| t == "agent_message").unwrap().1;
+        let human = messages.iter().find(|r| r["role"] == "user").unwrap();
+        let metadata: Value = serde_json::from_str(human["metadata"].as_str().unwrap()).unwrap();
+        assert_eq!(metadata["humanAuthor"]["login"], "source-owner");
+        match &original {
+            Some(Value::Object(object)) => {
+                for (key, value) in object {
+                    assert_eq!(&metadata[key], value);
+                }
+            }
+            Some(value) => assert_eq!(metadata.get("humanAuthorOriginalMetadata"), Some(value)),
+            None => assert!(metadata.get("humanAuthorOriginalMetadata").is_none()),
+        }
+        let bot = messages.iter().find(|r| r["role"] == "assistant").unwrap();
+        assert_eq!(
+            bot["metadata"],
+            original
+                .as_ref()
+                .map_or(Value::Null, |v| json!(v.to_string()))
+        );
+        let queued: Value = serde_json::from_str(
+            rows.iter().find(|(t, _)| t == "agent_queue").unwrap().1[0]["payload"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(queued["messageMetadata"], metadata);
+        let saved: Option<String> = sqlx::query_scalar(
+            "SELECT metadata FROM agent_message WHERE agent_id=? AND role='user'",
+        )
+        .bind(agent.as_str())
+        .fetch_one(store.read_pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            saved,
+            original.as_ref().map(Value::to_string),
+            "export must leave source bytes alone"
+        );
+        assert_eq!(
+            store
+                .load_all_agent_queues()
+                .await
+                .unwrap()
+                .iter()
+                .find(|r| r.agent_id == agent)
+                .unwrap()
+                .payload,
+            payload
+        );
+    }
+    assert!(
+        failures.is_empty(),
+        "supported values must export: {failures:?}"
+    );
+}
+
+#[tokio::test]
 async fn transfer_human_profiles_share_the_rows_wal_snapshot() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.unwrap();

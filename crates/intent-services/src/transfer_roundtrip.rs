@@ -102,6 +102,42 @@ async fn transfer_human_authors_survive_member_export_and_return_without_grants(
             .await
             .unwrap();
     }
+    let originals = crate::human_attribution_tests::legacy_metadata_values();
+    let mut queued = Vec::new();
+    for (i, metadata) in originals.iter().enumerate() {
+        for role in ["user", "assistant"] {
+            source
+                .store
+                .append_agent_message_with_id(
+                    &agent,
+                    &format!("legacy-{role}-{i}"),
+                    role,
+                    &json!([{"type":"text","text":"retained"}]),
+                    metadata.as_ref(),
+                    "2020-01-01T00:00:00Z",
+                )
+                .await
+                .unwrap();
+        }
+        let id = format!("legacy-queue-{i}");
+        let mut payload = json!({"id":id,"content":"pending legacy input","queuedAt":"2020-01-01T00:00:00Z","userOrigin":true});
+        if let Some(metadata) = metadata {
+            payload["messageMetadata"] = metadata.clone();
+        }
+        queued.push(AgentQueueRow {
+            id: id.clone(),
+            agent_id: agent.clone(),
+            position: i64::try_from(i).unwrap(),
+            payload,
+            created_at: "2020-01-01T00:00:00Z".into(),
+            turn_id: id,
+        });
+    }
+    source
+        .store
+        .replace_agent_queue(&agent, &queued)
+        .await
+        .unwrap();
     source
         .store
         .append_agent_message_with_id(
@@ -128,6 +164,13 @@ async fn transfer_human_authors_survive_member_export_and_return_without_grants(
     let (size, sha, manifest) = ready_meta(&source, export);
     let committed = relay(&source, &target, export, &manifest, size, &sha).await;
     assert_eq!(committed["workspace"]["id"], ws.0);
+    // Reopen the destination database before reading or exporting its history.
+    drop(target);
+    let target = fresh_services(&b.0, &b.0.join("workspaces"), &b.0.join("assets")).await;
+    assert_eq!(
+        target.rehydrate_agent_queues().await.unwrap(),
+        originals.len()
+    );
     let view = target
         .agent_get_conversation(
             agent.clone(),
@@ -142,6 +185,43 @@ async fn transfer_human_authors_survive_member_export_and_return_without_grants(
         .await
         .unwrap();
     let rows = view["messages"].as_array().unwrap();
+    for (i, original) in originals.iter().enumerate() {
+        let id = format!("legacy-user-{i}");
+        let row = rows.iter().find(|r| r["id"] == id).unwrap();
+        assert_eq!(row["author"]["login"], "panghy");
+        let metadata = &row["metadata"];
+        match original {
+            Some(serde_json::Value::Object(object)) => {
+                for (key, value) in object {
+                    assert_eq!(&metadata[key], value);
+                }
+            }
+            Some(value) => assert_eq!(metadata.get("humanAuthorOriginalMetadata"), Some(value)),
+            None => assert!(metadata.get("humanAuthorOriginalMetadata").is_none()),
+        }
+        let bot = rows
+            .iter()
+            .find(|r| r["id"] == format!("legacy-assistant-{i}"))
+            .unwrap();
+        assert_eq!(
+            bot.get("metadata").filter(|v| !v.is_null()),
+            original.as_ref().filter(|v| !v.is_null())
+        );
+        assert!(bot.get("author").is_none());
+        let pending = target
+            .find_queued_message(&agent, &format!("legacy-queue-{i}"))
+            .unwrap();
+        assert_eq!(pending.message_metadata.as_ref(), Some(metadata));
+        assert!(!pending.ready_to_send());
+        assert_eq!(
+            intent_core::queue_attribution_with(
+                pending.message_metadata.as_ref(),
+                Some(&owner_b.id)
+            ),
+            intent_core::QueueAttribution::UnknownHuman
+        );
+    }
+    assert!(target.dequeue_message(&agent).is_none());
     for id in ["legacy-a", "stamped-a"] {
         let row = rows.iter().find(|r| r["id"] == id).unwrap();
         assert_eq!(
@@ -185,6 +265,18 @@ async fn transfer_human_authors_survive_member_export_and_return_without_grants(
         )
         .await
         .unwrap();
+    target
+        .store
+        .append_agent_message_with_id(
+            &agent,
+            "new-b-array",
+            "user",
+            &json!([]),
+            Some(&json!(["B", null])),
+            "2026-09-21T00:00:01Z",
+        )
+        .await
+        .unwrap();
     source
         .workspace_export_abort_op(export.to_string())
         .await
@@ -200,7 +292,7 @@ async fn transfer_human_authors_survive_member_export_and_return_without_grants(
         .await
         .unwrap();
     let returned = source
-        .agent_get_conversation(agent, None, Some(ws), None, None, None, None, false)
+        .agent_get_conversation(agent.clone(), None, Some(ws), None, None, None, None, false)
         .await
         .unwrap();
     for original in rows {
@@ -213,6 +305,10 @@ async fn transfer_human_authors_survive_member_export_and_return_without_grants(
         assert_eq!(row["author"], original["author"]);
         assert_eq!(row["contentBlocks"], original["contentBlocks"]);
         assert_eq!(row["timestamp"], original["timestamp"]);
+        assert_eq!(
+            row["metadata"], original["metadata"],
+            "re-export must not wrap again"
+        );
     }
     let new_b = returned["messages"]
         .as_array()
@@ -222,6 +318,24 @@ async fn transfer_human_authors_survive_member_export_and_return_without_grants(
         .unwrap();
     assert_eq!(new_b["author"]["login"], "shared-instance-github-handle");
     assert!(new_b["author"]["principalId"].is_null());
+    let new_b_array = returned["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == "new-b-array")
+        .unwrap();
+    assert_eq!(new_b_array["author"], new_b["author"]);
+    assert_eq!(
+        new_b_array["metadata"]["humanAuthorOriginalMetadata"],
+        json!(["B", null])
+    );
+    for i in 0..originals.len() {
+        let id = format!("legacy-queue-{i}");
+        let expected = target.find_queued_message(&agent, &id).unwrap();
+        let actual = source.find_queued_message(&agent, &id).unwrap();
+        assert_eq!(actual.message_metadata, expected.message_metadata);
+        assert!(!actual.ready_to_send());
+    }
 }
 
 /// Temp directory swept on drop (see [`test_tempdir`]).
