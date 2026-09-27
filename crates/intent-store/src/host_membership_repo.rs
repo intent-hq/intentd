@@ -605,6 +605,10 @@ impl Store {
     /// Validate owner and optional exact personal credential under the write
     /// lock. Dropping the permit releases the read-only transaction; no queue
     /// or authority row is changed. Keep it only through the atomic queue pop.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` when acquiring or querying the database fails.
     pub async fn owner_queue_permit(
         &self,
         principal_id: &PrincipalId,
