@@ -200,7 +200,8 @@ impl RepositoryAuthorityFence for ActiveFence {
         action: &mut (dyn FnMut() -> crate::repository_credentials::Result<()> + Send),
     ) -> crate::repository_credentials::Result<()> {
         // R lifetime -> active operation -> P directory. Action is the sole
-        // synchronous token release, never an HTTP/Git call or another R read.
+        // synchronous token release or one-use prepared-request admission,
+        // never an HTTP/Git call, task spawn, await, or another R read.
         let result = self.inner.retirement.dispatch(|| {
             let progress = self
                 .inner
@@ -213,7 +214,8 @@ impl RepositoryAuthorityFence for ActiveFence {
             }
             Ok(action())
         });
-        // The original legacy lease protects only this release, not later I/O.
+        // The original legacy lease protects this consuming action. An HTTP
+        // owner needs a fresh fence after preparation; admitted I/O can outlive it.
         drop(self);
         result.map_err(local_error)?
     }

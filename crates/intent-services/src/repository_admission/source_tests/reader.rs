@@ -3,6 +3,10 @@
 //! stage authority. Target/scope production and ACP responses remain explicit
 //! fixtures. No wire/daemon producer, `NativeRead` or final worker is installed.
 
+#[cfg(test)]
+#[path = "http_dispatch.rs"]
+mod http_dispatch_tests;
+
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
