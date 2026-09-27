@@ -6,6 +6,8 @@ use std::fmt::Write as _;
 
 #[path = "member_tools/accept_changes.rs"]
 mod accept_changes;
+#[path = "member_tools/scoped_owner.rs"]
+mod scoped_owner;
 
 const MEMBER_TOKEN: &str = "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1";
 

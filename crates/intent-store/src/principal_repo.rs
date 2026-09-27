@@ -540,7 +540,8 @@ impl Store {
             "WITH viewer AS (SELECT p.id, p.is_primary, h.principal_id IS NOT NULL AS is_host_member \
                 FROM principal p LEFT JOIN host_member h ON h.principal_id = p.id WHERE p.id = ?) \
              SELECT w.id AS workspace_id, w.owner_principal_id, \
-                COALESCE(v.is_primary OR (v.is_host_member AND w.id <> ?), 0) AS can_manage, \
+                COALESCE(v.is_primary OR CASE WHEN v.is_host_member THEN w.id <> ? \
+                    ELSE m.role = 'owner' END, 0) AS can_manage, \
                 CASE WHEN w.id = ? THEN s.direct_count ELSE s.non_host_count + h.member_count END AS member_count, \
                 s.open_invite_count, \
                 COALESCE(m.role, CASE WHEN v.is_host_member AND w.id <> ? THEN 'collaborator' END) AS my_role \

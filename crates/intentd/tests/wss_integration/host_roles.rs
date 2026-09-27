@@ -2,6 +2,156 @@ use super::*;
 use intent_core::WorkspaceRole;
 use serde_json::json;
 
+async fn workspace_push(guest: &mut Guest) -> Value {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            match guest.ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let frame: Value = serde_json::from_str(&text).unwrap();
+                    if frame["method"] == "subscription.push" {
+                        return frame["params"].clone();
+                    }
+                }
+                Some(Ok(Message::Ping(p))) => guest.ws.send(Message::Pong(p)).await.unwrap(),
+                Some(Ok(_)) => {}
+                other => panic!("expected workspace push, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("workspace push within deadline")
+}
+
+#[tokio::test]
+async fn scoped_owner_projection_over_wss_tracks_workspace_snapshots_and_role_loss() {
+    let srv = start(WsOptions::default()).await;
+    let primary = srv.store.get_primary_principal().await.unwrap();
+    let owned = WorkspaceId::new();
+    let other = WorkspaceId::new();
+    for id in [&owned, &other] {
+        srv.store
+            .insert_workspace(&fixture_workspace(id))
+            .await
+            .unwrap();
+    }
+    let token = "ba".repeat(32);
+    let mut guest = Guest::connect(&srv, &token).await;
+    srv.store
+        .set_workspace_member_role(&owned, &primary.id, WorkspaceRole::Collaborator)
+        .await
+        .unwrap();
+    srv.store
+        .add_workspace_member(&owned, &guest.principal.id, WorkspaceRole::Owner)
+        .await
+        .unwrap();
+    let me = guest.call("principal.me", json!({})).await;
+    assert_eq!(me["result"]["hostRole"], "guest");
+    assert_eq!(me["result"]["isAdministrator"], false);
+    let guest_id = guest.principal.id.clone();
+    let assert_owner = |row: &Value| {
+        assert_eq!(row["id"], owned.0, "{row}");
+        assert_eq!(row["myRole"], "owner", "{row}");
+        assert_eq!(row["ownerPrincipalId"], guest_id.0, "{row}");
+        assert_eq!(row["canManage"], true, "{row}");
+    };
+    let got = guest
+        .call("workspace.get", json!({"workspaceId":owned}))
+        .await;
+    assert_owner(&got["result"]["workspace"]);
+    let listed = guest.call("workspace.list", json!({})).await;
+    let rows = listed["result"]["workspaces"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_owner(&rows[0]);
+
+    let url = format!("wss://localhost:{}/ws?token={token}", srv.port);
+    let mut subscriber = Guest {
+        principal: guest.principal.clone(),
+        ws: common::wss_connect_with_retry(srv.port, srv.cfg.clone(), &url).await,
+        next_id: 0,
+    };
+    assert!(subscriber
+        .call("workspace.subscribe", json!({}))
+        .await
+        .get("error")
+        .is_none());
+    let snapshot = workspace_push(&mut subscriber).await;
+    assert_eq!(snapshot["kind"], "snapshot");
+    assert_eq!(snapshot["seq"], 0);
+    assert_owner(&snapshot["snapshot"][0]);
+    let updated = guest
+        .call(
+            "workspace.update",
+            json!({"workspaceId":owned,"title":"Scoped owner update"}),
+        )
+        .await;
+    assert_owner(&updated["result"]["workspace"]);
+    let delta = workspace_push(&mut subscriber).await;
+    assert_eq!(delta["kind"], "delta");
+    assert_owner(&delta["delta"]["updated"][0]);
+
+    for (method, params) in [
+        ("script.list", json!({"workspaceId":owned})),
+        ("workspace.create", json!({"title":"Forbidden creation"})),
+        ("settings.list", json!({})),
+    ] {
+        let refused = guest.call(method, params).await;
+        assert_eq!(refused["error"]["code"], -32003, "{method}: {refused}");
+    }
+    assert_eq!(
+        guest
+            .call("workspace.get", json!({"workspaceId":other}))
+            .await["error"]["data"]["code"],
+        "not-found"
+    );
+    srv.store
+        .set_workspace_member_role(&owned, &guest.principal.id, WorkspaceRole::Collaborator)
+        .await
+        .unwrap();
+    let updated = guest
+        .call(
+            "workspace.update",
+            json!({"workspaceId":owned,"title":"Demoted owner update"}),
+        )
+        .await;
+    assert_eq!(updated["result"]["workspace"]["canManage"], false);
+    assert_eq!(updated["result"]["workspace"]["myRole"], "collaborator");
+    let delta = workspace_push(&mut subscriber).await;
+    assert_eq!(delta["delta"]["updated"][0]["canManage"], false);
+    assert_eq!(delta["delta"]["updated"][0]["myRole"], "collaborator");
+    let refused = guest
+        .call(
+            "workspace.update",
+            json!({"workspaceId":owned,"defaultModel":"no-longer-owner"}),
+        )
+        .await;
+    assert_eq!(refused["error"]["code"], -32003, "{refused}");
+    let removed = intent_core::with_caller(
+        intent_core::Caller::Daemon,
+        srv.api
+            .workspace_members_remove(owned.clone(), guest.principal.id.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(removed["removed"], true);
+    let delta = workspace_push(&mut subscriber).await;
+    assert_eq!(delta["delta"]["removedIds"], json!([owned]));
+    assert_eq!(
+        guest
+            .call("workspace.get", json!({"workspaceId":owned}))
+            .await["error"]["data"]["code"],
+        "not-found"
+    );
+    assert!(
+        guest.call("workspace.list", json!({})).await["result"]["workspaces"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    drop(subscriber);
+    drop(guest);
+    srv.ws.stop().await;
+}
+
 /// Narrow role/admission proof; full member method/event/reverse/tunnel
 /// capabilities are exercised by the subsequent transport implementation.
 #[tokio::test]

@@ -45,6 +45,107 @@ async fn join(store: &Store, id: &str, person: &Principal, hash: &str) -> Join {
 }
 
 #[tokio::test]
+async fn scoped_owner_capability_follows_durable_workspace_role() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let primary = store.get_primary_principal().await.unwrap();
+    let guest = guest_identity(901);
+    let member = guest_identity(902);
+    let unrelated = guest_identity(903);
+    for person in [&guest, &unrelated] {
+        store.upsert_principal(person).await.unwrap();
+    }
+    join(&store, "capability-member", &member, "member-credential").await;
+    let owned = WorkspaceId::new();
+    let other = WorkspaceId::new();
+    for id in [&owned, &other] {
+        store
+            .insert_workspace(&sample_workspace(id, "Workspace", false))
+            .await
+            .unwrap();
+    }
+    store
+        .set_workspace_member_role(&owned, &primary.id, WorkspaceRole::Collaborator)
+        .await
+        .unwrap();
+    store
+        .add_workspace_member(&owned, &guest.id, WorkspaceRole::Owner)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_host_role(&guest.id).await.unwrap(),
+        HostRole::Guest
+    );
+    let unknown = PrincipalId::new();
+    for (viewer, can_manage, role) in [
+        (Some(&primary.id), true, Some(WorkspaceRole::Collaborator)),
+        (Some(&member.id), true, Some(WorkspaceRole::Collaborator)),
+        (Some(&guest.id), true, Some(WorkspaceRole::Owner)),
+        (Some(&unrelated.id), false, None),
+        (Some(&unknown), false, None),
+        (None, false, None),
+    ] {
+        let rows = store
+            .workspace_membership_summaries(viewer, &[owned.clone(), other.clone()])
+            .await
+            .unwrap();
+        assert_eq!(rows[&owned].can_manage, can_manage, "viewer {viewer:?}");
+        assert_eq!(rows[&owned].my_role, role);
+        assert_eq!(rows[&owned].owner_principal_id, Some(guest.id.clone()));
+        assert_eq!(rows[&owned].member_count, 3);
+        assert_eq!(rows[&other].owner_principal_id, Some(primary.id.clone()));
+        assert_eq!(
+            rows[&other].can_manage,
+            viewer == Some(&primary.id) || viewer == Some(&member.id)
+        );
+    }
+    store
+        .set_workspace_member_role(&owned, &guest.id, WorkspaceRole::Collaborator)
+        .await
+        .unwrap();
+    let rows = store
+        .workspace_membership_summaries(Some(&guest.id), std::slice::from_ref(&owned))
+        .await
+        .unwrap();
+    assert!(!rows[&owned].can_manage);
+    assert_eq!(rows[&owned].my_role, Some(WorkspaceRole::Collaborator));
+    assert_eq!(rows[&owned].owner_principal_id, None);
+    store
+        .remove_workspace_member(&owned, &guest.id)
+        .await
+        .unwrap();
+    let rows = store
+        .workspace_membership_summaries(Some(&guest.id), std::slice::from_ref(&owned))
+        .await
+        .unwrap();
+    assert!(!rows[&owned].can_manage);
+    assert_eq!(rows[&owned].my_role, None);
+
+    // Host members cannot use a retained owner row to bypass the Chief boundary.
+    let chief = WorkspaceId::chief();
+    if store.get_workspace(&chief).await.is_err() {
+        store
+            .insert_workspace(&sample_workspace(&chief, "Chief", false))
+            .await
+            .unwrap();
+    }
+    store
+        .set_workspace_member_role(&chief, &primary.id, WorkspaceRole::Collaborator)
+        .await
+        .unwrap();
+    store
+        .add_workspace_member(&chief, &member.id, WorkspaceRole::Owner)
+        .await
+        .unwrap();
+    let rows = store
+        .workspace_membership_summaries(Some(&member.id), &[chief.clone()])
+        .await
+        .unwrap();
+    assert_eq!(rows[&chief].my_role, Some(WorkspaceRole::Owner));
+    assert!(!rows[&chief].can_manage);
+}
+
+#[tokio::test]
 async fn upgrade_preserves_legacy_identity_grants_credentials_invites_and_owner_defaults() {
     let tmp = TempDb::new();
     let pool = SqlitePool::connect_with(

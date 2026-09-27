@@ -43,6 +43,106 @@ fn caller(id: &PrincipalId) -> Caller {
 }
 
 #[tokio::test]
+async fn scoped_owner_projection_matches_service_rights_and_role_loss() {
+    let tmp = TempDb::new();
+    let (svc, primary, member) = fixture(&tmp).await;
+    let mut guest = svc.store.get_principal(&member).await.unwrap();
+    guest.id = PrincipalId::new();
+    svc.store.upsert_principal(&guest).await.unwrap();
+    let owned = WorkspaceId::new();
+    let other = WorkspaceId::new();
+    for id in [&owned, &other] {
+        svc.store.insert_workspace(&workspace(id)).await.unwrap();
+    }
+    svc.store
+        .set_workspace_member_role(&owned, &primary, WorkspaceRole::Collaborator)
+        .await
+        .unwrap();
+    svc.store
+        .add_workspace_member(&owned, &guest.id, WorkspaceRole::Owner)
+        .await
+        .unwrap();
+    let guest_caller = Caller::Wire {
+        principal_id: guest.id.clone(),
+        host_role: HostRole::Guest,
+    };
+    with_caller(guest_caller.clone(), async {
+        let me = svc.principal_me().await.unwrap();
+        assert_eq!(me["hostRole"], "guest");
+        assert_eq!(me["isAdministrator"], false);
+        svc.require_workspace_manager(&owned, "workspace.update")
+            .await
+            .unwrap();
+        let assert_owner = |row: &intent_core::Workspace| {
+            let summary = row.membership.as_ref().unwrap();
+            assert!(
+                summary.can_manage,
+                "an explicit owner can manage this workspace"
+            );
+            assert_eq!(summary.my_role, Some(WorkspaceRole::Owner));
+            assert_eq!(summary.owner_principal_id.as_ref(), Some(&guest.id));
+        };
+        assert_owner(&svc.get_workspace(owned.clone()).await.unwrap());
+        for rows in [
+            svc.list_workspaces(true).await.unwrap(),
+            svc.list_workspaces_lite(true).await.unwrap(),
+        ] {
+            assert_eq!(rows.len(), 1);
+            assert_owner(&rows[0]);
+        }
+        assert_owner(
+            &svc.update_workspace(
+                owned.clone(),
+                WorkspaceUpdate {
+                    default_model: Some("owned-model".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        assert_owner(&svc.archive_workspace(owned.clone(), None).await.unwrap());
+        assert_owner(&svc.unarchive_workspace(owned.clone()).await.unwrap());
+        assert!(matches!(
+            svc.get_workspace(other.clone()).await,
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            svc.require_workspace_creator("workspace.create").await,
+            Err(Error::Forbidden(_))
+        ));
+        assert!(matches!(
+            Services::require_administrator("settings.set"),
+            Err(Error::Forbidden(_))
+        ));
+        svc.store
+            .set_workspace_member_role(&owned, &guest.id, WorkspaceRole::Collaborator)
+            .await
+            .unwrap();
+        let row = svc.get_workspace(owned.clone()).await.unwrap();
+        let summary = row.membership.unwrap();
+        assert!(!summary.can_manage);
+        assert_eq!(summary.my_role, Some(WorkspaceRole::Collaborator));
+        assert_eq!(summary.owner_principal_id, None);
+        assert!(matches!(
+            svc.require_workspace_manager(&owned, "workspace.update")
+                .await,
+            Err(Error::Forbidden(_))
+        ));
+        svc.store
+            .remove_workspace_member(&owned, &guest.id)
+            .await
+            .unwrap();
+        assert!(matches!(
+            svc.get_workspace(owned.clone()).await,
+            Err(Error::NotFound(_))
+        ));
+        assert!(svc.list_workspaces_lite(true).await.unwrap().is_empty());
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn member_sender_preamble_uses_bound_person_without_an_explicit_workspace_row() {
     let tmp = TempDb::new();
     let (svc, _, member) = fixture(&tmp).await;
