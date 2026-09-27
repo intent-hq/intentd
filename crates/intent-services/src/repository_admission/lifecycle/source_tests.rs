@@ -596,3 +596,122 @@ async fn cancelling_lock_wait_and_unknown_owner_ticket_cannot_leak_authority() {
         Err(AdmissionError::Unavailable)
     ));
 }
+
+#[tokio::test]
+async fn managed_reopen_retires_checked_request_before_followup_write() {
+    let fixture = Fixture::new().await;
+    let f = &fixture;
+    let services = Services::new(f.store.clone());
+    let registry = registry(f).await;
+    let original = owner(f, false).await;
+    let physical = FixtureOriginOwner::new(&registry, original.caller().clone()).unwrap();
+    with_repository_lifecycle_source(
+        &services,
+        original,
+        "before-reopen".into(),
+        vec![NativeReviewStage::Commit],
+        input(f),
+        lifetime(&registry, &physical),
+        |admission| async move {
+            let checked = revalidate_repository_stage(&admission, NativeReviewStage::Commit)
+                .await
+                .unwrap();
+            let reopened = Store::open(&f.dir.path().join("store.db")).await.unwrap();
+            assert!(matches!(
+                begin_repository_stage(checked),
+                Err(AdmissionError::Retired)
+            ));
+            assert!(matches!(
+                revalidate_repository_stage(&admission, NativeReviewStage::Commit).await,
+                Err(AdmissionError::Retired)
+            ));
+            drop(reopened);
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        with_repository_lifecycle_source(
+            &services,
+            owner(f, false).await,
+            "old-origin-after-reopen".into(),
+            vec![NativeReviewStage::Commit],
+            input(f),
+            lifetime(&registry, &physical),
+            |_| async { panic!("retired physical origin entered") }
+        )
+        .await,
+        Err::<(), _>(AdmissionError::Retired)
+    ));
+    let fresh = owner(f, false).await;
+    let replacement = FixtureOriginOwner::new(&registry, fresh.caller().clone()).unwrap();
+    with_repository_lifecycle_source(
+        &services,
+        fresh,
+        "fresh-origin-after-reopen".into(),
+        vec![NativeReviewStage::Commit],
+        input(f),
+        lifetime(&registry, &replacement),
+        |_| async { Ok(()) },
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn unknown_domain_survives_last_managed_handle_drop() {
+    for installed in [false, true] {
+        let Fixture {
+            dir,
+            store,
+            workspace,
+            ..
+        } = Fixture::new().await;
+        let registry = Arc::new(RepositoryLifecycleRegistry::default());
+        let caller = Caller::Daemon;
+        let physical = FixtureOriginOwner::new(&registry, caller.clone()).unwrap();
+        let keys = [
+            RepositoryLifecycleKey::Database,
+            RepositoryLifecycleKey::Workspace(workspace.id.clone()),
+        ];
+        let binding = lifetime(&registry, &physical);
+        let leaf = binding.retirement();
+        let subscription = if installed {
+            registry.install(&store).await.unwrap();
+            Some(binding.subscribe(&store, &caller, &keys).unwrap())
+        } else {
+            None
+        };
+        // This actual SQL error occurs after the Store mutation barrier. The
+        // owner does not assert confirmed settlement merely because it errored.
+        assert!(store.insert_workspace(&workspace).await.is_err());
+        if installed {
+            assert_eq!(leaf.check_current(), Err(AdmissionError::Retired));
+        }
+        drop(store);
+        let reopened = Store::open(&dir.path().join("store.db")).await.unwrap();
+        if installed {
+            let observer: Arc<dyn RepositoryLifecycleObserver> = registry.clone();
+            assert!(reopened.has_repository_lifecycle_observer(&observer));
+            registry.install(&reopened).await.unwrap();
+            let different = Arc::new(RepositoryLifecycleRegistry::default());
+            assert_eq!(
+                different.install(&reopened).await,
+                Err(AdmissionError::Unavailable)
+            );
+            let replacement = FixtureOriginOwner::new(&registry, caller.clone()).unwrap();
+            assert!(matches!(
+                lifetime(&registry, &replacement).subscribe(&reopened, &caller, &keys),
+                Err(AdmissionError::Unavailable)
+            ));
+            assert_eq!(leaf.check_current(), Err(AdmissionError::Retired));
+        } else {
+            assert_eq!(
+                registry.install(&reopened).await,
+                Err(AdmissionError::Unavailable)
+            );
+        }
+        drop(subscription);
+    }
+}
