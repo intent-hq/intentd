@@ -43,7 +43,7 @@ use crate::{accept_changes, changes_git_status_event, git_ops};
 /// (not reset by later ones), so a sustained churn — e.g. a branch switch
 /// touching many files — still refreshes within `DEBOUNCE` of its first event
 /// while everything inside the window collapses into one recompute.
-const DEBOUNCE: Duration = Duration::from_secs(1);
+pub(super) const DEBOUNCE: Duration = Duration::from_secs(1);
 
 /// Bridges `file:*` events to debounced `changes:git-status` refreshes.
 /// Dropping the handle tears both tasks down (clean-shutdown contract shared
@@ -82,14 +82,15 @@ impl GitStatusRefresher {
         });
         let (trigger_tx, trigger_rx) = mpsc::unbounded_channel::<WorkspaceId>();
         let forward_tx = trigger_tx.clone();
-        let forward_task = tokio::spawn(async move {
+        let forward_task = intent_core::spawn_daemon(async move {
             while let Some(batch) = sub.recv().await {
                 for ev in batch {
                     let _ = forward_tx.send(ev.workspace_id.clone());
                 }
             }
         });
-        let refresh_task = tokio::spawn(refresh_loop(bus, services, status_cache, trigger_rx));
+        let refresh_task =
+            intent_core::spawn_daemon(refresh_loop(bus, services, status_cache, trigger_rx));
         Self {
             trigger_tx,
             forward_task,
@@ -152,13 +153,13 @@ async fn sleep_until(deadline: Option<tokio::time::Instant>) {
 /// `changes:git-status` event. Remote workspaces and workspaces without a
 /// resolvable worktree are skipped (their status cannot change via local
 /// `file:*` events). Failures are logged, never fatal to the loop.
-async fn refresh_workspace(
+pub(crate) async fn refresh_workspace(
     bus: &EventBus,
     services: &dyn WorkspaceApi,
     status_cache: &GitStatusCache,
     ws_id: &WorkspaceId,
 ) {
-    let ws = match services.get_workspace(ws_id.clone()).await {
+    let mut ws = match services.get_workspace(ws_id.clone()).await {
         Ok(ws) => ws,
         Err(e) => {
             tracing::debug!(workspace = %ws_id, error = %e, "git-status refresh skipped: workspace lookup failed");
@@ -189,6 +190,9 @@ async fn refresh_workspace(
         status_cache.invalidate(&worktree);
         None
     };
+    if let Some(status) = &scanned {
+        crate::workspace_branch::reconcile_workspace_branch(bus, &mut ws, &status.branch).await;
+    }
     // Bounded history walk + remote/trunk resolution (libgit2) — run on the
     // blocking pool so a slow repo cannot stall the runtime (parity with
     // `accept-changes.getStatus`). The working-tree scan itself was already

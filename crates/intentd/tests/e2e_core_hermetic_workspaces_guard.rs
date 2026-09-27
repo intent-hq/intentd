@@ -18,7 +18,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -54,12 +54,10 @@ fn make_dirs() -> TestDirs {
 /// default workspaces root must refuse instead of falling back to `$HOME`.
 fn spawn_daemon(dirs: &TestDirs, workspaces_dir: Option<&Path>) -> Child {
     let log = std::fs::File::create(dirs.data_dir.join("daemon.log")).expect("create daemon log");
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("HOME", &dirs.home)
+    let mut cmd = common::serve_command();
+    cmd.env("HOME", &dirs.home)
         .env("INTENTD_DATA_DIR", &dirs.data_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
-        .env("INTENTD_TCP_PORT", "0")
         .env_remove("INTENTD_AUTH_TOKEN")
         .env_remove("INTENTD_WORKSPACES_DIR")
         .stdout(Stdio::null())

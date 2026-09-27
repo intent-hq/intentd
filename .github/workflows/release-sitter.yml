@@ -513,8 +513,8 @@ jobs:
             dpkg-deb --info "$deb"
             dpkg-deb --contents "$deb"
             test "$(dpkg-deb --field "$deb" Package)" = intentd
-            dpkg-deb --contents "$deb" | grep -q ' \./usr/bin/intentd$'
-            dpkg-deb --contents "$deb" | grep -q ' \./usr/lib/systemd/user/intentd\.service$'
+            dpkg-deb --contents "$deb" | grep ' \./usr/bin/intentd$' >/dev/null
+            dpkg-deb --contents "$deb" | grep ' \./usr/lib/systemd/user/intentd\.service$' >/dev/null
           done
       - name: Upload .debs to the tag release
         run: |

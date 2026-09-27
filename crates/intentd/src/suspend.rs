@@ -260,7 +260,7 @@ pub fn spawn_suspend_detector(threshold: Duration) -> Arc<SuspendTracker> {
         threshold_secs = threshold.as_secs(),
         "suspend/wake detector started"
     );
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         let period = Duration::from_secs(1);
         let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

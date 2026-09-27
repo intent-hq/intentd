@@ -122,7 +122,7 @@ fn init_git_repo(path: &Path) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_string()
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_create_branch_already_checked_out_returns_invalid_params() {
     let fx = boot().await;
     let mut rpc = connect(fx.port).await;
@@ -161,7 +161,7 @@ async fn workspace_create_branch_already_checked_out_returns_invalid_params() {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_create_unresolvable_base_ref_returns_invalid_params_with_data() {
     let fx = boot().await;
     let mut rpc = connect(fx.port).await;

@@ -224,13 +224,20 @@ pub(crate) async fn run_auggie_print(
         .spawn()
         .map_err(|e| Error::Internal(format!("failed to spawn auggie CLI: {e}")))?;
     let pid = child.id();
-    if let Some(mut stdin) = child.stdin.take() {
-        // A failed write is non-fatal — the child may have already exited.
-        let _ = stdin.write_all(prompt.as_bytes()).await;
-        // Dropping stdin closes it so the read-to-EOF `--print` exits cleanly.
-    }
+    let stdin = child.stdin.take();
+    // The stdin write sits inside the timed region: a prompt larger than the
+    // pipe capacity blocks until the child reads it, and a hung child never
+    // does (intent-hq/intent#5454).
+    let run = async move {
+        if let Some(mut stdin) = stdin {
+            // A failed write is non-fatal — the child may have already exited.
+            let _ = stdin.write_all(prompt.as_bytes()).await;
+            // Dropping stdin closes it so the read-to-EOF `--print` exits cleanly.
+        }
+        child.wait_with_output().await
+    };
 
-    match tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait_with_output()).await {
+    match tokio::time::timeout(Duration::from_millis(timeout_ms), run).await {
         Ok(Ok(output)) => {
             if !output.status.success() {
                 let code = output.status.code().unwrap_or(-1);
@@ -557,6 +564,40 @@ mod tests {
             err.to_string()
                 .contains("Prompt enhancement timed out after 200ms"),
             "got {err:?}"
+        );
+    }
+
+    /// intent-hq/intent#5454: a hung child that never reads stdin must still
+    /// be cut off at the budget when the prompt exceeds the pipe capacity
+    /// (64 KiB on Linux) — the stdin write is inside the timed region, not
+    /// before it, so the timer starts at spawn rather than after the write.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_auggie_print_times_out_when_child_never_reads_large_prompt() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::tests::test_tempdir("intentd-enhance-noread-");
+        let bin = dir.path().join("auggie");
+        // No `cat > /dev/null`: stdin is never drained.
+        std::fs::write(&bin, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let prompt = "x".repeat(4 * 1024 * 1024);
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_auggie_print(&bin, None, None, &prompt, 200, "One-shot completion"),
+        )
+        .await
+        .expect("stdin write blocked past the outer deadline: budget never started");
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("One-shot completion timed out after 200ms"),
+            "got {err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "not bounded by the budget: {:?}",
+            started.elapsed()
         );
     }
 

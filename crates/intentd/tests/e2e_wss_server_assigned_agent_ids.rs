@@ -158,7 +158,7 @@ fn init_git_repo(path: &PathBuf) {
 /// `agent.create` with a client-supplied `agentId` is rejected `-32602`
 /// ("server-assigned"); the same request without the field succeeds and
 /// returns a daemon-minted `agent-{uuid}` id.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_create_rejects_client_agent_id_and_mints_server_id() {
     let fx = boot().await;
     let mut rpc = connect(fx.port).await;
@@ -220,7 +220,7 @@ async fn agent_create_rejects_client_agent_id_and_mints_server_id() {
 /// `workspace.create` carrying `initialAgent.agentId` fails with `-32602`
 /// BEFORE any provisioning side effect: no workspace row, no worktree/clone
 /// directory under the workspaces root, and no `workspace:created` event.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_create_with_initial_agent_id_leaves_no_partial_workspace() {
     let fx = boot().await;
     let mut rpc = connect(fx.port).await;

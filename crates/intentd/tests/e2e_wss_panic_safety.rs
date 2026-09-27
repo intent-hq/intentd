@@ -199,7 +199,7 @@ async fn next_text(ws: &mut WsClient) -> Value {
 /// with echoed id; notification → no frame), panic in the inline
 /// `events.subscribe` fast path, then a healthy request on the SAME
 /// connection still succeeds — the connection and daemon survive throughout.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 #[cfg_attr(
     not(debug_assertions),
     ignore = "INTENTD_TEST_PANIC_METHOD injection is compiled out of release builds"

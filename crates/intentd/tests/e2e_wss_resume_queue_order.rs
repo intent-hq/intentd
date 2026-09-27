@@ -21,7 +21,7 @@ mod common;
 
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -212,9 +212,8 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)], resume_all: 
     // inert until the explicit resume path (`--resume-all` still forces the
     // sweep over the pin), but the `auto` default resumes on headless hosts.
     common::disable_resume_on_start(data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", &secrets_file)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -275,11 +274,13 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -346,9 +347,8 @@ async fn interrupt_midturn_with_queued_messages(data_dir: &Path, script: &str) -
         "firstTurnDelayMs": 600_000
     })
     .to_string();
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -605,9 +605,8 @@ async fn boot_restart_daemon(
     WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
 ) {
     let behavior = json!({ "response": "resumed turn done" }).to_string();
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];

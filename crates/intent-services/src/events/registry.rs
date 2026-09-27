@@ -221,7 +221,7 @@ impl WatcherRegistry {
         let specialists = SpecialistsWatcher::start(&hub, bus.clone(), initial);
         tracing::info!("specialists watcher started");
 
-        let task = tokio::spawn(lifecycle_loop(
+        let task = intent_core::spawn_daemon(lifecycle_loop(
             Arc::clone(&hub),
             Arc::clone(&git_common),
             bus,
@@ -301,6 +301,7 @@ fn start_git_metadata_watch(
         &path.to_path_buf(),
     ) {
         tracing::info!(workspace = %ws_id, path = %path.display(), "watching workspace .git metadata{suffix}");
+        refresher.trigger(ws_id.clone());
         Some(w)
     } else {
         tracing::debug!(workspace = %ws_id, path = %path.display(), "no .git directory; not watching git metadata");

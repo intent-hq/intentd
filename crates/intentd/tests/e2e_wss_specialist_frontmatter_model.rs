@@ -8,7 +8,7 @@
 mod common;
 
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -52,9 +52,9 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
+        .env_remove("MOCK_AGENT_SCRIPT_PATH")
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", &secrets_file)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -197,7 +197,7 @@ where
 }
 
 #[tokio::test]
-async fn specialist_frontmatter_model_resolved_over_wss() {
+async fn specialist_provider_and_frontmatter_model_resolved_over_wss() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
@@ -222,7 +222,7 @@ async fn specialist_frontmatter_model_resolved_over_wss() {
     let specialists_dir = data_dir.join(".intent").join("specialists");
     std::fs::create_dir_all(&specialists_dir).expect("mkdir specialists dir");
     let specialist_content =
-        "---\ncodingAgent: auggie\nmodel: opus\n---\n# Test Specialist\nTest behavior prompt.";
+        "---\ncodingAgent: auggie\nmodel: opus\naliases: [\"pinned-alias\"]\n---\n# Test Specialist\nTest behavior prompt.";
     std::fs::write(
         specialists_dir.join("test-specialist.md"),
         specialist_content,
@@ -234,9 +234,8 @@ async fn specialist_frontmatter_model_resolved_over_wss() {
     // default resolves (the frontmatter model no longer carries a provider).
     common::seed_default_provider(&data_dir);
 
-    let env: [(&str, &str); 3] = [
+    let env: [(&str, &str); 2] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("HOME", data_dir.to_str().expect("data_dir to str")),
     ];
     let daemon = Daemon {
@@ -256,7 +255,30 @@ async fn specialist_frontmatter_model_resolved_over_wss() {
 
     // Connect over WSS
     let cfg = client_config(&fp);
-    let mut ws = connect_ws(port, cfg).await;
+    let mut ws = connect_ws(port, cfg.clone()).await;
+    wss_rpc(
+        &mut ws,
+        1,
+        "settings.update",
+        json!({"changes": [
+            {"path": "model.defaultProvider", "value": "grok"},
+            {"path": "model.default", "value": "grok-default"},
+            {"path": "providers.paths", "value": {"auggie": "/bin/sh", "grok": "/bin/sh"}}
+        ]}),
+    )
+    .await;
+    // Creation is lazy: deterministic executable paths satisfy availability
+    // without starting any real provider or paid session.
+    let mut events = connect_ws(port, cfg).await;
+    wss_rpc(
+        &mut events,
+        1,
+        "events.subscribe",
+        json!({
+            "workspaceId": ws_id, "eventTypes": ["agent:created"]
+        }),
+    )
+    .await;
 
     // Create an agent with specialistId but no explicit model (review thread PRRT_kwDOS9Wxuc6SIhDg)
     let agent_res = wss_rpc(
@@ -265,7 +287,7 @@ async fn specialist_frontmatter_model_resolved_over_wss() {
         "agent.create",
         json!({
             "workspaceId": ws_id,
-            "specialistId": "test-specialist",  // Correct param name
+            "specialistId": "pinned-alias",
             "name": "TestAgent"
         }),
     )
@@ -280,6 +302,113 @@ async fn specialist_frontmatter_model_resolved_over_wss() {
     assert_eq!(
         get_res["agent"]["model"], "opus",
         "specialist frontmatter model not resolved"
+    );
+    assert_eq!(get_res["agent"]["provider"], "auggie");
+    assert_eq!(
+        get_res["agent"]["metadata"]["specialist"],
+        "test-specialist"
+    );
+    timeout(common::rpc_read_timeout(), async {
+        loop {
+            let frame = events
+                .next()
+                .await
+                .expect("event frame")
+                .expect("event read");
+            if let Message::Text(text) = frame {
+                let event: Value = serde_json::from_str(&text).expect("event JSON");
+                if event["method"] == "events.event"
+                    && event["params"]["event"]["type"] == "agent:created"
+                {
+                    assert_eq!(event["jsonrpc"], "2.0");
+                    assert_eq!(event["params"]["event"]["data"]["agentId"], agent_id);
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .expect("agent:created event");
+
+    let got = wss_rpc(&mut ws, 4, "specialist.get", json!({"id": "pinned-alias"})).await;
+    let list = wss_rpc(&mut ws, 5, "specialist.list", json!({})).await;
+    let listed = list["specialists"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == "test-specialist")
+        .expect("listed specialist");
+    for def in [&got["specialist"], listed] {
+        assert_eq!(def["resolvedProvider"], "auggie");
+        assert_eq!(def["resolvedModel"], "opus");
+    }
+    let overridden = wss_rpc(
+        &mut ws,
+        6,
+        "agent.create",
+        json!({
+            "workspaceId": ws_id, "specialistId": "pinned-alias",
+            "provider": "grok", "model": "grok-default"
+        }),
+    )
+    .await;
+    assert_eq!(overridden["agent"]["provider"], "grok");
+    assert_eq!(overridden["agent"]["model"], "grok-default");
+
+    // Invalid/unavailable pins fail before either creation seam writes rows
+    // or emits creation events. The mock environment is explicitly absent.
+    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
+        .await
+        .expect("read store");
+    let sessions_before = store.list_all_agent_sessions().await.unwrap().len();
+    let workspaces_before = store.list_workspaces(true).await.unwrap().len();
+    let notes_before = store.list_all_notes().await.unwrap().len();
+    let query = intent_store::EventQuery {
+        event_types: vec!["agent:created".into(), "workspace:created".into()],
+        ..Default::default()
+    };
+    let events_before = store.query_events(&query).await.unwrap().len();
+    for (i, pin, message) in [
+        (0, "not-a-provider", "unknown provider"),
+        (1, "mock", "not available"),
+    ] {
+        let id = format!("invalid-{i}");
+        std::fs::write(
+            specialists_dir.join(format!("{id}.md")),
+            format!("---\ncodingAgent: {pin}\nmodel: opus\n---\nTest."),
+        )
+        .unwrap();
+        for (j, method, params) in [
+            (
+                0,
+                "agent.create",
+                json!({"workspaceId": ws_id, "specialistId": id}),
+            ),
+            (
+                1,
+                "workspace.create",
+                json!({"title": "Rejected", "skipIsolation": true,
+                "initialAgent": {"specialist": id, "prompt": "Do work"}}),
+            ),
+        ] {
+            let rejected = wss_rpc_raw(&mut ws, 10 + i * 2 + j, method, params).await;
+            assert_eq!(rejected["error"]["code"], -32602, "{rejected}");
+            let error = rejected["error"]["message"].as_str().unwrap();
+            assert!(error.contains(pin) && error.contains(message), "{rejected}");
+        }
+    }
+    assert_eq!(
+        store.list_all_agent_sessions().await.unwrap().len(),
+        sessions_before
+    );
+    assert_eq!(
+        store.list_workspaces(true).await.unwrap().len(),
+        workspaces_before
+    );
+    assert_eq!(store.list_all_notes().await.unwrap().len(), notes_before);
+    assert_eq!(
+        store.query_events(&query).await.unwrap().len(),
+        events_before
     );
 
     drop(daemon);
@@ -312,9 +441,8 @@ async fn specialist_alias_resolves_and_persists_canonical_id_over_wss() {
     };
 
     // Hermetic empty user tier: HOME=data_dir with no specialists written.
-    let env: [(&str, &str); 3] = [
+    let env: [(&str, &str); 2] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("HOME", data_dir.to_str().expect("data_dir to str")),
     ];
     let daemon = Daemon {
@@ -431,9 +559,8 @@ async fn specialist_hidden_round_trips_over_wss() {
     )
     .expect("write visible specialist");
 
-    let env: [(&str, &str); 3] = [
+    let env: [(&str, &str); 2] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("HOME", data_dir.to_str().expect("data_dir to str")),
     ];
     let daemon = Daemon {
@@ -491,9 +618,8 @@ async fn embedded_bundled_catalog_over_wss() {
     let socket = data_dir.join("intentd.sock");
 
     // Hermetic empty user tier: HOME=data_dir with no specialists written.
-    let env: [(&str, &str); 3] = [
+    let env: [(&str, &str); 2] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("HOME", data_dir.to_str().expect("data_dir to str")),
     ];
     let daemon = Daemon {
@@ -604,9 +730,8 @@ async fn specialists_replacement_dir_over_wss() {
         .to_str()
         .expect("replacement dir to str")
         .to_string();
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("HOME", data_dir.to_str().expect("data_dir to str")),
         ("INTENTD_SPECIALISTS_DIR", &replacement_dir_str),
     ];
@@ -716,9 +841,8 @@ async fn specialist_config_scalars_inherit_over_wss() {
         .to_str()
         .expect("bundled dir to str")
         .to_string();
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("HOME", data_dir.to_str().expect("data_dir to str")),
         ("INTENTD_BUNDLED_SPECIALISTS_DIR", &bundled_dir_str),
     ];
@@ -868,9 +992,8 @@ async fn specialist_model_options_round_trip_over_wss() {
         .to_str()
         .expect("bundled dir to str")
         .to_string();
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("HOME", data_dir.to_str().expect("data_dir to str")),
         ("INTENTD_BUNDLED_SPECIALISTS_DIR", &bundled_dir_str),
     ];
@@ -1010,9 +1133,8 @@ async fn specialist_picker_metadata_round_trips_over_wss() {
         .to_str()
         .expect("bundled dir to str")
         .to_string();
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("HOME", data_dir.to_str().expect("data_dir to str")),
         ("INTENTD_BUNDLED_SPECIALISTS_DIR", &bundled_dir_str),
     ];
@@ -1175,10 +1297,12 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }

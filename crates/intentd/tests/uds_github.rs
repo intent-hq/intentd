@@ -34,7 +34,7 @@ async fn send(socket: &Path, frame: &str) -> Value {
     serde_json::from_str(line.trim()).expect("valid json")
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn uds_github_param_validation_and_routing() {
     // Short base under /tmp (UDS SUN_LEN cap); the guard removes the dir on
     // drop — hold it for the full test (`INTENTD_TEST_KEEP_TMP` keeps it).
@@ -52,7 +52,7 @@ async fn uds_github_param_validation_and_routing() {
         Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
-    let server = tokio::spawn(async move {
+    let server = intent_core::spawn_daemon(async move {
         serve_uds(services, bus, &socket, None, async move {
             let _ = rx.await;
         })

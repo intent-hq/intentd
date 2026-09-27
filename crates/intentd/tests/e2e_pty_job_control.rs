@@ -524,6 +524,8 @@ fn spawn_driver(dir: tempfile::TempDir, fixture: &str) -> Harness {
     cmd.env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"));
     cmd.env("INTENTD_ASSERT_HERMETIC_ROOT", "1");
     cmd.env("INTENTD_AUTH_TOKEN", TOKEN);
+    // serve-spawn: allow — bash -m driver execs $INTENTD_BIN serve in a PTY, so
+    // the shared builder cannot apply; the ephemeral-port seam is set here.
     cmd.env("INTENTD_TCP_PORT", "0");
     cmd.env("SHELL", "/bin/bash");
     cmd.env("HOME", &home);

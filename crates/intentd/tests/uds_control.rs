@@ -38,9 +38,8 @@ fn spawn_daemon_with_env(data_dir: &PathBuf, extra_env: &[(&str, &str)]) -> Chil
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -133,6 +132,22 @@ async fn status_then_stop_shuts_down_and_restarts_cleanly() {
     // Supervision probe (intent-hq/intent#3875): always present, and false
     // here — the daemon was spawned by the test harness, not a sitter.
     assert_eq!(r["updateSupported"], false, "updateSupported: {resp}");
+    // Idle-update handshake visibility: no turn in flight, and no sitter
+    // advertised the handshake, so the object is present with `supported`
+    // false and the timestamps explicitly null (never absent).
+    assert_eq!(r["busyAgents"], 0, "busyAgents: {resp}");
+    let idle = &r["idleUpdateCheck"];
+    assert!(
+        idle["enabled"].is_boolean(),
+        "idleUpdateCheck.enabled: {resp}"
+    );
+    assert_eq!(
+        idle["supported"], false,
+        "idleUpdateCheck.supported: {resp}"
+    );
+    assert_eq!(idle["restartPending"], false, "restartPending: {resp}");
+    assert!(idle["lastRequestedAt"].is_null(), "lastRequestedAt: {resp}");
+    assert!(idle["nextEligibleAt"].is_null(), "nextEligibleAt: {resp}");
     // Descriptor gauge (intent-hq/intent#4390): the startup sample lands
     // before the socket binds, so both fields are live on Linux/macOS and a
     // running daemon can never hold zero descriptors or exceed its soft limit.

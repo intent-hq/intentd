@@ -234,7 +234,7 @@ fn flood_event(i: usize, size: usize) -> NewEvent {
 /// one `events.event` follows it — proving the priority lane overtakes bulk.
 /// On a single-FIFO outbound queue the response could only arrive after every
 /// previously queued event frame.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn rpc_response_overtakes_saturated_event_stream() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;

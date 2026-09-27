@@ -63,9 +63,8 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -296,11 +295,13 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -330,9 +331,8 @@ async fn agent_midturn_failure_surfaces_and_retries_over_wss() {
         "response": "recovered after mid-turn crash",
     })
     .to_string();
-    let env: [(&str, &str); 7] = [
+    let env: [(&str, &str); 6] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_ATTEMPT_FILE", &attempt_file_s),
@@ -671,9 +671,8 @@ async fn stderr_hint_settles_past_pipe_holding_descendant_over_wss() {
         "response": "unused",
     })
     .to_string();
-    let env: [(&str, &str); 8] = [
+    let env: [(&str, &str); 7] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_ATTEMPT_FILE", &attempt_file_s),
@@ -793,9 +792,8 @@ async fn agent_retry_with_empty_queue_clears_to_idle_over_wss() {
         "response": "unused",
     })
     .to_string();
-    let env: [(&str, &str); 7] = [
+    let env: [(&str, &str); 6] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_ATTEMPT_FILE", &attempt_file_s),
@@ -1031,9 +1029,8 @@ async fn agent_dead_while_idle_respawns_transparently_over_wss() {
         ],
     })
     .to_string();
-    let env: [(&str, &str); 7] = [
+    let env: [(&str, &str); 6] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_PID_FILE", &pid_file_s),
@@ -1256,9 +1253,8 @@ async fn agent_pre_token_transport_failure_redrives_silently_over_wss() {
         "response": "silent-redrive-response-764",
     })
     .to_string();
-    let env: [(&str, &str); 8] = [
+    let env: [(&str, &str); 7] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_ATTEMPT_FILE", &attempt_file_s),

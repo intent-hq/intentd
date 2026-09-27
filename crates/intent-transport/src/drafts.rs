@@ -7,7 +7,10 @@
 //! intercepted before the JSON-RPC dispatcher. A connection that never said
 //! hello is an anonymous, connection-scoped client: a `clientId` is minted (and
 //! its `client` row created) lazily on first write, so its drafts round-trip
-//! within the connection but do not survive reconnect.
+//! within the connection but do not survive reconnect. On a non-administrator
+//! connection the binding is always principal-scoped
+//! ([`crate::client::scope_to_caller`]), whether it came from `client.hello`
+//! or was minted here, so no member can reach another member's drafts.
 
 use intent_core::{AgentId, ClientId, WorkspaceApi, WorkspaceId};
 use serde_json::{json, Value};
@@ -83,7 +86,8 @@ pub(crate) fn classify(value: &Value) -> Option<DraftRequest> {
 /// connection-scoped one (and persisting a placeholder `client` row to satisfy
 /// the draft FK) when the connection never completed `client.hello`. The
 /// placeholder records no hello, so it is never pinnable via
-/// `workspace.setBrowserClient`.
+/// `workspace.setBrowserClient`. A minted id is scoped to the caller like a
+/// hello'd one.
 async fn resolve_for_write(
     api: &dyn WorkspaceApi,
     client_id: &mut Option<ClientId>,
@@ -91,7 +95,7 @@ async fn resolve_for_write(
     if let Some(id) = client_id.as_ref() {
         return Ok(id.clone());
     }
-    let minted = ClientId::new();
+    let minted = crate::client::scope_to_caller(ClientId::new());
     api.ensure_client(minted.clone())
         .await
         .map_err(|e| (-32603, e.to_string()))?;

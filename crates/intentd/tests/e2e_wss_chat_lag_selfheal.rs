@@ -255,7 +255,7 @@ fn stream_event(ws_id: &str, agent_id: &str, event_type: &str, data: Value) -> N
 /// `agent:stream:end`) heals over the real WSS transport: the client receives
 /// a fresh snapshot at the next seq that equals `agent.getConversation`
 /// (converged, not mid-turn), then keeps receiving the next turn's deltas.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chat_subscription_self_heals_over_wss_after_broadcast_lag() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;

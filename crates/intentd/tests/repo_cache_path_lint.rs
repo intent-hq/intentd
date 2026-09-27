@@ -1,4 +1,4 @@
-//! Source-scan guard: test code must not hand-roll repo-cache paths.
+//! Source lint: test code must not hand-roll repo-cache paths.
 //!
 //! The repo-cache slot layout (`<workspaces_root>/.repo-cache/<owner>/<repo>`,
 //! case-folded via `RepoRef::identity_parts`) is owned by
@@ -28,10 +28,10 @@ fn needle() -> String {
     format!("\"{REPO_CACHE_DIR_NAME}\"")
 }
 
-/// The file that *defines* the helpers (and the constant), and this guard.
+/// The file that *defines* the helpers (and the constant), and this lint.
 const EXEMPT_FILES: &[&str] = &[
     "crates/intent-git/src/repo_cache.rs",
-    "crates/intentd/tests/repo_cache_path_guard.rs",
+    "crates/intentd/tests/repo_cache_path_lint.rs",
 ];
 
 fn workspace_root() -> PathBuf {

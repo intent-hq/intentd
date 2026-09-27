@@ -19,8 +19,9 @@ use crate::model::{
     AuthStatus, Branch, BranchRules, CheckRun, CheckState, Comment, CommentAnchor, Issue,
     IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeQueueRemoval,
     MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrInvolvement,
-    PrPatch, PrQuery, PrState, PullRequest, Repo, RepoRef, Review, ReviewComment, ReviewDecision,
-    ReviewThread, ReviewThreadComment, ReviewVerdict, RollupCheck, ScCapabilities, UserIdentity,
+    PrObservation, PrPatch, PrQuery, PrState, PullRequest, RateLimitStatus, Repo, RepoRef, Review,
+    ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment, ReviewThreadTally,
+    ReviewVerdict, RollupCheck, RollupCheckKind, ScCapabilities, UserIdentity,
 };
 use crate::SourceControl;
 
@@ -34,9 +35,65 @@ pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// rationale as [`CONNECT_TIMEOUT`] (intent-hq/monorepo#1988).
 pub(crate) const READ_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Only headers on an enforced request describe its actual quota. In
+/// particular, `/rate_limit` can report a healthy overview while these
+/// counters reject requests (intent#5837). Missing/malformed headers never
+/// establish recovery, nor does an unrelated resource's allowance.
+fn enforced_quota(headers: &http::HeaderMap, resource: &str) -> RateLimitStatus {
+    if headers
+        .get("x-ratelimit-resource")
+        .and_then(|v| v.to_str().ok())
+        != Some(resource)
+    {
+        return RateLimitStatus::default();
+    }
+    let number = |name| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok()?.parse::<u64>().ok())
+    };
+    let status = RateLimitStatus {
+        reset_at: number("x-ratelimit-reset"),
+        remaining: number("x-ratelimit-remaining"),
+        limit: number("x-ratelimit-limit"),
+    };
+    match (status.remaining, status.limit) {
+        (Some(remaining), Some(limit)) if limit > 0 && remaining <= limit => status,
+        _ => RateLimitStatus::default(),
+    }
+}
+
+/// PR reads spend both REST and GraphQL quota. Preserve an exhausted
+/// resource's reset (the later one when both are exhausted); otherwise use
+/// conservative headroom across BOTH resources. One unreadable resource
+/// cannot be declared recovered just because the other has quota left.
+fn pr_read_quota(core: RateLimitStatus, graphql: RateLimitStatus) -> RateLimitStatus {
+    if let Some(exhausted) = [core, graphql]
+        .into_iter()
+        .filter(|status| status.remaining == Some(0))
+        .max_by_key(|status| status.reset_at)
+    {
+        return exhausted;
+    }
+    match (core.remaining, graphql.remaining, core.limit, graphql.limit) {
+        (Some(rest), Some(gql), Some(rest_limit), Some(gql_limit)) => RateLimitStatus {
+            remaining: Some(rest.min(gql)),
+            limit: Some(rest_limit.max(gql_limit)),
+            reset_at: match rest.cmp(&gql) {
+                std::cmp::Ordering::Less => core.reset_at,
+                std::cmp::Ordering::Greater => graphql.reset_at,
+                // Equal headroom remains constrained until both refill.
+                std::cmp::Ordering::Equal => core.reset_at.max(graphql.reset_at),
+            },
+        },
+        _ => RateLimitStatus::default(),
+    }
+}
+
 /// GitHub implementation of [`SourceControl`].
 pub struct GitHubSourceControl {
     client: octocrab::Octocrab,
+    quota_client: octocrab::Octocrab,
 }
 
 impl GitHubSourceControl {
@@ -47,18 +104,75 @@ impl GitHubSourceControl {
     ///
     /// Returns an error if the octocrab client cannot be built (e.g. an invalid `api_base_url`).
     pub fn new(token: &str, api_base_url: Option<&str>) -> Result<Self> {
+        Ok(Self {
+            client: Self::build_client(Some(token), api_base_url, false)?,
+            quota_client: Self::build_client(Some(token), api_base_url, true)?,
+        })
+    }
+
+    /// Read the authenticated account and actual OAuth grant from the same response.
+    /// An omitted scope header is unknown, not an empty or requested grant.
+    ///
+    /// # Errors
+    /// Returns the same typed API/auth/rate-limit errors as `get_user`.
+    pub async fn get_user_with_scopes(&self) -> Result<(UserIdentity, Option<Vec<String>>)> {
+        use octocrab::FromResponse;
+        let response = octocrab::map_github_error(self.client._get("/user").await?).await?;
+        let scopes = response
+            .headers()
+            .get("x-oauth-scopes")
+            .and_then(|v| v.to_str().ok())
+            .map(crate::device_flow::parse_scopes);
+        let value = Value::from_response(response).await?;
+        Ok((map_user_identity(value)?, scopes))
+    }
+
+    /// Build a client with **no** credential (same base URI and timeouts as
+    /// [`Self::new`]): the host's fallback for reading a guest's public or
+    /// secret proof gist when it holds no GitHub token of its own. Every
+    /// authenticated read on it fails with `Auth`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the octocrab client cannot be built (e.g. an
+    /// invalid `api_base_url`).
+    pub fn anonymous(api_base_url: Option<&str>) -> Result<Self> {
+        Ok(Self {
+            client: Self::build_client(None, api_base_url, false)?,
+            quota_client: Self::build_client(None, api_base_url, true)?,
+        })
+    }
+
+    fn build_client(
+        token: Option<&str>,
+        api_base_url: Option<&str>,
+        quota_probe: bool,
+    ) -> Result<octocrab::Octocrab> {
         let mut builder = octocrab::Octocrab::builder()
-            .personal_token(token.to_string())
             .set_connect_timeout(Some(CONNECT_TIMEOUT))
             .set_read_timeout(Some(READ_WRITE_TIMEOUT))
             .set_write_timeout(Some(READ_WRITE_TIMEOUT));
+        if let Some(token) = token {
+            builder = builder.personal_token(token.to_string());
+        }
+        if quota_probe {
+            // The gate owns probe retries. Octocrab's default immediately
+            // retries 429/5xx three times, multiplying the metered probe cost.
+            builder =
+                builder.add_retry_config(octocrab::service::middleware::retry::RetryConfig::None);
+        }
         if let Some(base) = api_base_url {
             builder = builder
                 .base_uri(base)
                 .map_err(|e| Error::Config(format!("invalid github apiBaseUrl {base:?}: {e}")))?;
         }
-        let client = builder.build()?;
-        Ok(Self { client })
+        Ok(builder.build()?)
+    }
+
+    /// The underlying octocrab client (token + base URI + timeouts), for
+    /// crate-internal callers outside the [`SourceControl`] surface.
+    pub(crate) fn client(&self) -> &octocrab::Octocrab {
+        &self.client
     }
 
     fn repo_path(repo: &RepoRef, suffix: &str) -> String {
@@ -523,6 +637,28 @@ pub(crate) fn build_repo_search_query(input: &str) -> String {
     }
 }
 
+/// Rewrite raw user-search input into GitHub `/search/users` syntax: trim, drop
+/// one leading `@`, keep only the leading run of login characters (ASCII
+/// alphanumerics and `-`, GitHub's login alphabet), then narrow to login
+/// matches on user accounts (`<prefix> in:login type:user`). Cutting at the
+/// first non-login character keeps the input from reaching GitHub's search
+/// parser as syntax — `alice in:name`, `foo OR bar` and `repos:>100` search
+/// the logins `alice`, `foo` and `repos`, never a qualifier or a boolean.
+/// Input with no login prefix yields an empty query so the caller can skip
+/// the network round trip.
+pub(crate) fn build_user_search_query(input: &str) -> String {
+    let trimmed = input.trim();
+    let trimmed = trimmed.strip_prefix('@').unwrap_or(trimmed).trim_start();
+    let prefix_len = trimmed
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .unwrap_or(trimmed.len());
+    let prefix = &trimmed[..prefix_len];
+    if prefix.is_empty() {
+        return String::new();
+    }
+    format!("{prefix} in:login type:user")
+}
+
 pub(crate) fn map_review(value: Value) -> Result<Review> {
     let r: dto::Review = serde_json::from_value(value)?;
     Ok(Review {
@@ -582,6 +718,7 @@ pub(crate) fn map_check_run(value: Value) -> Result<CheckRun> {
             c.conclusion.as_deref(),
         ),
         url: c.html_url.or(c.details_url),
+        started_at: c.started_at,
     })
 }
 
@@ -815,6 +952,7 @@ mod dto {
         pub conclusion: Option<String>,
         pub html_url: Option<String>,
         pub details_url: Option<String>,
+        pub started_at: Option<String>,
     }
 
     #[derive(Deserialize)]
@@ -867,16 +1005,13 @@ fn parse_review_decision(data: &Value) -> Option<ReviewDecision> {
     }
 }
 
-/// Known ceiling: `contexts(first: 100)` is a single unpaginated page, so a
-/// PR whose rollup exceeds 100 contexts (very large CI matrices) silently
-/// truncates — checks beyond the page are invisible to the requirements
-/// probe, and a monitor diffing two truncated pages can report phantom
-/// "check removed" lines for whatever fell off. Paginating `contexts` is the
-/// complete fix if that ceiling is ever hit in practice.
+/// The first page of a head-bound check observation. Both entrypoints drain
+/// the connection through `graphql_with_all_checks` before trusting it.
 const MERGE_REQUIREMENTS_QUERY: &str = r"
-query GetMergeRequirements($owner: String!, $repo: String!, $prNumber: Int!) {
+query GetMergeRequirements($owner: String!, $repo: String!, $prNumber: Int!, $checksCursor: String) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $prNumber) {
+      headRefOid
       mergeStateStatus
       isInMergeQueue
       timelineItems(last: 1, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) {
@@ -892,14 +1027,18 @@ query GetMergeRequirements($owner: String!, $repo: String!, $prNumber: Int!) {
       commits(last: 1) {
         nodes {
           commit {
+            oid
             statusCheckRollup {
-              contexts(first: 100) {
+              contexts(first: 100, after: $checksCursor) {
+                pageInfo { hasNextPage endCursor }
+                totalCount
                 nodes {
                   __typename
                   ... on CheckRun {
                     name
                     status
                     conclusion
+                    startedAt
                     detailsUrl
                     isRequired(pullRequestNumber: $prNumber)
                   }
@@ -934,17 +1073,270 @@ const MERGE_QUEUE_TIMELINE_SELECTION: &str = "
         }
       }";
 
-/// [`MERGE_REQUIREMENTS_QUERY`] minus the merge-queue selections
-/// (`isInMergeQueue` and the removal-event timeline items), for hosts whose
-/// GraphQL schema predates merge queues (older GHES): GraphQL rejects the
-/// WHOLE query on an unknown field, so the probe retries once with this
-/// selection and the signals degrade to `None` instead of failing the entire
-/// checklist. A schema lacking `isInMergeQueue` also lacks
-/// `RemovedFromMergeQueueEvent`, so both go together.
-fn merge_requirements_query_without_merge_queue() -> String {
-    MERGE_REQUIREMENTS_QUERY
+/// A per-PR `query` ([`MERGE_REQUIREMENTS_QUERY`] or
+/// [`PR_OBSERVATION_QUERY`], which embed the selections verbatim) minus the
+/// merge-queue selections (`isInMergeQueue` and the removal-event timeline
+/// items), for hosts whose GraphQL schema predates merge queues (older
+/// GHES): GraphQL rejects the WHOLE query on an unknown field, so the read
+/// retries once with this selection and the signals degrade to `None`
+/// instead of failing the entire checklist. A schema lacking
+/// `isInMergeQueue` also lacks `RemovedFromMergeQueueEvent`, so both go
+/// together.
+fn without_merge_queue_selections(query: &str) -> String {
+    query
         .replace("\n      isInMergeQueue", "")
         .replace(MERGE_QUEUE_TIMELINE_SELECTION, "")
+}
+
+/// The PR monitor's folded per-poll read ([`SourceControl::pr_observation`]):
+/// [`MERGE_REQUIREMENTS_QUERY`]'s selections plus the [`PullRequest`]
+/// fields, the last window of reviews, the review-thread tally and the
+/// conversation-comment count — ONE GraphQL request in place of the
+/// `GET /pulls/{n}` + probe + `GET /pulls/{n}/reviews` + review-threads +
+/// `GET /issues/{n}/comments` sequence. Measured against api.github.com on
+/// a 21-review / 8-thread / 20-context PR: `rateLimit.cost` 1,
+/// `nodeCount` 302 (the `totalCount`-only connections request no nodes).
+///
+/// Windows: `reviews(last: 100)` and `reviewThreads(first: 100)` are single
+/// pages; `pageInfo` tells the caller when a PR outgrew them so it can take
+/// the paged reads instead of trusting a truncated tally. Check contexts are
+/// drained across pages with a consistent head before the observation returns.
+///
+/// Count parity: the `totalCount`s are unbounded, but the per-signal reads
+/// they replace are not — `list_comments` is a single `per_page=100` page
+/// and [`REVIEW_THREADS_QUERY`] selects `comments(first: 100)` per thread —
+/// so the parse saturates each count at the same ceiling
+/// ([`OBSERVED_COUNT_CEILING`]). Otherwise a poll that fell back to the
+/// per-signal reads on a busy PR would report a different count for the
+/// same forge state and fabricate a new-comment change.
+const PR_OBSERVATION_QUERY: &str = r"
+query GetPrObservation($owner: String!, $repo: String!, $prNumber: Int!, $checksCursor: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $prNumber) {
+      number
+      url
+      title
+      body
+      state
+      isDraft
+      headRefName
+      headRefOid
+      author { login }
+      mergeable
+      createdAt
+      updatedAt
+      mergeStateStatus
+      isInMergeQueue
+      timelineItems(last: 1, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) {
+        nodes {
+          ... on RemovedFromMergeQueueEvent {
+            createdAt
+            reason
+          }
+        }
+      }
+      reviewDecision
+      baseRefName
+      commits(last: 1) {
+        nodes {
+          commit {
+            oid
+            statusCheckRollup {
+              contexts(first: 100, after: $checksCursor) {
+                pageInfo { hasNextPage endCursor }
+                totalCount
+                nodes {
+                  __typename
+                  ... on CheckRun {
+                    name
+                    status
+                    conclusion
+                    startedAt
+                    detailsUrl
+                    isRequired(pullRequestNumber: $prNumber)
+                  }
+                  ... on StatusContext {
+                    context
+                    state
+                    targetUrl
+                    isRequired(pullRequestNumber: $prNumber)
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      reviews(last: 100) {
+        pageInfo { hasPreviousPage }
+        nodes { author { login } state submittedAt }
+      }
+      reviewThreads(first: 100) {
+        pageInfo { hasNextPage }
+        nodes {
+          isResolved
+          comments { totalCount }
+        }
+      }
+      comments { totalCount }
+    }
+  }
+}
+";
+
+/// Map the `pullRequest` node of [`PR_OBSERVATION_QUERY`] onto the same
+/// [`PullRequest`] `GET /pulls/{n}` yields: GraphQL's `mergeable`
+/// (`MERGEABLE`/`CONFLICTING`/`UNKNOWN`) becomes the REST tri-state bool,
+/// `mergeStateStatus` lowercased IS REST `mergeable_state` (same value set),
+/// and an empty `body` maps to `None` as REST reports it.
+fn map_graphql_pull(pr: &Value) -> Result<PullRequest> {
+    let text = |key: &str| pr.get(key).and_then(Value::as_str);
+    let owned = |key: &str| text(key).unwrap_or_default().to_string();
+    let number = pr
+        .get("number")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| Error::Decode("pullRequest node missing `number`".to_string()))?;
+    let state = match text("state") {
+        Some("MERGED") => PrState::Merged,
+        Some("CLOSED") => PrState::Closed,
+        _ => PrState::Open,
+    };
+    let mergeable = match text("mergeable") {
+        Some("MERGEABLE") => Some(true),
+        Some("CONFLICTING") => Some(false),
+        _ => None,
+    };
+    Ok(PullRequest {
+        number,
+        url: owned("url"),
+        title: owned("title"),
+        body: text("body").filter(|b| !b.is_empty()).map(String::from),
+        state,
+        draft: pr.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
+        source_branch: owned("headRefName"),
+        target_branch: owned("baseRefName"),
+        author: graphql_login(pr.get("author")),
+        mergeable,
+        mergeable_state: text("mergeStateStatus").map(str::to_ascii_lowercase),
+        head_sha: text("headRefOid").map(String::from),
+        created_at: owned("createdAt"),
+        updated_at: owned("updatedAt"),
+    })
+}
+
+/// `author { login }` → login, `"unknown"` for a deleted account (`null`
+/// author) — parity with the REST [`login_of`].
+fn graphql_login(author: Option<&Value>) -> String {
+    author
+        .and_then(|a| a.get("login"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+/// The merge-requirement signals a merge-requirements-shaped GraphQL
+/// payload carries (everything but the base branch's rules, which are a
+/// separate REST read).
+fn parse_merge_requirement_signals(data: &Value) -> MergeRequirementSignals {
+    let pr = data.pointer("/repository/pullRequest");
+    let rollup = data
+        .pointer(ROLLUP_CONTEXTS_POINTER)
+        .and_then(Value::as_array);
+    MergeRequirementSignals {
+        merge_state_status: pr
+            .and_then(|p| p.get("mergeStateStatus"))
+            .and_then(Value::as_str)
+            .map(String::from),
+        review_decision: parse_review_decision(data),
+        checks: rollup
+            .map(|nodes| nodes.iter().filter_map(map_rollup_context).collect())
+            .unwrap_or_default(),
+        checks_known: rollup.is_some(),
+        checks_head_sha: pr
+            .and_then(|p| p.get("headRefOid"))
+            .and_then(Value::as_str)
+            .map(String::from),
+        branch_rules: None,
+        // Absent on hosts that do not report it: degrades to `None`.
+        is_in_merge_queue: pr
+            .and_then(|p| p.get("isInMergeQueue"))
+            .and_then(Value::as_bool),
+        merge_queue_removal: parse_merge_queue_removal(pr),
+    }
+}
+
+/// The `reviews(last: 100)` window of [`PR_OBSERVATION_QUERY`] as
+/// [`Review`]s (bodies are not selected), or `None` when `hasPreviousPage`
+/// says the PR has more reviews than the window carries.
+fn parse_observed_reviews(pr: &Value) -> Option<Vec<Review>> {
+    let reviews = pr.get("reviews")?;
+    if reviews
+        .pointer("/pageInfo/hasPreviousPage")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let nodes = reviews.get("nodes").and_then(Value::as_array)?;
+    Some(
+        nodes
+            .iter()
+            .map(|r| Review {
+                author: graphql_login(r.get("author")),
+                verdict: verdict_from_state(r.get("state").and_then(Value::as_str).unwrap_or("")),
+                body: None,
+                submitted_at: r
+                    .get("submittedAt")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+            .collect(),
+    )
+}
+
+/// The ceiling a folded `totalCount` saturates at so it equals what the
+/// per-signal read reports: one `per_page=100` page of conversation
+/// comments, `comments(first: 100)` per review thread.
+const OBSERVED_COUNT_CEILING: i64 = REST_MAX_PER_PAGE as i64;
+
+/// A `{ totalCount }` selection saturated at [`OBSERVED_COUNT_CEILING`];
+/// `0` when absent.
+fn observed_count(connection: Option<&Value>) -> i64 {
+    connection
+        .and_then(|c| c.get("totalCount"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        .min(OBSERVED_COUNT_CEILING)
+}
+
+/// The `reviewThreads(first: 100)` window of [`PR_OBSERVATION_QUERY`] as a
+/// [`ReviewThreadTally`], or `None` when `hasNextPage` says the PR has more
+/// threads than the window carries. Each thread's comment count saturates
+/// at [`OBSERVED_COUNT_CEILING`], as the paged read's `comments(first: 100)`
+/// does.
+fn parse_observed_threads(pr: &Value) -> Option<ReviewThreadTally> {
+    let threads = pr.get("reviewThreads")?;
+    if threads
+        .pointer("/pageInfo/hasNextPage")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let nodes = threads.get("nodes").and_then(Value::as_array)?;
+    let mut tally = ReviewThreadTally::default();
+    for thread in nodes {
+        tally.review_comment_count += observed_count(thread.get("comments"));
+        if !thread
+            .get("isResolved")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            tally.unresolved += 1;
+        }
+    }
+    Some(tally)
 }
 
 /// True when a merge-requirements probe error is GraphQL rejecting one of the
@@ -1002,7 +1394,7 @@ fn map_rollup_context(value: &Value) -> Option<RollupCheck> {
         .get("isRequired")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let url = |key: &str| value.get(key).and_then(Value::as_str).map(String::from);
+    let text = |key: &str| value.get(key).and_then(Value::as_str).map(String::from);
     match value.get("__typename").and_then(Value::as_str) {
         Some("StatusContext") => Some(RollupCheck {
             name: value
@@ -1010,6 +1402,7 @@ fn map_rollup_context(value: &Value) -> Option<RollupCheck> {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
+            kind: RollupCheckKind::StatusContext,
             state: derive_status_context_state(
                 value
                     .get("state")
@@ -1017,7 +1410,8 @@ fn map_rollup_context(value: &Value) -> Option<RollupCheck> {
                     .unwrap_or_default(),
             ),
             is_required,
-            url: url("targetUrl"),
+            url: text("targetUrl"),
+            started_at: None,
         }),
         Some("CheckRun") => {
             let status = value
@@ -1035,9 +1429,11 @@ fn map_rollup_context(value: &Value) -> Option<RollupCheck> {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string(),
+                kind: RollupCheckKind::CheckRun,
                 state: derive_check_state(&status, conclusion.as_deref()),
                 is_required,
-                url: url("detailsUrl"),
+                url: text("detailsUrl"),
+                started_at: text("startedAt"),
             })
         }
         _ => None,
@@ -1140,16 +1536,92 @@ impl SourceControl for GitHubSourceControl {
         }
     }
 
-    async fn rate_limit_reset_at(&self) -> Result<Option<u64>> {
-        // `GET /rate_limit` is quota-free, so it stays usable while the core
-        // quota is exhausted (monorepo#2961).
-        let v: Value = self.client.get("/rate_limit", None::<&()>).await?;
-        Ok(v.pointer("/resources/core/reset").and_then(Value::as_u64))
+    async fn rate_limit_status(&self) -> Result<RateLimitStatus> {
+        // GitHub explicitly makes request headers authoritative over its
+        // quota overview: https://docs.github.com/en/rest/rate-limit/rate-limit.
+        // These small reads cost at most one point per resource; never query
+        // PR details merely to decide whether to resume them. Bypass HTTP
+        // caches; the shared gate bounds how often these reads can run.
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CACHE_CONTROL,
+            http::HeaderValue::from_static("no-cache"),
+        );
+        let rest = self
+            .quota_client
+            ._get_with_headers("/user", Some(headers))
+            .await?;
+        let core = enforced_quota(rest.headers(), "core");
+        let core = if rest.status().is_success() || core.remaining == Some(0) {
+            core
+        } else {
+            RateLimitStatus::default()
+        };
+        let _body = self.quota_client.body_to_string(rest).await?;
+        let graphql = self
+            .quota_client
+            ._post(
+                "/graphql",
+                Some(&json!({"query": "query { rateLimit { remaining } }"})),
+            )
+            .await?;
+        let quota = enforced_quota(graphql.headers(), "graphql");
+        let quota = if graphql.status().is_success() || quota.remaining == Some(0) {
+            quota
+        } else {
+            RateLimitStatus::default()
+        };
+        let _body = self.quota_client.body_to_string(graphql).await?;
+        Ok(pr_read_quota(core, quota))
+    }
+
+    fn rate_limit_probe_interval(&self) -> Duration {
+        Duration::from_secs(60)
     }
 
     async fn get_user(&self) -> Result<UserIdentity> {
         let v: Value = self.client.get("/user", None::<&()>).await?;
         map_user_identity(v)
+    }
+
+    async fn get_user_by_login(&self, login: &str) -> Result<UserIdentity> {
+        let login = login.trim();
+        if login.is_empty() || login.contains('/') {
+            return Err(Error::NotFound(format!("github user {login:?}")));
+        }
+        let v: Value = self
+            .client
+            .get(format!("/users/{login}"), None::<&()>)
+            .await?;
+        map_user_identity(v)
+    }
+
+    async fn get_proof_gist(&self, gist_id: &str) -> Result<crate::identity_proof::ProofGistView> {
+        let gist_id = gist_id.trim();
+        if gist_id.is_empty() || !gist_id.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return Err(Error::NotFound(format!("gist {gist_id:?}")));
+        }
+        let v: Value = self
+            .client
+            .get(format!("/gists/{gist_id}"), None::<&()>)
+            .await?;
+        crate::identity_proof::proof_gist_view(&v)
+    }
+
+    async fn search_users(&self, query: &str, limit: u8) -> Result<Vec<UserIdentity>> {
+        let search_query = build_user_search_query(query);
+        if search_query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let params: Vec<(&str, String)> =
+            vec![("q", search_query), ("per_page", limit.max(1).to_string())];
+        let v: Value = self.client.get("/search/users", Some(&params)).await?;
+        let items: Vec<Value> = serde_json::from_value(
+            v.get("items")
+                .cloned()
+                .unwrap_or_else(|| Value::Array(Vec::new())),
+        )?;
+        items.into_iter().map(map_user_identity).collect()
     }
 
     async fn list_repos(&self, page: PageParams) -> Result<Page<Repo>> {
@@ -1465,7 +1937,8 @@ impl SourceControl for GitHubSourceControl {
 
     async fn list_reviews(&self, repo: &RepoRef, number: u64) -> Result<Vec<Review>> {
         let route = Self::repo_path(repo, &format!("/pulls/{number}/reviews"));
-        self.rest_collect_all(&route, |v| v, map_review).await
+        self.rest_collect_all(&route, false, |v| v, map_review)
+            .await
     }
 
     async fn review_decision(&self, repo: &RepoRef, number: u64) -> Result<Option<ReviewDecision>> {
@@ -1487,92 +1960,62 @@ impl SourceControl for GitHubSourceControl {
         repo: &RepoRef,
         number: u64,
     ) -> Result<MergeRequirementSignals> {
-        let variables = json!({
-            "owner": repo.owner,
-            "repo": repo.name,
-            "prNumber": number,
-        });
-        let payload = json!({
-            "query": MERGE_REQUIREMENTS_QUERY,
-            "variables": variables,
-        });
-        // Schema tolerance: a host whose GraphQL schema lacks
-        // `isInMergeQueue` (older GHES) rejects the WHOLE query, so retry
-        // once without that selection — the signal degrades to `None`
-        // instead of failing the entire checklist.
-        let resp: Value = match self.client.graphql(&payload).await {
-            Ok(resp) => resp,
-            Err(err) => {
-                let err = Error::from(err);
-                if !merge_queue_field_unsupported(&err) {
-                    return Err(err);
-                }
-                tracing::debug!(
-                    pr_number = number,
-                    "merge_requirements: host schema lacks isInMergeQueue, retrying without it"
-                );
-                let fallback = json!({
-                    "query": merge_requirements_query_without_merge_queue(),
-                    "variables": variables,
-                });
-                self.client.graphql(&fallback).await?
-            }
-        };
-        let data = graphql_data(resp)?;
-        let pr = data.pointer("/repository/pullRequest");
-        let merge_state_status = pr
-            .and_then(|p| p.get("mergeStateStatus"))
-            .and_then(Value::as_str)
-            .map(String::from);
-        // Absent on hosts that do not report it: degrades to `None`.
-        let is_in_merge_queue = pr
-            .and_then(|p| p.get("isInMergeQueue"))
-            .and_then(Value::as_bool);
-        let merge_queue_removal = parse_merge_queue_removal(pr);
-        let rollup = data
-            .pointer(ROLLUP_CONTEXTS_POINTER)
-            .and_then(Value::as_array);
-        let checks = rollup
-            .map(|nodes| nodes.iter().filter_map(map_rollup_context).collect())
-            .unwrap_or_default();
+        let data = self
+            .graphql_with_all_checks(MERGE_REQUIREMENTS_QUERY, repo, number)
+            .await?;
+        let mut signals = parse_merge_requirement_signals(&data);
 
         // The base branch's rules are a separate REST read whose endpoint may
         // be unreadable (older GHES, a token without the scope); that degrades
-        // to `None` instead of failing the probe.
-        let branch_rules = match pr
-            .and_then(|p| p.get("baseRefName"))
+        // to `None` instead of failing the probe. Quota exhaustion is the one
+        // exception: it propagates so the caller pauses instead of persisting
+        // a degraded checklist as a successful poll (intent-hq/intent#5281).
+        let base = data
+            .pointer("/repository/pullRequest/baseRefName")
             .and_then(Value::as_str)
-            .filter(|b| !b.is_empty())
-        {
-            Some(base) => {
-                let route = Self::repo_path(
-                    repo,
-                    &format!("/rules/branches/{}", encode_path_segments(base)),
-                );
-                match self.client.get::<Value, _, ()>(&route, None::<&()>).await {
-                    Ok(v) => Some(map_branch_rules(&v)),
-                    Err(e) => {
-                        tracing::debug!(
-                            error = %e,
-                            pr_number = number,
-                            "merge_requirements: branch rules unreadable, degrading"
-                        );
-                        None
-                    }
+            .filter(|b| !b.is_empty());
+        if let Some(base) = base {
+            signals.branch_rules = match self.branch_rules(repo, base).await {
+                Ok(rules) => Some(rules),
+                Err(e @ Error::RateLimited(_)) => return Err(e),
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        pr_number = number,
+                        "merge_requirements: branch rules unreadable, degrading"
+                    );
+                    None
                 }
-            }
-            None => None,
-        };
+            };
+        }
+        Ok(signals)
+    }
 
-        Ok(MergeRequirementSignals {
-            merge_state_status,
-            review_decision: parse_review_decision(&data),
-            checks,
-            checks_known: rollup.is_some(),
-            branch_rules,
-            is_in_merge_queue,
-            merge_queue_removal,
-        })
+    async fn branch_rules(&self, repo: &RepoRef, branch: &str) -> Result<BranchRules> {
+        let route = Self::repo_path(
+            repo,
+            &format!("/rules/branches/{}", encode_path_segments(branch)),
+        );
+        let v: Value = self.client.get(&route, None::<&()>).await?;
+        Ok(map_branch_rules(&v))
+    }
+
+    async fn pr_observation(&self, repo: &RepoRef, number: u64) -> Result<Option<PrObservation>> {
+        let data = self
+            .graphql_with_all_checks(PR_OBSERVATION_QUERY, repo, number)
+            .await?;
+        let pr = data
+            .pointer("/repository/pullRequest")
+            .filter(|p| !p.is_null())
+            .ok_or_else(|| Error::NotFound(format!("PR #{number} not found")))?;
+        Ok(Some(PrObservation {
+            pr: map_graphql_pull(pr)?,
+            signals: parse_merge_requirement_signals(&data),
+            reviews: parse_observed_reviews(pr),
+            threads: parse_observed_threads(pr),
+            // Saturated like `list_comments`' single page below.
+            conversation_count: observed_count(pr.get("comments")),
+        }))
     }
 
     // Known ceiling: a single `per_page=100` page (newest first), not a full
@@ -1714,14 +2157,12 @@ impl SourceControl for GitHubSourceControl {
 
     async fn check_runs(&self, repo: &RepoRef, git_ref: &str) -> Result<Vec<CheckRun>> {
         let route = Self::repo_path(repo, &format!("/commits/{git_ref}/check-runs"));
-        // The check-runs payload nests the item array under `check_runs`.
+        // Missing data and a page-cap stop are unreadable, not authoritative
+        // empty/partial checks. The monitor must retain its last observation.
         self.rest_collect_all(
             &route,
-            |v| {
-                v.get("check_runs")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new()))
-            },
+            true,
+            |v| v.get("check_runs").cloned().unwrap_or(Value::Null),
             map_check_run,
         )
         .await
@@ -1810,10 +2251,12 @@ impl GitHubSourceControl {
     /// Fetch a REST listing to exhaustion: request `per_page=100` pages from
     /// page 1, extract each page's item array with `extract`, map items with
     /// `map`, and stop on a short page or at the [`REST_EXHAUSTIVE_MAX_PAGES`]
-    /// safety cap (see [`rest_fetch_next_page`]).
+    /// safety cap (see [`rest_fetch_next_page`]). `require_complete` makes a
+    /// cap stop an error rather than returning a partial check observation.
     async fn rest_collect_all<T>(
         &self,
         route: &str,
+        require_complete: bool,
         extract: impl Fn(Value) -> Value,
         map: impl Fn(Value) -> Result<T>,
     ) -> Result<Vec<T>> {
@@ -1832,11 +2275,153 @@ impl GitHubSourceControl {
                 out.push(map(item)?);
             }
             if !rest_fetch_next_page(page, fetched, per_page) {
+                if require_complete && fetched as u64 == per_page {
+                    return Err(Error::Decode(
+                        "incomplete check-runs observation: page limit exceeded".into(),
+                    ));
+                }
                 break;
             }
             page += 1;
         }
         Ok(out)
+    }
+
+    /// Collect the whole rollup or fail the read: no partial vector escapes.
+    /// Re-query the PR so each page's head and commit OID can be checked against
+    /// page one, retaining that first page's other signals. Cursor cycles,
+    /// malformed metadata, count changes and the safety cap are errors; callers
+    /// may retry via their ordinary fallback/poll path. Quota errors propagate.
+    async fn graphql_with_all_checks(
+        &self,
+        query: &str,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<Value> {
+        const MAX_PAGES: usize = 100;
+        const COMMIT: &str = "/repository/pullRequest/commits/nodes/0/commit";
+        let mut data = self
+            .graphql_tolerating_merge_queue_schema(query, repo, number, None)
+            .await?;
+        // A missing rollup retains the existing REST fallback. An existing
+        // connection with missing/invalid metadata must not be trusted instead.
+        if data
+            .pointer(&format!("{COMMIT}/statusCheckRollup"))
+            .is_none_or(Value::is_null)
+        {
+            return Ok(data);
+        }
+        let invalid =
+            |reason: &str| Error::Decode(format!("incomplete PR check observation: {reason}"));
+        let head = data
+            .pointer("/repository/pullRequest/headRefOid")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| invalid("missing head"))?
+            .to_string();
+        let mut page = data.clone();
+        let mut contexts = Vec::new();
+        let mut cursors = std::collections::HashSet::new();
+        let mut expected_total = None;
+        for _ in 0..MAX_PAGES {
+            if page
+                .pointer("/repository/pullRequest/headRefOid")
+                .and_then(Value::as_str)
+                != Some(&head)
+                || page
+                    .pointer(&format!("{COMMIT}/oid"))
+                    .and_then(Value::as_str)
+                    != Some(&head)
+            {
+                return Err(invalid("head changed during collection"));
+            }
+            let connection = page
+                .pointer(&format!("{COMMIT}/statusCheckRollup/contexts"))
+                .ok_or_else(|| invalid("missing connection"))?;
+            let nodes = connection
+                .get("nodes")
+                .and_then(Value::as_array)
+                .ok_or_else(|| invalid("missing nodes"))?;
+            if nodes.iter().any(|n| map_rollup_context(n).is_none()) {
+                return Err(invalid("unreadable context"));
+            }
+            let total = connection
+                .get("totalCount")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| invalid("missing total count"))?;
+            if *expected_total.get_or_insert(total) != total {
+                return Err(invalid("context count changed during collection"));
+            }
+            contexts.extend(nodes.iter().cloned());
+            let more = connection
+                .pointer("/pageInfo/hasNextPage")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| invalid("missing page info"))?;
+            if !more {
+                if contexts.len() as u64 != total {
+                    return Err(invalid("context count does not match collected pages"));
+                }
+                *data
+                    .pointer_mut(ROLLUP_CONTEXTS_POINTER)
+                    .expect("first page has nodes") = json!(contexts);
+                return Ok(data);
+            }
+            let cursor = connection
+                .pointer("/pageInfo/endCursor")
+                .and_then(Value::as_str)
+                .filter(|c| !c.is_empty())
+                .ok_or_else(|| invalid("missing continuation cursor"))?;
+            if !cursors.insert(cursor.to_string()) {
+                return Err(invalid("repeated continuation cursor"));
+            }
+            if cursors.len() == MAX_PAGES {
+                break;
+            }
+            page = self
+                .graphql_tolerating_merge_queue_schema(query, repo, number, Some(cursor))
+                .await?;
+        }
+        Err(invalid("page limit exceeded"))
+    }
+
+    /// Run a per-PR GraphQL `query` (the merge-requirements probe or the
+    /// folded PR observation) and return its `data`. Schema tolerance: a
+    /// host whose GraphQL schema lacks `isInMergeQueue` (older GHES) rejects
+    /// the WHOLE query, so retry once without the merge-queue selections —
+    /// those signals degrade to `None` instead of failing the entire read.
+    async fn graphql_tolerating_merge_queue_schema(
+        &self,
+        query: &str,
+        repo: &RepoRef,
+        number: u64,
+        checks_cursor: Option<&str>,
+    ) -> Result<Value> {
+        let variables = json!({
+            "owner": repo.owner,
+            "repo": repo.name,
+            "prNumber": number,
+            "checksCursor": checks_cursor,
+        });
+        let payload = json!({ "query": query, "variables": variables });
+        let resp: Value = match self.client.graphql(&payload).await {
+            Ok(resp) => resp,
+            Err(err) => {
+                let err = Error::from(err);
+                if !merge_queue_field_unsupported(&err) {
+                    return Err(err);
+                }
+                tracing::debug!(
+                    pr_number = number,
+                    "merge_requirements: host schema lacks isInMergeQueue, retrying without it"
+                );
+                let fallback = json!({
+                    "query": without_merge_queue_selections(query),
+                    "variables": variables,
+                });
+                self.client.graphql(&fallback).await?
+            }
+        };
+        graphql_data(resp)
     }
 
     async fn set_thread_resolution(&self, thread_id: &str, resolve: bool) -> Result<bool> {
@@ -1958,12 +2543,19 @@ mod tests {
             "name": "build",
             "status": "completed",
             "conclusion": "failure",
+            "started_at": "2026-09-18T11:08:02Z",
             "details_url": "https://ci/run/1"
         }))
         .unwrap();
         assert_eq!(cr.name, "build");
         assert_eq!(cr.state, CheckState::Failure);
         assert_eq!(cr.url.as_deref(), Some("https://ci/run/1"));
+        assert_eq!(cr.started_at.as_deref(), Some("2026-09-18T11:08:02Z"));
+        // Internal tie-break signal only: the wire shape stays `{ name, state, url? }`.
+        assert!(serde_json::to_value(&cr)
+            .unwrap()
+            .get("startedAt")
+            .is_none());
     }
 
     #[test]
@@ -2031,7 +2623,7 @@ mod tests {
         // The degraded query differs from the primary by exactly the
         // `isInMergeQueue` line and the removal-event timeline block —
         // everything else survives verbatim.
-        let fallback = merge_requirements_query_without_merge_queue();
+        let fallback = without_merge_queue_selections(MERGE_REQUIREMENTS_QUERY);
         assert!(!fallback.contains("isInMergeQueue"));
         assert!(!fallback.contains("timelineItems"));
         assert!(!fallback.contains("RemovedFromMergeQueueEvent"));
@@ -2054,6 +2646,150 @@ mod tests {
                 - 1
                 - MERGE_QUEUE_TIMELINE_SELECTION.matches('\n').count(),
             "exactly the merge-queue lines removed"
+        );
+    }
+
+    #[test]
+    fn pr_observation_query_embeds_the_probe_and_strips_the_same_way() {
+        // The folded read carries every probe selection verbatim (so the
+        // same parser serves both) and the schema fallback strips exactly
+        // the merge-queue lines from it too.
+        for probe_selection in [
+            "mergeStateStatus",
+            "isInMergeQueue",
+            "reviewDecision",
+            "baseRefName",
+            "statusCheckRollup",
+            "isRequired(pullRequestNumber: $prNumber)",
+        ] {
+            assert!(PR_OBSERVATION_QUERY.contains(probe_selection));
+        }
+        assert!(PR_OBSERVATION_QUERY.contains(MERGE_QUEUE_TIMELINE_SELECTION));
+        let fallback = without_merge_queue_selections(PR_OBSERVATION_QUERY);
+        assert!(!fallback.contains("isInMergeQueue"));
+        assert!(!fallback.contains("timelineItems"));
+        assert_eq!(
+            fallback.lines().count(),
+            PR_OBSERVATION_QUERY.lines().count()
+                - 1
+                - MERGE_QUEUE_TIMELINE_SELECTION.matches('\n').count(),
+        );
+    }
+
+    #[test]
+    fn graphql_pull_maps_onto_the_rest_shape() {
+        let pr = json!({
+            "number": 42,
+            "url": "https://github.com/o/r/pull/42",
+            "title": "Add thing",
+            "body": "",
+            "state": "OPEN",
+            "isDraft": true,
+            "headRefName": "feature",
+            "headRefOid": "abc123",
+            "baseRefName": "main",
+            "author": null,
+            "mergeable": "CONFLICTING",
+            "mergeStateStatus": "DIRTY",
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-02T00:00:00Z",
+        });
+        let mapped = map_graphql_pull(&pr).unwrap();
+        assert_eq!(
+            mapped,
+            PullRequest {
+                number: 42,
+                url: "https://github.com/o/r/pull/42".into(),
+                title: "Add thing".into(),
+                body: None,
+                state: PrState::Open,
+                draft: true,
+                source_branch: "feature".into(),
+                target_branch: "main".into(),
+                author: "unknown".into(),
+                mergeable: Some(false),
+                mergeable_state: Some("dirty".into()),
+                head_sha: Some("abc123".into()),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: "2026-01-02T00:00:00Z".into(),
+            }
+        );
+        let merged = json!({ "number": 1, "state": "MERGED", "mergeable": "UNKNOWN", "author": { "login": "octocat" } });
+        let merged = map_graphql_pull(&merged).unwrap();
+        assert_eq!(merged.state, PrState::Merged);
+        assert_eq!(merged.mergeable, None);
+        assert_eq!(merged.mergeable_state, None);
+        assert_eq!(merged.author, "octocat");
+        assert!(map_graphql_pull(&json!({ "state": "OPEN" })).is_err());
+    }
+
+    #[test]
+    fn observed_windows_degrade_to_none_when_exhausted() {
+        let pr = json!({
+            "reviews": {
+                "pageInfo": { "hasPreviousPage": false },
+                "nodes": [
+                    { "author": { "login": "a" }, "state": "APPROVED", "submittedAt": "2026-01-01T00:00:00Z" },
+                    { "author": null, "state": "COMMENTED", "submittedAt": null },
+                ]
+            },
+            "reviewThreads": {
+                "pageInfo": { "hasNextPage": false },
+                "nodes": [
+                    { "isResolved": true, "comments": { "totalCount": 2 } },
+                    { "isResolved": false, "comments": { "totalCount": 3 } },
+                ]
+            },
+        });
+        let reviews = parse_observed_reviews(&pr).expect("window complete");
+        assert_eq!(reviews.len(), 2);
+        assert_eq!(reviews[0].verdict, ReviewVerdict::Approve);
+        assert_eq!(reviews[1].author, "unknown");
+        assert_eq!(reviews[1].verdict, ReviewVerdict::Comment);
+        assert_eq!(
+            parse_observed_threads(&pr),
+            Some(ReviewThreadTally {
+                review_comment_count: 5,
+                unresolved: 1,
+            })
+        );
+
+        let overflowing = json!({
+            "reviews": { "pageInfo": { "hasPreviousPage": true }, "nodes": [] },
+            "reviewThreads": { "pageInfo": { "hasNextPage": true }, "nodes": [] },
+        });
+        assert_eq!(parse_observed_reviews(&overflowing), None);
+        assert_eq!(parse_observed_threads(&overflowing), None);
+        assert_eq!(parse_observed_reviews(&json!({})), None);
+        assert_eq!(parse_observed_threads(&json!({})), None);
+    }
+
+    /// The folded `totalCount`s saturate where the per-signal reads do —
+    /// `list_comments` at one `per_page=100` page, a thread's comments at
+    /// `comments(first: 100)` — so a fallback poll reports the same count.
+    #[test]
+    fn observed_counts_saturate_at_the_per_signal_ceiling() {
+        assert_eq!(observed_count(None), 0);
+        assert_eq!(observed_count(Some(&json!({ "totalCount": 7 }))), 7);
+        assert_eq!(observed_count(Some(&json!({ "totalCount": 100 }))), 100);
+        assert_eq!(observed_count(Some(&json!({ "totalCount": 101 }))), 100);
+        assert_eq!(observed_count(Some(&json!({ "totalCount": 5000 }))), 100);
+
+        let pr = json!({
+            "reviewThreads": {
+                "pageInfo": { "hasNextPage": false },
+                "nodes": [
+                    { "isResolved": false, "comments": { "totalCount": 250 } },
+                    { "isResolved": true, "comments": { "totalCount": 3 } },
+                ]
+            },
+        });
+        assert_eq!(
+            parse_observed_threads(&pr),
+            Some(ReviewThreadTally {
+                review_comment_count: 103,
+                unresolved: 1,
+            })
         );
     }
 
@@ -2121,6 +2857,7 @@ mod tests {
             "name": "build",
             "status": "COMPLETED",
             "conclusion": "SUCCESS",
+            "startedAt": "2026-09-18T11:32:04Z",
             "detailsUrl": "https://ci/run/1",
             "isRequired": true
         }))
@@ -2129,6 +2866,8 @@ mod tests {
         assert_eq!(check.state, CheckState::Success);
         assert!(check.is_required);
         assert_eq!(check.url.as_deref(), Some("https://ci/run/1"));
+        assert_eq!(check.started_at.as_deref(), Some("2026-09-18T11:32:04Z"));
+        assert_eq!(check.kind, RollupCheckKind::CheckRun);
 
         // An in-flight check-run is pending regardless of conclusion.
         let pending = map_rollup_context(&json!({
@@ -2141,6 +2880,7 @@ mod tests {
         .unwrap();
         assert_eq!(pending.state, CheckState::Pending);
         assert!(!pending.is_required);
+        assert_eq!(pending.started_at, None);
 
         let status = map_rollup_context(&json!({
             "__typename": "StatusContext",
@@ -2151,8 +2891,10 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(status.name, "ci/legacy");
+        assert_eq!(status.kind, RollupCheckKind::StatusContext);
         assert_eq!(status.state, CheckState::Failure);
         assert!(status.is_required);
+        assert_eq!(status.started_at, None);
 
         // Unknown union members are skipped rather than mis-mapped.
         assert!(map_rollup_context(&json!({ "__typename": "Something" })).is_none());
@@ -2204,10 +2946,13 @@ mod tests {
             review_decision: Some(ReviewDecision::ReviewRequired),
             checks: vec![RollupCheck {
                 name: "build".into(),
+                kind: RollupCheckKind::CheckRun,
                 state: CheckState::Pending,
                 is_required: true,
                 url: None,
+                started_at: None,
             }],
+            checks_head_sha: None,
             checks_known: true,
             branch_rules: Some(BranchRules {
                 required_approving_review_count: Some(1),
@@ -2568,6 +3313,59 @@ mod tests {
         );
         assert_eq!(build_repo_search_query("   "), "");
         assert_eq!(build_repo_search_query(""), "");
+    }
+
+    #[test]
+    fn rewrites_user_search_query() {
+        assert_eq!(
+            build_user_search_query("octocat"),
+            "octocat in:login type:user"
+        );
+        assert_eq!(
+            build_user_search_query("  @octocat  "),
+            "octocat in:login type:user"
+        );
+        assert_eq!(
+            build_user_search_query("octo-cat42"),
+            "octo-cat42 in:login type:user"
+        );
+        assert_eq!(build_user_search_query("@"), "");
+        assert_eq!(build_user_search_query("   "), "");
+        assert_eq!(build_user_search_query(""), "");
+    }
+
+    /// Search syntax never leaks through: the query is cut at the first
+    /// non-login character, so qualifiers, booleans, quotes and parentheses
+    /// in the typed text can neither widen the login-prefix contract nor
+    /// break the forge request.
+    #[test]
+    fn user_search_query_keeps_only_the_login_prefix() {
+        assert_eq!(
+            build_user_search_query("alice in:name"),
+            "alice in:login type:user"
+        );
+        assert_eq!(
+            build_user_search_query("foo OR bar"),
+            "foo in:login type:user"
+        );
+        assert_eq!(
+            build_user_search_query("repos:>100"),
+            "repos in:login type:user"
+        );
+        assert_eq!(
+            build_user_search_query("@bob@example.com"),
+            "bob in:login type:user"
+        );
+        assert_eq!(
+            build_user_search_query("octo\"cat"),
+            "octo in:login type:user"
+        );
+        // A bare qualifier is just the login prefix before its colon.
+        assert_eq!(build_user_search_query("in:name"), "in in:login type:user");
+        // No login prefix at all: nothing to search.
+        assert_eq!(build_user_search_query("(x)"), "");
+        assert_eq!(build_user_search_query("\"quoted\""), "");
+        assert_eq!(build_user_search_query("@ (x)"), "");
     }
 
     #[test]

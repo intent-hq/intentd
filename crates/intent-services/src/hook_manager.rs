@@ -40,7 +40,7 @@
 //! (still-active) hook so a silently broken check is observable via
 //! `ws.hook.list`; a later all-healthy run clears it.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -122,6 +122,28 @@ const HOOK_WAKE_LOGS_CAP: usize = crate::harness::v1::HOOK_WAKE_LOGS_CAP;
 /// `state` is dropped (the previous state is kept) with a warning line
 /// appended to that run's logs.
 const HOOK_STATE_MAX_BYTES: usize = 16 * 1024;
+
+/// How a cancel transition ([`Services::cancel_active_hook`],
+/// [`Services::cancel_active_pr_monitor`]) settles the owner's deferred
+/// completion watches. A completion watch on an idle owner defers while the
+/// owner has active hooks / PR monitors, so cancelling the LAST one must
+/// re-run the deferral backstop
+/// ([`Services::redeliver_completion_after_queue_mutation`]) — either
+/// through a wake or directly — or the watch strands forever.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum CancelSettlement<'a> {
+    /// Wake the owner with this notice; the wake runs the backstop itself
+    /// after the delivery attempt (FE/app cancel).
+    Notify(&'a str),
+    /// No wake; run the backstop directly (owner-side cancel, retire sweep).
+    Resettle,
+    /// Neither: the caller sweeps several items and runs the backstop ONCE
+    /// per owner after queueing its consolidated wake (archive sweep). The
+    /// per-item backstop would otherwise see an empty queue and no remaining
+    /// watches on the final item and synthesize a genuine completion,
+    /// consuming a parent's watch BEFORE the consolidated notice is queued.
+    Deferred,
+}
 
 /// Cap (in chars) on the `message` a dispatching run returns and on the error
 /// text an eviction wake carries. Longer text is head-kept and tail-marked
@@ -348,9 +370,12 @@ impl ScheduleKind {
 
 /// Parse a cron expression under the accepted grammar: standard 5-field
 /// (minute granularity — a seconds field is rejected), evaluated in UTC.
+/// `sloppy_ranges` keeps the croner 3.x shortcut step syntax (`5/5`)
+/// accepted so hooks persisted before the croner 4 upgrade still parse.
 fn parse_cron(expr: &str) -> Result<croner::Cron> {
     croner::parser::CronParser::builder()
         .seconds(croner::parser::Seconds::Disallowed)
+        .sloppy_ranges(true)
         .build()
         .parse(expr)
         .map_err(|e| {
@@ -639,7 +664,13 @@ async fn run_hook_script(
         timeout,
         ..intent_js::EvalOptions::default()
     };
-    match intent_js::eval(&full_code, &opts, Some(host)).await {
+    // Hook runs are daemon-internal work: every `ws.*` call the script makes
+    // is bound to the `Daemon` caller (multiplayer w1).
+    let eval = intent_core::with_caller(
+        intent_core::Caller::Daemon,
+        intent_js::eval(&full_code, &opts, Some(host)),
+    );
+    match eval.await {
         Ok(v) => {
             let logs = v
                 .get("__logs")
@@ -984,6 +1015,8 @@ impl Services {
             is_sub_agent,
         )
         .await;
+        let _mutation = self.workspace_mutations.enter(workspace_id)?;
+        self.store.get_workspace(workspace_id).await?;
         match outcome {
             RunOutcome::Failed { error, .. } => Err(Error::InvalidParams(format!(
                 "hook.schedule: first run failed: {error}"
@@ -1100,20 +1133,26 @@ impl Services {
     }
 
     /// `hook.list`: hooks in a workspace (optionally one agent's), oldest
-    /// first, as `{ hooks: [Hook] }`.
+    /// first, as `{ hooks: [Hook] }`. By default only ACTIVE
+    /// (`scheduled`/`running`) hooks are listed, as full rows (the FE chip
+    /// row reads `code` for its expanded view). With `include_retired`, the
+    /// terminal rows (`dispatched`/`evicted`/`cancelled`/`expired`) are
+    /// listed too, as a LIGHT projection — `code`, `lastState` and
+    /// `lastLogs` omitted — so a long-lived workspace's retired history never
+    /// inflates the frame (intent-hq/intent#5307); `hook.get` remains the
+    /// full-row recovery path. The state filter and the projection are
+    /// applied in SQL ([`Store::list_hook_rows`]), so the handler is
+    /// O(rows returned) and never hydrates a retired row's blobs.
     pub(crate) async fn hook_list_op(
         &self,
         workspace_id: &WorkspaceId,
         agent_id: Option<&AgentId>,
+        include_retired: bool,
     ) -> Result<Value> {
-        let hooks = match agent_id {
-            Some(a) => self.store.list_hooks_by_agent(a).await?,
-            None => self.store.list_hooks_by_workspace(workspace_id).await?,
-        };
-        let hooks: Vec<Hook> = hooks
-            .into_iter()
-            .filter(|h| &h.workspace_id == workspace_id)
-            .collect();
+        let hooks = self
+            .store
+            .list_hook_rows(workspace_id, agent_id, include_retired)
+            .await?;
         Ok(json!({ "hooks": hooks }))
     }
 
@@ -1278,20 +1317,26 @@ impl Services {
         let notice = caller
             .is_none()
             .then(|| crate::harness::latest().hook_cancelled_from_app_notice());
-        let hook = self.cancel_active_hook(hook, notice.as_deref()).await?;
+        let settlement = match notice.as_deref() {
+            Some(notice) => CancelSettlement::Notify(notice),
+            None => CancelSettlement::Resettle,
+        };
+        let hook = self.cancel_active_hook(hook, settlement).await?;
         Ok(json!({ "ok": true, "hook": hook }))
     }
 
     /// Core cancel transition shared by [`Services::hook_cancel_op`] and the
-    /// archive sweep ([`Services::cancel_workspace_hooks`]): abort the
-    /// scheduler task, persist `cancelled`, clear `nextRunAt`, and emit
-    /// `hook:cancelled`. With a `wake_notice` the owner is woken (the wake
-    /// runs the deferral backstop itself, inside `wake_hook_owner`, after
-    /// the delivery attempt); without one, no wake is delivered — a deferred
-    /// completion watch on the (idle) owner would otherwise never settle
-    /// when this was its last active hook, so the backstop runs directly.
-    /// The caller must have verified the hook is ACTIVE.
-    async fn cancel_active_hook(&self, mut hook: Hook, wake_notice: Option<&str>) -> Result<Hook> {
+    /// archive / retire sweeps ([`Services::cancel_workspace_hooks`],
+    /// [`Services::cancel_agent_hooks`]): abort the scheduler task, persist
+    /// `cancelled`, clear `nextRunAt`, and emit `hook:cancelled`. How the
+    /// owner's deferred completion watches settle is the caller's
+    /// [`CancelSettlement`] choice. The caller must have verified the hook
+    /// is ACTIVE.
+    async fn cancel_active_hook(
+        &self,
+        mut hook: Hook,
+        settlement: CancelSettlement<'_>,
+    ) -> Result<Hook> {
         self.abort_hook_task(&hook.hook_id);
         self.store
             .update_hook_state(&hook.hook_id, HookState::Cancelled)
@@ -1300,9 +1345,12 @@ impl Services {
         hook.state = HookState::Cancelled;
         hook.next_run_at = None;
         self.emit_hook_event(HOOK_CANCELLED, &hook, None).await;
-        match wake_notice {
-            Some(notice) => self.wake_hook_owner(&hook, notice, "cancelled").await,
-            None => self.resettle_owner_after_hook_terminal(&hook).await,
+        match settlement {
+            CancelSettlement::Notify(notice) => {
+                self.wake_hook_owner(&hook, notice, "cancelled").await;
+            }
+            CancelSettlement::Resettle => self.resettle_owner_after_hook_terminal(&hook).await,
+            CancelSettlement::Deferred => {}
         }
         // The last active hook settling can demote the derived displayStatus
         // (§6.5) and drop the orthogonal `waiting` flag (§5.1) —
@@ -1314,18 +1362,28 @@ impl Services {
     }
 
     /// Archive sweep (`workspace.archive`): cancel every ACTIVE
-    /// (`scheduled`/`running`) hook in the workspace through the
-    /// `hook.cancel` machinery — task aborted, state persisted to
-    /// `cancelled`, `hook:cancelled` emitted — plus an owner-wake notice so
-    /// the agent learns why its watch stopped. Runs AFTER the archived row
-    /// is persisted: the wake rides the archived gate in
-    /// [`Services::deliver_wake_message`], so it parks in the queue (at
-    /// most) and never starts a turn while the workspace is archived.
+    /// (`scheduled`/`running`) hook in the workspace through the shared
+    /// cancel transition ([`Services::cancel_active_hook`]) — task aborted,
+    /// state persisted to `cancelled`, `hook:cancelled` emitted, waiting
+    /// recomputed (§5.1). Each cancel is SILENT (no per-hook wake) and
+    /// DEFERRED ([`CancelSettlement::Deferred`]: no per-item completion
+    /// backstop either): the cancelled hooks are returned grouped by owner
+    /// as `(name, hook_id)` pairs, and the archive tail
+    /// ([`crate::Services::notify_owners_of_archived_watches`]) folds them
+    /// with the swept PR monitors into ONE consolidated notice per agent and
+    /// only THEN runs the backstop — so a completion watch deferred on a
+    /// monitoring-idle owner sees the queued notice and stays armed, exactly
+    /// as it did behind the retired per-item wakes.
     /// Terminal hooks (`dispatched`/`evicted`/`cancelled`/`expired`) are
-    /// untouched. Best-effort per hook: a store failure is logged and the
-    /// sweep moves on — archiving must not fail because one hook row would
-    /// not update.
-    pub(crate) async fn cancel_workspace_hooks(&self, workspace_id: &WorkspaceId) {
+    /// untouched, and unarchive does NOT resurrect cancelled hooks — the
+    /// notice tells the owner to reschedule if the condition still matters.
+    /// Best-effort per hook: a store failure is logged and the sweep moves
+    /// on — archiving must not fail because one hook row would not update.
+    pub(crate) async fn cancel_workspace_hooks(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> BTreeMap<AgentId, Vec<(String, HookId)>> {
+        let mut cancelled: BTreeMap<AgentId, Vec<(String, HookId)>> = BTreeMap::new();
         let hooks = match self.store.list_hooks_by_workspace(workspace_id).await {
             Ok(hooks) => hooks,
             Err(e) => {
@@ -1334,7 +1392,7 @@ impl Services {
                     error = %e,
                     "archive hook sweep: hook list failed; skipping"
                 );
-                return;
+                return cancelled;
             }
         };
         for hook in hooks {
@@ -1342,21 +1400,25 @@ impl Services {
                 continue;
             }
             let hook_id = hook.hook_id.clone();
-            if let Err(e) = self
-                .cancel_active_hook(
-                    hook,
-                    Some(&crate::harness::latest().hook_cancelled_workspace_archived_notice()),
-                )
+            match self
+                .cancel_active_hook(hook, CancelSettlement::Deferred)
                 .await
             {
-                tracing::warn!(
-                    workspace = %workspace_id.0,
-                    hook = %hook_id.0,
-                    error = %e,
-                    "archive hook sweep: cancel failed; continuing"
-                );
+                Ok(hook) => cancelled
+                    .entry(hook.agent_id)
+                    .or_default()
+                    .push((hook.name, hook.hook_id)),
+                Err(e) => {
+                    tracing::warn!(
+                        workspace = %workspace_id.0,
+                        hook = %hook_id.0,
+                        error = %e,
+                        "archive hook sweep: cancel failed; continuing"
+                    );
+                }
             }
         }
+        cancelled
     }
 
     /// Retire sweep (`ws.agent.retire`): cancel every ACTIVE
@@ -1388,7 +1450,10 @@ impl Services {
                 continue;
             }
             let hook_id = hook.hook_id.clone();
-            if let Err(e) = self.cancel_active_hook(hook, None).await {
+            if let Err(e) = self
+                .cancel_active_hook(hook, CancelSettlement::Resettle)
+                .await
+            {
                 tracing::warn!(
                     agent = %agent_id.0,
                     hook = %hook_id.0,
@@ -1572,7 +1637,7 @@ impl Services {
         let (control_tx, mut control_rx) = mpsc::channel::<HookControl>(4);
         let services = self.clone();
         let hook_id = hook.hook_id.clone();
-        let join = tokio::spawn(async move {
+        let join = intent_core::spawn_daemon(async move {
             let mut hook = hook;
             let mut delay = initial_delay
                 .unwrap_or_else(|| Duration::from_millis(hook.delay_ms.max(0).cast_unsigned()));
@@ -2362,11 +2427,13 @@ mod tests {
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         }
     }
 
@@ -2436,6 +2503,7 @@ mod tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         }
     }
 
@@ -2613,6 +2681,19 @@ mod tests {
         }
         let hooks = svc.store().list_hooks_by_agent(&owner).await.unwrap();
         assert!(hooks.is_empty());
+    }
+
+    /// Cron grammar back-compat: the croner 3.x shortcut step syntax
+    /// (`5/5` — start at 5, step by 5) keeps parsing alongside the standard
+    /// `*/5` form so persisted user hooks survive the croner 4 upgrade (which
+    /// rejects the shortcut by default); a seconds field stays rejected.
+    #[test]
+    fn parse_cron_keeps_sloppy_step_syntax_and_rejects_seconds() {
+        for ok in ["5/5 * * * *", "*/5 * * * *"] {
+            parse_cron(ok).unwrap_or_else(|e| panic!("expected {ok:?} to parse: {e}"));
+        }
+        let err = parse_cron("*/5 * * * * *").unwrap_err();
+        assert!(err.to_string().contains("no seconds"), "{err}");
     }
 
     /// Cron-kind validation: garbage and six-field (seconds) expressions are
@@ -2817,7 +2898,7 @@ mod tests {
         assert_eq!(hook.name, name);
         assert_eq!(hook.state, HookState::Scheduled);
         // Round-trips through list untouched.
-        let listed = svc.hook_list_op(&ws, Some(&owner)).await.unwrap();
+        let listed = svc.hook_list_op(&ws, Some(&owner), false).await.unwrap();
         let hooks = listed["hooks"].as_array().unwrap();
         assert_eq!(hooks.len(), 1);
         assert_eq!(hooks[0]["name"], json!(name));
@@ -2845,7 +2926,7 @@ mod tests {
         let stored = svc.store().get_hook(&hook.hook_id).await.unwrap();
         assert!(stored.perpetual);
         // `hook.list` carries both fields (camelCase).
-        let listed = svc.hook_list_op(&ws, Some(&owner)).await.unwrap();
+        let listed = svc.hook_list_op(&ws, Some(&owner), false).await.unwrap();
         let hooks = listed["hooks"].as_array().unwrap();
         assert_eq!(hooks[0]["perpetual"], json!(true));
         assert_eq!(hooks[0]["dispatchCount"], json!(0));
@@ -2894,8 +2975,85 @@ mod tests {
         assert!(types.contains(&HOOK_RUN_COMPLETED.to_string()), "{types:?}");
         assert!(types.contains(&HOOK_SCHEDULED.to_string()), "{types:?}");
         // list surfaces it.
-        let listed = svc.hook_list_op(&ws, Some(&owner)).await.unwrap();
+        let listed = svc.hook_list_op(&ws, Some(&owner), false).await.unwrap();
         assert_eq!(listed["hooks"].as_array().unwrap().len(), 1);
+    }
+
+    /// Regression (intent-hq/intent#5307): `hook.list` is active-only by
+    /// default, and `includeRetired` appends the terminal rows as a light
+    /// projection — `code` / `lastState` / `lastLogs` omitted — while active
+    /// rows keep the full shape (the FE chip row reads `code`). The
+    /// unscoped (workspace-wide) and agent-scoped reads behave the same.
+    #[tokio::test]
+    async fn list_defaults_to_active_and_lightens_retired_rows() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        // A dispatching hook retires on its validation run, carrying state
+        // and logs the light projection must drop.
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "retired",
+                    "code": "console.log('fired'); \
+                             return { dispatch: true, message: 'done', state: { n: 1 } };",
+                    "delayMs": 10_000,
+                }),
+            )
+            .await
+            .expect("schedule dispatching hook");
+        assert_eq!(out["dispatched"], json!(true));
+        let retired: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        assert_eq!(retired.state, HookState::Dispatched);
+        assert!(retired.last_state.is_some() && retired.last_logs.is_some());
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "active",
+                    "code": "return { dispatch: false, state: { n: 2 } };",
+                    "delayMs": 10_000,
+                }),
+            )
+            .await
+            .expect("schedule active hook");
+        let active: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        assert_eq!(active.state, HookState::Scheduled);
+
+        for agent in [None, Some(&owner)] {
+            // Default: the active row only, full shape.
+            let listed = svc.hook_list_op(&ws, agent, false).await.unwrap();
+            let hooks = listed["hooks"].as_array().unwrap();
+            assert_eq!(hooks.len(), 1, "active only by default: {listed}");
+            assert_eq!(hooks[0]["hookId"], json!(active.hook_id));
+            assert_eq!(hooks[0]["code"], json!(active.code));
+            assert_eq!(hooks[0]["lastState"], json!("{\"n\":2}"));
+
+            // includeRetired: both rows, oldest first; the retired one light.
+            let listed = svc.hook_list_op(&ws, agent, true).await.unwrap();
+            let hooks = listed["hooks"].as_array().unwrap();
+            assert_eq!(hooks.len(), 2, "{listed}");
+            let light = &hooks[0];
+            assert_eq!(light["hookId"], json!(retired.hook_id));
+            assert_eq!(light["state"], json!("dispatched"));
+            assert_eq!(light["name"], json!("retired"));
+            assert_eq!(light["agentId"], json!(owner));
+            assert_eq!(light["runCount"], json!(1));
+            assert_eq!(light["dispatchCount"], json!(1));
+            assert_eq!(light["perpetual"], json!(false));
+            assert!(light["createdAt"].is_string(), "{light}");
+            for heavy in ["code", "lastState", "lastLogs"] {
+                assert!(
+                    light.get(heavy).is_none(),
+                    "retired row must omit `{heavy}`: {light}"
+                );
+            }
+            let full = &hooks[1];
+            assert_eq!(full["hookId"], json!(active.hook_id));
+            assert_eq!(full["code"], json!(active.code), "active row keeps code");
+            assert_eq!(full["lastState"], json!("{\"n\":2}"));
+        }
     }
 
     /// Idle-visibility gating: the `waitingOnHooks` stamp applied by every
@@ -3236,6 +3394,69 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "task not removed");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// Multiplayer w1: every `ws.*` call a hook script makes runs with the
+    /// task-local `Caller::Daemon` bound (hook runs are daemon-internal
+    /// work, never the owning agent's wire identity).
+    #[tokio::test]
+    async fn hook_run_binds_daemon_caller() {
+        struct ProbeApi {
+            ws: Workspace,
+            seen: std::sync::Mutex<(bool, Option<intent_core::Caller>)>,
+        }
+        impl WorkspaceApi for ProbeApi {
+            fn get_workspace(
+                &self,
+                _id: WorkspaceId,
+            ) -> intent_core::BoxFuture<'_, intent_core::Result<Workspace>> {
+                *self.seen.lock().unwrap() = (true, intent_core::current_caller());
+                let snapshot = self.ws.clone();
+                Box::pin(async move { Ok(snapshot) })
+            }
+        }
+        let ws = WorkspaceId::new();
+        let api = Arc::new(ProbeApi {
+            ws: workspace(&ws),
+            seen: std::sync::Mutex::new((false, None)),
+        });
+        let hook = Hook {
+            hook_id: HookId::new(),
+            workspace_id: ws,
+            agent_id: AgentId::from("agent-hooks"),
+            name: "caller-probe".to_string(),
+            code: "await ws.workspace.info(); return { dispatch: false };".to_string(),
+            delay_ms: 10_000,
+            cron: None,
+            run_at: None,
+            state: HookState::Scheduled,
+            created_at: now_iso(),
+            last_run_at: None,
+            next_run_at: None,
+            run_count: 0,
+            last_error: None,
+            last_logs: None,
+            last_state: None,
+            expires_at: None,
+            perpetual: false,
+            dispatch_count: 0,
+        };
+        let outcome = run_hook_script(
+            api.clone(),
+            &hook,
+            Duration::from_secs(10),
+            &AgentFeaturesSettings::default(),
+            false,
+        )
+        .await;
+        assert!(
+            matches!(outcome, RunOutcome::Continue { .. }),
+            "probe script must complete without dispatching"
+        );
+        assert_eq!(
+            api.seen.lock().unwrap().clone(),
+            (true, Some(intent_core::Caller::Daemon))
+        );
     }
 
     #[tokio::test]
@@ -4104,7 +4325,7 @@ mod tests {
     /// the existing cancel semantics — state persisted to `cancelled`, task
     /// aborted, `hook:cancelled` emitted, owner told why — while terminal
     /// hooks are untouched.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn archive_cancels_active_hooks_and_leaves_terminal_hooks_untouched() {
         let (_tmp, _root, svc, ws, owner) = setup().await;
         // A terminal hook first: an immediate dispatch short-circuits the
@@ -4429,7 +4650,7 @@ mod tests {
     /// `workspace.delete` aborts the workspace's live hook scheduler tasks
     /// EAGERLY — the task is gone the moment delete returns, not lazily at
     /// its next tick — and the store cascade drops the row.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn delete_aborts_live_hook_tasks_eagerly() {
         let (_tmp, _root, svc, ws, owner) = setup().await;
         let out = svc
@@ -5279,7 +5500,7 @@ mod tests {
         let stored = svc.store().get_hook(&hook.hook_id).await.unwrap();
         assert_eq!(stored.last_logs, hook.last_logs);
         // hook.list serializes lastLogs.
-        let listed = svc.hook_list_op(&ws, Some(&owner)).await.unwrap();
+        let listed = svc.hook_list_op(&ws, Some(&owner), false).await.unwrap();
         assert_eq!(
             listed["hooks"][0]["lastLogs"],
             json!("checked 3 PRs\n{\"ok\":true}")
@@ -5328,7 +5549,7 @@ mod tests {
             .expect("schedule");
         let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
         assert_eq!(hook.last_logs, None);
-        let listed = svc.hook_list_op(&ws, Some(&owner)).await.unwrap();
+        let listed = svc.hook_list_op(&ws, Some(&owner), false).await.unwrap();
         assert_eq!(listed["hooks"][0].get("lastLogs"), None);
         // No `[hook logs]` section on a log-free run's wake path either.
         let session = svc.store().get_agent_session(&owner).await.unwrap();
@@ -5698,7 +5919,7 @@ mod tests {
         // The validation (arming) run persisted its state.
         assert_eq!(hook.last_state.as_deref(), Some("{\"n\":1}"));
         // hook.list serializes lastState.
-        let listed = svc.hook_list_op(&ws, Some(&owner)).await.unwrap();
+        let listed = svc.hook_list_op(&ws, Some(&owner), false).await.unwrap();
         assert_eq!(listed["hooks"][0]["lastState"], json!("{\"n\":1}"));
         // Second run reads the injected state and advances it.
         svc.hook_run_now_op(&ws, &hook.hook_id)
@@ -5797,7 +6018,7 @@ mod tests {
             !err.contains("echo broken"),
             "raw args must not persist: {err}"
         );
-        let listed = svc.hook_list_op(&ws, Some(&owner)).await.unwrap();
+        let listed = svc.hook_list_op(&ws, Some(&owner), false).await.unwrap();
         assert_eq!(
             listed["hooks"][0]["lastError"].as_str(),
             hook.last_error.as_deref()
@@ -6193,7 +6414,7 @@ mod tests {
         assert_eq!(ttl_of(&hook), 300_000);
         let stored = svc.store().get_hook(&hook.hook_id).await.unwrap();
         assert_eq!(stored.expires_at, hook.expires_at);
-        let listed = svc.hook_list_op(&ws, Some(&owner)).await.unwrap();
+        let listed = svc.hook_list_op(&ws, Some(&owner), false).await.unwrap();
         let mid = listed["hooks"]
             .as_array()
             .unwrap()

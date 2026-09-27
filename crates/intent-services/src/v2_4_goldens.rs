@@ -139,10 +139,14 @@ const COMPARED_SURFACES: &[&str] = &[
     "agent_naming_tool_reference",
     "naming_nudge",
     "role_reminder_prefix",
+    "setup_in_progress_notice",
+    "setup_failed_notice",
     "compose_turn_prompt",
     "stale_redrive_note",
     "dequeue_wait_note",
     "a2a_sender_note",
+    "collaborator_sender_preamble",
+    "host_member_sender_preamble",
     "wait_duration",
     "idle_timeout_warning",
     "truncation_redrive_nudge",
@@ -180,6 +184,8 @@ const COMPARED_SURFACES: &[&str] = &[
     "pr_terminal_wake",
     "pr_monitor_cancelled_from_app_notice",
     "pr_monitor_cancelled_workspace_archived_notice",
+    "pr_monitor_transferred_to_parent_notice",
+    "workspace_archived_watches_cancelled_notice",
     "delegation_first_message",
     "questions_dismissed_notice",
     "proposal_applied_notice",
@@ -239,7 +245,7 @@ fn harness_surface_list_is_exhaustive() {
 #[test]
 fn v2_4_matches_v2_3_on_every_other_surface() {
     use crate::agent_ops::ready_delta::{UnblockedReason, UnblockedTask};
-    use crate::harness::{ChildSettlementParams, TurnEnvelopeParams};
+    use crate::harness::{ChildSettlementParams, HostMemberSender, TurnEnvelopeParams};
 
     let v1 = crate::harness::resolve_entry("1.0").harness;
     let v2_3 = crate::harness::resolve_entry("2.3").harness;
@@ -290,9 +296,13 @@ fn v2_4_matches_v2_3_on_every_other_surface() {
     same!(naming_nudge(None, Some("ws-ref")));
     same!(naming_nudge(None, None));
     same!(role_reminder_prefix("Implementor", "Stay in scope."));
+    same!(setup_in_progress_notice("Setup Script"));
+    same!(setup_failed_notice(Some(3), "Setup Script"));
+    same!(setup_failed_notice(None, "Setup Script"));
     let full = TurnEnvelopeParams {
         first_turn_prepend: Some("<system>prepend</system>"),
         snapshot_line: Some("current ws.agent.snapshot() => {}"),
+        setup_notice: Some("[System: setup]"),
         stdin_context: Some("ctx"),
         naming_nudge: Some("<system>name it</system>"),
         role_reminder: Some("[Role Reminder: x]"),
@@ -301,6 +311,7 @@ fn v2_4_matches_v2_3_on_every_other_surface() {
     let bare = TurnEnvelopeParams {
         first_turn_prepend: None,
         snapshot_line: None,
+        setup_notice: None,
         stdin_context: None,
         naming_nudge: None,
         role_reminder: None,
@@ -314,6 +325,18 @@ fn v2_4_matches_v2_3_on_every_other_surface() {
     same!(dequeue_wait_note("2026-01-02T03:04:05Z", "5 minutes"));
     same!(a2a_sender_note(Some("Coordinator"), "agent-1"));
     same!(a2a_sender_note(None, "agent-1"));
+    same!(collaborator_sender_preamble(
+        Some("octocat"),
+        Some("The Octocat"),
+        "principal-1"
+    ));
+    same!(collaborator_sender_preamble(None, None, "principal-1"));
+    same!(host_member_sender_preamble(HostMemberSender {
+        login: Some("octocat"),
+        display_name: Some("The Octocat"),
+        principal_id: "principal-1",
+        identity: None,
+    }));
     for secs in [0, 59, 60, 3599, 3600, 90_000] {
         same!(wait_duration(secs));
     }
@@ -458,6 +481,20 @@ fn v2_4_matches_v2_3_on_every_other_surface() {
     same!(pr_terminal_wake("o/r#42", &changes, &merged));
     same!(pr_monitor_cancelled_from_app_notice("o/r#42"));
     same!(pr_monitor_cancelled_workspace_archived_notice("o/r#42"));
+    same!(pr_monitor_transferred_to_parent_notice(
+        "o/r#42",
+        "agent-parent"
+    ));
+
+    // --- Workspace archive notices ---
+    same!(workspace_archived_watches_cancelled_notice(
+        &[("pr-watch", "hook-1")],
+        &["o/r#42"]
+    ));
+    same!(workspace_archived_watches_cancelled_notice(
+        &[],
+        &["o/r#42"]
+    ));
 
     // --- Other conversation-reaching strings ---
     same!(delegation_first_message(Some("body"), "Title", "note-1"));

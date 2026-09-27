@@ -65,11 +65,13 @@ fn workspace(id: &WorkspaceId, path: &std::path::Path) -> Workspace {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -202,7 +204,7 @@ async fn run_turn(
         .to_string()
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn fs_read_write_round_trip() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
         format!(
@@ -266,7 +268,7 @@ async fn fs_read_write_round_trip() {
     manager.shutdown().await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn permission_request_allow() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
         format!(
@@ -317,7 +319,7 @@ async fn permission_request_allow() {
     manager.shutdown().await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn permission_request_deny() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
         format!(
@@ -368,7 +370,7 @@ async fn permission_request_deny() {
     manager.shutdown().await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 #[cfg(unix)]
 async fn terminal_lifecycle() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
@@ -441,7 +443,7 @@ async fn terminal_lifecycle() {
 }
 
 /// Test terminal/kill on a running process (sleep).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 #[cfg(unix)]
 async fn terminal_kill_running_process() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
@@ -496,7 +498,7 @@ async fn terminal_kill_running_process() {
 }
 
 /// Test terminal output truncation when byte limit is exceeded.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 #[cfg(unix)]
 async fn terminal_output_truncation() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
@@ -569,7 +571,7 @@ async fn terminal_output_truncation() {
 }
 
 /// Test `wait_for_exit` on a process that exits with non-zero code.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 #[cfg(unix)]
 async fn terminal_non_zero_exit() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
@@ -635,7 +637,7 @@ async fn terminal_non_zero_exit() {
 }
 
 /// Test error path: release unknown terminal ID.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 #[cfg(unix)]
 async fn terminal_release_unknown() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
@@ -682,7 +684,7 @@ async fn terminal_release_unknown() {
 }
 
 /// Test error path: output on unknown terminal ID.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 #[cfg(unix)]
 async fn terminal_output_unknown() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
@@ -729,7 +731,7 @@ async fn terminal_output_unknown() {
 }
 
 /// Test output after terminal has exited.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 #[cfg(unix)]
 async fn terminal_output_after_exit() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {

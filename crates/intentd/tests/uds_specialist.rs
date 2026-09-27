@@ -153,7 +153,7 @@ async fn start_with_config(config_toml: Option<&str>) -> Harness {
     let sock_dir = common::test_tempdir_in("/tmp", "is-");
     let socket = sock_dir.path().join("uds.sock");
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn({
+    let server = intent_core::spawn_daemon({
         let socket = socket.clone();
         async move {
             let _ = serve_uds(services, bus, &socket, None, async {
@@ -189,7 +189,7 @@ impl Harness {
     }
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn specialist_full_crud_and_three_tier_resolution() {
     let h = start().await;
     // Seed a bundled (read-only) specialist + a bundled-only one.
@@ -375,7 +375,7 @@ async fn specialist_full_crud_and_three_tier_resolution() {
     h.shutdown().await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn specialist_full_frontmatter_wire_parity() {
     let h = start().await;
     // Seed a bundled specialist whose frontmatter carries every optional scalar
@@ -518,7 +518,7 @@ async fn specialist_full_frontmatter_wire_parity() {
     h.shutdown().await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn specialist_hidden_inherits_across_tiers_on_the_wire() {
     let h = start().await;
     // Regression: a user-tier chief-of-staff.md materialized before the hidden
@@ -587,7 +587,7 @@ async fn specialist_hidden_inherits_across_tiers_on_the_wire() {
     h.shutdown().await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn specialist_bundled_read_only_and_invalid_params() {
     let h = start().await;
     write_specialist(
@@ -660,7 +660,7 @@ fn find_spec<'a>(list: &'a Value, id: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("specialist {id} missing from list"))
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn specialist_resolution_preview() {
     // monorepo#3044: the preview's "default provider" context derives from
     // settings only (no positional fallback), so pin auggie explicitly.
@@ -781,7 +781,7 @@ async fn specialist_resolution_preview() {
 /// concrete provider/model `agent.delegate` would pin — not
 /// "Provider default". A specialist with no pin of its own stays
 /// undecorated.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn specialist_preview_uses_own_pin_without_global_default() {
     let h = start().await;
     write_specialist_frontmatter(
@@ -831,7 +831,7 @@ async fn specialist_preview_uses_own_pin_without_global_default() {
     h.shutdown().await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn specialist_resolution_preview_inherits_settings() {
     let h = start_with_settings(
         "[model]\ndefaultProvider = \"auggie\"\ndefault = \"sonnet4.5\"\n\n[model.providerDefaults]\ncodex = \"gpt-5.3-codex/high\"\n",

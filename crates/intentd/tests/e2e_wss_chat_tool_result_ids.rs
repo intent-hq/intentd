@@ -28,7 +28,7 @@ mod common;
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -83,9 +83,13 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     let secrets_file = data_dir.join("secrets.json");
     common::enable_ws_api(data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    // The reconcile assertion compares the user row's `author` (anonymous
+    // principal: null login/displayName/avatarUrl) against a fresh snapshot;
+    // a host `gh auth login` would hydrate the real login onto the primary
+    // principal mid-test and race it (intent-hq/intent#5645).
+    common::hermetic_github_identity(&mut cmd, data_dir);
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", &secrets_file)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -323,11 +327,13 @@ async fn seed_workspace(data_dir: &Path) -> String {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     };
     store.insert_workspace(&ws).await.expect("insert ws");
     id.0
@@ -423,6 +429,8 @@ fn apply_entity(messages: &mut Vec<Value>, entity: &Value) {
         ("role", "role"),
         ("messageSeq", "seq"),
         ("timestamp", "timestamp"),
+        ("metadata", "metadata"),
+        ("author", "author"),
     ] {
         if let Some(v) = entity.get(from) {
             msg[to] = v.clone();
@@ -677,9 +685,8 @@ async fn interleaved_text_tool_result_keeps_its_durable_block_id_over_wss() {
     let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace(&data_dir).await;
     let behavior = behavior();
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -749,9 +756,8 @@ async fn parallel_tool_results_keep_their_durable_block_ids_over_wss() {
     let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace(&data_dir).await;
     let behavior = behavior();
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];

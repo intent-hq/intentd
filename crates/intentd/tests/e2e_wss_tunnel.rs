@@ -16,7 +16,9 @@ use futures_util::{SinkExt, StreamExt};
 use intent_core::{Result as CoreResult, WorkspaceApi};
 use intent_services::{EventBus, Services};
 use intent_store::Store;
-use intent_transport::tunnel::{Frame, TunnelLimits, MAX_TUNNEL_MESSAGE_BYTES, OP_OPEN};
+use intent_transport::tunnel::{
+    Frame, TunnelLimits, MAX_TUNNEL_MESSAGE_BYTES, OP_CREDIT, OP_OPEN, TUNNEL_INITIAL_CREDIT_BYTES,
+};
 use intent_transport::{
     ensure_tls_certificate, AsyncTokenStore, TokenStore, WsApiServer, WsOptions,
 };
@@ -224,9 +226,9 @@ async fn spawn_echo_listener() -> u16 {
         .await
         .expect("bind echo listener");
     let port = listener.local_addr().expect("local addr").port();
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         while let Ok((mut sock, _)) = listener.accept().await {
-            tokio::spawn(async move {
+            intent_core::spawn_daemon(async move {
                 let mut buf = [0u8; 4096];
                 loop {
                     match sock.read(&mut buf).await {
@@ -259,7 +261,7 @@ fn closed_port() -> (TcpSocket, u16) {
 /// OPEN a live echo port, push data both ways, then tear down with EOF: the
 /// client half-close propagates to the echo server, whose own close comes
 /// back as a daemon `EOF` followed by the final `CLOSE`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn tunnel_open_echo_eof_close_lifecycle() {
     let srv = start().await;
     let echo_port = spawn_echo_listener().await;
@@ -310,7 +312,7 @@ async fn tunnel_open_echo_eof_close_lifecycle() {
 
 /// A client `CLOSE` tears the stream down immediately; the daemon confirms
 /// with its own final `CLOSE` and the stream id becomes reusable.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn tunnel_close_tears_down_and_frees_stream_id() {
     let srv = start().await;
     let echo_port = spawn_echo_listener().await;
@@ -343,7 +345,7 @@ async fn tunnel_close_tears_down_and_frees_stream_id() {
 
 /// `OPEN` on a port nothing listens on answers `OPEN_ERR` naming the target,
 /// and the connection stays healthy for a subsequent successful `OPEN`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn tunnel_open_err_for_closed_port_keeps_connection_alive() {
     let srv = start().await;
     let (_port_reservation, dead_port) = closed_port();
@@ -385,7 +387,7 @@ async fn tunnel_open_err_for_closed_port_keeps_connection_alive() {
 
 /// A duplicate live stream id is rejected with `OPEN_ERR` without disturbing
 /// the original stream.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn tunnel_duplicate_stream_id_rejected() {
     let srv = start().await;
     let echo_port = spawn_echo_listener().await;
@@ -438,7 +440,7 @@ async fn tunnel_duplicate_stream_id_rejected() {
 
 /// The 33rd concurrent stream on one port (default per-port cap 32) is refused with `OPEN_ERR`,
 /// and closing one stream frees a slot for a new `OPEN`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn tunnel_concurrent_stream_cap_enforced() {
     let srv = start().await;
     let echo_port = spawn_echo_listener().await;
@@ -490,7 +492,7 @@ async fn tunnel_concurrent_stream_cap_enforced() {
 
 /// A malformed binary frame (unknown opcode) closes the connection with a
 /// `1002 Protocol Error` close frame.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn tunnel_malformed_frame_closes_with_protocol_error() {
     let srv = start().await;
     let mut ws = connect_tunnel(srv.port, srv.cfg.clone()).await;
@@ -503,7 +505,7 @@ async fn tunnel_malformed_frame_closes_with_protocol_error() {
 }
 
 /// Text frames are a protocol violation on `/tunnel` (binary-only endpoint).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn tunnel_text_frame_closes_with_protocol_error() {
     let srv = start().await;
     let mut ws = connect_tunnel(srv.port, srv.cfg.clone()).await;
@@ -517,13 +519,144 @@ async fn tunnel_text_frame_closes_with_protocol_error() {
 
 /// Daemon-only opcodes (`OPEN_OK` / `OPEN_ERR`) from the client are protocol
 /// violations that close the connection.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn tunnel_daemon_only_opcode_from_client_rejected() {
     let srv = start().await;
     let mut ws = connect_tunnel(srv.port, srv.cfg.clone()).await;
 
     send_frame(&mut ws, Frame::OpenOk { stream_id: 1 }).await;
     expect_protocol_close(&mut ws, "daemon-only opcode").await;
+    srv.ws.stop().await;
+}
+
+/// A `CREDIT` frame whose payload is not exactly 4 bytes, or that grants
+/// zero bytes, is malformed and closes the connection with `1002`
+/// (intent-hq/intent#5482).
+#[intent_test_macros::daemon_test]
+async fn tunnel_malformed_credit_closes_with_protocol_error() {
+    let srv = start().await;
+    let mut short = vec![OP_CREDIT];
+    short.extend_from_slice(&1u32.to_be_bytes());
+    short.extend_from_slice(&[0, 0, 1]);
+    let mut zero = vec![OP_CREDIT];
+    zero.extend_from_slice(&1u32.to_be_bytes());
+    zero.extend_from_slice(&0u32.to_be_bytes());
+    for (bytes, needle) in [
+        (short, "CREDIT payload must be exactly 4 bytes"),
+        (zero, "CREDIT must grant at least one byte"),
+    ] {
+        let mut ws = connect_tunnel(srv.port, srv.cfg.clone()).await;
+        ws.send(Message::Binary(bytes.into())).await.expect("send");
+        expect_protocol_close(&mut ws, needle).await;
+    }
+    srv.ws.stop().await;
+}
+
+/// Daemon→client `DATA` is flow-controlled per stream (intent-hq/intent#5482):
+/// a loopback reply larger than the initial window pauses at exactly
+/// `TUNNEL_INITIAL_CREDIT_BYTES` while the connection stays responsive, and a
+/// client `CREDIT` releases exactly the remainder. The peer's `EOF` is seen by
+/// the same gated read, so it follows only once the stream holds credit again.
+#[intent_test_macros::daemon_test]
+async fn tunnel_credit_window_pauses_reply_until_client_grants() {
+    const EXTRA: usize = 64 * 1024;
+    let srv = start().await;
+    let window = usize::try_from(TUNNEL_INITIAL_CREDIT_BYTES).expect("window fits");
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind");
+    let port = listener.local_addr().expect("local addr").port();
+    let served = intent_core::spawn_daemon(async move {
+        let (mut sock, _) = listener.accept().await.expect("accept");
+        sock.write_all(&vec![0xCD; window + EXTRA])
+            .await
+            .expect("write reply");
+        sock.shutdown().await.expect("shutdown");
+    });
+    let mut ws = connect_tunnel(srv.port, srv.cfg.clone()).await;
+    send_frame(&mut ws, Frame::Open { stream_id: 1, port }).await;
+    assert_eq!(recv_frame(&mut ws).await, Frame::OpenOk { stream_id: 1 });
+    let mut received = 0;
+    while received < window {
+        match recv_frame(&mut ws).await {
+            Frame::Data {
+                stream_id: 1,
+                payload,
+            } => received += payload.len(),
+            other => panic!("expected DATA, got {other:?} after {received} bytes"),
+        }
+    }
+    assert_eq!(received, window, "reply overshot the initial credit window");
+    // Paused, not stalled: the connection still answers while the peer's
+    // remaining bytes wait on credit — and no further DATA precedes the pong.
+    ws.send(Message::Ping(b"paused".to_vec().into()))
+        .await
+        .expect("ping");
+    loop {
+        match tokio::time::timeout(common::test_timeout(Duration::from_secs(10)), ws.next())
+            .await
+            .expect("timed out waiting for pong")
+            .expect("connected")
+            .expect("message")
+        {
+            Message::Pong(p) if p.as_ref() == b"paused" => break,
+            Message::Ping(p) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            other => panic!("expected pong while the reply is paused, got {other:?}"),
+        }
+    }
+    send_frame(
+        &mut ws,
+        Frame::Credit {
+            stream_id: 1,
+            credit: u32::try_from(EXTRA).expect("grant fits"),
+        },
+    )
+    .await;
+    let mut granted = 0;
+    while granted < EXTRA {
+        match recv_frame(&mut ws).await {
+            Frame::Data {
+                stream_id: 1,
+                payload,
+            } => granted += payload.len(),
+            other => panic!("expected DATA, got {other:?} after {granted} granted bytes"),
+        }
+    }
+    assert_eq!(granted, EXTRA, "grant released exactly the remaining bytes");
+    served.await.expect("listener task");
+    // The window is spent again, so the peer's close is not read yet; the
+    // next grant surfaces it as `EOF` with no further `DATA`.
+    ws.send(Message::Ping(b"spent".to_vec().into()))
+        .await
+        .expect("ping");
+    loop {
+        match tokio::time::timeout(common::test_timeout(Duration::from_secs(10)), ws.next())
+            .await
+            .expect("timed out waiting for pong")
+            .expect("connected")
+            .expect("message")
+        {
+            Message::Pong(p) if p.as_ref() == b"spent" => break,
+            Message::Ping(p) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            other => panic!("expected pong with the window spent, got {other:?}"),
+        }
+    }
+    send_frame(
+        &mut ws,
+        Frame::Credit {
+            stream_id: 1,
+            credit: 1,
+        },
+    )
+    .await;
+    assert_eq!(recv_frame(&mut ws).await, Frame::Eof { stream_id: 1 });
+    send_frame(&mut ws, Frame::Eof { stream_id: 1 }).await;
+    assert_eq!(recv_frame(&mut ws).await, Frame::Close { stream_id: 1 });
+    ws.close(None).await.expect("close ws");
     srv.ws.stop().await;
 }
 
@@ -553,7 +686,7 @@ async fn expect_protocol_close(ws: &mut common::TlsWs, needle: &str) {
 
 /// `/tunnel` shares the `/ws` upgrade gate: no bearer token ⇒ 401, bad token
 /// ⇒ 401, before any WebSocket handshake completes.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn tunnel_unauthenticated_upgrade_rejected() {
     let srv = start().await;
     for query in [
@@ -579,7 +712,7 @@ async fn tunnel_unauthenticated_upgrade_rejected() {
 
 /// The raw wire layout is exactly `[opcode u8][streamId u32 BE][payload]` on
 /// the socket — proven with a hand-built `OPEN` (no codec on the send side).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn tunnel_accepts_hand_built_wire_frames() {
     let srv = start().await;
     let echo_port = spawn_echo_listener().await;
@@ -597,7 +730,7 @@ async fn tunnel_accepts_hand_built_wire_frames() {
 /// `TcpStream` sanity: the daemon connects to the loopback target, so a
 /// listener bound to `127.0.0.1` (unreachable from other hosts) is reachable
 /// through the tunnel.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn tunnel_reaches_loopback_bound_listener() {
     let srv = start().await;
     // Explicitly loopback-only listener.
@@ -605,7 +738,7 @@ async fn tunnel_reaches_loopback_bound_listener() {
         .await
         .expect("bind");
     let port = listener.local_addr().expect("local addr").port();
-    let served = tokio::spawn(async move {
+    let served = intent_core::spawn_daemon(async move {
         let (mut sock, peer) = listener.accept().await.expect("accept");
         assert!(peer.ip().is_loopback(), "tunnel connects from loopback");
         sock.write_all(b"greeting from loopback")
@@ -635,7 +768,7 @@ async fn tunnel_reaches_loopback_bound_listener() {
 
 /// An idle stream (no data either way) is torn down with a final `CLOSE`
 /// after `TunnelLimits::idle_timeout`, and the connection stays usable.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn tunnel_idle_stream_times_out_with_close() {
     let srv = start_with(TunnelLimits {
         idle_timeout: Duration::from_millis(200),
@@ -673,7 +806,7 @@ async fn tunnel_idle_stream_times_out_with_close() {
 
 /// A non-reading target must not park the shared mux behind its full queue.
 /// Exercise the actual pinned WSS path, including a ping and a sibling echo.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn tunnel_stalled_upload_does_not_block_sibling_or_ping() {
     let srv = start().await;
     let socket = TcpSocket::new_v4().expect("socket");
@@ -771,7 +904,7 @@ async fn tunnel_stalled_upload_does_not_block_sibling_or_ping() {
 /// timeout. A firewalled/blackholed port is simulated with a bound listener
 /// whose backlog is exhausted; if the connect happens to be accepted by the
 /// kernel anyway the test is skipped rather than flaking.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn tunnel_connect_timeout_answers_open_err() {
     let srv = start_with(TunnelLimits {
         connect_timeout: Duration::from_millis(150),
@@ -814,7 +947,7 @@ async fn tunnel_connect_timeout_answers_open_err() {
 /// A `DATA` message over the inbound message cap closes the connection with
 /// `1009 Message Too Big`, and an over-limit single frame still terminates
 /// the connection.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn tunnel_oversize_data_closes_with_1009() {
     use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
     use tokio_tungstenite::tungstenite::protocol::frame::Frame as WsFrame;
@@ -923,7 +1056,7 @@ async fn tunnel_oversize_data_closes_with_1009() {
 
 /// `DATA` after the client's own `EOF` is dropped: the write side stays shut,
 /// the read side keeps relaying, and the stream ends cleanly.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn tunnel_data_after_eof_is_dropped() {
     let srv = start().await;
     // Serve a fixed greeting AFTER seeing EOF from the daemon side, proving
@@ -932,7 +1065,7 @@ async fn tunnel_data_after_eof_is_dropped() {
         .await
         .expect("bind");
     let port = listener.local_addr().expect("addr").port();
-    let served = tokio::spawn(async move {
+    let served = intent_core::spawn_daemon(async move {
         let (mut sock, _) = listener.accept().await.expect("accept");
         let mut buf = Vec::new();
         sock.read_to_end(&mut buf).await.expect("read to EOF");
@@ -982,7 +1115,7 @@ async fn tunnel_data_after_eof_is_dropped() {
 /// `/tunnel` connections live in the same client registry as `/ws`: the
 /// `client_count()` backing the `/health` count includes them, and `stop()`
 /// tears them down.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn tunnel_connections_counted_in_health_and_stopped() {
     let srv = start().await;
     assert_eq!(srv.ws.client_count(), 0);
@@ -1023,7 +1156,7 @@ async fn tunnel_connections_counted_in_health_and_stopped() {
 /// pong-bookkeeping arm, so a mixed-clock regression there (wall-clock stamp
 /// vs monotonic reaper, or vice versa) would reap this responsive client
 /// within one timeout window without ever failing the `/ws` test.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn heartbeat_keeps_responsive_tunnel_client_alive() {
     let srv = start_with_heartbeat(
         TunnelLimits::default(),
@@ -1032,7 +1165,8 @@ async fn heartbeat_keeps_responsive_tunnel_client_alive() {
     .await;
     let mut ws = connect_tunnel(srv.port, srv.cfg.clone()).await;
     // Keep the stream polled so tungstenite answers each Ping with a Pong.
-    let poller = tokio::spawn(async move { while let Some(Ok(_)) = ws.next().await {} });
+    let poller =
+        intent_core::spawn_daemon(async move { while let Some(Ok(_)) = ws.next().await {} });
     let deadline = Instant::now() + common::test_timeout(Duration::from_secs(10));
     while srv.ws.client_count() != 1 {
         assert!(Instant::now() < deadline, "tunnel client never registered");

@@ -722,9 +722,9 @@ dependencies = [
 
 [[package]]
 name = "croner"
-version = "3.0.1"
+version = "4.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4aa42bcd3d846ebf66e15bd528d1087f75d1c6c1c66ebff626178a106353c576"
+checksum = "a59ed87528b2ee2b6d2b14d6767f6dbe41867dfc581433fc23a7c0fae847467a"
 dependencies = [
  "chrono",
  "derive_builder",
@@ -2161,7 +2161,7 @@ dependencies = [
 
 [[package]]
 name = "intent-acp"
-version = "0.9.59"
+version = "0.9.112"
 dependencies = [
  "agent-client-protocol",
  "ctor",
@@ -2172,6 +2172,7 @@ dependencies = [
  "intent-providers",
  "intent-pty",
  "intent-services",
+ "libc",
  "nix 0.31.3",
  "serde",
  "serde_json",
@@ -2181,11 +2182,12 @@ dependencies = [
  "toon-format",
  "tracing",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "intent-context"
-version = "0.9.59"
+version = "0.9.112"
 dependencies = [
  "async-trait",
  "ctor",
@@ -2198,11 +2200,12 @@ dependencies = [
 
 [[package]]
 name = "intent-core"
-version = "0.9.59"
+version = "0.9.112"
 dependencies = [
  "async-trait",
  "ctor",
  "directories",
+ "intentd-test-support",
  "libc",
  "serde",
  "serde_json",
@@ -2210,6 +2213,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "time",
+ "tokio",
  "toml",
  "tracing",
  "uuid",
@@ -2218,7 +2222,7 @@ dependencies = [
 
 [[package]]
 name = "intent-git"
-version = "0.9.59"
+version = "0.9.112"
 dependencies = [
  "git2",
  "intent-core",
@@ -2232,7 +2236,7 @@ dependencies = [
 
 [[package]]
 name = "intent-js"
-version = "0.9.59"
+version = "0.9.112"
 dependencies = [
  "rquickjs",
  "serde_json",
@@ -2242,7 +2246,7 @@ dependencies = [
 
 [[package]]
 name = "intent-linear"
-version = "0.9.59"
+version = "0.9.112"
 dependencies = [
  "async-trait",
  "intent-core",
@@ -2256,7 +2260,7 @@ dependencies = [
 
 [[package]]
 name = "intent-providers"
-version = "0.9.59"
+version = "0.9.112"
 dependencies = [
  "ctor",
  "intent-core",
@@ -2267,7 +2271,7 @@ dependencies = [
 
 [[package]]
 name = "intent-pty"
-version = "0.9.59"
+version = "0.9.112"
 dependencies = [
  "intent-core",
  "nix 0.31.3",
@@ -2278,7 +2282,7 @@ dependencies = [
 
 [[package]]
 name = "intent-search"
-version = "0.9.59"
+version = "0.9.112"
 dependencies = [
  "globset",
  "grep",
@@ -2291,7 +2295,7 @@ dependencies = [
 
 [[package]]
 name = "intent-sentry"
-version = "0.9.59"
+version = "0.9.112"
 dependencies = [
  "async-trait",
  "intent-core",
@@ -2305,7 +2309,7 @@ dependencies = [
 
 [[package]]
 name = "intent-services"
-version = "0.9.59"
+version = "0.9.112"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -2328,7 +2332,9 @@ dependencies = [
  "intent-sentry",
  "intent-sourcecontrol",
  "intent-store",
+ "intent-test-macros",
  "intent-voice",
+ "intentd-test-support",
  "libc",
  "nix 0.31.3",
  "notify",
@@ -2346,19 +2352,22 @@ dependencies = [
  "tokio",
  "toml_edit",
  "tracing",
+ "tracing-subscriber",
  "uuid",
+ "windows-sys 0.61.2",
  "zip",
 ]
 
 [[package]]
 name = "intent-sourcecontrol"
-version = "0.9.59"
+version = "0.9.112"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
  "http",
  "intent-core",
  "octocrab",
+ "reqwest",
  "secrecy",
  "serde",
  "serde_json",
@@ -2370,7 +2379,7 @@ dependencies = [
 
 [[package]]
 name = "intent-store"
-version = "0.9.59"
+version = "0.9.112"
 dependencies = [
  "base64 0.23.1",
  "flate2",
@@ -2387,8 +2396,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "intent-test-macros"
+version = "0.9.55"
+dependencies = [
+ "intent-core",
+ "tokio",
+]
+
+[[package]]
 name = "intent-transport"
-version = "0.9.59"
+version = "0.9.112"
 dependencies = [
  "base64 0.23.1",
  "ctor",
@@ -2406,6 +2423,7 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "rustls-pki-types",
+ "semver",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -2437,7 +2455,7 @@ dependencies = [
 
 [[package]]
 name = "intentd"
-version = "0.9.59"
+version = "0.9.112"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2459,8 +2477,11 @@ dependencies = [
  "intent-services",
  "intent-sourcecontrol",
  "intent-store",
+ "intent-test-macros",
  "intent-transport",
  "intent-voice",
+ "intentd-sitter",
+ "intentd-test-support",
  "libc",
  "nix 0.31.3",
  "openssl-sys",
@@ -2487,10 +2508,11 @@ dependencies = [
 
 [[package]]
 name = "intentd-sitter"
-version = "0.1.13"
+version = "0.1.20"
 dependencies = [
  "directories",
  "flate2",
+ "intentd-test-support",
  "liblzma",
  "nix 0.31.3",
  "reqwest",
@@ -2506,6 +2528,14 @@ dependencies = [
  "toml",
  "tracing",
  "zip",
+]
+
+[[package]]
+name = "intentd-test-support"
+version = "0.0.0"
+dependencies = [
+ "nix 0.31.3",
+ "tempfile",
 ]
 
 [[package]]

@@ -77,11 +77,13 @@ fn sample_ws(id: &WorkspaceId, worktree: &std::path::Path) -> Workspace {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -136,7 +138,7 @@ async fn wait_for_subscriber_count(bus: &EventBus, target: usize) {
     panic!("subscriber_count never reached {target}");
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn rules_round_trip_overrides_files_and_event() {
     let work = common::test_tempdir("intentd-rules-");
     std::fs::write(work.path().join("CLAUDE.md"), "ALWAYS run the linter.").unwrap();
@@ -161,7 +163,7 @@ async fn rules_round_trip_overrides_files_and_event() {
     let socket = sock_dir.path().join("uds.sock");
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn({
+    let server = intent_core::spawn_daemon({
         let bus = bus.clone();
         let socket = socket.clone();
         async move {

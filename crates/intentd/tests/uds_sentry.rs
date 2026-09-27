@@ -233,7 +233,7 @@ async fn start(
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let serve_socket = socket.clone();
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         serve_uds(services, bus, &serve_socket, None, async move {
             let _ = rx.await;
         })
@@ -249,7 +249,7 @@ async fn start(
     (socket, tx, base, ws_root)
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn uds_sentry_read_surface_round_trip() {
     let engine = Arc::new(StubEngine::new(false));
     let seen_request = engine.seen_request.clone();
@@ -357,7 +357,7 @@ async fn uds_sentry_read_surface_round_trip() {
     assert_eq!(resp["error"]["code"], json!(-32602));
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn uds_sentry_not_configured_is_internal() {
     let engine = Arc::new(StubEngine::new(true));
     let (socket, _tx, _base, _ws_root) = start(engine, "unconfigured").await;
@@ -404,7 +404,7 @@ async fn uds_sentry_not_configured_is_internal() {
     }
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn uds_sentry_p1_p2_round_trip() {
     let engine = Arc::new(StubEngine::new(false));
     let seen_projects_limit = engine.seen_projects_limit.clone();

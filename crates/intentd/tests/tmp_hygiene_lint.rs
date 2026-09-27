@@ -1,4 +1,4 @@
-//! Source-scan guard: test code must not construct raw temp paths.
+//! Source lint: test code must not construct raw temp paths.
 //!
 //! Every scratch dir a test creates must come from the shared helpers
 //! (`intentd/tests/common::test_tempdir` / `test_tempdir_in`, or
@@ -16,12 +16,12 @@ use std::path::{Path, PathBuf};
 
 const ALLOW_MARKER: &str = "// tmp-hygiene: allow";
 
-/// Files that *define* the helpers (and this guard, whose docs quote the
+/// Files that *define* the helpers (and this lint, whose docs quote the
 /// patterns).
 const EXEMPT_FILES: &[&str] = &[
     "crates/intentd/tests/common/mod.rs",
     "crates/intent-services/src/test_support.rs",
-    "crates/intentd/tests/tmp_hygiene_guard.rs",
+    "crates/intentd/tests/tmp_hygiene_lint.rs",
 ];
 
 fn workspace_root() -> PathBuf {

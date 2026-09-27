@@ -7,23 +7,25 @@
 //! context; `list` / `cancel` / `runNow` mirror the wire methods of the same
 //! names. `cancel` is ownership-scoped and therefore also requires an agent
 //! caller context: an agent can only cancel its own hooks, and that cancel
-//! does not wake the owner — only the FE cancel path does. `get` is MCP-only
-//! like `schedule` but read-only and unguarded (mirrors `list` visibility):
-//! the full hook row including `code`, active or retired, so an agent can
-//! recover a retired hook's script to re-arm it.
+//! does not wake the owner — only the FE cancel path does. `list` returns
+//! ACTIVE hooks by default; `{ includeRetired: true }` appends the retired
+//! rows as a light projection (no `code` / `lastState` / `lastLogs`). `get`
+//! is MCP-only like `schedule` but read-only and unguarded (mirrors `list`
+//! visibility): the full hook row including `code`, active or retired, so an
+//! agent can recover a retired hook's script to re-arm it.
 
 use std::sync::Arc;
 
 use intent_core::{AgentId, HookId, WorkspaceApi, WorkspaceId};
 use serde_json::Value;
 
-use super::{map_err, req_str};
+use super::{map_err, opt_bool, req_str};
 
 pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.hook = {
         schedule: (opts) => host({ method: 'hook.schedule', args: opts || {} }),
-        list: () => host({ method: 'hook.list' }),
+        list: (opts) => host({ method: 'hook.list', args: opts || {} }),
         get: (hookId) => host({ method: 'hook.get', args: { hookId } }),
         cancel: (hookId) => host({ method: 'hook.cancel', args: { hookId } }),
         runNow: (hookId) => host({ method: 'hook.runNow', args: { hookId } }),
@@ -39,7 +41,7 @@ pub(crate) async fn dispatch(
 ) -> Result<Value, String> {
     match method {
         "schedule" => schedule(api, ws, caller, args).await,
-        "list" => list(api, ws).await,
+        "list" => list(api, ws, args).await,
         "get" => get(api, ws, args).await,
         "cancel" => cancel(api, ws, caller, args).await,
         "runNow" => run_now(api, ws, args).await,
@@ -65,8 +67,16 @@ async fn schedule(
         .map_err(map_err)
 }
 
-async fn list(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value, String> {
-    let raw = api.hook_list(ws.clone(), None).await.map_err(map_err)?;
+async fn list(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    args: &Value,
+) -> Result<Value, String> {
+    let include_retired = opt_bool(args, "includeRetired").unwrap_or(false);
+    let raw = api
+        .hook_list(ws.clone(), None, include_retired)
+        .await
+        .map_err(map_err)?;
     // The service returns `{ hooks: [...] }` (the wire shape); JS callers get
     // the bare array, mirroring `ws.script.list`.
     if let Some(inner) = raw.get("hooks") {
@@ -122,19 +132,31 @@ mod tests {
     use intent_core::{BoxFuture, Result};
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
 
     /// `WorkspaceApi` that records whether the ownership-scoped hook methods
     /// were reached at all — the caller-context guards must reject before the
-    /// service layer sees the call.
+    /// service layer sees the call — and the `include_retired` flag `list`
+    /// forwarded.
     #[derive(Default)]
-    #[expect(clippy::struct_field_names)]
     struct SpyApi {
         cancel_called: AtomicBool,
         schedule_called: AtomicBool,
         get_called: AtomicBool,
+        list_include_retired: Mutex<Option<bool>>,
     }
 
     impl WorkspaceApi for SpyApi {
+        fn hook_list(
+            &self,
+            _workspace_id: WorkspaceId,
+            _agent_id: Option<AgentId>,
+            include_retired: bool,
+        ) -> BoxFuture<'_, Result<Value>> {
+            *self.list_include_retired.lock().unwrap() = Some(include_retired);
+            Box::pin(async { Ok(json!({ "hooks": [{ "hookId": "hook-1" }] })) })
+        }
+
         fn hook_get(
             &self,
             _workspace_id: WorkspaceId,
@@ -250,5 +272,27 @@ mod tests {
             !spy.get_called.load(Ordering::SeqCst),
             "service must not be reached"
         );
+    }
+
+    /// Regression (intent-hq/intent#5307): a bare `ws.hook.list()` forwards
+    /// `include_retired = false` (active-only default) and still unwraps the
+    /// `{ hooks }` envelope to the bare array.
+    #[tokio::test]
+    async fn list_defaults_to_active_only() {
+        let (spy, api, ws) = spy();
+        let rows = dispatch(&api, &ws, None, "list", &json!({}))
+            .await
+            .expect("list dispatched");
+        assert_eq!(*spy.list_include_retired.lock().unwrap(), Some(false));
+        assert_eq!(rows, json!([{ "hookId": "hook-1" }]));
+    }
+
+    #[tokio::test]
+    async fn list_forwards_include_retired() {
+        let (spy, api, ws) = spy();
+        dispatch(&api, &ws, None, "list", &json!({ "includeRetired": true }))
+            .await
+            .expect("list dispatched");
+        assert_eq!(*spy.list_include_retired.lock().unwrap(), Some(true));
     }
 }

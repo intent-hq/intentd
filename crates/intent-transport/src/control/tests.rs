@@ -16,11 +16,13 @@ struct FakeControl {
     credential_pid: std::sync::Mutex<Option<Option<u64>>>,
     update_error: Option<String>,
     update_called: AtomicBool,
+    exact_target: std::sync::Mutex<Option<String>>,
 }
 
 impl FakeControl {
     fn new() -> Self {
         Self {
+            exact_target: std::sync::Mutex::new(None),
             status: SystemStatus {
                 listen_mode: "both".to_string(),
                 uds: true,
@@ -47,6 +49,8 @@ impl FakeControl {
                 child_processes: Some(4),
                 child_memory_bytes: Some(2_684_354_560),
                 child_memory_peak_bytes: Some(5_368_709_120),
+                agent_memory_bytes: Some(2_147_483_648),
+                agent_process_count: Some(3),
                 agent_memory_budget_bytes: Some(21_474_836_480),
                 agent_memory_charged_bytes: Some(3_221_225_472),
                 queued_spawns: Some(1),
@@ -60,6 +64,14 @@ impl FakeControl {
                 fd_count: Some(312),
                 fd_limit: Some(10240),
                 update_supported: true,
+                busy_agents: 1,
+                idle_update_check: IdleUpdateCheckStatus {
+                    enabled: true,
+                    supported: true,
+                    last_requested_at: Some("2026-09-15T14:00:00Z".to_string()),
+                    next_eligible_at: Some("2026-09-15T15:00:00Z".to_string()),
+                    restart_pending: true,
+                },
             },
             shutdown_called: AtomicBool::new(false),
             import_force: std::sync::Mutex::new(None),
@@ -86,6 +98,13 @@ impl FakeControl {
 }
 
 impl SystemControl for FakeControl {
+    fn exact_update_supported(&self) -> bool {
+        self.update_error.is_none()
+    }
+    fn request_exact_update(&self, target: &str) -> Result<(), String> {
+        *self.exact_target.lock().unwrap() = Some(target.into());
+        Ok(())
+    }
     fn status(&self) -> SystemStatus {
         self.status.clone()
     }
@@ -185,6 +204,19 @@ fn status_json_local_vs_remote_locality() {
     // present, so a client can gate its update affordance without probing
     // system.requestUpdate.
     assert_eq!(local["updateSupported"], true);
+    // Idle-update handshake visibility: busy-turn count plus the requester /
+    // staged-restart state, RFC 3339 timestamps as plain strings.
+    assert_eq!(local["busyAgents"], 1);
+    assert_eq!(
+        local["idleUpdateCheck"],
+        json!({
+            "enabled": true,
+            "supported": true,
+            "lastRequestedAt": "2026-09-15T14:00:00Z",
+            "nextEligibleAt": "2026-09-15T15:00:00Z",
+            "restartPending": true,
+        })
+    );
 
     let remote = status_json(&status, false);
     assert_eq!(remote["host"]["locality"], "remote");
@@ -225,6 +257,8 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
         child_processes: None,
         child_memory_bytes: None,
         child_memory_peak_bytes: None,
+        agent_memory_bytes: None,
+        agent_process_count: None,
         agent_memory_budget_bytes: None,
         agent_memory_charged_bytes: None,
         queued_spawns: None,
@@ -234,6 +268,8 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
         fd_count: None,
         fd_limit: None,
         update_supported: false,
+        busy_agents: 0,
+        idle_update_check: IdleUpdateCheckStatus::default(),
     };
     let v = status_json(&status, true);
     assert_eq!(v["transports"], json!(["uds"]));
@@ -251,6 +287,9 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
     assert_eq!(v["childProcesses"], Value::Null);
     assert_eq!(v["childMemoryBytes"], Value::Null);
     assert_eq!(v["childMemoryPeakBytes"], Value::Null);
+    // The agent-attributed share rides the same sample: null alongside it.
+    assert_eq!(v["agentMemoryBytes"], Value::Null);
+    assert_eq!(v["agentProcessCount"], Value::Null);
     // Budget off ⇒ the budget fields are ABSENT (presence-detected), not null.
     let obj = v.as_object().unwrap();
     // Builds without source metadata omit the additive identity field.
@@ -271,6 +310,19 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
     // Unsupervised daemon ⇒ updateSupported is PRESENT and false — a plain
     // boolean, never absent or null.
     assert_eq!(v["updateSupported"], false);
+    // Idle-update handshake off ⇒ the object is still PRESENT with the
+    // booleans false and the timestamps explicitly null — never absent.
+    assert_eq!(v["busyAgents"], 0);
+    assert_eq!(
+        v["idleUpdateCheck"],
+        json!({
+            "enabled": false,
+            "supported": false,
+            "lastRequestedAt": Value::Null,
+            "nextEligibleAt": Value::Null,
+            "restartPending": false,
+        })
+    );
     assert!(v["host"].get("deviceKind").is_none());
     assert!(v["host"].get("hardwareModel").is_none());
 }
@@ -288,6 +340,10 @@ fn status_json_carries_the_child_process_tree_sample() {
     // bundle captured after a burst drains sees baseline in `childMemoryBytes`
     // and the overshoot only in `childMemoryPeakBytes`.
     assert_eq!(v["childMemoryPeakBytes"], 5_368_709_120u64);
+    // The agent-attributed share of the tree and the number of spawned
+    // agents with a live root pid, from the same sweep.
+    assert_eq!(v["agentMemoryBytes"], 2_147_483_648u64);
+    assert_eq!(v["agentProcessCount"], 3);
     // Own-RSS and tree-RSS are distinct fields; the tree dwarfs the daemon.
     assert_eq!(v["memoryBytes"], 104_857_600u64);
 }
@@ -367,16 +423,151 @@ fn status_json_carries_the_fd_count_and_limit_when_sampled() {
     assert_eq!(v["fdLimit"], 10240);
 }
 
+/// The collaborator projection keeps exactly the boot / routing /
+/// host-identity subset, byte-identical in value to the administrator's
+/// snapshot, and drops every daemon-global count and telemetry field.
+#[test]
+fn collaborator_status_json_projects_to_guest_safe_fields() {
+    let status = FakeControl::new().status;
+    let full = status_json(&status, false);
+    let guest = collaborator_status_json(&status, false);
+
+    let mut keys: Vec<&str> = guest
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "buildCommit",
+            "fingerprint",
+            "host",
+            "hostname",
+            "listenMode",
+            "localIps",
+            "port",
+            "prettyHostname",
+            "protocolVersion",
+            "running",
+            "tcAddress",
+            "version",
+        ]
+    );
+    let mut host_keys: Vec<&str> = guest["host"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    host_keys.sort_unstable();
+    assert_eq!(
+        host_keys,
+        ["arch", "deviceKind", "hardwareModel", "locality", "os"]
+    );
+
+    // Retained values are the administrator's, unmodified.
+    for key in COLLABORATOR_STATUS_FIELDS.iter().filter(|k| **k != "host") {
+        assert_eq!(guest[*key], full[*key], "{key}");
+    }
+    for key in COLLABORATOR_STATUS_HOST_FIELDS {
+        assert_eq!(guest["host"][*key], full["host"][*key], "host.{key}");
+    }
+    assert_eq!(guest["host"]["locality"], "remote");
+
+    // The fields the guest must not see are present on the full snapshot
+    // (so the projection is what removed them) and absent here.
+    for key in [
+        "transports",
+        "clients",
+        "agents",
+        "busyAgents",
+        "maxAgents",
+        "uptimeSeconds",
+        "cpuPercent",
+        "memoryBytes",
+        "childProcesses",
+        "childMemoryBytes",
+        "childMemoryPeakBytes",
+        "agentMemoryBudgetBytes",
+        "agentMemoryChargedBytes",
+        "queuedSpawns",
+        "workspacesDiskAvailableBytes",
+        "workspacesDiskTotalBytes",
+        "fileWatch",
+        "fdCount",
+        "fdLimit",
+        "updateSupported",
+        "idleUpdateCheck",
+    ] {
+        assert!(full.get(key).is_some(), "{key} missing from full snapshot");
+        assert!(guest.get(key).is_none(), "{key} leaked to collaborator");
+    }
+    assert!(full["host"].get("hasDisplay").is_some());
+    assert!(guest["host"].get("hasDisplay").is_none());
+}
+
+/// Presence-detected fields stay presence-detected under the projection:
+/// a daemon without a tunnel / build commit / device identity omits them for
+/// the collaborator too, never `null`.
+#[test]
+fn collaborator_status_json_keeps_presence_detection() {
+    let mut status = FakeControl::new().status;
+    status.tc_address = None;
+    status.build_commit = None;
+    status.device_kind = None;
+    status.hardware_model = None;
+    let guest = collaborator_status_json(&status, true);
+    let obj = guest.as_object().unwrap();
+    assert!(!obj.contains_key("tcAddress"));
+    assert!(!obj.contains_key("buildCommit"));
+    let host = guest["host"].as_object().unwrap();
+    assert!(!host.contains_key("deviceKind"));
+    assert!(!host.contains_key("hardwareModel"));
+    assert_eq!(guest["host"]["locality"], "local");
+    assert_eq!(guest["localIps"], json!(["192.168.1.10", "10.0.0.5"]));
+}
+
 #[tokio::test]
 async fn handle_status_returns_a_response_frame() {
     let control = FakeControl::new();
     let req = classify(&json!({ "jsonrpc": "2.0", "id": 7, "method": "system.status" })).unwrap();
-    let frame = handle(req, &control, true, true)
+    let frame = handle(req, &control, true, true, true)
         .await
         .expect("status has a response");
     let parsed: Value = serde_json::from_str(&frame).unwrap();
     assert_eq!(parsed["id"], 7);
     assert_eq!(parsed["result"]["running"], true);
+    // Administrator: the full snapshot, counts included.
+    assert_eq!(parsed["result"]["agents"], 1);
+    assert_eq!(parsed["result"]["clients"], 2);
+    assert!(!control.shutdown_called.load(Ordering::SeqCst));
+}
+
+/// A non-administrator `system.status` is answered with the collaborator
+/// projection: same envelope, no daemon-global counts or telemetry.
+#[tokio::test]
+async fn handle_status_projects_for_non_administrator() {
+    let control = FakeControl::new();
+    let req = classify(&json!({ "jsonrpc": "2.0", "id": 8, "method": "system.status" })).unwrap();
+    let frame = handle(req, &control, false, false, false)
+        .await
+        .expect("status has a response");
+    let parsed: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(parsed["id"], 8);
+    assert_eq!(parsed["jsonrpc"], "2.0");
+    assert_eq!(
+        parsed["result"],
+        collaborator_status_json(&control.status, false)
+    );
+    assert_eq!(parsed["result"]["running"], true);
+    assert_eq!(parsed["result"]["hostname"], "studio.local");
+    assert_eq!(parsed["result"]["host"]["locality"], "remote");
+    assert!(parsed["result"].get("agents").is_none());
+    assert!(parsed["result"].get("busyAgents").is_none());
+    assert!(parsed["result"].get("clients").is_none());
     assert!(!control.shutdown_called.load(Ordering::SeqCst));
 }
 
@@ -384,7 +575,7 @@ async fn handle_status_returns_a_response_frame() {
 async fn handle_shutdown_triggers_request_and_acks() {
     let control = FakeControl::new();
     let req = classify(&json!({ "jsonrpc": "2.0", "id": 9, "method": "system.shutdown" })).unwrap();
-    let frame = handle(req, &control, true, true)
+    let frame = handle(req, &control, true, true, true)
         .await
         .expect("shutdown acks the request");
     let parsed: Value = serde_json::from_str(&frame).unwrap();
@@ -398,7 +589,7 @@ async fn handle_notification_gets_no_response() {
     let control = FakeControl::new();
     // No `id` member ⇒ a notification; shutdown still fires but no frame returns.
     let req = classify(&json!({ "jsonrpc": "2.0", "method": "system.shutdown" })).unwrap();
-    assert!(handle(req, &control, true, true).await.is_none());
+    assert!(handle(req, &control, true, true, true).await.is_none());
     assert!(control.shutdown_called.load(Ordering::SeqCst));
 }
 
@@ -407,7 +598,7 @@ async fn handle_shutdown_remote_rejects_with_uds_only_error() {
     let control = FakeControl::new();
     let req =
         classify(&json!({ "jsonrpc": "2.0", "id": 11, "method": "system.shutdown" })).unwrap();
-    let frame = handle(req, &control, false, false)
+    let frame = handle(req, &control, false, false, true)
         .await
         .expect("remote shutdown gets an error response");
     let parsed: Value = serde_json::from_str(&frame).unwrap();
@@ -425,7 +616,7 @@ async fn handle_shutdown_remote_notification_is_ignored() {
     let control = FakeControl::new();
     // A remote notification gets no frame back AND must not trigger shutdown.
     let req = classify(&json!({ "jsonrpc": "2.0", "method": "system.shutdown" })).unwrap();
-    assert!(handle(req, &control, false, false).await.is_none());
+    assert!(handle(req, &control, false, false, true).await.is_none());
     assert!(!control.shutdown_called.load(Ordering::SeqCst));
 }
 
@@ -434,7 +625,7 @@ async fn request_update_supervised_returns_ok() {
     let control = FakeControl::new();
     let req =
         classify(&json!({ "jsonrpc": "2.0", "id": 31, "method": "system.requestUpdate" })).unwrap();
-    let frame = handle(req, &control, true, true)
+    let frame = handle(req, &control, true, true, true)
         .await
         .expect("requestUpdate has a response");
     let parsed: Value = serde_json::from_str(&frame).unwrap();
@@ -449,7 +640,7 @@ async fn request_update_unsupervised_maps_to_internal_error() {
     let req =
         classify(&json!({ "jsonrpc": "2.0", "id": 32, "method": "system.requestUpdate" })).unwrap();
     let parsed: Value =
-        serde_json::from_str(&handle(req, &control, true, true).await.unwrap()).unwrap();
+        serde_json::from_str(&handle(req, &control, true, true, true).await.unwrap()).unwrap();
     assert_eq!(parsed["id"], 32);
     assert_eq!(parsed["error"]["code"], -32603);
     assert_eq!(
@@ -466,7 +657,7 @@ async fn request_update_is_served_to_remote_callers() {
     let req =
         classify(&json!({ "jsonrpc": "2.0", "id": 33, "method": "system.requestUpdate" })).unwrap();
     let parsed: Value =
-        serde_json::from_str(&handle(req, &control, false, false).await.unwrap()).unwrap();
+        serde_json::from_str(&handle(req, &control, false, false, true).await.unwrap()).unwrap();
     assert_eq!(parsed["result"], json!({ "ok": true }));
     assert!(control.update_called.load(Ordering::SeqCst));
 }
@@ -475,7 +666,7 @@ async fn request_update_is_served_to_remote_callers() {
 async fn request_update_notification_fires_without_response() {
     let control = FakeControl::new();
     let req = classify(&json!({ "jsonrpc": "2.0", "method": "system.requestUpdate" })).unwrap();
-    assert!(handle(req, &control, true, true).await.is_none());
+    assert!(handle(req, &control, true, true, true).await.is_none());
     assert!(control.update_called.load(Ordering::SeqCst));
 }
 
@@ -486,7 +677,7 @@ async fn import_legacy_defaults_force_and_returns_counts() {
         "jsonrpc": "2.0", "id": 11, "method": "system.importLegacy", "params": {}
     }))
     .unwrap();
-    let frame = handle(req, &control, true, true).await.unwrap();
+    let frame = handle(req, &control, true, true, true).await.unwrap();
     let parsed: Value = serde_json::from_str(&frame).unwrap();
     assert_eq!(parsed["result"]["imported"], 1);
     assert_eq!(parsed["result"]["notes"], 2);
@@ -504,7 +695,7 @@ async fn import_legacy_rejects_invalid_force_and_remote_transport() {
     }))
     .unwrap();
     let parsed: Value =
-        serde_json::from_str(&handle(invalid, &control, true, true).await.unwrap()).unwrap();
+        serde_json::from_str(&handle(invalid, &control, true, true, true).await.unwrap()).unwrap();
     assert_eq!(parsed["error"]["code"], -32602);
     assert_eq!(parsed["error"]["data"]["code"], "invalid-params");
 
@@ -512,8 +703,12 @@ async fn import_legacy_rejects_invalid_force_and_remote_transport() {
         "jsonrpc": "2.0", "id": 13, "method": "system.importLegacy", "params": []
     }))
     .unwrap();
-    let parsed: Value =
-        serde_json::from_str(&handle(positional, &control, true, true).await.unwrap()).unwrap();
+    let parsed: Value = serde_json::from_str(
+        &handle(positional, &control, true, true, true)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(parsed["error"]["code"], -32602);
     assert_eq!(parsed["error"]["data"]["code"], "invalid-params");
 
@@ -523,7 +718,7 @@ async fn import_legacy_rejects_invalid_force_and_remote_transport() {
     }))
     .unwrap();
     let parsed: Value =
-        serde_json::from_str(&handle(remote, &control, false, false).await.unwrap()).unwrap();
+        serde_json::from_str(&handle(remote, &control, false, false, true).await.unwrap()).unwrap();
     assert_eq!(parsed["error"]["code"], -32001);
     assert_eq!(*control.import_force.lock().unwrap(), None);
 }
@@ -537,7 +732,7 @@ async fn git_credential_returns_credential_and_forwards_pid() {
     }))
     .unwrap();
     let parsed: Value =
-        serde_json::from_str(&handle(req, &control, true, true).await.unwrap()).unwrap();
+        serde_json::from_str(&handle(req, &control, true, true, true).await.unwrap()).unwrap();
     assert_eq!(parsed["id"], 21);
     assert_eq!(parsed["result"]["credential"]["username"], "x-access-token");
     assert_eq!(parsed["result"]["credential"]["password"], "gho_secret");
@@ -554,7 +749,7 @@ async fn git_credential_none_yields_null_and_pid_is_lenient() {
     }))
     .unwrap();
     let parsed: Value =
-        serde_json::from_str(&handle(req, &control, true, true).await.unwrap()).unwrap();
+        serde_json::from_str(&handle(req, &control, true, true, true).await.unwrap()).unwrap();
     assert_eq!(parsed["result"]["credential"], Value::Null);
     assert_eq!(*control.credential_pid.lock().unwrap(), Some(None));
 
@@ -565,7 +760,7 @@ async fn git_credential_none_yields_null_and_pid_is_lenient() {
     }))
     .unwrap();
     let parsed: Value =
-        serde_json::from_str(&handle(req, &control, true, true).await.unwrap()).unwrap();
+        serde_json::from_str(&handle(req, &control, true, true, true).await.unwrap()).unwrap();
     assert_eq!(parsed["result"]["credential"], Value::Null);
 }
 
@@ -591,7 +786,7 @@ async fn git_credential_out_of_scope_yields_null_without_resolver() {
         }))
         .unwrap();
         let parsed: Value =
-            serde_json::from_str(&handle(req, &control, true, true).await.unwrap()).unwrap();
+            serde_json::from_str(&handle(req, &control, true, true, true).await.unwrap()).unwrap();
         assert_eq!(parsed["result"]["credential"], Value::Null);
         assert_eq!(*control.credential_pid.lock().unwrap(), None);
     }
@@ -605,7 +800,7 @@ async fn git_credential_remote_rejects_with_uds_only_error() {
     }))
     .unwrap();
     let parsed: Value =
-        serde_json::from_str(&handle(req, &control, false, false).await.unwrap()).unwrap();
+        serde_json::from_str(&handle(req, &control, false, false, true).await.unwrap()).unwrap();
     assert_eq!(parsed["error"]["code"], -32001);
     assert_eq!(
         parsed["error"]["message"],
@@ -613,4 +808,50 @@ async fn git_credential_remote_rejects_with_uds_only_error() {
     );
     // The resolver must never run for a remote caller.
     assert_eq!(*control.credential_pid.lock().unwrap(), None);
+}
+
+#[tokio::test]
+async fn exact_update_validates_and_never_falls_back_to_channel() {
+    let control = FakeControl::new();
+    for target in [
+        json!(null),
+        json!(42),
+        json!(""),
+        json!("v1.2.3"),
+        json!("../1.2.3"),
+        json!("https://host/1.2.3"),
+        json!("1.2.3+build"),
+        json!("01.2.3"),
+        json!("1.2.3;id"),
+        json!("1.2.3-01"),
+        json!(format!("1.2.3-{}", "a".repeat(129))),
+    ] {
+        let req = classify(&json!({"jsonrpc":"2.0","id":71,"method":"system.requestUpdate","params":{"targetVersion":target}})).unwrap();
+        let response: Value =
+            serde_json::from_str(&handle(req, &control, false, false, true).await.unwrap())
+                .unwrap();
+        assert_eq!(response["error"]["code"], -32602, "{response}");
+    }
+    assert!(!control.update_called.load(Ordering::SeqCst));
+    assert_eq!(*control.exact_target.lock().unwrap(), None);
+    let req = classify(&json!({"jsonrpc":"2.0","id":72,"method":"system.requestUpdate","params":{"targetVersion":"1.2.3-beta.1"}})).unwrap();
+    let response: Value =
+        serde_json::from_str(&handle(req, &control, false, false, true).await.unwrap()).unwrap();
+    assert_eq!(
+        response,
+        json!({"jsonrpc":"2.0","id":72,"result":{"ok":true,"targetVersion":"1.2.3-beta.1"}})
+    );
+    assert_eq!(
+        *control.exact_target.lock().unwrap(),
+        Some("1.2.3-beta.1".into())
+    );
+    assert!(!control.update_called.load(Ordering::SeqCst));
+
+    let unsupported = FakeControl::with_update_error("old sitter");
+    let req = classify(&json!({"jsonrpc":"2.0","id":73,"method":"system.requestUpdate","params":{"targetVersion":"1.2.3"}})).unwrap();
+    let response: Value =
+        serde_json::from_str(&handle(req, &unsupported, false, false, true).await.unwrap())
+            .unwrap();
+    assert_eq!(response["error"]["code"], -32603);
+    assert!(!unsupported.update_called.load(Ordering::SeqCst));
 }

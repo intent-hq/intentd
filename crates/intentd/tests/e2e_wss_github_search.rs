@@ -4,7 +4,7 @@
 //! the `nextToken` cursor must round-trip onto the engine cursor, and the
 //! no-query call must keep the pre-existing listing behavior (`search: None`).
 //! Also covers the single-issue `github.issues.get` read and its `GithubIssue`
-//! author/timestamp fields.
+//! author/timestamp fields, and the login-prefix `github.users.search`.
 //! Drives a real [`WsApiServer`] over TLS with bearer-token auth and a pinned
 //! self-signed fingerprint (the production transport path) with a recording
 //! stub forge injected via `with_source_control`.
@@ -179,6 +179,7 @@ struct RecordingForge {
     issue_queries: Mutex<Vec<IssueQuery>>,
     issue_gets: Mutex<Vec<(RepoRef, u64)>>,
     branch_queries: Mutex<Vec<(Option<String>, Option<String>)>>,
+    user_searches: Mutex<Vec<(String, u8)>>,
 }
 
 #[async_trait]
@@ -201,6 +202,28 @@ impl SourceControl for RecordingForge {
     }
     async fn get_user(&self) -> ScResult<UserIdentity> {
         unimplemented!()
+    }
+    async fn search_users(&self, query: &str, limit: u8) -> ScResult<Vec<UserIdentity>> {
+        self.user_searches
+            .lock()
+            .unwrap()
+            .push((query.to_string(), limit));
+        Ok(vec![
+            UserIdentity {
+                login: "octocat".into(),
+                id: Some(583_231),
+                name: Some("The Octocat".into()),
+                avatar_url: Some("https://avatars.example/u/1".into()),
+                html_url: Some("https://github.com/octocat".into()),
+            },
+            UserIdentity {
+                login: "octodog".into(),
+                id: Some(7),
+                name: None,
+                avatar_url: None,
+                html_url: None,
+            },
+        ])
     }
     async fn list_repos(&self, _: PageParams) -> ScResult<Page<Repo>> {
         unimplemented!()
@@ -487,7 +510,7 @@ fn wire_next_token(cursor: &str) -> String {
 /// the engine as `PrQuery.search`, the involvement filter still parses, the
 /// `nextToken` decodes onto the engine cursor, and the response carries the
 /// PR page plus an encoded `nextToken` for the engine's `next_cursor`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn pulls_search_forwards_query_and_cursor() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;
@@ -519,7 +542,7 @@ async fn pulls_search_forwards_query_and_cursor() {
 /// `github.issues.search` with a free-text `query`: the trimmed text reaches
 /// the engine as `IssueQuery.search` with the state filter intact, and the
 /// cursor round-trips both ways.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn issues_search_forwards_query_and_cursor() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;
@@ -552,7 +575,7 @@ async fn issues_search_forwards_query_and_cursor() {
 
 /// Without a `query` (or with a blank one) the engine sees `search: None` —
 /// the pre-existing listing behavior is unchanged.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn search_without_query_leaves_listing_unchanged() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;
@@ -786,8 +809,10 @@ async fn search_repos_rejects_malformed_and_over_cap() {
 /// the addressing reaches the engine verbatim and the `{ issue }` result is
 /// the `GithubIssue` DTO with `user.login` / `createdAt` / `updatedAt`
 /// populated from the engine model, while a missing `number` is rejected in
-/// the router with `-32602` before the engine is touched.
-#[tokio::test]
+/// the router with `-32602` before the engine is touched. A repeat read
+/// within `prCache.maxAgeSeconds` is served from the daemon's issue cache:
+/// the same `{ issue }`, no second `get_issue` on the engine.
+#[intent_test_macros::daemon_test]
 async fn issues_get_returns_issue_with_author_and_timestamps() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;
@@ -831,6 +856,17 @@ async fn issues_get_returns_issue_with_author_and_timestamps() {
     .await;
     assert_eq!(r3["issue"]["number"], 9);
 
+    // A repeat hover within `prCache.maxAgeSeconds` is a cache hit: the
+    // identical `{ issue }` with no further engine read.
+    let again = wss_rpc(
+        &mut ws,
+        4,
+        "github.issues.get",
+        json!({ "owner": "o", "repo": "r", "number": 7 }),
+    )
+    .await;
+    assert_eq!(again["issue"], r["issue"], "a hit answers the cached issue");
+
     // `RepoRef` equality is case-insensitive, so compare the recorded fields
     // directly to prove the addressing was forwarded verbatim.
     let gets = fx.forge.issue_gets.lock().unwrap();
@@ -838,7 +874,11 @@ async fn issues_get_returns_issue_with_author_and_timestamps() {
         .iter()
         .map(|(repo, number)| (repo.owner.as_str(), repo.name.as_str(), *number))
         .collect();
-    assert_eq!(recorded, vec![("o", "r", 7), ("Intent-HQ", "IntentD", 9)]);
+    assert_eq!(
+        recorded,
+        vec![("o", "r", 7), ("Intent-HQ", "IntentD", 9)],
+        "a hit within max_age costs no engine request"
+    );
 }
 
 /// `github.issues.search` rejects the PR-only `review-requested` filter with
@@ -846,7 +886,7 @@ async fn issues_get_returns_issue_with_author_and_timestamps() {
 /// filter set from PROTOCOL §5 (`all, assigned, created, involves`) and never
 /// reaches the engine, while `github.pulls.search` continues to accept
 /// `review-requested` (monorepo#551).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn issues_search_rejects_pr_only_review_requested_filter() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;
@@ -902,7 +942,7 @@ async fn issues_search_rejects_pr_only_review_requested_filter() {
 /// reaches the engine and narrows the branch names, the `nextToken` cursor
 /// round-trips onto the engine cursor, and the no-prefix (or blank-prefix)
 /// call keeps the pre-existing unfiltered listing (`prefix: None`).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn branches_list_forwards_optional_prefix() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;
@@ -952,6 +992,85 @@ async fn branches_list_forwards_optional_prefix() {
             (Some("feature/".to_string()), Some("3".to_string())),
             (None, None),
             (None, None),
+        ]
+    );
+}
+
+/// `github.users.search` (PROTOCOL §5.27): `query` is required (`-32602`
+/// when missing); a trimmed non-blank query reaches the engine with the
+/// default limit of 8 and an explicit `limit` clamped into `[1, 10]`; the
+/// result is `{ users: [{ id, login, avatarUrl, htmlUrl }] }` with optionals
+/// defaulted to `""`; a blank query answers `{ users: [] }` without a forge
+/// round trip.
+#[intent_test_macros::daemon_test]
+async fn users_search_forwards_query_and_clamps_limit() {
+    let fx = boot().await;
+    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+
+    let missing = wss_rpc_envelope(&mut ws, 1, "github.users.search", json!({})).await;
+    assert_eq!(missing["jsonrpc"], "2.0");
+    assert_eq!(missing["id"], 1);
+    assert_eq!(missing["error"]["code"], -32602, "{missing}");
+    assert!(missing.get("result").is_none(), "{missing}");
+
+    let ok = wss_rpc_envelope(
+        &mut ws,
+        2,
+        "github.users.search",
+        json!({ "query": "  octo " }),
+    )
+    .await;
+    assert_eq!(ok["jsonrpc"], "2.0");
+    assert_eq!(ok["id"], 2);
+    assert!(ok.get("error").is_none(), "{ok}");
+    assert_eq!(
+        ok["result"],
+        json!({
+            "users": [
+                {
+                    "id": 583_231,
+                    "login": "octocat",
+                    "avatarUrl": "https://avatars.example/u/1",
+                    "htmlUrl": "https://github.com/octocat",
+                },
+                { "id": 7, "login": "octodog", "avatarUrl": "", "htmlUrl": "" },
+            ]
+        })
+    );
+
+    wss_rpc(
+        &mut ws,
+        3,
+        "github.users.search",
+        json!({ "query": "octo", "limit": 0 }),
+    )
+    .await;
+    wss_rpc(
+        &mut ws,
+        4,
+        "github.users.search",
+        json!({ "query": "octo", "limit": 99 }),
+    )
+    .await;
+    wss_rpc(
+        &mut ws,
+        5,
+        "github.users.search",
+        json!({ "query": "octo", "limit": 3 }),
+    )
+    .await;
+
+    let blank = wss_rpc(&mut ws, 6, "github.users.search", json!({ "query": "   " })).await;
+    assert_eq!(blank, json!({ "users": [] }));
+
+    let searches = fx.forge.user_searches.lock().unwrap();
+    assert_eq!(
+        *searches,
+        vec![
+            ("octo".to_string(), 8),
+            ("octo".to_string(), 1),
+            ("octo".to_string(), 10),
+            ("octo".to_string(), 3),
         ]
     );
 }

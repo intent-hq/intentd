@@ -492,6 +492,42 @@ fn nvm_node_version(path: &Path) -> Option<(u64, u64, u64, bool)> {
     (parts.next().is_none()).then_some((major, minor, patch, is_stable))
 }
 
+/// The inherited `PATH` split into directories, in order (empty when `PATH`
+/// is unset). The first tier of [`enhanced_path_dirs`] and of the
+/// `host.checkNode` resolver's Node lookup.
+#[must_use]
+pub fn inherited_path_dirs() -> Vec<PathBuf> {
+    std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default()
+}
+
+/// Whether `path` is an nvm Node installation's bin directory
+/// (`<…>/.nvm/versions/node/<version>/bin`). Shared by the `host.checkNode`
+/// resolver and provider discovery so both apply the same "newest nvm Node
+/// before other enriched directories" fallback when the inherited PATH
+/// carries no `node`.
+#[must_use]
+#[expect(clippy::similar_names)] // nvm's literal directory layout (versions/<version>)
+pub fn is_nvm_node_bin_dir(path: &Path) -> bool {
+    let Some(version_dir) = path.parent() else {
+        return false;
+    };
+    let Some(node_dir) = version_dir.parent() else {
+        return false;
+    };
+    let Some(versions_dir) = node_dir.parent() else {
+        return false;
+    };
+    let Some(nvm_dir) = versions_dir.parent() else {
+        return false;
+    };
+    path.file_name() == Some(std::ffi::OsStr::new("bin"))
+        && node_dir.file_name() == Some(std::ffi::OsStr::new("node"))
+        && versions_dir.file_name() == Some(std::ffi::OsStr::new("versions"))
+        && nvm_dir.file_name() == Some(std::ffi::OsStr::new(".nvm"))
+}
+
 /// Injectable core - accepts the home directory and a function that returns
 /// login-shell dirs, so tests can avoid spawning the real shell.
 fn enriched_tool_dirs_impl<F>(home: Option<&std::path::Path>, login_dirs_fn: F) -> Vec<PathBuf>

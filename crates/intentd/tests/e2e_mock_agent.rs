@@ -69,15 +69,17 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn mock_agent_full_turn_with_real_mcp_tool_call() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
         format!(

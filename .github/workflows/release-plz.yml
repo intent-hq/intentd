@@ -96,6 +96,10 @@ jobs:
   release-plz-pr:
     name: Release-plz PR
     runs-on: gh-linux-16x
+    outputs:
+      no_release_needed: ${{ steps.no_release.outputs.no_release_needed }}
+      baseline_tag: ${{ steps.no_release.outputs.baseline_tag }}
+      baseline_sha: ${{ steps.no_release.outputs.baseline_sha }}
     # Run after the release job: on a Release-PR merge commit the tag must be
     # pushed before release-pr computes the next version, or it races on tag
     # visibility and can open a spurious Release PR. On ordinary commits the
@@ -261,11 +265,19 @@ jobs:
         shell: bash
         run: echo "CARGO_PROFILE_DEV_DEBUG=false" >> "$GITHUB_ENV"
       - name: Run release-plz release-pr
+        id: release_pr
         uses: release-plz/action@aec534bbd8631793b9b3b8f1ee6cd886c322e17f # v0.5.133
         with:
           command: release-pr
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+      - name: Validate release-plz no-op baseline
+        id: no_release
+        if: ${{ success() && steps.release_pr.outcome == 'success' }}
+        env:
+          RELEASE_PLZ_OUTCOME: ${{ steps.release_pr.outcome }}
+          RELEASE_PLZ_PRS: ${{ steps.release_pr.outputs.prs }}
+        run: python3 -S scripts/release-plz-noop.py >> "$GITHUB_OUTPUT"
       # Surface cache hit rates in the log; `always()` keeps them visible
       # when release-pr fails. Skips cleanly when sccache was never
       # enabled, and never fails the job — this step is observability only
@@ -282,3 +294,15 @@ jobs:
           else
             echo "sccache not enabled; skipping stats"
           fi
+
+  # Machine-readable proof for the frontend's dependency guard. The run binds
+  # it to the assessed main SHA; the name binds it to the released baseline.
+  # Consumers require a successful run AND this successful job; a skipped job
+  # or a release-pr failure must never count as a confirmed no-op.
+  release-plz-no-release:
+    name: "Release-plz no release needed: ${{ needs.release-plz-pr.outputs.baseline_tag }}@${{ needs.release-plz-pr.outputs.baseline_sha }}"
+    needs: release-plz-pr
+    if: ${{ needs.release-plz-pr.result == 'success' && needs.release-plz-pr.outputs.no_release_needed == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo 'Release-plz confirmed no release is needed for this commit.'

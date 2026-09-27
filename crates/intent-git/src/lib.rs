@@ -55,7 +55,11 @@ pub(crate) const SLOW_GIT_WARN_THRESHOLD: std::time::Duration = std::time::Durat
 // By-value so it slots point-free into `map_err(map_git_err)` everywhere.
 #[expect(clippy::needless_pass_by_value)]
 pub(crate) fn map_git_err(e: git2::Error) -> Error {
-    Error::Internal(e.message().to_string())
+    if e.code() == git2::ErrorCode::Auth {
+        Error::GitAuthorization(e.message().to_string())
+    } else {
+        Error::Internal(e.message().to_string())
+    }
 }
 
 /// Whether `path` points at a git repository (a repo root or a linked

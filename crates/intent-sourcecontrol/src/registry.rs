@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::github::GitHubSourceControl;
+use crate::gitlab_auth::{GitlabHost, GITLAB_COM_HOST};
 use crate::token::{self, TokenSource};
 use crate::SourceControl;
 
@@ -32,6 +33,63 @@ pub struct GithubSettings {
     pub api_base_url: Option<String>,
 }
 
+/// GitLab-specific settings (`sourceControl.gitlab.*`): one instance per
+/// daemon. Consumed by [`crate::gitlab_auth`] (device grant / PAT) and
+/// [`crate::gitlab_token`]; the registry does not build a GitLab provider yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitlabSettings {
+    /// Instance host or URL (`gitlab.com`, `https://gitlab.acme.internal`);
+    /// normalized by [`GitlabHost::parse`].
+    #[serde(default = "default_gitlab_host")]
+    pub host: String,
+    /// OAuth application client id for the device grant (public, not a
+    /// secret). Empty falls back to the compiled gitlab.com default on
+    /// gitlab.com only — see [`crate::gitlab_auth::resolve_client_id`].
+    #[serde(default)]
+    pub oauth_client_id: String,
+    /// Instance root override (test seam / non-standard deployments). When
+    /// set it replaces [`Self::host`] for every `/oauth/*` and `/api/v4/*`
+    /// request; same normalization rules as the host.
+    #[serde(default)]
+    pub api_base_url: Option<String>,
+}
+
+fn default_gitlab_host() -> String {
+    GITLAB_COM_HOST.to_string()
+}
+
+impl Default for GitlabSettings {
+    fn default() -> Self {
+        Self {
+            host: default_gitlab_host(),
+            oauth_client_id: String::new(),
+            api_base_url: None,
+        }
+    }
+}
+
+impl GitlabSettings {
+    /// The instance every request targets: [`Self::api_base_url`] when set
+    /// (non-blank), else [`Self::host`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] when the chosen value is not a valid GitLab
+    /// instance reference (see [`GitlabHost::parse`]).
+    pub fn resolved_host(&self) -> Result<GitlabHost> {
+        match self
+            .api_base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(base) => GitlabHost::parse(base),
+            None => GitlabHost::parse(&self.host),
+        }
+    }
+}
+
 /// Top-level source-control settings (`sourceControl.*`, §9.8).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -41,6 +99,10 @@ pub struct SourceControlSettings {
     /// GitHub provider settings.
     #[serde(default)]
     pub github: GithubSettings,
+    /// GitLab provider settings (additive; not yet selectable as the active
+    /// provider).
+    #[serde(default)]
+    pub gitlab: GitlabSettings,
 }
 
 impl Default for SourceControlSettings {
@@ -48,6 +110,7 @@ impl Default for SourceControlSettings {
         Self {
             active_provider: "github".to_string(),
             github: GithubSettings::default(),
+            gitlab: GitlabSettings::default(),
         }
     }
 }
@@ -109,10 +172,61 @@ mod tests {
     async fn unknown_provider_is_config_error() {
         let settings = SourceControlSettings {
             active_provider: "gitlab".to_string(),
-            github: GithubSettings::default(),
+            ..SourceControlSettings::default()
         };
         let result = SourceControlRegistry::from_settings(&settings).await;
         assert!(matches!(result, Err(Error::Config(_))));
+    }
+
+    #[test]
+    fn gitlab_settings_default_to_gitlab_com_and_deserialize_additively() {
+        let defaults = SourceControlSettings::default();
+        assert_eq!(defaults.gitlab, GitlabSettings::default());
+        assert_eq!(defaults.gitlab.host, "gitlab.com");
+        assert!(defaults.gitlab.oauth_client_id.is_empty());
+        assert_eq!(defaults.gitlab.api_base_url, None);
+        assert_eq!(
+            defaults.gitlab.resolved_host().unwrap().host(),
+            "gitlab.com"
+        );
+
+        // Existing settings payloads without a `gitlab` block keep working.
+        let parsed: SourceControlSettings =
+            serde_json::from_value(serde_json::json!({ "activeProvider": "github" })).unwrap();
+        assert_eq!(parsed.gitlab, GitlabSettings::default());
+
+        let parsed: SourceControlSettings = serde_json::from_value(serde_json::json!({
+            "activeProvider": "github",
+            "gitlab": { "host": "https://GitLab.Acme.internal/", "oauthClientId": "abc" }
+        }))
+        .unwrap();
+        assert_eq!(parsed.gitlab.oauth_client_id, "abc");
+        let host = parsed.gitlab.resolved_host().unwrap();
+        assert_eq!(host.host(), "gitlab.acme.internal");
+        assert_eq!(host.base_url(), "https://gitlab.acme.internal");
+        let v = serde_json::to_value(&parsed.gitlab).unwrap();
+        assert_eq!(v["host"], "https://GitLab.Acme.internal/");
+        assert_eq!(v["oauthClientId"], "abc");
+    }
+
+    #[test]
+    fn gitlab_api_base_url_overrides_the_host_when_non_blank() {
+        let settings = GitlabSettings {
+            host: "gitlab.com".to_string(),
+            api_base_url: Some("http://127.0.0.1:4321".to_string()),
+            ..GitlabSettings::default()
+        };
+        assert_eq!(settings.resolved_host().unwrap().host(), "127.0.0.1:4321");
+        let blank = GitlabSettings {
+            api_base_url: Some("   ".to_string()),
+            ..GitlabSettings::default()
+        };
+        assert_eq!(blank.resolved_host().unwrap().host(), "gitlab.com");
+        let bad = GitlabSettings {
+            host: "http://gitlab.acme.internal".to_string(),
+            ..GitlabSettings::default()
+        };
+        assert!(matches!(bad.resolved_host(), Err(Error::Config(_))));
     }
 
     #[tokio::test]
@@ -123,6 +237,7 @@ mod tests {
                 token: Some("ghp_test_token".to_string()),
                 ..GithubSettings::default()
             },
+            ..SourceControlSettings::default()
         };
         let sc = SourceControlRegistry::from_settings(&settings)
             .await

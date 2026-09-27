@@ -586,6 +586,196 @@ fn update_installs_libexec_sidecar_next_to_the_daemon() {
 }
 
 #[test]
+fn update_repairs_current_tailcat_payload_without_replacing_daemon_or_rollback() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    for damage in [
+        "missing-directory",
+        "missing-binary",
+        "missing-license",
+        "not-executable",
+        "empty",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = SitterPaths::from_data_dir(dir.path());
+        preinstall(&paths, "0.9.91");
+        preinstall(&paths, "0.9.92");
+        let bin = paths.daemon_binary("0.9.92");
+        let inode = fs::metadata(&bin).unwrap().ino();
+        let before = fs::read(&bin).unwrap();
+        let state_before = fs::read(&paths.state_path).unwrap();
+        let libexec = bin.parent().unwrap().join("libexec");
+        if damage != "missing-directory" {
+            fs::create_dir_all(&libexec).unwrap();
+            if damage != "missing-binary" {
+                fs::write(
+                    libexec.join("tailcat"),
+                    if damage == "empty" {
+                        b"".as_slice()
+                    } else {
+                        b"tailcat sidecar".as_slice()
+                    },
+                )
+                .unwrap();
+                fs::set_permissions(
+                    libexec.join("tailcat"),
+                    fs::Permissions::from_mode(if damage == "not-executable" {
+                        0o644
+                    } else {
+                        0o755
+                    }),
+                )
+                .unwrap();
+            }
+            if damage != "missing-license" {
+                fs::write(libexec.join("tailcat.LICENSE"), b"license text").unwrap();
+            }
+        }
+        let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+        let (base_url, requests) = serve_recording(Arc::clone(&routes));
+        publish_stable_with_libexec(
+            &routes,
+            &base_url,
+            "0.9.92",
+            b"replacement daemon",
+            b"tailcat sidecar",
+        );
+
+        let check = run_sitter(dir.path(), &base_url, &["update", "--check"]);
+        assert!(check.status.success(), "{}", stderr_of(&check));
+        assert!(
+            stdout_of(&check).contains("update available"),
+            "{damage}: {}",
+            stdout_of(&check)
+        );
+        assert_eq!(requests.lock().unwrap().len(), 1, "check must not download");
+
+        let output = run_sitter(dir.path(), &base_url, &["update"]);
+        assert!(output.status.success(), "{damage}: {}", stderr_of(&output));
+        assert_eq!(
+            fs::read(libexec.join("tailcat")).unwrap(),
+            b"tailcat sidecar"
+        );
+        assert_ne!(
+            fs::metadata(libexec.join("tailcat"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+        assert_eq!(
+            fs::read(libexec.join("tailcat.LICENSE")).unwrap(),
+            b"license text"
+        );
+        assert_eq!(fs::metadata(&bin).unwrap().ino(), inode);
+        assert_eq!(fs::read(&bin).unwrap(), before);
+        assert_eq!(fs::read(&paths.state_path).unwrap(), state_before);
+        assert!(paths.daemon_binary("0.9.91").exists());
+
+        let count = requests.lock().unwrap().len();
+        let output = run_sitter(dir.path(), &base_url, &["update"]);
+        assert!(output.status.success(), "{}", stderr_of(&output));
+        assert!(stdout_of(&output).contains("already up to date"));
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            count + 1,
+            "healthy install must not redownload"
+        );
+    }
+}
+
+#[test]
+fn update_rejects_archive_without_tailcat_and_keeps_installation() {
+    for current in [None, Some("0.9.91"), Some("0.9.92")] {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = SitterPaths::from_data_dir(dir.path());
+        if let Some(current) = current {
+            preinstall(&paths, current);
+        }
+        let before = current.map(|v| fs::read(paths.daemon_binary(v)).unwrap());
+        let state_before = fs::read(&paths.state_path).ok();
+        let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+        let (base_url, _) = serve_recording(Arc::clone(&routes));
+        publish_stable(&routes, &base_url, "0.9.92", b"replacement daemon");
+        let output = run_sitter(dir.path(), &base_url, &["update"]);
+        assert!(!output.status.success());
+        assert!(stderr_of(&output).contains("required Tailcat payload"));
+        assert_eq!(
+            current.map(|v| fs::read(paths.daemon_binary(v)).unwrap()),
+            before
+        );
+        assert_eq!(fs::read(&paths.state_path).ok(), state_before);
+        if current != Some("0.9.92") {
+            assert!(!paths.daemon_binary("0.9.92").exists());
+        }
+    }
+}
+
+#[test]
+fn exact_and_channel_repairs_keep_the_installed_version_when_channel_trails() {
+    use intentd_sitter::cli::Channel;
+    use intentd_sitter::updater::{UpdateOutcome, Updater};
+
+    for exact in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = SitterPaths::from_data_dir(dir.path());
+        preinstall(&paths, "0.9.92");
+        let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+        let (base_url, requests) = serve_recording(Arc::clone(&routes));
+        publish_stable(&routes, &base_url, "0.9.91", b"older daemon");
+        let asset = format!("intentd-{TARGET_TRIPLE}.tar.xz");
+        let archive = make_tar_xz_with_libexec(b"replacement daemon", b"tailcat sidecar");
+        {
+            let mut routes = routes.lock().unwrap();
+            routes.insert(
+                format!("/v0.9.92/{asset}.sha256"),
+                format!("{}  {asset}\n", sha256_hex(&archive)).into_bytes(),
+            );
+            routes.insert(format!("/v0.9.92/{asset}"), archive);
+        }
+        let updater = Updater::with_base_url(paths.clone(), &base_url).unwrap();
+        let outcome = if exact {
+            updater.install_exact("0.9.92", "0.9.92")
+        } else {
+            assert!(
+                updater
+                    .check_only(Channel::Stable)
+                    .unwrap()
+                    .update_available
+            );
+            updater.check_and_install(Channel::Stable)
+        }
+        .unwrap();
+        assert_eq!(
+            outcome,
+            UpdateOutcome::Installed {
+                version: "0.9.92".into(),
+                previous: Some("0.9.92".into())
+            }
+        );
+        assert_eq!(
+            state::load(&paths.state_path).current_version.as_deref(),
+            Some("0.9.92")
+        );
+        assert!(!paths.daemon_binary("0.9.91").exists());
+        assert!(paths.versions_dir.join("0.9.92/libexec/tailcat").is_file());
+        let count = requests.lock().unwrap().len();
+        assert_eq!(
+            updater.install_exact("0.9.92", "0.9.92").unwrap(),
+            UpdateOutcome::AlreadyCurrent {
+                version: "0.9.92".into()
+            }
+        );
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            count,
+            "healthy exact request must not fetch"
+        );
+    }
+}
+
+#[test]
 fn update_when_already_current_is_a_noop() {
     let dir = tempfile::tempdir().unwrap();
     let paths = SitterPaths::from_data_dir(dir.path());

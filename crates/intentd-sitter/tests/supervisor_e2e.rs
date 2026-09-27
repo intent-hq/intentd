@@ -3,7 +3,10 @@
 //! windows code paths are cfg-compiled but exercised via CI builds).
 //!
 //! Timing runs at millisecond scale through the `INTENTD_SITTER_*_MS` env
-//! overrides so no test sleeps for hours.
+//! overrides so no test sleeps for hours. Positive-path waits go through a
+//! [`Barrier`] or [`wait_until`]; the few fixed sleeps that remain carry a
+//! `// timing-guard: <reason>` marker, enforced repo-wide by the
+//! `fixed_sleep_lint` test in `intent-core`.
 
 #![cfg(unix)]
 
@@ -12,12 +15,16 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use nix::errno::Errno;
+use nix::sys::signal::kill;
+use nix::unistd::Pid;
 use sha2::{Digest, Sha256};
 
 use intentd_sitter::cli::{Channel, CHANNEL_ENV};
@@ -26,8 +33,10 @@ use intentd_sitter::paths::{SitterPaths, DAEMON_BIN_NAME, DATA_DIR_ENV};
 use intentd_sitter::state::{self, SitterState};
 use intentd_sitter::supervisor::{
     BACKOFF_CAP_ENV, BACKOFF_INITIAL_ENV, BACKOFF_RESET_ENV, CHECK_MAX_ENV, CHECK_MIN_ENV,
-    GIVE_UP_AFTER_ENV, KILL_TIMEOUT_ENV, MANIFEST_BASE_URL_ENV, UPDATE_RESTART_ENV,
+    GIVE_UP_AFTER_ENV, IDLE_RESTART_ENV, KILL_TIMEOUT_ENV, MANIFEST_BASE_URL_ENV,
+    RESTART_FOR_UPDATE_EXIT_CODE, UPDATE_RESTART_ENV,
 };
+use intentd_test_support::{Barrier, GuardedChild};
 
 const SITTER_BIN: &str = env!("CARGO_BIN_EXE_intentd-sitter");
 
@@ -149,6 +158,7 @@ fn serve_stallable(routes: Routes) -> (String, Arc<std::sync::atomic::AtomicBool
             thread::spawn(move || {
                 if stalled.load(std::sync::atomic::Ordering::SeqCst) {
                     let _hold = stream;
+                    // timing-guard: park forever
                     thread::sleep(Duration::from_secs(3600));
                 } else {
                     handle(stream, &routes, &log);
@@ -157,6 +167,46 @@ fn serve_stallable(routes: Routes) -> (String, Arc<std::sync::atomic::AtomicBool
         }
     });
     (url, stalled)
+}
+
+/// [`serve`] with a hold switch: while the returned flag is set, each
+/// accepted socket is parked (and counted in the returned counter) until
+/// the flag clears, then served normally — an update check a test can keep
+/// in flight for as long as it needs and then release.
+fn serve_holdable(
+    routes: Routes,
+) -> (
+    String,
+    Arc<std::sync::atomic::AtomicBool>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let hold = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let parked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server_hold = Arc::clone(&hold);
+    let server_parked = Arc::clone(&parked);
+    thread::spawn(move || {
+        let log: RequestLog = Arc::new(Mutex::new(Vec::new()));
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let routes = Arc::clone(&routes);
+            let log = Arc::clone(&log);
+            let hold = Arc::clone(&server_hold);
+            let parked = Arc::clone(&server_parked);
+            thread::spawn(move || {
+                if hold.load(std::sync::atomic::Ordering::SeqCst) {
+                    parked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    while hold.load(std::sync::atomic::Ordering::SeqCst) {
+                        // timing-guard: poll interval
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                handle(stream, &routes, &log);
+            });
+        }
+    });
+    (url, hold, parked)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -279,13 +329,89 @@ fn crash_env_script(code: i32) -> String {
     )
 }
 
+/// Fake daemon speaking the idle-restart handshake: the start line records
+/// the update-restart and idle-restart markers; SIGTERM/SIGINT log a `term`
+/// line and exit 0; SIGUSR2 logs a `usr2` line, then holds at `release` —
+/// so a test can assert the held state for as long as it needs — and only
+/// once the test releases it exits with [`RESTART_FOR_UPDATE_EXIT_CODE`].
+fn idle_restart_script(version: &str, release: &Barrier) -> String {
+    format!(
+        "#!/bin/sh\n\
+         printf 'start {version} update_restart=%s idle_restart=%s\\n' \
+         \"${{{UPDATE_RESTART_ENV}:-unset}}\" \"${{{IDLE_RESTART_ENV}:-unset}}\" \
+         >> \"${FAKE_DAEMON_LOG}\"\n\
+         trap 'echo \"term {version}\" >> \"${FAKE_DAEMON_LOG}\"; exit 0' TERM INT\n\
+         trap 'echo \"usr2 {version}\" >> \"${FAKE_DAEMON_LOG}\"; {wait}; \
+         exit {RESTART_FOR_UPDATE_EXIT_CODE}' USR2\n\
+         sleep 60 &\n\
+         wait $!\n\
+         exit 0\n",
+        wait = release.sh_wait(),
+    )
+}
+
+/// Like [`idle_restart_script`] but SIGUSR2 is only logged, never acted on:
+/// a daemon that never gets idle.
+fn never_idle_script(version: &str) -> String {
+    format!(
+        "#!/bin/sh\n\
+         printf 'start {version} update_restart=%s idle_restart=%s\\n' \
+         \"${{{UPDATE_RESTART_ENV}:-unset}}\" \"${{{IDLE_RESTART_ENV}:-unset}}\" \
+         >> \"${FAKE_DAEMON_LOG}\"\n\
+         trap 'echo \"term {version}\" >> \"${FAKE_DAEMON_LOG}\"; exit 0' TERM INT\n\
+         trap 'echo \"usr2 {version}\" >> \"${FAKE_DAEMON_LOG}\"' USR2\n\
+         while :; do sleep 60 & wait $!; done\n"
+    )
+}
+
+/// Fake daemon: the first run arrives at and holds on `release`, then exits
+/// with [`RESTART_FOR_UPDATE_EXIT_CODE`] on its own once released (a daemon
+/// that was already idle when asked); later runs behave like
+/// [`long_running_script`]. The one-shot marker lives next to the log.
+fn restart_once_script(version: &str, release: &Barrier) -> String {
+    format!(
+        "#!/bin/sh\n\
+         printf 'start {version} update_restart=%s idle_restart=%s\\n' \
+         \"${{{UPDATE_RESTART_ENV}:-unset}}\" \"${{{IDLE_RESTART_ENV}:-unset}}\" \
+         >> \"${FAKE_DAEMON_LOG}\"\n\
+         if [ ! -e \"${FAKE_DAEMON_LOG}.restarted\" ]; then\n\
+         : > \"${FAKE_DAEMON_LOG}.restarted\"\n\
+         {arrive}\n\
+         {wait}\n\
+         exit {RESTART_FOR_UPDATE_EXIT_CODE}\n\
+         fi\n\
+         trap 'exit 0' TERM INT\n\
+         sleep 60 &\n\
+         wait $!\n\
+         exit 0\n",
+        arrive = release.sh_arrive(),
+        wait = release.sh_wait(),
+    )
+}
+
+/// Fake daemon: log its own pid, arrive at `release`, and hold there for
+/// as long as the test lets it (the injected-panic test never releases it).
+fn parked_pid_script(release: &Barrier) -> String {
+    format!(
+        "#!/bin/sh\n\
+         echo \"pid $$\" >> \"${FAKE_DAEMON_LOG}\"\n\
+         {arrive}\n\
+         {wait}\n\
+         exit 0\n",
+        arrive = release.sh_arrive(),
+        wait = release.sh_wait(),
+    )
+}
+
 /// Fake daemon: log one line, stay up `secs`, then crash with `code` — a
 /// daemon that serves for a while and dies, not one that can never start.
 fn long_lived_crash_script(secs: &str, code: i32) -> String {
+    // timing-guard: uptime > reset knob
+    let stay_up = format!("sleep {secs}");
     format!(
         "#!/bin/sh\n\
          echo run >> \"${FAKE_DAEMON_LOG}\"\n\
-         sleep {secs}\n\
+         {stay_up}\n\
          exit {code}\n"
     )
 }
@@ -302,6 +428,23 @@ fn sitter_command(data_dir: &Path, base_url: &str) -> Command {
             fs::File::create(stderr_path(data_dir)).unwrap(),
         ));
     cmd
+}
+
+/// Spawn the sitter as a [`GuardedChild`]: the leader of its own process
+/// group, torn down with that whole group (the sitter and its fake daemon)
+/// if dropped while still running — e.g. by a test that parks its daemon on
+/// a [`Barrier`] and panics before releasing it.
+fn spawn_guarded(cmd: &mut Command) -> GuardedChild {
+    GuardedChild::spawn(cmd).unwrap()
+}
+
+/// Whether `pid` still names a process (signal 0 probe), zombies included.
+fn alive(pid: u32) -> bool {
+    match kill(Pid::from_raw(pid.cast_signed()), None) {
+        Ok(()) => true,
+        Err(Errno::ESRCH) => false,
+        Err(e) => panic!("kill({pid}, 0): {e}"),
+    }
 }
 
 fn daemon_log_path(data_dir: &Path) -> std::path::PathBuf {
@@ -323,6 +466,7 @@ fn wait_until(what: &str, timeout: Duration, mut cond: impl FnMut() -> bool) {
         if cond() {
             return;
         }
+        // timing-guard: poll interval
         thread::sleep(Duration::from_millis(20));
     }
     panic!("timed out after {timeout:?} waiting for {what}");
@@ -336,6 +480,7 @@ fn wait_exit(child: &mut Child, timeout: Duration) -> ExitStatus {
         if let Some(status) = child.try_wait().unwrap() {
             return status;
         }
+        // timing-guard: poll interval
         thread::sleep(Duration::from_millis(20));
     }
     let _ = child.kill();
@@ -939,6 +1084,7 @@ fn crash_respawn_backs_off_exponentially() {
         .arg("serve")
         .spawn()
         .unwrap();
+    // timing-guard: measurement window
     thread::sleep(Duration::from_secs(5));
     send_signal(&sitter, "TERM");
     let status = wait_exit(&mut sitter, Duration::from_secs(10));
@@ -1871,6 +2017,509 @@ fn sigusr1_during_crash_backoff_checks_and_respawns_the_fix() {
     assert_eq!(status.code(), Some(0));
 }
 
+/// SIGUSR2 ("update when idle"): the on-demand check installs the newer
+/// published version but hands it to the daemon as SIGUSR2 instead of a
+/// SIGTERM; the daemon stays up until it exits with the restart-for-update
+/// code, and only then does the sitter respawn — the new version, marked as
+/// an update restart, immediately (no backoff). The child also sees the
+/// handshake advertised via `INTENTD_SITTER_IDLE_RESTART=1`.
+#[test]
+fn sigusr2_stages_update_and_respawns_when_daemon_exits_for_restart() {
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    let release = Barrier::new(dir.path(), "release");
+    preinstall(&paths, "0.1.0", &idle_restart_script("0.1.0", &release));
+    let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
+        MANIFEST_PATH.to_string(),
+        manifest_bare("0.1.0"),
+    )])));
+    let base_url = serve(Arc::clone(&routes));
+
+    // Hour-long check interval: only the SIGUSR2 may check. A 30s backoff
+    // (never elapsing within the test) proves the restart-for-update exit
+    // respawns without one.
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &base_url)
+            .env_remove(UPDATE_RESTART_ENV)
+            .env_remove(IDLE_RESTART_ENV)
+            .env(CHECK_MIN_ENV, "3600000")
+            .env(CHECK_MAX_ENV, "3600001")
+            .env(BACKOFF_INITIAL_ENV, "30000")
+            .env(BACKOFF_CAP_ENV, "30000")
+            .env(KILL_TIMEOUT_ENV, "5000")
+            .arg("serve"),
+    );
+    let log_path = daemon_log_path(dir.path());
+    wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
+        read_or_empty(&log_path).contains("start 0.1.0")
+    });
+
+    // Publish 0.2.0, then `kill -USR2`: the sitter installs it and asks the
+    // daemon to restart when idle.
+    let archive = make_tar_xz(idle_restart_script("0.2.0", &release).as_bytes());
+    let asset = format!("intentd-{TARGET_TRIPLE}.tar.xz");
+    let sha = sha256_hex(&archive);
+    {
+        let mut routes = routes.lock().unwrap();
+        routes.insert(format!("/{asset}"), archive);
+        routes.insert(
+            MANIFEST_PATH.to_string(),
+            manifest_json("0.2.0", &base_url, &asset, &sha),
+        );
+    }
+    let stderr = stderr_path(dir.path());
+    send_signal(&sitter, "USR2");
+    wait_until(
+        "daemon 0.1.0 to receive SIGUSR2 and the sitter to log the hand-off",
+        Duration::from_secs(15),
+        || {
+            read_or_empty(&log_path).contains("usr2 0.1.0")
+                && read_or_empty(&stderr).contains("asking daemon to restart when idle")
+        },
+    );
+    // The daemon holds at the hand-off until the test releases it, so this
+    // state is stable for as long as the assertions take: the sitter must
+    // not have stopped it or respawned anything, and must still be
+    // supervising it.
+    let staged = read_or_empty(&log_path);
+    assert!(
+        !staged.contains("term") && !staged.contains("start 0.2.0"),
+        "the staged daemon must be left running: {staged}"
+    );
+    assert_eq!(
+        state::load(&paths.state_path).current_version.as_deref(),
+        Some("0.2.0"),
+        "the install must be committed before the daemon is asked to restart"
+    );
+    assert!(
+        sitter.try_wait().unwrap().is_none(),
+        "the sitter must keep supervising the daemon it asked to restart"
+    );
+
+    // Release the daemon: it exits with the restart-for-update code, and —
+    // well under the 30s backoff — the staged version must respawn at once.
+    release.release();
+    wait_until("daemon 0.2.0 to start", Duration::from_secs(10), || {
+        read_or_empty(&log_path).contains("start 0.2.0")
+    });
+    assert!(
+        sitter.try_wait().unwrap().is_none(),
+        "the sitter must survive the staged restart"
+    );
+
+    send_signal(&sitter, "TERM");
+    let status = wait_exit(&mut sitter, Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0));
+
+    let lines: Vec<String> = read_or_empty(&log_path).lines().map(String::from).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "start 0.1.0 update_restart=unset idle_restart=1".to_string(),
+            "usr2 0.1.0".to_string(),
+            "start 0.2.0 update_restart=1 idle_restart=1".to_string(),
+            "term 0.2.0".to_string(),
+        ],
+        "SIGUSR2 hand-off, no SIGTERM to 0.1.0, update-marked respawn"
+    );
+    let stderr = read_or_empty(&stderr);
+    assert!(
+        stderr.contains("SIGUSR2 received; checking for updates now"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("installed intentd 0.2.0 (was 0.1.0); asking daemon to restart when idle"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("exited to restart for a staged update"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("exited unexpectedly") && !stderr.contains("respawning intentd in"),
+        "the restart exit is neither a crash nor backed off: {stderr}"
+    );
+}
+
+/// SIGUSR2 when the channel has nothing newer: the check runs but nothing
+/// is signaled to the child — no SIGUSR2, no SIGTERM, no restart.
+#[test]
+fn sigusr2_when_already_current_signals_nothing_to_the_daemon() {
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    // Never released: an already-current check must not even reach the hold.
+    let release = Barrier::new(dir.path(), "release");
+    preinstall(&paths, "0.1.0", &idle_restart_script("0.1.0", &release));
+    let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
+        MANIFEST_PATH.to_string(),
+        manifest_bare("0.1.0"),
+    )])));
+    let (base_url, requests) = serve_recording(routes);
+
+    // Hour-long check interval: only the SIGUSR2 may trigger a check.
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &base_url)
+            .env(CHECK_MIN_ENV, "3600000")
+            .env(CHECK_MAX_ENV, "3600001")
+            .env(KILL_TIMEOUT_ENV, "5000")
+            .arg("serve"),
+    );
+    let log_path = daemon_log_path(dir.path());
+    wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
+        read_or_empty(&log_path).contains("start 0.1.0")
+    });
+    let startup_requests = requests.lock().unwrap().len();
+
+    let stderr = stderr_path(dir.path());
+    send_signal(&sitter, "USR2");
+    wait_until(
+        "the SIGUSR2 check against the 0.1.0 manifest",
+        Duration::from_secs(15),
+        || {
+            requests.lock().unwrap().len() > startup_requests
+                && read_or_empty(&stderr).contains("intentd 0.1.0 is already current")
+        },
+    );
+    // Give a stray signal to the child time to be logged before asserting.
+    // timing-guard: negative assertion
+    thread::sleep(Duration::from_millis(200));
+    assert!(
+        sitter.try_wait().unwrap().is_none(),
+        "an already-current check must not exit the sitter"
+    );
+    assert_eq!(
+        read_or_empty(&log_path).trim(),
+        "start 0.1.0 update_restart=unset idle_restart=1",
+        "an already-current SIGUSR2 must signal nothing to the daemon"
+    );
+
+    send_signal(&sitter, "TERM");
+    let status = wait_exit(&mut sitter, Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0));
+}
+
+/// SIGUSR1 ("update now") keeps its semantics when it lands while a
+/// SIGUSR2 idle-mode check is still in flight: the running check is
+/// escalated, so when it installs the new version the daemon is stopped
+/// (SIGTERM) and the new version respawned at once — not handed a SIGUSR2
+/// and left to restart when idle.
+#[test]
+fn sigusr1_during_an_idle_mode_check_escalates_it_to_restart_now() {
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    // Never released: the escalated check SIGTERMs the daemon instead.
+    let release = Barrier::new(dir.path(), "release");
+    preinstall(&paths, "0.1.0", &idle_restart_script("0.1.0", &release));
+    let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
+        MANIFEST_PATH.to_string(),
+        manifest_bare("0.1.0"),
+    )])));
+    let (base_url, hold, parked) = serve_holdable(Arc::clone(&routes));
+
+    // Hour-long check interval: only the signals may check.
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &base_url)
+            .env_remove(UPDATE_RESTART_ENV)
+            .env(CHECK_MIN_ENV, "3600000")
+            .env(CHECK_MAX_ENV, "3600001")
+            .env(KILL_TIMEOUT_ENV, "5000")
+            .arg("serve"),
+    );
+    let log_path = daemon_log_path(dir.path());
+    wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
+        read_or_empty(&log_path).contains("start 0.1.0")
+    });
+
+    // Publish 0.2.0 but hold the endpoint so the SIGUSR2 check stays in
+    // flight; once its manifest request is parked, send SIGUSR1.
+    let archive = make_tar_xz(idle_restart_script("0.2.0", &release).as_bytes());
+    let asset = format!("intentd-{TARGET_TRIPLE}.tar.xz");
+    let sha = sha256_hex(&archive);
+    {
+        let mut routes = routes.lock().unwrap();
+        routes.insert(format!("/{asset}"), archive);
+        routes.insert(
+            MANIFEST_PATH.to_string(),
+            manifest_json("0.2.0", &base_url, &asset, &sha),
+        );
+    }
+    hold.store(true, std::sync::atomic::Ordering::SeqCst);
+    send_signal(&sitter, "USR2");
+    wait_until(
+        "the SIGUSR2 check to be parked at the endpoint",
+        Duration::from_secs(15),
+        || parked.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+    );
+    let stderr = stderr_path(dir.path());
+    send_signal(&sitter, "USR1");
+    wait_until(
+        "the in-flight check to be escalated",
+        Duration::from_secs(15),
+        || {
+            read_or_empty(&stderr).contains(
+                "SIGUSR1 received; an update check is already running, escalating it to restart now",
+            )
+        },
+    );
+    hold.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    wait_until("daemon 0.2.0 to start", Duration::from_secs(15), || {
+        read_or_empty(&log_path).contains("start 0.2.0")
+    });
+    assert!(
+        sitter.try_wait().unwrap().is_none(),
+        "the sitter must survive the escalated restart"
+    );
+
+    send_signal(&sitter, "TERM");
+    let status = wait_exit(&mut sitter, Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0));
+
+    let lines: Vec<String> = read_or_empty(&log_path).lines().map(String::from).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "start 0.1.0 update_restart=unset idle_restart=1".to_string(),
+            "term 0.1.0".to_string(),
+            "start 0.2.0 update_restart=1 idle_restart=1".to_string(),
+            "term 0.2.0".to_string(),
+        ],
+        "SIGUSR1 mid-check must SIGTERM 0.1.0 and respawn 0.2.0 — no SIGUSR2 hand-off"
+    );
+    let stderr = read_or_empty(&stderr);
+    assert!(
+        stderr.contains("installed intentd 0.2.0 (was 0.1.0); restarting daemon"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("asking daemon to restart when idle"),
+        "the escalated check must not promise an idle restart: {stderr}"
+    );
+}
+
+/// A staged version the daemon never restarted into (`state.json` names an
+/// installed version other than the running one) is caught by the periodic
+/// check: "already current" relative to the manifest, but not the running
+/// version, so the sitter forces the restart — graceful SIGTERM + respawn of
+/// the staged version, marked as an update restart.
+#[test]
+fn periodic_check_force_restarts_a_staged_version_the_daemon_never_took() {
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0", &never_idle_script("0.1.0"));
+    let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
+        MANIFEST_PATH.to_string(),
+        manifest_bare("0.1.0"),
+    )])));
+    let base_url = serve(Arc::clone(&routes));
+
+    let mut sitter = sitter_command(dir.path(), &base_url)
+        .env_remove(UPDATE_RESTART_ENV)
+        .env(CHECK_MIN_ENV, "300")
+        .env(CHECK_MAX_ENV, "301")
+        .env(KILL_TIMEOUT_ENV, "5000")
+        .arg("serve")
+        .spawn()
+        .unwrap();
+    let log_path = daemon_log_path(dir.path());
+    wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
+        read_or_empty(&log_path).contains("start 0.1.0")
+    });
+
+    // Stage 0.2.0 exactly as a SIGUSR2 check leaves it behind a daemon that
+    // never gets idle: installed and named by state.json, not running. The
+    // 0.1.0 manifest is "not newer" than it, so the next periodic check
+    // reports it as already current.
+    preinstall(&paths, "0.2.0", &never_idle_script("0.2.0"));
+    wait_until("daemon 0.2.0 to start", Duration::from_secs(15), || {
+        read_or_empty(&log_path).contains("start 0.2.0")
+    });
+    assert!(
+        sitter.try_wait().unwrap().is_none(),
+        "the sitter must survive the forced restart"
+    );
+
+    send_signal(&sitter, "TERM");
+    let status = wait_exit(&mut sitter, Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0));
+
+    let lines: Vec<String> = read_or_empty(&log_path).lines().map(String::from).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "start 0.1.0 update_restart=unset idle_restart=1".to_string(),
+            "term 0.1.0".to_string(),
+            "start 0.2.0 update_restart=1 idle_restart=1".to_string(),
+            "term 0.2.0".to_string(),
+        ],
+        "the periodic check must SIGTERM the stale daemon and respawn the staged version"
+    );
+    let stderr = read_or_empty(&stderr_path(dir.path()));
+    assert!(
+        stderr.contains("found staged intentd 0.2.0 (was 0.1.0); restarting daemon"),
+        "stderr: {stderr}"
+    );
+}
+
+/// A child exiting with the restart-for-update code while `state.json` still
+/// names the running version is respawned on that same version at once —
+/// no backoff, not counted as a crash — and, being same-version, without
+/// the update-restart marker.
+#[test]
+fn restart_for_update_exit_with_unchanged_state_respawns_same_version_unmarked() {
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    let release = Barrier::new(dir.path(), "release");
+    preinstall(&paths, "0.1.0", &restart_once_script("0.1.0", &release));
+    let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
+        MANIFEST_PATH.to_string(),
+        manifest_bare("0.1.0"),
+    )])));
+    let (base_url, requests) = serve_recording(routes);
+
+    // Hour-long check interval and a 30s backoff: the respawn below can
+    // only happen promptly if the exit is neither checked nor backed off.
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &base_url)
+            .env_remove(UPDATE_RESTART_ENV)
+            .env(CHECK_MIN_ENV, "3600000")
+            .env(CHECK_MAX_ENV, "3600001")
+            .env(BACKOFF_INITIAL_ENV, "30000")
+            .env(BACKOFF_CAP_ENV, "30000")
+            .env(KILL_TIMEOUT_ENV, "5000")
+            .arg("serve"),
+    );
+    let log_path = daemon_log_path(dir.path());
+    wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
+        read_or_empty(&log_path).contains("start 0.1.0")
+    });
+    let startup_requests = requests.lock().unwrap().len();
+
+    // The daemon holds at the barrier before exiting: nothing may respawn
+    // while it is still alive.
+    wait_until(
+        "daemon 0.1.0 to reach the hold",
+        Duration::from_secs(10),
+        || release.entered(),
+    );
+    assert_eq!(read_or_empty(&log_path).lines().count(), 1);
+    assert!(sitter.try_wait().unwrap().is_none());
+
+    release.release();
+    wait_until(
+        "daemon 0.1.0 to be respawned",
+        Duration::from_secs(10),
+        || read_or_empty(&log_path).lines().count() >= 2,
+    );
+    assert!(
+        sitter.try_wait().unwrap().is_none(),
+        "the sitter must survive the restart exit"
+    );
+
+    send_signal(&sitter, "TERM");
+    let status = wait_exit(&mut sitter, Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0));
+
+    let lines: Vec<String> = read_or_empty(&log_path).lines().map(String::from).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "start 0.1.0 update_restart=unset idle_restart=1".to_string(),
+            "start 0.1.0 update_restart=unset idle_restart=1".to_string(),
+        ],
+        "a same-version restart-for-update respawn must not carry the update marker"
+    );
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        startup_requests,
+        "the restart exit is not a failed start: no off-schedule re-check"
+    );
+    let stderr = read_or_empty(&stderr_path(dir.path()));
+    assert!(
+        stderr.contains("intentd 0.1.0 exited to restart for a staged update; respawning"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("exited unexpectedly") && !stderr.contains("respawning intentd in"),
+        "the restart exit is neither a crash nor backed off: {stderr}"
+    );
+}
+
+/// Regression for the #1924 review ask: a test that panics while its sitter
+/// is parked on a [`Barrier`] must not leave the sitter or its fake daemon
+/// behind. The panic unwinds through the [`GuardedChild`] guard, which
+/// `SIGKILL`s the sitter's whole process group (the daemon inherits it), so
+/// both pids are gone within the bound even though the barrier is never
+/// released.
+#[test]
+fn panic_mid_test_leaves_no_sitter_or_daemon_behind() {
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Declared before the guard so the release file outlives the unwind:
+    // nothing but the kill may unpark the daemon.
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    let release = Barrier::new(dir.path(), "release");
+    preinstall(&paths, "0.1.0", &parked_pid_script(&release));
+    let log_path = daemon_log_path(dir.path());
+
+    let pids = Mutex::new(None);
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        let sitter = spawn_guarded(
+            sitter_command(dir.path(), &dead_url())
+                .env(CHECK_MIN_ENV, "3600000")
+                .env(CHECK_MAX_ENV, "3600001")
+                .arg("serve"),
+        );
+        wait_until(
+            "daemon 0.1.0 to reach the hold",
+            Duration::from_secs(15),
+            || release.entered(),
+        );
+        let daemon_pid: u32 = read_or_empty(&log_path)
+            .lines()
+            .find_map(|line| line.strip_prefix("pid "))
+            .expect("fake daemon logs its pid before arriving")
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(alive(sitter.id()) && alive(daemon_pid));
+        *pids.lock().unwrap() = Some((sitter.id(), daemon_pid));
+        panic!("injected mid-test panic while the sitter is parked on the barrier");
+    }));
+    assert!(outcome.is_err(), "the injected panic must unwind");
+    let (sitter_pid, daemon_pid) = pids
+        .into_inner()
+        .unwrap()
+        .expect("spawned and recorded pids before panicking");
+
+    wait_until(
+        "sitter and fake daemon to be gone after unwinding",
+        Duration::from_secs(5),
+        || !alive(sitter_pid) && !alive(daemon_pid),
+    );
+    assert!(
+        !release.path().exists(),
+        "the barrier must never have been released: only the guard's kill unparks the daemon"
+    );
+}
+
 #[test]
 fn one_shot_subcommand_nonzero_exit_passes_through_without_respawn() {
     let dir = tempfile::tempdir().unwrap();
@@ -2240,6 +2889,7 @@ fn sitter_initiated_stop_does_not_respawn() {
     let status = wait_exit(&mut sitter, Duration::from_secs(10));
     assert_eq!(status.code(), Some(0));
 
+    // timing-guard: negative assertion
     thread::sleep(Duration::from_millis(300));
     let starts = read_or_empty(&log_path)
         .lines()

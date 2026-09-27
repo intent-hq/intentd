@@ -187,9 +187,8 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> std::proc
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", &secrets_file)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -428,11 +427,13 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -525,9 +526,8 @@ async fn baseline_plus_aggregated_wake() {
         &delegate_a_js,
         &delegate_b_js,
     );
-    let env_daemon1: [(&str, &str); 5] = [
+    let env_daemon1: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior_daemon1),
         ("RUST_LOG", "intent_services=info"),
@@ -743,9 +743,8 @@ async fn baseline_plus_aggregated_wake() {
         &delegate_a_js,
         &delegate_b_js,
     );
-    let env_daemon2: [(&str, &str); 5] = [
+    let env_daemon2: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior_daemon2),
         ("RUST_LOG", "intent_services=info"),

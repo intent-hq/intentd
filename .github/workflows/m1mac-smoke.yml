@@ -69,7 +69,7 @@ jobs:
           if xcrun simctl help >/dev/null 2>&1; then
             echo "== iOS runtimes (xcrun simctl list runtimes) =="
             xcrun simctl list runtimes
-            if xcrun simctl list runtimes 2>/dev/null | grep -q "^iOS "; then
+            if xcrun simctl list runtimes 2>/dev/null | grep "^iOS " >/dev/null; then
               echo "iOS platform runtime: present"
             else
               echo "iOS platform runtime: absent"

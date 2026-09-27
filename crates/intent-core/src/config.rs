@@ -111,6 +111,23 @@ pub const DEFAULT_HOOKS_MAX_PER_AGENT: u32 = 5;
 /// (`server.maxOutstandingRpcs`); `0` means unlimited.
 pub const DEFAULT_SERVER_MAX_OUTSTANDING_RPCS: u32 = 256;
 
+/// Default for `sharing.maxGuestsPerWorkspace` — how many guests
+/// (collaborators plus open invites) one workspace admits besides its owner.
+pub const DEFAULT_SHARING_MAX_GUESTS_PER_WORKSPACE: u32 = 10;
+
+/// Ceiling for `sharing.maxGuestsPerWorkspace`; `0` closes every workspace
+/// to guests.
+pub const MAX_SHARING_MAX_GUESTS_PER_WORKSPACE: u32 = 100;
+
+/// Default for `sharing.maxGuestConnections` — the listener-wide cap on
+/// concurrent WSS connections held by non-primary principals; `0` means
+/// unlimited. The primary credential is never counted.
+pub const DEFAULT_SHARING_MAX_GUEST_CONNECTIONS: u32 = 40;
+
+/// Default for `sharing.maxConnectionsPerGuest` — concurrent WSS connections
+/// one guest principal may hold; `0` means unlimited.
+pub const DEFAULT_SHARING_MAX_CONNECTIONS_PER_GUEST: u32 = 4;
+
 /// Default for `wakeResume.enabled` — whether the daemon detects host
 /// sleep/wake and resumes work on wake. On by default.
 pub const DEFAULT_WAKE_RESUME_ENABLED: bool = true;
@@ -162,6 +179,24 @@ pub const MIN_PR_MONITOR_HOURLY_REQUEST_BUDGET: u64 = 60;
 /// (the settings catalog also rejects them up front).
 pub const MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET: u64 = 5000;
 
+/// Default for `prMonitor.quotaSharePercent` — the share of the forge's
+/// REMAINING PR-read quota (from shared authoritative quota probes)
+/// the PR-monitor loop may plan to spend before the window resets. The
+/// hourly budget plans the steady state; this stretches the per-PR
+/// interval ahead of exhaustion once the quota is running low (agents'
+/// own `gh` use, the PR-refresh sweep, and paginated reads all draw on the
+/// same window), so the monitor slows down BEFORE the shared rate-limit
+/// pause has to stop it. Half leaves the other half for everything else.
+pub const DEFAULT_PR_MONITOR_QUOTA_SHARE_PERCENT: u64 = 50;
+
+/// Floor for `prMonitor.quotaSharePercent`. Sub-floor values (notably `0`,
+/// which would plan no polling at all) are clamped up at read time.
+pub const MIN_PR_MONITOR_QUOTA_SHARE_PERCENT: u64 = 1;
+
+/// Ceiling for `prMonitor.quotaSharePercent` — the whole remaining quota.
+/// Over-ceiling values are clamped down at read time.
+pub const MAX_PR_MONITOR_QUOTA_SHARE_PERCENT: u64 = 100;
+
 /// Default quiet window a changed PR must observe before its consolidated
 /// wake is delivered (`prMonitor.debounceSeconds`).
 pub const DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS: u64 = 60;
@@ -169,6 +204,45 @@ pub const DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS: u64 = 60;
 /// Floor for `prMonitor.debounceSeconds`. Sub-minimum values (notably `0`)
 /// are clamped up at read time.
 pub const MIN_PR_MONITOR_DEBOUNCE_SECONDS: u64 = 10;
+
+/// Default for `prCache.maxAgeSeconds` — how old a cached PR read may be
+/// and still be served to an on-demand reader (`github.pulls.get`,
+/// `ws.pr.snapshot`) without a forge call. The shared PR cache is refreshed
+/// by the PR monitor's polls, so a PR under an active monitor is usually
+/// served from its last poll; an unmonitored PR is re-read once per window.
+pub const DEFAULT_PR_CACHE_MAX_AGE_SECONDS: u64 = 60;
+
+/// Floor for `prCache.maxAgeSeconds` — below this every hover would re-read
+/// the forge. Sub-floor values (notably `0`) are clamped up at read time.
+pub const MIN_PR_CACHE_MAX_AGE_SECONDS: u64 = 10;
+
+/// Ceiling for `prCache.maxAgeSeconds` — the staleness an on-demand reader
+/// may be shown. Over-ceiling values are clamped down at read time.
+pub const MAX_PR_CACHE_MAX_AGE_SECONDS: u64 = 600;
+
+/// Default for `updates.checkOnIdle` — whether the daemon asks the sitter
+/// (via `SIGUSR2`) to check for updates once it has been continuously idle;
+/// on by default.
+pub const DEFAULT_UPDATES_CHECK_ON_IDLE: bool = true;
+
+/// Default for `updates.idleCheckIntervalMinutes` — minimum spacing (in
+/// minutes) between two idle-triggered update checks, also applied from
+/// process start since the sitter checks at startup.
+pub const DEFAULT_UPDATES_IDLE_CHECK_INTERVAL_MINUTES: u32 = 60;
+
+/// Floor for `updates.idleCheckIntervalMinutes` — a tighter interval would
+/// re-request checks the sitter already answered. Sub-minimum values
+/// (notably `0`) are clamped up at read time.
+pub const MIN_UPDATES_IDLE_CHECK_INTERVAL_MINUTES: u32 = 5;
+
+/// Default for `updates.idleGraceSeconds` — how long (in seconds) the daemon
+/// must be continuously idle before it requests an update check.
+pub const DEFAULT_UPDATES_IDLE_GRACE_SECONDS: u32 = 120;
+
+/// Floor for `updates.idleGraceSeconds` — below this a momentary lull between
+/// agent turns would count as idle. Sub-minimum values (notably `0`) are
+/// clamped up at read time.
+pub const MIN_UPDATES_IDLE_GRACE_SECONDS: u32 = 10;
 
 /// Resolved filesystem locations for the daemon.
 #[derive(Debug, Clone, PartialEq, Eq)]

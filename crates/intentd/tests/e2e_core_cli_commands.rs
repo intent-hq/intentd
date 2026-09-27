@@ -27,13 +27,11 @@ fn spawn_daemon(data_dir: &PathBuf) -> Child {
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     let secrets_file = data_dir.join("secrets.json");
-    Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("serve")
+    common::serve_command()
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", &secrets_file)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
-        .env("INTENTD_TCP_PORT", "0")
         .env_remove("INTENTD_AUTH_TOKEN")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log))
@@ -182,13 +180,11 @@ fn spawn_daemon_both_inner(
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     let secrets_file = data_dir.join("secrets.json");
     common::enable_ws_api(data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", &secrets_file)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
-        .env("INTENTD_TCP_PORT", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
     match token {

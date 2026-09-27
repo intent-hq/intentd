@@ -12,7 +12,7 @@
 mod common;
 
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,13 +42,11 @@ fn spawn_serve(data_dir: &Path, home_dir: &Path) -> Child {
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     common::enable_ws_api(data_dir);
-    Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("serve")
+    common::serve_command()
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", "0")
         .env("HOME", home_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::from(log))
@@ -282,6 +280,109 @@ where
 
 fn specialist_md(name: &str, body: &str) -> String {
     format!("---\nname: \"{name}\"\ndescription: \"d\"\n---\n\n{body}")
+}
+
+#[tokio::test]
+async fn external_branch_rename_updates_workspace_over_wss() {
+    let data_dir = scratch_dir("branch");
+    let home_dir = data_dir.path().join("home");
+    std::fs::create_dir_all(&home_dir).unwrap();
+    let checkout = data_dir.path().join("checkout");
+    std::fs::create_dir_all(&checkout).unwrap();
+    for args in [
+        vec!["init", "--initial-branch=original"],
+        vec![
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ],
+    ] {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&checkout)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let _guard = common::DaemonGuard::process_only(spawn_serve(data_dir.path(), &home_dir));
+    let socket = data_dir.path().join("intentd.sock");
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["workspace:updated"] }),
+    )
+    .await;
+    let mut rpc = connect_ws(port, cfg).await;
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "workspace.create",
+        json!({
+            "title": "Branch rename", "branch": "original", "skipWorktree": true,
+            "path": checkout.to_string_lossy(), "repositoryPath": checkout.to_string_lossy()
+        }),
+    )
+    .await;
+    let ws_id = created["workspace"]["id"].as_str().unwrap();
+
+    let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(30));
+    let mut attempt = 0;
+    let renamed = loop {
+        attempt += 1;
+        let name = format!("fix/renamed-{attempt}");
+        let output = std::process::Command::new("git")
+            .args(["branch", "-m", &name])
+            .current_dir(&checkout)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "branch rename never reached the workspace UI event stream"
+        );
+        if let Some(event) = try_next_event(
+            &mut sub,
+            &["workspace:updated"],
+            common::test_timeout(Duration::from_secs(2)).min(remaining),
+        )
+        .await
+        {
+            if event["workspaceId"] == ws_id && event["data"]["changes"]["branch"] == name {
+                assert_eq!(event["data"]["workspaceId"], ws_id);
+                break name;
+            }
+        }
+    };
+    let workspace = wss_rpc(
+        &mut rpc,
+        3,
+        "workspace.get",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(workspace["workspace"]["branch"], renamed, "{workspace}");
 }
 
 /// End-to-end #611 lifecycle behavior over a single daemon boot: a workspace

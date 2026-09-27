@@ -41,7 +41,7 @@ async fn send(socket: &Path, frame: &str) -> Value {
     serde_json::from_str(line.trim()).expect("valid json")
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chief_workspace_over_uds() {
     // Short UDS path (`SUN_LEN ~ 104B` on macOS).
     let dir = common::test_tempdir_in("/tmp", "intentd-chief-");
@@ -58,7 +58,7 @@ async fn chief_workspace_over_uds() {
         Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
-    let server = tokio::spawn(async move {
+    let server = intent_core::spawn_daemon(async move {
         serve_uds(services, bus, &socket, None, async move {
             let _ = rx.await;
         })

@@ -122,7 +122,7 @@ fn entry<'a>(list: &'a Value, path: &str) -> &'a Value {
 
 const SECRET: &str = "ghp_super_secret_token_value_0123456789";
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn settings_round_trip_redaction_validation_and_event() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -142,7 +142,7 @@ async fn settings_round_trip_redaction_validation_and_event() {
     let socket = sock_dir.path().join("uds.sock");
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn({
+    let server = intent_core::spawn_daemon({
         let bus = bus.clone();
         let socket = socket.clone();
         async move {
@@ -574,17 +574,49 @@ async fn settings_round_trip_redaction_validation_and_event() {
         assert!(e.get("sensitive").is_none(), "{path}");
     }
 
-    // `[prMonitor]` — three non-secret TOML-backed numbers: the two interval
-    // knobs (floor 10) and the hourly request budget (floor 60, max 5000).
+    // `[prMonitor]` — four non-secret TOML-backed numbers: the two interval
+    // knobs (floor 10), the hourly request budget (floor 60, max 5000) and
+    // the remaining-quota share (floor 1, max 100).
     for (path, default, min, max) in [
         ("prMonitor.debounceSeconds", 60.0, 10.0, 86_400.0),
         ("prMonitor.pollSeconds", 30.0, 10.0, 3_600.0),
         ("prMonitor.hourlyRequestBudget", 1500.0, 60.0, 5_000.0),
+        ("prMonitor.quotaSharePercent", 50.0, 1.0, 100.0),
     ] {
         let e = entry(&list, path);
         assert_eq!(e["type"], "number", "{path}");
         assert_eq!(e["value"], json!(default), "{path}");
         assert_eq!(e["category"], "prMonitor", "{path}");
+        assert_eq!(e["min"], json!(min), "{path}");
+        assert_eq!(e["max"], json!(max), "{path}");
+        assert!(e.get("sensitive").is_none(), "{path}");
+    }
+
+    // `[prCache]` — the shared PR cache's serve window: one non-secret
+    // TOML-backed number (default 60, floor 10, max 600).
+    let e = entry(&list, "prCache.maxAgeSeconds");
+    assert_eq!(e["type"], "number");
+    assert_eq!(e["value"], json!(60.0));
+    assert_eq!(e["category"], "prCache");
+    assert_eq!(e["min"], json!(10.0));
+    assert_eq!(e["max"], json!(600.0));
+    assert!(e.get("sensitive").is_none());
+
+    // `[updates]` — the idle-triggered update-check knobs: one non-secret
+    // TOML-backed boolean (default on) and two numbers (floors 5 and 10).
+    let e = entry(&list, "updates.checkOnIdle");
+    assert_eq!(e["type"], "boolean");
+    assert_eq!(e["value"], json!(true));
+    assert_eq!(e["category"], "updates");
+    assert!(e.get("sensitive").is_none());
+    for (path, default, min, max) in [
+        ("updates.idleCheckIntervalMinutes", 60.0, 5.0, 10_080.0),
+        ("updates.idleGraceSeconds", 120.0, 10.0, 86_400.0),
+    ] {
+        let e = entry(&list, path);
+        assert_eq!(e["type"], "number", "{path}");
+        assert_eq!(e["value"], json!(default), "{path}");
+        assert_eq!(e["category"], "updates", "{path}");
         assert_eq!(e["min"], json!(min), "{path}");
         assert_eq!(e["max"], json!(max), "{path}");
         assert!(e.get("sensitive").is_none(), "{path}");

@@ -45,9 +45,8 @@ fn spawn_daemon(prefix: &str, envs: &[(&str, &str)]) -> (Daemon, PathBuf, PathBu
     let log = std::fs::File::create(&log_path).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", &data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -562,12 +561,17 @@ async fn transfer_plan_stays_within_statement_budget() {
 /// fetch through to the attention probe, and decides written markers inline.
 /// With 10 answered-question sessions the pre-fix `workspace.get` shape
 /// executed 15+ statements; the fixed shape stays at ~6. A statement
-/// threshold of 10 pins that.
+/// threshold of 10 pinned that; the first (cache-seeding) read now executes
+/// 12 statements — #1884 folds the secondary git-root PRs into
+/// `displayStatus` (10, intermittently 11 on main), and the caller's
+/// membership / role enrichment on the workspace payload adds one — so the
+/// threshold is the observed maximum, 12. Folding the membership lookup into
+/// the `workspace.get` query is a recorded follow-up.
 #[tokio::test]
 async fn workspace_get_enrichment_stays_within_statement_budget() {
     let (_daemon, socket, log_path) = spawn_daemon(
         "itdp-wsget",
-        &[("INTENTD_RPC_STATEMENT_WARN_THRESHOLD", "10")],
+        &[("INTENTD_RPC_STATEMENT_WARN_THRESHOLD", "12")],
     );
     assert!(await_socket(&socket).await, "daemon did not start");
 
@@ -675,17 +679,31 @@ async fn workspace_get_enrichment_stays_within_statement_budget() {
 /// `list_agent_sessions` hydrated every session's transcript (message +
 /// payload SELECTs) just to read `id`/`name`, and the per-agent teardown ran
 /// one `agent_stop_redelivery` DELETE plus one `advisory_wake_delivery` DELETE
-/// each — 128 statements / 180 ms observed for a 30-agent workspace, over the
-/// compound budget of 100. The sweep now reads session summaries and folds
-/// both clears into one batched `IN`-list statement each, so the dispatch
-/// executes a constant ~10 statements regardless of how many agents, messages
-/// or notes the workspace holds. The compound threshold is lowered to 20 so
-/// even a small N+1 regression (≥ 3 agents) fires the WARN.
+/// each — 128 statements / 180 ms observed for a 30-agent workspace. Preserve
+/// the summary-only read and batched runtime clears, while allowing the
+/// intentional per-session cleanup added for intent-hq/intent#5337. For this
+/// fixture (histories smaller than one batch), cleanup costs 10 statements
+/// per agent plus fixed workspace work: 324 statements observed. A budget of
+/// 340 still catches even one extra query per agent; SQL tracing also guards
+/// the original hydration and per-agent runtime-clear regressions directly.
+/// Larger histories legitimately add batches, covered by the interleaving
+/// regressions in intent-store/services and `wss_integration/workspace_delete`.
 #[tokio::test]
 async fn workspace_delete_stays_within_statement_budget_at_scale() {
+    const AGENTS: usize = 30;
+    let statement_budget = (10 * AGENTS + 40).to_string();
     let (_daemon, socket, log_path) = spawn_daemon(
         "itdp-wsdel",
-        &[("INTENTD_RPC_COMPOUND_STATEMENT_WARN_THRESHOLD", "20")],
+        &[
+            (
+                "INTENTD_RPC_COMPOUND_STATEMENT_WARN_THRESHOLD",
+                &statement_budget,
+            ),
+            (
+                "RUST_LOG",
+                "warn,sqlx::query=debug,intent_transport::rpc_dispatch=info",
+            ),
+        ],
     );
     assert!(await_socket(&socket).await, "daemon did not start");
 
@@ -701,7 +719,7 @@ async fn workspace_delete_stays_within_statement_budget_at_scale() {
         .expect("workspace id")
         .to_string();
 
-    for a in 0..30 {
+    for a in 0..AGENTS {
         let resp = rpc_with_params(
             &socket,
             "agent.create",
@@ -746,7 +764,7 @@ async fn workspace_delete_stays_within_statement_budget_at_scale() {
     .await;
     assert_eq!(resp["result"]["success"], json!(true), "resp: {resp}");
 
-    // The cascade removed the workspace and everything under it.
+    // Incremental cleanup removed the workspace and everything under it.
     let resp = rpc_with_params(
         &socket,
         "workspace.get",
@@ -779,6 +797,45 @@ async fn workspace_delete_stays_within_statement_budget_at_scale() {
             &["exceeded SQL statement budget", "method=workspace.delete"]
         ),
         0,
-        "workspace.delete exceeded the lowered compound statement budget, log:\n{log}"
+        "workspace.delete exceeded the batch-aware statement budget, log:\n{log}"
     );
+
+    let plain_log = strip_ansi(&log);
+    let deletion_queries: Vec<_> = plain_log
+        .lines()
+        .filter(|line| {
+            line.contains("sqlx::query:") && line.contains("method=\"workspace.delete\"")
+        })
+        .collect();
+    assert!(
+        deletion_queries.iter().any(|line| {
+            line.contains("summary=\"SELECT") && line.contains("FROM agent_session")
+        }),
+        "expected session reads in the deletion SQL trace, log:\n{log}"
+    );
+    assert!(
+        !deletion_queries.iter().any(|line| {
+            line.contains("summary=\"SELECT") && line.contains("FROM agent_message")
+        }),
+        "workspace.delete must not hydrate message or payload rows, log:\n{log}"
+    );
+    for predicate in [
+        "DELETE FROM agent_stop_redelivery WHERE agent_id",
+        "DELETE FROM advisory_wake_delivery WHERE child_agent_id",
+    ] {
+        let clears: Vec<_> = deletion_queries
+            .iter()
+            .filter(|line| line.contains(predicate))
+            .collect();
+        assert_eq!(
+            clears.len(),
+            1,
+            "runtime clear must run once for all agents ({predicate}), log:\n{log}"
+        );
+        assert!(
+            clears[0].contains(" IN ("),
+            "runtime clear must use the batched IN predicate: {}",
+            clears[0]
+        );
+    }
 }

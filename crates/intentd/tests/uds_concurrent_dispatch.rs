@@ -66,7 +66,7 @@ async fn read_json(reader: &mut BufReader<OwnedReadHalf>, budget: Duration) -> V
 /// serialized dispatch the slow id=1 response would always be written first;
 /// with concurrent dispatch the fast id=2 response arrives first. Ordering is
 /// robust under host load, unlike fixed wall-clock latency budgets.
-#[tokio::test(flavor = "multi_thread")]
+#[intent_test_macros::daemon_test(flavor = "multi_thread")]
 async fn slow_host_exec_does_not_block_fast_workspace_list() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -80,7 +80,7 @@ async fn slow_host_exec_does_not_block_fast_workspace_list() {
     let socket = sock_dir.path().join("uds.sock");
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn({
+    let server = intent_core::spawn_daemon({
         let socket = socket.clone();
         async move {
             let _ = serve_uds(services, bus, &socket, None, async {

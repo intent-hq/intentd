@@ -390,7 +390,7 @@ async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value 
 /// content fetch (`.intent/config.json` at the requested ref) and the response
 /// is `{ config, exists: true }` with camelCase fields and unknown keys
 /// preserved.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn repo_config_get_returns_parsed_remote_config() {
     let fx = boot().await;
     *fx.forge.file_content.lock().unwrap() = Some(
@@ -426,7 +426,7 @@ async fn repo_config_get_returns_parsed_remote_config() {
 /// `{ config: null, exists: false }`, invalid JSON folds to
 /// `{ config: {}, exists: true }` (never an error), and an omitted `ref`
 /// reaches the engine as `None` (default-branch read).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn repo_config_get_missing_or_invalid_yields_empty_config() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;
@@ -461,7 +461,7 @@ async fn repo_config_get_missing_or_invalid_yields_empty_config() {
 
 /// Missing required params fail with the JSON-RPC `-32602` invalid-params
 /// envelope and never reach the engine.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn repo_config_get_requires_owner_and_repo() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;

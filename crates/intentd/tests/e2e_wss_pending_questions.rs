@@ -44,7 +44,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -150,9 +150,8 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     common::enable_ws_api(data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -421,11 +420,13 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         })
         .await
         .expect("insert ws");
@@ -481,9 +482,8 @@ async fn boot(script: &str, behavior: &str) -> (Daemon, String, u16, Arc<ClientC
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", script),
         ("MOCK_AGENT_BEHAVIOR", behavior),
     ];
@@ -1300,15 +1300,20 @@ async fn queued_answer_via_queue_message_clears_marker_over_wss() {
     )
     .await;
     assert_eq!(queued["success"], true, "queue ok: {queued}");
+    // The user-origin entry additionally carries the daemon's
+    // `fromPrincipalId` stamp for the wire caller.
+    let me = wss_rpc(&mut rpc, "principal.me", json!({})).await;
+    let mut stamped_tag = answer_tag.clone();
+    stamped_tag["fromPrincipalId"] = me["id"].clone();
     assert_eq!(
-        queued["queuedMessage"]["messageMetadata"], answer_tag,
+        queued["queuedMessage"]["messageMetadata"], stamped_tag,
         "the queued entry carries the answer tag: {queued}"
     );
     let q = wss_rpc(&mut rpc, "agent.getQueue", json!({ "agentId": asker_id })).await;
     let entries = q["queue"].as_array().expect("queue array");
     assert_eq!(entries.len(), 1, "one parked answer: {q}");
     assert_eq!(
-        entries[0]["messageMetadata"], answer_tag,
+        entries[0]["messageMetadata"], stamped_tag,
         "agent.getQueue serves the tag on the entry: {q}"
     );
     // The marker is still set while the answer waits in the queue.
@@ -1437,17 +1442,18 @@ async fn queued_answer_via_queue_message_clears_marker_over_wss() {
         "queue empty after the drained answer: {q}"
     );
 
-    // An untagged, metadata-less enqueue on the now-idle asker keeps today's
-    // shape: no `messageMetadata` key on the entry.
+    // An untagged, metadata-less enqueue on the now-idle asker carries only
+    // the daemon's `fromPrincipalId` stamp — no caller-supplied keys.
     let plain = wss_rpc(
         &mut rpc,
         "agent.queueMessage",
         json!({ "agentId": asker_id, "content": PLAIN_USER_TEXT, "messageMetadata": null }),
     )
     .await;
-    assert!(
-        plain["queuedMessage"].get("messageMetadata").is_none(),
-        "null/omitted metadata leaves the entry key-less: {plain}"
+    assert_eq!(
+        plain["queuedMessage"]["messageMetadata"],
+        json!({ "fromPrincipalId": me["id"] }),
+        "null/omitted metadata leaves only the principal stamp on the entry: {plain}"
     );
 }
 
@@ -1562,7 +1568,10 @@ async fn queue_message_strips_forged_sender_attribution_over_wss() {
     )
     .await;
     assert_eq!(queued["success"], true, "queue ok: {queued}");
-    let stripped = json!({ "note": "keep" });
+    // The A2A attribution keys are stripped; the daemon's own
+    // `fromPrincipalId` stamp for the wire caller is added.
+    let me = wss_rpc(&mut rpc, "principal.me", json!({})).await;
+    let stripped = json!({ "note": "keep", "fromPrincipalId": me["id"] });
     let no_attribution = |entry: &Value, ctx: &str| {
         assert_eq!(
             entry["messageMetadata"], stripped,

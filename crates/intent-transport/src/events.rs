@@ -8,10 +8,227 @@
 //! `ws-sub-<n>` id counter, and the `events.event` notification envelope). The
 //! connection orchestration that consumes these lives in [`crate::listener`].
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use intent_core::Event;
+use intent_core::events::{AGENT_QUEUE_PROCESSING, AGENT_QUEUE_UPDATED, WORKSPACE_UPDATED};
+use intent_core::{Caller, Event, PrincipalId, WorkspaceApi, WorkspaceId};
 use serde_json::{json, Map, Value};
+
+/// Delivery-time membership boundary for a non-administrator connection's
+/// raw `events.subscribe` stream and its per-agent `chat` channel
+/// (multiplayer w3). The bus filter only narrows event *types*; this gate
+/// decides, per event, whether the subscriber may see the event's
+/// *workspace*, by re-reading it through the API under the subscriber's
+/// caller (`workspace.get` is `NotFound` for a non-member). Verdicts are
+/// cached per workspace for [`Self::TTL`] so a busy stream costs one read
+/// per workspace per window, and an unshare
+/// (`workspace:updated { changes: { members, removedPrincipalId } }`)
+/// invalidates the entry immediately: the removed member sees that one
+/// event as its final notification and nothing after it.
+pub(crate) struct MembershipGate {
+    api: Arc<dyn WorkspaceApi>,
+    principal_id: PrincipalId,
+    verdicts: HashMap<String, (bool, Instant)>,
+    last_role: Option<intent_core::HostRole>,
+}
+
+impl MembershipGate {
+    const TTL: Duration = Duration::from_secs(30);
+
+    /// A gate for the current request's caller, or `None` when the caller is
+    /// an administrator (or unbound): those connections see every workspace.
+    pub(crate) fn for_current_caller(api: &Arc<dyn WorkspaceApi>) -> Option<Self> {
+        match crate::context::current_caller() {
+            Some(Caller::Wire {
+                principal_id,
+                host_role: intent_core::HostRole::Member | intent_core::HostRole::Guest,
+            }) => Some(Self {
+                api: Arc::clone(api),
+                principal_id,
+                verdicts: HashMap::new(),
+                last_role: None,
+            }),
+            _ => None,
+        }
+    }
+
+    /// The `changes.removedPrincipalId` of an unshare event, if any.
+    fn unshared_principal(event: &Event) -> Option<&str> {
+        if event.event_type != WORKSPACE_UPDATED {
+            return None;
+        }
+        event
+            .data
+            .get("changes")
+            .and_then(|c| c.get("removedPrincipalId"))
+            .and_then(Value::as_str)
+    }
+
+    /// Whether `event` names a membership change (add or remove) of its
+    /// workspace — the cached verdict for that workspace is stale.
+    fn is_membership_change(event: &Event) -> bool {
+        event.event_type == WORKSPACE_UPDATED
+            && event
+                .data
+                .get("changes")
+                .and_then(|c| c.get("members"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+    }
+
+    /// Whether `event` is the subscriber's own removal from its workspace.
+    pub(crate) fn is_own_unshare(&self, event: &Event) -> bool {
+        Self::unshared_principal(event) == Some(self.principal_id.as_str())
+    }
+
+    /// Forget the verdict for a workspace whose membership just changed. Fed
+    /// by the side subscription on `workspace:updated`, so a removal takes
+    /// effect even when the subscriber's own patterns exclude that type.
+    pub(crate) fn observe_membership_event(&mut self, event: &Event) {
+        if event.event_type == intent_core::events::HOST_MEMBERS_CHANGED {
+            self.verdicts.clear();
+            return;
+        }
+        if !Self::is_membership_change(event) {
+            return;
+        }
+        let workspace_id = event.workspace_id.as_str();
+        if self.is_own_unshare(event) {
+            self.verdicts
+                .insert(workspace_id.to_string(), (false, Instant::now()));
+        } else {
+            self.verdicts.remove(workspace_id);
+        }
+    }
+
+    /// Whether the subscriber may receive `event`.
+    pub(crate) async fn allows(&mut self, event: &Event) -> bool {
+        let workspace_id = event.workspace_id.as_str();
+        let role = self
+            .api
+            .principal_host_role(self.principal_id.clone())
+            .await
+            .ok();
+        if self.last_role != role {
+            self.verdicts.clear();
+            self.last_role = role;
+        }
+        if intent_core::events::is_client_event_type(&event.event_type) {
+            return workspace_id.is_empty()
+                && (matches!(
+                    role,
+                    Some(intent_core::HostRole::Owner | intent_core::HostRole::Member)
+                ) || (role == Some(intent_core::HostRole::Guest)
+                    && event.data["principalId"].as_str() == Some(self.principal_id.as_str())));
+        }
+        if event.event_type == intent_core::events::HOST_MEMBERS_CHANGED {
+            self.verdicts.clear();
+            return workspace_id.is_empty()
+                && (matches!(
+                    role,
+                    Some(intent_core::HostRole::Owner | intent_core::HostRole::Member)
+                ) || (event.data["principalId"].as_str() == Some(self.principal_id.as_str())
+                    && event.data["action"] == "removed"));
+        }
+        if intent_core::events::is_member_execution_event_type(&event.event_type) {
+            // Prompt/context events never use the cached visibility verdict.
+            // Revocation takes effect before a socket is physically closed.
+            if !matches!(
+                role,
+                Some(intent_core::HostRole::Owner | intent_core::HostRole::Member)
+            ) {
+                return false;
+            }
+            if event.event_type == intent_core::events::HOST_EXECUTION_CONTEXT_CHANGED {
+                return workspace_id.is_empty();
+            }
+            return !workspace_id.is_empty()
+                && self
+                    .api
+                    .get_workspace(WorkspaceId::from(workspace_id))
+                    .await
+                    .is_ok();
+        }
+        if workspace_id.is_empty() {
+            // Every collaborator-visible type is workspace-scoped; a global
+            // event reaching here has nothing to authorize against.
+            return false;
+        }
+        if role == Some(intent_core::HostRole::Member) {
+            if event.event_type == intent_core::events::WORKSPACE_DELETED {
+                return !WorkspaceId::from(workspace_id).is_chief();
+            }
+            return self
+                .api
+                .get_workspace(WorkspaceId::from(workspace_id))
+                .await
+                .is_ok();
+        }
+        if self.is_own_unshare(event) {
+            // The removed member's own final notification.
+            self.verdicts
+                .insert(workspace_id.to_string(), (false, Instant::now()));
+            return true;
+        }
+        if Self::is_membership_change(event) {
+            self.verdicts.remove(workspace_id);
+        }
+        if let Some((allowed, at)) = self.verdicts.get(workspace_id) {
+            if at.elapsed() < Self::TTL {
+                return *allowed;
+            }
+        }
+        let allowed = self
+            .api
+            .get_workspace(WorkspaceId::from(workspace_id))
+            .await
+            .is_ok();
+        self.verdicts
+            .insert(workspace_id.to_string(), (allowed, Instant::now()));
+        allowed
+    }
+}
+
+/// Egress projection of the per-principal queue events for the current
+/// request's caller. A non-administrator wire principal's
+/// `agent:queue:updated` keeps in `data.queue` only the entries it may see
+/// ([`intent_core::project_queue_for_caller`] — its own plus unattributed
+/// ones; `position` is not renumbered); its `agent:queue:processing` for an
+/// entry it may not see (the publisher's `metadata` attribution —
+/// [`intent_core::queue_processing_event_attribution`]: another principal's
+/// stamp, or the unknown-human marker of a human-origin entry the workspace
+/// could not attribute — under the same
+/// [`intent_core::queue_attribution_visible_to`] predicate) loses
+/// `data.content` and keeps `agentId` / `messageId` / `turnId`, so the
+/// drain-start signal still keys the turn without leaking the hidden
+/// entry's text (intentd#2068). Every other event type, and every other
+/// caller, passes through untouched. Called on events that passed the
+/// [`MembershipGate`], under the subscriber's caller re-established by the
+/// forwarder spawn.
+pub(crate) fn project_queue_event_for_current_caller(event: &mut Event) {
+    if event.event_type == AGENT_QUEUE_UPDATED {
+        let Some(queue) = event.data.get_mut("queue").and_then(Value::as_array_mut) else {
+            return;
+        };
+        let caller = crate::context::current_caller();
+        let entries = std::mem::take(queue);
+        *queue = intent_core::project_queue_for_caller(caller.as_ref(), entries);
+    } else if event.event_type == AGENT_QUEUE_PROCESSING {
+        let Some(caller) = crate::context::current_caller() else {
+            return;
+        };
+        let attribution = intent_core::queue_processing_event_attribution(event.metadata.as_ref());
+        if intent_core::queue_attribution_visible_to(&caller, &attribution) {
+            return;
+        }
+        if let Some(data) = event.data.as_object_mut() {
+            data.remove("content");
+        }
+    }
+}
 
 /// The `id` member of a fast-path request: whether it was present (a response is
 /// only sent for requests, not notifications) and the value to echo (`id ?? null`).

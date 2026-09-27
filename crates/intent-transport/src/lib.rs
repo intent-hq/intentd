@@ -8,12 +8,18 @@
 pub use intent_core::Result;
 pub use intent_services::Services;
 
-pub use auth::{generate_token, get_or_create_token, AsyncTokenStore, FileTokenStore, TokenStore};
-pub use context::{is_tcp_connection, with_connection_context};
-pub use control::{FileWatchStatus, SystemControl, SystemStatus};
+pub use auth::{
+    generate_token, get_or_create_token, hash_token, AsyncTokenStore, FileTokenStore, TokenStore,
+};
+pub use context::{
+    current_caller, is_tcp_connection, with_caller, with_connection_context, with_request_context,
+    Caller,
+};
+pub use control::{FileWatchStatus, IdleUpdateCheckStatus, SystemControl, SystemStatus};
 pub use host_env::{
     detect_has_display, detect_host_environment, local_hostname, pretty_hostname, HostEnvironment,
 };
+pub use invite::InviteLinkResolver;
 #[cfg(windows)]
 pub use listener::pipe_name_for_socket_path;
 pub use listener::{serve_uds, serve_uds_with_reverse};
@@ -29,7 +35,9 @@ pub use server::{
     PairingSnapshot, ServerPairingInfo,
 };
 pub use tls::{ensure_tls_certificate, inspect_cert, CertStatus, TlsCertificate};
-pub use ws::{WsApiServer, WsOptions};
+pub use ws::{
+    GuestConnectionLimits, SharedGuestLimits, WsApiServer, WsOptions, GUEST_CAP_RETRY_AFTER_SECS,
+};
 
 /// Source commit embedded at build time, when the build environment can identify it.
 pub const BUILD_COMMIT: Option<&str> = option_env!("INTENTD_EMBEDDED_BUILD_COMMIT");
@@ -60,10 +68,12 @@ mod forward;
 pub mod host;
 pub mod host_env;
 mod host_ops;
+mod invite;
 pub mod lifecycle;
 pub mod listener;
 pub mod pairing;
 mod panic_guard;
+mod presence;
 mod protocol;
 mod provider_setup;
 pub mod reverse;

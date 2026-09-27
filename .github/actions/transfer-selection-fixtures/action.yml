@@ -1,0 +1,28 @@
+name: Transfer selection fixtures
+description: Acquire monorepo main once and record the shared validator and golden revision.
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@v7
+      with:
+        repository: intent-hq/intent
+        ref: main
+        path: .transfer-selection-contract
+        persist-credentials: false
+        sparse-checkout: |
+          docs/protocol/fixtures/transfer-selection
+          scripts/check-transfer-selection-contract.mjs
+        sparse-checkout-cone-mode: false
+    - uses: actions/setup-node@v7
+      with:
+        node-version: 22
+    - name: Validate and expose the required shared fixtures
+      shell: bash
+      run: |
+        set -euo pipefail
+        contract_root="$GITHUB_WORKSPACE/.transfer-selection-contract"
+        echo "TRANSFER_SELECTION_FIXTURE_ROOT=$contract_root/docs/protocol/fixtures/transfer-selection" >> "$GITHUB_ENV"
+        contract_sha=$(git -C "$contract_root" rev-parse HEAD)
+        echo "Transfer selection contract: intent-hq/intent@$contract_sha"
+        echo "Transfer selection contract: intent-hq/intent@$contract_sha" >> "$GITHUB_STEP_SUMMARY"
+        node "$contract_root/scripts/check-transfer-selection-contract.mjs"

@@ -84,16 +84,25 @@ impl Drop for PendingRequest<'_> {
 
 /// Daemon→client reverse-RPC channel for one connection. Cheap to clone (`Arc`
 /// inside); cloning shares the same pending map and id counter.
+///
+/// Administrator channels retain the existing reverse surface. A member can
+/// receive only workspace-scoped `browser.exec`, checked against current
+/// durable authority on each request. Hello metadata never grants that role.
 #[derive(Clone)]
 pub struct ReverseChannel {
     out_tx: mpsc::Sender<String>,
     pending: Pending,
     next_id: Arc<AtomicU64>,
+    administrator: bool,
+    browser_member: Arc<std::sync::atomic::AtomicBool>,
+    member_authority: Option<(Arc<dyn intent_core::WorkspaceApi>, intent_core::PrincipalId)>,
 }
 
 impl ReverseChannel {
     /// Build a channel that pushes reverse requests through `out_tx` (the
-    /// connection's outbound frame queue).
+    /// connection's outbound frame queue). The connection is taken to be the
+    /// administrator's (the legacy single-user default); see
+    /// [`ReverseChannel::with_administrator`].
     #[must_use]
     pub fn new(out_tx: mpsc::Sender<String>) -> Self {
         Self {
@@ -103,7 +112,80 @@ impl ReverseChannel {
                 closed: false,
             })),
             next_id: Arc::new(AtomicU64::new(0)),
+            administrator: true,
+            browser_member: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            member_authority: None,
         }
+    }
+
+    /// Record whether the connection this channel serves is bound to the
+    /// daemon's administrator. Non-administrator channels fail closed unless
+    /// bound member authority separately permits a scoped browser request.
+    #[must_use]
+    pub fn with_administrator(mut self, administrator: bool) -> Self {
+        self.administrator = administrator;
+        self
+    }
+
+    /// Whether the connection this channel serves is the administrator's.
+    #[must_use]
+    pub fn is_administrator(&self) -> bool {
+        self.administrator
+    }
+
+    pub(crate) fn with_member_authority(
+        mut self,
+        api: Arc<dyn intent_core::WorkspaceApi>,
+        caller: Option<&intent_core::Caller>,
+    ) -> Self {
+        if let Some(intent_core::Caller::Wire {
+            principal_id,
+            host_role,
+        }) = caller
+        {
+            if *host_role != intent_core::HostRole::Owner {
+                self.administrator = false;
+                self.member_authority = Some((api, principal_id.clone()));
+            }
+        }
+        self
+    }
+
+    pub(crate) fn set_browser_member(&self, allowed: bool) {
+        self.browser_member.store(allowed, Ordering::Release);
+    }
+
+    pub(crate) fn may_host_browser(&self) -> bool {
+        self.administrator
+            || (self.member_authority.is_some() && self.browser_member.load(Ordering::Acquire))
+    }
+
+    async fn member_may_receive(&self, method: &str, params: &Value) -> bool {
+        let Some((api, principal_id)) = &self.member_authority else {
+            return false;
+        };
+        if method != "browser.exec"
+            || !api
+                .principal_host_role(principal_id.clone())
+                .await
+                .is_ok_and(|role| role == intent_core::HostRole::Member)
+        {
+            return false;
+        }
+        let Some(workspace) = params["workspaceId"].as_str().filter(|id| !id.is_empty()) else {
+            return false;
+        };
+        // An owner/agent dispatch must be authorized against the receiving
+        // person's scope too, so chief tabs can never fall back to a member.
+        intent_core::with_caller(
+            intent_core::Caller::Wire {
+                principal_id: principal_id.clone(),
+                host_role: intent_core::HostRole::Guest,
+            },
+            api.get_workspace(intent_core::WorkspaceId::from(workspace)),
+        )
+        .await
+        .is_ok()
     }
 
     /// Mint the next `rev-<n>` reverse-request id.
@@ -118,7 +200,10 @@ impl ReverseChannel {
     ///
     /// # Errors
     ///
-    /// Returns [`ReverseError`] if the connection is closed, the response channel is dropped, or the client does not reply within `timeout`.
+    /// Returns [`ReverseError`] if the connection is bound to a
+    /// non-administrator principal (`-32003`, nothing is sent), the connection
+    /// is closed, the response channel is dropped, or the client does not
+    /// reply within `timeout`.
     ///
     /// # Panics
     ///
@@ -129,6 +214,15 @@ impl ReverseChannel {
         params: Value,
         timeout: Duration,
     ) -> Result<Value, ReverseError> {
+        if !self.administrator && !self.member_may_receive(method, &params).await {
+            return Err(ReverseError {
+                code: i64::from(crate::catalog::FORBIDDEN_ERROR_CODE),
+                message: format!(
+                    "{}: reverse RPC {method} is outside this connection's authority",
+                    crate::catalog::FORBIDDEN_ERROR_MESSAGE
+                ),
+            });
+        }
         let id = self.mint_id();
         let (tx, rx) = oneshot::channel();
         {

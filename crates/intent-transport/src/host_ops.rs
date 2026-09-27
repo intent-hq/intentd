@@ -28,7 +28,7 @@
 //! root so they unit-test cleanly with a temp directory.
 
 use std::collections::HashSet;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -169,7 +169,7 @@ where
     if name == "node" {
         let nvm_dirs: Vec<PathBuf> = enriched_tool_dirs
             .iter()
-            .filter(|dir| is_nvm_node_bin_dir(dir))
+            .filter(|dir| path_utils::is_nvm_node_bin_dir(dir))
             .cloned()
             .collect();
         if let Some(path) = find_executable_in_dir_candidates(name, &nvm_dirs) {
@@ -211,26 +211,6 @@ where
         tracing::info!("no usable Node candidate found");
     }
     None
-}
-
-#[expect(clippy::similar_names)] // nvm's literal directory layout (versions/<version>)
-fn is_nvm_node_bin_dir(path: &Path) -> bool {
-    let Some(version_dir) = path.parent() else {
-        return false;
-    };
-    let Some(node_dir) = version_dir.parent() else {
-        return false;
-    };
-    let Some(versions_dir) = node_dir.parent() else {
-        return false;
-    };
-    let Some(nvm_dir) = versions_dir.parent() else {
-        return false;
-    };
-    path.file_name() == Some(OsStr::new("bin"))
-        && node_dir.file_name() == Some(OsStr::new("node"))
-        && versions_dir.file_name() == Some(OsStr::new("versions"))
-        && nvm_dir.file_name() == Some(OsStr::new(".nvm"))
 }
 
 /// Candidate filenames to try when resolving `name` in a directory, mirroring

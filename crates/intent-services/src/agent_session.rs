@@ -9,7 +9,7 @@
 //! `agent:stream:end` is emitted per turn — `complete` and `error` both map to it
 //! (PROTOCOL §7).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -29,14 +29,15 @@ use intent_core::{
     MessageOrigin, Result, UsageCost, WorkspaceId, WorkspaceStatus,
 };
 use intent_store::NewEvent;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::agent_ops::{
     last_response_and_digest_from_blocks, live_response_and_digest_from_blocks,
 };
-use crate::{token_usage, usage_stats, Services};
+use crate::image_dimensions::{self, ProbeContext};
+use crate::{file_ops, token_usage, usage_stats, Services};
 
 /// Derive the cross-layer, content-free stream correlation value used only in
 /// diagnostics. The input is an existing wire `turnId` (or the assistant
@@ -159,12 +160,29 @@ pub(crate) const PROMPT_SUSPEND_INTERRUPT_PREFIX: &str =
 /// against this prefix so the contract cannot drift.
 pub(crate) const PROMPT_AUTH_REQUIRED_PREFIX: &str = "session/prompt: provider \"";
 
+/// The auth-specific marker of [`crate::provider_auth::not_authenticated_message`].
+/// The turn-start disabled-provider rejection
+/// ([`crate::agent_ops::ensure_provider_enabled`] labelled `session/prompt`,
+/// intent-hq/intent#5737) shares [`PROMPT_AUTH_REQUIRED_PREFIX`] but reads
+/// `… is not enabled …` and has NOT emitted the terminal pair, so the
+/// classifier requires this marker too.
+pub(crate) const PROMPT_AUTH_REQUIRED_MARKER: &str = ") is not authenticated";
+
 /// Whether a turn error is the auth-required `session/prompt` mapping from
-/// [`Services::run_prompt_turn`] (see [`PROMPT_AUTH_REQUIRED_PREFIX`]).
-/// Prefix-anchored on the `InvalidParams` payload — mid-string mentions and
-/// other `InvalidParams` shapes never classify.
+/// [`Services::run_prompt_turn`] (see [`PROMPT_AUTH_REQUIRED_PREFIX`] and
+/// [`PROMPT_AUTH_REQUIRED_MARKER`]). Prefix-anchored on the `InvalidParams`
+/// payload — mid-string mentions, the disabled-provider rejection, and other
+/// `InvalidParams` shapes never classify.
 pub(crate) fn prompt_auth_required_turn_error(err: &Error) -> bool {
-    matches!(err, Error::InvalidParams(msg) if msg.starts_with(PROMPT_AUTH_REQUIRED_PREFIX))
+    if let Error::ExecutionAuthorization { source, .. } = err {
+        return prompt_auth_required_turn_error(source);
+    }
+    matches!(
+        err,
+        Error::InvalidParams(msg)
+            if msg.starts_with(PROMPT_AUTH_REQUIRED_PREFIX)
+                && msg.contains(PROMPT_AUTH_REQUIRED_MARKER)
+    )
 }
 
 /// Prefix of the auth-required `session/load` mapping
@@ -179,6 +197,9 @@ pub(crate) const LOAD_AUTH_REQUIRED_PREFIX: &str = "session/load: provider \"";
 /// succeed while logged out — deferring the actionable login error to a
 /// later opaque prompt failure.
 pub(crate) fn load_auth_required_error(err: &Error) -> bool {
+    if let Error::ExecutionAuthorization { source, .. } = err {
+        return load_auth_required_error(source);
+    }
     matches!(err, Error::InvalidParams(msg) if msg.starts_with(LOAD_AUTH_REQUIRED_PREFIX))
 }
 
@@ -287,9 +308,10 @@ pub(crate) struct AcpSessionOpened {
 pub(crate) struct ThoughtLevelOption {
     /// The adapter's config id, sent as `configId`.
     pub config_id: String,
-    /// The value the adapter reported as current at session open — the
-    /// provider's own default, restored when the session's `reasoningEffort`
-    /// is cleared.
+    /// The provider default to restore when `reasoningEffort` is cleared.
+    /// Discovered at fresh session open; on resume the manager restores the
+    /// saved default (or the adapter's default sentinel), since the loaded
+    /// current value may be an explicit override. Empty when unknown.
     pub initial_value: String,
     /// The value the adapter is currently on (tracked across applications so
     /// an unchanged effort is never re-sent).
@@ -361,7 +383,26 @@ struct Transcript {
     /// whose arguments happen to be `{ code, summary }` keeps its own name
     /// and must never claim a `workspace_api` batch (intent-hq/intent#4491).
     identified_tool_calls: HashSet<String>,
+    /// Resolution context for the Markdown image dimension probe (§7.1 text
+    /// block `media` sidecar); `None` disables probing (unit drivers).
+    probe: Option<ProbeContext>,
+    /// Per-turn probe cache: Markdown `src` → header-only dimensions (`None`
+    /// = unresolvable), so a source repeated across blocks is probed once.
+    probe_cache: HashMap<String, Option<(u32, u32)>>,
+    /// `media` entries resolved for the PENDING text buffer so far (the union
+    /// [`flush_text`](Self::flush_text) stamps onto the block).
+    pending_media: BTreeMap<String, (u32, u32)>,
+    /// Byte offset into [`text`](Self::text) up to which completed image
+    /// references were already consumed (see `scan_image_refs`).
+    media_scan_pos: usize,
+    /// Image references examined for the pending buffer (cap, see
+    /// [`MAX_IMAGE_REFS_PER_BLOCK`]).
+    media_refs_seen: usize,
 }
+
+/// Cap on Markdown image references examined per text block — bounds both
+/// the header probes and the `media` sidecar size of one block.
+const MAX_IMAGE_REFS_PER_BLOCK: usize = 32;
 
 /// The block indices one [`Transcript::record_tool`] call materialized. The
 /// `agent:tool:call` event carries the ids derived from them (§7.1
@@ -392,13 +433,100 @@ impl Transcript {
             usage_cost: None,
             open_tool_calls: HashSet::new(),
             identified_tool_calls: HashSet::new(),
+            probe: None,
+            probe_cache: HashMap::new(),
+            pending_media: BTreeMap::new(),
+            media_scan_pos: 0,
+            media_refs_seen: 0,
         }
+    }
+
+    /// Enable the Markdown image dimension probe for this turn's text blocks.
+    #[must_use]
+    fn with_probe_context(mut self, probe: ProbeContext) -> Self {
+        self.probe = Some(probe);
+        self
+    }
+
+    /// Detect the image references the last chunk COMPLETED in the pending
+    /// assistant-text buffer, probe each (once per turn per `src`, cached),
+    /// and return the `media` entries newly resolved for the block — the
+    /// live delta's `media` field (§7.1) — or `None` when nothing new
+    /// resolved. The entries also join [`pending_media`](Self::pending_media),
+    /// the union [`flush_text`](Self::flush_text) persists, so live and
+    /// persisted `media` agree by construction. Reasoning (`thinking`)
+    /// buffers and probe-less transcripts never resolve anything.
+    fn probe_new_images(&mut self) -> Option<Map<String, Value>> {
+        let probe = self.probe.as_ref()?;
+        if self.pending_thought || self.media_refs_seen >= MAX_IMAGE_REFS_PER_BLOCK {
+            return None;
+        }
+        let refs = image_dimensions::scan_image_refs(&self.text, &mut self.media_scan_pos);
+        let mut new_entries = Map::new();
+        for src in refs {
+            if self.media_refs_seen >= MAX_IMAGE_REFS_PER_BLOCK {
+                break;
+            }
+            self.media_refs_seen += 1;
+            if self.pending_media.contains_key(&src) {
+                continue;
+            }
+            let dims = *self
+                .probe_cache
+                .entry(src.clone())
+                .or_insert_with(|| probe.probe(&src));
+            let Some((width, height)) = dims else {
+                continue;
+            };
+            self.pending_media.insert(src.clone(), (width, height));
+            new_entries.insert(src, json!({ "width": width, "height": height }));
+        }
+        (!new_entries.is_empty()).then_some(new_entries)
+    }
+
+    /// The `media` sidecar of the pending text buffer as a JSON object, or
+    /// `None` when nothing resolved (the key is then omitted).
+    fn pending_media_json(&self) -> Option<Value> {
+        if self.pending_media.is_empty() {
+            return None;
+        }
+        Some(Value::Object(
+            self.pending_media
+                .iter()
+                .map(|(src, (w, h))| (src.clone(), json!({ "width": w, "height": h })))
+                .collect(),
+        ))
     }
 
     /// Number of recorded tool calls still awaiting a terminal
     /// `tool_call_update` (see [`open_tool_calls`](Self::open_tool_calls)).
     fn open_tool_call_count(&self) -> usize {
         self.open_tool_calls.len()
+    }
+
+    /// Human-readable label of one open tool call — `"{id} ({name}: {title})"`
+    /// (title omitted when absent) — for the open-tool terminal provider-stall
+    /// error and attention reason (intent-hq/intent#5395). Deterministic
+    /// under several open calls (smallest id), `None` when none is open.
+    fn open_tool_call_label(&self) -> Option<String> {
+        let id = self.open_tool_calls.iter().min()?;
+        let block = self
+            .tool_use_index
+            .get(id)
+            .and_then(|&index| self.blocks.get(index));
+        let name = block
+            .and_then(|b| b.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown tool");
+        let title = block
+            .and_then(|b| b.get("input"))
+            .and_then(|input| input.get("_acpTitle"))
+            .and_then(Value::as_str)
+            .filter(|title| !title.is_empty());
+        Some(match title {
+            Some(title) => format!("{id} ({name}: {title})"),
+            None => format!("{id} ({name})"),
+        })
     }
 
     /// The stable block id for a 0-based block index (`{messageId}:{index}`).
@@ -442,16 +570,26 @@ impl Transcript {
         }
     }
 
+    /// Close the pending chunk buffer into a `text`/`thinking` block. A text
+    /// block carries the `media` sidecar — the union of every entry
+    /// [`probe_new_images`](Self::probe_new_images) resolved for it (§7.1),
+    /// omitted when nothing resolved — and the per-block scan state resets.
     fn flush_text(&mut self) {
         if !self.text.is_empty() {
             let index = self.blocks.len();
             let id = self.block_id(index);
             let block_type = self.pending_block_type();
-            self.blocks.push(
-                json!({ "type": block_type, "id": id, "text": std::mem::take(&mut self.text) }),
-            );
+            let mut block =
+                json!({ "type": block_type, "id": id, "text": std::mem::take(&mut self.text) });
+            if let Some(media) = self.pending_media_json() {
+                block["media"] = media;
+            }
+            self.blocks.push(block);
         }
         self.pending_thought = false;
+        self.pending_media.clear();
+        self.media_scan_pos = 0;
+        self.media_refs_seen = 0;
     }
 
     /// Record a tool call into the transcript (CS-0 D6). On first sight of a
@@ -712,11 +850,15 @@ impl Transcript {
         let mut blocks = self.blocks.clone();
         if !self.text.is_empty() {
             let index = blocks.len();
-            blocks.push(json!({
+            let mut block = json!({
                 "type": self.pending_block_type(),
                 "id": self.block_id(index),
                 "text": self.text.clone(),
-            }));
+            });
+            if let Some(media) = self.pending_media_json() {
+                block["media"] = media;
+            }
+            blocks.push(block);
         }
         blocks
     }
@@ -984,12 +1126,14 @@ pub(crate) fn silent_tail_suspect_ms() -> u64 {
 /// silent thinking phases some models run well past 90s while staying below
 /// the 8-minute #2669 silent-tail suspicion window
 /// ([`silent_tail_suspect_ms`]) and far below the 30-minute prompt idle
-/// timeout, which remains the only terminal mechanism — the stall event never
-/// cancels or fails the turn. Tool-call-aware (intent-hq/monorepo#3466):
-/// while ≥1 recorded tool call is still open the stalled advisory is fully
-/// suppressed regardless of silence duration — long tool runs are expected
-/// silence — with the 30-minute prompt idle timeout as the backstop for hung
-/// tools. Overridable via `INTENTD_STREAM_STALL_MS` (test seam).
+/// timeout. The stall event itself never cancels or fails the turn; the
+/// terminal mechanisms are [`provider_stall_terminal_ms`] (tool-free silence),
+/// [`open_tool_call_terminal_ms`] (silence under an open tool call) and the
+/// 30-minute prompt idle timeout. Tool-call-aware
+/// (intent-hq/monorepo#3466): while ≥1 recorded tool call is still open the
+/// advisory is suppressed — long tool runs are expected silence — but only up
+/// to [`open_tool_call_stall_ms`] (intent-hq/intent#5395), past which it fires
+/// regardless. Overridable via `INTENTD_STREAM_STALL_MS` (test seam).
 pub(crate) fn stream_stall_ms() -> u64 {
     if let Ok(val) = std::env::var("INTENTD_STREAM_STALL_MS") {
         if let Ok(ms) = val.parse::<u64>() {
@@ -997,6 +1141,78 @@ pub(crate) fn stream_stall_ms() -> u64 {
         }
     }
     5 * 60 * 1000
+}
+
+/// Silence ceiling for the tool-call-aware stall suppression
+/// (intent-hq/intent#5395): while ≥1 recorded tool call is open, the
+/// `stalled` advisory is suppressed only until the silence reaches this many
+/// ms — then it fires exactly as the tool-free [`stream_stall_ms`] advisory
+/// does. Before this ceiling existed, a `tool_call` that never received its
+/// terminal `tool_call_update` (the opencode/grok signature: the adapter
+/// loses the tool's completion and the prompt hangs) suppressed the advisory
+/// for the whole 30-minute idle window, so the FE showed a bare "Thinking"
+/// for the entire hang. 15 minutes sits well above legitimate long tool runs
+/// (the daemon's own `host.exec` cap is 10 minutes; agent harness shell
+/// tools cap at or below that) while still surfacing the hang midway through
+/// the idle window, and keeps the ordering stall < silent-tail-suspect <
+/// open-tool ceiling < terminal stall < open-tool terminal < 30-minute idle
+/// timeout. Advisory only — the open-tool terminal decision is
+/// [`open_tool_call_terminal_ms`]. Overridable via
+/// `INTENTD_OPEN_TOOL_CALL_STALL_MS` (test seam).
+pub(crate) fn open_tool_call_stall_ms() -> u64 {
+    if let Ok(val) = std::env::var("INTENTD_OPEN_TOOL_CALL_STALL_MS") {
+        if let Ok(ms) = val.parse::<u64>() {
+            return ms;
+        }
+    }
+    15 * 60 * 1000
+}
+
+/// Terminal provider-stall threshold (intent-hq/intent#5395): once a turn has
+/// gone this many ms with zero `session/update` traffic AND no recorded tool
+/// call open, [`run_prompt_turn`](Services::run_prompt_turn) ends the turn
+/// with [`AcpError::ProviderStall`] — a distinct terminal error naming the
+/// stall — and raises a blocker-style attention request on the agent (the
+/// intent-hq/intent#5419 shape), instead of leaving the silence to the
+/// 30-minute idle timeout's warn-and-continue redrive. A provider that is
+/// neither streaming nor running a tool for this long is hung; silence under
+/// an open tool call gets the longer [`open_tool_call_terminal_ms`] budget
+/// instead. 20 minutes is 4× the advisory threshold and 2.5× the #2669
+/// silent-tail suspicion window — past any observed healthy tool-free
+/// inference tail — and below the 30-minute idle timeout so it is reachable.
+/// Overridable via `INTENTD_PROVIDER_STALL_TERMINAL_MS` (test seam).
+pub(crate) fn provider_stall_terminal_ms() -> u64 {
+    if let Ok(val) = std::env::var("INTENTD_PROVIDER_STALL_TERMINAL_MS") {
+        if let Ok(ms) = val.parse::<u64>() {
+            return ms;
+        }
+    }
+    20 * 60 * 1000
+}
+
+/// Terminal provider-stall threshold for silence UNDER an open tool call
+/// (intent-hq/intent#5395): once a turn has gone this many ms with zero
+/// `session/update` traffic of any kind while ≥1 recorded tool call is still
+/// open, [`run_prompt_turn`](Services::run_prompt_turn) ends the turn with
+/// [`AcpError::ProviderStall`] naming the hung call and raises the same
+/// blocker-style attention request as the tool-free case. This is the exact
+/// reported signature: the adapter loses the terminal `tool_call_update`
+/// across an event-stream reconnect and the prompt hangs on an open call
+/// forever. Silence means NO update at all — any `tool_call_update` chunk or
+/// content resets the clock, so a legitimately long tool that emits anything
+/// is never killed; a tool call that is completely silent for 25 minutes is
+/// treated as hung (the daemon's own `host.exec` caps at 10 minutes, agent
+/// harness shell tools at or below that). 25 minutes sits above the 15-minute
+/// open-tool advisory and the 20-minute tool-free terminal threshold, and
+/// below the 30-minute idle timeout so it is reachable. Overridable via
+/// `INTENTD_OPEN_TOOL_CALL_TERMINAL_MS` (test seam).
+pub(crate) fn open_tool_call_terminal_ms() -> u64 {
+    if let Ok(val) = std::env::var("INTENTD_OPEN_TOOL_CALL_TERMINAL_MS") {
+        if let Ok(ms) = val.parse::<u64>() {
+            return ms;
+        }
+    }
+    25 * 60 * 1000
 }
 
 /// Per-agent consecutive suspected-truncation auto-redrive counter
@@ -1365,10 +1581,14 @@ fn is_acp_auth_required(e: &AcpError) -> bool {
 fn map_acp_session_error(context: &str, e: &AcpError, provider_id: &str) -> Error {
     if is_acp_auth_required(e) {
         crate::provider_auth::demote_auth_verdict(provider_id);
-        return Error::InvalidParams(format!(
-            "{context}: {}",
-            crate::provider_auth::not_authenticated_message(provider_id)
-        ));
+        return crate::host_execution::ai_authorization_error(
+            Error::InvalidParams(format!(
+                "{context}: {}",
+                crate::provider_auth::not_authenticated_message(provider_id)
+            )),
+            provider_id,
+            intent_core::execution::ExecutionAuthorizationReason::Rejected,
+        );
     }
     Error::Internal(format!("{context} failed: {e}"))
 }
@@ -1439,15 +1659,15 @@ fn model_select(options: &[SessionConfigOption]) -> Option<&session::SessionConf
         .or_else(|| select_by(&|o| matches!(o.category, Some(SessionConfigOptionCategory::Model))))
 }
 
-/// Discover the provider's reasoning-effort selector in a `session/new` /
-/// `session/load` response's `configOptions` (PROTOCOL §5.5): the first
+/// Discover the provider's reasoning-effort selector in a session-open or
+/// model-change response's `configOptions` (PROTOCOL §5.5): the first
 /// SELECT whose `category` is `thought_level`. Adapters pick their own ids
 /// (`effort` for claude-agent-acp, `reasoning_effort` for codex-acp), so the
 /// category is the only portable key; the discovered id is what the
 /// subsequent `session/set_config_option` must carry. `None` when the
 /// provider advertises no such option (every non-supporting provider, which
 /// then silently ignores the session's `reasoningEffort`).
-fn discover_thought_level(
+pub(crate) fn discover_thought_level(
     config_options: Option<&[SessionConfigOption]>,
 ) -> Option<ThoughtLevelOption> {
     let (option, select) = config_options?.iter().find_map(|o| match &o.kind {
@@ -1581,6 +1801,22 @@ fn build_session_meta(
 }
 
 impl Services {
+    /// The turn's Markdown image dimension probe context (§7.1 text block
+    /// `media`): the workspace root (or the agent's sandbox path, `CoW`
+    /// containment) plus the assets root, resolved ONCE per turn so the
+    /// per-chunk probe does no store reads.
+    async fn image_probe_context(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+    ) -> ProbeContext {
+        ProbeContext {
+            workspace_id: workspace_id.0.clone(),
+            workspace_root: file_ops::resolve_root(&self.store, workspace_id, Some(agent_id)).await,
+            assets_root: self.assets_root.clone(),
+        }
+    }
+
     /// Begin a live-turn slot for `agent_id` (CS-0 D5): seed it with the freshly
     /// minted assistant `message_id` and no blocks yet, returning a
     /// [`LiveTurnGuard`] that clears the slot on drop (abort-safe). The slot is
@@ -1939,28 +2175,35 @@ impl Services {
     ///
     /// Callers are exactly the three teardown paths (keep-alive interrupt,
     /// hard stop, graceful shutdown), which pin immediately BEFORE aborting
-    /// the worker and flush AFTER it. Deliberately returns NOTHING (monorepo#2110):
-    /// the flush re-reads the slot — which the pin guarantees is still there,
-    /// against both the [`LiveTurnGuard`] drop and a normal turn end (see
-    /// [`clear_unpinned_live_turn`](Self::clear_unpinned_live_turn)) — so a
-    /// `session/update` processed in the pin→abort gap is persisted rather than
-    /// trimmed off a stale pre-abort clone. A no-op when no turn is in flight;
-    /// the flush's `None` says so on its own. Pinning is idempotent and never
-    /// outlives the turn: the next turn's [`begin_live_turn`](Self::begin_live_turn)
-    /// replaces the slot wholesale.
-    pub(crate) fn pin_live_turn(&self, agent_id: &AgentId) {
-        if let Ok(mut slots) = self.live_turns.lock() {
-            if let Some(slot) = slots.get_mut(agent_id) {
-                slot.flush_pending = true;
-                // A fresh pin means a fresh flush attempt is in flight, so an
-                // earlier give-up no longer describes this slot: re-pinning a
-                // slot a previous flush abandoned (a later teardown, e.g.
-                // shutdown, reaching the same stranded content) gives it a real
-                // second chance at persisting, and must not leave it looking
-                // abandoned to `try_begin` in the meantime.
-                slot.flush_failed = false;
-            }
-        }
+    /// the worker and flush AFTER it. Deliberately returns no slot CONTENT
+    /// (monorepo#2110): the flush re-reads the slot — which the pin guarantees
+    /// is still there, against both the [`LiveTurnGuard`] drop and a normal
+    /// turn end (see [`clear_unpinned_live_turn`](Self::clear_unpinned_live_turn))
+    /// — so a `session/update` processed in the pin→abort gap is persisted
+    /// rather than trimmed off a stale pre-abort clone. Returns whether a slot
+    /// was there to pin: `false` means no turn is in flight at this instant
+    /// (the flush's `None` then agrees), which is the ONE read a caller may
+    /// base an "is there a turn to cut short?" decision on — an unpinned
+    /// `live_turn` snapshot taken before an await can be cleared by a normal
+    /// turn end in that await (intent-hq/intent#5380). Pinning is idempotent
+    /// and never outlives the turn: the next turn's
+    /// [`begin_live_turn`](Self::begin_live_turn) replaces the slot wholesale.
+    pub(crate) fn pin_live_turn(&self, agent_id: &AgentId) -> bool {
+        let Ok(mut slots) = self.live_turns.lock() else {
+            return false;
+        };
+        let Some(slot) = slots.get_mut(agent_id) else {
+            return false;
+        };
+        slot.flush_pending = true;
+        // A fresh pin means a fresh flush attempt is in flight, so an
+        // earlier give-up no longer describes this slot: re-pinning a
+        // slot a previous flush abandoned (a later teardown, e.g.
+        // shutdown, reaching the same stranded content) gives it a real
+        // second chance at persisting, and must not leave it looking
+        // abandoned to `try_begin` in the meantime.
+        slot.flush_failed = false;
+        true
     }
 
     /// Read just the text of the live-turn slot's `type: "text"` blocks
@@ -2801,7 +3044,8 @@ impl Services {
         // block ids `{messageId}:{index}` match the blocks ultimately persisted.
         let message_id = Uuid::now_v7().to_string();
         trace_stream_correlation_mapping(&message_id, turn_id);
-        let mut transcript = Transcript::new(message_id.clone());
+        let mut transcript = Transcript::new(message_id.clone())
+            .with_probe_context(self.image_probe_context(agent_id, workspace_id).await);
         // Turn wall-clock start, for the global usage-stats longest-run MAX.
         let turn_started = std::time::Instant::now();
         // Publish the in-flight turn so a `chat.subscribe` arriving mid-turn can
@@ -2869,27 +3113,75 @@ impl Services {
         // client-served handler may have side-effected on behalf of this
         // turn, so the attempt is no longer provably idempotent.
         let client_request_watermark = conn.client_request_seq();
+        // Post-output transient fetch failure (intent-hq/intent#5419): the
+        // attempt failed with a transient-shaped provider fetch error AFTER
+        // it streamed output or side-effected, so the #3007 in-place retry is
+        // off the table and the error falls through to terminal
+        // classification. Recorded here so the terminal path below can raise
+        // a blocker-style attention request on the dying agent — the death
+        // is otherwise discovered only later by a delegation-group watch or a
+        // coordinator reading the log. Deliberately NOT a redrive: whether a
+        // redrive is safe after partial output is not yet known. Carries the
+        // number of `session/prompt` dispatches actually made (the failing
+        // attempt's ordinal), captured at each fall-through site because
+        // `fetch_retry_attempt` is bumped BEFORE the backoff and so overcounts
+        // on the abandon-during-backoff path — plus which guard tripped
+        // (streamed output vs. a side-effecting client request), so the
+        // user-visible reason names the actual cause.
+        let mut post_output_transient_fetch_failure: Option<(u32, &'static str)> = None;
+        let retry_guard_cause = |any_update_received: bool| -> &'static str {
+            if any_update_received {
+                "streamed output"
+            } else {
+                "a side-effecting client request"
+            }
+        };
         // Mid-turn stall detection (intent-hq/monorepo#3402): a timer arm in
         // the select loop below samples `activity.idle_ms()` on a fraction of
-        // the stall threshold (clamped to 15s at the 5-minute default) and
+        // the smallest stall threshold (clamped to 15s at the defaults) and
         // emits ONE advisory `stalled` status event once the silence crosses
         // [`stream_stall_ms`].
         // The next received `session/update` emits `resumed` and re-arms the
         // detector, so a later second stall in the same turn reports again.
-        // Advisory only: turn resolution is untouched (the 30-minute prompt
-        // idle timeout stays the terminal backstop).
+        // The advisory itself never resolves the turn.
         //
         // Tool-call-aware (intent-hq/monorepo#3466): while ≥1 recorded tool
         // call is still open (`transcript.open_tool_call_count() > 0`), the
-        // arm emits nothing regardless of silence duration — long tool runs
-        // (builds, test suites) are legitimately silent between `tool_call`
-        // and the terminal `tool_call_update`. Once the last open call
-        // resolves, the standard threshold applies to subsequent silence
-        // (`activity` was touched by the resolving update, so the window
-        // restarts from that point). Hung tools stay covered by the
-        // 30-minute prompt idle timeout.
+        // advisory threshold is [`open_tool_call_stall_ms`] instead — long
+        // tool runs (builds, test suites) are legitimately silent between
+        // `tool_call` and the terminal `tool_call_update`, but not
+        // indefinitely (intent-hq/intent#5395: a `tool_call` whose completion
+        // the adapter lost used to suppress the advisory for the whole idle
+        // window). Once the last open call resolves, the standard threshold
+        // applies to subsequent silence (`activity` was touched by the
+        // resolving update, so the window restarts from that point).
+        //
+        // Terminal provider stall (intent-hq/intent#5395): silence past
+        // [`provider_stall_terminal_ms`] with NO tool call open — or past the
+        // longer [`open_tool_call_terminal_ms`] WITH a tool call open (the
+        // reported opencode/grok signature: the tool's completion was lost
+        // and the call hangs open forever) — ends the attempt with
+        // `AcpError::ProviderStall`. Silence is zero `session/update` traffic
+        // of any kind, so a long tool that keeps emitting `tool_call_update`
+        // chunks resets the clock and is never killed. Breaking out drops
+        // `prompt_fut` (its pending-map entry is cleaned by the transport's
+        // drop guard, exactly like the idle-timeout early return in
+        // `session::prompt`); the error then takes the ordinary terminal
+        // path below (Error status, `agent:failed`, blocker attention raise)
+        // and the worker's `handle_terminal_turn_failure` tears the hung
+        // child down so a retry spawns fresh.
         let stall_threshold_ms = stream_stall_ms();
-        let stall_check = Duration::from_millis((stall_threshold_ms / 6).clamp(10, 15_000));
+        let open_tool_stall_ms = open_tool_call_stall_ms();
+        let stall_terminal_ms = provider_stall_terminal_ms();
+        let open_tool_terminal_ms = open_tool_call_terminal_ms();
+        let stall_check = Duration::from_millis(
+            (stall_threshold_ms
+                .min(open_tool_stall_ms)
+                .min(stall_terminal_ms)
+                .min(open_tool_terminal_ms)
+                / 6)
+            .clamp(10, 15_000),
+        );
         let mut stall_emitted = false;
         let result = loop {
             let prompt_fut = session::prompt(conn, acp_session_id, prompt.clone(), &activity);
@@ -2909,17 +3201,43 @@ impl Services {
                         }
                         None => closed = true,
                     },
-                    () = tokio::time::sleep(stall_check), if !stall_emitted => {
+                    () = tokio::time::sleep(stall_check) => {
                         let silent_ms = activity.idle_ms();
-                        if silent_ms >= stall_threshold_ms && transcript.open_tool_call_count() == 0 {
+                        let tool_call_open = transcript.open_tool_call_count() > 0;
+                        let advisory_threshold_ms = if tool_call_open {
+                            open_tool_stall_ms
+                        } else {
+                            stall_threshold_ms
+                        };
+                        if !stall_emitted && silent_ms >= advisory_threshold_ms {
                             stall_emitted = true;
                             tracing::warn!(
                                 agent = %agent_id,
                                 silent_ms,
+                                tool_call_open,
                                 "mid-turn stream stall — no session/update past threshold (monorepo#3402)"
                             );
                             self.publish_stalled_status_event(workspace_id, agent_id, silent_ms)
                                 .await;
+                        }
+                        let terminal_ms = if tool_call_open {
+                            open_tool_terminal_ms
+                        } else {
+                            stall_terminal_ms
+                        };
+                        if silent_ms >= terminal_ms {
+                            let open_tool_call = transcript.open_tool_call_label();
+                            tracing::warn!(
+                                agent = %agent_id,
+                                silent_ms,
+                                terminal_ms,
+                                open_tool_call = open_tool_call.as_deref().unwrap_or("none"),
+                                "provider stall — no session/update past the terminal threshold; failing the turn (intent#5395)"
+                            );
+                            break Err(AcpError::ProviderStall {
+                                silent: Duration::from_millis(silent_ms),
+                                open_tool_call,
+                            });
                         }
                     }
                 }
@@ -2984,8 +3302,24 @@ impl Services {
                             attempt = fetch_retry_attempt,
                             "output arrived during retry backoff — abandoning retry (monorepo#3007)"
                         );
+                        // `fetch_retry_attempt` was already bumped for the
+                        // retry that is now abandoned: the failing attempt is
+                        // the one dispatched BEFORE that bump.
+                        post_output_transient_fetch_failure =
+                            Some((fetch_retry_attempt, retry_guard_cause(any_update_received)));
                         break attempt_result;
                     }
+                }
+                Err(e)
+                    if (any_update_received
+                        || conn.client_request_seq() != client_request_watermark)
+                        && intent_acp::is_transient_provider_fetch_failure(e) =>
+                {
+                    post_output_transient_fetch_failure = Some((
+                        fetch_retry_attempt + 1,
+                        retry_guard_cause(any_update_received),
+                    ));
+                    break attempt_result;
                 }
                 _ => break attempt_result,
             }
@@ -3376,7 +3710,7 @@ impl Services {
                 .lock()
                 .ok()
                 .and_then(|mut chain| chain.remove(agent_id));
-            let handle = tokio::spawn(async move {
+            let handle = intent_core::spawn_daemon(async move {
                 if let Some(prev) = prev {
                     let _ = prev.await;
                 }
@@ -3429,6 +3763,109 @@ impl Services {
                 chain.insert(agent_id.clone(), handle);
             }
         }
+        // Post-output transient fetch failure (intent-hq/intent#5419): the
+        // turn is about to fail terminally exactly as today (Error status,
+        // `agent:failed`, no redrive), but the death would otherwise only be
+        // discovered later by a delegation-group watch or a coordinator
+        // reading the log. Raise a blocker-style attention request on the
+        // dying agent through the SAME shared op `ws.agent.reportBlocker`
+        // uses — pending fields persisted on the session, linked task →
+        // `blocked`, immediate parent + watcher wakes — so whoever is waiting
+        // on the agent hears about it at once. Placed AFTER the assistant-row
+        // persist so the transcript notice lands after the streamed partial,
+        // and BEFORE the terminal persist/emits below: the agent is busy
+        // here, so the op parks the user-facing surfacing on the deferred
+        // registry and the `Err` arm's `flush_deferred_attention` surfaces it
+        // ahead of `agent:failed`. The attention columns are written by the
+        // narrow `set_attention_request` writer (not the full-row update the
+        // terminal persist uses), so the two writes cannot clobber each
+        // other; `park_attention_write` guards only the workspace-level
+        // `raise_attention` flag, which this path never touches. Best-effort:
+        // a failed raise logs and the terminal path proceeds unchanged.
+        if let Some((attempts, cause)) = post_output_transient_fetch_failure {
+            if let Err(e) = &result {
+                tracing::warn!(
+                    agent = %agent_id,
+                    error = %e,
+                    attempts,
+                    cause,
+                    "transient provider fetch failure after output/side effect — not retrying in place; attention raised (monorepo#5419)"
+                );
+                let reason = format!(
+                    "Turn failed with a transient provider fetch failure after {cause} \
+                     (attempt {attempts} of {}; error class: transient provider fetch failure). \
+                     The in-place retry only applies to attempts with no streamed output and no \
+                     side-effecting client request, so the turn was not retried and the agent is \
+                     stopping with status error. Provider error: {e}",
+                    MAX_TRANSIENT_PROMPT_FETCH_RETRIES + 1
+                );
+                if let Err(raise_err) = self
+                    .agent_request_attention_op(
+                        workspace_id.clone(),
+                        "blocker".to_string(),
+                        reason,
+                        Some(agent_id.clone()),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        agent = %agent_id,
+                        error = %raise_err,
+                        "failed to raise attention for the post-output transient fetch failure (monorepo#5419)"
+                    );
+                }
+            }
+        }
+        // Terminal provider stall (intent-hq/intent#5395): the select loop
+        // above ended the attempt because the provider went silent past
+        // [`provider_stall_terminal_ms`] with no tool call in flight, or past
+        // [`open_tool_call_terminal_ms`] with a tool call hung open. Same
+        // terminal path and same blocker-style attention raise as the #5419
+        // block above (ordering, deferred flush, and best-effort semantics
+        // identical), so the parent / watchers / user learn about the hang at
+        // once instead of after an hour of "Thinking".
+        if let Err(AcpError::ProviderStall {
+            silent,
+            open_tool_call,
+        }) = &result
+        {
+            let reason = match open_tool_call {
+                Some(label) => format!(
+                    "Turn ended after a provider stall: no session/update from the provider for \
+                     {silent:?} with tool call {label} still open (open-tool terminal threshold \
+                     {:?}; error class: provider stall). The tool call never reported completion \
+                     and emitted nothing for the whole window, so the turn was failed instead of \
+                     waiting for the idle timeout; the agent is stopping with status error and its \
+                     provider process is restarted on the next turn. Retry the turn to continue.",
+                    Duration::from_millis(open_tool_terminal_ms),
+                ),
+                None => format!(
+                    "Turn ended after a provider stall: no session/update from the provider for \
+                     {silent:?} with no tool call in flight (terminal threshold {:?}; error class: \
+                     provider stall). The provider is neither streaming nor running a tool, so the \
+                     turn was failed instead of waiting for the idle timeout; the agent is stopping \
+                     with status error and its provider process is restarted on the next turn. Retry \
+                     the turn to continue.",
+                    Duration::from_millis(stall_terminal_ms),
+                ),
+            };
+            if let Err(raise_err) = self
+                .agent_request_attention_op(
+                    workspace_id.clone(),
+                    "blocker".to_string(),
+                    reason,
+                    Some(agent_id.clone()),
+                )
+                .await
+            {
+                tracing::warn!(
+                    agent = %agent_id,
+                    error = %raise_err,
+                    "failed to raise attention for the provider stall (intent#5395)"
+                );
+            }
+        }
+
         // Durable-before-observable for the streaming terminal-failure path
         // (monorepo#2050): an ordinary mid-turn `session/prompt failed:` error
         // is terminal, and this function emits its own terminal
@@ -3455,7 +3892,7 @@ impl Services {
         // fast at the create/delegate gate instead of dying on their first
         // turn. Falls back to the opaque wrapper when the agent's provider
         // cannot be resolved from the session row.
-        let prompt_auth_message = match &result {
+        let prompt_auth_error = match &result {
             Err(e)
                 if !pre_output_transport_failure
                     && !prompt_idle_timeout
@@ -3472,12 +3909,18 @@ impl Services {
                     )
                     .map(|provider_id| {
                         crate::provider_auth::demote_auth_verdict(&provider_id);
-                        format!(
-                            "session/prompt: {}",
-                            self.agent_manager().map_or_else(
-                                || crate::provider_auth::not_authenticated_message(&provider_id),
-                                |manager| manager.provider_auth_message(&provider_id, agent_id),
-                            )
+                        crate::host_execution::ai_authorization_error(
+                            Error::InvalidParams(format!(
+                                "session/prompt: {}",
+                                self.agent_manager().map_or_else(
+                                    || crate::provider_auth::not_authenticated_message(
+                                        &provider_id
+                                    ),
+                                    |manager| manager.provider_auth_message(&provider_id, agent_id),
+                                )
+                            )),
+                            &provider_id,
+                            intent_core::execution::ExecutionAuthorizationReason::Rejected,
                         )
                     }),
                     Err(e) => {
@@ -3518,11 +3961,9 @@ impl Services {
         };
         if let Err(e) = &result {
             if !pre_output_transport_failure && !prompt_idle_timeout {
-                let wrapped = match prompt_auth_message.as_deref() {
-                    Some(msg) => Error::InvalidParams(msg.to_string()),
-                    None => Error::Internal(format!("session/prompt failed: {e}")),
-                };
-                if !crate::agent_manager::prompt_cancellation_error(&wrapped) {
+                let fallback = Error::Internal(format!("session/prompt failed: {e}"));
+                let wrapped = prompt_auth_error.as_ref().unwrap_or(&fallback);
+                if !crate::agent_manager::prompt_cancellation_error(wrapped) {
                     let persist = crate::agent_manager::persist_terminal_error_status_via_services(
                         self,
                         agent_id,
@@ -3673,6 +4114,12 @@ impl Services {
                 if let Ok(session) = self.store.get_agent_session(agent_id).await {
                     data["agentName"] = Value::String(session.name);
                     data["isBackground"] = Value::Bool(session.is_background);
+                    // Mute hint: present only when true (absent ≠ false, like
+                    // `workspaceArchived`) so notification clients stay quiet
+                    // for a muted agent without a follow-up read.
+                    if session.notifications_muted {
+                        data["notificationsMuted"] = Value::Bool(true);
+                    }
                     if let Some(report) = session.completion_report {
                         data["completionReport"] = Value::String(report.clone());
                         data["report"] = Value::String(report);
@@ -3756,8 +4203,20 @@ impl Services {
                 // Auth-required mapping (intent-hq/intent#3941): the event
                 // carries the same actionable message as the persisted
                 // stop_reason and returned error, not the raw adapter error.
-                let error_text = prompt_auth_message.clone().unwrap_or_else(|| e.to_string());
+                let error_text = prompt_auth_error.as_ref().map_or_else(
+                    || e.to_string(),
+                    |error| match error {
+                        Error::InvalidParams(message) => message.clone(),
+                        error => error.to_string(),
+                    },
+                );
                 let mut data = json!({ "agentId": agent_id.0, "error": error_text });
+                if let Some(auth) = prompt_auth_error
+                    .as_ref()
+                    .and_then(Error::execution_authorization)
+                {
+                    data["executionAuthorization"] = json!(auth);
+                }
                 if let Some(tid) = turn_id {
                     data["turnId"] = json!(tid);
                 }
@@ -3787,10 +4246,10 @@ impl Services {
                 Error::Internal(format!(
                     "session/prompt failed: {e} {PROMPT_IDLE_TIMEOUT_STREAMED_SUFFIX}"
                 ))
-            } else if let Some(msg) = prompt_auth_message {
+            } else if let Some(error) = prompt_auth_error {
                 // Auth-required failure: identical message to the persisted
                 // stop_reason above (intent-hq/intent#3941).
-                Error::InvalidParams(msg)
+                error
             } else {
                 Error::Internal(format!("session/prompt failed: {e}"))
             }
@@ -3901,7 +4360,7 @@ impl Services {
                 // against a racing wake sweep / `resolveInterrupted`.
                 let services = self.clone();
                 let debounce = wake_resume_self_heal_debounce();
-                tokio::spawn(async move {
+                intent_core::spawn_daemon(async move {
                     tokio::time::sleep(debounce).await;
                     services.resume_suspend_interrupted_agents().await;
                 });
@@ -3999,7 +4458,8 @@ impl Services {
     ) -> HarnessWakeOutcome {
         let turn_started = Instant::now();
         let message_id = Uuid::now_v7().to_string();
-        let mut transcript = Transcript::new(message_id.clone());
+        let mut transcript = Transcript::new(message_id.clone())
+            .with_probe_context(self.image_probe_context(agent_id, workspace_id).await);
         // Live-turn slot + abort-safe guard, same contract as a prompt turn:
         // a `chat.subscribe` arriving mid-wake reconstructs the partial
         // message, and an abort (preempting prompt / stop) clears the slot.
@@ -4301,6 +4761,9 @@ impl Services {
         if let Ok(session) = self.store.get_agent_session(agent_id).await {
             data["agentName"] = Value::String(session.name);
             data["isBackground"] = Value::Bool(session.is_background);
+            if session.notifications_muted {
+                data["notificationsMuted"] = Value::Bool(true);
+            }
             if let Some(report) = session.completion_report {
                 data["completionReport"] = Value::String(report.clone());
                 data["report"] = Value::String(report);
@@ -4768,35 +5231,38 @@ impl Services {
                 // thought↔text switch or a non-text block starts a new one.
                 // Thought chunks flush as `thinking` blocks (Zed's model) and
                 // ride the same `chat:stream:delta` shape.
-                let (block_index, block_type) = if let Some(t) = &text {
+                // A text chunk that COMPLETES a Markdown image reference
+                // also carries the reference's header-probed dimensions as
+                // `media` (§7.1 sidecar) — only the entries this chunk
+                // resolved; the persisted block carries the union.
+                let (block_index, block_type, media) = if let Some(t) = &text {
                     let index = transcript.push_chunk(t, thought);
                     let block_type = if thought { "thinking" } else { "text" };
-                    (index, block_type.to_string())
+                    (index, block_type.to_string(), transcript.probe_new_images())
                 } else {
                     let block_type = content
                         .get("type")
                         .and_then(Value::as_str)
                         .unwrap_or("unknown")
                         .to_string();
-                    (transcript.push_block(content.clone()), block_type)
+                    (transcript.push_block(content.clone()), block_type, None)
                 };
                 // Internal chat-channel delta (§7.1): the full content-bearing
                 // payload the per-agent `chat.subscribe` forwarder accumulates
                 // into block deltas (D4 block identity kept).
-                self.publish_agent_event(
-                    workspace_id,
-                    agent_id,
-                    CHAT_STREAM_DELTA,
-                    json!({
-                        "agentId": agent_id.0,
-                        "content": content,
-                        "messageId": message_id,
-                        "blockIndex": block_index,
-                        "blockId": transcript.block_id(block_index),
-                        "blockType": block_type,
-                    }),
-                )
-                .await;
+                let mut delta = json!({
+                    "agentId": agent_id.0,
+                    "content": content,
+                    "messageId": message_id,
+                    "blockIndex": block_index,
+                    "blockId": transcript.block_id(block_index),
+                    "blockType": block_type,
+                });
+                if let Some(media) = media {
+                    delta["media"] = Value::Object(media);
+                }
+                self.publish_agent_event(workspace_id, agent_id, CHAT_STREAM_DELTA, delta)
+                    .await;
                 // External activity signal (§7): leading-edge throttled per
                 // agent — the first chunk of a turn emits immediately
                 // (preserves the FE's pre-first-token status-hint clearing

@@ -861,7 +861,7 @@ async fn run_table(method: &str, rows: Vec<Row>) {
             row.name
         );
         let name = row.name;
-        if let Err(join) = tokio::spawn(run_row(row)).await {
+        if let Err(join) = intent_core::spawn_daemon(run_row(row)).await {
             let payload = join.into_panic();
             let msg = payload
                 .downcast_ref::<String>()
@@ -879,37 +879,37 @@ async fn run_table(method: &str, rows: Vec<Row>) {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn note_set_content_precedence_table() {
     run_table(SET_CONTENT, set_content_rows()).await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn note_add_precedence_table() {
     run_table(NOTE_ADD, surgical_rows(NOTE_ADD)).await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn note_edit_precedence_table() {
     run_table(NOTE_EDIT, surgical_rows(NOTE_EDIT)).await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn note_edit_lines_precedence_table() {
     run_table(NOTE_EDIT_LINES, surgical_rows(NOTE_EDIT_LINES)).await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn task_update_status_precedence_table() {
     run_table(TASK_UPDATE_STATUS, surgical_rows(TASK_UPDATE_STATUS)).await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn task_update_precedence_table() {
     run_table(TASK_UPDATE, surgical_rows(TASK_UPDATE)).await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn task_update_note_status_precedence_table() {
     run_table(TASK_UPDATE_NOTE_STATUS, task_update_note_status_rows()).await;
 }

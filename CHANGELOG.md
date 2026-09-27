@@ -2,6 +2,561 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.112] - 2026-09-27
+
+### 🚀 Features
+
+- Advertise authoritative legacy provider aliases ([#2132](https://github.com/intent-hq/intentd/pull/2132))
+
+### 🐛 Bug Fixes
+
+- Keep redirected diagnostic warnings plain ([#2130](https://github.com/intent-hq/intentd/pull/2130))
+- Isolate device-auth and shutdown WSS fixtures ([#2131](https://github.com/intent-hq/intentd/pull/2131))
+- *(test)* Isolate tempdir retention assertions ([#5929](https://github.com/intent-hq/intentd/pull/5929)) ([#2133](https://github.com/intent-hq/intentd/pull/2133))
+- Publish specialist WSS fixtures atomically ([#2134](https://github.com/intent-hq/intentd/pull/2134))
+
+
+## [0.9.111] - 2026-09-26
+
+### 🚀 Features
+
+- Persist confirmed effort changes at turn start ([#2136](https://github.com/intent-hq/intentd/pull/2136))
+
+
+## [0.9.110] - 2026-09-25
+
+### 🐛 Bug Fixes
+
+- Apply initial-agent reasoning effort before first turn ([#5948](https://github.com/intent-hq/intentd/pull/5948)) ([#2125](https://github.com/intent-hq/intentd/pull/2125))
+
+
+## [0.9.109] - 2026-09-25
+
+### 🐛 Bug Fixes
+
+- Keep workspace deletion responsive with bounded cleanup ([#2121](https://github.com/intent-hq/intentd/pull/2121))
+- Keep PR check observations complete and stable ([#2123](https://github.com/intent-hq/intentd/pull/2123))
+
+
+## [0.9.108] - 2026-09-25
+
+### 🚀 Features
+
+- Enable peer agents by default ([#2118](https://github.com/intent-hq/intentd/pull/2118))
+- Report effective Codex runtime and catalogs in doctor ([#2117](https://github.com/intent-hq/intentd/pull/2117))
+
+### 🐛 Bug Fixes
+
+- Use the enabled GitLab OAuth application by default ([#2120](https://github.com/intent-hq/intentd/pull/2120))
+- Honor specialist provider pins in create and previews ([#2116](https://github.com/intent-hq/intentd/pull/2116))
+- *(settings)* Validate config before committing writes ([#2119](https://github.com/intent-hq/intentd/pull/2119))
+
+### 🧪 Testing
+
+- Assert sender-attributed peer kickoff over WSS ([#2115](https://github.com/intent-hq/intentd/pull/2115))
+
+
+## [0.9.107] - 2026-09-25
+
+### 🐛 Bug Fixes
+
+- *(scripts)* Restore previously running auto-start services at boot ([#2102](https://github.com/intent-hq/intentd/pull/2102))
+- *(test)* Canonicalize npx isolation launch roots ([#5812](https://github.com/intent-hq/intentd/pull/5812)) ([#2101](https://github.com/intent-hq/intentd/pull/2101))
+- Disable Codex built-in subagents ([#2108](https://github.com/intent-hq/intentd/pull/2108))
+- Avoid false GitHub quota recovery ([#2110](https://github.com/intent-hq/intentd/pull/2110))
+- Preserve Windows Pi session paths with published adapter ([#2103](https://github.com/intent-hq/intentd/pull/2103))
+
+### 🧪 Testing
+
+- Generate transfer selection contract from public imports ([#2109](https://github.com/intent-hq/intentd/pull/2109))
+
+
+## [0.9.106] - 2026-09-24
+
+### 🐛 Bug Fixes
+
+- *(identity)* Expose invite requirements and harden forge credentials ([#2042](https://github.com/intent-hq/intentd/pull/2042))
+
+
+## [0.9.105] - 2026-09-24
+
+### 🚀 Features
+
+- GitLab forge connection (device grant + PAT) behind sourceControl.* auth RPCs ([#2024](https://github.com/intent-hq/intentd/pull/2024))
+- *(store)* Key principals and invite pins by a provider-neutral identity triple ([#2036](https://github.com/intent-hq/intentd/pull/2036))
+- *(sourcecontrol)* Add GitLab snippet identity proofs ([#2037](https://github.com/intent-hq/intentd/pull/2037))
+
+### 🐛 Bug Fixes
+
+- Update Codex ACP and automate reviewed pin bumps ([#2105](https://github.com/intent-hq/intentd/pull/2105))
+- Preserve agent selections across workspace transfers ([#2099](https://github.com/intent-hq/intentd/pull/2099))
+- Reflect workspace branch renames in the UI ([#2053](https://github.com/intent-hq/intentd/pull/2053))
+- Reserve discussion requests for stalled assigned work ([#2107](https://github.com/intent-hq/intentd/pull/2107))
+
+
+## [0.9.104] - 2026-09-23
+
+### ⚙️ Miscellaneous Tasks
+
+- Bump pinned claude-agent-acp to 0.81.1 ([#2097](https://github.com/intent-hq/intentd/pull/2097))
+
+
+## [0.9.103] - 2026-09-23
+
+### 🐛 Bug Fixes
+
+- *(providers)* Pair npx with the detected node and reject stale npm-6 npx ([#2090](https://github.com/intent-hq/intentd/pull/2090))
+
+
+## [0.9.102] - 2026-09-23
+
+### 🐛 Bug Fixes
+
+- Isolate npx provider startup from workspace package configuration ([#2092](https://github.com/intent-hq/intentd/pull/2092))
+
+
+## [0.9.101] - 2026-09-23
+
+### 🐛 Bug Fixes
+
+- *(agent)* Re-home sessions on a disabled provider at turn start ([#2091](https://github.com/intent-hq/intentd/pull/2091))
+
+
+## [0.9.100] - 2026-09-22
+
+### 🐛 Bug Fixes
+
+- Default Codex ACP to full access ([#2088](https://github.com/intent-hq/intentd/pull/2088))
+
+
+## [0.9.99] - 2026-09-22
+
+### 🐛 Bug Fixes
+
+- *(agent)* Reject self-targeted ws.agent.send / sendToTask ([#2084](https://github.com/intent-hq/intentd/pull/2084))
+
+### 🧪 Testing
+
+- *(intentd)* Mid tool-call interrupt settles and drains the queue ([#5669](https://github.com/intent-hq/intentd/pull/5669)) ([#2086](https://github.com/intent-hq/intentd/pull/2086))
+
+
+## [0.9.98] - 2026-09-22
+
+### 🚀 Features
+
+- *(github)* Expose flowId on connect and scope cancelAuth to it ([#2082](https://github.com/intent-hq/intentd/pull/2082))
+
+
+## [0.9.97] - 2026-09-22
+
+### 🚀 Features
+
+- *(workspace)* Surface setup-script state to agents ([#2075](https://github.com/intent-hq/intentd/pull/2075))
+
+### 🐛 Bug Fixes
+
+- *(pr)* Derive the pool-path pr_queued from a persisted isInMergeQueue ([#2079](https://github.com/intent-hq/intentd/pull/2079))
+
+### 🔧 Refactor
+
+- Share source-lint scaffolding across *_lint.rs tests ([#2078](https://github.com/intent-hq/intentd/pull/2078))
+
+### 🧪 Testing
+
+- *(agent)* Table-driven queue visibility contract and egress lint ([#2081](https://github.com/intent-hq/intentd/pull/2081))
+- *(e2e)* Make uds_integration and the WSS tool-result-ids suite hermetic to host GitHub identity ([#2077](https://github.com/intent-hq/intentd/pull/2077))
+- *(e2e)* Decouple spawn-retry WSS suite from host Node startup latency ([#2080](https://github.com/intent-hq/intentd/pull/2080))
+
+
+## [0.9.96] - 2026-09-22
+
+### 🚀 Features
+
+- *(agent)* Hide other members' queued chats from guests in shared workspaces ([#2068](https://github.com/intent-hq/intentd/pull/2068))
+- *(agents)* Serve delegatedCounts.orphaned and orphanedOnly on agent.list ([#2072](https://github.com/intent-hq/intentd/pull/2072))
+- Image dimension sidecar (protocol 10.7) ([#2069](https://github.com/intent-hq/intentd/pull/2069))
+
+### 🐛 Bug Fixes
+
+- *(github)* Surface Error::RateLimited with data.code "rate-limited" ([#2071](https://github.com/intent-hq/intentd/pull/2071))
+- *(archive)* One consolidated post-unarchive notice for cancelled hooks and PR monitors ([#2074](https://github.com/intent-hq/intentd/pull/2074))
+- *(pr-monitor)* Replace PrMonitorFetchCache with a shared PrCache every PR read can use ([#2064](https://github.com/intent-hq/intentd/pull/2064))
+
+### ⚡ Performance
+
+- *(agent)* Batch the agent.listActive session lookup into one statement ([#2070](https://github.com/intent-hq/intentd/pull/2070))
+
+### 🧪 Testing
+
+- *(core)* Source lint for re-implemented running-turn status rule ([#2073](https://github.com/intent-hq/intentd/pull/2073))
+
+
+## [0.9.95] - 2026-09-22
+
+### 🐛 Bug Fixes
+
+- *(pr-monitor)* Register and defer the baseline under a GitHub rate limit ([#2060](https://github.com/intent-hq/intentd/pull/2060))
+
+### 🧪 Testing
+
+- *(intentd)* Stable conversation fingerprint for WSS E2E no-wake assertions ([#2062](https://github.com/intent-hq/intentd/pull/2062))
+
+
+## [0.9.94] - 2026-09-22
+
+### 🚀 Features
+
+- Require the tunnel for invite links and emit tc only ([#2057](https://github.com/intent-hq/intentd/pull/2057))
+
+### 🐛 Bug Fixes
+
+- *(scripts)* Document and test the startup-failure completion path; gate the non-UTF-8 ref test to Linux ([#2054](https://github.com/intent-hq/intentd/pull/2054))
+- *(notes)* Note.update / note.updateMetadata return the committed revision ([#2056](https://github.com/intent-hq/intentd/pull/2056))
+
+### 🔧 Refactor
+
+- *(core)* Single source for the running-turn status rule ([#2058](https://github.com/intent-hq/intentd/pull/2058))
+
+
+## [0.9.93] - 2026-09-21
+
+### 🚀 Features
+
+- *(acp)* Spawn agent children at reduced scheduling priority ([#2049](https://github.com/intent-hq/intentd/pull/2049))
+
+
+## [0.9.92] - 2026-09-21
+
+### 🚀 Features
+
+- *(agent)* Serve delegatedCounts on agent.list ([#2051](https://github.com/intent-hq/intentd/pull/2051))
+
+### 🐛 Bug Fixes
+
+- *(identity)* Keep a concurrent account switch over a stale background refresh ([#2050](https://github.com/intent-hq/intentd/pull/2050))
+- *(principal)* Refresh primary GitHub identity from principal.list and at startup ([#2047](https://github.com/intent-hq/intentd/pull/2047))
+
+
+## [0.9.91] - 2026-09-21
+
+### 🐛 Bug Fixes
+
+- *(identity)* Refresh the primary identity from workspace.members.list ([#2044](https://github.com/intent-hq/intentd/pull/2044))
+
+### 📚 Documentation
+
+- *(core)* Note lastToolUse flag presence in fit_agent_list_frame rustdoc ([#2043](https://github.com/intent-hq/intentd/pull/2043))
+
+
+## [0.9.90] - 2026-09-21
+
+### 🐛 Bug Fixes
+
+- *(agent)* Fit agent.list rows to a response-level frame budget ([#2039](https://github.com/intent-hq/intentd/pull/2039))
+
+
+## [0.9.89] - 2026-09-21
+
+### 🚀 Features
+
+- *(invite)* Invite.inspect and invite.accept for a returning guest on /invite ([#1963](https://github.com/intent-hq/intentd/pull/1963))
+- *(github)* Gist scope + github.identityProof.create/delete ([#1965](https://github.com/intent-hq/intentd/pull/1965))
+- *(invite)* Invite.challenge and invite.prove (nonce + gist identity proof) on /invite ([#1967](https://github.com/intent-hq/intentd/pull/1967))
+- *(multiplayer)* Make unpinned invite links reusable until expiry or revocation ([#1988](https://github.com/intent-hq/intentd/pull/1988))
+- *(multiplayer)* Refuse agent creation and delegation for collaborators ([#1998](https://github.com/intent-hq/intentd/pull/1998))
+- *(multiplayer)* Prepend a sender preamble to collaborator messages ([#1987](https://github.com/intent-hq/intentd/pull/1987))
+- *(principal)* Principal.list — owner-only roster of credentialed guests ([#2023](https://github.com/intent-hq/intentd/pull/2023))
+- *(workspace)* Workspace.members.add — direct member add with live guest delivery ([#2025](https://github.com/intent-hq/intentd/pull/2025))
+
+### 🐛 Bug Fixes
+
+- *(store)* Treat write-pool acquire timeouts as transient in the retry helpers ([#2030](https://github.com/intent-hq/intentd/pull/2030))
+- *(invite)* Refuse the host owner's own account joining as a guest ([#1986](https://github.com/intent-hq/intentd/pull/1986))
+
+### 🧪 Testing
+
+- *(transport)* Bound tunnel backpressure test waits by wall clock, not yield counts ([#2033](https://github.com/intent-hq/intentd/pull/2033))
+- *(services)* Presence deferred-flush test waits on the observable flush ([#2031](https://github.com/intent-hq/intentd/pull/2031))
+
+### ⚙️ Miscellaneous Tasks
+
+- *(invite)* Remove the host-side device flow (invite.redeem) ([#1969](https://github.com/intent-hq/intentd/pull/1969))
+
+
+## [0.9.88] - 2026-09-20
+
+### 🚀 Features
+
+- *(github)* Add github.users.search RPC ([#1912](https://github.com/intent-hq/intentd/pull/1912))
+- *(invite)* Persist the invite secret and return url from workspace.invite.list ([#1913](https://github.com/intent-hq/intentd/pull/1913))
+- *(sharing)* Enforce guest membership and guest connection caps ([#1917](https://github.com/intent-hq/intentd/pull/1917))
+- *(sharing)* Hot-reload guest connection caps ([#1918](https://github.com/intent-hq/intentd/pull/1918))
+- *(sharing)* Allowlist system.status for collaborator connections ([#1934](https://github.com/intent-hq/intentd/pull/1934))
+- Agent memory fields on system.status and a daemon-wide agent.memoryUsage RPC ([#2026](https://github.com/intent-hq/intentd/pull/2026))
+- *(invite)* Return host identity in the invite.redeem phase-1 result ([#1955](https://github.com/intent-hq/intentd/pull/1955))
+
+
+## [0.9.87] - 2026-09-20
+
+### 🚀 Features
+
+- *(transport)* Tunnel CREDIT frame and per-stream daemon→client credit window ([#2022](https://github.com/intent-hq/intentd/pull/2022))
+
+
+## [0.9.86] - 2026-09-20
+
+### 🚀 Features
+
+- Principals - caller binding, principal.me and role on workspace payloads ([#1868](https://github.com/intent-hq/intentd/pull/1868))
+- Principal attribution on human chat messages ([#1869](https://github.com/intent-hq/intentd/pull/1869))
+- Membership and capability matrix enforcement in the service layer ([#1870](https://github.com/intent-hq/intentd/pull/1870))
+- Invite links and identity-only device-flow join ([#1872](https://github.com/intent-hq/intentd/pull/1872))
+- *(presence)* Workspace presence and per-note caret channel ([#1887](https://github.com/intent-hq/intentd/pull/1887))
+
+### 🐛 Bug Fixes
+
+- *(transport)* Keep tunnel inbound draining while a large reply waits on a lagging client ([#2017](https://github.com/intent-hq/intentd/pull/2017))
+- *(services)* Bound one-shot ACP response sends by the running phase timeout ([#2016](https://github.com/intent-hq/intentd/pull/2016))
+- *(services)* Fail closed on an unbound caller at every capability gate ([#1877](https://github.com/intent-hq/intentd/pull/1877))
+
+### 🧪 Testing
+
+- *(multiplayer)* Emit-path taxonomy golden and collaborator e2e (w3 follow-up) ([#1871](https://github.com/intent-hq/intentd/pull/1871))
+
+### ⚙️ Miscellaneous Tasks
+
+- Arm INTENTD_ASSERT_BOUND_CALLER in the coverage jobs ([#2020](https://github.com/intent-hq/intentd/pull/2020))
+
+
+## [0.9.85] - 2026-09-20
+
+### 🐛 Bug Fixes
+
+- *(services)* Bound auto-commit generation and cool down after timeouts ([#2009](https://github.com/intent-hq/intentd/pull/2009))
+- *(agent)* Surface and end mid-turn provider stalls (intent#5395) ([#2007](https://github.com/intent-hq/intentd/pull/2007))
+- Raise tokio worker stack size to 8 MiB for the daemon runtime ([#2011](https://github.com/intent-hq/intentd/pull/2011))
+
+
+## [0.9.84] - 2026-09-19
+
+### 🧪 Testing
+
+- *(events)* Drain FSEvents replay before the negative git-metadata assertion on macOS ([#2008](https://github.com/intent-hq/intentd/pull/2008))
+
+
+## [0.9.83] - 2026-09-19
+
+### 🚀 Features
+
+- *(rpc)* Slim agent.list / workspace.list rows, scope filter, push-side projection ([#2001](https://github.com/intent-hq/intentd/pull/2001))
+
+### 🐛 Bug Fixes
+
+- *(agent_session)* Raise blocker attention on post-output transient fetch failure ([#2004](https://github.com/intent-hq/intentd/pull/2004))
+
+
+## [0.9.82] - 2026-09-19
+
+### 🐛 Bug Fixes
+
+- *(services)* Serialize same-key first-use in with_idempotency ([#2000](https://github.com/intent-hq/intentd/pull/2000))
+
+
+## [0.9.81] - 2026-09-19
+
+### 🚀 Features
+
+- Support exact-version remote daemon updates ([#1941](https://github.com/intent-hq/intentd/pull/1941))
+
+
+## [0.9.80] - 2026-09-19
+
+### 🚀 Features
+
+- *(acp)* Add ws.workspace.applyProposal binding for agent-applied sibling proposals ([#1995](https://github.com/intent-hq/intentd/pull/1995))
+
+### 🐛 Bug Fixes
+
+- *(acp)* Make queued ws.agent.send durable past the eval budget ([#1994](https://github.com/intent-hq/intentd/pull/1994))
+- *(rpc_profile)* Budget agent.sendQueuedMessageNow / agent.resolveProposal on the compound tier ([#1993](https://github.com/intent-hq/intentd/pull/1993))
+
+### 🧪 Testing
+
+- *(acp)* Egress registry + contract test for AGENT_HIDDEN_FIELDS ([#1996](https://github.com/intent-hq/intentd/pull/1996))
+
+
+## [0.9.79] - 2026-09-18
+
+### 🚀 Features
+
+- *(agent)* Per-agent notificationsMuted flag with workspace rollup exclusion ([#1984](https://github.com/intent-hq/intentd/pull/1984))
+
+
+## [0.9.78] - 2026-09-18
+
+### 🐛 Bug Fixes
+
+- *(transport)* Drop Chief workspace from workspace subscription deltas ([#1989](https://github.com/intent-hq/intentd/pull/1989))
+- *(agent)* Skip preemption when no live turn is registered ([#1991](https://github.com/intent-hq/intentd/pull/1991))
+- *(pr-monitor)* Dedupe same-name check runs so a cancelled duplicate cannot flap the checklist ([#1985](https://github.com/intent-hq/intentd/pull/1985))
+
+
+## [0.9.77] - 2026-09-18
+
+### 🐛 Bug Fixes
+
+- *(events)* Give the bus writer a wall-clock retry budget so bulk workspace.delete never drops a batch ([#1980](https://github.com/intent-hq/intentd/pull/1980))
+
+### ⚙️ Miscellaneous Tasks
+
+- Isolate pwsh startup cache in install.ps1 guard tests ([#1982](https://github.com/intent-hq/intentd/pull/1982))
+
+
+## [0.9.76] - 2026-09-18
+
+### 🐛 Bug Fixes
+
+- *(acp)* Classify missing bare-command launches and harden Antigravity e2es under load ([#1978](https://github.com/intent-hq/intentd/pull/1978))
+
+
+## [0.9.75] - 2026-09-18
+
+### 🐛 Bug Fixes
+
+- *(git)* Remove origin and overlay-fetch safely under a global remote.origin.prune ([#1975](https://github.com/intent-hq/intentd/pull/1975))
+
+
+## [0.9.74] - 2026-09-18
+
+### 🐛 Bug Fixes
+
+- Make agent questions and blockers plain and self-contained ([#1798](https://github.com/intent-hq/intentd/pull/1798))
+
+
+## [0.9.73] - 2026-09-18
+
+### 🐛 Bug Fixes
+
+- *(hooks)* Default hook.list to active hooks and lighten retired rows ([#1971](https://github.com/intent-hq/intentd/pull/1971))
+
+
+## [0.9.72] - 2026-09-17
+
+### 🐛 Bug Fixes
+
+- *(sourcecontrol)* Propagate RateLimited from the nested branch_rules read ([#1966](https://github.com/intent-hq/intentd/pull/1966))
+
+### 📚 Documentation
+
+- *(tests)* Describe the merged interrupt slot-release ordering in the WSS queued-spawn e2e ([#1961](https://github.com/intent-hq/intentd/pull/1961))
+
+
+## [0.9.71] - 2026-09-17
+
+### 🚀 Features
+
+- *(pr-monitor)* Stretch the sweep cadence on the remaining forge quota ([#1948](https://github.com/intent-hq/intentd/pull/1948))
+
+### 🐛 Bug Fixes
+
+- *(agent-manager)* Release the busy slot before waking a queued process-slot waiter ([#1952](https://github.com/intent-hq/intentd/pull/1952))
+- *(pr-monitor)* Sample pausedUntil after snapshot reads and cover it over WSS ([#1954](https://github.com/intent-hq/intentd/pull/1954))
+
+### ⚡ Performance
+
+- *(pr-monitor)* Fold one PR poll into a single GraphQL observation ([#1949](https://github.com/intent-hq/intentd/pull/1949))
+
+
+## [0.9.70] - 2026-09-17
+
+### 🐛 Bug Fixes
+
+- *(pr-monitor)* Surface the forge rate-limit pause on every active monitor ([#1945](https://github.com/intent-hq/intentd/pull/1945))
+
+
+## [0.9.69] - 2026-09-17
+
+### 🐛 Bug Fixes
+
+- *(agent-manager)* Gate memory budget on host headroom and emit resumed on timed admission ([#1947](https://github.com/intent-hq/intentd/pull/1947))
+
+
+## [0.9.68] - 2026-09-17
+
+### 🧪 Testing
+
+- *(install.ps1)* Pester coverage for the startup wait and Scheduled Task registration ([#1944](https://github.com/intent-hq/intentd/pull/1944))
+
+
+## [0.9.67] - 2026-09-17
+
+### 🐛 Bug Fixes
+
+- *(scripts)* Make the saved-script terminal state total so lost processes reach exited ([#1942](https://github.com/intent-hq/intentd/pull/1942))
+
+
+## [0.9.66] - 2026-09-16
+
+### 🧪 Testing
+
+- *(services)* Deflake concurrent retire unread settle test ([#1938](https://github.com/intent-hq/intentd/pull/1938))
+
+
+## [0.9.65] - 2026-09-16
+
+### 🚀 Features
+
+- *(pr-monitor)* Let a parent adopt a settled child's monitor ([#1935](https://github.com/intent-hq/intentd/pull/1935))
+
+### ⚙️ Miscellaneous Tasks
+
+- Select source lints by the *_lint convention and lint their discovery ([#1937](https://github.com/intent-hq/intentd/pull/1937))
+
+
+## [0.9.64] - 2026-09-16
+
+### 🧪 Testing
+
+- Share a process-group GuardedChild across e2e suites and lint raw Child ([#1928](https://github.com/intent-hq/intentd/pull/1928))
+
+
+## [0.9.63] - 2026-09-16
+
+### 🐛 Bug Fixes
+
+- Keep workspace PR status fresh (hover fold + cheap monitor polls) ([#1923](https://github.com/intent-hq/intentd/pull/1923))
+
+### 🧪 Testing
+
+- *(core)* Repo-wide fixed-sleep annotation lint with ratcheting baseline ([#1926](https://github.com/intent-hq/intentd/pull/1926))
+- *(e2e)* Centralize intentd serve spawns in common::serve_command and add serve_spawn_guard ([#1927](https://github.com/intent-hq/intentd/pull/1927))
+
+
+## [0.9.62] - 2026-09-16
+
+### 🧪 Testing
+
+- *(sitter,intentd)* Deterministic release-file barriers for the signal-handshake e2e suites ([#1924](https://github.com/intent-hq/intentd/pull/1924))
+
+
+## [0.9.61] - 2026-09-16
+
+### 🚀 Features
+
+- Opportunistic idle-triggered intentd update restarts ([#1920](https://github.com/intent-hq/intentd/pull/1920))
+
+### ⚙️ Miscellaneous Tasks
+
+- Bump croner from 3.0.1 to 4.0.0 ([#1782](https://github.com/intent-hq/intentd/pull/1782))
+
+
+## [0.9.60] - 2026-09-16
+
+### 🐛 Bug Fixes
+
+- *(pr-monitor)* Let a live agent adopt a monitor owned by a dead agent ([#1916](https://github.com/intent-hq/intentd/pull/1916))
+
+
 ## [0.9.59] - 2026-09-15
 
 ### 🐛 Bug Fixes

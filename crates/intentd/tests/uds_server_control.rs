@@ -116,7 +116,7 @@ async fn rpc(
 
 /// UDS connections treat server.wsApi.enabled → false as safe (not TCP), but
 /// if the listener start fails, the setting must NOT be persisted.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn settings_rollback_on_failed_listener_start() {
     let tmpdb = TempDb::new();
     let store = Store::open(&tmpdb.path).await.expect("open store");
@@ -139,7 +139,7 @@ async fn settings_rollback_on_failed_listener_start() {
     let socket_path_clone = socket_path.clone();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         serve_uds(api, bus, &socket_path_clone, None, async {
             shutdown_rx.await.ok();
         })
@@ -195,7 +195,7 @@ async fn settings_rollback_on_failed_listener_start() {
 /// exercise the fixed path. Full regression coverage for the UDS-started runtime
 /// toggle should be added to `e2e_wss_runtime_control.rs` or a similar e2e suite
 /// that spawns an actual intentd process without WSS enabled.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 #[ignore = "placeholder for e2e coverage in e2e_wss_runtime_control.rs"]
 async fn uds_started_daemon_can_enable_ws_listener_at_runtime() {
     // Test body intentionally empty — this is a reminder to add e2e coverage.

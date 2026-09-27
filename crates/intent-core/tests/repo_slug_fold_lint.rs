@@ -7,46 +7,36 @@
 //! compared anywhere under `crates/*/src/**/*.rs` other than
 //! `crates/intent-core/src/repo_ref.rs`.
 //!
-//! The heuristic is deliberately small:
+//! The pre-processing — blanking comments, string literals, and `#[cfg(test)]`
+//! items, cutting the text into statements (a block expression used as an
+//! operand — its `}` followed by `.`, `?`, or `else` — chains with the text
+//! around it: `let repo = if c { a } else { b }.to_lowercase()` is one
+//! statement while the block bodies stay their own), locating the opt-out
+//! marker, and walking `crates/*/src/**/*.rs` minus `tests/` directories and
+//! `tests.rs` files — is the shared `intentd_test_support::source_lint`
+//! scaffolding; its module doc spells out those semantics. The rule itself is
+//! deliberately small:
 //!
-//! - Skipped: `crates/intent-core/src/repo_ref.rs`, any file named `tests.rs`
-//!   or under a `tests/` directory, and any `#[cfg(test)]` item, attribute to
-//!   end of item. An item introduced by `const` / `static` / `type` / `use`
-//!   (any `const` other than `const fn`) ends at the first `;` at brace depth
-//!   0, so a `const` initializer with its own blocks is skipped whole; one
-//!   introduced by `fn` / `mod` / `impl` / `struct` / `enum` / `union` /
-//!   `trait` / `macro_rules` ends at the `}` closing its body, or at a `;` at
-//!   depth 0 seen first (`mod tests;`, `struct X;`, a trait method
-//!   signature). Anything else falls back to the first balanced `}` or `;`.
-//!   The attribute is matched as the token sequence `# [ cfg ( test ) ]` with
-//!   any whitespace between tokens, after comments are blanked — so
-//!   `#[cfg( test )]` and `#[cfg(/* c */ test)]` are skipped, while
-//!   `#[cfg(not(test))]` and `#[cfg(all(test, …))]` are scanned like ordinary
-//!   code.
-//! - String literals and comments are blanked first, so `"github.com"` and doc
-//!   comments never count. A "statement" is the text between `;` / `{` / `}`
-//!   boundaries, except that a block expression used as an operand — its `}`
-//!   followed by `.`, `?`, or `else` — is chained: the text before its `{`
-//!   and the text after its `}` form one statement (`let repo = if c { a }
-//!   else { b }.to_lowercase()`, `match x { … }.to_lowercase()`, `unsafe { … }
-//!   .eq_ignore_ascii_case(..)`), while the block bodies stay their own
-//!   statements.
 //! - A statement is flagged when it contains a fold call (`to_lowercase`,
 //!   `to_ascii_lowercase`, `eq_ignore_ascii_case`, `make_ascii_lowercase`)
 //!   AND a slug identifier: an identifier token with an underscore-delimited
 //!   component equal to `owner`, `repo`, `repository`, or `slug`, or the bare
 //!   token `name` when the same statement also carries an `owner` component.
+//! - Skipped: `crates/intent-core/src/repo_ref.rs`, on top of the test code
+//!   the shared walker and `#[cfg(test)]` blanking leave out.
 //! - Opt-out: `// repo-slug-fold: allow — <reason>` on the line immediately
-//!   above the statement's first line. The marker counts only as a standalone
-//!   `//` line comment (nothing but whitespace before it, not inside a
-//!   `/* … */` block comment or a string literal, not trailing code), the
-//!   token must be exactly `repo-slug-fold: allow` (a longer word such as
-//!   `allowance` is malformed), and it must be followed by whitespace, an em
-//!   dash or hyphen, and a nonempty reason. A malformed marker never
-//!   suppresses the hit; the report says so.
+//!   above the statement's first line, in the shared marker grammar (a
+//!   standalone `//` line comment, the exact token, whitespace, an em dash or
+//!   hyphen, and a nonempty reason). A malformed marker never suppresses the
+//!   hit; the report says so.
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+
+use intentd_test_support::source_lint::{
+    blank_cfg_test_items, crate_src_files, lex, markers_by_line, split_statements, workspace_root,
+    Marker,
+};
 
 const FOLD_CALLS: &[&str] = &[
     "to_lowercase",
@@ -55,8 +45,7 @@ const FOLD_CALLS: &[&str] = &[
     "make_ascii_lowercase",
 ];
 const SLUG_COMPONENTS: &[&str] = &["owner", "repo", "repository", "slug"];
-const OPT_OUT_MARKER: &str = "// repo-slug-fold: allow";
-const CFG_TEST_TOKENS: &[&str] = &["#", "[", "cfg", "(", "test", ")", "]"];
+const OPT_OUT_TAG: &str = "repo-slug-fold";
 const EXEMPT_FILE: &[&str] = &["crates", "intent-core", "src", "repo_ref.rs"];
 const EXCERPT_CHARS: usize = 120;
 
@@ -67,445 +56,6 @@ struct Hit {
     /// The line above carried something that starts like the opt-out marker
     /// but is malformed (longer token, or no reason).
     marker_malformed: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Marker {
-    Absent,
-    WithReason,
-    Malformed,
-}
-
-/// A real `//` line comment found by the lexer (never one nested inside a
-/// block comment or a string literal).
-struct LineComment {
-    line: usize,
-    /// Only whitespace precedes the `//` on its line.
-    standalone: bool,
-    text: String,
-}
-
-/// Source text with comments/literals blanked, plus the line comments the
-/// lexer passed over on the way.
-struct Stripped {
-    text: String,
-    line_comments: Vec<LineComment>,
-}
-
-/// Marker state of one line comment's text: `Absent` unless it starts with
-/// the marker prefix; `WithReason` only when the token is exactly the marker
-/// (not a longer word such as `allowance`) followed by whitespace, a dash,
-/// and a nonempty reason; anything else that starts like the marker is
-/// `Malformed`.
-fn classify_marker(comment: &str) -> Marker {
-    let Some(rest) = comment.strip_prefix(OPT_OUT_MARKER) else {
-        return Marker::Absent;
-    };
-    if rest
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
-        return Marker::Malformed;
-    }
-    let after_space = rest.trim_start();
-    if after_space.len() == rest.len() && !rest.is_empty() {
-        return Marker::Malformed;
-    }
-    let Some(reason) = after_space
-        .strip_prefix('—')
-        .or_else(|| after_space.strip_prefix('-'))
-    else {
-        return Marker::Malformed;
-    };
-    if reason.trim().is_empty() {
-        Marker::Malformed
-    } else {
-        Marker::WithReason
-    }
-}
-
-/// Opt-out marker state per line; index 0 is a placeholder so the vector is
-/// addressed by 1-based line number. Only a standalone `//` line comment can
-/// carry the marker.
-fn markers_by_line(src: &str, line_comments: &[LineComment]) -> Vec<Marker> {
-    let mut out = vec![Marker::Absent; src.lines().count() + 1];
-    for comment in line_comments.iter().filter(|c| c.standalone) {
-        if let Some(slot) = out.get_mut(comment.line) {
-            *slot = classify_marker(&comment.text);
-        }
-    }
-    out
-}
-
-fn push_blank(out: &mut String, c: char) {
-    out.push(if c == '\n' { '\n' } else { ' ' });
-}
-
-/// `Some(hashes)` when a raw string literal (`r"`, `r#"`, `br"`, `cr#"`, …)
-/// starts at `i`; `None` otherwise. Cooked `b"…"` / `c"…"` strings need no
-/// special case: their prefix letter is left as an inert identifier and the
-/// `"` branch consumes the body.
-fn raw_string_hashes(chars: &[char], i: usize) -> Option<usize> {
-    let preceded_by_ident = i > 0 && (chars[i - 1].is_ascii_alphanumeric() || chars[i - 1] == '_');
-    if preceded_by_ident {
-        return None;
-    }
-    let mut j = i;
-    if matches!(chars.get(j), Some('b' | 'c')) {
-        j += 1;
-    }
-    if chars.get(j) != Some(&'r') {
-        return None;
-    }
-    j += 1;
-    let mut hashes = 0;
-    while chars.get(j) == Some(&'#') {
-        hashes += 1;
-        j += 1;
-    }
-    (chars.get(j) == Some(&'"')).then_some(hashes)
-}
-
-/// Replaces every comment, string literal, and char literal with spaces
-/// (newlines preserved) so neither their contents nor their delimiters take
-/// part in statement splitting or identifier matching. Every `//` line
-/// comment the lexer consumes is also reported, since only those may carry
-/// the opt-out marker.
-fn blank_literals_and_comments(src: &str) -> Stripped {
-    let chars: Vec<char> = src.chars().collect();
-    let mut out = String::with_capacity(src.len());
-    let mut line_comments = Vec::new();
-    // Line bookkeeping is advanced lazily, only when a `//` comment is met,
-    // so newlines swallowed by the block-comment and string loops still count.
-    let mut line = 1usize;
-    let mut line_start = 0usize;
-    let mut counted_upto = 0usize;
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        let next = chars.get(i + 1).copied();
-        if c == '/' && next == Some('/') {
-            let start = i;
-            for (offset, ch) in chars[counted_upto..start].iter().enumerate() {
-                if *ch == '\n' {
-                    line += 1;
-                    line_start = counted_upto + offset + 1;
-                }
-            }
-            counted_upto = start;
-            while i < chars.len() && chars[i] != '\n' {
-                out.push(' ');
-                i += 1;
-            }
-            line_comments.push(LineComment {
-                line,
-                standalone: chars[line_start..start].iter().all(|c| c.is_whitespace()),
-                text: chars[start..i].iter().collect(),
-            });
-        } else if c == '/' && next == Some('*') {
-            let mut depth = 0usize;
-            while i < chars.len() {
-                if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
-                    depth += 1;
-                    out.push_str("  ");
-                    i += 2;
-                } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
-                    depth -= 1;
-                    out.push_str("  ");
-                    i += 2;
-                    if depth == 0 {
-                        break;
-                    }
-                } else {
-                    push_blank(&mut out, chars[i]);
-                    i += 1;
-                }
-            }
-        } else if let Some(hashes) = raw_string_hashes(&chars, i) {
-            while chars[i] != '"' {
-                out.push(' ');
-                i += 1;
-            }
-            out.push(' ');
-            i += 1;
-            while i < chars.len() {
-                let closing =
-                    chars[i] == '"' && (1..=hashes).all(|k| chars.get(i + k) == Some(&'#'));
-                push_blank(&mut out, chars[i]);
-                i += 1;
-                if closing {
-                    out.push_str(&" ".repeat(hashes));
-                    i += hashes;
-                    break;
-                }
-            }
-        } else if c == '"' {
-            out.push(' ');
-            i += 1;
-            while i < chars.len() {
-                let d = chars[i];
-                push_blank(&mut out, d);
-                i += 1;
-                if d == '\\' {
-                    if let Some(&escaped) = chars.get(i) {
-                        push_blank(&mut out, escaped);
-                        i += 1;
-                    }
-                } else if d == '"' {
-                    break;
-                }
-            }
-        } else if c == '\'' {
-            // `'\…'` and `'x'` are char literals; anything else is a lifetime
-            // or loop label, which carries no fold call or slug identifier.
-            if next == Some('\\') {
-                let start = i;
-                i += 2;
-                if chars.get(i) == Some(&'u') {
-                    while i < chars.len() && chars[i] != '}' {
-                        i += 1;
-                    }
-                }
-                i += 1;
-                if chars.get(i) == Some(&'\'') {
-                    i += 1;
-                }
-                i = i.min(chars.len());
-                for &d in &chars[start..i] {
-                    push_blank(&mut out, d);
-                }
-            } else if chars.get(i + 2) == Some(&'\'') {
-                out.push_str("   ");
-                i += 3;
-            } else {
-                out.push(' ');
-                i += 1;
-            }
-        } else {
-            out.push(c);
-            i += 1;
-        }
-    }
-    Stripped {
-        text: out,
-        line_comments,
-    }
-}
-
-/// Whether the `#[cfg(test)]` token sequence starts at `i`, ignoring any
-/// whitespace between tokens (a blanked `/* comment */` inside the attribute
-/// leaves spaces behind, and `# [cfg(test)]` is legal Rust).
-fn starts_with_cfg_test(chars: &[char], i: usize) -> bool {
-    if chars.get(i) != Some(&'#') {
-        return false;
-    }
-    let mut j = i;
-    for token in CFG_TEST_TOKENS {
-        while chars.get(j).is_some_and(|c| c.is_whitespace()) {
-            j += 1;
-        }
-        for want in token.chars() {
-            if chars.get(j) != Some(&want) {
-                return false;
-            }
-            j += 1;
-        }
-    }
-    true
-}
-
-/// Items whose body is a brace block; they end at the `}` closing it (or at a
-/// `;` at depth 0 seen first).
-const BODY_ITEM_KEYWORDS: &[&str] = &[
-    "fn",
-    "mod",
-    "impl",
-    "struct",
-    "enum",
-    "union",
-    "trait",
-    "macro_rules",
-];
-/// Items that end at the first `;` at depth 0, whatever blocks their
-/// initializer contains.
-const SEMICOLON_ITEM_KEYWORDS: &[&str] = &["const", "static", "type", "use"];
-/// Qualifiers that turn `const` into `const fn` / `const unsafe fn` / ….
-const FN_QUALIFIERS: &[&str] = &["fn", "unsafe", "extern", "async"];
-
-fn skip_whitespace(chars: &[char], mut j: usize) -> usize {
-    while chars.get(j).is_some_and(|c| c.is_whitespace()) {
-        j += 1;
-    }
-    j
-}
-
-/// Index just past the delimiter group (`(…)` or `[…]`) opening at `j`.
-fn skip_group(chars: &[char], mut j: usize, open: char, close: char) -> usize {
-    let mut depth = 0usize;
-    while let Some(&c) = chars.get(j) {
-        j += 1;
-        if c == open {
-            depth += 1;
-        } else if c == close {
-            depth -= 1;
-            if depth == 0 {
-                break;
-            }
-        }
-    }
-    j
-}
-
-/// `(word, index past it)` for the identifier starting at `j`, if any.
-fn word_at(chars: &[char], j: usize) -> Option<(String, usize)> {
-    let mut k = j;
-    while chars
-        .get(k)
-        .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_')
-    {
-        k += 1;
-    }
-    (k > j).then(|| (chars[j..k].iter().collect(), k))
-}
-
-/// Whether the item introduced after the attribute(s) starting at `j` ends at
-/// a `;` at brace depth 0 rather than at the `}` closing its body. Looks past
-/// further attributes and qualifiers (`pub(crate)`, `unsafe`, …) to the item
-/// keyword; an unrecognized item is treated as body-terminated.
-fn cfg_test_item_ends_at_semicolon(chars: &[char], mut j: usize) -> bool {
-    loop {
-        j = skip_whitespace(chars, j);
-        match chars.get(j) {
-            Some('#') => {
-                j += 1;
-                if chars.get(j) == Some(&'!') {
-                    j += 1;
-                }
-                j = skip_group(chars, j, '[', ']');
-            }
-            Some('(') => j = skip_group(chars, j, '(', ')'),
-            Some(c) if c.is_ascii_alphabetic() || *c == '_' => {
-                let (word, next) = word_at(chars, j).expect("identifier start");
-                j = next;
-                if BODY_ITEM_KEYWORDS.contains(&word.as_str()) {
-                    return false;
-                }
-                if word == "const" {
-                    let after = skip_whitespace(chars, j);
-                    return !word_at(chars, after)
-                        .is_some_and(|(w, _)| FN_QUALIFIERS.contains(&w.as_str()));
-                }
-                if SEMICOLON_ITEM_KEYWORDS.contains(&word.as_str()) {
-                    return true;
-                }
-            }
-            _ => return false,
-        }
-    }
-}
-
-/// Blanks every `#[cfg(test)]` attribute together with the whole item that
-/// follows it (see the module doc for where each kind of item ends). Runs on
-/// already-blanked text, so the attribute cannot hide inside a string or
-/// comment.
-fn blank_cfg_test_items(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = String::with_capacity(text.len());
-    let mut i = 0;
-    while i < chars.len() {
-        if !starts_with_cfg_test(&chars, i) {
-            out.push(chars[i]);
-            i += 1;
-            continue;
-        }
-        let ends_at_semicolon = cfg_test_item_ends_at_semicolon(&chars, i);
-        let mut depth = 0usize;
-        while i < chars.len() {
-            let c = chars[i];
-            push_blank(&mut out, c);
-            i += 1;
-            match c {
-                '{' => depth += 1,
-                '}' => {
-                    depth = depth.saturating_sub(1);
-                    if depth == 0 && !ends_at_semicolon {
-                        break;
-                    }
-                }
-                ';' if depth == 0 => break,
-                _ => {}
-            }
-        }
-    }
-    out
-}
-
-struct Statement {
-    line: usize,
-    text: String,
-}
-
-/// Whether the `}` just before `j` is followed by `.`, `?`, or `else`, i.e.
-/// the block is an operand and the enclosing statement continues after it.
-fn block_is_operand(chars: &[char], j: usize) -> bool {
-    let j = skip_whitespace(chars, j);
-    match chars.get(j) {
-        Some('.' | '?') => true,
-        Some(_) => word_at(chars, j).is_some_and(|(w, _)| w == "else"),
-        None => false,
-    }
-}
-
-/// Splits blanked source at `;` / `{` / `}`; each statement records the line
-/// of its first non-whitespace character. The text before a `{` is held back
-/// until the matching `}`: when that `}` is followed by `.`, `?`, or `else`
-/// the held text resumes as the current statement (so an operand block chains
-/// with what surrounds it), otherwise it is emitted as it stood. Statements
-/// come back in source order.
-fn split_statements(text: &str) -> Vec<Statement> {
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = Vec::new();
-    let mut line = 1usize;
-    let mut current = String::new();
-    let mut start_line: Option<usize> = None;
-    let mut held: Vec<Option<Statement>> = Vec::new();
-    let take = |current: &mut String, start_line: &mut Option<usize>| {
-        let text = std::mem::take(current);
-        start_line.take().map(|line| Statement { line, text })
-    };
-    for (i, &c) in chars.iter().enumerate() {
-        match c {
-            ';' => out.extend(take(&mut current, &mut start_line)),
-            '{' => held.push(take(&mut current, &mut start_line)),
-            '}' => {
-                out.extend(take(&mut current, &mut start_line));
-                if let Some(prefix) = held.pop().flatten() {
-                    if block_is_operand(&chars, i + 1) {
-                        current = prefix.text;
-                        current.push(' ');
-                        start_line = Some(prefix.line);
-                    } else {
-                        out.push(prefix);
-                    }
-                }
-            }
-            '\n' => {
-                line += 1;
-                current.push(c);
-            }
-            _ => {
-                if !c.is_whitespace() && start_line.is_none() {
-                    start_line = Some(line);
-                }
-                current.push(c);
-            }
-        }
-    }
-    out.extend(take(&mut current, &mut start_line));
-    out.extend(held.into_iter().flatten());
-    out.sort_by_key(|s| s.line);
-    out
 }
 
 /// ASCII identifier tokens (`[A-Za-z_][A-Za-z0-9_]*`) in `text`.
@@ -558,9 +108,9 @@ fn excerpt(text: &str) -> String {
 /// Scans one Rust source file's text and returns every flagged statement
 /// that is not suppressed by a reasoned opt-out marker.
 fn scan_source(src: &str) -> Vec<Hit> {
-    let stripped = blank_literals_and_comments(src);
-    let markers = markers_by_line(src, &stripped.line_comments);
-    let blanked = blank_cfg_test_items(&stripped.text);
+    let lexed = lex(src);
+    let markers = markers_by_line(src, &lexed.line_comments, OPT_OUT_TAG);
+    let blanked = blank_cfg_test_items(&lexed.blanked);
     split_statements(&blanked)
         .into_iter()
         .filter(|s| is_flagged(&s.text))
@@ -576,23 +126,6 @@ fn scan_source(src: &str) -> Vec<Hit> {
             }
         })
         .collect()
-}
-
-/// Every `*.rs` under `dir`, skipping `tests/` directories and `tests.rs`.
-fn collect_rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
-    let entries = fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
-    for entry in entries {
-        let entry = entry.unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
-        let path = entry.path();
-        let name = entry.file_name();
-        if path.is_dir() {
-            if name != "tests" {
-                collect_rust_sources(&path, out);
-            }
-        } else if path.extension().is_some_and(|ext| ext == "rs") && name != "tests.rs" {
-            out.push(path);
-        }
-    }
 }
 
 fn is_exempt(rel: &Path) -> bool {
@@ -613,7 +146,7 @@ fn display_rel(rel: &Path) -> String {
 
 #[test]
 fn slug_identity_is_only_folded_inside_repo_ref() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let root = workspace_root();
     let exempt: PathBuf = EXEMPT_FILE.iter().collect();
     assert!(
         root.join(&exempt).is_file(),
@@ -621,21 +154,11 @@ fn slug_identity_is_only_folded_inside_repo_ref() {
         display_rel(&exempt)
     );
 
-    let mut files = Vec::new();
-    let crates_dir = root.join("crates");
-    let crates = fs::read_dir(&crates_dir)
-        .unwrap_or_else(|e| panic!("read_dir {}: {e}", crates_dir.display()));
-    for entry in crates {
-        let src = entry.expect("crate dir entry").path().join("src");
-        if src.is_dir() {
-            collect_rust_sources(&src, &mut files);
-        }
-    }
-    files.sort();
+    let files = crate_src_files(&root);
     assert!(
         !files.is_empty(),
         "no Rust sources found under {}",
-        crates_dir.display()
+        root.join("crates").display()
     );
 
     let mut report = Vec::new();
@@ -953,88 +476,11 @@ fn opt_out_marker_without_a_reason_still_fails() {
 }
 
 #[test]
-fn opt_out_marker_accepts_an_em_dash_or_a_hyphen() {
-    for marker in [
-        "// repo-slug-fold: allow — reason",
-        "// repo-slug-fold: allow - reason",
-        "// repo-slug-fold: allow   —   reason",
-    ] {
-        let src = format!(
-            "fn slugify(repo_name: &str) -> String {{\n    {marker}\n    repo_name.to_lowercase()\n}}\n"
-        );
-        assert_eq!(hit_lines(&src), Vec::<usize>::new(), "{marker:?}");
-    }
-}
-
-#[test]
 fn opt_out_marker_must_sit_immediately_above_the_statement() {
     let src = "fn slugify(repo_name: &str) -> String {\n    // repo-slug-fold: allow — reason\n\n    repo_name.to_lowercase()\n}\n";
     let hits = scan_source(src);
     assert_eq!(hit_lines(src), vec![4]);
     assert!(!hits[0].marker_malformed);
-}
-
-#[test]
-fn opt_out_marker_counts_only_as_a_standalone_line_comment() {
-    // Inside a block comment: not a line comment at all.
-    let in_block = "fn slugify(repo_name: &str) -> String {\n    /*\n    // repo-slug-fold: allow — example */\n    repo_name.to_lowercase()\n}\n";
-    let hits = scan_source(in_block);
-    assert_eq!(hit_lines(in_block), vec![4], "{hits:?}");
-    assert!(!hits[0].marker_malformed);
-
-    // Inside a string literal that spans lines.
-    let in_string = "fn slugify(repo_name: &str) -> String {\n    let _doc = \"\n    // repo-slug-fold: allow — example\";\n    repo_name.to_lowercase()\n}\n";
-    assert_eq!(hit_lines(in_string), vec![4]);
-
-    // Trailing on a code line: not standalone.
-    let trailing = "fn slugify(repo_name: &str) -> String {\n    let _n = 1; // repo-slug-fold: allow — example\n    repo_name.to_lowercase()\n}\n";
-    let hits = scan_source(trailing);
-    assert_eq!(hit_lines(trailing), vec![3], "{hits:?}");
-    assert!(!hits[0].marker_malformed);
-}
-
-#[test]
-fn opt_out_marker_must_match_the_whole_token() {
-    for marker in [
-        "// repo-slug-fold: allowance",
-        "// repo-slug-fold: allow_me — reason",
-        "// repo-slug-fold: allows — reason",
-    ] {
-        let src = format!(
-            "fn slugify(repo_name: &str) -> String {{\n    {marker}\n    repo_name.to_lowercase()\n}}\n"
-        );
-        let hits = scan_source(&src);
-        assert_eq!(hit_lines(&src), vec![3], "{marker:?}: {hits:?}");
-        assert!(hits[0].marker_malformed, "{marker:?}");
-    }
-}
-
-#[test]
-fn cfg_test_attribute_matches_across_comments_and_whitespace() {
-    let src = r"
-#[cfg(/* tests only */ test)]
-fn helper(owner: &str) -> String {
-    owner.to_ascii_lowercase()
-}
-
-#[cfg( test )]
-fn spaced(owner: &str) -> String {
-    owner.to_ascii_lowercase()
-}
-
-# [ cfg ( test ) ]
-mod tests {
-    fn folds(owner: &str, repo: &str) -> bool {
-        owner.to_lowercase() == repo.to_lowercase()
-    }
-}
-
-#[cfg(not(test))]
-fn real(owner: &str) -> String {
-    owner.to_lowercase()
-}
-";
-    assert_eq!(hit_lines(src), vec![line_of(src, "fn real(owner") + 1]);
 }
 
 #[test]
@@ -1060,50 +506,6 @@ fn real(owner: &str) -> String {
 }
 ";
     assert_eq!(hit_lines(src), vec![line_of(src, "fn real(owner") + 1]);
-}
-
-#[test]
-fn cfg_test_items_are_skipped_to_their_real_end() {
-    // A `const` initializer with its own balanced blocks is skipped whole
-    // (the fold in its second block is not a hit), and the live fn after it
-    // is still flagged.
-    let src = r"
-#[cfg(test)]
-const X: fn(&str) -> String = if cfg!(a) { |s| s.to_string() } else { |owner| owner.to_lowercase() };
-fn live(owner: &str) { owner.to_lowercase(); }
-";
-    assert_eq!(hit_lines(src), vec![line_of(src, "fn live(owner")]);
-
-    // A fn body with an early balanced block is skipped to the closing `}`.
-    let src = r"
-#[cfg(test)]
-fn t(owner: &str) { let _ = { 1 }; owner.to_lowercase(); }
-fn live(owner: &str) { owner.to_lowercase(); }
-";
-    assert_eq!(hit_lines(src), vec![line_of(src, "fn live(owner")]);
-
-    // Qualifiers and further attributes do not confuse the item keyword.
-    let src = r"
-#[cfg(test)]
-#[allow(dead_code)]
-pub(crate) const fn t(owner: &str) -> String { let _ = { 1 }; owner.to_lowercase() }
-#[cfg(test)]
-pub static Y: fn(&str) -> String = if cfg!(a) { |s| s.to_string() } else { |owner| owner.to_lowercase() };
-#[cfg(test)]
-use self::{a, b};
-fn live(owner: &str) { owner.to_lowercase(); }
-";
-    assert_eq!(hit_lines(src), vec![line_of(src, "fn live(owner")]);
-
-    // Body items still end at a `;` seen first, and the mod fixture holds.
-    let src = r"
-#[cfg(test)]
-struct Marker;
-#[cfg(test)]
-mod t { fn folds(owner: &str) -> String { let _ = { 1 }; owner.to_lowercase() } }
-fn live(owner: &str) { owner.to_lowercase(); }
-";
-    assert_eq!(hit_lines(src), vec![line_of(src, "fn live(owner")]);
 }
 
 #[test]

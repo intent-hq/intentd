@@ -44,6 +44,10 @@ fn provider_visible(p: &intent_providers::ProviderConfig, env_has: &dyn Fn(&str)
 fn provider_row(p: &intent_providers::ProviderConfig, env_has: &dyn Fn(&str) -> bool) -> Value {
     let mut row = serde_json::Map::new();
     row.insert("id".into(), json!(p.id));
+    let legacy_aliases = intent_providers::legacy_aliases_for_provider(p.id);
+    if !legacy_aliases.is_empty() {
+        row.insert("legacyAliases".into(), json!(legacy_aliases));
+    }
     row.insert("displayName".into(), json!(p.display_name));
     row.insert("shortName".into(), json!(p.short_name));
     row.insert("command".into(), json!(p.command));
@@ -152,6 +156,78 @@ mod tests {
             .iter()
             .find(|p| p["id"] == id)
             .unwrap()
+    }
+
+    #[test]
+    fn legacy_aliases_match_the_resolver_without_unknown_fallbacks() {
+        for env_has in [false, true] {
+            let v = catalog(&|_| env_has);
+            let rows = v["providers"].as_array().unwrap();
+            for alias in ["default", "acp", "augment"] {
+                let target = intent_providers::find_provider_or_legacy_alias(alias).unwrap();
+                let advertised: Vec<&str> = rows
+                    .iter()
+                    .filter(|p| {
+                        p["legacyAliases"]
+                            .as_array()
+                            .is_some_and(|aliases| aliases.contains(&json!(alias)))
+                    })
+                    .map(|p| p["id"].as_str().unwrap())
+                    .collect();
+                assert_eq!(advertised, [target.id], "alias {alias}");
+            }
+            for p in rows {
+                let id = p["id"].as_str().unwrap();
+                assert_eq!(
+                    intent_providers::find_provider_or_legacy_alias(id)
+                        .unwrap()
+                        .id,
+                    id
+                );
+                if let Some(aliases) = p.get("legacyAliases") {
+                    let aliases = aliases.as_array().expect("aliases are strings, never null");
+                    assert!(!aliases.is_empty(), "empty alias lists are omitted");
+                    for alias in aliases {
+                        let alias = alias.as_str().unwrap();
+                        assert!(intent_providers::find_provider(alias).is_none());
+                        assert_eq!(
+                            intent_providers::find_provider_or_legacy_alias(alias)
+                                .unwrap()
+                                .id,
+                            id
+                        );
+                    }
+                }
+            }
+            for unknown in ["", "nope", "ACP", " acp", "auggie-typo"] {
+                assert!(intent_providers::find_provider_or_legacy_alias(unknown).is_none());
+                assert!(rows.iter().all(|p| p["legacyAliases"]
+                    .as_array()
+                    .is_none_or(|aliases| !aliases.contains(&json!(unknown)))));
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_aliases_survive_visibility_gates_without_changing_capabilities() {
+        let auggie = intent_providers::find_provider("auggie").unwrap();
+        let ungated = provider_row(auggie, &|_| true);
+        let gated = intent_providers::ProviderConfig {
+            requires_env_var: Some("TEST_PROVIDER_GATE"),
+            ..*auggie
+        };
+        let mut hidden = provider_row(&gated, &|_| false);
+        assert_eq!(hidden["visible"], false);
+        assert_eq!(
+            hidden["legacyAliases"],
+            json!(["default", "acp", "augment"])
+        );
+        hidden.as_object_mut().unwrap().remove("requiresEnvVar");
+        hidden["visible"] = json!(true);
+        assert_eq!(
+            hidden, ungated,
+            "gating changes visibility, not identity or capabilities"
+        );
     }
 
     #[test]

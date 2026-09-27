@@ -10,7 +10,7 @@ mod common;
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -141,15 +141,13 @@ fn spawn_daemon(data_dir: &Path, legacy_root: &Path, hold_file: &Path) -> Child 
     let log = std::fs::File::create(data_dir.join("daemon.log")).unwrap();
     let workspaces = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces).unwrap();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", workspaces)
         .env("INTENTD_LEGACY_IMPORT_ROOTS", legacy_root)
         .env("INTENTD_LEGACY_APP_DIR", "")
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", "0")
         .env("INTENTD_TEST_LEGACY_IMPORT_HOLD_FILE", hold_file)
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));

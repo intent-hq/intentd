@@ -466,12 +466,230 @@
 //! entry → `-32602`), `sort=updated`, every item's `owner` / `repo` naming
 //! its own hit's repository. The catalog contains 304 router methods, 49
 //! fast-path methods, and two aliases: 355 client-callable names.
+//!
+//! Version 10.2 adds two always-present `system.status` result fields
+//! (additive; §5.7): `busyAgents` — agents with a turn in flight — and the
+//! `idleUpdateCheck` object `{ enabled, supported, lastRequestedAt,
+//! nextEligibleAt, restartPending }` describing the daemon→sitter idle
+//! update handshake: the daemon itself asks the sitter for an idle-mode
+//! update check (SIGUSR2, rate-limited, only while no turn is in flight) and
+//! exits for a staged update only once idle; `system.requestUpdate`
+//! (SIGUSR1) still restarts immediately. No method-catalog change.
+//!
+//! Version 10.3 adds multiplayer (additive; staged as 9.14 / 9.15 while
+//! main moved to 10.x). Principals (multiplayer w1): every connection
+//! is bound to a principal at admission (UDS and the legacy bearer token →
+//! the primary user; a hashed per-principal credential → its principal) and
+//! `principal.me` returns that binding
+//! (`{ id, login?, displayName?, avatarUrl?, isAdministrator }`).
+//! `workspace.get` / `workspace.list` rows carry the flattened membership
+//! summary `ownerPrincipalId?`, `myRole?` (`owner` | `collaborator`, relative
+//! to the caller), `memberCount`, `openInviteCount`.
+//!
+//! Also within 10.3, invite links and the identity-only join
+//! (multiplayer w4): `workspace.invite.create` (fast path; returns the
+//! `intent://invite?…` link — the pair envelope minus the bearer token plus
+//! `inviteId` / `secret`, the secret exactly once), `workspace.invite.list` /
+//! `workspace.invite.revoke`, `workspace.members.leave`, `principal.revokeSelf`
+//! (closes the caller's own connections), and the unauthenticated `/invite`
+//! WSS endpoint serving the guest join methods below. Invite refusals
+//! carry `error.data.code` (`invite-expired`, `invite-revoked`,
+//! `invite-redeemed`, `invite-pin-mismatch`, `invite-flow-busy`, …). Also
+//! within 10.3, ephemeral presence (multiplayer w5): `presence.update` /
+//! `note.presence.update` (fast path), `presence.snapshot`, and the
+//! `note.presence.subscribe` / `note.presence.unsubscribe` channel pair.
+//! Also within 10.3, the collaborator picker's `github.users.search`
+//! router method (additive; §5.27, administrator-only): login-prefix user
+//! search over `GET /search/users` — `{ query, limit? }` → `{ users: [{ id,
+//! login, avatarUrl, htmlUrl }] }`. `query` is required (`-32602` when
+//! missing; a blank query answers `{ users: [] }` without a forge call); the
+//! forge request keeps only the leading run of login characters (ASCII
+//! alphanumerics and `-`), so search qualifiers / booleans typed after it
+//! never reach GitHub's search parser and a query with no such prefix
+//! answers `{ users: [] }`; `limit` defaults to 8 and is clamped into
+//! `[1, 10]`. Also within 10.3,
+//! `workspace.invite.list` rows (and the `invite` of `workspace.invite.create`)
+//! carry the additive `url` — the open invite's `intent://invite?…` link
+//! rebuilt from the stored secret — omitted when the row predates the
+//! stored secret or no link can be built right now (listener down, tunnel
+//! down — invite links are tunnel-only: `workspace.invite.create` refuses
+//! with `error.data.code` `tunnel-down` without a tunnel address, and the
+//! link carries `tc` but no `host`); the secret itself never appears as a
+//! field. Also within
+//! 10.3, guest caps: `workspace.invite.create` refuses with
+//! `error.data.code` `guest-limit` once a workspace's collaborators plus
+//! open invites reach `sharing.maxGuestsPerWorkspace`, the join refuses with
+//! `workspace-full` (the invite stays open) once its collaborators do, and
+//! `workspace.members.list` carries the additive `guestCount` / `guestLimit`;
+//! a per-principal credential's `/ws` upgrade is refused with `503` while
+//! `sharing.maxGuestConnections` / `sharing.maxConnectionsPerGuest` are
+//! spent, and `GET /health` carries the additive `guestConnections`. Also
+//! within 10.3, the returning guest's `/invite` methods (additive):
+//! `invite.inspect` (`{ inviteId, secret }` → `{ workspaceId,
+//! workspaceTitle, hostname, prettyHostname }`, the link validation with
+//! no nonce) and `invite.accept` (`{ inviteId, secret, credential }` → the
+//! `authorized` shape `{ status, token, principalId, login, workspaceId }`,
+//! joining with a per-principal credential this host already minted; an
+//! unknown / revoked credential is `error.data.code` `credential-invalid`).
+//! Also within 10.3, the gist identity proof's `/invite` methods
+//! (additive): `invite.challenge` (`{ inviteId, secret }` → the
+//! `invite.inspect` result plus a single-use `nonce` and its
+//! `nonceExpiresAt`, 10 minutes out) and `invite.prove` (`{ inviteId,
+//! secret, nonce, gistId, login }` → the `authorized` shape once the host
+//! has read a gist owned by `login` whose `intent-join-proof.txt` starts
+//! with the nonce and postdates it; the nonce is spent by the first
+//! attempt; `error.data.code` `proof-invalid` / `proof-expired` /
+//! `github-unreachable`). Both joins refuse the host owner's own account
+//! with `error.data.code` `owner-self-join` (-32602): the primary
+//! principal never receives a per-principal credential, and the invite
+//! stays open. The gist proof replaces the host-side device flow:
+//! `invite.redeem` is no longer served (an `/invite` connection naming it
+//! gets `-32001` like any other non-invite method). Also within 10.3,
+//! reusable invite links (additive): an unpinned invite is redeemable by
+//! any number of distinct GitHub accounts until it expires or is revoked
+//! (each redemption is one more collaborator, a member re-joining is
+//! idempotent and not counted; the seat cap and expiry apply per
+//! redemption), while a pinned invite stays single-use; `invite-redeemed`
+//! is therefore only ever answered for a pinned link. Invite rows
+//! (`workspace.invite.list`, the `invite` of `workspace.invite.create`)
+//! carry the additive `reusable` (`true` iff unpinned) and
+//! `redemptionCount`, with `redeemedAt` / `redeemedByPrincipalId` naming
+//! the latest redemption; `openInviteCount` / `guestCount` count a
+//! reusable invite as open while it is unexpired and unrevoked, redeemed
+//! or not. Also within 10.3 (behavior only), the collaborator sender
+//! preamble: a human message sent by a per-principal wire caller whose
+//! role in the target workspace is `collaborator` (`agent.sendMessage`
+//! user-origin, `agent.sendToTask`, `agent.queueMessage`,
+//! `agent.editAndRegenerate`, a collaborator's `agent.editQueuedMessage`
+//! of a human-authored entry, a `role: user` row of
+//! `agent.appendMessage` (string content, or the first `text` block of a
+//! block array — a text-less array gains a leading text block; other roles
+//! byte-identical), and the free text of `agent.wakeOrCreate`
+//! (`contextMessage`) and `agent.delegate` (`agentInstructions` /
+//! `taskText`; not the task-note fallback) — both
+//! refused to collaborators at the transport gate (`-32003`), so their
+//! service-level preamble is defense in depth) is persisted — and delivered
+//! to the model — with the
+//! daemon-prepended single-line paragraph `Message from @{login}
+//! ({displayName}), a collaborator (guest) of this workspace — not the
+//! workspace owner.` plus a blank line above the caller's text (login-only
+//! / display-name-only / `principal {id}` fallbacks). Idempotent by exact
+//! match, like the `[MESSAGE FROM AGENT …]` header; the owner's, the
+//! administrator's and every UDS / legacy-token send stay byte-identical,
+//! and the `fromPrincipalId` stamp is unchanged. Intentional exception: a
+//! collaborator's `agent.editQueuedMessage` of an agent-authored (A2A /
+//! automatic) entry is not preambled — its sender stays the originating
+//! agent's header; the edit is recorded by the stamp only. Also within
+//! 10.3, direct member add (additive; sharing access extended to active host
+//! members by shared-host-membership §5.49): `principal.list` (no
+//! params) → `{ principals: [{ principalId, login?, displayName?,
+//! avatarUrl?, githubUserId?, identity?, hostRole }] }`, every non-primary principal holding at
+//! least one active (non-revoked) credential, by creation time; a guest
+//! that revoked itself is omitted. A workspace guest is `-32003`.
+//! `workspace.members.add { workspaceId, principalId }`
+//! (owner/member) → `{ added, memberCount }`: attaches such a guest as a
+//! collaborator; `added: false` when already a member (idempotent, nothing
+//! published); `-32602` for an unknown principal, the primary principal, a
+//! principal without an active credential (`invalid-params`) or a spent
+//! guest cap (`guest-limit`; collaborators plus open invites). The
+//! credential predicate, the cap check and the seat are one store
+//! transaction, so concurrent adds cannot overshoot the last seat and a
+//! `principal.revokeSelf` racing the add (which revokes credentials before
+//! it drops memberships) never leaves a seated member without an active
+//! credential. The seated count is protected at redemption, not at mint:
+//! an invite minted concurrently with a direct add may be refused
+//! `workspace-full` at join. An add publishes the same `workspace:updated
+//! { changes: { members: true, addedPrincipalId, memberCount } }` an invite
+//! join does, so the guest's open `workspace` channel — whose forwarder
+//! re-reads under the guest's own caller — upserts the now-visible row as
+//! an `updated` delta without a reconnect. The catalog contains
+//! 328 router methods, 56 fast-path methods, and two aliases: 386
+//! client-callable names.
+
+//! Version 10.3 adds optional `system.requestUpdate.targetVersion` and
+//! `system.status.exactUpdateSupported` / `targetUpdate`. Fixed-release
+//! installs are asynchronous and never fall back to channel updates.
+//!
+//! Version 10.4 is an additive minor bump over 10.3. The `/tunnel` endpoint
+//! gains the client→daemon `CREDIT` frame (opcode `0x07`) and a per-stream
+//! daemon→client credit window (§1.4); a client sends `CREDIT` only to a
+//! daemon whose `client.hello` `protocolVersion` is ≥ 10.4, and a pre-10.4
+//! daemon closes the connection with `1002` on the unknown opcode. It also
+//! adds agent memory attribution (§5.5, §5.7): the daemon-global
+//! `agent.memoryUsage` router method — one row per spawned agent the
+//! descendant-tree sampler bucketed, with its per-process rows — and two
+//! always-present `system.status` fields from the same sweep,
+//! `agentMemoryBytes` (the agent-attributed share of `childMemoryBytes`)
+//! and `agentProcessCount` (buckets with a live root pid), `null` until the
+//! first sample lands. The catalog contains 325 router methods, 53
+//! fast-path methods, and two aliases: 380 client-callable names.
+//!
+//! Version 10.5 adds the provider-generic auth surface (§5.27):
+//! `sourceControl.authStatus` / `connect` / `cancelAuth` / `revoke` /
+//! `getUser` with `provider: "github" | "gitlab"` and an optional gitlab
+//! `host`, the `device-grant-unsupported` / `source-control-unauthorized`
+//! typed errors, the `sourceControl:auth-changed { provider, host, status }`
+//! event and the `sourceControl.gitlab.*` settings. The `github.*` auth
+//! quintet is served as byte-identical aliases. The catalog contains 334
+//! router methods, 56 fast-path methods, and two aliases: 392
+//! client-callable names.
+//!
+//! Versions 10.5 (`sourceControl.*` forge auth) and 10.6 (provider-neutral
+//! principal identity) are documented in the monorepo's
+//! `docs/protocol/versioning.md`.
+//!
+//! Version 10.7 is an additive minor bump over 10.6: the image dimension
+//! sidecar (§5.5, §7.1). A `text` content block gains
+//! `media?: { [src]: { width, height } }` — intrinsic dimensions of every
+//! probeable Markdown image reference, keyed by the `src` exactly as
+//! written, omitted when nothing resolved; live `chat.subscribe` text chunk
+//! deltas carry only the entries that chunk resolved and the persisted block
+//! carries the union. An `image` block gains `width?` / `height?` (the
+//! original's intrinsic dimensions, kept by the slim projection). Both are
+//! computed on the write path and stored; no method-catalog change.
+//!
+//! Version 10.8 is an additive minor bump over 10.7: the provider-neutral
+//! identity key. Every projected principal gains an optional `identity:
+//! { provider, host, externalUserId }` object (`principal.list` rows
+//! alongside the kept `githubUserId`; a github.com account carries both,
+//! `identity.externalUserId` being the decimal `githubUserId`), and a
+//! pinned invite gains the matching optional `pinIdentity` next to the kept
+//! `pinGithubUserId` / `pinLogin`. Identities are stored and resolved by
+//! the triple (`0130_principal_identity`), so an account on another
+//! provider or host with the same numeric id is a distinct principal.
+//! `invite.inspect` and `invite.challenge` return the required `pinIdentity`
+//! triple (including a legacy GitHub pin) or explicit `null` when unpinned,
+//! after validating the open invite and secret, with no forge call. Errors
+//! disclose no pin; older daemons omit the field. Guests can select the
+//! matching connected account before publishing a proof, while the host
+//! retains its final provider/host/account pin enforcement.
+//! The same version adds the provider-neutral guest half of the identity
+//! proof: `sourceControl.identityProof.create` / `delete` with `provider:
+//! "github" | "gitlab"` and an optional gitlab `host` (a public personal
+//! snippet on GitLab, the existing gist on GitHub; the result carries
+//! `proofId`, `provider`, `host`, `login`, `externalUserId`, `avatarUrl`
+//! and, for github, the compatibility `gistId`). The `github.identityProof.*`
+//! pair is kept as aliases with `provider: "github"` pinned: the same
+//! params (`delete` spells the proof id `gistId`), with the `create` result
+//! projected to its documented `{ gistId, login }` — not byte-identical to
+//! the provider-neutral result. New typed errors:
+//! `gitlab-not-connected`, `gitlab-scope-missing`, `gitlab-unreachable` on
+//! the guest half and `identity-unverifiable { host }` when the host can
+//! read neither anonymously nor with its own connection to the same
+//! instance. No event is added. The catalog contains 336 router methods,
+//! 56 fast-path methods, and two aliases: 394 client-callable names.
+//!
+//! Version 10.9 adds the collaboration credential purpose: six owner-only
+//! `identity.*` methods, isolated credential/proof resolution and explicit
+//! identity selection, plus `identity:auth-changed`. The hello capability
+//! `collaborationIdentity: 1` gates purpose-aware proof calls. This does not
+//! advertise the separately implemented host-membership capability.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "10.1";
+pub const PROTOCOL_VERSION: &str = "10.9";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

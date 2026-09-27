@@ -179,13 +179,19 @@ impl Services {
     /// hot RPC's statement count stays independent of the workspace count —
     /// AGENTS.md RPC cost contract). `None` (single-row paths: get, mutation
     /// responses, event emits) runs the bounded per-workspace EXISTS probe.
+    ///
+    /// `external_prs` — the workspace's git-root PRs and displayStatus
+    /// monitor rows when the caller already read them (`workspace.get` reads
+    /// them ONCE and reuses them for its PR merge, so the detail read issues
+    /// no duplicate scoped statement). `None` runs the two scoped reads.
     pub(crate) async fn enrich_display_status(
         &self,
         ws: &mut Workspace,
         sessions: Option<&[intent_core::AgentSession]>,
         unread: Option<bool>,
+        external_prs: Option<WorkspaceExternalPrs<'_>>,
     ) {
-        self.enrich_display_status_with_snapshot(ws, sessions, unread, None)
+        self.enrich_display_status_inner(ws, sessions, unread, external_prs, None)
             .await;
     }
 
@@ -197,6 +203,24 @@ impl Services {
         ws: &mut Workspace,
         sessions: Option<&[intent_core::AgentSession]>,
         unread: Option<bool>,
+        snapshot: Option<WorkspaceStatusSnapshot<'_>>,
+    ) {
+        self.enrich_display_status_inner(
+            ws,
+            sessions,
+            unread,
+            snapshot.map(|snapshot| snapshot.external_prs()),
+            snapshot,
+        )
+        .await;
+    }
+
+    async fn enrich_display_status_inner(
+        &self,
+        ws: &mut Workspace,
+        sessions: Option<&[intent_core::AgentSession]>,
+        unread: Option<bool>,
+        external_prs: Option<WorkspaceExternalPrs<'_>>,
         snapshot: Option<WorkspaceStatusSnapshot<'_>>,
     ) {
         // Served `attention` is DERIVED on this same emit path (§5.1):
@@ -261,12 +285,12 @@ impl Services {
         // the awaits below must not have this seed resurrect the baseline.
         let generation = self.last_display_statuses.generation();
         // Git-root PRs feed the PR rungs alongside the workspace's own
-        // linkage: the list snapshot carries them from its one bulk read;
-        // single-row callers do one scoped read (same class as the monitor
-        // probe below).
+        // linkage: the list snapshot carries them from its one bulk read and
+        // `workspace.get` from its one pre-read; other single-row callers do
+        // one scoped read (same class as the monitor probe below).
         let fetched_git_root_prs;
-        let git_root_prs: &[PullRequestInfo] = if let Some(snapshot) = snapshot {
-            snapshot.git_root_prs
+        let git_root_prs: &[PullRequestInfo] = if let Some(external) = external_prs {
+            external.git_root_prs
         } else {
             fetched_git_root_prs = self.workspace_git_root_prs(&ws.id).await;
             &fetched_git_root_prs
@@ -293,7 +317,23 @@ impl Services {
         // signals (hooks/subscriptions) no longer fold into the promotion —
         // they surface as the orthogonal `waiting` flag above — but
         // agent-monitored PRs DO feed the PR rungs: an active monitor on an
-        // open PR (including cross-repo) reads as an open-PR signal.
+        // open PR (including cross-repo) reads as an open-PR signal, unless
+        // a workspace-owned copy of that PR already reached a fresher
+        // terminal lifecycle ([`terminal_pr_copies`]).
+        let terminal_prs = terminal_pr_copies(
+            ws.active_pull_request.as_ref(),
+            ws.pull_requests.as_deref().unwrap_or_default(),
+            git_root_prs,
+        );
+        let monitor_prs = match external_prs {
+            Some(external) => {
+                crate::pr_monitor::fold_monitor_pr_signals(external.monitor_rows, &terminal_prs)
+            }
+            None => {
+                self.workspace_monitor_pr_signals(&ws.id, &terminal_prs)
+                    .await
+            }
+        };
         let display_status = compute_display_status(
             self.workspace_attention_signals_with_legacy_holds(
                 &ws.id,
@@ -308,10 +348,7 @@ impl Services {
             git_root_prs,
             ws.pr_url.as_deref(),
             ws.pr_status,
-            match snapshot {
-                Some(snapshot) => snapshot.monitor_pr_signals,
-                None => self.workspace_monitor_pr_signals(&ws.id).await,
-            },
+            monitor_prs,
             ws.task_stats.as_ref(),
         );
         self.last_display_statuses
@@ -344,6 +381,40 @@ impl Services {
                 );
                 Vec::new()
             }
+        }
+    }
+
+    /// The `workspace.get` external-PR reads: the git-root PRs
+    /// ([`Self::workspace_git_root_prs`]) plus the one-statement monitor
+    /// read serving both the displayStatus rows and the PR-merge projection
+    /// (`Store::load_workspace_pr_monitor_reads`) — two scoped statements,
+    /// the same count the derivation alone paid before the merge existed.
+    /// Best-effort like its parts: a monitor read failure is logged and
+    /// reads as no monitors (no signals, nothing merged) so the detail read
+    /// is never wedged.
+    pub(crate) async fn workspace_external_pr_reads(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> WorkspaceExternalPrReads {
+        let git_root_prs = self.workspace_git_root_prs(workspace_id).await;
+        let monitors = match self
+            .store
+            .load_workspace_pr_monitor_reads(workspace_id)
+            .await
+        {
+            Ok(monitors) => monitors,
+            Err(e) => {
+                tracing::warn!(
+                    workspace = %workspace_id.0,
+                    error = %e,
+                    "workspace.get: pr monitor read failed; reads as no monitors"
+                );
+                intent_store::WorkspacePrMonitorReads::default()
+            }
+        };
+        WorkspaceExternalPrReads {
+            git_root_prs,
+            monitors,
         }
     }
 
@@ -403,7 +474,19 @@ impl Services {
         // ([`Services::workspace_is_waiting`]); only a live agent turn
         // promotes here. Agent-monitored PRs and git-root PRs feed the PR
         // rungs, so the monitor lifecycle choke points
-        // (register/complete/cancel) route through this recompute.
+        // (register/complete/cancel) route through this recompute. A
+        // workspace-owned terminal copy of a monitored PR supersedes the
+        // monitor's open snapshot ([`terminal_pr_copies`]), so the passive
+        // `github.pulls.get` fold moves the rollup without waiting for the
+        // monitor sweep.
+        let terminal_prs = terminal_pr_copies(
+            ws.active_pull_request.as_ref(),
+            ws.pull_requests.as_deref().unwrap_or_default(),
+            &git_root_prs,
+        );
+        let monitor_prs = self
+            .workspace_monitor_pr_signals(workspace_id, &terminal_prs)
+            .await;
         let status = compute_display_status(
             signals,
             self.workspace_activity(workspace_id) == WorkspaceActivity::AgentRunning,
@@ -412,7 +495,7 @@ impl Services {
             &git_root_prs,
             ws.pr_url.as_deref(),
             ws.pr_status,
-            self.workspace_monitor_pr_signals(workspace_id).await,
+            monitor_prs,
             Some(&task_stats),
         );
         let Some(transitioned) =
@@ -525,7 +608,8 @@ impl Services {
     /// The `unread` workspace attention flag never feeds the signals — it
     /// is the flag's own contract (§9.9), not a displayStatus axis.
     /// Child/background sessions never count — their attention surface is
-    /// the parent/subscriber (attention-retire taxonomy). A pending request
+    /// the parent/subscriber (attention-retire taxonomy) — and neither do
+    /// soft-retired or muted (`notificationsMuted`) sessions. A pending request
     /// raised MID-TURN whose surfacing is still parked on the
     /// deferred-attention registry does not count either: the workspace
     /// stays `in_progress` until the raising agent's turn-end flush
@@ -579,6 +663,7 @@ impl Services {
                     && !s.is_background
                     && s.status != intent_core::AgentStatus::Deleted
                     && s.retired_at.is_none()
+                    && !s.notifications_muted
             })
             .collect();
         for s in &top_level {
@@ -632,11 +717,85 @@ impl Services {
 #[derive(Clone, Copy)]
 pub(crate) struct WorkspaceStatusSnapshot<'a> {
     pub(crate) waiting: bool,
-    pub(crate) monitor_pr_signals: MonitorPrSignals,
+    /// The workspace's displayStatus-relevant PR monitor rows, from the list
+    /// call's one bulk read; folded into [`MonitorPrSignals`] per row
+    /// against the workspace's own terminal PR copies
+    /// ([`crate::pr_monitor::fold_monitor_pr_signals`]).
+    pub(crate) monitor_rows: &'a [intent_core::PrMonitor],
     /// PRs persisted on the workspace's secondary git roots, from the list
     /// call's one bulk read (`list_workspace_git_roots_with_prs`).
     pub(crate) git_root_prs: &'a [PullRequestInfo],
     pub(crate) legacy_question_holds: &'a HashSet<AgentId>,
+}
+
+impl<'a> WorkspaceStatusSnapshot<'a> {
+    fn external_prs(&self) -> WorkspaceExternalPrs<'a> {
+        WorkspaceExternalPrs {
+            monitor_rows: self.monitor_rows,
+            git_root_prs: self.git_root_prs,
+        }
+    }
+}
+
+/// The externally known PR inputs to the displayStatus derivation a caller
+/// already read: the subset of [`WorkspaceStatusSnapshot`] every path can
+/// supply without the list-only `waiting` / legacy-hold batches.
+#[derive(Clone, Copy)]
+pub(crate) struct WorkspaceExternalPrs<'a> {
+    /// See [`WorkspaceStatusSnapshot::monitor_rows`].
+    pub(crate) monitor_rows: &'a [intent_core::PrMonitor],
+    /// See [`WorkspaceStatusSnapshot::git_root_prs`].
+    pub(crate) git_root_prs: &'a [PullRequestInfo],
+}
+
+/// The `workspace.get` external-PR reads, issued ONCE per call
+/// ([`Services::workspace_external_pr_reads`]) and consumed twice: the
+/// displayStatus derivation ([`WorkspaceExternalPrReads::status_inputs`])
+/// and, after enrichment, the PR merge
+/// (`Services::merge_workspace_external_pull_requests`) — so the detail read
+/// serves the merged pool with no extra statement over the enrichment it
+/// already paid for (`workspace_get_enrichment_stays_within_statement_budget`).
+pub(crate) struct WorkspaceExternalPrReads {
+    /// PRs persisted on the workspace's secondary git roots
+    /// ([`Services::workspace_git_root_prs`]).
+    pub(crate) git_root_prs: Vec<PullRequestInfo>,
+    /// The one-statement monitor read: displayStatus rows plus the PR-merge
+    /// projection of every non-cancelled row.
+    pub(crate) monitors: intent_store::WorkspacePrMonitorReads,
+}
+
+impl WorkspaceExternalPrReads {
+    pub(crate) fn status_inputs(&self) -> WorkspaceExternalPrs<'_> {
+        WorkspaceExternalPrs {
+            monitor_rows: &self.monitors.display_rows,
+            git_root_prs: &self.git_root_prs,
+        }
+    }
+}
+
+/// The workspace-owned PR copies (linked `activePullRequest`, pooled
+/// `pullRequests`, git-root pools) whose persisted lifecycle is terminal
+/// (merged or closed) — the set an ACTIVE monitor's open snapshot of the
+/// same PR yields to in [`crate::pr_monitor::fold_monitor_pr_signals`]. The
+/// passive `github.pulls.get` fold writes these copies straight from the
+/// forge, so a fresh terminal copy must move the rollup without waiting for
+/// the monitor sweep to re-observe it.
+pub(crate) fn terminal_pr_copies<'a>(
+    active_pr: Option<&'a PullRequestInfo>,
+    pull_requests: &'a [PullRequestInfo],
+    git_root_prs: &'a [PullRequestInfo],
+) -> Vec<&'a PullRequestInfo> {
+    active_pr
+        .into_iter()
+        .chain(pull_requests)
+        .chain(git_root_prs)
+        .filter(|pr| {
+            matches!(
+                pr.status,
+                PullRequestStatus::Merged | PullRequestStatus::Closed
+            )
+        })
+        .collect()
 }
 
 /// Attention-axis inputs to [`compute_display_status`], probed by
@@ -660,7 +819,9 @@ pub(crate) struct AttentionSignals {
 /// via `ws.pr.monitor` — including a cross-repo PR that never appears in the
 /// workspace's own PR linkage — participates in the PR rungs of
 /// [`compute_display_status`]. Derived purely from persisted
-/// `state`/`last_snapshot` columns: no forge calls.
+/// `state`/`last_snapshot` columns (plus the workspace's own terminal PR
+/// copies, which an ACTIVE monitor's stale open snapshot yields to): no
+/// forge calls.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[expect(clippy::struct_excessive_bools)]
 pub(crate) struct MonitorPrSignals {
@@ -703,7 +864,10 @@ pub(crate) struct MonitorPrSignals {
 ///    plus the PRs persisted on the workspace's secondary git roots,
 ///    `git_root_prs`, folded in by [`fold_git_root_prs`]) — yields
 ///    `pr_queued` when the PR sits in the forge's merge queue
-///    (`mergeable_state == "queued"`, not draft), `pr_ready` only when truly
+///    (`is_in_merge_queue == Some(true)` — the signal the `github.pulls.get`
+///    fold persists, since GitHub's REST `mergeable_state` reads `"clean"`
+///    for a queued PR — or a host-reported `mergeable_state == "queued"`;
+///    not draft), `pr_ready` only when truly
 ///    mergeable (`mergeable == Some(true)` AND `mergeable_state == "clean"`,
 ///    not draft), else `pr_open`. GitHub's `mergeable` flag alone only means
 ///    "no merge conflicts" — a PR blocked by required checks or reviews
@@ -714,7 +878,9 @@ pub(crate) struct MonitorPrSignals {
 ///    is in the merge queue (not draft), `pr_ready` when the snapshot's full
 ///    merge-requirements checklist is clear and the PR is not draft, else
 ///    `pr_open` — so a workspace watching an open PR (including cross-repo)
-///    never falls through to `complete`/`idle`. When none of those carries
+///    never falls through to `complete`/`idle`; a monitor whose PR the
+///    workspace already holds as a fresher terminal copy contributes
+///    nothing ([`terminal_pr_copies`]). When none of those carries
 ///    an open/draft entry but the workspace `prStatus` column is
 ///    `Open`/`Draft`, that column is the fallback PR-stage signal and
 ///    yields `pr_open` (never `pr_ready`: the column carries no mergeable
@@ -811,18 +977,27 @@ pub(crate) fn upgrade_pr_lifecycle(present: &mut PullRequestInfo, candidate: &Pu
     }
 }
 
+/// Step 4's merge-queue predicate: the persisted `isInMergeQueue: true`
+/// signal (the `github.pulls.get` fold, intent-hq/intent#5654), or a host
+/// that does report `mergeableState: "queued"` (GitHub's REST never does — a
+/// queued PR reads `"clean"` there).
+fn pr_in_merge_queue(info: &PullRequestInfo) -> bool {
+    info.is_in_merge_queue == Some(true) || info.mergeable_state.as_deref() == Some("queued")
+}
+
 /// Step-4 readiness rung of a same-URL copy, the tie-break behind
 /// [`pr_lifecycle_key`] for copies of equal (rank, `updated_at`). Mirrors
 /// the `pr_queued > pr_ready > pr_open` precedence of
 /// [`rollup_over_pr_pool`] with the same predicates: a non-draft
-/// `mergeableState: "queued"` copy ranks highest, then a non-draft
+/// merge-queued copy ([`pr_in_merge_queue`]: `isInMergeQueue: true` or
+/// `mergeableState: "queued"`) ranks highest, then a non-draft
 /// `mergeable: true` + `"clean"` copy, then any other `mergeable: true`,
 /// then unknown mergeability (`None`), then `mergeable: false` lowest; a
 /// draft copy never ranks as queued/ready (step 4 reads it `pr_open`).
 fn pr_readiness_rank(info: &PullRequestInfo) -> u8 {
     let draft = info.status == PullRequestStatus::Draft || info.is_draft == Some(true);
     let state = info.mergeable_state.as_deref();
-    if !draft && state == Some("queued") {
+    if !draft && pr_in_merge_queue(info) {
         5
     } else if !draft && info.mergeable == Some(true) && state == Some("clean") {
         4
@@ -836,12 +1011,14 @@ fn pr_readiness_rank(info: &PullRequestInfo) -> u8 {
 }
 
 /// [`pr_lifecycle_key`]'s shape: (rank, `updated_at`, readiness rank,
-/// non-draft, `mergeableState`, `mergeable`, `isDraft`, status-not-draft).
+/// non-draft, `isInMergeQueue`, `mergeableState`, `mergeable`, `isDraft`,
+/// status-not-draft).
 type PrLifecycleKey<'a> = (
     u8,
     &'a str,
     u8,
     bool,
+    Option<bool>,
     Option<&'a str>,
     Option<bool>,
     Option<bool>,
@@ -855,10 +1032,10 @@ type PrLifecycleKey<'a> = (
 /// on (rank, `updated_at`) — two open copies of one PR read at the same
 /// instant with different mergeability — resolve by readiness
 /// ([`pr_readiness_rank`]: queued > ready > open, mirroring step 4), then
-/// non-draft over draft, then the raw `mergeableState` / `mergeable` /
-/// `isDraft` / `status` fields so the order is total over every lifecycle
-/// field: equal keys mean identical lifecycle snapshots, and the selected
-/// copy never depends on the order the copies are visited in.
+/// non-draft over draft, then the raw `isInMergeQueue` / `mergeableState` /
+/// `mergeable` / `isDraft` / `status` fields so the order is total over
+/// every lifecycle field: equal keys mean identical lifecycle snapshots, and
+/// the selected copy never depends on the order the copies are visited in.
 fn pr_lifecycle_key(info: &PullRequestInfo) -> PrLifecycleKey<'_> {
     let draft = info.status == PullRequestStatus::Draft || info.is_draft == Some(true);
     (
@@ -866,6 +1043,7 @@ fn pr_lifecycle_key(info: &PullRequestInfo) -> PrLifecycleKey<'_> {
         info.updated_at.as_str(),
         pr_readiness_rank(info),
         !draft,
+        info.is_in_merge_queue,
         info.mergeable_state.as_deref(),
         info.mergeable,
         info.is_draft,
@@ -878,7 +1056,7 @@ fn pr_lifecycle_key(info: &PullRequestInfo) -> PrLifecycleKey<'_> {
 /// equal-ranked `canonical` with a newer `updated_at` advances the
 /// timestamp too; equal (rank, `updated_at`) copies converge on the
 /// readier one ([`pr_lifecycle_key`]). The readiness fields (`isDraft`,
-/// `mergeable`, `mergeableState`) travel with the selected snapshot, so
+/// `mergeable`, `mergeableState`, `isInMergeQueue`) travel with the selected snapshot, so
 /// `present` reads as one coherent copy — the one chosen by the key —
 /// rather than a newer status over whichever copy's mergeability the fold
 /// visited first (step 4's `pr_ready` / `pr_queued` would otherwise depend
@@ -898,6 +1076,7 @@ pub(crate) fn canonicalize_pr_lifecycle(
         present
             .mergeable_state
             .clone_from(&canonical.mergeable_state);
+        present.is_in_merge_queue = canonical.is_in_merge_queue;
     }
 }
 
@@ -1113,9 +1292,11 @@ fn rollup_over_pr_pool(
     });
     if let Some(pr) = open_pr {
         let draft = pr.status == PullRequestStatus::Draft || pr.is_draft == Some(true);
-        // GitHub reports `mergeable_state: "queued"` for a PR sitting in
-        // the merge queue — it is beyond "ready", the queue is handling it.
-        let queued = pr.mergeable_state.as_deref() == Some("queued");
+        // A PR sitting in the merge queue is beyond "ready" — the queue is
+        // handling it. The signal is the fold-persisted `isInMergeQueue`
+        // (GitHub's REST `mergeable_state` reads `"clean"` for a queued PR)
+        // or a host that does report `mergeable_state: "queued"`.
+        let queued = pr_in_merge_queue(pr);
         // `mergeable` alone only rules out conflicts; only a "clean"
         // `mergeable_state` means the forge would actually accept the merge
         // (blocked/behind/dirty/unstable/unknown/absent all read `pr_open`).
@@ -1346,6 +1527,7 @@ mod display_status {
             mergeable: None,
             mergeable_state: None,
             is_draft: None,
+            is_in_merge_queue: None,
         }
     }
 
@@ -1673,6 +1855,78 @@ mod display_status {
         // Attention axes and a running agent still outrank a queued PR.
         let mut queued = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         queued.mergeable_state = Some("queued".into());
+        assert_eq!(
+            compute_display_status(sig(true), false, Some(&queued), &[], None, None),
+            WorkspaceDisplayStatus::NeedsAttention
+        );
+        assert_eq!(
+            compute_display_status(sig(false), true, Some(&queued), &[], None, None),
+            WorkspaceDisplayStatus::InProgress
+        );
+    }
+
+    /// The pool path keys `pr_queued` on the fold-persisted
+    /// `isInMergeQueue: true` (intent-hq/intent#5654): GitHub's REST never
+    /// reports `mergeable_state: "queued"` — a queued PR reads `"clean"` —
+    /// so a pooled open PR carrying `is_in_merge_queue: Some(true)` over a
+    /// `clean` mergeability reads `pr_queued` with no monitor, linked or
+    /// found via the `pullRequests` scan, whatever `mergeable` says; a draft
+    /// never reads queued; `Some(false)` / `None` keep the `clean` →
+    /// `pr_ready` mapping.
+    #[test]
+    fn open_pr_with_is_in_merge_queue_is_pr_queued_without_a_monitor() {
+        let queued_clean = |mergeable: Option<bool>| {
+            let mut info = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+            info.mergeable = mergeable;
+            info.mergeable_state = Some("clean".into());
+            info.is_in_merge_queue = Some(true);
+            info
+        };
+        for mergeable in [Some(true), Some(false), None] {
+            let queued = queued_clean(mergeable);
+            assert_eq!(
+                compute_display_status(
+                    sig(false),
+                    false,
+                    Some(&queued),
+                    &[],
+                    None,
+                    Some(&stats(2, 2, 0))
+                ),
+                WorkspaceDisplayStatus::PrQueued,
+                "linked, mergeable {mergeable:?}"
+            );
+            assert_eq!(
+                compute_display_status(sig(false), false, None, &[queued], None, None),
+                WorkspaceDisplayStatus::PrQueued,
+                "pooled, mergeable {mergeable:?}"
+            );
+        }
+        // Not queued (reported false or unknown): the REST mapping applies.
+        for not_queued in [Some(false), None] {
+            let mut clean = queued_clean(Some(true));
+            clean.is_in_merge_queue = not_queued;
+            assert_eq!(
+                compute_display_status(sig(false), false, Some(&clean), &[], None, None),
+                WorkspaceDisplayStatus::PrReady,
+                "is_in_merge_queue {not_queued:?}"
+            );
+        }
+        // Drafts never read queued.
+        let mut draft = queued_clean(Some(true));
+        draft.status = PullRequestStatus::Draft;
+        assert_eq!(
+            compute_display_status(sig(false), false, Some(&draft), &[], None, None),
+            WorkspaceDisplayStatus::PrOpen
+        );
+        let mut flagged = queued_clean(Some(true));
+        flagged.is_draft = Some(true);
+        assert_eq!(
+            compute_display_status(sig(false), false, Some(&flagged), &[], None, None),
+            WorkspaceDisplayStatus::PrOpen
+        );
+        // Attention axes and a running agent still outrank a queued PR.
+        let queued = queued_clean(Some(true));
         assert_eq!(
             compute_display_status(sig(true), false, Some(&queued), &[], None, None),
             WorkspaceDisplayStatus::NeedsAttention
@@ -2921,6 +3175,80 @@ mod display_status {
         }
     }
 
+    /// The readiness rank keys on the same merge-queue predicate as step 4
+    /// (intent-hq/intent#5654): an `isInMergeQueue: true` copy over a `clean`
+    /// mergeability ranks as queued — above a plain `clean` copy of the same
+    /// timestamp in either root order — and the field travels with the
+    /// selected snapshot, so the canonical pooled copy carries it (a lower
+    /// key never moves it onto a readier copy); a draft copy never ranks
+    /// queued.
+    #[test]
+    fn equal_timestamp_same_url_copies_prefer_the_is_in_merge_queue_copy() {
+        const AT: &str = "2026-01-02T00:00:00Z";
+        let clean = open_pr("clean", AT);
+        let mut queued = open_pr("clean", AT);
+        queued.is_in_merge_queue = Some(true);
+        for roots in [
+            [clean.clone(), queued.clone()],
+            [queued.clone(), clean.clone()],
+        ] {
+            let order: Vec<_> = roots.iter().map(|p| p.is_in_merge_queue).collect();
+            assert_eq!(
+                with_git_root_prs(None, &[], &roots, None),
+                WorkspaceDisplayStatus::PrQueued,
+                "roots {order:?}"
+            );
+            let folded = super::fold_git_root_prs(None, &[], &roots, None);
+            assert_eq!(
+                folded
+                    .pool
+                    .iter()
+                    .map(|p| (p.status, p.mergeable_state.as_deref(), p.is_in_merge_queue))
+                    .collect::<Vec<_>>(),
+                vec![(PullRequestStatus::Open, Some("clean"), Some(true))],
+                "roots {order:?}"
+            );
+        }
+        // The same for a workspace-owned pooled copy: the stale `None` pool
+        // entry adopts the root copy's signal and keeps its identity.
+        let pool = [clean.clone()];
+        let folded = super::fold_git_root_prs(None, &pool, &[queued.clone()], Some(PR_URL));
+        assert_eq!(
+            folded
+                .pool
+                .iter()
+                .map(|p| (p.id.as_str(), p.is_in_merge_queue))
+                .collect::<Vec<_>>(),
+            vec![(pool[0].id.as_str(), Some(true))]
+        );
+        assert_eq!(
+            with_git_root_prs(None, &pool, &[queued.clone()], None),
+            WorkspaceDisplayStatus::PrQueued
+        );
+        // A draft copy never ranks queued: the non-draft clean copy wins.
+        let mut draft_queued = queued.clone();
+        draft_queued.status = PullRequestStatus::Draft;
+        draft_queued.is_draft = Some(true);
+        for roots in [
+            [clean.clone(), draft_queued.clone()],
+            [draft_queued.clone(), clean.clone()],
+        ] {
+            assert_eq!(
+                with_git_root_prs(None, &[], &roots, None),
+                WorkspaceDisplayStatus::PrReady
+            );
+            let folded = super::fold_git_root_prs(None, &[], &roots, None);
+            assert_eq!(
+                folded
+                    .pool
+                    .iter()
+                    .map(|p| (p.status, p.is_in_merge_queue))
+                    .collect::<Vec<_>>(),
+                vec![(PullRequestStatus::Open, None)]
+            );
+        }
+    }
+
     /// The same tie rule across a workspace's own copies: a linked
     /// `open(blocked)` and a pooled `open(clean)` of one URL at the same
     /// timestamp, plus an older same-URL root copy (and a same-timestamp
@@ -3329,6 +3657,7 @@ mod workspace_needs_attention {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         }
     }
 
@@ -3512,6 +3841,66 @@ mod workspace_needs_attention {
         }
     }
 
+    /// A muted top-level session (`notifications_muted`) feeds none of the
+    /// axes: its `error` status, pending blocker/discussion request, and
+    /// pending questions marker are all silenced. Unmuting brings each
+    /// signal back.
+    #[tokio::test]
+    async fn muted_top_level_sessions_never_count_until_unmuted() {
+        let (svc, ws, _tmp) = setup().await;
+
+        let mut failed = mk_session(&ws, "agent-muted-error");
+        failed.status = AgentStatus::Error;
+        failed.notifications_muted = true;
+        svc.store.insert_agent_session(&failed).await.unwrap();
+
+        let mut blocker = mk_session(&ws, "agent-muted-blocker");
+        blocker.attention_request_kind = Some("blocker".to_string());
+        blocker.notifications_muted = true;
+        svc.store.insert_agent_session(&blocker).await.unwrap();
+
+        let mut discuss = mk_session(&ws, "agent-muted-discussion");
+        discuss.attention_request_kind = Some("discussion".to_string());
+        discuss.notifications_muted = true;
+        svc.store.insert_agent_session(&discuss).await.unwrap();
+
+        let mut questions = mk_session(&ws, "agent-muted-questions");
+        questions.metadata = Some(json!({
+            (intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY): "msg-pending"
+        }));
+        questions.notifications_muted = true;
+        svc.store.insert_agent_session(&questions).await.unwrap();
+
+        assert_eq!(
+            signals(&svc, &ws).await,
+            AttentionSignals::default(),
+            "muted sessions feed no attention axis"
+        );
+
+        let cases: [(&AgentSession, Axis); 4] = [
+            (&failed, |s| s.failed),
+            (&blocker, |s| s.blocked),
+            (&discuss, |s| s.needs_attention),
+            (&questions, |s| s.needs_attention),
+        ];
+        for (session, expect) in cases {
+            let ts = intent_core::now_iso();
+            svc.store
+                .set_agent_notifications_muted(&ws, &session.id, false, &ts)
+                .await
+                .unwrap();
+            assert!(
+                expect(&signals(&svc, &ws).await),
+                "unmuting {} surfaces its signal again",
+                session.id.0
+            );
+            svc.store
+                .set_agent_notifications_muted(&ws, &session.id, true, &ts)
+                .await
+                .unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn pending_questions_on_top_level_session_is_needs_attention() {
         let (svc, ws, _tmp) = setup().await;
@@ -3524,7 +3913,7 @@ mod workspace_needs_attention {
         assert!(signals(&svc, &ws).await.needs_attention);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn question_marker_shapes_match_across_get_list_and_lite_snapshot() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -3590,7 +3979,7 @@ mod workspace_needs_attention {
         }
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn batch_tail_failure_falls_back_without_hiding_pending_questions() {
         let (svc, ws, _tmp) = setup().await;
         let pending = mk_session(&ws, "agent-pending-batch-fallback");
@@ -3869,7 +4258,7 @@ mod display_status_events {
     /// A task-completion transition (`in_progress` → complete over
     /// `task.updateNoteStatus`) emits the event with the self-sufficient
     /// `{ workspaceId, displayStatus }` payload.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn task_completion_transition_emits() {
         let h = harness().await;
         h.store
@@ -3948,6 +4337,7 @@ mod display_status_events {
                     mergeable: None,
                     mergeable_state: None,
                     is_draft: None,
+                    is_in_merge_queue: None,
                 }]),
                 created_at: ts.clone(),
                 updated_at: ts,
@@ -3970,7 +4360,7 @@ mod display_status_events {
     /// A task-status change that does not move the derived rollup (a second
     /// task flipping `not_started` → `in_progress` while the rollup is already
     /// `in_progress`) publishes no displayStatus event.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn no_op_recompute_stays_silent() {
         let h = harness().await;
         h.store
@@ -4020,7 +4410,7 @@ mod display_status_events {
     /// last-observed baseline the same way the enriched path does — a seed
     /// never emits — so the first post-boot mutation emits the transition
     /// against that baseline.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn lite_list_seeds_baseline_then_first_mutation_emits() {
         let h = harness().await;
         // Hermetic root: the lite path probes the workspaces root for
@@ -4064,7 +4454,7 @@ mod display_status_events {
     /// (complete → idle once the only completed task is gone) emits the
     /// transition event: `note.delete` goes through the same
     /// recompute+maybe-emit hook as the task-status mutations.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn task_note_delete_transition_emits() {
         let h = harness().await;
         h.store
@@ -4275,6 +4665,130 @@ mod display_status_events {
         );
     }
 
+    /// `agent.update { notificationsMuted: true }` on the only
+    /// attention-raising agent removes it from the derivation and emits the
+    /// `needs_attention` → idle demotion; unmuting emits the promotion back.
+    #[tokio::test]
+    async fn agent_update_notifications_muted_transition_emits() {
+        let h = harness().await;
+        let session = super::workspace_needs_attention::mk_session(&h.ws, "agent-muted");
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("session");
+        h.store
+            .set_attention_request(&h.ws, &session.id, "discussion", "input", &now_iso())
+            .await
+            .expect("set attention");
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .agent_update_op(session.id.clone(), json!({ "notificationsMuted": true }))
+            .await
+            .expect("mute agent");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "idle" })
+        );
+
+        h.services
+            .agent_update_op(session.id.clone(), json!({ "notificationsMuted": false }))
+            .await
+            .expect("unmute agent");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "needs_attention" })
+        );
+    }
+
+    /// Muting the LAST unread top-level agent settles the derived workspace
+    /// `unread` like the last seen-marker advance: the stored flag clears and
+    /// exactly one `workspace:attention-changed { none }` fires. A no-op
+    /// re-mute and the later unmute write nothing at the workspace level (an
+    /// unmuted unseen tail re-derives `unread` on the next read).
+    #[tokio::test]
+    async fn muting_last_unread_agent_settles_workspace_unread() {
+        let h = harness().await;
+        let session = super::workspace_needs_attention::mk_session(&h.ws, "agent-unread-muted");
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("session");
+        h.store
+            .append_agent_message(
+                &session.id,
+                "assistant",
+                &json!([{ "type": "text", "text": "done" }]),
+                &now_iso(),
+            )
+            .await
+            .expect("append assistant tail");
+        h.services
+            .raise_attention(&h.ws, intent_core::WorkspaceAttention::Unread)
+            .await
+            .expect("raise unread");
+        assert!(
+            h.store
+                .workspace_has_unread_top_level_session(&h.ws)
+                .await
+                .expect("probe"),
+            "unmuted unseen tail derives unread"
+        );
+
+        let mut attn_sub = h.bus.subscribe(SubscriptionFilter {
+            workspace_id: Some(h.ws.0.clone()),
+            event_types: vec!["workspace:attention-changed".to_string()],
+            ..Default::default()
+        });
+        h.services
+            .agent_update_op(session.id.clone(), json!({ "notificationsMuted": true }))
+            .await
+            .expect("mute agent");
+        let ev = recv_one(&mut attn_sub).await;
+        assert_eq!(ev["type"], "workspace:attention-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "attention": "none" })
+        );
+        assert_silent(&mut attn_sub).await;
+        let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(ws.attention, intent_core::WorkspaceAttention::None);
+        assert!(
+            !h.store
+                .workspace_has_unread_top_level_session(&h.ws)
+                .await
+                .expect("probe"),
+            "a muted session never derives unread"
+        );
+
+        // Idempotent re-mute: no transition, no event.
+        h.services
+            .agent_update_op(session.id.clone(), json!({ "notificationsMuted": true }))
+            .await
+            .expect("re-mute agent");
+        assert_silent(&mut attn_sub).await;
+
+        // Unmute: silent at the workspace level; the derivation reads unread
+        // again on the next probe.
+        h.services
+            .agent_update_op(session.id.clone(), json!({ "notificationsMuted": false }))
+            .await
+            .expect("unmute agent");
+        assert_silent(&mut attn_sub).await;
+        assert!(
+            h.store
+                .workspace_has_unread_top_level_session(&h.ws)
+                .await
+                .expect("probe"),
+            "unmuting re-derives unread"
+        );
+    }
+
     /// Question-resolution trigger via `agent.dismissQuestions` (§6.5 step 0):
     /// persisting the dismissal marker retires the pending set and emits the
     /// `needs_attention` → idle demotion.
@@ -4340,7 +4854,7 @@ mod display_status_events {
 
     /// G3: a spec-body write over `note.update` that changes the linked task
     /// set moves the link-gated `taskStats` rollup and emits the transition.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn spec_body_update_transition_emits() {
         let h = harness().await;
         h.store
@@ -4380,7 +4894,7 @@ mod display_status_events {
 
     /// G4: `note.restoreVersion` on the spec re-gates `taskStats` from the
     /// restored body and emits the transition.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn spec_restore_version_transition_emits() {
         let h = harness().await;
         h.store
@@ -4436,7 +4950,7 @@ mod display_status_events {
 
     /// G5: a spec checkbox-line rewrite over `task.update` that strips a
     /// task link re-gates `taskStats` and emits the transition.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn spec_task_line_update_transition_emits() {
         let h = harness().await;
         h.store
@@ -4477,7 +4991,7 @@ mod display_status_events {
 
     /// G6: `task.createPrerequisite` with the spec as dependent adds a fresh
     /// open spec-child task and emits the transition.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_prerequisite_on_spec_transition_emits() {
         let h = harness().await;
         h.store
@@ -4513,7 +5027,7 @@ mod display_status_events {
 
     /// G7: `workspace.delete` evicts the last-observed baseline so the
     /// in-memory cache does not leak deleted-workspace entries.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn workspace_delete_evicts_baseline() {
         let h = harness().await;
         // Hermetic root: the delete path sweeps the workspaces root, and
@@ -4587,7 +5101,7 @@ mod display_status_events {
 
     /// G8: `workspace.update` carrying a PR field recomputes — a `prStatus`
     /// flip to open moves the derived rollup to `pr_open` and emits.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn workspace_update_pr_status_transition_emits() {
         let h = harness().await;
         // Baseline: no tasks, no PR → not_started → idle.
@@ -4954,7 +5468,7 @@ mod display_status_events {
     /// `workspace.markSeen` both leave the derived rollup at `idle` — no
     /// `workspace:displayStatus-changed` — while the flag's own
     /// `workspace:attention-changed` events still fire on raise and clear.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn unread_raise_and_mark_seen_never_move_display_status() {
         let h = harness().await;
         // Seed: idle baseline (no agents, no PR, no tasks).
@@ -5008,7 +5522,7 @@ mod display_status_events {
     /// Regression: a terminal `complete` base with the unread flag raised
     /// serves `displayStatus: complete` — the turn-end blue dot never masks
     /// the real terminal state (raise and markSeen both stay silent).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn unread_flag_never_masks_complete() {
         let h = harness().await;
         h.store
@@ -5026,7 +5540,9 @@ mod display_status_events {
         assert_silent(&mut sub).await;
         let mut ws = h.store.get_workspace(&h.ws).await.expect("reload");
         ws.task_stats = Some(h.services.cheap_task_stats(&h.ws).await.expect("stats"));
-        h.services.enrich_display_status(&mut ws, None, None).await;
+        h.services
+            .enrich_display_status(&mut ws, None, None, None)
+            .await;
         assert_eq!(ws.display_status, Some(WorkspaceDisplayStatus::Complete));
 
         h.services.mark_seen(h.ws.clone()).await.expect("mark seen");
@@ -5038,7 +5554,7 @@ mod display_status_events {
     /// guarded no-op (no `attention-changed`), and a later
     /// `workspace.markSeen` (guarded on `unread`) leaves the review-required
     /// attention in place.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn unread_raise_never_downgrades_review_required() {
         let h = harness().await;
         h.services
@@ -5081,7 +5597,7 @@ mod display_status_events {
     /// carrying `attention: review_required` promotes the derived rollup to
     /// `needs_attention` and emits; `workspace.dismissAttention` retires it
     /// and emits the demotion.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn review_required_flag_transitions_emit() {
         let h = harness().await;
         // Seed: idle baseline.

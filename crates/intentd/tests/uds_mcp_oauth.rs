@@ -98,7 +98,7 @@ fn assert_no_dummy(v: &Value, ctx: &str) {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn mcp_oauth_round_trip_never_echoes_bag_and_validates_params() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -115,7 +115,7 @@ async fn mcp_oauth_round_trip_never_echoes_bag_and_validates_params() {
     let socket = sock_dir.path().join("uds.sock");
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn({
+    let server = intent_core::spawn_daemon({
         let bus = bus.clone();
         let socket = socket.clone();
         async move {

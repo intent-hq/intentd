@@ -22,6 +22,7 @@ fn msg(role: &str, content: Value) -> AgentMessage {
         content,
         metadata: None,
         app_message_id: None,
+        author: None,
         created_at: "2024-01-01T00:00:00Z".to_string(),
     }
 }

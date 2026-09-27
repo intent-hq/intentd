@@ -56,9 +56,8 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -294,7 +293,7 @@ async fn boot() -> (Daemon, u16, Arc<ClientConfig>) {
     let data_dir = data_dir_guard.path().to_path_buf();
     let scratch_guard = scratch_dir("scratch");
     let scratch = scratch_guard.path().to_path_buf();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {
         child,
@@ -534,9 +533,8 @@ async fn boot_with_stub_git() -> (Daemon, u16, Arc<ClientConfig>, PathBuf) {
     let capture = scratch.join("git-capture");
     let path = make_stub_git(&scratch.join("stub-bin"), &capture);
     let secrets_str = secrets.to_string_lossy().to_string();
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("INTENTD_SECRETS_FILE", &secrets_str),
         ("PATH", &path),
     ];

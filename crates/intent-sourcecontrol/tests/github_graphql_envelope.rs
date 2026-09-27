@@ -26,6 +26,7 @@ struct MockGraphql {
 
 /// Per-request responder: raw request text (head + body) → `(status, body)`.
 type Responder = Arc<dyn Fn(&str) -> (u16, String) + Send + Sync>;
+type HeaderResponder = Arc<dyn Fn(&str) -> (u16, String, String) + Send + Sync>;
 
 async fn spawn_mock_graphql(body: Value) -> MockGraphql {
     let body = serde_json::to_string(&body).expect("serialize mock body");
@@ -44,6 +45,14 @@ async fn spawn_mock_graphql_with(
 /// Loopback HTTP stub whose responder picks the status code too — the REST
 /// error paths (422 / 404 / 403) need it.
 async fn spawn_mock_with(respond: Responder) -> MockGraphql {
+    spawn_mock_with_headers(Arc::new(move |request| {
+        let (status, body) = respond(request);
+        (status, String::new(), body)
+    }))
+    .await
+}
+
+async fn spawn_mock_with_headers(respond: HeaderResponder) -> MockGraphql {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .expect("bind mock graphql host");
@@ -68,7 +77,7 @@ async fn spawn_mock_with(respond: Responder) -> MockGraphql {
 /// answer with the responder's status + JSON, and close.
 async fn serve_conn(
     mut stream: TcpStream,
-    respond: &(dyn Fn(&str) -> (u16, String) + Send + Sync),
+    respond: &(dyn Fn(&str) -> (u16, String, String) + Send + Sync),
 ) -> std::io::Result<()> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 1024];
@@ -100,7 +109,7 @@ async fn serve_conn(
         buf.extend_from_slice(&tmp[..n]);
     }
     let request = String::from_utf8_lossy(&buf).to_string();
-    let (status, body) = respond(&request);
+    let (status, headers, body) = respond(&request);
     let reason = match status {
         200 => "OK",
         403 => "Forbidden",
@@ -109,12 +118,149 @@ async fn serve_conn(
         _ => "Status",
     };
     let resp = format!(
-        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        "HTTP/1.1 {status} {reason}\r\n{headers}content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
         body.len(),
         body
     );
     stream.write_all(resp.as_bytes()).await?;
     stream.flush().await
+}
+
+/// intent#5837: `/rate_limit` can disagree with the counters GitHub actually
+/// enforces, even with a current Date and no-cache. A healthy overview must
+/// not hide either exhausted PR-read resource, or supply its reset deadline.
+#[tokio::test]
+async fn quota_probe_uses_enforced_core_and_graphql_counters_not_the_overview() {
+    for exhausted in ["core", "graphql"] {
+        let recovered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let state = recovered.clone();
+        let mock = spawn_mock_with_headers(Arc::new(move |request| {
+            let target = request_target(request);
+            if target.starts_with("/rate_limit") {
+                return (200, String::new(), json!({"resources": {
+                    "core": {"remaining": 4999, "limit": 5000, "reset": 9999},
+                    "graphql": {"remaining": 5000, "limit": 5000, "reset": 9999}
+                }}).to_string());
+            }
+            let resource = match target.as_str() {
+                "/user" => "core",
+                "/graphql" => "graphql",
+                other => panic!("unexpected quota probe {other}"),
+            };
+            let limited = resource == exhausted
+                && !state.load(std::sync::atomic::Ordering::SeqCst);
+            let remaining = if limited { 0 } else { 4500 };
+            let reset = if resource == exhausted { 1200 } else { 1800 };
+            let headers = format!(
+                "x-ratelimit-resource: {resource}\r\nx-ratelimit-remaining: {remaining}\r\nx-ratelimit-limit: 5000\r\nx-ratelimit-reset: {reset}\r\n"
+            );
+            let status = if limited && resource == "core" { 403 } else { 200 };
+            (status, headers, json!({}).to_string())
+        }))
+        .await;
+        let sc = GitHubSourceControl::new("token-not-a-real-secret", Some(&mock.base_uri))
+            .expect("build github client");
+        let status = sc.rate_limit_status().await.expect("quota probe");
+        assert_eq!(status.remaining, Some(0), "{exhausted} is exhausted");
+        assert_eq!(
+            status.reset_at,
+            Some(1200),
+            "the exhausted resource's reset"
+        );
+        assert_eq!(status.limit, Some(5000));
+
+        recovered.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            sc.rate_limit_status()
+                .await
+                .expect("recovered quota")
+                .remaining,
+            Some(4500),
+            "fresh evidence permits genuine recovery"
+        );
+    }
+}
+
+#[tokio::test]
+async fn quota_probe_requires_valid_headers_for_both_resources() {
+    for bad_headers in [
+        String::new(),
+        "x-ratelimit-resource: search\r\nx-ratelimit-remaining: 4999\r\nx-ratelimit-limit: 5000\r\n".into(),
+        "x-ratelimit-resource: graphql\r\nx-ratelimit-remaining: 6000\r\nx-ratelimit-limit: 5000\r\n".into(),
+    ] {
+        let mock = spawn_mock_with_headers(Arc::new(move |request| {
+            let headers = if request_target(request) == "/user" {
+                "x-ratelimit-resource: core\r\nx-ratelimit-remaining: 4999\r\nx-ratelimit-limit: 5000\r\nx-ratelimit-reset: 1800\r\n".into()
+            } else {
+                bad_headers.clone()
+            };
+            (200, headers, "{}".into())
+        })).await;
+        let sc = GitHubSourceControl::new("token-not-a-real-secret", Some(&mock.base_uri)).unwrap();
+        assert_eq!(sc.rate_limit_status().await.unwrap().remaining, None);
+    }
+}
+
+#[tokio::test]
+async fn quota_probe_keeps_the_later_reset_when_both_resources_are_exhausted() {
+    let mock = spawn_mock_with_headers(Arc::new(|request| {
+        let (resource, reset) = if request_target(request) == "/user" {
+            ("core", 1200)
+        } else {
+            ("graphql", 1800)
+        };
+        (200, format!("x-ratelimit-resource: {resource}\r\nx-ratelimit-remaining: 0\r\nx-ratelimit-limit: 5000\r\nx-ratelimit-reset: {reset}\r\n"), "{}".into())
+    })).await;
+    let sc = GitHubSourceControl::new("token-not-a-real-secret", Some(&mock.base_uri)).unwrap();
+    let status = sc.rate_limit_status().await.unwrap();
+    assert_eq!(status.remaining, Some(0));
+    assert_eq!(status.reset_at, Some(1800));
+}
+
+#[tokio::test]
+async fn quota_probe_keeps_the_later_reset_when_resource_balances_are_equal() {
+    for (core_reset, graphql_reset) in [(1200, 1800), (1800, 1200)] {
+        let mock = spawn_mock_with_headers(Arc::new(move |request| {
+            let (resource, reset) = if request_target(request) == "/user" {
+                ("core", core_reset)
+            } else {
+                ("graphql", graphql_reset)
+            };
+            (200, format!("x-ratelimit-resource: {resource}\r\nx-ratelimit-remaining: 200\r\nx-ratelimit-limit: 5000\r\nx-ratelimit-reset: {reset}\r\n"), "{}".into())
+        })).await;
+        let sc = GitHubSourceControl::new("token-not-a-real-secret", Some(&mock.base_uri)).unwrap();
+        let status = sc.rate_limit_status().await.unwrap();
+        assert_eq!(status.remaining, Some(200));
+        assert_eq!(
+            status.reset_at,
+            Some(1800),
+            "equal headroom cannot refill before both resources reset"
+        );
+    }
+}
+
+#[tokio::test]
+async fn quota_probes_never_multiply_requests_with_immediate_http_retries() {
+    for status in [429, 503] {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = calls.clone();
+        let mock = spawn_mock_with_headers(Arc::new(move |_| {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (status, String::new(), "{}".into())
+        }))
+        .await;
+        let sc = GitHubSourceControl::new("token-not-a-real-secret", Some(&mock.base_uri)).unwrap();
+        assert_eq!(
+            sc.rate_limit_probe_interval(),
+            std::time::Duration::from_secs(60)
+        );
+        assert_eq!(sc.rate_limit_status().await.unwrap().remaining, None);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one request per resource for HTTP {status}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -606,10 +752,11 @@ async fn merge_requirements_retries_without_is_in_merge_queue_on_old_schemas() {
                 "data": {
                     "repository": {
                         "pullRequest": {
-                            "mergeStateStatus": "CLEAN",
+                            "headRefOid": "0123456789abcdef0123456789abcdef01234567",
+                        "mergeStateStatus": "CLEAN",
                             "reviewDecision": "APPROVED",
-                            "commits": { "nodes": [{ "commit": { "statusCheckRollup": {
-                                "contexts": { "nodes": [] }
+                            "commits": { "nodes": [{ "commit": { "oid": "0123456789abcdef0123456789abcdef01234567", "statusCheckRollup": {
+                                "contexts": { "nodes": [], "totalCount": 0, "pageInfo": { "hasNextPage": false, "endCursor": null } }
                             } } }] }
                         }
                     }
@@ -645,12 +792,13 @@ async fn merge_requirements_parses_merge_queue_removal_event() {
             "data": {
                 "repository": {
                     "pullRequest": {
+                        "headRefOid": "0123456789abcdef0123456789abcdef01234567",
                         "mergeStateStatus": "CLEAN",
                         "isInMergeQueue": false,
                         "timelineItems": { "nodes": timeline_nodes },
                         "reviewDecision": "APPROVED",
-                        "commits": { "nodes": [{ "commit": { "statusCheckRollup": {
-                            "contexts": { "nodes": [] }
+                        "commits": { "nodes": [{ "commit": { "oid": "0123456789abcdef0123456789abcdef01234567", "statusCheckRollup": {
+                            "contexts": { "nodes": [], "totalCount": 0, "pageInfo": { "hasNextPage": false, "endCursor": null } }
                         } } }] }
                     }
                 }
@@ -682,4 +830,251 @@ async fn merge_requirements_parses_merge_queue_removal_event() {
         .await
         .expect("merge requirements");
     assert_eq!(signals.merge_queue_removal, None, "never ejected");
+}
+
+/// One mock host for the merge-requirements probe: the GraphQL read succeeds
+/// with a PR on base `main`, and the nested REST `branch_rules` read
+/// (`GET /repos/{owner}/{repo}/rules/branches/main`) answers `rules`.
+fn merge_requirements_host_with_branch_rules(rules: (u16, String)) -> Responder {
+    Arc::new(move |request: &str| {
+        if request_target(request).starts_with("/repos/intent-hq/intentd/rules/branches/") {
+            return rules.clone();
+        }
+        (
+            200,
+            json!({
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "headRefOid": "0123456789abcdef0123456789abcdef01234567",
+                        "mergeStateStatus": "CLEAN",
+                            "isInMergeQueue": false,
+                            "timelineItems": { "nodes": [] },
+                            "reviewDecision": "APPROVED",
+                            "baseRefName": "main",
+                            "commits": { "nodes": [{ "commit": { "oid": "0123456789abcdef0123456789abcdef01234567", "statusCheckRollup": {
+                                "contexts": { "nodes": [], "totalCount": 0, "pageInfo": { "hasNextPage": false, "endCursor": null } }
+                            } } }] }
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+    })
+}
+
+/// Quota exhaustion on the nested `branch_rules` REST read is NOT a degradable
+/// error: it must propagate as [`Error::RateLimited`] so the PR monitor opens
+/// the shared forge rate-limit pause like it does for every other read in the
+/// poll, instead of persisting a `rulesKnown: false` checklist as a successful
+/// poll (intent-hq/intent#5281).
+#[tokio::test]
+async fn merge_requirements_propagates_rate_limited_branch_rules_read() {
+    let mock = spawn_mock_with(merge_requirements_host_with_branch_rules((
+        403,
+        json!({ "message": "API rate limit exceeded for user ID 526899." }).to_string(),
+    )))
+    .await;
+    let sc = GitHubSourceControl::new("token-not-a-real-secret", Some(&mock.base_uri))
+        .expect("build github client");
+
+    let err = sc
+        .merge_requirements(&RepoRef::new("intent-hq", "intentd"), 928)
+        .await
+        .expect_err("a rate-limited branch_rules read must fail the probe");
+    assert!(
+        matches!(&err, Error::RateLimited(msg) if msg.contains("API rate limit exceeded")),
+        "expected RateLimited carrying GitHub's message: {err:?}"
+    );
+}
+
+/// Every other `branch_rules` failure (older GHES without the endpoint, a
+/// token without the scope) keeps degrading: the probe succeeds with
+/// `branch_rules: None` (`rulesKnown: false` on the checklist).
+#[tokio::test]
+async fn merge_requirements_degrades_branch_rules_on_non_rate_limit_error() {
+    let mock = spawn_mock_with(merge_requirements_host_with_branch_rules((
+        404,
+        json!({ "message": "Not Found" }).to_string(),
+    )))
+    .await;
+    let sc = GitHubSourceControl::new("token-not-a-real-secret", Some(&mock.base_uri))
+        .expect("build github client");
+
+    let signals = sc
+        .merge_requirements(&RepoRef::new("intent-hq", "intentd"), 928)
+        .await
+        .expect("an unreadable branch_rules endpoint degrades, not fails");
+    assert_eq!(signals.branch_rules, None, "rules degrade to unknown");
+    assert_eq!(signals.merge_state_status.as_deref(), Some("CLEAN"));
+    assert!(signals.checks_known, "the probe's other signals survive");
+}
+
+// ---------------------------------------------------------------------------
+// Folded PR observation: count parity with the per-signal reads it replaces.
+// ---------------------------------------------------------------------------
+
+/// A PR past both per-signal ceilings: more conversation comments than the
+/// single `per_page=100` page `list_comments` reads, and a review thread with
+/// more replies than the `comments(first: 100)` window of the paged read.
+const BUSY_CONVERSATION_COMMENTS: i64 = 2426;
+const BUSY_THREAD_REPLIES: i64 = 250;
+
+/// The folded observation the mock host reports for the busy PR: exact
+/// `totalCount`s, as GitHub's GraphQL reports them.
+fn busy_pr_observation_envelope() -> Value {
+    json!({
+        "data": {
+            "repository": {
+                "pullRequest": {
+                    "number": 42,
+                    "url": "https://github.com/intent-hq/intentd/pull/42",
+                    "title": "busy",
+                    "body": "",
+                    "state": "OPEN",
+                    "isDraft": false,
+                    "headRefName": "feat/busy",
+                    "headRefOid": "0123456789abcdef0123456789abcdef01234567",
+                    "author": { "login": "octocat" },
+                    "mergeable": "MERGEABLE",
+                    "createdAt": "2026-08-06T00:00:00Z",
+                    "updatedAt": "2026-08-06T00:00:00Z",
+                    "mergeStateStatus": "CLEAN",
+                    "isInMergeQueue": false,
+                    "timelineItems": { "nodes": [] },
+                    "reviewDecision": "APPROVED",
+                    "baseRefName": "main",
+                    "commits": { "nodes": [{ "commit": { "oid": "0123456789abcdef0123456789abcdef01234567", "statusCheckRollup": {
+                        "contexts": { "nodes": [], "totalCount": 0, "pageInfo": { "hasNextPage": false, "endCursor": null } }
+                    } } }] },
+                    "reviews": { "pageInfo": { "hasPreviousPage": false }, "nodes": [] },
+                    "reviewThreads": {
+                        "pageInfo": { "hasNextPage": false },
+                        "nodes": [
+                            { "isResolved": false, "comments": { "totalCount": BUSY_THREAD_REPLIES } },
+                            { "isResolved": true, "comments": { "totalCount": 1 } }
+                        ]
+                    },
+                    "comments": { "totalCount": BUSY_CONVERSATION_COMMENTS }
+                }
+            }
+        }
+    })
+}
+
+/// The paged review-thread read for the same PR: the busy thread's
+/// `comments(first: 100)` window carries exactly 100 of its replies.
+fn busy_review_threads_envelope() -> Value {
+    let comment = |i: i64| {
+        json!({
+            "id": format!("PRRC_{i}"), "body": "reply", "author": { "login": "octocat" },
+            "path": "src/lib.rs", "line": 12, "createdAt": "2026-08-06T00:00:00Z"
+        })
+    };
+    json!({
+        "data": {
+            "repository": {
+                "pullRequest": {
+                    "reviewThreads": {
+                        "pageInfo": { "hasNextPage": false, "endCursor": "Y3Vyc29yOjI=" },
+                        "nodes": [
+                            {
+                                "id": "PRRT_busy",
+                                "isResolved": false,
+                                "comments": { "nodes": (0..100).map(comment).collect::<Vec<_>>() }
+                            },
+                            {
+                                "id": "PRRT_resolved",
+                                "isResolved": true,
+                                "comments": { "nodes": [comment(100)] }
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// The single `per_page=100` page `list_comments` reads for the same PR.
+fn busy_conversation_page() -> Value {
+    Value::Array(
+        (0..100)
+            .map(|i| {
+                json!({
+                    "id": 1000 + i, "user": { "login": "octocat" }, "body": "comment",
+                    "created_at": "2026-08-06T00:00:00Z",
+                    "html_url": format!("https://github.com/intent-hq/intentd/pull/42#issuecomment-{i}")
+                })
+            })
+            .collect(),
+    )
+}
+
+/// One mock host serving the busy PR to both the folded observation and the
+/// per-signal reads it replaces, so a test can compare what each reports.
+fn busy_pr_host() -> Responder {
+    Arc::new(|request: &str| {
+        let body = if request.contains("GetPrObservation") {
+            busy_pr_observation_envelope()
+        } else if request.contains("GetReviewThreads") {
+            busy_review_threads_envelope()
+        } else if request_target(request).starts_with("/repos/intent-hq/intentd/issues/42/comments")
+        {
+            busy_conversation_page()
+        } else {
+            return (404, json!({ "message": "unexpected request" }).to_string());
+        };
+        (200, body.to_string())
+    })
+}
+
+/// Count parity past the per-signal ceilings, against the real adapter: the
+/// folded read's conversation and review-comment counts must equal what the
+/// paged reads report for the same forge state (100 and 101 here), not the
+/// unbounded `totalCount`s (2426 and 251). Otherwise a poll that fell back
+/// to the per-signal reads on such a PR would see a count change the forge
+/// never made and fabricate a new-comment wake.
+#[tokio::test]
+async fn pr_observation_counts_match_the_per_signal_reads_past_their_ceilings() {
+    let mock = spawn_mock_with(busy_pr_host()).await;
+    let sc = GitHubSourceControl::new("token-not-a-real-secret", Some(&mock.base_uri))
+        .expect("build github client");
+    let repo = RepoRef::new("intent-hq", "intentd");
+
+    let observation = sc
+        .pr_observation(&repo, 42)
+        .await
+        .expect("folded read")
+        .expect("github folds the read");
+    let threads = sc
+        .get_review_threads(&repo, 42, PageParams::first(100))
+        .await
+        .expect("paged review threads");
+    let comments = sc
+        .list_comments(&repo, 42)
+        .await
+        .expect("conversation page");
+
+    let count = |n: usize| i64::try_from(n).expect("count fits in i64");
+    let paged_conversation = count(comments.len());
+    let paged_review_comments = count(threads.items.iter().map(|t| t.comments.len()).sum());
+    let paged_unresolved = count(threads.items.iter().filter(|t| !t.is_resolved).count());
+    assert!(
+        paged_conversation < BUSY_CONVERSATION_COMMENTS
+            && paged_review_comments < BUSY_THREAD_REPLIES,
+        "the fixture must exceed the per-signal ceilings for parity to mean saturation"
+    );
+
+    let tally = observation.threads.expect("threads fit the folded window");
+    assert_eq!(
+        observation.conversation_count, paged_conversation,
+        "folded conversation count must equal the single page list_comments reads"
+    );
+    assert_eq!(
+        tally.review_comment_count, paged_review_comments,
+        "folded review-comment count must equal the paged threads' comment windows"
+    );
+    assert_eq!(tally.unresolved, paged_unresolved);
 }

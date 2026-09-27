@@ -21,9 +21,9 @@
 //!
 //! Also covers the combined flush of parked archive notices
 //! (intent-hq/intent#3883): archiving a workspace with an active hook parks
-//! the hook-cancellation wake, and a later user `agent.sendMessage` delivers
-//! the parked wake FIFO in ONE combined turn with the user message and the
-//! trailing unarchive prompt notice.
+//! the consolidated archive-watch wake, and a later user `agent.sendMessage`
+//! delivers the parked wake FIFO in ONE combined turn with the user message
+//! and the trailing unarchive prompt notice.
 //!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
 
@@ -32,7 +32,7 @@
 mod common;
 
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -90,9 +90,8 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     common::enable_ws_api(data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -331,11 +330,13 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -360,9 +361,8 @@ async fn send_message_into_archived_workspace_auto_unarchives_over_wss() {
     let prompt_log = data_dir.join("prompts.jsonl");
     let prompt_log_str = prompt_log.to_string_lossy().into_owned();
     let behavior = json!({ "response": "auto-unarchive ok" }).to_string();
-    let env: [(&str, &str); 5] = [
+    let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_PROMPT_LOG", &prompt_log_str),
@@ -680,13 +680,18 @@ async fn send_message_into_archived_workspace_auto_unarchives_over_wss() {
 /// Marker the kickoff prompt carries so the mock agent schedules the hook.
 const SCHEDULE_MARKER: &str = "SCHEDULE-THE-HOOK";
 
+/// Substring of the consolidated archive-watch notice the archive tail
+/// queues for the owner of a swept hook (harness v2.7 surface).
+const ARCHIVE_WATCH_NOTICE_MARKER: &str = "was archived and has since been unarchived";
+
 /// Combined flush of parked archive notices (intent-hq/intent#3883):
-/// archiving a workspace with an active hook cancels the hook and parks its
-/// cancellation wake behind the archived gate (the owner is idle); a later
-/// USER `agent.sendMessage` converts to an enqueue + drain kick, so ONE
-/// combined provider turn carries the parked wake FIFO ahead of the user
-/// message with the trailing unarchive prompt notice — and the same claim
-/// auto-unarchives the workspace and persists the `auto_unarchived` row.
+/// archiving a workspace with an active hook cancels the hook and parks the
+/// consolidated archive-watch wake behind the archived gate (the owner is
+/// idle); a later USER `agent.sendMessage` converts to an enqueue + drain
+/// kick, so ONE combined provider turn carries the parked wake FIFO ahead of
+/// the user message with the trailing unarchive prompt notice — and the same
+/// claim auto-unarchives the workspace and persists the `auto_unarchived`
+/// row.
 #[tokio::test]
 async fn user_send_flushes_parked_archive_notices_in_one_combined_turn() {
     let Some(script) = gate("WSS combined-flush auto-unarchive E2E") else {
@@ -716,9 +721,8 @@ async fn user_send_flushes_parked_archive_notices_in_one_combined_turn() {
     let ws_id = seed_workspace_only(&data_dir).await;
     let prompt_log = data_dir.join("prompts.jsonl");
     let prompt_log_str = prompt_log.to_string_lossy().into_owned();
-    let env: [(&str, &str); 5] = [
+    let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_PROMPT_LOG", &prompt_log_str),
@@ -820,8 +824,9 @@ async fn user_send_flushes_parked_archive_notices_in_one_combined_turn() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    // Archive the idle workspace: the sweep cancels the hook and its
-    // cancellation wake PARKS behind the archived gate (idle delivery arm).
+    // Archive the idle workspace: the sweep cancels the hook and the
+    // consolidated archive-watch wake PARKS behind the archived gate (idle
+    // delivery arm).
     let archived = wss_rpc(
         &mut rpc,
         12,
@@ -845,7 +850,7 @@ async fn user_send_flushes_parked_archive_notices_in_one_combined_turn() {
         if entries.iter().any(|m| {
             m["content"]
                 .as_str()
-                .is_some_and(|c| c.contains("cancelled because its workspace was archived"))
+                .is_some_and(|c| c.contains(ARCHIVE_WATCH_NOTICE_MARKER))
         }) {
             parked = true;
             break;
@@ -854,7 +859,7 @@ async fn user_send_flushes_parked_archive_notices_in_one_combined_turn() {
     }
     assert!(
         parked,
-        "the hook-cancel wake parked behind the archived gate"
+        "the archive-watch wake parked behind the archived gate"
     );
 
     // The USER send converts to an enqueue + drain kick: one combined turn.
@@ -953,8 +958,7 @@ async fn user_send_flushes_parked_archive_notices_in_one_combined_turn() {
                 })
         })
     };
-    let wake_idx =
-        row_idx("cancelled because its workspace was archived").expect("wake row landed");
+    let wake_idx = row_idx(ARCHIVE_WATCH_NOTICE_MARKER).expect("wake row landed");
     let user_idx = row_idx("back to work").expect("user row landed");
     assert!(
         wake_idx < user_idx,
@@ -980,7 +984,7 @@ async fn user_send_flushes_parked_archive_notices_in_one_combined_turn() {
     assert_eq!(prompts.len(), 2, "kickoff + one combined turn: {prompts:?}");
     let combined = prompts[1]["text"].as_str().expect("prompt text");
     let w = combined
-        .find("cancelled because its workspace was archived")
+        .find(ARCHIVE_WATCH_NOTICE_MARKER)
         .expect("wake in the combined prompt");
     let u = combined.find("back to work").expect("user msg in prompt");
     assert!(w < u, "prompt order wake → user: {combined}");

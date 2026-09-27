@@ -14,10 +14,11 @@ use clap::{Parser, Subcommand};
 use intent_core::config::DEFAULT_STREAM_RETENTION_HOURS;
 use intent_core::{AgentId, Config, ServerControl, WorkspaceApi};
 use intent_services::{
-    agent_memory_budget_bytes, default_process_cap, init_adapter_slots, live_adapters,
-    max_concurrent_adapters, max_concurrent_agents, recommended_memory_budget_bytes, AgentManager,
-    BusEventSink, EventBus, GitStatusRefresher, PermissionPolicy, Services, TreeMemoryProbe,
-    WatcherRegistry,
+    agent_memory_budget_bytes, default_process_cap, host_total_memory_bytes, init_adapter_slots,
+    live_adapters, max_concurrent_adapters, max_concurrent_agents, recommended_memory_budget_bytes,
+    AgentManager, AgentMemorySnapshot, BusEventSink, EventBus, GitStatusRefresher,
+    PermissionPolicy, ProcessSample, Services, TreeMemoryProbe, TreeSample, WatcherRegistry,
+    WorkspaceSetupStates,
 };
 use intent_store::Store;
 use intent_transport::{
@@ -31,6 +32,8 @@ use serde_json::{json, Value};
 use sqlx::Row;
 
 mod client;
+mod doctor_codex;
+mod exact_update;
 mod git_credential;
 mod import;
 mod legacy_import;
@@ -107,7 +110,22 @@ enum Command {
     Stop,
     /// Diagnostics: data-dir writable, SQLite/migrations current, providers,
     /// ports free, cert validity, GitHub token, context engine, host caps (§5.7).
-    Doctor,
+    Doctor {
+        /// Compare fresh ACP and selected-runtime model catalogs. May download
+        /// the managed npm package; uses existing file/environment authentication
+        /// in isolated state, without prompts, login or token refresh. Each
+        /// catalog allows 30 seconds, plus local inspection/startup/cleanup
+        /// budgets. Missing models and partial failures remain advisory; catalog
+        /// membership does not verify account entitlement. Without this flag,
+        /// Codex reports the pinned launch and Node.js/npx prerequisites without
+        /// resolving npm. Configured/PATH adapters and `CODEX_PATH` are ignored.
+        /// Package metadata is meaningful only for an established selected
+        /// entrypoint. On macOS, version and catalog process probes are unsupported,
+        /// because descendant cleanup cannot be guaranteed. No npm resolution
+        /// or diagnostic authentication capture occurs on macOS.
+        #[arg(long)]
+        codex_models: bool,
+    },
     /// Read or change daemon settings (§5.12) on a running daemon. With no
     /// arguments, lists every setting with its type and current value
     /// (`settings.list`); with `<name>`, prints that setting (`settings.get`);
@@ -249,6 +267,14 @@ fn main() -> ExitCode {
         std::sync::atomic::Ordering::Relaxed,
     );
     std::env::remove_var(UPDATE_RESTART_ENV);
+    // Same capture-and-scrub for the sitter's idle-restart handshake marker:
+    // a leaked marker would make a nested daemon signal a non-sitter parent.
+    SITTER_IDLE_RESTART.store(
+        env_flag(SITTER_IDLE_RESTART_ENV),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    std::env::remove_var(SITTER_IDLE_RESTART_ENV);
+    exact_update::capture_sitter_handshake();
     // Parse the CLI here too — before the tokio runtime — so `serve
     // --specialists-dir` can fold into INTENTD_SPECIALISTS_DIR while
     // `env::set_var` is still sound (the flag wins over an inherited env
@@ -262,10 +288,29 @@ fn main() -> ExitCode {
     {
         std::env::set_var("INTENTD_SPECIALISTS_DIR", dir);
     }
-    async_main(cli)
+    build_runtime().block_on(async_main(cli))
 }
 
-#[tokio::main]
+/// Stack size for the runtime's worker (and blocking) threads. Tokio's
+/// default is the std thread default, 2 MiB. A debug build's nested `poll`
+/// frames along the agent-turn / completion-delivery paths already sit
+/// within a few hundred KB of that (`run_message_worker` alone is ~660 KB),
+/// so the daemon reserves its worker stacks explicitly instead of aborting
+/// with "has overflowed its stack" on the next few frames of growth. Thread
+/// stacks are reserved virtual memory; only the pages a thread actually
+/// touches are committed, so the larger reservation costs nothing at rest.
+const WORKER_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+/// The daemon's tokio runtime: multi-threaded, all drivers enabled, worker
+/// stacks sized by [`WORKER_THREAD_STACK_BYTES`].
+fn build_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(WORKER_THREAD_STACK_BYTES)
+        .build()
+        .expect("build tokio runtime")
+}
+
 async fn async_main(cli: Cli) -> ExitCode {
     let command = match cli.command {
         Command::Provider { command } if command.is_internal_helper() => {
@@ -290,62 +335,74 @@ async fn async_main(cli: Cli) -> ExitCode {
     if !matches!(command, Command::Serve { .. } | Command::McpBridge { .. }) {
         ONE_SHOT_CLI.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    match command {
-        Command::Provider { command } => provider::run(command).await,
-        Command::Serve {
-            mode,
-            insecure,
-            resume_all,
-            // Folded into INTENTD_SPECIALISTS_DIR in `main()`, pre-runtime.
-            specialists_dir: _,
-        } => to_exit(cmd_serve(mode.as_deref(), insecure, resume_all).await),
-        Command::Call { method, params } => to_exit(cmd_call(&method, params.as_deref()).await),
-        Command::Status => cmd_status().await,
-        Command::Stop => cmd_stop().await,
-        Command::Doctor => cmd_doctor().await,
-        Command::Settings { name, value, stdin } => {
-            to_exit(cmd_settings(name.as_deref(), value.as_deref(), stdin).await)
-        }
-        Command::McpBridge { connect } => {
-            // The bridge reads stdin via `tokio::io::stdin()`, whose pending
-            // blocking-pool read outlives `run_stdio_bridge`; returning
-            // through the runtime drop would wait on it — i.e. until the
-            // provider closes stdin — so an initial-connect give-up would
-            // never actually exit (monorepo#908). Exit explicitly instead;
-            // there is no bridge state to unwind and stdout is flushed per
-            // line.
-            match cmd_mcp_bridge(&connect).await {
-                Ok(()) => std::process::exit(0),
+    // The composition root acts as the daemon: every service call made from
+    // the main task (startup pins, resume, one-shot subcommands) is bound so
+    // the capability gates never see an unbound request (fail-closed).
+    intent_core::with_caller(intent_core::Caller::Daemon, async move {
+        match command {
+            Command::Provider { command } => provider::run(command).await,
+            Command::Serve {
+                mode,
+                insecure,
+                resume_all,
+                // Folded into INTENTD_SPECIALISTS_DIR in `main()`, pre-runtime.
+                specialists_dir: _,
+            } => match cmd_serve(mode.as_deref(), insecure, resume_all).await {
+                Ok(code) => code,
                 Err(e) => {
                     eprintln!("error: {e}");
-                    std::process::exit(1);
+                    ExitCode::FAILURE
+                }
+            },
+            Command::Call { method, params } => to_exit(cmd_call(&method, params.as_deref()).await),
+            Command::Status => cmd_status().await,
+            Command::Stop => cmd_stop().await,
+            Command::Doctor { codex_models } => cmd_doctor(codex_models).await,
+            Command::Settings { name, value, stdin } => {
+                to_exit(cmd_settings(name.as_deref(), value.as_deref(), stdin).await)
+            }
+            Command::McpBridge { connect } => {
+                // The bridge reads stdin via `tokio::io::stdin()`, whose pending
+                // blocking-pool read outlives `run_stdio_bridge`; returning
+                // through the runtime drop would wait on it — i.e. until the
+                // provider closes stdin — so an initial-connect give-up would
+                // never actually exit (monorepo#908). Exit explicitly instead;
+                // there is no bridge state to unwind and stdout is flushed per
+                // line.
+                match cmd_mcp_bridge(&connect).await {
+                    Ok(()) => std::process::exit(0),
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
                 }
             }
-        }
-        Command::Import { from } => to_exit(cmd_import(&from).await),
-        Command::ImportLegacy {
-            root,
-            app_dir,
-            dry_run,
-            force,
-        } => to_exit(cmd_import_legacy(root, app_dir, dry_run, force).await),
-        Command::Pair {
-            png,
-            svg,
-            yes,
-            select_endpoints,
-            rotate,
-        } => {
-            if select_endpoints {
-                to_exit(cmd_pair_select_endpoints().await)
-            } else {
-                to_exit(cmd_pair(png.as_deref(), svg.as_deref(), yes, rotate).await)
+            Command::Import { from } => to_exit(cmd_import(&from).await),
+            Command::ImportLegacy {
+                root,
+                app_dir,
+                dry_run,
+                force,
+            } => to_exit(cmd_import_legacy(root, app_dir, dry_run, force).await),
+            Command::Pair {
+                png,
+                svg,
+                yes,
+                select_endpoints,
+                rotate,
+            } => {
+                if select_endpoints {
+                    to_exit(cmd_pair_select_endpoints().await)
+                } else {
+                    to_exit(cmd_pair(png.as_deref(), svg.as_deref(), yes, rotate).await)
+                }
             }
+            Command::GitCredential { operation } => cmd_git_credential(&operation).await,
+            #[cfg(feature = "js-engine")]
+            Command::JsEval { code, timeout_ms } => to_exit(cmd_js_eval(&code, timeout_ms).await),
         }
-        Command::GitCredential { operation } => cmd_git_credential(&operation).await,
-        #[cfg(feature = "js-engine")]
-        Command::JsEval { code, timeout_ms } => to_exit(cmd_js_eval(&code, timeout_ms).await),
-    }
+    })
+    .await
 }
 
 /// WSAPI-1 spike: run one JS snippet in a fresh QuickJS context, enforce a
@@ -1222,6 +1279,7 @@ async fn cmd_import_legacy(
             // running daemon learns about the rows via `system.importLegacy`
             // or its next boot, both of which publish.
             event_bus: None,
+            setup_states: None,
         },
     )
     .await?;
@@ -1283,6 +1341,7 @@ fn to_exit(result: anyhow::Result<()>) -> ExitCode {
 }
 
 fn init_tracing() {
+    use std::io::IsTerminal;
     use tracing_subscriber::{
         fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
     };
@@ -1336,9 +1395,13 @@ fn init_tracing() {
         || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     // Set up dual output: stderr (for interactive use) and optionally file (for diagnostics)
-    let stderr_layer = fmt::layer()
-        .with_writer(std::io::stderr)
-        .with_filter(output_filter());
+    let mut stderr_layer = fmt::layer().with_writer(std::io::stderr);
+    // Preserve fmt's NO_COLOR policy on terminals, but never emit ANSI to
+    // redirected diagnostics (including ordinary SQLx warnings).
+    if !std::io::stderr().is_terminal() {
+        stderr_layer = stderr_layer.with_ansi(false);
+    }
+    let stderr_layer = stderr_layer.with_filter(output_filter());
 
     // Per-RPC statement-count / duration WARN profiling (expensive-RPC
     // guardrail); its warns flow through the output layers above.
@@ -1386,6 +1449,36 @@ const UPDATE_RESTART_ENV: &str = "INTENTD_UPDATE_RESTART";
 /// [`UPDATE_RESTART_ENV`] captured in `main()` before the env var is
 /// scrubbed. Read by `cmd_serve` for the startup resume decision.
 static UPDATE_RESTART: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Env var the sitter sets on a supervised `serve` child to advertise the
+/// idle-mode restart handshake (see
+/// `intentd_sitter::supervisor::IDLE_RESTART_ENV`): the daemon may send the
+/// sitter SIGUSR2 to stage an update, and receives SIGUSR2 back once a newer
+/// version is staged. Captured into [`SITTER_IDLE_RESTART`] and scrubbed in
+/// `main()` like [`UPDATE_RESTART_ENV`].
+const SITTER_IDLE_RESTART_ENV: &str = "INTENTD_SITTER_IDLE_RESTART";
+
+/// Whether the supervising sitter advertised the idle-mode restart handshake:
+/// the value of [`SITTER_IDLE_RESTART_ENV`] captured in `main()`. Gates the
+/// idle update requester and the SIGUSR2 exit-when-idle path — an older
+/// sitter has no SIGUSR2 handler, and the default disposition would kill it.
+static SITTER_IDLE_RESTART: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Exit code by which a supervised daemon asks the sitter to respawn it on
+/// the staged version once idle (its answer to SIGUSR2). Mirrors
+/// `intentd_sitter::supervisor::RESTART_FOR_UPDATE_EXIT_CODE`; keep both in
+/// sync.
+#[cfg(unix)]
+const RESTART_FOR_UPDATE_EXIT_CODE: u8 = 75;
+
+/// Cadence of the idle update requester tick.
+#[cfg(unix)]
+const IDLE_UPDATE_TICK: Duration = Duration::from_secs(30);
+
+/// Cadence at which a pending staged restart re-checks for an idle daemon.
+#[cfg(unix)]
+const STAGED_RESTART_POLL: Duration = Duration::from_secs(1);
 
 /// Exit status mirroring a default-disposition SIGPIPE death (128 + 13), the
 /// code shells report for standard Unix tools whose output pipe closes early.
@@ -1456,7 +1549,15 @@ fn banner_build_commit(build_commit: Option<&str>) -> &str {
     build_commit.unwrap_or("unknown")
 }
 
-async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyhow::Result<()> {
+/// Runs the daemon to completion. `Ok` carries the process exit code:
+/// success after a plain graceful shutdown, [`RESTART_FOR_UPDATE_EXIT_CODE`]
+/// when the shutdown was the sitter's staged-update handshake firing once
+/// idle.
+async fn cmd_serve(
+    mode: Option<&str>,
+    insecure: bool,
+    resume_all: bool,
+) -> anyhow::Result<ExitCode> {
     // Build-identity banner as the first serve log line so every log file
     // opens with which build produced it (monorepo#3649). Same identity
     // values `system.info` and the hello handshake expose.
@@ -1563,6 +1664,10 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // observe a missing row before either inserts it, turning the loser's
     // idempotent skip into a spurious `insert failed` failure-summary entry.
     let legacy_import_lock = Arc::new(tokio::sync::Mutex::new(()));
+    // Per-workspace setup-stage map shared by the services surface and the
+    // legacy importer (both the first-boot task and `system.importLegacy`),
+    // so an imported row reads `skipped` from `ws.workspace.details()`.
+    let workspace_setup_states = WorkspaceSetupStates::default();
     // First-boot legacy workspace import: the eligibility decision (fresh DB
     // / marker state) is made synchronously here, but the import itself runs
     // in a spawned background task concurrently with the transports coming up
@@ -1586,9 +1691,10 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
                 let assets_root = Some(config.data_dir.join("assets"));
                 let app_dir = legacy_import::default_app_dir();
                 let event_bus = Some(bus.clone());
+                let setup_states = Some(workspace_setup_states.clone());
                 let lock = legacy_import_lock.clone();
                 let resumed = decision == legacy_import::FirstBootDecision::Resume;
-                Some(tokio::spawn(async move {
+                Some(intent_core::spawn_daemon(async move {
                     let _guard = lock.lock().await;
                     legacy_import::run_first_boot_import(
                         &store,
@@ -1596,6 +1702,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
                         assets_root,
                         app_dir,
                         event_bus,
+                        setup_states,
                         resumed,
                     )
                     .await;
@@ -1708,6 +1815,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         // Persist the per-provider models.list cache in the data dir (§5.30).
         .with_models_cache_dir(&config.data_dir.clone())
         .with_event_bus(bus.clone())
+        .with_workspace_setup_states(workspace_setup_states.clone())
         .with_reverse_dispatch(reverse_registry.clone())
         .with_settings_registry(settings_registry.clone())
         .with_hooks_max_per_agent(config.hooks_max_per_agent);
@@ -1815,12 +1923,10 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // agent's subtree was measured from 436 MB idle to 9.6 GB running a test
     // suite. When installed, the budget reads the same descendant-tree sampler
     // `system.status` reports (intentd#1139) and gates new spawns only — see
-    // [`ProcessRegistry::acquire`].
-    let total_memory_bytes = {
-        let mut sys = sysinfo::System::new();
-        sys.refresh_memory();
-        sys.total_memory()
-    };
+    // [`ProcessRegistry::acquire`]. The RAM reading is the one the settings
+    // catalog derives `agents.memoryBudgetMb`'s `max` / `defaultValue` from, so
+    // what `settings.get` advertises as auto is what gets installed here.
+    let total_memory_bytes = host_total_memory_bytes().unwrap_or(0);
     let recommended_bytes = recommended_memory_budget_bytes(total_memory_bytes);
     let budget_enabled = if let Some(budget_bytes) =
         agent_memory_budget_bytes(&boot_settings.effective, total_memory_bytes)
@@ -1948,13 +2054,20 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         Ok(resumed) => tracing::info!(resumed, "rehydrated active PR monitors on startup"),
         Err(e) => tracing::warn!(error = %e, "PR monitor rehydration failed"),
     }
+    // Populate the primary principal's GitHub identity once at boot when the
+    // row still predates the GitHub connection (`login: null`), so roster
+    // reads do not wait for a `principal.me` (intent-hq/intent#5534).
+    // Fire-and-forget: only spawns the bounded off-path refresh (one refresh
+    // per IDENTITY_REFRESH_INTERVAL across all trigger sites); a no-op
+    // without GitHub auth and never a startup failure.
+    services.refresh_primary_identity_at_startup().await;
     // Sweep orphaned `*.deleting-*` worktree trash dirs left behind when a
     // prior daemon crashed between the locked detach rename and the unlocked
     // recursive removal (monorepo#473). Spawned so the potentially multi-GB
     // removal never blocks startup; best-effort throughout — a failure never
     // aborts startup, and a missing workspaces root is a silent no-op.
     let services_trash_sweep = services.clone();
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         let removed = services_trash_sweep.sweep_orphaned_worktree_trash().await;
         if removed > 0 {
             tracing::info!(
@@ -1967,13 +2080,13 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // are in-memory only, so after a restart every leftover staging dir is an
     // orphan. Spawned + best-effort like the worktree trash sweep above.
     let services_export_sweep = services.clone();
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         services_export_sweep.sweep_stale_export_staging().await;
     });
     // Sweep expired attachment idempotency-key bindings (7-day retention,
     // intent-hq/intent#4691); also swept lazily by keyed placements/begins.
     let services_idempotency_sweep = services.clone();
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         services_idempotency_sweep
             .sweep_expired_attachment_idempotency_keys()
             .await;
@@ -1991,7 +2104,10 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // pollSeconds` (read live, floor 10s), poll the due active monitors —
     // each PR on an effective interval stretched to fit the `[prMonitor]
     // hourlyRequestBudget` cost model (a cadence planner, not a request
-    // limiter), a capped oldest-first subset per tick — diff each
+    // limiter) and stretched further ahead of exhaustion when the tick's
+    // shared quota probe shows the remaining quota would not cover the
+    // projected spend to reset within `quotaSharePercent`, a capped
+    // oldest-first subset per tick — diff each
     // against its persisted baseline, and deliver one consolidated wake once
     // the PR has been quiet for the debounce window. Safe when source control
     // is unconfigured (the tick logs and returns). Aborted on clean shutdown.
@@ -2016,6 +2132,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // per-workspace `changes:agent-locks` snapshot when it changes. No-op-safe
     // without an event bus. Aborted on clean shutdown.
     let agent_locks_loop = services.spawn_agent_locks_loop();
+    let execution_context_loop = services.spawn_execution_context_loop();
     // Idle agent reaping (§5.6/§6.7): periodically evict agents idle past the
     // configured TTL, killing each one's whole process group — and, when an
     // aggregate memory budget is installed (monorepo#2063), drain idle agents
@@ -2077,7 +2194,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // clean shutdown, which drops the registry and every watcher it owns.
     let mut mcp_start_task = {
         let services = services.clone();
-        tokio::spawn(async move { services.start_enabled_mcp_servers().await })
+        intent_core::spawn_daemon(async move { services.start_enabled_mcp_servers().await })
     };
     // Watch-health handle created BEFORE the backgrounded registry start so
     // DaemonControl can hold it now; it snapshots `None` (fileWatch absent
@@ -2168,6 +2285,20 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         );
     }
     ws_options.rpc_limiter = rpc_limiter.clone();
+    // Guest connection caps (`sharing.maxGuestConnections` /
+    // `sharing.maxConnectionsPerGuest`, 0 = unlimited): ONE live cell built
+    // here (like `rpc_limiter`) and carried by every listener the runtime
+    // toggle builds later, so a toggle keeps the current values. The follower
+    // task applies `settings.update` / config.toml live-reload changes to the
+    // cell; they reach the next guest upgrade without a listener restart and
+    // never evict an admitted connection.
+    let guest_limits =
+        intent_transport::SharedGuestLimits::new(intent_transport::GuestConnectionLimits {
+            max_guest_connections: boot_settings.effective.sharing.max_guest_connections,
+            max_connections_per_guest: boot_settings.effective.sharing.max_connections_per_guest,
+        });
+    let guest_limits_task = guest_limits.follow(settings_registry.clone());
+    ws_options.guest_limits = guest_limits;
 
     // TLS + bearer auth: provision the cert (lazy; cert stays on disk) + build
     // the token store for auth layers (§5.2/§5.3). Always provision for runtime
@@ -2254,6 +2385,14 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         &config.data_dir.join("tunnel"),
     ));
 
+    // Sitter idle-update handshake state (unix only), created ahead of the
+    // control surface so `system.status` can report it; the requester and
+    // staged-restart watcher below share it.
+    #[cfg(unix)]
+    let idle_update_state = Arc::new(IdleUpdateState::new(
+        SITTER_IDLE_RESTART.load(std::sync::atomic::Ordering::Relaxed),
+    ));
+
     let control = Arc::new(DaemonControl {
         manager: manager.clone(),
         shutdown: shutdown_notify.clone(),
@@ -2268,9 +2407,13 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         legacy_import_assets_root: assets_root,
         legacy_import_lock: legacy_import_lock.clone(),
         legacy_import_bus: bus.clone(),
+        legacy_import_setup_states: workspace_setup_states.clone(),
         settings_registry: settings_registry.clone(),
         sitter_pid_path: config.data_dir.join("sitter").join("sitter.pid"),
+        exact_update: exact_update::ExactUpdate::default(),
         tunnel: tunnel_supervisor.clone(),
+        #[cfg(unix)]
+        idle_update_state: idle_update_state.clone(),
     });
 
     // Populate the runtime control OnceLock so runtime-toggled WSS listeners can
@@ -2279,6 +2422,26 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     assert!(
         runtime.control.set(control.clone()).is_ok(),
         "control OnceLock should only be set once"
+    );
+
+    // Sitter idle-update handshake (unix only): the requester asks the sitter
+    // for an idle-mode update check (SIGUSR2) while no turn is in flight, and
+    // the staged-restart watcher answers the sitter's SIGUSR2 ("a newer
+    // version is staged") by exiting with RESTART_FOR_UPDATE_EXIT_CODE the
+    // moment `list_busy()` drains. Both are gated on the sitter having
+    // advertised the handshake via INTENTD_SITTER_IDLE_RESTART.
+    #[cfg(unix)]
+    let staged_restart_watcher = spawn_staged_restart_watcher(
+        manager.clone(),
+        idle_update_state.clone(),
+        shutdown_notify.clone(),
+    );
+    #[cfg(unix)]
+    let idle_update_requester = spawn_idle_update_requester(
+        manager.clone(),
+        settings_registry.clone(),
+        control.sitter_pid_path.clone(),
+        idle_update_state.clone(),
     );
 
     // Auto-resume interrupted agents at startup. `--resume-all` forces the
@@ -2422,13 +2585,31 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         } else {
             None
         };
+    // Let `workspace.invite.list` stamp each open invite with its `url`
+    // (multiplayer w4): the same envelope the create fast path resolves.
+    if let Some(provider) = pairing_info.clone() {
+        services.attach_invite_link_builder(Arc::new(intent_transport::InviteLinkResolver::new(
+            provider,
+        )));
+    }
 
     let shutdown = {
         let notify = shutdown_notify.clone();
+        #[cfg(unix)]
+        let idle_update_state = idle_update_state.clone();
         async move {
             tokio::select! {
                 () = shutdown_signal() => {}
                 () = notify.notified() => tracing::info!("shutdown requested via system.shutdown"),
+            }
+            // Latch the cause at the decision point, before any teardown
+            // await: a staged restart that fires later must not overwrite a
+            // requested stop. The compare-and-set loses (correctly) when the
+            // staged-restart watcher latched `RestartForUpdate` before
+            // notifying, or `system.shutdown` already latched `Stop`.
+            #[cfg(unix)]
+            if idle_update_state.latch_shutdown_cause(ShutdownCause::Stop) {
+                tracing::info!("shutdown cause latched: requested stop");
             }
         }
     };
@@ -2446,7 +2627,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         const WAKE_RESUME_DEBOUNCE: Duration = Duration::from_secs(2);
         let services_clone = services.clone();
         let mut resume_rx = tracker.subscribe();
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             use tokio::sync::broadcast::error::RecvError;
             loop {
                 match resume_rx.recv().await {
@@ -2497,7 +2678,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     let repository_metadata_prewarm = {
         let services = services.clone();
         let socket_path = config.socket_path.clone();
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             while !uds_is_live(&socket_path).await {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
@@ -2516,6 +2697,17 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     )
     .await;
     repository_metadata_prewarm.abort();
+    // The shutdown cause is latched by now; retire the sitter handshake tasks
+    // FIRST, before any teardown await (the tunnel stop below can block for
+    // its whole address timeout), so no idle-update SIGUSR2 goes out to the
+    // sitter mid-teardown and the exit-when-idle cannot even attempt to
+    // contest a requested stop. The write-once latch is the correctness
+    // guarantee; this ordering keeps the window empty in practice.
+    #[cfg(unix)]
+    {
+        idle_update_requester.abort();
+        staged_restart_watcher.abort();
+    }
     serve_result?;
 
     // Clean shutdown: stop the tailcat tunnel sidecar (kill the child), stop
@@ -2532,6 +2724,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     completion_delivery.abort();
     auto_commit_loop.abort();
     agent_locks_loop.abort();
+    execution_context_loop.abort();
     if let Some(reap_task) = reap_task {
         reap_task.abort();
     }
@@ -2543,6 +2736,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // that hold them.
     watcher_init_task.abort();
     config_watcher_task.abort();
+    guest_limits_task.abort();
     // Stop the MCP health monitor and reap every external MCP server's process
     // group so no orphan stdio servers survive the daemon (§18.3). The deferred
     // start task is JOINED (bounded) rather than merely aborted: a server still
@@ -2594,7 +2788,15 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // is visible to the next daemon instance.
     shutdown_store.close().await;
 
-    Ok(())
+    #[cfg(unix)]
+    if idle_update_state.restart_exit_fired() {
+        tracing::info!(
+            exit_code = RESTART_FOR_UPDATE_EXIT_CODE,
+            "exiting for staged update restart"
+        );
+        return Ok(ExitCode::from(RESTART_FOR_UPDATE_EXIT_CODE));
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Live daemon control surface backing `system.status`, `system.shutdown`, and
@@ -2637,15 +2839,23 @@ struct DaemonControl {
     /// Event bus for `workspace:created` publishes on imported rows, so live
     /// subscribers learn about workspaces the importer writes through `Store`.
     legacy_import_bus: EventBus,
+    /// Setup-state map shared with `Services`, so imported rows record
+    /// `skipped` alongside their `workspace:setup:completed` publish.
+    legacy_import_setup_states: WorkspaceSetupStates,
     /// Settings registry backing the `system.gitCredential` gate + token
     /// source (monorepo#884).
     settings_registry: Arc<intent_services::SettingsRegistry>,
     /// `<data_dir>/sitter/sitter.pid` — the supervising sitter's pidfile,
     /// read by `system.requestUpdate` to find the process to SIGUSR1.
     sitter_pid_path: PathBuf,
+    exact_update: exact_update::ExactUpdate,
     /// Tailcat tunnel sidecar supervisor (`server.tunnel.*`). Always present
     /// so the runtime toggle works whether or not the tunnel was boot-started.
     tunnel: Arc<tunnel::TunnelSupervisor>,
+    /// Sitter idle-update handshake state, reported as `system.status` →
+    /// `idleUpdateCheck`; shared with the requester and staged-restart watcher.
+    #[cfg(unix)]
+    idle_update_state: Arc<IdleUpdateState>,
 }
 
 /// Latest own-process resource sample for `system.status`, written by the
@@ -2831,7 +3041,7 @@ fn spawn_route_info_sampler() -> Arc<RouteInfo> {
         inner: std::sync::RwLock::new(sample()),
     });
     let task_info = info.clone();
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         let period = Duration::from_secs(15);
         let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -2906,7 +3116,7 @@ fn spawn_proc_usage_sampler() -> Arc<ProcUsage> {
     };
 
     let task_usage = usage.clone();
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         // Start one period out: `interval`'s first tick fires immediately,
         // which would re-refresh right after the startup sample — under
         // sysinfo's MINIMUM_CPU_UPDATE_INTERVAL, yielding an unreliable delta.
@@ -3114,7 +3324,7 @@ fn spawn_workspaces_disk_sampler(root: PathBuf) -> Arc<WorkspacesDiskUsage> {
     sample(&usage);
 
     let task_usage = usage.clone();
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         let period = Duration::from_secs(30);
         let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -3152,6 +3362,17 @@ struct ChildTreeSample {
     /// Measurement only today — nothing enforces per-agent limits with it.
     /// Behind an `Arc` so `load()` stays a cheap clone.
     agent_bytes: std::sync::Arc<HashMap<AgentId, u64>>,
+    /// The processes behind each `agent_bytes` bucket, from the same walk: a
+    /// bucket's rows sum to its total by construction. Collected only on
+    /// published sweeps — burst sweeps pass no agent roots and produce none.
+    agent_processes: std::sync::Arc<HashMap<AgentId, Vec<ProcessSample>>>,
+    /// Host memory available for new allocations (`sysinfo::System::
+    /// available_memory`, Linux `MemAvailable`), refreshed in the same sweep
+    /// as `memory_bytes` so the spawn budget compares a tree total and the
+    /// host headroom from one instant. `None` when the reading was zero
+    /// (sysinfo's "unknown" on unsupported platforms), which the budget treats
+    /// as "not measured".
+    available_memory_bytes: Option<u64>,
     /// Sweep counter, incremented on every store. Carried inside the sample for
     /// the same reason the other three fields are published together: the spawn
     /// budget (monorepo#2063) uses it to tell a re-measured reading from the one
@@ -3159,6 +3380,10 @@ struct ChildTreeSample {
     /// sweep with a byte total from the next would make it discard a correction
     /// it should keep, or keep one it should discard.
     seq: u64,
+    /// RFC-3339 UTC time the sweep was stored, for `agent.memoryUsage`'s
+    /// `sampledAt` (§5.5) — the sample a client reads is up to one
+    /// [`CHILD_TREE_BASE_PERIOD`] old, and the stamp lets it say so.
+    sampled_at: String,
 }
 
 /// The three fields are published together under one lock rather than as
@@ -3174,7 +3399,13 @@ struct ChildTreeUsage {
 }
 
 impl ChildTreeUsage {
-    fn store(&self, count: usize, memory_bytes: u64, agent_bytes: HashMap<AgentId, u64>) {
+    fn store(&self, walk: TreeWalk, available_memory_bytes: Option<u64>) {
+        let TreeWalk {
+            count,
+            bytes: memory_bytes,
+            agent_bytes,
+            agent_processes,
+        } = walk;
         let mut guard = self.inner.write().expect("child tree usage lock poisoned");
         let peak_memory_bytes = guard.as_ref().map_or(memory_bytes, |prev| {
             prev.peak_memory_bytes.max(memory_bytes)
@@ -3185,7 +3416,10 @@ impl ChildTreeUsage {
             memory_bytes,
             peak_memory_bytes,
             agent_bytes: std::sync::Arc::new(agent_bytes),
+            agent_processes: std::sync::Arc::new(agent_processes),
+            available_memory_bytes,
             seq,
+            sampled_at: intent_core::now_iso(),
         });
     }
 
@@ -3226,10 +3460,15 @@ impl ChildTreeUsage {
 }
 
 impl TreeMemoryProbe for ChildTreeUsage {
-    fn sample(&self) -> Option<(u64, u64)> {
-        // One read of the whole sample: the bytes and the sequence number that
-        // identifies them come from the same sweep by construction.
-        self.load().map(|s| (s.memory_bytes, s.seq))
+    fn sample(&self) -> Option<TreeSample> {
+        // One `load()` of the whole sample: the bytes, the sequence number
+        // that identifies them and the host headroom come from the same sweep
+        // by construction — a `store()` cannot land between them.
+        self.load().map(|s| TreeSample {
+            memory_bytes: s.memory_bytes,
+            seq: s.seq,
+            available_memory: s.available_memory_bytes,
+        })
     }
 
     fn agent_samples(&self) -> HashMap<AgentId, u64> {
@@ -3238,6 +3477,16 @@ impl TreeMemoryProbe for ChildTreeUsage {
         self.load()
             .map(|s| s.agent_bytes.as_ref().clone())
             .unwrap_or_default()
+    }
+
+    fn agent_memory_snapshot(&self) -> Option<AgentMemorySnapshot> {
+        // One `load()` for the stamp and the rows: `agent.memoryUsage` reports
+        // a `sampledAt` that describes exactly the processes beside it, even
+        // when a `store()` lands while the request is being served.
+        self.load().map(|s| AgentMemorySnapshot {
+            sampled_at: Some(s.sampled_at),
+            processes: s.agent_processes.as_ref().clone(),
+        })
     }
 }
 
@@ -3306,10 +3555,26 @@ const CHILD_TREE_WARN_FRACTION: f64 = 0.5;
 /// Absolute WARN threshold used when total system RAM cannot be determined.
 const CHILD_TREE_WARN_FALLBACK_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
-/// Aggregate `(process count, resident bytes, per-agent resident bytes)` of
-/// every pid reachable from `root` through the `pid -> children` adjacency,
-/// excluding `root` itself — the root is already reported as `memoryBytes`,
-/// and counting it twice would inflate every bundle's tree total.
+/// One pass of [`walk_descendants`]: the aggregate, the per-agent buckets and
+/// the rows behind them, all from the same traversal.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TreeWalk {
+    /// Descendant processes found (the root excluded).
+    count: usize,
+    /// Aggregate resident bytes of those descendants.
+    bytes: u64,
+    /// Resident bytes credited to each registered agent root.
+    agent_bytes: HashMap<AgentId, u64>,
+    /// The processes credited to each agent; a bucket's rows sum to its
+    /// `agent_bytes` entry. Empty when `agent_roots` is empty.
+    agent_processes: HashMap<AgentId, Vec<ProcessSample>>,
+}
+
+/// Aggregate process count and resident bytes, plus per-agent buckets and
+/// rows, of every pid reachable from `root` through the `pid -> children`
+/// adjacency, excluding `root` itself — the root is already reported as
+/// `memoryBytes`, and counting it twice would inflate every bundle's tree
+/// total.
 ///
 /// `agent_roots` maps each registered agent's spawned child pid to its agent
 /// id. During the walk, every descendant is additionally credited to the
@@ -3320,6 +3585,10 @@ const CHILD_TREE_WARN_FALLBACK_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// the aggregate. One pass, O(processes) — attribution rides the existing
 /// traversal instead of re-walking per agent.
 ///
+/// `describe` yields a descendant's `(name, cmdline)` and is called only for
+/// pids that land in a bucket, so a walk with no `agent_roots` — the burst
+/// sweep — never pays for the strings.
+///
 /// Split from [`descendant_tree_usage`] so the traversal is testable without a
 /// live process table. The walk is iterative and visited-guarded: a pid table
 /// sampled while processes exit and get reparented can contain a cycle, and
@@ -3327,12 +3596,11 @@ const CHILD_TREE_WARN_FALLBACK_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 fn walk_descendants(
     children: &HashMap<sysinfo::Pid, Vec<sysinfo::Pid>>,
     memory_of: &dyn Fn(sysinfo::Pid) -> Option<u64>,
+    describe: &dyn Fn(sysinfo::Pid) -> (String, String),
     root: sysinfo::Pid,
     agent_roots: &HashMap<sysinfo::Pid, AgentId>,
-) -> (usize, u64, HashMap<AgentId, u64>) {
-    let mut count = 0usize;
-    let mut bytes = 0u64;
-    let mut agent_bytes: HashMap<AgentId, u64> = HashMap::new();
+) -> TreeWalk {
+    let mut walk = TreeWalk::default();
     let mut seen: HashSet<sysinfo::Pid> = HashSet::from([root]);
     // Each frame carries the bucket its subtree inherits: the nearest
     // registered agent root at or above it (`None` outside any agent subtree).
@@ -3347,21 +3615,31 @@ fn walk_descendants(
             // credited to the sub-agent, not its ancestor.
             let child_bucket = agent_roots.get(child).or(bucket);
             if let Some(memory) = memory_of(*child) {
-                count += 1;
-                bytes = bytes.saturating_add(memory);
+                walk.count += 1;
+                walk.bytes = walk.bytes.saturating_add(memory);
                 if let Some(agent) = child_bucket {
-                    let slot = agent_bytes.entry(agent.clone()).or_insert(0);
+                    let slot = walk.agent_bytes.entry(agent.clone()).or_insert(0);
                     *slot = slot.saturating_add(memory);
+                    let (name, cmdline) = describe(*child);
+                    walk.agent_processes
+                        .entry(agent.clone())
+                        .or_default()
+                        .push(ProcessSample {
+                            pid: child.as_u32(),
+                            parent_pid: pid.as_u32(),
+                            name,
+                            cmdline,
+                            memory_bytes: memory,
+                        });
                 }
             }
             stack.push((*child, child_bucket));
         }
     }
-    (count, bytes, agent_bytes)
+    walk
 }
 
-/// Walk `root`'s descendants in the refreshed process table, returning
-/// `(process count, aggregate resident bytes, per-agent resident bytes)`.
+/// Walk `root`'s descendants in the refreshed process table.
 ///
 /// Thread rows are excluded from both the adjacency and the sums: on Linux,
 /// sysinfo lists threads (`/proc/<pid>/task` entries) as `Process` rows whose
@@ -3373,7 +3651,7 @@ fn descendant_tree_usage(
     sys: &sysinfo::System,
     root: sysinfo::Pid,
     agent_roots: &HashMap<sysinfo::Pid, AgentId>,
-) -> (usize, u64, HashMap<AgentId, u64>) {
+) -> TreeWalk {
     let mut children: HashMap<sysinfo::Pid, Vec<sysinfo::Pid>> = HashMap::new();
     for (pid, proc) in sys.processes() {
         if proc.thread_kind().is_some() {
@@ -3389,6 +3667,17 @@ fn descendant_tree_usage(
             sys.process(pid)
                 .filter(|p| p.thread_kind().is_none())
                 .map(sysinfo::Process::memory)
+        },
+        &|pid| {
+            sys.process(pid).map_or_else(Default::default, |p| {
+                let cmdline = p
+                    .cmd()
+                    .iter()
+                    .map(|arg| arg.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                (p.name().to_string_lossy().into_owned(), cmdline)
+            })
         },
         root,
         agent_roots,
@@ -3442,7 +3731,7 @@ fn child_tree_sweep(live_chains: usize, since_full: Duration) -> ChildTreeSweep 
 /// a peak-only sweep in between while an ephemeral adapter chain is live, and
 /// nothing at all otherwise.
 fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: &Arc<ChildTreeUsage>) {
-    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
     let Ok(pid) = sysinfo::get_current_pid() else {
         tracing::warn!("cannot resolve own pid; child-process memory sampling disabled");
@@ -3465,12 +3754,17 @@ fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: &Arc<ChildTreeUsa
     };
 
     let task_usage = usage.clone();
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         // `without_tasks()`: on Linux, `nothing()` still enumerates every
         // `/proc/<pid>/task` directory and lists each thread as a process
         // row (monorepo#2342). The walk filters thread rows defensively,
         // but not fetching them at all keeps the sweep cheap.
         let refresh_kind = ProcessRefreshKind::nothing().with_memory().without_tasks();
+        // Published sweeps also fetch each process's command line for the
+        // per-agent rows — once per process (`OnlyIfNotSet`: one
+        // `/proc/<pid>/cmdline` read when it first appears), and never on a
+        // burst sweep, which consumes only the aggregate.
+        let publish_refresh_kind = refresh_kind.with_cmd(UpdateKind::OnlyIfNotSet);
         let mut sys = System::new();
         let mut warned = false;
         let mut tick = tokio::time::interval(CHILD_TREE_BURST_PERIOD);
@@ -3488,14 +3782,22 @@ fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: &Arc<ChildTreeUsa
                 ChildTreeSweep::Full => true,
                 ChildTreeSweep::Peak => false,
             };
-            sys.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind);
+            sys.refresh_processes_specifics(
+                ProcessesToUpdate::All,
+                true,
+                if publish {
+                    publish_refresh_kind
+                } else {
+                    refresh_kind
+                },
+            );
             // Snapshot of registered agent root pids, taken alongside the
             // process-table refresh so the buckets describe the same instant
             // as the tree they partition. Burst (peak-only) sweeps skip it:
             // `observe_burst` consumes only the aggregate bytes, so paying
-            // the handles lock + per-descendant bucketing at sub-second
-            // cadence would buy nothing — an empty map keeps the walk on
-            // its aggregate-only fast path.
+            // the handles lock + per-descendant bucketing and row building
+            // at sub-second cadence would buy nothing — an empty map keeps
+            // the walk on its aggregate-only fast path.
             let agent_roots: HashMap<sysinfo::Pid, AgentId> = if publish {
                 manager
                     .agent_root_pids()
@@ -3505,9 +3807,18 @@ fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: &Arc<ChildTreeUsa
             } else {
                 HashMap::new()
             };
-            let (count, bytes, agent_bytes) = descendant_tree_usage(&sys, pid, &agent_roots);
+            let walk = descendant_tree_usage(&sys, pid, &agent_roots);
+            let (count, bytes) = (walk.count, walk.bytes);
             if publish {
-                task_usage.store(count, bytes, agent_bytes);
+                // Host headroom is read only on published sweeps: it is the
+                // spawn budget's second input, and the budget only consumes
+                // published samples.
+                sys.refresh_memory();
+                let available = match sys.available_memory() {
+                    0 => None,
+                    bytes => Some(bytes),
+                };
+                task_usage.store(walk, available);
                 // Stamped from the poll instant, not from here: dating the
                 // baseline from when the sweep *finished* would add its own
                 // ~12 ms to every period and let the published cadence drift.
@@ -3672,6 +3983,10 @@ impl SystemControl for DaemonControl {
         // (absent on the wire) until the first sample lands or when no
         // mounted volume matches the root.
         let workspaces_disk = self.workspaces_disk.load();
+        // One supervision probe serves both `updateSupported` and
+        // `idleUpdateCheck.supported`.
+        let update_supported = sitter_update_supported(&self.sitter_pid_path);
+        let idle_update_check = self.idle_update_check(update_supported);
         SystemStatus {
             listen_mode: if tcp { "both" } else { "uds" }.to_string(),
             uds: true,
@@ -3698,6 +4013,8 @@ impl SystemControl for DaemonControl {
             child_processes: child_tree.as_ref().map(|s| s.count),
             child_memory_bytes: child_tree.as_ref().map(|s| s.memory_bytes),
             child_memory_peak_bytes: child_tree.as_ref().map(|s| s.peak_memory_bytes),
+            agent_memory_bytes: child_tree.as_ref().map(|s| s.agent_bytes.values().sum()),
+            agent_process_count: child_tree.as_ref().map(|s| s.agent_bytes.len()),
             agent_memory_budget_bytes: budget.map(|(bytes, _, _)| bytes),
             agent_memory_charged_bytes: budget.and_then(|(_, charged, _)| charged),
             queued_spawns: budget.map(|(_, _, queued)| queued),
@@ -3722,7 +4039,10 @@ impl SystemControl for DaemonControl {
             // Signal-free supervision probe (intent-hq/intent#3875): one
             // pidfile read + one single-process sysinfo refresh, never a
             // signal, so status stays cheap and side-effect free.
-            update_supported: sitter_update_supported(&self.sitter_pid_path),
+            update_supported,
+            // In-flight turns: one lock read of the manager's busy set.
+            busy_agents: self.manager.list_busy().len(),
+            idle_update_check,
         }
     }
 
@@ -3731,13 +4051,37 @@ impl SystemControl for DaemonControl {
     }
 
     fn request_shutdown(&self) {
+        // Decide the cause before waking the serve loop so a staged restart
+        // draining to idle in between cannot claim the exit code.
+        #[cfg(unix)]
+        if self
+            .idle_update_state
+            .latch_shutdown_cause(ShutdownCause::Stop)
+        {
+            tracing::info!("shutdown cause latched: requested stop");
+        }
         // `notify_one` stores a permit if the serve loop is not yet awaiting, so
         // the shutdown is never lost to a race with a freshly-arrived RPC.
         self.shutdown.notify_one();
     }
 
     fn request_update(&self) -> Result<(), String> {
+        if self.exact_update.active() {
+            return Err("an exact-version update is already in progress".into());
+        }
         signal_sitter_update(&self.sitter_pid_path)
+    }
+
+    fn exact_update_supported(&self) -> bool {
+        exact_update::supported(&self.sitter_pid_path)
+    }
+
+    fn target_update_status(&self) -> Option<Value> {
+        self.exact_update.status()
+    }
+
+    fn request_exact_update(&self, target: &str) -> Result<(), String> {
+        self.exact_update.start(&self.sitter_pid_path, target)
     }
 
     fn import_legacy(
@@ -3756,6 +4100,7 @@ impl SystemControl for DaemonControl {
                     assets_root: Some(self.legacy_import_assets_root.clone()),
                     app_dir: legacy_import::default_app_dir(),
                     event_bus: Some(self.legacy_import_bus.clone()),
+                    setup_states: Some(self.legacy_import_setup_states.clone()),
                 },
             )
             .await
@@ -4444,6 +4789,475 @@ fn sitter_update_supported(_pid_path: &Path) -> bool {
     false
 }
 
+/// Idle-mode counterpart of [`signal_sitter_update_with_parent`]: the same
+/// supervision check, but SIGUSR2 — the sitter's "check for updates and only
+/// STAGE what you find" signal (it answers with SIGUSR2 to the daemon once a
+/// newer version is staged; see `spawn_staged_restart_watcher`). Callers must
+/// hold the [`SITTER_IDLE_RESTART`] gate: an older sitter has no SIGUSR2
+/// handler and the default disposition would terminate it.
+#[cfg(unix)]
+fn signal_sitter_idle_update_with_parent(
+    pid_path: &Path,
+    expected_parent: u32,
+) -> Result<(), String> {
+    let pid = supervising_sitter_pid(pid_path, expected_parent).ok_or_else(|| {
+        format!(
+            "daemon is not supervised by intentd-sitter (pid in {} is not the daemon's parent)",
+            pid_path.display()
+        )
+    })?;
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid.cast_signed()),
+        nix::sys::signal::Signal::SIGUSR2,
+    )
+    .map_err(|e| format!("failed to signal intentd-sitter (pid {pid}): {e}"))?;
+    tracing::info!(
+        sitter_pid = pid,
+        "sent SIGUSR2 to intentd-sitter (idle update check)"
+    );
+    Ok(())
+}
+
+/// Shared state of the sitter idle-update handshake: written by the idle
+/// update requester (`timing`), the SIGUSR2 staged-restart watcher
+/// (`restart_pending`, `shutdown_cause`) and the two requested-stop paths
+/// (`shutdown_cause`), read by the serve loop's exit-code decision and
+/// available to `system.status` reporters.
+#[cfg(unix)]
+struct IdleUpdateState {
+    /// The sitter advertised the handshake at boot ([`SITTER_IDLE_RESTART`]).
+    advertised: bool,
+    /// Process start; the first idle request interval counts from here.
+    boot_at: std::time::Instant,
+    /// The sitter announced a staged version: the daemon exits with
+    /// [`RESTART_FOR_UPDATE_EXIT_CODE`] as soon as it is idle. Suppresses
+    /// further idle update requests meanwhile.
+    restart_pending: std::sync::atomic::AtomicBool,
+    /// Why the serve loop is shutting down, as a [`ShutdownCause`]
+    /// discriminant. Latched WRITE-ONCE (compare-and-set from `Undecided`)
+    /// at the moment the shutdown decision is made — before any teardown
+    /// await — so a requested stop (SIGTERM / Ctrl-C / `system.shutdown`)
+    /// can never be overwritten by a staged restart that lands during
+    /// teardown, and vice versa. Distinct from `restart_pending`: a pending
+    /// restart only becomes the exit cause if the exit-when-idle wins the
+    /// latch.
+    shutdown_cause: std::sync::atomic::AtomicU8,
+    /// Requester bookkeeping, refreshed on every tick.
+    timing: std::sync::Mutex<IdleUpdateTiming>,
+}
+
+/// The serve loop's shutdown cause (see [`IdleUpdateState::shutdown_cause`]).
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum ShutdownCause {
+    /// No shutdown decision has been made yet.
+    Undecided = 0,
+    /// A requested stop: SIGTERM / Ctrl-C or `system.shutdown`. Exits 0.
+    Stop = 1,
+    /// The staged-restart exit-when-idle fired. Exits with
+    /// [`RESTART_FOR_UPDATE_EXIT_CODE`] so the sitter respawns the staged
+    /// version.
+    RestartForUpdate = 2,
+}
+
+#[cfg(unix)]
+impl ShutdownCause {
+    fn from_u8(raw: u8) -> Self {
+        match raw {
+            1 => Self::Stop,
+            2 => Self::RestartForUpdate,
+            _ => Self::Undecided,
+        }
+    }
+}
+
+/// Idle update requester bookkeeping (see [`IdleUpdateState::timing`]).
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct IdleUpdateTiming {
+    /// Start of the current continuous-idle stretch as of the last tick
+    /// (`AgentManager::idle_since`); `None` while a turn is in flight.
+    idle_since: Option<std::time::Instant>,
+    /// When SIGUSR2 was last sent (or last failed to send).
+    last_request_at: Option<std::time::Instant>,
+    /// Earliest instant the interval rule allows another request (the later
+    /// of boot and the last request, plus the interval); `None` while the
+    /// requester is disabled (handshake not advertised or `checkOnIdle` off).
+    next_eligible_at: Option<std::time::Instant>,
+}
+
+#[cfg(unix)]
+impl IdleUpdateState {
+    fn new(advertised: bool) -> Self {
+        Self {
+            advertised,
+            boot_at: std::time::Instant::now(),
+            restart_pending: std::sync::atomic::AtomicBool::new(false),
+            shutdown_cause: std::sync::atomic::AtomicU8::new(ShutdownCause::Undecided as u8),
+            timing: std::sync::Mutex::new(IdleUpdateTiming::default()),
+        }
+    }
+
+    fn is_restart_pending(&self) -> bool {
+        self.restart_pending
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn shutdown_cause(&self) -> ShutdownCause {
+        ShutdownCause::from_u8(
+            self.shutdown_cause
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
+    }
+
+    /// Latch the shutdown cause if none has been decided yet. Returns whether
+    /// THIS call decided it; a `false` means an earlier decision stands (read
+    /// it back with [`Self::shutdown_cause`]). `Undecided` is never latched.
+    fn latch_shutdown_cause(&self, cause: ShutdownCause) -> bool {
+        cause != ShutdownCause::Undecided
+            && self
+                .shutdown_cause
+                .compare_exchange(
+                    ShutdownCause::Undecided as u8,
+                    cause as u8,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_ok()
+    }
+
+    /// The exit-when-idle won the shutdown decision, so the serve loop must
+    /// exit with [`RESTART_FOR_UPDATE_EXIT_CODE`].
+    fn restart_exit_fired(&self) -> bool {
+        self.shutdown_cause() == ShutdownCause::RestartForUpdate
+    }
+
+    fn timing(&self) -> IdleUpdateTiming {
+        *self
+            .timing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn set_timing(&self, timing: IdleUpdateTiming) {
+        *self
+            .timing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = timing;
+    }
+
+    /// The `system.status` → `idleUpdateCheck` projection. `supervised` is the
+    /// caller's already-evaluated supervision probe (`updateSupported`), so
+    /// `supported` reads "idle checks will actually be sent": handshake
+    /// advertised AND a live supervising sitter right now.
+    fn status(&self, enabled: bool, supervised: bool) -> intent_transport::IdleUpdateCheckStatus {
+        let timing = self.timing();
+        let now = std::time::Instant::now();
+        let now_sys = std::time::SystemTime::now();
+        intent_transport::IdleUpdateCheckStatus {
+            enabled,
+            supported: self.advertised && supervised,
+            last_requested_at: timing
+                .last_request_at
+                .map(|at| instant_to_iso(at, now, now_sys)),
+            next_eligible_at: timing
+                .next_eligible_at
+                .map(|at| instant_to_iso(at, now, now_sys)),
+            restart_pending: self.is_restart_pending(),
+        }
+    }
+}
+
+/// Project a monotonic `Instant` onto the wall clock as an RFC 3339 UTC
+/// string, given one shared `(now, now_sys)` reading. Works for instants on
+/// either side of `now`: `Instant::elapsed` saturates at zero for a future
+/// instant (`next_eligible_at`), so the offset is taken in whichever
+/// direction is non-zero.
+#[cfg(unix)]
+fn instant_to_iso(
+    at: std::time::Instant,
+    now: std::time::Instant,
+    now_sys: std::time::SystemTime,
+) -> String {
+    let wall = if at >= now {
+        now_sys.checked_add(at.saturating_duration_since(now))
+    } else {
+        now_sys.checked_sub(now.saturating_duration_since(at))
+    };
+    let secs = wall
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
+        .unwrap_or_default();
+    intent_core::iso_from_unix_secs(secs)
+}
+
+impl DaemonControl {
+    /// `system.status` → `idleUpdateCheck`: `enabled` follows the live
+    /// `updates.checkOnIdle` setting; the rest comes from the shared
+    /// handshake state (unix) or reads as the all-off default where sitter
+    /// supervision cannot exist.
+    #[cfg(unix)]
+    fn idle_update_check(&self, supervised: bool) -> intent_transport::IdleUpdateCheckStatus {
+        let enabled = self
+            .settings_registry
+            .snapshot()
+            .effective
+            .updates
+            .check_on_idle;
+        self.idle_update_state.status(enabled, supervised)
+    }
+
+    #[cfg(not(unix))]
+    fn idle_update_check(&self, _supervised: bool) -> intent_transport::IdleUpdateCheckStatus {
+        intent_transport::IdleUpdateCheckStatus {
+            enabled: self
+                .settings_registry
+                .snapshot()
+                .effective
+                .updates
+                .check_on_idle,
+            ..intent_transport::IdleUpdateCheckStatus::default()
+        }
+    }
+}
+
+/// Inputs to the idle update requester decision (see
+/// [`should_request_idle_update`]); the `updates.*` fields are re-read from
+/// the live settings on every tick.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IdleUpdatePolicy {
+    /// The sitter advertised the handshake at boot ([`SITTER_IDLE_RESTART`]).
+    advertised: bool,
+    /// `updates.checkOnIdle`.
+    check_on_idle: bool,
+    /// `updates.idleCheckIntervalMinutes` (clamped), as a duration.
+    interval: Duration,
+    /// `updates.idleGraceSeconds` (clamped), as a duration.
+    grace: Duration,
+}
+
+#[cfg(unix)]
+impl IdleUpdatePolicy {
+    fn from_settings(
+        advertised: bool,
+        updates: &intent_core::settings_file::UpdatesSettings,
+    ) -> Self {
+        Self {
+            advertised,
+            check_on_idle: updates.check_on_idle,
+            interval: Duration::from_secs(
+                u64::from(updates.effective_idle_check_interval_minutes()) * 60,
+            ),
+            grace: Duration::from_secs(u64::from(updates.effective_idle_grace_seconds())),
+        }
+    }
+}
+
+/// Pure decision for one idle update requester tick: send SIGUSR2 to the
+/// sitter now exactly when the handshake is advertised, `checkOnIdle` is on,
+/// no staged restart is pending, the daemon has been continuously idle
+/// (`idle_since`, `None` while a turn is in flight) for at least the grace,
+/// and at least the interval has elapsed since the later of process start
+/// and the last request (sent or failed).
+#[cfg(unix)]
+fn should_request_idle_update(
+    now: std::time::Instant,
+    boot_at: std::time::Instant,
+    idle_since: Option<std::time::Instant>,
+    last_request_at: Option<std::time::Instant>,
+    restart_pending: bool,
+    policy: &IdleUpdatePolicy,
+) -> bool {
+    if !policy.advertised || !policy.check_on_idle || restart_pending {
+        return false;
+    }
+    let Some(idle_since) = idle_since else {
+        return false;
+    };
+    if now.saturating_duration_since(idle_since) < policy.grace {
+        return false;
+    }
+    let interval_from = last_request_at.map_or(boot_at, |last| last.max(boot_at));
+    now.saturating_duration_since(interval_from) >= policy.interval
+}
+
+/// [`IdleUpdateTiming::next_eligible_at`] for one tick: the later of boot and
+/// the last request plus the interval, or `None` while the requester is
+/// disabled by the policy.
+#[cfg(unix)]
+fn next_eligible_at(
+    boot_at: std::time::Instant,
+    last_request_at: Option<std::time::Instant>,
+    policy: &IdleUpdatePolicy,
+) -> Option<std::time::Instant> {
+    if !policy.advertised || !policy.check_on_idle {
+        return None;
+    }
+    let interval_from = last_request_at.map_or(boot_at, |last| last.max(boot_at));
+    interval_from.checked_add(policy.interval)
+}
+
+/// Spawn the idle update requester: every [`IDLE_UPDATE_TICK`] it reads the
+/// start of the current continuous-idle stretch from
+/// `AgentManager::idle_since` (maintained on the in-flight-turn edges under
+/// the busy lock, so a turn that starts and ends between two ticks still
+/// resets the grace; hooks, PR monitors, subscriptions, queued messages and
+/// idle agents never count), and when [`should_request_idle_update`] holds
+/// and the daemon is sitter-supervised, sends the sitter SIGUSR2. A failed
+/// signal is logged and still counts for the interval; an unsupervised tick
+/// does not. Each tick publishes its bookkeeping to
+/// [`IdleUpdateState::timing`].
+#[cfg(unix)]
+fn spawn_idle_update_requester(
+    manager: Arc<AgentManager>,
+    settings_registry: Arc<intent_services::SettingsRegistry>,
+    sitter_pid_path: PathBuf,
+    state: Arc<IdleUpdateState>,
+) -> tokio::task::JoinHandle<()> {
+    if !state.advertised {
+        tracing::debug!(
+            "sitter did not advertise the idle-restart handshake; idle update requests disabled"
+        );
+    }
+    intent_core::spawn_daemon(async move {
+        let mut ticker = tokio::time::interval(IDLE_UPDATE_TICK);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let now = std::time::Instant::now();
+            let mut timing = state.timing();
+            timing.idle_since = manager.idle_since();
+            let policy = IdleUpdatePolicy::from_settings(
+                state.advertised,
+                &settings_registry.snapshot().effective.updates,
+            );
+            let restart_pending = state.is_restart_pending();
+            let request = should_request_idle_update(
+                now,
+                state.boot_at,
+                timing.idle_since,
+                timing.last_request_at,
+                restart_pending,
+                &policy,
+            );
+            let parent = std::os::unix::process::parent_id();
+            let supervised = request && supervising_sitter_pid(&sitter_pid_path, parent).is_some();
+            if supervised {
+                timing.last_request_at = Some(now);
+            }
+            timing.next_eligible_at =
+                next_eligible_at(state.boot_at, timing.last_request_at, &policy);
+            state.set_timing(timing);
+            if !request {
+                tracing::debug!(
+                    idle_secs = timing
+                        .idle_since
+                        .map(|t| now.saturating_duration_since(t).as_secs()),
+                    restart_pending,
+                    check_on_idle = policy.check_on_idle,
+                    "idle update requester: tick skipped"
+                );
+                continue;
+            }
+            if !supervised {
+                tracing::debug!("idle update requester: daemon is not sitter-supervised; skipped");
+                continue;
+            }
+            if let Err(e) = signal_sitter_idle_update_with_parent(&sitter_pid_path, parent) {
+                tracing::warn!(error = %e, "idle update requester: failed to signal intentd-sitter");
+            }
+        }
+    })
+}
+
+/// Spawn the staged-restart watcher: installs the SIGUSR2 handler (the
+/// sitter's "a newer version is staged; exit when idle"), and on receipt
+/// marks the restart pending and triggers the graceful shutdown as soon as
+/// `list_busy()` is empty — immediately if already idle, otherwise polled
+/// every [`STAGED_RESTART_POLL`] with no cap (the sitter's periodic check is
+/// the forced fallback). The serve loop then exits with
+/// [`RESTART_FOR_UPDATE_EXIT_CODE`]. Installed even when the handshake was
+/// not advertised so a stray SIGUSR2 cannot kill the daemon via the default
+/// disposition; it is then logged and ignored.
+///
+/// The exit-when-idle competes for the write-once
+/// [`IdleUpdateState::shutdown_cause`] latch: once a requested stop has
+/// been decided (SIGTERM / `system.shutdown`), a SIGUSR2 arriving during
+/// teardown is ignored and a pending restart that drains to idle mid-teardown
+/// does not flip the exit code — the sitter must never respawn a daemon the
+/// user explicitly stopped.
+#[cfg(unix)]
+fn spawn_staged_restart_watcher(
+    manager: Arc<AgentManager>,
+    state: Arc<IdleUpdateState>,
+    shutdown: Arc<tokio::sync::Notify>,
+) -> tokio::task::JoinHandle<()> {
+    intent_core::spawn_daemon(async move {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut usr2 = match signal(SignalKind::user_defined2()) {
+            Ok(stream) => stream,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to install the SIGUSR2 handler; staged update restarts disabled");
+                return;
+            }
+        };
+        loop {
+            if usr2.recv().await.is_none() {
+                return;
+            }
+            if !state.advertised {
+                tracing::warn!(
+                    "SIGUSR2 received but the supervisor did not advertise the idle-restart handshake; ignored"
+                );
+                continue;
+            }
+            if state.shutdown_cause() != ShutdownCause::Undecided {
+                tracing::info!("SIGUSR2 received after shutdown was already decided; ignored");
+                continue;
+            }
+            if state.is_restart_pending() {
+                tracing::debug!(
+                    "SIGUSR2 received while a staged update restart is already pending"
+                );
+                continue;
+            }
+            state
+                .restart_pending
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!("staged update restart accepted; exiting once no turn is in flight");
+            loop {
+                if state.shutdown_cause() != ShutdownCause::Undecided {
+                    tracing::info!(
+                        "shutdown already in progress; staged update restart not applied"
+                    );
+                    return;
+                }
+                let busy = manager.list_busy().len();
+                if busy == 0 {
+                    break;
+                }
+                tracing::debug!(busy, "staged update restart waiting for in-flight turns");
+                tokio::time::sleep(STAGED_RESTART_POLL).await;
+            }
+            // Latch BEFORE notifying so the serve loop's own `Stop` latch on
+            // wake loses to this decision; a lost race means a requested
+            // stop already won and the restart must not hijack it.
+            if !state.latch_shutdown_cause(ShutdownCause::RestartForUpdate) {
+                tracing::info!("shutdown already in progress; staged update restart not applied");
+                return;
+            }
+            tracing::info!(
+                exit_code = RESTART_FOR_UPDATE_EXIT_CODE,
+                "daemon idle; exiting for staged update restart"
+            );
+            shutdown.notify_one();
+            return;
+        }
+    })
+}
+
 /// Local-transport liveness probe: a successful connect means a daemon is
 /// listening. Probes the UDS on Unix and the derived named pipe on Windows.
 #[cfg(unix)]
@@ -4647,7 +5461,7 @@ fn spawn_idle_reap_loop(
         );
         budget_floor
     };
-    Some(tokio::spawn(async move {
+    Some(intent_core::spawn_daemon(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -4746,7 +5560,7 @@ fn spawn_stream_retention_loop(
         );
         interval
     };
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -4794,7 +5608,7 @@ fn spawn_idempotency_reap_loop(
         interval_secs = interval.as_secs(),
         "idempotency reaper enabled"
     );
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -4856,7 +5670,7 @@ fn spawn_sandbox_merge_retry_loop(services: Services) -> tokio::task::JoinHandle
         interval_secs = SANDBOX_MERGE_SWEEP_INTERVAL.as_secs(),
         "merge-pending retry sweep enabled"
     );
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         // Crash recovery: a daemon that died mid-merge leaves sandboxes
         // stranded `merging` — invisible to the sweep. No merge can be in
         // flight on a fresh daemon, so reset them to `merge_pending` before
@@ -4940,7 +5754,7 @@ fn spawn_watcher_registry_init(
     refresher: Arc<GitStatusRefresher>,
     watch_health: intent_services::WatchHealth,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         // `block_in_place`, not a bare `spawn`: the registrations inside are
         // synchronous `fseventsd` IPC that block the calling *thread*, so
         // spawning alone would only move them onto another Tokio worker — on a
@@ -4986,7 +5800,7 @@ fn spawn_config_watcher_init(
     registry: Arc<intent_services::SettingsRegistry>,
     services: Services,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         let watcher_services = services.clone();
         let started = intent_services::ConfigWatcher::start(
             &hub,
@@ -5584,6 +6398,22 @@ fn print_status(config: &Config, r: &Value) {
         "  updateSupported: {}",
         r["updateSupported"].as_bool().unwrap_or(false)
     );
+    println!("  busyAgents: {}", r["busyAgents"].as_u64().unwrap_or(0));
+    let idle = &r["idleUpdateCheck"];
+    println!(
+        "  idleUpdateCheck: enabled={} supported={} restartPending={}",
+        idle["enabled"].as_bool().unwrap_or(false),
+        idle["supported"].as_bool().unwrap_or(false),
+        idle["restartPending"].as_bool().unwrap_or(false),
+    );
+    println!(
+        "    lastRequestedAt: {}",
+        idle["lastRequestedAt"].as_str().unwrap_or("(never)")
+    );
+    println!(
+        "    nextEligibleAt: {}",
+        idle["nextEligibleAt"].as_str().unwrap_or("(disabled)")
+    );
     match r["fingerprint"].as_str() {
         Some(fp) => println!("  fingerprint: {fp}"),
         None => println!("  fingerprint: (none)"),
@@ -5762,7 +6592,7 @@ impl Signaller for NixSignaller {
     }
 }
 
-async fn cmd_doctor() -> ExitCode {
+async fn cmd_doctor(codex_models: bool) -> ExitCode {
     // `resolve_config` parses config.toml strictly — the same gate `serve`
     // applies. A malformed file exits non-zero here with the offending key.
     let config = match resolve_config() {
@@ -5822,7 +6652,7 @@ async fn cmd_doctor() -> ExitCode {
         }
     }
 
-    report_provider_availability(&config).await;
+    report_provider_availability(&config, codex_models).await;
 
     // §5.7 additions: ports-free window, cert validity, GitHub token presence,
     // context-engine availability, and host display/locality. The first two are
@@ -6094,13 +6924,12 @@ fn report_cow_support(config: &Config) {
 /// `providers.paths` override — monorepo#1065) and, best-effort, which are
 /// authenticated. Provider availability never fails `doctor` — a host with no
 /// providers installed is a valid (if limited) state.
-async fn report_provider_availability(config: &Config) {
+async fn report_provider_availability(config: &Config, codex_models: bool) {
     // Same settings source `serve` uses; a missing/unreadable file degrades
     // to no overrides (auto-detection only) rather than failing doctor.
-    let provider_paths =
-        intent_core::settings_file::SettingsFile::load_or_init(&config.config_path)
-            .map(|f| f.providers.paths)
-            .unwrap_or_default();
+    let settings = intent_core::settings_file::SettingsFile::load_or_init(&config.config_path)
+        .unwrap_or_default();
+    let provider_paths = &settings.providers.paths;
     println!("providers:");
     for provider in intent_providers::discover_providers_with_overrides(&|key| {
         provider_paths
@@ -6112,7 +6941,26 @@ async fn report_provider_availability(config: &Config) {
             println!("  [--] {} ({})", provider.id, reason);
             continue;
         }
-        // npx-only providers (claude-code, pi) never resolve a local binary;
+        if provider.id == "codex" {
+            // Node+npx availability says nothing about the pinned package's
+            // runtime. Only the safe diagnostic report supplies that evidence;
+            // do not run an opaque adapter as a generic auth/version probe.
+            if provider.installed {
+                println!("  [ok] codex Node.js/npx prerequisites: available");
+            } else {
+                println!(
+                    "{}",
+                    npx_provider_availability_line(
+                        "codex",
+                        intent_providers::CODEX_ACP_NPX_PACKAGE,
+                        None
+                    )
+                );
+            }
+            doctor_codex::report(settings.clone(), codex_models).await;
+            continue;
+        }
+        // npx-only providers (claude-code, codex, pi) never resolve a local binary;
         // report npx availability instead (the auth probe would need a package
         // download, so it is skipped — auth is the external `claude` CLI).
         // A valid `providers.paths` adapter override (claude-code opts in,
@@ -6153,15 +7001,14 @@ async fn report_provider_availability(config: &Config) {
                             println!("  [--] {} unavailable{verdict}", provider.id);
                         }
                         None => {
-                            println!("  [ok] {} via npx: {} -y {pkg}", provider.id, npx.display());
+                            println!(
+                                "{}",
+                                npx_provider_availability_line(provider.id, pkg, Some(npx))
+                            );
                         }
                     }
                 }
-                None => println!(
-                    "  [--] {} unavailable (npx not found — {} is required)",
-                    provider.id,
-                    intent_providers::CLAUDE_AGENT_ACP_NODE_REQUIREMENT
-                ),
+                None => println!("{}", npx_provider_availability_line(provider.id, pkg, None)),
             }
             continue;
         }
@@ -6197,6 +7044,21 @@ async fn report_provider_availability(config: &Config) {
         );
         let auth = check_provider_auth(provider.id, &program, provider.auth_check_args).await;
         println!("  [ok] {} installed: {path}{auth}", provider.id);
+    }
+}
+
+/// Format the ordinary npx doctor line from discovery's result without probing again.
+fn npx_provider_availability_line(id: &str, package: &str, npx: Option<&Path>) -> String {
+    match npx {
+        Some(npx) => format!("  [ok] {id} via npx: {} -y {package}", npx.display()),
+        None if id == "codex" => format!(
+            "  [--] {id} unavailable ({})",
+            intent_providers::CODEX_ACP_PREREQUISITE_ERROR
+        ),
+        None => format!(
+            "  [--] {id} unavailable (npx not found — {} is required)",
+            intent_providers::CLAUDE_AGENT_ACP_NODE_REQUIREMENT
+        ),
     }
 }
 
@@ -6463,6 +7325,77 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn doctor_codex_unavailable_names_both_runtime_prerequisites() {
+        // Codex discovery returns None when Node is missing even if npx
+        // exists, as well as when npx or both are missing. The provider
+        // resolver tests cover that executable matrix without touching PATH.
+        let line =
+            npx_provider_availability_line("codex", intent_providers::CODEX_ACP_NPX_PACKAGE, None);
+        assert_eq!(
+            line,
+            format!(
+                "  [--] codex unavailable ({})",
+                intent_providers::CODEX_ACP_PREREQUISITE_ERROR
+            )
+        );
+        assert!(!line.contains("npx not found"));
+    }
+
+    #[test]
+    fn doctor_npx_unavailable_keeps_other_provider_diagnostics() {
+        for id in ["claude-code", "pi"] {
+            let provider = intent_providers::find_provider(id).unwrap();
+            assert_eq!(
+                npx_provider_availability_line(id, provider.npx_only_package.unwrap(), None),
+                format!(
+                    "  [--] {id} unavailable (npx not found — {} is required)",
+                    intent_providers::CLAUDE_AGENT_ACP_NODE_REQUIREMENT
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn doctor_available_npx_provider_keeps_selected_package_and_path() {
+        let npx = Path::new("/toolchain/npx");
+        for id in ["codex", "claude-code"] {
+            let package = intent_providers::find_provider(id)
+                .unwrap()
+                .npx_only_package
+                .unwrap();
+            assert_eq!(
+                npx_provider_availability_line(id, package, Some(npx)),
+                format!("  [ok] {id} via npx: {} -y {package}", npx.display())
+            );
+        }
+    }
+
+    /// Regression guard for [`WORKER_THREAD_STACK_BYTES`]: a task whose
+    /// frame needs more than the 2 MiB std default must still complete on a
+    /// runtime worker. On a default-sized runtime this aborts the test
+    /// process with "has overflowed its stack" instead of failing an
+    /// assertion, which is the same symptom the daemon showed.
+    #[test]
+    fn runtime_workers_carry_more_than_the_default_thread_stack() {
+        const FRAME_BYTES: usize = 3 * 1024 * 1024;
+        // The oversized frame is the point: it has to live on the worker's
+        // stack, not the heap, to exercise the configured stack size.
+        #[expect(clippy::large_stack_arrays)]
+        #[inline(never)]
+        fn burn_stack() -> usize {
+            let mut buf = [0u8; FRAME_BYTES];
+            std::hint::black_box(&mut buf);
+            usize::from(buf[0]) + usize::from(buf[FRAME_BYTES - 1])
+        }
+        let sum = build_runtime().block_on(async {
+            tokio::spawn(async { burn_stack() })
+                .await
+                .expect("stack-heavy task joins")
+        });
+        assert_eq!(sum, 0);
+    }
 
     #[test]
     fn banner_build_commit_passes_through_embedded_commit() {
@@ -6922,6 +7855,278 @@ mod tests {
             child.kill().unwrap();
             child.wait().unwrap();
         }
+    }
+
+    /// The idle-mode signal shares the supervision gate with
+    /// `signal_sitter_update` (non-parent pids rejected) and sends SIGUSR2,
+    /// never SIGUSR1: the stand-in (default disposition for both) must die by
+    /// SIGUSR2.
+    #[cfg(unix)]
+    #[test]
+    fn signal_sitter_idle_update_sends_sigusr2_to_the_parent_sitter() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sitter.pid");
+        let mut child = spawn_stand_in_sitter(dir.path(), "intentd-sitter");
+        std::fs::write(&path, format!("{}\n", child.id())).unwrap();
+
+        let err = signal_sitter_idle_update_with_parent(&path, std::os::unix::process::parent_id())
+            .unwrap_err();
+        assert!(err.contains("not supervised"), "{err}");
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "rejected pid must not be signaled"
+        );
+
+        signal_sitter_idle_update_with_parent(&path, child.id()).unwrap();
+        let status = child.wait().unwrap();
+        assert_eq!(
+            status.signal(),
+            Some(nix::sys::signal::Signal::SIGUSR2 as i32),
+            "sitter must be terminated by SIGUSR2"
+        );
+    }
+
+    /// `IdleUpdatePolicy` applies the settings clamps (the sitter contract's
+    /// floors) and converts minutes/seconds to durations.
+    #[cfg(unix)]
+    #[test]
+    fn idle_update_policy_applies_settings_clamps() {
+        use intent_core::config::{
+            MIN_UPDATES_IDLE_CHECK_INTERVAL_MINUTES, MIN_UPDATES_IDLE_GRACE_SECONDS,
+        };
+        use intent_core::settings_file::UpdatesSettings;
+        let below = UpdatesSettings {
+            check_on_idle: true,
+            idle_check_interval_minutes: 0,
+            idle_grace_seconds: 0,
+        };
+        let policy = IdleUpdatePolicy::from_settings(true, &below);
+        assert_eq!(
+            policy,
+            IdleUpdatePolicy {
+                advertised: true,
+                check_on_idle: true,
+                interval: Duration::from_secs(
+                    u64::from(MIN_UPDATES_IDLE_CHECK_INTERVAL_MINUTES) * 60
+                ),
+                grace: Duration::from_secs(u64::from(MIN_UPDATES_IDLE_GRACE_SECONDS)),
+            }
+        );
+
+        let above = UpdatesSettings {
+            check_on_idle: false,
+            idle_check_interval_minutes: 90,
+            idle_grace_seconds: 600,
+        };
+        let policy = IdleUpdatePolicy::from_settings(false, &above);
+        assert_eq!(
+            policy,
+            IdleUpdatePolicy {
+                advertised: false,
+                check_on_idle: false,
+                interval: Duration::from_secs(90 * 60),
+                grace: Duration::from_secs(600),
+            }
+        );
+    }
+
+    /// The requester decision: fires only when advertised + `checkOnIdle` +
+    /// no pending restart + continuously idle ≥ grace + interval elapsed since
+    /// the later of boot and the last request; busy (`idle_since == None`)
+    /// never fires.
+    #[cfg(unix)]
+    #[test]
+    fn should_request_idle_update_gates() {
+        use std::time::Instant;
+        let policy = IdleUpdatePolicy {
+            advertised: true,
+            check_on_idle: true,
+            interval: Duration::from_secs(600),
+            grace: Duration::from_secs(60),
+        };
+        let boot = Instant::now();
+        let at = |secs: u64| boot + Duration::from_secs(secs);
+        let decide = |now, idle_since, last, pending, policy: &IdleUpdatePolicy| {
+            should_request_idle_update(now, boot, idle_since, last, pending, policy)
+        };
+
+        // Idle since boot, grace met, interval met ⇒ fire.
+        assert!(decide(at(600), Some(boot), None, false, &policy));
+        // Interval counts from boot: idle long enough but too soon after start.
+        assert!(!decide(at(599), Some(boot), None, false, &policy));
+        // Grace not met: became idle recently.
+        assert!(!decide(at(700), Some(at(650)), None, false, &policy));
+        assert!(decide(at(710), Some(at(650)), None, false, &policy));
+        // A turn in flight never fires.
+        assert!(!decide(at(700), None, None, false, &policy));
+        // The reviewer's scenario: ticks saw idle at 0/30/60/90, a turn ran
+        // entirely between ticks (100..110) and the manager re-armed
+        // `idle_since` at its end. The 120 s tick sees only 10 s of idle and
+        // must not fire even though the interval has elapsed since boot.
+        assert!(!decide(at(720), Some(at(710)), None, false, &policy));
+        assert!(decide(at(770), Some(at(710)), None, false, &policy));
+        // Interval from the last request (later than boot).
+        assert!(!decide(at(1199), Some(boot), Some(at(600)), false, &policy));
+        assert!(decide(at(1200), Some(boot), Some(at(600)), false, &policy));
+        // Pending staged restart suppresses further requests.
+        assert!(!decide(at(1200), Some(boot), None, true, &policy));
+        // checkOnIdle off / handshake not advertised ⇒ never.
+        let off = IdleUpdatePolicy {
+            check_on_idle: false,
+            ..policy
+        };
+        assert!(!decide(at(1200), Some(boot), None, false, &off));
+        let not_advertised = IdleUpdatePolicy {
+            advertised: false,
+            ..policy
+        };
+        assert!(!decide(at(1200), Some(boot), None, false, &not_advertised));
+    }
+
+    /// The exit-code decision is keyed on the shutdown cause (the
+    /// exit-when-idle actually won the latch), not `restart_pending`: an
+    /// unrelated shutdown while a restart is pending must still exit cleanly.
+    #[cfg(unix)]
+    #[test]
+    fn staged_restart_exit_is_distinct_from_pending() {
+        let state = IdleUpdateState::new(true);
+        assert!(state.advertised);
+        assert!(!state.is_restart_pending());
+        assert!(!state.restart_exit_fired());
+        assert_eq!(state.shutdown_cause(), ShutdownCause::Undecided);
+        assert_eq!(state.timing(), IdleUpdateTiming::default());
+        state
+            .restart_pending
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(state.is_restart_pending());
+        assert!(!state.restart_exit_fired());
+        assert!(state.latch_shutdown_cause(ShutdownCause::RestartForUpdate));
+        assert!(state.restart_exit_fired());
+    }
+
+    /// The shutdown cause is write-once: whichever decision lands first
+    /// stands. A requested stop that has already won is never overwritten by
+    /// a staged restart landing during teardown (the reviewer's SIGTERM →
+    /// SIGUSR2 hijack), and a restart that won first is not demoted by the
+    /// serve loop's own `Stop` latch on wake. `Undecided` never latches.
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_cause_latch_is_write_once() {
+        let stop_first = IdleUpdateState::new(true);
+        assert!(!stop_first.latch_shutdown_cause(ShutdownCause::Undecided));
+        assert_eq!(stop_first.shutdown_cause(), ShutdownCause::Undecided);
+        assert!(stop_first.latch_shutdown_cause(ShutdownCause::Stop));
+        assert!(!stop_first.latch_shutdown_cause(ShutdownCause::RestartForUpdate));
+        assert!(!stop_first.latch_shutdown_cause(ShutdownCause::Stop));
+        assert_eq!(stop_first.shutdown_cause(), ShutdownCause::Stop);
+        assert!(!stop_first.restart_exit_fired());
+
+        let restart_first = IdleUpdateState::new(true);
+        assert!(restart_first.latch_shutdown_cause(ShutdownCause::RestartForUpdate));
+        assert!(!restart_first.latch_shutdown_cause(ShutdownCause::Stop));
+        assert_eq!(
+            restart_first.shutdown_cause(),
+            ShutdownCause::RestartForUpdate
+        );
+        assert!(restart_first.restart_exit_fired());
+    }
+
+    /// `instant_to_iso` projects instants on BOTH sides of `now` onto the
+    /// wall clock: a future `next_eligible_at` must not collapse to `now`
+    /// (which `Instant::elapsed` would do by saturating at zero).
+    #[cfg(unix)]
+    #[test]
+    fn instant_to_iso_handles_past_and_future_instants() {
+        use std::time::{Instant, SystemTime, UNIX_EPOCH};
+        // Build the past instant first so `now` is derived by addition only.
+        let past = Instant::now();
+        let now = past + Duration::from_secs(90);
+        let now_sys = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        assert_eq!(instant_to_iso(now, now, now_sys), "2027-01-15T08:00:00Z");
+        assert_eq!(
+            instant_to_iso(now + Duration::from_secs(3600), now, now_sys),
+            "2027-01-15T09:00:00Z"
+        );
+        assert_eq!(instant_to_iso(past, now, now_sys), "2027-01-15T07:58:30Z");
+        // A real wall clock still yields a well-formed RFC 3339 string.
+        let live = instant_to_iso(now, now, SystemTime::now());
+        assert!(live.ends_with('Z') && live.len() >= 20, "{live}");
+    }
+
+    /// The `idleUpdateCheck` projection: `supported` needs BOTH the boot-time
+    /// handshake advertisement and a live supervising sitter; unset timing
+    /// reads as null timestamps; `restartPending` mirrors the watcher flag.
+    #[cfg(unix)]
+    #[test]
+    fn idle_update_check_status_projection() {
+        use std::time::Instant;
+        let state = IdleUpdateState::new(true);
+        let status = state.status(true, false);
+        assert!(status.enabled);
+        assert!(!status.supported, "advertised but not supervised");
+        assert_eq!(status.last_requested_at, None);
+        assert_eq!(status.next_eligible_at, None);
+        assert!(!status.restart_pending);
+
+        let last_request = Instant::now();
+        state.set_timing(IdleUpdateTiming {
+            idle_since: Some(last_request + Duration::from_secs(60)),
+            last_request_at: Some(last_request),
+            next_eligible_at: Some(last_request + Duration::from_secs(3600)),
+        });
+        state
+            .restart_pending
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let status = state.status(false, true);
+        assert!(!status.enabled);
+        assert!(status.supported, "advertised and supervised");
+        let last = status.last_requested_at.expect("lastRequestedAt set");
+        let next = status.next_eligible_at.expect("nextEligibleAt set");
+        assert!(last < next, "future eligibility is after the last request");
+        assert!(status.restart_pending);
+
+        let not_advertised = IdleUpdateState::new(false);
+        assert!(
+            !not_advertised.status(true, true).supported,
+            "supervised by an older sitter without the handshake"
+        );
+    }
+
+    /// `next_eligible_at` (published for `system.status`) is the later of
+    /// boot and the last request plus the interval, and `None` while the
+    /// requester is disabled.
+    #[cfg(unix)]
+    #[test]
+    fn next_eligible_at_tracks_boot_then_last_request() {
+        use std::time::Instant;
+        let policy = IdleUpdatePolicy {
+            advertised: true,
+            check_on_idle: true,
+            interval: Duration::from_secs(600),
+            grace: Duration::from_secs(60),
+        };
+        let boot = Instant::now();
+        assert_eq!(
+            next_eligible_at(boot, None, &policy),
+            Some(boot + Duration::from_secs(600))
+        );
+        let last = boot + Duration::from_secs(900);
+        assert_eq!(
+            next_eligible_at(boot, Some(last), &policy),
+            Some(last + Duration::from_secs(600))
+        );
+        let off = IdleUpdatePolicy {
+            check_on_idle: false,
+            ..policy
+        };
+        assert_eq!(next_eligible_at(boot, Some(last), &off), None);
+        let not_advertised = IdleUpdatePolicy {
+            advertised: false,
+            ..policy
+        };
+        assert_eq!(next_eligible_at(boot, Some(last), &not_advertised), None);
     }
 
     #[test]
@@ -8158,6 +9363,38 @@ mod tests {
         );
     }
 
+    /// A [`TreeWalk`] with buckets but no rows, for the `store()` tests that
+    /// only exercise the aggregate and bucket fields.
+    fn tree_walk(count: usize, bytes: u64, agent_bytes: HashMap<AgentId, u64>) -> TreeWalk {
+        TreeWalk {
+            count,
+            bytes,
+            agent_bytes,
+            agent_processes: HashMap::new(),
+        }
+    }
+
+    /// Deterministic `(name, cmdline)` for a fake pid.
+    fn describe(pid: sysinfo::Pid) -> (String, String) {
+        (
+            format!("proc-{pid}"),
+            format!("/bin/proc-{pid} --pid {pid}"),
+        )
+    }
+
+    /// One row as [`walk_descendants`] builds it from [`describe`] and a
+    /// `pid * 100` memory table.
+    fn row(pid: u32, parent_pid: u32) -> ProcessSample {
+        let (name, cmdline) = describe(sysinfo::Pid::from_u32(pid));
+        ProcessSample {
+            pid,
+            parent_pid,
+            name,
+            cmdline,
+            memory_bytes: u64::from(pid) * 100,
+        }
+    }
+
     /// A status read that beats the sampler's first tick must report `null`,
     /// not zero — a bundle reading `childMemoryBytes: 0` would conclude the
     /// daemon has no children, which is the opposite of what an unsampled
@@ -8166,7 +9403,7 @@ mod tests {
     fn child_tree_usage_is_none_until_the_first_sample() {
         let usage = ChildTreeUsage::default();
         assert_eq!(usage.load(), None);
-        usage.store(6, 4_294_967_296, HashMap::new());
+        usage.store(tree_walk(6, 4_294_967_296, HashMap::new()), None);
         let sample = usage.load().expect("sampled");
         assert_eq!(sample.count, 6);
         assert_eq!(sample.memory_bytes, 4_294_967_296);
@@ -8183,25 +9420,45 @@ mod tests {
         let a = AgentId::from("agent-a");
         let b = AgentId::from("agent-b");
         usage.store(
-            4,
-            1_000,
-            HashMap::from([(a.clone(), 700), (b.clone(), 200)]),
+            TreeWalk {
+                count: 4,
+                bytes: 1_000,
+                agent_bytes: HashMap::from([(a.clone(), 700), (b.clone(), 200)]),
+                agent_processes: HashMap::from([
+                    (a.clone(), vec![row(7, 1)]),
+                    (b.clone(), vec![row(2, 1)]),
+                ]),
+            },
+            None,
         );
         let sample = usage.load().expect("sampled");
         assert_eq!(sample.agent_bytes.get(&a), Some(&700));
         assert_eq!(sample.agent_bytes.get(&b), Some(&200));
+        assert_eq!(sample.agent_processes.get(&a), Some(&vec![row(7, 1)]));
+        assert_eq!(sample.agent_processes.get(&b), Some(&vec![row(2, 1)]));
 
         // A burst reading moves only the peak — the buckets stay put.
         usage.observe_burst(9_000);
         let after_burst = usage.load().expect("sampled");
         assert_eq!(after_burst.agent_bytes, sample.agent_bytes);
+        assert_eq!(after_burst.agent_processes, sample.agent_processes);
 
         // The next full sample replaces the buckets wholesale: an agent that
         // exited between sweeps must not linger.
-        usage.store(1, 300, HashMap::from([(b.clone(), 300)]));
+        usage.store(
+            TreeWalk {
+                count: 1,
+                bytes: 300,
+                agent_bytes: HashMap::from([(b.clone(), 300)]),
+                agent_processes: HashMap::from([(b.clone(), vec![row(3, 1)])]),
+            },
+            None,
+        );
         let next = usage.load().expect("sampled");
         assert_eq!(next.agent_bytes.get(&a), None);
         assert_eq!(next.agent_bytes.get(&b), Some(&300));
+        assert_eq!(next.agent_processes.get(&a), None);
+        assert_eq!(next.agent_processes.get(&b), Some(&vec![row(3, 1)]));
     }
 
     /// The probe's `agent_samples` (monorepo#2063 A2) serves the buckets from
@@ -8214,8 +9471,104 @@ mod tests {
         let probe: &dyn TreeMemoryProbe = &usage;
         assert!(probe.agent_samples().is_empty());
         let a = AgentId::from("agent-a");
-        usage.store(2, 900, HashMap::from([(a.clone(), 700)]));
+        usage.store(
+            TreeWalk {
+                count: 2,
+                bytes: 900,
+                agent_bytes: HashMap::from([(a.clone(), 700)]),
+                agent_processes: HashMap::from([(a.clone(), vec![row(7, 1)])]),
+            },
+            None,
+        );
         assert_eq!(probe.agent_samples().get(&a), Some(&700));
+    }
+
+    /// The probe's `agent_memory_snapshot` (§5.5 `agent.memoryUsage`) serves
+    /// the sweep's timestamp and its per-agent process rows as one value from
+    /// one `load()` — `None` before the first sample — so a `store()` landing
+    /// between two reads can never pair one sweep's stamp with the next
+    /// sweep's rows. Each stored sweep replaces both together, and the stamp
+    /// is the one the stored sample carries.
+    #[test]
+    fn child_tree_usage_probe_serves_one_agent_snapshot_per_sweep() {
+        let usage = ChildTreeUsage::default();
+        let probe: &dyn TreeMemoryProbe = &usage;
+        assert_eq!(probe.agent_memory_snapshot(), None);
+        let a = AgentId::from("agent-a");
+        let b = AgentId::from("agent-b");
+        usage.store(
+            TreeWalk {
+                count: 2,
+                bytes: 900,
+                agent_bytes: HashMap::from([(a.clone(), 700)]),
+                agent_processes: HashMap::from([(a.clone(), vec![row(7, 1)])]),
+            },
+            None,
+        );
+        let first = probe.agent_memory_snapshot().expect("sampled");
+        let first_stored = usage.load().expect("sampled");
+        assert_eq!(
+            first.sampled_at.as_deref(),
+            Some(first_stored.sampled_at.as_str())
+        );
+        assert_eq!(
+            first.processes,
+            HashMap::from([(a.clone(), vec![row(7, 1)])])
+        );
+
+        usage.store(
+            TreeWalk {
+                count: 1,
+                bytes: 200,
+                agent_bytes: HashMap::from([(b.clone(), 200)]),
+                agent_processes: HashMap::from([(b.clone(), vec![row(2, 1)])]),
+            },
+            None,
+        );
+        let second = probe.agent_memory_snapshot().expect("sampled");
+        let second_stored = usage.load().expect("sampled");
+        assert_eq!(
+            second.sampled_at.as_deref(),
+            Some(second_stored.sampled_at.as_str())
+        );
+        assert_eq!(
+            second.processes,
+            HashMap::from([(b.clone(), vec![row(2, 1)])]),
+            "the next sweep replaces the rows wholesale alongside its stamp"
+        );
+    }
+
+    /// The probe's `sample` serves the tree total, its sequence number and
+    /// the host headroom as one value from one sweep — `None` before the
+    /// first sample, `available_memory: None` when the sweep could not read
+    /// it — so the spawn budget's "over budget but the host is not short"
+    /// decision pairs a tree total with the headroom of the same instant. A
+    /// `store()` between two admissions replaces all three together; no
+    /// second read exists for it to land between.
+    #[test]
+    fn child_tree_usage_probe_serves_one_sample_per_sweep() {
+        let usage = ChildTreeUsage::default();
+        let probe: &dyn TreeMemoryProbe = &usage;
+        assert_eq!(probe.sample(), None);
+        usage.store(tree_walk(2, 900, HashMap::new()), Some(63_000_000_000));
+        assert_eq!(
+            probe.sample(),
+            Some(TreeSample {
+                memory_bytes: 900,
+                seq: 1,
+                available_memory: Some(63_000_000_000),
+            })
+        );
+        usage.store(tree_walk(3, 1_200, HashMap::new()), None);
+        assert_eq!(
+            probe.sample(),
+            Some(TreeSample {
+                memory_bytes: 1_200,
+                seq: 2,
+                available_memory: None,
+            }),
+            "an unreadable headroom on a later sweep must not serve a stale one"
+        );
     }
 
     /// The peak must survive the tree draining back to baseline — that is the
@@ -8225,9 +9578,9 @@ mod tests {
     #[test]
     fn child_tree_usage_peak_is_a_high_water_mark() {
         let usage = ChildTreeUsage::default();
-        usage.store(4, 1_000_000_000, HashMap::new());
-        usage.store(24, 5_000_000_000, HashMap::new());
-        usage.store(0, 0, HashMap::new());
+        usage.store(tree_walk(4, 1_000_000_000, HashMap::new()), None);
+        usage.store(tree_walk(24, 5_000_000_000, HashMap::new()), None);
+        usage.store(tree_walk(0, 0, HashMap::new()), None);
         let sample = usage.load().expect("sampled");
         assert_eq!(
             (sample.count, sample.memory_bytes, sample.peak_memory_bytes),
@@ -8244,9 +9597,9 @@ mod tests {
     #[test]
     fn child_tree_usage_burst_reading_reaches_the_peak() {
         let usage = ChildTreeUsage::default();
-        usage.store(0, 10_000_000, HashMap::new());
+        usage.store(tree_walk(0, 10_000_000, HashMap::new()), None);
         usage.observe_burst(6_970_000_000);
-        usage.store(0, 10_000_000, HashMap::new());
+        usage.store(tree_walk(0, 10_000_000, HashMap::new()), None);
         let sample = usage.load().expect("sampled");
         assert_eq!(
             sample.peak_memory_bytes, 6_970_000_000,
@@ -8263,7 +9616,7 @@ mod tests {
     #[test]
     fn child_tree_usage_burst_reading_moves_only_the_peak() {
         let usage = ChildTreeUsage::default();
-        usage.store(4, 1_000_000_000, HashMap::new());
+        usage.store(tree_walk(4, 1_000_000_000, HashMap::new()), None);
         let before = usage.load().expect("sampled");
         usage.observe_burst(7_000_000_000);
         let after = usage.load().expect("sampled");
@@ -8316,14 +9669,14 @@ mod tests {
         const A: (usize, u64) = (4, 1_000_000_000);
         const B: (usize, u64) = (24, 5_000_000_000);
         let usage = Arc::new(ChildTreeUsage::default());
-        usage.store(A.0, A.1, HashMap::new());
+        usage.store(tree_walk(A.0, A.1, HashMap::new()), None);
 
         let writer = {
             let usage = usage.clone();
             std::thread::spawn(move || {
                 for i in 0..20_000 {
                     let (count, bytes) = if i % 2 == 0 { A } else { B };
-                    usage.store(count, bytes, HashMap::new());
+                    usage.store(tree_walk(count, bytes, HashMap::new()), None);
                 }
             })
         };
@@ -8374,12 +9727,21 @@ mod tests {
         // plus a second agent 1 → 5, and an unrelated tree 9 → 10.
         let children = adjacency(&[(1, 2), (2, 3), (3, 4), (1, 5), (9, 10)]);
         let memory = |pid: sysinfo::Pid| Some(usize::from(pid) as u64 * 100);
-        let (count, bytes, agent_bytes) =
-            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &HashMap::new());
-        assert_eq!(count, 4, "2, 3, 4 and 5 are all descendants of 1");
+        let walk = walk_descendants(
+            &children,
+            &memory,
+            &describe,
+            sysinfo::Pid::from(1),
+            &HashMap::new(),
+        );
+        assert_eq!(walk.count, 4, "2, 3, 4 and 5 are all descendants of 1");
         // 200 + 300 + 400 + 500 — the root's own 100 is deliberately absent.
-        assert_eq!(bytes, 1400);
-        assert!(agent_bytes.is_empty(), "no registered roots, no buckets");
+        assert_eq!(walk.bytes, 1400);
+        assert!(
+            walk.agent_bytes.is_empty(),
+            "no registered roots, no buckets"
+        );
+        assert!(walk.agent_processes.is_empty(), "no buckets, no rows");
     }
 
     /// Attribution buckets each descendant under its nearest registered agent
@@ -8398,16 +9760,31 @@ mod tests {
             (sysinfo::Pid::from(2), a.clone()),
             (sysinfo::Pid::from(5), b.clone()),
         ]);
-        let (count, bytes, agent_bytes) =
-            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &roots);
-        assert_eq!(count, 6);
-        assert_eq!(bytes, 200 + 300 + 400 + 500 + 600 + 700);
+        let walk = walk_descendants(&children, &memory, &describe, sysinfo::Pid::from(1), &roots);
+        assert_eq!(walk.count, 6);
+        assert_eq!(walk.bytes, 200 + 300 + 400 + 500 + 600 + 700);
         // Agent A: its root 2 plus descendants 3 and 4.
-        assert_eq!(agent_bytes.get(&a), Some(&(200 + 300 + 400)));
+        assert_eq!(walk.agent_bytes.get(&a), Some(&(200 + 300 + 400)));
         // Agent B: just its root 5.
-        assert_eq!(agent_bytes.get(&b), Some(&500));
+        assert_eq!(walk.agent_bytes.get(&b), Some(&500));
         // 6 → 7 is under no registered root: aggregate-only.
-        assert_eq!(agent_bytes.values().sum::<u64>(), 1400);
+        assert_eq!(walk.agent_bytes.values().sum::<u64>(), 1400);
+
+        // The rows behind each bucket: the same pids, each with the pid it
+        // hangs off and its own RSS, and nothing from the unregistered chain.
+        assert_eq!(
+            walk.agent_processes.get(&a),
+            Some(&vec![row(2, 1), row(3, 2), row(4, 3)])
+        );
+        assert_eq!(walk.agent_processes.get(&b), Some(&vec![row(5, 1)]));
+        assert_eq!(walk.agent_processes.len(), 2);
+        for (agent, rows) in &walk.agent_processes {
+            assert_eq!(
+                rows.iter().map(|r| r.memory_bytes).sum::<u64>(),
+                walk.agent_bytes[agent],
+                "a bucket's rows sum to its total"
+            );
+        }
     }
 
     /// A registered root nested under another agent's subtree opens its own
@@ -8424,11 +9801,16 @@ mod tests {
             (sysinfo::Pid::from(2), a.clone()),
             (sysinfo::Pid::from(3), b.clone()),
         ]);
-        let (_, bytes, agent_bytes) =
-            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &roots);
-        assert_eq!(bytes, 200 + 300 + 400);
-        assert_eq!(agent_bytes.get(&a), Some(&200), "only its own pid");
-        assert_eq!(agent_bytes.get(&b), Some(&(300 + 400)));
+        let walk = walk_descendants(&children, &memory, &describe, sysinfo::Pid::from(1), &roots);
+        assert_eq!(walk.bytes, 200 + 300 + 400);
+        assert_eq!(walk.agent_bytes.get(&a), Some(&200), "only its own pid");
+        assert_eq!(walk.agent_bytes.get(&b), Some(&(300 + 400)));
+        assert_eq!(walk.agent_processes.get(&a), Some(&vec![row(2, 1)]));
+        assert_eq!(
+            walk.agent_processes.get(&b),
+            Some(&vec![row(3, 2), row(4, 3)]),
+            "the nested root's rows belong to the nested agent"
+        );
     }
 
     /// A registered root whose pid is not in the walked tree (already exited,
@@ -8439,10 +9821,10 @@ mod tests {
         let children = adjacency(&[(1, 2)]);
         let memory = |_: sysinfo::Pid| Some(10);
         let roots = HashMap::from([(sysinfo::Pid::from(42), AgentId::from("agent-gone"))]);
-        let (count, bytes, agent_bytes) =
-            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &roots);
-        assert_eq!((count, bytes), (1, 10));
-        assert!(agent_bytes.is_empty());
+        let walk = walk_descendants(&children, &memory, &describe, sysinfo::Pid::from(1), &roots);
+        assert_eq!((walk.count, walk.bytes), (1, 10));
+        assert!(walk.agent_bytes.is_empty());
+        assert!(walk.agent_processes.is_empty());
     }
 
     /// An agent root that vanished mid-walk (its memory read fails) still
@@ -8454,10 +9836,22 @@ mod tests {
         let memory = |pid: sysinfo::Pid| (usize::from(pid) != 2).then_some(700);
         let a = AgentId::from("agent-a");
         let roots = HashMap::from([(sysinfo::Pid::from(2), a.clone())]);
-        let (count, bytes, agent_bytes) =
-            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &roots);
-        assert_eq!((count, bytes), (1, 700));
-        assert_eq!(agent_bytes.get(&a), Some(&700));
+        let walk = walk_descendants(&children, &memory, &describe, sysinfo::Pid::from(1), &roots);
+        assert_eq!((walk.count, walk.bytes), (1, 700));
+        assert_eq!(walk.agent_bytes.get(&a), Some(&700));
+        // The dead root itself gets no row; the live child under it keeps
+        // the root as its parent pid.
+        let (name, cmdline) = describe(sysinfo::Pid::from(3));
+        assert_eq!(
+            walk.agent_processes.get(&a),
+            Some(&vec![ProcessSample {
+                pid: 3,
+                parent_pid: 2,
+                name,
+                cmdline,
+                memory_bytes: 700,
+            }])
+        );
     }
 
     /// A pid table sampled while processes exit and get reparented can contain
@@ -8467,10 +9861,15 @@ mod tests {
     fn walk_descendants_terminates_on_a_cycle() {
         let children = adjacency(&[(1, 2), (2, 3), (3, 1), (3, 2)]);
         let memory = |_: sysinfo::Pid| Some(10);
-        let (count, bytes, _) =
-            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &HashMap::new());
-        assert_eq!(count, 2, "each pid is counted exactly once");
-        assert_eq!(bytes, 20);
+        let walk = walk_descendants(
+            &children,
+            &memory,
+            &describe,
+            sysinfo::Pid::from(1),
+            &HashMap::new(),
+        );
+        assert_eq!(walk.count, 2, "each pid is counted exactly once");
+        assert_eq!(walk.bytes, 20);
     }
 
     /// A pid that vanished between the table refresh and the walk contributes
@@ -8480,10 +9879,15 @@ mod tests {
     fn walk_descendants_skips_pids_that_exited_mid_walk() {
         let children = adjacency(&[(1, 2), (2, 3)]);
         let memory = |pid: sysinfo::Pid| (usize::from(pid) != 2).then_some(700);
-        let (count, bytes, _) =
-            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &HashMap::new());
-        assert_eq!(count, 1);
-        assert_eq!(bytes, 700);
+        let walk = walk_descendants(
+            &children,
+            &memory,
+            &describe,
+            sysinfo::Pid::from(1),
+            &HashMap::new(),
+        );
+        assert_eq!(walk.count, 1);
+        assert_eq!(walk.bytes, 700);
     }
 
     /// A leaf root reports an empty tree — the daemon before any agent spawns.
@@ -8492,8 +9896,14 @@ mod tests {
         let children = adjacency(&[(9, 10)]);
         let memory = |_: sysinfo::Pid| Some(10);
         assert_eq!(
-            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &HashMap::new()),
-            (0, 0, HashMap::new())
+            walk_descendants(
+                &children,
+                &memory,
+                &describe,
+                sysinfo::Pid::from(1),
+                &HashMap::new()
+            ),
+            TreeWalk::default()
         );
     }
 
@@ -8574,7 +9984,7 @@ mod tests {
         );
         assert_eq!(
             usage,
-            (0, 0, HashMap::new()),
+            TreeWalk::default(),
             "threads are not descendant processes: a walk rooted at a multi-threaded child must charge nothing"
         );
     }

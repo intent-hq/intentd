@@ -28,6 +28,14 @@ pub const RPC_DISPATCH_SPAN_TARGET: &str = "intent_transport::rpc_dispatch";
 /// Name of the per-dispatch profiling span (the literal passed to
 /// `info_span!` in [`handle_message`]).
 pub const RPC_DISPATCH_SPAN_NAME: &str = "rpc_dispatch";
+/// Optional string field on the per-dispatch profiling span naming the
+/// request VARIANT a handler served (intent-hq/intent#5531): today only
+/// `agent.list` records it — `default`, `includeRetired`, `retiredOnly`, or
+/// `scope=<bin>` (+ ` parentAgentId` when the delegated read is narrowed) —
+/// so the profiling layer's oversize / slow WARNs say which read shape
+/// overflowed. Flags only, never ids or payload. Absent on every other
+/// dispatch.
+pub const RPC_REQUEST_SHAPE_FIELD: &str = "request_shape";
 
 const PARSE_ERROR: i32 = -32700;
 const INVALID_REQUEST: i32 = -32600;
@@ -78,7 +86,30 @@ fn not_found(message: impl Into<String>) -> RpcErr {
 /// surface as `-32603 "Internal error"` carrying the original cause in `data`.
 fn domain_to_rpc(e: Error) -> RpcErr {
     match e {
-        Error::Internal(msg) => RpcErr {
+        Error::ExecutionAuthorization {
+            source,
+            authorization,
+        } => {
+            let code = match source.as_ref() {
+                Error::CloneFailed { .. } | Error::SourceControlUnauthorized { .. } => {
+                    source.code()
+                }
+                _ => -32603,
+            };
+            let data_code = match source.as_ref() {
+                Error::CloneFailed { category, .. } => category.as_str(),
+                Error::SourceControlUnauthorized { .. } => "source-control-unauthorized",
+                _ => "host-execution-authorization",
+            };
+            RpcErr {
+                code,
+                message: authorization.message(),
+                data: Some(json!({
+                    "code": data_code, "executionAuthorization": authorization,
+                })),
+            }
+        }
+        Error::Internal(msg) | Error::GitAuthorization(msg) => RpcErr {
             code: -32603,
             message: "Internal error".to_string(),
             data: Some(Value::String(msg)),
@@ -159,10 +190,94 @@ fn domain_to_rpc(e: Error) -> RpcErr {
                 "limit": limit,
             })),
         },
+        // Provider-generic auth typed errors (§5.27): -32603 with the stable
+        // `data = { code, provider, host }` so the FE keys its PAT fallback
+        // and "credential rejected" presentation on `data.code`, not prose.
+        ref e @ Error::DeviceGrantUnsupported {
+            ref provider,
+            ref host,
+        } => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({
+                "code": "device-grant-unsupported",
+                "provider": provider,
+                "host": host,
+            })),
+        },
+        ref e @ Error::HostMembershipRequired => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": "host-membership-required" })),
+        },
+        ref e @ (Error::IdentityMismatch | Error::IdentityInUse) => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(
+                json!({ "code": if matches!(e, Error::IdentityMismatch) { "identity-mismatch" } else { "identity-in-use" } }),
+            ),
+        },
+        ref e @ Error::SourceControlUnauthorized {
+            ref provider,
+            ref host,
+        } => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({
+                "code": "source-control-unauthorized",
+                "provider": provider,
+                "host": host,
+            })),
+        },
         // -32602 discriminator (monorepo#1320): `data.code` distinguishes a
         // nonexistent entity from bad request params; messages are unchanged.
         e @ Error::NotFound(_) => not_found(e.to_string()),
         e @ (Error::InvalidParams(_) | Error::InvalidInput(_)) => invalid_params(e.to_string()),
+        // Capability refusal (multiplayer w3): the same `-32003 "Forbidden"`
+        // envelope the connection-level allowlist emits, with the reason in
+        // `data.detail` so a client cannot tell the two refusals apart by
+        // code or message.
+        Error::Forbidden(detail) => RpcErr {
+            code: crate::catalog::FORBIDDEN_ERROR_CODE,
+            message: crate::catalog::FORBIDDEN_ERROR_MESSAGE.to_string(),
+            data: Some(json!({ "code": "forbidden", "detail": detail })),
+        },
+        // Invite / identity-only join refusal (multiplayer w4): the kind's
+        // own code with the stable `data.code` so an invite client can route
+        // "expired" / "pin mismatch" / "denied" without matching on prose.
+        ref e @ Error::Invite(kind) => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": kind.as_str() })),
+        },
+        // Identity-proof refusal (guest half): `-32603` with the stable
+        // `data.code` (`<provider>-not-connected` / `-scope-missing` /
+        // `-unreachable`) so the join flow can route "sign in" vs "retry"
+        // without matching on prose.
+        ref e @ Error::IdentityProof(kind) => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": kind.as_str() })),
+        },
+        // Identity-proof refusal (host half, protocol 10.8): the forge will
+        // not serve the proof to this host — `data.host` names the instance
+        // so the guest can be told which connection the host lacks.
+        ref e @ Error::IdentityUnverifiable { ref host } => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": "identity-unverifiable", "host": host })),
+        },
+        // Forge rate limiting — every cause the source-control layer
+        // classifies as `RateLimited` (REST primary 403/429, secondary-limit
+        // 403s, GraphQL RATE_LIMIT) on `github.getUser`, the identity-proof
+        // methods and PR reads: same `-32603` code and human message, plus
+        // the stable `data.code` so clients route "wait for the limit to
+        // reset" instead of prompting a sign-in (intent-hq/intent#5627).
+        ref e @ Error::RateLimited(_) => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": "rate-limited" })),
+        },
         other => RpcErr {
             code: other.code(),
             message: other.to_string(),
@@ -306,11 +421,15 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
 
     // Keep one span alive through dispatch AND response encoding. The writer
     // queue consumes the returned frame later, so queue latency is deliberately
-    // excluded from `encode_elapsed_ms`.
+    // excluded from `encode_elapsed_ms`. `request_shape` is recorded by the
+    // handlers that opt in (see [`RPC_REQUEST_SHAPE_FIELD`]) so the
+    // rpc_profile WARNs can attribute an oversize / slow dispatch to a
+    // request variant — flags only, never payload.
     let span = tracing::info_span!(
         target: RPC_DISPATCH_SPAN_TARGET,
         RPC_DISPATCH_SPAN_NAME,
         method,
+        request_shape = tracing::field::Empty,
         response_bytes = tracing::field::Empty,
         encode_elapsed_ms = tracing::field::Empty,
         oversized_replacement = tracing::field::Empty,
@@ -589,6 +708,81 @@ async fn dispatch(
             let id = require_workspace_id(params)?;
             let ws = api.mark_seen(id).await.map_err(workspace_err)?;
             Ok(json!({ "workspace": ws }))
+        }
+        // `workspace.members.*` (multiplayer w3): membership roster of one
+        // workspace. Member+ may list; add / removal are Owner-only in the
+        // service layer (`-32003` for a collaborator, `-32602` for a
+        // non-member).
+        "workspace.members.list" => {
+            let id = require_workspace_id(params)?;
+            let r = api
+                .workspace_members_list(id)
+                .await
+                .map_err(workspace_err)?;
+            Ok(r)
+        }
+        // `workspace.members.add` (direct member add): attach a credentialed
+        // guest as a collaborator; `-32602` for an unknown / primary /
+        // uncredentialed principal or a spent guest cap.
+        "workspace.members.add" => {
+            let id = require_workspace_id(params)?;
+            let principal_id = require_str_param(params, "principalId")?;
+            let r = api
+                .workspace_members_add(id, intent_core::PrincipalId::from(principal_id))
+                .await
+                .map_err(workspace_err)?;
+            Ok(r)
+        }
+        "workspace.members.remove" => {
+            let id = require_workspace_id(params)?;
+            let principal_id = require_str_param(params, "principalId")?;
+            let r = api
+                .workspace_members_remove(id, intent_core::PrincipalId::from(principal_id))
+                .await
+                .map_err(workspace_err)?;
+            Ok(r)
+        }
+        // `workspace.members.leave` (multiplayer w4): the bound collaborator
+        // drops its own membership; an owner is `-32602`.
+        "workspace.members.leave" => {
+            let id = require_workspace_id(params)?;
+            let r = api
+                .workspace_members_leave(id)
+                .await
+                .map_err(workspace_err)?;
+            Ok(r)
+        }
+        // `workspace.invite.*` (multiplayer w4): owner-only invite links.
+        // `workspace.invite.create` is handled on the connection fast-path
+        // (it wraps the secret into the `intent://invite` link with the
+        // listener's own hosts/port); only list/revoke route here.
+        "host.members.list" => api.host_members_list().await.map_err(domain_to_rpc),
+        "host.members.remove" => api
+            .host_members_remove(intent_core::PrincipalId(require_str_param(
+                params,
+                "principalId",
+            )?))
+            .await
+            .map_err(domain_to_rpc),
+        "host.executionContext" => api.host_execution_context().await.map_err(domain_to_rpc),
+        "host.invite.list" => api.host_invite_list().await.map_err(domain_to_rpc),
+        "host.invite.revoke" => api
+            .host_invite_revoke(require_str_param(params, "inviteId")?)
+            .await
+            .map_err(domain_to_rpc),
+        "workspace.invite.list" => {
+            let id = require_workspace_id(params)?;
+            let r = api.workspace_invite_list(id).await.map_err(workspace_err)?;
+            Ok(r)
+        }
+        "workspace.invite.revoke" => {
+            let id = require_workspace_id(params)?;
+            let invite_id = require_str_param(params, "inviteId")?;
+            let r = api
+                .workspace_invite_revoke(id, invite_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
         }
         "workspace.getTokenUsage" => {
             let id = require_workspace_id(params)?;
@@ -1350,7 +1544,31 @@ async fn dispatch(
                     "includeRetired and retiredOnly are mutually exclusive",
                 ));
             }
-            let agents = if retired_only {
+            // Row scope (§5.5): `scope` selects ONE bin of the non-retired
+            // sessions — `"topLevel"` / `"delegated"` / `"background"` —
+            // while absent / null / `"all"` keep today's read. Unlike the
+            // lenient retired flags, an unknown or non-string `scope` is
+            // `-32602`, never coerced, and a bin scope cannot be combined
+            // with either retired flag (retired is its own bin). A
+            // `delegated` read narrows by `parentAgentId` OR `orphanedOnly`
+            // (never both). Every variant additionally carries
+            // `scopeCounts` (one grouped SQL aggregate over the non-retired
+            // rows) and `delegatedCounts` (one grouped aggregate over the
+            // non-retired delegated rows, per direct parent, with its
+            // `orphaned` sub-aggregate) under the same
+            // no-snapshot-isolation tolerance as `retiredCount`.
+            let scope = parse_agent_list_scope(params, include_retired || retired_only)?;
+            // Attribute the dispatch to its read variant for the profiling
+            // WARNs (flags only — see `RPC_REQUEST_SHAPE_FIELD`).
+            tracing::Span::current().record(
+                RPC_REQUEST_SHAPE_FIELD,
+                agent_list_request_shape(scope.as_ref(), include_retired, retired_only).as_str(),
+            );
+            let agents = if let Some(scope) = scope {
+                api.agent_list_scoped(ws.clone(), scope)
+                    .await
+                    .map_err(domain_to_rpc)?
+            } else if retired_only {
                 api.agent_list_retired_only(ws.clone())
                     .await
                     .map_err(domain_to_rpc)?
@@ -1361,8 +1579,24 @@ async fn dispatch(
             } else {
                 api.agent_list(ws.clone()).await.map_err(domain_to_rpc)?
             };
-            let retired_count = api.agent_retired_count(ws).await.map_err(domain_to_rpc)?;
-            Ok(json!({ "agents": agents, "retiredCount": retired_count }))
+            let retired_count = api
+                .agent_retired_count(ws.clone())
+                .await
+                .map_err(domain_to_rpc)?;
+            let scope_counts = api
+                .agent_scope_counts(ws.clone())
+                .await
+                .map_err(domain_to_rpc)?;
+            let delegated_counts = api
+                .agent_delegated_counts(ws)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!({
+                "agents": agents,
+                "retiredCount": retired_count,
+                "scopeCounts": scope_counts,
+                "delegatedCounts": delegated_counts,
+            }))
         }
         "agent.listActive" => api.agent_list_active().await.map_err(domain_to_rpc),
         "agent.get" => {
@@ -2144,6 +2378,12 @@ async fn dispatch(
             let result = api.agent_list_interrupted().await.map_err(domain_to_rpc)?;
             Ok(result)
         }
+        "agent.memoryUsage" => {
+            // No workspaceId: per-agent memory attribution spans every live
+            // agent the daemon's descendant-tree sampler bucketed (§5.5).
+            let result = api.agent_memory_usage().await.map_err(domain_to_rpc)?;
+            Ok(result)
+        }
         "agent.resolveInterrupted" => {
             // Optional resume/abandon arrays; ids must be pending interrupted_agent rows.
             // If present, must be arrays of strings (reject non-array and non-string elements).
@@ -2907,7 +3147,19 @@ async fn dispatch(
             Ok(r)
         }
         "github.cancelAuth" => {
-            let r = api.github_cancel_auth().await.map_err(domain_to_rpc)?;
+            // Strict: only an OMITTED `flowId` is the unscoped cancel. Any
+            // present non-string — an explicit `null` included, unlike
+            // `opt_str_strict` — is rejected so it can never silently widen
+            // the cancel to "whichever flow is pending".
+            let flow_id = match params.get("flowId") {
+                None => None,
+                Some(Value::String(s)) => Some(s.clone()),
+                Some(_) => return Err(invalid_params("flowId must be a string")),
+            };
+            let r = api
+                .github_cancel_auth(flow_id)
+                .await
+                .map_err(domain_to_rpc)?;
             Ok(r)
         }
         "github.revoke" => {
@@ -2916,6 +3168,210 @@ async fn dispatch(
         }
         "github.getUser" => {
             let r = api.github_get_user().await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "github.users.search" => {
+            let query = require_str_param(params, "query")?;
+            let limit = opt_int(params, "limit");
+            let r = api
+                .github_users_search(query, limit)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        // `github.identityProof.*` (gist identity-proof join flow, guest
+        // half): the local daemon publishes a host-issued nonce in a secret
+        // gist made with the stored token; owner-client only, the token
+        // never crosses the wire.
+        "github.identityProof.create" => {
+            let nonce = require_str_param(params, "nonce")?;
+            let host_label = require_str_param(params, "hostLabel")?;
+            let r = api
+                .github_identity_proof_create(nonce, host_label)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "github.identityProof.delete" => {
+            let gist_id = require_str_param(params, "gistId")?;
+            let r = api
+                .github_identity_proof_delete(gist_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        // `sourceControl.identityProof.*` (protocol 10.8): the
+        // provider-generic form of the pair above — `provider` required
+        // (`github` | `gitlab`), `host` optional and gitlab-only, parsed
+        // strictly like the `sourceControl.*` auth methods; `proofId` is the
+        // gist id / snippet id `create` answered.
+        "sourceControl.identityProof.create" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let nonce = require_str_param(params, "nonce")?;
+            let host_label = require_str_param(params, "hostLabel")?;
+            let r = api
+                .source_control_identity_proof_create(
+                    provider,
+                    host,
+                    nonce,
+                    host_label,
+                    opt_str_strict(params, "purpose")?,
+                    params
+                        .get("expectedIdentity")
+                        .filter(|v| !v.is_null())
+                        .map(|v| {
+                            serde_json::from_value(v.clone())
+                                .map_err(|_| invalid_params("invalid expectedIdentity"))
+                        })
+                        .transpose()?,
+                )
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "sourceControl.identityProof.delete" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let proof_id = require_str_param(params, "proofId")?;
+            let r = api
+                .source_control_identity_proof_delete(
+                    provider,
+                    host,
+                    proof_id,
+                    opt_str_strict(params, "purpose")?,
+                )
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        // Provider-generic auth (§5.27 "Provider-generic auth —
+        // `sourceControl.*`", v10.5): `provider` is required on every method
+        // (`github` | `gitlab`), `host` is optional and gitlab-only; both are
+        // validated by the service so the `-32602` messages stay in one place.
+        // The optional fields are parsed strictly: absent / `null` ⇒ omitted,
+        // but a present non-string is `-32602` before the service runs — a
+        // lax `host` would otherwise route `{"host": 123}` as host-omitted
+        // and, on `revoke`, act on the bound credential instead of failing.
+        "identity.authStatus" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            api.identity_auth_status(provider, host)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "identity.connect" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let method = opt_str_strict(params, "method")?;
+            let token = opt_str_strict(params, "token")?;
+            api.identity_connect(provider, host, method, token)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "identity.cancelAuth" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let flow_id = require_str_param(params, "flowId")?;
+            api.identity_cancel_auth(provider, host, flow_id)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "identity.revoke" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            api.identity_revoke(provider, host)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "identity.getUser" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            api.identity_get_user(provider, host)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "identity.select" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let external_user_id = require_str_param(params, "externalUserId")?;
+            api.identity_select(provider, host, external_user_id)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "sourceControl.authStatus" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let r = api
+                .source_control_auth_status(provider, host)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "sourceControl.connect" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let method = opt_str_strict(params, "method")?;
+            let token = opt_str_strict(params, "token")?;
+            let r = api
+                .source_control_connect(provider, host, method, token)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "sourceControl.cancelAuth" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let r = api
+                .source_control_cancel_auth(provider, host)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "sourceControl.revoke" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let r = api
+                .source_control_revoke(provider, host)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "sourceControl.getUser" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let r = api
+                .source_control_get_user(provider, host)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        // `principal.me` (multiplayer w1): the principal this connection was
+        // bound to at admission; no params. Fails when no caller is bound.
+        "principal.me" => {
+            let r = api.principal_me().await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        // Credentialed sharing directory for owner/member callers; no params.
+        // The service reads current durable authority; guests are refused.
+        "principal.list" => {
+            let r = api.principal_list().await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        // `principal.revokeSelf` (multiplayer w4): the bound collaborator
+        // revokes its own credentials and leaves its workspaces; the
+        // transport then closes its connections. The administrator is
+        // `-32602`.
+        "principal.revokeSelf" => {
+            let r = api.principal_revoke_self().await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        // `presence.snapshot` (multiplayer w5): the current `presence:changed`
+        // roster of a member workspace, on demand. Member+; a non-member is
+        // `-32602 not-found` like any other membership-narrowed read.
+        "presence.snapshot" => {
+            let id = require_workspace_id(params)?;
+            let r = api.presence_snapshot(id).await.map_err(workspace_err)?;
             Ok(r)
         }
         // `linear.*` (§5.28) is daemon-owned and global: no `workspaceId`. A key
@@ -3722,7 +4178,12 @@ async fn dispatch(
         // surfaces as `-32602` (`Error::NotFound` → invalid params).
         "hook.list" => {
             let ws = require_ws_note(params)?;
-            api.hook_list(ws, None).await.map_err(domain_to_rpc)
+            // Active hooks only by default; `includeRetired` appends the
+            // terminal rows as a light projection (no code/lastState/lastLogs).
+            let include_retired = opt_bool(params, "includeRetired").unwrap_or(false);
+            api.hook_list(ws, None, include_retired)
+                .await
+                .map_err(domain_to_rpc)
         }
         "hook.cancel" => {
             let ws = require_ws_note(params)?;
@@ -4444,6 +4905,112 @@ fn parse_projection(
         }
         Some(_) => Err(invalid_params("projection must be \"slim\"")),
     }
+}
+
+/// The [`RPC_REQUEST_SHAPE_FIELD`] value for one `agent.list` read: which
+/// variant the parsed params selected. Flags only — a `parentAgentId`
+/// narrowing reads as the literal ` parentAgentId` suffix, never the id;
+/// an `orphanedOnly` narrowing as ` orphanedOnly`.
+fn agent_list_request_shape(
+    scope: Option<&intent_core::AgentListRowScope>,
+    include_retired: bool,
+    retired_only: bool,
+) -> String {
+    use intent_core::AgentListRowScope;
+    match scope {
+        Some(AgentListRowScope::Delegated {
+            parent_agent_id: Some(_),
+            ..
+        }) => "scope=delegated parentAgentId".to_string(),
+        Some(AgentListRowScope::Delegated {
+            orphaned_only: true,
+            ..
+        }) => "scope=delegated orphanedOnly".to_string(),
+        Some(scope) => format!("scope={}", scope.wire_name()),
+        None if retired_only => "retiredOnly".to_string(),
+        None if include_retired => "includeRetired".to_string(),
+        None => "default".to_string(),
+    }
+}
+
+/// Parse the optional `agent.list` `scope` + `parentAgentId` +
+/// `orphanedOnly` params (§5.5). Absent / `null` / `"all"` is `None` —
+/// today's read; `"topLevel"` / `"delegated"` / `"background"` select one
+/// bin of the non-retired rows. Any other value (unknown string OR
+/// non-string) is `-32602`, never coerced. `parentAgentId` (a canonical
+/// `agent-{uuid}`) narrows a `delegated` read to that parent's direct
+/// sub-agents and is `-32602` with any other scope, including the default.
+/// `orphanedOnly: true` (a boolean, else `-32602`) narrows a `delegated`
+/// read the other way, to the workspace's orphaned delegated rows; it is
+/// `-32602` with any other scope and `-32602` combined with `parentAgentId`
+/// (the two sub-filters are mutually exclusive); `false` reads as absent.
+/// A bin scope combined with `includeRetired` / `retiredOnly`
+/// (`retired_flag`) is `-32602`: retired sessions are their own bin. Every
+/// rejection lands before any read.
+fn parse_agent_list_scope(
+    params: &Map<String, Value>,
+    retired_flag: bool,
+) -> Result<Option<intent_core::AgentListRowScope>, RpcErr> {
+    use intent_core::AgentListRowScope;
+    let parent_agent_id = match params.get("parentAgentId") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => {
+            let id = AgentId::from(s.as_str());
+            if !id.is_canonical() {
+                return Err(invalid_params(
+                    "parentAgentId must be a canonical agent-{uuid} id",
+                ));
+            }
+            Some(id)
+        }
+        Some(_) => {
+            return Err(invalid_params(
+                "parentAgentId must be a canonical agent-{uuid} id",
+            ));
+        }
+    };
+    let orphaned_only = match params.get("orphanedOnly") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(invalid_params("orphanedOnly must be a boolean")),
+    };
+    let scope = match params.get("scope") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if s == "all" => None,
+        Some(Value::String(s)) if s == "topLevel" => Some(AgentListRowScope::TopLevel),
+        Some(Value::String(s)) if s == "delegated" => Some(AgentListRowScope::Delegated {
+            parent_agent_id: parent_agent_id.clone(),
+            orphaned_only,
+        }),
+        Some(Value::String(s)) if s == "background" => Some(AgentListRowScope::Background),
+        Some(_) => {
+            return Err(invalid_params(
+                "scope must be \"all\", \"topLevel\", \"delegated\" or \"background\"",
+            ));
+        }
+    };
+    if let Some(scope) = &scope {
+        if retired_flag {
+            return Err(invalid_params(format!(
+                "scope \"{}\" cannot be combined with includeRetired or retiredOnly: retired sessions are their own bin",
+                scope.wire_name()
+            )));
+        }
+    }
+    if parent_agent_id.is_some() && !matches!(scope, Some(AgentListRowScope::Delegated { .. })) {
+        return Err(invalid_params("parentAgentId requires scope \"delegated\""));
+    }
+    if orphaned_only {
+        if !matches!(scope, Some(AgentListRowScope::Delegated { .. })) {
+            return Err(invalid_params("orphanedOnly requires scope \"delegated\""));
+        }
+        if parent_agent_id.is_some() {
+            return Err(invalid_params(
+                "orphanedOnly cannot be combined with parentAgentId: an orphan's direct children are pulled by parent",
+            ));
+        }
+    }
+    Ok(scope)
 }
 
 /// Parse the optional `projection` param on `note.list` (§5.2): absent /

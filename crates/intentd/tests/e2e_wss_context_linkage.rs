@@ -149,7 +149,7 @@ async fn next_event(ws: &mut PlainWs) -> Value {
 /// list. FE parity: matches
 /// `packages/cloudlands-fe/src/store/renderer/slices/context/context-slice.ts`
 /// hydrate/add/remove/update collapsed to a single authoritative-list write.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_context_round_trip_and_event() {
     let fx = boot().await;
     let mut rpc = connect(fx.port).await;
@@ -268,7 +268,7 @@ async fn workspace_context_round_trip_and_event() {
 /// daemon-owned rows. FE parity: the response `linksByNoteId` mirrors
 /// `TaskAgentAssociationsState.byNoteId → byTaskKey → association` so the FE
 /// hydration is a mechanical cut-over.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn task_agent_link_lifecycle_and_events() {
     let fx = boot().await;
     let mut rpc = connect(fx.port).await;
@@ -414,7 +414,7 @@ async fn task_agent_link_lifecycle_and_events() {
 /// `-32602 Invalid params` (the store rows are keyed by
 /// `(workspace_id, id)`, so the router validates up front to keep the error
 /// contract clean instead of surfacing a store constraint violation).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_update_context_rejects_duplicate_ids() {
     let fx = boot().await;
     let mut rpc = connect(fx.port).await;

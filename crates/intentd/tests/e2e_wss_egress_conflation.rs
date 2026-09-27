@@ -221,7 +221,7 @@ fn terminal_event(ws_id: &str, event_type: &str, data: Value) -> NewEvent {
 /// `terminal:data` burst gets every byte back — chunks may arrive merged
 /// (conflated), but the decoded concatenation is exact — and the stream's
 /// `terminal:exit` barrier arrives strictly after all of its data.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn stalled_subscriber_receives_burst_losslessly_with_exit_after_data() {
     const CHUNK_BYTES: usize = 4 * 1024;
     const CHUNKS: usize = 600;

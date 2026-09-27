@@ -127,7 +127,7 @@ fn boot(
             .with_event_bus(bus.clone()),
     );
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn({
+    let server = intent_core::spawn_daemon({
         let bus = bus.clone();
         let socket = socket.clone();
         async move {
@@ -140,7 +140,7 @@ fn boot(
     (socket, server, shutdown_tx, ws_root, sock_dir)
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn note_subscribe_snapshot_then_ordered_deltas() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -257,7 +257,7 @@ async fn note_subscribe_snapshot_then_ordered_deltas() {
     let _ = server.await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn replace_group_swaps_and_firehose_coexists() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");

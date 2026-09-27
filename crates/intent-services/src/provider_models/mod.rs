@@ -11,8 +11,8 @@
 //! Sources:
 //! - `claude-code` — ACP probe via the pinned npx adapter
 //!   ([`intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE`]).
-//! - `codex` — ACP probe via a resolved `codex-acp` binary, falling back to
-//!   the pinned npx package. Base models with reasoning-effort support carry
+//! - `codex` — ACP probe via the pinned npx package. Base models with
+//!   reasoning-effort support carry
 //!   their levels as `effortLevels` (parity with the FE). The FE
 //!   additionally tries a `codex app-server` transport first, but that path
 //!   exists to reuse its Electron-managed codex runtime; daemon-side the
@@ -222,8 +222,8 @@ pub(crate) async fn fetch_claude_code_models() -> ProviderModelsFetch {
     )
 }
 
-/// codex: ACP probe via a resolved `codex-acp` binary, else the pinned npx
-/// fallback. Effort-capable base models carry `effortLevels` on one row.
+/// codex: ACP probe via the pinned npx adapter.
+/// Effort-capable base models carry `effortLevels` on one row.
 ///
 /// The probe child runs with an isolated `CODEX_HOME` (fresh per-probe temp
 /// dir, removed after the probe) so the user's `~/.codex/config.toml` — and
@@ -233,14 +233,15 @@ pub(crate) async fn fetch_claude_code_models() -> ProviderModelsFetch {
 /// only the user's configured `model` / `model_reasoning_effort` so that
 /// model appears in the reported catalog.
 pub(crate) async fn fetch_codex_models() -> ProviderModelsFetch {
-    let Some(cmd) =
-        codex_probe_launch(find_provider_binary("codex", "codex-acp", None), find_npx())
-    else {
+    let Some(cmd) = codex_probe_launch(intent_providers::find_codex_npx()) else {
         return ProviderModelsFetch::unavailable(
             "codex",
-            "codex-acp binary not found and npx unavailable for the pinned fallback",
+            intent_providers::CODEX_ACP_PREREQUISITE_ERROR,
         );
     };
+    if let Err(err) = cmd.check_npx_version().await {
+        return ProviderModelsFetch::unavailable("codex", err);
+    }
     let (cmd, codex_home) = match with_isolated_codex_home(cmd) {
         Ok(pair) => pair,
         Err(e) => {
@@ -255,23 +256,11 @@ pub(crate) async fn fetch_codex_models() -> ProviderModelsFetch {
     finish("codex", outcome)
 }
 
-/// Pick the codex probe launch: a resolved `codex-acp` binary (the user's
-/// escape hatch) spawns with the daemon env untouched, while the pinned npx
-/// fallback is daemon-managed and gets `CODEX_PATH` / `CODEX_CONFIG` removed
-/// from its inherited env so a stray value cannot redirect the adapter (#555).
-fn codex_probe_launch(
-    resolved_bin: Option<PathBuf>,
-    npx: Option<PathBuf>,
-) -> Option<AcpProbeCommand> {
-    if let Some(bin) = resolved_bin {
-        Some(AcpProbeCommand::binary(bin, Vec::new()))
-    } else {
-        npx.map(|npx| {
-            AcpProbeCommand::npx(npx, intent_providers::config::CODEX_ACP_NPX_PACKAGE)
-                .env_remove("CODEX_PATH")
-                .env_remove("CODEX_CONFIG")
-        })
-    }
+/// The same pinned launch and policy used by one-shot completions. No native
+/// or configured adapter path is accepted by a Codex model probe.
+fn codex_probe_launch(npx: Option<PathBuf>) -> Option<AcpProbeCommand> {
+    let provider = intent_providers::find_provider("codex")?;
+    crate::complete_ops::one_shot_launch(provider, None, npx, None)
 }
 
 /// Attach a freshly created isolated `CODEX_HOME` to an ephemeral codex

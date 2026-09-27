@@ -273,7 +273,7 @@ async fn wait_for_warm_completion(ws: &mut TlsWs, root: &std::path::Path, url: &
 /// `{ started: true, owner, repo }` result immediately, and the detached
 /// ensure populates `<root>/.repo-cache/<owner>/<repo>` from the `file://`
 /// fixture.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn repo_warm_cache_starts_and_populates_cache_over_wss() {
     let fx = boot().await;
     let mut rpc = connect(&fx).await;
@@ -305,7 +305,7 @@ async fn repo_warm_cache_starts_and_populates_cache_over_wss() {
 /// Busy rejection over WSS: with the warm's ensure parked behind the held
 /// per-repo cache lock, a second `repo.warmCache` is rejected with `-32603`
 /// carrying `error.data = { code: "warm-in-flight", owner, repo }`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[intent_test_macros::daemon_test(flavor = "multi_thread", worker_threads = 2)]
 async fn repo_warm_cache_busy_rejection_envelope_over_wss() {
     let fx = boot().await;
     let mut rpc = connect(&fx).await;
@@ -326,7 +326,7 @@ async fn repo_warm_cache_busy_rejection_envelope_over_wss() {
     let cache_path = cache_slot(&fx.root, &owner, &repo);
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
     let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
-    let lock_holder = tokio::spawn(async move {
+    let lock_holder = intent_core::spawn_daemon(async move {
         intent_git::repo_cache::with_cache_lock_blocking(&cache_path, move || {
             held_tx.send(()).unwrap();
             release_rx.recv().unwrap();
@@ -356,7 +356,7 @@ async fn repo_warm_cache_busy_rejection_envelope_over_wss() {
 
 /// Invalid URL over WSS: a `githubUrl` with no owner/repo pair is `-32602`,
 /// and a missing `githubUrl` param is `-32602` as well.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn repo_warm_cache_invalid_params_over_wss() {
     let fx = boot().await;
     let mut rpc = connect(&fx).await;

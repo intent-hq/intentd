@@ -21,7 +21,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -67,9 +67,8 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     common::enable_ws_api(data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -299,11 +298,13 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         })
         .await
         .expect("insert ws");
@@ -323,9 +324,8 @@ async fn boot_daemon(script: &str, behavior: &str, budget: Budget) -> Setup {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", script),
         ("MOCK_AGENT_BEHAVIOR", behavior),
     ];
@@ -395,34 +395,43 @@ fn blocks_text(message: &Value) -> String {
     serde_json::to_string(&message["contentBlocks"]).unwrap_or_default()
 }
 
-/// Serialized conversation text for an agent.
-async fn conversation_text(rpc: &mut TlsWs, id: i64, ws_id: &str, agent_id: &str) -> String {
-    let convo = wss_rpc(
+/// The `agent.getConversation` page for an agent.
+async fn conversation_page(rpc: &mut TlsWs, id: i64, ws_id: &str, agent_id: &str) -> Value {
+    wss_rpc(
         rpc,
         id,
         "agent.getConversation",
         json!({ "workspaceId": ws_id, "agentId": agent_id }),
     )
-    .await;
-    convo.to_string()
+    .await
 }
 
 /// Poll until the agent's conversation stops changing across two consecutive
-/// reads 400ms apart (all queued wake turns drained). Returns the settled text.
+/// reads 400ms apart with no turn in flight (all queued wake turns drained).
+/// "Changing" is judged on the `common::conversation_fingerprint` (persisted
+/// row identity/content), not the raw payload, so read-time `author`
+/// hydration cannot keep the loop spinning (intent-hq/intent#5603). A turn
+/// persists nothing until it ends, so the page-level `turnInFlight` flag
+/// (dropped by the fingerprint) is checked separately: matching fingerprints
+/// while a wake turn is still running do not count as settled. Returns the
+/// settled page.
 async fn await_conversation_settled(
     rpc: &mut TlsWs,
     req_id: &mut i64,
     ws_id: &str,
     agent_id: &str,
     deadline: tokio::time::Instant,
-) -> String {
-    let mut prev = conversation_text(rpc, *req_id, ws_id, agent_id).await;
+) -> Value {
+    let mut prev = conversation_page(rpc, *req_id, ws_id, agent_id).await;
     *req_id += 1;
     loop {
         tokio::time::sleep(Duration::from_millis(400)).await;
-        let next = conversation_text(rpc, *req_id, ws_id, agent_id).await;
+        let next = conversation_page(rpc, *req_id, ws_id, agent_id).await;
         *req_id += 1;
-        if next == prev {
+        let turn_in_flight = next["turnInFlight"].as_bool() == Some(true);
+        if !turn_in_flight
+            && common::conversation_fingerprint(&next) == common::conversation_fingerprint(&prev)
+        {
             return next;
         }
         prev = next;
@@ -644,7 +653,8 @@ async fn debounced_report_combined_with_completion_wake_over_wss() {
         &parent,
         budget.step(60),
     )
-    .await;
+    .await
+    .to_string();
     assert!(
         !text.contains("reported. Report:"),
         "no separate progress wake was delivered: {text}"

@@ -13,8 +13,12 @@
 //! Only a *public* OAuth App `client_id` is needed (no client secret, no
 //! callback URL). 🔒 The `access_token` and `device_code` are secrets: they
 //! are never logged, never carried in any `Debug`/`Serialize` shape, and the
-//! token never leaves this module — callers only see [`PollStatus`].
+//! token never leaves this module — callers see [`PollStatus`] or an opaque
+//! [`GithubGrant`] that they can verify before committing to their own store.
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use intent_core::FileSecretStore;
@@ -25,6 +29,7 @@ use tokio::time::timeout;
 
 use crate::error::{Error, Result};
 use crate::token::SECRET_ACCOUNT;
+use crate::SourceControl;
 
 #[cfg(test)]
 use intent_core::settings_file::DEFAULT_GITHUB_OAUTH_CLIENT_ID as DEFAULT_OAUTH_CLIENT_ID;
@@ -40,9 +45,15 @@ const SLOW_DOWN_BUMP_SECS: u64 = 5;
 /// cancelled — `spawn_blocking` closures cannot be interrupted).
 const SECRET_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Default scopes requested by the device flow (§spec: PR/issue/review work,
-/// org-repo listing, and workflow-file pushes).
-pub const DEFAULT_SCOPES: &[&str] = &["repo", "read:org", "workflow"];
+/// Permissions for publishing a collaboration identity proof only.
+pub const COLLABORATION_SCOPES: &[&str] = &["gist"];
+
+/// Default scopes requested by the repository device flow (§spec: PR/issue/review work,
+/// org-repo listing, workflow-file pushes, and the secret proof gist of the
+/// gist identity-proof join flow — [`crate::identity_proof`]). Tokens granted
+/// before `gist` was added keep working; they only need a re-authorization
+/// when the user first joins a workspace as a guest.
+pub const DEFAULT_SCOPES: &[&str] = &["repo", "read:org", "workflow", "gist"];
 
 /// User-facing half of the device-flow start response. Deliberately excludes
 /// the secret `device_code` (which stays inside [`DeviceFlow`]) so this shape
@@ -73,7 +84,36 @@ pub enum PollStatus {
     Expired,
     /// The user denied the authorization request.
     Denied,
+    /// The user authorized, but the [`IdentityGuard`] refused the granted
+    /// account: the token was discarded, nothing was persisted, and the
+    /// previously stored credential (if any) is untouched. Terminal.
+    Refused,
 }
+
+/// Opaque value an [`IdentityGuard`] returns on admission. The flow holds
+/// it across the token write and drops it right after, so whatever the
+/// guard pinned while deciding (the daemon's identity transition lock)
+/// stays pinned until the credential and the identity it verified are
+/// both on disk — no invite or concurrent switch can land in between.
+pub type IdentityLease = Box<dyn std::any::Any + Send>;
+
+/// Pre-persist hook of a [`DeviceFlow`] (multiplayer w4): once a grant
+/// arrives, the hook receives a forge client bound to the *new* token —
+/// never the token itself — and decides before anything is written.
+/// `Ok(lease)` persists the token while the [`IdentityLease`] is held;
+/// `Err(reason)` discards it and the poll reports [`PollStatus::Refused`].
+/// The daemon uses it to verify `GET /user` against the primary
+/// principal's reconnect guard so a different GitHub account cannot
+/// replace the publishing credential while collaborators or open invites
+/// depend on the cached identity.
+pub type IdentityGuard = Arc<
+    dyn Fn(
+            Arc<dyn SourceControl>,
+        )
+            -> Pin<Box<dyn Future<Output = std::result::Result<IdentityLease, String>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// Opaque in-flight flow handle returned by [`start`]. Holds the secret
 /// `device_code` privately; intentionally no `Debug`/`Serialize`.
@@ -83,6 +123,9 @@ pub struct DeviceFlow {
     device_code: SecretString,
     interval: u64,
     store: FileSecretStore,
+    /// Optional pre-persist hook plus the API base its client talks to
+    /// (`None` = api.github.com).
+    identity_guard: Option<(Option<String>, IdentityGuard)>,
 }
 
 /// The production login host the device flow talks to.
@@ -151,6 +194,7 @@ pub async fn start_at(
         device_code: SecretString::from(codes.device_code),
         interval: codes.interval,
         store: FileSecretStore::new(),
+        identity_guard: None,
     };
     Ok((auth, flow))
 }
@@ -162,20 +206,71 @@ impl DeviceFlow {
         self.interval
     }
 
+    /// Install an [`IdentityGuard`] consulted between the grant and the
+    /// token write; `api_base_uri` is where its client's API calls go
+    /// (`None` = api.github.com, the test seam points it at a mock).
+    #[must_use]
+    pub fn with_identity_guard(mut self, api_base_uri: Option<&str>, guard: IdentityGuard) -> Self {
+        self.identity_guard = Some((api_base_uri.map(str::to_string), guard));
+        self
+    }
+
     /// Poll the token endpoint once. On [`PollStatus::Authorized`] the access
     /// token has already been persisted to the secret store under
     /// `sourceControl.github.token` — it is never returned to the caller.
+    /// With an [`IdentityGuard`] installed, the grant is first handed to the
+    /// guard as a token-bound client; a refusal drops the token unpersisted
+    /// and reports [`PollStatus::Refused`], and an admission's
+    /// [`IdentityLease`] is held by the token write itself until it returns
+    /// — even when this caller has given up on it after
+    /// [`SECRET_WRITE_TIMEOUT`].
     ///
     /// # Errors
     ///
     /// Returns an error when the token request fails, the response cannot be classified, or persisting the token to the secret store fails. Grant expiration and denial are not errors — they are reported as [`PollStatus::Expired`] and [`PollStatus::Denied`].
     pub async fn poll_once(&mut self) -> Result<PollStatus> {
-        // GitHub's device-token endpoint reports pending/slow_down/expired/
-        // denied as an `error` code in an HTTP 200 body. octocrab's
-        // `DeviceCodes::poll_once` (untagged `TokenResponse`) cannot represent
-        // the terminal errors — deserialization fails and the expired/denied
-        // distinction is lost — so we post the same grant ourselves through
-        // the same octocrab client and classify the raw body.
+        match self.exchange_once().await? {
+            GithubExchange::Authorized(grant) => {
+                let mut lease = None;
+                if let Some((api_base_uri, guard)) = &self.identity_guard {
+                    let client: Arc<dyn SourceControl> =
+                        Arc::new(crate::github::GitHubSourceControl::new(
+                            grant.access_token.expose_secret(),
+                            api_base_uri.as_deref(),
+                        )?);
+                    match guard(client).await {
+                        Ok(held) => lease = Some(held),
+                        Err(reason) => {
+                            tracing::warn!(
+                                reason,
+                                "github device flow grant refused by identity guard"
+                            );
+                            return Ok(PollStatus::Refused);
+                        }
+                    }
+                }
+                grant.commit(lease).await?;
+                Ok(PollStatus::Authorized)
+            }
+            GithubExchange::Pending => Ok(PollStatus::Pending),
+            GithubExchange::Expired => Ok(PollStatus::Expired),
+            GithubExchange::Denied => Ok(PollStatus::Denied),
+        }
+    }
+
+    /// Direct persistence to an isolated store without changing repository defaults.
+    #[must_use]
+    pub fn with_store(mut self, store: FileSecretStore) -> Self {
+        self.store = store;
+        self
+    }
+
+    /// Exchange without persisting: cancellation and account verification happen
+    /// before the caller commits the opaque grant.
+    ///
+    /// # Errors
+    /// Returns provider transport or malformed-response errors.
+    pub async fn exchange_once(&mut self) -> Result<GithubExchange> {
         let body: Value = self
             .crab
             .post(
@@ -189,18 +284,73 @@ impl DeviceFlow {
             .await?;
         match parse_poll_response(&body)? {
             PollResponse::Authorized { access_token } => {
-                persist_token(self.store.clone(), access_token).await?;
-                Ok(PollStatus::Authorized)
+                Ok(GithubExchange::Authorized(GithubGrant {
+                    store: self.store.clone(),
+                    access_token,
+                    scopes: body.get("scope").and_then(Value::as_str).map(parse_scopes),
+                }))
             }
-            PollResponse::Pending => Ok(PollStatus::Pending),
+            PollResponse::Pending => Ok(GithubExchange::Pending),
             PollResponse::SlowDown { interval } => {
                 self.interval = next_interval(self.interval, interval);
-                Ok(PollStatus::Pending)
+                Ok(GithubExchange::Pending)
             }
-            PollResponse::Expired => Ok(PollStatus::Expired),
-            PollResponse::Denied => Ok(PollStatus::Denied),
+            PollResponse::Expired => Ok(GithubExchange::Expired),
+            PollResponse::Denied => Ok(GithubExchange::Denied),
         }
     }
+}
+
+/// Authorized tokens remain opaque until the caller commits or discards them.
+pub enum GithubExchange {
+    /// A verified device response, not yet persisted.
+    Authorized(GithubGrant),
+    /// Authorization has not completed.
+    Pending,
+    /// The device code expired.
+    Expired,
+    /// The person denied authorization.
+    Denied,
+}
+
+/// An uncommitted GitHub grant. Deliberately has no Debug/Serialize.
+pub struct GithubGrant {
+    store: FileSecretStore,
+    access_token: SecretString,
+    scopes: Option<Vec<String>>,
+}
+
+impl GithubGrant {
+    /// Verify the account using the new token, including observed permissions.
+    ///
+    /// # Errors
+    /// Returns the authenticated user lookup error.
+    pub async fn verify(
+        &self,
+        api_base: Option<&str>,
+    ) -> Result<(crate::UserIdentity, Option<Vec<String>>)> {
+        let (user, scopes) =
+            crate::github::GitHubSourceControl::new(self.access_token.expose_secret(), api_base)?
+                .get_user_with_scopes()
+                .await?;
+        Ok((user, scopes.or_else(|| self.scopes.clone())))
+    }
+
+    /// Commit while holding the caller's persistence lease through blocking IO.
+    ///
+    /// # Errors
+    /// Returns the bounded secret-store write error.
+    pub async fn commit(self, lease: Option<IdentityLease>) -> Result<()> {
+        persist_token(self.store, self.access_token, lease).await
+    }
+}
+
+pub(crate) fn parse_scopes(scopes: &str) -> Vec<String> {
+    scopes
+        .split(|c: char| c == ',' || c.is_ascii_whitespace())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Classified device-token poll response (crate-private: the authorized arm
@@ -268,10 +418,34 @@ fn next_interval(current: u64, hinted: Option<u64>) -> u64 {
 /// (the first slot of the existing resolution chain). Runs on the blocking
 /// pool like the loads in [`crate::token`], bounded by
 /// [`SECRET_WRITE_TIMEOUT`] so a wedged filesystem cannot hang the caller.
-async fn persist_token(store: FileSecretStore, token: SecretString) -> Result<()> {
-    let handle =
-        tokio::task::spawn_blocking(move || store.store(SECRET_ACCOUNT, token.expose_secret()));
-    match timeout(SECRET_WRITE_TIMEOUT, handle).await {
+/// The [`IdentityLease`] travels with the write and is released only once
+/// it returns, so a caller that gives up on the timeout cannot release the
+/// identity transition while the abandoned write is still in flight.
+async fn persist_token(
+    store: FileSecretStore,
+    token: SecretString,
+    lease: Option<IdentityLease>,
+) -> Result<()> {
+    persist_with(
+        move || store.store(SECRET_ACCOUNT, token.expose_secret()),
+        lease,
+        SECRET_WRITE_TIMEOUT,
+    )
+    .await
+}
+
+/// Run the blocking `write` on the pool with `lease` held inside the closure
+/// until the write returns, waiting at most `budget` for the result.
+async fn persist_with<F>(write: F, lease: Option<IdentityLease>, budget: Duration) -> Result<()>
+where
+    F: FnOnce() -> intent_core::Result<()> + Send + 'static,
+{
+    let handle = tokio::task::spawn_blocking(move || {
+        let result = write();
+        drop(lease);
+        result
+    });
+    match timeout(budget, handle).await {
         Ok(Ok(Ok(()))) => Ok(()),
         Ok(Ok(Err(e))) => Err(Error::Api(format!("could not persist github token: {e}"))),
         Ok(Err(join_err)) => Err(Error::Api(format!(
@@ -387,7 +561,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = FileSecretStore::with_path(dir.path().join("secrets.json"));
 
-        persist_token(store.clone(), SecretString::from("gho_roundtrip"))
+        persist_token(store.clone(), SecretString::from("gho_roundtrip"), None)
             .await
             .expect("persist");
         assert_eq!(
@@ -403,6 +577,59 @@ mod tests {
 
         // Revoking an already-absent entry stays an idempotent success.
         revoke_token(store).await.expect("revoke twice");
+    }
+
+    /// The lease outlives the caller's wait: when the write is held past the
+    /// budget the caller times out, but the lease stays held until the
+    /// blocking write actually returns, and is released right after.
+    #[tokio::test]
+    async fn lease_is_held_until_the_abandoned_write_returns() {
+        struct Released(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Released {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let lease: IdentityLease = Box::new(Released(released.clone()));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (returned_tx, returned_rx) = std::sync::mpsc::channel::<()>();
+
+        let err = persist_with(
+            move || {
+                entered_tx.send(()).expect("signal entry");
+                release_rx.recv().expect("wait for release");
+                returned_tx.send(()).expect("signal return");
+                Ok(())
+            },
+            Some(lease),
+            Duration::from_millis(50),
+        )
+        .await
+        .expect_err("caller times out while the write is held");
+        assert!(matches!(&err, Error::Api(msg) if msg.contains("timed out")));
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("write entered");
+        assert!(
+            !released.load(std::sync::atomic::Ordering::SeqCst),
+            "the lease must not be released while the write is still in flight"
+        );
+
+        release_tx.send(()).expect("release the writer");
+        returned_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("write returned");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !released.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the lease is released once the write returns"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     #[test]
@@ -423,7 +650,8 @@ mod tests {
 
     #[test]
     fn default_scopes_and_client_id_match_the_registered_oauth_app() {
-        assert_eq!(DEFAULT_SCOPES, &["repo", "read:org", "workflow"]);
+        assert_eq!(DEFAULT_SCOPES, &["repo", "read:org", "workflow", "gist"]);
+        assert!(DEFAULT_SCOPES.contains(&crate::identity_proof::REQUIRED_SCOPE));
         assert_eq!(DEFAULT_OAUTH_CLIENT_ID, "Ov23li8bvmPsd4B4pW38");
     }
 }

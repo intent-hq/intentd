@@ -102,7 +102,7 @@ async fn read_json(reader: &mut BufReader<OwnedReadHalf>, budget: Duration) -> V
 /// starved every other RPC. Mirrors `uds_concurrent_dispatch.rs`: JSON-RPC
 /// correlates responses by `id`, so the fast reply is expected out-of-order
 /// well before the slow `settings.list` finishes.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wedged_settings_list_does_not_stall_concurrent_workspace_list() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -122,7 +122,7 @@ async fn wedged_settings_list_does_not_stall_concurrent_workspace_list() {
     let socket = sock_dir.path().join("uds.sock");
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn({
+    let server = intent_core::spawn_daemon({
         let socket = socket.clone();
         async move {
             let _ = serve_uds(services, bus, &socket, None, async {

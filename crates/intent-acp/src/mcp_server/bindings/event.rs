@@ -11,7 +11,7 @@ use std::sync::Arc;
 use intent_core::{AgentId, EventQueryParams, WorkspaceApi, WorkspaceId};
 use serde_json::Value;
 
-use super::{map_err, opt_bool, opt_str, opt_vec_str, req_str};
+use super::{map_err, opt_bool, opt_str, opt_vec_str, req_str, strip_agent_hidden_fields};
 
 pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
@@ -28,6 +28,12 @@ pub(crate) const PRELUDE: &str = r"
     };
 ";
 
+/// Every `ws.event.*` result passes through [`strip_agent_hidden_fields`]:
+/// persisted `agent:updated` / `agent:idle` / `agent:attention-requested`
+/// payloads carry the user's `notificationsMuted` preference, and
+/// `event.query` / `event.agentActivity` serve event history verbatim
+/// (paginated `{ events, nextPageToken }` included), so the scrub happens
+/// here rather than per read path.
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
@@ -35,14 +41,16 @@ pub(crate) async fn dispatch(
     method: &str,
     args: &Value,
 ) -> Result<Value, String> {
-    match method {
+    let mut out = match method {
         "agentActivity" => agent_activity(api, ws, args).await,
         "workspaceSummary" => workspace_summary(api, ws, args).await,
         "query" => query(api, ws, args).await,
         "subscribe" => subscribe(api, ws, caller, args).await,
         "unsubscribe" => unsubscribe(api, ws, args).await,
         other => Err(format!("host: unknown method `event.{other}`")),
-    }
+    }?;
+    strip_agent_hidden_fields(&mut out);
+    Ok(out)
 }
 
 async fn agent_activity(

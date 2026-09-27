@@ -15,9 +15,10 @@ use std::sync::Arc;
 
 use intent_core::{parse_iso, Error, PullRequestInfo, PullRequestStatus, Result, Workspace};
 use intent_sourcecontrol::{
-    CheckRun, CheckState, MergeMethod, MergeRequirementSignals, Page, PageParams, PrQuery, PrState,
-    PullRequest, RepoRef, Review, ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment,
-    ReviewVerdict, RollupCheck, SourceControl, SourceControlRegistry, SourceControlSettings,
+    CheckRun, CheckState, MergeMethod, MergeRequirementSignals, Page, PageParams, PrObservation,
+    PrQuery, PrState, PullRequest, RepoRef, Review, ReviewComment, ReviewDecision, ReviewThread,
+    ReviewThreadComment, ReviewVerdict, RollupCheck, RollupCheckKind, SourceControl,
+    SourceControlRegistry, SourceControlSettings,
 };
 use time::OffsetDateTime;
 
@@ -33,13 +34,7 @@ pub(crate) const NO_ACTIVE_PR: &str = "No active PR";
 /// code) so the background sweeps can detect quota exhaustion and pause
 /// instead of misreporting it as an auth/internal error (monorepo#2961).
 pub(crate) fn map_sc_err(e: intent_sourcecontrol::Error) -> Error {
-    match e {
-        intent_sourcecontrol::Error::Unsupported(msg) => {
-            Error::Internal(format!("unsupported by provider: {msg}"))
-        }
-        intent_sourcecontrol::Error::RateLimited(msg) => Error::RateLimited(msg),
-        other => Error::Internal(other.to_string()),
-    }
+    crate::host_execution::forge_error(e)
 }
 
 /// Resolve the active [`SourceControl`]: the injected handle (tests / explicit
@@ -298,6 +293,41 @@ pub(crate) async fn discover_matching_open_pr(
     Ok(best)
 }
 
+/// Carry a persisted merge-queue signal onto a REST-only snapshot
+/// (intent-hq/intent#5654). A REST read never observes the merge queue — a
+/// queued PR reads `mergeable_state: "clean"` — so `fresh` arrives with
+/// `is_in_merge_queue: None` whether or not the PR is still queued, and
+/// taking it verbatim would erase the `Some(true)` the last signal-bearing
+/// read ([`build_pr_info_with_merge_queue`], the `github.pulls.get` fold)
+/// persisted. The rule: an incoming `None` inherits the persisted `Some(true)`
+/// while the PR stays **open, non-draft and on the same known `head_sha`**;
+/// it lapses when the PR leaves `Open` (merged / closed / draft), when the
+/// head moves (a new push after a queue ejection), or when either head SHA is
+/// unknown. A signal-bearing read always wins: `fresh` carrying `Some(_)`
+/// (or written through [`upsert_pr_info_by_url`], which never carries) is
+/// taken as reported.
+///
+/// The donor must be the same PR, not merely a same-numbered one: pools can
+/// be cross-repository, and a queued `fork/repo#42` may share a commit with
+/// an unqueued `upstream/repo#42` (the same head pushed to both), so identity
+/// is the URL ([`same_pr_url`]) in addition to the number the caller matched.
+pub(crate) fn carry_merge_queue_signal(fresh: &mut PullRequestInfo, previous: &PullRequestInfo) {
+    if fresh.is_in_merge_queue.is_some()
+        || previous.is_in_merge_queue != Some(true)
+        || !same_pr_url(&fresh.url, &previous.url)
+    {
+        return;
+    }
+    let open = fresh.status == PullRequestStatus::Open && fresh.is_draft != Some(true);
+    let same_head = matches!(
+        (fresh.head_sha.as_deref(), previous.head_sha.as_deref()),
+        (Some(a), Some(b)) if a == b
+    );
+    if open && same_head {
+        fresh.is_in_merge_queue = Some(true);
+    }
+}
+
 /// Upsert a PR snapshot into the daemon-owned `workspace.pull_requests` list
 /// (keyed by PR number), returning `true` when the list actually changed.
 /// Keeps merged/closed PRs recorded alongside the currently-linked one so the
@@ -305,11 +335,20 @@ pub(crate) async fn discover_matching_open_pr(
 /// Pre-existing duplicates for the same number (e.g. written via
 /// `workspace.update` before the daemon owned the list) are collapsed into the
 /// single upserted entry.
+///
+/// This is the REST-only path (branch sweep, git-root sweep, `pr.refresh`,
+/// stale-pool heal), so the entry the snapshot replaces lends it its
+/// merge-queue signal per [`carry_merge_queue_signal`]; `info` is updated in
+/// place so a caller persisting the same snapshot elsewhere
+/// (`activePullRequest`) writes one coherent copy.
 pub(crate) fn upsert_pr_info(
     list: &mut Option<Vec<PullRequestInfo>>,
-    info: &PullRequestInfo,
+    info: &mut PullRequestInfo,
 ) -> bool {
     let items = list.get_or_insert_with(Vec::new);
+    if let Some(previous) = items.iter().find(|p| p.number == info.number) {
+        carry_merge_queue_signal(info, previous);
+    }
     let matches = items.iter().filter(|p| p.number == info.number).count();
     // Unchanged only when exactly one entry for this number exists and it
     // already equals the snapshot.
@@ -333,6 +372,176 @@ pub(crate) fn upsert_pr_info(
     true
 }
 
+/// PR URL identity for the passive `github.pulls.get` fold. The forge serves
+/// PR URLs in its canonical slug casing while persisted URLs may carry a
+/// client-supplied variant (`workspace.update` accepts them unchanged), so
+/// two URLs name the same PR when they agree ignoring ASCII case — the
+/// in-memory counterpart of the `COLLATE NOCASE` store lookups
+/// (`list_workspaces_referencing_pr_url` and its git-root sibling).
+pub(crate) fn same_pr_url(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
+/// URL-keyed sibling of [`upsert_pr_info`] for the passive `github.pulls.get`
+/// fold: a fetched snapshot replaces every pool entry sharing its `url`
+/// ([`same_pr_url`]; appending when absent) and never a same-numbered PR from
+/// another repository. Pre-existing same-URL duplicates collapse into the
+/// single fetched snapshot at the first duplicate's position, so no stale
+/// copy outlives the fold. Returns `true` when the list actually changed.
+///
+/// The fold rides a signal-bearing full read, so — unlike [`upsert_pr_info`]
+/// — the snapshot's `is_in_merge_queue` is taken as reported and never
+/// inherits the replaced entry's: a `None` here means the read observed the
+/// PR not queued (or the host reported nothing), which clears a persisted
+/// `Some(true)` ([`carry_merge_queue_signal`]).
+pub(crate) fn upsert_pr_info_by_url(
+    list: &mut Option<Vec<PullRequestInfo>>,
+    info: &PullRequestInfo,
+) -> bool {
+    let items = list.get_or_insert_with(Vec::new);
+    let same = |p: &PullRequestInfo| same_pr_url(&p.url, &info.url);
+    let matches = items.iter().filter(|p| same(p)).count();
+    if matches == 1 {
+        let existing = items.iter_mut().find(|p| same(p)).unwrap();
+        if *existing == *info {
+            return false;
+        }
+        *existing = info.clone();
+        return true;
+    }
+    if matches == 0 {
+        items.push(info.clone());
+        return true;
+    }
+    let first = items.iter().position(&same).unwrap();
+    items.retain(|p| !same(p));
+    items.insert(first, info.clone());
+    true
+}
+
+/// The cache-hit projection of the passive fold (intent-hq/intent#5654). The
+/// fold runs on every serve, fetched or cached: a fetch writes the fresh
+/// record whole, while a snapshot served from the shared PR cache — a hit,
+/// no forge read of its own — writes **only** `is_in_merge_queue`, and only
+/// onto a persisted copy on the **same known head**. Rationale: a
+/// `ws.pr.snapshot` (or another reader's fill) can seed the cache with the
+/// queue signal the pool never received, and the next hover must land it
+/// instead of skipping the fold as a hit; but a REST sweep may have run
+/// between the fill and the hit, so writing the older cached record back
+/// would roll fresher pool fields (title, `updatedAt`, `mergeableState`,
+/// status) back — the queue signal is the one field only a signal-bearing
+/// read owns. A differing head means the cached signal describes a head the
+/// pool has already left (or an unknown one): nothing is written. Returns
+/// whether `persisted` changed; an agreeing hit writes nothing.
+pub(crate) fn project_served_queue_signal(
+    persisted: &mut PullRequestInfo,
+    served: &PullRequestInfo,
+) -> bool {
+    let same_known_head = persisted.head_sha.is_some() && persisted.head_sha == served.head_sha;
+    if !same_known_head || persisted.is_in_merge_queue == served.is_in_merge_queue {
+        return false;
+    }
+    persisted.is_in_merge_queue = served.is_in_merge_queue;
+    true
+}
+
+/// [`project_served_queue_signal`] over a pool: every entry sharing the
+/// served URL ([`same_pr_url`]) takes the projection; an absent entry is
+/// never added (a hit never grows a pool). Returns whether any entry changed.
+pub(crate) fn project_pool_queue_signal(
+    pool: &mut Option<Vec<PullRequestInfo>>,
+    served: &PullRequestInfo,
+) -> bool {
+    let Some(items) = pool.as_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    for p in items.iter_mut() {
+        if same_pr_url(&p.url, &served.url) {
+            changed |= project_served_queue_signal(p, served);
+        }
+    }
+    changed
+}
+
+/// Rebase a REST-path `pull_requests` list about to be persisted onto the
+/// pool currently in the store (intent-hq/intent#5654). REST refreshes build
+/// their list from a row read taken before the forge round trip (the sweep
+/// reads it once at sweep start), so a signal-bearing `github.pulls.get`
+/// fold landing in between is invisible to them: taking the list verbatim
+/// would erase a concurrent enqueue (the fold's `Some(true)` is not in the
+/// snapshot the carry ran against) or resurrect a concurrent dequeue (the
+/// snapshot still holds the `Some(true)` the fold cleared) — and, unlike the
+/// plain REST fields, [`carry_merge_queue_signal`] would then perpetuate the
+/// stale value sweep after sweep instead of converging. Runs inside the
+/// store's write transaction, against the row as it is at write time:
+///
+/// - an entry whose number is in `refreshed` was fetched fresh from the forge
+///   this pass, so its REST fields stand and only its queue signal is
+///   re-derived — the snapshot-based carry is discarded and
+///   [`carry_merge_queue_signal`] reruns against the persisted same-PR
+///   entry;
+/// - any other entry was not touched this pass, so the persisted copy (at
+///   least as new as the snapshot's) replaces it wholesale;
+/// - a persisted entry the outgoing list lacks (appended by a concurrent
+///   fold) is kept.
+///
+/// Identity is number plus [`same_pr_url`] throughout, so a same-numbered PR
+/// of another repository never donates or replaces. A row with no persisted
+/// list leaves `outgoing` as built.
+pub(crate) fn rebase_pool_on_persisted(
+    outgoing: &mut Option<Vec<PullRequestInfo>>,
+    persisted: Option<Vec<PullRequestInfo>>,
+    refreshed: &[u64],
+) {
+    let Some(persisted) = persisted else {
+        return;
+    };
+    let same = |a: &PullRequestInfo, b: &PullRequestInfo| {
+        a.number == b.number && same_pr_url(&a.url, &b.url)
+    };
+    let items = outgoing.get_or_insert_with(Vec::new);
+    for entry in items.iter_mut() {
+        let Some(current) = persisted.iter().find(|p| same(p, entry)) else {
+            continue;
+        };
+        if refreshed.contains(&entry.number) {
+            entry.is_in_merge_queue = None;
+            carry_merge_queue_signal(entry, current);
+        } else {
+            *entry = current.clone();
+        }
+    }
+    for current in persisted {
+        if !items.iter().any(|e| same(e, &current)) {
+            items.push(current);
+        }
+    }
+}
+
+/// Workspace form of [`rebase_pool_on_persisted`] for the REST-path
+/// persist (`Store::update_workspace_pr_linkage_rebased`): rebases
+/// `ws.pull_requests`, then re-mirrors `activePullRequest` from the linked
+/// PR's rebased pool entry so the two persisted copies stay one coherent
+/// snapshot.
+pub(crate) fn rebase_workspace_pr_pool(
+    ws: &mut Workspace,
+    persisted: Option<Vec<PullRequestInfo>>,
+    refreshed: &[u64],
+) {
+    rebase_pool_on_persisted(&mut ws.pull_requests, persisted, refreshed);
+    if let (Some(number), Some(active)) = (ws.pr_number, ws.active_pull_request.as_mut()) {
+        let pooled = ws.pull_requests.as_deref().and_then(|items| {
+            items
+                .iter()
+                .find(|p| p.number == number && same_pr_url(&p.url, &active.url))
+        });
+        if let Some(entry) = pooled {
+            *active = entry.clone();
+        }
+    }
+}
+
 /// Cap on stale `pull_requests` re-fetches per git root per sweep
 /// (monorepo#3127). Bounds the forge calls added by
 /// [`refresh_stale_pool_entries`] so a long PR history stays within the
@@ -349,8 +558,11 @@ pub(crate) const MAX_STALE_POOL_REFETCHES: usize = 5;
 /// is the only irreversible forge state — a Closed PR can be reopened, and
 /// the list PR pool merge is deliberately one-way (a terminal entry is never
 /// downgraded by a candidate), so only this authoritative re-fetch can move
-/// a persisted Closed entry back to Open. `exclude` names PR numbers already
-/// fetched fresh this pass (the linked / just-discovered PR). At most
+/// a persisted Closed entry back to Open. `fetched_fresh` names PR numbers
+/// already fetched fresh this pass (the linked / just-discovered PR), which
+/// are skipped; every number this call re-fetches successfully is appended
+/// to it, so the caller's persist can tell fresh entries from untouched ones
+/// ([`rebase_pool_on_persisted`]). At most
 /// [`MAX_STALE_POOL_REFETCHES`] entries are re-fetched per call, oldest
 /// `updatedAt` first (unparseable timestamps sort oldest, ties by number);
 /// fail-soft per entry — a forge error logs and keeps the persisted
@@ -366,7 +578,7 @@ pub(crate) async fn refresh_stale_pool_entries(
     sc: &dyn SourceControl,
     repo_ref: &RepoRef,
     list: &mut Option<Vec<PullRequestInfo>>,
-    exclude: &[u64],
+    fetched_fresh: &mut Vec<u64>,
     per_entry_timeout: std::time::Duration,
 ) -> (bool, Option<String>) {
     let Some(items) = list.as_deref() else {
@@ -374,7 +586,7 @@ pub(crate) async fn refresh_stale_pool_entries(
     };
     let mut candidates: Vec<(Option<OffsetDateTime>, u64)> = items
         .iter()
-        .filter(|p| p.status != PullRequestStatus::Merged && !exclude.contains(&p.number))
+        .filter(|p| p.status != PullRequestStatus::Merged && !fetched_fresh.contains(&p.number))
         .map(|p| (parse_iso(&p.updated_at), p.number))
         .collect();
     candidates.sort();
@@ -383,7 +595,8 @@ pub(crate) async fn refresh_stale_pool_entries(
     for (_, number) in candidates {
         match tokio::time::timeout(per_entry_timeout, sc.get_pr(repo_ref, number)).await {
             Ok(Ok(pr)) => {
-                changed |= upsert_pr_info(list, &build_pr_info(&pr));
+                fetched_fresh.push(number);
+                changed |= upsert_pr_info(list, &mut build_pr_info(&pr));
             }
             Ok(Err(intent_sourcecontrol::Error::RateLimited(detail))) => {
                 return (changed, Some(detail));
@@ -420,8 +633,24 @@ pub(crate) fn derive_pr_status(pr: &PullRequest) -> PullRequestStatus {
 
 /// Build the persisted [`PullRequestInfo`] snapshot from a forge PR (§7.6).
 /// Empty strings on optional fields collapse to `None` so absent values are
-/// omitted from the wire, matching the TS `PullRequestInfo` JSON shape.
+/// omitted from the wire, matching the TS `PullRequestInfo` JSON shape. The
+/// REST `PullRequest` carries no merge-queue signal, so `is_in_merge_queue`
+/// is `None`; see [`build_pr_info_with_merge_queue`] for the signal-bearing
+/// read.
 pub(crate) fn build_pr_info(pr: &PullRequest) -> PullRequestInfo {
+    build_pr_info_with_merge_queue(pr, None)
+}
+
+/// [`build_pr_info`] for a signal-bearing read: `merge_queue_reported` is the
+/// host's merge-queue state as reported by the same full read
+/// ([`MergeRequirementsRead::merge_queue_reported`]). Only a reported `true`
+/// is persisted (`Some(true)`); a reported `false` or an unreported state
+/// both land as `None`, matching the presence-only
+/// `MergeRequirements::is_in_merge_queue` (intent-hq/intent#5654).
+pub(crate) fn build_pr_info_with_merge_queue(
+    pr: &PullRequest,
+    merge_queue_reported: Option<bool>,
+) -> PullRequestInfo {
     let non_empty = |s: &str| (!s.is_empty()).then(|| s.to_string());
     PullRequestInfo {
         id: pr.number.to_string(),
@@ -438,6 +667,7 @@ pub(crate) fn build_pr_info(pr: &PullRequest) -> PullRequestInfo {
         mergeable: pr.mergeable,
         mergeable_state: pr.mergeable_state.clone(),
         is_draft: Some(pr.draft),
+        is_in_merge_queue: merge_queue_reported.filter(|&queued| queued),
     }
 }
 
@@ -744,6 +974,80 @@ pub struct MergeRequirementsChecks {
     pub required_known: bool,
 }
 
+impl MergeRequirementsChecks {
+    pub(crate) fn from_items(items: Vec<MergeRequirementCheck>, required_known: bool) -> Self {
+        let tally = |word: &str| {
+            i64::try_from(items.iter().filter(|c| c.status == word).count())
+                .expect("value fits in i64")
+        };
+        let names = |word: &str| {
+            items
+                .iter()
+                .filter(|c| c.required && c.status == word)
+                .map(|c| c.name.clone())
+                .collect::<Vec<_>>()
+        };
+        Self {
+            total: i64::try_from(items.len()).expect("value fits in i64"),
+            passed: tally("passed"),
+            failed: tally("failed"),
+            pending: tally("pending"),
+            failing_required: names("failed"),
+            pending_required: names("pending"),
+            required_known,
+            items,
+        }
+    }
+
+    /// REST observes check runs but neither legacy statuses nor required flags.
+    /// Combine fresh runs with just those missing signals from the same head.
+    pub(crate) fn retain_status_evidence(
+        &mut self,
+        previous: &Self,
+        statuses: &[MergeRequirementCheck],
+        required_check_names: &std::collections::BTreeSet<String>,
+    ) {
+        let before: HashMap<_, _> = previous.items.iter().map(|c| (&c.name, c)).collect();
+        for check in &mut self.items {
+            if let Some(prior) = before.get(&check.name) {
+                check.required = prior.required;
+            }
+        }
+        let severity = |status: &str| match status {
+            "failed" => 2,
+            "pending" => 1,
+            _ => 0,
+        };
+        let mut slots: HashMap<_, _> = self
+            .items
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.name.clone(), i))
+            .collect();
+        for status in statuses {
+            if let Some(&i) = slots.get(&status.name) {
+                let check = &mut self.items[i];
+                if severity(&status.status) > severity(&check.status) {
+                    check.status.clone_from(&status.status);
+                    check.url.clone_from(&status.url);
+                }
+                check.required |= status.required;
+            } else {
+                slots.insert(status.name.clone(), self.items.len());
+                self.items.push(status.clone());
+            }
+        }
+        let required_known = if self.items.is_empty() {
+            previous.required_known
+        } else {
+            self.items
+                .iter()
+                .all(|c| required_check_names.contains(&c.name))
+        };
+        *self = Self::from_items(std::mem::take(&mut self.items), required_known);
+    }
+}
+
 /// The `approvals` block of the checklist.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -849,6 +1153,161 @@ fn check_status_word(state: CheckState) -> &'static str {
     }
 }
 
+/// One run of a named check, before the checklist collapses same-name runs.
+struct CheckRunSignal {
+    name: String,
+    kind: RollupCheckKind,
+    state: CheckState,
+    required: bool,
+    url: Option<String>,
+    started_at: Option<OffsetDateTime>,
+}
+
+/// What the checklist holds for one check name: the live check run (several
+/// attempts collapse onto one, see [`live_key`]) and, separately, the legacy
+/// commit status posted under the same context name. The two are independent
+/// evidence — GitHub requires BOTH to pass when their shared name is required
+/// — so a run never supersedes a status, nor a status a run.
+#[derive(Default)]
+struct NameEvidence {
+    run: Option<CheckRunSignal>,
+    status: Option<CheckRunSignal>,
+}
+
+impl NameEvidence {
+    fn slot(&mut self, kind: RollupCheckKind) -> &mut Option<CheckRunSignal> {
+        match kind {
+            RollupCheckKind::CheckRun => &mut self.run,
+            RollupCheckKind::StatusContext => &mut self.status,
+        }
+    }
+
+    /// The outcome the checklist reports for the name: the worse of its
+    /// independent live outcomes (failed over pending over passed), the run
+    /// on a tie so it supplies the link.
+    fn reported(&self) -> &CheckRunSignal {
+        [self.run.as_ref(), self.status.as_ref()]
+            .into_iter()
+            .flatten()
+            .reduce(|held, next| {
+                if outcome_severity(next.state) > outcome_severity(held.state) {
+                    next
+                } else {
+                    held
+                }
+            })
+            .expect("a name is only slotted by a run")
+    }
+}
+
+/// How far a check outcome is from letting the PR merge.
+fn outcome_severity(state: CheckState) -> u8 {
+    match check_status_word(state) {
+        "failed" => 2,
+        "pending" => 1,
+        _ => 0,
+    }
+}
+
+/// Last resort among same-name runs with equal (or equally unknown) starts:
+/// a real failure over a success, and a `cancelled` run last — a
+/// `concurrency`-cancelled duplicate must never shadow the run that actually
+/// completed.
+fn check_state_rank(state: CheckState) -> u8 {
+    match state {
+        CheckState::Pending => 4,
+        CheckState::Failure => 3,
+        CheckState::Success => 2,
+        CheckState::Neutral => 1,
+        CheckState::Cancelled => 0,
+    }
+}
+
+/// The liveness key of one run of a named check: the greatest key among a
+/// name's runs of the same [`RollupCheckKind`] is the live one. A single
+/// lexicographic key — not a pairwise rule that switches criteria on missing
+/// data — so the maximum, and with it the checklist, is the same for every
+/// order the host lists the runs in.
+///
+/// 1. In-flight beats completed: a re-run in progress (even one the host has
+///    not stamped a start on yet) makes the check pending.
+/// 2. The later start wins — a re-run, or the run that superseded a
+///    `concurrency`-cancelled duplicate (intent-hq/intent#5372). A run with
+///    no reported start (a host that omits it) sorts below every timed run:
+///    an unknown start is never evidence of being newer.
+/// 3. [`check_state_rank`] settles equal or equally unknown starts.
+fn live_key(run: &CheckRunSignal) -> (bool, Option<OffsetDateTime>, u8) {
+    (
+        run.state == CheckState::Pending,
+        run.started_at,
+        check_state_rank(run.state),
+    )
+}
+
+/// Whether `candidate` is the live run of its name over `held`; equal keys
+/// keep `held`, so the first-listed of identical twins supplies the link.
+fn supersedes(candidate: &CheckRunSignal, held: &CheckRunSignal) -> bool {
+    live_key(candidate) > live_key(held)
+}
+
+/// One checklist entry per check name. A head that carries several runs of
+/// the same check (a concurrency-cancelled duplicate beside the live run, a
+/// re-run beside its predecessor) is collapsed onto the run with the greatest
+/// [`live_key`]; a legacy commit status under the same name is kept beside
+/// the live run and the entry reports the worse of the two
+/// ([`NameEvidence::reported`]). The first occurrence keeps its position, and
+/// the name is required when any of its runs is.
+fn dedupe_checks(runs: impl IntoIterator<Item = CheckRunSignal>) -> Vec<MergeRequirementCheck> {
+    let mut slots: HashMap<String, usize> = HashMap::new();
+    let mut kept: Vec<(String, bool, NameEvidence)> = Vec::new();
+    for run in runs {
+        let i = *slots.entry(run.name.clone()).or_insert_with(|| {
+            kept.push((run.name.clone(), false, NameEvidence::default()));
+            kept.len() - 1
+        });
+        let (_, required, evidence) = &mut kept[i];
+        *required |= run.required;
+        let slot = evidence.slot(run.kind);
+        if slot.as_ref().is_none_or(|held| supersedes(&run, held)) {
+            *slot = Some(run);
+        }
+    }
+    kept.into_iter()
+        .map(|(name, required, evidence)| {
+            let live = evidence.reported();
+            MergeRequirementCheck {
+                name,
+                status: check_status_word(live.state).to_string(),
+                required,
+                url: live.url.clone(),
+            }
+        })
+        .collect()
+}
+
+fn rollup_items<'a>(
+    checks: impl IntoIterator<Item = &'a RollupCheck>,
+) -> Vec<MergeRequirementCheck> {
+    dedupe_checks(checks.into_iter().map(|c| CheckRunSignal {
+        name: c.name.clone(),
+        kind: c.kind,
+        state: c.state,
+        required: c.is_required,
+        url: c.url.clone(),
+        started_at: c.started_at.as_deref().and_then(parse_iso),
+    }))
+}
+
+fn status_checks(signals: Option<&MergeRequirementSignals>) -> Option<Vec<MergeRequirementCheck>> {
+    signals.filter(|s| s.checks_known).map(|s| {
+        rollup_items(
+            s.checks
+                .iter()
+                .filter(|c| c.kind == RollupCheckKind::StatusContext),
+        )
+    })
+}
+
 /// Compose the merge-requirements checklist (§ task 1) from a PR snapshot, the
 /// host's merge-requirement signals, the aggregated reviews, and the
 /// unresolved-thread count (`None` when the resolution state was unreadable).
@@ -883,45 +1342,17 @@ pub(crate) fn merge_requirements(
         .filter(|s| s.checks_known)
         .map(|s| s.checks.as_slice());
     let items: Vec<MergeRequirementCheck> = match rollup {
-        Some(checks) => checks
-            .iter()
-            .map(|c| MergeRequirementCheck {
-                name: c.name.clone(),
-                status: check_status_word(c.state).to_string(),
-                required: c.is_required,
-                url: c.url.clone(),
-            })
-            .collect(),
-        None => fallback_runs
-            .iter()
-            .map(|r| MergeRequirementCheck {
-                name: r.name.clone(),
-                status: check_status_word(r.state).to_string(),
-                required: false,
-                url: r.url.clone(),
-            })
-            .collect(),
+        Some(checks) => rollup_items(checks),
+        None => dedupe_checks(fallback_runs.iter().map(|r| CheckRunSignal {
+            name: r.name.clone(),
+            kind: RollupCheckKind::CheckRun,
+            state: r.state,
+            required: false,
+            url: r.url.clone(),
+            started_at: r.started_at.as_deref().and_then(parse_iso),
+        })),
     };
-    let tally = |word: &str| {
-        i64::try_from(items.iter().filter(|c| c.status == word).count()).expect("value fits in i64")
-    };
-    let names = |word: &str| {
-        items
-            .iter()
-            .filter(|c| c.required && c.status == word)
-            .map(|c| c.name.clone())
-            .collect::<Vec<_>>()
-    };
-    let checks = MergeRequirementsChecks {
-        total: i64::try_from(items.len()).expect("value fits in i64"),
-        passed: tally("passed"),
-        failed: tally("failed"),
-        pending: tally("pending"),
-        failing_required: names("failed"),
-        pending_required: names("pending"),
-        required_known: rollup.is_some(),
-        items,
-    };
+    let checks = MergeRequirementsChecks::from_items(items, rollup.is_some());
 
     let rules = signals.and_then(|s| s.branch_rules.as_ref());
     let approvals = MergeRequirementsApprovals {
@@ -976,24 +1407,26 @@ pub(crate) async fn fetch_merge_requirements(
     repo_ref: &RepoRef,
     number: u64,
 ) -> Result<MergeRequirements> {
-    let (_, requirements, _, _) = fetch_merge_requirements_detailed(sc, repo_ref, number).await?;
-    Ok(requirements)
+    let (_, read) = fetch_merge_requirements_detailed(sc, repo_ref, number).await?;
+    Ok(read.requirements)
 }
 
 /// [`fetch_merge_requirements`] plus the by-products the PR monitor needs
 /// for its own snapshot — the [`PullRequest`] the checklist was composed from
-/// (title / url / head SHA), the review-comment count from the same thread
-/// fetch, and the probe-answered flag (see [`merge_requirements_for_pr`]) —
-/// so a poll never repeats the `get_pr` / thread reads.
+/// (title / url / head SHA) and the [`MergeRequirementsRead`] it came with
+/// (review-comment count from the same thread fetch, probe-answered flag,
+/// sub-read completeness) — so a poll never repeats the `get_pr` / thread
+/// reads. Production reads go through the PR cache's full fetch, which
+/// issues the same sequence with its own `get_pr` error mapping.
+#[cfg(test)]
 pub(crate) async fn fetch_merge_requirements_detailed(
     sc: &dyn SourceControl,
     repo_ref: &RepoRef,
     number: u64,
-) -> Result<(PullRequest, MergeRequirements, i64, bool)> {
+) -> Result<(PullRequest, MergeRequirementsRead)> {
     let pr = sc.get_pr(repo_ref, number).await.map_err(map_sc_err)?;
-    let (requirements, review_comments, ejection_known) =
-        merge_requirements_for_pr(sc, repo_ref, number, &pr).await?;
-    Ok((pr, requirements, review_comments, ejection_known))
+    let read = merge_requirements_for_pr_detailed(sc, repo_ref, number, &pr).await?;
+    Ok((pr, read))
 }
 
 /// Split a best-effort forge read into "answered" / "degraded" while
@@ -1025,12 +1458,58 @@ fn degrade_unless_rate_limited<T>(
 /// ejection signal, so `false` means the checklist's `mergeQueueEjection` is
 /// "unknown", not "no ejection" (the PR monitor keeps its previously
 /// observed event instead of dropping it).
+#[cfg(test)]
 pub(crate) async fn merge_requirements_for_pr(
     sc: &dyn SourceControl,
     repo_ref: &RepoRef,
     number: u64,
     pr: &PullRequest,
 ) -> Result<(MergeRequirements, i64, bool)> {
+    let read = merge_requirements_for_pr_detailed(sc, repo_ref, number, pr).await?;
+    Ok((
+        read.requirements,
+        read.review_comment_count,
+        read.ejection_known,
+    ))
+}
+
+/// [`merge_requirements_for_pr`]'s result plus whether EVERY sub-read behind
+/// it answered — the PR monitor's precondition for reusing a checklist on
+/// later polls instead of re-fetching it.
+#[derive(Debug, Clone)]
+pub(crate) struct MergeRequirementsRead {
+    pub(crate) requirements: MergeRequirements,
+    /// Review-comment count from the same thread fetch.
+    pub(crate) review_comment_count: i64,
+    /// Whether the merge-requirements probe itself answered (the only source
+    /// of the merge-queue ejection signal).
+    pub(crate) ejection_known: bool,
+    /// `false` when ANY sub-read degraded — probe, reviews, review decision,
+    /// fallback check runs, or review threads (whose fallback cannot report
+    /// thread resolution) — so the checklist carries a default in place of a
+    /// signal the forge may answer on the next read.
+    pub(crate) complete: bool,
+    /// Whether check runs answered, independently of other reads. The legacy
+    /// status subset is tracked separately in `status_checks`.
+    pub(crate) check_runs_known: bool,
+    pub(crate) status_checks: Option<Vec<MergeRequirementCheck>>,
+    /// The host's merge-queue state as reported (GitHub GraphQL
+    /// `isInMergeQueue`): `Some(true)` / `Some(false)` exactly when the probe
+    /// carried it, `None` when the host did not report it (no probe, REST-only
+    /// fallback). Unlike the checklist's presence-only
+    /// `MergeRequirements::is_in_merge_queue`, this keeps the reported
+    /// `false` — what `GithubPullRequest.isInMergeQueue` carries.
+    pub(crate) merge_queue_reported: Option<bool>,
+}
+
+/// [`merge_requirements_for_pr`] reporting per-sub-read completeness (see
+/// [`MergeRequirementsRead::complete`]).
+pub(crate) async fn merge_requirements_for_pr_detailed(
+    sc: &dyn SourceControl,
+    repo_ref: &RepoRef,
+    number: u64,
+    pr: &PullRequest,
+) -> Result<MergeRequirementsRead> {
     let (signals, reviews) = tokio::join!(
         sc.merge_requirements(repo_ref, number),
         sc.list_reviews(repo_ref, number)
@@ -1042,10 +1521,21 @@ pub(crate) async fn merge_requirements_for_pr(
             "merge requirements: probe unavailable, degrading to snapshot-only checklist"
         );
     }))?;
+    if let Some(signals) = signals.as_mut() {
+        if signals
+            .checks_head_sha
+            .as_ref()
+            .is_some_and(|head| Some(head) != pr.head_sha.as_ref())
+        {
+            signals.checks_known = false;
+            signals.checks.clear();
+        }
+    }
     let reviews = degrade_unless_rate_limited(reviews)?;
     // Captured BEFORE the review-decision backfill below can fabricate a
     // stub `signals` for a failed probe.
     let ejection_known = signals.is_some();
+    let mut complete = ejection_known && reviews.is_some();
     let agg = aggregate_reviews(&reviews.unwrap_or_default());
 
     // The probe carries the forge's `reviewDecision`; when it did not — no
@@ -1062,46 +1552,131 @@ pub(crate) async fn merge_requirements_for_pr(
                     "merge requirements: review_decision fetch failed, falling back to aggregate"
                 );
             }),
-        )?
-        .flatten();
-        if let Some(decision) = decision {
+        )?;
+        complete &= decision.is_some();
+        if let Some(decision) = decision.flatten() {
             signals.get_or_insert_with(Default::default).review_decision = Some(decision);
         }
     }
 
-    // The REST check-runs are only needed when the probe carried no rollup.
-    let rollup_known = signals.as_ref().is_some_and(|s| s.checks_known);
+    let (fallback_runs, runs_complete) =
+        fallback_check_runs(sc, repo_ref, pr, signals.as_ref()).await?;
+    complete &= runs_complete
+        && (signals.as_ref().is_some_and(|s| s.checks_known) || !sc.capabilities().check_runs);
+    let (review_comments, unresolved, threads_complete) =
+        read_review_thread_tally(sc, repo_ref, number).await?;
+    complete &= threads_complete;
+
+    let merge_queue_reported = signals.as_ref().and_then(|s| s.is_in_merge_queue);
+    let requirements = merge_requirements(pr, signals.as_ref(), &fallback_runs, &agg, unresolved);
+    Ok(MergeRequirementsRead {
+        requirements,
+        review_comment_count: review_comments,
+        ejection_known,
+        complete,
+        check_runs_known: runs_complete,
+        status_checks: status_checks(signals.as_ref()),
+        merge_queue_reported,
+    })
+}
+
+/// [`merge_requirements_for_pr_detailed`] composed from a folded
+/// [`PrObservation`] (the PR monitor's one-round-trip read) instead of the
+/// per-signal reads: the observation already carries the probe, the reviews,
+/// the thread tally and the review decision — its `reviewDecision` IS the
+/// standalone read's answer, so a `None` there is authoritative and never
+/// re-fetched — leaving only the base branch's rules to read (when the host
+/// did not fold them in), plus the same per-piece fallbacks as the
+/// per-signal path: the REST check-runs when the probe carried no rollup,
+/// and the paged reviews / review threads when the PR outgrew the
+/// observation's windows. Same completeness and quota semantics.
+pub(crate) async fn merge_requirements_from_observation(
+    sc: &dyn SourceControl,
+    repo_ref: &RepoRef,
+    number: u64,
+    observation: &PrObservation,
+) -> Result<MergeRequirementsRead> {
+    let pr = &observation.pr;
+    let mut signals = observation.signals.clone();
+    let mut complete = true;
+    if signals.branch_rules.is_none() && !pr.target_branch.is_empty() {
+        signals.branch_rules =
+            degrade_unless_rate_limited(sc.branch_rules(repo_ref, &pr.target_branch).await)?;
+    }
+    let reviews = if let Some(reviews) = &observation.reviews {
+        Some(reviews.clone())
+    } else {
+        let reviews = degrade_unless_rate_limited(sc.list_reviews(repo_ref, number).await)?;
+        complete &= reviews.is_some();
+        reviews
+    };
+    let agg = aggregate_reviews(&reviews.unwrap_or_default());
+
+    let (fallback_runs, runs_complete) =
+        fallback_check_runs(sc, repo_ref, pr, Some(&signals)).await?;
+    complete &= runs_complete && (signals.checks_known || !sc.capabilities().check_runs);
+    let (review_comments, unresolved, threads_complete) = match observation.threads {
+        Some(tally) => (tally.review_comment_count, Some(tally.unresolved), true),
+        None => read_review_thread_tally(sc, repo_ref, number).await?,
+    };
+    complete &= threads_complete;
+
+    let merge_queue_reported = signals.is_in_merge_queue;
+    let requirements = merge_requirements(pr, Some(&signals), &fallback_runs, &agg, unresolved);
+    Ok(MergeRequirementsRead {
+        requirements,
+        review_comment_count: review_comments,
+        ejection_known: true,
+        complete,
+        check_runs_known: runs_complete,
+        status_checks: status_checks(Some(&signals)),
+        merge_queue_reported,
+    })
+}
+
+/// The REST check-runs on the PR head, read only when the probe carried no
+/// rollup (and the host supports check-runs). Returns the runs — empty when
+/// not needed — and whether the read (if issued) answered.
+async fn fallback_check_runs(
+    sc: &dyn SourceControl,
+    repo_ref: &RepoRef,
+    pr: &PullRequest,
+    signals: Option<&MergeRequirementSignals>,
+) -> Result<(Vec<CheckRun>, bool)> {
+    let rollup_known = signals.is_some_and(|s| s.checks_known);
     let head_ref = pr
         .head_sha
         .clone()
         .filter(|s| !s.is_empty())
         .or_else(|| Some(pr.source_branch.clone()).filter(|s| !s.is_empty()));
-    let fallback_runs = match head_ref {
+    match head_ref {
         Some(git_ref) if !rollup_known && sc.capabilities().check_runs => {
-            degrade_unless_rate_limited(sc.check_runs(repo_ref, &git_ref).await)?
-                .unwrap_or_default()
+            let runs = degrade_unless_rate_limited(sc.check_runs(repo_ref, &git_ref).await)?;
+            let complete = runs.is_some();
+            Ok((runs.unwrap_or_default(), complete))
         }
-        _ => Vec::new(),
-    };
+        _ => Ok((Vec::new(), rollup_known || !sc.capabilities().check_runs)),
+    }
+}
 
-    // Inline review comments: threads via GraphQL when available, else the
-    // flat REST list grouped by reply parent. Resolution state is unavailable
-    // on the fallback path, so the unresolved count is reported as unknown
-    // (`None`) there rather than inflated to every thread or defaulted to
-    // zero — both degradations are logged at `warn` so they are visible at
-    // the default log level.
-    let (review_comments, unresolved) = match fetch_all_pages(|p| {
-        sc.get_review_threads(repo_ref, number, p)
-    })
-    .await
-    {
+/// Inline review comments: threads via GraphQL when available, else the
+/// flat REST list grouped by reply parent. Resolution state is unavailable
+/// on the fallback path, so the unresolved count is reported as unknown
+/// (`None`) there rather than inflated to every thread or defaulted to
+/// zero — both degradations are logged at `warn` so they are visible at
+/// the default log level. Returns `(review_comment_count, unresolved,
+/// complete)`, `complete` being false on either degradation.
+async fn read_review_thread_tally(
+    sc: &dyn SourceControl,
+    repo_ref: &RepoRef,
+    number: u64,
+) -> Result<(i64, Option<i64>, bool)> {
+    match fetch_all_pages(|p| sc.get_review_threads(repo_ref, number, p)).await {
         Ok((threads, _, _)) => {
             let (comments, unresolved) = count_thread_comments(&threads);
-            (comments, Some(unresolved))
+            Ok((comments, Some(unresolved), true))
         }
-        Err(intent_sourcecontrol::Error::RateLimited(msg)) => {
-            return Err(Error::RateLimited(msg));
-        }
+        Err(intent_sourcecontrol::Error::RateLimited(msg)) => Err(Error::RateLimited(msg)),
         Err(e) => {
             tracing::warn!(
                 error = %e,
@@ -1109,26 +1684,23 @@ pub(crate) async fn merge_requirements_for_pr(
                 "merge requirements: review threads unavailable, falling back to REST comments (thread resolution state unavailable, unresolved count reported as unknown)"
             );
             match fetch_all_pages(|p| sc.list_review_comments(repo_ref, number, p)).await {
-                Ok((comments, _, _)) => {
-                    (count_thread_comments(&fallback_threads(comments)).0, None)
-                }
-                Err(intent_sourcecontrol::Error::RateLimited(msg)) => {
-                    return Err(Error::RateLimited(msg));
-                }
+                Ok((comments, _, _)) => Ok((
+                    count_thread_comments(&fallback_threads(comments)).0,
+                    None,
+                    false,
+                )),
+                Err(intent_sourcecontrol::Error::RateLimited(msg)) => Err(Error::RateLimited(msg)),
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
                         pr_number = number,
                         "merge requirements: review comments unavailable, reporting zero review comments and unknown unresolved"
                     );
-                    (0, None)
+                    Ok((0, None, false))
                 }
             }
         }
-    };
-
-    let requirements = merge_requirements(pr, signals.as_ref(), &fallback_runs, &agg, unresolved);
-    Ok((requirements, review_comments, ejection_known))
+    }
 }
 
 // ===========================================================================
@@ -1318,27 +1890,27 @@ mod tests {
 
     #[test]
     fn upserts_pr_info_by_number() {
-        let open = build_pr_info(&pr(PrState::Open, false, Some(true), Some("clean")));
+        let mut open = build_pr_info(&pr(PrState::Open, false, Some(true), Some("clean")));
         let mut list: Option<Vec<PullRequestInfo>> = None;
 
         // Insert into an absent list.
-        assert!(upsert_pr_info(&mut list, &open));
+        assert!(upsert_pr_info(&mut list, &mut open));
         assert_eq!(list.as_ref().unwrap().len(), 1);
 
         // Identical snapshot: no change.
-        assert!(!upsert_pr_info(&mut list, &open));
+        assert!(!upsert_pr_info(&mut list, &mut open));
         assert_eq!(list.as_ref().unwrap().len(), 1);
 
         // Same number, different snapshot: replaced in place.
-        let merged = build_pr_info(&pr(PrState::Merged, false, None, None));
-        assert!(upsert_pr_info(&mut list, &merged));
+        let mut merged = build_pr_info(&pr(PrState::Merged, false, None, None));
+        assert!(upsert_pr_info(&mut list, &mut merged));
         assert_eq!(list.as_ref().unwrap().len(), 1);
         assert_eq!(list.as_ref().unwrap()[0].status, PullRequestStatus::Merged);
 
         // A different number appends.
         let mut second = pr(PrState::Open, false, None, None);
         second.number = 2;
-        assert!(upsert_pr_info(&mut list, &build_pr_info(&second)));
+        assert!(upsert_pr_info(&mut list, &mut build_pr_info(&second)));
         assert_eq!(list.as_ref().unwrap().len(), 2);
 
         // Pre-existing duplicates (e.g. legacy workspace.update writes) are
@@ -1346,12 +1918,383 @@ mod tests {
         let dup = list.as_ref().unwrap()[0].clone();
         list.as_mut().unwrap().push(dup);
         assert_eq!(list.as_ref().unwrap().len(), 3);
-        assert!(upsert_pr_info(&mut list, &merged));
+        assert!(upsert_pr_info(&mut list, &mut merged));
         let items = list.as_ref().unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].number, merged.number);
         assert_eq!(items[0].status, PullRequestStatus::Merged);
         assert_eq!(items[1].number, 2);
+    }
+
+    /// A merge-queued open PR as the signal-bearing fold persisted it: REST
+    /// mergeability `clean` (GitHub never reports `queued` there) plus
+    /// `is_in_merge_queue: Some(true)`, on head `sha1`.
+    fn queued_pooled_pr() -> PullRequestInfo {
+        let mut queued = pr(PrState::Open, false, Some(true), Some("clean"));
+        queued.head_sha = Some("sha1".into());
+        build_pr_info_with_merge_queue(&queued, Some(true))
+    }
+
+    /// The signal-bearing builder persists only a reported `true`: `false`
+    /// and unreported both land as `None`, and the REST builder never sets
+    /// the field (intent-hq/intent#5654).
+    #[test]
+    fn build_pr_info_persists_only_a_reported_queued_signal() {
+        let open = pr(PrState::Open, false, Some(true), Some("clean"));
+        assert_eq!(
+            build_pr_info_with_merge_queue(&open, Some(true)).is_in_merge_queue,
+            Some(true)
+        );
+        assert_eq!(
+            build_pr_info_with_merge_queue(&open, Some(false)).is_in_merge_queue,
+            None
+        );
+        assert_eq!(
+            build_pr_info_with_merge_queue(&open, None).is_in_merge_queue,
+            None
+        );
+        assert_eq!(build_pr_info(&open).is_in_merge_queue, None);
+        // Everything else is the plain REST snapshot.
+        let mut with_signal = build_pr_info_with_merge_queue(&open, Some(true));
+        with_signal.is_in_merge_queue = None;
+        assert_eq!(with_signal, build_pr_info(&open));
+    }
+
+    /// The number-keyed (REST-only) upsert carries a persisted
+    /// `is_in_merge_queue: Some(true)` onto a refresh that cannot observe the
+    /// queue, exactly while the PR stays open, non-draft and on the same
+    /// head; the caller's snapshot is updated in place so `activePullRequest`
+    /// and the pool entry agree (intent-hq/intent#5654).
+    #[test]
+    fn upsert_pr_info_keeps_queued_signal_on_a_same_head_rest_refresh() {
+        let mut list = Some(vec![queued_pooled_pr()]);
+        let mut rest = pr(PrState::Open, false, Some(true), Some("clean"));
+        rest.head_sha = Some("sha1".into());
+        rest.updated_at = "2026-01-02T00:00:00Z".into();
+        let mut fresh = build_pr_info(&rest);
+        assert_eq!(fresh.is_in_merge_queue, None);
+
+        assert!(upsert_pr_info(&mut list, &mut fresh));
+        assert_eq!(fresh.is_in_merge_queue, Some(true));
+        let items = list.as_ref().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].is_in_merge_queue, Some(true));
+        assert_eq!(items[0].updated_at, "2026-01-02T00:00:00Z");
+        // The carried snapshot is stable: the same refresh again is a no-op.
+        assert!(!upsert_pr_info(&mut list, &mut build_pr_info(&rest)));
+    }
+
+    /// Every transition that lapses the carried signal: the PR leaves
+    /// `Open` (merged, closed, draft), the head moves (a new push after a
+    /// queue ejection), or the head is unknown on either side.
+    #[test]
+    fn upsert_pr_info_drops_queued_signal_when_the_pr_leaves_the_queue_shape() {
+        type Mutate = Box<dyn Fn(&mut PullRequest)>;
+        let cases: [(&str, Mutate); 6] = [
+            ("merged", Box::new(|p| p.state = PrState::Merged)),
+            ("closed", Box::new(|p| p.state = PrState::Closed)),
+            ("draft", Box::new(|p| p.draft = true)),
+            ("new head", Box::new(|p| p.head_sha = Some("sha2".into()))),
+            ("unknown fresh head", Box::new(|p| p.head_sha = None)),
+            ("unknown persisted head", Box::new(|_| {})),
+        ];
+        for (label, mutate) in cases {
+            let mut persisted = queued_pooled_pr();
+            if label == "unknown persisted head" {
+                persisted.head_sha = None;
+            }
+            let mut list = Some(vec![persisted]);
+            let mut rest = pr(PrState::Open, false, Some(true), Some("clean"));
+            rest.head_sha = Some("sha1".into());
+            mutate(&mut rest);
+            let mut fresh = build_pr_info(&rest);
+            assert!(upsert_pr_info(&mut list, &mut fresh), "{label}");
+            assert_eq!(fresh.is_in_merge_queue, None, "{label}");
+            assert_eq!(list.as_ref().unwrap()[0].is_in_merge_queue, None, "{label}");
+        }
+    }
+
+    /// A signal-bearing snapshot is taken as reported through either upsert:
+    /// the REST-keyed path never overrides a `Some(_)` it is handed, and the
+    /// fold's URL-keyed path never inherits — a fold that observed the PR
+    /// no longer queued (or a host reporting nothing) clears the persisted
+    /// `Some(true)` even on the same open head.
+    #[test]
+    fn signal_bearing_snapshots_replace_the_queued_signal_as_reported() {
+        let mut queued = pr(PrState::Open, false, Some(true), Some("clean"));
+        queued.head_sha = Some("sha1".into());
+
+        // Fold: same head, not queued any more → cleared.
+        let mut list = Some(vec![queued_pooled_pr()]);
+        let dequeued = build_pr_info_with_merge_queue(&queued, Some(false));
+        assert!(upsert_pr_info_by_url(&mut list, &dequeued));
+        assert_eq!(list.as_ref().unwrap()[0].is_in_merge_queue, None);
+        // Fold: host reported nothing → cleared too.
+        let mut list = Some(vec![queued_pooled_pr()]);
+        assert!(upsert_pr_info_by_url(
+            &mut list,
+            &build_pr_info_with_merge_queue(&queued, None)
+        ));
+        assert_eq!(list.as_ref().unwrap()[0].is_in_merge_queue, None);
+        // Fold: queued reported onto a plain REST entry → set.
+        let mut list = Some(vec![build_pr_info(&queued)]);
+        assert!(upsert_pr_info_by_url(
+            &mut list,
+            &build_pr_info_with_merge_queue(&queued, Some(true))
+        ));
+        assert_eq!(list.as_ref().unwrap()[0].is_in_merge_queue, Some(true));
+
+        // Number-keyed path handed a signal-bearing `Some(true)` on a plain
+        // entry keeps it as reported.
+        let mut list = Some(vec![build_pr_info(&queued)]);
+        let mut fresh = build_pr_info_with_merge_queue(&queued, Some(true));
+        assert!(upsert_pr_info(&mut list, &mut fresh));
+        assert_eq!(list.as_ref().unwrap()[0].is_in_merge_queue, Some(true));
+
+        // No persisted entry → nothing to carry.
+        let mut list: Option<Vec<PullRequestInfo>> = None;
+        let mut fresh = build_pr_info(&queued);
+        assert!(upsert_pr_info(&mut list, &mut fresh));
+        assert_eq!(fresh.is_in_merge_queue, None);
+    }
+
+    /// The donor must be the same PR: a queued `fork/repo#42` sharing its
+    /// head commit with an unqueued `upstream/repo#42` never lends it the
+    /// signal, while the same PR under a case-variant URL still does.
+    #[test]
+    fn carry_merge_queue_signal_requires_the_same_pr_url() {
+        let queued = queued_pooled_pr();
+        let mut rest = pr(PrState::Open, false, Some(true), Some("clean"));
+        rest.head_sha = Some("sha1".into());
+
+        // Same number + head, another repository → no inheritance.
+        rest.url = "https://github.com/fork/repo/pull/1".into();
+        let mut stranger = build_pr_info(&rest);
+        carry_merge_queue_signal(&mut stranger, &queued);
+        assert_eq!(stranger.is_in_merge_queue, None);
+        let mut list = Some(vec![queued.clone()]);
+        let mut stranger = build_pr_info(&rest);
+        assert!(upsert_pr_info(&mut list, &mut stranger));
+        assert_eq!(stranger.is_in_merge_queue, None);
+        assert_eq!(list.as_ref().unwrap()[0].is_in_merge_queue, None);
+
+        // Same PR, slug casing differs → inherits.
+        rest.url = queued.url.to_ascii_uppercase();
+        let mut same = build_pr_info(&rest);
+        carry_merge_queue_signal(&mut same, &queued);
+        assert_eq!(same.is_in_merge_queue, Some(true));
+    }
+
+    /// The cache-hit projection: a served snapshot on the same known head
+    /// writes only its queue signal onto the persisted copy — a differing
+    /// signal lands (enqueue and dequeue alike) while title, `updatedAt`,
+    /// `mergeableState` and status stay as persisted; an agreeing signal, a
+    /// moved head or an unknown head on either side writes nothing. Over a
+    /// pool, only entries sharing the served URL take the projection (a
+    /// same-numbered stranger is left alone, a case-variant URL matches, an
+    /// absent entry is never added).
+    #[test]
+    fn project_served_queue_signal_writes_only_the_signal_on_the_same_head() {
+        let queued = queued_pooled_pr();
+        let mut dequeued = queued.clone();
+        dequeued.is_in_merge_queue = None;
+        dequeued.title = "renamed by the cached read".into();
+        dequeued.updated_at = "2025-12-31T00:00:00Z".into();
+        dequeued.mergeable_state = Some("blocked".into());
+        dequeued.status = PullRequestStatus::Merged;
+
+        let mut persisted = queued.clone();
+        assert!(!project_served_queue_signal(&mut persisted, &queued));
+        assert_eq!(persisted, queued, "an agreeing hit writes nothing");
+
+        assert!(project_served_queue_signal(&mut persisted, &dequeued));
+        assert_eq!(persisted.is_in_merge_queue, None, "the dequeue lands");
+        assert_eq!(persisted.title, queued.title, "REST fields stay persisted");
+        assert_eq!(persisted.updated_at, queued.updated_at);
+        assert_eq!(persisted.mergeable_state, queued.mergeable_state);
+        assert_eq!(persisted.status, queued.status, "status stays persisted");
+
+        let mut requeued = persisted.clone();
+        assert!(project_served_queue_signal(&mut requeued, &queued));
+        assert_eq!(requeued.is_in_merge_queue, Some(true), "the enqueue lands");
+
+        let mut moved = dequeued.clone();
+        moved.head_sha = Some("sha2".into());
+        let mut persisted = queued.clone();
+        assert!(!project_served_queue_signal(&mut persisted, &moved));
+        assert_eq!(persisted, queued, "a moved head writes nothing");
+        let mut unknown = dequeued.clone();
+        unknown.head_sha = None;
+        assert!(!project_served_queue_signal(&mut persisted, &unknown));
+        let mut headless = queued.clone();
+        headless.head_sha = None;
+        assert!(!project_served_queue_signal(&mut headless, &unknown));
+        assert_eq!(headless.is_in_merge_queue, Some(true));
+
+        let mut none: Option<Vec<PullRequestInfo>> = None;
+        assert!(!project_pool_queue_signal(&mut none, &dequeued));
+        assert!(none.is_none(), "a hit never grows a pool");
+        let mut empty = Some(Vec::new());
+        assert!(!project_pool_queue_signal(&mut empty, &dequeued));
+        assert_eq!(empty.as_deref(), Some(&[][..]));
+
+        let mut stranger = dequeued.clone();
+        stranger.url = "https://github.com/fork/repo/pull/1".into();
+        let mut pool = Some(vec![queued.clone()]);
+        assert!(!project_pool_queue_signal(&mut pool, &stranger));
+        assert_eq!(pool.as_deref().unwrap()[0].is_in_merge_queue, Some(true));
+
+        let mut cased = dequeued.clone();
+        cased.url = queued.url.to_ascii_uppercase();
+        assert!(project_pool_queue_signal(&mut pool, &cased));
+        let entry = &pool.as_deref().unwrap()[0];
+        assert_eq!(entry.is_in_merge_queue, None);
+        assert_eq!(entry.url, queued.url, "the persisted URL spelling stays");
+        assert_eq!(entry.title, queued.title);
+    }
+
+    /// The write-time rebase re-derives a fresh entry's queue signal from the
+    /// persisted row rather than the snapshot the refresh started from: a
+    /// fold that enqueued in between is kept, a fold that dequeued in between
+    /// is not resurrected, a moved head lapses, an untouched entry takes the
+    /// persisted copy wholesale, a concurrently appended entry survives, and
+    /// a same-numbered stranger is left alone (intent-hq/intent#5654).
+    #[test]
+    fn rebase_pool_on_persisted_rederives_the_queue_signal_at_write_time() {
+        let mut rest = pr(PrState::Open, false, Some(true), Some("clean"));
+        rest.head_sha = Some("sha1".into());
+        rest.updated_at = "2026-01-02T00:00:00Z".into();
+        let fresh = build_pr_info(&rest);
+
+        // Snapshot had no signal; a fold enqueued before the write.
+        let mut outgoing = Some(vec![fresh.clone()]);
+        rebase_pool_on_persisted(&mut outgoing, Some(vec![queued_pooled_pr()]), &[1]);
+        let items = outgoing.as_ref().unwrap();
+        assert_eq!(items[0].is_in_merge_queue, Some(true));
+        assert_eq!(
+            items[0].updated_at, "2026-01-02T00:00:00Z",
+            "REST fields stand"
+        );
+
+        // Snapshot carried `Some(true)`; a fold dequeued before the write.
+        let mut carried = fresh.clone();
+        carried.is_in_merge_queue = Some(true);
+        let mut outgoing = Some(vec![carried.clone()]);
+        let mut dequeued = queued_pooled_pr();
+        dequeued.is_in_merge_queue = None;
+        rebase_pool_on_persisted(&mut outgoing, Some(vec![dequeued]), &[1]);
+        assert_eq!(outgoing.as_ref().unwrap()[0].is_in_merge_queue, None);
+
+        // Persisted queued on another head → lapses.
+        let mut moved = fresh.clone();
+        moved.head_sha = Some("sha2".into());
+        let mut outgoing = Some(vec![moved]);
+        rebase_pool_on_persisted(&mut outgoing, Some(vec![queued_pooled_pr()]), &[1]);
+        assert_eq!(outgoing.as_ref().unwrap()[0].is_in_merge_queue, None);
+
+        // Not refreshed this pass → the persisted copy replaces the snapshot's.
+        let mut outgoing = Some(vec![fresh.clone()]);
+        rebase_pool_on_persisted(&mut outgoing, Some(vec![queued_pooled_pr()]), &[]);
+        assert_eq!(outgoing.as_ref().unwrap()[0], queued_pooled_pr());
+
+        // A concurrently appended entry is kept; a same-numbered stranger
+        // neither donates nor replaces.
+        let mut other = pr(PrState::Open, false, Some(true), Some("clean"));
+        other.number = 2;
+        other.url = "https://github.com/o/r/pull/2".into();
+        let mut stranger = queued_pooled_pr();
+        stranger.url = "https://github.com/fork/repo/pull/1".into();
+        let mut outgoing = Some(vec![fresh.clone()]);
+        rebase_pool_on_persisted(
+            &mut outgoing,
+            Some(vec![stranger.clone(), build_pr_info(&other)]),
+            &[1],
+        );
+        let items = outgoing.as_ref().unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0], fresh);
+        assert_eq!(items[1], stranger);
+        assert_eq!(items[2].number, 2);
+
+        // No persisted list → the outgoing list stands.
+        let mut outgoing = Some(vec![carried.clone()]);
+        rebase_pool_on_persisted(&mut outgoing, None, &[1]);
+        assert_eq!(outgoing.as_ref().unwrap()[0], carried);
+    }
+
+    #[test]
+    fn upserts_pr_info_by_url_never_touches_a_same_numbered_stranger() {
+        let open = build_pr_info(&pr(PrState::Open, false, Some(true), Some("clean")));
+        let mut list: Option<Vec<PullRequestInfo>> = None;
+
+        // Insert into an absent list; identical snapshot is a no-op.
+        assert!(upsert_pr_info_by_url(&mut list, &open));
+        assert!(!upsert_pr_info_by_url(&mut list, &open));
+        assert_eq!(list.as_ref().unwrap().len(), 1);
+
+        // Same URL, different snapshot: replaced in place.
+        let merged = build_pr_info(&pr(PrState::Merged, false, None, None));
+        assert!(upsert_pr_info_by_url(&mut list, &merged));
+        assert_eq!(list.as_ref().unwrap().len(), 1);
+        assert_eq!(list.as_ref().unwrap()[0].status, PullRequestStatus::Merged);
+
+        // Same number from another repository (cross-repo pool): appended,
+        // and the original entry is left untouched.
+        let mut other_repo = pr(PrState::Open, false, None, None);
+        other_repo.url = "https://github.com/other/repo/pull/1".into();
+        let other_info = build_pr_info(&other_repo);
+        assert!(upsert_pr_info_by_url(&mut list, &other_info));
+        let items = list.as_ref().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].number, items[1].number);
+        assert_eq!(items[0].status, PullRequestStatus::Merged);
+        assert_eq!(items[1].url, other_info.url);
+    }
+
+    /// Regression (intent-hq/intentd#1923 review): a persisted pool holding
+    /// the same URL twice (`workspace.update` accepts duplicates) collapses
+    /// into the single fetched snapshot at the first duplicate's position —
+    /// never `[Merged, Open]` with a stale copy keeping the rollup at
+    /// `pr_ready` — while a distinct cross-repo URL survives.
+    #[test]
+    fn upserts_pr_info_by_url_collapses_same_url_duplicates() {
+        let open = build_pr_info(&pr(PrState::Open, false, Some(true), Some("clean")));
+        let mut other_repo = pr(PrState::Open, false, None, None);
+        other_repo.url = "https://github.com/other/repo/pull/1".into();
+        let other_info = build_pr_info(&other_repo);
+        let mut list = Some(vec![open.clone(), other_info.clone(), open.clone()]);
+
+        let merged = build_pr_info(&pr(PrState::Merged, false, None, None));
+        assert!(upsert_pr_info_by_url(&mut list, &merged));
+        let items = list.as_ref().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].status, PullRequestStatus::Merged);
+        assert_eq!(items[1].url, other_info.url);
+        // The collapsed pool is stable: an identical re-fetch is a no-op.
+        assert!(!upsert_pr_info_by_url(&mut list, &merged));
+    }
+
+    /// Regression (intent-hq/intentd#1923 review): PR URL identity folds
+    /// ASCII case — a persisted `example/repo` URL is the same PR as the
+    /// forge's canonical `Example/Repo` casing, so the fetched snapshot
+    /// replaces it (adopting the forge casing) instead of appending a
+    /// duplicate.
+    #[test]
+    fn upserts_pr_info_by_url_matches_case_variant_urls() {
+        let mut persisted = pr(PrState::Open, false, Some(true), Some("clean"));
+        persisted.url = "https://github.com/example/repo/pull/42".into();
+        let mut list = Some(vec![build_pr_info(&persisted)]);
+
+        let mut fetched = pr(PrState::Merged, false, None, None);
+        fetched.url = "https://github.com/Example/Repo/pull/42".into();
+        let fetched_info = build_pr_info(&fetched);
+        assert!(same_pr_url(&persisted.url, &fetched.url));
+        assert!(upsert_pr_info_by_url(&mut list, &fetched_info));
+        let items = list.as_ref().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].status, PullRequestStatus::Merged);
+        assert_eq!(items[0].url, fetched_info.url);
+        assert!(!upsert_pr_info_by_url(&mut list, &fetched_info));
     }
 
     #[test]
@@ -1607,9 +2550,11 @@ mod tests {
     fn rollup(name: &str, state: CheckState, required: bool) -> RollupCheck {
         RollupCheck {
             name: name.into(),
+            kind: RollupCheckKind::CheckRun,
             state,
             is_required: required,
             url: None,
+            started_at: None,
         }
     }
 
@@ -1632,6 +2577,7 @@ mod tests {
                 rollup("e2e", CheckState::Pending, true),
                 rollup("optional-lint", CheckState::Failure, false),
             ],
+            checks_head_sha: None,
             checks_known: true,
             branch_rules: Some(intent_sourcecontrol::BranchRules {
                 required_approving_review_count: Some(2),
@@ -1693,6 +2639,7 @@ mod tests {
             merge_state_status: Some("CLEAN".into()),
             review_decision: Some(ReviewDecision::Approved),
             checks: vec![rollup("build", CheckState::Success, false)],
+            checks_head_sha: None,
             checks_known: true,
             branch_rules: None,
             is_in_merge_queue: None,
@@ -1719,11 +2666,13 @@ mod tests {
                 name: "build".into(),
                 state: CheckState::Success,
                 url: Some("https://ci/1".into()),
+                started_at: None,
             },
             CheckRun {
                 name: "test".into(),
                 state: CheckState::Failure,
                 url: None,
+                started_at: None,
             },
         ];
         // A probe that failed entirely still yields the snapshot-derived rows.
@@ -1751,6 +2700,345 @@ mod tests {
         assert!(!req.checks.required_known);
         assert_eq!(req.merge_state_status.as_deref(), Some("UNSTABLE"));
     }
+
+    /// Regression (intent-hq/intent#5372): a head carrying two runs of the
+    /// same workflow — the live `completed/success` run and an earlier
+    /// `concurrency`-cancelled duplicate whose gate job reports a genuine
+    /// `failure` — reports ONE `passed` entry per check name, whichever
+    /// order the host lists the nodes in: the latest-started run is the
+    /// live one, so the tally never counts the superseded twin and never
+    /// depends on rollup order. Without start times a genuine failure
+    /// still wins over a same-name success, an in-flight re-run over any
+    /// completed outcome, and a cancelled run over nothing.
+    #[test]
+    fn merge_requirements_dedupes_same_name_checks_by_live_outcome() {
+        let p = pr(PrState::Open, false, Some(true), Some("clean"));
+        let signals = |checks: Vec<RollupCheck>| MergeRequirementSignals {
+            merge_state_status: Some("CLEAN".into()),
+            checks,
+            checks_known: true,
+            ..Default::default()
+        };
+        // The superseding run started 24 minutes after the duplicate.
+        let live = |name: &str, state: CheckState| RollupCheck {
+            url: Some(format!("https://ci/live/{name}")),
+            started_at: Some("2026-09-18T11:32:04Z".into()),
+            ..rollup(name, state, true)
+        };
+        let dup = |name: &str, state: CheckState| RollupCheck {
+            url: Some(format!("https://ci/dup/{name}")),
+            started_at: Some("2026-09-18T11:08:02Z".into()),
+            ..rollup(name, state, true)
+        };
+
+        let cancelled_first = vec![
+            dup("CI Gate", CheckState::Failure),
+            dup("route", CheckState::Cancelled),
+            live("CI Gate", CheckState::Success),
+            live("route", CheckState::Success),
+        ];
+        let cancelled_last = cancelled_first.iter().rev().cloned().collect::<Vec<_>>();
+        for order in [cancelled_first, cancelled_last] {
+            let req = merge_requirements(&p, Some(&signals(order)), &[], &agg(0, 0), Some(0));
+            assert_eq!(req.checks.total, 2, "{:?}", req.checks.items);
+            assert_eq!(
+                (req.checks.passed, req.checks.failed, req.checks.pending),
+                (2, 0, 0),
+                "{:?}",
+                req.checks.items
+            );
+            assert!(req.checks.failing_required.is_empty(), "{:?}", req.checks);
+            let gate = req
+                .checks
+                .items
+                .iter()
+                .find(|c| c.name == "CI Gate")
+                .expect("one CI Gate entry");
+            assert_eq!(gate.status, "passed");
+            assert!(gate.required);
+            assert_eq!(gate.url.as_deref(), Some("https://ci/live/CI Gate"));
+        }
+
+        // A later re-run that failed IS the live outcome, whichever side it
+        // is listed on — the latest start decides, not the friendlier state.
+        let rerun = |name: &str, state: CheckState| RollupCheck {
+            started_at: Some("2026-09-18T12:00:00Z".into()),
+            ..rollup(name, state, true)
+        };
+        for order in [
+            vec![
+                live("test", CheckState::Success),
+                rerun("test", CheckState::Failure),
+            ],
+            vec![
+                rerun("test", CheckState::Failure),
+                live("test", CheckState::Success),
+            ],
+        ] {
+            let req = merge_requirements(&p, Some(&signals(order)), &[], &agg(0, 0), Some(0));
+            assert_eq!(req.checks.total, 1);
+            assert_eq!((req.checks.passed, req.checks.failed), (0, 1));
+            assert_eq!(req.checks.failing_required, vec!["test".to_string()]);
+        }
+
+        // Without start times (a host that omits them) the state decides: a
+        // failure over a success, an in-flight run over any completed twin,
+        // and a cancelled run only when it is alone.
+        let untimed = |name: &str, state: CheckState| rollup(name, state, true);
+        for order in [
+            vec![
+                untimed("lint", CheckState::Success),
+                untimed("lint", CheckState::Failure),
+            ],
+            vec![
+                untimed("lint", CheckState::Failure),
+                untimed("lint", CheckState::Success),
+            ],
+        ] {
+            let req = merge_requirements(&p, Some(&signals(order)), &[], &agg(0, 0), Some(0));
+            assert_eq!((req.checks.passed, req.checks.failed), (0, 1));
+        }
+        let req = merge_requirements(
+            &p,
+            Some(&signals(vec![
+                untimed("e2e", CheckState::Failure),
+                untimed("e2e", CheckState::Pending),
+                untimed("docs", CheckState::Cancelled),
+                untimed("docs", CheckState::Success),
+            ])),
+            &[],
+            &agg(0, 0),
+            Some(0),
+        );
+        assert_eq!(
+            (req.checks.passed, req.checks.failed, req.checks.pending),
+            (1, 0, 1),
+            "{:?}",
+            req.checks.items
+        );
+        assert_eq!(req.checks.pending_required, vec!["e2e".to_string()]);
+
+        // Mixed evidence — two timed runs plus an untimed run under one name
+        // — must reduce to the same answer in every one of the six orders:
+        // the reduction is a single total order, not a pairwise rule that
+        // switches criteria on missing data. The latest timed run wins; an
+        // untimed run never outranks a timed one. An in-flight run with no
+        // start stamped yet still wins outright.
+        let mixed = [
+            dup("gate", CheckState::Failure),
+            live("gate", CheckState::Success),
+            untimed("gate", CheckState::Failure),
+        ];
+        for perm in PERMUTATIONS_OF_THREE {
+            let order: Vec<RollupCheck> = perm.iter().map(|&i| mixed[i].clone()).collect();
+            let req = merge_requirements(&p, Some(&signals(order)), &[], &agg(0, 0), Some(0));
+            assert_eq!(req.checks.total, 1, "{perm:?}: {:?}", req.checks.items);
+            assert_eq!(
+                (req.checks.passed, req.checks.failed),
+                (1, 0),
+                "{perm:?}: {:?}",
+                req.checks.items
+            );
+            assert_eq!(
+                req.checks.items[0].url.as_deref(),
+                Some("https://ci/live/gate"),
+                "{perm:?}"
+            );
+        }
+        let queued = [
+            dup("gate", CheckState::Failure),
+            live("gate", CheckState::Success),
+            untimed("gate", CheckState::Pending),
+        ];
+        for perm in PERMUTATIONS_OF_THREE {
+            let order: Vec<RollupCheck> = perm.iter().map(|&i| queued[i].clone()).collect();
+            let req = merge_requirements(&p, Some(&signals(order)), &[], &agg(0, 0), Some(0));
+            assert_eq!(
+                (req.checks.passed, req.checks.failed, req.checks.pending),
+                (0, 0, 1),
+                "{perm:?}: {:?}",
+                req.checks.items
+            );
+        }
+
+        // The REST check-runs fallback carries `started_at` too, so the
+        // older duplicate's genuine failure loses to the newer success there
+        // as well, and an untimed cancelled twin never wins.
+        let rest = |state: CheckState, started_at: Option<&str>, url: Option<&str>| CheckRun {
+            name: "build".into(),
+            state,
+            url: url.map(String::from),
+            started_at: started_at.map(String::from),
+        };
+        for runs in [
+            vec![
+                rest(CheckState::Failure, Some("2026-09-18T11:08:02Z"), None),
+                rest(
+                    CheckState::Success,
+                    Some("2026-09-18T11:32:04Z"),
+                    Some("https://ci/live/build"),
+                ),
+            ],
+            vec![
+                rest(
+                    CheckState::Success,
+                    Some("2026-09-18T11:32:04Z"),
+                    Some("https://ci/live/build"),
+                ),
+                rest(CheckState::Failure, Some("2026-09-18T11:08:02Z"), None),
+            ],
+            vec![
+                rest(CheckState::Cancelled, None, None),
+                rest(CheckState::Success, None, Some("https://ci/live/build")),
+            ],
+        ] {
+            let req = merge_requirements(&p, None, &runs, &agg(0, 0), Some(0));
+            assert_eq!(req.checks.total, 1, "{:?}", req.checks.items);
+            assert_eq!(
+                (req.checks.passed, req.checks.failed),
+                (1, 0),
+                "{:?}",
+                req.checks.items
+            );
+            assert_eq!(
+                req.checks.items[0].url.as_deref(),
+                Some("https://ci/live/build")
+            );
+        }
+    }
+
+    /// A legacy commit status posted under a check run's name is independent
+    /// evidence, not an older attempt of the run: GitHub requires both to
+    /// pass when the shared name is required. Deduping the run's attempts
+    /// must never let a timed success hide the status's failure (or vice
+    /// versa), in either order; the entry reports the worse of the two.
+    #[test]
+    fn merge_requirements_keeps_a_same_name_legacy_status_beside_the_live_run() {
+        let p = pr(PrState::Open, false, Some(true), Some("clean"));
+        let signals = |checks: Vec<RollupCheck>| MergeRequirementSignals {
+            merge_state_status: Some("CLEAN".into()),
+            checks,
+            checks_known: true,
+            ..Default::default()
+        };
+        let run = |state: CheckState, started_at: &str| RollupCheck {
+            url: Some(format!("https://ci/run/{started_at}")),
+            started_at: Some(started_at.into()),
+            ..rollup("build", state, true)
+        };
+        let status = |state: CheckState| RollupCheck {
+            kind: RollupCheckKind::StatusContext,
+            url: Some("https://ci/status".into()),
+            ..rollup("build", state, true)
+        };
+        let both_orders = |a: RollupCheck, b: RollupCheck| [vec![a.clone(), b.clone()], vec![b, a]];
+        let live = "2026-09-18T11:32:04Z";
+        let dup = "2026-09-18T11:08:02Z";
+
+        // Timed success + failing status: failed, required, the status's link.
+        for order in both_orders(run(CheckState::Success, live), status(CheckState::Failure)) {
+            let req = merge_requirements(&p, Some(&signals(order)), &[], &agg(0, 0), Some(0));
+            assert_eq!(req.checks.total, 1, "{:?}", req.checks.items);
+            assert_eq!(
+                (req.checks.passed, req.checks.failed, req.checks.pending),
+                (0, 1, 0),
+                "{:?}",
+                req.checks.items
+            );
+            assert_eq!(req.checks.failing_required, vec!["build".to_string()]);
+            assert_eq!(
+                req.checks.items[0].url.as_deref(),
+                Some("https://ci/status")
+            );
+        }
+        // Failing run + passing status is just as blocked, with the run's link.
+        for order in both_orders(run(CheckState::Failure, live), status(CheckState::Success)) {
+            let req = merge_requirements(&p, Some(&signals(order)), &[], &agg(0, 0), Some(0));
+            assert_eq!((req.checks.passed, req.checks.failed), (0, 1));
+            assert_eq!(req.checks.failing_required, vec!["build".to_string()]);
+            assert_eq!(
+                req.checks.items[0].url.as_deref(),
+                Some("https://ci/run/2026-09-18T11:32:04Z")
+            );
+        }
+        // A status still pending holds the name pending; an in-flight run
+        // beside a failed status is still a failure.
+        for order in both_orders(run(CheckState::Success, live), status(CheckState::Pending)) {
+            let req = merge_requirements(&p, Some(&signals(order)), &[], &agg(0, 0), Some(0));
+            assert_eq!((req.checks.passed, req.checks.pending), (0, 1));
+            assert_eq!(req.checks.pending_required, vec!["build".to_string()]);
+        }
+        for order in both_orders(run(CheckState::Pending, live), status(CheckState::Failure)) {
+            let req = merge_requirements(&p, Some(&signals(order)), &[], &agg(0, 0), Some(0));
+            assert_eq!((req.checks.failed, req.checks.pending), (1, 0));
+        }
+        // Both green: one passed entry, the run's link.
+        for order in both_orders(run(CheckState::Success, live), status(CheckState::Success)) {
+            let req = merge_requirements(&p, Some(&signals(order)), &[], &agg(0, 0), Some(0));
+            assert_eq!(req.checks.total, 1);
+            assert_eq!((req.checks.passed, req.checks.failed), (1, 0));
+            assert_eq!(
+                req.checks.items[0].url.as_deref(),
+                Some("https://ci/run/2026-09-18T11:32:04Z")
+            );
+        }
+        // A green status never covers for a check run that only ever got
+        // cancelled: the run is still the name's live run, and it failed.
+        for order in both_orders(
+            run(CheckState::Cancelled, live),
+            status(CheckState::Success),
+        ) {
+            let req = merge_requirements(&p, Some(&signals(order)), &[], &agg(0, 0), Some(0));
+            assert_eq!(
+                (req.checks.total, req.checks.passed, req.checks.failed),
+                (1, 0, 1),
+                "{:?}",
+                req.checks.items
+            );
+            assert_eq!(req.checks.failing_required, vec!["build".to_string()]);
+        }
+        // The cancelled duplicate still collapses onto the live run when a
+        // status shares the name, and the status's failure still counts.
+        let triple = [
+            run(CheckState::Failure, dup),
+            run(CheckState::Success, live),
+            status(CheckState::Success),
+        ];
+        let blocked = [
+            run(CheckState::Failure, dup),
+            run(CheckState::Success, live),
+            status(CheckState::Failure),
+        ];
+        for perm in PERMUTATIONS_OF_THREE {
+            let order: Vec<RollupCheck> = perm.iter().map(|&i| triple[i].clone()).collect();
+            let req = merge_requirements(&p, Some(&signals(order)), &[], &agg(0, 0), Some(0));
+            assert_eq!(
+                (req.checks.total, req.checks.passed, req.checks.failed),
+                (1, 1, 0),
+                "{perm:?}: {:?}",
+                req.checks.items
+            );
+            let order: Vec<RollupCheck> = perm.iter().map(|&i| blocked[i].clone()).collect();
+            let req = merge_requirements(&p, Some(&signals(order)), &[], &agg(0, 0), Some(0));
+            assert_eq!(
+                (req.checks.total, req.checks.passed, req.checks.failed),
+                (1, 0, 1),
+                "{perm:?}: {:?}",
+                req.checks.items
+            );
+            assert_eq!(req.checks.failing_required, vec!["build".to_string()]);
+        }
+    }
+
+    /// Every ordering of three rollup nodes, as index triples.
+    const PERMUTATIONS_OF_THREE: [[usize; 3]; 6] = [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ];
 
     #[test]
     fn merge_requirements_reports_draft_and_conflicts() {

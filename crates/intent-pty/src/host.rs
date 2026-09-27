@@ -97,10 +97,34 @@ impl PtySize {
 /// that need richer parity treat a non-success code as the failure indicator.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PtyExit {
-    /// The raw process exit code as reported by the platform.
+    /// The raw process exit code as reported by the platform. When
+    /// `observed` is `false` this is the placeholder failure code
+    /// [`PtyExit::UNOBSERVABLE_CODE`], not anything the child reported.
     pub exit_code: u32,
     /// Whether the process exited successfully (code 0).
     pub success: bool,
+    /// Whether the platform actually reported the status. `false` when the
+    /// child is gone but its status could not be read — `waitpid` failed
+    /// (e.g. `ECHILD` after an out-of-band reap) — so the exit is terminal but
+    /// its real code is unknown; callers surface it as unobservable rather
+    /// than trusting `exit_code`.
+    pub observed: bool,
+}
+
+impl PtyExit {
+    /// Placeholder `exit_code` for an exit whose status could not be read.
+    pub const UNOBSERVABLE_CODE: u32 = 1;
+
+    /// The terminal-but-unobservable exit: the child is gone, its status is
+    /// not readable, and consumers must not wait for it any longer.
+    #[must_use]
+    pub const fn unobservable() -> Self {
+        Self {
+            exit_code: Self::UNOBSERVABLE_CODE,
+            success: false,
+            observed: false,
+        }
+    }
 }
 
 /// A signal to deliver to a PTY's process group.
@@ -229,22 +253,31 @@ struct PtySession {
 
 /// Latch and return a session's exit status: returns the cached value, or polls
 /// the child once (non-blocking) and caches the result when it has exited.
+///
+/// A `try_wait` failure other than `EINTR` (e.g. `ECHILD`: the child was
+/// already reaped out of band, so its status is gone for good) is latched as
+/// [`PtyExit::unobservable`] — terminal, so `wait()` and every exit-polling
+/// consumer settle instead of reporting "still running" forever.
 fn observe_exit(session: &PtySession) -> Option<PtyExit> {
     let mut cached = session.exit.lock().unwrap();
     if let Some(exit) = cached.as_ref() {
         return Some(exit.clone());
     }
-    match session.child.lock().unwrap().try_wait() {
-        Ok(Some(status)) => {
-            let exit = PtyExit {
-                exit_code: status.exit_code(),
-                success: status.success(),
-            };
-            *cached = Some(exit.clone());
-            Some(exit)
+    let exit = match session.child.lock().unwrap().try_wait() {
+        Ok(Some(status)) => PtyExit {
+            exit_code: status.exit_code(),
+            success: status.success(),
+            observed: true,
+        },
+        Ok(None) => return None,
+        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => return None,
+        Err(e) => {
+            tracing::warn!(pid = ?session.pid, error = %e, "pty child status unobservable; latching exit");
+            PtyExit::unobservable()
         }
-        _ => None,
-    }
+    };
+    *cached = Some(exit.clone());
+    Some(exit)
 }
 
 fn internal(e: impl std::fmt::Display) -> Error {
@@ -1393,6 +1426,72 @@ mod tests {
             &host.scrollback(id).unwrap(),
             b"pty587-leak-check"
         ));
+        host.kill(id).await;
+        assert_eq!(host.count(), 0);
+    }
+
+    /// Stand-in for a child that was reaped out of band: every `waitpid`
+    /// fails with `ECHILD`, so the real status is gone for good.
+    #[derive(Debug)]
+    struct ReapedElsewhere;
+
+    impl ChildKiller for ReapedElsewhere {
+        fn kill(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(ReapedElsewhere)
+        }
+    }
+
+    impl Child for ReapedElsewhere {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            Err(nix::errno::Errno::ECHILD.into())
+        }
+
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            Err(nix::errno::Errno::ECHILD.into())
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+    }
+
+    /// A `try_wait` failure (the child was reaped by someone else, so
+    /// `waitpid` reports `ECHILD` forever) is latched as a terminal,
+    /// unobservable exit instead of being reported as "still running" on
+    /// every poll — otherwise `wait()` and every exit-polling consumer would
+    /// spin until the daemon dies.
+    #[tokio::test]
+    async fn try_exit_latches_unobservable_exit_when_try_wait_fails() {
+        let host = PtyHost::new();
+        let mut spec = SpawnSpec::new("s", "sleep");
+        spec.args = vec!["30".into()];
+        let id = host.spawn(spec).unwrap();
+        assert_eq!(host.try_exit(id).unwrap(), None, "child is alive");
+
+        let session = host.get(id).unwrap();
+        *session.child.lock().unwrap() = Box::new(ReapedElsewhere);
+
+        let exit = host
+            .try_exit(id)
+            .unwrap()
+            .expect("try_wait failure is a terminal exit, not None");
+        assert!(!exit.observed, "status could not be read: {exit:?}");
+        assert!(!exit.success, "unobservable counts as failure: {exit:?}");
+        assert_eq!(
+            host.try_exit(id).unwrap().as_ref(),
+            Some(&exit),
+            "latched: later polls return the same exit"
+        );
+        let waited = tokio::time::timeout(Duration::from_secs(5), host.wait(id))
+            .await
+            .expect("wait() settles instead of spinning")
+            .unwrap();
+        assert_eq!(waited, exit);
+
         host.kill(id).await;
         assert_eq!(host.count(), 0);
     }

@@ -12,7 +12,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::Duration;
 
 use tokio::time::timeout;
@@ -41,12 +41,10 @@ fn make_dirs() -> TestDirs {
 
 fn spawn_daemon(dirs: &TestDirs) -> Child {
     let log = std::fs::File::create(dirs.data_dir.join("daemon.log")).expect("create daemon log");
-    Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("serve")
+    common::serve_command()
         .env("INTENTD_DATA_DIR", &dirs.data_dir)
         .env("INTENTD_WORKSPACES_DIR", &dirs.workspaces)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
-        .env("INTENTD_TCP_PORT", "0")
         .env_remove("INTENTD_AUTH_TOKEN")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log))
