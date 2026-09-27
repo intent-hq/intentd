@@ -5,10 +5,45 @@
 //! a later milestone when the `pr.*` methods land — this crate stays free of
 //! any wire concern (§3.2).
 
+/// Request-purpose-aware failure. No response body, URL or credential is retained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderFailureKind {
+    /// The upstream rejected this connection's credential, regardless of endpoint purpose.
+    CredentialRejected,
+    /// The addressed project rejected access, including an access-hiding 404.
+    /// Consumers invalidate that project within the admitted connection scope.
+    ProjectDenied,
+    /// An item or endpoint rejected access, including an access-hiding 404.
+    /// This is not evidence that access to its parent project was lost.
+    ResourceDenied,
+    /// An optional signal was readable only with additional permission.
+    OptionalRestricted,
+    /// An optional signal is unavailable on this instance/version.
+    OptionalUnavailable,
+    /// Transport/server failure; cached success is not proof that this read passed.
+    Transient,
+    /// A response could not establish a known result.
+    Unknown,
+    /// The write may have reached the provider; reconcile instead of retrying blindly.
+    WriteUncertain,
+}
+
+/// Structured evidence for cache consumers; status is absent for transport failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("provider request failed ({kind:?}, status {status:?})")]
+pub struct ProviderFailure {
+    pub kind: ProviderFailureKind,
+    pub status: Option<u16>,
+}
+
 /// Errors surfaced by [`crate::SourceControl`] implementations and the
 /// [`crate::SourceControlRegistry`].
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// Structured provider denial/availability/uncertain-write classification.
+    #[error(transparent)]
+    Provider(#[from] ProviderFailure),
+
     /// No usable credential/configuration for the active provider. The daemon
     /// keeps running and source-control features report this (graceful per
     /// §8.3 / §7.3).
