@@ -40,6 +40,7 @@ mod note_repo;
 mod note_version_repo;
 mod pr_monitor_repo;
 mod principal_repo;
+mod repository_authority_repo;
 mod sandbox_repo;
 mod script_repo;
 mod settings_repo;
@@ -85,6 +86,10 @@ pub use pr_monitor_repo::{
 pub use principal_repo::{
     ArchivedGuestSweep, CollaboratorAddOutcome, EffectiveWorkspaceMember, InviteInsertOutcome,
     InviteJoinOutcome, WorkspaceAuthorFallback, WorkspaceGuestCount,
+};
+pub use repository_authority_repo::{
+    AuthorityRevision, RepositoryAuthoritySnapshot, RepositoryCredentialAuthority,
+    RepositoryPrincipalAuthority, RepositoryWorkspaceAuthority, VersionedAuthority,
 };
 pub use sandbox_repo::{Sandbox, SandboxStatus};
 pub use tracked_changes_repo::{NewTrackedChange, TrackedChangeRow};

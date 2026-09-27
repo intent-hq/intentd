@@ -8146,6 +8146,39 @@ async fn primary_principal_is_minted_once() {
     assert_eq!(store.list_principals().await.expect("list").len(), 1);
 }
 
+/// Remove only 0136 objects before historical fixtures drop source columns.
+/// Reopening runs the ordinary migration against the seeded legacy rows.
+async fn rewind_repository_authority(store: &Store) {
+    for kind in [
+        "workspace",
+        "principal",
+        "workspace_member",
+        "host_member",
+        "credential",
+    ] {
+        for suffix in ["ai", "ad", "au"] {
+            sqlx::query(&format!(
+                "DROP TRIGGER repository_authority_{kind}_{suffix}"
+            ))
+            .execute(store.write_pool())
+            .await
+            .expect("drop 0136 source trigger");
+        }
+    }
+    for sql in [
+        "DROP TRIGGER repository_authority_revision_no_delete",
+        "DROP TRIGGER repository_authority_revision_no_reset",
+        "DROP TRIGGER repository_authority_revision_monotonic",
+        "DROP TABLE repository_authority_revision",
+        "DELETE FROM _sqlx_migrations WHERE version = 136",
+    ] {
+        sqlx::query(sql)
+            .execute(store.write_pool())
+            .await
+            .expect("rewind 0136 object");
+    }
+}
+
 /// Remove derived 0134 state before a fixture rewinds its source schema. The
 /// real migration must replay after the legacy rows have been seeded.
 async fn rewind_sharing_projection(store: &Store) {
@@ -8183,6 +8216,7 @@ async fn principals_migration_backfills_existing_workspaces() {
     let ws_b = WorkspaceId::from("ws-mig-b");
     {
         let store = Store::open(&tmp.path).await.expect("open store");
+        rewind_repository_authority(&store).await;
         rewind_sharing_projection(&store).await;
         // 0130 re-widens the recreated principal/invite tables; 0133 adds
         // host tables and triggers referencing principal. Rewind both before
@@ -9544,6 +9578,7 @@ async fn principal_identity_migration_backfills_github_rows() {
     {
         let store = Store::open(&tmp.path).await.expect("open store");
         let primary = store.get_primary_principal().await.expect("primary").id;
+        rewind_repository_authority(&store).await;
         rewind_sharing_projection(&store).await;
         for sql in [
             "DELETE FROM _sqlx_migrations WHERE version = 130",

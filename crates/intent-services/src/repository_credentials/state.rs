@@ -247,14 +247,17 @@ impl RepositoryConnectionDirectory {
         Ok(true)
     }
 
-    /// Used by a future response adapter; quota survives verified same-account refresh.
+    /// Connection quota can arrive after refresh has paused credential release.
+    /// Preserve it provisionally for that same binding; settlement clears it if
+    /// replacement/compensation/disconnect creates a different lifetime. Unknown
+    /// settlement accepts no further receipts, and never permits acquisition.
     pub(crate) fn record_backoff(
         &self,
         stamp: &RepositoryDispatchStamp,
         until: Instant,
     ) -> Result<bool> {
         let mut state = self.lock()?;
-        if !self.current_stamp(&state, stamp) {
+        if !self.current_stamp(&state, stamp) && !self.refreshing_stamp(&state, stamp) {
             return Ok(false);
         }
         state.backoff_until = Some(state.backoff_until.map_or(until, |old| old.max(until)));
@@ -262,8 +265,27 @@ impl RepositoryConnectionDirectory {
     }
 
     fn current_stamp(&self, state: &State, stamp: &RepositoryDispatchStamp) -> bool {
+        state.status == RepositoryConnectionState::Ready && self.matches_stamp(state, stamp)
+    }
+
+    // Quota bookkeeping only. In particular, credential rejection must continue
+    // using the Ready-only predicate and the exact current secret revision.
+    fn refreshing_stamp(&self, state: &State, stamp: &RepositoryDispatchStamp) -> bool {
+        state.status == RepositoryConnectionState::Mutating
+            && self.matches_stamp(state, stamp)
+            && state.active.as_ref().is_some_and(|active| {
+                active.kind == RepositoryMutationKind::Refresh
+                    && active.previous.as_ref().is_some_and(|previous| {
+                        state.published.as_ref().is_some_and(|published| {
+                            previous.binding == published.binding
+                                && previous.verified == published.verified
+                        })
+                    })
+            })
+    }
+
+    fn matches_stamp(&self, state: &State, stamp: &RepositoryDispatchStamp) -> bool {
         stamp.epoch == self.epoch
-            && state.status == RepositoryConnectionState::Ready
             && state
                 .published
                 .as_ref()

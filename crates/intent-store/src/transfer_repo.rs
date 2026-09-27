@@ -215,6 +215,11 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
         "host-local principal revocation generations",
     ),
     (
+        "repository_authority_revision",
+        "daemon-local authority continuity and tombstones; target mutations retain \
+         their own revisions, and source counters cannot authorize target operations",
+    ),
+    (
         "host_invite",
         "host-local invitations and secrets, unrelated to workspace transfer",
     ),
