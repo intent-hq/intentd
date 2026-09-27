@@ -31604,6 +31604,10 @@ impl WorkspaceApi for Services {
                     // is cancelled; a terminal slot stays until the next
                     // connect replaces it (same rule as `github.cancelAuth`).
                     let mut guard = self.gitlab_auth.lock().await;
+                    let starting = guard
+                        .starting
+                        .as_ref()
+                        .is_some_and(|s| s.host == host.host());
                     let cancelled = matches!(
                         guard.flow.as_ref(),
                         Some(f) if f.host == host.host()
@@ -31612,7 +31616,10 @@ impl WorkspaceApi for Services {
                     if cancelled {
                         guard.flow = None;
                     }
-                    Ok(serde_json::json!({ "ok": true, "cancelled": cancelled }))
+                    if starting {
+                        guard.starting = None;
+                    }
+                    Ok(serde_json::json!({ "ok": true, "cancelled": cancelled || starting }))
                 }
             }
         })
@@ -31641,6 +31648,13 @@ impl WorkspaceApi for Services {
                         let mut guard = self.gitlab_auth.lock().await;
                         if guard.flow.as_ref().is_some_and(|f| f.host == host.host()) {
                             guard.flow = None;
+                        }
+                        if guard
+                            .starting
+                            .as_ref()
+                            .is_some_and(|s| s.host == host.host())
+                        {
+                            guard.starting = None;
                         }
                     }
                     // Only the bound instance owns the stored token — read
