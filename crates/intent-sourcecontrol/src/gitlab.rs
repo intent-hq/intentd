@@ -34,6 +34,11 @@ use crate::{
 
 mod http;
 use http::{failure, Purpose, RequestScope};
+mod dispatch;
+pub use dispatch::{
+    GitlabAdmittedRequest, GitlabAuthenticatedRequest, GitlabPreparedRequest,
+    GitlabResponseObservation, GitlabResponseReceipt,
+};
 mod provenance;
 use provenance::RequestProvenance;
 mod creation;
@@ -61,6 +66,20 @@ pub trait GitlabRequestCredentials: Send + Sync {
     ) -> Result<SecretString> {
         let _ = request;
         self.token_for(instance).await
+    }
+
+    /// Admit the exact prepared HTTP request. Managed adapters must override this
+    /// hook and consume a fresh original-authority fence after authentication.
+    /// This default preserves explicitly injected ordinary credential callbacks.
+    async fn admit_http_request(
+        &self,
+        prepared: GitlabPreparedRequest<'_>,
+    ) -> Result<GitlabAdmittedRequest> {
+        let context = prepared.credential_request();
+        let token = self
+            .token_for_request(context.descriptor.instance(), context)
+            .await?;
+        Ok(prepared.authenticate(token)?.admit(None))
     }
 }
 

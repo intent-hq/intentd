@@ -2,8 +2,12 @@ use std::future::Future;
 use std::pin::Pin;
 
 use intent_sourcecontrol::{
-    error::AdmissionUnavailable, gitlab::GitlabCredentialRequest, Error, GitLabSourceControl,
-    GitlabInstance, GitlabRequestCredentials,
+    error::AdmissionUnavailable,
+    gitlab::{
+        GitlabAdmittedRequest, GitlabAuthenticatedRequest, GitlabCredentialRequest,
+        GitlabPreparedRequest, GitlabResponseObservation, GitlabResponseReceipt,
+    },
+    Error, GitLabSourceControl, GitlabInstance, GitlabRequestCredentials,
 };
 
 use super::authority::RepositoryCredentialTransport;
@@ -152,6 +156,68 @@ impl RepositoryConnectionDirectory {
         .await
         .map_err(|_| RepositoryCredentialError::TimedOut)?
     }
+
+    // The token-release fence is already consumed. Revalidate the SAME captured
+    // authority and perform only a one-use ownership transfer under its new fence.
+    async fn admit_http_exact(
+        self: &Arc<Self>,
+        admission: &RepositoryCredentialAdmission,
+        stamp: RepositoryDispatchStamp,
+        prepared: GitlabAuthenticatedRequest<'_>,
+    ) -> Result<GitlabAdmittedRequest> {
+        let fence = admission.authority.revalidate(&admission.request).await?;
+        let mut pending = Some((
+            prepared,
+            Box::new(DispatchReceipt {
+                directory: self.clone(),
+                stamp,
+            }),
+        ));
+        let mut admitted = None;
+        fence.dispatch(&mut || {
+            let state = self.lock()?;
+            self.check_locked(&state, admission)?;
+            let stamp = &pending
+                .as_ref()
+                .ok_or(RepositoryCredentialError::AuthorityDenied)?
+                .1
+                .stamp;
+            if stamp.epoch != self.epoch
+                || stamp.binding != admission.binding
+                || stamp.child_revision != admission.child_revision
+                || stamp.use_kind != admission.request.use_kind
+            {
+                return Err(RepositoryCredentialError::Retired);
+            }
+            if stamp.secret_revision != state.secret_revision {
+                return Err(RepositoryCredentialError::SecretMismatch);
+            }
+            let (request, receipt) = pending
+                .take()
+                .ok_or(RepositoryCredentialError::AuthorityDenied)?;
+            admitted = Some(request.admit(Some(receipt)));
+            Ok(())
+        })?;
+        admitted.ok_or(RepositoryCredentialError::AuthorityDenied)
+    }
+}
+
+struct DispatchReceipt {
+    directory: Arc<RepositoryConnectionDirectory>,
+    stamp: RepositoryDispatchStamp,
+}
+impl GitlabResponseReceipt for DispatchReceipt {
+    fn observe(&self, observation: GitlabResponseObservation) {
+        if let Some(until) = observation.backoff_until {
+            let _ = self.directory.record_backoff(&self.stamp, until);
+        }
+        if observation.status == 401 {
+            let _ = self.directory.reject_current_credential(&self.stamp);
+        }
+        // These existing predicates ignore obsolete receipts. A bookkeeping
+        // failure must not erase the actual dispatched HTTP outcome, and a
+        // poisoned directory already refuses subsequent acquisition.
+    }
 }
 
 fn valid_project(path: &str) -> bool {
@@ -211,11 +277,11 @@ impl BoundGitlabRequestCredentials {
         GitLabSourceControl::new(self.admission.descriptor.clone(), Arc::new(self))
     }
 
-    async fn for_request(
+    fn validate_request(
         &self,
         instance: &GitlabInstance,
         request: GitlabCredentialRequest<'_>,
-    ) -> intent_sourcecontrol::Result<SecretString> {
+    ) -> intent_sourcecontrol::Result<()> {
         if instance.as_str() != self.admission.binding.account.instance_base_url
             || request.descriptor != &self.admission.descriptor
             || !request.is_for_project(&self.admission.request.target.project_path)
@@ -225,17 +291,61 @@ impl BoundGitlabRequestCredentials {
         {
             return Err(RepositoryCredentialError::BoundaryMismatch.into());
         }
+        Ok(())
+    }
+
+    async fn for_request(
+        &self,
+        instance: &GitlabInstance,
+        request: GitlabCredentialRequest<'_>,
+    ) -> intent_sourcecontrol::Result<SecretString> {
+        self.validate_request(instance, request)?;
         let ticket = self
             .directory
             .acquire_exact(&self.admission, self.reader.as_ref(), self.budget)
             .await?;
         Ok(ticket.token)
     }
+
+    async fn for_http_request(
+        &self,
+        prepared: GitlabPreparedRequest<'_>,
+    ) -> intent_sourcecontrol::Result<GitlabAdmittedRequest> {
+        let context = prepared.credential_request();
+        self.validate_request(context.descriptor.instance(), context)?;
+        tokio::time::timeout(self.budget, async {
+            let ticket = self
+                .directory
+                .acquire_exact(&self.admission, self.reader.as_ref(), self.budget)
+                .await?;
+            let authenticated = prepared.authenticate(ticket.token)?;
+            self.directory
+                .admit_http_exact(&self.admission, ticket.stamp, authenticated)
+                .await
+                .map_err(Error::from)
+        })
+        .await
+        .map_err(|_| Error::from(RepositoryCredentialError::TimedOut))?
+    }
 }
 
 // Match the existing async-trait ABI without adding a service dependency on the
 // macro. No token is cached in this callback or its HTTP pool.
 impl GitlabRequestCredentials for BoundGitlabRequestCredentials {
+    fn admit_http_request<'s, 'r, 'f>(
+        &'s self,
+        prepared: GitlabPreparedRequest<'r>,
+    ) -> Pin<
+        Box<dyn Future<Output = intent_sourcecontrol::Result<GitlabAdmittedRequest>> + Send + 'f>,
+    >
+    where
+        's: 'f,
+        'r: 'f,
+        Self: 'f,
+    {
+        Box::pin(self.for_http_request(prepared))
+    }
+
     fn token_for<'s, 'i, 'f>(
         &'s self,
         _instance: &'i GitlabInstance,

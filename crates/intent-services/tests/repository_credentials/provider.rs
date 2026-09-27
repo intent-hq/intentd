@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::sync::atomic::Ordering;
 use std::{future::Future, pin::Pin};
 
@@ -31,6 +32,9 @@ struct Server {
     test: Arc<Test>,
     seen: Arc<Mutex<Vec<(String, String)>>>,
     handler: Arc<Mutex<Handler>>,
+    headers: Arc<Mutex<Vec<(String, String)>>>,
+    response_pause: Arc<Mutex<Option<Arc<Pause>>>>,
+    response_completed: Arc<tokio::sync::Notify>,
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for Server {
@@ -52,6 +56,12 @@ impl Server {
             Arc::new(Mutex::new(Box::new(|_, _| Reply::ok(json!([])))));
         let observed = seen.clone();
         let respond = handler.clone();
+        let headers = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let response_headers = headers.clone();
+        let response_pause = Arc::new(Mutex::new(None::<Arc<Pause>>));
+        let paused = response_pause.clone();
+        let response_completed = Arc::new(tokio::sync::Notify::new());
+        let completed = response_completed.clone();
         let task = tokio::spawn(async move {
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
@@ -59,6 +69,9 @@ impl Server {
                 };
                 let observed = observed.clone();
                 let respond = respond.clone();
+                let response_headers = response_headers.clone();
+                let pause = paused.lock().unwrap().clone();
+                let completed = completed.clone();
                 tokio::spawn(async move {
                     let mut buffer = Vec::new();
                     let mut chunk = [0; 4096];
@@ -98,12 +111,22 @@ impl Server {
                         .unwrap()
                         .push((line.clone(), head.to_string()));
                     let reply = respond.lock().unwrap()(method, path);
+                    if let Some(pause) = pause {
+                        pause.entered.notify_one();
+                        pause.release.acquire().await.unwrap().forget();
+                    }
                     let body = reply.body.to_string();
                     let next = reply
                         .next
                         .map_or_else(String::new, |page| format!("x-next-page: {page}\r\n"));
-                    let response = format!("HTTP/1.1 {} Test\r\ncontent-type: application/json\r\ncontent-length: {}\r\n{next}connection: close\r\n\r\n{body}", reply.status, body.len());
-                    socket.write_all(response.as_bytes()).await.unwrap();
+                    let mut extra = String::new();
+                    for (key, value) in response_headers.lock().unwrap().iter() {
+                        write!(&mut extra, "{key}: {value}\r\n").unwrap();
+                    }
+                    let response = format!("HTTP/1.1 {} Test\r\ncontent-type: application/json\r\ncontent-length: {}\r\n{next}{extra}connection: close\r\n\r\n{body}", reply.status, body.len());
+                    // Cancellation can close an already admitted socket.
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    completed.notify_one();
                 });
             }
         });
@@ -111,6 +134,9 @@ impl Server {
             test,
             seen,
             handler,
+            headers,
+            response_pause,
+            response_completed,
             task,
         }
     }
@@ -152,6 +178,106 @@ fn pair(branch: &str) -> ReviewBranchIdentity {
     }
 }
 
+// These fixtures use an injected authority to schedule the real managed callback
+// after token release. They do not exercise concrete Store/Git authority.
+#[derive(Clone, Copy)]
+enum AfterRelease {
+    Retire,
+    Refresh,
+    Replace,
+}
+struct ReleaseAuthority {
+    test: Arc<Test>,
+    action: AfterRelease,
+    calls: std::sync::atomic::AtomicUsize,
+}
+struct ReleaseFence {
+    inner: Box<dyn super::authority::RepositoryAuthorityFence>,
+    test: Arc<Test>,
+    after: Option<AfterRelease>,
+}
+impl super::authority::RepositoryAuthorityFence for ReleaseFence {
+    fn dispatch(self: Box<Self>, action: &mut (dyn FnMut() -> Result<()> + Send)) -> Result<()> {
+        self.inner.dispatch(action)?;
+        match self.after {
+            Some(AfterRelease::Retire) => self.test.directory.retire()?,
+            Some(AfterRelease::Refresh) => self.test.refresh("token-new"),
+            Some(AfterRelease::Replace) => {
+                self.test.replace(self.test.verified.clone());
+            }
+            None => {}
+        }
+        Ok(())
+    }
+}
+impl RepositoryAuthority for ReleaseAuthority {
+    fn revalidate<'a>(
+        &'a self,
+        request: &'a RepositoryAuthorityRequest,
+    ) -> super::authority::CredentialFuture<'a, Box<dyn super::authority::RepositoryAuthorityFence>>
+    {
+        Box::pin(async move {
+            let inner = self.test.authority.revalidate(request).await?;
+            Ok(Box::new(ReleaseFence {
+                inner,
+                test: self.test.clone(),
+                after: (self.calls.fetch_add(1, Ordering::SeqCst) == 0).then_some(self.action),
+            })
+                as Box<dyn super::authority::RepositoryAuthorityFence>)
+        })
+    }
+}
+async fn refuses_after_token_release(action: AfterRelease) {
+    let server = Server::new().await;
+    let authority = Arc::new(ReleaseAuthority {
+        test: server.test.clone(),
+        action,
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let admission = server
+        .test
+        .directory
+        .admit(
+            &server.test.directory.binding().unwrap(),
+            server
+                .test
+                .request(RepositoryCredentialUse::NativeReviewCreate),
+            authority,
+        )
+        .unwrap();
+    let provider = BoundGitlabRequestCredentials::new(
+        server.test.directory.clone(),
+        admission,
+        server.test.secrets.clone(),
+        Duration::from_secs(2),
+    )
+    .unwrap()
+    .into_provider()
+    .unwrap();
+    let result = provider.list_comments(&repo(), 4).await;
+    assert!(
+        matches!(
+            result,
+            Err(Error::AdmissionRetired | Error::AdmissionUnavailable(_))
+        ),
+        "stale preparation reached HTTP: {result:?}"
+    );
+    assert!(server.seen.lock().unwrap().is_empty());
+    assert_eq!(server.test.secrets.calls.load(Ordering::SeqCst), 1);
+}
+#[tokio::test]
+async fn http_admission_retirement_after_token_release_sends_nothing() {
+    refuses_after_token_release(AfterRelease::Retire).await;
+}
+#[tokio::test]
+async fn http_admission_refresh_after_token_release_cannot_send_old_secret() {
+    refuses_after_token_release(AfterRelease::Refresh).await;
+}
+#[tokio::test]
+async fn http_admission_replacement_after_token_release_cannot_rebind() {
+    refuses_after_token_release(AfterRelease::Replace).await;
+}
+
 #[tokio::test]
 async fn bound_callback_reacquires_fresh_token_and_original_authority_on_each_page() {
     let server = Server::new().await;
@@ -178,8 +304,8 @@ async fn bound_callback_reacquires_fresh_token_and_original_authority_on_each_pa
     assert!(seen[1].1.contains("Bearer token-new"));
     assert_eq!(server.test.secrets.calls.load(Ordering::SeqCst), 2);
     let requests = server.test.authority.requests.lock().unwrap();
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0], requests[1]);
+    assert_eq!(requests.len(), 4);
+    assert!(requests.iter().all(|request| request == &requests[0]));
 }
 
 #[tokio::test]
@@ -237,8 +363,13 @@ async fn optional_requests_propagate_local_retirement_and_actual_credential_deni
                 matches!(error, Error::Provider(p) if p.kind == ProviderFailureKind::CredentialRejected)
             );
             assert_eq!(server.seen.lock().unwrap().len(), 3);
-            // A provider error alone cannot delete credentials or mutate the directory.
-            assert!(server.test.directory.binding().is_ok());
+            // The original response receipt fences eligibility; it never deletes
+            // the stored credential or claims the auth owner has logged out.
+            assert_eq!(
+                server.test.directory.binding(),
+                Err(RepositoryCredentialError::Disconnected)
+            );
+            assert_eq!(*server.test.secrets.value.lock().unwrap(), "token-old");
         }
     }
 }
@@ -786,4 +917,626 @@ async fn bound_target_pipeline_keeps_optional_restrictions_separate_from_denial(
             .iter()
             .any(|(line, _)| line.contains("/projects/41/pipelines/9/jobs")));
     }
+}
+
+// Private authority/secret doubles schedule the actual Bound/provider chain.
+// Original Store/Git authority and paired-file evidence are covered separately.
+struct AdmissionSchedule {
+    test: Arc<Test>,
+    calls: std::sync::atomic::AtomicUsize,
+    pause: Option<Arc<Pause>>,
+    after: Option<AfterRelease>,
+}
+impl RepositoryAuthority for AdmissionSchedule {
+    fn revalidate<'a>(
+        &'a self,
+        request: &'a RepositoryAuthorityRequest,
+    ) -> super::authority::CredentialFuture<'a, Box<dyn super::authority::RepositoryAuthorityFence>>
+    {
+        Box::pin(async move {
+            let inner = self.test.authority.revalidate(request).await?;
+            let final_check = self.calls.fetch_add(1, Ordering::SeqCst) == 1;
+            if final_check {
+                if let Some(pause) = &self.pause {
+                    pause.entered.notify_one();
+                    pause.release.acquire().await.unwrap().forget();
+                }
+            }
+            Ok(Box::new(ReleaseFence {
+                inner,
+                test: self.test.clone(),
+                after: final_check.then_some(self.after).flatten(),
+            })
+                as Box<dyn super::authority::RepositoryAuthorityFence>)
+        })
+    }
+}
+fn scheduled_provider(
+    server: &Server,
+    pause: Option<Arc<Pause>>,
+    after: Option<AfterRelease>,
+    budget: Duration,
+) -> intent_sourcecontrol::GitLabSourceControl {
+    let authority = Arc::new(AdmissionSchedule {
+        test: server.test.clone(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        pause,
+        after,
+    });
+    let admission = server
+        .test
+        .directory
+        .admit(
+            &server.test.directory.binding().unwrap(),
+            server
+                .test
+                .request(RepositoryCredentialUse::NativeReviewCreate),
+            authority,
+        )
+        .unwrap();
+    BoundGitlabRequestCredentials::new(
+        server.test.directory.clone(),
+        admission,
+        server.test.secrets.clone(),
+        budget,
+    )
+    .unwrap()
+    .into_provider()
+    .unwrap()
+}
+async fn reached(pause: &Pause) {
+    tokio::time::timeout(Duration::from_secs(2), pause.entered.notified())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn http_admission_final_fence_rechecks_directory_and_original_authority() {
+    for change in 0..4 {
+        let server = Server::new().await;
+        let pause = Pause::new();
+        let provider =
+            scheduled_provider(&server, Some(pause.clone()), None, Duration::from_secs(2));
+        let task = tokio::spawn(async move { provider.list_comments(&repo(), 4).await });
+        reached(&pause).await;
+        match change {
+            0 => server.test.directory.retire().unwrap(),
+            1 => server.test.refresh("token-new"),
+            2 => {
+                server.test.replace(server.test.verified.clone());
+            }
+            _ => *server.test.authority.revision.lock().unwrap() += 1,
+        }
+        pause.release.add_permits(1);
+        let error = task.await.unwrap().unwrap_err();
+        if change == 1 {
+            assert!(matches!(
+                error,
+                Error::AdmissionUnavailable(
+                    intent_sourcecontrol::error::AdmissionUnavailable::SecretChanged
+                )
+            ));
+        } else {
+            assert!(matches!(error, Error::AdmissionRetired));
+        }
+        assert!(server.seen.lock().unwrap().is_empty());
+        assert_eq!(server.test.secrets.calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn http_admission_winning_transfer_preserves_known_success_after_retirement() {
+    let server = Server::new().await;
+    let provider = scheduled_provider(
+        &server,
+        None,
+        Some(AfterRelease::Retire),
+        Duration::from_secs(2),
+    );
+    provider.list_comments(&repo(), 4).await.unwrap();
+    assert_eq!(server.seen.lock().unwrap().len(), 1);
+    assert!(matches!(
+        provider.list_comments(&repo(), 4).await,
+        Err(Error::AdmissionRetired)
+    ));
+    assert_eq!(server.seen.lock().unwrap().len(), 1);
+    assert_eq!(server.test.authority.requests.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn http_admission_cancellation_at_prepared_fence_sends_nothing() {
+    let server = Server::new().await;
+    let pause = Pause::new();
+    let provider = scheduled_provider(&server, Some(pause.clone()), None, Duration::from_secs(2));
+    let task = tokio::spawn(async move { provider.list_comments(&repo(), 4).await });
+    reached(&pause).await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    pause.release.add_permits(1);
+    assert!(server.seen.lock().unwrap().is_empty());
+    server
+        .provider(RepositoryCredentialUse::NativeReviewCreate)
+        .list_comments(&repo(), 4)
+        .await
+        .unwrap();
+    assert_eq!(server.seen.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn http_admission_detached_preparation_still_refuses_original_retirement() {
+    let server = Server::new().await;
+    let pause = Pause::new();
+    let provider = scheduled_provider(&server, Some(pause.clone()), None, Duration::from_secs(2));
+    let (send, receive) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _ = send.send(provider.list_comments(&repo(), 4).await);
+    });
+    reached(&pause).await;
+    drop(task); // Detaching is not cancellation or authority.
+    server.test.directory.retire().unwrap();
+    pause.release.add_permits(1);
+    assert!(matches!(
+        receive.await.unwrap(),
+        Err(Error::AdmissionRetired)
+    ));
+    assert!(server.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn http_admission_timeout_after_preparation_is_local_and_unsent() {
+    let server = Server::new().await;
+    let pause = Pause::new();
+    let provider = scheduled_provider(
+        &server,
+        Some(pause.clone()),
+        None,
+        Duration::from_millis(100),
+    );
+    let task = tokio::spawn(async move { provider.list_comments(&repo(), 4).await });
+    reached(&pause).await;
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(Error::AdmissionUnavailable(
+            intent_sourcecontrol::error::AdmissionUnavailable::TimedOut
+        ))
+    ));
+    assert!(server.seen.lock().unwrap().is_empty());
+    assert!(server.test.directory.binding().is_ok());
+}
+
+#[tokio::test]
+async fn http_admission_old_401_cannot_disconnect_refreshed_or_replaced_secret() {
+    for replace in [false, true] {
+        let server = Server::new().await;
+        let test = server.test.clone();
+        *server.handler.lock().unwrap() = Box::new(move |_, _| {
+            if replace {
+                test.replace(test.verified.clone());
+                *test.secrets.value.lock().unwrap() = "replacement-token".into();
+            } else {
+                test.refresh("token-new");
+            }
+            Reply {
+                status: 401,
+                body: json!({}),
+                next: None,
+            }
+        });
+        let provider = server.provider(RepositoryCredentialUse::NativeReviewCreate);
+        assert!(
+            matches!(provider.list_comments(&repo(),4).await, Err(Error::Provider(p)) if p.kind==ProviderFailureKind::CredentialRejected)
+        );
+        assert!(server.test.directory.binding().is_ok());
+        *server.handler.lock().unwrap() = Box::new(|_, _| Reply::ok(json!([])));
+        if replace {
+            assert!(matches!(
+                provider.list_comments(&repo(), 4).await,
+                Err(Error::AdmissionRetired)
+            ));
+            assert_eq!(server.seen.lock().unwrap().len(), 1);
+        } else {
+            provider.list_comments(&repo(), 4).await.unwrap();
+        }
+        server
+            .provider(RepositoryCredentialUse::NativeReviewCreate)
+            .list_comments(&repo(), 4)
+            .await
+            .unwrap();
+        let seen = server.seen.lock().unwrap();
+        assert!(seen[0].1.contains("Bearer token-old"));
+        assert!(seen.last().unwrap().1.contains(if replace {
+            "Bearer replacement-token"
+        } else {
+            "Bearer token-new"
+        }));
+    }
+}
+
+#[tokio::test]
+async fn http_admission_current_401_retires_only_volatile_eligibility() {
+    let server = Server::new().await;
+    *server.handler.lock().unwrap() = Box::new(|_, _| Reply {
+        status: 401,
+        body: json!({}),
+        next: None,
+    });
+    let provider = server.provider(RepositoryCredentialUse::NativeReviewCreate);
+    assert!(
+        matches!(provider.list_comments(&repo(),4).await,Err(Error::Provider(p)) if p.kind==ProviderFailureKind::CredentialRejected)
+    );
+    assert_eq!(
+        server.test.directory.binding(),
+        Err(RepositoryCredentialError::Disconnected)
+    );
+    assert_eq!(*server.test.secrets.value.lock().unwrap(), "token-old");
+    assert!(matches!(
+        provider.list_comments(&repo(), 4).await,
+        Err(Error::AdmissionRetired)
+    ));
+    assert_eq!(server.seen.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn http_admission_429_during_refresh_keeps_original_quota_and_longest_deadline() {
+    let server = Server::new().await;
+    server
+        .headers
+        .lock()
+        .unwrap()
+        .push(("retry-after".into(), "120".into()));
+    let test = server.test.clone();
+    let held = Arc::new(Mutex::new(None));
+    let pending = held.clone();
+    let prior = server
+        .test
+        .acquire(
+            &server
+                .test
+                .admit(RepositoryCredentialUse::NativeReviewCreate),
+        )
+        .await
+        .unwrap()
+        .stamp;
+    let floor = Instant::now() + Duration::from_secs(300);
+    *server.handler.lock().unwrap() = Box::new(move |_, _| {
+        test.directory.record_backoff(&prior, floor).unwrap();
+        let ticket = test
+            .directory
+            .reserve_mutation(RepositoryMutationKind::Refresh)
+            .unwrap();
+        test.directory.begin_mutation(&ticket).unwrap();
+        *pending.lock().unwrap() = Some(ticket);
+        Reply {
+            status: 429,
+            body: json!({}),
+            next: None,
+        }
+    });
+    let provider = server.provider(RepositoryCredentialUse::NativeReviewCreate);
+    assert!(matches!(
+        provider.list_comments(&repo(), 4).await,
+        Err(Error::RateLimited(_))
+    ));
+    let deadline = server.test.directory.lock().unwrap().backoff_until.unwrap();
+    assert!(deadline >= floor);
+    assert_eq!(
+        server.test.directory.lock().unwrap().status,
+        RepositoryConnectionState::Mutating
+    );
+    let ticket = held.lock().unwrap().take().unwrap();
+    *server.test.secrets.value.lock().unwrap() = "token-new".into();
+    server
+        .test
+        .directory
+        .finish_mutation(
+            &ticket,
+            SettledCredentialState::Verified(server.test.verified.clone()),
+        )
+        .unwrap();
+    assert_eq!(
+        server.test.directory.lock().unwrap().backoff_until,
+        Some(deadline)
+    );
+    assert!(matches!(
+        provider.list_comments(&repo(), 4).await,
+        Err(Error::AdmissionUnavailable(
+            intent_sourcecontrol::error::AdmissionUnavailable::Backoff
+        ))
+    ));
+    assert_eq!(server.seen.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn http_admission_replaced_binding_does_not_inherit_old_quota() {
+    let server = Server::new().await;
+    server
+        .headers
+        .lock()
+        .unwrap()
+        .push(("retry-after".into(), "120".into()));
+    let test = server.test.clone();
+    *server.handler.lock().unwrap() = Box::new(move |_, _| {
+        test.replace(test.verified.clone());
+        Reply {
+            status: 429,
+            body: json!({}),
+            next: None,
+        }
+    });
+    assert!(matches!(
+        server
+            .provider(RepositoryCredentialUse::NativeReviewCreate)
+            .list_comments(&repo(), 4)
+            .await,
+        Err(Error::RateLimited(_))
+    ));
+    assert!(server
+        .test
+        .directory
+        .lock()
+        .unwrap()
+        .backoff_until
+        .is_none());
+    *server.handler.lock().unwrap() = Box::new(|_, _| Reply::ok(json!([])));
+    server
+        .provider(RepositoryCredentialUse::NativeReviewCreate)
+        .list_comments(&repo(), 4)
+        .await
+        .unwrap();
+    assert_eq!(server.seen.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn http_admission_optional_quota_is_observed_before_partial_result() {
+    let server = Server::new().await;
+    server
+        .headers
+        .lock()
+        .unwrap()
+        .push(("retry-after".into(), "120".into()));
+    *server.handler.lock().unwrap() = Box::new(|_, path| {
+        if path.ends_with("/merge_requests/4") {
+            return Reply::ok(mr());
+        }
+        if path.ends_with("team%2Fsub%2Fproject") {
+            return Reply::ok(project());
+        }
+        if path.ends_with("/approvals") {
+            return Reply::ok(json!({"approvals_required":0,"approvals_left":0,"approved_by":[]}));
+        }
+        Reply {
+            status: 429,
+            body: json!([]),
+            next: None,
+        }
+    });
+    let provider = server.provider(RepositoryCredentialUse::NativeReviewCreate);
+    let result = provider.observe_review(&repo(), 4).await.unwrap();
+    assert_eq!(
+        result.availability.discussions,
+        intent_sourcecontrol::model::ProviderAvailability::RateLimited
+    );
+    assert!(server
+        .test
+        .directory
+        .lock()
+        .unwrap()
+        .backoff_until
+        .is_some());
+    assert!(matches!(
+        provider.observe_review(&repo(), 4).await,
+        Err(Error::AdmissionUnavailable(
+            intent_sourcecontrol::error::AdmissionUnavailable::Backoff
+        ))
+    ));
+    assert_eq!(server.seen.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn http_admission_detach_or_cancel_cannot_recall_a_request_already_seen() {
+    for cancel in [false, true] {
+        let server = Server::new().await;
+        let pause = Pause::new();
+        *server.response_pause.lock().unwrap() = Some(pause.clone());
+        let provider = server.provider(RepositoryCredentialUse::NativeReviewCreate);
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = send.send(provider.list_comments(&repo(), 4).await);
+        });
+        reached(&pause).await;
+        assert_eq!(server.seen.lock().unwrap().len(), 1);
+        if cancel {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        } else {
+            drop(task);
+        }
+        server.test.directory.retire().unwrap();
+        pause.release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(2), server.response_completed.notified())
+            .await
+            .unwrap();
+        if cancel {
+            // Dropping a sent future cannot prove that its effect was unsent.
+            assert!(receive.await.is_err());
+        } else {
+            receive.await.unwrap().unwrap();
+        }
+        assert_eq!(server.seen.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn http_admission_early_optional_quota_blocks_follow_up_without_auth_denial() {
+    let server = Server::new().await;
+    server
+        .headers
+        .lock()
+        .unwrap()
+        .push(("retry-after".into(), "120".into()));
+    *server.handler.lock().unwrap() = Box::new(|_, path| {
+        if path.ends_with("/merge_requests/4") {
+            return Reply::ok(mr());
+        }
+        if path.ends_with("team%2Fsub%2Fproject") {
+            return Reply::ok(project());
+        }
+        Reply {
+            status: 429,
+            body: json!([]),
+            next: None,
+        }
+    });
+    let provider = server.provider(RepositoryCredentialUse::NativeReviewCreate);
+    let error = provider.observe_review(&repo(), 4).await.unwrap_err();
+    // Approval quota is observed before degradation. The later discussion request
+    // is locally refused; neither an extra HTTP attempt nor a logout is allowed.
+    assert!(matches!(
+        error,
+        Error::AdmissionUnavailable(intent_sourcecontrol::error::AdmissionUnavailable::Backoff)
+    ));
+    assert!(server
+        .test
+        .directory
+        .lock()
+        .unwrap()
+        .backoff_until
+        .is_some());
+    assert!(server.test.directory.binding().is_ok());
+    assert_eq!(server.seen.lock().unwrap().len(), 3);
+    assert_eq!(
+        provider.rate_limit_status().await.unwrap().remaining,
+        Some(0)
+    );
+}
+
+struct FaultyAdmission {
+    test: Arc<Test>,
+    calls: std::sync::atomic::AtomicUsize,
+    fault: u8,
+}
+struct FaultyFence {
+    inner: Box<dyn super::authority::RepositoryAuthorityFence>,
+    fault: u8,
+}
+impl super::authority::RepositoryAuthorityFence for FaultyFence {
+    fn dispatch(self: Box<Self>, action: &mut (dyn FnMut() -> Result<()> + Send)) -> Result<()> {
+        self.inner.dispatch(&mut || match self.fault {
+            0 => Ok(()),
+            1 => {
+                action()?;
+                action()
+            }
+            _ => {
+                action()?;
+                Err(RepositoryCredentialError::AuthorityUnavailable)
+            }
+        })
+    }
+}
+impl RepositoryAuthority for FaultyAdmission {
+    fn revalidate<'a>(
+        &'a self,
+        request: &'a RepositoryAuthorityRequest,
+    ) -> super::authority::CredentialFuture<'a, Box<dyn super::authority::RepositoryAuthorityFence>>
+    {
+        Box::pin(async move {
+            let inner = self.test.authority.revalidate(request).await?;
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Ok(inner);
+            }
+            Ok(Box::new(FaultyFence {
+                inner,
+                fault: self.fault,
+            })
+                as Box<dyn super::authority::RepositoryAuthorityFence>)
+        })
+    }
+}
+#[tokio::test]
+async fn http_admission_transfer_requires_one_successful_consuming_action() {
+    for fault in 0..3 {
+        let server = Server::new().await;
+        let authority = Arc::new(FaultyAdmission {
+            test: server.test.clone(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            fault,
+        });
+        let admission = server
+            .test
+            .directory
+            .admit(
+                &server.test.directory.binding().unwrap(),
+                server
+                    .test
+                    .request(RepositoryCredentialUse::NativeReviewCreate),
+                authority,
+            )
+            .unwrap();
+        let provider = BoundGitlabRequestCredentials::new(
+            server.test.directory.clone(),
+            admission,
+            server.test.secrets.clone(),
+            Duration::from_secs(2),
+        )
+        .unwrap()
+        .into_provider()
+        .unwrap();
+        let error = provider.list_comments(&repo(), 4).await.unwrap_err();
+        assert!(matches!(error, Error::AdmissionUnavailable(_)));
+        assert!(server.seen.lock().unwrap().is_empty());
+        assert_eq!(server.test.secrets.calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn http_admission_confirmed_create_is_not_rewritten_as_unsent_after_retirement() {
+    let server = Server::new().await;
+    let test = server.test.clone();
+    *server.handler.lock().unwrap() = Box::new(move |method, path| {
+        if method == "POST" {
+            test.directory.retire().unwrap();
+            return Reply::ok(mr());
+        }
+        if path.ends_with("team%2Fsub%2Fproject") {
+            return Reply::ok(project());
+        }
+        if path.contains("/repository/branches/") {
+            return Reply::ok(
+                json!({"name":path.rsplit('/').next().unwrap(),"commit":{"id":"actual-sha"}}),
+            );
+        }
+        Reply::ok(json!([]))
+    });
+    let result = server
+        .provider(RepositoryCredentialUse::NativeReviewCreate)
+        .create_same_project(
+            &repo(),
+            NewPullRequest {
+                title: "sent title".into(),
+                body: None,
+                source_branch: "feature".into(),
+                target_branch: "main".into(),
+                draft: false,
+            },
+            &pair("feature"),
+            &pair("main"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result.outcome,
+        intent_sourcecontrol::model::ReviewCreateOutcome::Created
+    );
+    assert_eq!(result.details.review.title, "actual title");
+    assert_eq!(
+        server
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(line, _)| line.starts_with("POST "))
+            .count(),
+        1
+    );
 }

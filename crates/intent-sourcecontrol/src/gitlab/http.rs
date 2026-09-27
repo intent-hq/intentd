@@ -1,8 +1,7 @@
 //! Request boundary: injected credentials per request, no redirects or body-bearing errors.
 use super::{
-    project, Error, ExposeSecret, GitLabSourceControl, HeaderMap, Method, ProviderAvailability,
-    ProviderFailure, ProviderFailureKind, RepoRef, RequestProvenance, Result, Value,
-    MAX_RESPONSE_BYTES,
+    project, Error, GitLabSourceControl, HeaderMap, Method, ProviderAvailability, ProviderFailure,
+    ProviderFailureKind, RepoRef, RequestProvenance, Result, Value, MAX_RESPONSE_BYTES,
 };
 
 #[derive(Clone, Copy)]
@@ -78,29 +77,6 @@ impl GitLabSourceControl {
                 "GitLab endpoint escaped configured instance".into(),
             ));
         }
-        // The callback captures the original admitted scope. Never cache this token
-        // in the HTTP client or retry a write after the callback returns another token.
-        let token = self
-            .credentials
-            .token_for_request(
-                self.descriptor.instance(),
-                super::GitlabCredentialRequest {
-                    descriptor: &self.descriptor,
-                    path,
-                    writing: method != Method::GET,
-                    provenance: scope.provenance,
-                },
-            )
-            .await?;
-        if token.expose_secret().trim().is_empty() {
-            return Err(Error::NotConfigured("GitLab credential is absent".into()));
-        }
-        let mut header =
-            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.expose_secret()))
-                .map_err(|_| {
-                    Error::Config("GitLab credential contains invalid header characters".into())
-                })?;
-        header.set_sensitive(true);
         let writing = method != Method::GET;
         let uncertain = || {
             failure(
@@ -112,18 +88,40 @@ impl GitLabSourceControl {
                 None,
             )
         };
-        let mut request = self
-            .client
-            .request(method, url)
-            .header(reqwest::header::AUTHORIZATION, header)
-            .query(query);
+        let mut request = self.client.request(method, url).query(query);
         if let Some(body) = body {
             request = request.json(&body);
         }
-        let mut response = request.send().await.map_err(|_| uncertain())?;
+        let prepared = super::GitlabPreparedRequest::new(
+            request
+                .build()
+                .map_err(|_| Error::Config("cannot prepare GitLab request".into()))?,
+            super::GitlabCredentialRequest {
+                descriptor: &self.descriptor,
+                path,
+                writing,
+                provenance: scope.provenance,
+            },
+        );
+        let admitted = self.credentials.admit_http_request(prepared).await?;
+        // No application queue, await or spawn between admission and execution.
+        // The pinned transport may continue an already admitted request (including
+        // a recovered unstarted pooled request); retirement cannot recall it.
+        let (request, receipt) = admitted.into_parts();
+        let mut response = self
+            .client
+            .execute(request)
+            .await
+            .map_err(|_| uncertain())?;
         let status = response.status();
         let headers = response.headers().clone();
         self.observe_rate_limit(&headers, status.as_u16() == 429);
+        if let Some(receipt) = receipt {
+            receipt.observe(super::GitlabResponseObservation::from_headers(
+                status.as_u16(),
+                &headers,
+            ));
+        }
         if !status.is_success() {
             let code = status.as_u16();
             let kind = match (code, scope.purpose) {

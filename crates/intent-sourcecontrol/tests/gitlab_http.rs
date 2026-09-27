@@ -1539,3 +1539,118 @@ async fn optional_admission_rejection_propagates_without_an_upstream_request() {
     assert_eq!(f.requests().len(), 2);
     assert!(f.requests().iter().all(|r| !r.path.contains("/approvals")));
 }
+
+struct AdmissionOnly {
+    calls: std::sync::atomic::AtomicUsize,
+    deny: bool,
+}
+#[async_trait]
+impl GitlabRequestCredentials for AdmissionOnly {
+    async fn token_for(&self, _: &GitlabInstance) -> intent_sourcecontrol::Result<SecretString> {
+        panic!("HTTP bypassed the mandatory admission hook")
+    }
+    async fn admit_http_request(
+        &self,
+        prepared: intent_sourcecontrol::gitlab::GitlabPreparedRequest<'_>,
+    ) -> intent_sourcecontrol::Result<intent_sourcecontrol::gitlab::GitlabAdmittedRequest> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let context = prepared.credential_request();
+        assert_eq!(context.descriptor.instance().as_str(), INSTANCE);
+        assert!(context.is_for_project("team/sub/project"));
+        if self.deny {
+            return Err(Error::AdmissionRetired);
+        }
+        Ok(prepared
+            .authenticate(SecretString::from("admitted-test-token"))?
+            .admit(None))
+    }
+}
+#[tokio::test]
+async fn http_admission_hook_is_mandatory_and_preserves_exact_request() {
+    for deny in [false, true] {
+        let f = Fixture::new(|request| {
+            assert_eq!(request.method, "GET");
+            assert!(request.path.starts_with(
+                "/fixture/api/v4/projects/team%2Fsub%2Fproject/merge_requests/4/notes?"
+            ));
+            assert!(request.path.contains("per_page=100"));
+            assert!(request.headers.contains("Bearer admitted-test-token"));
+            reply(200, json!([]))
+        })
+        .await;
+        let credentials = Arc::new(AdmissionOnly {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            deny,
+        });
+        let provider = GitLabSourceControl::new(
+            GitlabDescriptor::with_loopback_endpoint(
+                GitlabInstance::parse(INSTANCE).unwrap(),
+                &f.endpoint,
+            )
+            .unwrap(),
+            credentials.clone(),
+        )
+        .unwrap();
+        let result = provider
+            .list_comments(
+                &RepoRef {
+                    owner: "team/sub".into(),
+                    name: "project".into(),
+                },
+                4,
+            )
+            .await;
+        if deny {
+            assert!(matches!(result, Err(Error::AdmissionRetired)));
+        } else {
+            result.unwrap();
+        }
+        assert_eq!(
+            credentials.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(f.requests().len(), usize::from(!deny));
+    }
+}
+#[tokio::test]
+async fn http_admission_redirect_never_releases_credentials_to_another_endpoint() {
+    let destination = Fixture::new(|_| reply(200, json!([]))).await;
+    for status in [301, 302, 307, 308] {
+        let url = format!("{}/stolen", destination.endpoint);
+        let f = Fixture::new(move |_| {
+            let mut result = reply(status, json!({}));
+            result.headers.push(("location".into(), url.clone()));
+            result
+        })
+        .await;
+        let credentials = Arc::new(AdmissionOnly {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            deny: false,
+        });
+        let provider = GitLabSourceControl::new(
+            GitlabDescriptor::with_loopback_endpoint(
+                GitlabInstance::parse(INSTANCE).unwrap(),
+                &f.endpoint,
+            )
+            .unwrap(),
+            credentials.clone(),
+        )
+        .unwrap();
+        let result = provider
+            .list_comments(
+                &RepoRef {
+                    owner: "team/sub".into(),
+                    name: "project".into(),
+                },
+                4,
+            )
+            .await;
+        assert!(matches!(result,Err(Error::Provider(p)) if p.kind==ProviderFailureKind::Unknown));
+        assert_eq!(f.requests().len(), 1);
+        assert_eq!(
+            credentials.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(destination.requests().is_empty());
+    }
+}
