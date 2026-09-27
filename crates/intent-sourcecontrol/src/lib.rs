@@ -21,6 +21,7 @@ pub mod identity_proof;
 pub mod instance;
 pub mod model;
 pub mod registry;
+pub mod remote_project;
 pub mod token;
 
 use async_trait::async_trait;
