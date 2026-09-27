@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.113] - 2026-09-27
+
+### 🚀 Features
+
+- Add shared host membership and portable human attribution ([#2128](https://github.com/intent-hq/intentd/pull/2128))
+
+
 ## [0.9.112] - 2026-09-27
 
 ### 🚀 Features
