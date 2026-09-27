@@ -25196,10 +25196,10 @@ mod file_tracking {
             vec![ours, incoming]
         );
         assert_eq!(commit.tree_id(), tree);
-        assert_eq!(commit.author().name(), Some("Test"));
-        assert_eq!(commit.author().email(), Some("test@example.com"));
-        assert_eq!(commit.committer().name(), Some("Test"));
-        assert_eq!(commit.committer().email(), Some("test@example.com"));
+        assert_eq!(commit.author().name().unwrap(), "Test");
+        assert_eq!(commit.author().email().unwrap(), "test@example.com");
+        assert_eq!(commit.committer().name().unwrap(), "Test");
+        assert_eq!(commit.committer().email().unwrap(), "test@example.com");
         let message = commit.message().unwrap();
         assert!(message.contains("Agent-Id: agent-merge"), "{message}");
         assert!(message.contains("Linked-Note-Id: note-merge"), "{message}");
