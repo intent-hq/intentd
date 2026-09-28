@@ -169,6 +169,12 @@ pub(crate) static V2_8: InstructionSet = InstructionSet {
     ..V2_6
 };
 
+/// Harness v2.10 teaches app file links independently of rich chat blocks.
+pub(crate) static V2_10: InstructionSet = InstructionSet {
+    common: instr!("v2.10", "common"),
+    ..V2_8
+};
+
 /// Utility agents that don't get the workspace instruction layer (port of
 /// `UTILITY_AGENTS`).
 fn is_utility_agent(agent_type: &str) -> bool {
@@ -475,8 +481,8 @@ mod tests {
         defaults()
     }
 
-    /// The latest common body includes v2.8 discussion-request guidance.
-    const COMMON_LATEST: &str = V2_8.common;
+    /// The latest common body includes v2.10 app file-link guidance.
+    const COMMON_LATEST: &str = V2_10.common;
     /// The latest set's workspace body. Harness v2.2 rewrites the workspace
     /// status-message guidance to one short plain sentence.
     const WORKSPACE_LATEST: &str = V2_2.workspace;
@@ -958,7 +964,8 @@ mod tests {
         assert!(!out.contains("ws.agent.reportBlocker"));
         assert!(!out.contains("ws.agent.requestDiscussion"));
         // Neighboring sections survive intact, with clean separation.
-        assert!(out.contains("(which replaces everything).\n\n## Show media"));
+        assert!(out.contains("(which replaces everything).\n\n## Open workspace files in the app"));
+        assert!(out.contains("rich chat blocks.\n\n## Show media"));
         assert!(
             out.contains("for the workspace card screenshot.\n\n## Waiting on External Conditions")
         );
