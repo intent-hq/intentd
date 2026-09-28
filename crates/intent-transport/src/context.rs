@@ -91,6 +91,70 @@ impl Drop for ReadConnectionGuard {
     }
 }
 
+/// Local listeners historically leave ordinary accepted tasks alive on stop.
+/// Retain only weak read-owner allocations so that stop still closes their
+/// qualified cohorts, including a bind completing after listener shutdown.
+#[cfg(any(unix, windows))]
+#[derive(Default)]
+pub(crate) struct ReadConnectionOwners {
+    state: std::sync::Mutex<ReadOwnerState>,
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Default)]
+struct ReadOwnerState {
+    closed: bool,
+    owners: Vec<std::sync::Weak<dyn RepositoryReadConnection>>,
+}
+
+#[cfg(any(unix, windows))]
+impl ReadConnectionOwners {
+    pub(crate) fn register(&self, guard: &ReadConnectionGuard) {
+        let Some(owner) = &guard.0 else { return };
+        let closed = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.owners.retain(|owner| owner.strong_count() != 0);
+            state.owners.push(Arc::downgrade(owner));
+            state.closed
+        };
+        if closed {
+            owner.retire();
+        }
+    }
+
+    fn retire(&self) {
+        let owners = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.closed = true;
+            state
+                .owners
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+                .collect::<Vec<_>>()
+        };
+        for owner in owners {
+            owner.retire();
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Default)]
+pub(crate) struct ReadListenerGuard(pub(crate) Arc<ReadConnectionOwners>);
+
+#[cfg(any(unix, windows))]
+impl Drop for ReadListenerGuard {
+    fn drop(&mut self) {
+        self.0.retire();
+    }
+}
+
 struct RequestCompletion(Arc<dyn RepositoryReadRequestScope>);
 
 impl Drop for RequestCompletion {

@@ -352,18 +352,73 @@ pub(crate) fn check_envelope(value: &Value) -> EnvelopeCheck<'_> {
 /// Handle one JSON-RPC frame. Returns `Some(response)` for requests and `None`
 /// for notifications (including unknown / failed ones, per §3.4).
 pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<String> {
+    prepare_message(api, message)
+        .await
+        .map(PreparedReply::into_frame)
+}
+
+/// Classification comes from dispatch/encoding, never from response JSON.
+pub(crate) struct PreparedReply {
+    pub(crate) frame: String,
+    pub(crate) service: Option<(
+        intent_core::repository_request::RepositoryReadReplyKind,
+        Value,
+    )>,
+}
+
+impl PreparedReply {
+    pub(crate) fn transport(frame: String) -> Self {
+        Self {
+            frame,
+            service: None,
+        }
+    }
+
+    pub(crate) fn into_frame(self) -> String {
+        self.frame
+    }
+}
+
+fn prepared_error(id: &Value, code: i32, message: &str, data: Option<Value>) -> PreparedReply {
+    PreparedReply::transport(error_string(id, code, message, data))
+}
+
+/// A final local refusal uses the existing domain-error encoder and size cap.
+pub(crate) fn delivery_error(id: &Value, error: Error) -> String {
+    encode_dispatch_result(
+        id,
+        "",
+        false,
+        Err(domain_to_rpc(error)),
+        crate::MAX_OUTBOUND_MESSAGE_BYTES,
+    )
+    .frame
+    .expect("a request error has a frame")
+}
+
+pub(crate) async fn prepare_message(
+    api: &dyn WorkspaceApi,
+    message: &str,
+) -> Option<PreparedReply> {
     let value: Value = match serde_json::from_str(message) {
         Ok(v) => v,
         // Parse errors are always answered with id null (§9), even for
         // would-be notifications — notification status is not yet known.
-        Err(_) => return Some(error_string(&Value::Null, PARSE_ERROR, "Parse error", None)),
+        Err(_) => {
+            return Some(prepared_error(
+                &Value::Null,
+                PARSE_ERROR,
+                "Parse error",
+                None,
+            ))
+        }
     };
 
     // Envelope validation (-32600). Answered even for notification-shaped
     // frames: notification status is not trusted until the envelope is valid.
     let (echo_id, method, is_notification) = match check_envelope(&value) {
         EnvelopeCheck::NotObject => {
-            return Some(error_string(
+            return Some(prepared_error(
                 &Value::Null,
                 INVALID_REQUEST,
                 "Invalid Request: expected an object",
@@ -371,7 +426,7 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
             ))
         }
         EnvelopeCheck::BadJsonRpc { echo_id } => {
-            return Some(error_string(
+            return Some(prepared_error(
                 &echo_id,
                 INVALID_REQUEST,
                 "Invalid Request: jsonrpc must be \"2.0\"",
@@ -379,7 +434,7 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
             ))
         }
         EnvelopeCheck::BadMethod { echo_id } => {
-            return Some(error_string(
+            return Some(prepared_error(
                 &echo_id,
                 INVALID_REQUEST,
                 "Invalid Request: method must be a non-empty string",
@@ -387,7 +442,7 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
             ))
         }
         EnvelopeCheck::BadId => {
-            return Some(error_string(
+            return Some(prepared_error(
                 &Value::Null,
                 INVALID_REQUEST,
                 "Invalid Request: id must be a string, number, or null",
@@ -410,7 +465,7 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
             if is_notification {
                 return None;
             }
-            return Some(error_string(
+            return Some(prepared_error(
                 &echo_id,
                 INVALID_PARAMS,
                 "Invalid params",
@@ -438,6 +493,11 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
     let profile_span = span.clone();
     async move {
         let result = dispatch(api, method, &params).await;
+        let kind = if result.is_ok() {
+            intent_core::repository_request::RepositoryReadReplyKind::Result
+        } else {
+            intent_core::repository_request::RepositoryReadReplyKind::ServiceError
+        };
         let encode_started = Instant::now();
         let encoded = encode_dispatch_result(
             &echo_id,
@@ -458,7 +518,16 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
         profile_span.record("encode_elapsed_ms", encode_elapsed_ms);
         profile_span.record("oversized_replacement", encoded.oversized_replacement);
         profile_span.record("encode_failed", encoded.encode_failed);
-        encoded.frame
+        encoded.frame.map(|frame| {
+            if encoded.oversized_replacement || encoded.encode_failed {
+                PreparedReply::transport(frame)
+            } else {
+                PreparedReply {
+                    frame,
+                    service: Some((kind, echo_id)),
+                }
+            }
+        })
     }
     .instrument(span)
     .await

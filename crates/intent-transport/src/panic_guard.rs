@@ -123,6 +123,43 @@ where
     }
 }
 
+/// Typed counterpart for ordinary router dispatch. Service failures keep their
+/// classification; only an actual panic becomes a public transport error.
+pub(crate) async fn guard_prepared<F>(
+    method: &str,
+    rpc_id: Option<Value>,
+    fut: F,
+) -> Option<crate::router::PreparedReply>
+where
+    F: Future<Output = Option<crate::router::PreparedReply>>,
+{
+    let result = AssertUnwindSafe(async {
+        maybe_inject_panic(method);
+        fut.await
+    })
+    .catch_unwind()
+    .await;
+    match result {
+        Ok(reply) => {
+            if let Some(reply) = &reply {
+                crate::protocol::warn_if_large_frame(
+                    crate::protocol::FrameDirection::Outbound,
+                    method,
+                    reply.frame.len(),
+                );
+            }
+            reply
+        }
+        Err(payload) => {
+            tracing::error!(method, panic = %panic_message(payload.as_ref()),
+                "JSON-RPC handler panicked; connection kept alive");
+            rpc_id
+                .as_ref()
+                .map(|id| crate::router::PreparedReply::transport(internal_error_frame(id)))
+        }
+    }
+}
+
 /// Run an async handler that sends its own frames and returns channel
 /// liveness. On panic, sends the `-32603` frame for requests (nothing for
 /// notifications) and reports whether the outbound channel is still open.

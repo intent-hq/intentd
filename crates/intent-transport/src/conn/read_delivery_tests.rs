@@ -34,6 +34,10 @@ impl Gate {
 }
 
 #[derive(Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent fixture observations of qualification, error policy, retirement and transfer"
+)]
 struct ScopeState {
     retired: bool,
     qualified: bool,
@@ -259,21 +263,25 @@ impl Harness {
         }
     }
 
-    async fn dispatch(&self, raw: &str) -> bool {
+    fn dispatch(&self, raw: &str) -> impl Future<Output = bool> + Send + 'static {
+        let raw = raw.to_string();
         let api: Arc<dyn WorkspaceApi> = self.api.clone();
-        let reverse = ReverseChannel::new(self.tx.priority_sender());
-        let registry = Arc::new(PrimaryReverseRegistry::new());
-        let guard = registry.register(reverse.clone(), ReverseTransport::Wss);
+        let tx = self.tx.clone();
+        let bus = self.bus.clone();
+        let limiter = self.limiter.clone();
         with_credential_context(
             true,
             Some(self.caller.clone()),
             Some(self.credential.clone()),
-            self.connection.run(async {
+            self.connection.run(async move {
+                let reverse = ReverseChannel::new(tx.priority_sender());
+                let registry = Arc::new(PrimaryReverseRegistry::new());
+                let guard = registry.register(reverse.clone(), ReverseTransport::Wss);
                 process_frame(
-                    raw,
+                    &raw,
                     &api,
-                    &self.bus,
-                    &self.tx,
+                    &bus,
+                    &tx,
                     &mut ConnSubs::default(),
                     &mut ForwardRegistry::default(),
                     &reverse,
@@ -282,12 +290,11 @@ impl Harness {
                     None,
                     &mut None,
                     false,
-                    &self.limiter,
+                    &limiter,
                 )
                 .await
             }),
         )
-        .await
     }
 
     async fn response(&mut self) -> Value {
@@ -353,4 +360,576 @@ async fn original_retirement_prevents_the_prepared_private_response() {
         "private response escaped original retirement: {reply}"
     );
     assert!(!reply.to_string().contains("original payload"));
+}
+
+async fn until(mut ready: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !ready() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn capture_precedes_a_full_queue_and_holds_no_limiter_while_waiting() {
+    let mut h = Harness::new(FixtureApi::default(), HostRole::Owner).await;
+    for _ in 0..PRIORITY_CAPACITY {
+        h.tx.priority.send("occupied".into()).await.unwrap();
+    }
+    let call = h.dispatch(&request("private"));
+    tokio::pin!(call);
+    tokio::select! {
+        biased;
+        result = &mut call => panic!("full queue did not wait: {result}"),
+        () = tokio::task::yield_now() => {}
+    }
+    let original = h.original();
+    assert_eq!(original.scopes.lock().unwrap().len(), 1);
+    assert_eq!(h.limiter.available_permits(), Some(1));
+    h.connection.retire();
+    assert_eq!(h.rx.priority.recv().await.as_deref(), Some("occupied"));
+    assert!(call.await);
+    for _ in 1..PRIORITY_CAPACITY {
+        assert_eq!(h.rx.priority.recv().await.as_deref(), Some("occupied"));
+    }
+    assert!(h.response().await.get("result").is_none());
+}
+
+#[tokio::test]
+async fn unpolled_frame_and_pending_permission_drop_retire_escaped_original_scopes() {
+    let h = Harness::new(FixtureApi::default(), HostRole::Owner).await;
+    let api: Arc<dyn WorkspaceApi> = h.api.clone();
+    let reverse = ReverseChannel::new(h.tx.priority_sender());
+    let registry = Arc::new(PrimaryReverseRegistry::new());
+    let guard = registry.register(reverse.clone(), ReverseTransport::Wss);
+    with_credential_context(
+        true,
+        Some(h.caller.clone()),
+        Some(h.credential.clone()),
+        h.connection.run(async {
+            let raw = request("private");
+            let mut subs = ConnSubs::default();
+            let mut forwards = ForwardRegistry::default();
+            let mut client = None;
+            let future = process_frame(
+                &raw,
+                &api,
+                &h.bus,
+                &h.tx,
+                &mut subs,
+                &mut forwards,
+                &reverse,
+                &guard,
+                None,
+                None,
+                &mut client,
+                false,
+                &h.limiter,
+            );
+            let escaped = h.original().scopes.lock().unwrap()[0].clone();
+            assert!(!escaped.state.lock().unwrap().retired);
+            drop(future);
+            assert!(escaped.state.lock().unwrap().retired);
+        }),
+    )
+    .await;
+
+    let gate = Arc::new(Gate::default());
+    let h = Harness::new(
+        FixtureApi {
+            permission: Some(gate.clone()),
+            ..FixtureApi::default()
+        },
+        HostRole::Guest,
+    )
+    .await;
+    let task = tokio::spawn(h.dispatch(&request("private")));
+    gate.entered.notified().await;
+    let escaped = h.original().scopes.lock().unwrap()[0].clone();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert!(escaped.state.lock().unwrap().retired);
+    assert_eq!(h.limiter.available_permits(), Some(1));
+}
+
+#[tokio::test]
+async fn final_delivery_wait_is_handler_work_and_retirement_has_both_orders() {
+    for retire_first in [true, false] {
+        let gate = Arc::new(Gate::default());
+        let mut h = Harness::new(
+            FixtureApi {
+                delivery: Some(gate.clone()),
+                ..FixtureApi::default()
+            },
+            HostRole::Owner,
+        )
+        .await;
+        assert!(h.dispatch(&request("private")).await);
+        gate.entered.notified().await;
+        assert_eq!(h.limiter.available_permits(), Some(0));
+        assert!(h.rx.priority.try_recv().is_err());
+        if retire_first {
+            h.connection.retire();
+        }
+        gate.release.notify_one();
+        until(|| h.limiter.available_permits() == Some(1)).await;
+        if !retire_first {
+            h.connection.retire();
+        }
+        let reply = h.response().await;
+        assert_eq!(reply.get("result").is_some(), !retire_first);
+        let escaped = h.original().scopes.lock().unwrap()[0].clone();
+        until(|| escaped.state.lock().unwrap().retired).await;
+        assert_eq!(escaped.state.lock().unwrap().sent, !retire_first);
+    }
+}
+
+#[tokio::test]
+async fn final_future_abort_releases_original_packet_permit_and_request() {
+    let gate = Arc::new(Gate::default());
+    let h = Harness::new(
+        FixtureApi {
+            delivery: Some(gate.clone()),
+            ..FixtureApi::default()
+        },
+        HostRole::Owner,
+    )
+    .await;
+    let captured = with_credential_context(
+        true,
+        Some(h.caller.clone()),
+        Some(h.credential.clone()),
+        h.connection
+            .run(async { crate::context::CapturedFrame::capture() }),
+    )
+    .await;
+    let scope = h.original().scopes.lock().unwrap()[0].clone();
+    let slot = h.tx.reserve_priority().await.unwrap();
+    let permit = h.limiter.try_acquire().unwrap();
+    let api = h.api.clone();
+    let task = tokio::spawn(async move {
+        captured
+            .run(finish_prepared_rpc(
+                &captured,
+                permit,
+                crate::router::prepare_message(api.as_ref(), &request("private")),
+                slot,
+            ))
+            .await;
+    });
+    gate.entered.notified().await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert!(scope.state.lock().unwrap().retired);
+    assert!(!scope.state.lock().unwrap().sent);
+    assert_eq!(h.limiter.available_permits(), Some(1));
+    assert!(h.tx.priority_idle());
+}
+
+#[tokio::test]
+async fn typed_service_failures_and_public_transport_errors_keep_distinct_policies() {
+    for path in [
+        "private-error",
+        "provider-error",
+        "oversized",
+        "panic",
+        "ordinary",
+    ] {
+        let gate = Arc::new(Gate::default());
+        let mut h = Harness::new(
+            FixtureApi {
+                handler: Some(gate.clone()),
+                ..FixtureApi::default()
+            },
+            HostRole::Owner,
+        )
+        .await;
+        assert!(h.dispatch(&request(path)).await);
+        gate.entered.notified().await;
+        h.connection.retire();
+        gate.release.notify_one();
+        let reply = h.response().await;
+        assert_eq!(reply["id"], 7);
+        match path {
+            "private-error" => {
+                assert!(!reply.to_string().contains("private service error"));
+                assert!(reply
+                    .to_string()
+                    .contains("original read delivery unavailable"));
+            }
+            "provider-error" => {
+                assert!(reply.to_string().contains("actual retained provider error"));
+            }
+            "oversized" => assert_eq!(reply["error"]["code"], -32010),
+            "panic" => assert_eq!(reply["error"]["code"], -32603),
+            "ordinary" => assert!(reply.get("result").is_some()),
+            _ => unreachable!(),
+        }
+        let escaped = h.original().scopes.lock().unwrap()[0].clone();
+        until(|| escaped.state.lock().unwrap().retired).await;
+        let state = escaped.state.lock().unwrap();
+        if matches!(path, "private-error" | "provider-error") {
+            assert_eq!(state.kinds, [RepositoryReadReplyKind::ServiceError]);
+        } else if matches!(path, "panic" | "oversized") {
+            assert!(state.kinds.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn independent_completion_and_equal_public_ids_never_rebind_scopes() {
+    let mut first = Harness::new(FixtureApi::default(), HostRole::Owner).await;
+    let mut second = Harness::new(
+        FixtureApi {
+            principal: first.api.principal.clone(),
+            ..FixtureApi::default()
+        },
+        HostRole::Owner,
+    )
+    .await;
+    for _ in 0..2 {
+        assert!(first.dispatch(&request("private")).await);
+        let reply = first.response().await;
+        assert_eq!(reply["result"]["scoped"], true);
+        assert!(reply["result"].get("error").is_some());
+    }
+    let a = first.original();
+    let scopes = a.scopes.lock().unwrap().clone();
+    assert_eq!(scopes.len(), 2);
+    assert!(!Arc::ptr_eq(&scopes[0].state, &scopes[1].state));
+    first.connection.retire();
+    assert!(second.dispatch(&request("private")).await);
+    assert_eq!(second.response().await["result"]["scoped"], true);
+    assert!(!second.original().cohort.lock().unwrap().closed);
+}
+
+#[tokio::test]
+async fn notifications_overload_and_invalid_frames_keep_existing_queue_policy() {
+    let gate = Arc::new(Gate::default());
+    let mut h = Harness::new(
+        FixtureApi {
+            handler: Some(gate.clone()),
+            ..FixtureApi::default()
+        },
+        HostRole::Owner,
+    )
+    .await;
+    let raw =
+        json!({"jsonrpc":"2.0","method":"settings.get","params":{"path":"private"}}).to_string();
+    assert!(h.dispatch(&raw).await);
+    gate.entered.notified().await;
+    assert_eq!(h.limiter.available_permits(), Some(0));
+    assert!(h.dispatch(&request("private")).await);
+    assert_eq!(h.response().await["error"]["code"], -32011);
+    assert!(h.dispatch("not json").await);
+    assert_eq!(h.response().await["error"]["code"], -32700);
+    gate.release.notify_one();
+    until(|| h.limiter.available_permits() == Some(1)).await;
+    assert!(h.rx.priority.try_recv().is_err());
+    assert!(h.tx.priority_idle());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn actual_uds_binding_and_listener_shutdown_preserve_original_cohorts() {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+    let dir = tempfile::Builder::new()
+        .prefix("carrier-uds-")
+        .tempdir()
+        .unwrap();
+    let bus = EventBus::new(
+        intent_store::Store::open(&dir.path().join("bus.db"))
+            .await
+            .unwrap(),
+    );
+    let api = Arc::new(FixtureApi::default());
+    let path = dir.path().join("daemon.sock");
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server_api = api.clone();
+    let server_path = path.clone();
+    let server = tokio::spawn(async move {
+        crate::listener::serve_uds(server_api, bus, &server_path, None, async {
+            let _ = stopped.await;
+        })
+        .await
+    });
+    until(|| path.exists()).await;
+    let socket = tokio::net::UnixStream::connect(&path).await.unwrap();
+    let (read, mut write) = socket.into_split();
+    let mut lines = tokio::io::BufReader::new(read).lines();
+    for _ in 0..2 {
+        write
+            .write_all(format!("{}\n", request("private")).as_bytes())
+            .await
+            .unwrap();
+        let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&line).unwrap()["result"]["scoped"],
+            true
+        );
+    }
+    let original = api.connections.lock().unwrap()[0].clone();
+    let scopes = original.scopes.lock().unwrap().clone();
+    assert_eq!(scopes.len(), 2);
+    assert!(scopes.iter().all(|scope| scope.credential.is_none()));
+    assert_eq!(
+        *api.entries.lock().unwrap(),
+        [RepositoryWireEntry::AdmittedLocal]
+    );
+    assert!(!original.cohort.lock().unwrap().closed);
+    stop.send(()).unwrap();
+    server.await.unwrap().unwrap();
+    assert!(original.cohort.lock().unwrap().closed);
+    // The old listener policy keeps accepted ordinary connections alive.
+    // Shutdown retires only qualified scopes, not ordinary response handling.
+    for path in ["private", "ordinary"] {
+        write
+            .write_all(format!("{}\n", request(path)).as_bytes())
+            .await
+            .unwrap();
+        let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&line)
+                .unwrap()
+                .get("result")
+                .is_some(),
+            path == "ordinary"
+        );
+    }
+    drop(write);
+    drop(lines);
+}
+
+struct MemoryToken(Mutex<String>);
+
+impl crate::auth::TokenStore for MemoryToken {
+    fn load_token(&self) -> Option<String> {
+        Some(self.0.lock().unwrap().clone())
+    }
+    fn store_token(&self, token: &str) -> intent_core::Result<()> {
+        *self.0.lock().unwrap() = token.to_string();
+        Ok(())
+    }
+}
+
+type TestWebSocket =
+    tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
+
+async fn connect_wss(port: u16, certificate: &crate::TlsCertificate, token: &str) -> TestWebSocket {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut certificate.cert.as_bytes()) {
+        roots.add(cert.unwrap()).unwrap();
+    }
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let socket = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let stream = tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect(
+            rustls_pki_types::ServerName::try_from("localhost").unwrap(),
+            socket,
+        )
+        .await
+        .unwrap();
+    let mut request = format!("wss://localhost:{port}/ws")
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert("Authorization", format!("Bearer {token}").parse().unwrap());
+    request
+        .headers_mut()
+        .insert("Origin", "http://localhost:3000".parse().unwrap());
+    tokio_tungstenite::client_async(request, stream)
+        .await
+        .unwrap()
+        .0
+}
+
+async fn ws_response(socket: &mut TestWebSocket) -> Value {
+    use futures::StreamExt as _;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match socket.next().await.unwrap().unwrap() {
+                tokio_tungstenite::tungstenite::Message::Text(text) => {
+                    return serde_json::from_str(&text).unwrap()
+                }
+                tokio_tungstenite::tungstenite::Message::Ping(_) => {}
+                other => panic!("expected original response, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn actual_wss_binding_retains_exact_bearer_across_independent_requests() {
+    use futures::SinkExt as _;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let dir = tempfile::Builder::new()
+        .prefix("carrier-wss-")
+        .tempdir()
+        .unwrap();
+    let bus = EventBus::new(
+        intent_store::Store::open(&dir.path().join("bus.db"))
+            .await
+            .unwrap(),
+    );
+    let api = Arc::new(FixtureApi::default());
+    let certificate = crate::ensure_tls_certificate(dir.path()).unwrap();
+    let token = "a".repeat(64);
+    let tokens = Arc::new(crate::AsyncTokenStore::new(Arc::new(MemoryToken(
+        Mutex::new(token.clone()),
+    ))));
+    let server = crate::WsApiServer::new(
+        api.clone(),
+        bus,
+        &certificate,
+        &tokens,
+        crate::WsOptions {
+            base_port: 0,
+            ..crate::WsOptions::default()
+        },
+        None,
+    )
+    .unwrap();
+    let port = server.start().await.unwrap();
+    let mut socket = connect_wss(port, &certificate, &token).await;
+    for _ in 0..2 {
+        socket
+            .send(Message::Text(request("private").into()))
+            .await
+            .unwrap();
+        assert_eq!(ws_response(&mut socket).await["result"]["scoped"], true);
+    }
+    let original = api.connections.lock().unwrap()[0].clone();
+    let scopes = original.scopes.lock().unwrap().clone();
+    assert_eq!(scopes.len(), 2);
+    assert_eq!(*api.entries.lock().unwrap(), [RepositoryWireEntry::Bearer]);
+    let (
+        Some(WireCredential::Legacy {
+            authority: first, ..
+        }),
+        Some(WireCredential::Legacy {
+            authority: second, ..
+        }),
+    ) = (&scopes[0].credential, &scopes[1].credential)
+    else {
+        panic!("actual WSS bearer missing")
+    };
+    assert!(Arc::ptr_eq(first, second));
+    assert!(!Arc::ptr_eq(&scopes[0].state, &scopes[1].state));
+    socket.close(None).await.unwrap();
+    until(|| original.cohort.lock().unwrap().closed).await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn actual_wss_close_rotation_shutdown_and_heartbeat_retire_held_requests() {
+    use futures::SinkExt as _;
+    use tokio_tungstenite::tungstenite::Message;
+
+    for mode in ["close", "rotation", "shutdown", "heartbeat"] {
+        let dir = tempfile::Builder::new()
+            .prefix("carrier-wss-close-")
+            .tempdir()
+            .unwrap();
+        let bus = EventBus::new(
+            intent_store::Store::open(&dir.path().join("bus.db"))
+                .await
+                .unwrap(),
+        );
+        let handler = Arc::new(Gate::default());
+        let api = Arc::new(FixtureApi {
+            handler: Some(handler.clone()),
+            ..FixtureApi::default()
+        });
+        let certificate = crate::ensure_tls_certificate(dir.path()).unwrap();
+        let token = "c".repeat(64);
+        let tokens = Arc::new(crate::AsyncTokenStore::new(Arc::new(MemoryToken(
+            Mutex::new(token.clone()),
+        ))));
+        let (heartbeat, gate) = tokio::sync::watch::channel(false);
+        let options = if mode == "heartbeat" {
+            crate::WsOptions {
+                base_port: 0,
+                heartbeat_interval: Duration::from_millis(10),
+                heartbeat_timeout: Duration::from_millis(10),
+                heartbeat_gate: Some(gate),
+                ..crate::WsOptions::default()
+            }
+        } else {
+            crate::WsOptions {
+                base_port: 0,
+                ..crate::WsOptions::default()
+            }
+        };
+        let server =
+            crate::WsApiServer::new(api.clone(), bus, &certificate, &tokens, options, None)
+                .unwrap();
+        let mut socket = connect_wss(server.start().await.unwrap(), &certificate, &token).await;
+        socket
+            .send(Message::Text(request("private").into()))
+            .await
+            .unwrap();
+        handler.entered.notified().await;
+        let original = api.connections.lock().unwrap()[0].clone();
+        let scope = original.scopes.lock().unwrap()[0].clone();
+        let shutdown = if mode == "shutdown" {
+            let owner = server.clone();
+            Some(tokio::spawn(async move {
+                owner.stop().await;
+            }))
+        } else {
+            None
+        };
+        match mode {
+            "close" => {
+                socket.close(None).await.unwrap();
+            }
+            "rotation" => {
+                tokens.store_token(&"d".repeat(64)).await.unwrap();
+            }
+            "heartbeat" => {
+                heartbeat.send(true).unwrap();
+            }
+            _ => {}
+        }
+        until(|| original.cohort.lock().unwrap().closed).await;
+        assert!(scope.state.lock().unwrap().retired, "{mode}");
+        handler.release.notify_one();
+        if mode == "rotation" {
+            let reply = ws_response(&mut socket).await;
+            assert!(reply.get("result").is_none());
+            assert!(!reply.to_string().contains("original payload"));
+        }
+        until(|| !scope.state.lock().unwrap().kinds.is_empty()).await;
+        assert!(!scope.state.lock().unwrap().sent);
+        if let Some(task) = shutdown {
+            task.await.unwrap();
+        }
+        server.stop().await;
+    }
 }
