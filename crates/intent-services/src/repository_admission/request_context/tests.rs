@@ -207,12 +207,10 @@ async fn acp_scope_retains_the_original_capture_through_operation_and_preparatio
         Err(AdmissionError::Unavailable)
     ));
     drop(scope);
-    assert!(original
-        .as_ref()
-        .unwrap()
-        .retirement
-        .check_current()
-        .is_ok());
+    assert_eq!(
+        original.as_ref().unwrap().retirement.check_current(),
+        Err(AdmissionError::Retired)
+    );
     let leaf = original.take().unwrap().retirement.clone();
     assert_eq!(leaf.check_current(), Err(AdmissionError::Retired));
 }

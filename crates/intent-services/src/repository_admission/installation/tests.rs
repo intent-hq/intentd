@@ -328,6 +328,117 @@ mod read_owner {
     }
 
     #[tokio::test]
+    async fn final_scope_drop_retires_escaped_read_and_source_after_successful_preparation() {
+        let f = Fixture::new().await;
+        let owner = confirmed(&f).await;
+        let callback = anchored(&f, &owner);
+        let committed = serde_json::to_value(
+            f.services
+                .store()
+                .get_agent_session(&f.agent)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        for retain_clone in [false, true] {
+            let scope = McpRequestContext::capture(&callback);
+            let clone = scope.clone();
+            let sibling = McpRequestContext::capture(&callback);
+            let sibling_read = read(&sibling, caller(&f)).await.unwrap();
+            let mut escaped = None;
+            let mut result = None;
+            with_wire_credential(
+                None,
+                with_caller(
+                    caller(&f),
+                    scope.scope(Box::pin(async {
+                        escaped = Some((
+                            current_read_request().unwrap(),
+                            current_source_lifetime().unwrap(),
+                        ));
+                        result = Some("original completed body");
+                    })),
+                ),
+            )
+            .await;
+            let (original_read, original_source) = escaped.unwrap();
+            let remaining = if retain_clone {
+                drop(scope);
+                clone
+            } else {
+                drop(clone);
+                scope
+            };
+            let mut prepared = None;
+            with_wire_credential(
+                None,
+                with_caller(
+                    caller(&f),
+                    remaining.scope(Box::pin(async {
+                        assert!(Arc::ptr_eq(
+                            &original_read,
+                            &current_read_request().unwrap()
+                        ));
+                        assert!(original_read.check_current().is_ok());
+                        assert!(original_source.retirement().check_current().is_ok());
+                        let source = current_source_lifetime().unwrap();
+                        let subscription = source
+                            .subscribe(
+                                f.services.store(),
+                                &caller(&f),
+                                &[RepositoryLifecycleKey::Database],
+                            )
+                            .unwrap();
+                        drop(subscription);
+                        assert!(original_read.check_current().is_ok());
+                        prepared = Some("original completed preparation");
+                    })),
+                ),
+            )
+            .await;
+            drop(remaining);
+            with_wire_credential(
+                None,
+                with_caller(caller(&f), async {
+                    assert_eq!(
+                        (
+                            original_read.check_current(),
+                            original_source.retirement().check_current(),
+                        ),
+                        (Err(AdmissionError::Retired), Err(AdmissionError::Retired)),
+                        "escaped metadata must not outlive the final MCP scope"
+                    );
+                    assert_eq!(
+                        original_source
+                            .retirement()
+                            .dispatch(|| Ok("late transfer")),
+                        Err(AdmissionError::Retired)
+                    );
+                    assert!(sibling_read.check_current().is_ok());
+                    assert!(read(&sibling, caller(&f)).await.is_ok());
+                    let fresh = McpRequestContext::capture(&callback);
+                    assert!(read(&fresh, caller(&f)).await.is_ok());
+                    assert_eq!(original_read.check_current(), Err(AdmissionError::Retired));
+                }),
+            )
+            .await;
+            assert_eq!(result, Some("original completed body"));
+            assert_eq!(prepared, Some("original completed preparation"));
+            assert_eq!(
+                serde_json::to_value(
+                    f.services
+                        .store()
+                        .get_agent_session(&f.agent)
+                        .await
+                        .unwrap()
+                )
+                .unwrap(),
+                committed
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn same_capture_survives_normal_source_cleanup_and_retires_with_original_request() {
         let f = Fixture::new().await;
         let owner = confirmed(&f).await;
