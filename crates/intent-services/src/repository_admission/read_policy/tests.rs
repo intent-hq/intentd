@@ -780,3 +780,6 @@ async fn unavailable_git_control_does_not_repair_old_source_but_allows_same_requ
         vec![(Boundary::HostPromise, 2), (Boundary::DirectResponse, 2)]
     );
 }
+
+#[path = "tests/aliases.rs"]
+mod aliases;
