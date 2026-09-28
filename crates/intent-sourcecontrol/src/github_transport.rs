@@ -36,7 +36,15 @@ enum AttemptError {
 /// Delegate all real responses/errors to Octocrab's unchanged policy. A local
 /// admission refusal is not a failed transport attempt and must not be retried.
 #[derive(Clone)]
-struct AdmittedRetry(RetryConfig);
+struct AdmittedRetry {
+    policy: RetryConfig,
+    admission: Option<crate::request_budget::Admission>,
+}
+
+/// A retry admitted while its previous response is still available. Consumed
+/// by the counted service; deliberately not copied by `clone_request`.
+#[derive(Clone)]
+struct AdmittedAttempt;
 
 impl<B> tower::retry::Policy<http::Request<OctoBody>, http::Response<B>, AttemptError>
     for AdmittedRetry
@@ -57,8 +65,18 @@ impl<B> tower::retry::Policy<http::Request<OctoBody>, http::Response<B>, Attempt
             Err(AttemptError::Transport(error)) => Err(error),
             Err(AttemptError::Denied) => return None,
         };
-        let retry = self.0.retry(req, &mut transport);
+        let retry = self.policy.retry(req, &mut transport);
         *result = transport.map_err(AttemptError::Transport);
+        if retry.is_some() {
+            if let Some(admit) = &self.admission {
+                // Refuse before Tower discards the response for the next
+                // attempt, preserving quota status/body for normal decoding.
+                if !admit() {
+                    return None;
+                }
+                req.extensions_mut().insert(AdmittedAttempt);
+            }
+        }
         retry
     }
 
@@ -67,7 +85,7 @@ impl<B> tower::retry::Policy<http::Request<OctoBody>, http::Response<B>, Attempt
             _,
             http::Response<B>,
             hyper_util::client::legacy::Error,
-        >>::clone_request(&mut self.0, req)
+        >>::clone_request(&mut self.policy, req)
     }
 }
 
@@ -123,7 +141,8 @@ impl Transport {
         // Octocrab buffers requests on another task; capture before that hop.
         let context = traffic::context();
         let admission = crate::request_budget::current();
-        let counted = tower::service_fn(move |request: http::Request<OctoBody>| {
+        let retry_admission = admission.clone();
+        let counted = tower::service_fn(move |mut request: http::Request<OctoBody>| {
             let mut pool = pool.clone();
             let admission = admission.clone();
             let mut context = context.clone();
@@ -133,7 +152,12 @@ impl Transport {
             let page = page && operation != Operation::Other && operation != Operation::QuotaProbe;
             context.continuation |= continuation;
             async move {
-                if admission.as_ref().is_some_and(|admit| !admit()) {
+                if request
+                    .extensions_mut()
+                    .remove::<AdmittedAttempt>()
+                    .is_none()
+                    && admission.as_ref().is_some_and(|admit| !admit())
+                {
                     return Err(AttemptError::Denied);
                 }
                 context.start(operation, graphql, page);
@@ -162,11 +186,14 @@ impl Transport {
         // Match Octocrab's existing retry policy, including no retries for
         // the gate-owned quota probes. Every retry enters `counted` separately.
         let retry = tower::retry::Retry::new(
-            AdmittedRetry(if quota_probe {
-                RetryConfig::None
-            } else {
-                RetryConfig::Simple(3)
-            }),
+            AdmittedRetry {
+                policy: if quota_probe {
+                    RetryConfig::None
+                } else {
+                    RetryConfig::Simple(3)
+                },
+                admission: retry_admission,
+            },
             counted,
         );
         let redirects = tower_http::follow_redirect::FollowRedirectLayer::new().layer(retry);
