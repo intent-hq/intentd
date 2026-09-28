@@ -251,6 +251,7 @@ impl RepositoryOrigin {
     pub(super) fn accept_session<T>(
         self: &Arc<Self>,
         attempt: SessionAttempt,
+        connection: &Arc<intent_acp::Connection>,
         outcome: crate::agent_session::RepositorySessionOutcome<T>,
     ) -> (T, Option<ConfirmedCallbackAttempt>) {
         let mut delivery = None;
@@ -260,8 +261,19 @@ impl RepositoryOrigin {
                 let context = owner.callback();
                 let retirement = owner.retirement();
                 let original_attempt = SessionAttempt(attempt.0.clone());
+                let blueprint = self.state.lock().unwrap().blueprint.clone();
+                // Bind once, synchronously, outside the state lock while the
+                // consumed original physical owner is still directly available.
+                let live = outcome.query.as_ref().and_then(|_| {
+                    let original = self.original.as_ref()?;
+                    blueprint.as_ref()?.bind_context(
+                        connection,
+                        &owner,
+                        &original.workspace,
+                        &original.agent,
+                    )
+                });
                 if self.install(attempt, owner) {
-                    let blueprint = self.state.lock().unwrap().blueprint.clone();
                     if let (Some(query), Some(blueprint)) = (outcome.query, blueprint) {
                         delivery = Some(ConfirmedCallbackAttempt::new(
                             self,
@@ -270,6 +282,7 @@ impl RepositoryOrigin {
                             retirement,
                             blueprint,
                             query,
+                            live,
                         ));
                     }
                 }
@@ -306,9 +319,30 @@ impl RepositoryOrigin {
         drop(pending);
     }
 
+    pub(super) fn capture_prompt(
+        &self,
+        connection: &Arc<intent_acp::Connection>,
+    ) -> Option<callback_delivery::RepositoryPromptInput> {
+        let endpoint = {
+            let state = self.state.lock().unwrap();
+            if state.retired {
+                return None;
+            }
+            state.endpoint.clone()?
+        };
+        endpoint.capture_prompt(connection)
+    }
+
     pub(super) fn interrupt_requests(&self) {
-        if let Some(owner) = &self.state.lock().unwrap().owner {
-            owner.interrupt_requests();
+        let endpoint = {
+            let state = self.state.lock().unwrap();
+            if let Some(owner) = &state.owner {
+                owner.interrupt_requests();
+            }
+            state.endpoint.clone()
+        };
+        if let Some(endpoint) = endpoint {
+            endpoint.interrupt_context();
         }
     }
 }

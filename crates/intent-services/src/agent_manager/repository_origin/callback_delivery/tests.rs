@@ -177,11 +177,68 @@ impl intent_acp::mcp_server::repository_guidance::RepositoryGuidanceSource for P
     }
 }
 
+#[derive(Default)]
+struct PeerWriterGate {
+    blocked: AtomicBool,
+    entered: Notify,
+    waker: Mutex<Option<std::task::Waker>>,
+}
+impl PeerWriterGate {
+    fn block(&self) {
+        self.blocked.store(true, Ordering::SeqCst);
+    }
+    async fn reached(&self) {
+        tokio::time::timeout(WAIT, self.entered.notified())
+            .await
+            .unwrap();
+    }
+    fn resume(&self) {
+        self.blocked.store(false, Ordering::SeqCst);
+        if let Some(waker) = self.waker.lock().unwrap().take() {
+            waker.wake();
+        }
+    }
+}
+struct PeerWriter {
+    stdin: tokio::process::ChildStdin,
+    gate: Arc<PeerWriterGate>,
+}
+impl tokio::io::AsyncWrite for PeerWriter {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        data: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        {
+            let mut waker = self.gate.waker.lock().unwrap();
+            if self.gate.blocked.load(Ordering::SeqCst) {
+                *waker = Some(cx.waker().clone());
+                self.gate.entered.notify_one();
+                return std::task::Poll::Pending;
+            }
+        }
+        std::pin::Pin::new(&mut self.stdin).poll_write(cx, data)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stdin).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stdin).poll_shutdown(cx)
+    }
+}
+
 struct NodePeer {
     child: tokio::process::Child,
     connection: Arc<Connection>,
     notes: Arc<TokioMutex<mpsc::UnboundedReceiver<IncomingNotification>>>,
     scratch: tempfile::TempDir,
+    writer: Arc<PeerWriterGate>,
 }
 
 impl NodePeer {
@@ -207,6 +264,9 @@ const { deferred } = await moduleAt("tests/mcp-peer.mjs");
 let next = {};
 let capability = "normal";
 let promptNotes = [];
+let promptFaults = [];
+let promptFaultStreams = false;
+let failLoad = false;
 const initialize = agent.initialize.bind(agent);
 agent.initialize = async (params) => {
     const response = await initialize(params);
@@ -237,6 +297,10 @@ processWaiters[processes.length - 1]?.resolve(child);
 "#).replace(r#""fixture/inspect": return {"#, r#""fixture/next": next = p; return {};
         case "fixture/capability": capability = p.mode; return {};
         case "fixture/prompt-notes": promptNotes = p.notes; return {};
+        case "fixture/prompt-faults": promptFaults = p.errors; promptFaultStreams = p.stream ?? false; return {};
+        case "fixture/prompts": return requests.filter(r => r.method === "session/prompt");
+        case "fixture/fail-load": failLoad = true; return {};
+        case "fixture/ignore": return {};
         case "fixture/hold": {
             const child = processes[p.query ?? 0];
             child.hold = deferred(); child.setEntered = deferred();
@@ -254,6 +318,20 @@ processWaiters[processes.length - 1]?.resolve(child);
 allocated.push(agent.sessions[response.sessionId]);
 if (capability === "missing-receipt") delete response._meta?.intentCallbackRegistration;
 "#,
+        );
+        let source = source.replace(
+            "requests.push({ method: frame.method, params: frame.params });",
+            r#"requests.push({ id: frame.id, method: frame.method, params: frame.params });
+        if (frame.method === "session/load" && failLoad) {
+            failLoad = false;
+            process.stdout.write(`${JSON.stringify({jsonrpc:"2.0",id:frame.id,error:{code:-32603,message:"scripted lost resumable session"}})}\n`);
+            return;
+        }
+        if (frame.method === "session/prompt" && promptFaults.length) {
+            if (promptFaultStreams) process.stdout.write(`${JSON.stringify({jsonrpc:"2.0",method:"session/update",params:{sessionId:frame.params.sessionId,update:{sessionUpdate:"agent_message_chunk",content:{type:"text",text:"completed scripted output"}}}})}\n`);
+            process.stdout.write(`${JSON.stringify({jsonrpc:"2.0",id:frame.id,error:{code:-32603,message:promptFaults.shift()}})}\n`);
+            return;
+        }"#,
         );
         assert_ne!(source, base);
         let script = scratch.path().join("peer.mjs");
@@ -294,8 +372,12 @@ if (capability === "missing-receipt") delete response._meta?.intentCallbackRegis
             .kill_on_drop(true);
         let mut child = command.spawn().unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
+        let writer = Arc::new(PeerWriterGate::default());
         let connection = Arc::new(Connection::new(
-            child.stdin.take().unwrap(),
+            PeerWriter {
+                stdin: child.stdin.take().unwrap(),
+                gate: writer.clone(),
+            },
             child.stdout.take().unwrap(),
             Some(Box::new(child.stderr.take().unwrap())),
             ConnectionHooks {
@@ -308,6 +390,7 @@ if (capability === "missing-receipt") delete response._meta?.intentCallbackRegis
             connection,
             notes: Arc::new(TokioMutex::new(rx)),
             scratch,
+            writer,
         }
     }
 
@@ -1169,7 +1252,7 @@ async fn metadata_delivery_ordering(replace_handle: bool, install_before_old: bo
     let mut later = Some((attempt, outcome));
     if install_before_old {
         let (attempt, outcome) = later.take().unwrap();
-        let (id, delivery) = origin.accept_session(attempt, outcome);
+        let (id, delivery) = origin.accept_session(attempt, &h.node.connection, outcome);
         assert_eq!(id, new_id);
         assert!(delivery.is_some());
         deliver_optional(delivery).await;
@@ -1186,7 +1269,7 @@ async fn metadata_delivery_ordering(replace_handle: bool, install_before_old: bo
             callback(origin).is_none(),
             "old completion must not install before its successor"
         );
-        let (id, delivery) = origin.accept_session(attempt, outcome);
+        let (id, delivery) = origin.accept_session(attempt, &h.node.connection, outcome);
         assert_eq!(id, new_id);
         deliver_optional(delivery).await;
     }
@@ -1807,6 +1890,8 @@ struct NativeControl {
     records: Mutex<Vec<Arc<crate::repository_read_source::ReadRecord>>>,
     foreign: Mutex<Vec<Arc<crate::repository_read_source::ReadRecord>>>,
     captures: AtomicUsize,
+    optional_captures: AtomicUsize,
+    optional_events: Mutex<Vec<(Boundary, usize)>>,
     entered: AtomicUsize,
     changed: Notify,
     blocked: AtomicBool,
@@ -1896,6 +1981,67 @@ impl McpRequestScope for NativeScope {
 }
 
 impl McpPrivatePolicy for NativePolicy {
+    fn capture_optional_context(
+        &self,
+    ) -> Option<Box<dyn intent_acp::mcp_server::private_results::McpOptionalContextScope>> {
+        let scope = self.original.capture_optional_context();
+        if scope.is_some() {
+            self.control
+                .optional_captures
+                .fetch_add(1, Ordering::SeqCst);
+        }
+        scope
+    }
+
+    fn admit_optional<'a>(
+        &'a self,
+        boundary: &'a McpPrivateBoundary,
+        sealed: intent_acp::mcp_server::private_results::McpSealedReads<'a>,
+        evidence: &'a intent_acp::mcp_server::private_results::McpOptionalEvidence,
+        packet: intent_acp::mcp_server::private_results::PreparedMcpVariants<'a>,
+    ) -> BoxFuture<'a, McpPrivateAdmission> {
+        Box::pin(async move {
+            self.control
+                .optional_events
+                .lock()
+                .unwrap()
+                .push((boundary.kind(), sealed.records().len()));
+            self.control
+                .events
+                .lock()
+                .unwrap()
+                .push((boundary.kind(), sealed.records().len()));
+            let retained =
+                crate::repository_read_source::tests::retain_and_check_records(sealed.records())
+                    .await;
+            *self.control.records.lock().unwrap() = retained;
+            let hold = {
+                let mut held = self.control.hold.lock().unwrap();
+                if held
+                    .as_ref()
+                    .is_some_and(|(kind, _, _)| *kind == boundary.kind())
+                {
+                    held.take()
+                } else {
+                    None
+                }
+            };
+            if let Some((_, false, gate)) = &hold {
+                gate.wait().await;
+            }
+            // Delegate the same successful seal, optional evidence, boundary,
+            // one-use packet and resulting receipt. No fixture authority.
+            let actual = self
+                .original
+                .admit_optional(boundary, sealed, evidence, packet)
+                .await;
+            if let Some((_, true, gate)) = &hold {
+                gate.wait().await;
+            }
+            actual
+        })
+    }
+
     fn capture_host(&self, call: McpHostCall) -> Box<dyn McpPrivateHostScope> {
         self.original.capture_host(call)
     }
@@ -2012,13 +2158,16 @@ impl NativeHarness {
                 ),
             ],
         );
-        let row: intent_core::AgentSession = serde_json::from_value(json!({
+        let mut row = json!({
             "id":intent_core::AgentId::new(),"workspaceId":git.workspace.id,
             "name":"original manager read","provider":"claude-code","status":"idle",
             "harnessVersion":stamp,"createdAt":"2026-09-28T00:00:00Z",
             "updatedAt":"2026-09-28T00:00:00Z"
-        }))
-        .unwrap();
+        });
+        if stamp == "<missing>" {
+            row.as_object_mut().unwrap().remove("harnessVersion");
+        }
+        let row: intent_core::AgentSession = serde_json::from_value(row).unwrap();
         original.store.insert_agent_session(&row).await.unwrap();
         let manager = Arc::new(AgentManager::new(
             original.as_ref().clone(),
@@ -2045,7 +2194,8 @@ impl NativeHarness {
             WorkspaceMcpServer::for_agent_type(api.clone(), workspace.clone(), "default")
                 .with_caller_agent_id(Some(agent.clone()))
                 .with_turn_attachments(Some(attachments.clone()))
-        });
+        })
+        .with_original_services(original.clone(), f.row.clone());
         if let Some(control) = control {
             blueprint.context_decorator = Some(Arc::new(move |context| control.wrap(context)));
         }
@@ -3037,7 +3187,7 @@ async fn native_metadata_delivery_ordering(replace_handle: bool, install_before_
     let mut later = Some((attempt, outcome));
     if install_before_old {
         let (attempt, outcome) = later.take().unwrap();
-        let (id, delivery) = origin.accept_session(attempt, outcome);
+        let (id, delivery) = origin.accept_session(attempt, &h.node.connection, outcome);
         assert_eq!(id, new_id);
         assert!(delivery.is_some());
         deliver_optional(delivery).await;
@@ -3054,7 +3204,7 @@ async fn native_metadata_delivery_ordering(replace_handle: bool, install_before_
             callback(origin).is_none(),
             "old completion must not install before its successor"
         );
-        let (id, delivery) = origin.accept_session(attempt, outcome);
+        let (id, delivery) = origin.accept_session(attempt, &h.node.connection, outcome);
         assert_eq!(id, new_id);
         deliver_optional(delivery).await;
     }
@@ -3327,7 +3477,7 @@ async fn confirmed_read_direct_companion_uses_same_original_policy_as_delivered_
         let blueprint = h.origin.state.lock().unwrap().blueprint.clone().unwrap();
         let server = blueprint
             .server
-            .confirmed_server(callback(&h.origin).unwrap());
+            .confirmed_server(callback(&h.origin).unwrap(), None);
         let gate = control.at(Boundary::DirectResponse, after);
         let task = tokio::spawn(async move {
             crate::repository_read_source::tests::run(&server, "return await ws.pr.snapshot(4);")
@@ -4108,5 +4258,960 @@ mod confirmed_aliases {
         assert_eq!(results[0], results[1]);
         // Numeric raw quota receipts remain separately inherited producer proof;
         // public availability and HTTP counts are not an observation of them.
+    }
+}
+
+mod live_context {
+    use super::*;
+    use crate::agent_manager::{OriginalTurn, TurnOptions};
+    use intent_store::{RepositorySelectionChange, RepositorySelectionWriteResult};
+
+    const FACTS: &str = "[Repository facts — inert JSON lines]";
+
+    async fn select(h: &NativeHarness, change: RepositorySelectionChange) {
+        let old = h
+            .original
+            .store
+            .repository_selection_snapshot(&h.git.root())
+            .await
+            .unwrap();
+        let result = h
+            .original
+            .store
+            .write_repository_selection(&old, change)
+            .await;
+        assert!(matches!(
+            result.result.unwrap(),
+            RepositorySelectionWriteResult::Applied(_)
+                | RepositorySelectionWriteResult::Unchanged(_)
+        ));
+    }
+    async fn selected(control: Option<Arc<NativeControl>>) -> NativeHarness {
+        let h = NativeHarness::observed("3.0", true, false, control, None).await;
+        select(&h, RepositorySelectionChange::Automatic).await;
+        h
+    }
+    fn owner(h: &NativeHarness) -> Arc<RepositoryContextOwner> {
+        h.origin
+            .state
+            .lock()
+            .unwrap()
+            .endpoint
+            .as_ref()
+            .unwrap()
+            .live
+            .as_ref()
+            .unwrap()
+            .owner
+            .as_ref()
+            .unwrap()
+            .clone()
+    }
+    async fn daemon<T: Send + 'static>(
+        h: &NativeHarness,
+        body: impl std::future::Future<Output = T> + Send + 'static,
+    ) -> T {
+        intent_core::spawn_daemon(crate::host_execution::background_execution(
+            h.original.as_ref().clone(),
+            None,
+            body,
+        ))
+        .await
+        .unwrap()
+    }
+    async fn capture(h: &NativeHarness) -> OriginalTurn {
+        let f = h.f.clone();
+        daemon(h, async move {
+            assert_eq!(intent_core::current_caller(), Some(Caller::Daemon));
+            let turn = f.manager.capture_turn(&f.row.id).unwrap();
+            assert!(turn
+                .prompt
+                .as_ref()
+                .unwrap()
+                .captured
+                .as_ref()
+                .unwrap()
+                .is_ok());
+            turn
+        })
+        .await
+    }
+    async fn dispatch(
+        h: &NativeHarness,
+        id: &str,
+        turn: OriginalTurn,
+        text: &str,
+    ) -> intent_core::Result<intent_acp::session::StopReason> {
+        let f = h.f.clone();
+        let id = id.to_owned();
+        let text = text.to_owned();
+        daemon(h, async move {
+            let prompt = serde_json::from_value(json!([{"type":"text","text":text}])).unwrap();
+            f.manager
+                .run_turn_owned(&f.row.id, &f.row.workspace_id, &id, prompt, None, turn)
+                .await
+        })
+        .await
+    }
+    async fn prompts(h: &NativeHarness) -> Vec<Value> {
+        serde_json::from_value(h.node.call("fixture/prompts", json!({})).await).unwrap()
+    }
+    async fn worker(h: &NativeHarness, text: &str) {
+        // Real spawn_worker -> spawn_daemon -> retry_spawn_owned -> captured
+        // dispatch. The already-running native peer is explicitly scripted.
+        let row = h.f.stored().await;
+        let settings = h.original.effective_settings();
+        let workspace = h
+            .original
+            .store
+            .get_workspace(&row.workspace_id)
+            .await
+            .unwrap();
+        let resolved =
+            crate::agent_manager::resolve_spawn(&row, Some(&workspace), &settings, None).unwrap();
+        {
+            let mut map = h.f.manager.handles.lock().unwrap();
+            let handle = map.get_mut(&row.id).unwrap();
+            handle.spawned_model = resolved.model;
+            handle.spawned_provider = resolved.provider.command.into();
+        }
+        h.f.manager
+            .send_message(
+                row.id.clone(),
+                row.workspace_id.clone(),
+                text.into(),
+                None,
+                TurnOptions::default(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(WAIT, async {
+            loop {
+                if !h.f.manager.is_busy(&row.id) && h.f.manager.workers.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("actual manager worker settles");
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn confirmed_context_original_manager_mcp_public_cache_and_unresolved_facts() {
+        let h = selected(None).await;
+        let secrets = std::fs::read(h.original.gitlab_secret_store.path()).unwrap();
+        h.start().await;
+        let original = owner(&h);
+        assert!(Arc::ptr_eq(&original.services, &h.original));
+        assert!(h
+            .original
+            .store
+            .shares_repository_lifecycle_domain(&h.git.store));
+        let name = h.confirmed(0).await;
+        let first = h.call(0, &name, "return await ws.pr.snapshot(4);").await;
+        assert!(first.to_string().contains("actual review"), "{first}");
+        assert!(first.to_string().contains(FACTS), "{first}");
+        let requests = h.http.count();
+        assert!(requests > 0);
+        // The original cache is request-scoped. Two calls in the next
+        // invocation acquire only the same four HTTP responses as the first.
+        let cached = h
+            .call(
+                0,
+                &name,
+                "await ws.pr.snapshot(4); return await ws.pr.snapshot(4);",
+            )
+            .await;
+        assert!(cached.to_string().contains(FACTS), "{cached}");
+        assert_eq!(h.http.count(), requests * 2);
+        let requests = h.http.count();
+        select(
+            &h,
+            RepositorySelectionChange::ExplicitRemote {
+                remote_name: "missing-real-choice".into(),
+            },
+        )
+        .await;
+        let unresolved = h.call(0, &name, "return 'ordinary-unresolved';").await;
+        assert!(unresolved.to_string().contains(FACTS), "{unresolved}");
+        assert!(
+            unresolved.to_string().contains("selectionRequired"),
+            "{unresolved}"
+        );
+        assert_eq!(h.http.count(), requests);
+        assert_eq!(
+            std::fs::read(h.original.gitlab_secret_store.path()).unwrap(),
+            secrets
+        );
+        assert_eq!(h.f.writes().await, 1);
+        h.finish().await;
+        original.drain_jobs().await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn confirmed_context_successful_zero_pending_absent_and_failed_never_conflate() {
+        let control = Arc::new(NativeControl::default());
+        let h = selected(Some(control.clone())).await;
+        h.start().await;
+        let reply = h
+            .call(0, &h.confirmed(0).await, "return 'sealed-zero-result';")
+            .await;
+        assert!(reply.to_string().contains(FACTS), "{reply}");
+        assert!(reply.to_string().contains("sealed-zero-result"));
+        assert!(control
+            .optional_events
+            .lock()
+            .unwrap()
+            .contains(&(Boundary::TcpResponse, 0)));
+        assert_eq!(h.http.count(), 0);
+        let captures = control.optional_captures.load(Ordering::SeqCst);
+        for name in ["workspace-mcp", "user-kept"] {
+            let ordinary = h.call(0, name, "return 'unqualified-ordinary';").await;
+            assert!(ordinary.to_string().contains("unqualified-ordinary"));
+            assert!(!ordinary.to_string().contains(FACTS));
+        }
+        assert_eq!(captures, control.optional_captures.load(Ordering::SeqCst));
+        h.finish().await;
+        let failed = NativeHarness::new("3.0", true, true).await;
+        failed.start().await;
+        let reply = failed
+            .call(
+                0,
+                &failed.confirmed(0).await,
+                "try { await ws.pr.snapshot(4); } catch(e) {} return 'caught-not-a-zero-proof';",
+            )
+            .await;
+        assert!(!reply.to_string().contains(FACTS));
+        // No original read scope was ever installed, so this caught error
+        // precedes qualified acquisition. Its ordinary result stays ordinary.
+        assert!(
+            reply.to_string().contains("caught-not-a-zero-proof"),
+            "{reply}"
+        );
+        assert_eq!(failed.http.count(), 0);
+        failed.finish().await;
+
+        let qualified = selected(None).await;
+        qualified.start().await;
+        // One lazy read plus 64 calls overflows the real original ledger.
+        // Catching the acquisition error cannot manufacture a successful zero.
+        let refused = qualified.call(0, &qualified.confirmed(0).await,
+            "for(let i=0;i<64;i++){try{await ws.pr.snapshot(4);}catch(e){}} return 'must-not-escape-failed-seal';").await;
+        assert!(
+            refused
+                .to_string()
+                .contains("Private result delivery refused"),
+            "{refused}"
+        );
+        assert!(!refused.to_string().contains("must-not-escape-failed-seal"));
+        assert!(!refused.to_string().contains(FACTS));
+        assert_eq!(qualified.http.count(), 4);
+        qualified.finish().await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn confirmed_context_actual_daemon_worker_and_continuation_retain_original_transport() {
+        let h = selected(None).await;
+        // The scripted child already exists; actual ensure/start confirms its
+        // first session and carries that capture through the real worker.
+        worker(&h, "first real manager message").await;
+        let id = h.f.stored().await.acp_session_id.unwrap();
+        let first = prompts(&h).await;
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0]["params"]["sessionId"], id);
+        assert!(first[0].to_string().contains(FACTS), "{}", first[0]);
+        h.git.git(
+            &h.git.path,
+            &[
+                "remote",
+                "add",
+                "second",
+                "https://github.com/team/continuation.git",
+            ],
+        );
+        select(
+            &h,
+            RepositorySelectionChange::ExplicitRemote {
+                remote_name: "second".into(),
+            },
+        )
+        .await;
+        worker(&h, "subsequent actual continuation").await;
+        let frames = prompts(&h).await;
+        assert_eq!(frames.len(), 2);
+        assert_ne!(frames[0]["id"], frames[1]["id"]);
+        assert_eq!(frames[1]["params"]["sessionId"], id);
+        assert!(frames[1].to_string().contains(FACTS), "{}", frames[1]);
+        assert!(
+            frames[1].to_string().contains("team/continuation"),
+            "{}",
+            frames[1]
+        );
+        assert!(!frames[0].to_string().contains("team/continuation"));
+        assert_eq!(h.http.count(), 0);
+        assert_eq!(h.f.writes().await, 1);
+        let inspect = h.node.call("fixture/inspect", json!({})).await;
+        assert_eq!(count_requests(&inspect, "session/new"), 1);
+        h.finish().await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn confirmed_context_saved_legacy_and_disabled_outbound_messages_remain_ordinary() {
+        for (stamp, enabled) in [
+            ("2.9", true),
+            ("<missing>", true),
+            ("future-unknown", true),
+            ("3.0", false),
+        ] {
+            let control = Arc::new(NativeControl::default());
+            let h =
+                NativeHarness::observed(stamp, enabled, false, Some(control.clone()), None).await;
+            let first = h.start().await;
+            if stamp == "<missing>" {
+                assert_ne!(h.f.stored().await.harness_version, "3.0");
+            }
+            assert!(h.origin.state.lock().unwrap().endpoint.is_none());
+            for id in [first, h.start().await] {
+                let f = h.f.clone();
+                daemon(&h, async move {
+                    let prompt = serde_json::from_value(
+                        json!([{"type":"text","text":"unchanged historical prompt"}]),
+                    )
+                    .unwrap();
+                    f.manager
+                        .run_turn(&f.row.id, &f.row.workspace_id, &id, prompt, None)
+                        .await
+                        .unwrap();
+                })
+                .await;
+            }
+            h.recreate();
+            let id = h.start().await;
+            let f = h.f.clone();
+            daemon(&h, async move {
+                let prompt = serde_json::from_value(
+                    json!([{"type":"text","text":"unchanged historical prompt"}]),
+                )
+                .unwrap();
+                f.manager
+                    .run_turn(&f.row.id, &f.row.workspace_id, &id, prompt, None)
+                    .await
+                    .unwrap();
+            })
+            .await;
+            let frames = prompts(&h).await;
+            assert_eq!(frames.len(), 3);
+            for frame in frames {
+                assert_eq!(
+                    frame["params"]["prompt"],
+                    json!([{"type":"text","text":"unchanged historical prompt"}])
+                );
+            }
+            assert_eq!(control.optional_captures.load(Ordering::SeqCst), 0);
+            assert_eq!(h.http.count(), 0);
+            assert_eq!(
+                count_requests(&h.node.call("fixture/inspect", json!({})).await, METHOD),
+                0
+            );
+            h.finish().await;
+        }
+    }
+
+    async fn registered(h: &NativeHarness) -> intent_core::WorkspaceGitRoot {
+        let path = h.node.scratch.path().join("optional-root");
+        let repo = git2::Repository::init_opts(
+            &path,
+            git2::RepositoryInitOptions::new().initial_head("main"),
+        )
+        .unwrap();
+        let oid = repo.index().unwrap().write_tree().unwrap();
+        let tree = repo.find_tree(oid).unwrap();
+        let sig = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "registered fixture", &tree, &[])
+            .unwrap();
+        let row=serde_json::from_value(json!({"id":intent_core::WorkspaceGitRootId::new(),"workspaceId":h.f.row.workspace_id,"path":path,"source":"agent","registeredByAgentIds":[h.f.row.id],"createdAt":"2026-09-28T00:00:00Z","updatedAt":"2026-09-28T00:00:00Z"})).unwrap();
+        h.original
+            .store
+            .upsert_workspace_git_root(&row)
+            .await
+            .unwrap()
+            .0
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn confirmed_context_first_failure_and_equal_id_replacement_keep_original_binding() {
+        let failed = NativeHarness::new("3.0", true, true).await;
+        failed.start().await;
+        let endpoint = failed
+            .origin
+            .state
+            .lock()
+            .unwrap()
+            .endpoint
+            .clone()
+            .unwrap();
+        let live = endpoint.live.as_ref().unwrap();
+        assert!(live.owner.is_err());
+        assert!(RepositoryReadOwner::capture(failed.original.clone()).is_ok());
+        let origin = failed.origin.clone();
+        let connection = failed.node.connection.clone();
+        let mut original = daemon(&failed, async move {
+            origin.capture_prompt(&connection).unwrap()
+        })
+        .await;
+        assert!(original.captured.as_ref().unwrap().is_err());
+        assert!(daemon(&failed, async move { original.prepare().await })
+            .await
+            .is_none());
+        failed.finish().await;
+
+        let h = selected(None).await;
+        let old_id = h.start().await;
+        let old_owner = owner(&h);
+        let original = capture(&h).await;
+        let (replacement, new_origin) = h.replacement().await;
+        let f = h.f.clone();
+        let path = h.git.path.clone();
+        let started = daemon(&h, async move {
+            f.manager
+                .start_session_owned(
+                    &f.row.id,
+                    path,
+                    intent_providers::provider_config("claude-code"),
+                )
+                .await
+                .unwrap()
+        })
+        .await;
+        assert_eq!(started.session_id, old_id);
+        assert!(!Arc::ptr_eq(&started.turn.origin, &h.origin));
+        assert!(Arc::ptr_eq(&started.turn.origin, &new_origin));
+        assert!(Arc::ptr_eq(
+            &started.turn.connection,
+            &replacement.connection
+        ));
+        let new_owner = new_origin
+            .state
+            .lock()
+            .unwrap()
+            .endpoint
+            .as_ref()
+            .unwrap()
+            .live
+            .as_ref()
+            .unwrap()
+            .owner
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert!(!Arc::ptr_eq(&old_owner, &new_owner));
+        dispatch(&h, &old_id, original, "old captured transport")
+            .await
+            .unwrap();
+        assert!(!prompts(&h).await[0].to_string().contains(FACTS));
+        dispatch(
+            &h,
+            &started.session_id,
+            started.turn,
+            "fresh original transport",
+        )
+        .await
+        .unwrap();
+        let frames = replacement.call("fixture/prompts", json!({})).await;
+        assert_eq!(frames.as_array().unwrap().len(), 1);
+        assert!(frames[0].to_string().contains(FACTS), "{frames}");
+        assert_eq!(prompts(&h).await.len(), 1);
+        old_owner.drain_jobs().await;
+        new_origin.retire();
+        replacement.finish().await;
+        h.finish().await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn confirmed_context_load_and_failed_load_new_keep_original_producers_and_capture() {
+        let h = selected(None).await;
+        let first = h.start().await;
+        let old = capture(&h).await;
+        let old_owner = owner(&h);
+        let f = h.f.clone();
+        let path = h.git.path.clone();
+        let loaded = daemon(&h, async move {
+            f.manager
+                .start_session_owned(
+                    &f.row.id,
+                    path,
+                    intent_providers::provider_config("claude-code"),
+                )
+                .await
+                .unwrap()
+        })
+        .await;
+        assert_eq!(loaded.session_id, first);
+        assert_eq!(h.f.writes().await, 1);
+        dispatch(&h, &first, old, "old before load").await.unwrap();
+        assert!(!prompts(&h).await[0].to_string().contains(FACTS));
+        dispatch(&h, &loaded.session_id, loaded.turn, "loaded original")
+            .await
+            .unwrap();
+        assert!(prompts(&h).await[1].to_string().contains(FACTS));
+        // Script an error for the original session/load RPC; the unchanged
+        // manager fallback must produce and settle exactly one session/new.
+        h.node
+            .call("fixture/fail-load", json!({"sessionId":first}))
+            .await;
+        let f = h.f.clone();
+        let path = h.git.path.clone();
+        let recreated = daemon(&h, async move {
+            f.manager
+                .start_session_owned(
+                    &f.row.id,
+                    path,
+                    intent_providers::provider_config("claude-code"),
+                )
+                .await
+                .unwrap()
+        })
+        .await;
+        assert_ne!(recreated.session_id, first);
+        assert_eq!(h.f.writes().await, 2);
+        dispatch(
+            &h,
+            &recreated.session_id,
+            recreated.turn,
+            "fallback new original",
+        )
+        .await
+        .unwrap();
+        assert!(prompts(&h).await[2].to_string().contains(FACTS));
+        let inspect = h.node.call("fixture/inspect", json!({})).await;
+        assert_eq!(count_requests(&inspect, "session/new"), 2);
+        assert_eq!(count_requests(&inspect, "session/load"), 2);
+        assert_eq!(count_requests(&inspect, METHOD), 3);
+        old_owner.drain_jobs().await;
+        h.finish().await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn confirmed_context_optional_root_omits_but_required_selection_refuses_completed_effect()
+    {
+        for required in [false, true] {
+            let c = Arc::new(NativeControl::default());
+            let h = selected(Some(c.clone())).await;
+            let root = registered(&h).await;
+            h.start().await;
+            let gate = c.at(Boundary::TcpResponse, false);
+            let task=h.call_task(0,&h.confirmed(0).await,"await ws.workspace.setStatusMessage('completed context effect'); await ws.pr.snapshot(4); return 'original context result';");
+            gate.reached().await;
+            assert!(c
+                .optional_events
+                .lock()
+                .unwrap()
+                .contains(&(Boundary::TcpResponse, 2)));
+            if required {
+                select(
+                    &h,
+                    RepositorySelectionChange::ExplicitRemote {
+                        remote_name: "missing-now".into(),
+                    },
+                )
+                .await;
+            } else {
+                h.original
+                    .store
+                    .delete_workspace_git_root(&root.id)
+                    .await
+                    .unwrap();
+            }
+            gate.release.add_permits(1);
+            let reply = task.await.unwrap();
+            assert_eq!(
+                h.original
+                    .store
+                    .get_workspace(&h.f.row.workspace_id)
+                    .await
+                    .unwrap()
+                    .status_message
+                    .as_deref(),
+                Some("completed context effect")
+            );
+            assert!(!reply.to_string().contains(FACTS), "{reply}");
+            assert_eq!(
+                reply.to_string().contains("original context result"),
+                !required,
+                "{reply}"
+            );
+            if required {
+                assert!(
+                    reply
+                        .to_string()
+                        .contains("Private result delivery refused"),
+                    "{reply}"
+                );
+            }
+            h.finish().await;
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn confirmed_context_settings_and_provider_changes_distinguish_optional_from_required() {
+        use intent_sourcecontrol::gitlab_token::{
+            EXPIRES_AT_SECRET_ACCOUNT, REFRESH_SECRET_ACCOUNT,
+        };
+        for mode in ["settings", "refresh", "replacement"] {
+            let c = Arc::new(NativeControl::default());
+            let h = selected(Some(c.clone())).await;
+            if mode == "refresh" {
+                h.original
+                    .gitlab_secret_store
+                    .store(REFRESH_SECRET_ACCOUNT, "refresh-old")
+                    .unwrap();
+                let expiry = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 7200;
+                h.original
+                    .gitlab_secret_store
+                    .store(EXPIRES_AT_SECRET_ACCOUNT, &expiry.to_string())
+                    .unwrap();
+                h.original
+                    .reconcile_gitlab_repository_binding()
+                    .await
+                    .unwrap();
+            }
+            h.start().await;
+            let initial = h.auth.request();
+            let gate = c.at(Boundary::TcpResponse, false);
+            let task = h.call_task(
+                0,
+                &h.confirmed(0).await,
+                "await ws.pr.snapshot(4);return 'completed required provider result';",
+            );
+            gate.reached().await;
+            let services = h.original.clone();
+            let host = h.http.fixture.host.clone();
+            daemon(&h,async move {
+                match mode {
+                    "settings" => {services.settings_update(json!([{"path":"git.autoCommit","value":false}])).await.unwrap();}
+                    "refresh" => {
+                        services.gitlab_secret_store.store(EXPIRES_AT_SECRET_ACCOUNT,"0").unwrap();
+                        services.stored_proof_token(&crate::source_control_auth_ops::Target::Gitlab{host}).await.unwrap();
+                    }
+                    _ => {services.settings_update(json!([{"path":intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT,"value":"replacement-token"}])).await.unwrap();}
+                }
+            }).await;
+            if mode == "refresh" {
+                let now = h.auth.request();
+                assert_eq!(initial.binding, now.binding);
+                assert!(now.secret_revision > initial.secret_revision);
+            }
+            gate.release.add_permits(1);
+            let reply = task.await.unwrap();
+            assert!(!reply.to_string().contains(FACTS), "{mode}: {reply}");
+            assert_eq!(
+                reply
+                    .to_string()
+                    .contains("completed required provider result"),
+                mode != "replacement",
+                "{mode}: {reply}"
+            );
+            if mode == "replacement" {
+                assert!(
+                    reply
+                        .to_string()
+                        .contains("Private result delivery refused"),
+                    "{reply}"
+                );
+            }
+            h.finish().await;
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn confirmed_context_queued_prompt_and_full_original_writer_keep_original_id() {
+        for writer in [false, true] {
+            let h = selected(None).await;
+            let id = h.start().await;
+            let original = capture(&h).await;
+            let notes = if writer {
+                None
+            } else {
+                Some(h.node.notes.lock().await)
+            };
+            if writer {
+                h.node.writer.block();
+                h.node
+                    .connection
+                    .notify("fixture/ignore", json!({}))
+                    .await
+                    .unwrap();
+                h.node.writer.reached().await;
+                let mut filled = 0;
+                loop {
+                    let mut notification =
+                        Box::pin(h.node.connection.notify("fixture/ignore", json!({})));
+                    let queued = std::future::poll_fn(|cx| {
+                        std::task::Poll::Ready(
+                            match std::future::Future::poll(notification.as_mut(), cx) {
+                                std::task::Poll::Ready(result) => {
+                                    result.unwrap();
+                                    true
+                                }
+                                std::task::Poll::Pending => false,
+                            },
+                        )
+                    })
+                    .await;
+                    if !queued {
+                        break;
+                    }
+                    filled += 1;
+                    assert!(filled <= 256);
+                }
+                assert!(filled > 0);
+            }
+            let f = h.f.clone();
+            let session = id.clone();
+            let (entered, ready) = tokio::sync::oneshot::channel();
+            let task = intent_core::spawn_daemon(crate::host_execution::background_execution(
+                h.original.as_ref().clone(),
+                None,
+                async move {
+                    let blocks = serde_json::from_value(
+                        json!([{"type":"text","text":"original queued prompt"}]),
+                    )
+                    .unwrap();
+                    if writer {
+                        // Direct writer companion: actual manager-owned capture
+                        // and original Connection, using only public ACP APIs.
+                        let mut original = original;
+                        let guidance = original.prompt.as_mut().unwrap().prepare().await;
+                        assert!(guidance.is_some());
+                        let activity = intent_acp::session::ActivityTracker::new();
+                        let mut waiting = Box::pin(intent_acp::session::prompt_with_guidance(
+                            &original.connection,
+                            &session,
+                            blocks,
+                            &activity,
+                            guidance,
+                        ));
+                        std::future::poll_fn(|cx| {
+                            assert!(std::future::Future::poll(waiting.as_mut(), cx).is_pending());
+                            std::task::Poll::Ready(())
+                        })
+                        .await;
+                        entered.send(()).unwrap();
+                        waiting
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| intent_core::Error::Internal(e.to_string()))
+                    } else {
+                        entered.send(()).unwrap();
+                        f.manager
+                            .run_turn_owned(
+                                &f.row.id,
+                                &f.row.workspace_id,
+                                &session,
+                                blocks,
+                                None,
+                                original,
+                            )
+                            .await
+                            .map(|_| ())
+                    }
+                },
+            ));
+            ready.await.unwrap();
+            h.origin.interrupt_requests();
+            drop(notes);
+            h.node.writer.resume();
+            task.await.unwrap().unwrap();
+            let frames = prompts(&h).await;
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0]["params"]["sessionId"], id);
+            assert_eq!(
+                frames[0]["params"]["prompt"],
+                json!([{"type":"text","text":"original queued prompt"}])
+            );
+            assert!(frames[0]["id"].is_number());
+            dispatch(&h, &id, capture(&h).await, "fresh after old wait")
+                .await
+                .unwrap();
+            assert!(prompts(&h).await[1].to_string().contains(FACTS));
+            h.finish().await;
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn confirmed_context_optional_contention_budget_and_owned_drain_preserve_base() {
+        let h = selected(None).await;
+        let id = h.start().await;
+        let original_owner = owner(&h);
+        let gate = NativeHold::new();
+        let held = gate.clone();
+        let path = h.git.path.clone();
+        let locks = h.original.worktree_locks.clone();
+        let holder = tokio::spawn(async move {
+            locks.with_lock(&path, || async { held.wait().await }).await;
+        });
+        gate.reached().await;
+        dispatch(&h, &id, capture(&h).await, "ordinary despite busy Git")
+            .await
+            .unwrap();
+        assert!(!prompts(&h).await[0].to_string().contains(FACTS));
+        // Optional Git lock contention omits immediately; no queued read exists.
+        original_owner.drain_jobs().await;
+        gate.release.add_permits(1);
+        holder.await.unwrap();
+
+        // The existing settings fixture holds the actual snapshot writer lock.
+        // The real context worker blocks on its original snapshot read, even
+        // after the bounded original prompt preparation waiter is dropped.
+        let mut original = capture(&h).await;
+        let held = crate::repository_context_live::tests::BlockingHold::new();
+        let registry = h.auth.registry.clone();
+        let block = held.clone();
+        let holder = tokio::task::spawn_blocking(move || {
+            registry.context_hold_snapshot_for_test(|| block.wait());
+        });
+        held.reached().await;
+        let session = id.clone();
+        daemon(&h, async move {
+            let guidance = original.prompt.as_mut().unwrap().prepare().await;
+            assert!(guidance.is_none());
+            let activity = intent_acp::session::ActivityTracker::new();
+            let prompt = serde_json::from_value(
+                json!([{"type":"text","text":"base after bounded preparation"}]),
+            )
+            .unwrap();
+            // Direct consuming-boundary companion, using the actual manager
+            // capture and its original Connection. Ordinary Service settings
+            // reads are intentionally outside this held settings-lock schedule.
+            intent_acp::session::prompt_with_guidance(
+                &original.connection,
+                &session,
+                prompt,
+                &activity,
+                guidance,
+            )
+            .await
+            .unwrap();
+        })
+        .await;
+        let frames = prompts(&h).await;
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[1]["params"]["sessionId"], id);
+        assert!(!frames[1].to_string().contains(FACTS));
+        h.origin.interrupt_requests();
+        let mut draining = Box::pin(original_owner.drain_jobs());
+        std::future::poll_fn(|cx| {
+            assert!(
+                std::future::Future::poll(draining.as_mut(), cx).is_pending(),
+                "the real blocked snapshot job still owns its work"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        held.release();
+        holder.await.unwrap();
+        tokio::time::timeout(WAIT, draining).await.unwrap();
+        dispatch(&h, &id, capture(&h).await, "fresh after real drain")
+            .await
+            .unwrap();
+        assert!(prompts(&h).await[2].to_string().contains(FACTS));
+        assert_eq!(h.http.count(), 0);
+        h.finish().await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn confirmed_context_soft_interrupt_drop_hard_stop_and_fresh_sibling() {
+        let h = selected(None).await;
+        let id = h.start().await;
+        let mut old = capture(&h).await;
+        h.origin.interrupt_requests();
+        assert!(daemon(
+            &h,
+            async move { old.prompt.as_mut().unwrap().prepare().await }
+        )
+        .await
+        .is_none());
+        let mut fresh = capture(&h).await;
+        daemon(&h, async move {
+            assert!(fresh.prompt.as_mut().unwrap().prepare().await.is_some());
+            assert!(
+                fresh.prompt.as_mut().unwrap().prepare().await.is_none(),
+                "one consumed original capture"
+            );
+        })
+        .await;
+        dispatch(&h, &id, capture(&h).await, "still live after optional drop")
+            .await
+            .unwrap();
+        assert!(prompts(&h).await[0].to_string().contains(FACTS));
+        let stopped = capture(&h).await;
+        assert!(h.f.manager.stop(&h.f.row.id).await);
+        assert!(h.origin.capture_prompt(&h.node.connection).is_none());
+        dispatch(&h, &id, stopped, "ordinary captured result after stop")
+            .await
+            .unwrap();
+        assert!(!prompts(&h).await[1].to_string().contains(FACTS));
+        let sibling = selected(None).await;
+        let sibling_id = sibling.start().await;
+        dispatch(
+            &sibling,
+            &sibling_id,
+            capture(&sibling).await,
+            "fresh sibling",
+        )
+        .await
+        .unwrap();
+        assert!(prompts(&sibling).await[0].to_string().contains(FACTS));
+        sibling.finish().await;
+        h.finish().await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn confirmed_context_output_free_retry_has_new_capture_and_effect_errors_never_replay() {
+        for mode in ["retry", "streamed", "consumer"] {
+            let h = selected(None).await;
+            let id = h.start().await;
+            // Complete one ordinary turn to consume original session-start
+            // notifications before asserting that the next attempt is output-free.
+            dispatch(&h, &id, capture(&h).await, "completed warmup")
+                .await
+                .unwrap();
+            assert_eq!(prompts(&h).await.len(), 1);
+            let message = if mode == "consumer" {
+                "scripted terminal consumer error"
+            } else {
+                "Internal error: fetch failed (ECONNRESET)"
+            };
+            h.node
+                .call(
+                    "fixture/prompt-faults",
+                    json!({"errors":[message],"stream":mode=="streamed"}),
+                )
+                .await;
+            let result = dispatch(
+                &h,
+                &id,
+                capture(&h).await,
+                "same prompt through ordinary retry rules",
+            )
+            .await;
+            assert_eq!(result.is_ok(), mode == "retry", "{mode}: {result:?}");
+            let frames = prompts(&h).await.into_iter().skip(1).collect::<Vec<_>>();
+            assert_eq!(frames.len(), if mode == "retry" { 2 } else { 1 });
+            for frame in &frames {
+                assert_eq!(frame["params"]["sessionId"], id);
+                assert!(frame.to_string().contains(FACTS), "{mode}: {frame}");
+            }
+            if mode == "retry" {
+                assert_ne!(frames[0]["id"], frames[1]["id"]);
+            }
+            assert_eq!(h.f.writes().await, 1);
+            h.finish().await;
+        }
     }
 }

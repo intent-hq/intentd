@@ -3198,6 +3198,34 @@ impl Services {
         prompt: Vec<ContentBlock>,
         turn_id: Option<&str>,
     ) -> Result<StopReason> {
+        self.run_prompt_turn_captured(
+            conn,
+            notifications,
+            agent_id,
+            workspace_id,
+            acp_session_id,
+            prompt,
+            turn_id,
+            None,
+        )
+        .await
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Preserve the ordinary turn inputs with one owned original prompt capture"
+    )]
+    pub(crate) async fn run_prompt_turn_captured(
+        &self,
+        conn: &Connection,
+        notifications: &mut mpsc::UnboundedReceiver<IncomingNotification>,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        acp_session_id: &str,
+        prompt: Vec<ContentBlock>,
+        turn_id: Option<&str>,
+        mut captured: Option<crate::agent_manager::RepositoryPromptInput>,
+    ) -> Result<StopReason> {
         // Mint the assistant message id at turn START (CS-0 D1) so streaming
         // block ids `{messageId}:{index}` match the blocks ultimately persisted.
         let message_id = Uuid::now_v7().to_string();
@@ -3343,63 +3371,79 @@ impl Services {
         );
         let mut stall_emitted = false;
         let result = loop {
-            let prompt_fut = session::prompt(conn, acp_session_id, prompt.clone(), &activity);
-            tokio::pin!(prompt_fut);
-            let attempt_result = loop {
-                tokio::select! {
-                    res = &mut prompt_fut => break res,
-                    maybe = notifications.recv(), if !closed => match maybe {
-                        Some(note) => {
-                            activity.touch();
-                            self.clear_stream_stall(&mut stall_emitted, workspace_id, agent_id)
-                                .await;
-                            any_update_received = true;
-                            updates_applied |= self
-                                .route_notification(&note, agent_id, workspace_id, &mut transcript)
-                                .await;
-                        }
-                        None => closed = true,
-                    },
-                    () = tokio::time::sleep(stall_check) => {
-                        let silent_ms = activity.idle_ms();
-                        let tool_call_open = transcript.open_tool_call_count() > 0;
-                        let advisory_threshold_ms = if tool_call_open {
-                            open_tool_stall_ms
-                        } else {
-                            stall_threshold_ms
-                        };
-                        if !stall_emitted && silent_ms >= advisory_threshold_ms {
-                            stall_emitted = true;
-                            tracing::warn!(
-                                agent = %agent_id,
-                                silent_ms,
-                                tool_call_open,
-                                "mid-turn stream stall — no session/update past threshold (monorepo#3402)"
-                            );
-                            self.publish_stalled_status_event(workspace_id, agent_id, silent_ms)
-                                .await;
-                        }
-                        let terminal_ms = if tool_call_open {
-                            open_tool_terminal_ms
-                        } else {
-                            stall_terminal_ms
-                        };
-                        if silent_ms >= terminal_ms {
-                            let open_tool_call = transcript.open_tool_call_label();
-                            tracing::warn!(
-                                agent = %agent_id,
-                                silent_ms,
-                                terminal_ms,
-                                open_tool_call = open_tool_call.as_deref().unwrap_or("none"),
-                                "provider stall — no session/update past the terminal threshold; failing the turn (intent#5395)"
-                            );
-                            break Err(AcpError::ProviderStall {
-                                silent: Duration::from_millis(silent_ms),
-                                open_tool_call,
-                            });
+            let attempt_result = {
+                let prompt_fut = async {
+                    let guidance = match captured.as_mut() {
+                        Some(original) => original.prepare().await,
+                        None => None,
+                    };
+                    session::prompt_with_guidance(
+                        conn,
+                        acp_session_id,
+                        prompt.clone(),
+                        &activity,
+                        guidance,
+                    )
+                    .await
+                };
+                tokio::pin!(prompt_fut);
+                let attempt_result = loop {
+                    tokio::select! {
+                        res = &mut prompt_fut => break res,
+                        maybe = notifications.recv(), if !closed => match maybe {
+                            Some(note) => {
+                                activity.touch();
+                                self.clear_stream_stall(&mut stall_emitted, workspace_id, agent_id)
+                                    .await;
+                                any_update_received = true;
+                                updates_applied |= self
+                                    .route_notification(&note, agent_id, workspace_id, &mut transcript)
+                                    .await;
+                            }
+                            None => closed = true,
+                        },
+                        () = tokio::time::sleep(stall_check) => {
+                            let silent_ms = activity.idle_ms();
+                            let tool_call_open = transcript.open_tool_call_count() > 0;
+                            let advisory_threshold_ms = if tool_call_open {
+                                open_tool_stall_ms
+                            } else {
+                                stall_threshold_ms
+                            };
+                            if !stall_emitted && silent_ms >= advisory_threshold_ms {
+                                stall_emitted = true;
+                                tracing::warn!(
+                                    agent = %agent_id,
+                                    silent_ms,
+                                    tool_call_open,
+                                    "mid-turn stream stall — no session/update past threshold (monorepo#3402)"
+                                );
+                                self.publish_stalled_status_event(workspace_id, agent_id, silent_ms)
+                                    .await;
+                            }
+                            let terminal_ms = if tool_call_open {
+                                open_tool_terminal_ms
+                            } else {
+                                stall_terminal_ms
+                            };
+                            if silent_ms >= terminal_ms {
+                                let open_tool_call = transcript.open_tool_call_label();
+                                tracing::warn!(
+                                    agent = %agent_id,
+                                    silent_ms,
+                                    terminal_ms,
+                                    open_tool_call = open_tool_call.as_deref().unwrap_or("none"),
+                                    "provider stall — no session/update past the terminal threshold; failing the turn (intent#5395)"
+                                );
+                                break Err(AcpError::ProviderStall {
+                                    silent: Duration::from_millis(silent_ms),
+                                    open_tool_call,
+                                });
+                            }
                         }
                     }
-                }
+                };
+                attempt_result
             };
             // Drain updates buffered before this attempt settled BEFORE the
             // retry decision: `prompt_fut` can win the `select!` with streamed
@@ -3438,6 +3482,9 @@ impl Services {
                         delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
                         "transient provider fetch failure — retrying session/prompt (monorepo#3007)"
                     );
+                    if let Some(original) = captured.as_mut() {
+                        original.recapture();
+                    }
                     tokio::time::sleep(delay).await;
                     // Re-drain after the backoff: a straggling update (or a
                     // channel close) can land DURING the sleep, and

@@ -72,9 +72,38 @@ use crate::agent_session::{
 use crate::events::EventBus;
 use crate::Services;
 
+/// The initialized transport and its captured prompt authority travel together.
+/// Returning an ACP string never permits reconstructing this tuple from an ID.
+struct StartedSession {
+    session_id: String,
+    turn: OriginalTurn,
+}
+struct OriginalTurn {
+    connection: Arc<Connection>,
+    notifications: Arc<TokioMutex<mpsc::UnboundedReceiver<IncomingNotification>>>,
+    origin: Arc<RepositoryOrigin>,
+    prompt: Option<RepositoryPromptInput>,
+}
+impl OriginalTurn {
+    fn capture(
+        connection: Arc<Connection>,
+        notifications: Arc<TokioMutex<mpsc::UnboundedReceiver<IncomingNotification>>>,
+        origin: Arc<RepositoryOrigin>,
+    ) -> Self {
+        let prompt = origin.capture_prompt(&connection);
+        Self {
+            connection,
+            notifications,
+            origin,
+            prompt,
+        }
+    }
+}
+
 mod repository_origin;
 use crate::repository_admission::lifecycle::physical_owner::RepositoryCreationIntent;
-use repository_origin::callback_delivery::{deliver_optional, EndpointBlueprint, ServerBlueprint};
+pub(crate) use repository_origin::callback_delivery::RepositoryPromptInput;
+use repository_origin::callback_delivery::{deliver_captured, EndpointBlueprint, ServerBlueprint};
 use repository_origin::RepositoryOrigin;
 
 #[cfg(test)]
@@ -3093,7 +3122,7 @@ impl AgentManager {
         // Per-agent in-process MCP server over the SAME services surface the FE
         // uses, with the §18.4 denylist for this agent type applied, served over
         // a loopback bridge a real spawned child reaches via `--mcp-config`.
-        let api: Arc<dyn WorkspaceApi> = original_services;
+        let api: Arc<dyn WorkspaceApi> = original_services.clone();
         let specialist_model_options = self
             .services
             .specialist_model_options_for_workspace(&workspace_id)
@@ -3132,6 +3161,7 @@ impl AgentManager {
                     )
                     .with_compact_tool_descriptions(compact)
             })
+            .with_original_services(original_services, session.clone())
         };
         let mut server = server_blueprint.server();
         if let Some(context) = repository_origin.pending_callback() {
@@ -3729,6 +3759,17 @@ impl AgentManager {
         cwd: PathBuf,
         provider: &ProviderConfig,
     ) -> Result<String> {
+        self.start_session_owned(agent_id, cwd, provider)
+            .await
+            .map(|started| started.session_id)
+    }
+
+    async fn start_session_owned(
+        &self,
+        agent_id: &AgentId,
+        cwd: PathBuf,
+        provider: &ProviderConfig,
+    ) -> Result<StartedSession> {
         let (conn, notes, repository_origin, session_mcp_servers, wake_gate, antigravity_profile) = {
             let map = self.handles.lock().unwrap();
             let handle = map
@@ -3860,7 +3901,7 @@ impl AgentManager {
                 )
                 .await
                 .map(|opened| {
-                    opened.map(|outcome| repository_origin.accept_session(attempt, outcome))
+                    opened.map(|outcome| repository_origin.accept_session(attempt, &conn, outcome))
                 })
         } else {
             self.services
@@ -3918,8 +3959,16 @@ impl AgentManager {
                     Some(&default),
                 )
                 .await;
-                deliver_optional(delivery).await;
-                return Ok(opened.session_id);
+                let captured = deliver_captured(delivery).await;
+                return Ok(StartedSession {
+                    session_id: opened.session_id,
+                    turn: OriginalTurn {
+                        connection: conn,
+                        notifications: notes,
+                        origin: repository_origin,
+                        prompt: captured,
+                    },
+                });
             }
             Ok(None) => {}
             // Auth-required resume failure (intent-hq/intent#3941): the
@@ -3985,6 +4034,7 @@ impl AgentManager {
                 (
                     repository_origin.accept_session(
                         attempt,
+                        &conn,
                         crate::agent_session::RepositorySessionOutcome {
                             response: opened,
                             owner: outcome.owner,
@@ -4019,8 +4069,16 @@ impl AgentManager {
                 None,
             )
             .await;
-            deliver_optional(delivery).await;
-            return Ok(opened.session_id);
+            let captured = deliver_captured(delivery).await;
+            return Ok(StartedSession {
+                session_id: opened.session_id,
+                turn: OriginalTurn {
+                    connection: conn,
+                    notifications: notes,
+                    origin: repository_origin,
+                    prompt: captured,
+                },
+            });
         }
 
         // 2) Resume impossible but a session existed → recreate + flag for resend.
@@ -4037,6 +4095,7 @@ impl AgentManager {
                 }) {
                 repository_origin.accept_session(
                     attempt,
+                    &conn,
                     self.services
                         .create_repository_acp_session(
                             (conn.as_ref(), callbacks.as_ref()),
@@ -4090,8 +4149,16 @@ impl AgentManager {
                 None,
             )
             .await;
-            deliver_optional(delivery).await;
-            return Ok(opened.session_id);
+            let captured = deliver_captured(delivery).await;
+            return Ok(StartedSession {
+                session_id: opened.session_id,
+                turn: OriginalTurn {
+                    connection: conn,
+                    notifications: notes,
+                    origin: repository_origin,
+                    prompt: captured,
+                },
+            });
         }
 
         // 3) Brand-new agent → open and persist the first session (write-once).
@@ -4100,6 +4167,7 @@ impl AgentManager {
         {
             repository_origin.accept_session(
                 attempt,
+                &conn,
                 self.services
                     .create_repository_acp_session(
                         (conn.as_ref(), callbacks.as_ref()),
@@ -4146,8 +4214,16 @@ impl AgentManager {
             None,
         )
         .await;
-        deliver_optional(delivery).await;
-        Ok(opened.session_id)
+        let captured = deliver_captured(delivery).await;
+        Ok(StartedSession {
+            session_id: opened.session_id,
+            turn: OriginalTurn {
+                connection: conn,
+                notifications: notes,
+                origin: repository_origin,
+                prompt: captured,
+            },
+        })
     }
 
     /// A loaded session reports its current value, which may be a prior
@@ -5054,7 +5130,20 @@ impl AgentManager {
         prompt: Vec<ContentBlock>,
         turn_id: Option<&str>,
     ) -> Result<StopReason> {
-        let (conn, notes, _repository_origin) = {
+        let original = self.capture_turn(agent_id)?;
+        self.run_turn_owned(
+            agent_id,
+            workspace_id,
+            acp_session_id,
+            prompt,
+            turn_id,
+            original,
+        )
+        .await
+    }
+
+    fn capture_turn(&self, agent_id: &AgentId) -> Result<OriginalTurn> {
+        let (conn, notes, origin) = {
             let map = self.handles.lock().unwrap();
             let handle = map
                 .get(agent_id)
@@ -5065,11 +5154,29 @@ impl AgentManager {
                 handle.repository_origin.clone(),
             )
         };
+        Ok(OriginalTurn::capture(conn, notes, origin))
+    }
+
+    async fn run_turn_owned(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        acp_session_id: &str,
+        prompt: Vec<ContentBlock>,
+        turn_id: Option<&str>,
+        original: OriginalTurn,
+    ) -> Result<StopReason> {
+        let OriginalTurn {
+            connection: conn,
+            notifications: notes,
+            origin: _origin,
+            prompt: captured,
+        } = original;
         self.registry.mark_active(agent_id);
         let mut guard = notes.lock().await;
         let result = self
             .services
-            .run_prompt_turn(
+            .run_prompt_turn_captured(
                 conn.as_ref(),
                 &mut guard,
                 agent_id,
@@ -5077,6 +5184,7 @@ impl AgentManager {
                 acp_session_id,
                 prompt,
                 turn_id,
+                captured,
             )
             .await;
         self.registry.mark_idle_slot_held(agent_id);
@@ -9208,11 +9316,22 @@ impl AgentManager {
     /// session otherwise. When the session's model/provider has changed (via
     /// `agent.setModel`), tears down the existing child and respawns with the
     /// new model before the next turn. Returns the `acpSessionId` to drive the turn.
+    #[cfg(test)]
     async fn ensure_started(
         &self,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
     ) -> Result<String> {
+        self.ensure_started_owned(agent_id, workspace_id)
+            .await
+            .map(|started| started.session_id)
+    }
+
+    async fn ensure_started_owned(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+    ) -> Result<StartedSession> {
         // Teardown fence (ghost-agent race): refuse to (re)spawn an agent a
         // `workspace.delete` batch stop (`stop_many`) is tearing down — its
         // session row is about to be cascade-deleted, so a lazy spawn here
@@ -9300,6 +9419,7 @@ impl AgentManager {
                 self.kill_child_only(agent_id).await;
             } else if let Some(acp) = session.acp_session_id.clone() {
                 if self.handle_is_live(agent_id) {
+                    let original = self.capture_turn(agent_id)?;
                     // Model unchanged and child is live — reuse the existing
                     // session. The notice/commit still runs: the live child may
                     // predate a same-provider model change the reuse tolerates,
@@ -9312,13 +9432,8 @@ impl AgentManager {
                     // for the turn about to run (PROTOCOL §5.5). A no-op when
                     // the effort is unchanged or the provider advertised no
                     // such option.
-                    let conn = self
-                        .handles
-                        .lock()
-                        .unwrap()
-                        .get(agent_id)
-                        .map(|h| h.connection.clone());
-                    if let Some(conn) = conn {
+                    {
+                        let conn = &original.connection;
                         let effort = Self::session_model_effort(
                             &resolved.provider,
                             session.model.as_deref(),
@@ -9329,7 +9444,10 @@ impl AgentManager {
                     }
                     self.maybe_persist_effort_change_notice(agent_id, workspace_id, &resolved)
                         .await;
-                    return Ok(acp);
+                    return Ok(StartedSession {
+                        session_id: acp,
+                        turn: original,
+                    });
                 }
                 // The child/transport died while the agent sat idle
                 // (monorepo#764): clear the stale handle + registry entry and
@@ -9529,7 +9647,7 @@ impl AgentManager {
             .await?;
         }
         let session_result = self
-            .start_session(agent_id, resolved.cwd.clone(), &resolved.provider)
+            .start_session_owned(agent_id, resolved.cwd.clone(), &resolved.provider)
             .await;
         let acp_session_id = match session_result {
             Ok(id) => id,
@@ -11300,8 +11418,11 @@ async fn run_message_worker(
                 .acquire_turn_start(&agent_id, try_claim, release)
                 .await;
         }
-        match retry_spawn(&mgr, &agent_id, &workspace_id).await {
-            Ok(acp_session_id) => {
+        match retry_spawn_owned(&mgr, &agent_id, &workspace_id).await {
+            Ok(StartedSession {
+                session_id: acp_session_id,
+                turn,
+            }) => {
                 // Clear any persisted completion report at the start of this turn
                 // (including queue-drained turns). Skip the store write when no
                 // report is set; the `agent:idle` wake for a prior turn that set a
@@ -11347,12 +11468,13 @@ async fn run_message_worker(
                     .build_turn_prompt(&agent_id, &workspace_id, &content, &options)
                     .await;
                 match mgr
-                    .run_turn(
+                    .run_turn_owned(
                         &agent_id,
                         &workspace_id,
                         &acp_session_id,
                         prompt,
                         options.turn_id.as_deref(),
+                        turn,
                     )
                     .await
                 {
@@ -12807,15 +12929,26 @@ fn is_retryable_spawn_error(err: &Error) -> bool {
 /// nothing terminal is ever surfaced. The final / non-retryable attempt keeps
 /// the plain WARN: its handle is left installed for the caller's terminal
 /// "failed after all retries" hint.
+#[cfg(test)]
 async fn retry_spawn(
     mgr: &AgentManager,
     agent_id: &AgentId,
     workspace_id: &WorkspaceId,
 ) -> Result<String> {
+    retry_spawn_owned(mgr, agent_id, workspace_id)
+        .await
+        .map(|started| started.session_id)
+}
+
+async fn retry_spawn_owned(
+    mgr: &AgentManager,
+    agent_id: &AgentId,
+    workspace_id: &WorkspaceId,
+) -> Result<StartedSession> {
     let mut last_error: Option<Error> = None;
 
     for attempt in 1..=MAX_SPAWN_ATTEMPTS {
-        match mgr.ensure_started(agent_id, workspace_id).await {
+        match mgr.ensure_started_owned(agent_id, workspace_id).await {
             Ok(session_id) => return Ok(session_id),
             Err(e) => {
                 let retryable = is_retryable_spawn_error(&e);
