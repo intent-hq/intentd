@@ -138,6 +138,11 @@ pub struct QuickActionsSettings {
     /// `quickActions.typeOverrides` — per-quick-action model overrides
     /// (`commit`, `pr`, `review`, `fast`).
     pub type_overrides: BTreeMap<String, String>,
+    /// Shared effort for quick actions; blank reads as unset.
+    #[serde(deserialize_with = "de_blank_as_none")]
+    pub default_reasoning_effort: Option<String>,
+    /// Per-action effort, independent of the per-action model override.
+    pub type_reasoning_effort_overrides: BTreeMap<String, String>,
     /// `quickActions.providerSettings` — per-provider quick-action settings
     /// (opaque FE-owned bags; validated structurally as a table only).
     pub provider_settings: toml::Table,
@@ -1660,6 +1665,10 @@ providerDefaults = {}
 # defaultModel = "claude-sonnet-4-5"
 # Quick action type overrides -- per-quick-action model overrides.
 typeOverrides = {}
+# Quick action effort -- provider-defined; blank means provider default.
+# defaultReasoningEffort = "high"
+# Per-action effort overrides; blank or absent inherits the shared effort.
+typeReasoningEffortOverrides = {}
 # Quick action provider settings -- per-provider quick-action settings.
 providerSettings = {}
 
@@ -2687,6 +2696,22 @@ mod tests {
             }))
         );
         assert_eq!(legacy.len(), 1);
+    }
+
+    #[test]
+    fn quick_action_effort_blank_reads_unset_but_nonblank_spelling_survives() {
+        for (input, expected) in [("", None), ("   ", None), (" High ", Some(" High "))] {
+            let text = format!("[quickActions]\ndefaultReasoningEffort = {input:?}\n[quickActions.typeReasoningEffortOverrides]\ncommit = \"   \"\n");
+            let parsed = SettingsFile::parse_str(&text).unwrap();
+            assert_eq!(
+                parsed.quick_actions.default_reasoning_effort.as_deref(),
+                expected
+            );
+            assert_eq!(
+                parsed.quick_actions.type_reasoning_effort_overrides["commit"],
+                "   "
+            );
+        }
     }
 
     #[test]

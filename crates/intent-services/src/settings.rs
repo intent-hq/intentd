@@ -1257,6 +1257,20 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "providers",
             Some(json!({})),
         ),
+        string(
+            "quickActions.defaultReasoningEffort",
+            "Default quick action effort",
+            "Reasoning effort for quick actions; blank uses the provider default",
+            "providers",
+            None,
+        ),
+        object(
+            "quickActions.typeReasoningEffortOverrides",
+            "Quick action effort overrides",
+            "Per-action reasoning effort; blank or absent inherits the shared quick action effort",
+            "providers",
+            Some(json!({})),
+        ),
         object(
             "quickActions.providerSettings",
             "Per-provider quick action settings",
