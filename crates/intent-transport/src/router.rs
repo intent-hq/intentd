@@ -11,6 +11,11 @@
 //! their semantic selectors: catalogs/settings/capabilities/client registry remain
 //! daemon-wide, and specialist project writes still require explicit scope/path.
 //! No workspace lookup or extra service argument is needed for this metadata.
+//!
+//! Selected resource continuations likewise accept optional routing context:
+//! agent/terminal/upload/export/search IDs keep selecting the resource, and the
+//! service authorizes its actual owner. In particular, source export follow-ups
+//! retain their exportId/seq/archiveSource semantics without a workspace lookup.
 
 use intent_core::{
     AgentCreateExtra, AgentDelegateInput, AgentId, AgentWakeCreateOptions, AgentWakeOrCreateInput,
