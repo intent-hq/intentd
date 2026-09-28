@@ -6781,8 +6781,8 @@ mod genuine_native_startup {
             let original_session_id = first.session_id.clone();
             let mut observation = json!({
                 "stage":"original-connection-release", "connection":"retained",
-                "pending-listener":{"state":"not-reached","lastResult":null},
-                "confirmed-listener":{"state":"not-reached","lastResult":null}
+                "pending-listener":{"state":"not-reached","lastResult":null,"lastReset":null},
+                "confirmed-listener":{"state":"not-reached","lastResult":null,"lastReset":null}
             });
             // Releasing the caller's tuple permits final Connection Drop. Its
             // lazy writer-channel flag is not a process-exit or retirement fence.
@@ -6825,6 +6825,12 @@ mod genuine_native_startup {
                                     "errorKind":format!("{:?}", error.kind()),
                                     "rawOsError":error.raw_os_error()
                                 });
+                                if error.kind() == std::io::ErrorKind::ConnectionReset {
+                                    observation[stage]["lastReset"] =
+                                        observation[stage]["lastResult"].clone();
+                                    tokio::task::yield_now().await;
+                                    continue;
+                                }
                                 if error.kind() != std::io::ErrorKind::ConnectionRefused {
                                     diagnostic("failure", &observation);
                                     panic!("{stage}: expected ConnectionRefused, observed {error}");
