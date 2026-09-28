@@ -14,12 +14,14 @@ pub mod device_flow;
 pub mod error;
 pub mod gh_sync;
 pub mod github;
+mod github_transport;
 pub mod gitlab_auth;
 pub mod gitlab_token;
 pub mod identity_proof;
 pub mod model;
 pub mod registry;
 pub mod token;
+pub mod traffic;
 
 use async_trait::async_trait;
 

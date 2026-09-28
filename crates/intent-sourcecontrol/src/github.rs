@@ -92,8 +92,7 @@ fn pr_read_quota(core: RateLimitStatus, graphql: RateLimitStatus) -> RateLimitSt
 
 /// GitHub implementation of [`SourceControl`].
 pub struct GitHubSourceControl {
-    client: octocrab::Octocrab,
-    quota_client: octocrab::Octocrab,
+    transport: crate::github_transport::Transport,
 }
 
 impl GitHubSourceControl {
@@ -105,8 +104,7 @@ impl GitHubSourceControl {
     /// Returns an error if the octocrab client cannot be built (e.g. an invalid `api_base_url`).
     pub fn new(token: &str, api_base_url: Option<&str>) -> Result<Self> {
         Ok(Self {
-            client: Self::build_client(Some(token), api_base_url, false)?,
-            quota_client: Self::build_client(Some(token), api_base_url, true)?,
+            transport: crate::github_transport::Transport::new(Some(token), api_base_url)?,
         })
     }
 
@@ -117,7 +115,7 @@ impl GitHubSourceControl {
     /// Returns the same typed API/auth/rate-limit errors as `get_user`.
     pub async fn get_user_with_scopes(&self) -> Result<(UserIdentity, Option<Vec<String>>)> {
         use octocrab::FromResponse;
-        let response = octocrab::map_github_error(self.client._get("/user").await?).await?;
+        let response = octocrab::map_github_error(self.client()._get("/user").await?).await?;
         let scopes = response
             .headers()
             .get("x-oauth-scopes")
@@ -138,41 +136,59 @@ impl GitHubSourceControl {
     /// invalid `api_base_url`).
     pub fn anonymous(api_base_url: Option<&str>) -> Result<Self> {
         Ok(Self {
-            client: Self::build_client(None, api_base_url, false)?,
-            quota_client: Self::build_client(None, api_base_url, true)?,
+            transport: crate::github_transport::Transport::new(None, api_base_url)?,
         })
     }
 
-    fn build_client(
-        token: Option<&str>,
-        api_base_url: Option<&str>,
-        quota_probe: bool,
-    ) -> Result<octocrab::Octocrab> {
-        let mut builder = octocrab::Octocrab::builder()
-            .set_connect_timeout(Some(CONNECT_TIMEOUT))
-            .set_read_timeout(Some(READ_WRITE_TIMEOUT))
-            .set_write_timeout(Some(READ_WRITE_TIMEOUT));
-        if let Some(token) = token {
-            builder = builder.personal_token(token.to_string());
-        }
-        if quota_probe {
-            // The gate owns probe retries. Octocrab's default immediately
-            // retries 429/5xx three times, multiplying the metered probe cost.
-            builder =
-                builder.add_retry_config(octocrab::service::middleware::retry::RetryConfig::None);
-        }
-        if let Some(base) = api_base_url {
-            builder = builder
-                .base_uri(base)
-                .map_err(|e| Error::Config(format!("invalid github apiBaseUrl {base:?}: {e}")))?;
-        }
-        Ok(builder.build()?)
+    /// A facade over the shared HTTP pool capturing this caller's accounting context.
+    pub(crate) fn client(&self) -> octocrab::Octocrab {
+        self.transport.client(false, None)
     }
 
-    /// The underlying octocrab client (token + base URI + timeouts), for
-    /// crate-internal callers outside the [`SourceControl`] surface.
-    pub(crate) fn client(&self) -> &octocrab::Octocrab {
-        &self.client
+    fn quota_client(&self) -> octocrab::Octocrab {
+        self.transport.client(true, None)
+    }
+
+    async fn graphql_accounted(&self, payload: &Value) -> octocrab::Result<Value> {
+        let mut payload = payload.clone();
+        let is_mutation = payload
+            .get("query")
+            .and_then(Value::as_str)
+            .is_some_and(|q| q.trim_start().starts_with("mutation"));
+        let operation = if is_mutation {
+            crate::traffic::Operation::Other
+        } else {
+            crate::traffic::Operation::PrDetail
+        };
+        // All documents here are daemon-owned. Queries can request their actual
+        // cost alongside the existing selections; mutations do not expose it.
+        if let Some(query) = payload.get("query").and_then(Value::as_str) {
+            if !is_mutation {
+                if let Some(end) = query.rfind('}') {
+                    payload["query"] = Value::String(format!(
+                        "{} rateLimit {{ cost }} {}",
+                        &query[..end],
+                        &query[end..]
+                    ));
+                }
+            }
+        }
+        let result: octocrab::Result<Value> = self
+            .transport
+            .client(false, Some(operation))
+            .graphql(&payload)
+            .await;
+        let cost = result
+            .as_ref()
+            .ok()
+            .and_then(|v| v.pointer("/rateLimit/cost"))
+            .and_then(Value::as_u64);
+        crate::traffic::graphql_result(
+            operation,
+            cost,
+            matches!(&result, Err(octocrab::Error::Graphql { .. })),
+        );
+        result
     }
 
     fn repo_path(repo: &RepoRef, suffix: &str) -> String {
@@ -194,7 +210,7 @@ impl GitHubSourceControl {
             ("per_page", per_page.to_string()),
             ("page", page_no.to_string()),
         ];
-        let v: Value = self.client.get("/search/issues", Some(&params)).await?;
+        let v: Value = self.client().get("/search/issues", Some(&params)).await?;
         Ok(serde_json::from_value(
             v.get("items")
                 .cloned()
@@ -237,7 +253,7 @@ impl GitHubSourceControl {
         let mut readable: Vec<RepoRef> = Vec::with_capacity(scope.len());
         for repo in scope {
             match self
-                .client
+                .client()
                 .get::<Value, _, _>(&Self::repo_path(repo, ""), None::<&()>)
                 .await
             {
@@ -1522,7 +1538,11 @@ impl SourceControl for GitHubSourceControl {
     }
 
     async fn check_auth(&self) -> Result<AuthStatus> {
-        match self.client.get::<Value, _, ()>("/user", None::<&()>).await {
+        match self
+            .client()
+            .get::<Value, _, ()>("/user", None::<&()>)
+            .await
+        {
             Ok(user) => Ok(AuthStatus {
                 authenticated: true,
                 login: user.get("login").and_then(Value::as_str).map(String::from),
@@ -1548,7 +1568,7 @@ impl SourceControl for GitHubSourceControl {
             http::HeaderValue::from_static("no-cache"),
         );
         let rest = self
-            .quota_client
+            .quota_client()
             ._get_with_headers("/user", Some(headers))
             .await?;
         let core = enforced_quota(rest.headers(), "core");
@@ -1557,9 +1577,9 @@ impl SourceControl for GitHubSourceControl {
         } else {
             RateLimitStatus::default()
         };
-        let _body = self.quota_client.body_to_string(rest).await?;
+        let _body = self.quota_client().body_to_string(rest).await?;
         let graphql = self
-            .quota_client
+            .quota_client()
             ._post(
                 "/graphql",
                 Some(&json!({"query": "query { rateLimit { remaining } }"})),
@@ -1571,7 +1591,7 @@ impl SourceControl for GitHubSourceControl {
         } else {
             RateLimitStatus::default()
         };
-        let _body = self.quota_client.body_to_string(graphql).await?;
+        let _body = self.quota_client().body_to_string(graphql).await?;
         Ok(pr_read_quota(core, quota))
     }
 
@@ -1580,7 +1600,7 @@ impl SourceControl for GitHubSourceControl {
     }
 
     async fn get_user(&self) -> Result<UserIdentity> {
-        let v: Value = self.client.get("/user", None::<&()>).await?;
+        let v: Value = self.client().get("/user", None::<&()>).await?;
         map_user_identity(v)
     }
 
@@ -1590,7 +1610,7 @@ impl SourceControl for GitHubSourceControl {
             return Err(Error::NotFound(format!("github user {login:?}")));
         }
         let v: Value = self
-            .client
+            .client()
             .get(format!("/users/{login}"), None::<&()>)
             .await?;
         map_user_identity(v)
@@ -1602,7 +1622,7 @@ impl SourceControl for GitHubSourceControl {
             return Err(Error::NotFound(format!("gist {gist_id:?}")));
         }
         let v: Value = self
-            .client
+            .client()
             .get(format!("/gists/{gist_id}"), None::<&()>)
             .await?;
         crate::identity_proof::proof_gist_view(&v)
@@ -1615,7 +1635,7 @@ impl SourceControl for GitHubSourceControl {
         }
         let params: Vec<(&str, String)> =
             vec![("q", search_query), ("per_page", limit.max(1).to_string())];
-        let v: Value = self.client.get("/search/users", Some(&params)).await?;
+        let v: Value = self.client().get("/search/users", Some(&params)).await?;
         let items: Vec<Value> = serde_json::from_value(
             v.get("items")
                 .cloned()
@@ -1632,7 +1652,7 @@ impl SourceControl for GitHubSourceControl {
             ("page", page_no.to_string()),
             ("sort", "updated".to_string()),
         ];
-        let v: Value = self.client.get("/user/repos", Some(&params)).await?;
+        let v: Value = self.client().get("/user/repos", Some(&params)).await?;
         let items: Vec<Value> = serde_json::from_value(v)?;
         let fetched = items.len();
         let repos = items
@@ -1663,7 +1683,7 @@ impl SourceControl for GitHubSourceControl {
             ("page", page_no.to_string()),
         ];
         let v: Value = self
-            .client
+            .client()
             .get("/search/repositories", Some(&params))
             .await?;
         let items: Vec<Value> = serde_json::from_value(
@@ -1684,7 +1704,7 @@ impl SourceControl for GitHubSourceControl {
 
     async fn get_repo(&self, owner: &str, name: &str) -> Result<Repo> {
         let route = format!("/repos/{owner}/{name}");
-        let v: Value = self.client.get(&route, None::<&()>).await?;
+        let v: Value = self.client().get(&route, None::<&()>).await?;
         map_repo(v)
     }
 
@@ -1713,7 +1733,7 @@ impl SourceControl for GitHubSourceControl {
                 "/repos/{owner}/{name}/git/matching-refs/heads/{}",
                 encode_path_segments(prefix)
             );
-            let v: Value = self.client.get(&route, None::<&()>).await?;
+            let v: Value = self.client().get(&route, None::<&()>).await?;
             let items: Vec<Value> = serde_json::from_value(v)?;
             let branches: Vec<Branch> = items
                 .into_iter()
@@ -1725,7 +1745,7 @@ impl SourceControl for GitHubSourceControl {
             return Ok(page_full_set(branches, page_no, per_page));
         }
         let route = format!("/repos/{owner}/{name}/branches");
-        let v: Value = self.client.get(&route, Some(&params)).await?;
+        let v: Value = self.client().get(&route, Some(&params)).await?;
         let items: Vec<Value> = serde_json::from_value(v)?;
         let fetched = items.len();
         let branches = items
@@ -1746,7 +1766,7 @@ impl SourceControl for GitHubSourceControl {
     ) -> Result<Option<String>> {
         let route = Self::repo_path(repo, &format!("/contents/{}", encode_path_segments(path)));
         let params: Option<Vec<(&str, String)>> = git_ref.map(|r| vec![("ref", r.to_string())]);
-        let v: Value = match self.client.get(&route, params.as_ref()).await {
+        let v: Value = match self.client().get(&route, params.as_ref()).await {
             Ok(v) => v,
             Err(e) => {
                 // 404 (file/repo/ref absent) is the graceful "no such file"
@@ -1769,13 +1789,13 @@ impl SourceControl for GitHubSourceControl {
             "draft": input.draft,
         });
         let route = Self::repo_path(repo, "/pulls");
-        let v: Value = self.client.post(route, Some(&body)).await?;
+        let v: Value = self.client().post(route, Some(&body)).await?;
         map_pull(v)
     }
 
     async fn get_pr(&self, repo: &RepoRef, number: u64) -> Result<PullRequest> {
         let route = Self::repo_path(repo, &format!("/pulls/{number}"));
-        let v: Value = self.client.get(&route, None::<&()>).await?;
+        let v: Value = self.client().get(&route, None::<&()>).await?;
         map_pull(v)
     }
 
@@ -1830,7 +1850,7 @@ impl SourceControl for GitHubSourceControl {
         params.push(("per_page", per_page.to_string()));
         params.push(("page", page_no.to_string()));
         let route = Self::repo_path(repo, "/pulls");
-        let v: Value = self.client.get(&route, Some(&params)).await?;
+        let v: Value = self.client().get(&route, Some(&params)).await?;
         let raw: Vec<Value> = serde_json::from_value(v)?;
         // Paging is measured on the raw GitHub page; the optional client-side
         // `author` filter only narrows what this page returns.
@@ -1864,7 +1884,10 @@ impl SourceControl for GitHubSourceControl {
             None => {}
         }
         let route = Self::repo_path(repo, &format!("/pulls/{number}"));
-        let v: Value = self.client.patch(route, Some(&Value::Object(body))).await?;
+        let v: Value = self
+            .client()
+            .patch(route, Some(&Value::Object(body)))
+            .await?;
         map_pull(v)
     }
 
@@ -1891,7 +1914,7 @@ impl SourceControl for GitHubSourceControl {
             body.insert("commit_message".into(), json!(message));
         }
         let route = Self::repo_path(repo, &format!("/pulls/{number}/merge"));
-        let v: Value = self.client.put(route, Some(&Value::Object(body))).await?;
+        let v: Value = self.client().put(route, Some(&Value::Object(body))).await?;
         Ok(MergeOutcome {
             merged: v.get("merged").and_then(Value::as_bool).unwrap_or(false),
             message: v
@@ -1905,13 +1928,13 @@ impl SourceControl for GitHubSourceControl {
 
     async fn mergeability(&self, repo: &RepoRef, number: u64) -> Result<Mergeability> {
         let route = Self::repo_path(repo, &format!("/pulls/{number}"));
-        let v: Value = self.client.get(&route, None::<&()>).await?;
+        let v: Value = self.client().get(&route, None::<&()>).await?;
         map_mergeability(v)
     }
 
     async fn update_branch(&self, repo: &RepoRef, number: u64) -> Result<()> {
         let route = Self::repo_path(repo, &format!("/pulls/{number}/update-branch"));
-        let _: Value = self.client.put(route, None::<&()>).await?;
+        let _: Value = self.client().put(route, None::<&()>).await?;
         Ok(())
     }
 
@@ -1929,7 +1952,7 @@ impl SourceControl for GitHubSourceControl {
         }
         let route = Self::repo_path(repo, &format!("/pulls/{number}/reviews"));
         let v: Value = self
-            .client
+            .client()
             .post(route, Some(&Value::Object(payload)))
             .await?;
         map_review(v)
@@ -1950,7 +1973,7 @@ impl SourceControl for GitHubSourceControl {
                 "prNumber": number,
             },
         });
-        let resp: Value = self.client.graphql(&payload).await?;
+        let resp: Value = self.graphql_accounted(&payload).await?;
         let data = graphql_data(resp)?;
         Ok(parse_review_decision(&data))
     }
@@ -1996,7 +2019,7 @@ impl SourceControl for GitHubSourceControl {
             repo,
             &format!("/rules/branches/{}", encode_path_segments(branch)),
         );
-        let v: Value = self.client.get(&route, None::<&()>).await?;
+        let v: Value = self.client().get(&route, None::<&()>).await?;
         Ok(map_branch_rules(&v))
     }
 
@@ -2027,7 +2050,7 @@ impl SourceControl for GitHubSourceControl {
             repo,
             &format!("/issues/{number}/comments?per_page=100&sort=created&direction=desc"),
         );
-        let v: Value = self.client.get(&route, None::<&()>).await?;
+        let v: Value = self.client().get(&route, None::<&()>).await?;
         map_list(v, map_issue_comment)
     }
 
@@ -2042,7 +2065,7 @@ impl SourceControl for GitHubSourceControl {
             None => {
                 let route = Self::repo_path(repo, &format!("/issues/{number}/comments"));
                 let v: Value = self
-                    .client
+                    .client()
                     .post(route, Some(&json!({ "body": body })))
                     .await?;
                 map_issue_comment(v)
@@ -2057,7 +2080,7 @@ impl SourceControl for GitHubSourceControl {
                 }
                 let route = Self::repo_path(repo, &format!("/pulls/{number}/comments"));
                 let v: Value = self
-                    .client
+                    .client()
                     .post(route, Some(&Value::Object(payload)))
                     .await?;
                 Ok(review_comment_as_comment(map_review_comment(v)?))
@@ -2080,7 +2103,7 @@ impl SourceControl for GitHubSourceControl {
             ("sort", "created".to_string()),
             ("direction", "desc".to_string()),
         ];
-        let v: Value = self.client.get(&route, Some(&params)).await?;
+        let v: Value = self.client().get(&route, Some(&params)).await?;
         let items: Vec<Value> = serde_json::from_value(v)?;
         let fetched = items.len();
         let comments = items
@@ -2102,7 +2125,7 @@ impl SourceControl for GitHubSourceControl {
     ) -> Result<ReviewComment> {
         let route = Self::repo_path(repo, &format!("/pulls/{number}/comments"));
         let payload = json!({ "body": body, "in_reply_to": comment_id });
-        let v: Value = self.client.post(route, Some(&payload)).await?;
+        let v: Value = self.client().post(route, Some(&payload)).await?;
         map_review_comment(v)
     }
 
@@ -2125,7 +2148,13 @@ impl SourceControl for GitHubSourceControl {
                 "after": after,
             },
         });
-        let resp: Value = self.client.graphql(&payload).await?;
+        let attempt = if after.is_some() {
+            crate::traffic::Attempt::Continuation
+        } else {
+            crate::traffic::Attempt::Initial
+        };
+        let resp: Value =
+            crate::traffic::with_attempt(attempt, self.graphql_accounted(&payload)).await?;
         let data = graphql_data(resp)?;
         let threads = data.pointer("/repository/pullRequest/reviewThreads");
         let nodes = threads
@@ -2176,7 +2205,7 @@ impl SourceControl for GitHubSourceControl {
         }
         let route = Self::repo_path(repo, "/issues");
         let v: Value = self
-            .client
+            .client()
             .post(route, Some(&Value::Object(payload)))
             .await?;
         map_issue(v)
@@ -2184,7 +2213,7 @@ impl SourceControl for GitHubSourceControl {
 
     async fn get_issue(&self, repo: &RepoRef, number: u64) -> Result<Issue> {
         let route = Self::repo_path(repo, &format!("/issues/{number}"));
-        let v: Value = self.client.get(&route, None::<&()>).await?;
+        let v: Value = self.client().get(&route, None::<&()>).await?;
         map_issue_at_number(v, number)
     }
 
@@ -2232,7 +2261,7 @@ impl SourceControl for GitHubSourceControl {
         params.push(("per_page", per_page.to_string()));
         params.push(("page", page_no.to_string()));
         let route = Self::repo_path(repo, "/issues");
-        let v: Value = self.client.get(&route, Some(&params)).await?;
+        let v: Value = self.client().get(&route, Some(&params)).await?;
         let raw: Vec<Value> = serde_json::from_value(v)?;
         // Paging is measured on the raw GitHub page; the `pull_request` filter
         // only narrows what this page returns (parity with the `author` filter
@@ -2268,7 +2297,7 @@ impl GitHubSourceControl {
                 ("per_page", per_page.to_string()),
                 ("page", page.to_string()),
             ];
-            let v: Value = self.client.get(route, Some(&params)).await?;
+            let v: Value = self.client().get(route, Some(&params)).await?;
             let items: Vec<Value> = serde_json::from_value(extract(v))?;
             let fetched = items.len();
             for item in items {
@@ -2377,9 +2406,11 @@ impl GitHubSourceControl {
             if cursors.len() == MAX_PAGES {
                 break;
             }
-            page = self
-                .graphql_tolerating_merge_queue_schema(query, repo, number, Some(cursor))
-                .await?;
+            page = crate::traffic::with_attempt(
+                crate::traffic::Attempt::Continuation,
+                self.graphql_tolerating_merge_queue_schema(query, repo, number, Some(cursor)),
+            )
+            .await?;
         }
         Err(invalid("page limit exceeded"))
     }
@@ -2403,7 +2434,7 @@ impl GitHubSourceControl {
             "checksCursor": checks_cursor,
         });
         let payload = json!({ "query": query, "variables": variables });
-        let resp: Value = match self.client.graphql(&payload).await {
+        let resp: Value = match self.graphql_accounted(&payload).await {
             Ok(resp) => resp,
             Err(err) => {
                 let err = Error::from(err);
@@ -2418,7 +2449,11 @@ impl GitHubSourceControl {
                     "query": without_merge_queue_selections(query),
                     "variables": variables,
                 });
-                self.client.graphql(&fallback).await?
+                crate::traffic::with_attempt(
+                    crate::traffic::Attempt::Fallback,
+                    self.graphql_accounted(&fallback),
+                )
+                .await?
             }
         };
         graphql_data(resp)
@@ -2437,7 +2472,7 @@ impl GitHubSourceControl {
             )
         };
         let payload = json!({ "query": mutation, "variables": { "id": thread_id } });
-        let resp: Value = self.client.graphql(&payload).await?;
+        let resp: Value = self.graphql_accounted(&payload).await?;
         let data = graphql_data(resp)?;
         Ok(data
             .pointer(&format!("/{field}/thread/isResolved"))

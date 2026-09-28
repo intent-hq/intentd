@@ -1651,7 +1651,13 @@ async fn fallback_check_runs(
         .or_else(|| Some(pr.source_branch.clone()).filter(|s| !s.is_empty()));
     match head_ref {
         Some(git_ref) if !rollup_known && sc.capabilities().check_runs => {
-            let runs = degrade_unless_rate_limited(sc.check_runs(repo_ref, &git_ref).await)?;
+            let runs = degrade_unless_rate_limited(
+                intent_sourcecontrol::traffic::with_attempt(
+                    intent_sourcecontrol::traffic::Attempt::Fallback,
+                    sc.check_runs(repo_ref, &git_ref),
+                )
+                .await,
+            )?;
             let complete = runs.is_some();
             Ok((runs.unwrap_or_default(), complete))
         }
@@ -1683,7 +1689,12 @@ async fn read_review_thread_tally(
                 pr_number = number,
                 "merge requirements: review threads unavailable, falling back to REST comments (thread resolution state unavailable, unresolved count reported as unknown)"
             );
-            match fetch_all_pages(|p| sc.list_review_comments(repo_ref, number, p)).await {
+            match intent_sourcecontrol::traffic::with_attempt(
+                intent_sourcecontrol::traffic::Attempt::Fallback,
+                fetch_all_pages(|p| sc.list_review_comments(repo_ref, number, p)),
+            )
+            .await
+            {
                 Ok((comments, _, _)) => Ok((
                     count_thread_comments(&fallback_threads(comments)).0,
                     None,

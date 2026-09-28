@@ -897,18 +897,25 @@ async fn fetch_pr_full(
     if let Some(observation) = observe_pr(sc, repo_ref, number).await? {
         return shared_snapshot_from_observation(sc, repo_ref, number, observation).await;
     }
-    // The load-bearing read: a PR the forge does not know is reported by
-    // number and repo (the message `ws.pr.snapshot` documents), the rest
-    // maps as every other forge error.
-    let pr = sc.get_pr(repo_ref, number).await.map_err(|e| match e {
-        intent_sourcecontrol::Error::NotFound(_) => Error::Internal(format!(
-            "PR #{number} not found in {}/{}",
-            repo_ref.owner, repo_ref.name
-        )),
-        other => pr_ops::map_sc_err(other),
-    })?;
-    let read = pr_ops::merge_requirements_for_pr_detailed(sc, repo_ref, number, &pr).await?;
-    finish_shared_snapshot(sc, repo_ref, number, pr, read).await
+    intent_sourcecontrol::traffic::with_attempt(
+        intent_sourcecontrol::traffic::Attempt::Fallback,
+        async {
+            // The load-bearing read: a PR the forge does not know is reported by
+            // number and repo (the message `ws.pr.snapshot` documents), the rest
+            // maps as every other forge error.
+            let pr = sc.get_pr(repo_ref, number).await.map_err(|e| match e {
+                intent_sourcecontrol::Error::NotFound(_) => Error::Internal(format!(
+                    "PR #{number} not found in {}/{}",
+                    repo_ref.owner, repo_ref.name
+                )),
+                other => pr_ops::map_sc_err(other),
+            })?;
+            let read =
+                pr_ops::merge_requirements_for_pr_detailed(sc, repo_ref, number, &pr).await?;
+            finish_shared_snapshot(sc, repo_ref, number, pr, read).await
+        },
+    )
+    .await
 }
 
 /// The host's folded one-round-trip read
@@ -1022,6 +1029,10 @@ pub(crate) async fn read_pr_via_with_fetched(
         PrReadPolicy::Serve { max_age } => max_age,
     };
     if let Some(entry) = cached_pr_within(cache, &key, max_age) {
+        intent_sourcecontrol::traffic::record_reuse(
+            intent_sourcecontrol::traffic::Operation::PrDetail,
+            intent_sourcecontrol::traffic::Reuse::CacheHit,
+        );
         tracing::trace!(pr_number = number, "pr cache: serving the cached read");
         return Ok((entry, false));
     }
@@ -1060,10 +1071,12 @@ async fn poll_pr(
     let observation = observe_pr(sc, repo_ref, number).await?;
     let pr = match &observation {
         Some(observation) => observation.pr.clone(),
-        None => sc
-            .get_pr(repo_ref, number)
-            .await
-            .map_err(pr_ops::map_sc_err)?,
+        None => intent_sourcecontrol::traffic::with_attempt(
+            intent_sourcecontrol::traffic::Attempt::Fallback,
+            sc.get_pr(repo_ref, number),
+        )
+        .await
+        .map_err(pr_ops::map_sc_err)?,
     };
     let fingerprint = PrFingerprint::of(&pr);
     let now = Instant::now();
@@ -1080,6 +1093,10 @@ async fn poll_pr(
         }
     };
     if let Some(entry) = reused {
+        intent_sourcecontrol::traffic::record_reuse(
+            intent_sourcecontrol::traffic::Operation::PrDetail,
+            intent_sourcecontrol::traffic::Reuse::DetailRefresh,
+        );
         tracing::trace!(
             pr_number = number,
             "pr monitor: PR fingerprint unchanged; reusing previous full fetch"
@@ -1090,7 +1107,13 @@ async fn poll_pr(
         Some(observation) => {
             shared_snapshot_from_observation(sc, repo_ref, number, observation).await?
         }
-        None => fetch_shared_snapshot_for(sc, repo_ref, number, pr).await?,
+        None => {
+            intent_sourcecontrol::traffic::with_attempt(
+                intent_sourcecontrol::traffic::Attempt::Fallback,
+                fetch_shared_snapshot_for(sc, repo_ref, number, pr),
+            )
+            .await?
+        }
     };
     let entry = PrCacheEntry::new(pr, snapshot, now);
     let mut cache = cache.lock().unwrap();
@@ -1727,6 +1750,10 @@ impl Services {
         if let PrReadPolicy::Serve { max_age } = policy {
             let key = pr_key_for(repo_ref, number.cast_signed());
             if let Some(entry) = cached_pr_within(&self.pr_cache, &key, max_age) {
+                intent_sourcecontrol::traffic::record_reuse(
+                    intent_sourcecontrol::traffic::Operation::PrDetail,
+                    intent_sourcecontrol::traffic::Reuse::CacheHit,
+                );
                 tracing::trace!(pr_number = number, "pr cache: serving the cached read");
                 return Ok((entry, false));
             }
@@ -3038,6 +3065,14 @@ impl Services {
     /// either way; a full sweep (`skip_fresh == false`) plans no cadence and
     /// spends none.
     async fn sweep_pr_monitors(&self, skip_fresh: bool) {
+        intent_sourcecontrol::traffic::with_caller(
+            intent_sourcecontrol::traffic::Caller::PrMonitor,
+            self.sweep_pr_monitors_accounted(skip_fresh),
+        )
+        .await;
+    }
+
+    async fn sweep_pr_monitors_accounted(&self, skip_fresh: bool) {
         let mut probed = None;
         if self.sweeps_rate_limited() {
             let lifted = match pr_ops::resolve_source_control(self.source_control.clone()).await {
@@ -3081,7 +3116,13 @@ impl Services {
         for monitor in monitors {
             let key = pr_key(&monitor);
             let fetched = match shared.entry(key.clone()) {
-                std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    intent_sourcecontrol::traffic::record_reuse(
+                        intent_sourcecontrol::traffic::Operation::PrDetail,
+                        intent_sourcecontrol::traffic::Reuse::CacheHit,
+                    );
+                    entry.get().clone()
+                }
                 // The gate closed mid-sweep — by this sweep's own fetch or by
                 // a sibling sweep sharing the gate: PRs not fetched yet stay
                 // untouched until the pause window elapses.

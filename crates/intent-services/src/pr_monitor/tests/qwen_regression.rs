@@ -1539,3 +1539,86 @@ async fn qwen_paginated_legacy_status_and_lone_cancellation_remain_failures() {
     assert_eq!(check_map(&row(&svc, &monitor).await), baseline);
     assert_quiet(&svc, &monitor, &owner).await;
 }
+
+#[tokio::test]
+async fn traffic_attributes_real_monitor_http_pages_and_on_demand_cache_reuse() {
+    use intent_sourcecontrol::traffic::{with_traffic, Caller, Operation, Traffic};
+    let (_db, _root, svc, _forge, ws, owner) = setup().await;
+    let mock = MockQwen::start(11506).await;
+    let svc = svc.with_source_control(mock.sc.clone());
+    let traffic = Traffic::default();
+    with_traffic(traffic.clone(), async {
+        svc.pr_monitor_register(&ws, &owner, "QwenLM", "qwen-code", 11506)
+            .await
+            .unwrap();
+        let before = traffic.snapshot();
+        assert_eq!(
+            before.counts[&(Caller::OnDemand, Operation::PrDetail)].graphql_requests,
+            2
+        );
+        assert_eq!(
+            before.counts[&(Caller::OnDemand, Operation::Rules)].rest_requests,
+            1
+        );
+        let repo = RepoRef::new("QwenLM", "qwen-code");
+        svc.read_pr(
+            &repo,
+            11506,
+            PrReadPolicy::Serve {
+                max_age: Duration::from_secs(60),
+            },
+        )
+        .await
+        .unwrap();
+        let hit = traffic.snapshot();
+        assert_eq!(
+            hit.counts[&(Caller::OnDemand, Operation::PrDetail)].graphql_requests,
+            2
+        );
+        assert_eq!(
+            hit.counts[&(Caller::OnDemand, Operation::PrDetail)].cache_hits,
+            1
+        );
+        svc.poll_pr_monitors().await;
+    })
+    .await;
+    let snapshot = traffic.snapshot();
+    let monitor = &snapshot.counts[&(Caller::PrMonitor, Operation::PrDetail)];
+    assert_eq!(
+        monitor.graphql_requests, 2,
+        "real check pagination under the monitor caller"
+    );
+    assert_eq!(monitor.continuation_requests, 1);
+    assert_eq!(
+        monitor.detail_refresh_reuses, 1,
+        "unchanged fingerprint reuses full details"
+    );
+    assert!(!snapshot
+        .counts
+        .contains_key(&(Caller::PrMonitor, Operation::Rules)));
+    assert_eq!(mock.calls("GetPrObservation"), 4);
+    assert_eq!(mock.calls("/rules/branches/"), 1);
+
+    mock.edit(|s| s.mode = ReadMode::Rest);
+    svc.backdate_pr_cache(PR_MONITOR_MAX_CHEAP_AGE + Duration::from_secs(1));
+    let fallback = Traffic::default();
+    let before = mock.calls("");
+    with_traffic(fallback.clone(), svc.poll_pr_monitors()).await;
+    let fallback_snapshot = fallback.snapshot();
+    let c = &fallback_snapshot.counts[&(Caller::PrMonitor, Operation::PrDetail)];
+    assert_eq!(c.graphql_errors, 2, "both folded queries were rejected");
+    assert_eq!(
+        c.continuation_requests, 1,
+        "the REST check fallback paginates"
+    );
+    assert_eq!(
+        c.fallback_requests,
+        c.rest_requests + c.graphql_requests - 1,
+        "all requests after the failed observation belong to its fallback"
+    );
+    assert_eq!(
+        c.rest_requests + c.graphql_requests,
+        (mock.calls("") - before) as u64,
+        "service counts agree with actual server requests"
+    );
+}

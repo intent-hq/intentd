@@ -5099,6 +5099,18 @@ impl Services {
     /// the next `workspace.list`.
     async fn refresh_git_root_pr(
         &self,
+        root: intent_core::WorkspaceGitRoot,
+        sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
+    ) -> Result<pr_ops::PrRefreshOutcome> {
+        intent_sourcecontrol::traffic::with_caller(
+            intent_sourcecontrol::traffic::Caller::GitRootRefresh,
+            self.refresh_git_root_pr_accounted(root, sc),
+        )
+        .await
+    }
+
+    async fn refresh_git_root_pr_accounted(
+        &self,
         mut root: intent_core::WorkspaceGitRoot,
         sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
     ) -> Result<pr_ops::PrRefreshOutcome> {
@@ -5360,6 +5372,18 @@ impl Services {
     /// `github.pulls.get` fold landing mid-refresh is neither erased nor
     /// resurrected.
     async fn refresh_workspace_pr_with_sc(
+        &self,
+        ws: Workspace,
+        sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
+    ) -> Result<pr_ops::PrRefreshOutcome> {
+        intent_sourcecontrol::traffic::with_caller(
+            intent_sourcecontrol::traffic::Caller::WorkspaceRefresh,
+            self.refresh_workspace_pr_with_sc_accounted(ws, sc),
+        )
+        .await
+    }
+
+    async fn refresh_workspace_pr_with_sc_accounted(
         &self,
         mut ws: Workspace,
         sc: &Arc<dyn intent_sourcecontrol::SourceControl>,

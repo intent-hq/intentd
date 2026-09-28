@@ -2365,6 +2365,9 @@ dependencies = [
  "async-trait",
  "base64 0.23.1",
  "http",
+ "hyper-rustls",
+ "hyper-timeout",
+ "hyper-util",
  "intent-core",
  "octocrab",
  "reqwest",
@@ -2374,6 +2377,8 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tower",
+ "tower-http",
  "tracing",
 ]
 
