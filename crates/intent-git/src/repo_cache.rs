@@ -790,6 +790,22 @@ pub(crate) fn sync_bare_base(cache: &Path, bare: &Path) -> Result<()> {
             .expect("glob prefix");
         wanted.insert(format!("refs/heads/{branch}"), name.to_string());
     }
+    // Remove obsolete heads before fetching: topic and topic/subtopic cannot
+    // coexist as Git refs. Fetching first would fail before reaching the prune
+    // on every retry. This loop touches only the head-owned base namespace;
+    // checkpoint/agent/publication refs keep their objects pinned throughout.
+    for reference in destination
+        .references_glob("refs/heads/*")
+        .map_err(map_git_err)?
+    {
+        let mut reference = reference.map_err(map_git_err)?;
+        let name = reference
+            .name()
+            .map_err(|e| Error::InvalidParams(format!("non-UTF-8 hub base branch: {e}")))?;
+        if !wanted.contains_key(name) {
+            reference.delete().map_err(map_git_err)?;
+        }
+    }
     if !wanted.is_empty() {
         let specs: Vec<String> = wanted
             .iter()
@@ -804,18 +820,6 @@ pub(crate) fn sync_bare_base(cache: &Path, bare: &Path) -> Result<()> {
         ];
         args.extend(specs.iter().map(std::ffi::OsStr::new));
         run_git_os(bare, &args, None, cache_clone_timeout())?;
-    }
-    for reference in destination
-        .references_glob("refs/heads/*")
-        .map_err(map_git_err)?
-    {
-        let mut reference = reference.map_err(map_git_err)?;
-        let name = reference
-            .name()
-            .map_err(|e| Error::InvalidParams(format!("non-UTF-8 hub base branch: {e}")))?;
-        if !wanted.contains_key(name) {
-            reference.delete().map_err(map_git_err)?;
-        }
     }
     Ok(())
 }

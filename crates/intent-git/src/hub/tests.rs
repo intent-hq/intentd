@@ -588,3 +588,116 @@ async fn failed_git_initialization_is_not_published_and_retry_rebuilds() {
     git(hub.path(), &["gc", "--prune=now"]);
     git(hub.path(), &["fsck", "--full", "--no-dangling"]);
 }
+
+async fn assert_base_prefix_transition(old: &str, new: &str, packed: bool) {
+    let fixture = Fixture::new().await;
+    let forge = Repository::open(fixture.forge.path()).unwrap();
+    forge
+        .reference(&format!("refs/heads/{old}"), fixture.tip, false, "fixture")
+        .unwrap();
+    let fetch_args = [
+        "fetch",
+        "--prune",
+        "--no-tags",
+        fixture.forge.path().to_str().unwrap(),
+        "+refs/heads/*:refs/remotes/origin/*",
+    ];
+    git(&fixture.cache, &fetch_args);
+    fixture.hub.sync_base(&fixture.cache_root).await.unwrap();
+
+    // This object is reachable exclusively through hidden refs, never base
+    // branches or the cache. Pruning/fetching must preserve its full closure.
+    let repo = fixture.hub.open().unwrap();
+    let blob = repo.blob(b"private checkpoint data\n").unwrap();
+    let mut builder = repo.treebuilder(None).unwrap();
+    builder.insert("private", blob, 0o100_644).unwrap();
+    let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+    let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+    let hidden = repo
+        .commit(
+            None,
+            &signature,
+            &signature,
+            "hidden checkpoint",
+            &tree,
+            &[],
+        )
+        .unwrap();
+    let scope = fixture.scope();
+    let updates: Vec<_> = [AgentRef::Head, AgentRef::Wip]
+        .into_iter()
+        .map(|kind| RefUpdate {
+            new: Some(hidden),
+            ..fixture.update(kind)
+        })
+        .collect();
+    fixture
+        .hub
+        .finalize_agent_refs(&scope, &scope, &updates)
+        .unwrap();
+    let mut retained: Vec<_> = updates.iter().map(|update| update.name.clone()).collect();
+    for kind in [
+        CheckpointRef::Head,
+        CheckpointRef::Wip,
+        CheckpointRef::Index,
+    ] {
+        fixture.hub.anchor("prefix-change", kind, hidden).unwrap();
+        retained.push(checkpoint_ref("prefix-change", &scope.repo_key, kind).unwrap());
+    }
+    let publication = publish_ref("topic").unwrap();
+    repo.reference(&publication, hidden, false, "fixture")
+        .unwrap();
+    retained.push(publication);
+    if packed {
+        git(fixture.hub.path(), &["pack-refs", "--all", "--prune"]);
+    }
+
+    forge
+        .find_reference(&format!("refs/heads/{old}"))
+        .unwrap()
+        .delete()
+        .unwrap();
+    forge
+        .reference(&format!("refs/heads/{new}"), fixture.tip, false, "rename")
+        .unwrap();
+    git(&fixture.cache, &fetch_args);
+    // Also prove a retry settles to the same result rather than getting stuck
+    // forever behind the obsolete prefix. Collect both errors before asserting.
+    let first = fixture.hub.sync_base(&fixture.cache_root).await;
+    let retry = fixture.hub.sync_base(&fixture.cache_root).await;
+    assert!(
+        first.is_ok() && retry.is_ok(),
+        "{old} -> {new}: first={first:?}, retry={retry:?}"
+    );
+    assert!(repo.find_reference(&format!("refs/heads/{old}")).is_err());
+    assert_eq!(
+        repo.refname_to_id(&format!("refs/heads/{new}")).unwrap(),
+        fixture.tip
+    );
+    assert_eq!(repo.refname_to_id("refs/heads/main").unwrap(), fixture.tip);
+    for name in &retained {
+        assert_eq!(
+            repo.refname_to_id(name).unwrap(),
+            hidden,
+            "hidden ref {name} moved"
+        );
+    }
+    std::fs::remove_dir_all(&fixture.cache).unwrap();
+    git(fixture.hub.path(), &["gc", "--prune=now"]);
+    git(fixture.hub.path(), &["fsck", "--full", "--no-dangling"]);
+    assert_eq!(
+        repo.find_blob(blob).unwrap().content(),
+        b"private checkpoint data\n"
+    );
+    assert!(repo.find_commit(hidden).is_ok());
+}
+
+#[tokio::test]
+async fn base_prefix_transition_topic_to_subtopic_preserves_hidden_refs() {
+    assert_base_prefix_transition("topic", "topic/subtopic", false).await;
+}
+
+#[tokio::test]
+async fn base_prefix_transition_subtopic_to_topic_preserves_packed_hidden_refs() {
+    assert_base_prefix_transition("topic/subtopic", "topic", true).await;
+}
