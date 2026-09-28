@@ -46,6 +46,12 @@ readline.createInterface({input:process.stdin, terminal:false}).on('line', line 
       } else return send({jsonrpc:'2.0', id:msg.id, error:{code:-32602, message:'unsupported option'}});
       return result(msg.id, {configOptions:options()});
     case 'session/prompt': {
+      const text = p.prompt?.[0]?.text ?? '';
+      if (text.startsWith('/model ')) {
+        model = text.slice(7);
+        send({jsonrpc:'2.0', method:'session/update', params:{sessionId:sid,
+          update:{sessionUpdate:'config_option_update', configOptions:options()}}});
+      }
       const state = {model, effort, pid:process.pid, sessionId:sid, controls,
         fastMode: fast && model !== 'unsupported',
         serviceTier: fast && model !== 'unsupported' ? 'fast' : null};
@@ -59,6 +65,11 @@ readline.createInterface({input:process.stdin, terminal:false}).on('line', line 
         update:{sessionUpdate:'agent_message_chunk', content:{type:'text', text:JSON.stringify(state)}}}});
       return result(msg.id, {stopReason:'end_turn', native:state});
     }
+    case 'fixture/external_model':
+      model = p.model;
+      send({jsonrpc:'2.0', method:'session/update', params:{sessionId:sid,
+        update:{sessionUpdate:'config_option_update', configOptions:options()}}});
+      return result(msg.id, {});
     case 'fixture/release':
       result(held.id, {stopReason:'end_turn', native:held.state});
       held = null;

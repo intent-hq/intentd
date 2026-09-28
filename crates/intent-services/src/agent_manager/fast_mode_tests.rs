@@ -250,3 +250,83 @@ async fn fast_mode_failed_off_blocks_prompt_without_recycling() {
         mgr.stop(&id).await;
     }
 }
+
+// External /model commands and SDK fallback report capabilities as notifications,
+// not as responses to an Intent model-selection request.
+async fn external_model(mgr: &AgentManager, id: &AgentId, model: &str) {
+    mgr.run_turn(
+        id,
+        &WorkspaceId::from("ws-1"),
+        "fast-session",
+        vec![format!("/model {model}").into()],
+        None,
+    )
+    .await
+    .unwrap();
+}
+
+async fn routed_turn(mgr: &AgentManager, id: &AgentId, dir: &tempfile::TempDir) -> Value {
+    let ws = WorkspaceId::from("ws-1");
+    let sid = mgr.ensure_started(id, &ws).await.unwrap();
+    mgr.run_turn(id, &ws, &sid, vec!["inspect".into()], None)
+        .await
+        .unwrap();
+    calls(dir)
+        .into_iter()
+        .rev()
+        .find_map(|c| c.get("native").cloned())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn fast_mode_notification_removes_ineligible_control_before_warm_turn() {
+    let (mgr, id, dir) = fixture("claude-code", "supported", false).await;
+    preference(&mgr, "claude-code", true);
+    let initial = routed_turn(&mgr, &id, &dir).await;
+    external_model(&mgr, &id, "unsupported").await;
+    preference(&mgr, "claude-code", false);
+    let state = routed_turn(&mgr, &id, &dir).await;
+    assert_eq!(state["model"], "unsupported");
+    assert_eq!(state["effort"], "high");
+    assert_eq!(state["pid"], initial["pid"]);
+    assert_eq!(state["sessionId"], initial["sessionId"]);
+    assert_eq!(state["controls"], json!(["on"]));
+    assert_eq!(state["fastMode"], false);
+    assert_eq!(
+        calls(&dir)
+            .iter()
+            .filter(|c| c["params"]["configId"] == "fast")
+            .count(),
+        1
+    );
+    mgr.stop(&id).await;
+}
+
+#[tokio::test]
+async fn fast_mode_notification_adds_control_and_clears_inherited_fast_before_warm_turn() {
+    let (mgr, id, dir) = fixture("claude-code", "unsupported", false).await;
+    let initial = routed_turn(&mgr, &id, &dir).await;
+    assert_eq!(initial["controls"], json!([]));
+    external_model(&mgr, &id, "supported").await;
+    let switched_turn = calls(&dir)
+        .into_iter()
+        .rev()
+        .find_map(|c| c.get("native").cloned())
+        .unwrap();
+    assert_eq!(
+        switched_turn["fastMode"], true,
+        "notification must not control the active turn"
+    );
+    assert_eq!(switched_turn["controls"], json!([]));
+    let state = routed_turn(&mgr, &id, &dir).await;
+    assert_eq!(state["model"], "supported");
+    assert_eq!(state["effort"], "high");
+    assert_eq!(state["pid"], initial["pid"]);
+    assert_eq!(state["sessionId"], initial["sessionId"]);
+    assert_eq!(
+        state["fastMode"], false,
+        "clear native enabled state after eligibility notification"
+    );
+    assert_eq!(state["controls"], json!(["off"]));
+    mgr.stop(&id).await;
+}

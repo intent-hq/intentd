@@ -27,6 +27,12 @@ pub(crate) async fn apply(
     else {
         return Ok(());
     };
+    // The adapter can switch models itself (/model or SDK fallback). Read the
+    // ordered transport snapshot after model/effort setup at this turn boundary,
+    // even if its notification has already been consumed by another router.
+    if let Some(latest) = conn.session_config_options(session_id) {
+        *options = Some(latest);
+    }
     let option = options
         .as_ref()
         .and_then(Value::as_array)
