@@ -1212,11 +1212,10 @@ fn observation_checks_real_config_head_and_root_again_after_local_read() {
         )
         .err()
         .unwrap();
-        assert!(error.to_string().contains(if change == "git-directory" {
-            "Git read failed"
-        } else {
-            "changed during read"
-        }));
+        assert!(
+            error.to_string().contains("changed during read"),
+            "{change}: {error}"
+        );
     }
 }
 
