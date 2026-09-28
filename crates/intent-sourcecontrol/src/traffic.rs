@@ -279,6 +279,10 @@ mod tests {
 
     #[test]
     fn accounting_scopes_do_not_embed_large_service_futures() {
+        #[expect(
+            clippy::large_stack_arrays,
+            reason = "the regression needs an inline large future to detect scope storage growth"
+        )]
         fn large_future() -> impl Future<Output = ()> {
             let data = [0_u8; 64 * 1024];
             async move {
