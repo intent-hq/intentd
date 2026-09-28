@@ -918,3 +918,155 @@ async fn cancelled_caller_does_not_cancel_original_final_commit_or_settle_pendin
     );
     assert!(probe.blocked(&key));
 }
+
+#[tokio::test]
+async fn domain_identity_matches_clones_and_managed_opens_without_granting_installation() {
+    let f = Fixture::new(true).await;
+    let clone = f.store.clone();
+    let reopened = Store::open(&f.dir.path().join("pending.db")).await.unwrap();
+    let observer: Arc<dyn RepositoryLifecycleObserver> = Arc::new(Probe::default());
+    let guard = f
+        .store
+        .begin_repository_pending_delete(&[f.key()])
+        .await
+        .unwrap();
+
+    assert!(f.store.shares_repository_lifecycle_domain(&f.store));
+    assert!(f.store.shares_repository_lifecycle_domain(&clone));
+    assert!(clone.shares_repository_lifecycle_domain(&reopened));
+    assert!(reopened.shares_repository_lifecycle_domain(&f.store));
+    assert!(!clone.has_repository_lifecycle_observer(&observer));
+    assert!(reopened
+        .install_repository_lifecycle_observer(observer.clone())
+        .await
+        .is_err());
+
+    guard.settle_confirmed();
+    reopened
+        .install_repository_lifecycle_observer(observer.clone())
+        .await
+        .unwrap();
+    assert!(f.store.shares_repository_lifecycle_domain(&reopened));
+    assert!(f.store.has_repository_lifecycle_observer(&observer));
+    assert!(clone.has_repository_lifecycle_observer(&observer));
+}
+
+#[tokio::test]
+async fn domain_identity_distinguishes_equal_rows_and_shared_observer_on_other_database() {
+    let original = Fixture::new(true).await;
+    let other = Fixture::new(true).await;
+    assert_eq!(original.workspace.id, other.workspace.id);
+    let probe = Arc::new(Probe::default());
+    let observer = probe.install(&original.store).await;
+    other
+        .store
+        .install_repository_lifecycle_observer(observer.clone())
+        .await
+        .unwrap();
+
+    assert!(original.store.has_repository_lifecycle_observer(&observer));
+    assert!(other.store.has_repository_lifecycle_observer(&observer));
+    assert!(!original
+        .store
+        .shares_repository_lifecycle_domain(&other.store));
+    assert!(!other
+        .store
+        .shares_repository_lifecycle_domain(&original.store));
+    assert!(other
+        .store
+        .shares_repository_lifecycle_domain(&other.store.clone()));
+}
+
+#[tokio::test]
+async fn domain_identity_preserves_unobserved_uncertainty_after_last_store_reopen() {
+    let f = Fixture::new(true).await;
+    let original_domain = Arc::downgrade(&f.store.repository_lifecycle);
+    let guard = f
+        .store
+        .begin_repository_pending_delete(&[f.key()])
+        .await
+        .unwrap();
+    drop(guard);
+    drop(f.store);
+
+    let reopened = Store::open(&f.dir.path().join("pending.db")).await.unwrap();
+    let independent = Store::open(&f.dir.path().join("pending.db")).await.unwrap();
+    assert!(Arc::ptr_eq(
+        &original_domain.upgrade().unwrap(),
+        &reopened.repository_lifecycle
+    ));
+    assert!(reopened.shares_repository_lifecycle_domain(&independent));
+    let observer: Arc<dyn RepositoryLifecycleObserver> = Arc::new(Probe::default());
+    for store in [&reopened, &independent] {
+        assert!(store
+            .install_repository_lifecycle_observer(observer.clone())
+            .await
+            .is_err());
+    }
+}
+
+#[tokio::test]
+async fn domain_identity_preserves_installed_unknown_ticket_after_last_store_reopen() {
+    let f = Fixture::new(true).await;
+    let original_domain = Arc::downgrade(&f.store.repository_lifecycle);
+    let key = f.key();
+    let probe = Arc::new(Probe::default());
+    let observer = probe.install(&f.store).await;
+    let guard = f
+        .store
+        .begin_repository_pending_delete(std::slice::from_ref(&key))
+        .await
+        .unwrap();
+    drop(guard);
+    drop(f.store);
+
+    let reopened = Store::open(&f.dir.path().join("pending.db")).await.unwrap();
+    let independent = Store::open(&f.dir.path().join("pending.db")).await.unwrap();
+    assert!(Arc::ptr_eq(
+        &original_domain.upgrade().unwrap(),
+        &reopened.repository_lifecycle
+    ));
+    assert!(reopened.shares_repository_lifecycle_domain(&independent));
+    assert!(independent.has_repository_lifecycle_observer(&observer));
+    independent
+        .install_repository_lifecycle_observer(observer)
+        .await
+        .unwrap();
+    independent
+        .begin_repository_pending_delete(std::slice::from_ref(&key))
+        .await
+        .unwrap()
+        .settle_confirmed();
+    assert!(reopened.shares_repository_lifecycle_domain(&independent));
+    assert!(
+        probe.blocked(&key),
+        "identity does not confirm an old owner"
+    );
+}
+
+#[tokio::test]
+async fn domain_identity_remains_true_for_invalidated_original_handles() {
+    let f = Fixture::new(true).await;
+    let clone = f.store.clone();
+    let probe = Arc::new(Probe::default());
+    let observer = probe.install(&f.store).await;
+    f.store.close().await;
+    let path = f.dir.path().join("pending.db");
+    let previous = f.dir.path().join("previous.db");
+    std::fs::rename(&path, &previous).unwrap();
+    std::fs::copy(&previous, &path).unwrap();
+    assert!(Store::open(&path).await.is_err());
+
+    assert!(f.store.shares_repository_lifecycle_domain(&clone));
+    assert!(clone.shares_repository_lifecycle_domain(&f.store));
+    for store in [&f.store, &clone] {
+        assert!(!store.has_repository_lifecycle_observer(&observer));
+        assert!(store
+            .begin_repository_pending_delete(&[f.key()])
+            .await
+            .is_err());
+    }
+    let other = Fixture::new(true).await;
+    assert!(!f.store.shares_repository_lifecycle_domain(&other.store));
+    assert!(probe.blocked(&RepositoryLifecycleKey::Database));
+}

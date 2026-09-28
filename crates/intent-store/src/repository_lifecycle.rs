@@ -322,6 +322,16 @@ impl RepositoryPendingDeleteGuard {
 }
 
 impl Store {
+    /// Compare retained database-domain allocation identity only.
+    ///
+    /// Clones and independent managed opens can share this allocation, including
+    /// after it is invalidated. This does not establish observer installation,
+    /// settlement, permission or current usability; those checks remain separate.
+    #[must_use]
+    pub fn shares_repository_lifecycle_domain(&self, other: &Store) -> bool {
+        Arc::ptr_eq(&self.repository_lifecycle, &other.repository_lifecycle)
+    }
+
     /// Retain original ownership before publishing or claiming pending deletion.
     ///
     /// Uses the sole retained Store domain and its actual installed observer.
