@@ -240,8 +240,8 @@ fn read_cut(path: &Path, options: &CaptureOptions) -> Result<Cut> {
                 index.add(&entry).map_err(map_git_err)?;
             }
             Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
-                // add_all selected the replacement blob; the raw-byte pass
-                // below preserves it instead of overwriting it with a gitlink.
+                // The raw-byte pass handles replacements even if add_all
+                // skipped this gitlink because it is assume-unchanged.
             }
             Ok(_) => return Err(invalid("unsupported submodule file type")),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -255,7 +255,7 @@ fn read_cut(path: &Path, options: &CaptureOptions) -> Result<Cut> {
     // add_all selects Git-visible paths, but its clean filters normalize file
     // bytes (e.g. CRLF). A checkpoint preserves the actual worktree; overwrite
     // only this in-memory index with raw blobs, never follow symlink contents.
-    let candidates: Vec<_> = index.iter().filter(|e| e.mode != 0o16_0000).collect();
+    let candidates: Vec<_> = index.iter().collect();
     for mut entry in candidates {
         let relative = path_from_bytes(&entry.path);
         let full = workdir.join(&relative);
@@ -267,6 +267,9 @@ fn read_cut(path: &Path, options: &CaptureOptions) -> Result<Cut> {
             }
             Err(e) => return Err(invalid(e.to_string())),
         };
+        if entry.mode == 0o16_0000 && metadata.is_dir() {
+            continue;
+        }
         if metadata.file_type().is_symlink() {
             let target = std::fs::read_link(&full).map_err(|e| invalid(e.to_string()))?;
             entry.id = repo
@@ -274,6 +277,9 @@ fn read_cut(path: &Path, options: &CaptureOptions) -> Result<Cut> {
                 .map_err(map_git_err)?;
             entry.mode = 0o12_0000;
         } else if metadata.is_file() {
+            if entry.mode == 0o16_0000 {
+                entry.mode = 0o10_0644;
+            }
             let mut writer = repo.blob_writer(None).map_err(map_git_err)?;
             let mut file = std::fs::File::open(&full).map_err(|e| invalid(e.to_string()))?;
             std::io::copy(&mut file, &mut writer).map_err(|e| invalid(e.to_string()))?;

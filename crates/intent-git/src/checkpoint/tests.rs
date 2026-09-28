@@ -295,6 +295,7 @@ fn assert_replacement_roundtrip(path: &Path, expected: Option<&[u8]>) {
         })
         .collect();
     let snapshot = capture(path, &CaptureOptions::default()).unwrap();
+    verify_source(path, &snapshot, &CaptureOptions::default()).unwrap();
     assert_eq!(fingerprint(path), before);
     assert!(
         snapshot.wip.is_some(),
@@ -421,4 +422,73 @@ fn checkpoint_submodule_replaced_by_symlink_roundtrips_staged_and_unstaged() {
         );
         assert_eq!(fingerprint(parent.path()), before);
     }
+}
+
+fn flag_submodule(path: &Path, flag: &str) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["update-index", flag, "sub"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+}
+
+#[test]
+fn checkpoint_submodule_assume_unchanged_binary_replacement_roundtrips() {
+    let (parent, _child) = submodule_fixture();
+    flag_submodule(parent.path(), "--assume-unchanged");
+    fs::remove_dir_all(parent.path().join("sub")).unwrap();
+    fs::write(parent.path().join("sub"), [0, 255, 4, 13, 10]).unwrap();
+    assert_replacement_roundtrip(parent.path(), Some(&[0, 255, 4, 13, 10]));
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_submodule_assume_unchanged_symlink_replacement_roundtrips() {
+    let (parent, _child) = submodule_fixture();
+    flag_submodule(parent.path(), "--assume-unchanged");
+    fs::remove_dir_all(parent.path().join("sub")).unwrap();
+    std::os::unix::fs::symlink("root", parent.path().join("sub")).unwrap();
+    assert_replacement_roundtrip(parent.path(), Some(b"root"));
+    let snapshot = capture(parent.path(), &CaptureOptions::default()).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let dst = temp.path().join("restore");
+    restore(parent.path(), &snapshot, &dst).unwrap();
+    assert_eq!(fs::read_link(dst.join("sub")).unwrap(), Path::new("root"));
+}
+
+#[test]
+fn checkpoint_submodule_assume_unchanged_controls_and_sparse_rejection() {
+    let (parent, _child) = submodule_fixture();
+    flag_submodule(parent.path(), "--assume-unchanged");
+    let before = fingerprint(parent.path());
+    assert!(capture(parent.path(), &CaptureOptions::default())
+        .unwrap()
+        .wip
+        .is_none());
+    assert_eq!(fingerprint(parent.path()), before);
+    fs::remove_dir_all(parent.path().join("sub")).unwrap();
+    assert_replacement_roundtrip(parent.path(), None);
+    fs::create_dir(parent.path().join("sub")).unwrap();
+    let before = fingerprint(parent.path());
+    assert!(capture(parent.path(), &CaptureOptions::default())
+        .unwrap()
+        .wip
+        .is_none());
+    assert_eq!(fingerprint(parent.path()), before);
+    write_file(parent.path(), "sub/important", "must not vanish");
+    let before = fingerprint(parent.path());
+    assert!(capture(parent.path(), &CaptureOptions::default())
+        .unwrap_err()
+        .to_string()
+        .contains("submodule"));
+    assert_eq!(fingerprint(parent.path()), before);
+    flag_submodule(parent.path(), "--skip-worktree");
+    let before = fingerprint(parent.path());
+    assert!(capture(parent.path(), &CaptureOptions::default())
+        .unwrap_err()
+        .to_string()
+        .contains("sparse"));
+    assert_eq!(fingerprint(parent.path()), before);
 }
