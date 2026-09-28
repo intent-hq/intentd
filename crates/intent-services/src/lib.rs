@@ -104,6 +104,7 @@ mod source_control_auth_ops;
 
 mod agent_list_cache;
 mod codex_home;
+mod fast_mode;
 mod harness;
 mod history_xml;
 mod hook_manager;
@@ -177,6 +178,8 @@ mod tests;
 mod v1_1_goldens;
 #[cfg(test)]
 mod v1_goldens;
+#[cfg(test)]
+mod v2_10_goldens;
 #[cfg(test)]
 mod v2_1_goldens;
 #[cfg(test)]
@@ -29781,6 +29784,7 @@ impl WorkspaceApi for Services {
         quick_action_type: Option<String>,
         workspace_id: Option<WorkspaceId>,
         timeout_ms: Option<u64>,
+        reasoning_effort: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             if let Some(ws) = workspace_id.as_ref() {
@@ -29796,6 +29800,7 @@ impl WorkspaceApi for Services {
                 quick_action_type,
                 workspace_id,
                 timeout_ms,
+                reasoning_effort,
             )
             .await
         })

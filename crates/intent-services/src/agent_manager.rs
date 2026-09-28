@@ -2383,6 +2383,7 @@ struct AgentHandle {
     /// `ensure_started` re-apply a mid-session `reasoningEffort` change on the
     /// LIVE child, so it lands before the next prompt without a respawn.
     thought_level: Option<ThoughtLevelOption>,
+    config_options: Option<Value>,
     /// Set only after the latest turn-boundary application was acknowledged
     /// (or already current). A rejection/unsupported option leaves it empty.
     confirmed_effort: Option<AppliedEffort>,
@@ -3464,6 +3465,7 @@ impl AgentManager {
             spawned_model: opts.model.map(std::string::ToString::to_string),
             spawned_provider: opts.provider.command.to_string(),
             thought_level: None,
+            config_options: None,
             confirmed_effort: None,
             wake_gate: Arc::new(AtomicUsize::new(0)),
             wake_listener: None,
@@ -4134,6 +4136,10 @@ impl AgentManager {
         stored_effort: Option<&str>,
         default_override: Option<&str>,
     ) {
+        if let Some(handle) = self.handles.lock().unwrap().get_mut(&session_record.id) {
+            handle.config_options.clone_from(&opened.config_options);
+            crate::fast_mode::refresh_options(&mut handle.config_options, model_response.as_ref());
+        }
         let mut thought_level = opened.thought_level.clone();
         if let Some(options) = model_response
             .and_then(|mut response| response.get_mut("configOptions").map(Value::take))
@@ -4171,6 +4177,39 @@ impl AgentManager {
         }
         self.apply_thought_level(conn, &session_record.id, &opened.session_id, stored_effort)
             .await;
+    }
+
+    /// Apply the latest preference after model/effort selection and before a
+    /// new turn. Always send explicit off, even if the advertised value is
+    /// already off: native or resumed tier inheritance must be cleared.
+    async fn apply_fast_mode(
+        &self,
+        agent_id: &AgentId,
+        session_id: &str,
+        provider: &str,
+    ) -> Result<()> {
+        let Some((conn, mut options)) = self
+            .handles
+            .lock()
+            .unwrap()
+            .get(agent_id)
+            .map(|h| (h.connection.clone(), h.config_options.clone()))
+        else {
+            return Ok(());
+        };
+        let enabled = self
+            .services
+            .effective_settings()
+            .providers
+            .fast_mode
+            .get(provider)
+            .copied()
+            .unwrap_or(false);
+        crate::fast_mode::apply(&conn, session_id, provider, enabled, &mut options).await?;
+        if let Some(handle) = self.handles.lock().unwrap().get_mut(agent_id) {
+            handle.config_options = options;
+        }
+        Ok(())
     }
 
     /// Send the session's `reasoningEffort` to the provider through the
@@ -4233,6 +4272,12 @@ impl AgentManager {
             .await
             {
                 Ok(response) => {
+                    if let Some(handle) = self.handles.lock().unwrap().get_mut(agent_id) {
+                        crate::fast_mode::refresh_options(
+                            &mut handle.config_options,
+                            Some(&response),
+                        );
+                    }
                     // Older adapters acknowledge with {}. When a value is
                     // echoed, it must actually confirm the requested setting.
                     if let Some(actual) = response
@@ -9193,6 +9238,8 @@ impl AgentManager {
                     }
                     self.maybe_persist_effort_change_notice(agent_id, workspace_id, &resolved)
                         .await;
+                    self.apply_fast_mode(agent_id, &acp, resolved.provider.id)
+                        .await?;
                     return Ok(acp);
                 }
                 // The child/transport died while the agent sat idle
@@ -9434,6 +9481,8 @@ impl AgentManager {
             .await;
         self.maybe_persist_effort_change_notice(agent_id, workspace_id, &resolved)
             .await;
+        self.apply_fast_mode(agent_id, &acp_session_id, resolved.provider.id)
+            .await?;
         self.spawn_attempt_provider.lock().unwrap().remove(agent_id);
         Ok(acp_session_id)
     }
@@ -16342,6 +16391,7 @@ mod dead_child_respawn_tests {
             spawned_model: None,
             spawned_provider: "node".to_string(),
             thought_level: None,
+            config_options: None,
             confirmed_effort: None,
             wake_gate: Arc::new(AtomicUsize::new(0)),
             wake_listener: None,
@@ -17823,6 +17873,7 @@ mod thought_level_tests {
                 session_id: "sid-1".into(),
                 modes: None,
                 thought_level: Some(option("medium")),
+                config_options: None,
             };
             mgr.services
                 .persist_session_effort_levels(
@@ -17871,6 +17922,7 @@ mod thought_level_tests {
                 session_id: "sid-1".into(),
                 modes: None,
                 thought_level: Some(option("medium")),
+                config_options: None,
             };
             mgr.services
                 .persist_session_effort_levels(
@@ -20290,3 +20342,7 @@ mod agent_retry_tests {
 #[cfg(all(test, unix))]
 #[path = "agent_manager/effort_notice_tests.rs"]
 mod effort_notice_tests;
+
+#[cfg(all(test, unix))]
+#[path = "agent_manager/fast_mode_tests.rs"]
+mod fast_mode_tests;

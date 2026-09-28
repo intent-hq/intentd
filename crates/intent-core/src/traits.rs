@@ -2320,7 +2320,10 @@ pub trait WorkspaceApi: Send + Sync {
     /// resolves that override then `quickActions.defaultModel` before the
     /// provider CLI default (monorepo#1734). An explicit `model` must be a
     /// bare model id (compound `provider:model` ids reject `-32602` at the
-    /// wire boundary, §5.5).
+    /// wire boundary, §5.5). `reasoning_effort` independently overrides the
+    /// quick-action effort settings; live ACP validation happens after model
+    /// selection and before the prompt (§5.32).
+    #[expect(clippy::too_many_arguments)]
     fn agent_complete_once(
         &self,
         prompt: String,
@@ -2329,6 +2332,7 @@ pub trait WorkspaceApi: Send + Sync {
         quick_action_type: Option<String>,
         workspace_id: Option<WorkspaceId>,
         timeout_ms: Option<u64>,
+        reasoning_effort: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = (
             prompt,
@@ -2337,6 +2341,7 @@ pub trait WorkspaceApi: Send + Sync {
             quick_action_type,
             workspace_id,
             timeout_ms,
+            reasoning_effort,
         );
         Box::pin(async {
             Err(Error::Internal(

@@ -1167,3 +1167,100 @@ async fn active_provider_boot_migration_rewrites_config_once_over_wss() {
         "a file without the legacy key is never rewritten at boot"
     );
 }
+
+#[tokio::test]
+async fn quick_action_effort_persists_emits_changes_and_resets_over_wss() {
+    let dir = temp_data_dir();
+    let (daemon, mut rpc, mut sub) = boot_with_wss(dir.path()).await;
+    await_config_watcher_ready(dir.path()).await;
+    let paths = [
+        "quickActions.defaultReasoningEffort",
+        "quickActions.typeReasoningEffortOverrides",
+        "quickActions.providerSettings",
+    ];
+    let initial = settings_snapshot(&mut rpc, &paths).await;
+    assert_eq!(initial[0]["value"], Value::Null);
+    assert_eq!(initial[1]["value"], json!({}));
+    let revision = initial[0]["revision"].as_u64().unwrap();
+    let values = [
+        json!(" High "),
+        json!({"commit":"low"}),
+        json!({
+            "codex":{"defaultReasoningEffort":"high","typeReasoningEffortOverrides":{"commit":"low"}},
+            "claude-code":{"defaultModel":"old-snapshot"}
+        }),
+    ];
+    let changes: Vec<Value> = paths
+        .iter()
+        .zip(&values)
+        .map(|(path, value)| json!({"path":path,"value":value}))
+        .collect();
+    let update = wss_rpc(&mut rpc, 20, "settings.update", json!({"changes":changes})).await;
+    let applied: Vec<Value> = paths
+        .iter()
+        .zip(&values)
+        .map(|(path, value)| json!({"path":path,"value":value,"origin":"file"}))
+        .collect();
+    assert_eq!(
+        update,
+        json!({"jsonrpc":"2.0","id":20,"result":{"applied":applied,"revision":revision+1}})
+    );
+    assert_settings_change(&mut sub, &json!(applied), revision + 1).await;
+    drop(sub);
+    drop(rpc);
+    drop(daemon);
+    let (restarted_daemon, mut rpc, mut sub) = boot_with_wss(dir.path()).await;
+    await_config_watcher_ready(dir.path()).await;
+    let reloaded = settings_snapshot(&mut rpc, &paths).await;
+    for (got, value) in reloaded.iter().zip(&values) {
+        assert_eq!(got["value"], *value);
+    }
+    let revision = reloaded[0]["revision"].as_u64().unwrap();
+    let reset = wss_rpc(&mut rpc, 21, "settings.reset", json!({"path":paths[0]})).await;
+    assert_eq!(
+        reset,
+        json!({"jsonrpc":"2.0","id":21,"result":{"path":paths[0],"value":null,"origin":"default","revision":revision+1}})
+    );
+    assert_settings_change(
+        &mut sub,
+        &json!([{"path":paths[0],"value":null,"origin":"default"}]),
+        revision + 1,
+    )
+    .await;
+    let after = settings_snapshot(&mut rpc, &paths).await;
+    assert_eq!(after[0]["value"], Value::Null);
+    assert_eq!(after[1]["value"], values[1]);
+    assert_eq!(after[2]["value"], values[2]);
+    for invalid in [json!({"commit":false}), json!({"commit":null})] {
+        let rejected = wss_rpc(
+            &mut rpc,
+            22,
+            "settings.update",
+            json!({"changes":[{"path":paths[1],"value":invalid}]}),
+        )
+        .await;
+        assert_eq!(rejected["error"]["code"], -32602);
+    }
+    // Blank writes read as unset immediately and after a daemon restart.
+    for blank in ["", "   "] {
+        let updated = wss_rpc(
+            &mut rpc,
+            23,
+            "settings.update",
+            json!({"changes":[{"path":paths[0],"value":blank}]}),
+        )
+        .await;
+        assert!(updated.get("error").is_none(), "{updated}");
+        assert_eq!(
+            settings_snapshot(&mut rpc, &paths).await[0]["value"],
+            Value::Null
+        );
+    }
+    drop(sub);
+    drop(rpc);
+    drop(restarted_daemon);
+    let (_blank_restart, mut rpc, _sub) = boot_with_wss(dir.path()).await;
+    let blank_reloaded = settings_snapshot(&mut rpc, &paths).await;
+    assert_eq!(blank_reloaded[0]["value"], Value::Null);
+    assert_eq!(blank_reloaded[1]["value"], values[1]);
+}
