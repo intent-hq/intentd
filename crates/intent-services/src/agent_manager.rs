@@ -4937,7 +4937,7 @@ impl AgentManager {
     }
 
     /// Fence a user-retired session before aborting its worker and child.
-    /// The service has already committed retired_at and checked descendants.
+    /// The service has already committed `retired_at` and checked descendants.
     pub(crate) async fn retire(&self, agent_id: &AgentId) {
         self.retired.lock().unwrap().insert(agent_id.clone());
         self.stop(agent_id).await;
