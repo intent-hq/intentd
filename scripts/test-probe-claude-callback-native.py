@@ -411,5 +411,171 @@ class CleanupOwnershipTests(unittest.TestCase):
             owner.finish()
             child.stdout.close(); child.stderr.close()
 
+class ServicesStartupRunnerTests(unittest.TestCase):
+    """Offline parser/launch controls; synthetic milestones are never native proof."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="services-runner-inert-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def events(self, case):
+        facts = {
+            "runner-verified": {"case": case, "testElf": probe.SERVICES_SHA,
+                                "bridge": probe.BRIDGE_SHA,
+                                "runtimeIdentity": "a08355be6f7f7aafd77977b0cdf030dc32f3fdce9178ec1883e0b04d71629597"},
+            "ordinary-started": {"legacy": case == "legacy", "sessionId": "inert-session",
+                                 "agent": "inert-agent", "workspace": "inert-workspace",
+                                 "adapterPid": 10, "pendingEndpoint": "127.0.0.1:1"},
+            "original-acknowledged": {"sessionId": "inert-session", "confirmedEndpoint": "127.0.0.1:2",
+                                      "sameServicesReadAnchorConnection": True,
+                                      "receipt": "Acknowledged inert-session"},
+            "original-reused": {"sameConnectionOriginSession": True, "distinctOwnedCaptures": True,
+                                "registrationCount": 1},
+            "owned-retired": {"legacy": case == "legacy", "handleAbsent": True,
+                              "originalTransportClosed": True, "contextJobs": "none prepared; drain completed"},
+            "completed": {"case": case},
+        }
+        return [{"nativeServicesStartup": 1, "event": event, "facts": facts[event]}
+                for event in probe.SERVICES_EVENTS[case]]
+
+    def result(self, case, events=None):
+        events = self.events(case) if events is None else events
+        text = "running 1 test\ntest " + probe.SERVICES_SELECTORS[case] + " ... "
+        text += "\n".join(json.dumps(event) for event in events)
+        text += "\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 123 filtered out; finished in 1.00s\n"
+        return {"stdout": text, "stderr": "", "containment_passed": True,
+                "returncode": 0, "reason": "exited", "elapsed_seconds": 1,
+                "live_original_processes_after_cleanup": []}
+
+    def test_closed_cases_have_only_two_exact_rust_selectors(self):
+        for case in ("confirmed", "legacy"):
+            self.assertEqual(probe.services_argv(case), ["/probe/services-test",
+                "agent_manager::repository_origin::callback_delivery::tests::genuine_native_startup::normal_services_native_" + case + "_startup",
+                "--exact", "--ignored", "--nocapture", "--test-threads=1"])
+        for option in ("--selector", "--services-elf", "--environment", "--mount", "--command"):
+            with self.subTest(option=option), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                probe.parser().parse_args(["--case", "services-confirmed", "--output", str(self.root), option, "inert"])
+        for case in ("", "native", "confirmed --list", "anything"):
+            with self.subTest(case=case), self.assertRaises(probe.Refusal):
+                probe.services_argv(case)
+
+    def test_contract_has_only_original_namespaces_case_and_independent_pin(self):
+        original = {name: name + ":[123]" for name in probe.NS_NAMES}
+        for case in ("confirmed", "legacy"):
+            data = probe.services_contract(case, original)
+            self.assertLessEqual(len(data), 4096)
+            self.assertEqual(json.loads(data), {"format": "intent-services-native-startup-v1",
+                "case": case, "test_elf_sha256": probe.SERVICES_SHA, "host_namespaces": original})
+        for invalid in ({}, {**original, "extra": "net:[123]"}, {**original, "net": "caller"}):
+            with self.subTest(invalid=invalid), self.assertRaises(probe.Refusal):
+                probe.services_contract("confirmed", invalid)
+
+    def test_wrong_elf_bytes_size_mode_and_links_refuse_without_execution(self):
+        file = self.root / "inert-elf"
+        file.write_bytes(b"\x7fELF\x02\x01inert")
+        file.chmod(0o555)
+        with patch.object(probe, "SERVICES_ELF", file), patch.object(probe, "run_bounded") as launch:
+            with self.assertRaises(probe.Refusal):
+                probe.check_services_elf()
+            with patch.object(probe, "SERVICES_SHA", probe.hash_file(file)), patch.object(probe, "SERVICES_BYTES", file.stat().st_size):
+                self.assertEqual(probe.check_services_elf(), file)
+                file.chmod(0o755)
+                with self.assertRaises(probe.Refusal): probe.check_services_elf()
+                file.chmod(0o555)
+                link = self.root / "link"; os.link(file, link)
+                with self.assertRaises(probe.Refusal): probe.check_services_elf()
+                link.unlink()
+                file.unlink(); file.symlink_to(self.root / "missing")
+                with self.assertRaises(probe.Refusal): probe.check_services_elf()
+            launch.assert_not_called()
+
+    def test_caller_manifest_cannot_replace_compiled_input_authority(self):
+        path = self.root / "compile-v4/before.json"
+        path.parent.mkdir(); path.write_text('{}\n')
+        with patch.object(probe, "SERVICES_PREPARATION", self.root), patch.object(probe, "check_services_elf"), patch.object(probe, "run_bounded") as launch:
+            with self.assertRaises(probe.Refusal): probe.check_services_inputs()
+            launch.assert_not_called()
+
+    def test_services_launch_has_only_pinned_extra_mounts_and_exact_environment(self):
+        for case in ("confirmed", "legacy"):
+            config = {"services_case": case, "services_argv": probe.services_argv(case),
+                      "environment": probe.SERVICES_ENV, "payload": True}
+            command = probe.sandbox_command(self.root, config, self.root / "payload", self.root / "bridge")
+            mounts = [command[i+1:i+3] for i, value in enumerate(command) if value == "--ro-bind"]
+            self.assertEqual(mounts[-2:], [[str(probe.SERVICES_ELF), "/probe/services-test"],
+                [str(self.root / "services-contract.json"), "/probe/services-contract.json"]])
+            self.assertEqual(len(mounts), len(probe.OS_INPUTS["mounts"]) + 5)
+            self.assertNotIn("/probe/client.mjs", command)
+            self.assertEqual({command[i+1]: command[i+2] for i, value in enumerate(command) if value == "--setenv"}, probe.SERVICES_ENV)
+            self.assertEqual(command[-5:-1], ["-I", "-S", "-B", "-c"])
+            for key, value in (("services_argv", ["/bin/arbitrary"]), ("environment", {"HOME": "/host"})):
+                bad = {**config, key: value}
+                with self.assertRaises(probe.Refusal):
+                    probe.sandbox_command(self.root, bad, self.root / "payload", self.root / "bridge")
+
+    def test_both_complete_ordered_result_shapes_are_recognized_offline(self):
+        for case in ("confirmed", "legacy"):
+            self.assertEqual(probe.validate_services_result(case, self.result(case), 45), self.events(case))
+
+    def test_missing_duplicate_unknown_wrong_case_or_reordered_milestones_refuse(self):
+        for case in ("confirmed", "legacy"):
+            events = self.events(case)
+            for i in range(len(events)):
+                for variant in (events[:i] + events[i+1:], events[:i] + [events[i]] + events[i:],
+                                events[:i] + [{**events[i], "event": "unexpected"}] + events[i+1:]):
+                    with self.subTest(case=case, i=i), self.assertRaises(probe.Refusal):
+                        probe.validate_services_result(case, self.result(case, variant), 45)
+            with self.assertRaises(probe.Refusal):
+                probe.validate_services_result(case, self.result(case, list(reversed(events))), 45)
+            with self.assertRaises(probe.Refusal):
+                probe.validate_services_result(case, self.result("legacy" if case == "confirmed" else "confirmed"), 45)
+
+    def test_original_facts_cannot_be_replaced_by_an_early_or_foreign_success(self):
+        changes = {"runner-verified": {"testElf": "foreign"},
+                   "ordinary-started": {"sessionId": ""},
+                   "original-acknowledged": {"sessionId": "foreign"},
+                   "original-reused": {"registrationCount": 2},
+                   "owned-retired": {"originalTransportClosed": False},
+                   "completed": {"case": "legacy"}}
+        for event, update in changes.items():
+            events = self.events("confirmed")
+            next(item for item in events if item["event"] == event)["facts"].update(update)
+            with self.subTest(event=event), self.assertRaises(probe.Refusal):
+                probe.validate_services_result("confirmed", self.result("confirmed", events), 45)
+        for update in ({"receipt": "Refused"}, {"receipt": "Acknowledged " + "x"*8192},
+                       {"confirmedEndpoint": "127.0.0.1:1"}):
+            events = self.events("confirmed"); events[2]["facts"].update(update)
+            with self.assertRaises(probe.Refusal):
+                probe.validate_services_result("confirmed", self.result("confirmed", events), 45)
+
+    def test_nonzero_timeout_cancellation_or_survivor_cannot_count_as_pass(self):
+        for case in ("confirmed", "legacy"):
+            for update in ({"returncode": 1}, {"returncode": -9}, {"reason": "deadline"},
+                           {"reason": "cancelled"}, {"reason": "output-limit"}, {"elapsed_seconds": 46},
+                           {"containment_passed": False}, {"live_original_processes_after_cleanup": [123]}):
+                with self.subTest(case=case, update=update), self.assertRaises(probe.Refusal):
+                    probe.validate_services_result(case, {**self.result(case), **update}, 45)
+
+    def test_missing_wrong_or_multiple_libtest_summaries_refuse(self):
+        result = self.result("confirmed")
+        for text in (result["stdout"].replace("test result:", "not a result:"),
+                     result["stdout"].replace("1 passed;", "0 passed;"),
+                     result["stdout"] + result["stdout"],
+                     result["stdout"].replace(probe.SERVICES_SELECTORS["confirmed"], "another::case")):
+            with self.assertRaises(probe.Refusal):
+                probe.validate_services_result("confirmed", {**result, "stdout": text}, 45)
+
+    def test_malformed_or_oversized_transcripts_refuse(self):
+        for text in ('{"nativeServicesStartup":', json.dumps({"nativeServicesStartup": True, "event": "x", "facts": {}}),
+                     json.dumps({"nativeServicesStartup": 1, "event": "x", "facts": {"large": "x"*16384}})):
+            with self.assertRaises(probe.Refusal): probe.services_milestones(text)
+
+    def test_missing_services_inputs_refuse_before_containment(self):
+        args = argparse.Namespace(case="services-confirmed", output=self.root / "out", bundle=None,
+                                  intentd=None, deadline_seconds=45)
+        with patch.object(probe, "run_bounded") as launch, self.assertRaises(probe.Refusal):
+            probe.execute(args)
+        launch.assert_not_called()
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

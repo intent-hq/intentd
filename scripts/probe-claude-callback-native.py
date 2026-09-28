@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bounded offline native-control probe. No credentials, model prompt or host network.
 
-Only the two named cases are exposed. Product trust comes from the exact accepted
+Only named control and Services startup cases are exposed. Product trust comes from the exact accepted
 installer; the client, bridge, native CLI, sandbox and OS inputs are pinned here.
 A real inert containment check runs before payload execution in the SAME namespace.
 """
@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import resource
+import re
 import select
 import selectors
 import signal
@@ -40,6 +41,38 @@ ENV = {"HOME": "/home/probe", "XDG_CONFIG_HOME": "/home/probe/.config",
        "DISABLE_ERROR_REPORTING": "1"}
 OUTER_ENV = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
 OUTPUT_LIMIT = 262144
+SERVICES_PREPARATION = Path("/home/clement/intent/workspaces/ideate-future/intent/.dev/slice-b/harness-native-startup-preparation/.dev/preparation")
+SERVICES_ELF = SERVICES_PREPARATION / "artifacts/intent-services-lib-test"
+SERVICES_SHA = "c47c384293832449f9de37c0bcc98aab4052e86977a35ab0825a58fa29ca0379"
+SERVICES_BYTES = 546394424
+SERVICES_SELECTORS = {
+    "confirmed": "agent_manager::repository_origin::callback_delivery::tests::genuine_native_startup::normal_services_native_confirmed_startup",
+    "legacy": "agent_manager::repository_origin::callback_delivery::tests::genuine_native_startup::normal_services_native_legacy_startup",
+}
+SERVICES_EVENTS = {
+    "confirmed": ["runner-verified", "ordinary-started", "original-acknowledged", "original-reused", "owned-retired", "completed"],
+    "legacy": ["runner-verified", "ordinary-started", "owned-retired", "completed"],
+}
+SERVICES_ENV = {**ENV, "INTENT_NATIVE_SERVICES_RUN": "1"}
+# Immutable local build attribution, not registry provenance or reproducibility.
+SERVICES_MANIFESTS = {
+    "compile-v4/before.json": "7809890a201fc0f1bb8050219e6d6e18b38e1b8a21a0c17f2a239863b0723fb8",
+    "compile-v4/after.json": "7809890a201fc0f1bb8050219e6d6e18b38e1b8a21a0c17f2a239863b0723fb8",
+    "compile-v4/environment.json": "6ad577de5b1399d10a50aa899ac74911986149351e399f20cd038d348011fbfe",
+    "compile-v4/results.json": "5994fdb7b8eb56d907c310ea979ea49c381a2f2917334c2dfac17b4d56f93d47",
+    "compile-v4/compile.stdout": "7f0138551c0dca4fac8a610c17ab8f86e98b053b6634ff65b72b25e956a45727",
+    "attribution/elf.json": "669c1003a941d60f4ef2da829981acce010ca1258b79ca4d098115f3daf6cc9f",
+    "attribution/cargo-selected.json": "9d6a15f06e34b76002e9d361a7533a42a606ecd44bab837d268b8836b71e9e90",
+    "attribution/cargo-build-scripts.json": "87c60cf9599b3d5776490ef114215dd633cf7717731b4869d7963811a7351f6c",
+    "attribution/cargo-config-search.json": "1b25c93ffa1f8600aafde156a507daab35bf7218a39003ef90fc4d871f4ea71c",
+    "attribution/dependency-files.json": "78caa7dfbbd04b38e2d262736ad54f5688754186c4cd13ed4f3588adfa2d542d",
+    "attribution/dependency-packages.json": "7c69e7ddf5b324b5112dce515ceb42271b604db63d8f6ec8044cfc593c039f2c",
+    "attribution/generated-compiler-inputs.json": "a9a0fd9d94a42c18791234c1da82d8eca16eb1331f992f3a864e2d87712367b4",
+    "attribution/cargo-fingerprints.json": "a14ef043ea2bb1876a1d5800d5106048148df1b042c9650c936b66b56cb567a1",
+    "attribution/toolchain-inputs.json": "023837e4fc5f303cfc9c6cd0b3a8eebc604c9583b93842bc1e74febc413ec155",
+    "attribution/compiler-dependency-records.json": "40ff9754fc3f7b9dd88d65a642045a4ebb80773de9354e5eb994509264c11049",
+    "attribution/os-closure.json": "3e20a3024d075cd74f5174a13a3b2167a89d6f0c5ea8a44c66a457a9c458d9d1",
+}
 
 class Refusal(Exception):
     pass
@@ -355,6 +388,14 @@ peer.close();client.close();listener.close()
 print('CONTAINMENT '+repr({'namespaces':actual,'private_loopback':True,'host_listener_hidden':True,
       'readonly_probe':True,'host_sentinel_hidden':True,'interfaces':devices,'environment':dict(os.environ)}),flush=True)
 if c['payload']:
+    if c.get('services_case'):
+        assert 'CapEff:\t0000000000000000' in open('/proc/self/status').read().splitlines()
+        for path in ('/etc','/run','/sys','/root','/home/clement'):
+            assert not os.path.exists(path), 'unexpected host path'
+        mounts=[line.split() for line in open('/proc/self/mountinfo')]
+        for path in ('/','/runtime','/bridge/intentd','/probe/services-test','/probe/services-contract.json'):
+            assert any(row[4]==path and 'ro' in row[5].split(',') for row in mounts), 'writable input mount'
+        os.execve('/probe/services-test',c['services_argv'],c['environment'])
     os.execve('/runtime/node/bin/node',['/runtime/node/bin/node','--max-old-space-size=256',
               '/probe/client.mjs'],c['environment'])
 """
@@ -374,22 +415,31 @@ def sandbox_command(scratch, config, payload=None, bridge=None):
     command += ["--ro-bind", str(scratch / "visible-sentinel"), "/probe/sentinel"]
     if payload is not None:
         command += ["--ro-bind", str(payload), "/runtime",
-                    "--ro-bind", str(bridge), "/bridge/intentd",
-                    "--ro-bind", str(scratch / "client.mjs"),
-                    "/probe/client.mjs"]
+                    "--ro-bind", str(bridge), "/bridge/intentd"]
+        if config.get("services_case"):
+            require(config["services_argv"] == services_argv(config["services_case"]),
+                    "unexpected Services execution arguments")
+            require(config["environment"] == SERVICES_ENV, "unexpected Services environment")
+            command += ["--ro-bind", str(SERVICES_ELF), "/probe/services-test",
+                        "--ro-bind", str(scratch / "services-contract.json"), "/probe/services-contract.json"]
+        else:
+            command += ["--ro-bind", str(scratch / "client.mjs"), "/probe/client.mjs"]
     for name, dest in (("home", "/home/probe"), ("work", "/work"), ("tmp", "/tmp")):
         command += ["--bind", str(scratch / name), dest]
     command += ["--proc", "/proc", "--dev", "/dev", "--remount-ro", "/",
                 "--chdir", "/work"]
-    for name, value in sorted(ENV.items()):
+    for name, value in sorted(config["environment"].items()):
         command += ["--setenv", name, value]
     command += ["--", "/usr/bin/python3.12", "-I", "-S", "-B", "-c",
                 INERT.replace("@CONFIG@", repr(config))]
     return command
 
-def containment(scratch, seconds, payload=None, bridge=None, client=None):
+def containment(scratch, seconds, payload=None, bridge=None, client=None, services_case=None):
     scratch.mkdir(mode=0o700)
-    if payload is not None:
+    environment = ENV if services_case is None else SERVICES_ENV
+    if services_case is not None:
+        services_argv(services_case)  # Closed case validation, never a caller selector.
+    if payload is not None and services_case is None:
         require(client is not None and hashlib.sha256(client).hexdigest() == CLIENT_SHA,
                 "missing pinned client bytes")
         (scratch / "client.mjs").write_bytes(client)
@@ -405,11 +455,15 @@ def containment(scratch, seconds, payload=None, bridge=None, client=None):
         host.listen(1)
         host.settimeout(0.02)
         config = {"parent": namespaces(), "hidden": str(hidden), "sentinel": token,
-                  "port": host.getsockname()[1], "environment": ENV, "payload": payload is not None}
+                  "port": host.getsockname()[1], "environment": environment, "payload": payload is not None}
+        if services_case is not None and payload is not None:
+            config.update({"services_case": services_case, "services_argv": services_argv(services_case)})
+            (scratch / "services-contract.json").write_bytes(services_contract(services_case, config["parent"]))
+            (scratch / "services-contract.json").chmod(0o444)
         command = sandbox_command(scratch, config, payload, bridge)
         result = run_bounded(command, seconds)
         result["parent_namespaces"] = config["parent"]
-        result["sandbox_environment"] = ENV
+        result["sandbox_environment"] = environment
         try:
             connection, _ = host.accept()
         except TimeoutError:
@@ -423,12 +477,237 @@ def containment(scratch, seconds, payload=None, bridge=None, client=None):
     result["containment"] = proof
     result["containment_passed"] = bool(proof and not result["host_canary_connection"]
         and not result["live_original_processes_after_cleanup"]
+        and proof["environment"] == environment and proof["interfaces"] == ["lo"]
+        and all(proof[name] is True for name in ("private_loopback", "host_listener_hidden",
+                                                "readonly_probe", "host_sentinel_hidden"))
         and all(proof["namespaces"][n] != config["parent"][n] for n in NS_NAMES))
     return result
 
+def services_argv(case):
+    require(case in SERVICES_SELECTORS, "unknown Services startup case")
+    return ["/probe/services-test", SERVICES_SELECTORS[case], "--exact", "--ignored",
+            "--nocapture", "--test-threads=1"]
+
+def services_contract(case, original_namespaces):
+    services_argv(case)
+    require(set(original_namespaces) == set(NS_NAMES), "incomplete original namespaces")
+    require(all(re.fullmatch(re.escape(name) + r":\[\d+\]", value)
+                for name, value in original_namespaces.items()), "invalid original namespace identity")
+    result = json.dumps({"format": "intent-services-native-startup-v1", "case": case,
+                         "test_elf_sha256": SERVICES_SHA, "host_namespaces": original_namespaces},
+                        sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    require(len(result) <= 4096, "Services contract exceeds bound")
+    return result
+
+def check_services_elf():
+    path = checked_file(SERVICES_ELF, SERVICES_SHA, SERVICES_BYTES)
+    require(stat.S_IMODE(path.stat().st_mode) == 0o555 and path.stat().st_uid == os.getuid(),
+            "Services ELF ownership/mode mismatch")
+    with path.open("rb") as stream:
+        require(stream.read(6) == b"\x7fELF\x02\x01", "Services input is not the pinned ELF")
+    return path
+
+def check_services_inputs():
+    """Verify the accepted local compilation inputs; never build or launch them."""
+    check_services_elf()
+    raw = {name: source_bytes(SERVICES_PREPARATION / name, digest)
+           for name, digest in SERVICES_MANIFESTS.items()}
+    records = {name: json.loads(data) for name, data in raw.items() if name.endswith(".json")}
+    sources = records["compile-v4/before.json"]
+    require(sources == records["compile-v4/after.json"] and len(sources) == 1227,
+            "frozen compiled source mismatch")
+    root = Path(__file__).resolve().parent.parent
+    for name, row in sources.items():
+        path = root / name
+        info = path.lstat()
+        require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1,
+                "non-regular compiled source")
+        require(info.st_size == row["bytes"] and hash_file(path) == row["sha256"]
+                and ("100755" if info.st_mode & 0o111 else "100644") == row["mode"],
+                "composed source differs from compiled input: " + name)
+
+    def local_input(row):
+        path = Path(row["path"])
+        if row.get("exists") is False:
+            require(not path.exists() and not path.is_symlink(), "new Cargo configuration")
+            return
+        info = path.stat()
+        require(stat.S_ISREG(info.st_mode) and info.st_size == row["bytes"]
+                and oct(stat.S_IMODE(info.st_mode)) == row["mode"] and info.st_uid == row["uid"]
+                and hash_file(path) == row["sha256"], "local compiled input changed: " + str(path))
+
+    for name in ("dependency-files", "generated-compiler-inputs"):
+        for row in records["attribution/" + name + ".json"].values():
+            local_input(row)
+    for name in ("toolchain-inputs", "cargo-config-search"):
+        for row in records["attribution/" + name + ".json"]:
+            local_input(row)
+    for path, value in records["attribution/cargo-fingerprints.json"].items():
+        require(json.loads(Path(path).read_bytes()) == value, "Cargo fingerprint changed")
+    for path, value in records["attribution/compiler-dependency-records.json"].items():
+        require(Path(path).read_text() == value, "compiler dependency record changed")
+    packages = records["attribution/dependency-packages.json"]
+    files = records["attribution/dependency-files.json"]
+    require(len(packages) == 404 and len(files) == 19472
+            and all(row["registryChecksum"] is None and row["verifiedRegistryFiles"] == 0
+                    for row in packages), "unexpected registry attribution")
+    found = set()
+    for package in packages:
+        for directory, dirs, names in os.walk(package["root"]):
+            dirs[:] = [name for name in dirs if name not in (".git", "target")]
+            found.update(str(Path(directory) / name) for name in names)
+    require(found == set(files), "external local dependency inventory changed")
+    selected = records["attribution/cargo-selected.json"]
+    cargo = [json.loads(line) for line in raw["compile-v4/compile.stdout"].splitlines()]
+    require(cargo[-1] == {"reason": "build-finished", "success": True}
+            and selected in cargo, "missing successful original compiler receipt")
+    require(selected["features"] == [] and selected["profile"]["test"] is True,
+            "unexpected Services build configuration")
+    closure = records["attribution/os-closure.json"]
+    require(closure["missingMounts"] == {} and closure["historicalMounts"] == 20,
+            "unresolved Services OS closure")
+    for row in closure["inspected"].values():
+        if row["path"] == str(SERVICES_ELF):
+            require(row["sha256"] == SERVICES_SHA and row["bytes"] == SERVICES_BYTES,
+                    "Services attribution differs from independent pin")
+        else:
+            mount = OS_INPUTS["mounts"][row["logical"]]
+            require(row["sha256"] == mount["sha256"] and row["bytes"] == mount["bytes"],
+                    "Services requires an unpinned OS library")
+    return {"elf_sha256": SERVICES_SHA, "elf_bytes": SERVICES_BYTES,
+            "manifests": SERVICES_MANIFESTS, "compiled_source_entries": len(sources),
+            "dependency_packages": len(packages), "local_dependency_files": len(files),
+            "registry_checksum_verified_files": 0, "registry_provenance_or_reproducibility": False,
+            "generated_inputs": len(records["attribution/generated-compiler-inputs.json"]),
+            "fingerprints": len(records["attribution/cargo-fingerprints.json"]),
+            "toolchain_files": len(records["attribution/toolchain-inputs.json"])}
+
+def services_milestones(stdout):
+    result = []
+    for line in stdout.splitlines():
+        if '"nativeServicesStartup"' not in line:
+            continue
+        require(len(line.encode()) <= 16384, "oversized Services milestone")
+        try:
+            value = json.loads(line[line.index("{"):])
+        except (ValueError, json.JSONDecodeError) as error:
+            raise Refusal("malformed Services milestone") from error
+        require(set(value) == {"nativeServicesStartup", "event", "facts"}
+                and type(value["nativeServicesStartup"]) is int and value["nativeServicesStartup"] == 1
+                and isinstance(value["facts"], dict), "invalid Services milestone shape")
+        result.append(value)
+    return result
+
+def validate_services_result(case, result, deadline):
+    selector = services_argv(case)[1]
+    require(result["containment_passed"] is True, "Services namespace proof missing")
+    require(result["returncode"] == 0 and result["reason"] == "exited"
+            and result["elapsed_seconds"] <= deadline
+            and result["live_original_processes_after_cleanup"] == [],
+            "Services startup refused, failed, cancelled or bounded out")
+    events = services_milestones(result["stdout"])
+    require([event["event"] for event in events] == SERVICES_EVENTS[case],
+            "missing, reordered, duplicate or unexpected Services milestones")
+    facts = {event["event"]: event["facts"] for event in events}
+    verified = facts["runner-verified"]
+    require(verified.get("case") == case and verified.get("testElf") == SERVICES_SHA
+            and verified.get("bridge") == BRIDGE_SHA
+            and verified.get("runtimeIdentity") == "a08355be6f7f7aafd77977b0cdf030dc32f3fdce9178ec1883e0b04d71629597",
+            "Services verified the wrong inputs")
+    started = facts["ordinary-started"]
+    require(started.get("legacy") is (case == "legacy")
+            and all(isinstance(started.get(name), str) and started[name]
+                    for name in ("sessionId", "agent", "workspace", "pendingEndpoint"))
+            and type(started.get("adapterPid")) is int and started["adapterPid"] > 0,
+            "ordinary original startup evidence missing")
+    if case == "confirmed":
+        ack, reused = facts["original-acknowledged"], facts["original-reused"]
+        receipt = ack.get("receipt", "")
+        require(isinstance(receipt, str) and len(receipt.encode()) <= 8192
+                and "Acknowledged" in receipt and started["sessionId"] in receipt
+                and ack.get("sessionId") == started["sessionId"]
+                and ack.get("sameServicesReadAnchorConnection") is True
+                and isinstance(ack.get("confirmedEndpoint"), str)
+                and ack["confirmedEndpoint"] != started["pendingEndpoint"],
+                "original acknowledged ownership evidence missing")
+        require(reused.get("sameConnectionOriginSession") is True
+                and reused.get("distinctOwnedCaptures") is True
+                and type(reused.get("registrationCount")) is int and reused["registrationCount"] == 1,
+                "original startup reuse evidence missing")
+    retired = facts["owned-retired"]
+    require(retired.get("legacy") is (case == "legacy") and retired.get("handleAbsent") is True
+            and retired.get("originalTransportClosed") is True
+            and retired.get("contextJobs") == "none prepared; drain completed"
+            and facts["completed"].get("case") == case, "original retirement incomplete")
+    lines = result["stdout"].splitlines()
+    require(sum(line.startswith("test " + selector + " ... ") for line in lines) == 1,
+            "missing exact selected libtest case")
+    summaries = [line for line in lines if line.startswith("test result:")]
+    require(len(summaries) == 1 and re.fullmatch(
+        r"test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; \d+ filtered out; finished in \d+(?:\.\d+)?s",
+        summaries[0]), "missing one exact libtest pass")
+    return events
+
+def execute_services(args):
+    case = args.case.removeprefix("services-")
+    services_argv(case)
+    require(args.bundle is not None and args.intentd is not None, "Services requires exact bundle and bridge")
+    installer = load_installer()
+    output = installer.absolute_directory(args.output)
+    require(not output.exists() and output.parent.is_dir(), "new owned output directory required")
+    check_os()
+    inputs = check_services_inputs()
+    contract = installer.configuration()
+    installer.check_bundle(contract, args.bundle)
+    checked_file(args.intentd, BRIDGE_SHA, BRIDGE_BYTES)
+    require(stat.S_IMODE(args.intentd.stat().st_mode) == 0o555, "bridge mode mismatch")
+    output.mkdir(mode=0o700)
+    result = {"case": args.case, "inputs": inputs, "status": "starting",
+              "services_sandbox_attempted": False, "services_milestones": [],
+              "native_schedules": "not-reached", "namespace_before": namespaces()}
+    payload = None
+    def save():
+        (output / "receipt.json").write_text(json.dumps(result, sort_keys=True, indent=2) + "\n")
+    save()
+    try:
+        first = containment(output / "inert", min(args.deadline_seconds, 10), services_case=case)
+        result["inert"] = first
+        require(first["containment_passed"] and first["returncode"] == 0 and first["reason"] == "exited",
+                "required inert namespace containment unavailable")
+        launcher = installer.install(contract, args.bundle, output / "installed")
+        payload = launcher.parent.parent
+        installer.verify_install(contract, payload)
+        checked_file(payload / NATIVE_REL, NATIVE_SHA, 233709640)
+        result["services_sandbox_attempted"] = True
+        result["native_schedules"] = "startup only; no prompt, private tool or model request"
+        result["services"] = containment(output / "services", args.deadline_seconds,
+                                         payload, args.intentd, services_case=case)
+        result["services_milestones"] = services_milestones(result["services"]["stdout"])
+        validate_services_result(case, result["services"], args.deadline_seconds)
+        result["status"] = "completed"
+    except (Exception, KeyboardInterrupt) as error:
+        result["status"] = "refused"
+        result["reason"] = str(error)[:2048]
+    finally:
+        try:
+            if payload is not None:
+                installer.verify_install(contract, payload)  # Includes exact owned marker.
+                result["product_inventory_after"] = {"identity": contract.identity, "entries": 6367,
+                                                      "owned_marker_verified": True}
+            require(check_services_inputs() == inputs, "Services input attribution changed during execution")
+            check_os()
+            checked_file(args.intentd, BRIDGE_SHA, BRIDGE_BYTES)
+            require(namespaces() == result["namespace_before"], "outer namespace changed")
+            result["input_guards_after"] = True
+        except (Exception, KeyboardInterrupt) as error:
+            result["status"] = "refused"
+            result["postcheck_error"] = str(error)[:2048]
+        save()
+    return 0 if result["status"] == "completed" else 1
+
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--case", choices=("containment", "native"), required=True)
+    p.add_argument("--case", choices=("containment", "native", "services-confirmed", "services-legacy"), required=True)
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--bundle", type=Path)
     p.add_argument("--intentd", type=Path)
@@ -438,6 +717,8 @@ def parser():
 def execute(args):
     require(sys.flags.isolated and sys.flags.no_site, "use Python -I -S -B")
     require(1 <= args.deadline_seconds <= 45, "deadline must be 1..45 seconds")
+    if args.case in ("services-confirmed", "services-legacy"):
+        return execute_services(args)
     require((args.case == "native") == (args.bundle is not None and args.intentd is not None),
             "native case requires exact bundle and bridge; containment takes neither")
     if args.case == "containment":
