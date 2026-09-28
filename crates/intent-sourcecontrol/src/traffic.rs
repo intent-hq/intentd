@@ -141,38 +141,56 @@ pub(crate) fn context() -> Context {
 
 /// Scope a caller without leaking labels between concurrent futures. Spawned
 /// tasks must explicitly re-enter a scope (Tokio task locals are not inherited).
-pub async fn with_caller<T>(caller: Caller, future: impl Future<Output = T>) -> T {
-    CONTEXT
-        .scope(
-            Context {
-                caller,
-                ..context()
-            },
-            future,
-        )
-        .await
+pub fn with_caller<T>(caller: Caller, future: impl Future<Output = T>) -> impl Future<Output = T> {
+    // Service sweep futures are large. Box before constructing the scope so
+    // accounting does not duplicate their storage through nested async states.
+    // Capture context when polled, preserving nested with_traffic/with_caller.
+    let future = Box::pin(future);
+    async move {
+        CONTEXT
+            .scope(
+                Context {
+                    caller,
+                    ..context()
+                },
+                future,
+            )
+            .await
+    }
 }
 
 /// Run against an isolated aggregate; useful for functional request assertions.
-pub async fn with_traffic<T>(traffic: Traffic, future: impl Future<Output = T>) -> T {
-    CONTEXT
-        .scope(
-            Context {
-                traffic,
-                ..context()
-            },
-            future,
-        )
-        .await
+pub fn with_traffic<T>(
+    traffic: Traffic,
+    future: impl Future<Output = T>,
+) -> impl Future<Output = T> {
+    let future = Box::pin(future);
+    async move {
+        CONTEXT
+            .scope(
+                Context {
+                    traffic,
+                    ..context()
+                },
+                future,
+            )
+            .await
+    }
 }
 
 /// Mark requests issued to continue a page chain or recover from a degraded
 /// read. Nested scopes retain both facts (a fallback can itself paginate).
-pub async fn with_attempt<T>(attempt: Attempt, future: impl Future<Output = T>) -> T {
-    let mut ctx = context();
-    ctx.continuation |= attempt == Attempt::Continuation;
-    ctx.fallback |= attempt == Attempt::Fallback;
-    CONTEXT.scope(ctx, future).await
+pub fn with_attempt<T>(
+    attempt: Attempt,
+    future: impl Future<Output = T>,
+) -> impl Future<Output = T> {
+    let future = Box::pin(future);
+    async move {
+        let mut ctx = context();
+        ctx.continuation |= attempt == Attempt::Continuation;
+        ctx.fallback |= attempt == Attempt::Fallback;
+        CONTEXT.scope(ctx, future).await
+    }
 }
 
 /// Called at the branch that actually reuses data, never at speculative lookup.
@@ -258,6 +276,20 @@ pub(crate) fn graphql_result(operation: Operation, cost: Option<u64>, failed: bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accounting_scopes_do_not_embed_large_service_futures() {
+        fn large_future() -> impl Future<Output = ()> {
+            let data = [0_u8; 64 * 1024];
+            async move {
+                std::hint::black_box(data);
+            }
+        }
+        assert!(std::mem::size_of_val(&large_future()) >= 64 * 1024);
+        assert!(std::mem::size_of_val(&with_caller(Caller::PrMonitor, large_future())) < 1024);
+        assert!(std::mem::size_of_val(&with_attempt(Attempt::Fallback, large_future())) < 1024);
+        assert!(std::mem::size_of_val(&with_traffic(Traffic::default(), large_future())) < 1024);
+    }
 
     #[tokio::test]
     async fn nested_scopes_restore_callers_and_keep_reuse_out_of_http_counts() {
