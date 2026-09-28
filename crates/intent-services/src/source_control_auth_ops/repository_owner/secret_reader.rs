@@ -220,13 +220,6 @@ pub(crate) struct RepositorySettledConnection {
     selected: RepositorySecretRequest,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "original NativeRead source consumer remains separately owned"
-    )
-)]
 impl RepositorySettledConnection {
     pub(crate) fn descriptor(&self) -> &GitlabDescriptor {
         &self.descriptor
@@ -475,13 +468,6 @@ impl RepositoryReadEligibility {
 impl crate::Services {
     /// Observe only this Services instance's original settled, paired owner.
     /// This reads no secret and supplies no caller, target or read authority.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "original NativeRead source consumer remains separately owned"
-        )
-    )]
     pub(crate) fn gitlab_repository_settled_connection(
         &self,
     ) -> Result<super::RepositorySettledConnection> {
@@ -492,13 +478,6 @@ impl crate::Services {
 
     /// Capture only this Services instance's installed owner and actual read
     /// admission. Dispatch deadlines do not govern eligibility of retained data.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "qualified cache consumption remains separately owned"
-        )
-    )]
     pub(crate) fn gitlab_repository_read_eligibility(
         &self,
         admission: &RepositoryCredentialAdmission,
@@ -514,13 +493,6 @@ impl crate::Services {
     }
 
     /// Capture the original installed source, with no selectable replacement.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "repository reader awaits its separately owned service consumer"
-        )
-    )]
     pub(crate) fn gitlab_repository_secret_reader(
         &self,
     ) -> Result<Arc<dyn RepositorySecretReader>> {

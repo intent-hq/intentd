@@ -18,6 +18,30 @@ fn fixture() -> (Arc<RepositoryLifecycleRegistry>, FixtureOriginOwner, Caller) {
 }
 
 #[tokio::test]
+async fn absent_or_failed_private_policy_keeps_ordinary_body_and_preparation() {
+    let (registry, owner, caller) = fixture();
+    for failed in [false, true] {
+        let mut callback = RepositoryCallbackContext::new(&registry, Some(owner.origin()));
+        if failed {
+            callback = callback.with_read_owner(Err(AdmissionError::Denied));
+        }
+        let scope = McpRequestContext::capture(&callback);
+        assert!(scope.private_result_policy().is_none());
+        let mut effects = 0;
+        for _ in 0..2 {
+            with_caller(
+                caller.clone(),
+                scope.scope(Box::pin(async {
+                    effects += 1;
+                })),
+            )
+            .await;
+        }
+        assert_eq!(effects, 2);
+    }
+}
+
+#[tokio::test]
 async fn failed_read_attachment_keeps_original_body_source_and_preparation() {
     let (registry, owner, caller) = fixture();
     let callback = RepositoryCallbackContext::new(&registry, Some(owner.origin()))

@@ -270,6 +270,37 @@ mod read_owner {
             .with_read_owner(RepositoryReadOwner::capture(Arc::new(f.services.clone())))
     }
 
+    #[tokio::test]
+    async fn original_installed_factory_keeps_policy_but_never_repairs_an_unavailable_anchor() {
+        let f = Fixture::new().await;
+        let original = Arc::new(f.services.clone());
+        let failed = RepositoryReadOwner::capture(original.clone());
+        assert!(failed.is_err());
+        let owner = confirmed(&f).await;
+        let unavailable = owner.callback().with_read_owner(failed);
+        assert!(McpRequestContext::capture(&unavailable)
+            .private_result_policy()
+            .is_none());
+        let callback = owner
+            .callback()
+            .with_read_owner(RepositoryReadOwner::capture(original.clone()));
+        let scope = McpRequestContext::capture(&callback);
+        let policy = scope
+            .private_result_policy()
+            .expect("same original installed factory");
+        let escaped = read(&scope, caller(&f)).await.unwrap();
+        assert!(escaped.retains(original.as_ref()));
+        assert!(!escaped.retains(&f.services));
+        drop(scope);
+        with_caller(caller(&f), async {
+            assert_eq!(escaped.check_current(), Err(AdmissionError::Retired));
+        })
+        .await;
+        drop(policy);
+        let fresh = McpRequestContext::capture(&callback);
+        assert!(read(&fresh, caller(&f)).await.is_ok());
+    }
+
     async fn read(
         scope: &Arc<dyn McpRequestScope>,
         original_caller: Caller,

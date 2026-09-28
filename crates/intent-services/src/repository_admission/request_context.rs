@@ -137,6 +137,15 @@ impl Drop for RetireCancelledScope {
 }
 
 impl McpRequestScope for RepositoryRequestScope {
+    fn private_result_policy(
+        &self,
+    ) -> Option<Arc<dyn intent_acp::mcp_server::private_results::McpPrivatePolicy>> {
+        self.read
+            .as_ref()
+            .ok()
+            .and_then(RepositoryReadRequest::policy)
+    }
+
     fn scope<'a>(&'a self, request: McpContextFuture<'a>) -> McpContextFuture<'a> {
         // Construct the guard before the future: even an unpolled cancelled
         // scope must retire this request, without retiring the physical owner.

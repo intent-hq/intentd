@@ -15,7 +15,13 @@ impl RepositoryReadOwner {
     pub(crate) fn capture(original: Arc<Services>) -> AdmissionResult<Arc<Self>> {
         let store = original.store().clone();
         let registry = original.repository_lifecycle_registry.clone();
-        Self::retain_original(original, store, registry)
+        let owner = Self::retain_original(original.clone(), store, registry)?;
+        Ok(owner.with_policy(Arc::new(move |request| {
+            Arc::new(crate::repository_read_policy::RepositoryReadPolicy::new(
+                original.clone(),
+                request,
+            ))
+        })))
     }
 }
 

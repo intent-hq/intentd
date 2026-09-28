@@ -133,7 +133,7 @@ async fn read_current_authority(
     Ok(facts)
 }
 
-async fn read_agent_identity(
+pub(crate) async fn read_agent_identity(
     services: &Services,
     caller: &Caller,
 ) -> AdmissionResult<Option<RepositoryAgentIdentity>> {

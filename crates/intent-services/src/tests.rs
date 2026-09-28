@@ -19287,9 +19287,24 @@ pub(crate) mod pr {
 
     // ---- ws.pr.snapshot engine (`pr_state`, MCP-only) --------------------
 
+    /// Actual local Git facts for implicit GitHub snapshot routing. Kept local
+    /// to this family so unrelated forge/metadata fixtures remain unchanged.
+    async fn snapshot_git_root(svc: &Services, id: &WorkspaceId) -> tempfile::TempDir {
+        let dir = test_tempdir("snapshot-github-root-");
+        {
+            let repo = git2::Repository::init(dir.path()).unwrap();
+            repo.remote("origin", "https://github.com/o/r").unwrap();
+        }
+        let mut ws = svc.store().get_workspace(id).await.unwrap();
+        ws.worktree_path = Some(dir.path().to_string_lossy().into_owned());
+        svc.store().update_workspace(&ws).await.unwrap();
+        dir
+    }
+
     #[intent_test_macros::daemon_test]
     async fn state_snapshot_shape_and_counts() {
         let (_t, svc, ws) = setup(false, true).await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["repo"], "o/r");
         assert_eq!(v["prNumber"], 42);
@@ -19340,6 +19355,7 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["comments"]["conversationCount"], 1);
         assert_eq!(v["comments"]["reviewCommentCount"], 2);
@@ -19358,6 +19374,7 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["mergeable"], false);
         assert_eq!(v["mergeableState"], "dirty");
@@ -19375,6 +19392,7 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["state"], "merged");
         assert_eq!(v["isMerged"], true);
@@ -19400,6 +19418,7 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["mergeableState"], "blocked");
         assert_eq!(v["reviews"]["decision"], "none");
@@ -19421,6 +19440,7 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["mergeableState"], "clean");
         assert_eq!(v["reviews"]["decision"], "review_required");
@@ -19439,6 +19459,7 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["reviews"]["decision"], "approved");
         assert_eq!(v["reviews"]["approvals"], 1);
@@ -19454,17 +19475,18 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let err = svc.pr_state(ws, 999, None).await.unwrap_err();
         assert!(matches!(err, Error::Internal(m) if m.contains("PR #999 not found in o/r")));
     }
 
     #[intent_test_macros::daemon_test]
-    async fn state_snapshot_requires_workspace_repo() {
-        // No repository on the workspace: same "No active PR" guard as the
-        // other pr.* methods (the required prNumber does not bypass it).
+    async fn state_snapshot_unknown_root_uses_fixed_discovery_refusal() {
+        // An absent original Git root cannot infer a provider from metadata or
+        // expose new discovery details through the snapshot error.
         let (_t, svc, ws) = setup(false, false).await;
         let err = svc.pr_state(ws, 42, None).await.unwrap_err();
-        assert!(matches!(err, Error::Internal(m) if m == "No active PR"));
+        assert!(matches!(err, Error::Forbidden(m) if m == crate::repository_read_source::REFUSAL));
     }
 
     #[intent_test_macros::daemon_test]
@@ -19496,6 +19518,7 @@ pub(crate) mod pr {
         *forge.on_list_comments.lock().unwrap() = Some(Box::new(move || {
             assert!(gate.pause_for(std::time::Duration::from_secs(3600), true));
         }));
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws.clone(), 42, None).await.expect("snapshot");
         let until = svc
             .sweep_rate_limit_paused_until()

@@ -167,6 +167,10 @@ mod repository_credential_writers;
     )
 )]
 mod repository_credentials;
+#[path = "repository_admission/read_policy.rs"]
+mod repository_read_policy;
+#[path = "repository_admission/read_source.rs"]
+mod repository_read_source;
 
 mod agent_list_cache;
 mod harness;
@@ -30936,20 +30940,38 @@ impl WorkspaceApi for Services {
         pr_number: u64,
         repo: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let captured = repo.is_none().then(|| {
+            repository_read_source::CapturedReview::capture(self, workspace_id.clone(), pr_number)
+        });
         let store = self.store.clone();
         let this = self.clone();
         self.execution_call(async move {
             self.require_member(&workspace_id).await?;
-            let ws = load_ws_for_pr(&store, &workspace_id).await?;
-            // Cross-repo override (`{ repo: "owner/name" }`) wins over the
-            // workspace repo; either way the resolved repo is echoed in the
-            // result so a wrong-repo read is detectable.
+            load_ws_for_pr(&store, &workspace_id).await?;
+            // Explicit GitHub addressing keeps its existing path. Implicit
+            // reads first resolve the actual original local repository.
             let repo_ref = match repo {
                 Some(slug) => {
                     let (owner, repo) = pr_ops::parse_repo_slug(&slug)?;
                     intent_sourcecontrol::RepoRef::new(owner, repo)
                 }
-                None => pr_ops::repo_of(&ws)?,
+                None => match captured
+                    .ok_or_else(repository_read_source::refused)?
+                    .read(self)
+                    .await
+                    .map_err(|_| repository_read_source::refused())?
+                {
+                    repository_read_source::ReadOutcome::Github(repo) => repo,
+                    repository_read_source::ReadOutcome::Managed { target, result } => {
+                        let read = (*result).map_err(|failure| match failure.cause {
+                            pr_monitor::qualified_cache::CacheError::Provider(error) => {
+                                pr_ops::map_sc_err(error)
+                            }
+                            _ => repository_read_source::refused(),
+                        })?;
+                        return pr_ops::qualified_review_snapshot(&target, &read.value);
+                    }
+                },
             };
             let repo_slug = format!("{}/{}", repo_ref.owner, repo_ref.name);
             // Served from the shared PR cache (§5.7): the entry is the PR

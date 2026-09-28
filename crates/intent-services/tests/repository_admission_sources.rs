@@ -8,6 +8,10 @@
 )]
 #[path = "../src/repository_admission.rs"]
 mod repository_admission;
+#[expect(
+    dead_code,
+    reason = "NativeRead root/group consumers are exercised in Services; this harness preserves original source adapter coverage"
+)]
 #[path = "../src/repository_admission/git_source.rs"]
 mod repository_admission_git_source;
 #[path = "../src/repository_context_reader.rs"]

@@ -16,8 +16,9 @@ use intent_store::Store;
 use sha2::{Digest, Sha256};
 
 use crate::repository_context_reader::{
-    read_repository_context_with_resolver, AdmittedRepositoryRoot, GitConfigEnvironment,
-    RepositoryContextInput, RepositoryContextRead,
+    observe_repository_root_with_resolver, read_repository_context_with_resolver,
+    AdmittedRepositoryRoot, GitConfigEnvironment, RepositoryContextInput, RepositoryContextRead,
+    RepositoryObservedRoot,
 };
 
 use crate::repository_admission::{
@@ -48,6 +49,33 @@ fn local_error(error: &intent_core::Error) -> AdmissionError {
 }
 
 impl RootRecord {
+    /// Internal control discovery under the original stored lock. This observes
+    /// only local Git facts and neither constructs a lifetime nor grants access.
+    pub(super) async fn observe_local(
+        &self,
+        store: &Store,
+        locks: &WorktreeLocks,
+        resolver: CanonicalRemoteResolver,
+    ) -> AdmissionResult<RepositoryObservedRoot> {
+        locks
+            .with_lock(&self.lock_path, || async {
+                if Self::read(store, &self.root).await? != *self {
+                    return Err(AdmissionError::BindingChanged);
+                }
+                let observed =
+                    observe_local(self.root.clone(), self.canonical_path.clone(), resolver).await?;
+                if Self::read(store, &self.root).await? != *self {
+                    return Err(AdmissionError::BindingChanged);
+                }
+                Ok(observed)
+            })
+            .await
+    }
+
+    pub(super) fn lifecycle_key(&self) -> intent_store::RepositoryLifecycleKey {
+        intent_store::RepositoryLifecycleKey::Worktree(self.lock_path.clone())
+    }
+
     pub(super) async fn read(store: &Store, root: &RepositoryRootId) -> AdmissionResult<Self> {
         let workspace = store
             .get_workspace(&root.workspace_id)
@@ -118,6 +146,70 @@ pub(super) struct RepositoryGitSource {
 }
 
 impl RepositoryGitSource {
+    /// Retain all logical records while taking each original stored lock once.
+    /// Different stored keys which alias one physical path are not interchangeable.
+    pub(super) async fn with_group<T, F, Fut>(
+        store: &Store,
+        locks: &WorktreeLocks,
+        records: Vec<RootRecord>,
+        retirement: RepositoryRetirement,
+        action: F,
+    ) -> AdmissionResult<T>
+    where
+        T: Send,
+        F: FnOnce(Vec<Arc<Self>>) -> Fut + Send,
+        Fut: Future<Output = AdmissionResult<T>> + Send,
+    {
+        let _pending = RetireOnDrop(retirement.clone());
+        retirement.check_current()?;
+        for (i, record) in records.iter().enumerate() {
+            if records[..i].iter().any(|earlier| {
+                earlier.canonical_path == record.canonical_path
+                    && earlier.lock_path != record.lock_path
+            }) {
+                return Err(AdmissionError::BindingChanged);
+            }
+        }
+        let mut paths = records
+            .iter()
+            .map(|record| record.lock_path.clone())
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        lock_group(locks, &paths, || async move {
+            let _locked = RetireOnDrop(retirement.clone());
+            let mut sources = Vec::with_capacity(records.len());
+            for record in records {
+                retirement.check_current()?;
+                if RootRecord::read(store, &record.root).await? != record {
+                    return Err(AdmissionError::BindingChanged);
+                }
+                sources.push(Arc::new(Self {
+                    store: store.clone(),
+                    record,
+                    retirement: retirement.clone(),
+                }));
+            }
+            action(sources).await
+        })
+        .await
+    }
+
+    pub(super) async fn observe_root(
+        &self,
+        resolver: CanonicalRemoteResolver,
+    ) -> AdmissionResult<RepositoryObservedRoot> {
+        self.check_root().await?;
+        let observed = observe_local(
+            self.record.root.clone(),
+            self.record.canonical_path.clone(),
+            resolver,
+        )
+        .await?;
+        self.check_root().await?;
+        Ok(observed)
+    }
+
     pub(super) async fn with_locked<T, F, Fut>(
         store: &Store,
         locks: &WorktreeLocks,
@@ -316,4 +408,43 @@ impl RepositoryGitSource {
         self.retirement.check_current()?;
         Ok(fingerprint)
     }
+}
+
+async fn observe_local(
+    root: RepositoryRootId,
+    path: PathBuf,
+    resolver: CanonicalRemoteResolver,
+) -> AdmissionResult<RepositoryObservedRoot> {
+    tokio::task::spawn_blocking(move || {
+        observe_repository_root_with_resolver(
+            &root,
+            &path,
+            &resolver,
+            &GitConfigEnvironment::default(),
+        )
+    })
+    .await
+    .map_err(|_| AdmissionError::Unavailable)?
+    .map_err(|error| local_error(&error))
+}
+
+fn lock_group<'a, T, F, Fut>(
+    locks: &'a WorktreeLocks,
+    paths: &'a [PathBuf],
+    action: F,
+) -> std::pin::Pin<Box<dyn Future<Output = AdmissionResult<T>> + Send + 'a>>
+where
+    T: Send + 'a,
+    F: FnOnce() -> Fut + Send + 'a,
+    Fut: Future<Output = AdmissionResult<T>> + Send + 'a,
+{
+    Box::pin(async move {
+        if let Some((first, remaining)) = paths.split_first() {
+            locks
+                .with_lock(first, || lock_group(locks, remaining, action))
+                .await
+        } else {
+            action().await
+        }
+    })
 }
