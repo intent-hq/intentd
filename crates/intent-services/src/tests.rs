@@ -23632,7 +23632,9 @@ pub(crate) mod pr {
             ),
         ]);
         let mut fetched_fresh = Vec::new();
+        let (_db, svc) = github_svc().await;
         let (changed, rate_limited) = crate::pr_ops::refresh_stale_pool_entries(
+            &svc,
             &sc,
             &repo,
             &mut list,

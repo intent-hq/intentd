@@ -1622,3 +1622,49 @@ async fn traffic_attributes_real_monitor_http_pages_and_on_demand_cache_reuse() 
         "service counts agree with actual server requests"
     );
 }
+
+#[tokio::test]
+async fn shared_discovery_borrows_newer_monitor_details_without_extra_http() {
+    use intent_sourcecontrol::traffic::{with_caller, with_traffic, Caller, Operation, Traffic};
+    let (_db, _root, svc, _forge, ws, owner) = setup().await;
+    let mock = MockQwen::start(11506).await;
+    let svc = svc.with_source_control(mock.sc.clone());
+    svc.pr_monitor_register(&ws, &owner, "QwenLM", "qwen-code", 11506)
+        .await
+        .unwrap();
+    let repo = RepoRef::new("QwenLM", "qwen-code");
+    let traffic = Traffic::default();
+    let before = mock.calls("");
+    with_traffic(
+        traffic.clone(),
+        with_caller(Caller::GitRootRefresh, async {
+            svc.shared_pr_record(mock.sc.as_ref(), &repo, 11506)
+                .await
+                .unwrap();
+            svc.shared_pr_record(mock.sc.as_ref(), &repo, 11506)
+                .await
+                .unwrap();
+        }),
+    )
+    .await;
+    assert_eq!(mock.calls(""), before);
+    assert_eq!(
+        traffic.snapshot().counts[&(Caller::GitRootRefresh, Operation::PrDetail)].rest_requests,
+        0
+    );
+    mock.edit(|s| s.pr["state"] = json!("CLOSED"));
+    svc.read_pr(&repo, 11506, PrReadPolicy::REFRESH)
+        .await
+        .unwrap();
+    let before = mock.calls("");
+    let current = svc
+        .shared_pr_record(mock.sc.as_ref(), &repo, 11506)
+        .await
+        .unwrap();
+    assert_eq!(current.state, PrState::Closed);
+    assert_eq!(
+        mock.calls(""),
+        before,
+        "newer monitor read supersedes the background hit"
+    );
+}

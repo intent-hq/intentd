@@ -93,6 +93,19 @@ fn pr_read_quota(core: RateLimitStatus, graphql: RateLimitStatus) -> RateLimitSt
 /// GitHub implementation of [`SourceControl`].
 pub struct GitHubSourceControl {
     transport: crate::github_transport::Transport,
+    cache_scope: crate::cache_scope::CacheScope,
+}
+
+fn github_cache_scope(
+    token: Option<&str>,
+    base: Option<&str>,
+) -> Result<crate::cache_scope::CacheScope> {
+    let base = reqwest::Url::parse(base.unwrap_or("https://api.github.com"))
+        .map_err(|_| Error::Config("invalid github apiBaseUrl".into()))?;
+    Ok(crate::cache_scope::CacheScope::github(
+        token,
+        base.as_str().trim_end_matches('/'),
+    ))
 }
 
 impl GitHubSourceControl {
@@ -105,6 +118,7 @@ impl GitHubSourceControl {
     pub fn new(token: &str, api_base_url: Option<&str>) -> Result<Self> {
         Ok(Self {
             transport: crate::github_transport::Transport::new(Some(token), api_base_url)?,
+            cache_scope: github_cache_scope(Some(token), api_base_url)?,
         })
     }
 
@@ -137,6 +151,7 @@ impl GitHubSourceControl {
     pub fn anonymous(api_base_url: Option<&str>) -> Result<Self> {
         Ok(Self {
             transport: crate::github_transport::Transport::new(None, api_base_url)?,
+            cache_scope: github_cache_scope(None, api_base_url)?,
         })
     }
 
@@ -1529,6 +1544,10 @@ query GetReviewThreads($owner: String!, $repo: String!, $prNumber: Int!, $first:
 
 #[async_trait]
 impl SourceControl for GitHubSourceControl {
+    fn cache_scope(&self) -> Option<crate::cache_scope::CacheScope> {
+        Some(self.cache_scope.clone())
+    }
+
     fn provider_id(&self) -> &'static str {
         "github"
     }
@@ -1850,12 +1869,37 @@ impl SourceControl for GitHubSourceControl {
         params.push(("per_page", per_page.to_string()));
         params.push(("page", page_no.to_string()));
         let route = Self::repo_path(repo, "/pulls");
-        let v: Value = self.client().get(&route, Some(&params)).await?;
-        let raw: Vec<Value> = serde_json::from_value(v)?;
-        // Paging is measured on the raw GitHub page; the optional client-side
-        // `author` filter only narrows what this page returns.
-        let next_cursor = rest_next_cursor(page_no, raw.len(), per_page);
-        let prs = raw.into_iter().map(map_pull).collect::<Result<Vec<_>>>()?;
+        let page: octocrab::Page<Value> = self.client().get(&route, Some(&params)).await?;
+        // Consume GitHub's continuation when supplied, but never follow its URL
+        // with credentials. Only a strictly advancing numeric page is accepted;
+        // the next request reconstructs this same repository route and filters.
+        let next_cursor = if let Some(next) = page.next.as_ref() {
+            let next = reqwest::Url::parse(&next.to_string())
+                .map_err(|_| Error::Decode("invalid PR pagination link".into()))?;
+            let pages: Vec<_> = next.query_pairs().filter(|(k, _)| k == "page").collect();
+            let number = if pages.len() == 1 {
+                pages[0].1.parse::<u64>().ok()
+            } else {
+                None
+            };
+            Some(
+                number
+                    .filter(|n| Some(*n) == page_no.checked_add(1))
+                    .ok_or_else(|| Error::Decode("non-advancing PR pagination link".into()))?
+                    .to_string(),
+            )
+        } else if page.prev.is_some() || page.first.is_some() || page.last.is_some() {
+            None
+        } else {
+            // Hosts/fixtures omitting Link need the empty sentinel page at an
+            // exact page-size boundary; a full page alone cannot prove absence.
+            rest_next_cursor(page_no, page.items.len(), per_page)
+        };
+        let prs = page
+            .items
+            .into_iter()
+            .map(map_pull)
+            .collect::<Result<Vec<_>>>()?;
         let items = match &query.author {
             Some(author) => prs.into_iter().filter(|p| &p.author == author).collect(),
             None => prs,

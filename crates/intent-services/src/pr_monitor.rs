@@ -706,6 +706,7 @@ impl PrReadPolicy {
 /// One PR's last full read, remembered between reads.
 #[derive(Debug, Clone)]
 pub struct PrCacheEntry {
+    authorization: Option<intent_sourcecontrol::cache_scope::CacheScope>,
     /// The PR record as of the newest read that confirmed this entry: the
     /// full fetch, or a later cheap poll whose record carried the same
     /// fingerprint.
@@ -730,6 +731,7 @@ pub struct PrCacheEntry {
 impl PrCacheEntry {
     fn new(pr: PullRequest, snapshot: SharedPrSnapshot, now: Instant) -> Self {
         Self {
+            authorization: None,
             fingerprint: PrFingerprint::of(&pr),
             pr,
             snapshot,
@@ -775,6 +777,20 @@ pub(crate) struct PrCacheSlot {
 /// daemon restart starts cold. Shared across [`Services`] clones.
 pub(crate) type PrCache = Arc<Mutex<HashMap<PrKey, PrCacheSlot>>>;
 
+/// Background discovery may borrow only a recent record observed in the same
+/// authorization context; it never replaces the full snapshot with list fields.
+pub(crate) fn cached_record_for_discovery(
+    cache: &PrCache,
+    repo: &RepoRef,
+    number: u64,
+    authorization: &intent_sourcecontrol::cache_scope::CacheScope,
+    max_age: Duration,
+) -> Option<(PullRequest, Instant)> {
+    let entry = cached_pr_within(cache, &pr_key_for(repo, number.cast_signed()), max_age)?;
+    (authorization.is_current() && entry.authorization.as_ref() == Some(authorization))
+        .then_some((entry.pr, entry.refreshed_at))
+}
+
 /// Store an on-demand full read and bump the slot's generation, so a sweep
 /// poll already in flight for the PR does not overwrite it with its
 /// (possibly older) result. `monitored` is the set of PRs under an active
@@ -785,9 +801,11 @@ fn store_on_demand(
     pr: PullRequest,
     snapshot: SharedPrSnapshot,
     monitored: &HashSet<PrKey>,
+    authorization: Option<intent_sourcecontrol::cache_scope::CacheScope>,
 ) -> PrCacheEntry {
     let now = Instant::now();
-    let entry = PrCacheEntry::new(pr, snapshot, now);
+    let mut entry = PrCacheEntry::new(pr, snapshot, now);
+    entry.authorization = authorization;
     let mut cache = cache.lock().unwrap();
     let slot = cache.entry(key).or_default();
     slot.generation += 1;
@@ -1037,7 +1055,10 @@ pub(crate) async fn read_pr_via_with_fetched(
         return Ok((entry, false));
     }
     let (pr, snapshot) = fetch_pr_full(sc, repo_ref, number).await?;
-    Ok((store_on_demand(cache, key, pr, snapshot, monitored), true))
+    Ok((
+        store_on_demand(cache, key, pr, snapshot, monitored, sc.cache_scope()),
+        true,
+    ))
 }
 
 /// The cached entry for `key` when a forge read confirmed it current less
@@ -1115,7 +1136,8 @@ async fn poll_pr(
             .await?
         }
     };
-    let entry = PrCacheEntry::new(pr, snapshot, now);
+    let mut entry = PrCacheEntry::new(pr, snapshot, now);
+    entry.authorization = sc.cache_scope();
     let mut cache = cache.lock().unwrap();
     let slot = cache.entry(key).or_default();
     if slot.generation == generation {
@@ -3711,7 +3733,7 @@ impl Services {
     async fn refresh_workspace_pr_after_terminal(&self, workspace_id: &WorkspaceId) {
         match tokio::time::timeout(
             self.pr_refresh_fetch_timeout,
-            self.refresh_workspace_pr(workspace_id),
+            self.refresh_workspace_pr_cached(workspace_id),
         )
         .await
         {
@@ -8192,6 +8214,7 @@ mod tests {
                 pr.clone(),
                 snapshot.clone(),
                 &HashSet::new(),
+                None,
             );
         })));
         let polled = read_pr_via(&forge, &repo, 42, &cache, PrReadPolicy::Poll, &NONE)

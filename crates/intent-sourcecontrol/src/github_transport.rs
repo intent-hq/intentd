@@ -25,6 +25,52 @@ use tower::{Layer, Service, ServiceExt};
 type Pool =
     Client<hyper_timeout::TimeoutConnector<hyper_rustls::HttpsConnector<HttpConnector>>, OctoBody>;
 
+#[derive(Debug, thiserror::Error)]
+enum AttemptError {
+    #[error(transparent)]
+    Transport(#[from] hyper_util::client::legacy::Error),
+    #[error("background forge request budget exhausted")]
+    Denied,
+}
+
+/// Delegate all real responses/errors to Octocrab's unchanged policy. A local
+/// admission refusal is not a failed transport attempt and must not be retried.
+#[derive(Clone)]
+struct AdmittedRetry(RetryConfig);
+
+impl<B> tower::retry::Policy<http::Request<OctoBody>, http::Response<B>, AttemptError>
+    for AdmittedRetry
+{
+    type Future = <RetryConfig as tower::retry::Policy<
+        http::Request<OctoBody>,
+        http::Response<B>,
+        hyper_util::client::legacy::Error,
+    >>::Future;
+
+    fn retry(
+        &mut self,
+        req: &mut http::Request<OctoBody>,
+        result: &mut std::result::Result<http::Response<B>, AttemptError>,
+    ) -> Option<Self::Future> {
+        let mut transport = match std::mem::replace(result, Err(AttemptError::Denied)) {
+            Ok(response) => Ok(response),
+            Err(AttemptError::Transport(error)) => Err(error),
+            Err(AttemptError::Denied) => return None,
+        };
+        let retry = self.0.retry(req, &mut transport);
+        *result = transport.map_err(AttemptError::Transport);
+        retry
+    }
+
+    fn clone_request(&mut self, req: &http::Request<OctoBody>) -> Option<http::Request<OctoBody>> {
+        <RetryConfig as tower::retry::Policy<
+            _,
+            http::Response<B>,
+            hyper_util::client::legacy::Error,
+        >>::clone_request(&mut self.0, req)
+    }
+}
+
 pub(crate) struct Transport {
     pool: Pool,
     base: Uri,
@@ -76,8 +122,10 @@ impl Transport {
         let graphql_path = format!("{}/graphql", self.base.path().trim_end_matches('/'));
         // Octocrab buffers requests on another task; capture before that hop.
         let context = traffic::context();
+        let admission = crate::request_budget::current();
         let counted = tower::service_fn(move |request: http::Request<OctoBody>| {
             let mut pool = pool.clone();
+            let admission = admission.clone();
             let mut context = context.clone();
             let (operation, graphql, page, continuation) =
                 classify(request.uri(), request.method(), quota_probe, &graphql_path);
@@ -85,13 +133,16 @@ impl Transport {
             let page = page && operation != Operation::Other && operation != Operation::QuotaProbe;
             context.continuation |= continuation;
             async move {
+                if admission.as_ref().is_some_and(|admit| !admit()) {
+                    return Err(AttemptError::Denied);
+                }
                 context.start(operation, graphql, page);
                 let result = pool.call(request).await;
                 context.finish(
                     operation,
                     result.as_ref().ok().map(|r| (r.status(), r.headers())),
                 );
-                result.map(|response| {
+                result.map_err(AttemptError::Transport).map(|response| {
                     response.map(|body| {
                         // Bodies are consumed after the service future (and often
                         // its caller scope) ends. Observe errors without buffering
@@ -111,11 +162,11 @@ impl Transport {
         // Match Octocrab's existing retry policy, including no retries for
         // the gate-owned quota probes. Every retry enters `counted` separately.
         let retry = tower::retry::Retry::new(
-            if quota_probe {
+            AdmittedRetry(if quota_probe {
                 RetryConfig::None
             } else {
                 RetryConfig::Simple(3)
-            },
+            }),
             counted,
         );
         let redirects = tower_http::follow_redirect::FollowRedirectLayer::new().layer(retry);
@@ -135,7 +186,12 @@ impl Transport {
         // default builder does; preserve the original concrete transport error.
         octocrab::OctocrabBuilder::new_empty()
             .with_service(
-                auth.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) }),
+                auth.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                    match e {
+                        AttemptError::Transport(error) => Box::new(error),
+                        AttemptError::Denied => Box::new(AttemptError::Denied),
+                    }
+                }),
             )
             .with_auth(octocrab::AuthState::None)
             .build()
@@ -210,6 +266,58 @@ mod tests {
             if bytes.ends_with(b"\r\n\r\n") {
                 return String::from_utf8(bytes).ok();
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn traffic_admission_bounds_actual_retry_and_redirect_attempts() {
+        for redirect in [false, true] {
+            let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let seen = attempts.clone();
+            let location = base.clone();
+            let server = tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    request(&mut socket).await.unwrap();
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    let response = if redirect {
+                        format!("HTTP/1.1 302 Found\r\nlocation: {location}/repos/o/r/pulls?page=2\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    } else {
+                        "HTTP/1.1 503 Unavailable\r\ncontent-length: 2\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{}".into()
+                    };
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                }
+            });
+            let remaining = Arc::new(AtomicUsize::new(2));
+            let allowance = remaining.clone();
+            let admission = Arc::new(move || {
+                allowance
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok()
+            });
+            let transport = Transport::new(None, Some(&base)).unwrap();
+            let traffic = Traffic::default();
+            let result = with_traffic(
+                traffic.clone(),
+                crate::request_budget::with_admission(admission, async {
+                    transport
+                        .client(false, None)
+                        .get::<serde_json::Value, _, ()>("/repos/o/r/pulls?page=1", None)
+                        .await
+                }),
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(attempts.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                traffic.snapshot().counts[&(Caller::OnDemand, Operation::Discovery)].rest_requests,
+                2
+            );
+            assert_eq!(remaining.load(Ordering::SeqCst), 0);
+            server.abort();
         }
     }
 
