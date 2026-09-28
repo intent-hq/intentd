@@ -490,7 +490,7 @@ class ServicesStartupRunnerTests(unittest.TestCase):
             launch.assert_not_called()
 
     def test_caller_manifest_cannot_replace_compiled_input_authority(self):
-        path = self.root / "compile-v4/before.json"
+        path = self.root / "compile-v1/before.json"
         path.parent.mkdir(); path.write_text('{}\n')
         with patch.object(probe, "SERVICES_PREPARATION", self.root), patch.object(probe, "check_services_elf"), patch.object(probe, "run_bounded") as launch:
             with self.assertRaises(probe.Refusal): probe.check_services_inputs()
