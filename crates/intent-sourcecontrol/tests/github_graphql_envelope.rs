@@ -1330,3 +1330,68 @@ async fn traffic_transport_strips_authentication_on_cross_origin_redirects() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn traffic_rest_branch_named_graphql_remains_rules_with_enterprise_prefix() {
+    use intent_sourcecontrol::traffic::{with_traffic, Caller, Operation, Traffic};
+    for prefix in ["", "/api/v3"] {
+        let expected = format!("{prefix}/repos/o/r/rules/branches/graphql");
+        let mock = spawn_mock_with(Arc::new(move |request| {
+            assert_eq!(request_target(request), expected);
+            (200, "[]".into())
+        }))
+        .await;
+        let sc =
+            GitHubSourceControl::new("fake", Some(&format!("{}{prefix}", mock.base_uri))).unwrap();
+        let traffic = Traffic::default();
+        with_traffic(
+            traffic.clone(),
+            sc.branch_rules(&RepoRef::new("o", "r"), "graphql"),
+        )
+        .await
+        .unwrap();
+        let snapshot = traffic.snapshot();
+        let counts = snapshot
+            .counts
+            .get(&(Caller::OnDemand, Operation::Rules))
+            .expect("REST rules attribution");
+        assert_eq!(
+            (
+                counts.rest_requests,
+                counts.graphql_requests,
+                counts.page_requests
+            ),
+            (1, 0, 0)
+        );
+        assert_eq!(snapshot.counts.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn traffic_comments_count_the_single_first_page() {
+    use intent_sourcecontrol::traffic::{with_traffic, Caller, Operation, Traffic};
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let recorded = calls.clone();
+    let mock = spawn_mock_with(Arc::new(move |request| {
+        recorded.lock().unwrap().push(request_target(request));
+        (200, "[]".into())
+    }))
+    .await;
+    let sc = GitHubSourceControl::new("fake", Some(&mock.base_uri)).unwrap();
+    let traffic = Traffic::default();
+    with_traffic(
+        traffic.clone(),
+        sc.list_comments(&RepoRef::new("o", "r"), 1),
+    )
+    .await
+    .unwrap();
+    let snapshot = traffic.snapshot();
+    let counts = &snapshot.counts[&(Caller::OnDemand, Operation::PrDetail)];
+    assert_eq!(counts.rest_requests, 1);
+    assert_eq!(counts.page_requests, 1);
+    assert_eq!(counts.continuation_requests, 0);
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].contains("per_page=100"));
+    assert!(calls[0].contains("sort=created&direction=desc"));
+}

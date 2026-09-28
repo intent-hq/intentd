@@ -4847,7 +4847,11 @@ impl Services {
             };
             match refreshed {
                 Err(Error::RateLimited(detail)) => {
-                    self.pause_sweeps_for_rate_limit(sc, &detail).await;
+                    intent_sourcecontrol::traffic::with_caller(
+                        intent_sourcecontrol::traffic::Caller::GitRootRefresh,
+                        self.pause_sweeps_for_rate_limit(sc, &detail),
+                    )
+                    .await;
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -5806,7 +5810,11 @@ impl Services {
         // A paused tick consults the shared quota probe here: the pause
         // lifts early once the quota has recovered (monorepo#2961).
         if let Some(sc) = sc.as_ref() {
-            self.maybe_lift_rate_limit_pause(sc).await;
+            intent_sourcecontrol::traffic::with_caller(
+                intent_sourcecontrol::traffic::Caller::WorkspaceRefresh,
+                self.maybe_lift_rate_limit_pause(sc),
+            )
+            .await;
         }
         for ws in workspaces {
             // STAB-3 fix: refresh all workspaces (discovery + update), not just
@@ -5837,7 +5845,11 @@ impl Services {
                 };
                 match refreshed {
                     Err(Error::RateLimited(detail)) => {
-                        self.pause_sweeps_for_rate_limit(sc, &detail).await;
+                        intent_sourcecontrol::traffic::with_caller(
+                            intent_sourcecontrol::traffic::Caller::WorkspaceRefresh,
+                            self.pause_sweeps_for_rate_limit(sc, &detail),
+                        )
+                        .await;
                     }
                     Err(e) => {
                         tracing::warn!(

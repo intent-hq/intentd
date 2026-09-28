@@ -221,6 +221,15 @@ impl Context {
         });
     }
 
+    pub fn body_failed(&self, operation: Operation) {
+        self.traffic.update(|s| {
+            s.counts
+                .entry((self.caller, operation))
+                .or_default()
+                .transport_errors += 1;
+        });
+    }
+
     pub fn finish(
         &self,
         operation: Operation,

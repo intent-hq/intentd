@@ -2048,7 +2048,7 @@ impl SourceControl for GitHubSourceControl {
     async fn list_comments(&self, repo: &RepoRef, number: u64) -> Result<Vec<Comment>> {
         let route = Self::repo_path(
             repo,
-            &format!("/issues/{number}/comments?per_page=100&sort=created&direction=desc"),
+            &format!("/issues/{number}/comments?per_page=100&page=1&sort=created&direction=desc"),
         );
         let v: Value = self.client().get(&route, None::<&()>).await?;
         map_list(v, map_issue_comment)

@@ -7,6 +7,7 @@ use crate::{
     traffic::{self, Operation},
 };
 use http::{HeaderValue, Uri};
+use http_body_util::BodyExt;
 use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
     rt::TokioExecutor,
@@ -72,13 +73,14 @@ impl Transport {
         operation_override: Option<Operation>,
     ) -> octocrab::Octocrab {
         let pool = self.pool.clone();
+        let graphql_path = format!("{}/graphql", self.base.path().trim_end_matches('/'));
         // Octocrab buffers requests on another task; capture before that hop.
         let context = traffic::context();
         let counted = tower::service_fn(move |request: http::Request<OctoBody>| {
             let mut pool = pool.clone();
             let mut context = context.clone();
             let (operation, graphql, page, continuation) =
-                classify(request.uri(), request.method(), quota_probe);
+                classify(request.uri(), request.method(), quota_probe, &graphql_path);
             let operation = operation_override.unwrap_or(operation);
             let page = page && operation != Operation::Other && operation != Operation::QuotaProbe;
             context.continuation |= continuation;
@@ -89,7 +91,21 @@ impl Transport {
                     operation,
                     result.as_ref().ok().map(|r| (r.status(), r.headers())),
                 );
-                result
+                result.map(|response| {
+                    response.map(|body| {
+                        // Bodies are consumed after the service future (and often
+                        // its caller scope) ends. Observe errors without buffering
+                        // or turning a failed body into another HTTP attempt.
+                        let mut reported = false;
+                        body.map_err(move |error| {
+                            if !reported {
+                                context.body_failed(operation);
+                                reported = true;
+                            }
+                            error
+                        })
+                    })
+                })
             }
         });
         // Match Octocrab's existing retry policy, including no retries for
@@ -127,9 +143,14 @@ impl Transport {
     }
 }
 
-fn classify(uri: &Uri, method: &http::Method, probe: bool) -> (Operation, bool, bool, bool) {
+fn classify(
+    uri: &Uri,
+    method: &http::Method,
+    probe: bool,
+    graphql_path: &str,
+) -> (Operation, bool, bool, bool) {
     let path = uri.path();
-    let graphql = path.ends_with("/graphql");
+    let graphql = path == graphql_path;
     let parts: Vec<_> = path.split('/').filter(|s| !s.is_empty()).collect();
     let suffix = parts
         .iter()
@@ -282,5 +303,83 @@ mod tests {
         let counts = &snapshot.counts[&(Caller::OnDemand, Operation::Discovery)];
         assert_eq!(counts.rest_requests, 4);
         assert_eq!(counts.transport_errors, 4);
+    }
+    async fn body_failure_keeps_captured_context(stall: bool) {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let connections = Arc::new(AtomicUsize::new(0));
+        let count = connections.clone();
+        let server = tokio::spawn(async move {
+            let mut children = tokio::task::JoinSet::new();
+            while let Ok((mut stream, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::SeqCst);
+                children.spawn(async move {
+                    request(&mut stream).await.unwrap();
+                    stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 50\r\ncontent-type: application/json\r\nx-ratelimit-resource: core\r\n\r\n[").await.unwrap();
+                    if stall { std::future::pending::<()>().await; }
+                });
+            }
+        });
+        let transport = Transport::with_timeouts(
+            None,
+            Some(&base),
+            Duration::from_secs(1),
+            Duration::from_millis(50),
+        )
+        .unwrap();
+        let traffic = Traffic::default();
+        let response = with_traffic(
+            traffic.clone(),
+            with_caller(Caller::WorkspaceRefresh, async {
+                transport
+                    .client(false, None)
+                    ._get_with_headers("/repos/o/r/pulls?page=1", None)
+                    .await
+                    .unwrap()
+            }),
+        )
+        .await;
+        // Consumption happens after both task-local scopes have exited.
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            transport.client(false, None).body_to_string(response),
+        )
+        .await
+        .expect("body read timeout remains bounded");
+        server.abort();
+        assert!(error.is_err());
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            1,
+            "body IO errors must not retry the request"
+        );
+        let snapshot = traffic.snapshot();
+        assert_eq!(snapshot.counts.len(), 1);
+        let counts = &snapshot.counts[&(Caller::WorkspaceRefresh, Operation::Discovery)];
+        assert_eq!(
+            (
+                counts.rest_requests,
+                counts.page_requests,
+                counts.transport_errors
+            ),
+            (1, 1, 1)
+        );
+        assert_eq!((counts.http_errors, counts.graphql_errors), (0, 0));
+        assert_eq!(
+            snapshot.quotas.values().map(|q| q.responses).sum::<u64>(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn traffic_truncated_body_counts_one_captured_transport_error() {
+        body_failure_keeps_captured_context(false).await;
+    }
+
+    #[tokio::test]
+    async fn traffic_stalled_body_counts_one_error_without_retrying() {
+        body_failure_keeps_captured_context(true).await;
     }
 }
