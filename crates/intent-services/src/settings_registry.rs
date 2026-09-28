@@ -1210,6 +1210,29 @@ mod tests {
     }
 
     #[test]
+    fn quick_action_effort_blank_normalizes_on_write_and_reload() {
+        let (_dir, path) = temp_config(None);
+        let reg = SettingsRegistry::load(&path).unwrap();
+        for (input, expected) in [
+            ("", Value::Null),
+            ("   ", Value::Null),
+            (" High ", json!(" High ")),
+        ] {
+            reg.apply(&[("quickActions.defaultReasoningEffort".into(), json!(input))])
+                .unwrap();
+            assert_eq!(
+                reg.get("quickActions.defaultReasoningEffort"),
+                Some(expected.clone())
+            );
+            let fresh = SettingsRegistry::load(&path).unwrap();
+            assert_eq!(
+                fresh.get("quickActions.defaultReasoningEffort"),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
     fn quick_action_effort_round_trips_and_resets_independently() {
         let (_dir, path) = temp_config(Some("[quickActions]\ndefaultModel = \"existing\"\n"));
         let reg = SettingsRegistry::load(&path).unwrap();

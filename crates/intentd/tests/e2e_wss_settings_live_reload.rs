@@ -1183,7 +1183,7 @@ async fn quick_action_effort_persists_emits_changes_and_resets_over_wss() {
     assert_eq!(initial[1]["value"], json!({}));
     let revision = initial[0]["revision"].as_u64().unwrap();
     let values = [
-        json!("high"),
+        json!(" High "),
         json!({"commit":"low"}),
         json!({
             "codex":{"defaultReasoningEffort":"high","typeReasoningEffortOverrides":{"commit":"low"}},
@@ -1209,7 +1209,7 @@ async fn quick_action_effort_persists_emits_changes_and_resets_over_wss() {
     drop(sub);
     drop(rpc);
     drop(daemon);
-    let (_restarted, mut rpc, mut sub) = boot_with_wss(dir.path()).await;
+    let (restarted_daemon, mut rpc, mut sub) = boot_with_wss(dir.path()).await;
     await_config_watcher_ready(dir.path()).await;
     let reloaded = settings_snapshot(&mut rpc, &paths).await;
     for (got, value) in reloaded.iter().zip(&values) {
@@ -1241,4 +1241,26 @@ async fn quick_action_effort_persists_emits_changes_and_resets_over_wss() {
         .await;
         assert_eq!(rejected["error"]["code"], -32602);
     }
+    // Blank writes read as unset immediately and after a daemon restart.
+    for blank in ["", "   "] {
+        let updated = wss_rpc(
+            &mut rpc,
+            23,
+            "settings.update",
+            json!({"changes":[{"path":paths[0],"value":blank}]}),
+        )
+        .await;
+        assert!(updated.get("error").is_none(), "{updated}");
+        assert_eq!(
+            settings_snapshot(&mut rpc, &paths).await[0]["value"],
+            Value::Null
+        );
+    }
+    drop(sub);
+    drop(rpc);
+    drop(restarted_daemon);
+    let (_blank_restart, mut rpc, _sub) = boot_with_wss(dir.path()).await;
+    let blank_reloaded = settings_snapshot(&mut rpc, &paths).await;
+    assert_eq!(blank_reloaded[0]["value"], Value::Null);
+    assert_eq!(blank_reloaded[1]["value"], values[1]);
 }

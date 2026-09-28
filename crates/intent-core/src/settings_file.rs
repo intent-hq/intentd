@@ -138,7 +138,8 @@ pub struct QuickActionsSettings {
     /// `quickActions.typeOverrides` — per-quick-action model overrides
     /// (`commit`, `pr`, `review`, `fast`).
     pub type_overrides: BTreeMap<String, String>,
-    /// Shared effort for quick actions; blank means provider default.
+    /// Shared effort for quick actions; blank reads as unset.
+    #[serde(deserialize_with = "de_blank_as_none")]
     pub default_reasoning_effort: Option<String>,
     /// Per-action effort, independent of the per-action model override.
     pub type_reasoning_effort_overrides: BTreeMap<String, String>,
@@ -2695,6 +2696,22 @@ mod tests {
             }))
         );
         assert_eq!(legacy.len(), 1);
+    }
+
+    #[test]
+    fn quick_action_effort_blank_reads_unset_but_nonblank_spelling_survives() {
+        for (input, expected) in [("", None), ("   ", None), (" High ", Some(" High "))] {
+            let text = format!("[quickActions]\ndefaultReasoningEffort = {input:?}\n[quickActions.typeReasoningEffortOverrides]\ncommit = \"   \"\n");
+            let parsed = SettingsFile::parse_str(&text).unwrap();
+            assert_eq!(
+                parsed.quick_actions.default_reasoning_effort.as_deref(),
+                expected
+            );
+            assert_eq!(
+                parsed.quick_actions.type_reasoning_effort_overrides["commit"],
+                "   "
+            );
+        }
     }
 
     #[test]
