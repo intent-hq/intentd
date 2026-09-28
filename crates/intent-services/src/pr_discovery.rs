@@ -629,4 +629,33 @@ mod tests {
         drop(current);
         assert_eq!(budget.lock().unwrap().available, ATTEMPTS);
     }
+    #[tokio::test(start_paused = true)]
+    async fn shared_discovery_repair_active_fifo_survives_sixty_windows() {
+        let budget = Arc::new(Mutex::new(Budget::default()));
+        let scope = scope();
+        let keys: Vec<_> = (0..170)
+            .map(|i| key(&scope, i, None))
+            .chain((0..20).map(|i| key(&scope, 170, Some(i))))
+            .collect();
+        let mut admitted = HashSet::new();
+        for _ in 0..60 {
+            let mut attempts = 0;
+            for (i, key) in keys.iter().enumerate() {
+                if let Ok(lease) = Budget::reserve(&budget, key) {
+                    // A complete ten-page list, or one targeted PR read.
+                    let cost = if key.number.is_none() { 10 } else { 1 };
+                    lease.remaining.fetch_sub(cost, Ordering::SeqCst);
+                    attempts += cost;
+                    admitted.insert(i);
+                }
+            }
+            assert!(attempts <= ATTEMPTS);
+            tokio::time::advance(WINDOW).await;
+        }
+        assert_eq!(
+            admitted.len(),
+            keys.len(),
+            "continuously active late repositories and records must not starve"
+        );
+    }
 }

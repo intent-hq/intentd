@@ -1668,3 +1668,191 @@ async fn shared_discovery_borrows_newer_monitor_details_without_extra_http() {
         "newer monitor read supersedes the background hit"
     );
 }
+
+#[tokio::test]
+async fn shared_discovery_repair_monitor_provenance_across_real_hosts_and_tokens() {
+    for other_host in [false, true] {
+        let (_db, _root, svc, _, _, _) = setup().await;
+        let a = MockQwen::start(10978).await;
+        let b = MockQwen::start(10978).await;
+        let repo = RepoRef::new("QwenLM", "qwen-code");
+        read_pr_via(
+            a.sc.as_ref(),
+            &repo,
+            10978,
+            &svc.pr_cache,
+            PrReadPolicy::REFRESH,
+            &HashSet::new(),
+        )
+        .await
+        .unwrap();
+        let source = if other_host { &b } else { &a };
+        source.edit(|s| s.title = "provider B".into());
+        let provider = intent_sourcecontrol::GitHubSourceControl::new(
+            if other_host {
+                "fixture-token"
+            } else {
+                "provider-B-token"
+            },
+            Some(&source.base),
+        )
+        .unwrap();
+        let rules = source.calls("/rules/branches/");
+        let entry = read_pr_via(
+            &provider,
+            &repo,
+            10978,
+            &svc.pr_cache,
+            PrReadPolicy::Poll,
+            &HashSet::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(entry.pr.title, "provider B");
+        assert!(
+            cached_record_for_discovery(
+                &svc.pr_cache,
+                &repo,
+                10978,
+                &a.sc.cache_scope().unwrap(),
+                Duration::from_secs(180)
+            )
+            .is_none(),
+            "scope A must not borrow B's record"
+        );
+        assert_eq!(
+            cached_record_for_discovery(
+                &svc.pr_cache,
+                &repo,
+                10978,
+                &provider.cache_scope().unwrap(),
+                Duration::from_secs(180)
+            )
+            .unwrap()
+            .0
+            .title,
+            "provider B"
+        );
+        assert_eq!(
+            entry.snapshot.title, "provider B",
+            "a new context must obtain its own rich snapshot"
+        );
+        assert!(source.calls("/rules/branches/") > rules);
+    }
+}
+
+#[tokio::test]
+async fn shared_discovery_repair_authorization_changes_during_monitor_poll() {
+    let (_db, _root, svc, _, _, _) = setup().await;
+    let mock = MockQwen::start(10978).await;
+    let repo = RepoRef::new("QwenLM", "qwen-code");
+    read_pr_via(
+        mock.sc.as_ref(),
+        &repo,
+        10978,
+        &svc.pr_cache,
+        PrReadPolicy::REFRESH,
+        &HashSet::new(),
+    )
+    .await
+    .unwrap();
+    mock.edit(|s| s.title = "obsolete observation".into());
+    let gate = mock.gate("/graphql");
+    let monitored = HashSet::new();
+    let poll = read_pr_via(
+        mock.sc.as_ref(),
+        &repo,
+        10978,
+        &svc.pr_cache,
+        PrReadPolicy::Poll,
+        &monitored,
+    );
+    let change = async {
+        gate.entered.notified().await;
+        intent_sourcecontrol::cache_scope::invalidate_authorization();
+        gate.release.add_permits(100);
+    };
+    let (result, ()) = tokio::join!(poll, change);
+    assert!(
+        result.is_err(),
+        "an obsolete in-flight monitor must not publish"
+    );
+    let cached = svc.pr_cache.lock().unwrap();
+    assert_ne!(
+        cached[&pr_key_for(&repo, 10978)]
+            .entry
+            .as_ref()
+            .unwrap()
+            .pr
+            .title,
+        "obsolete observation"
+    );
+}
+
+#[tokio::test]
+async fn shared_discovery_repair_late_open_observation_cannot_erase_merged_confirmation() {
+    let (_db, _root, svc, _, _, _) = setup().await;
+    let mock = MockQwen::start(10978).await;
+    mock.edit(|s| s.pr["state"] = json!("OPEN"));
+    let repo = RepoRef::new("QwenLM", "qwen-code");
+    let gate = mock.gate("/rules/branches/");
+    let monitored = HashSet::new();
+    let old_full = read_pr_via(
+        mock.sc.as_ref(),
+        &repo,
+        10978,
+        &svc.pr_cache,
+        PrReadPolicy::REFRESH,
+        &monitored,
+    );
+    let confirm = async {
+        gate.entered.notified().await;
+        mock.edit(|s| s.pr["state"] = json!("MERGED"));
+        let merged = svc
+            .shared_pr_record(mock.sc.as_ref(), &repo, 10978)
+            .await
+            .unwrap();
+        assert_eq!(merged.state, PrState::Merged);
+        gate.release.add_permits(100);
+    };
+    let (old, ()) = tokio::join!(old_full, confirm);
+    assert_eq!(
+        old.unwrap().pr.state,
+        PrState::Open,
+        "fixture really parked an older Open observation"
+    );
+    let before = mock.calls("");
+    assert_eq!(
+        svc.shared_pr_record(mock.sc.as_ref(), &repo, 10978)
+            .await
+            .unwrap()
+            .state,
+        PrState::Merged
+    );
+    assert_eq!(
+        mock.calls(""),
+        before,
+        "confirmed merged state needs no extra read"
+    );
+    // Even a later non-terminal donor cannot undo irreversible merged state.
+    mock.edit(|s| s.pr["state"] = json!("OPEN"));
+    read_pr_via(
+        mock.sc.as_ref(),
+        &repo,
+        10978,
+        &svc.pr_cache,
+        PrReadPolicy::REFRESH,
+        &monitored,
+    )
+    .await
+    .unwrap();
+    let before = mock.calls("");
+    assert_eq!(
+        svc.shared_pr_record(mock.sc.as_ref(), &repo, 10978)
+            .await
+            .unwrap()
+            .state,
+        PrState::Merged
+    );
+    assert_eq!(mock.calls(""), before);
+}

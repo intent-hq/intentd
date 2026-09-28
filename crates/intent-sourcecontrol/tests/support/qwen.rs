@@ -36,6 +36,7 @@ pub enum CheckFault {
 }
 
 pub struct State {
+    pub title: String,
     pub pr: Value,
     pub nodes: Vec<Value>,
     pub mode: ReadMode,
@@ -65,6 +66,7 @@ impl State {
         }
         assert_eq!(nodes.len(), if number == 10978 { 40 } else { 136 });
         Self {
+            title: "Qwen captured checks".into(),
             pr,
             nodes,
             mode: ReadMode::Folded,
@@ -81,7 +83,7 @@ impl State {
         let start = offset.min(self.nodes.len());
         let end = (start + 100).min(self.nodes.len());
         pr["url"] = json!(format!("https://github.com/QwenLM/qwen-code/pull/{number}"));
-        pr["title"] = json!("Qwen captured checks");
+        pr["title"] = json!(self.title);
         pr["body"] = json!("");
         pr["isDraft"] = json!(false);
         pr["headRefName"] = json!("fixture");
@@ -152,7 +154,7 @@ impl State {
     fn rest_pr(&self) -> Value {
         let number = self.pr["number"].as_u64().unwrap();
         json!({
-            "number": number, "title": "Qwen captured checks", "state": if self.pr["state"] == "OPEN" { "open" } else { "closed" },
+            "number": number, "title": self.title, "merged": self.pr["state"] == "MERGED", "state": if self.pr["state"] == "OPEN" { "open" } else { "closed" },
             "html_url": format!("https://github.com/QwenLM/qwen-code/pull/{number}"),
             "draft": false, "head": {"ref": "fixture", "sha": self.rest_head.as_ref().map_or_else(|| self.pr["headRefOid"].clone(), |h| json!(h))},
             "base": {"ref": "main"}, "user": {"login": "fixture"},
@@ -297,7 +299,15 @@ fn bound_check_cursor(query: &str, vars: &Value) -> usize {
     }
 }
 
+pub struct ResponseGate {
+    path: String,
+    pub entered: tokio::sync::Notify,
+    pub release: tokio::sync::Semaphore,
+}
+
 pub struct MockQwen {
+    pub base: String,
+    gate: Arc<Mutex<Option<Arc<ResponseGate>>>>,
     pub sc: Arc<GitHubSourceControl>,
     state: Arc<Mutex<State>>,
     requests: Arc<Mutex<Vec<String>>>,
@@ -318,21 +328,34 @@ impl MockQwen {
             .await
             .unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        let (s, r) = (state.clone(), requests.clone());
+        let gate = Arc::new(Mutex::new(None));
+        let (s, r, g) = (state.clone(), requests.clone(), gate.clone());
         let server = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                let (s, r) = (s.clone(), r.clone());
+                let (s, r, g) = (s.clone(), r.clone(), g.clone());
                 tokio::spawn(async move {
-                    serve(stream, s, r).await.unwrap();
+                    serve(stream, s, r, g).await.unwrap();
                 });
             }
         });
         Self {
             sc: Arc::new(GitHubSourceControl::new("fixture-token", Some(&base)).unwrap()),
+            base,
+            gate,
             state,
             requests,
             server,
         }
+    }
+
+    pub fn gate(&self, path: &str) -> Arc<ResponseGate> {
+        let gate = Arc::new(ResponseGate {
+            path: path.into(),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        *self.gate.lock().unwrap() = Some(gate.clone());
+        gate
     }
 
     pub fn edit(&self, f: impl FnOnce(&mut State)) {
@@ -391,6 +414,7 @@ async fn serve(
     mut stream: TcpStream,
     state: Arc<Mutex<State>>,
     requests: Arc<Mutex<Vec<String>>>,
+    gate: Arc<Mutex<Option<Arc<ResponseGate>>>>,
 ) -> std::io::Result<()> {
     let mut buf = Vec::new();
     let mut chunk = [0; 4096];
@@ -429,6 +453,15 @@ async fn serve(
     };
     requests.lock().unwrap().push(request.to_string());
     let (status, body) = state.lock().unwrap().respond(target, &body);
+    let gate = gate
+        .lock()
+        .unwrap()
+        .clone()
+        .filter(|g| target.contains(&g.path));
+    if let Some(gate) = gate {
+        gate.entered.notify_one();
+        gate.release.acquire().await.unwrap().forget();
+    }
     let body = body.to_string();
     let resource = if target == "/graphql" {
         "graphql"
