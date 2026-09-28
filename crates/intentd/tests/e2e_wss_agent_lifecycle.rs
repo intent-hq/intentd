@@ -2416,6 +2416,144 @@ async fn agent_notifications_muted_round_trip_and_idle_stamp_over_wss() {
     );
 }
 
+/// Direct user retirement cancels a real parked ACP turn over authenticated
+/// WSS and preserves the streamed conversation without sending a model message.
+#[intent_test_macros::daemon_test]
+async fn agent_retire_stops_running_turn_over_wss() {
+    let Some(script) = gate("WSS direct retirement E2E") else {
+        return;
+    };
+
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let behavior = json!({ "blockUntilCancel": true, "response": "resumed" }).to_string();
+    let env: [(&str, &str); 3] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*", "chat:stream:delta"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "first" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // First turn streams a chunk and parks at session/cancel.
+    let mut saw_block_chunk = false;
+    for _ in 0..50 {
+        let frame = wss_event(&mut sub, 30).await;
+        if frame["params"]["event"]["type"] == "chat:stream:delta"
+            && frame["params"]["event"]["data"]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("streaming-before-cancel")
+        {
+            saw_block_chunk = true;
+            break;
+        }
+    }
+    assert!(saw_block_chunk, "first turn streamed a chunk and parked");
+
+    let retired = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.retire",
+        json!({
+            "agentId": agent_id, "workspaceId": ws_id, "reason": "user requested retirement"
+        }),
+    )
+    .await;
+    assert_eq!(retired["success"], true, "{retired}");
+    assert!(retired["retiredAt"].is_string(), "{retired}");
+    loop {
+        let frame = wss_event(&mut sub, 30).await;
+        let event = &frame["params"]["event"];
+        if event["type"] == "agent:retired" {
+            assert_eq!(event["data"]["agentId"], agent_id);
+            assert_eq!(event["data"]["reason"], "user requested retirement");
+            break;
+        }
+    }
+    let got = wss_rpc(&mut rpc, 13, "agent.get", json!({"agentId": agent_id})).await;
+    assert_eq!(got["agent"]["turnInFlight"], false, "worker stopped: {got}");
+    assert_eq!(got["agent"]["retiredAt"], retired["retiredAt"]);
+    let conversation = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.getConversation",
+        json!({"agentId": agent_id}),
+    )
+    .await;
+    let messages = conversation["messages"].as_array().expect("messages");
+    assert_eq!(
+        messages.iter().filter(|m| m["role"] == "user").count(),
+        1,
+        "retirement must not send a model message: {conversation}"
+    );
+    let partial = messages
+        .iter()
+        .find(|m| m["role"] == "assistant")
+        .expect("partial assistant output preserved");
+    assert_eq!(partial["metadata"]["interrupted"], true, "{partial}");
+    assert!(
+        partial["contentBlocks"]
+            .to_string()
+            .contains("streaming-before-cancel"),
+        "{partial}"
+    );
+    let restored = wss_rpc(&mut rpc, 15, "agent.restore", json!({"agentId": agent_id})).await;
+    assert_eq!(restored["restored"], true);
+    let got = wss_rpc(&mut rpc, 16, "agent.get", json!({"agentId": agent_id})).await;
+    assert!(got["agent"].get("retiredAt").is_none());
+    assert_eq!(
+        got["agent"]["turnInFlight"], false,
+        "restore does not restart the turn: {got}"
+    );
+}
+
 /// `agent.stop` keep-alive + resume over WSS (step 10). The first turn streams
 /// "streaming-before-cancel" and parks at `session/cancel`; `agent.stop`
 /// interrupts (terminal stream:end emitted, child kept alive); a follow-up

@@ -1256,8 +1256,8 @@ async fn wss_agent_lite_omits_initial_message() {
     srv.ws.stop().await;
 }
 
-/// Soft retire round-trip over the real WSS transport: `agent.retire` (via
-/// the service seam the MCP binding calls) marks the session inert —
+/// Soft retire round-trip over the real WSS transport: `agent.retire`
+/// marks the session inert —
 /// excluded from default `agent.list`, served by `includeRetired: true` with
 /// `retiredAt`, still readable via `agent.get`, rejecting `agent.sendMessage`
 /// — and the wire `agent.restore` method returns it to service. Both
@@ -1347,23 +1347,57 @@ async fn wss_agent_soft_retire_and_restore_round_trip() {
         "subscribe: {sub}"
     );
 
-    // Retire via the WorkspaceApi seam (the MCP `ws.agent.retire` binding
-    // routes here; there is deliberately no wire agent.retire method).
-    let retired = srv
-        .api
-        .agent_retire(
-            intent_core::AgentId::from(agent_id.as_str()),
-            Some(WorkspaceId(ws_id.clone())),
-            Some("handing off".to_string()),
+    for params in [
+        serde_json::json!({}),
+        serde_json::json!({ "agentId": "unknown-agent" }),
+        serde_json::json!({ "agentId": agent_id, "reason": 42 }),
+        serde_json::json!({ "agentId": agent_id, "workspaceId": "wrong-workspace" }),
+    ] {
+        let response = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": 18, "method": "agent.retire", "params": params
+            })
+            .to_string(),
         )
-        .await
-        .expect("retire");
+        .await;
+        assert_eq!(response["error"]["code"], -32602, "{response}");
+        assert!(srv
+            .store
+            .get_agent_session(&intent_core::AgentId::from(agent_id.as_str()))
+            .await
+            .unwrap()
+            .retired_at
+            .is_none());
+    }
+
+    // Direct user retirement works independently of model peer-agent features.
+    srv.set_setting("agentFeatures.peerAgents", serde_json::json!(false));
+    let retire_frame = serde_json::json!({
+        "jsonrpc": "2.0", "id": 17, "method": "agent.retire",
+        "params": { "agentId": agent_id, "workspaceId": ws_id, "reason": "handing off" }
+    })
+    .to_string();
+    let envelope = wss_call(srv.port, srv.cfg.clone(), &retire_frame).await;
+    assert_eq!(envelope["jsonrpc"], "2.0");
+    assert_eq!(envelope["id"], 17);
+    assert!(envelope.get("error").is_none(), "{envelope}");
+    let retired = &envelope["result"];
     assert_eq!(retired["success"], serde_json::json!(true));
     let retired_at = retired["retiredAt"]
         .as_str()
         .expect("retiredAt")
         .to_string();
     let retired_at = retired_at.as_str();
+
+    let repeated = wss_call(srv.port, srv.cfg.clone(), &retire_frame).await;
+    assert_eq!(
+        repeated["result"],
+        serde_json::json!({
+            "success": true, "retiredAt": retired_at, "alreadyRetired": true
+        })
+    );
 
     // agent:retired reaches the subscriber with name + reason.
     let evt = next_event(&mut ws, "agent:retired").await;
@@ -2302,12 +2336,18 @@ async fn wss_agent_retire_cascade_guard_hooks_and_watches() {
 
     // Guard: retire fails while a descendant is running a turn — the error
     // names the child and NOTHING is mutated.
-    let err = srv
-        .api
-        .agent_retire(parent.clone(), Some(workspace_id.clone()), None)
-        .await
-        .expect_err("retire with an active child must be rejected");
-    let msg = err.to_string();
+    let rejected = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 19, "method": "agent.retire",
+            "params": { "agentId": parent_id, "workspaceId": ws_id }
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(rejected["error"]["code"], -32602, "{rejected}");
+    let msg = rejected["error"]["message"].as_str().unwrap();
     assert!(
         msg.contains("active child agent(s) still running a turn") && msg.contains("Junior"),
         "guard error names the active child: {msg}"
@@ -2402,16 +2442,17 @@ async fn wss_agent_retire_cascade_guard_hooks_and_watches() {
     }
 
     // Retire the parent: guard passes now, the cascade retires the child.
-    let retired = srv
-        .api
-        .agent_retire(
-            parent.clone(),
-            Some(workspace_id.clone()),
-            Some("shutting down".to_string()),
-        )
-        .await
-        .expect("retire parent");
-    assert_eq!(retired["success"], serde_json::json!(true), "{retired}");
+    let retired = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 20, "method": "agent.retire",
+            "params": { "agentId": parent_id, "workspaceId": ws_id, "reason": "shutting down" }
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(retired["result"]["success"], true, "{retired}");
 
     // Collect the three lifecycle events (relative order not asserted).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
@@ -4340,6 +4381,8 @@ async fn wss_collaborator_capability_matrix_in_service_layer() {
                 "agent.sendMessage",
                 json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "hello from guest" }),
             ),
+            ("agent.retire", json!({ "agentId": agent_id })),
+            ("agent.restore", json!({ "agentId": agent_id })),
             ("git.push", json!({ "workspaceId": ws_id })),
         ]
     };
@@ -4382,6 +4425,11 @@ async fn wss_collaborator_capability_matrix_in_service_layer() {
             "collaborator {method}: {v}"
         );
         match method {
+            "agent.retire" => {
+                assert_eq!(v["result"]["success"], true, "{v}");
+                assert!(v["result"]["retiredAt"].is_string(), "{v}");
+            }
+            "agent.restore" => assert_eq!(v["result"]["restored"], true, "{v}"),
             "workspace.get" => {
                 assert_eq!(v["result"]["workspace"]["myRole"], "collaborator", "{v}");
                 assert_eq!(v["result"]["workspace"]["ownerPrincipalId"], primary.id.0);

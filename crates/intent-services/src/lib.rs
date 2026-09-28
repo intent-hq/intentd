@@ -461,6 +461,8 @@ pub struct Services {
     /// between a `syncTabs` commit and that sync's per-row `tab-opened`,
     /// leaving subscribers with a ghost tab the database no longer has.
     browser_tab_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Per-target ordering of retirement cleanup and restore.
+    agent_retirement_gates: agent_ops::AgentRetirementGates,
     /// Per-entry debounce-hold release timers, keyed by queue-entry id: each
     /// held [`agent_ops::QueuedMessage`] gets a spawned sleeper that flushes
     /// the hold marker at `holdUntil` and kicks delivery. Release/retract
@@ -1389,6 +1391,7 @@ impl Services {
             agent_queue_publish_gate: Arc::new(tokio::sync::Mutex::new(())),
             browser_client_pin_gate: Arc::new(tokio::sync::Mutex::new(())),
             browser_tab_gate: Arc::new(tokio::sync::Mutex::new(())),
+            agent_retirement_gates: agent_ops::AgentRetirementGates::default(),
             hold_release_timers: Arc::new(Mutex::new(HashMap::new())),
             pending_question_mutation_locks: agent_ops::PendingQuestionMutationLocks::default(),
             pending_marker_mutation_park: None,

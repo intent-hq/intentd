@@ -9162,6 +9162,189 @@ async fn interrupt_colliding_with_suspend_enrollment_row_keeps_interrupted_end()
     );
 }
 
+/// A user retiring a running agent must abort its worker, release the runtime,
+/// and preserve the partial conversation; marking the row alone is insufficient.
+#[tokio::test]
+async fn user_retire_stops_running_target_and_preserves_partial_turn() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-retire"),
+        AgentId::from("retire-running"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    track(&mgr, &id);
+    assert!(mgr.try_begin(&id, &ws).await);
+    let worker = tokio::spawn(std::future::pending::<()>());
+    let aborted = worker.abort_handle();
+    mgr.workers.lock().unwrap().insert(id.clone(), worker);
+    let blocks = vec![json!({ "type": "text", "text": "partial retirement turn" })];
+    mgr.services
+        .set_live_turn(&id, "retire-partial", blocks.clone());
+
+    let result = intent_core::with_caller(
+        intent_core::Caller::Wire {
+            principal_id: intent_core::PrincipalId::new(),
+            host_role: intent_core::HostRole::Owner,
+        },
+        mgr.services
+            .agent_retire(id.clone(), Some(ws.clone()), None),
+    )
+    .await
+    .expect("user retirement");
+    assert_eq!(result["success"], true);
+    timeout(Duration::from_secs(2), async {
+        while !aborted.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("retirement must abort the running worker");
+    assert!(!mgr.is_busy(&id));
+    assert!(!mgr.contains(&id));
+    assert!(!mgr.registry().is_registered(&id));
+    assert!(!mgr.workers.lock().unwrap().contains_key(&id));
+    let row = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert!(row.retired_at.is_some());
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].content, Value::Array(blocks));
+    assert_eq!(messages[0].metadata.as_ref().unwrap()["interrupted"], true);
+    let sent = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "late send".into(),
+            None,
+            super::TurnOptions::default(),
+        )
+        .await;
+    assert!(
+        matches!(sent, Err(Error::InvalidParams(ref message)) if message.contains("retired")),
+        "{sent:?}"
+    );
+    mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+    assert!(!mgr.is_busy(&id));
+    assert!(!mgr.contains(&id));
+    // A send may have passed its store check before retirement. Neither
+    // its late claim nor a late worker registration can restart the target.
+    assert!(!mgr.try_begin(&id, &ws).await);
+    mgr.spawn_worker(
+        id.clone(),
+        ws.clone(),
+        "racing send".into(),
+        super::TurnOptions::default(),
+        false,
+    );
+    assert!(!mgr.workers.lock().unwrap().contains_key(&id));
+    mgr.services
+        .agent_restore_op(id.clone(), Some(ws.clone()))
+        .await
+        .unwrap();
+    assert!(
+        mgr.try_begin(&id, &ws).await,
+        "restore clears runtime fence"
+    );
+    mgr.end_turn(&id).await;
+}
+
+#[tokio::test]
+async fn user_retire_active_descendant_rejection_does_not_stop_target() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let (ws, id, child) = (
+        WorkspaceId::from("ws-retire-guard"),
+        AgentId::from("parent"),
+        AgentId::from("child"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    let mut descendant = mgr.services.store.get_agent_session(&id).await.unwrap();
+    descendant.id = child.clone();
+    descendant.parent_agent_id = Some(id.clone());
+    descendant.status = AgentStatus::Active;
+    mgr.services
+        .store
+        .insert_agent_session(&descendant)
+        .await
+        .unwrap();
+    track(&mgr, &id);
+    assert!(mgr.try_begin(&id, &ws).await);
+    let worker = tokio::spawn(std::future::pending::<()>());
+    let aborted = worker.abort_handle();
+    mgr.workers.lock().unwrap().insert(id.clone(), worker);
+    let result = intent_core::with_caller(
+        intent_core::Caller::Wire {
+            principal_id: intent_core::PrincipalId::new(),
+            host_role: intent_core::HostRole::Owner,
+        },
+        mgr.services
+            .agent_retire(id.clone(), Some(ws.clone()), None),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(Error::InvalidParams(ref message)) if message.contains("active child")),
+        "{result:?}"
+    );
+    assert!(!aborted.is_finished());
+    assert!(mgr.is_busy(&id));
+    assert!(mgr.contains(&id));
+    assert!(!mgr.retired.lock().unwrap().contains(&id));
+    for agent in [&id, &child] {
+        assert!(mgr
+            .services
+            .store
+            .get_agent_session(agent)
+            .await
+            .unwrap()
+            .retired_at
+            .is_none());
+    }
+    mgr.stop(&id).await;
+}
+
+#[tokio::test]
+async fn mcp_retire_leaves_calling_worker_alive_to_finish_response() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-mcp-retire"),
+        AgentId::from("self-retire"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    track(&mgr, &id);
+    assert!(mgr.try_begin(&id, &ws).await);
+    let worker = tokio::spawn(std::future::pending::<()>());
+    let aborted = worker.abort_handle();
+    mgr.workers.lock().unwrap().insert(id.clone(), worker);
+    let result = intent_core::with_caller(
+        intent_core::Caller::Agent {
+            agent_id: id.clone(),
+        },
+        mgr.services.agent_retire(id.clone(), Some(ws), None),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result["success"], true);
+    assert!(!aborted.is_finished(), "MCP response must not abort itself");
+    assert!(mgr
+        .services
+        .store
+        .get_agent_session(&id)
+        .await
+        .unwrap()
+        .retired_at
+        .is_some());
+    mgr.stop(&id).await;
+}
+
 /// Regression companion: the hard `stop()` path (interrupt fallback / kill)
 /// flushes the partial live turn the same way as the keep-alive interrupt, so
 /// a mid-stream `agent.stop` that lands on the kill path (no `acpSessionId`)

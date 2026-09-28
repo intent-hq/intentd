@@ -2657,6 +2657,9 @@ pub struct AgentManager {
     /// the caller's store cascade, at which point the session row is gone and
     /// the spawn path fails `NotFound` on its own).
     stopping: Arc<Mutex<HashSet<AgentId>>>,
+    /// User-retired sessions remain fenced until explicit restore. This lock
+    /// orders retirement with slot claims, worker spawns and handle installs.
+    retired: Arc<Mutex<HashSet<AgentId>>>,
     /// Daemon-owned singleton Unsloth server (spec "Proposed design" §4,
     /// monorepo#878): started on demand when an `unsloth`-provider agent
     /// spawns, reused while the served model matches, restarted on model
@@ -2754,6 +2757,7 @@ impl AgentManager {
             force_recreate: Arc::new(Mutex::new(HashSet::new())),
             spawn_attempt_provider: Arc::new(Mutex::new(HashMap::new())),
             stopping: Arc::new(Mutex::new(HashSet::new())),
+            retired: Arc::new(Mutex::new(HashSet::new())),
             unsloth: Arc::new(crate::unsloth_server::UnslothServerManager::default()),
             tree_probe: std::sync::OnceLock::new(),
             auto_unarchived: Arc::new(Mutex::new(HashSet::new())),
@@ -3436,8 +3440,9 @@ impl AgentManager {
         // installed first → `stop_many`'s detach finds it and kills it with
         // the batch. Either interleaving leaves no orphaned process.
         let fenced = {
+            let retired = self.retired.lock().unwrap();
             let stopping = self.stopping.lock().unwrap();
-            if stopping.contains(&agent_id) {
+            if retired.contains(&agent_id) || stopping.contains(&agent_id) {
                 Some(handle)
             } else {
                 self.handles
@@ -4931,6 +4936,17 @@ impl AgentManager {
         removed
     }
 
+    /// Fence a user-retired session before aborting its worker and child.
+    /// The service has already committed retired_at and checked descendants.
+    pub(crate) async fn retire(&self, agent_id: &AgentId) {
+        self.retired.lock().unwrap().insert(agent_id.clone());
+        self.stop(agent_id).await;
+    }
+
+    pub(crate) fn restore_retired(&self, agent_id: &AgentId) {
+        self.retired.lock().unwrap().remove(agent_id);
+    }
+
     /// Stop MANY agents under ONE shared grace window: detach each agent with
     /// the exact [`AgentManager::stop`] per-agent semantics (partial-turn
     /// flush, recreate/prepend flag cleanup, live-turn slot release, handle
@@ -5873,6 +5889,12 @@ impl AgentManager {
         // Insert into `agent_ws` while still holding the `busy` lock
         // (busy → agent_ws order, matching `list_busy`) so a concurrent
         // `list_busy` never observes a busy agent without its workspace.
+        let retired = self.retired.lock().unwrap();
+        if retired.contains(agent_id) {
+            // Like an idle-reap claim, retirement permits no implicit wake
+            // turn. Any delivery that already passed its store check parks.
+            return Err(SlotClaimLoss::ReapClaimed);
+        }
         let mut busy = self.busy.lock().unwrap();
         // An agent claimed by the idle-reap sweep (monorepo#2118) counts
         // as busy: the sweep is about to (or is mid-way through) killing
@@ -7968,6 +7990,13 @@ impl AgentManager {
         mut options: TurnOptions,
         user_persisted: bool,
     ) {
+        // Hold through spawn + registration: retirement either sees this
+        // worker in its abort sweep or prevents it from starting at all.
+        let retired = self.retired.lock().unwrap();
+        if retired.contains(&agent_id) {
+            self.release_in_flight_slot(&agent_id);
+            return;
+        }
         // Every worker spawn flows through here, so this is the single mint
         // point for the turn correlation id (monorepo#1022): direct sends get
         // a fresh id; callers that already carry one (a drained queue entry's
@@ -8243,6 +8272,11 @@ impl AgentManager {
         // turn is open.
         let mgr = self.clone();
         let (id, ws) = (agent_id.clone(), workspace_id.clone());
+        let retired = self.retired.lock().unwrap();
+        if retired.contains(agent_id) {
+            self.release_in_flight_slot(agent_id);
+            return true;
+        }
         let drive = intent_core::spawn_daemon(async move {
             let outcome = mgr
                 .services
@@ -9039,7 +9073,7 @@ impl AgentManager {
         // settled sandbox fields. No-op when no provisioning is in flight —
         // the common case for every turn after the first.
         self.services.await_sandbox_provisioning(agent_id).await;
-        let mut session = self.services.store.get_agent_session(agent_id).await?;
+        let mut session = self.services.require_agent_session(agent_id).await?;
         // Lazy legacy feature freeze (intent-hq/monorepo#2459): a pre-0096
         // row still carrying harness_features = NULL gets its snapshot
         // materialized at this activation choke point — every turn (first
