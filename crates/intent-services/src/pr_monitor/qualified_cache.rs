@@ -15,8 +15,15 @@ use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::repository_credentials::read::{
+    RepositoryProviderRead, RepositoryResponseAttribution, RepositoryResponseDisposition,
+};
+use crate::repository_credentials::{RepositoryCredentialError, Result as CredentialResult};
+use crate::source_control_auth_ops::repository_owner::RepositoryReadEligibility;
 use intent_core::{RepositoryResourceKind, ReviewTarget};
-use intent_sourcecontrol::{RateLimitStatus, ReviewDetails, ReviewObservation};
+use intent_sourcecontrol::{
+    error::ProviderFailureKind, RateLimitStatus, ReviewDetails, ReviewObservation,
+};
 
 use crate::observation_adapter::{
     complete_snapshot, ConnectionObservations, ObservationReceipt, ObservationTicket, QualifiedKey,
@@ -94,9 +101,139 @@ impl CacheRequest<'_> {
     }
 }
 
+/// The original caller owner supplies this short synchronous fence. It must not
+/// await, perform I/O or reacquire the cache. This is not a permission producer.
+pub(crate) type CacheAdmissionAction<'a> = dyn FnMut() -> CredentialResult<()> + Send + 'a;
+pub(crate) type CacheAdmissionGuard<'a> =
+    dyn Fn(&mut CacheAdmissionAction<'_>) -> CredentialResult<()> + Sync + 'a;
+
+/// Read-only original-caller checks stay in `request`; credential eligibility is
+/// separate so a rejection does not erase its own provider error. The owner must
+/// bind these observations to the SAME admitted execution/connection lifetime.
+/// Final delivery still needs its fresh original-caller fence outside the cache.
+pub(crate) struct ManagedCacheRequest<'a> {
+    pub(crate) request: CacheRequest<'a>,
+    pub(crate) eligibility: &'a RepositoryReadEligibility,
+    pub(crate) with_authority: &'a CacheAdmissionGuard<'a>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum DetailAccess<'r, 'a> {
+    Legacy(&'r CacheRequest<'a>),
+    Managed(&'r ManagedCacheRequest<'a>),
+}
+
+pub(crate) struct DetailOutcome<T> {
+    value: intent_sourcecontrol::Result<T>,
+    quota: RateLimitStatus,
+    attribution: Option<RepositoryResponseAttribution>,
+}
+impl<T> From<ProviderRead<T>> for DetailOutcome<T> {
+    fn from((value, quota): ProviderRead<T>) -> Self {
+        Self {
+            value,
+            quota,
+            attribution: None,
+        }
+    }
+}
+impl<T> From<RepositoryProviderRead<T>> for DetailOutcome<T> {
+    fn from(outcome: RepositoryProviderRead<T>) -> Self {
+        let (value, quota, attribution) = outcome.into_parts();
+        Self {
+            value,
+            quota,
+            attribution: Some(attribution),
+        }
+    }
+}
+
+impl<'r, 'a> DetailAccess<'r, 'a> {
+    fn request(self) -> &'r CacheRequest<'a> {
+        match self {
+            Self::Legacy(r) => r,
+            Self::Managed(r) => &r.request,
+        }
+    }
+    fn check(self, quota: RateLimitStatus) -> Result<(), CacheFailure> {
+        match self {
+            Self::Legacy(r) => r.check(quota),
+            Self::Managed(_) => self.with_current(quota, None, || Ok(())),
+        }
+    }
+    // Managed actions already hold the original R and P fences. Do not call
+    // either owner back from inside their locks.
+    fn check_in_action(self, quota: RateLimitStatus) -> Result<(), CacheFailure> {
+        if matches!(self, Self::Legacy(_)) {
+            return self.request().check(quota);
+        }
+        if !self.request().connection.is_active() {
+            return Err(CacheFailure::ineligible(Ineligible::RetiredScope, quota));
+        }
+        Ok(())
+    }
+    fn response_current<T: Send>(
+        self,
+        quota: RateLimitStatus,
+        attribution: Option<&RepositoryResponseAttribution>,
+        action: impl FnOnce() -> Result<T, CacheFailure> + Send,
+    ) -> Result<T, CacheFailure> {
+        if matches!(self, Self::Managed(_)) && attribution.is_none() {
+            return Err(CacheFailure {
+                cause: CacheError::Credential(RepositoryCredentialError::BoundaryMismatch),
+                quota,
+            });
+        }
+        self.with_current(quota, attribution, action)
+    }
+    fn with_current<T: Send>(
+        self,
+        quota: RateLimitStatus,
+        attribution: Option<&RepositoryResponseAttribution>,
+        action: impl FnOnce() -> Result<T, CacheFailure> + Send,
+    ) -> Result<T, CacheFailure> {
+        let Self::Managed(r) = self else {
+            return action();
+        };
+        r.request.check(quota)?;
+        let mut action = Some(action);
+        let mut output = None;
+        (r.with_authority)(&mut || {
+            if let Some(attribution) = attribution {
+                r.eligibility
+                    .with_response(attribution, r.request.target, &mut |d| {
+                        if d == RepositoryResponseDisposition::NoDenial {
+                            Ok(())
+                        } else {
+                            Err(RepositoryCredentialError::BoundaryMismatch)
+                        }
+                    })?;
+            }
+            r.eligibility.with_current(&mut || {
+                let action = action
+                    .take()
+                    .ok_or(RepositoryCredentialError::Indeterminate)?;
+                output = Some(action());
+                Ok(())
+            })
+        })
+        .map_err(|error| CacheFailure {
+            cause: CacheError::Credential(error),
+            quota,
+        })?;
+        output.unwrap_or_else(|| {
+            Err(CacheFailure {
+                cause: CacheError::Credential(RepositoryCredentialError::Indeterminate),
+                quota,
+            })
+        })
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum CacheError {
     Admission(intent_core::Error),
+    Credential(RepositoryCredentialError),
     Ineligible(Ineligible),
     Provider(intent_sourcecontrol::Error),
     PageTooLarge,
@@ -187,48 +324,61 @@ pub(crate) enum Started<T> {
 
 /// Insert request-start metadata into the SAME bounded map as response payloads.
 /// Evicting a pending slot drops its right to write; there is no tombstone map.
-pub(crate) fn start<K: Clone + Eq + Hash, L, T: Clone>(
+pub(crate) fn start<K: Clone + Eq + Hash + Send, L: Send, T: Clone + Send>(
     cache: &SharedCache<K, L, T>,
     request: &CacheRequest<'_>,
     max_age: Duration,
-    retain: impl Fn(&mut CacheMap<K, L, T>),
+    retain: impl Fn(&mut CacheMap<K, L, T>) + Send,
 ) -> Result<Started<T>, CacheFailure> {
+    start_access(cache, DetailAccess::Legacy(request), max_age, retain)
+}
+
+pub(crate) fn start_access<K: Clone + Eq + Hash + Send, L: Send, T: Clone + Send>(
+    cache: &SharedCache<K, L, T>,
+    access: DetailAccess<'_, '_>,
+    max_age: Duration,
+    retain: impl Fn(&mut CacheMap<K, L, T>) + Send,
+) -> Result<Started<T>, CacheFailure> {
+    let request = access.request();
     let quota = RateLimitStatus::default();
-    request.check(quota)?;
+    access.check(quota)?;
     let key = request.key();
-    let mut cache = cache.lock().unwrap();
-    // Expire the old lifetime before issuing a new ticket for the refresh.
-    // Otherwise the post-insertion pass could evict that very ticket.
-    retain(&mut cache);
-    let slot = cache.entry(key).or_insert_with(|| new_slot(request));
-    let CacheSlot::Qualified(slot) = slot else {
-        unreachable!("qualified cache key")
-    };
-    if !slot.observations.belongs_to(request.connection) {
-        **slot = new_qualified_slot(request);
-    }
-    let previous = slot
-        .payload
-        .as_ref()
-        .filter(|p| slot.observations.can_serve(&p.receipt, request.connection));
-    if let Some(payload) = previous.filter(|p| p.freshness.refreshed_at.elapsed() < max_age) {
-        request.check(payload.quota)?;
-        return Ok(Started::Hit(CacheRead {
-            value: payload.value.clone(),
-            quota: payload.quota,
-            fetched: false,
-        }));
-    }
-    let previous = previous
-        .filter(|_| slot.reuse_allowed)
-        .map(|p| (p.value.clone(), p.freshness));
-    let ticket = slot
-        .observations
-        .begin(Coverage::Detail)
-        .map_err(|e| CacheFailure::ineligible(e, quota))?;
-    retain(&mut cache);
-    request.check(quota)?;
-    Ok(Started::Read { ticket, previous })
+    let mut locked = cache.lock().unwrap();
+    let cache = &mut *locked;
+    access.with_current(quota, None, move || {
+        // Expire the old lifetime before issuing a new ticket for the refresh.
+        // Otherwise the post-insertion pass could evict that very ticket.
+        retain(cache);
+        let slot = cache.entry(key).or_insert_with(|| new_slot(request));
+        let CacheSlot::Qualified(slot) = slot else {
+            unreachable!("qualified cache key")
+        };
+        if !slot.observations.belongs_to(request.connection) {
+            **slot = new_qualified_slot(request);
+        }
+        let previous = slot
+            .payload
+            .as_ref()
+            .filter(|p| slot.observations.can_serve(&p.receipt, request.connection));
+        if let Some(payload) = previous.filter(|p| p.freshness.refreshed_at.elapsed() < max_age) {
+            access.check_in_action(payload.quota)?;
+            return Ok(Started::Hit(CacheRead {
+                value: payload.value.clone(),
+                quota: payload.quota,
+                fetched: false,
+            }));
+        }
+        let previous = previous
+            .filter(|_| slot.reuse_allowed)
+            .map(|p| (p.value.clone(), p.freshness));
+        let ticket = slot
+            .observations
+            .begin(Coverage::Detail)
+            .map_err(|e| CacheFailure::ineligible(e, quota))?;
+        retain(cache);
+        access.check_in_action(quota)?;
+        Ok(Started::Read { ticket, previous })
+    })
 }
 
 fn new_slot<L, T>(request: &CacheRequest<'_>) -> CacheSlot<L, T> {
@@ -250,71 +400,144 @@ fn new_qualified_slot<T>(request: &CacheRequest<'_>) -> QualifiedSlot<T> {
 
 /// Apply errors before any lossy mapping. Both cache kinds share connection and
 /// project lifetimes, so a denial observed by an issue also fences review data.
-pub(crate) fn finish<K: Clone + Eq + Hash, L, T: Clone>(
+pub(crate) fn finish<K: Clone + Eq + Hash + Send, L: Send, T: Clone + Send>(
     cache: &SharedCache<K, L, T>,
     request: &CacheRequest<'_>,
     ticket: ObservationTicket,
     outcome: ProviderRead<T>,
-    complete: impl FnOnce(&T) -> bool,
+    complete: impl FnOnce(&T) -> bool + Send,
     freshness: Freshness,
-    retain: impl FnOnce(&mut CacheMap<K, L, T>),
+    retain: impl FnOnce(&mut CacheMap<K, L, T>) + Send,
 ) -> Result<CacheRead<T>, CacheFailure> {
-    let (outcome, quota) = outcome;
-    request.check(quota)?;
-    let mut cache = cache.lock().unwrap();
-    let Some(CacheSlot::Qualified(slot)) = cache.get_mut(&request.key()) else {
-        return Err(CacheFailure::ineligible(Ineligible::DifferentSlot, quota));
-    };
-    let value = match outcome {
-        Ok(value) => value,
-        Err(error) => {
-            let (error, quota) = slot
-                .observations
-                .failure(ticket, error, quota)
-                .map_err(|e| CacheFailure::ineligible(e, quota))?;
-            slot.reuse_allowed = false;
-            return Err(CacheFailure {
-                cause: CacheError::Provider(error),
-                quota,
-            });
-        }
-    };
-    slot.observations
-        .validate(&ticket)
-        .map_err(|e| CacheFailure::ineligible(e, quota))?;
-    // A cheap poll captured its previous fields before the provider await.
-    // A failed full read may have disabled reuse since then. Check under the
-    // map lock so that captured fields cannot bypass the current reuse fence.
-    if freshness.cheap_polls > 0 && !slot.reuse_allowed {
-        return Err(CacheFailure::ineligible(
-            Ineligible::OlderObservation,
-            quota,
-        ));
-    }
-    request.check(quota)?;
-    slot.reuse_allowed = complete(&value);
-    if slot.reuse_allowed {
-        let receipt = slot
-            .observations
-            .primary_success(ticket)
-            .map_err(|e| CacheFailure::ineligible(e, quota))?;
-        slot.payload = Some(Payload {
-            value: value.clone(),
-            quota,
-            receipt,
-            freshness,
-        });
-    } else {
-        slot.observations
-            .partial_success(&ticket)
-            .map_err(|e| CacheFailure::ineligible(e, quota))?;
-    }
-    // Partial results retain their exact fields but never refresh old cache data.
-    retain(&mut cache);
-    Ok(CacheRead {
-        value,
+    finish_access(
+        cache,
+        DetailAccess::Legacy(request),
+        ticket,
+        outcome.into(),
+        complete,
+        freshness,
+        retain,
+    )
+}
+
+pub(crate) fn finish_access<K: Clone + Eq + Hash + Send, L: Send, T: Clone + Send>(
+    cache: &SharedCache<K, L, T>,
+    access: DetailAccess<'_, '_>,
+    ticket: ObservationTicket,
+    outcome: DetailOutcome<T>,
+    complete: impl FnOnce(&T) -> bool + Send,
+    freshness: Freshness,
+    retain: impl FnOnce(&mut CacheMap<K, L, T>) + Send,
+) -> Result<CacheRead<T>, CacheFailure> {
+    let request = access.request();
+    let DetailOutcome {
+        value: outcome,
         quota,
-        fetched: true,
+        attribution,
+    } = outcome;
+    if let (DetailAccess::Managed(managed), Err(_)) = (access, &outcome) {
+        // The response error is already known. Eligibility/slot refusal must not
+        // turn it into a synthetic local error or discard its quota.
+        let mut locked = cache.lock().unwrap();
+        if let Some(CacheSlot::Qualified(slot)) = locked.get_mut(&request.key()) {
+            if slot.observations.belongs_to(request.connection) {
+                if let Some(attribution) = &attribution {
+                    let mut ticket = Some(ticket);
+                    let _ = (managed.with_authority)(&mut || {
+                        managed
+                            .eligibility
+                            .with_response(attribution, request.target, &mut |d| {
+                                use RepositoryResponseDisposition as D;
+                                let kind = match d {
+                                    D::AcceptedCredentialRejection => {
+                                        Some(ProviderFailureKind::CredentialRejected)
+                                    }
+                                    D::CurrentProjectDenial => {
+                                        Some(ProviderFailureKind::ProjectDenied)
+                                    }
+                                    D::CurrentResourceDenial => {
+                                        Some(ProviderFailureKind::ResourceDenied)
+                                    }
+                                    D::NoDenial => None,
+                                    D::NotApplied | D::Unattributed | D::Indeterminate => {
+                                        return Ok(())
+                                    }
+                                };
+                                let ticket = ticket
+                                    .take()
+                                    .ok_or(RepositoryCredentialError::Indeterminate)?;
+                                if slot.observations.failure_kind(ticket, kind).is_ok() {
+                                    slot.reuse_allowed = false;
+                                }
+                                Ok(())
+                            })
+                    });
+                }
+            }
+        }
+        return Err(CacheFailure {
+            cause: CacheError::Provider(outcome.err().unwrap()),
+            quota,
+        });
+    }
+    access.check(quota)?;
+    let mut locked = cache.lock().unwrap();
+    let cache = &mut *locked;
+    access.response_current(quota, attribution.as_ref(), || {
+        let Some(CacheSlot::Qualified(slot)) = cache.get_mut(&request.key()) else {
+            return Err(CacheFailure::ineligible(Ineligible::DifferentSlot, quota));
+        };
+        let value = match outcome {
+            Ok(value) => value,
+            Err(error) => {
+                let (error, quota) = slot
+                    .observations
+                    .failure(ticket, error, quota)
+                    .map_err(|e| CacheFailure::ineligible(e, quota))?;
+                slot.reuse_allowed = false;
+                return Err(CacheFailure {
+                    cause: CacheError::Provider(error),
+                    quota,
+                });
+            }
+        };
+        slot.observations
+            .validate(&ticket)
+            .map_err(|e| CacheFailure::ineligible(e, quota))?;
+        // A cheap poll captured its previous fields before the provider await.
+        // A failed full read may have disabled reuse since then. Check under the
+        // map lock so that captured fields cannot bypass the current reuse fence.
+        if freshness.cheap_polls > 0 && !slot.reuse_allowed {
+            return Err(CacheFailure::ineligible(
+                Ineligible::OlderObservation,
+                quota,
+            ));
+        }
+        access.check_in_action(quota)?;
+        slot.reuse_allowed = complete(&value);
+        if slot.reuse_allowed {
+            let receipt = slot
+                .observations
+                .primary_success(ticket)
+                .map_err(|e| CacheFailure::ineligible(e, quota))?;
+            slot.payload = Some(Payload {
+                value: value.clone(),
+                quota,
+                receipt,
+                freshness,
+            });
+        } else {
+            slot.observations
+                .partial_success(&ticket)
+                .map_err(|e| CacheFailure::ineligible(e, quota))?;
+        }
+        // Partial results retain their exact fields but never refresh old cache data.
+        retain(cache);
+        Ok(CacheRead {
+            value,
+            quota,
+            fetched: true,
+        })
     })
 }
 
@@ -372,6 +595,59 @@ where
     F: FnOnce() -> FF,
     FF: Future<Output = ProviderRead<ReviewObservation>>,
 {
+    read_review_access(
+        cache,
+        DetailAccess::Legacy(request),
+        policy,
+        monitored,
+        || async { primary().await.into() },
+        || async { full().await.into() },
+    )
+    .await
+}
+
+/// Each consuming managed provider call contributes its OWN opaque receipt.
+/// Eligibility is not network readiness; backoff is enforced by that call.
+pub(crate) async fn read_managed_review<P, PF, F, FF>(
+    cache: &PrCache,
+    request: &ManagedCacheRequest<'_>,
+    policy: PrReadPolicy,
+    monitored: &HashSet<PrKey>,
+    primary: P,
+    full: F,
+) -> Result<CacheRead<ReviewObservation>, CacheFailure>
+where
+    P: FnOnce() -> PF,
+    PF: Future<Output = RepositoryProviderRead<ReviewDetails>>,
+    F: FnOnce() -> FF,
+    FF: Future<Output = RepositoryProviderRead<ReviewObservation>>,
+{
+    read_review_access(
+        cache,
+        DetailAccess::Managed(request),
+        policy,
+        monitored,
+        || async { primary().await.into() },
+        || async { full().await.into() },
+    )
+    .await
+}
+
+async fn read_review_access<P, PF, F, FF>(
+    cache: &PrCache,
+    access: DetailAccess<'_, '_>,
+    policy: PrReadPolicy,
+    monitored: &HashSet<PrKey>,
+    primary: P,
+    full: F,
+) -> Result<CacheRead<ReviewObservation>, CacheFailure>
+where
+    P: FnOnce() -> PF,
+    PF: Future<Output = DetailOutcome<ReviewDetails>>,
+    F: FnOnce() -> FF,
+    FF: Future<Output = DetailOutcome<ReviewObservation>>,
+{
+    let request = access.request();
     if request.target.kind == RepositoryResourceKind::Issue {
         return Err(CacheFailure::ineligible(
             Ineligible::DifferentSlot,
@@ -382,7 +658,7 @@ where
         PrReadPolicy::Serve { max_age } => max_age,
         PrReadPolicy::Poll => Duration::ZERO,
     };
-    let (ticket, previous) = match start(cache, request, max_age, |c| {
+    let (ticket, previous) = match start_access(cache, access, max_age, |c| {
         retain_pr_cache(c, monitored, Instant::now());
     })? {
         Started::Hit(hit) => return Ok(hit),
@@ -391,24 +667,35 @@ where
     let keep = |c: &mut _| retain_pr_cache(c, monitored, Instant::now());
     let mut observed_quota = RateLimitStatus::default();
     if matches!(policy, PrReadPolicy::Poll) {
-        request.check(RateLimitStatus::default())?;
-        let (details, quota) = primary().await;
+        access.check(RateLimitStatus::default())?;
+        let DetailOutcome {
+            value: details,
+            quota,
+            attribution,
+        } = primary().await;
         observed_quota = quota;
-        request.check(quota)?;
+        if matches!(access, DetailAccess::Legacy(_)) {
+            request.check(quota)?;
+        }
         let details = match details {
             Ok(details) => details,
             Err(error) => {
-                return finish(
+                return finish_access(
                     cache,
-                    request,
+                    access,
                     ticket,
-                    (Err(error), quota),
+                    DetailOutcome {
+                        value: Err(error),
+                        quota,
+                        attribution,
+                    },
                     complete_snapshot,
                     Freshness::full(),
                     keep,
                 )
             }
         };
+        access.response_current(quota, attribution.as_ref(), || Ok(()))?;
         {
             let cache = cache.lock().unwrap();
             let Some(CacheSlot::Qualified(slot)) = cache.get(&request.key()) else {
@@ -429,11 +716,15 @@ where
                 old.details = details;
                 freshness.cheap_polls += 1;
                 freshness.refreshed_at = Instant::now();
-                return finish(
+                return finish_access(
                     cache,
-                    request,
+                    access,
                     ticket,
-                    (Ok(old), quota),
+                    DetailOutcome {
+                        value: Ok(old),
+                        quota,
+                        attribution,
+                    },
                     complete_snapshot,
                     freshness,
                     keep,
@@ -441,11 +732,11 @@ where
             }
         }
     }
-    request.check(observed_quota)?;
+    access.check(observed_quota)?;
     let outcome = full().await;
-    finish(
+    finish_access(
         cache,
-        request,
+        access,
         ticket,
         outcome,
         complete_snapshot,

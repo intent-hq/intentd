@@ -140,6 +140,47 @@ where
     )
 }
 
+/// Managed issue reads retain the provider's opaque response evidence until
+/// the existing slot is borrowed and the original caller/response guards run.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "managed issue entry remains separately owned")
+)]
+pub(crate) async fn read_managed_issue<F, Fut>(
+    cache: &IssueCache,
+    request: &qualified_cache::ManagedCacheRequest<'_>,
+    max_age: Duration,
+    read: F,
+) -> std::result::Result<CacheRead<Issue>, CacheFailure>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = crate::repository_credentials::read::RepositoryProviderRead<Issue>>,
+{
+    if request.request.target.kind != intent_core::RepositoryResourceKind::Issue {
+        return Err(CacheFailure::ineligible(
+            crate::observation_policy::Ineligible::DifferentSlot,
+            intent_sourcecontrol::RateLimitStatus::default(),
+        ));
+    }
+    let access = qualified_cache::DetailAccess::Managed(request);
+    let ticket = match qualified_cache::start_access(cache, access, max_age, |c| {
+        retain_issue_cache(c, Instant::now());
+    })? {
+        Started::Hit(hit) => return Ok(hit),
+        Started::Read { ticket, .. } => ticket,
+    };
+    let outcome = read().await;
+    qualified_cache::finish_access(
+        cache,
+        access,
+        ticket,
+        outcome.into(),
+        |_| true,
+        Freshness::full(),
+        |c| retain_issue_cache(c, Instant::now()),
+    )
+}
+
 impl Services {
     /// Read one issue through the cache under the on-demand readers'
     /// policy: served without a forge call when read within

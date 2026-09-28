@@ -18,10 +18,12 @@ use crate::tool_restrictions::get_tool_denylist_for_agent_type;
 
 pub(crate) mod bindings;
 mod dispatch;
+pub mod private_results;
 pub mod repository_guidance;
 pub mod request_context;
 mod tools;
 
+use private_results::DeliveryResponse;
 use repository_guidance::{BridgeResponse, GuidanceBinding, RepositoryGuidanceSource};
 use request_context::{CapturedRequestContext, McpRequestContext};
 
@@ -189,7 +191,13 @@ impl WorkspaceMcpServer {
             .clone()
             .map(|agent_id| intent_core::Caller::Agent { agent_id })
             .or_else(intent_core::current_caller);
-        CapturedRequestContext::capture(caller, self.request_context.as_deref())
+        CapturedRequestContext::capture_with_budget(
+            caller,
+            self.request_context.as_deref(),
+            self.workspace_api_timeout
+                .saturating_mul(2)
+                .max(Duration::from_secs(120)),
+        )
     }
 
     /// Opt in a verified immutable session to the optional transport sidecar.
@@ -361,9 +369,10 @@ impl WorkspaceMcpServer {
     /// on a fresh task, which would otherwise arrive unbound. A bridge with no
     /// caller agent leaves whatever caller the enclosing scope bound.
     pub async fn handle_message(&self, message: &Value) -> Option<Value> {
-        self.handle_message_response(message, false, self.capture_request_context())
-            .await
-            .map(|response| response.value)
+        let response = self
+            .handle_message_response(message, false, self.capture_request_context())
+            .await?;
+        Some(response.into_direct().await.value)
     }
 
     pub(crate) async fn handle_message_for_bridge(
@@ -371,6 +380,15 @@ impl WorkspaceMcpServer {
         message: &Value,
         context: CapturedRequestContext,
     ) -> Option<BridgeResponse> {
+        let response = self.handle_message_response(message, true, context).await?;
+        Some(response.into_direct().await)
+    }
+
+    pub(crate) async fn handle_message_for_delivery(
+        &self,
+        message: &Value,
+        context: CapturedRequestContext,
+    ) -> Option<DeliveryResponse> {
         self.handle_message_response(message, true, context).await
     }
 
@@ -379,7 +397,7 @@ impl WorkspaceMcpServer {
         message: &Value,
         sidecar: bool,
         context: CapturedRequestContext,
-    ) -> Option<BridgeResponse> {
+    ) -> Option<DeliveryResponse> {
         let method = message.get("method").and_then(Value::as_str)?;
         let id = message.get("id").cloned()?;
         let handled = async {
@@ -404,7 +422,7 @@ impl WorkspaceMcpServer {
             response
         };
         let response = context.run(handled).await;
-        Some(response)
+        Some(DeliveryResponse::from_context(response, &context))
     }
 
     async fn handle_request(&self, id: &Value, method: &str, message: &Value) -> Value {

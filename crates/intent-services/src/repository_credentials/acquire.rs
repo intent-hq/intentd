@@ -11,6 +11,7 @@ use intent_sourcecontrol::{
 };
 
 use super::authority::RepositoryCredentialTransport;
+use super::read::ReadReceiptSink;
 use super::*;
 
 impl RepositoryConnectionDirectory {
@@ -164,6 +165,7 @@ impl RepositoryConnectionDirectory {
         admission: &RepositoryCredentialAdmission,
         stamp: RepositoryDispatchStamp,
         prepared: GitlabAuthenticatedRequest<'_>,
+        read_sink: Option<Arc<ReadReceiptSink>>,
     ) -> Result<GitlabAdmittedRequest> {
         let fence = admission.authority.revalidate(&admission.request).await?;
         let mut pending = Some((
@@ -171,6 +173,7 @@ impl RepositoryConnectionDirectory {
             Box::new(DispatchReceipt {
                 directory: self.clone(),
                 stamp,
+                read_sink,
             }),
         ));
         let mut admitted = None;
@@ -205,14 +208,17 @@ impl RepositoryConnectionDirectory {
 struct DispatchReceipt {
     directory: Arc<RepositoryConnectionDirectory>,
     stamp: RepositoryDispatchStamp,
+    read_sink: Option<Arc<ReadReceiptSink>>,
 }
 impl GitlabResponseReceipt for DispatchReceipt {
     fn observe(&self, observation: GitlabResponseObservation) {
         if let Some(until) = observation.backoff_until {
             let _ = self.directory.record_backoff(&self.stamp, until);
         }
-        if observation.status == 401 {
-            let _ = self.directory.reject_current_credential(&self.stamp);
+        let rejection = (observation.status == 401)
+            .then(|| self.directory.reject_current_credential(&self.stamp));
+        if let Some(sink) = &self.read_sink {
+            sink.observe(&self.stamp, observation.status, rejection);
         }
         // These existing predicates ignore obsolete receipts. A bookkeeping
         // failure must not erase the actual dispatched HTTP outcome, and a
@@ -247,6 +253,7 @@ pub(crate) struct BoundGitlabRequestCredentials {
     admission: RepositoryCredentialAdmission,
     reader: Arc<dyn RepositorySecretReader>,
     budget: Duration,
+    read_sink: Option<Arc<ReadReceiptSink>>,
 }
 impl BoundGitlabRequestCredentials {
     pub(crate) fn new(
@@ -270,7 +277,20 @@ impl BoundGitlabRequestCredentials {
             admission,
             reader,
             budget,
+            read_sink: None,
         })
+    }
+
+    pub(super) fn for_read(
+        directory: Arc<RepositoryConnectionDirectory>,
+        admission: RepositoryCredentialAdmission,
+        reader: Arc<dyn RepositorySecretReader>,
+        budget: Duration,
+        read_sink: Arc<ReadReceiptSink>,
+    ) -> Result<Self> {
+        let mut bound = Self::new(directory, admission, reader, budget)?;
+        bound.read_sink = Some(read_sink);
+        Ok(bound)
     }
 
     pub(crate) fn into_provider(self) -> intent_sourcecontrol::Result<GitLabSourceControl> {
@@ -320,7 +340,12 @@ impl BoundGitlabRequestCredentials {
                 .await?;
             let authenticated = prepared.authenticate(ticket.token)?;
             self.directory
-                .admit_http_exact(&self.admission, ticket.stamp, authenticated)
+                .admit_http_exact(
+                    &self.admission,
+                    ticket.stamp,
+                    authenticated,
+                    self.read_sink.clone(),
+                )
                 .await
                 .map_err(Error::from)
         })

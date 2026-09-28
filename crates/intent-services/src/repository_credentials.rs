@@ -17,6 +17,8 @@ use uuid::Uuid;
 mod acquire;
 #[path = "repository_credentials/authority.rs"]
 pub(crate) mod authority;
+#[path = "repository_credentials/read.rs"]
+pub(crate) mod read;
 #[path = "repository_credentials/state.rs"]
 mod state;
 pub(crate) use acquire::BoundGitlabRequestCredentials;

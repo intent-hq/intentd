@@ -13,9 +13,13 @@ use sha2::{Digest, Sha256};
 
 use super::{GitlabCredentialGate, RepositoryOwner};
 use crate::repository_credentials::authority::CredentialFuture;
+use crate::repository_credentials::read::{
+    RepositoryReadScope, RepositoryResponseAttribution, RepositoryResponseDisposition,
+};
 use crate::repository_credentials::{
-    RepositoryConnectionBinding, RepositoryCredentialError as Error, RepositoryCredentialSource,
-    RepositorySecretReader, RepositorySecretRequest, RepositorySecretSnapshot, Result,
+    RepositoryConnectionBinding, RepositoryCredentialAdmission, RepositoryCredentialError as Error,
+    RepositoryCredentialSource, RepositorySecretReader, RepositorySecretRequest,
+    RepositorySecretSnapshot, Result,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -207,7 +211,308 @@ struct GitlabRepositorySecretReader {
     store: FileSecretStore,
 }
 
+/// A past coherent observation of the original settled connection, not a
+/// permission lease. Reobservation cannot switch its owner or connection.
+pub(crate) struct RepositorySettledConnection {
+    gate: GitlabCredentialGate,
+    owner: Arc<RepositoryOwner>,
+    descriptor: GitlabDescriptor,
+    selected: RepositorySecretRequest,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "original NativeRead source consumer remains separately owned"
+    )
+)]
+impl RepositorySettledConnection {
+    pub(crate) fn descriptor(&self) -> &GitlabDescriptor {
+        &self.descriptor
+    }
+
+    pub(crate) fn selected(&self) -> &RepositorySecretRequest {
+        &self.selected
+    }
+
+    /// A genuinely settled refresh may replace the proof and secret revision.
+    /// Earlier observations and response stamps remain immutable.
+    pub(crate) fn reobserve(&self) -> Result<Self> {
+        Self::observe(self.gate.clone(), self.owner.clone(), Some(self))
+    }
+
+    fn observe(
+        gate: GitlabCredentialGate,
+        owner: Arc<RepositoryOwner>,
+        original: Option<&Self>,
+    ) -> Result<Self> {
+        let (descriptor, selected) = {
+            let settings = owner.settings.get().ok_or(Error::Unverified)?;
+            let config = settings.config.lock().map_err(|_| Error::Indeterminate)?;
+            let descriptor = owner.descriptor.lock().map_err(|_| Error::Indeterminate)?;
+            owner.directory.with_settled_metadata(
+                original.map(|value| &value.selected.binding),
+                |actual, selected| {
+                    let proof = owner
+                        .evidence
+                        .published
+                        .lock()
+                        .map_err(|_| Error::Indeterminate)?;
+                    if settings.source.is_none()
+                        || settings.store.is_none()
+                        || selected.source != RepositoryCredentialSource::GitlabSecretSlot
+                    {
+                        return Err(Error::Unverified);
+                    }
+                    let proof = proof.as_ref().ok_or(Error::Unverified)?;
+                    if proof.request != *selected {
+                        return Err(Error::SecretMismatch);
+                    }
+                    if descriptor.as_ref() != Some(actual)
+                        || proof.descriptor != *actual
+                        || super::adoption::approved_descriptor(&config, settings.fixture.as_ref())
+                            .as_ref()
+                            != Some(actual)
+                        || original.is_some_and(|value| {
+                            value.descriptor != *actual || value.selected.source != selected.source
+                        })
+                    {
+                        return Err(Error::BoundaryMismatch);
+                    }
+                    Ok((actual.clone(), selected.clone()))
+                },
+            )?
+        };
+        Ok(Self {
+            gate,
+            owner,
+            descriptor,
+            selected,
+        })
+    }
+}
+
+/// Original owner metadata, never an alternative permission or secret source.
+/// The authority owner holds its original read-operation fence before either action.
+pub(crate) struct RepositoryReadEligibility {
+    owner: Arc<RepositoryOwner>,
+    scope: RepositoryReadScope,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "qualified cache consumption remains separately owned"
+    )
+)]
+impl RepositoryReadEligibility {
+    pub(crate) fn check(&self) -> Result<()> {
+        self.with_current(&mut || Ok(()))
+    }
+
+    /// Simultaneous eligibility of every captured scope, under the caller's
+    /// fresh all-request authority fence. Only locks, never scopes, are deduped.
+    /// The prebuilt transfer runs once with all metadata guards retained; it
+    /// must not await, do I/O, or acquire caller/cache locks.
+    pub(crate) fn with_all_current(
+        originals: &[&Self],
+        transfer: impl FnOnce() -> Result<()> + Send,
+    ) -> Result<()> {
+        let scopes = originals.iter().map(|item| &item.scope).collect::<Vec<_>>();
+        let batch = RepositoryReadScope::prepare_all_current(&scopes)?;
+        let mut owners = originals
+            .iter()
+            .map(|item| item.owner.clone())
+            .collect::<Vec<_>>();
+        owners.sort_unstable_by_key(Arc::as_ptr);
+        owners.dedup_by(|left, right| Arc::ptr_eq(left, right));
+        let indices = originals
+            .iter()
+            .map(|item| {
+                owners
+                    .binary_search_by_key(&Arc::as_ptr(&item.owner), Arc::as_ptr)
+                    .expect("captured owner remains retained")
+            })
+            .collect::<Vec<_>>();
+        let settings = owners
+            .iter()
+            .map(|owner| owner.settings.get().ok_or(Error::Unverified))
+            .collect::<Result<Vec<_>>>()?;
+
+        // All groups use this same rank order, including owners which share a
+        // directory. No per-owner lock is reacquired inside the directory action.
+        let configs = settings
+            .iter()
+            .map(|settings| settings.config.lock().map_err(|_| Error::Indeterminate))
+            .collect::<Result<Vec<_>>>()?;
+        let descriptors = owners
+            .iter()
+            .map(|owner| owner.descriptor.lock().map_err(|_| Error::Indeterminate))
+            .collect::<Result<Vec<_>>>()?;
+        batch.with_current(|selected| {
+            let proofs = owners
+                .iter()
+                .map(|owner| {
+                    owner
+                        .evidence
+                        .published
+                        .lock()
+                        .map_err(|_| Error::Indeterminate)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for ((original, index), selected) in originals.iter().zip(indices).zip(selected) {
+                original.check_source(
+                    settings[index],
+                    &configs[index],
+                    descriptors[index].as_ref(),
+                    proofs[index].as_deref(),
+                    selected,
+                )?;
+            }
+            transfer()
+        })
+    }
+
+    /// Lock order: settings config -> descriptor -> directory -> source proof.
+    /// Only a prebuilt, synchronous metadata/ownership action may run here.
+    pub(crate) fn with_current(
+        &self,
+        action: &mut (dyn FnMut() -> Result<()> + Send),
+    ) -> Result<()> {
+        let settings = self.owner.settings.get().ok_or(Error::Unverified)?;
+        let config = settings.config.lock().map_err(|_| Error::Indeterminate)?;
+        let descriptor = self
+            .owner
+            .descriptor
+            .lock()
+            .map_err(|_| Error::Indeterminate)?;
+        self.scope.with_current(&mut |selected| {
+            let proof = self
+                .owner
+                .evidence
+                .published
+                .lock()
+                .map_err(|_| Error::Indeterminate)?;
+            self.check_source(
+                settings,
+                &config,
+                descriptor.as_ref(),
+                proof.as_deref(),
+                selected,
+            )?;
+            action()
+        })
+    }
+
+    pub(crate) fn with_response(
+        &self,
+        attribution: &RepositoryResponseAttribution,
+        target: &intent_core::ReviewTarget,
+        apply: &mut (dyn FnMut(RepositoryResponseDisposition) -> Result<()> + Send),
+    ) -> Result<()> {
+        let settings = self.owner.settings.get().ok_or(Error::Unverified)?;
+        let config = settings.config.lock().map_err(|_| Error::Indeterminate)?;
+        let descriptor = self
+            .owner
+            .descriptor
+            .lock()
+            .map_err(|_| Error::Indeterminate)?;
+        self.scope
+            .with_response(attribution, target, &mut |disposition, selected| {
+                let proof = self
+                    .owner
+                    .evidence
+                    .published
+                    .lock()
+                    .map_err(|_| Error::Indeterminate)?;
+                if let Some(selected) = selected {
+                    self.check_source(
+                        settings,
+                        &config,
+                        descriptor.as_ref(),
+                        proof.as_deref(),
+                        selected,
+                    )?;
+                }
+                // Rejection's accepted event survives its own directory disconnect.
+                // NoDenial likewise says nothing about successful payload eligibility.
+                apply(disposition)
+            })
+    }
+
+    fn check_source(
+        &self,
+        settings: &super::adoption::SettingsAttachment,
+        config: &intent_core::settings_file::GitlabSettings,
+        descriptor: Option<&GitlabDescriptor>,
+        proof: Option<&AttestedSource>,
+        selected: &RepositorySecretRequest,
+    ) -> Result<()> {
+        if settings.source.is_none()
+            || settings.store.is_none()
+            || selected.source != RepositoryCredentialSource::GitlabSecretSlot
+        {
+            return Err(Error::Unverified);
+        }
+        let proof = proof.ok_or(Error::Unverified)?;
+        if proof.request != *selected {
+            return Err(Error::SecretMismatch);
+        }
+        let expected = self.scope.descriptor();
+        if descriptor != Some(expected)
+            || proof.descriptor != *expected
+            || super::adoption::approved_descriptor(config, settings.fixture.as_ref()).as_ref()
+                != Some(expected)
+        {
+            return Err(Error::BoundaryMismatch);
+        }
+        Ok(())
+    }
+}
+
 impl crate::Services {
+    /// Observe only this Services instance's original settled, paired owner.
+    /// This reads no secret and supplies no caller, target or read authority.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "original NativeRead source consumer remains separately owned"
+        )
+    )]
+    pub(crate) fn gitlab_repository_settled_connection(
+        &self,
+    ) -> Result<super::RepositorySettledConnection> {
+        let gate = self.gitlab_credential_gate.clone();
+        let owner = gate.repository.get().cloned().ok_or(Error::Unverified)?;
+        RepositorySettledConnection::observe(gate, owner, None)
+    }
+
+    /// Capture only this Services instance's installed owner and actual read
+    /// admission. Dispatch deadlines do not govern eligibility of retained data.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "qualified cache consumption remains separately owned"
+        )
+    )]
+    pub(crate) fn gitlab_repository_read_eligibility(
+        &self,
+        admission: &RepositoryCredentialAdmission,
+    ) -> Result<super::RepositoryReadEligibility> {
+        let owner = self
+            .gitlab_credential_gate
+            .repository
+            .get()
+            .cloned()
+            .ok_or(Error::Unverified)?;
+        let scope = RepositoryReadScope::capture(owner.directory.clone(), admission)?;
+        Ok(RepositoryReadEligibility { owner, scope })
+    }
+
     /// Capture the original installed source, with no selectable replacement.
     #[cfg_attr(
         not(test),
@@ -284,3 +589,9 @@ impl RepositorySecretReader for GitlabRepositorySecretReader {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+// The standalone credential test wrapper has no Services owner. Include these
+// real-owner interaction cases only in the library's existing private owner.
+#[cfg(test)]
+#[path = "../../../tests/repository_credentials/read.rs"]
+mod read_tests;

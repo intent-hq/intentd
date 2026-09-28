@@ -453,39 +453,37 @@ impl ReviewObservations {
         error: Error,
         quota: RateLimitStatus,
     ) -> Result<(Error, RateLimitStatus), Ineligible> {
-        let error = self.item.failure(ticket.item, error, |error| {
-            matches!(
-                error,
-                Error::Provider(ProviderFailure {
-                    kind: ProviderFailureKind::ResourceDenied,
-                    ..
-                })
-            )
+        let kind = match &error {
+            Error::Provider(failure) => Some(failure.kind),
+            _ => None,
+        };
+        self.failure_kind(ticket, kind)?;
+        Ok((error, quota))
+    }
+
+    /// Apply already-attributed provider breadth under the cache and original
+    /// authority/response guards. A raw managed error is not attribution.
+    pub(crate) fn failure_kind(
+        &mut self,
+        ticket: ObservationTicket,
+        kind: Option<ProviderFailureKind>,
+    ) -> Result<(), Ineligible> {
+        self.item.failure(ticket.item, (), |()| {
+            kind == Some(ProviderFailureKind::ResourceDenied)
         })?;
-        let error = self.project.failure(ticket.project, error, |_| false)?;
-        // Both private tickets must belong to this active slot before broad
-        // evidence can invalidate any of its siblings.
-        match &error {
-            Error::Provider(ProviderFailure {
-                kind: ProviderFailureKind::ResourceDenied,
-                ..
-            }) => self
+        self.project.failure(ticket.project, (), |()| false)?;
+        match kind {
+            Some(ProviderFailureKind::ResourceDenied) => self
                 .project_scope
                 .history
                 .lock()
                 .unwrap()
                 .record(self.key().resource.clone(), SummaryChange::Denied),
-            Error::Provider(ProviderFailure {
-                kind: ProviderFailureKind::CredentialRejected,
-                ..
-            }) => self.connection_scope.deny(),
-            Error::Provider(ProviderFailure {
-                kind: ProviderFailureKind::ProjectDenied,
-                ..
-            }) => self.project_scope.scope.deny(),
+            Some(ProviderFailureKind::CredentialRejected) => self.connection_scope.deny(),
+            Some(ProviderFailureKind::ProjectDenied) => self.project_scope.scope.deny(),
             _ => {}
         }
-        Ok((error, quota))
+        Ok(())
     }
 
     /// Preserve the provider's partial/unknown fields and quota evidence.

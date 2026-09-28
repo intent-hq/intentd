@@ -12,6 +12,7 @@
 //! daily-rotated per-agent log file (STAB-53).
 
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -22,6 +23,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::sync::{mpsc, oneshot, watch, Notify};
 use tokio::task::JoinHandle;
 
+use crate::callback_registration::{CallbackFailure, CallbackToolRoutes};
 use crate::error::{AcpError, AcpResult, JsonRpcError};
 
 /// Default per-request timeout (§6.4). `initialize` uses its own, more
@@ -61,6 +63,33 @@ struct PendingEntryGuard {
 impl Drop for PendingEntryGuard {
     fn drop(&mut self) {
         self.pending.lock().unwrap().remove(&self.id);
+    }
+}
+
+pub(crate) enum CallbackRequestOutcome {
+    Response(Value),
+    NotSent(CallbackFailure),
+    Unknown(CallbackFailure),
+}
+
+// Unlike ordinary pending cleanup, an abandoned callback request also attempts
+// peer cancellation. No await, task, or retry is allowed in this guard.
+struct CallbackPendingGuard<'a> {
+    connection: &'a Connection,
+    id: i64,
+    queued: bool,
+    completed: bool,
+}
+
+impl Drop for CallbackPendingGuard<'_> {
+    fn drop(&mut self) {
+        self.connection.pending.lock().unwrap().remove(&self.id);
+        if self.queued && !self.completed {
+            let _ = self.connection.try_notify(
+                "$/cancel_request",
+                &serde_json::json!({"requestId":self.id}),
+            );
+        }
     }
 }
 
@@ -350,6 +379,7 @@ fn dispatch(
 /// so the detached drain (and its capture file) may outlive the connection
 /// until that process exits or the daemon's shutdown sweep reaps it.
 pub struct Connection {
+    callback_routes: Arc<CallbackToolRoutes>,
     writer_tx: mpsc::Sender<String>,
     pending: PendingMap,
     next_id: AtomicI64,
@@ -533,6 +563,7 @@ impl Connection {
         }
 
         Self {
+            callback_routes: Arc::new(CallbackToolRoutes::default()),
             writer_tx,
             pending,
             next_id: AtomicI64::new(1),
@@ -545,6 +576,69 @@ impl Connection {
             stderr_captured,
             auth_required,
             tasks,
+        }
+    }
+
+    /// Historical callback attribution belonging only to this connection.
+    #[must_use]
+    pub fn callback_tool_routes(&self) -> Arc<CallbackToolRoutes> {
+        Arc::clone(&self.callback_routes)
+    }
+
+    pub(crate) async fn request_callback(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        cancelled: impl Future<Output = ()>,
+    ) -> CallbackRequestOutcome {
+        let deadline = tokio::time::sleep(timeout);
+        tokio::pin!(deadline, cancelled);
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().unwrap().insert(id, tx);
+        let mut guard = CallbackPendingGuard {
+            connection: self,
+            id,
+            queued: false,
+            completed: false,
+        };
+        if self.auth_required.load(Ordering::SeqCst) {
+            return CallbackRequestOutcome::NotSent(CallbackFailure::Connection(AcpError::Rpc(
+                authentication_required(),
+            )));
+        }
+        let line = match encode_message(Some(id), method, &params) {
+            Ok(line) => line,
+            Err(error) => {
+                return CallbackRequestOutcome::NotSent(CallbackFailure::Connection(error))
+            }
+        };
+        // Reserving is cancellation-safe. The queued flag and send occur in the
+        // same poll, with no await between them; NotSent therefore means no send.
+        let permit = tokio::select! {
+            biased;
+            () = &mut cancelled => return CallbackRequestOutcome::NotSent(CallbackFailure::Cancelled),
+            () = &mut deadline => return CallbackRequestOutcome::NotSent(CallbackFailure::Deadline),
+            permit = self.writer_tx.reserve() => match permit {
+                Ok(permit) => permit,
+                Err(_) => return CallbackRequestOutcome::NotSent(CallbackFailure::Connection(AcpError::Transport("writer task closed".into()))),
+            },
+        };
+        guard.queued = true;
+        permit.send(line);
+        tokio::select! {
+            biased;
+            () = &mut cancelled => CallbackRequestOutcome::Unknown(CallbackFailure::Cancelled),
+            () = &mut deadline => CallbackRequestOutcome::Unknown(CallbackFailure::Deadline),
+            response = rx => match response {
+                Ok(Ok(value)) => {
+                    guard.completed = true;
+                    CallbackRequestOutcome::Response(value)
+                }
+                Ok(Err(error)) => CallbackRequestOutcome::Unknown(CallbackFailure::Connection(AcpError::Rpc(error))),
+                Err(_) => CallbackRequestOutcome::Unknown(CallbackFailure::Connection(AcpError::Transport("response channel dropped".into()))),
+            },
         }
     }
 

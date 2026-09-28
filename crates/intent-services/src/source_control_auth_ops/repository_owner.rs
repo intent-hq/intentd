@@ -10,6 +10,8 @@ mod secret_reader;
 #[cfg(test)]
 pub(crate) mod secret_reader;
 pub(crate) use adoption::{logical_instance, RepositorySettingsWrite};
+pub(crate) use secret_reader::RepositoryReadEligibility;
+pub(crate) use secret_reader::RepositorySettledConnection;
 
 use intent_sourcecontrol::gitlab_auth::{
     GitlabWriteObserver, GitlabWriteOutcome, PersistenceLease,

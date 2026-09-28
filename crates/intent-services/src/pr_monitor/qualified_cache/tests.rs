@@ -1201,3 +1201,1037 @@ async fn qualified_and_legacy_rows_share_caps_and_monitor_exemptions_survive_leg
         "one combined bound"
     );
 }
+
+// Real original owner/file/HTTP composition. Caller authority is explicitly
+// injected; this suite does not install an RPC or final-delivery authority.
+mod managed {
+    use super::*;
+    use crate::repository_credentials::authority::{
+        CredentialFuture, RepositoryAuthority, RepositoryAuthorityFence,
+        RepositoryAuthorityRequest, RepositoryCredentialTransport,
+    };
+    use crate::repository_credentials::read::RepositoryReadOperation;
+    use crate::repository_credentials::{
+        RepositoryCredentialAdmission, RepositoryCredentialError as Error, RepositoryCredentialUse,
+        Result,
+    };
+    use crate::source_control_auth_ops::repository_owner::secret_reader::tests::{Fixture, Server};
+    use crate::source_control_auth_ops::repository_owner::RepositoryReadEligibility;
+    use intent_sourcecontrol::{
+        gitlab_token::{EXPIRES_AT_SECRET_ACCOUNT, REFRESH_SECRET_ACCOUNT},
+        GitlabDescriptor,
+    };
+    use serde_json::json;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::Notify;
+    use tokio::time::timeout;
+    const BUDGET: Duration = Duration::from_secs(5);
+    const MR: &str = "/api/v4/projects/group%2Fproject/merge_requests/4";
+    const PROJECT: &str = "/api/v4/projects/group%2Fproject";
+    const ISSUE: &str = "/api/v4/projects/group%2Fproject/issues/4";
+
+    #[derive(Default)]
+    struct InjectedAuthority {
+        denied: AtomicBool,
+        calls: AtomicUsize,
+    }
+    impl RepositoryAuthority for InjectedAuthority {
+        fn revalidate<'a>(
+            &'a self,
+            _: &'a RepositoryAuthorityRequest,
+        ) -> CredentialFuture<'a, Box<dyn RepositoryAuthorityFence>> {
+            Box::pin(async {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if self.denied.load(Ordering::SeqCst) {
+                    return Err(Error::AuthorityDenied);
+                }
+                Ok(Box::new(InjectedFence) as Box<dyn RepositoryAuthorityFence>)
+            })
+        }
+    }
+    struct InjectedFence;
+    impl RepositoryAuthorityFence for InjectedFence {
+        fn dispatch(
+            self: Box<Self>,
+            action: &mut (dyn FnMut() -> Result<()> + Send),
+        ) -> Result<()> {
+            action()
+        }
+    }
+
+    #[derive(Default)]
+    struct Replies {
+        statuses: Mutex<HashMap<String, u16>>,
+        pause: Mutex<Option<String>>,
+        entered: Notify,
+        release: Notify,
+        calls: Mutex<Vec<String>>,
+    }
+    struct ReadServer {
+        fixture: Server,
+        replies: Arc<Replies>,
+        task: tokio::task::JoinHandle<()>,
+    }
+    impl Drop for ReadServer {
+        fn drop(&mut self) {
+            self.replies.release.notify_waiters();
+            self.task.abort();
+        }
+    }
+    impl ReadServer {
+        async fn new() -> Self {
+            let mut fixture = Server::new().await;
+            let upstream = fixture
+                .host
+                .base_url()
+                .trim_start_matches("http://")
+                .trim_end_matches('/')
+                .to_owned();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            // Only select the disposable endpoint BEFORE original Services creation.
+            // Auth/adoption still forwards to the unchanged original owner fixture.
+            fixture.host = intent_sourcecontrol::GitlabHost::parse("gitlab.test")
+                .unwrap()
+                .with_api_origin(&endpoint)
+                .unwrap();
+            fixture.descriptor = GitlabDescriptor::with_loopback_endpoint(
+                fixture.descriptor.instance().clone(),
+                &endpoint,
+            )
+            .unwrap();
+            let replies = Arc::new(Replies::default());
+            let control = replies.clone();
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((mut socket, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let control = control.clone();
+                    let upstream = upstream.clone();
+                    tokio::spawn(async move {
+                        let mut request = Vec::new();
+                        let mut buf = [0_u8; 4096];
+                        loop {
+                            let Ok(n) = socket.read(&mut buf).await else {
+                                return;
+                            };
+                            if n == 0 {
+                                return;
+                            }
+                            request.extend_from_slice(&buf[..n]);
+                            assert!(request.len() < 65_536);
+                            if let Some(end) = request.windows(4).position(|b| b == b"\r\n\r\n") {
+                                let header = String::from_utf8_lossy(&request[..end]);
+                                let len = header
+                                    .lines()
+                                    .find_map(|line| {
+                                        let (k, v) = line.split_once(':')?;
+                                        k.eq_ignore_ascii_case("content-length")
+                                            .then(|| v.trim().parse::<usize>().unwrap())
+                                    })
+                                    .unwrap_or(0);
+                                if request.len() >= end + 4 + len {
+                                    break;
+                                }
+                            }
+                        }
+                        let text = String::from_utf8_lossy(&request);
+                        let path = text.split_whitespace().nth(1).unwrap().to_owned();
+                        if !path.starts_with("/api/v4/projects/") {
+                            let mut remote =
+                                tokio::net::TcpStream::connect(&upstream).await.unwrap();
+                            remote.write_all(&request).await.unwrap();
+                            let mut response = Vec::new();
+                            remote.read_to_end(&mut response).await.unwrap();
+                            let _ = socket.write_all(&response).await;
+                            return;
+                        }
+                        assert!(
+                            text.contains("stored-pat")
+                                || text.contains("rotated")
+                                || text.contains("pat-second"),
+                            "only real original-owner tokens reach this fixture"
+                        );
+                        control.calls.lock().unwrap().push(path.clone());
+                        let status = *control.statuses.lock().unwrap().get(&path).unwrap_or(&200);
+                        let pause = {
+                            let mut pause = control.pause.lock().unwrap();
+                            if pause.as_ref() == Some(&path) {
+                                pause.take();
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if pause {
+                            control.entered.notify_one();
+                            control.release.notified().await;
+                        }
+                        let body=if path==PROJECT {
+                        json!({"id":42,"path_with_namespace":"group/project",
+                            "only_allow_merge_if_pipeline_succeeds":false,
+                            "only_allow_merge_if_all_discussions_are_resolved":false})
+                    } else if path.ends_with("/approvals") {
+                        json!({"approvals_required":0,"approvals_left":0,"approved_by":[]})
+                    } else if path.contains("/discussions") { json!([]) }
+                    else if path==MR {
+                        json!({"iid":4,"web_url":"https://gitlab.test/forge/group/project/-/merge_requests/4",
+                            "title":"actual review","state":"opened","draft":false,"source_branch":"feature","target_branch":"main",
+                            "source_project_id":42,"target_project_id":42,"created_at":"2026-09-27T00:00:00Z","updated_at":"2026-09-27T00:00:00Z"})
+                    } else {
+                        json!({"iid":4,"web_url":"https://gitlab.test/forge/group/project/-/issues/4",
+                            "title":"actual issue","state":"opened","created_at":"2026-09-27T00:00:00Z","updated_at":"2026-09-27T00:00:00Z"})
+                    }.to_string();
+                        let extra = if status == 429 {
+                            "Retry-After: 60\r\n"
+                        } else {
+                            ""
+                        };
+                        let response=format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRateLimit-Remaining: 23\r\nRateLimit-Reset: 4000000000\r\n{extra}Connection: close\r\n\r\n{body}",body.len());
+                        let _ = socket.write_all(response.as_bytes()).await;
+                    });
+                }
+            });
+            Self {
+                fixture,
+                replies,
+                task,
+            }
+        }
+        fn status(&self, path: &str, status: u16) {
+            self.replies
+                .statuses
+                .lock()
+                .unwrap()
+                .insert(path.into(), status);
+        }
+        fn pause(&self, path: &str) {
+            *self.replies.pause.lock().unwrap() = Some(path.into());
+        }
+        async fn entered(&self) {
+            timeout(BUDGET, self.replies.entered.notified())
+                .await
+                .unwrap();
+        }
+        fn resume(&self) {
+            self.replies.release.notify_one();
+        }
+        fn count(&self) -> usize {
+            self.replies.calls.lock().unwrap().len()
+        }
+    }
+
+    struct ReadFixture {
+        auth: Fixture,
+        authority: Arc<InjectedAuthority>,
+    }
+    impl ReadFixture {
+        async fn new(server: &ReadServer, oauth: bool) -> Self {
+            let auth = if oauth {
+                let f = Fixture::unadopted(&server.fixture).await;
+                f.service
+                    .gitlab_secret_store
+                    .store(REFRESH_SECRET_ACCOUNT, "refresh-old")
+                    .unwrap();
+                let expiry = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 7200;
+                f.service
+                    .gitlab_secret_store
+                    .store(EXPIRES_AT_SECRET_ACCOUNT, &expiry.to_string())
+                    .unwrap();
+                f.service
+                    .reconcile_gitlab_repository_binding()
+                    .await
+                    .unwrap();
+                f
+            } else {
+                Fixture::new(&server.fixture).await
+            };
+            Self {
+                auth,
+                authority: Arc::new(InjectedAuthority::default()),
+            }
+        }
+        fn target(&self, kind: RepositoryResourceKind) -> ReviewTarget {
+            ReviewTarget {
+                repository: RepositoryTarget {
+                    provider: RepositoryProvider::Gitlab,
+                    instance_base_url: self.auth.request().binding.account.instance_base_url,
+                    project_path: "group/project".into(),
+                },
+                kind,
+                number: 4,
+            }
+        }
+        fn admission(&self, server: &ReadServer) -> RepositoryCredentialAdmission {
+            let directory = self.auth.service.repository_connection_directory();
+            let binding = directory.binding().unwrap();
+            directory
+                .admit(
+                    &binding,
+                    RepositoryAuthorityRequest {
+                        execution: ExecutionScope {
+                            daemon_id: binding.daemon_id.clone(),
+                            authority_scope_id: "injected-reader-test".into(),
+                            authority_generation: 1,
+                        },
+                        connection: binding.scope.clone(),
+                        target: self.target(RepositoryResourceKind::MergeRequest).repository,
+                        use_kind: RepositoryCredentialUse::NativeRead,
+                        allowed_transport: RepositoryCredentialTransport::GitlabApi(
+                            server.fixture.descriptor.clone(),
+                        ),
+                    },
+                    self.authority.clone(),
+                )
+                .unwrap()
+        }
+        fn operation(
+            &self,
+            server: &ReadServer,
+            kind: RepositoryResourceKind,
+        ) -> (
+            RepositoryReadEligibility,
+            RepositoryReadOperation,
+            ReviewTarget,
+        ) {
+            let target = self.target(kind);
+            let admission = self.admission(server);
+            let eligibility = self
+                .auth
+                .service
+                .gitlab_repository_read_eligibility(&admission)
+                .unwrap();
+            let operation = RepositoryReadOperation::new(
+                self.auth.service.repository_connection_directory(),
+                admission,
+                self.auth.service.gitlab_repository_secret_reader().unwrap(),
+                BUDGET,
+                target.clone(),
+            )
+            .unwrap();
+            (eligibility, operation, target)
+        }
+        async fn refresh(&self, server: &ReadServer) {
+            self.auth
+                .service
+                .gitlab_secret_store
+                .store(EXPIRES_AT_SECRET_ACCOUNT, "0")
+                .unwrap();
+            self.auth
+                .service
+                .stored_proof_token(&crate::source_control_auth_ops::Target::Gitlab {
+                    host: server.fixture.host.clone(),
+                })
+                .await
+                .unwrap();
+        }
+    }
+
+    fn connection(f: &ReadFixture) -> ConnectionObservations {
+        let binding = f
+            .auth
+            .service
+            .repository_connection_directory()
+            .binding()
+            .unwrap();
+        ConnectionObservations::new(
+            ExecutionScope {
+                daemon_id: binding.daemon_id,
+                authority_scope_id: "injected-reader-test".into(),
+                authority_generation: 1,
+            },
+            binding.scope,
+        )
+    }
+
+    // The exact P envelope is consumed by the managed path. No response stamp
+    // or denial predicate is constructed by this test bridge.
+    async fn issue_read(
+        cache: &IssueCache,
+        c: &ConnectionObservations,
+        t: &ReviewTarget,
+        e: &RepositoryReadEligibility,
+        f: &ReadFixture,
+        age: Duration,
+        op: RepositoryReadOperation,
+    ) -> std::result::Result<CacheRead<Issue>, CacheFailure> {
+        let check = || {
+            if f.authority.denied.load(Ordering::SeqCst) {
+                Err(intent_core::Error::Internal("fixture retired".into()))
+            } else {
+                Ok(())
+            }
+        };
+        let fence = |action: &mut CacheAdmissionAction<'_>| {
+            if f.authority.denied.load(Ordering::SeqCst) {
+                Err(Error::AuthorityDenied)
+            } else {
+                action()
+            }
+        };
+        let request = ManagedCacheRequest {
+            request: CacheRequest {
+                connection: c,
+                target: t,
+                revalidate: &check,
+            },
+            eligibility: e,
+            with_authority: &fence,
+        };
+        crate::issue_cache::read_managed_issue(cache, &request, age, || op.read_issue()).await
+    }
+    async fn review_read(
+        cache: &PrCache,
+        c: &ConnectionObservations,
+        t: &ReviewTarget,
+        e: &RepositoryReadEligibility,
+        f: &ReadFixture,
+        age: Duration,
+        op: RepositoryReadOperation,
+    ) -> std::result::Result<CacheRead<ReviewObservation>, CacheFailure> {
+        let check = || {
+            if f.authority.denied.load(Ordering::SeqCst) {
+                Err(intent_core::Error::Internal("fixture retired".into()))
+            } else {
+                Ok(())
+            }
+        };
+        let fence = |action: &mut CacheAdmissionAction<'_>| {
+            if f.authority.denied.load(Ordering::SeqCst) {
+                Err(Error::AuthorityDenied)
+            } else {
+                action()
+            }
+        };
+        let request = ManagedCacheRequest {
+            request: CacheRequest {
+                connection: c,
+                target: t,
+                revalidate: &check,
+            },
+            eligibility: e,
+            with_authority: &fence,
+        };
+        read_managed_review(
+            cache,
+            &request,
+            PrReadPolicy::Serve { max_age: age },
+            &HashSet::new(),
+            || async { panic!("Serve never polls") },
+            || op.review_observation(),
+        )
+        .await
+    }
+    fn provider_error<T: std::fmt::Debug>(
+        r: std::result::Result<CacheRead<T>, CacheFailure>,
+        kind: ProviderFailureKind,
+        status: u16,
+    ) {
+        let err = r.unwrap_err();
+        assert!(
+            matches!(&err.cause,CacheError::Provider(intent_sourcecontrol::Error::Provider(f)) if f.kind==kind && f.status==Some(status)),
+            "original provider error must survive: {err:?}"
+        );
+        assert_eq!(err.quota.remaining, Some(23));
+    }
+    fn serveable<K: Eq + Hash, L, T>(
+        cache: &SharedCache<K, L, T>,
+        c: &ConnectionObservations,
+        t: &ReviewTarget,
+    ) -> bool {
+        let locked = cache.lock().unwrap();
+        let Some(CacheSlot::Qualified(slot)) =
+            locked.get(&CacheKey::Qualified(Box::new(c.key(t.clone()))))
+        else {
+            return false;
+        };
+        slot.payload
+            .as_ref()
+            .is_some_and(|p| slot.observations.can_serve(&p.receipt, c))
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn current_401_keeps_raw_error_and_denies_review_and_issue() {
+        let s = ReadServer::new().await;
+        let f = ReadFixture::new(&s, true).await;
+        let c = connection(&f);
+        let issues = IssueCache::default();
+        let reviews = PrCache::default();
+        let (e, op, t) = f.operation(&s, RepositoryResourceKind::Issue);
+        issue_read(&issues, &c, &t, &e, &f, Duration::ZERO, op)
+            .await
+            .unwrap();
+        let (re, op, rt) = f.operation(&s, RepositoryResourceKind::MergeRequest);
+        let warm = review_read(&reviews, &c, &rt, &re, &f, Duration::ZERO, op)
+            .await
+            .unwrap();
+        assert!(complete_snapshot(&warm.value));
+        let (_, op, _) = f.operation(&s, RepositoryResourceKind::Issue);
+        s.status(ISSUE, 401);
+        provider_error(
+            issue_read(&issues, &c, &t, &e, &f, Duration::ZERO, op).await,
+            ProviderFailureKind::CredentialRejected,
+            401,
+        );
+        assert!(e.check().is_err());
+        assert!(!serveable(&issues, &c, &t));
+        assert!(!serveable(&reviews, &c, &rt));
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn obsolete_401_does_not_deny_fresh_cache_after_same_binding_refresh() {
+        let s = Arc::new(ReadServer::new().await);
+        let f = Arc::new(ReadFixture::new(&s, true).await);
+        let c = Arc::new(connection(&f));
+        let cache = IssueCache::default();
+        let (e, op, t) = f.operation(&s, RepositoryResourceKind::Issue);
+        issue_read(&cache, &c, &t, &e, &f, Duration::ZERO, op)
+            .await
+            .unwrap();
+        s.status(ISSUE, 401);
+        s.pause(ISSUE);
+        let pending = {
+            let f = f.clone();
+            let s = s.clone();
+            let c = c.clone();
+            let cache = cache.clone();
+            tokio::spawn(async move {
+                let (e, op, t) = f.operation(&s, RepositoryResourceKind::Issue);
+                issue_read(&cache, &c, &t, &e, &f, Duration::ZERO, op).await
+            })
+        };
+        s.entered().await;
+        f.refresh(&s).await;
+        s.status(ISSUE, 200);
+        let (_, op, _) = f.operation(&s, RepositoryResourceKind::Issue);
+        issue_read(&cache, &c, &t, &e, &f, Duration::ZERO, op)
+            .await
+            .unwrap();
+        s.resume();
+        provider_error(
+            pending.await.unwrap(),
+            ProviderFailureKind::CredentialRejected,
+            401,
+        );
+        assert!(
+            serveable(&cache, &c, &t),
+            "old secret rejection must not deny the refreshed cache"
+        );
+        let before = s.count();
+        let (_, op, _) = f.operation(&s, RepositoryResourceKind::Issue);
+        assert!(
+            !issue_read(&cache, &c, &t, &e, &f, Duration::from_secs(60), op)
+                .await
+                .unwrap()
+                .fetched
+        );
+        assert_eq!(s.count(), before);
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn obsolete_project_denial_does_not_deny_a_refreshed_review() {
+        let s = Arc::new(ReadServer::new().await);
+        let f = Arc::new(ReadFixture::new(&s, true).await);
+        let c = Arc::new(connection(&f));
+        let cache = PrCache::default();
+        let (e, op, t) = f.operation(&s, RepositoryResourceKind::MergeRequest);
+        assert!(complete_snapshot(
+            &review_read(&cache, &c, &t, &e, &f, Duration::ZERO, op)
+                .await
+                .unwrap()
+                .value
+        ));
+        s.status(PROJECT, 403);
+        s.pause(PROJECT);
+        let pending = {
+            let f = f.clone();
+            let s = s.clone();
+            let c = c.clone();
+            let cache = cache.clone();
+            tokio::spawn(async move {
+                let (e, op, t) = f.operation(&s, RepositoryResourceKind::MergeRequest);
+                review_read(&cache, &c, &t, &e, &f, Duration::ZERO, op).await
+            })
+        };
+        s.entered().await;
+        f.refresh(&s).await;
+        s.status(PROJECT, 200);
+        let (_, op, _) = f.operation(&s, RepositoryResourceKind::MergeRequest);
+        review_read(&cache, &c, &t, &e, &f, Duration::ZERO, op)
+            .await
+            .unwrap();
+        s.resume();
+        provider_error(
+            pending.await.unwrap(),
+            ProviderFailureKind::ProjectDenied,
+            403,
+        );
+        assert!(
+            serveable(&cache, &c, &t),
+            "obsolete project response cannot deny newer settled source"
+        );
+    }
+    #[intent_test_macros::daemon_test]
+    async fn same_revision_late_project_denial_is_not_waived_by_newer_success() {
+        let s = Arc::new(ReadServer::new().await);
+        let f = Arc::new(ReadFixture::new(&s, true).await);
+        let c = Arc::new(connection(&f));
+        let reviews = PrCache::default();
+        let issues = IssueCache::default();
+        let (e, op, t) = f.operation(&s, RepositoryResourceKind::MergeRequest);
+        review_read(&reviews, &c, &t, &e, &f, Duration::ZERO, op)
+            .await
+            .unwrap();
+        let (ie, op, it) = f.operation(&s, RepositoryResourceKind::Issue);
+        issue_read(&issues, &c, &it, &ie, &f, Duration::ZERO, op)
+            .await
+            .unwrap();
+        s.status(PROJECT, 404);
+        s.pause(PROJECT);
+        let pending = {
+            let f = f.clone();
+            let s = s.clone();
+            let c = c.clone();
+            let reviews = reviews.clone();
+            tokio::spawn(async move {
+                let (e, op, t) = f.operation(&s, RepositoryResourceKind::MergeRequest);
+                review_read(&reviews, &c, &t, &e, &f, Duration::ZERO, op).await
+            })
+        };
+        s.entered().await;
+        s.status(PROJECT, 200);
+        let (_, op, _) = f.operation(&s, RepositoryResourceKind::MergeRequest);
+        review_read(&reviews, &c, &t, &e, &f, Duration::ZERO, op)
+            .await
+            .unwrap();
+        s.resume();
+        provider_error(
+            pending.await.unwrap(),
+            ProviderFailureKind::ProjectDenied,
+            404,
+        );
+        assert!(!serveable(&reviews, &c, &t));
+        assert!(!serveable(&issues, &c, &it));
+        let (_, op, _) = f.operation(&s, RepositoryResourceKind::Issue);
+        issue_read(&issues, &c, &it, &ie, &f, Duration::ZERO, op)
+            .await
+            .unwrap();
+        assert!(serveable(&issues, &c, &it));
+        assert!(
+            !serveable(&reviews, &c, &t),
+            "fresh issue cannot revive old review"
+        );
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn quota_partial_keeps_old_cache_time_and_hit_but_blocks_dispatch() {
+        let s = ReadServer::new().await;
+        let f = ReadFixture::new(&s, false).await;
+        let c = connection(&f);
+        let cache = PrCache::default();
+        let (e, op, t) = f.operation(&s, RepositoryResourceKind::MergeRequest);
+        review_read(&cache, &c, &t, &e, &f, Duration::ZERO, op)
+            .await
+            .unwrap();
+        let key = CacheKey::Qualified(Box::new(c.key(t.clone())));
+        let before = {
+            let locked = cache.lock().unwrap();
+            let CacheSlot::Qualified(slot) = locked.get(&key).unwrap() else {
+                panic!()
+            };
+            slot.payload.as_ref().unwrap().freshness
+        };
+        s.status(PROJECT, 429);
+        let calls = s.count();
+        let (_, op, _) = f.operation(&s, RepositoryResourceKind::MergeRequest);
+        let partial = review_read(&cache, &c, &t, &e, &f, Duration::ZERO, op)
+            .await
+            .unwrap();
+        assert_eq!(partial.quota.remaining, Some(0));
+        assert_eq!(
+            partial.value.availability.policy,
+            intent_sourcecontrol::ProviderAvailability::RateLimited
+        );
+        assert!(!complete_snapshot(&partial.value));
+        assert_eq!(s.count(), calls + 2);
+        e.check().unwrap();
+        {
+            let locked = cache.lock().unwrap();
+            let CacheSlot::Qualified(slot) = locked.get(&key).unwrap() else {
+                panic!()
+            };
+            let current = slot.payload.as_ref().unwrap().freshness;
+            assert_eq!(current.fetched_at, before.fetched_at);
+            assert_eq!(current.refreshed_at, before.refreshed_at);
+            assert!(!slot.reuse_allowed);
+        }
+        let (_, op, _) = f.operation(&s, RepositoryResourceKind::MergeRequest);
+        let hit = review_read(&cache, &c, &t, &e, &f, Duration::from_secs(60), op)
+            .await
+            .unwrap();
+        assert!(!hit.fetched);
+        assert!(complete_snapshot(&hit.value));
+        assert_eq!(s.count(), calls + 2);
+        let (_, op, _) = f.operation(&s, RepositoryResourceKind::MergeRequest);
+        let failed = review_read(&cache, &c, &t, &e, &f, Duration::ZERO, op)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            failed.cause,
+            CacheError::Provider(intent_sourcecontrol::Error::AdmissionUnavailable(
+                intent_sourcecontrol::error::AdmissionUnavailable::Backoff
+            ))
+        ));
+        assert_eq!(s.count(), calls + 2);
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn caller_refusal_keeps_observed_error_and_quota_without_applying_it() {
+        let s = Arc::new(ReadServer::new().await);
+        let f = Arc::new(ReadFixture::new(&s, false).await);
+        let c = Arc::new(connection(&f));
+        let cache = IssueCache::default();
+        let (e, op, t) = f.operation(&s, RepositoryResourceKind::Issue);
+        issue_read(&cache, &c, &t, &e, &f, Duration::ZERO, op)
+            .await
+            .unwrap();
+        s.status(ISSUE, 403);
+        s.pause(ISSUE);
+        let pending = {
+            let f = f.clone();
+            let s = s.clone();
+            let c = c.clone();
+            let cache = cache.clone();
+            tokio::spawn(async move {
+                let (e, op, t) = f.operation(&s, RepositoryResourceKind::Issue);
+                issue_read(&cache, &c, &t, &e, &f, Duration::ZERO, op).await
+            })
+        };
+        s.entered().await;
+        f.authority.denied.store(true, Ordering::SeqCst);
+        s.resume();
+        provider_error(
+            pending.await.unwrap(),
+            ProviderFailureKind::ResourceDenied,
+            403,
+        );
+        assert!(
+            serveable(&cache, &c, &t),
+            "refused application does not mutate the slot"
+        );
+        let (_, op, _) = f.operation(&s, RepositoryResourceKind::Issue);
+        let calls = s.count();
+        assert!(
+            issue_read(&cache, &c, &t, &e, &f, Duration::from_secs(60), op)
+                .await
+                .is_err()
+        );
+        assert_eq!(s.count(), calls);
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn foreign_success_and_denial_receipts_cannot_apply_to_the_requested_item() {
+        for status in [200, 404] {
+            let s = ReadServer::new().await;
+            let f = ReadFixture::new(&s, false).await;
+            let c = connection(&f);
+            let cache = IssueCache::default();
+            let (e, op, t) = f.operation(&s, RepositoryResourceKind::Issue);
+            issue_read(&cache, &c, &t, &e, &f, Duration::ZERO, op)
+                .await
+                .unwrap();
+            let mut other = t.clone();
+            other.number += 1;
+            let op = RepositoryReadOperation::new(
+                f.auth.service.repository_connection_directory(),
+                f.admission(&s),
+                f.auth.service.gitlab_repository_secret_reader().unwrap(),
+                BUDGET,
+                other,
+            )
+            .unwrap();
+            s.status("/api/v4/projects/group%2Fproject/issues/5", status);
+            let result = issue_read(&cache, &c, &t, &e, &f, Duration::ZERO, op).await;
+            if status == 200 {
+                assert!(matches!(
+                    result.unwrap_err().cause,
+                    CacheError::Credential(Error::BoundaryMismatch)
+                ));
+            } else {
+                provider_error(result, ProviderFailureKind::ResourceDenied, 404);
+            }
+            assert!(serveable(&cache, &c, &t));
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn observed_source_change_blocks_hits_even_after_old_bytes_are_restored() {
+        let s = ReadServer::new().await;
+        let f = ReadFixture::new(&s, false).await;
+        let c = connection(&f);
+        let cache = IssueCache::default();
+        let (e, op, t) = f.operation(&s, RepositoryResourceKind::Issue);
+        issue_read(&cache, &c, &t, &e, &f, Duration::ZERO, op)
+            .await
+            .unwrap();
+        let (_, op, _) = f.operation(&s, RepositoryResourceKind::Issue);
+        let calls = s.count();
+        f.auth
+            .service
+            .gitlab_secret_store
+            .store(
+                intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT,
+                "different-disposable-bytes",
+            )
+            .unwrap();
+        let err = issue_read(&cache, &c, &t, &e, &f, Duration::ZERO, op)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err.cause,
+            CacheError::Provider(intent_sourcecontrol::Error::AdmissionUnavailable(_))
+        ));
+        assert_eq!(s.count(), calls);
+        f.auth
+            .service
+            .gitlab_secret_store
+            .store(
+                intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT,
+                "stored-pat",
+            )
+            .unwrap();
+        assert!(e.check().is_err());
+        let (_, op, _) = f.operation(&s, RepositoryResourceKind::Issue);
+        assert!(
+            issue_read(&cache, &c, &t, &e, &f, Duration::from_secs(60), op)
+                .await
+                .is_err()
+        );
+        assert_eq!(s.count(), calls);
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn poll_full_failure_uses_its_own_response_instead_of_primary_receipt() {
+        let s = ReadServer::new().await;
+        let f = ReadFixture::new(&s, false).await;
+        let c = connection(&f);
+        let cache = PrCache::default();
+        let (e, op, t) = f.operation(&s, RepositoryResourceKind::MergeRequest);
+        review_read(&cache, &c, &t, &e, &f, Duration::ZERO, op)
+            .await
+            .unwrap();
+        // Force a full optional-field attempt after the next primary response.
+        {
+            let mut locked = cache.lock().unwrap();
+            let CacheSlot::Qualified(slot) = locked
+                .get_mut(&CacheKey::Qualified(Box::new(c.key(t.clone()))))
+                .unwrap()
+            else {
+                panic!()
+            };
+            slot.reuse_allowed = false;
+        }
+        let (_, primary, _) = f.operation(&s, RepositoryResourceKind::MergeRequest);
+        let (_, full, _) = f.operation(&s, RepositoryResourceKind::MergeRequest);
+        let check = || Ok(());
+        let fence = |action: &mut CacheAdmissionAction<'_>| action();
+        let request = ManagedCacheRequest {
+            request: CacheRequest {
+                connection: &c,
+                target: &t,
+                revalidate: &check,
+            },
+            eligibility: &e,
+            with_authority: &fence,
+        };
+        let result = read_managed_review(
+            &cache,
+            &request,
+            PrReadPolicy::Poll,
+            &HashSet::new(),
+            || primary.review_details(),
+            || async {
+                s.status(PROJECT, 403);
+                full.review_observation().await
+            },
+        )
+        .await;
+        provider_error(result, ProviderFailureKind::ProjectDenied, 403);
+        assert!(!serveable(&cache, &c, &t));
+    }
+    #[intent_test_macros::daemon_test]
+    async fn managed_pre_denial_success_cannot_revive_after_fresh_recovery() {
+        let s = Arc::new(ReadServer::new().await);
+        let f = Arc::new(ReadFixture::new(&s, false).await);
+        let c = Arc::new(connection(&f));
+        let cache = IssueCache::default();
+        let (e, op, t) = f.operation(&s, RepositoryResourceKind::Issue);
+        issue_read(&cache, &c, &t, &e, &f, Duration::ZERO, op)
+            .await
+            .unwrap();
+        s.pause(ISSUE);
+        let pending = {
+            let f = f.clone();
+            let s = s.clone();
+            let c = c.clone();
+            let cache = cache.clone();
+            tokio::spawn(async move {
+                let (e, op, t) = f.operation(&s, RepositoryResourceKind::Issue);
+                issue_read(&cache, &c, &t, &e, &f, Duration::ZERO, op).await
+            })
+        };
+        s.entered().await;
+        s.status(ISSUE, 404);
+        let (_, op, _) = f.operation(&s, RepositoryResourceKind::Issue);
+        provider_error(
+            issue_read(&cache, &c, &t, &e, &f, Duration::ZERO, op).await,
+            ProviderFailureKind::ResourceDenied,
+            404,
+        );
+        s.status(ISSUE, 200);
+        let (_, op, _) = f.operation(&s, RepositoryResourceKind::Issue);
+        issue_read(&cache, &c, &t, &e, &f, Duration::ZERO, op)
+            .await
+            .unwrap();
+        s.resume();
+        let old = pending.await.unwrap().unwrap_err();
+        assert!(matches!(old.cause, CacheError::Ineligible(_)));
+        assert_eq!(old.quota.remaining, Some(23));
+        assert!(serveable(&cache, &c, &t));
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn managed_eviction_fences_late_success_and_keeps_late_error_unchanged() {
+        for status in [200, 403] {
+            let s = Arc::new(ReadServer::new().await);
+            let f = Arc::new(ReadFixture::new(&s, false).await);
+            let c = Arc::new(connection(&f));
+            let cache = IssueCache::default();
+            let (e, op, t) = f.operation(&s, RepositoryResourceKind::Issue);
+            issue_read(&cache, &c, &t, &e, &f, Duration::ZERO, op)
+                .await
+                .unwrap();
+            s.status(ISSUE, status);
+            s.pause(ISSUE);
+            let pending = {
+                let f = f.clone();
+                let s = s.clone();
+                let c = c.clone();
+                let cache = cache.clone();
+                tokio::spawn(async move {
+                    let (e, op, t) = f.operation(&s, RepositoryResourceKind::Issue);
+                    issue_read(&cache, &c, &t, &e, &f, Duration::ZERO, op).await
+                })
+            };
+            s.entered().await;
+            cache
+                .lock()
+                .unwrap()
+                .remove(&CacheKey::Qualified(Box::new(c.key(t.clone()))));
+            s.status(ISSUE, 200);
+            let (_, op, _) = f.operation(&s, RepositoryResourceKind::Issue);
+            issue_read(&cache, &c, &t, &e, &f, Duration::ZERO, op)
+                .await
+                .unwrap();
+            s.resume();
+            let old = pending.await.unwrap();
+            if status == 200 {
+                assert!(matches!(
+                    old.unwrap_err().cause,
+                    CacheError::Ineligible(Ineligible::DifferentSlot)
+                ));
+            } else {
+                provider_error(old, ProviderFailureKind::ResourceDenied, 403);
+            }
+            assert!(serveable(&cache, &c, &t));
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn obsolete_item_denial_does_not_apply_after_refresh() {
+        for status in [403, 404] {
+            let s = Arc::new(ReadServer::new().await);
+            let f = Arc::new(ReadFixture::new(&s, true).await);
+            let c = Arc::new(connection(&f));
+            let cache = IssueCache::default();
+            let (e, op, t) = f.operation(&s, RepositoryResourceKind::Issue);
+            issue_read(&cache, &c, &t, &e, &f, Duration::ZERO, op)
+                .await
+                .unwrap();
+            s.status(ISSUE, status);
+            s.pause(ISSUE);
+            let pending = {
+                let f = f.clone();
+                let s = s.clone();
+                let c = c.clone();
+                let cache = cache.clone();
+                tokio::spawn(async move {
+                    let (e, op, t) = f.operation(&s, RepositoryResourceKind::Issue);
+                    issue_read(&cache, &c, &t, &e, &f, Duration::ZERO, op).await
+                })
+            };
+            s.entered().await;
+            f.refresh(&s).await;
+            s.status(ISSUE, 200);
+            let (_, op, _) = f.operation(&s, RepositoryResourceKind::Issue);
+            issue_read(&cache, &c, &t, &e, &f, Duration::ZERO, op)
+                .await
+                .unwrap();
+            s.resume();
+            provider_error(
+                pending.await.unwrap(),
+                ProviderFailureKind::ResourceDenied,
+                status,
+            );
+            assert!(serveable(&cache, &c, &t));
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn managed_success_requires_its_opaque_response_receipt() {
+        let s = ReadServer::new().await;
+        let f = ReadFixture::new(&s, false).await;
+        let c = connection(&f);
+        let cache = IssueCache::default();
+        let (e, _op, t) = f.operation(&s, RepositoryResourceKind::Issue);
+        let check = || Ok(());
+        let fence = |action: &mut CacheAdmissionAction<'_>| action();
+        let request = ManagedCacheRequest {
+            request: CacheRequest {
+                connection: &c,
+                target: &t,
+                revalidate: &check,
+            },
+            eligibility: &e,
+            with_authority: &fence,
+        };
+        let access = DetailAccess::Managed(&request);
+        let Started::Read { ticket, .. } =
+            start_access(&cache, access, Duration::ZERO, |_| {}).unwrap()
+        else {
+            panic!()
+        };
+        // A legacy tuple is not proof for the managed success branch.
+        let result = finish_access(
+            &cache,
+            access,
+            ticket,
+            (Ok(super::issue(4, "unattributed")), quota()).into(),
+            |_| true,
+            Freshness::full(),
+            |_| {},
+        );
+        assert!(matches!(
+            result.unwrap_err().cause,
+            CacheError::Credential(Error::BoundaryMismatch)
+        ));
+        assert!(!serveable(&cache, &c, &t));
+        assert_eq!(s.count(), 0);
+    }
+}

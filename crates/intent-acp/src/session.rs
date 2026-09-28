@@ -484,6 +484,25 @@ pub fn map_notification(note: &IncomingNotification) -> Option<MappedUpdate> {
     map_session_update(&parsed.update)
 }
 
+/// Map with exact historical callback names from this original connection.
+/// Only tool attribution changes; titles, authority markers and results remain intact.
+#[must_use]
+pub fn map_notification_with_callback_routes(
+    note: &IncomingNotification,
+    routes: &crate::callback_registration::CallbackToolRoutes,
+) -> Option<MappedUpdate> {
+    let mut mapped = map_notification(note)?;
+    if let (Some(session_id), MappedUpdate::ToolCall(call)) = (
+        note.params.get("sessionId").and_then(Value::as_str),
+        &mut mapped,
+    ) {
+        if routes.matches_workspace_api(session_id, &call.title, &call.tool_name) {
+            call.tool_name = "workspace_api".into();
+        }
+    }
+    Some(mapped)
+}
+
 /// Extract `(event content, accumulated text)` from a streamed content block.
 /// Text blocks carry their string both as the event payload and the transcript
 /// text; other blocks pass through as the full JSON block with no text.

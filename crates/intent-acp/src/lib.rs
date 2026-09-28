@@ -15,6 +15,7 @@
 //! baseline-env + redaction helpers ([`mcp_env`]), and the per-agent-type tool
 //! denylist ([`tool_restrictions`]).
 
+pub mod callback_registration;
 #[cfg(unix)]
 pub mod descendant_sweep;
 pub mod error;

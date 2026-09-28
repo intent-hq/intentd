@@ -340,6 +340,58 @@ impl BridgeResponse {
             None => format!("{}\n", self.value),
         }
     }
+
+    /// Encode both candidates before mandatory private-payload admission. The
+    /// later writer only chooses optional guidance; it cannot authorize data.
+    pub(crate) fn prepare_line(self) -> PreparedBridgeLine {
+        let base = format!("{}\n", self.value);
+        let enriched = self.guidance.map(|guidance| {
+            let mut value = self.value;
+            if let Some(items) = value
+                .pointer_mut("/result/content")
+                .and_then(Value::as_array_mut)
+            {
+                items.push(json!({"type":"text", "text":guidance.text}));
+            }
+            (guidance, format!("{value}\n"))
+        });
+        PreparedBridgeLine { base, enriched }
+    }
+}
+
+/// Already shaped/encoded packet. Mandatory admission happens before this
+/// enters the original bounded response queue. Its writer needs no R/P policy.
+pub(crate) struct PreparedBridgeLine {
+    base: String,
+    enriched: Option<(GuidanceCandidate, String)>,
+}
+
+impl PreparedBridgeLine {
+    pub(crate) fn plain(value: Value) -> Self {
+        BridgeResponse::plain(value).prepare_line()
+    }
+
+    pub(crate) fn into_line(self, connection: &ConnectionToken) -> String {
+        let Some((candidate, enriched)) = self.enriched else {
+            return self.base;
+        };
+        if let Ok(state) = candidate.lease.fence.active.lock() {
+            let current = state.as_ref().is_some_and(|active| {
+                Arc::ptr_eq(&active.generation, &candidate.lease.generation)
+                    && match (&candidate.stamp, &active.stamp) {
+                        (Some(candidate), Some(current)) => {
+                            candidate.compare(current) == Some(Ordering::Equal)
+                        }
+                        (None, None) => true,
+                        _ => false,
+                    }
+            });
+            if current && connection.is_live() {
+                return enriched;
+            }
+        }
+        self.base
+    }
 }
 
 #[derive(Clone)]
@@ -349,7 +401,7 @@ pub(crate) struct ConnectionToken {
 }
 
 impl ConnectionToken {
-    fn is_live(&self) -> bool {
+    pub(crate) fn is_live(&self) -> bool {
         self.live.load(AtomicOrdering::Acquire)
             && self
                 .endpoint

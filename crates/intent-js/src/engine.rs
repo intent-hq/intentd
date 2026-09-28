@@ -1,8 +1,12 @@
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rquickjs::{function::Async, AsyncContext, AsyncRuntime, CatchResultExt, Function, Promise};
 
-use crate::{EvalOptions, HostFn, JsError, OUTER_SAFETY_MARGIN};
+use crate::{
+    EvalOptions, GuardedHostFn, HostAdmissionOutcome, HostCallId, HostFn, HostReply,
+    HostTransferReceipt, JsError, PreparedHostTransfer, OUTER_SAFETY_MARGIN,
+};
 
 /// JS bridge exposed to user code when a host function is provided. It captures
 /// the raw host function in a closure (so it never sits on `globalThis` where
@@ -58,6 +62,32 @@ pub async fn eval(
     code: &str,
     opts: &EvalOptions,
     host: Option<HostFn>,
+) -> Result<serde_json::Value, JsError> {
+    eval_guarded(code, opts, host.map(ordinary_host)).await
+}
+
+fn ordinary_host(h: HostFn) -> GuardedHostFn {
+    Arc::new(move |value, _original| {
+        // Legacy HostFn closures ran on first poll, not when the JS callback
+        // created its promise. Only GuardedHostFn opts into synchronous capture.
+        let h = h.clone();
+        Box::pin(async move { HostReply::Ordinary(h(value).await) })
+    })
+}
+
+/// Evaluate with an opt-in, typed admission for individual host replies.
+///
+/// Evaluation, encoding, and errors otherwise match [`eval`]. Successful host
+/// transfer admits only that original JS promise, not later evaluation output.
+/// Cancellation drops the original pending futures and completion slots.
+///
+/// # Errors
+/// Returns the same [`JsError`] variants as [`eval`]. Refused host admission
+/// rejects the JS host promise with a fixed non-private control error.
+pub async fn eval_guarded(
+    code: &str,
+    opts: &EvalOptions,
+    host: Option<GuardedHostFn>,
 ) -> Result<serde_json::Value, JsError> {
     let rt = AsyncRuntime::new().map_err(|e| JsError::Engine(e.to_string()))?;
 
@@ -126,12 +156,17 @@ fn stringify_js_err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
 }
 
-fn bind_host(ctx: &rquickjs::Ctx<'_>, host: HostFn) -> rquickjs::Result<()> {
+fn bind_host(ctx: &rquickjs::Ctx<'_>, host: GuardedHostFn) -> rquickjs::Result<()> {
     let host_arc = host;
     let host_raw = Function::new(
         ctx.clone(),
         Async(move |arg_json: String| {
-            let h = host_arc.clone();
+            // Allocate the original slot before invoking the trusted closure;
+            // context capture is synchronous, before any host future is polled.
+            let identity = Arc::new(());
+            let (sender, mut receiver) = tokio::sync::oneshot::channel();
+            let host_future = serde_json::from_str::<serde_json::Value>(&arg_json)
+                .map(|value| host_arc(value, HostCallId(identity.clone())));
             async move {
                 // A malformed argument frame is an engine-internal invariant
                 // violation (the JS wrapper always calls `JSON.stringify`), so
@@ -139,8 +174,8 @@ fn bind_host(ctx: &rquickjs::Ctx<'_>, host: HostFn) -> rquickjs::Result<()> {
                 // the bridge JS turns the `{ok:false, error}` frame back into a
                 // JS `Error`, so the failure lands on the caller instead of
                 // silently substituting `null`.
-                let value = match serde_json::from_str::<serde_json::Value>(&arg_json) {
-                    Ok(v) => v,
+                let future = match host_future {
+                    Ok(future) => future,
                     Err(e) => {
                         let frame = serde_json::json!({
                             "ok": false,
@@ -149,17 +184,48 @@ fn bind_host(ctx: &rquickjs::Ctx<'_>, host: HostFn) -> rquickjs::Result<()> {
                         return Ok::<String, rquickjs::Error>(frame.to_string());
                     }
                 };
-                let frame = match h(value).await {
-                    Ok(v) => serde_json::json!({ "ok": true, "value": v }),
-                    Err(msg) => serde_json::json!({ "ok": false, "error": msg }),
+                let encoded = match future.await {
+                    HostReply::Ordinary(outcome) => encode_host_outcome(outcome),
+                    HostReply::Guarded { outcome, admission } => {
+                        // No encoding or JS is performed by the consuming action.
+                        let packet = PreparedHostTransfer {
+                            receipt: HostTransferReceipt(identity.clone()),
+                            sender,
+                            encoded: encode_host_outcome(outcome),
+                        };
+                        let outcome = admission.admit(packet).await;
+                        // Admission has finished and released its guards. Never
+                        // await a missing transfer, accept a foreign receipt, or
+                        // fall back to the private outcome after refusal.
+                        match outcome {
+                            HostAdmissionOutcome::Transferred(receipt)
+                                if Arc::ptr_eq(&receipt.0, &identity) =>
+                            {
+                                receiver.try_recv().unwrap_or_else(|_| refused_host_reply())
+                            }
+                            _ => refused_host_reply(),
+                        }
+                    }
                 };
-                Ok::<String, rquickjs::Error>(frame.to_string())
+                Ok::<String, rquickjs::Error>(encoded)
             }
         }),
     )?;
     ctx.globals().set("__hostRaw", host_raw)?;
     ctx.eval::<(), _>(HOST_BRIDGE_JS)?;
     Ok(())
+}
+
+fn encode_host_outcome(outcome: Result<serde_json::Value, String>) -> String {
+    match outcome {
+        Ok(v) => serde_json::json!({ "ok": true, "value": v }),
+        Err(msg) => serde_json::json!({ "ok": false, "error": msg }),
+    }
+    .to_string()
+}
+
+fn refused_host_reply() -> String {
+    encode_host_outcome(Err("host reply admission refused".into()))
 }
 
 async fn run_user_code<'js>(
@@ -209,6 +275,26 @@ async fn run_user_code<'js>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ordinary_wrapper_defers_original_closure_until_polled() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let call_count = calls.clone();
+        let original: HostFn = Arc::new(move |value| {
+            call_count.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(value) })
+        });
+        let wrapped = ordinary_host(original);
+        let future = wrapped(serde_json::json!(7), HostCallId(Arc::new(())));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(future.await, HostReply::Ordinary(Ok(v)) if v == 7));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let unpolled = wrapped(serde_json::json!(8), HostCallId(Arc::new(())));
+        drop(unpolled);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn timeout_ms_passes_through_small_values() {

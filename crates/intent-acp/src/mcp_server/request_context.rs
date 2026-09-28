@@ -7,6 +7,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use super::private_results::{McpPrivateInvocation, McpPrivatePolicy};
 use intent_core::Caller;
 
 /// A context wrapper's body. Unit output keeps transport response types private.
@@ -24,6 +25,14 @@ pub trait McpRequestContext: Send + Sync {
 
 /// One captured request, shared by the operation and its optional guidance.
 pub trait McpRequestScope: Send + Sync {
+    /// Optional original-request private-result policy. No existing endpoint
+    /// enables it. A qualified producer must require a reservation from this
+    /// carrier before acquiring private data; absence is never an ordinary
+    /// fallback for a qualified read.
+    fn private_result_policy(&self) -> Option<Arc<dyn McpPrivatePolicy>> {
+        None
+    }
+
     /// Apply only the captured context while awaiting `request` exactly once.
     ///
     /// Do not replace, skip, detach or retry the body, and do not recapture the
@@ -37,18 +46,33 @@ pub trait McpRequestScope: Send + Sync {
 pub(crate) struct CapturedRequestContext {
     caller: Option<Caller>,
     scope: Option<Arc<dyn McpRequestScope>>,
+    pub(crate) private_invocation: Option<McpPrivateInvocation>,
 }
 
 impl CapturedRequestContext {
     pub(crate) fn capture(caller: Option<Caller>, context: Option<&dyn McpRequestContext>) -> Self {
+        Self::capture_with_budget(caller, context, std::time::Duration::from_secs(120))
+    }
+
+    pub(crate) fn capture_with_budget(
+        caller: Option<Caller>,
+        context: Option<&dyn McpRequestContext>,
+        budget: std::time::Duration,
+    ) -> Self {
+        let scope = context.map(McpRequestContext::capture);
+        let private_invocation = scope
+            .as_ref()
+            .and_then(|scope| scope.private_result_policy())
+            .map(|policy| McpPrivateInvocation::new(policy, budget));
         Self {
             caller,
-            scope: context.map(McpRequestContext::capture),
+            scope,
+            private_invocation,
         }
     }
 
     pub(crate) async fn run<T: Send>(&self, request: impl Future<Output = T> + Send) -> T {
-        let scoped = async {
+        let scoped = McpPrivateInvocation::scope(self.private_invocation.clone(), async {
             if let Some(scope) = &self.scope {
                 let mut result = None;
                 scope
@@ -58,7 +82,7 @@ impl CapturedRequestContext {
             } else {
                 request.await
             }
-        };
+        });
         match &self.caller {
             Some(caller) => intent_core::with_caller(caller.clone(), scoped).await,
             None => scoped.await,

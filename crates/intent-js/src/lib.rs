@@ -16,8 +16,9 @@
 //! - Per-execution isolation: every call constructs a fresh `AsyncRuntime` +
 //!   `AsyncContext`, so globals never leak between invocations.
 //!
-//! The public surface is intentionally minimal — just [`eval`] + [`EvalOptions`] +
-//! [`HostFn`] + [`JsError`]. Real `ws.*` bindings and MCP tool wiring live elsewhere.
+//! [`eval_guarded`] additionally supports opaque admission of an original host
+//! reply. It supplies ownership mechanics, not an authorization policy. Real
+//! `ws.*` bindings and MCP tool wiring live elsewhere.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -37,6 +38,105 @@ pub type HostFn = Arc<
         + Send
         + Sync,
 >;
+
+/// Host binding that explicitly distinguishes ordinary and guarded replies.
+///
+/// The engine allocates the original call identity and completion slot before
+/// invoking this closure. The closure can capture its context synchronously,
+/// before returning the future. Equal JSON arguments never imply equal calls.
+pub type GuardedHostFn =
+    Arc<dyn Fn(serde_json::Value, HostCallId) -> BoxFuture<'static, HostReply> + Send + Sync>;
+
+/// An engine-created call identity. It cannot be constructed, cloned, or
+/// reconstructed from public values. Keep it in the original admission object.
+///
+/// ```compile_fail
+/// let forged = intent_js::HostCallId(std::sync::Arc::new(()));
+/// ```
+pub struct HostCallId(Arc<()>);
+
+/// A trusted host's actual outcome and, when needed, its admission policy.
+/// JSON fields and error strings never select the admission path.
+pub enum HostReply {
+    /// The existing host behavior, with no additional admission.
+    Ordinary(Result<serde_json::Value, String>),
+    /// Withhold the encoded outcome unless its original transfer is admitted.
+    Guarded {
+        /// The actual host outcome, encoded before admission runs.
+        outcome: Result<serde_json::Value, String>,
+        /// Opaque policy owned by the caller, not by this leaf crate.
+        admission: Box<dyn HostReplyAdmission>,
+    },
+}
+
+/// One-use admission of a prepared reply to its original JS host promise.
+///
+/// Implementors revalidate their original authority, then call
+/// [`PreparedHostTransfer::transfer`] within their consuming boundary. That
+/// action only transfers ownership; all policy guards must be released before
+/// this future resolves. The engine waits for that resolution before reading
+/// the slot or allowing `QuickJS` to observe the reply. No runtime installs this
+/// policy by default. Implementors must not detach the transfer or its future.
+pub trait HostReplyAdmission: Send {
+    /// Consume this admission and the packet. Refusal must not include private
+    /// diagnostics: the engine supplies a fixed non-private control error.
+    fn admit(
+        self: Box<Self>,
+        transfer: PreparedHostTransfer,
+    ) -> BoxFuture<'static, HostAdmissionOutcome>;
+}
+
+/// A receipt only the original prepared transfer can create. Not cloneable.
+pub struct HostTransferReceipt(Arc<()>);
+
+/// Result of the consuming action. A receipt cannot be fabricated by an adapter.
+pub enum HostAdmissionOutcome {
+    /// The bytes entered the original slot. This effect cannot be recalled and
+    /// does not authorize any later output or artifact publication.
+    Transferred(HostTransferReceipt),
+    /// The original consumer has gone away; its bytes were discarded.
+    ConsumerClosed,
+    /// A different call identity was offered; its bytes were discarded.
+    ForeignCall,
+    /// No private bytes are authorized for this original completion.
+    Refused,
+}
+
+/// Encoded bytes bound to one engine-owned completion. Fields are private;
+/// there is no constructor, clone, payload accessor, or replacement-slot API.
+#[must_use = "dropping a prepared transfer withholds its private reply"]
+pub struct PreparedHostTransfer {
+    receipt: HostTransferReceipt,
+    sender: tokio::sync::oneshot::Sender<String>,
+    encoded: String,
+}
+
+impl PreparedHostTransfer {
+    /// Move the prebuilt bytes into their original slot, exactly once.
+    ///
+    /// This synchronous action performs no JS execution, JSON construction,
+    /// await, I/O, or spawn. The receiver remains unread until `admit` returns.
+    /// A foreign identity consumes and discards the packet rather than
+    /// redirecting it. A closed consumer similarly discards the packet.
+    ///
+    /// ```compile_fail,E0382
+    /// use intent_js::{HostCallId, PreparedHostTransfer};
+    /// fn reuse(packet: PreparedHostTransfer, id: &HostCallId) {
+    ///     let _ = packet.transfer(id);
+    ///     let _ = packet.transfer(id); // the original packet was consumed
+    /// }
+    /// ```
+    #[must_use]
+    pub fn transfer(self, original: &HostCallId) -> HostAdmissionOutcome {
+        if !Arc::ptr_eq(&self.receipt.0, &original.0) {
+            return HostAdmissionOutcome::ForeignCall;
+        }
+        match self.sender.send(self.encoded) {
+            Ok(()) => HostAdmissionOutcome::Transferred(self.receipt),
+            Err(_) => HostAdmissionOutcome::ConsumerClosed,
+        }
+    }
+}
 
 /// Default wall-clock timeout — mirrors the reference TS tool.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -88,4 +188,4 @@ impl Default for EvalOptions {
 }
 
 mod engine;
-pub use engine::eval;
+pub use engine::{eval, eval_guarded};

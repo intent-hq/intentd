@@ -26,7 +26,10 @@ use tokio::sync::{mpsc, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 
-use crate::mcp_server::repository_guidance::{BridgeResponse, ConnectionLifetime, ConnectionToken};
+use crate::mcp_server::private_results::DeliveryResponse;
+use crate::mcp_server::repository_guidance::{
+    BridgeResponse, ConnectionLifetime, ConnectionToken, PreparedBridgeLine,
+};
 use crate::mcp_server::WorkspaceMcpServer;
 
 #[cfg(test)]
@@ -34,6 +37,9 @@ mod guidance_tests;
 
 #[cfg(test)]
 mod request_context_tests;
+
+#[cfg(test)]
+mod private_result_tests;
 
 /// Per-connection cap on concurrently dispatched requests. Small on purpose:
 /// enough that a long `tools/call` never blocks a liveness ping behind it
@@ -82,6 +88,14 @@ pub(crate) trait BridgeDispatch: Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Option<BridgeResponse>> + Send>> {
         Box::pin(async move { self.dispatch(message).await.map(BridgeResponse::plain) })
     }
+
+    fn dispatch_for_delivery(
+        self: Arc<Self>,
+        message: Value,
+    ) -> Pin<Box<dyn Future<Output = Option<DeliveryResponse>> + Send>> {
+        let captured = self.dispatch_for_bridge(message);
+        Box::pin(async move { captured.await.map(DeliveryResponse::ordinary) })
+    }
 }
 
 impl BridgeDispatch for WorkspaceMcpServer {
@@ -98,6 +112,14 @@ impl BridgeDispatch for WorkspaceMcpServer {
     ) -> Pin<Box<dyn Future<Output = Option<BridgeResponse>> + Send>> {
         let context = self.capture_request_context();
         Box::pin(async move { self.handle_message_for_bridge(&message, context).await })
+    }
+
+    fn dispatch_for_delivery(
+        self: Arc<Self>,
+        message: Value,
+    ) -> Pin<Box<dyn Future<Output = Option<DeliveryResponse>> + Send>> {
+        let context = self.capture_request_context();
+        Box::pin(async move { self.handle_message_for_delivery(&message, context).await })
     }
 }
 
@@ -235,7 +257,7 @@ async fn serve_connection<S: BridgeDispatch>(
     connection: ConnectionLifetime,
 ) -> std::io::Result<()> {
     let (read, write) = stream.into_split();
-    let (response_tx, response_rx) = mpsc::channel::<BridgeResponse>(RESPONSE_CHANNEL_CAPACITY);
+    let (response_tx, response_rx) = mpsc::channel::<PreparedBridgeLine>(RESPONSE_CHANNEL_CAPACITY);
     let writer = tokio::spawn(write_responses(write, response_rx, connection.token()));
 
     let limiter = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS));
@@ -269,13 +291,14 @@ async fn serve_connection<S: BridgeDispatch>(
                         .to_string();
                     // Constructing the future captures context, but must not
                     // poll the operation or begin its watchdog before admission.
-                    let dispatch_future = server.clone().dispatch_for_bridge(message);
+                    let dispatch_future = server.clone().dispatch_for_delivery(message);
                     let permit = limiter
                         .clone()
                         .acquire_owned()
                         .await
                         .expect("bridge semaphore is never closed");
                     let response_tx = response_tx.clone();
+                    let response_connection = connection.token();
                     in_flight.spawn(async move {
                         let _permit = permit;
                         // A request is `method` + `id` — with any present
@@ -294,8 +317,7 @@ async fn serve_connection<S: BridgeDispatch>(
                                     // Dispatch is complete: its watchdog must
                                     // never replace this original result while
                                     // optional guidance is being prepared.
-                                    let response = response.prepare_guidance().await;
-                                    let _ = response_tx.send(response).await;
+                                    response.enqueue(response_tx, &response_connection).await;
                                 }
                                 Ok(None) => {}
                                 Err(e) => {
@@ -319,7 +341,7 @@ async fn serve_connection<S: BridgeDispatch>(
                                             "data": { "retryable": false },
                                         },
                                     });
-                                    let _ = response_tx.send(BridgeResponse::plain(response)).await;
+                                    let _ = response_tx.send(PreparedBridgeLine::plain(response)).await;
                                 }
                             }
                         }
@@ -342,7 +364,7 @@ async fn serve_connection<S: BridgeDispatch>(
 /// Aborts the wrapped dispatch task on drop, so a per-request task torn down
 /// at connection teardown (or by the watchdog path exiting) never leaks a
 /// still-running dispatch: dropping a bare `JoinHandle` would detach it.
-struct AbortOnDrop(JoinHandle<Option<BridgeResponse>>);
+struct AbortOnDrop(JoinHandle<Option<DeliveryResponse>>);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
@@ -352,9 +374,25 @@ impl Drop for AbortOnDrop {
 
 /// Finalize only the optional guidance at the real writer, after queueing and
 /// immediately before serialization/write. Ordinary operation results are kept.
-async fn write_responses<W: AsyncWrite + Unpin>(
+trait ResponseLine {
+    fn into_line(self, connection: &ConnectionToken) -> String;
+}
+
+impl ResponseLine for BridgeResponse {
+    fn into_line(self, connection: &ConnectionToken) -> String {
+        self.into_line(connection)
+    }
+}
+
+impl ResponseLine for PreparedBridgeLine {
+    fn into_line(self, connection: &ConnectionToken) -> String {
+        self.into_line(connection)
+    }
+}
+
+async fn write_responses<W: AsyncWrite + Unpin, T: ResponseLine>(
     mut write: W,
-    mut responses: mpsc::Receiver<BridgeResponse>,
+    mut responses: mpsc::Receiver<T>,
     connection: ConnectionToken,
 ) {
     while let Some(response) = responses.recv().await {

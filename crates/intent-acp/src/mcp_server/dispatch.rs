@@ -13,7 +13,7 @@ use intent_core::{
     new_attachment_id, now_iso, AgentId, AttachmentPolicy, TurnAttachment, TurnAttachmentRegistry,
     WorkspaceApi, WorkspaceId, ATTACHMENT_ID_KEY,
 };
-use intent_js::{eval as js_eval, BoxFuture, EvalOptions, HostFn, JsError};
+use intent_js::{eval as js_eval, eval_guarded, BoxFuture, EvalOptions, HostFn, JsError};
 use serde_json::{json, Value};
 
 /// Per-invocation collector of turn attachments stamped at binding call time
@@ -105,6 +105,10 @@ impl Drop for StageSentinel {
     }
 }
 
+use super::private_results::{
+    refusal_tool_result, ArtifactAccounting, ArtifactOutcome, McpPrivateBoundaryKind,
+    McpPrivateInvocation, SealedPrivateOutput,
+};
 use super::WorkspaceMcpServer;
 
 /// Wall-clock budget for one `workspace_api` invocation — matches the 30s
@@ -218,7 +222,15 @@ impl WorkspaceMcpServer {
         // call the script makes (multiplayer w1); host calls run inline on
         // this task, so the task-local scope covers them. A bridge with no
         // caller agent leaves whatever caller the enclosing scope bound.
-        let eval = js_eval(&full_code, &opts, Some(host));
+        let invocation = McpPrivateInvocation::current();
+        let eval = async {
+            match &invocation {
+                Some(invocation) => {
+                    eval_guarded(&full_code, &opts, Some(invocation.guarded_host(host))).await
+                }
+                None => js_eval(&full_code, &opts, Some(host)).await,
+            }
+        };
         let eval_result = match &self.caller_agent_id {
             Some(agent_id) => {
                 intent_core::with_caller(
@@ -234,6 +246,16 @@ impl WorkspaceMcpServer {
         let eval_ms = u64::try_from(eval_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let eval_ok = eval_result.is_ok();
         tracing::trace!(eval_ms, eval_ok, "workspace_api dispatch: eval finished");
+        // QuickJS has cleaned up its pending host futures. Seal before ANY
+        // output publication, independent of what the script returned/caught.
+        let output = match invocation
+            .as_ref()
+            .map(McpPrivateInvocation::seal)
+            .transpose()
+        {
+            Ok(output) => output.flatten(),
+            Err(()) => return refusal_tool_result(),
+        };
         // Drain the binding-time collection unconditionally: the attachments
         // were stamped and handed to the agent's JS with `ok: true`, so they
         // register no matter what the script did afterwards — discarded the
@@ -246,7 +268,13 @@ impl WorkspaceMcpServer {
         let result = match eval_result {
             Ok(v) => match v.get("__k").and_then(Value::as_str) {
                 Some("u") => {
-                    self.register_pending_attachments(pending_batch);
+                    if self
+                        .register_pending_attachments(pending_batch, output.as_ref())
+                        .await
+                        .is_err()
+                    {
+                        return refusal_tool_result();
+                    }
                     workspace_api_success("(no return value)")
                 }
                 Some("v") => {
@@ -264,15 +292,29 @@ impl WorkspaceMcpServer {
                         // call time (nonce in `pending_batch`) are not
                         // re-stamped or re-registered. No-op unless both the
                         // registry and a caller agent are wired.
-                        let content_items =
-                            self.register_turn_attachments(content_items, pending_batch);
+                        let Ok(content_items) = self
+                            .register_turn_attachments(
+                                content_items,
+                                pending_batch,
+                                output.as_ref(),
+                            )
+                            .await
+                        else {
+                            return refusal_tool_result();
+                        };
                         // Return MCP content items directly
                         json!({
                             "content": content_items,
                             "isError": false,
                         })
                     } else {
-                        self.register_pending_attachments(pending_batch);
+                        if self
+                            .register_pending_attachments(pending_batch, output.as_ref())
+                            .await
+                            .is_err()
+                        {
+                            return refusal_tool_result();
+                        }
                         // Error results and the `__mcpContentItems` pass-through
                         // above are exempt from both knobs: only the plain
                         // success body is TOON-encoded / size-limited.
@@ -292,7 +334,7 @@ impl WorkspaceMcpServer {
                         tracing::trace!("workspace_api dispatch: output finalize starting");
                         let stage_started = Instant::now();
                         let out = self
-                            .finalize_workspace_api_output(body, ext, max_chars)
+                            .finalize_workspace_api_output(body, ext, max_chars, output.as_ref())
                             .await;
                         finalize_ms = Some(
                             u64::try_from(stage_started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -301,12 +343,24 @@ impl WorkspaceMcpServer {
                     }
                 }
                 _ => {
-                    self.register_pending_attachments(pending_batch);
+                    if self
+                        .register_pending_attachments(pending_batch, output.as_ref())
+                        .await
+                        .is_err()
+                    {
+                        return refusal_tool_result();
+                    }
                     workspace_api_error("Error: engine: unexpected workspace_api envelope")
                 }
             },
             Err(e) => {
-                self.register_pending_attachments(pending_batch);
+                if self
+                    .register_pending_attachments(pending_batch, output.as_ref())
+                    .await
+                    .is_err()
+                {
+                    return refusal_tool_result();
+                }
                 workspace_api_error(&format_js_error(&e))
             }
         };
@@ -391,6 +445,7 @@ impl WorkspaceMcpServer {
         text: String,
         ext: &str,
         max_chars: usize,
+        output: Option<&SealedPrivateOutput>,
     ) -> Value {
         if max_chars == 0 {
             return workspace_api_success(&text);
@@ -399,7 +454,7 @@ impl WorkspaceMcpServer {
         if total_chars <= max_chars {
             return workspace_api_success(&text);
         }
-        match self.write_oversized_output(&text, ext).await {
+        match self.write_oversized_output(&text, ext, output).await {
             Ok(path) => {
                 let preview: String = text.chars().take(OUTPUT_PREVIEW_CHARS).collect();
                 workspace_api_success(&format!(
@@ -412,11 +467,16 @@ impl WorkspaceMcpServer {
                      whole.\n\nFirst {OUTPUT_PREVIEW_CHARS} characters:\n{preview}"
                 ))
             }
-            Err(reason) => {
-                tracing::warn!(
-                    "workspace_api: oversized output ({total_chars} chars > {max_chars}) \
+            Err(SpillError::Refused) => refusal_tool_result(),
+            Err(SpillError::Failed(reason)) => {
+                // A qualified error can contain a private path. It is shaped
+                // privately below and must pass the separate response boundary.
+                if output.is_none() {
+                    tracing::warn!(
+                        "workspace_api: oversized output ({total_chars} chars > {max_chars}) \
                      could not be redirected to a file ({reason}); returning truncated head"
-                );
+                    );
+                }
                 let head: String = text.chars().take(max_chars).collect();
                 workspace_api_success(&format!(
                     "Output too large: {total_chars} characters (limit: {max_chars}). \
@@ -444,30 +504,47 @@ impl WorkspaceMcpServer {
         &self,
         text: &str,
         ext: &str,
-    ) -> std::result::Result<String, String> {
+        output: Option<&SealedPrivateOutput>,
+    ) -> std::result::Result<String, SpillError> {
         let ws = self
             .api
             .get_workspace(self.workspace_id.clone())
             .await
-            .map_err(|e| format!("get_workspace: {e}"))?;
-        let checkout = ws
-            .effective_path()
-            .ok_or_else(|| "workspace has no on-disk checkout path".to_string())?;
+            .map_err(|e| SpillError::Failed(format!("get_workspace: {e}")))?;
+        let checkout = ws.effective_path().ok_or_else(|| {
+            SpillError::Failed("workspace has no on-disk checkout path".to_string())
+        })?;
         let folder = std::path::Path::new(checkout)
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
-            .ok_or_else(|| format!("checkout path `{checkout}` has no parent directory"))?;
+            .ok_or_else(|| {
+                SpillError::Failed(format!(
+                    "checkout path `{checkout}` has no parent directory"
+                ))
+            })?;
         let dir = folder.join("tool-outputs");
-        tokio::fs::create_dir_all(&dir)
-            .await
-            .map_err(|e| format!("create {}: {e}", dir.display()))?;
         let stamp = now_iso().replace(':', "-");
         let short_id = uuid::Uuid::new_v4().simple().to_string();
         let file = dir.join(format!("{stamp}-{}.{ext}", &short_id[..8]));
-        tokio::fs::write(&file, text)
-            .await
-            .map_err(|e| format!("write {}: {e}", file.display()))?;
-        Ok(file.to_string_lossy().into_owned())
+        // One bounded writer job per invocation; prepare all bytes/name/location
+        // before START. No create/write occurs inside an admission action.
+        let job = ArtifactJob {
+            dir,
+            file,
+            bytes: text.as_bytes().to_vec(),
+            outcome: ArtifactOutcome::NotStarted,
+            accounting: output.map(SealedPrivateOutput::artifact_accounting),
+        };
+        let job = match output {
+            Some(output) => output
+                .transfer_prepared(McpPrivateBoundaryKind::ArtifactStart, || {
+                    StartedArtifactJob(job)
+                })
+                .await
+                .map_err(|()| SpillError::Refused)?,
+            None => StartedArtifactJob(job),
+        };
+        job.run().await.map_err(SpillError::Failed)
     }
 
     /// §7.1 deterministic attach — registration side. For every well-formed
@@ -489,31 +566,116 @@ impl WorkspaceMcpServer {
     /// by the time the provider can echo the tool's completion. Pass-through
     /// (no clone mutation, no registration) when the registry or caller agent
     /// is unwired.
-    fn register_turn_attachments(
+    async fn register_turn_attachments(
         &self,
         items: &[Value],
         pending_batch: Vec<TurnAttachment>,
-    ) -> Vec<Value> {
+        output: Option<&SealedPrivateOutput>,
+    ) -> Result<Vec<Value>, ()> {
         let (Some(registry), Some(agent_id)) = (&self.turn_attachments, &self.caller_agent_id)
         else {
-            return items.to_vec();
+            return Ok(items.to_vec());
         };
         let known: HashSet<String> = pending_batch.iter().map(|a| a.id.clone()).collect();
         let mut out = items.to_vec();
         let new_entries = stamp_and_collect(&mut out, &known);
         let mut batch = pending_batch;
         batch.extend(new_entries);
+        let batch = prepare_attachment_publication(batch, output).await?;
         registry.register_all(agent_id, batch);
-        out
+        Ok(out)
     }
 
     /// Register the binding-time attachment batch on the result paths that do
     /// NOT return `__mcpContentItems` — the agent's JS discarded (or threw
     /// past) the envelope, but the proposals it produced still attach to the
     /// tool result via the `workspace_api` FIFO claim (monorepo#2637).
-    fn register_pending_attachments(&self, pending_batch: Vec<TurnAttachment>) {
+    async fn register_pending_attachments(
+        &self,
+        pending_batch: Vec<TurnAttachment>,
+        output: Option<&SealedPrivateOutput>,
+    ) -> Result<(), ()> {
         if let (Some(registry), Some(agent_id)) = (&self.turn_attachments, &self.caller_agent_id) {
+            let pending_batch = prepare_attachment_publication(pending_batch, output).await?;
             registry.register_all(agent_id, pending_batch);
+        }
+        Ok(())
+    }
+}
+
+async fn prepare_attachment_publication(
+    batch: Vec<TurnAttachment>,
+    output: Option<&SealedPrivateOutput>,
+) -> Result<Vec<TurnAttachment>, ()> {
+    match output {
+        Some(output) if !batch.is_empty() => {
+            output
+                .transfer(McpPrivateBoundaryKind::Attachments, batch)
+                .await
+        }
+        _ => Ok(batch),
+    }
+}
+
+enum SpillError {
+    Refused,
+    Failed(String),
+}
+
+struct ArtifactJob {
+    dir: std::path::PathBuf,
+    file: std::path::PathBuf,
+    bytes: Vec<u8>,
+    outcome: ArtifactOutcome,
+    accounting: Option<ArtifactAccounting>,
+}
+
+// Creating this envelope is a pure ownership move in the START action. Its
+// drop accounts for admitted-but-unobserved work even when admission's future
+// is cancelled before releasing its guards. It never performs filesystem I/O.
+struct StartedArtifactJob(ArtifactJob);
+
+impl StartedArtifactJob {
+    async fn run(mut self) -> Result<String, String> {
+        // Tokio filesystem work can outlive a cancelled await. Once START was
+        // admitted, cancellation means unknown, never a claim of no file effect.
+        self.0.outcome = ArtifactOutcome::Unknown;
+        if let Some(accounting) = &self.0.accounting {
+            accounting.record(ArtifactOutcome::Unknown);
+        }
+        let result = async {
+            tokio::fs::create_dir_all(&self.0.dir)
+                .await
+                .map_err(|e| format!("create {}: {e}", self.0.dir.display()))?;
+            tokio::fs::write(&self.0.file, &self.0.bytes)
+                .await
+                .map_err(|e| format!("write {}: {e}", self.0.file.display()))?;
+            Ok(self.0.file.to_string_lossy().into_owned())
+        }
+        .await;
+        self.0.outcome = if result.is_ok() {
+            ArtifactOutcome::Written
+        } else {
+            ArtifactOutcome::Failed
+        };
+        if let Some(accounting) = &self.0.accounting {
+            accounting.record(self.0.outcome);
+        }
+        result
+    }
+}
+
+impl Drop for StartedArtifactJob {
+    fn drop(&mut self) {
+        if matches!(
+            self.0.outcome,
+            ArtifactOutcome::NotStarted | ArtifactOutcome::Unknown
+        ) {
+            if let Some(accounting) = &self.0.accounting {
+                accounting.record(ArtifactOutcome::Unknown);
+            }
+            // Accounting only: no logging/I/O in a destructor that can run
+            // inside a transfer action. Never remove a successor or retry.
         }
     }
 }
