@@ -25,9 +25,9 @@ use super::{
     budget_admits, charged_bytes, compute_process_cap, derive_agent_type, derive_is_orchestrator,
     is_cancel_transport_closed, pop_and_wake_waiter, recommended_memory_budget_bytes,
     resolve_npx_only, resolve_spawn, settle_stale_waiter, text_prompt, AgentHandle, AgentManager,
-    BusEventSink, KillFn, ProcessRegistry, RegistryInner, ResolvedSpawn, TreeMemoryProbe,
-    TreeSample, DEFAULT_AGENT_TYPE, HOST_MEMORY_RESERVE_BYTES, PROVISIONAL_AGENT_BYTES,
-    REASON_MEMORY_BUDGET, REASON_SLOTS,
+    BusEventSink, KillFn, LocalResources, ProcessRegistry, RegistryInner, ResolvedSpawn,
+    RuntimeHandle, TreeMemoryProbe, TreeSample, DEFAULT_AGENT_TYPE, HOST_MEMORY_RESERVE_BYTES,
+    PROVISIONAL_AGENT_BYTES, REASON_MEMORY_BUDGET, REASON_SLOTS,
 };
 use crate::agent_ops::user_message_blocks;
 use crate::events::{EventBus, SubscriptionFilter};
@@ -2314,16 +2314,18 @@ fn mock_handle() -> AgentHandle {
         },
     ));
     AgentHandle {
-        connection,
-        notifications: Arc::new(TokioMutex::new(note_rx)),
-        serve_task: tokio::spawn(async {}),
-        child: None,
-        child_pid: None,
-        _mcp_bridge: None,
-        _mcp_config: None,
-        _rules_config: None,
-        _pi_extension: None,
-        npx_launch_dir: None,
+        execution: RuntimeHandle::local(LocalResources {
+            connection,
+            notifications: Arc::new(TokioMutex::new(note_rx)),
+            serve_task: tokio::spawn(async {}),
+            child: None,
+            child_pid: None,
+            _mcp_bridge: None,
+            _mcp_config: None,
+            _rules_config: None,
+            _pi_extension: None,
+            npx_launch_dir: None,
+        }),
         antigravity_profile: None,
         session_mcp_servers: Vec::new(),
         spawned_model: None,
@@ -3950,9 +3952,25 @@ fn track_with_child(mgr: &AgentManager, id: &AgentId) -> (u32, tokio::task::Join
     cmd.process_group(0);
     let child = cmd.spawn().expect("spawn sleeper child");
     let pid = child.id().expect("live child has a pid");
-    let mut handle = mock_handle();
-    handle.child = Some(child);
-    handle.child_pid = Some(pid);
+    let handle = mock_handle();
+    handle
+        .execution
+        .local
+        .as_ref()
+        .unwrap()
+        .resources
+        .lock()
+        .unwrap()
+        .child = Some(child);
+    handle
+        .execution
+        .local
+        .as_ref()
+        .unwrap()
+        .resources
+        .lock()
+        .unwrap()
+        .child_pid = Some(pid);
     mgr.handles.lock().unwrap().insert(id.clone(), handle);
     mgr.registry.register(id.clone(), mgr.make_kill(id.clone()));
     let watcher = mgr.arm_child_exit_watcher(id.clone(), Some(pid));
@@ -4150,9 +4168,25 @@ async fn stop_many_tears_down_slow_children_in_one_shared_grace_window() {
         cmd.kill_on_drop(true);
         let child = cmd.spawn().expect("spawn slow child");
         let pid = child.id().expect("live child has a pid");
-        let mut handle = mock_handle();
-        handle.child = Some(child);
-        handle.child_pid = Some(pid);
+        let handle = mock_handle();
+        handle
+            .execution
+            .local
+            .as_ref()
+            .unwrap()
+            .resources
+            .lock()
+            .unwrap()
+            .child = Some(child);
+        handle
+            .execution
+            .local
+            .as_ref()
+            .unwrap()
+            .resources
+            .lock()
+            .unwrap()
+            .child_pid = Some(pid);
         mgr.handles.lock().unwrap().insert(id.clone(), handle);
         mgr.registry.register(id.clone(), mgr.make_kill(id.clone()));
         ids.push(id);
@@ -4593,16 +4627,18 @@ fn track_mock_agent_inner(
     mgr.handles.lock().unwrap().insert(
         id.clone(),
         AgentHandle {
-            connection,
-            notifications: Arc::new(TokioMutex::new(note_rx)),
-            serve_task: tokio::spawn(async {}),
-            child: None,
-            child_pid: None,
-            _mcp_bridge: None,
-            _mcp_config: None,
-            _rules_config: None,
-            _pi_extension: None,
-            npx_launch_dir: None,
+            execution: RuntimeHandle::local(LocalResources {
+                connection,
+                notifications: Arc::new(TokioMutex::new(note_rx)),
+                serve_task: tokio::spawn(async {}),
+                child: None,
+                child_pid: None,
+                _mcp_bridge: None,
+                _mcp_config: None,
+                _rules_config: None,
+                _pi_extension: None,
+                npx_launch_dir: None,
+            }),
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
@@ -4745,16 +4781,18 @@ fn track_mock_agent_prompt_rpc_error_inner(
     mgr.handles.lock().unwrap().insert(
         id.clone(),
         AgentHandle {
-            connection,
-            notifications: Arc::new(TokioMutex::new(note_rx)),
-            serve_task: tokio::spawn(async {}),
-            child: None,
-            child_pid: None,
-            _mcp_bridge: None,
-            _mcp_config: None,
-            _rules_config: None,
-            _pi_extension: None,
-            npx_launch_dir: None,
+            execution: RuntimeHandle::local(LocalResources {
+                connection,
+                notifications: Arc::new(TokioMutex::new(note_rx)),
+                serve_task: tokio::spawn(async {}),
+                child: None,
+                child_pid: None,
+                _mcp_bridge: None,
+                _mcp_config: None,
+                _rules_config: None,
+                _pi_extension: None,
+                npx_launch_dir: None,
+            }),
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
@@ -5466,7 +5504,19 @@ fn track_antigravity_setup(
         }
     });
     track(mgr, id);
-    mgr.handles.lock().unwrap().get_mut(id).unwrap().connection = Arc::new(Connection::new(
+    mgr.handles
+        .lock()
+        .unwrap()
+        .get_mut(id)
+        .unwrap()
+        .execution
+        .local
+        .as_ref()
+        .unwrap()
+        .resources
+        .lock()
+        .unwrap()
+        .connection = Arc::new(Connection::new(
         client_write,
         client_read,
         None,
@@ -8542,16 +8592,18 @@ async fn interrupt_on_wedged_transport_still_emits_terminal_events() {
     mgr.handles.lock().unwrap().insert(
         id.clone(),
         AgentHandle {
-            connection: conn,
-            notifications: Arc::new(TokioMutex::new(note_rx)),
-            serve_task: tokio::spawn(async {}),
-            child: None,
-            child_pid: None,
-            _mcp_bridge: None,
-            _mcp_config: None,
-            _rules_config: None,
-            _pi_extension: None,
-            npx_launch_dir: None,
+            execution: RuntimeHandle::local(LocalResources {
+                connection: conn,
+                notifications: Arc::new(TokioMutex::new(note_rx)),
+                serve_task: tokio::spawn(async {}),
+                child: None,
+                child_pid: None,
+                _mcp_bridge: None,
+                _mcp_config: None,
+                _rules_config: None,
+                _pi_extension: None,
+                npx_launch_dir: None,
+            }),
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
@@ -8614,7 +8666,11 @@ async fn cancel_and_settle_idle_prompt_times_out_on_wedged_transport() {
     let id = AgentId::from("a-wedged-settle");
     let settled = timeout(
         Duration::from_secs(10),
-        super::cancel_and_settle_idle_prompt(&conn, &id, "acp-wedged"),
+        super::cancel_and_settle_idle_prompt(
+            &super::runtime::ConnectionRuntime(&conn),
+            &id,
+            "acp-wedged",
+        ),
     )
     .await
     .expect("settle returns despite the wedged transport (monorepo#3039)");
@@ -12732,11 +12788,14 @@ async fn prompt_idle_event_precedes_end_turn_status_persistence() {
     let (connection, notifications) = {
         let handles = mgr.handles.lock().unwrap();
         let handle = handles.get(&id).unwrap();
-        (handle.connection.clone(), handle.notifications.clone())
+        (
+            handle.execution.connection().unwrap(),
+            handle.execution.runtime.notifications(),
+        )
     };
     let mut sub = bus.subscribe(SubscriptionFilter::default());
     mgr.services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &connection,
             &mut *notifications.lock().await,
             &id,
@@ -14461,6 +14520,13 @@ async fn probe_bridge_workspace_api(mgr: &AgentManager, id: &AgentId, code: &str
         .unwrap()
         .get(id)
         .expect("the woken agent keeps a live handle")
+        .execution
+        .local
+        .as_ref()
+        .unwrap()
+        .resources
+        .lock()
+        .unwrap()
         ._mcp_bridge
         .as_ref()
         .expect("the live handle serves a workspace_api bridge")
@@ -19903,16 +19969,18 @@ mod harness_wake_tests {
             ConnectionHooks::default(),
         ));
         let handle = AgentHandle {
-            connection,
-            notifications: Arc::new(TokioMutex::new(note_rx)),
-            serve_task: tokio::spawn(async {}),
-            child: None,
-            child_pid: None,
-            _mcp_bridge: None,
-            _mcp_config: None,
-            _rules_config: None,
-            _pi_extension: None,
-            npx_launch_dir: None,
+            execution: RuntimeHandle::local(LocalResources {
+                connection,
+                notifications: Arc::new(TokioMutex::new(note_rx)),
+                serve_task: tokio::spawn(async {}),
+                child: None,
+                child_pid: None,
+                _mcp_bridge: None,
+                _mcp_config: None,
+                _rules_config: None,
+                _pi_extension: None,
+                npx_launch_dir: None,
+            }),
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
@@ -20445,7 +20513,7 @@ mod harness_wake_tests {
         // The replay drain (resume path) still sees the buffered burst.
         let notes = {
             let map = mgr.handles.lock().unwrap();
-            map.get(&id).unwrap().notifications.clone()
+            map.get(&id).unwrap().execution.runtime.notifications()
         };
         {
             let mut guard = notes.lock().await;
@@ -20484,7 +20552,7 @@ mod harness_wake_tests {
         {
             let notes = {
                 let map = mgr.handles.lock().unwrap();
-                map.get(&id).unwrap().notifications.clone()
+                map.get(&id).unwrap().execution.runtime.notifications()
             };
             let mut guard = notes.try_lock().expect("receiver not held");
             let buffered = guard.try_recv();
@@ -20704,7 +20772,7 @@ mod harness_wake_tests {
         note_tx.send(chunk_note("later burst")).unwrap();
         let notes = {
             let map = mgr.handles.lock().unwrap();
-            map.get(&id).unwrap().notifications.clone()
+            map.get(&id).unwrap().execution.runtime.notifications()
         };
         let persisted_id = {
             let mut guard = notes.lock().await;
@@ -23072,7 +23140,19 @@ mod session_model_tests {
             ConnectionHooks::default(),
         ));
         track(mgr, id);
-        mgr.handles.lock().unwrap().get_mut(id).unwrap().connection = conn.clone();
+        mgr.handles
+            .lock()
+            .unwrap()
+            .get_mut(id)
+            .unwrap()
+            .execution
+            .local
+            .as_ref()
+            .unwrap()
+            .resources
+            .lock()
+            .unwrap()
+            .connection = conn.clone();
         (conn, server, request)
     }
 
@@ -23556,9 +23636,25 @@ async fn member_removal_preserves_running_turn_and_automation_but_sweeps_human_q
                 ..ConnectionHooks::default()
             },
         ));
-        let mut handle = mock_handle();
-        handle.connection = connection;
-        handle.notifications = Arc::new(TokioMutex::new(note_rx));
+        let handle = mock_handle();
+        handle
+            .execution
+            .local
+            .as_ref()
+            .unwrap()
+            .resources
+            .lock()
+            .unwrap()
+            .connection = connection;
+        handle
+            .execution
+            .local
+            .as_ref()
+            .unwrap()
+            .resources
+            .lock()
+            .unwrap()
+            .notifications = Arc::new(TokioMutex::new(note_rx));
         mgr.handles.lock().unwrap().insert(id.clone(), handle);
         mgr.registry.register(id.clone(), mgr.make_kill(id.clone()));
         let caller = Caller::Wire {
@@ -23671,3 +23767,104 @@ async fn member_removal_preserves_running_turn_and_automation_but_sweeps_human_q
         let _ = mock.await;
     }
 }
+
+/// Characterize the orchestration state that must outlive runtime teardown:
+/// queued delivery and the provider session belong to the agent, not its child.
+#[tokio::test]
+async fn runtime_characterization_stop_preserves_queue_and_resume_identity() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr.with_policy(PermissionPolicy::Interactive));
+    let ws = WorkspaceId::from("ws-runtime-stop");
+    let id = AgentId::from("runtime-stop");
+    seed_agent(&mgr, &ws, &id).await;
+    let agent = track_mock_agent(&mgr, &id, true);
+    let sid = mgr
+        .start_session(&id, PathBuf::from("/tmp/ws"), &test_provider())
+        .await
+        .unwrap();
+    assert!(mgr.try_begin(&id, &ws).await);
+    let queued = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "follow-up survives stop".into(),
+            Some("runtime-queued-message".into()),
+            super::TurnOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(queued["queued"], true);
+    let before = mgr.services.queue_snapshot(&id);
+    assert_eq!(before.len(), 1);
+
+    let mut permission = mgr
+        .permissions
+        .register(prompt("runtime-permission", &id.0));
+    assert!(mgr.respond_permission("runtime-permission", PermissionOutcome::Cancelled));
+    assert_eq!(permission.try_recv().unwrap(), PermissionOutcome::Cancelled);
+    assert!(!mgr.respond_permission("runtime-permission", PermissionOutcome::Cancelled));
+    assert!(mgr.pending_permissions().is_empty());
+
+    assert!(mgr.stop(&id).await);
+    assert!(!mgr.stop(&id).await, "teardown is idempotent");
+    assert!(!mgr.is_busy(&id));
+    assert!(!mgr.registry().is_registered(&id));
+    let after = mgr.services.queue_snapshot(&id);
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0]["id"], before[0]["id"]);
+    assert_eq!(after[0]["content"], before[0]["content"]);
+    assert_eq!(after[0]["turnId"], before[0]["turnId"]);
+    assert_eq!(
+        mgr.services
+            .store
+            .get_agent_session(&id)
+            .await
+            .unwrap()
+            .acp_session_id,
+        Some(sid)
+    );
+    agent.abort();
+}
+
+/// Idle reaping frees runtime capacity without changing the provider session
+/// identity; the next runtime resumes it instead of resending conversation.
+#[tokio::test]
+async fn runtime_characterization_idle_reap_resumes_same_session() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-runtime-reap");
+    let id = AgentId::from("runtime-reap");
+    seed_agent(&mgr, &ws, &id).await;
+    let first = track_mock_agent(&mgr, &id, true);
+    let sid = mgr
+        .start_session(&id, PathBuf::from("/tmp/ws"), &test_provider())
+        .await
+        .unwrap();
+    mgr.registry.set_last_active(&id, 1);
+    assert!(mgr.try_begin(&id, &ws).await);
+    assert_eq!(mgr.reap_idle_older_than(Duration::from_secs(60)).await, 0);
+    mgr.end_turn(&id).await;
+    mgr.registry.set_last_active(&id, 1);
+    assert_eq!(mgr.reap_idle_older_than(Duration::from_secs(60)).await, 1);
+    assert!(!mgr.contains(&id));
+    first.abort();
+
+    let (second, log) = track_mock_agent_with_log(&mgr, &id, true);
+    assert_eq!(
+        mgr.start_session(&id, PathBuf::from("/tmp/ws"), &test_provider())
+            .await
+            .unwrap(),
+        sid
+    );
+    assert!(!mgr.take_recreated(&id));
+    let calls = log.lock().unwrap().clone();
+    assert!(calls
+        .iter()
+        .any(|(method, params)| method == "session/load" && params["sessionId"] == sid));
+    assert!(!calls.iter().any(|(method, _)| method == "session/new"));
+    assert!(mgr.stop(&id).await);
+    second.abort();
+}
+
+#[path = "runtime_tests.rs"]
+mod runtime_tests;

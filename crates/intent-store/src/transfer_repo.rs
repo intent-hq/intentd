@@ -116,6 +116,27 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
         "daemon-global repository registry; the target daemon discovers repos itself",
     ),
     (
+        "execution_node",
+        "node registrations and pinned identities belong to the source head installation; \
+         workspace transfer cannot enroll hosts or claim their ownership on the target",
+    ),
+    (
+        "node_lease",
+        "source-head lease/incarnation bindings, link generations, acknowledgement watermarks \
+         and release fences are not portable execution authority; the target needs its own enrollment",
+    ),
+    (
+        "node_assignment",
+        "run ownership, capture counters, opaque node paths, merge targets and tombstones bind \
+         agents to source-head leases; imported agent sessions do not inherit those assignments",
+    ),
+    (
+        "node_checkpoint",
+        "checkpoint metadata and replay receipts bind source-head assignments to immutable \
+         hub refs, manifests and blobs not carried by the workspace archive; importing these \
+         rows alone would create dangling recovery pointers and cannot transfer ownership",
+    ),
+    (
         "client",
         "connected FE clients are per-daemon; imported draft rows referencing them \
          are dropped by the import transform layer",
