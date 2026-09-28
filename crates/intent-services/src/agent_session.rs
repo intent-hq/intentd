@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use intent_acp::callback_registration::{CallbackClient, CallbackQuery, CallbackToolRoutes};
 use intent_acp::session::{
     self, ContentBlock, InitializeResponse, MappedToolCall, MappedUpdate, McpServer, Meta,
     SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
@@ -28,7 +29,7 @@ use intent_core::{
     now_epoch_ms, now_iso, ActorType, AgentId, AgentSession, ContextUsage, Error, EventActor,
     MessageOrigin, Result, UsageCost, WorkspaceId, WorkspaceStatus,
 };
-use intent_store::NewEvent;
+use intent_store::{NewEvent, RepositoryAcpCompatibilityResult};
 use serde_json::{json, Map, Value};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -37,6 +38,9 @@ use crate::agent_ops::{
     last_response_and_digest_from_blocks, live_response_and_digest_from_blocks,
 };
 use crate::image_dimensions::{self, ProbeContext};
+use crate::repository_admission::lifecycle::physical_owner::{
+    RepositoryCreationOwner, RepositoryPhysicalOwner,
+};
 use crate::{file_ops, token_usage, usage_stats, Services};
 
 /// Derive the cross-layer, content-free stream correlation value used only in
@@ -273,7 +277,38 @@ fn transient_prompt_retry_base_ms() -> u64 {
 /// A candidate session that has not changed the canonical stored ACP identity.
 pub(crate) struct PreparedAcpSession {
     pub response: session::NewSessionResponse,
+    pub query: Option<CallbackQuery>,
     stored: AgentSession,
+}
+
+/// Ordinary session response and independently confirmed original ownership.
+/// A failed ownership check must not replace a completed session response.
+pub(crate) struct RepositorySessionOutcome<T> {
+    pub response: T,
+    pub owner: Result<RepositoryPhysicalOwner>,
+    pub query: Option<CallbackQuery>,
+}
+
+struct PreparedAcpLoad {
+    response: session::LoadSessionResponse,
+    query: Option<CallbackQuery>,
+    stored: AgentSession,
+    session_id: String,
+}
+
+enum RepositoryLoadAttempt {
+    Skipped,
+    Failed(Error),
+}
+
+/// Preserve the legacy returned ID, including a descriptive submitted fallback.
+/// This value is never used as proof of physical ownership.
+pub(crate) fn compatibility_session_id(result: RepositoryAcpCompatibilityResult) -> String {
+    match result {
+        RepositoryAcpCompatibilityResult::Observed { session_id }
+        | RepositoryAcpCompatibilityResult::SubmittedFallback { session_id }
+        | RepositoryAcpCompatibilityResult::Committed { session_id, .. } => session_id,
+    }
 }
 
 /// Result of opening or resuming an ACP session: the canonical `acpSessionId`
@@ -351,6 +386,7 @@ impl ThoughtLevelOption {
 /// one (Zed's model), so thoughts interleave with text/tool blocks in stream
 /// order.
 struct Transcript {
+    callback_routes: Arc<CallbackToolRoutes>,
     /// Assistant `AgentMessage` id minted at turn start (the block-id prefix).
     message_id: String,
     blocks: Vec<Value>,
@@ -423,6 +459,7 @@ struct RecordedToolBlocks {
 impl Transcript {
     fn new(message_id: String) -> Self {
         Self {
+            callback_routes: Arc::default(),
             message_id,
             blocks: Vec::new(),
             text: String::new(),
@@ -439,6 +476,11 @@ impl Transcript {
             media_scan_pos: 0,
             media_refs_seen: 0,
         }
+    }
+
+    fn with_callback_routes(mut self, routes: Arc<CallbackToolRoutes>) -> Self {
+        self.callback_routes = routes;
+        self
     }
 
     /// Enable the Markdown image dimension probe for this turn's text blocks.
@@ -2675,6 +2717,18 @@ impl Services {
         cwd: impl Into<PathBuf>,
         mcp_servers: Vec<McpServer>,
     ) -> Result<PreparedAcpSession> {
+        self.prepare_acp_session_with_callbacks(conn, None, agent_id, cwd, mcp_servers)
+            .await
+    }
+
+    pub(crate) async fn prepare_acp_session_with_callbacks(
+        &self,
+        conn: &Connection,
+        callbacks: Option<&CallbackClient>,
+        agent_id: &AgentId,
+        cwd: impl Into<PathBuf>,
+        mcp_servers: Vec<McpServer>,
+    ) -> Result<PreparedAcpSession> {
         // Load the session up front so the store write is scoped to the owning
         // workspace (the store's `set_acp_session_id` now requires it as a
         // defense-in-depth guard). This call is only reached after the caller
@@ -2708,11 +2762,22 @@ impl Services {
             "info",
         )
         .await;
-        let resp = session::new_session(conn, cwd, mcp_servers, meta)
-            .await
-            .map_err(|e| map_acp_session_error("session/new", &e, &provider_id))?;
+        let opened = if let Some(callbacks) = callbacks {
+            callbacks.new_session(cwd, mcp_servers, meta).await
+        } else {
+            session::new_session(conn, cwd, mcp_servers, meta)
+                .await
+                .map(
+                    |response| intent_acp::callback_registration::CallbackSession {
+                        response,
+                        query: None,
+                    },
+                )
+        }
+        .map_err(|e| map_acp_session_error("session/new", &e, &provider_id))?;
         Ok(PreparedAcpSession {
-            response: resp,
+            response: opened.response,
+            query: opened.query,
             stored,
         })
     }
@@ -2724,59 +2789,45 @@ impl Services {
         prepared: PreparedAcpSession,
         expected_old: Option<&str>,
     ) -> Result<AcpSessionOpened> {
-        let PreparedAcpSession {
-            response: resp,
-            stored,
-        } = prepared;
-        let candidate = resp.session_id.0.to_string();
+        let candidate = prepared.response.session_id.0.to_string();
         if candidate.is_empty() {
             return Err(Error::InvalidParams(
                 "Antigravity returned an empty session ID".into(),
             ));
         }
-        let workspace_id = &stored.workspace_id;
-        let agent_id = &stored.id;
-        // Use the existing transactional CAS even for first-set: an empty
-        // expected id cannot match a valid established session, while the
-        // store's None branch atomically initializes an unclaimed session.
         let canonical = self
             .store
             .replace_acp_session_id(
-                workspace_id,
-                agent_id,
+                &prepared.stored.workspace_id,
+                &prepared.stored.id,
                 expected_old.unwrap_or(""),
                 &candidate,
             )
             .await?;
-        if canonical != candidate {
+        self.finish_antigravity_acp_session(prepared, expected_old, canonical)
+            .await
+    }
+
+    /// Finish the original Antigravity candidate after its one persistence
+    /// operation. A canonical loser is never paired with this candidate's config.
+    pub(crate) async fn finish_antigravity_acp_session(
+        &self,
+        prepared: PreparedAcpSession,
+        expected_old: Option<&str>,
+        canonical: String,
+    ) -> Result<AcpSessionOpened> {
+        if canonical != prepared.response.session_id.0.as_ref() {
             return Err(Error::Conflict {
                 current: json!({"acpSessionId": canonical}),
             });
         }
-        if expected_old.is_some() {
-            self.clear_context_usage(agent_id);
-        }
-        self.persist_effective_model(
-            workspace_id,
-            agent_id,
-            stored.model.as_deref(),
-            resp.config_options.as_deref(),
-        )
-        .await;
-        let thought_level = discover_thought_level(resp.config_options.as_deref());
-        self.persist_session_effort_levels(workspace_id, agent_id, thought_level.as_ref())
-            .await;
-        Ok(AcpSessionOpened {
-            session_id: candidate,
-            modes: resp.modes,
-            thought_level,
-        })
+        Ok(self
+            .finish_created_acp_session(prepared, canonical, expected_old.is_some())
+            .await)
     }
 
-    /// Open a new ACP session and persist its id as `AgentSession.acpSessionId`
-    /// (write-once, for later resume) (§6.5). Returns the fresh id plus the
-    /// modes the provider advertised in `session/new` (used by the caller to
-    /// pick a permissive `session/set_mode` target from `availableModes`).
+    /// Open the first session with the ordinary write-once behavior when no
+    /// original repository creation context was available to the physical handle.
     pub(crate) async fn open_acp_session(
         &self,
         conn: &Connection,
@@ -2784,44 +2835,20 @@ impl Services {
         cwd: impl Into<PathBuf>,
         mcp_servers: Vec<McpServer>,
     ) -> Result<AcpSessionOpened> {
-        let PreparedAcpSession {
-            response: resp,
-            stored,
-        } = self
+        let prepared = self
             .prepare_acp_session(conn, agent_id, cwd, mcp_servers)
             .await?;
-        let workspace_id = stored.workspace_id.clone();
-        let acp_session_id = resp.session_id.0.to_string();
+        let session_id = prepared.response.session_id.0.to_string();
         self.store
-            .set_acp_session_id(&workspace_id, agent_id, &acp_session_id)
+            .set_acp_session_id(&prepared.stored.workspace_id, agent_id, &session_id)
             .await?;
-        self.persist_effective_model(
-            &workspace_id,
-            agent_id,
-            stored.model.as_deref(),
-            resp.config_options.as_deref(),
-        )
-        .await;
-        let thought_level = discover_thought_level(resp.config_options.as_deref());
-        self.persist_session_effort_levels(&workspace_id, agent_id, thought_level.as_ref())
-            .await;
-        Ok(AcpSessionOpened {
-            session_id: acp_session_id,
-            modes: resp.modes,
-            thought_level,
-        })
+        Ok(self
+            .finish_created_acp_session(prepared, session_id, false)
+            .await)
     }
 
-    /// Open a FRESH ACP session that REPLACES a lost/unsupported stored id (the
-    /// resume-impossible fallback): `session/new` then compare-and-swap the
-    /// persisted `acpSessionId` from `expected_old` (the id we just failed to
-    /// load) to the fresh one. Unlike [`open_acp_session`] (write-once first-set)
-    /// this is used ONLY when resume is impossible — `loadSession` unsupported or
-    /// `session/load` failed (§6.5). The CAS keeps the id canonical: if a
-    /// concurrent recreate already swapped it, the stored value is returned and
-    /// reused instead of being clobbered. Returns the canonical `acpSessionId`
-    /// with modes only when the freshly-opened session won the CAS — otherwise
-    /// the modes belong to some other session and callers must not act on them.
+    /// Preserve the original recreate/CAS result and accounting without an
+    /// original repository context. A losing candidate never supplies modes.
     pub(crate) async fn recreate_acp_session(
         &self,
         conn: &Connection,
@@ -2830,51 +2857,97 @@ impl Services {
         cwd: impl Into<PathBuf>,
         mcp_servers: Vec<McpServer>,
     ) -> Result<AcpSessionOpened> {
+        let prepared = self
+            .prepare_acp_session(conn, agent_id, cwd, mcp_servers)
+            .await?;
+        let canonical = self
+            .store
+            .replace_acp_session_id(
+                &prepared.stored.workspace_id,
+                agent_id,
+                expected_old,
+                &prepared.response.session_id.0,
+            )
+            .await?;
+        Ok(self
+            .finish_created_acp_session(prepared, canonical, true)
+            .await)
+    }
+
+    /// The original creator owns the actual ACP future and sole compatible
+    /// Store transaction. Neither a second SQL call nor a canonical ID supplies
+    /// ownership; its independently consumed owner stays with the caller.
+    pub(crate) async fn create_repository_acp_session(
+        &self,
+        conn: (&Connection, Option<&CallbackClient>),
+        agent_id: &AgentId,
+        cwd: impl Into<PathBuf>,
+        mcp_servers: Vec<McpServer>,
+        creation: RepositoryCreationOwner,
+        replacing: bool,
+    ) -> Result<RepositorySessionOutcome<AcpSessionOpened>> {
+        let (conn, callbacks) = conn;
+        let outcome = creation
+            .initialize_compatible(|| async {
+                let prepared = self
+                    .prepare_acp_session_with_callbacks(conn, callbacks, agent_id, cwd, mcp_servers)
+                    .await?;
+                Ok::<_, Error>((prepared.response.session_id.0.to_string(), prepared))
+            })
+            .await;
+        let mut prepared = outcome.producer?;
+        let query = prepared.query.take();
+        let canonical = compatibility_session_id(outcome.result?);
+        let response = self
+            .finish_created_acp_session(prepared, canonical, replacing)
+            .await;
+        Ok(RepositorySessionOutcome {
+            response,
+            owner: outcome.owner,
+            query,
+        })
+    }
+
+    async fn finish_created_acp_session(
+        &self,
+        prepared: PreparedAcpSession,
+        canonical: String,
+        replacing: bool,
+    ) -> AcpSessionOpened {
         let PreparedAcpSession {
             response: resp,
             stored,
-        } = self
-            .prepare_acp_session(conn, agent_id, cwd, mcp_servers)
-            .await?;
-        let workspace_id = stored.workspace_id.clone();
-        let new_acp_session_id = resp.session_id.0.to_string();
-        let canonical = self
-            .store
-            .replace_acp_session_id(&workspace_id, agent_id, expected_old, &new_acp_session_id)
-            .await?;
-        // On CAS loss the canonical id belongs to a session we did not open;
-        // our modes are meaningless for it and would target the wrong sid.
-        // The effective-model, thought-level, and effort-levels resolutions
-        // are skipped for the same reason — in particular the loser must NOT
-        // persist (or clear) `effort_levels`: its `None` means "CAS lost /
-        // unknown", not "the provider advertised no selector", and writing it
-        // would clobber what the winner just persisted.
-        let (modes, thought_level) = if canonical == new_acp_session_id {
-            // The old ACP session is gone: its last context-occupancy report
-            // no longer describes anything live, so drop it rather than serve
-            // a stale snapshot until the new session's first `usage_update`
-            // (intent-hq/intent#3797). Skipped on CAS loss — the winner owns
-            // the canonical session and this cleanup with it.
-            self.clear_context_usage(agent_id);
+            query: _,
+        } = prepared;
+        // On CAS loss the provider metadata belongs to the losing candidate.
+        // Preserve the winner's usage, effective model and effort metadata.
+        let (modes, thought_level) = if canonical == resp.session_id.0.as_ref() {
+            if replacing {
+                self.clear_context_usage(&stored.id);
+            }
             self.persist_effective_model(
-                &workspace_id,
-                agent_id,
+                &stored.workspace_id,
+                &stored.id,
                 stored.model.as_deref(),
                 resp.config_options.as_deref(),
             )
             .await;
             let thought_level = discover_thought_level(resp.config_options.as_deref());
-            self.persist_session_effort_levels(&workspace_id, agent_id, thought_level.as_ref())
-                .await;
+            self.persist_session_effort_levels(
+                &stored.workspace_id,
+                &stored.id,
+                thought_level.as_ref(),
+            )
+            .await;
             (resp.modes, thought_level)
         } else {
             (None, None)
         };
-        Ok(AcpSessionOpened {
+        AcpSessionOpened {
             session_id: canonical,
             modes,
             thought_level,
-        })
+        }
     }
 
     /// Resume the agent's persisted `acpSessionId` via `session/load`, but only
@@ -2889,6 +2962,60 @@ impl Services {
         cwd: impl Into<PathBuf>,
         mcp_servers: Vec<McpServer>,
     ) -> Result<Option<AcpSessionOpened>> {
+        let Some(prepared) = self
+            .prepare_acp_load(conn, None, init, agent_id, cwd, mcp_servers)
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(self.finish_acp_load(prepared).await))
+    }
+
+    pub(crate) async fn resume_repository_acp_session(
+        &self,
+        conn: (&Connection, Option<&CallbackClient>),
+        init: &InitializeResponse,
+        agent_id: &AgentId,
+        cwd: impl Into<PathBuf>,
+        mcp_servers: Vec<McpServer>,
+        creation: RepositoryCreationOwner,
+    ) -> Result<Option<RepositorySessionOutcome<AcpSessionOpened>>> {
+        let (conn, callbacks) = conn;
+        let outcome = creation
+            .initialize_compatible(|| async {
+                let prepared = self
+                    .prepare_acp_load(conn, callbacks, init, agent_id, cwd, mcp_servers)
+                    .await
+                    .map_err(RepositoryLoadAttempt::Failed)?
+                    .ok_or(RepositoryLoadAttempt::Skipped)?;
+                Ok((prepared.session_id.clone(), prepared))
+            })
+            .await;
+        let mut prepared = match outcome.producer {
+            Ok(prepared) => prepared,
+            Err(RepositoryLoadAttempt::Skipped) => return Ok(None),
+            Err(RepositoryLoadAttempt::Failed(error)) => return Err(error),
+        };
+        // session/load already returned its original response. The optional
+        // ownership read does not replace it or write another ACP session ID.
+        let query = prepared.query.take();
+        let response = self.finish_acp_load(prepared).await;
+        Ok(Some(RepositorySessionOutcome {
+            response,
+            owner: outcome.owner,
+            query,
+        }))
+    }
+
+    async fn prepare_acp_load(
+        &self,
+        conn: &Connection,
+        callbacks: Option<&CallbackClient>,
+        init: &InitializeResponse,
+        agent_id: &AgentId,
+        cwd: impl Into<PathBuf>,
+        mcp_servers: Vec<McpServer>,
+    ) -> Result<Option<PreparedAcpLoad>> {
         let stored = self.store.get_agent_session(agent_id).await?;
         let workspace_id = stored.workspace_id.clone();
         let Some(acp_session_id) = stored.acp_session_id.clone() else {
@@ -2963,24 +3090,55 @@ impl Services {
             "info",
         )
         .await;
-        let resp = session::load_session(conn, &acp_session_id, cwd, mcp_servers, meta)
-            .await
-            .map_err(|e| map_acp_session_error("session/load", &e, &provider_id))?;
+        let opened = if let Some(callbacks) = callbacks {
+            callbacks
+                .load_session(&acp_session_id, cwd, mcp_servers, meta)
+                .await
+        } else {
+            session::load_session(conn, &acp_session_id, cwd, mcp_servers, meta)
+                .await
+                .map(
+                    |response| intent_acp::callback_registration::CallbackSession {
+                        response,
+                        query: None,
+                    },
+                )
+        }
+        .map_err(|e| map_acp_session_error("session/load", &e, &provider_id))?;
+        Ok(Some(PreparedAcpLoad {
+            response: opened.response,
+            query: opened.query,
+            stored,
+            session_id: acp_session_id,
+        }))
+    }
+
+    async fn finish_acp_load(&self, prepared: PreparedAcpLoad) -> AcpSessionOpened {
+        let PreparedAcpLoad {
+            response: resp,
+            stored,
+            session_id,
+            query: _,
+        } = prepared;
         self.persist_effective_model(
-            &workspace_id,
-            agent_id,
+            &stored.workspace_id,
+            &stored.id,
             stored.model.as_deref(),
             resp.config_options.as_deref(),
         )
         .await;
         let thought_level = discover_thought_level(resp.config_options.as_deref());
-        self.persist_session_effort_levels(&workspace_id, agent_id, thought_level.as_ref())
-            .await;
-        Ok(Some(AcpSessionOpened {
-            session_id: acp_session_id,
+        self.persist_session_effort_levels(
+            &stored.workspace_id,
+            &stored.id,
+            thought_level.as_ref(),
+        )
+        .await;
+        AcpSessionOpened {
+            session_id,
             modes: resp.modes,
             thought_level,
-        }))
+        }
     }
 
     /// Discard the `session/update` burst that `session/load` replays after a
@@ -3045,6 +3203,7 @@ impl Services {
         let message_id = Uuid::now_v7().to_string();
         trace_stream_correlation_mapping(&message_id, turn_id);
         let mut transcript = Transcript::new(message_id.clone())
+            .with_callback_routes(conn.callback_tool_routes())
             .with_probe_context(self.image_probe_context(agent_id, workspace_id).await);
         // Turn wall-clock start, for the global usage-stats longest-run MAX.
         let turn_started = std::time::Instant::now();
@@ -4443,6 +4602,13 @@ impl Services {
     /// (`None` when the burst persisted nothing), the empty-response
     /// classification (intent-hq/monorepo#3262), and the content-free
     /// correlation needed by the caller's later idle diagnostic.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retain the ordinary driver for callers without a connection route table"
+        )
+    )]
     pub(crate) async fn run_harness_wake_turn(
         &self,
         notifications: &mut mpsc::UnboundedReceiver<IncomingNotification>,
@@ -4451,9 +4617,30 @@ impl Services {
         workspace_id: &WorkspaceId,
         settle: std::time::Duration,
     ) -> HarnessWakeOutcome {
+        self.run_harness_wake_turn_with_routes(
+            notifications,
+            first,
+            agent_id,
+            workspace_id,
+            settle,
+            Arc::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn run_harness_wake_turn_with_routes(
+        &self,
+        notifications: &mut mpsc::UnboundedReceiver<IncomingNotification>,
+        first: IncomingNotification,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        settle: std::time::Duration,
+        routes: Arc<CallbackToolRoutes>,
+    ) -> HarnessWakeOutcome {
         let turn_started = Instant::now();
         let message_id = Uuid::now_v7().to_string();
         let mut transcript = Transcript::new(message_id.clone())
+            .with_callback_routes(routes)
             .with_probe_context(self.image_probe_context(agent_id, workspace_id).await);
         // Live-turn slot + abort-safe guard, same contract as a prompt turn:
         // a `chat.subscribe` arriving mid-wake reconstructs the partial
@@ -5210,7 +5397,9 @@ impl Services {
         workspace_id: &WorkspaceId,
         transcript: &mut Transcript,
     ) -> bool {
-        let Some(mapped) = session::map_notification(note) else {
+        let Some(mapped) =
+            session::map_notification_with_callback_routes(note, &transcript.callback_routes)
+        else {
             return false;
         };
         let message_id = transcript.message_id.clone();

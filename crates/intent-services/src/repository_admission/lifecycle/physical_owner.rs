@@ -8,9 +8,11 @@ use std::sync::{Arc, Mutex, Weak};
 
 use intent_core::{AgentId, WorkspaceId};
 use intent_store::{
-    RepositoryAcpInitialization, RepositoryInitializationBinding, RepositoryInitializationClaim,
-    RepositoryInitializationConfirmation, RepositoryInitializationOutcome,
-    RepositoryInitializationPersistence, RepositoryInitializationTicket,
+    RepositoryAcpCompatibilityOutcome, RepositoryAcpCompatibilityPersistence,
+    RepositoryAcpCompatibilityResult, RepositoryAcpInitialization, RepositoryInitializationBinding,
+    RepositoryInitializationClaim, RepositoryInitializationConfirmation,
+    RepositoryInitializationOutcome, RepositoryInitializationPersistence,
+    RepositoryInitializationTicket,
 };
 
 use super::{
@@ -36,6 +38,15 @@ pub(crate) struct RepositoryCreationOutcome<T, E> {
     pub producer: Result<T, E>,
     pub persistence: RepositoryInitializationPersistence,
     pub owner: AdmissionResult<RepositoryPhysicalOwner>,
+}
+
+/// The original producer, ordinary persistence/result and optional ownership
+/// remain independent. Returned session strings never supply ownership proof.
+pub(crate) struct RepositoryCompatibleCreationOutcome<T, E> {
+    pub producer: Result<T, E>,
+    pub persistence: RepositoryAcpCompatibilityPersistence,
+    pub result: intent_core::Result<RepositoryAcpCompatibilityResult>,
+    pub owner: intent_core::Result<RepositoryPhysicalOwner>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -271,6 +282,98 @@ impl RepositoryCreationOwner {
         RepositoryCreationOutcome {
             producer: Ok(payload),
             persistence: outcome.persistence,
+            owner,
+        }
+    }
+
+    /// Run the original producer once, retaining ordinary ACP behavior even
+    /// when this pending allocation was retired. Only the captured Store and
+    /// original intent can reach the sole compatibility transaction.
+    pub(crate) async fn initialize_compatible<T, E, F, Fut>(
+        self,
+        operation: F,
+    ) -> RepositoryCompatibleCreationOutcome<T, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<(String, T), E>>,
+    {
+        let (session_id, payload) = match operation().await {
+            Ok(produced) => produced,
+            Err(error) => {
+                return RepositoryCompatibleCreationOutcome {
+                    producer: Err(error),
+                    persistence: RepositoryAcpCompatibilityPersistence::NotAttempted,
+                    result: Err(unavailable()),
+                    owner: Err(unavailable()),
+                };
+            }
+        };
+        let action = match &self.intent {
+            RepositoryCreationIntent::FirstSet => RepositoryAcpInitialization::FirstSet {
+                session_id: session_id.clone(),
+            },
+            RepositoryCreationIntent::Loaded {
+                session_id: expected,
+            } => {
+                if expected != &session_id {
+                    return RepositoryCompatibleCreationOutcome {
+                        producer: Ok(payload),
+                        persistence: RepositoryAcpCompatibilityPersistence::NotAttempted,
+                        result: Err(intent_core::Error::Internal(
+                            "original repository load returned another session".into(),
+                        )),
+                        owner: Err(unavailable()),
+                    };
+                }
+                RepositoryAcpInitialization::Loaded {
+                    session_id: session_id.clone(),
+                }
+            }
+            RepositoryCreationIntent::Replace { expected } => {
+                RepositoryAcpInitialization::Replace {
+                    expected: expected.clone(),
+                    session_id: session_id.clone(),
+                }
+            }
+        };
+        let binding = RepositoryInitializationBinding {
+            workspace_id: self.workspace.clone(),
+            agent_id: self.agent.clone(),
+            action,
+        };
+        // Missing/retired proof cannot become a new claim. Store may preserve
+        // ordinary behavior under its distinct mutation owner, never by
+        // replacing this original attempt or changing its captured database.
+        let claim = self
+            .claim_after_success(session_id)
+            .ok()
+            .map(|(claim, _)| claim);
+        let outcome = self
+            .store
+            .initialize_repository_acp_session_compatible(claim, binding)
+            .await;
+        self.complete_compatible(payload, outcome)
+    }
+
+    fn complete_compatible<T, E>(
+        self,
+        payload: T,
+        outcome: RepositoryAcpCompatibilityOutcome,
+    ) -> RepositoryCompatibleCreationOutcome<T, E> {
+        let store = self.store.clone();
+        // Preserve the original Store confirmation error without projecting
+        // it into a generic denial or erasing a known committed result.
+        let owner = outcome.confirmation.and_then(|confirmation| {
+            self.consume(&store, confirmation).map_err(|error| {
+                intent_core::Error::Internal(format!(
+                    "original repository owner confirmation rejected: {error:?}"
+                ))
+            })
+        });
+        RepositoryCompatibleCreationOutcome {
+            producer: Ok(payload),
+            persistence: outcome.persistence,
+            result: outcome.result,
             owner,
         }
     }
@@ -516,6 +619,22 @@ impl RepositoryInitializationTicket for Initialization {
             pending.phase = Phase::Retired;
         }
         self.settled = true;
+    }
+
+    fn settle_committed_without_confirmation(mut self: Box<Self>) -> intent_core::Result<()> {
+        let mut state = self.registry.state.lock().map_err(|_| unavailable())?;
+        // This ticket acknowledges only its own actual committed effect.
+        // No completion is created, even if the pending attempt is still live.
+        state.pending.remove(&self.barrier);
+        if let Some(pending) = state.creations.get_mut(&self.creator) {
+            if Weak::ptr_eq(&pending.token, &self.token)
+                && pending.binding.as_ref() == Some(&self.binding)
+            {
+                pending.phase = Phase::Retired;
+            }
+        }
+        self.settled = true;
+        Ok(())
     }
 }
 

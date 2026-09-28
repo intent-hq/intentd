@@ -2314,6 +2314,7 @@ fn mock_handle() -> AgentHandle {
         },
     ));
     AgentHandle {
+        repository_origin: crate::agent_manager::RepositoryOrigin::unavailable(),
         connection,
         notifications: Arc::new(TokioMutex::new(note_rx)),
         serve_task: tokio::spawn(async {}),
@@ -4592,6 +4593,7 @@ fn track_mock_agent_inner(
     mgr.handles.lock().unwrap().insert(
         id.clone(),
         AgentHandle {
+            repository_origin: crate::agent_manager::RepositoryOrigin::unavailable(),
             connection,
             notifications: Arc::new(TokioMutex::new(note_rx)),
             serve_task: tokio::spawn(async {}),
@@ -4743,6 +4745,7 @@ fn track_mock_agent_prompt_rpc_error_inner(
     mgr.handles.lock().unwrap().insert(
         id.clone(),
         AgentHandle {
+            repository_origin: crate::agent_manager::RepositoryOrigin::unavailable(),
             connection,
             notifications: Arc::new(TokioMutex::new(note_rx)),
             serve_task: tokio::spawn(async {}),
@@ -8539,6 +8542,7 @@ async fn interrupt_on_wedged_transport_still_emits_terminal_events() {
     mgr.handles.lock().unwrap().insert(
         id.clone(),
         AgentHandle {
+            repository_origin: crate::agent_manager::RepositoryOrigin::unavailable(),
             connection: conn,
             notifications: Arc::new(TokioMutex::new(note_rx)),
             serve_task: tokio::spawn(async {}),
@@ -19899,6 +19903,7 @@ mod harness_wake_tests {
             ConnectionHooks::default(),
         ));
         let handle = AgentHandle {
+            repository_origin: crate::agent_manager::RepositoryOrigin::unavailable(),
             connection,
             notifications: Arc::new(TokioMutex::new(note_rx)),
             serve_task: tokio::spawn(async {}),

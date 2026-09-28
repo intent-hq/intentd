@@ -34,12 +34,12 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use intent_acp::handshake::try_bypass_permissions_mode;
+use intent_acp::handshake::{handshake_with_callbacks, try_bypass_permissions_mode};
 use intent_acp::session::{
     ContentBlock, McpServer, SessionConfigOption, SessionModeState, StopReason,
 };
 use intent_acp::{
-    apply_baseline_env_to_stdio_servers, build_baseline_mcp_env_from_process, handshake,
+    apply_baseline_env_to_stdio_servers, build_baseline_mcp_env_from_process,
     normalize_mcp_servers, normalize_spaced_bridge_command, serve_workspace_mcp_tcp,
     spawn_provider, to_acp_session_mcp_servers, to_auggie_mcp_config, to_opencode_mcp_config,
     ClientRequestHandler, Connection, ConnectionHooks, EnvMap, EventSink, FileService,
@@ -71,6 +71,11 @@ use crate::agent_session::{
 };
 use crate::events::EventBus;
 use crate::Services;
+
+mod repository_origin;
+use crate::repository_admission::lifecycle::physical_owner::RepositoryCreationIntent;
+use repository_origin::callback_delivery::{deliver_optional, EndpointBlueprint, ServerBlueprint};
+use repository_origin::RepositoryOrigin;
 
 #[cfg(test)]
 pub(crate) mod tests;
@@ -2345,6 +2350,7 @@ struct AppliedEffort {
 /// spawned with, enabling `ensure_started` to detect model changes (via `agent.setModel`)
 /// and respawn the child with the new model before the next turn.
 struct AgentHandle {
+    repository_origin: Arc<RepositoryOrigin>,
     connection: Arc<Connection>,
     notifications: Arc<TokioMutex<mpsc::UnboundedReceiver<IncomingNotification>>>,
     serve_task: JoinHandle<()>,
@@ -2398,6 +2404,7 @@ struct AgentHandle {
 
 impl Drop for AgentHandle {
     fn drop(&mut self) {
+        self.repository_origin.retire();
         self.serve_task.abort();
         if let Some(listener) = &self.wake_listener {
             listener.abort();
@@ -3074,39 +3081,63 @@ impl AgentManager {
         // restart) keeps the surface the session was created with — matching
         // what `harnessFeatures` reports on the wire.
         let agent_features = self.services.session_agent_features(&session);
+        // Allocate before exposing a listener/config/callback to this child.
+        // Its pending callback is permanently unavailable, even after ACP
+        // initialization confirms a distinct physical owner.
+        let original_services = Arc::new(self.services.clone());
+        let repository_origin = RepositoryOrigin::allocate(&original_services, &session).await;
+        let read_owner = crate::repository_admission::read_request::RepositoryReadOwner::capture(
+            original_services.clone(),
+        );
 
         // Per-agent in-process MCP server over the SAME services surface the FE
         // uses, with the §18.4 denylist for this agent type applied, served over
         // a loopback bridge a real spawned child reaches via `--mcp-config`.
-        let api: Arc<dyn WorkspaceApi> = Arc::new(self.services.clone());
-        let server = Arc::new(
-            WorkspaceMcpServer::for_agent_type(api, workspace_id.clone(), agent_type)
-                // Caller-aware tools attribute back to this spawning agent.
-                .with_caller_agent_id(Some(agent_id.clone()))
-                // §7.1 deterministic attach: tool dispatch registers resource
-                // payloads into the same registry the transcript writer claims.
-                .with_turn_attachments(Some(self.services.turn_attachments()))
-                // The session's captured `[agentFeatures]` snapshot: settings
-                // changes after creation never mutate this session's surface,
-                // across respawns included.
-                .with_agent_features(agent_features.clone())
-                // Sub-agent bridges prune/deny `ws.app.question.*` (top-level
-                // agents only own a user-facing chat turn).
-                .with_sub_agent(is_sub_agent)
-                // Specialist `modelOptions` (PROTOCOL §5.11) resolved once
-                // at bridge creation, same snapshot semantics as the
-                // feature toggles: the delegate docs in this agent's
-                // `workspace_api` description list them per specialist.
-                .with_specialist_model_options(
-                    self.services
-                        .specialist_model_options_for_workspace(&workspace_id)
-                        .await,
-                )
-                // Truncating providers (claude-code cuts tool descriptions
-                // at ~2k chars) get the compact `workspace_api` description;
-                // the full reference rides the system prompt below.
-                .with_compact_tool_descriptions(opts.provider.truncates_tool_descriptions),
-        );
+        let api: Arc<dyn WorkspaceApi> = original_services;
+        let specialist_model_options = self
+            .services
+            .specialist_model_options_for_workspace(&workspace_id)
+            .await;
+        let server_blueprint = {
+            let workspace_id = workspace_id.clone();
+            let agent_id = agent_id.clone();
+            let agent_type = agent_type.to_string();
+            let attachments = self.services.turn_attachments();
+            let features = agent_features.clone();
+            let compact = opts.provider.truncates_tool_descriptions;
+            ServerBlueprint::new(read_owner, move || {
+                WorkspaceMcpServer::for_agent_type(api.clone(), workspace_id.clone(), &agent_type)
+                    .with_caller_agent_id(Some(agent_id.clone()))
+                    .with_turn_attachments(Some(attachments.clone()))
+                    .with_agent_features(features.clone())
+                    .with_sub_agent(is_sub_agent)
+                    .with_specialist_model_options(
+                        specialist_model_options
+                            .iter()
+                            .map(|options| intent_acp::SpecialistModelOptions {
+                                specialist: options.specialist.clone(),
+                                default_model: options.default_model.clone(),
+                                options: options
+                                    .options
+                                    .iter()
+                                    .map(|option| intent_acp::SpecialistModelOption {
+                                        provider: option.provider.clone(),
+                                        model: option.model.clone(),
+                                        hint: option.hint.clone(),
+                                        reasoning_effort: option.reasoning_effort.clone(),
+                                    })
+                                    .collect(),
+                            })
+                            .collect(),
+                    )
+                    .with_compact_tool_descriptions(compact)
+            })
+        };
+        let mut server = server_blueprint.server();
+        if let Some(context) = repository_origin.pending_callback() {
+            server = server.with_request_context(Arc::new(context));
+        }
+        let server = Arc::new(server);
         let antigravity_profile = if opts.provider.id == "antigravity" {
             let root = self.antigravity_state_root.as_deref().ok_or_else(|| {
                 Error::InvalidInput(
@@ -3191,6 +3222,11 @@ impl AgentManager {
         let mut session_mcp_servers: Vec<McpServer> = Vec::new();
         if opts.provider.supports_session_mcp_servers {
             let servers = self.normalized_mcp_servers(bridge.connect_addr()).await?;
+            if let Some(blueprint) = servers.get("workspace-mcp").and_then(|original| {
+                EndpointBlueprint::from_original(server_blueprint, original, &bridge.connect_addr())
+            }) {
+                repository_origin.configure_callbacks(blueprint);
+            }
             session_mcp_servers = to_acp_session_mcp_servers(&servers);
         }
 
@@ -3387,9 +3423,8 @@ impl AgentManager {
             }
         });
 
-        self.registry
-            .register(agent_id.clone(), self.make_kill(agent_id.clone()));
         let handle = AgentHandle {
+            repository_origin: repository_origin.clone(),
             connection,
             notifications: Arc::new(TokioMutex::new(note_rx)),
             serve_task,
@@ -3420,7 +3455,9 @@ impl AgentManager {
         // fresh `handle` above drops with its child still inside: its `Drop`
         // hands that child to the owned cleanup too, so neither tree is
         // orphaned and neither launch dir is removed early.
-        let stale = self.handles.lock().unwrap().remove(&agent_id);
+        let stale = repository_origin::capture(&self.handles, &agent_id).and_then(|original| {
+            repository_origin::take(&self.handles, &agent_id, &original, Some(&self.registry))
+        });
         if let Some(mut stale) = stale {
             if let Some(child) = DetachedChild::take(&mut stale) {
                 child.kill_tree().await;
@@ -3440,15 +3477,25 @@ impl AgentManager {
             if stopping.contains(&agent_id) {
                 Some(handle)
             } else {
-                self.handles
-                    .lock()
-                    .unwrap()
-                    .insert(agent_id.clone(), handle);
-                None
+                let mut slots = self.handles.lock().unwrap();
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    slots.entry(agent_id.clone())
+                {
+                    entry.insert(handle);
+                    self.registry.register(
+                        agent_id.clone(),
+                        self.make_original_kill(
+                            agent_id.clone(),
+                            Arc::downgrade(&repository_origin),
+                        ),
+                    );
+                    None
+                } else {
+                    Some(handle)
+                }
             }
         };
         if let Some(mut handle) = fenced {
-            self.registry.deregister(&agent_id);
             if let Some(child) = DetachedChild::take(&mut handle) {
                 child.kill_tree().await;
             }
@@ -3682,13 +3729,15 @@ impl AgentManager {
         cwd: PathBuf,
         provider: &ProviderConfig,
     ) -> Result<String> {
-        let (conn, session_mcp_servers, wake_gate, antigravity_profile) = {
+        let (conn, notes, repository_origin, session_mcp_servers, wake_gate, antigravity_profile) = {
             let map = self.handles.lock().unwrap();
             let handle = map
                 .get(agent_id)
                 .ok_or_else(|| Error::NotFound(format!("agent {agent_id}")))?;
             (
                 handle.connection.clone(),
+                handle.notifications.clone(),
+                handle.repository_origin.clone(),
                 handle.session_mcp_servers.clone(),
                 handle.wake_gate.clone(),
                 handle.antigravity_profile.clone(),
@@ -3717,9 +3766,15 @@ impl AgentManager {
                 "info",
             )
             .await;
-        let handshake = handshake(conn.as_ref(), provider)
-            .await
-            .map_err(|e| Error::Internal(format!("handshake failed: {e}")))?;
+        let negotiated = handshake_with_callbacks(
+            conn.clone(),
+            provider,
+            repository_origin.callback_offer(&session_record, provider),
+        )
+        .await
+        .map_err(|e| Error::Internal(format!("handshake failed: {e}")))?;
+        let callbacks = negotiated.callbacks;
+        let handshake = negotiated.ordinary;
 
         // Per the ACP schema, http/sse `McpServer` entries are only valid when
         // the agent advertised `mcpCapabilities.http`/`sse` in `initialize` —
@@ -3789,6 +3844,24 @@ impl AgentManager {
         // 1) Try to resume the persisted session (gated on stored id + capability).
         match if forced {
             Ok(None)
+        } else if let Some((creation, attempt)) = stored_id.as_ref().and_then(|session_id| {
+            repository_origin.begin_session(RepositoryCreationIntent::Loaded {
+                session_id: session_id.clone(),
+            })
+        }) {
+            self.services
+                .resume_repository_acp_session(
+                    (conn.as_ref(), callbacks.as_ref()),
+                    &handshake.initialize,
+                    agent_id,
+                    cwd.clone(),
+                    session_mcp_servers.clone(),
+                    creation,
+                )
+                .await
+                .map(|opened| {
+                    opened.map(|outcome| repository_origin.accept_session(attempt, outcome))
+                })
         } else {
             self.services
                 .resume_acp_session(
@@ -3799,21 +3872,16 @@ impl AgentManager {
                     session_mcp_servers.clone(),
                 )
                 .await
+                .map(|opened| opened.map(|response| (response, None)))
         } {
-            Ok(Some(opened)) => {
+            Ok(Some((opened, delivery))) => {
                 // `session/load` replays the prior conversation as a buffered
                 // `session/update` burst; discard it before the first turn so it
                 // is neither re-published as events nor re-accumulated into the
                 // transcript (parity with TS's "no active streaming handler ⇒
                 // drop"). Only the resume path needs this settle-window drain —
                 // new/recreate sessions have no buffered replay.
-                let notes = self
-                    .handles
-                    .lock()
-                    .unwrap()
-                    .get(agent_id)
-                    .map(|h| h.notifications.clone());
-                if let Some(notes) = notes {
+                {
                     let mut guard = notes.lock().await;
                     Services::drain_replay_notifications(&mut guard).await;
                 }
@@ -3850,6 +3918,7 @@ impl AgentManager {
                     Some(&default),
                 )
                 .await;
+                deliver_optional(delivery).await;
                 return Ok(opened.session_id);
             }
             Ok(None) => {}
@@ -3871,23 +3940,71 @@ impl AgentManager {
         // becomes resumable. A failed attempt leaves the prior stored ID and
         // transcript intact, including across a daemon restart.
         if provider.id == "antigravity" {
-            let prepared = self
-                .services
-                .prepare_acp_session(conn.as_ref(), agent_id, cwd, session_mcp_servers)
-                .await?;
-            let model_response = self
-                .maybe_apply_session_model(
-                    conn.as_ref(),
-                    agent_id,
-                    provider,
-                    &prepared.response.session_id.0,
-                    stored_model.as_deref(),
+            let creation = repository_origin.begin_session(RepositoryCreationIntent::Replace {
+                // Preserve the legacy first-set empty expectation without
+                // claiming that it was a strict NULL-to-value winner.
+                expected: Some(stored_id.clone().unwrap_or_default()),
+            });
+            let prepare = || async {
+                let prepared = self
+                    .services
+                    .prepare_acp_session_with_callbacks(
+                        conn.as_ref(),
+                        callbacks.as_ref(),
+                        agent_id,
+                        cwd,
+                        session_mcp_servers,
+                    )
+                    .await?;
+                let model_response = self
+                    .maybe_apply_session_model(
+                        conn.as_ref(),
+                        agent_id,
+                        provider,
+                        &prepared.response.session_id.0,
+                        stored_model.as_deref(),
+                    )
+                    .await?;
+                let candidate = prepared.response.session_id.0.to_string();
+                if candidate.is_empty() {
+                    return Err(Error::InvalidParams(
+                        "Antigravity returned an empty session ID".into(),
+                    ));
+                }
+                Ok::<_, Error>((candidate, (prepared, model_response)))
+            };
+            let ((opened, delivery), model_response) = if let Some((creation, attempt)) = creation {
+                let outcome = creation.initialize_compatible(prepare).await;
+                let (mut prepared, model_response) = outcome.producer?;
+                let query = prepared.query.take();
+                let canonical = crate::agent_session::compatibility_session_id(outcome.result?);
+                let opened = self
+                    .services
+                    .finish_antigravity_acp_session(prepared, stored_id.as_deref(), canonical)
+                    .await?;
+                (
+                    repository_origin.accept_session(
+                        attempt,
+                        crate::agent_session::RepositorySessionOutcome {
+                            response: opened,
+                            owner: outcome.owner,
+                            query,
+                        },
+                    ),
+                    model_response,
                 )
-                .await?;
-            let opened = self
-                .services
-                .commit_antigravity_acp_session(prepared, stored_id.as_deref())
-                .await?;
+            } else {
+                let (_, (prepared, model_response)) = prepare().await?;
+                (
+                    (
+                        self.services
+                            .commit_antigravity_acp_session(prepared, stored_id.as_deref())
+                            .await?,
+                        None,
+                    ),
+                    model_response,
+                )
+            };
             self.force_recreate.lock().unwrap().remove(agent_id);
             if stored_id.is_some() {
                 self.recreated.lock().unwrap().insert(agent_id.clone());
@@ -3902,6 +4019,7 @@ impl AgentManager {
                 None,
             )
             .await;
+            deliver_optional(delivery).await;
             return Ok(opened.session_id);
         }
 
@@ -3913,16 +4031,37 @@ impl AgentManager {
         // replace keeps the id canonical, swapping only the exact id we failed to
         // load.
         if let Some(expected_old) = stored_id {
-            let opened = self
-                .services
-                .recreate_acp_session(
-                    conn.as_ref(),
-                    agent_id,
-                    &expected_old,
-                    cwd,
-                    session_mcp_servers.clone(),
+            let (opened, delivery) = if let Some((creation, attempt)) = repository_origin
+                .begin_session(RepositoryCreationIntent::Replace {
+                    expected: Some(expected_old.clone()),
+                }) {
+                repository_origin.accept_session(
+                    attempt,
+                    self.services
+                        .create_repository_acp_session(
+                            (conn.as_ref(), callbacks.as_ref()),
+                            agent_id,
+                            cwd,
+                            session_mcp_servers.clone(),
+                            creation,
+                            true,
+                        )
+                        .await?,
                 )
-                .await?;
+            } else {
+                (
+                    self.services
+                        .recreate_acp_session(
+                            conn.as_ref(),
+                            agent_id,
+                            &expected_old,
+                            cwd,
+                            session_mcp_servers.clone(),
+                        )
+                        .await?,
+                    None,
+                )
+            };
             self.force_recreate.lock().unwrap().remove(agent_id);
             self.recreated.lock().unwrap().insert(agent_id.clone());
             self.arm_first_turn_prepend(agent_id, provider);
@@ -3951,14 +4090,35 @@ impl AgentManager {
                 None,
             )
             .await;
+            deliver_optional(delivery).await;
             return Ok(opened.session_id);
         }
 
         // 3) Brand-new agent → open and persist the first session (write-once).
-        let opened = self
-            .services
-            .open_acp_session(conn.as_ref(), agent_id, cwd, session_mcp_servers)
-            .await?;
+        let (opened, delivery) = if let Some((creation, attempt)) =
+            repository_origin.begin_session(RepositoryCreationIntent::FirstSet)
+        {
+            repository_origin.accept_session(
+                attempt,
+                self.services
+                    .create_repository_acp_session(
+                        (conn.as_ref(), callbacks.as_ref()),
+                        agent_id,
+                        cwd,
+                        session_mcp_servers,
+                        creation,
+                        false,
+                    )
+                    .await?,
+            )
+        } else {
+            (
+                self.services
+                    .open_acp_session(conn.as_ref(), agent_id, cwd, session_mcp_servers)
+                    .await?,
+                None,
+            )
+        };
         self.force_recreate.lock().unwrap().remove(agent_id);
         self.arm_first_turn_prepend(agent_id, provider);
         self.maybe_bypass_permissions(
@@ -3986,6 +4146,7 @@ impl AgentManager {
             None,
         )
         .await;
+        deliver_optional(delivery).await;
         Ok(opened.session_id)
     }
 
@@ -4893,12 +5054,16 @@ impl AgentManager {
         prompt: Vec<ContentBlock>,
         turn_id: Option<&str>,
     ) -> Result<StopReason> {
-        let (conn, notes) = {
+        let (conn, notes, _repository_origin) = {
             let map = self.handles.lock().unwrap();
             let handle = map
                 .get(agent_id)
                 .ok_or_else(|| Error::NotFound(format!("agent {agent_id}")))?;
-            (handle.connection.clone(), handle.notifications.clone())
+            (
+                handle.connection.clone(),
+                handle.notifications.clone(),
+                handle.repository_origin.clone(),
+            )
         };
         self.registry.mark_active(agent_id);
         let mut guard = notes.lock().await;
@@ -5022,6 +5187,13 @@ impl AgentManager {
         redelivery: Option<crate::agent_ops::QueuedPrepend>,
         sync_store: bool,
     ) -> (bool, Option<DetachedChild>) {
+        let original = repository_origin::capture(&self.handles, agent_id);
+        if let Some(original) = &original {
+            original.retire();
+            if !repository_origin::is_current(&self.handles, agent_id, original) {
+                return (false, None);
+            }
+        }
         // Pin the live-turn slot BEFORE aborting the worker (the abort drops
         // LiveTurnGuard; the pin keeps the slot published until the flush
         // below persists the row — monorepo#2056), then flush the partial
@@ -5087,10 +5259,11 @@ impl AgentManager {
             self.sync_stop_redelivery(agent_id).await;
         }
         self.end_turn(agent_id).await;
-        let handle = self.handles.lock().unwrap().remove(agent_id);
+        let handle = original.as_ref().and_then(|original| {
+            repository_origin::take(&self.handles, agent_id, original, Some(&self.registry))
+        });
         let removed = handle.is_some();
         let child = handle.and_then(|mut h| DetachedChild::take(&mut h));
-        self.registry.deregister(agent_id);
         (removed, child)
     }
 
@@ -5150,13 +5323,14 @@ impl AgentManager {
         let suppress_idle_emit = reason == InterruptReason::PreemptedByMessage;
         // The live connection is the interrupt capability; grab it WITHOUT
         // removing the handle so the child stays alive for resume.
-        let conn = self
-            .handles
-            .lock()
-            .unwrap()
-            .get(agent_id)
-            .map(|h| h.connection.clone());
-        let Some(conn) = conn else {
+        let original = self.handles.lock().unwrap().get(agent_id).map(|h| {
+            (
+                h.connection.clone(),
+                h.notifications.clone(),
+                h.repository_origin.clone(),
+            )
+        });
+        let Some((conn, notes, repository_origin)) = original else {
             // No live session to interrupt → keep-alive is a no-op; fall back to
             // the hard kill path (itself a no-op when the agent is already gone).
             return InterruptOutcome::killed(self.stop_with_redelivery_arm(agent_id, reason).await);
@@ -5165,6 +5339,14 @@ impl AgentManager {
         // `acpSessionId` to cancel. Without an `acpSessionId` there is no
         // in-flight turn to interrupt, so fall back to the kill path.
         let session = self.services.store.get_agent_session(agent_id).await.ok();
+        if !repository_origin::is_current(&self.handles, agent_id, &repository_origin) {
+            repository_origin.retire();
+            return InterruptOutcome {
+                agent_found: false,
+                preempted: false,
+                interrupted_row_id: None,
+            };
+        }
         let acp_session_id = session.as_ref().and_then(|s| s.acp_session_id.clone());
         let Some(acp_session_id) = acp_session_id else {
             return InterruptOutcome::killed(self.stop_with_redelivery_arm(agent_id, reason).await);
@@ -5193,6 +5375,7 @@ impl AgentManager {
             };
         }
         let turn_in_flight = self.is_busy(agent_id);
+        repository_origin.interrupt_requests();
         // Abort the in-flight worker so it stops draining the turn/queue; the
         // child is kept alive (unlike `stop`, which also kills the child).
         if let Some(worker) = self.workers.lock().unwrap().remove(agent_id) {
@@ -5314,7 +5497,7 @@ impl AgentManager {
                     timeout = ?SESSION_CANCEL_WRITE_TIMEOUT,
                     "session/cancel undeliverable (transport wedged) — killing the child so the stop settles (monorepo#3039)"
                 );
-                self.kill_child_only(agent_id).await;
+                self.kill_original_child(agent_id, &repository_origin).await;
             }
         }
         // Provider quirk teardown (intent-hq/monorepo#2763): providers with
@@ -5351,7 +5534,7 @@ impl AgentManager {
                 agent = %agent_id,
                 "provider kills_child_on_interrupt quirk: tearing the child down after session/cancel (monorepo#2763)"
             );
-            self.kill_child_only(agent_id).await;
+            self.kill_original_child(agent_id, &repository_origin).await;
         }
         // STAB-124: the cancelled child echoes `tool_call_update`s for the
         // aborted tool call (title-less, status failed). With the worker gone,
@@ -5361,13 +5544,7 @@ impl AgentManager {
         // Discard them with the same bounded settle-window drain the resume
         // path uses for the `session/load` replay burst. The aborted worker's
         // channel lock is released when its task drops, so this cannot deadlock.
-        let notes = self
-            .handles
-            .lock()
-            .unwrap()
-            .get(agent_id)
-            .map(|h| h.notifications.clone());
-        if let Some(notes) = notes {
+        {
             let mut guard = notes.lock().await;
             Services::drain_replay_notifications(&mut guard).await;
         }
@@ -8098,12 +8275,16 @@ impl AgentManager {
         let Ok(_mutation) = self.services.workspace_mutations.enter(workspace_id) else {
             return false;
         };
-        let (notes, gate) = {
+        let (notes, gate, callback_routes) = {
             let map = self.handles.lock().unwrap();
             let Some(handle) = map.get(agent_id) else {
                 return false;
             };
-            (handle.notifications.clone(), handle.wake_gate.clone())
+            (
+                handle.notifications.clone(),
+                handle.wake_gate.clone(),
+                handle.connection.callback_tool_routes(),
+            )
         };
         if gate.load(AtomicOrdering::SeqCst) > 0 {
             return true;
@@ -8213,12 +8394,13 @@ impl AgentManager {
                 // here needs no redrive/attention (monorepo#3262).
                 let _ = self
                     .services
-                    .run_harness_wake_turn(
+                    .run_harness_wake_turn_with_routes(
                         &mut guard,
                         first,
                         agent_id,
                         workspace_id,
                         Duration::ZERO,
+                        callback_routes,
                     )
                     .await;
                 return true;
@@ -8246,7 +8428,14 @@ impl AgentManager {
         let drive = intent_core::spawn_daemon(async move {
             let outcome = mgr
                 .services
-                .run_harness_wake_turn(&mut guard, first, &id, &ws, HARNESS_WAKE_SETTLE)
+                .run_harness_wake_turn_with_routes(
+                    &mut guard,
+                    first,
+                    &id,
+                    &ws,
+                    HARNESS_WAKE_SETTLE,
+                    callback_routes,
+                )
                 .await;
             // Idle without waking a queued spawn: the busy slot is still held
             // here, so the `end_turn` below performs the wake (#5253).
@@ -8332,6 +8521,10 @@ impl AgentManager {
         if session.status != AgentStatus::Error {
             return Ok(json!({ "ok": false }));
         }
+        let original = repository_origin::capture(&self.handles, &agent_id);
+        if let Some(original) = &original {
+            original.retire();
+        }
 
         // Use the session's persisted workspace_id for safety (cross-workspace guard)
         let workspace_id = &session.workspace_id;
@@ -8392,7 +8585,9 @@ impl AgentManager {
 
         // Tear down any stale child handle (use kill_child_only to avoid
         // overwriting the status we just set)
-        self.kill_child_only(&agent_id).await;
+        if let Some(original) = original {
+            self.kill_original_child(&agent_id, &original).await;
+        }
 
         // Close the check-then-flip race: a message enqueued between the queue
         // check above and the status flip had its own drain attempt suppressed
@@ -9373,7 +9568,23 @@ impl AgentManager {
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn shutdown(&self) {
-        let ids: Vec<AgentId> = self.handles.lock().unwrap().keys().cloned().collect();
+        let originals: Vec<_> = self
+            .handles
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, handle)| (id.clone(), handle.repository_origin.clone()))
+            .collect();
+        let ids: Vec<_> = originals.iter().map(|(id, _)| id.clone()).collect();
+        self.stopping.lock().unwrap().extend(ids.iter().cloned());
+        let _fence = TeardownFence {
+            stopping: self.stopping.clone(),
+            ids: ids.clone(),
+        };
+        // Never hold the handles map while an already-admitted stage drains.
+        for (_, original) in &originals {
+            original.retire();
+        }
         let now = intent_core::now_iso();
 
         // Capture in-flight agents before stop() settles them to RuntimeIdle.
@@ -9648,27 +9859,42 @@ impl AgentManager {
     /// worker or busy flag. Safe to call from within the worker itself (e.g.,
     /// retry loop). Use `stop()` for full teardown from external callers.
     async fn kill_child_only(&self, agent_id: &AgentId) {
-        let handle = self.handles.lock().unwrap().remove(agent_id);
+        if let Some(original) = repository_origin::capture(&self.handles, agent_id) {
+            self.kill_original_child(agent_id, &original).await;
+        }
+    }
+
+    async fn kill_original_child(&self, agent_id: &AgentId, original: &Arc<RepositoryOrigin>) {
+        let handle =
+            repository_origin::take(&self.handles, agent_id, original, Some(&self.registry));
         if let Some(mut handle) = handle {
             if let Some(child) = DetachedChild::take(&mut handle) {
                 child.kill_tree().await;
             }
         }
-        self.registry.deregister(agent_id);
     }
 
     /// Build the kill callback for `agent_id`: removing the handle signals the
     /// child's whole process group (SIGTERM→SIGKILL) and aborts its request
     /// loop, so no orphaned grandchildren linger.
+    #[cfg(test)]
     fn make_kill(&self, agent_id: AgentId) -> KillFn {
+        let original = repository_origin::capture(&self.handles, &agent_id)
+            .map_or_else(Weak::new, |origin| Arc::downgrade(&origin));
+        self.make_original_kill(agent_id, original)
+    }
+
+    fn make_original_kill(&self, agent_id: AgentId, original: Weak<RepositoryOrigin>) -> KillFn {
         let handles: Weak<Mutex<HashMap<AgentId, AgentHandle>>> = Arc::downgrade(&self.handles);
         Arc::new(move || {
             let handles = handles.clone();
             let id = agent_id.clone();
+            let original = original.clone();
             Box::pin(async move {
-                let removed = handles
-                    .upgrade()
-                    .and_then(|h| h.lock().unwrap().remove(&id));
+                let removed = handles.upgrade().and_then(|handles| {
+                    let original = original.upgrade()?;
+                    repository_origin::take(&handles, &id, &original, None)
+                });
                 if let Some(mut handle) = removed {
                     if let Some(child) = DetachedChild::take(&mut handle) {
                         child.kill_tree().await;
@@ -9705,6 +9931,8 @@ impl AgentManager {
         agent_id: AgentId,
         child_pid: Option<u32>,
     ) -> JoinHandle<bool> {
+        let original = repository_origin::capture(&self.handles, &agent_id)
+            .map_or_else(Weak::new, |origin| Arc::downgrade(&origin));
         let handles = Arc::downgrade(&self.handles);
         let registry = Arc::downgrade(&self.registry);
         let busy = Arc::downgrade(&self.busy);
@@ -9712,9 +9940,12 @@ impl AgentManager {
         intent_core::spawn_daemon(async move {
             loop {
                 tokio::time::sleep(CHILD_EXIT_POLL_INTERVAL).await;
-                let (Some(handles), Some(registry), Some(busy)) =
-                    (handles.upgrade(), registry.upgrade(), busy.upgrade())
-                else {
+                let (Some(handles), Some(registry), Some(busy), Some(original)) = (
+                    handles.upgrade(),
+                    registry.upgrade(),
+                    busy.upgrade(),
+                    original.upgrade(),
+                ) else {
                     return false; // manager torn down
                 };
                 // Snapshot busy membership BEFORE the handles lock (no nested
@@ -9729,6 +9960,9 @@ impl AgentManager {
                     let Some(handle) = map.get_mut(&agent_id) else {
                         return false;
                     };
+                    if !Arc::ptr_eq(&handle.repository_origin, &original) {
+                        return false;
+                    }
                     let Some(child) = handle.child.as_mut() else {
                         return false;
                     };
@@ -9763,21 +9997,20 @@ impl AgentManager {
                             if is_busy {
                                 None
                             } else {
-                                let dead = map.remove(&agent_id);
-                                registry.deregister(&agent_id);
-                                Some((
-                                    status,
-                                    dead.map(|mut h| {
-                                        (DetachedChild::take(&mut h), Arc::clone(&h.connection))
-                                    }),
-                                ))
+                                Some(status)
                             }
                         }
                     }
                 };
-                if let Some((status, dead)) = exited {
-                    let (dead_child, dead_conn) =
-                        dead.map_or((None, None), |(child, conn)| (child, Some(conn)));
+                if let Some(status) = exited {
+                    let Some(mut dead) =
+                        repository_origin::take(&handles, &agent_id, &original, Some(&registry))
+                    else {
+                        return false;
+                    };
+                    let dead_child = DetachedChild::take(&mut dead);
+                    let dead_conn = Some(Arc::clone(&dead.connection));
+                    drop(dead);
                     // The direct child is already reaped (`try_wait` above),
                     // but same-group descendants can survive it: sweep the
                     // process group via the spawn-time pid. Swept BEFORE the
@@ -9876,6 +10109,7 @@ impl DetachedChild {
     /// Move the child (and its launch dir) out of `handle`; `None` when the
     /// handle owns no child.
     fn take(handle: &mut AgentHandle) -> Option<Self> {
+        handle.repository_origin.retire();
         let child = handle.child.take()?;
         Some(Self {
             child: Some(child),
@@ -16253,6 +16487,7 @@ mod dead_child_respawn_tests {
         let (_note_tx, note_rx) = mpsc::unbounded_channel::<IncomingNotification>();
         let child_pid = child.as_ref().and_then(tokio::process::Child::id);
         AgentHandle {
+            repository_origin: RepositoryOrigin::unavailable(),
             connection,
             notifications: Arc::new(TokioMutex::new(note_rx)),
             serve_task: tokio::spawn(async {}),

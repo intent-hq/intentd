@@ -3,6 +3,7 @@
 
 use intent_core::caller::with_caller;
 use intent_core::{chief_workspace, AgentSession, Workspace};
+use intent_store::{RepositoryAcpCompatibilityEffect, RepositoryInitializationObservation};
 
 use super::*;
 
@@ -364,6 +365,79 @@ async fn forged_owner_and_known_no_effect_cannot_mint_confirmation() {
     assert!(creator.claim_after_success("after".into()).is_err());
     assert!(f.registry.state.lock().unwrap().origins.is_empty());
     assert!(f.registry.state.lock().unwrap().pending.is_empty());
+}
+
+#[tokio::test]
+async fn committed_without_confirmation_settles_original_barrier_without_live_owner() {
+    let f = Fixture::new(None).await;
+    let creator = f.creator(RepositoryCreationIntent::FirstSet);
+    let callback = creator.callback();
+    begin_fixture(&creator)
+        .settle_committed_without_confirmation()
+        .unwrap();
+    assert!(creator.claim_after_success("late".into()).is_err());
+    assert!(!current(&callback.capture(), f.caller()).await);
+    assert!(f.registry.state.lock().unwrap().origins.is_empty());
+    assert!(f.registry.state.lock().unwrap().pending.is_empty());
+    let fresh = f.creator(RepositoryCreationIntent::FirstSet);
+    assert!(fresh
+        .initialize(&f.store, || async { Ok("fresh".into()) })
+        .await
+        .is_ok());
+}
+
+#[tokio::test]
+async fn committed_without_confirmation_preserves_other_unknown_barrier() {
+    let f = Fixture::new(None).await;
+    let creator = f.creator(RepositoryCreationIntent::FirstSet);
+    let original = begin_fixture(&creator);
+    let original_barriers = f
+        .registry
+        .state
+        .lock()
+        .unwrap()
+        .pending
+        .keys()
+        .copied()
+        .collect::<HashSet<_>>();
+    let unknown = f
+        .registry
+        .begin_mutation(&[RepositoryLifecycleKey::Agent(f.agent.clone())])
+        .unwrap();
+    let other_barriers = f
+        .registry
+        .state
+        .lock()
+        .unwrap()
+        .pending
+        .keys()
+        .copied()
+        .filter(|id| !original_barriers.contains(id))
+        .collect::<HashSet<_>>();
+    assert_eq!(other_barriers.len(), 1);
+    drop(unknown);
+    original.settle_committed_without_confirmation().unwrap();
+    assert_eq!(
+        f.registry
+            .state
+            .lock()
+            .unwrap()
+            .pending
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>(),
+        other_barriers
+    );
+    assert!(creator.claim_after_success("late".into()).is_err());
+    assert!(f.registry.state.lock().unwrap().origins.is_empty());
+    assert!(RepositoryCreationOwner::allocate(
+        &f.registry,
+        &f.store,
+        f.workspace.id.clone(),
+        f.agent.clone(),
+        RepositoryCreationIntent::FirstSet,
+    )
+    .is_err());
 }
 
 #[tokio::test]
@@ -995,4 +1069,477 @@ async fn outcome_rejects_foreign_store_without_losing_the_actual_producer_result
             .acp_session_id
             .is_none());
     }
+}
+
+#[tokio::test]
+async fn compatible_original_producer_payload_and_fresh_callback_survive_once() {
+    struct Payload(Arc<()>);
+    let f = Fixture::new(None).await;
+    let creator = f.creator(RepositoryCreationIntent::FirstSet);
+    let pending = creator.callback();
+    let marker = Arc::new(());
+    let payload = Payload(marker.clone());
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let count = &calls;
+    let outcome = creator
+        .initialize_compatible(|| async move {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok::<_, AdmissionError>(("created".into(), payload))
+        })
+        .await;
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(Arc::ptr_eq(&outcome.producer.unwrap().0, &marker));
+    assert_eq!(
+        outcome.result.unwrap(),
+        RepositoryAcpCompatibilityResult::Committed {
+            session_id: "created".into(),
+            effect: RepositoryAcpCompatibilityEffect::FirstSet,
+        }
+    );
+    assert_eq!(
+        outcome.persistence,
+        RepositoryAcpCompatibilityPersistence::Committed {
+            observed: RepositoryInitializationObservation::Present {
+                session_id: Some("created".into())
+            },
+            affected_rows: 1,
+        }
+    );
+    let owner = outcome.owner.unwrap();
+    assert!(!current(&pending.capture(), f.caller()).await);
+    assert!(current(&owner.callback().capture(), f.caller()).await);
+}
+
+#[tokio::test]
+async fn compatible_original_producer_error_never_becomes_a_store_attempt() {
+    #[derive(Debug)]
+    struct ProducerError(Arc<()>);
+    let f = Fixture::new(None).await;
+    let marker = Arc::new(());
+    let error = ProducerError(marker.clone());
+    let outcome = f
+        .creator(RepositoryCreationIntent::FirstSet)
+        .initialize_compatible(|| async move { Err::<(String, ()), _>(error) })
+        .await;
+    assert!(Arc::ptr_eq(&outcome.producer.unwrap_err().0, &marker));
+    assert_eq!(
+        outcome.persistence,
+        RepositoryAcpCompatibilityPersistence::NotAttempted
+    );
+    assert!(outcome.result.is_err());
+    assert!(outcome.owner.is_err());
+    assert!(f
+        .store
+        .get_agent_session(&f.agent)
+        .await
+        .unwrap()
+        .acp_session_id
+        .is_none());
+    assert!(f.registry.state.lock().unwrap().pending.is_empty());
+}
+
+#[tokio::test]
+async fn compatible_setup_writes_preserve_results_and_retire_only_binding_changes() {
+    for setup in 0..3 {
+        let f = Fixture::new(None).await;
+        let creator = f.creator(RepositoryCreationIntent::FirstSet);
+        let pending = creator.callback();
+        let retirement = creator.retirement();
+        let outcome = creator
+            .initialize_compatible(|| async {
+                if setup == 2 {
+                    f.store
+                        .set_agent_session_system_prompt(
+                            &f.workspace.id,
+                            &f.agent,
+                            "original prompt",
+                        )
+                        .await
+                        .unwrap();
+                } else if setup == 1 {
+                    f.store
+                        .set_agent_session_model(
+                            &f.workspace.id,
+                            &f.agent,
+                            "different-model",
+                            None,
+                            "2026-09-27T02:00:00Z",
+                        )
+                        .await
+                        .unwrap();
+                } else {
+                    retirement.retire();
+                }
+                Ok::<_, AdmissionError>(("ordinary".into(), "actual original response"))
+            })
+            .await;
+        assert_eq!(outcome.producer.unwrap(), "actual original response");
+        assert_eq!(
+            outcome.result.unwrap(),
+            RepositoryAcpCompatibilityResult::Committed {
+                session_id: "ordinary".into(),
+                effect: RepositoryAcpCompatibilityEffect::FirstSet,
+            }
+        );
+        assert!(matches!(
+            outcome.persistence,
+            RepositoryAcpCompatibilityPersistence::Committed {
+                affected_rows: 1,
+                ..
+            }
+        ));
+        let owner = outcome.owner.ok();
+        assert_eq!(owner.is_some(), setup == 2);
+        let row = f.store.get_agent_session(&f.agent).await.unwrap();
+        assert_eq!(row.acp_session_id.as_deref(), Some("ordinary"));
+        if setup == 2 {
+            assert_eq!(row.system_prompt.as_deref(), Some("original prompt"));
+        }
+        assert!(!current(&pending.capture(), f.caller()).await);
+        assert!(f.registry.state.lock().unwrap().pending.is_empty());
+        drop(owner);
+        assert!(f.registry.state.lock().unwrap().origins.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn compatible_same_id_and_current_null_accounting_commit_without_owner() {
+    for same_id in [false, true] {
+        let f = Fixture::new(same_id.then_some("original")).await;
+        let totals = intent_core::TokenUsageTotals {
+            input_tokens: 37,
+            ..Default::default()
+        };
+        f.store
+            .set_agent_session_token_usage(&f.workspace.id, &f.agent, &totals)
+            .await
+            .unwrap();
+        let creator = f.creator(RepositoryCreationIntent::Replace {
+            expected: Some("original".into()),
+        });
+        let pending = creator.callback();
+        let session = if same_id { "original" } else { "replacement" };
+        let outcome = creator
+            .initialize_compatible(|| async {
+                Ok::<_, AdmissionError>((session.into(), "response"))
+            })
+            .await;
+        assert_eq!(outcome.producer.unwrap(), "response");
+        assert_eq!(
+            outcome.result.unwrap(),
+            RepositoryAcpCompatibilityResult::Committed {
+                session_id: session.into(),
+                effect: if same_id {
+                    RepositoryAcpCompatibilityEffect::AccountingOnly
+                } else {
+                    RepositoryAcpCompatibilityEffect::Replace { previous: None }
+                },
+            }
+        );
+        assert!(matches!(
+            outcome.persistence,
+            RepositoryAcpCompatibilityPersistence::Committed {
+                affected_rows: 1,
+                ..
+            }
+        ));
+        assert!(outcome.owner.is_err());
+        let rows = f
+            .store
+            .get_workspace_agent_usage_data(&f.workspace.id)
+            .await
+            .unwrap();
+        assert!(rows[0].2.is_none());
+        assert_eq!(rows[0].3.as_ref(), Some(&totals));
+        assert!(!current(&pending.capture(), f.caller()).await);
+        assert!(f.registry.state.lock().unwrap().pending.is_empty());
+        assert!(f.registry.state.lock().unwrap().origins.is_empty());
+        // Only a distinct successful load can obtain a later owner.
+        let fresh = f
+            .creator(RepositoryCreationIntent::Loaded {
+                session_id: session.into(),
+            })
+            .initialize_compatible(|| async { Ok::<_, AdmissionError>((session.into(), ())) })
+            .await;
+        assert!(fresh.owner.is_ok());
+        let rows = f
+            .store
+            .get_workspace_agent_usage_data(&f.workspace.id)
+            .await
+            .unwrap();
+        assert_eq!(rows[0].3.as_ref(), Some(&totals));
+    }
+}
+
+#[tokio::test]
+async fn compatible_observed_canonical_and_submitted_fallback_are_never_proof() {
+    let f = Fixture::new(Some("winner")).await;
+    let replaced = f
+        .creator(RepositoryCreationIntent::Replace {
+            expected: Some("stale".into()),
+        })
+        .initialize_compatible(|| async {
+            Ok::<_, AdmissionError>(("submitted".into(), "original response"))
+        })
+        .await;
+    assert_eq!(replaced.producer.unwrap(), "original response");
+    assert_eq!(
+        replaced.result.unwrap(),
+        RepositoryAcpCompatibilityResult::Observed {
+            session_id: "winner".into()
+        }
+    );
+    assert_eq!(
+        replaced.persistence,
+        RepositoryAcpCompatibilityPersistence::NoEffect {
+            observed: RepositoryInitializationObservation::Present {
+                session_id: Some("winner".into())
+            },
+        }
+    );
+    assert!(replaced.owner.is_err());
+    let creator = f.creator(RepositoryCreationIntent::Loaded {
+        session_id: "winner".into(),
+    });
+    f.store
+        .delete_agent_session(&f.workspace.id, &f.agent)
+        .await
+        .unwrap();
+    let missing = creator
+        .initialize_compatible(|| async {
+            Ok::<_, AdmissionError>(("winner".into(), "load response"))
+        })
+        .await;
+    assert_eq!(missing.producer.unwrap(), "load response");
+    assert_eq!(
+        missing.result.unwrap(),
+        RepositoryAcpCompatibilityResult::SubmittedFallback {
+            session_id: "winner".into()
+        }
+    );
+    assert_eq!(
+        missing.persistence,
+        RepositoryAcpCompatibilityPersistence::NoEffect {
+            observed: RepositoryInitializationObservation::Missing
+        }
+    );
+    assert!(missing.owner.is_err());
+    assert!(f.registry.state.lock().unwrap().origins.is_empty());
+}
+
+#[tokio::test]
+async fn compatible_committed_effect_survives_retired_confirmation_or_consumption() {
+    for during_commit in [false, true] {
+        let f = Fixture::new(None).await;
+        let creator = f.creator(RepositoryCreationIntent::FirstSet);
+        let retirement = creator.retirement();
+        let outcome: RepositoryCompatibleCreationOutcome<&str, AdmissionError> = if during_commit {
+            let mut conn = f.store.write_pool().acquire().await.unwrap();
+            conn.lock_handle().await.unwrap().set_commit_hook(move || {
+                retirement.retire();
+                true
+            });
+            drop(conn);
+            creator
+                .initialize_compatible(|| async { Ok(("committed".into(), "original")) })
+                .await
+        } else {
+            let (claim, binding) = creator.claim_after_success("committed".into()).unwrap();
+            let outcome = f
+                .store
+                .initialize_repository_acp_session_compatible(Some(claim), binding)
+                .await;
+            retirement.retire();
+            creator.complete_compatible("original", outcome)
+        };
+        assert_eq!(outcome.producer.unwrap(), "original");
+        assert!(matches!(
+            outcome.persistence,
+            RepositoryAcpCompatibilityPersistence::Committed {
+                affected_rows: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            outcome.result,
+            Ok(RepositoryAcpCompatibilityResult::Committed { .. })
+        ));
+        assert!(outcome.owner.is_err());
+        assert_eq!(
+            f.store
+                .get_agent_session(&f.agent)
+                .await
+                .unwrap()
+                .acp_session_id
+                .as_deref(),
+            Some("committed")
+        );
+        assert!(f.registry.state.lock().unwrap().pending.is_empty());
+        assert!(f.registry.state.lock().unwrap().origins.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn compatible_failed_original_begin_keeps_its_error_and_other_barrier() {
+    let f = Fixture::new(None).await;
+    let creator = f.creator(RepositoryCreationIntent::FirstSet);
+    let (claim, binding) = creator.claim_after_success("ordinary".into()).unwrap();
+    let unknown = f
+        .registry
+        .begin_mutation(&[RepositoryLifecycleKey::Agent(f.agent.clone())])
+        .unwrap();
+    let barriers = f
+        .registry
+        .state
+        .lock()
+        .unwrap()
+        .pending
+        .keys()
+        .copied()
+        .collect::<HashSet<_>>();
+    drop(unknown);
+    let stored = f
+        .store
+        .initialize_repository_acp_session_compatible(Some(claim), binding)
+        .await;
+    let original_error = stored.confirmation.as_ref().err().unwrap().to_string();
+    let outcome: RepositoryCompatibleCreationOutcome<&str, AdmissionError> =
+        creator.complete_compatible("response", stored);
+    assert_eq!(outcome.owner.err().unwrap().to_string(), original_error);
+    assert_eq!(outcome.producer.unwrap(), "response");
+    assert!(matches!(
+        outcome.result,
+        Ok(RepositoryAcpCompatibilityResult::Committed { .. })
+    ));
+    assert!(matches!(
+        outcome.persistence,
+        RepositoryAcpCompatibilityPersistence::Committed {
+            affected_rows: 1,
+            ..
+        }
+    ));
+    assert_eq!(
+        f.registry
+            .state
+            .lock()
+            .unwrap()
+            .pending
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>(),
+        barriers
+    );
+    assert!(RepositoryCreationOwner::allocate(
+        &f.registry,
+        &f.store,
+        f.workspace.id.clone(),
+        f.agent.clone(),
+        RepositoryCreationIntent::FirstSet
+    )
+    .is_err());
+}
+
+#[tokio::test]
+async fn compatible_sql_failure_preserves_unknown_receipt_and_original_barrier() {
+    let f = Fixture::new(None).await;
+    sqlx::query("CREATE TRIGGER compatibility_fault AFTER UPDATE OF acp_session_id ON agent_session BEGIN SELECT RAISE(ROLLBACK,'original compatibility failure'); END")
+        .execute(f.store.write_pool()).await.unwrap();
+    let outcome = f
+        .creator(RepositoryCreationIntent::FirstSet)
+        .initialize_compatible(|| async {
+            Ok::<_, AdmissionError>(("produced".into(), "producer response"))
+        })
+        .await;
+    assert_eq!(outcome.producer.unwrap(), "producer response");
+    assert_eq!(
+        outcome.persistence,
+        RepositoryAcpCompatibilityPersistence::Unknown
+    );
+    assert!(outcome
+        .result
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("original compatibility failure"));
+    assert!(outcome.owner.is_err());
+    assert!(f
+        .store
+        .get_agent_session(&f.agent)
+        .await
+        .unwrap()
+        .acp_session_id
+        .is_none());
+    assert_eq!(f.registry.state.lock().unwrap().pending.len(), 1);
+    assert!(RepositoryCreationOwner::allocate(
+        &f.registry,
+        &f.store,
+        f.workspace.id.clone(),
+        f.agent.clone(),
+        RepositoryCreationIntent::FirstSet
+    )
+    .is_err());
+}
+
+#[tokio::test]
+async fn compatible_wrong_loaded_producer_preserves_response_without_changing_intent() {
+    let f = Fixture::new(Some("original")).await;
+    let outcome = f
+        .creator(RepositoryCreationIntent::Loaded {
+            session_id: "original".into(),
+        })
+        .initialize_compatible(|| async {
+            Ok::<_, AdmissionError>(("different".into(), "original response"))
+        })
+        .await;
+    assert_eq!(outcome.producer.unwrap(), "original response");
+    assert_eq!(
+        outcome.persistence,
+        RepositoryAcpCompatibilityPersistence::NotAttempted
+    );
+    assert!(outcome.result.is_err());
+    assert!(outcome.owner.is_err());
+    assert_eq!(
+        f.store
+            .get_agent_session(&f.agent)
+            .await
+            .unwrap()
+            .acp_session_id
+            .as_deref(),
+        Some("original")
+    );
+}
+
+#[tokio::test]
+async fn compatible_uses_only_captured_store_even_with_same_observer_and_foreign_ids() {
+    let f = Fixture::new(None).await;
+    let foreign = Store::open(&f.dir.path().join("foreign-compatibility.db"))
+        .await
+        .unwrap();
+    foreign.insert_workspace(&f.workspace).await.unwrap();
+    let row = f.store.get_agent_session(&f.agent).await.unwrap();
+    foreign.insert_agent_session(&row).await.unwrap();
+    f.registry.install(&foreign).await.unwrap();
+    let creator = f.creator(RepositoryCreationIntent::FirstSet);
+    let outcome = creator
+        .initialize_compatible(|| async {
+            Ok::<_, AdmissionError>(("original database".into(), "response"))
+        })
+        .await;
+    assert_eq!(outcome.producer.unwrap(), "response");
+    assert!(outcome.owner.is_ok());
+    assert!(foreign
+        .get_agent_session(&f.agent)
+        .await
+        .unwrap()
+        .acp_session_id
+        .is_none());
+    assert_eq!(
+        f.store
+            .get_agent_session(&f.agent)
+            .await
+            .unwrap()
+            .acp_session_id
+            .as_deref(),
+        Some("original database")
+    );
 }
