@@ -733,6 +733,93 @@ where
         .map_err(|e| Error::Internal(format!("repo cache task failed: {e}")))?
 }
 
+/// Seed a hub through temporary cache alternates, then dissociate before it is
+/// exposed. Caller MUST hold `with_cache_lock_blocking` through this operation
+/// and publication of the destination. Cache refresh, self-heal and eviction
+/// cannot run while the hub borrows objects; afterwards it has no dependency on
+/// the cache. A failed initialization remains unpublished and is rebuilt on retry.
+pub(crate) fn seed_detached_bare(cache: &Path, bare: &Path) -> Result<()> {
+    let source = Repository::open(cache).map_err(map_git_err)?;
+    let objects = source
+        .path()
+        .join("objects")
+        .canonicalize()
+        .map_err(|e| Error::Internal(format!("cache object directory: {e}")))?;
+    let objects = objects
+        .to_str()
+        .filter(|p| !p.contains(['\n', '\r']))
+        .ok_or_else(|| Error::InvalidParams("cache object path cannot be an alternate".into()))?;
+    let alternate = bare.join("objects/info/alternates");
+    std::fs::write(&alternate, format!("{objects}\n"))
+        .map_err(|e| Error::Internal(format!("write hub alternate: {e}")))?;
+    sync_bare_base(cache, bare)?;
+    // Unlike -l, -a copies the reachable objects borrowed from alternates.
+    run_git(bare, &["repack", "-a", "-d"], None, cache_clone_timeout())?;
+    std::fs::remove_file(alternate)
+        .map_err(|e| Error::Internal(format!("dissociate hub alternate: {e}")))?;
+    run_git(
+        bare,
+        &["fsck", "--connectivity-only", "--no-dangling"],
+        None,
+        cache_clone_timeout(),
+    )
+}
+
+/// Copy only the cache's forge-tracking branch refs into the head-owned base
+/// namespace. The caller holds the cache lock. No configured remote, network
+/// fetch, agent refs or checkpoint refs are involved. Fetch imports missing
+/// objects normally when refreshing an already-dissociated hub.
+pub(crate) fn sync_bare_base(cache: &Path, bare: &Path) -> Result<()> {
+    let source = Repository::open(cache).map_err(map_git_err)?;
+    let destination = Repository::open_bare(bare).map_err(map_git_err)?;
+    let mut wanted = BTreeMap::new();
+    for reference in source
+        .references_glob("refs/remotes/origin/*")
+        .map_err(map_git_err)?
+    {
+        let reference = reference.map_err(map_git_err)?;
+        // origin/HEAD is symbolic, not a forge branch.
+        if reference.symbolic_target_bytes().is_some() {
+            continue;
+        }
+        let name = reference
+            .name()
+            .map_err(|e| Error::InvalidParams(format!("non-UTF-8 cache branch: {e}")))?;
+        let branch = name
+            .strip_prefix("refs/remotes/origin/")
+            .expect("glob prefix");
+        wanted.insert(format!("refs/heads/{branch}"), name.to_string());
+    }
+    if !wanted.is_empty() {
+        let specs: Vec<String> = wanted
+            .iter()
+            .map(|(dst, src)| format!("+{src}:{dst}"))
+            .collect();
+        let mut args = vec![
+            std::ffi::OsStr::new("fetch"),
+            std::ffi::OsStr::new("--no-tags"),
+            std::ffi::OsStr::new("--no-write-fetch-head"),
+            std::ffi::OsStr::new("--"),
+            cache.as_os_str(),
+        ];
+        args.extend(specs.iter().map(std::ffi::OsStr::new));
+        run_git_os(bare, &args, None, cache_clone_timeout())?;
+    }
+    for reference in destination
+        .references_glob("refs/heads/*")
+        .map_err(map_git_err)?
+    {
+        let mut reference = reference.map_err(map_git_err)?;
+        let name = reference
+            .name()
+            .map_err(|e| Error::InvalidParams(format!("non-UTF-8 hub base branch: {e}")))?;
+        if !wanted.contains_key(name) {
+            reference.delete().map_err(map_git_err)?;
+        }
+    }
+    Ok(())
+}
+
 /// Branches read from a cached clone by [`list_cached_branches`] — no
 /// network I/O involved.
 #[derive(Debug)]
