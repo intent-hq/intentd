@@ -3,7 +3,7 @@
 
 Run: RELEASE_PLZ=/path/to/release-plz python3 -S scripts/test-release-plz-changelog.py
 Requires Python 3.11+, cargo, git, and release-plz (CI pins its version).
-Uses the real release configuration with tiny dependency-free crates; no tokens,
+Uses the real release configuration with tiny crates and local dependencies; no tokens,
 registry access, release publication, or changes to the source checkout.
 """
 
@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "release-plz.toml"
 DAEMON_VERSION = "0.9.0"
 SITTER_VERSION = "0.1.0"
+INDEPENDENT_LIBRARY = "fixture-helper"
 
 
 class ReleasePlzChangelogTests(unittest.TestCase):
@@ -50,6 +51,15 @@ class ReleasePlzChangelogTests(unittest.TestCase):
         self.packages = {p["name"]: p for p in self.config["package"]}
         self.libraries = [name for name in self.packages
                           if name not in ("intentd", "intentd-sitter")]
+        # Production libraries aggregate their commits into daemon notes before
+        # dependency propagation. An independent library exercises the generated
+        # mixed dependency summaries without changing the production policy.
+        self.packages[INDEPENDENT_LIBRARY] = {"name": INDEPENDENT_LIBRARY}
+        with (self.repo / "release-plz.toml").open("a") as config:
+            config.write(
+                f'\n[[package]]\nname = "{INDEPENDENT_LIBRARY}"\n'
+                'release = true\ngit_only = true\n'
+            )
         (self.repo / "Cargo.toml").write_text(
             '[workspace]\nmembers = ["crates/*"]\nresolver = "2"\n'
         )
@@ -63,6 +73,17 @@ class ReleasePlzChangelogTests(unittest.TestCase):
                 'edition = "2021"\nlicense = "MIT"\ndescription = "Fixture"\n'
             )
             (crate / "src/lib.rs").write_text("pub fn value() -> u32 { 0 }\n")
+        daemon = self.repo / "crates/intentd"
+        with (daemon / "Cargo.toml").open("a") as manifest:
+            manifest.write(
+                '\n[dependencies]\n'
+                f'intentd-sitter = {{ path = "../intentd-sitter", version = "{SITTER_VERSION}" }}\n'
+                f'intent-core = {{ path = "../intent-core", version = "{DAEMON_VERSION}" }}\n'
+                f'{INDEPENDENT_LIBRARY} = {{ path = "../{INDEPENDENT_LIBRARY}", version = "{DAEMON_VERSION}" }}\n'
+            )
+        (daemon / "src/main.rs").write_text(
+            'fn main() { println!("{}", intentd_sitter::value() + intent_core::value()); }\n'
+        )
         self.run_command("cargo", "generate-lockfile", "--offline")
         self.commit("chore: fixture baseline")
         self.run_command("git", "tag", f"v{DAEMON_VERSION}")
@@ -100,8 +121,13 @@ class ReleasePlzChangelogTests(unittest.TestCase):
         changelog = self.repo / "CHANGELOG.md"
         notes = changelog.read_text() if changelog.exists() else ""
         self.assertNotIn("Sitter exclusive repair", notes)
-        self.assertEqual(self.version("intentd"), DAEMON_VERSION)
+        self.assertNotIn("Updated the following local packages: intentd-sitter", notes)
+        self.assertNotIn("###", notes)
+        # Dependency propagation still bumps the daemon; this is a notes policy.
+        self.assertEqual(self.version("intentd"), "0.9.1")
         self.assertEqual(self.version("intentd-sitter"), "0.1.1")
+        daemon = tomllib.loads((self.repo / "crates/intentd/Cargo.toml").read_text())
+        self.assertEqual(daemon["dependencies"]["intentd-sitter"]["version"], "0.1.1")
         self.assertFalse((self.repo / "crates/intentd-sitter/CHANGELOG.md").exists())
 
     def test_daemon_libraries_and_mixed_changes_remain_visible(self):
@@ -128,6 +154,29 @@ class ReleasePlzChangelogTests(unittest.TestCase):
         self.assertIn("Shared library repair", (self.repo / "CHANGELOG.md").read_text())
         self.assertEqual(self.version("intentd"), "0.9.1")
         self.assertEqual(self.version("intentd-sitter"), SITTER_VERSION)
+
+    def test_generated_mixed_dependency_summary_remains_visible(self):
+        self.change(["intentd-sitter", INDEPENDENT_LIBRARY], "fix: independent repairs")
+        self.update()
+        notes = (self.repo / "CHANGELOG.md").read_text()
+        self.assertIn("Updated the following local packages:", notes)
+        self.assertIn(INDEPENDENT_LIBRARY, notes)
+        self.assertIn("intentd-sitter", notes)
+        self.assertEqual(self.version("intentd-sitter"), "0.1.1")
+        self.assertEqual(self.version(INDEPENDENT_LIBRARY), "0.9.1")
+
+    def test_generated_library_dependency_summary_remains_visible(self):
+        self.change([INDEPENDENT_LIBRARY], "fix: independent library repair")
+        self.update()
+        notes = (self.repo / "CHANGELOG.md").read_text()
+        self.assertIn(f"Updated the following local packages: {INDEPENDENT_LIBRARY}", notes)
+        self.assertEqual(self.version("intentd-sitter"), SITTER_VERSION)
+
+    def test_real_commit_matching_generated_message_remains_visible(self):
+        self.change(["intentd"], "chore: updated the following local packages: intentd-sitter")
+        self.update()
+        notes = (self.repo / "CHANGELOG.md").read_text()
+        self.assertIn("Updated the following local packages: intentd-sitter", notes)
 
     def test_sitter_keeps_independent_version_and_publication_policy(self):
         policy = {**self.config["workspace"], **self.packages["intentd-sitter"]}

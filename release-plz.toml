@@ -191,6 +191,10 @@ git_only = true
 
 # Changelog rendering aligned with the monorepo cliff.toml conventions
 # (same groups and body layout; release-plz runs git-cliff under the hood).
+# release-plz also synthesizes dependency-update commits with id 0000000.
+# Omit only its sitter-only daemon entry before grouping, avoiding empty headings.
+# Real commits and mixed/library dependency summaries remain visible. This changes
+# rendering only: the daemon still depends on sitter and can bump when sitter does.
 [changelog]
 header = """
 # Changelog\n
@@ -202,7 +206,13 @@ body = """
 {% else %}\
     ## [unreleased]
 {% endif %}\
-{% for group, commits in commits | group_by(attribute="group") %}
+{% set visible_commits = [] %}\
+{% for commit in commits %}\
+    {% if package != "intentd" or commit.id != "0000000" or commit.message != "updated the following local packages: intentd-sitter" %}\
+        {% set_global visible_commits = visible_commits | concat(with=commit) %}\
+    {% endif %}\
+{% endfor %}\
+{% for group, commits in visible_commits | group_by(attribute="group") %}
     ### {{ group | striptags | trim | upper_first }}
     {% for commit in commits %}
         - {% if commit.scope %}*({{ commit.scope }})* {% endif %}\
