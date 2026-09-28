@@ -22,6 +22,22 @@ use intent_sourcecontrol::{
 };
 use time::OffsetDateTime;
 
+mod qualified_snapshot;
+#[cfg_attr(
+    not(test),
+    expect(
+        clippy::allow_attributes,
+        reason = "The frozen helper must compile both before and after consumer integration"
+    ),
+    allow(dead_code, reason = "qualified read consumer is integrated separately")
+)]
+pub(crate) fn qualified_review_snapshot(
+    target: &intent_core::ReviewTarget,
+    observation: &intent_sourcecontrol::ReviewObservation,
+) -> intent_core::Result<serde_json::Value> {
+    qualified_snapshot::qualified_review_snapshot(target, observation)
+}
+
 /// TS `NO_ACTIVE_PR_ERROR`; every active-PR-scoped method needs one (§5.7).
 pub(crate) const NO_ACTIVE_PR: &str = "No active PR";
 
