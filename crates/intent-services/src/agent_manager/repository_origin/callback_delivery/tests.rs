@@ -6348,6 +6348,8 @@ mod genuine_native_startup {
             ("DISABLE_TELEMETRY", "1"),
             ("DISABLE_ERROR_REPORTING", "1"),
             ("INTENT_NATIVE_SERVICES_RUN", "1"),
+            // crate::tests::disable_node_compile_cache sets this before test threads.
+            ("NODE_DISABLE_COMPILE_CACHE", "1"),
         ]
         .into_iter()
         .map(|(key, value)| (key.into(), value.into()))
