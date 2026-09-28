@@ -1171,7 +1171,16 @@ jobs:
       # self-skip without it, which silently drops coverage below the floor.
       - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: 24.21.0
+      - name: Verify callback fixture provisioner offline
+        run: python3 -I -B -S scripts/test-prepare-acp-callback-fixture.py
+      - name: Build the pinned callback fixture from verified source
+        run: |
+          set -euo pipefail
+          # The provisioner checks Node and uses only isolated npm 11.19.0.
+          fixture=$(python3 -I -B -S scripts/prepare-acp-callback-fixture.py \
+            --cache-dir "$RUNNER_TEMP/acp-callback-fixture" --build-from-source)
+          echo "INTENT_ACP_CALLBACK_ADAPTER_FIXTURE=$fixture" >> "$GITHUB_ENV"
       # Per-slot HOME for install-action — see the coverage-e2e job's comment
       # for the full rationale (shared ~/.install-action tmp/bin race across
       # the 8 tinybox slots; monorepo#1239).
@@ -1256,6 +1265,13 @@ jobs:
       # Same value and rationale as coverage-e2e (co-tenancy on tinybox,
       # matches the 16-core burst runner).
       NEXTEST_TEST_THREADS: 16
+      CALLBACK_FIXTURE_TESTS: |
+        callback_registration::tests::actual_adapter_sdk_and_rust_mcp_deliver_distinct_callback_preserving_old_result
+        callback_registration::tests::actual_adapter_replacement_rejects_old_query_and_disabled_never_registers
+        agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_actual_created_3_0_reaches_original_guidance_boundary
+        agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_saved_legacy_and_disabled_outbound_messages_remain_ordinary
+        agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_load_and_failed_load_new_keep_original_producers_and_capture
+        agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_successful_zero_pending_absent_and_failed_never_conflate
       BASE_REF: ${{ github.event.pull_request.base.ref }}
       PR_NUMBER: ${{ github.event.pull_request.number }}
     steps:
@@ -1298,6 +1314,23 @@ jobs:
             echo "::error title=coverage-changed: base unresolvable::changed-tests.sh could not connect BASE $BASE_SHA to HEAD $(git rev-parse HEAD) — a checkout/fetch problem in this job, not a test failure (intent-hq/intent#5414)"
           fi
           [ "$status" -eq 0 ] || exit "$status"
+          fixture_changed=false
+          fixture_status=0
+          git diff --quiet "$BASE_SHA" HEAD -- \
+            scripts/prepare-acp-callback-fixture.py \
+            scripts/test-prepare-acp-callback-fixture.py \
+            crates/intent-acp/tests/fixtures/claude-callback-adapter.json \
+            crates/intent-acp/tests/fixtures/claude-callback-canonical.patch \
+            crates/intent-acp/tests/fixtures/claude-callback-files.json \
+            .github/workflows/ci.yml || fixture_status=$?
+          if [ "$fixture_status" -eq 1 ]; then
+            fixture_changed=true
+            filter=$(printf '%s\n' "$CALLBACK_FIXTURE_TESTS" | sed '/^$/d;s/^/test(=/;s/$/)/' | paste -sd '|' -)
+            printf 'INTENTD_TEST_TIMEOUT_MULTIPLIER=3 cargo llvm-cov --no-report nextest -p intent-acp -p intent-services --lib -E "%s" --retries 0\n' "$filter" | tee -a "$plan"
+          elif [ "$fixture_status" -ne 0 ]; then
+            exit "$fixture_status"
+          fi
+          echo "callback_fixture_changed=$fixture_changed" >> "$GITHUB_OUTPUT"
           if grep -q 'cargo llvm-cov' "$plan"; then
             echo "has_selection=true" >> "$GITHUB_OUTPUT"
           else
@@ -1404,7 +1437,18 @@ jobs:
       - uses: actions/setup-node@v7
         if: steps.select.outputs.has_selection == 'true'
         with:
-          node-version: 22
+          node-version: 24.21.0
+      - name: Verify callback fixture provisioner offline
+        if: steps.select.outputs.has_selection == 'true'
+        run: python3 -I -B -S scripts/test-prepare-acp-callback-fixture.py
+      - name: Build the pinned callback fixture from verified source
+        if: steps.select.outputs.has_selection == 'true'
+        run: |
+          set -euo pipefail
+          # The provisioner checks Node and uses only isolated npm 11.19.0.
+          fixture=$(python3 -I -B -S scripts/prepare-acp-callback-fixture.py \
+            --cache-dir "$RUNNER_TEMP/acp-callback-fixture" --build-from-source)
+          echo "INTENT_ACP_CALLBACK_ADAPTER_FIXTURE=$fixture" >> "$GITHUB_ENV"
       # Per-slot install-action HOME — see coverage-e2e's comment
       # (monorepo#1239).
       - name: Key install-action dirs per runner slot
@@ -1435,6 +1479,27 @@ jobs:
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
         run: ./scripts/changed-tests.sh --instrumented --base "$BASE_SHA"
+      - name: Run callback fixture composition under llvm-cov
+        if: steps.select.outputs.callback_fixture_changed == 'true'
+        env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
+          INTENTD_TEST_TIMEOUT_MULTIPLIER: "3"
+        run: |
+          set -euo pipefail
+          filter=$(printf '%s\n' "$CALLBACK_FIXTURE_TESTS" | sed '/^$/d;s/^/test(=/;s/$/)/' | paste -sd '|' -)
+          cargo nextest list -p intent-acp -p intent-services --lib \
+            -E "$filter" --message-format json > "$RUNNER_TEMP/callback-fixture-tests.json"
+          python3 -I -B -S - "$RUNNER_TEMP/callback-fixture-tests.json" <<'PYTHON'
+          import json, os, sys
+          expected = os.environ["CALLBACK_FIXTURE_TESTS"].split()
+          suites = json.load(open(sys.argv[1]))["rust-suites"]
+          selected = [name for suite in suites.values() for name, case in suite["testcases"].items()
+                      if case["filter-match"]["status"] == "matches"]
+          assert len(expected) == len(selected) == 6 and set(selected) == set(expected), selected
+          PYTHON
+          cargo llvm-cov --no-report nextest -p intent-acp -p intent-services --lib \
+            -E "$filter" --no-fail-fast --retries 0 --show-progress none \
+            --status-level pass --final-status-level fail
       # Release the `.in-use` marker — see the `check` job's last step
       # (intent-hq/intent#5256). CARGO_TARGET_DIR is empty when the
       # selection was empty or on burst runners, so this is a no-op there.
