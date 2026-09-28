@@ -17,11 +17,22 @@ use crate::repository_admission::AdmissionResult;
 
 use super::{RepositoryOrigin, SessionAttempt};
 
+#[cfg(test)]
+type ContextDecorator = Arc<
+    dyn Fn(
+            Arc<dyn intent_acp::mcp_server::request_context::McpRequestContext>,
+        ) -> Arc<dyn intent_acp::mcp_server::request_context::McpRequestContext>
+        + Send
+        + Sync,
+>;
+
 /// Captured once from the original server inputs, before exposing its pending endpoint.
 #[derive(Clone)]
 pub(in crate::agent_manager) struct ServerBlueprint {
     build: Arc<dyn Fn() -> WorkspaceMcpServer + Send + Sync>,
     read_owner: AdmissionResult<Arc<RepositoryReadOwner>>,
+    #[cfg(test)]
+    context_decorator: Option<ContextDecorator>,
 }
 
 impl ServerBlueprint {
@@ -32,6 +43,8 @@ impl ServerBlueprint {
         Self {
             build: Arc::new(build),
             read_owner,
+            #[cfg(test)]
+            context_decorator: None,
         }
     }
 
@@ -40,6 +53,12 @@ impl ServerBlueprint {
     }
 
     fn confirmed_server(&self, context: RepositoryCallbackContext) -> WorkspaceMcpServer {
+        #[cfg(test)]
+        if let Some(decorate) = &self.context_decorator {
+            return self.server().with_request_context(decorate(Arc::new(
+                context.with_read_owner(self.read_owner.clone()),
+            )));
+        }
         // Keep the original success or failure; pending servers never receive
         // this anchor, and later endpoint construction cannot recapture it.
         self.server()

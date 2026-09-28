@@ -186,6 +186,10 @@ struct NodePeer {
 
 impl NodePeer {
     fn new() -> Self {
+        Self::with_original_repository(None)
+    }
+
+    fn with_original_repository(repository: Option<&std::path::Path>) -> Self {
         let adapter = std::fs::canonicalize(
             std::env::var("INTENT_ACP_CALLBACK_ADAPTER_FIXTURE")
                 .expect("explicit frozen da577fff adapter fixture"),
@@ -275,7 +279,13 @@ if (capability === "missing-receipt") delete response._meta?.intentCallbackRegis
             .arg(format!("--allow-fs-read={}", adapter.display()))
             .arg(format!("--allow-fs-read={}", dependencies.display()))
             .arg(format!("--allow-fs-read={}", scratch.path().display()))
-            .arg(format!("--allow-fs-write={}", scratch.path().display()))
+            .arg(format!("--allow-fs-write={}", scratch.path().display()));
+        // A replacement connection must see the same original disposable cwd.
+        // Native process spawning and all other filesystem paths stay denied.
+        if let Some(repository) = repository {
+            command.arg(format!("--allow-fs-read={}", repository.display()));
+        }
+        command
             .arg(script)
             .arg(adapter)
             .stdin(std::process::Stdio::piped())
@@ -1753,4 +1763,1989 @@ async fn failed_original_anchor_never_upgrades_while_confirmed_and_pending_resul
     assert_eq!(count_requests(&inspect, METHOD), 1);
     h.origin.retire();
     h.node.finish().await;
+}
+
+// Combined fixture: the manager creates the only physical owner, and the exact
+// typed Services allocation supplies both the read anchor and WorkspaceApi.
+// Only the native SDK child and local HTTP response producer are scripted.
+use intent_acp::mcp_server::private_results::{
+    McpHostCall, McpPrivateAdmission, McpPrivateBoundary, McpPrivateBoundaryKind as Boundary,
+    McpPrivateHostScope, McpPrivatePolicy, McpReadEvidence, PreparedMcpTransfer,
+};
+use intent_acp::mcp_server::request_context::McpContextFuture;
+
+struct NativeHold {
+    entered: Notify,
+    release: tokio::sync::Semaphore,
+}
+
+impl NativeHold {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            entered: Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        })
+    }
+
+    async fn wait(&self) {
+        self.entered.notify_one();
+        self.release.acquire().await.unwrap().forget();
+    }
+
+    async fn reached(&self) {
+        tokio::time::timeout(WAIT, self.entered.notified())
+            .await
+            .unwrap();
+    }
+}
+
+#[derive(Default)]
+struct NativeControl {
+    hold: Mutex<Option<(Boundary, bool, Arc<NativeHold>)>>,
+    events: Mutex<Vec<(Boundary, usize)>>,
+    reads: Mutex<Vec<ReadObservation>>,
+    records: Mutex<Vec<Arc<crate::repository_read_source::ReadRecord>>>,
+    foreign: Mutex<Vec<Arc<crate::repository_read_source::ReadRecord>>>,
+    captures: AtomicUsize,
+    entered: AtomicUsize,
+    changed: Notify,
+    blocked: AtomicBool,
+    release: Notify,
+    completed_body: Mutex<Option<Arc<NativeHold>>>,
+}
+
+impl NativeControl {
+    fn at(&self, boundary: Boundary, after: bool) -> Arc<NativeHold> {
+        let gate = NativeHold::new();
+        assert!(self
+            .hold
+            .lock()
+            .unwrap()
+            .replace((boundary, after, gate.clone()))
+            .is_none());
+        gate
+    }
+
+    fn wrap(self: &Arc<Self>, original: Arc<dyn McpRequestContext>) -> Arc<dyn McpRequestContext> {
+        Arc::new(NativeContext {
+            original,
+            control: self.clone(),
+        })
+    }
+}
+
+struct NativeContext {
+    original: Arc<dyn McpRequestContext>,
+    control: Arc<NativeControl>,
+}
+
+struct NativeScope {
+    original: Arc<dyn McpRequestScope>,
+    control: Arc<NativeControl>,
+}
+
+struct NativePolicy {
+    original: Arc<dyn McpPrivatePolicy>,
+    control: Arc<NativeControl>,
+}
+
+impl McpRequestContext for NativeContext {
+    fn capture(&self) -> Arc<dyn McpRequestScope> {
+        let original = self.original.capture();
+        self.control.captures.fetch_add(1, Ordering::SeqCst);
+        self.control.changed.notify_waiters();
+        Arc::new(NativeScope {
+            original,
+            control: self.control.clone(),
+        })
+    }
+}
+
+impl McpRequestScope for NativeScope {
+    fn scope<'a>(&'a self, body: McpContextFuture<'a>) -> McpContextFuture<'a> {
+        self.original.scope(Box::pin(async move {
+            self.control.reads.lock().unwrap().push(ReadObservation {
+                phase: "actual original scope".into(),
+                read: current_read_request(),
+                source: current_source_lifetime().ok(),
+            });
+            let release = self.control.release.notified();
+            tokio::pin!(release);
+            release.as_mut().enable();
+            self.control.entered.fetch_add(1, Ordering::SeqCst);
+            self.control.changed.notify_waiters();
+            if self.control.blocked.load(Ordering::SeqCst) {
+                release.await;
+            }
+            body.await;
+            let held = self.control.completed_body.lock().unwrap().take();
+            if let Some(held) = held {
+                held.wait().await;
+            }
+        }))
+    }
+
+    fn private_result_policy(&self) -> Option<Arc<dyn McpPrivatePolicy>> {
+        self.original.private_result_policy().map(|original| {
+            Arc::new(NativePolicy {
+                original,
+                control: self.control.clone(),
+            }) as Arc<dyn McpPrivatePolicy>
+        })
+    }
+}
+
+impl McpPrivatePolicy for NativePolicy {
+    fn capture_host(&self, call: McpHostCall) -> Box<dyn McpPrivateHostScope> {
+        self.original.capture_host(call)
+    }
+
+    fn admit<'a>(
+        &'a self,
+        boundary: &'a McpPrivateBoundary,
+        records: &'a [McpReadEvidence],
+        packet: PreparedMcpTransfer<'a>,
+    ) -> BoxFuture<'a, McpPrivateAdmission> {
+        Box::pin(async move {
+            self.control
+                .events
+                .lock()
+                .unwrap()
+                .push((boundary.kind(), records.len()));
+            let retained =
+                crate::repository_read_source::tests::retain_and_check_records(records).await;
+            let foreign = self.control.foreign.lock().unwrap().clone();
+            if !foreign.is_empty() {
+                crate::repository_read_source::tests::refuse_foreign_record_set(
+                    &retained, &foreign,
+                )
+                .await;
+            }
+            *self.control.records.lock().unwrap() = retained;
+            let hold = {
+                let mut held = self.control.hold.lock().unwrap();
+                if held
+                    .as_ref()
+                    .is_some_and(|(kind, _, _)| *kind == boundary.kind())
+                {
+                    held.take()
+                } else {
+                    None
+                }
+            };
+            if let Some((_, false, gate)) = &hold {
+                gate.wait().await;
+            }
+            let actual = self.original.admit(boundary, records, packet).await;
+            if let Some((_, true, gate)) = &hold {
+                gate.wait().await;
+            }
+            actual
+        })
+    }
+}
+
+struct NativeHarness {
+    f: Arc<Fixture>,
+    original: Arc<crate::Services>,
+    auth: crate::source_control_auth_ops::repository_owner::secret_reader::tests::Fixture,
+    git: crate::repository_admission_source_tests::fixtures::Fixture,
+    http: crate::repository_read_source::tests::ReadServer,
+    node: NodePeer,
+    origin: Arc<RepositoryOrigin>,
+    user: McpBridge,
+}
+
+impl NativeHarness {
+    async fn new(stamp: &str, opt_in: bool, failed_anchor: bool) -> Self {
+        Self::observed(stamp, opt_in, failed_anchor, None, None).await
+    }
+
+    async fn observed(
+        stamp: &str,
+        opt_in: bool,
+        failed_anchor: bool,
+        control: Option<Arc<NativeControl>>,
+        pending_control: Option<Arc<NativeControl>>,
+    ) -> Self {
+        use crate::agent_manager::{AgentManager, BusEventSink};
+        use crate::events::EventBus;
+
+        let http = crate::repository_read_source::tests::ReadServer::new().await;
+        let mut auth =
+            crate::source_control_auth_ops::repository_owner::secret_reader::tests::Fixture::new(
+                &http.fixture,
+            )
+            .await;
+        let mut git = crate::repository_admission_source_tests::fixtures::Fixture::new().await;
+        let node = NodePeer::new();
+        // The actual ACP cwd and original Store root share this real repository.
+        // Keep it inside the scripted peer's existing filesystem allowance.
+        let path = node.scratch.path().join("repo");
+        std::fs::rename(&git.path, &path).unwrap();
+        git.path = path;
+        git.workspace.repository_path = Some(git.path.to_str().unwrap().into());
+        let bus = EventBus::new(auth.service.store.clone());
+        let original = Arc::new(
+            auth.service
+                .as_ref()
+                .clone()
+                .with_workspaces_root(git.dir.path().join("owned-workspaces"))
+                .with_event_bus(bus.clone()),
+        );
+        auth.service = original.clone();
+        original
+            .store
+            .insert_workspace(&git.workspace)
+            .await
+            .unwrap();
+        git.store = original.store.clone();
+        git.git(
+            &git.path,
+            &[
+                "remote",
+                "add",
+                "origin",
+                &format!(
+                    "{}/group/project.git",
+                    http.fixture.descriptor.instance().as_str()
+                ),
+            ],
+        );
+        let row: intent_core::AgentSession = serde_json::from_value(json!({
+            "id":intent_core::AgentId::new(),"workspaceId":git.workspace.id,
+            "name":"original manager read","provider":"claude-code","status":"idle",
+            "harnessVersion":stamp,"createdAt":"2026-09-28T00:00:00Z",
+            "updatedAt":"2026-09-28T00:00:00Z"
+        }))
+        .unwrap();
+        original.store.insert_agent_session(&row).await.unwrap();
+        let manager = Arc::new(AgentManager::new(
+            original.as_ref().clone(),
+            Arc::new(BusEventSink::new(bus)),
+            4,
+        ));
+        original.attach_agent_manager(&manager);
+        assert!(Arc::ptr_eq(&original.agent_manager().unwrap(), &manager));
+        let f = Arc::new(Fixture {
+            dir: crate::test_support::test_tempdir("native-callback-accounting"),
+            manager,
+            row,
+        });
+        f.count_writes().await;
+        let failed = failed_anchor.then(|| RepositoryReadOwner::capture(original.clone()));
+        let origin = RepositoryOrigin::allocate(&original, &f.row).await;
+        let read_owner = failed.unwrap_or_else(|| RepositoryReadOwner::capture(original.clone()));
+        assert_eq!(read_owner.is_err(), failed_anchor);
+        let workspace = f.row.workspace_id.clone();
+        let agent = f.row.id.clone();
+        let api: Arc<dyn WorkspaceApi> = original.clone();
+        let attachments = original.turn_attachments();
+        let mut blueprint = ServerBlueprint::new(read_owner, move || {
+            WorkspaceMcpServer::for_agent_type(api.clone(), workspace.clone(), "default")
+                .with_caller_agent_id(Some(agent.clone()))
+                .with_turn_attachments(Some(attachments.clone()))
+        });
+        if let Some(control) = control {
+            blueprint.context_decorator = Some(Arc::new(move |context| control.wrap(context)));
+        }
+        let mut pending_context: Arc<dyn McpRequestContext> =
+            Arc::new(origin.pending_callback().unwrap());
+        if let Some(control) = pending_control {
+            pending_context = control.wrap(pending_context);
+        }
+        let pending = blueprint.server().with_request_context(pending_context);
+        let bridge = serve_workspace_mcp_tcp(Arc::new(pending)).await.unwrap();
+        let user = serve_workspace_mcp_tcp(Arc::new(blueprint.server()))
+            .await
+            .unwrap();
+        let (mut child, _, _) = handle(origin.clone());
+        child.connection = node.connection.clone();
+        child.notifications = node.notes.clone();
+        child.session_mcp_servers = serde_json::from_value(json!([
+            {"name":"workspace-mcp","command":"fixture-mcp","args":[bridge.connect_addr()],"env":[]},
+            {"name":"user-kept","command":"fixture-mcp","args":[user.connect_addr()],"env":[]}
+        ]))
+        .unwrap();
+        #[expect(
+            clippy::used_underscore_binding,
+            reason = "The actual handle owns its original pending bridge"
+        )]
+        {
+            child._mcp_bridge = Some(bridge);
+        }
+        origin.configure_callbacks(EndpointBlueprint {
+            server: blueprint,
+            command: "fixture-mcp".into(),
+            args_before_address: vec![],
+            env: BTreeMap::new(),
+        });
+        if opt_in {
+            origin.state.lock().unwrap().callback_offer = CallbackOffer::V1;
+        }
+        f.manager
+            .handles
+            .lock()
+            .unwrap()
+            .insert(f.row.id.clone(), child);
+        Self {
+            f,
+            original,
+            auth,
+            git,
+            http,
+            node,
+            origin,
+            user,
+        }
+    }
+
+    async fn start(&self) -> String {
+        self.f
+            .manager
+            .start_session(
+                &self.f.row.id,
+                self.git.path.clone(),
+                intent_providers::provider_config("claude-code"),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn start_task(&self) -> tokio::task::JoinHandle<intent_core::Result<String>> {
+        let f = self.f.clone();
+        let cwd = self.git.path.clone();
+        tokio::spawn(async move {
+            f.manager
+                .start_session(
+                    &f.row.id,
+                    cwd,
+                    intent_providers::provider_config("claude-code"),
+                )
+                .await
+        })
+    }
+
+    fn call_task(&self, query: usize, name: &str, code: &str) -> tokio::task::JoinHandle<Value> {
+        let connection = self.node.connection.clone();
+        let params = json!({"query":query,"name":name,"code":code});
+        tokio::spawn(async move {
+            connection
+                .request_timeout("fixture/call", params, WAIT)
+                .await
+                .unwrap()
+        })
+    }
+
+    fn recreate(&self) {
+        self.f
+            .manager
+            .force_recreate
+            .lock()
+            .unwrap()
+            .insert(self.f.row.id.clone());
+    }
+
+    async fn replacement(&self) -> (NodePeer, Arc<RepositoryOrigin>) {
+        let row = self.f.stored().await;
+        let blueprint = self.origin.state.lock().unwrap().blueprint.clone().unwrap();
+        let old = super::super::take(
+            &self.f.manager.handles,
+            &self.f.row.id,
+            &self.origin,
+            Some(&self.f.manager.registry),
+        )
+        .unwrap();
+        let mut servers = serde_json::to_value(&old.session_mcp_servers).unwrap();
+        drop(old);
+        let origin = RepositoryOrigin::allocate(&self.original, &row).await;
+        let node = NodePeer::with_original_repository(Some(&self.git.path));
+        let bridge = serve_workspace_mcp_tcp(Arc::new(
+            blueprint
+                .server
+                .server()
+                .with_request_context(Arc::new(origin.pending_callback().unwrap())),
+        ))
+        .await
+        .unwrap();
+        servers[0]["args"] = json!([bridge.connect_addr()]);
+        let (mut child, _, _) = handle(origin.clone());
+        child.connection = node.connection.clone();
+        child.notifications = node.notes.clone();
+        child.session_mcp_servers = serde_json::from_value(servers).unwrap();
+        #[expect(
+            clippy::used_underscore_binding,
+            reason = "Install the replacement handle-owned bridge"
+        )]
+        {
+            child._mcp_bridge = Some(bridge);
+        }
+        origin.configure_callbacks(EndpointBlueprint {
+            server: blueprint.server.clone(),
+            command: blueprint.command.clone(),
+            args_before_address: blueprint.args_before_address.clone(),
+            env: blueprint.env.clone(),
+        });
+        origin.state.lock().unwrap().callback_offer = CallbackOffer::V1;
+        self.f
+            .manager
+            .handles
+            .lock()
+            .unwrap()
+            .insert(self.f.row.id.clone(), child);
+        (node, origin)
+    }
+
+    async fn names(&self, query: usize) -> Vec<String> {
+        self.node
+            .call("fixture/names", json!({"query":query}))
+            .await
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|name| name.as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    async fn confirmed(&self, query: usize) -> String {
+        let names = self.names(query).await;
+        let confirmed = names
+            .into_iter()
+            .filter(|name| name.starts_with("intent-callback-"))
+            .collect::<Vec<_>>();
+        assert_eq!(confirmed.len(), 1, "one immutable registration per Query");
+        confirmed.into_iter().next().unwrap()
+    }
+
+    async fn call(&self, query: usize, name: &str, code: &str) -> Value {
+        self.node
+            .call(
+                "fixture/call",
+                json!({"query":query,"name":name,"code":code}),
+            )
+            .await
+    }
+
+    async fn finish(self) {
+        self.origin.retire();
+        self.node.finish().await;
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn confirmed_read_public_session_uses_original_services_cache_and_registered_endpoint() {
+    let h = NativeHarness::new("3.0", true, false).await;
+    let before = std::fs::read(h.original.gitlab_secret_store.path()).unwrap();
+    let pending = h.origin.pending_callback().unwrap().capture();
+    let session = h.start().await;
+    assert_eq!(
+        h.f.stored().await.acp_session_id.as_deref(),
+        Some(session.as_str())
+    );
+    assert_eq!(h.f.writes().await, 1);
+    assert!(Arc::ptr_eq(&h.original, &h.auth.service));
+    assert!(h
+        .original
+        .store
+        .shares_repository_lifecycle_domain(&h.git.store));
+    assert_ne!(h.user.connect_addr(), String::new());
+    let name = h.confirmed(0).await;
+    let reply = h
+        .call(
+            0,
+            &name,
+            "const a=await ws.pr.snapshot(4); const b=await ws.pr.snapshot(4); return [a,b];",
+        )
+        .await;
+    assert!(reply.to_string().contains("actual review"), "{reply}");
+    assert!(!reply.to_string().contains("stored-pat"));
+    assert!(h.http.count() > 0);
+    assert_eq!(
+        before,
+        std::fs::read(h.original.gitlab_secret_store.path()).unwrap()
+    );
+    assert!(!current(&pending, h.f.caller()).await);
+    for endpoint in ["workspace-mcp", "user-kept"] {
+        let before = h.http.count();
+        let denied = h
+            .call(
+                0,
+                endpoint,
+                "try { return await ws.pr.snapshot(4); } catch(e) { return e.message; }",
+            )
+            .await;
+        assert!(
+            denied
+                .to_string()
+                .contains(crate::repository_read_source::REFUSAL),
+            "{denied}"
+        );
+        assert_eq!(h.http.count(), before);
+        assert!(h
+            .call(0, endpoint, "return 'ordinary original result';")
+            .await
+            .to_string()
+            .contains("ordinary original result"));
+    }
+    let inspect = h.node.call("fixture/inspect", json!({})).await;
+    assert_eq!(count_requests(&inspect, "session/new"), 1);
+    assert_eq!(count_requests(&inspect, METHOD), 1);
+    assert_eq!(inspect["initializations"], json!([1]));
+    assert_eq!(h.f.writes().await, 1);
+    h.finish().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn confirmed_read_load_recreate_preserves_one_producer_and_original_accounting() {
+    let h = NativeHarness::new("3.0", true, false).await;
+    let first = h.start().await;
+    assert!(h
+        .call(0, &h.confirmed(0).await, "return await ws.pr.snapshot(4);")
+        .await
+        .to_string()
+        .contains("actual review"));
+    let old = callback(&h.origin).unwrap().capture();
+    assert_eq!(h.start().await, first);
+    assert!(!current(&old, h.f.caller()).await);
+    assert_eq!(h.f.writes().await, 1);
+    assert!(h
+        .call(1, &h.confirmed(1).await, "return await ws.pr.snapshot(4);")
+        .await
+        .to_string()
+        .contains("actual review"));
+    h.f.usage(23).await;
+    h.recreate();
+    let new = h.start().await;
+    assert_ne!(new, first);
+    assert_eq!(h.f.writes().await, 2);
+    let (usage, baseline) = h.f.accounting().await;
+    assert!(usage.is_none());
+    assert_eq!(baseline.unwrap()["inputTokens"], 23);
+    assert!(h
+        .call(2, &h.confirmed(2).await, "return await ws.pr.snapshot(4);")
+        .await
+        .to_string()
+        .contains("actual review"));
+    let inspect = h.node.call("fixture/inspect", json!({})).await;
+    assert_eq!(count_requests(&inspect, "session/new"), 2);
+    assert_eq!(count_requests(&inspect, "session/load"), 1);
+    assert_eq!(count_requests(&inspect, METHOD), 3);
+    assert_eq!(inspect["initializations"], json!([1, 1, 1]));
+    h.finish().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn confirmed_read_disabled_older_and_unavailable_receipts_keep_ordinary_results() {
+    for (stamp, enabled, capability) in [
+        ("3.0", false, "normal"),
+        ("2.9", true, "normal"),
+        ("3.0", true, "unsupported"),
+        ("3.0", true, "malformed"),
+        ("3.0", true, "missing-receipt"),
+    ] {
+        let h = NativeHarness::new(stamp, enabled, false).await;
+        if capability != "normal" {
+            h.node
+                .call("fixture/capability", json!({"mode":capability}))
+                .await;
+        }
+        h.start().await;
+        let inspect = h.node.call("fixture/inspect", json!({})).await;
+        assert_eq!(
+            count_requests(&inspect, METHOD),
+            0,
+            "{stamp}/{capability}: {inspect}"
+        );
+        assert_eq!(h.f.writes().await, 1);
+        assert!(h
+            .names(0)
+            .await
+            .iter()
+            .all(|n| !n.starts_with("intent-callback-")));
+        let ordinary = h
+            .call(0, "workspace-mcp", "return 'original ordinary result';")
+            .await;
+        assert!(ordinary.to_string().contains("original ordinary result"));
+        let denied = h
+            .call(
+                0,
+                "workspace-mcp",
+                "try {return await ws.pr.snapshot(4);} catch(e) {return e.message;}",
+            )
+            .await;
+        assert!(
+            denied
+                .to_string()
+                .contains(crate::repository_read_source::REFUSAL),
+            "{denied}"
+        );
+        assert_eq!(h.http.count(), 0);
+        h.finish().await;
+    }
+    let h = NativeHarness::new("3.0", true, true).await;
+    h.start().await;
+    let name = h.confirmed(0).await;
+    assert!(h
+        .call(
+            0,
+            &name,
+            "try {return await ws.pr.snapshot(4);} catch(e) {return e.message;}"
+        )
+        .await
+        .to_string()
+        .contains(crate::repository_read_source::REFUSAL));
+    assert!(RepositoryReadOwner::capture(h.original.clone()).is_ok());
+    assert!(h
+        .call(
+            0,
+            &name,
+            "try {return await ws.pr.snapshot(4);} catch(e) {return e.message;}"
+        )
+        .await
+        .to_string()
+        .contains(crate::repository_read_source::REFUSAL));
+    assert_eq!(h.http.count(), 0, "original failed capture never retries");
+    assert_eq!(h.f.writes().await, 1);
+    h.finish().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn confirmed_read_seventeenth_pending_capture_cannot_upgrade_after_registration() {
+    let pending = Arc::new(NativeControl::default());
+    let h = NativeHarness::observed("3.0", true, false, None, Some(pending.clone())).await;
+    h.node.call("fixture/next", json!({"hold":true})).await;
+    let start = h.start_task();
+    h.node.call("fixture/entered", json!({})).await;
+    pending.blocked.store(true, Ordering::SeqCst);
+    let before_capture = pending.captures.load(Ordering::SeqCst);
+    let before_entered = pending.entered.load(Ordering::SeqCst);
+    let mut tasks = Vec::new();
+    for i in 0..17 {
+        tasks.push(h.call_task(
+            0,
+            "workspace-mcp",
+            &format!(
+                "try {{await ws.pr.snapshot(4);}} catch(e) {{return 'queued-{i}: '+e.message;}}"
+            ),
+        ));
+    }
+    wait_count(&pending.entered, &pending.changed, before_entered + 16).await;
+    wait_count(&pending.captures, &pending.changed, before_capture + 17).await;
+    assert_eq!(pending.entered.load(Ordering::SeqCst), before_entered + 16);
+    h.node.call("fixture/release", json!({})).await;
+    start.await.unwrap().unwrap();
+    let fresh = h
+        .call(0, &h.confirmed(0).await, "return await ws.pr.snapshot(4);")
+        .await;
+    assert!(fresh.to_string().contains("actual review"), "{fresh}");
+    let reads = h.http.count();
+    pending.blocked.store(false, Ordering::SeqCst);
+    pending.release.notify_waiters();
+    for task in tasks {
+        let denied = task.await.unwrap();
+        assert!(denied.to_string().contains("queued-"), "{denied}");
+        assert!(
+            denied
+                .to_string()
+                .contains(crate::repository_read_source::REFUSAL),
+            "{denied}"
+        );
+    }
+    assert_eq!(h.http.count(), reads);
+    assert!(pending
+        .reads
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|r| r.read.is_err()));
+    assert_eq!(h.f.writes().await, 1);
+    h.finish().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn confirmed_read_escaped_handles_retire_only_after_their_original_scope() {
+    let control = Arc::new(NativeControl::default());
+    let h = NativeHarness::observed("3.0", true, false, Some(control.clone()), None).await;
+    h.start().await;
+    let name = h.confirmed(0).await;
+    // Initialization/list scopes have already completed. Observe the original
+    // tool invocation below, whose response is held at the real TCP boundary.
+    control.reads.lock().unwrap().clear();
+    let gate = control.at(Boundary::TcpResponse, false);
+    let first = h.call_task(0, &name, "return await ws.pr.snapshot(4);");
+    gate.reached().await;
+    let (read, source) = {
+        let mut observed = control.reads.lock().unwrap();
+        let r = observed.iter_mut().find(|r| r.read.is_ok()).unwrap();
+        (r.read.as_ref().unwrap().clone(), r.source.take().unwrap())
+    };
+    let cloned = read.clone();
+    intent_core::with_caller(h.f.caller(), async {
+        assert!(read.retains(h.original.as_ref()));
+        assert!(cloned.check_current().is_ok());
+        assert!(source.retirement().check_current().is_ok());
+    })
+    .await;
+    let sibling = h.call(0, &name, "return await ws.pr.snapshot(4);").await;
+    assert!(sibling.to_string().contains("actual review"));
+    assert!(
+        intent_core::with_caller(h.f.caller(), async { read.check_current() })
+            .await
+            .is_ok()
+    );
+    drop(cloned);
+    gate.release.add_permits(1);
+    assert!(first.await.unwrap().to_string().contains("actual review"));
+    tokio::time::timeout(WAIT, async {
+        while source.retirement().check_current().is_ok() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        intent_core::with_caller(h.f.caller(), async { read.check_current() })
+            .await
+            .is_err()
+    );
+    assert!(current(&callback(&h.origin).unwrap().capture(), h.f.caller()).await);
+    assert!(h
+        .call(0, &name, "return await ws.pr.snapshot(4);")
+        .await
+        .to_string()
+        .contains("actual review"));
+    h.finish().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn confirmed_read_host_and_tcp_boundary_keep_original_transfer_and_soft_interrupt() {
+    for (boundary, after) in [
+        (Boundary::HostPromise, false),
+        (Boundary::HostPromise, true),
+        (Boundary::TcpResponse, false),
+        (Boundary::TcpResponse, true),
+    ] {
+        let control = Arc::new(NativeControl::default());
+        let h = NativeHarness::observed("3.0", true, false, Some(control.clone()), None).await;
+        h.start().await;
+        let name = h.confirmed(0).await;
+        let endpoint = h.origin.state.lock().unwrap().endpoint.clone().unwrap();
+        let gate = control.at(boundary, after);
+        let task = h.call_task(0, &name, "return await ws.pr.snapshot(4);");
+        gate.reached().await;
+        assert!(h.f.manager.interrupt(&h.f.row.id).await);
+        assert!(Arc::ptr_eq(
+            &endpoint,
+            h.origin.state.lock().unwrap().endpoint.as_ref().unwrap()
+        ));
+        gate.release.add_permits(1);
+        let reply = task.await.unwrap();
+        // A TCP transfer already consumed the original packet before retirement.
+        let committed = boundary == Boundary::TcpResponse && after;
+        assert_eq!(
+            reply.to_string().contains("actual review"),
+            committed,
+            "{boundary:?}/{after}: {reply}"
+        );
+        if !committed {
+            assert!(
+                reply
+                    .to_string()
+                    .contains("Private result delivery refused"),
+                "{reply}"
+            );
+        }
+        assert!(h
+            .call(0, &name, "return await ws.pr.snapshot(4);")
+            .await
+            .to_string()
+            .contains("actual review"));
+        assert_eq!(h.f.writes().await, 1);
+        h.finish().await;
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn confirmed_read_caught_discarded_shared_root_and_budget_bind_every_original_read() {
+    for code in [
+        "await Promise.all([ws.pr.snapshot(4),ws.pr.snapshot(4)]); return 'constant';",
+        "await ws.pr.snapshot(4); try {await ws.pr.snapshot(99);} catch(e) {} return 'caught';",
+    ] {
+        let control = Arc::new(NativeControl::default());
+        let h = NativeHarness::observed("3.0", true, false, Some(control.clone()), None).await;
+        h.start().await;
+        let gate = control.at(Boundary::TcpResponse, false);
+        let task = h.call_task(0, &h.confirmed(0).await, code);
+        gate.reached().await;
+        assert!(control
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(b, n)| *b == Boundary::TcpResponse && *n >= 3));
+        assert!(h.f.manager.interrupt(&h.f.row.id).await);
+        gate.release.add_permits(1);
+        assert!(task
+            .await
+            .unwrap()
+            .to_string()
+            .contains("Private result delivery refused"));
+        h.finish().await;
+    }
+    for count in [63, 64] {
+        let control = Arc::new(NativeControl::default());
+        let h = NativeHarness::observed("3.0", true, false, Some(control.clone()), None).await;
+        h.start().await;
+        let code = format!("for(let i=0;i<{count};i++) {{await ws.pr.snapshot(4);}} return 'bounded original success';");
+        let reply = h.call(0, &h.confirmed(0).await, &code).await;
+        assert_eq!(
+            reply.to_string().contains("bounded original success"),
+            count == 63,
+            "{reply}"
+        );
+        if count == 63 {
+            assert!(control
+                .events
+                .lock()
+                .unwrap()
+                .contains(&(Boundary::TcpResponse, 64)));
+        } else {
+            assert!(
+                reply
+                    .to_string()
+                    .contains("Private result delivery refused"),
+                "{reply}"
+            );
+        }
+        h.finish().await;
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn confirmed_read_mixed_live_requests_never_borrow_sibling_evidence() {
+    let control = Arc::new(NativeControl::default());
+    let h = NativeHarness::observed("3.0", true, false, Some(control.clone()), None).await;
+    h.start().await;
+    let name = h.confirmed(0).await;
+    let gate = control.at(Boundary::TcpResponse, false);
+    let first = h.call_task(0, &name, "return await ws.pr.snapshot(4);");
+    gate.reached().await;
+    *control.foreign.lock().unwrap() = control.records.lock().unwrap().clone();
+    let second = h.call(0, &name, "return await ws.pr.snapshot(4);").await;
+    assert!(second.to_string().contains("actual review"), "{second}");
+    control.foreign.lock().unwrap().clear();
+    gate.release.add_permits(1);
+    assert!(first.await.unwrap().to_string().contains("actual review"));
+    h.finish().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn confirmed_read_original_source_and_credential_changes_fence_cached_final_output() {
+    for change in ["head", "remote", "secret", "settings"] {
+        let control = Arc::new(NativeControl::default());
+        let h = NativeHarness::observed("3.0", true, false, Some(control.clone()), None).await;
+        h.start().await;
+        let gate = control.at(Boundary::TcpResponse, false);
+        let task = h.call_task(
+            0,
+            &h.confirmed(0).await,
+            "await ws.pr.snapshot(4); await ws.pr.snapshot(4); return 'constant';",
+        );
+        gate.reached().await;
+        match change {
+            "head" => {
+                h.git.git(
+                    &h.git.path,
+                    &[
+                        "-c",
+                        "user.name=Fixture",
+                        "-c",
+                        "user.email=fixture@example.invalid",
+                        "commit",
+                        "--allow-empty",
+                        "-m",
+                        "replacement head",
+                    ],
+                );
+            }
+            "remote" => {
+                h.git.git(
+                    &h.git.path,
+                    &[
+                        "remote",
+                        "set-url",
+                        "origin",
+                        "https://unknown.invalid/changed/repository.git",
+                    ],
+                );
+            }
+            _ => {
+                let path = if change == "secret" {
+                    intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT
+                } else {
+                    "sourceControl.gitlab.oauthClientId"
+                };
+                intent_core::with_caller(
+                    Caller::Daemon,
+                    h.original
+                        .settings_update(json!([{"path":path,"value":"new-original-setting"}])),
+                )
+                .await
+                .unwrap();
+            }
+        }
+        gate.release.add_permits(1);
+        assert!(
+            task.await
+                .unwrap()
+                .to_string()
+                .contains("Private result delivery refused"),
+            "{change}"
+        );
+        assert_eq!(h.f.writes().await, 1);
+        h.finish().await;
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn confirmed_read_provider_completion_reobserves_git_before_cache_application() {
+    let h = NativeHarness::new("3.0", true, false).await;
+    h.start().await;
+    let name = h.confirmed(0).await;
+    h.http
+        .pause("/api/v4/projects/group%2Fproject/merge_requests/4/discussions");
+    let task = h.call_task(0, &name, "return await ws.pr.snapshot(4);");
+    h.http.entered().await;
+    h.git.git(
+        &h.git.path,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "changed during actual HTTP",
+        ],
+    );
+    h.http.resume();
+    let old = task.await.unwrap();
+    assert!(!old.to_string().contains("actual review"), "{old}");
+    let before = h.http.count();
+    let fresh = h.call(0, &name, "return await ws.pr.snapshot(4);").await;
+    assert!(fresh.to_string().contains("actual review"), "{fresh}");
+    assert!(h.http.count() > before, "old response was not cached");
+    h.finish().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn confirmed_read_original_deletion_schedule_cancel_preserves_fresh_endpoint() {
+    for agent in [false, true] {
+        let control = Arc::new(NativeControl::default());
+        let h = NativeHarness::observed("3.0", true, false, Some(control.clone()), None).await;
+        h.start().await;
+        let name = h.confirmed(0).await;
+        let gate = control.at(Boundary::TcpResponse, false);
+        let task = h.call_task(0, &name, "await ws.pr.snapshot(4); return 'constant';");
+        gate.reached().await;
+        intent_core::with_caller(Caller::Daemon, async {
+            if agent {
+                h.original
+                    .agent_schedule_delete(
+                        h.f.row.id.clone(),
+                        Some(h.git.workspace.id.clone()),
+                        60_000,
+                    )
+                    .await
+                    .unwrap();
+                assert!(h
+                    .original
+                    .agent_cancel_delete(h.f.row.id.clone(), Some(h.git.workspace.id.clone()))
+                    .await
+                    .unwrap());
+            } else {
+                h.original
+                    .schedule_workspace_delete(h.git.workspace.id.clone(), 60_000)
+                    .await
+                    .unwrap();
+                assert!(h
+                    .original
+                    .cancel_workspace_delete(h.git.workspace.id.clone())
+                    .await
+                    .unwrap());
+            }
+        })
+        .await;
+        gate.release.add_permits(1);
+        assert!(task
+            .await
+            .unwrap()
+            .to_string()
+            .contains("Private result delivery refused"));
+        assert!(h
+            .call(0, &name, "return await ws.pr.snapshot(4);")
+            .await
+            .to_string()
+            .contains("actual review"));
+        assert_eq!(h.f.writes().await, 1);
+        h.finish().await;
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn confirmed_read_claimed_delete_retires_original_manager_before_late_output() {
+    use crate::delete_grace::PendingDeleteSubject;
+    let control = Arc::new(NativeControl::default());
+    let h = NativeHarness::observed("3.0", true, false, Some(control.clone()), None).await;
+    h.start().await;
+    let gate = control.at(Boundary::TcpResponse, false);
+    let task = h.call_task(
+        0,
+        &h.confirmed(0).await,
+        "await ws.pr.snapshot(4); return 'constant';",
+    );
+    gate.reached().await;
+    intent_core::with_caller(Caller::Daemon, async {
+        h.original
+            .schedule_workspace_delete(h.git.workspace.id.clone(), 0)
+            .await
+            .unwrap();
+        tokio::time::timeout(WAIT, async {
+            while h
+                .original
+                .pending_workspace_deletes
+                .deadline(&PendingDeleteSubject::Workspace(h.git.workspace.id.clone()))
+                .unwrap()
+                .is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!h
+            .original
+            .cancel_workspace_delete(h.git.workspace.id.clone())
+            .await
+            .unwrap());
+    })
+    .await;
+    gate.release.add_permits(1);
+    let reply = task.await.unwrap();
+    assert!(
+        reply
+            .to_string()
+            .contains("Private result delivery refused"),
+        "{reply}"
+    );
+    tokio::time::timeout(WAIT, async {
+        while h
+            .original
+            .store
+            .get_workspace(&h.git.workspace.id)
+            .await
+            .is_ok()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!h
+        .f
+        .manager
+        .handles
+        .lock()
+        .unwrap()
+        .contains_key(&h.f.row.id));
+    h.finish().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn confirmed_read_artifact_and_attachment_start_preserve_actual_effects() {
+    for (boundary, after) in [
+        (Boundary::ArtifactStart, false),
+        (Boundary::ArtifactStart, true),
+        (Boundary::Attachments, false),
+        (Boundary::Attachments, true),
+    ] {
+        let control = Arc::new(NativeControl::default());
+        let h = NativeHarness::observed("3.0", true, false, Some(control.clone()), None).await;
+        h.auth
+            .registry
+            .apply(&[("workspaceApi.maxOutputChars".into(), json!(1000))])
+            .unwrap();
+        h.start().await;
+        let gate = control.at(boundary, after);
+        let code = if boundary == Boundary::ArtifactStart {
+            "const p=await ws.pr.snapshot(4); return p.title.repeat(300);"
+        } else {
+            "const p=await ws.pr.snapshot(4); return {__mcpContentItems:[{type:'resource',resource:{uri:'fixture://original',mimeType:'application/json',text:JSON.stringify({title:p.title})}}]};"
+        };
+        let task = h.call_task(0, &h.confirmed(0).await, code);
+        gate.reached().await;
+        let folder = h.git.dir.path().join("tool-outputs");
+        assert!(!folder.exists());
+        assert_eq!(
+            h.original
+                .turn_attachments()
+                .pending_count_by_mime(&h.f.row.id, "application/json"),
+            0
+        );
+        assert!(h.f.manager.interrupt(&h.f.row.id).await);
+        gate.release.add_permits(1);
+        let reply = task.await.unwrap();
+        assert!(
+            reply
+                .to_string()
+                .contains("Private result delivery refused"),
+            "{boundary:?}/{after}: {reply}"
+        );
+        if boundary == Boundary::ArtifactStart {
+            assert_eq!(folder.exists(), after);
+            if after {
+                let files = std::fs::read_dir(&folder)
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                assert_eq!(files.len(), 1);
+                assert!(std::fs::read_to_string(files[0].path())
+                    .unwrap()
+                    .contains("actual review"));
+            }
+        } else {
+            assert_eq!(
+                h.original
+                    .turn_attachments()
+                    .pending_count_by_mime(&h.f.row.id, "application/json"),
+                usize::from(after)
+            );
+        }
+        assert!(h
+            .call(0, "workspace-mcp", "return 'ordinary completed effect';")
+            .await
+            .to_string()
+            .contains("ordinary completed effect"));
+        h.finish().await;
+    }
+}
+
+async fn native_metadata_delivery_ordering(replace_handle: bool, install_before_old: bool) {
+    use crate::repository_admission::lifecycle::physical_owner::RepositoryCreationIntent;
+    let h = NativeHarness::new("3.0", true, false).await;
+    let store = &h.f.manager.services.store;
+    store
+        .set_agent_effort_levels(
+            &h.f.row.workspace_id,
+            &h.f.row.id,
+            Some(&["previous".into()]),
+            "2026-09-28T00:00:00Z",
+        )
+        .await
+        .unwrap();
+    for sql in [
+        "CREATE TABLE observed_model_metadata (id TEXT)",
+        "CREATE TABLE observed_effort_metadata (id TEXT)",
+        "CREATE TRIGGER pause_model_metadata AFTER UPDATE OF resolved_model ON agent_session BEGIN INSERT INTO observed_model_metadata VALUES (NEW.id); END",
+        "CREATE TRIGGER pause_effort_metadata AFTER UPDATE OF effort_levels ON agent_session BEGIN INSERT INTO observed_effort_metadata VALUES (NEW.id); END",
+    ] { sqlx::query(sql).execute(store.write_pool()).await.unwrap(); }
+    let (model_entered, model_wait) = tokio::sync::oneshot::channel();
+    let (model_release, model_resume) = std::sync::mpsc::channel();
+    let (effort_entered, effort_wait) = tokio::sync::oneshot::channel();
+    let (effort_release, effort_resume) = std::sync::mpsc::channel();
+    let mut model_pause = Some((model_entered, model_resume));
+    let mut effort_pause = Some((effort_entered, effort_resume));
+    let mut writer = store.write_pool().acquire().await.unwrap();
+    writer
+        .lock_handle()
+        .await
+        .unwrap()
+        .set_update_hook(move |change| {
+            let gate = match change.table {
+                "observed_model_metadata" => model_pause.take(),
+                "observed_effort_metadata" => effort_pause.take(),
+                _ => None,
+            };
+            if let Some((entered, resume)) = gate {
+                let _ = entered.send(());
+                let _ = resume.recv_timeout(WAIT);
+            }
+        });
+    drop(writer);
+    let original = h.start_task();
+    tokio::time::timeout(WAIT, model_wait)
+        .await
+        .unwrap()
+        .unwrap();
+    let old_id = h.f.stored().await.acp_session_id.unwrap();
+    assert!(
+        callback(&h.origin).is_none(),
+        "consumed owner remains inside finish metadata await"
+    );
+    let replacement = if replace_handle {
+        Some(h.replacement().await)
+    } else {
+        None
+    };
+    let (peer, origin) = replacement
+        .as_ref()
+        .map_or((&h.node, &h.origin), |(node, origin)| (node, origin));
+    let client = intent_acp::handshake::handshake_with_callbacks(
+        peer.connection.clone(),
+        intent_providers::provider_config("claude-code"),
+        CallbackOffer::V1,
+    )
+    .await
+    .unwrap()
+    .callbacks
+    .unwrap();
+    let servers = h.f.manager.handles.lock().unwrap()[&h.f.row.id]
+        .session_mcp_servers
+        .clone();
+    let (creator, attempt) = origin
+        .begin_session(RepositoryCreationIntent::Replace {
+            expected: Some(old_id.clone()),
+        })
+        .unwrap();
+    let (producer_done, produced) = tokio::sync::oneshot::channel();
+    let mut initializing = Box::pin(creator.initialize_compatible(|| async {
+        let response = client.new_session(&h.git.path, servers, None).await?;
+        producer_done.send(()).unwrap();
+        Ok::<_, intent_acp::AcpError>((response.response.session_id.0.to_string(), response))
+    }));
+    tokio::select! {
+        biased;
+        result = &mut initializing => panic!("Store writer still held: {:?}", result.result),
+        produced = produced => produced.unwrap(),
+    }
+    model_release.send(()).unwrap();
+    let result = initializing.await;
+    let response = result.producer.unwrap();
+    let new_id = response.response.session_id.0.to_string();
+    assert_eq!(
+        crate::agent_session::compatibility_session_id(result.result.unwrap()),
+        new_id
+    );
+    let owner = result.owner.unwrap();
+    let captured = owner.callback().capture();
+    let outcome = crate::agent_session::RepositorySessionOutcome {
+        response: new_id.clone(),
+        owner: Ok(owner),
+        query: response.query,
+    };
+    let mut later = Some((attempt, outcome));
+    if install_before_old {
+        let (attempt, outcome) = later.take().unwrap();
+        let (id, delivery) = origin.accept_session(attempt, outcome);
+        assert_eq!(id, new_id);
+        assert!(delivery.is_some());
+        deliver_optional(delivery).await;
+    }
+    tokio::time::timeout(WAIT, effort_wait)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(current(&captured, h.f.caller()).await);
+    effort_release.send(()).unwrap();
+    assert_eq!(original.await.unwrap().unwrap(), old_id);
+    if let Some((attempt, outcome)) = later {
+        assert!(
+            callback(origin).is_none(),
+            "old completion must not install before its successor"
+        );
+        let (id, delivery) = origin.accept_session(attempt, outcome);
+        assert_eq!(id, new_id);
+        deliver_optional(delivery).await;
+    }
+    assert!(current(&captured, h.f.caller()).await);
+    assert_eq!(
+        h.f.stored().await.acp_session_id.as_deref(),
+        Some(new_id.as_str())
+    );
+    assert_eq!(h.f.writes().await, 2);
+    let inspect = h.node.call("fixture/inspect", json!({})).await;
+    let (new_calls, registrations) = if let Some((node, _)) = &replacement {
+        let second = node.call("fixture/inspect", json!({})).await;
+        (
+            count_requests(&inspect, "session/new") + count_requests(&second, "session/new"),
+            count_requests(&inspect, METHOD) + count_requests(&second, METHOD),
+        )
+    } else {
+        (
+            count_requests(&inspect, "session/new"),
+            count_requests(&inspect, METHOD),
+        )
+    };
+    assert_eq!(new_calls, 2);
+    assert_eq!(
+        registrations, 1,
+        "obsolete receipt never reaches the custom dispatcher"
+    );
+    let query = usize::from(!replace_handle);
+    let names = peer.call("fixture/names", json!({"query":query})).await;
+    let alias = names
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|name| name.starts_with("intent-callback-"))
+        .unwrap();
+    let reply = peer
+        .call(
+            "fixture/call",
+            json!({"query":query,"name":alias,"code":"return await ws.pr.snapshot(4);"}),
+        )
+        .await;
+    assert!(reply.to_string().contains("actual review"), "{reply}");
+    let mut writer = store.write_pool().acquire().await.unwrap();
+    writer.lock_handle().await.unwrap().remove_update_hook();
+    drop(writer);
+    origin.retire();
+    if let Some((node, _)) = replacement {
+        node.finish().await;
+    }
+    h.node.finish().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn confirmed_read_metadata_completion_preserves_newer_owner_in_all_four_orders() {
+    for replace_handle in [false, true] {
+        for install_before_old in [false, true] {
+            native_metadata_delivery_ordering(replace_handle, install_before_old).await;
+        }
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn confirmed_read_late_sdk_completion_keeps_new_original_owner_in_all_four_orders() {
+    for replace in [false, true] {
+        for old_first in [false, true] {
+            let h = NativeHarness::new("3.0", true, false).await;
+            h.node.call("fixture/next", json!({"hold":true})).await;
+            let old = h.start_task();
+            h.node.call("fixture/entered", json!({})).await;
+            let old_id = h.f.stored().await.acp_session_id.unwrap();
+            let old_capture = callback(&h.origin).unwrap().capture();
+            let replacement = if replace {
+                Some(h.replacement().await)
+            } else {
+                None
+            };
+            let (peer, origin) = replacement
+                .as_ref()
+                .map_or((&h.node, &h.origin), |(p, o)| (p, o));
+            peer.call("fixture/next", json!({"hold":true})).await;
+            h.recreate();
+            let new = h.start_task();
+            let query = usize::from(!replace);
+            peer.call("fixture/entered", json!({"query":query})).await;
+            let fresh = callback(origin).unwrap().capture();
+            assert!(!current(&old_capture, h.f.caller()).await);
+            assert!(current(&fresh, h.f.caller()).await);
+            assert_eq!(old.await.unwrap().unwrap(), old_id);
+            if old_first {
+                h.node.call("fixture/release", json!({"query":0})).await;
+                h.node.call("fixture/settled", json!({"query":0})).await;
+            }
+            peer.call("fixture/release", json!({"query":query})).await;
+            let new_id = new.await.unwrap().unwrap();
+            if !old_first {
+                h.node.call("fixture/release", json!({"query":0})).await;
+                h.node.call("fixture/settled", json!({"query":0})).await;
+            }
+            assert_ne!(new_id, old_id);
+            assert_eq!(
+                h.f.stored().await.acp_session_id.as_deref(),
+                Some(new_id.as_str())
+            );
+            assert_eq!(h.f.writes().await, 2);
+            assert!(current(&fresh, h.f.caller()).await);
+            assert!(h
+                .names(0)
+                .await
+                .iter()
+                .all(|n| !n.starts_with("intent-callback-")));
+            let names = peer.call("fixture/names", json!({"query":query})).await;
+            let name = names
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .find(|n| n.starts_with("intent-callback-"))
+                .unwrap();
+            let reply = peer
+                .call(
+                    "fixture/call",
+                    json!({"query":query,"name":name,"code":"return await ws.pr.snapshot(4);"}),
+                )
+                .await;
+            assert!(
+                reply.to_string().contains("actual review"),
+                "{replace}/{old_first}: {reply}"
+            );
+            let original = h.node.call("fixture/inspect", json!({})).await;
+            let mut new_calls = count_requests(&original, "session/new");
+            let mut registrations = count_requests(&original, METHOD);
+            if let Some((node, _)) = &replacement {
+                let inspect = node.call("fixture/inspect", json!({})).await;
+                new_calls += count_requests(&inspect, "session/new");
+                registrations += count_requests(&inspect, METHOD);
+            }
+            assert_eq!(new_calls, 2);
+            assert_eq!(registrations, 2);
+            origin.retire();
+            if let Some((node, _)) = replacement {
+                node.finish().await;
+            }
+            h.finish().await;
+        }
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn confirmed_read_registration_failure_cancel_and_uncertainty_never_replay_or_upgrade() {
+    for mode in ["error", "cancel", "uncertain"] {
+        let h = NativeHarness::new("3.0", true, false).await;
+        if mode == "error" {
+            h.node
+                .call("fixture/next", json!({"error":"original control refusal"}))
+                .await;
+        } else {
+            h.node.call("fixture/next", json!({"hold":true})).await;
+        }
+        let start = h.start_task();
+        if mode != "error" {
+            h.node.call("fixture/entered", json!({})).await;
+        }
+        if mode == "cancel" {
+            start.abort();
+            assert!(start.await.unwrap_err().is_cancelled());
+        } else {
+            let id = tokio::time::timeout(WAIT, start)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                h.f.stored().await.acp_session_id.as_deref(),
+                Some(id.as_str())
+            );
+        }
+        assert_eq!(h.f.writes().await, 1);
+        let old = callback(&h.origin).unwrap().capture();
+        assert!(!current(&old, h.f.caller()).await);
+        assert!(h.origin.state.lock().unwrap().endpoint.is_none());
+        if mode != "error" {
+            h.node.call("fixture/release", json!({})).await;
+            h.node.call("fixture/settled", json!({})).await;
+        }
+        assert!(h
+            .names(0)
+            .await
+            .iter()
+            .all(|n| !n.starts_with("intent-callback-")));
+        assert!(h
+            .call(0, "workspace-mcp", "return 'completed ordinary original';")
+            .await
+            .to_string()
+            .contains("completed ordinary original"));
+        assert_eq!(h.http.count(), 0);
+        let inspect = h.node.call("fixture/inspect", json!({})).await;
+        assert_eq!(count_requests(&inspect, METHOD), 1);
+        assert_eq!(count_requests(&inspect, "session/new"), 1);
+        // The adapter's own five-second uncertainty response precedes the
+        // client's six-second guard. Only an aborted client sends cancellation.
+        assert_eq!(
+            count_requests(&inspect, "$/cancel_request"),
+            usize::from(mode == "cancel")
+        );
+        h.recreate();
+        h.start().await;
+        assert!(h
+            .call(1, &h.confirmed(1).await, "return await ws.pr.snapshot(4);")
+            .await
+            .to_string()
+            .contains("actual review"));
+        assert!(!current(&old, h.f.caller()).await);
+        assert_eq!(h.f.writes().await, 2);
+        h.finish().await;
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn confirmed_read_pending_completed_response_survives_distinct_registration() {
+    let pending = Arc::new(NativeControl::default());
+    let h = NativeHarness::observed("3.0", true, false, None, Some(pending.clone())).await;
+    h.node.call("fixture/next", json!({"hold":true})).await;
+    let start = h.start_task();
+    h.node.call("fixture/entered", json!({})).await;
+    let held = NativeHold::new();
+    *pending.completed_body.lock().unwrap() = Some(held.clone());
+    let ordinary = h.call_task(
+        0,
+        "workspace-mcp",
+        "return 'already completed original response';",
+    );
+    held.reached().await;
+    h.node.call("fixture/release", json!({})).await;
+    start.await.unwrap().unwrap();
+    assert!(h
+        .call(0, &h.confirmed(0).await, "return await ws.pr.snapshot(4);")
+        .await
+        .to_string()
+        .contains("actual review"));
+    held.release.add_permits(1);
+    assert!(ordinary
+        .await
+        .unwrap()
+        .to_string()
+        .contains("already completed original response"));
+    assert!(pending
+        .reads
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|r| r.read.is_err()));
+    assert_eq!(h.f.writes().await, 1);
+    h.finish().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn confirmed_read_direct_companion_uses_same_original_policy_as_delivered_tcp() {
+    for after in [false, true] {
+        let control = Arc::new(NativeControl::default());
+        let h = NativeHarness::observed("3.0", true, false, Some(control.clone()), None).await;
+        h.start().await;
+        assert!(h
+            .call(0, &h.confirmed(0).await, "return await ws.pr.snapshot(4);")
+            .await
+            .to_string()
+            .contains("actual review"));
+        // Companion in-process boundary on the same original confirmed owner;
+        // the positive delivered TCP endpoint above remains the delivery proof.
+        let blueprint = h.origin.state.lock().unwrap().blueprint.clone().unwrap();
+        let server = blueprint
+            .server
+            .confirmed_server(callback(&h.origin).unwrap());
+        let gate = control.at(Boundary::DirectResponse, after);
+        let task = tokio::spawn(async move {
+            crate::repository_read_source::tests::run(&server, "return await ws.pr.snapshot(4);")
+                .await
+        });
+        gate.reached().await;
+        assert!(h.f.manager.interrupt(&h.f.row.id).await);
+        gate.release.add_permits(1);
+        let reply = task.await.unwrap();
+        assert_eq!(
+            reply.to_string().contains("actual review"),
+            after,
+            "{reply}"
+        );
+        if !after {
+            assert!(reply
+                .to_string()
+                .contains("Private result delivery refused"));
+        }
+        h.finish().await;
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn confirmed_read_actual_file_retirement_and_provider_partial_results_stay_original() {
+    let h = NativeHarness::new("3.0", true, false).await;
+    h.start().await;
+    let name = h.confirmed(0).await;
+    let mut file =
+        crate::source_control_auth_ops::repository_owner::secret_reader::tests::PausedRead::install(
+            &h.auth,
+        );
+    let task = h.call_task(0, &name, "return await ws.pr.snapshot(4);");
+    file.entered().await;
+    assert!(h.f.manager.interrupt(&h.f.row.id).await);
+    file.resume();
+    assert!(!task.await.unwrap().to_string().contains("actual review"));
+    assert_eq!(
+        h.http.count(),
+        0,
+        "retired file acquisition never dispatches"
+    );
+    assert!(h
+        .call(0, &name, "return await ws.pr.snapshot(4);")
+        .await
+        .to_string()
+        .contains("actual review"));
+    h.finish().await;
+    for status in [401, 403, 404, 429] {
+        let h = NativeHarness::new("3.0", true, false).await;
+        h.start().await;
+        h.http
+            .status("/api/v4/projects/group%2Fproject/merge_requests/4", status);
+        let reply=h.call(0,&h.confirmed(0).await,"try {await ws.pr.snapshot(4);} catch(e) {} return 'constant after original denial';").await;
+        assert!(
+            !reply.to_string().contains("actual review"),
+            "{status}: {reply}"
+        );
+        assert!(h.http.count() > 0);
+        assert_eq!(
+            h.original.gitlab_repository_settled_connection().is_ok(),
+            status != 401
+        );
+        h.finish().await;
+    }
+    let h = NativeHarness::new("3.0", true, false).await;
+    h.start().await;
+    h.http.status(
+        "/api/v4/projects/group%2Fproject/merge_requests/4/approvals",
+        429,
+    );
+    let reply = h
+        .call(0, &h.confirmed(0).await, "return await ws.pr.snapshot(4);")
+        .await;
+    assert!(reply.to_string().contains("actual review"), "{reply}");
+    assert!(reply.to_string().contains("rate-limited"), "{reply}");
+    assert!(h.original.sweep_rate_limit_paused_until().is_none());
+    h.finish().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn confirmed_read_ambiguous_sources_refuse_without_acquisition_and_github_stays_ordinary() {
+    let h = NativeHarness::new("3.0", true, false).await;
+    h.start().await;
+    let name = h.confirmed(0).await;
+    h.git.git(
+        &h.git.path,
+        &[
+            "remote",
+            "add",
+            "other",
+            "https://github.com/Actual/Repository.git",
+        ],
+    );
+    let reply = h
+        .call(
+            0,
+            &name,
+            "try {return await ws.pr.snapshot(4);} catch(e) {return e.message;}",
+        )
+        .await;
+    assert!(
+        reply
+            .to_string()
+            .contains(crate::repository_read_source::REFUSAL),
+        "{reply}"
+    );
+    assert_eq!(h.http.count(), 0);
+    h.git.git(&h.git.path, &["remote", "remove", "origin"]);
+    intent_core::with_caller(Caller::Daemon, async {
+        h.original
+            .settings_update(
+                json!([{"path":intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT,"value":""}]),
+            )
+            .await
+            .unwrap();
+        assert!(h.original.gitlab_repository_settled_connection().is_err());
+        let captured = crate::repository_read_source::CapturedReview::capture(
+            &h.original,
+            h.git.workspace.id.clone(),
+            4,
+        );
+        let crate::repository_read_source::ReadOutcome::Github(repo) =
+            captured.read(&h.original).await.unwrap()
+        else {
+            panic!("positive local GitHub discovery")
+        };
+        assert_eq!(repo.owner, "actual");
+        assert_eq!(repo.name, "repository");
+    })
+    .await;
+    // This asserts local ordinary dispatch selection, not a GitHub provider call.
+    assert_eq!(h.http.count(), 0);
+    h.finish().await;
+}
+
+async fn native_transcript_tools(h: &NativeHarness) -> Vec<Value> {
+    h.f.manager
+        .services
+        .store
+        .get_agent_messages(&h.f.row.id, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .flat_map(|m| m.content.as_array().unwrap().clone())
+        .filter(|b| b["type"] == "tool_use")
+        .collect()
+}
+
+#[intent_test_macros::daemon_test]
+async fn confirmed_read_prompt_transcript_uses_only_original_connection_exact_routes_and_preserves_result_names(
+) {
+    let h = NativeHarness::new("3.0", true, false).await;
+    let id = h.start().await;
+    let alias = h.confirmed(0).await;
+    assert!(h
+        .call(0, &alias, "return await ws.pr.snapshot(4);")
+        .await
+        .to_string()
+        .contains("actual review"));
+    let title = format!("mcp__{alias}__workspace_api");
+    let foreign = "mcp__foreign__workspace_api";
+    let nested = format!("{title}__nested");
+    h.node.call("fixture/prompt-notes",json!({"notes":[
+        {"sessionUpdate":"tool_call","toolCallId":"known","title":title,"status":"in_progress","rawInput":{"code":"return 1"}},
+        {"sessionUpdate":"tool_call_update","toolCallId":"known","status":"completed","rawOutput":{"originalResult":"known"}},
+        tool_update("foreign",foreign), tool_update("nested",&nested),
+    ]})).await;
+    {
+        let mut notes = h.node.notes.lock().await;
+        while notes.try_recv().is_ok() {}
+        h.f.manager
+            .services
+            .run_prompt_turn(
+                &h.node.connection,
+                &mut notes,
+                &h.f.row.id,
+                &h.f.row.workspace_id,
+                &id,
+                vec![
+                    serde_json::from_value(json!({"type":"text","text":"local scripted output"}))
+                        .unwrap(),
+                ],
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    let tools = native_transcript_tools(&h).await;
+    assert_eq!(tools.len(), 3);
+    let known = tools.iter().find(|b| b["toolCallId"] == "known").unwrap();
+    assert_eq!(known["name"], "workspace_api");
+    assert_eq!(known["input"]["_acpTitle"], title);
+    assert_eq!(
+        tools.iter().find(|b| b["toolCallId"] == "foreign").unwrap()["name"],
+        "foreign_workspace_api"
+    );
+    assert_eq!(
+        tools.iter().find(|b| b["toolCallId"] == "nested").unwrap()["name"],
+        format!("{alias}_workspace_api__nested")
+    );
+    let messages =
+        h.f.manager
+            .services
+            .store
+            .get_agent_messages(&h.f.row.id, None)
+            .await
+            .unwrap();
+    assert!(messages
+        .iter()
+        .any(|m| m.content.to_string().contains("originalResult")));
+    // The same literal alias arriving on another actual ACP connection has no registration.
+    let other = NodePeer::new();
+    other
+        .call(
+            "fixture/prompt-notes",
+            json!({"notes":[tool_update("other-connection",&title)]}),
+        )
+        .await;
+    {
+        let mut notes = other.notes.lock().await;
+        h.f.manager
+            .services
+            .run_prompt_turn(
+                &other.connection,
+                &mut notes,
+                &h.f.row.id,
+                &h.f.row.workspace_id,
+                &id,
+                vec![
+                    serde_json::from_value(json!({"type":"text","text":"foreign connection"}))
+                        .unwrap(),
+                ],
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    let tools = native_transcript_tools(&h).await;
+    assert_eq!(
+        tools
+            .iter()
+            .find(|b| b["toolCallId"] == "other-connection")
+            .unwrap()["name"],
+        format!("{alias}_workspace_api")
+    );
+    assert_eq!(h.f.writes().await, 1);
+    assert!(h
+        .call(0, &alias, "return await ws.pr.snapshot(4);")
+        .await
+        .to_string()
+        .contains("actual review"));
+    h.origin.retire();
+    other.finish().await;
+    h.node.finish().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn confirmed_read_idle_wake_and_zero_settle_transcripts_keep_captured_connection_routes() {
+    let h = NativeHarness::new("3.0", true, false).await;
+    let id = h.start().await;
+    let alias = h.confirmed(0).await;
+    assert!(h
+        .call(0, &alias, "return await ws.pr.snapshot(4);")
+        .await
+        .to_string()
+        .contains("actual review"));
+    let title = format!("mcp__{alias}__workspace_api");
+    {
+        let mut notes = h.node.notes.lock().await;
+        while notes.try_recv().is_ok() {}
+    }
+    h.node
+        .call(
+            "fixture/note",
+            json!({"sessionId":id,"update":tool_update("wake",&title)}),
+        )
+        .await;
+    assert!(
+        h.f.manager
+            .wake_listener_tick(&h.f.row.id, &h.f.row.workspace_id)
+            .await
+    );
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if !h.f.manager.is_busy(&h.f.row.id) && !native_transcript_tools(&h).await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        native_transcript_tools(&h).await[0]["name"],
+        "workspace_api"
+    );
+    // Drive the same zero-settle path used by a wake tick which loses its busy
+    // claim, with a later notification already buffered for the prompt owner.
+    h.node
+        .call(
+            "fixture/note",
+            json!({"sessionId":id,"update":tool_update("zero",&title)}),
+        )
+        .await;
+    h.node.call("fixture/note",json!({"sessionId":id,"update":tool_update("left-buffered","mcp__user__workspace_api")})).await;
+    let (notes, routes) = {
+        let handles = h.f.manager.handles.lock().unwrap();
+        let original = &handles[&h.f.row.id];
+        (
+            original.notifications.clone(),
+            original.connection.callback_tool_routes(),
+        )
+    };
+    {
+        let mut notes = notes.lock().await;
+        let first = notes.try_recv().unwrap();
+        h.f.manager
+            .services
+            .run_harness_wake_turn_with_routes(
+                &mut notes,
+                first,
+                &h.f.row.id,
+                &h.f.row.workspace_id,
+                Duration::ZERO,
+                routes,
+            )
+            .await;
+        assert_eq!(
+            notes.try_recv().unwrap().params["update"]["toolCallId"],
+            "left-buffered"
+        );
+    }
+    let tools = native_transcript_tools(&h).await;
+    assert_eq!(tools.len(), 2);
+    assert!(tools.iter().all(|b| b["name"] == "workspace_api"));
+    assert!(current(&callback(&h.origin).unwrap().capture(), h.f.caller()).await);
+    assert!(h
+        .call(0, &alias, "return await ws.pr.snapshot(4);")
+        .await
+        .to_string()
+        .contains("actual review"));
+    h.origin.retire();
+    h.node.finish().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn confirmed_read_cache_hit_keeps_original_ledger_without_second_provider_read() {
+    let control = Arc::new(NativeControl::default());
+    let h = NativeHarness::observed("3.0", true, false, Some(control.clone()), None).await;
+    h.start().await;
+    let gate = control.at(Boundary::HostPromise, true);
+    let task = h.call_task(
+        0,
+        &h.confirmed(0).await,
+        "await ws.pr.snapshot(4); return await ws.pr.snapshot(4);",
+    );
+    gate.reached().await;
+    let first = h.http.count();
+    assert!(first > 0);
+    gate.release.add_permits(1);
+    let reply = task.await.unwrap();
+    assert!(reply.to_string().contains("actual review"), "{reply}");
+    assert_eq!(
+        h.http.count(),
+        first,
+        "same original cache hit must not dispatch a second provider read"
+    );
+    assert!(
+        control
+            .events
+            .lock()
+            .unwrap()
+            .contains(&(Boundary::TcpResponse, 3)),
+        "lazy read and both original calls remain obligations"
+    );
+    h.finish().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn confirmed_read_hard_stop_retires_delivery_but_keeps_accepted_ordinary_result_route() {
+    let h = NativeHarness::new("3.0", true, false).await;
+    h.start().await;
+    let name = h.confirmed(0).await;
+    assert!(h
+        .call(0, &name, "return await ws.pr.snapshot(4);")
+        .await
+        .to_string()
+        .contains("actual review"));
+    let original = callback(&h.origin).unwrap().capture();
+    let endpoint = h.origin.state.lock().unwrap().endpoint.clone().unwrap();
+    assert!(h.f.manager.stop(&h.f.row.id).await);
+    assert!(!current(&original, h.f.caller()).await);
+    assert!(endpoint.bridge.lock().unwrap().is_none());
+    let before = h.http.count();
+    let denied = h
+        .call(
+            0,
+            &name,
+            "try {return await ws.pr.snapshot(4);} catch(e) {return e.message;}",
+        )
+        .await;
+    assert!(
+        denied
+            .to_string()
+            .contains(crate::repository_read_source::REFUSAL),
+        "{denied}"
+    );
+    assert_eq!(h.http.count(), before);
+    assert!(h
+        .call(
+            0,
+            &name,
+            "return 'ordinary completion on accepted old socket';"
+        )
+        .await
+        .to_string()
+        .contains("ordinary completion on accepted old socket"));
+    assert_eq!(h.f.writes().await, 1);
+    h.finish().await;
 }
