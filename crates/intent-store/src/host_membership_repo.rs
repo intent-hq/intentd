@@ -10,8 +10,8 @@ use intent_core::{
 use sqlx::{sqlite::SqliteRow, Row, SqliteConnection};
 
 use crate::principal_repo::{
-    bind_identity, bind_principal, map_principal_row, INVITE_OPEN, PRINCIPAL_BY_IDENTITY,
-    PRINCIPAL_COLUMNS, PRINCIPAL_UPSERT_SET,
+    bind_identity, bind_principal, map_principal_row, principal_authority_changes, INVITE_OPEN,
+    PRINCIPAL_BY_IDENTITY, PRINCIPAL_COLUMNS, PRINCIPAL_UPSERT_SET,
 };
 use crate::{Error, Result, Store};
 
@@ -319,6 +319,7 @@ impl Store {
         identity: &Principal,
         credential: HostJoinCredential<'_>,
     ) -> Result<HostInviteJoinOutcome> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
         let key = identity
             .identity_key()
             .ok_or_else(|| Error::InvalidInput("host join requires a verified identity".into()))?;
@@ -409,6 +410,18 @@ impl Store {
         principal.display_name.clone_from(&identity.display_name);
         principal.avatar_url.clone_from(&identity.avatar_url);
         principal.updated_at.clone_from(&now);
+        let already_member: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM host_member WHERE principal_id = ?)")
+                .bind(&principal.id.0)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(db_error)?;
+        if principal_authority_changes(&mut tx, &principal).await?
+            || !already_member
+            || matches!(credential, HostJoinCredential::Proof { .. })
+        {
+            lifecycle.begin(&[crate::RepositoryLifecycleKey::WireAuthority])?;
+        }
         // A new identity may not overwrite an unrelated existing ID. Only a
         // principal resolved by its stable key can take the upsert path.
         let upsert = format!(
@@ -433,6 +446,7 @@ impl Store {
         }
         let revision = state_in_tx(&mut tx).await?.revision;
         tx.commit().await.map_err(db_error)?;
+        lifecycle.settle();
         Ok(HostInviteJoinOutcome::Joined {
             principal: Box::new(principal),
             membership_added,
@@ -489,6 +503,7 @@ impl Store {
         owner: Option<&PrincipalId>,
         revoke_guest: bool,
     ) -> Result<HostMemberRemoval> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
         let mut tx = self
             .write_pool()
             .begin_with("BEGIN IMMEDIATE")
@@ -519,6 +534,17 @@ impl Store {
             return Err(Error::InvalidInput(
                 "the host owner cannot be removed".into(),
             ));
+        }
+        let active: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM host_member WHERE principal_id = ?)")
+                .bind(&principal_id.0)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(db_error)?;
+        // Self-revocation advances durable authorization even with no rows to
+        // delete. A missing ordinary host member remains a genuine no-op.
+        if active || revoke_guest {
+            lifecycle.begin(&[crate::RepositoryLifecycleKey::WireAuthority])?;
         }
         let removed = sqlx::query("DELETE FROM host_member WHERE principal_id = ?")
             .bind(&principal_id.0)
@@ -574,6 +600,7 @@ impl Store {
                 .bind(&principal_id.0).execute(&mut *tx).await.map_err(db_error)?;
         }
         tx.commit().await.map_err(db_error)?;
+        lifecycle.settle();
         Ok(result)
     }
 }

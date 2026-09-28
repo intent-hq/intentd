@@ -26,6 +26,8 @@ pub use initialization::{
 pub enum RepositoryLifecycleKey {
     /// Every subscription includes this domain-wide retirement coordinate.
     Database,
+    /// Human authority changes; only original Wire read requests subscribe.
+    WireAuthority,
     /// The originally captured workspace.
     Workspace(WorkspaceId),
     /// The originally captured agent row.
@@ -53,6 +55,20 @@ pub trait RepositoryLifecycleObserver: Send + Sync {
         &self,
         keys: &[RepositoryLifecycleKey],
     ) -> Result<Box<dyn RepositoryLifecycleMutationTicket>>;
+
+    /// Block matching requests before a reversible pending-delete marker changes.
+    /// Retire request leaves, not their still-live physical owners; actual Store
+    /// deletion continues to use `begin_mutation`. No metadata lock may cross
+    /// retirement waits. Settlement belongs only to the original operation.
+    ///
+    /// # Errors
+    /// Unavailable by default. Ordinary mutation retirement is not a substitute.
+    fn begin_pending_delete(
+        &self,
+        _keys: &[RepositoryLifecycleKey],
+    ) -> Result<Box<dyn RepositoryLifecycleMutationTicket>> {
+        Err(lifecycle_error("pending deletion is unavailable"))
+    }
 
     /// Authenticate and consume an original pending physical owner's proof.
     /// Atomically block its keys, retire every prior live origin and competing
@@ -285,7 +301,68 @@ impl Drop for LifecycleWrite {
     }
 }
 
+/// Original pending-deletion ownership in one managed database domain.
+///
+/// This is not admission or proof of complete deletion. It holds no writer lock;
+/// its owner may carry it through a timer or asynchronous cleanup. Dropping it
+/// without original confirmed completion retains uncertainty, including before
+/// the first observer is installed and across same-process managed reopen.
+#[must_use = "retain through original completion; dropping does not settle"]
+pub struct RepositoryPendingDeleteGuard {
+    lifecycle: LifecycleWrite,
+}
+
+impl RepositoryPendingDeleteGuard {
+    /// Confirm only this operation's positively established terminal work or
+    /// no effect. A public success response, current row or another operation's
+    /// completion cannot establish this fact. Consumes the sole original guard.
+    pub fn settle_confirmed(self) {
+        self.lifecycle.settle();
+    }
+}
+
 impl Store {
+    /// Retain original ownership before publishing or claiming pending deletion.
+    ///
+    /// Uses the sole retained Store domain and its actual installed observer.
+    /// Without an observer, the active owner still blocks first installation;
+    /// dropping an unconfirmed owner preserves that protection on managed reopen.
+    /// No writer/install serialization is held during the observer callback.
+    /// This does not enable repository admission on unsupported platforms.
+    ///
+    /// # Errors
+    /// Rejects empty keys, a retired/invalid domain, exhausted ownership, or an
+    /// unavailable observer. An observer error never confirms an uncertain begin.
+    pub async fn begin_repository_pending_delete(
+        &self,
+        keys: &[RepositoryLifecycleKey],
+    ) -> Result<RepositoryPendingDeleteGuard> {
+        if keys.is_empty() {
+            return Err(lifecycle_error("pending deletion requires original keys"));
+        }
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        let observer = {
+            let state = lifecycle
+                .domain
+                .state
+                .lock()
+                .map_err(|_| lifecycle_error("database domain poisoned"))?;
+            if state.invalidated {
+                return Err(lifecycle_error("database incarnation was retired"));
+            }
+            state.observer.clone()
+        };
+        // This incremented owner and captured observer are protected by the
+        // existing writer/install serialization. A first install now sees an
+        // active owner even if this begin captured no observer.
+        lifecycle.begun = true;
+        lifecycle.release_serialization();
+        if let Some(observer) = observer {
+            lifecycle.ticket = Some(observer.begin_pending_delete(keys)?);
+        }
+        Ok(RepositoryPendingDeleteGuard { lifecycle })
+    }
+
     /// Install the sole invalidation owner for this managed database lifetime.
     /// Clones and independent managed opens observe the SAME installed Arc.
     /// Installation is not a permission grant or proof of complete writer coverage.
@@ -351,3 +428,9 @@ impl Store {
 
 #[cfg(all(test, unix))]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod wire_authority_tests;
+
+#[cfg(all(test, unix))]
+mod pending_delete_tests;

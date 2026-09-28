@@ -33,6 +33,25 @@ pub(crate) const DELETE_WORKSPACE_BROWSER_BATCH_SQL: &str =
     (SELECT rowid FROM browser_tab WHERE workspace_id = ? LIMIT ?) RETURNING tab_id";
 pub(crate) const DELETE_WORKSPACE_SQL: &str = "DELETE FROM workspace WHERE id = ?";
 
+/// Facts from the original Store deletion, never Services/cleanup completion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepositoryWorkspaceDeleteDisposition {
+    /// The original initial query proved absence before deletion work began.
+    NoEffect,
+    /// The original final commit and owned Store completion were acknowledged.
+    Committed,
+    /// The original attempt has not established either of those facts.
+    Unknown,
+}
+
+/// Original result and independent Store-phase facts from the same operation.
+/// A later ownership/worker error does not erase an already acknowledged commit.
+#[derive(Debug)]
+pub struct RepositoryWorkspaceDeleteOutcome {
+    pub result: Result<()>,
+    pub disposition: RepositoryWorkspaceDeleteDisposition,
+}
+
 /// SQL behind [`Store::clear_workspace_unread_if_all_seen`], extracted so the
 /// monorepo#4190 plan-shape guard runs `EXPLAIN` on the exact production
 /// statement (see `SESSION_MESSAGE_STATS_SQL` for the precedent).
@@ -804,6 +823,40 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn delete_workspace(&self, id: &WorkspaceId) -> Result<()> {
+        self.delete_workspace_with_outcome(id).await.result
+    }
+
+    /// Run the same deletion once, retaining facts before projecting its result.
+    ///
+    /// `NoEffect` is only the original initial absent observation. A later
+    /// zero-row delete may follow committed cleanup and remains `Unknown`.
+    /// `Committed` describes the acknowledged final commit and owned Store
+    /// completion, not earlier Services teardown or later filesystem cleanup.
+    /// Cancellation yields no returned outcome; it never proves settlement.
+    pub async fn delete_workspace_with_outcome(
+        &self,
+        id: &WorkspaceId,
+    ) -> RepositoryWorkspaceDeleteOutcome {
+        let mut disposition = RepositoryWorkspaceDeleteDisposition::Unknown;
+        let committed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let result = self
+            .delete_workspace_observed(id, &mut disposition, committed.clone())
+            .await;
+        if committed.load(std::sync::atomic::Ordering::Acquire) {
+            disposition = RepositoryWorkspaceDeleteDisposition::Committed;
+        }
+        RepositoryWorkspaceDeleteOutcome {
+            result,
+            disposition,
+        }
+    }
+
+    async fn delete_workspace_observed(
+        &self,
+        id: &WorkspaceId,
+        disposition: &mut RepositoryWorkspaceDeleteDisposition,
+        committed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<()> {
         let mut lifecycle = self.repository_lifecycle_write().await?;
         // In particular, a missing workspace must not delete opaque draft
         // keys. The final transaction also checks existence for racing deletes.
@@ -814,6 +867,7 @@ impl Store {
                 .await
                 .map_err(|e| Error::Internal(format!("delete workspace check failed: {e}")))?;
         if !exists {
+            *disposition = RepositoryWorkspaceDeleteDisposition::NoEffect;
             return Err(Error::NotFound(format!("workspace {id}")));
         }
 
@@ -917,6 +971,11 @@ impl Store {
         let id = id.clone();
         tokio::spawn(async move {
             let result = store.finish_workspace_delete(&id).await;
+            if result.is_ok() {
+                // Receipt only: the original commit and overlay eviction have
+                // completed. Preserve this fact even if ticket settlement panics.
+                committed.store(true, std::sync::atomic::Ordering::Release);
+            }
             lifecycle.finish(result)
         })
         .await

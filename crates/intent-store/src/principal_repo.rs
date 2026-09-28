@@ -66,6 +66,71 @@ fn principal_identity_columns(p: &Principal) -> (Option<PrincipalIdentity>, Opti
     (identity, github_user_id)
 }
 
+/// Compare the columns actually written by the shared upsert, under the
+/// original managed writer. Cached profile fields and the ignored incoming
+/// primary flag do not change authority. A missing row is a new incarnation.
+pub(crate) async fn principal_authority_changes(
+    conn: &mut sqlx::SqliteConnection,
+    principal: &Principal,
+) -> Result<bool> {
+    let row = sqlx::query(
+        "SELECT github_user_id, identity_provider, instance_host, external_user_id \
+         FROM principal WHERE id = ?",
+    )
+    .bind(&principal.id.0)
+    .fetch_optional(conn)
+    .await
+    .map_err(|e| Error::Internal(format!("read principal authority failed: {e}")))?;
+    let Some(row) = row else { return Ok(true) };
+    let (identity, github_user_id) = principal_identity_columns(principal);
+    Ok(
+        row.get::<Option<i64>, _>("github_user_id") != github_user_id
+            || row.get::<Option<String>, _>("identity_provider").as_deref()
+                != identity.as_ref().map(|i| i.provider.as_str())
+            || row.get::<Option<String>, _>("instance_host").as_deref()
+                != identity.as_ref().map(|i| i.host.as_str())
+            || row.get::<Option<String>, _>("external_user_id").as_deref()
+                != identity.as_ref().map(|i| i.external_user_id.as_str()),
+    )
+}
+
+async fn member_role_in_txn(
+    conn: &mut sqlx::SqliteConnection,
+    workspace_id: &WorkspaceId,
+    principal_id: &PrincipalId,
+) -> Result<Option<String>> {
+    sqlx::query_scalar(
+        "SELECT role FROM workspace_member WHERE workspace_id = ? AND principal_id = ?",
+    )
+    .bind(&workspace_id.0)
+    .bind(&principal_id.0)
+    .fetch_optional(conn)
+    .await
+    .map_err(|e| Error::Internal(format!("read member authority failed: {e}")))
+}
+
+/// The same owner expression as `sync_workspace_owner`, before any mutation.
+/// Even an unchanged membership can repair a stale owner column.
+async fn workspace_owner_needs_sync(
+    conn: &mut sqlx::SqliteConnection,
+    workspace_id: &WorkspaceId,
+) -> Result<bool> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM workspace WHERE id = ? \
+         AND owner_principal_id IS NOT COALESCE(\
+            (SELECT m.principal_id FROM workspace_member m \
+             WHERE m.workspace_id = workspace.id AND m.role = 'owner' \
+               AND m.principal_id = workspace.owner_principal_id), \
+            (SELECT m.principal_id FROM workspace_member m \
+             WHERE m.workspace_id = workspace.id AND m.role = 'owner' \
+             ORDER BY m.added_at, m.principal_id LIMIT 1)))",
+    )
+    .bind(&workspace_id.0)
+    .fetch_one(conn)
+    .await
+    .map_err(|e| Error::Internal(format!("read owner synchronization failed: {e}")))
+}
+
 /// The workspace columns an unstamped user message's author is resolved
 /// from (see [`Store::get_workspace_author_fallback`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -427,14 +492,24 @@ impl Store {
     /// Returns `Error::Internal` if the database operation fails (including
     /// an identity already linked to another principal).
     pub async fn upsert_principal(&self, p: &Principal) -> Result<()> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        let mut conn = self
+            .write_pool()
+            .acquire()
+            .await
+            .map_err(|e| Error::Internal(format!("upsert principal acquire failed: {e}")))?;
+        if principal_authority_changes(&mut conn, p).await? {
+            lifecycle.begin(&[crate::RepositoryLifecycleKey::WireAuthority])?;
+        }
         let sql = format!(
             "INSERT INTO principal ({PRINCIPAL_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?) \
              ON CONFLICT(id) DO UPDATE SET {PRINCIPAL_UPSERT_SET}"
         );
         bind_principal(sqlx::query(&sql), p)
-            .execute(self.write_pool())
+            .execute(&mut *conn)
             .await
             .map_err(|e| Error::Internal(format!("upsert principal failed: {e}")))?;
+        lifecycle.settle();
         Ok(())
     }
 
@@ -750,10 +825,20 @@ impl Store {
     ) -> Result<bool> {
         let pool = self.write_pool();
         crate::with_write_txn_retry(|| async {
+            // Each attempt owns its own ticket. A later retry never confirms
+            // an earlier failed/indeterminate transaction's barrier.
+            let mut lifecycle = self.repository_lifecycle_write().await?;
             let mut tx = pool
                 .begin()
                 .await
                 .map_err(|e| Error::Internal(format!("add workspace member begin failed: {e}")))?;
+            if member_role_in_txn(&mut tx, workspace_id, principal_id)
+                .await?
+                .is_none()
+                || workspace_owner_needs_sync(&mut tx, workspace_id).await?
+            {
+                lifecycle.begin(&[crate::RepositoryLifecycleKey::WireAuthority])?;
+            }
             let sql = format!(
                 "INSERT INTO workspace_member ({MEMBER_COLUMNS}) VALUES (?,?,?,?) \
                  ON CONFLICT(workspace_id, principal_id) DO NOTHING"
@@ -770,6 +855,7 @@ impl Store {
             tx.commit()
                 .await
                 .map_err(|e| Error::Internal(format!("add workspace member commit failed: {e}")))?;
+            lifecycle.settle();
             Ok(res.rows_affected() > 0)
         })
         .await
@@ -804,6 +890,7 @@ impl Store {
         principal_id: &PrincipalId,
         max_guests: u32,
     ) -> Result<CollaboratorAddOutcome> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
         let mut conn = self
             .write_pool()
             .acquire()
@@ -859,6 +946,7 @@ impl Store {
             }
             let insert =
                 format!("INSERT INTO workspace_member ({MEMBER_COLUMNS}) VALUES (?,?,?,?)");
+            lifecycle.begin(&[crate::RepositoryLifecycleKey::WireAuthority])?;
             sqlx::query(&insert)
                 .bind(&workspace_id.0)
                 .bind(&principal_id.0)
@@ -871,8 +959,10 @@ impl Store {
         }
         .await;
 
-        crate::commit_with_rollback_guard(conn, body_result, "capped member add commit failed")
-            .await
+        let result =
+            crate::commit_with_rollback_guard(conn, body_result, "capped member add commit failed")
+                .await;
+        lifecycle.finish(result)
     }
 
     /// Change an existing member's role. `workspace.owner_principal_id` is
@@ -893,9 +983,17 @@ impl Store {
     ) -> Result<()> {
         let pool = self.write_pool();
         crate::with_write_txn_retry(|| async {
+            let mut lifecycle = self.repository_lifecycle_write().await?;
             let mut tx = pool.begin().await.map_err(|e| {
                 Error::Internal(format!("set workspace member role begin failed: {e}"))
             })?;
+            let previous = member_role_in_txn(&mut tx, workspace_id, principal_id).await?;
+            if previous.is_some()
+                && (previous.as_deref() != Some(role.as_str())
+                    || workspace_owner_needs_sync(&mut tx, workspace_id).await?)
+            {
+                lifecycle.begin(&[crate::RepositoryLifecycleKey::WireAuthority])?;
+            }
             let res = sqlx::query(
                 "UPDATE workspace_member SET role = ? WHERE workspace_id = ? AND principal_id = ?",
             )
@@ -914,6 +1012,7 @@ impl Store {
             tx.commit().await.map_err(|e| {
                 Error::Internal(format!("set workspace member role commit failed: {e}"))
             })?;
+            lifecycle.settle();
             Ok(())
         })
         .await
@@ -933,9 +1032,17 @@ impl Store {
     ) -> Result<bool> {
         let pool = self.write_pool();
         crate::with_write_txn_retry(|| async {
+            let mut lifecycle = self.repository_lifecycle_write().await?;
             let mut tx = pool.begin().await.map_err(|e| {
                 Error::Internal(format!("remove workspace member begin failed: {e}"))
             })?;
+            if member_role_in_txn(&mut tx, workspace_id, principal_id)
+                .await?
+                .is_some()
+                || workspace_owner_needs_sync(&mut tx, workspace_id).await?
+            {
+                lifecycle.begin(&[crate::RepositoryLifecycleKey::WireAuthority])?;
+            }
             let res = sqlx::query(
                 "DELETE FROM workspace_member WHERE workspace_id = ? AND principal_id = ?",
             )
@@ -948,6 +1055,7 @@ impl Store {
             tx.commit().await.map_err(|e| {
                 Error::Internal(format!("remove workspace member commit failed: {e}"))
             })?;
+            lifecycle.settle();
             Ok(res.rows_affected() > 0)
         })
         .await
@@ -965,6 +1073,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         principal_id: &PrincipalId,
     ) -> Result<bool> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
         let mut tx = self
             .write_pool()
             .begin_with("BEGIN IMMEDIATE")
@@ -987,6 +1096,12 @@ impl Store {
                 "the workspace owner cannot leave or be removed".into(),
             ));
         }
+        if member_role_in_txn(&mut tx, workspace_id, principal_id)
+            .await?
+            .is_some()
+        {
+            lifecycle.begin(&[crate::RepositoryLifecycleKey::WireAuthority])?;
+        }
         let deleted =
             sqlx::query("DELETE FROM workspace_member WHERE workspace_id = ? AND principal_id = ?")
                 .bind(workspace_id.as_str())
@@ -997,6 +1112,7 @@ impl Store {
         tx.commit()
             .await
             .map_err(|e| Error::Internal(format!("remove guest commit failed: {e}")))?;
+        lifecycle.settle();
         Ok(deleted.rows_affected() > 0)
     }
 
@@ -1012,7 +1128,9 @@ impl Store {
         principal_id: &PrincipalId,
         token_hash: &str,
     ) -> Result<PrincipalCredential> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
         let now = now_iso();
+        lifecycle.begin(&[crate::RepositoryLifecycleKey::WireAuthority])?;
         sqlx::query(
             "INSERT INTO principal_credential (token_hash, principal_id, created_at) \
              VALUES (?,?,?)",
@@ -1023,6 +1141,7 @@ impl Store {
         .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("insert principal credential failed: {e}")))?;
+        lifecycle.settle();
         Ok(PrincipalCredential {
             token_hash: token_hash.to_string(),
             principal_id: principal_id.clone(),
@@ -1127,15 +1246,26 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn revoke_principal_credential(&self, token_hash: &str) -> Result<bool> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        let mut conn = self.write_pool().acquire().await.map_err(|e| {
+            Error::Internal(format!("revoke principal credential acquire failed: {e}"))
+        })?;
+        let active: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM principal_credential WHERE token_hash = ? AND revoked_at IS NULL)")
+            .bind(token_hash).fetch_one(&mut *conn).await
+            .map_err(|e| Error::Internal(format!("read credential authority failed: {e}")))?;
+        if active {
+            lifecycle.begin(&[crate::RepositoryLifecycleKey::WireAuthority])?;
+        }
         let res = sqlx::query(
             "UPDATE principal_credential SET revoked_at = ? \
              WHERE token_hash = ? AND revoked_at IS NULL",
         )
         .bind(now_iso())
         .bind(token_hash)
-        .execute(self.write_pool())
+        .execute(&mut *conn)
         .await
         .map_err(|e| Error::Internal(format!("revoke principal credential failed: {e}")))?;
+        lifecycle.settle();
         Ok(res.rows_affected() > 0)
     }
 
@@ -1149,15 +1279,26 @@ impl Store {
         &self,
         principal_id: &PrincipalId,
     ) -> Result<u64> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        let mut conn = self.write_pool().acquire().await.map_err(|e| {
+            Error::Internal(format!("revoke principal credentials acquire failed: {e}"))
+        })?;
+        let active: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM principal_credential WHERE principal_id = ? AND revoked_at IS NULL)")
+            .bind(&principal_id.0).fetch_one(&mut *conn).await
+            .map_err(|e| Error::Internal(format!("read principal credentials authority failed: {e}")))?;
+        if active {
+            lifecycle.begin(&[crate::RepositoryLifecycleKey::WireAuthority])?;
+        }
         let res = sqlx::query(
             "UPDATE principal_credential SET revoked_at = ? \
              WHERE principal_id = ? AND revoked_at IS NULL",
         )
         .bind(now_iso())
         .bind(&principal_id.0)
-        .execute(self.write_pool())
+        .execute(&mut *conn)
         .await
         .map_err(|e| Error::Internal(format!("revoke principal credentials failed: {e}")))?;
+        lifecycle.settle();
         Ok(res.rows_affected())
     }
 
@@ -1464,6 +1605,9 @@ impl Store {
             .into_iter()
             .map(PrincipalId)
             .collect();
+            if archived != Some(false) && !removed_collaborators.is_empty() {
+                lifecycle.begin(&[crate::RepositoryLifecycleKey::WireAuthority])?;
+            }
             let deleted = sqlx::query(
                 "DELETE FROM workspace_member AS m WHERE workspace_id = ? AND role <> 'owner' \
                  AND NOT EXISTS(SELECT 1 FROM host_member h WHERE h.principal_id = m.principal_id)",
@@ -1566,6 +1710,7 @@ impl Store {
         credential: HostJoinCredential<'_>,
         max_guests: u32,
     ) -> Result<InviteJoinOutcome> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
         let identity_key = identity
             .identity_key()
             .ok_or_else(|| Error::Internal("invite join requires an identity key".to_string()))?;
@@ -1686,6 +1831,13 @@ impl Store {
             principal.avatar_url.clone_from(&identity.avatar_url);
             principal.updated_at.clone_from(&now);
 
+            if principal_authority_changes(&mut conn, &principal).await?
+                || !already_member
+                || matches!(credential, HostJoinCredential::Proof { .. })
+            {
+                lifecycle.begin(&[crate::RepositoryLifecycleKey::WireAuthority])?;
+            }
+
             let upsert = format!(
                 "INSERT INTO principal ({PRINCIPAL_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?){}",
                 if was_existing { format!(" ON CONFLICT(id) DO UPDATE SET {PRINCIPAL_UPSERT_SET}") } else { String::new() }
@@ -1754,7 +1906,9 @@ impl Store {
         }
         .await;
 
-        crate::commit_with_rollback_guard(conn, body_result, "invite join commit failed").await
+        let result =
+            crate::commit_with_rollback_guard(conn, body_result, "invite join commit failed").await;
+        lifecycle.finish(result)
     }
 }
 

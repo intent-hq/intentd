@@ -461,6 +461,7 @@ impl Store {
         &self,
         rows: &[(String, Vec<serde_json::Value>)],
     ) -> Result<usize> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
         for (table, _) in rows {
             if !TRANSFER_TABLES.iter().any(|(t, _)| t == table) {
                 return Err(Error::InvalidParams(format!(
@@ -553,6 +554,11 @@ impl Store {
                 for (key, value) in map {
                     query = bind_json_value(query, table, key, value)?;
                 }
+                if inserted == 0 {
+                    // The one original batch may create grants through workspace
+                    // triggers. Do not nest per-row or membership tickets here.
+                    lifecycle.begin(&[crate::RepositoryLifecycleKey::Database])?;
+                }
                 query.execute(&mut *tx).await.map_err(|e| {
                     Error::Internal(format!("transfer import insert into {table} failed: {e}"))
                 })?;
@@ -562,6 +568,7 @@ impl Store {
         tx.commit()
             .await
             .map_err(|e| Error::Internal(format!("transfer import commit failed: {e}")))?;
+        lifecycle.settle();
         Ok(inserted)
     }
 }
