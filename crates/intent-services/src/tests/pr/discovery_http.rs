@@ -1,0 +1,1467 @@
+//! Service regressions count real HTTP attempts through the production adapter.
+use super::*;
+use intent_sourcecontrol::traffic::{with_traffic, Operation, Traffic};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Mutex,
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+struct Api {
+    base: String,
+    requests: Arc<Mutex<Vec<String>>>,
+    pulls: Arc<Mutex<Vec<serde_json::Value>>>,
+    fail_page: Arc<AtomicUsize>,
+    redirect_quota_detail: Arc<AtomicUsize>,
+    detail_error_status: Arc<AtomicUsize>,
+    detail_redirects: Arc<AtomicUsize>,
+    listing_redirects: Arc<AtomicUsize>,
+    next_link: Arc<Mutex<Option<String>>>,
+    gate: Arc<tokio::sync::Semaphore>,
+    entered: Arc<tokio::sync::Notify>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Api {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn pull(number: u64, branch: &str) -> serde_json::Value {
+    json!({"number":number,"html_url":format!("https://github.com/o/r/pull/{number}"),
+        "title":format!("PR {number}"),"state":"open","draft":false,
+        "head":{"ref":branch,"sha":"abc"},"base":{"ref":"main"},
+        "created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"})
+}
+
+impl Api {
+    async fn new(pulls: Vec<serde_json::Value>) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let data = Arc::new(Mutex::new(pulls));
+        let fail_page = Arc::new(AtomicUsize::new(0));
+        let redirect_quota_detail = Arc::new(AtomicUsize::new(0));
+        let quota_detail = redirect_quota_detail.clone();
+        let detail_error_status = Arc::new(AtomicUsize::new(429));
+        let error_status = detail_error_status.clone();
+        let detail_redirects = Arc::new(AtomicUsize::new(0));
+        let hops = detail_redirects.clone();
+        let listing_redirects = Arc::new(AtomicUsize::new(0));
+        let listing_hops = listing_redirects.clone();
+        let next_link = Arc::new(Mutex::new(None::<String>));
+        let gate = Arc::new(tokio::sync::Semaphore::new(10000));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let (fail, link, admission, notify) = (
+            fail_page.clone(),
+            next_link.clone(),
+            gate.clone(),
+            entered.clone(),
+        );
+        let (seen, records) = (requests.clone(), data.clone());
+        let task = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = Vec::new();
+                loop {
+                    let mut chunk = [0; 2048];
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&buf);
+                let path = request.split_whitespace().nth(1).unwrap_or("/");
+                seen.lock().unwrap().push(path.to_string());
+                notify.notify_one();
+                admission.acquire().await.unwrap().forget();
+                let url = reqwest::Url::parse(&format!("http://fixture{path}")).unwrap();
+                let query: std::collections::HashMap<_, _> =
+                    url.query_pairs().into_owned().collect();
+                let page = query
+                    .get("page")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(1);
+                let size = query
+                    .get("per_page")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(30);
+                let body = {
+                    let items = records.lock().unwrap();
+                    if request.starts_with("POST ") {
+                        items.last().cloned().unwrap()
+                    } else if url.path().ends_with("/pulls") {
+                        let filtered: Vec<_> = items
+                            .iter()
+                            .filter(|p| p["state"] == "open")
+                            .filter(|p| {
+                                query
+                                    .get("head")
+                                    .is_none_or(|head| p["head"]["ref"] == *head)
+                            })
+                            .cloned()
+                            .collect();
+                        json!(filtered
+                            .into_iter()
+                            .skip((page - 1) * size)
+                            .take(size)
+                            .collect::<Vec<_>>())
+                    } else {
+                        let number = url
+                            .path()
+                            .rsplit('/')
+                            .next()
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(0);
+                        items
+                            .iter()
+                            .find(|p| p["number"] == number)
+                            .cloned()
+                            .unwrap_or_else(|| pull(number, "feature"))
+                    }
+                    .to_string()
+                };
+                let failed = fail.load(Ordering::SeqCst) == page && url.path().ends_with("/pulls");
+                let (status, body) = if failed {
+                    (
+                        "422 Unprocessable Entity",
+                        json!({"message":"fixture later page failed"}).to_string(),
+                    )
+                } else {
+                    ("200 OK", body)
+                };
+                let header = link.lock().unwrap().as_ref().map_or(String::new(), |link| {
+                    format!("link: <http://fixture/repos/o/r/pulls?page={link}>; rel=\"next\"\r\n")
+                });
+                let limited = quota_detail.load(Ordering::SeqCst);
+                let (status, header, body) = if limited != 0
+                    && url.path() == format!("/repos/o/r/pulls/{limited}")
+                {
+                    (
+                        "301 Moved Permanently",
+                        format!("location: /repos/o/moved/pulls/{limited}\r\n"),
+                        "{}".into(),
+                    )
+                } else if limited != 0 && url.path() == format!("/repos/o/moved/pulls/{limited}") {
+                    (
+                        match error_status.load(Ordering::SeqCst) {
+                            403 => "403 Forbidden",
+                            500 => "500 Internal Server Error",
+                            _ => "429 Too Many Requests",
+                        },
+                        "retry-after: 60\r\nx-ratelimit-remaining: 0\r\n".into(),
+                        json!({"message":"You have exceeded a secondary rate limit."}).to_string(),
+                    )
+                } else {
+                    (status, header, body)
+                };
+                let hop = query
+                    .get("hop")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let hop_limit = if url.path().ends_with("/pulls/42") {
+                    hops.load(Ordering::SeqCst)
+                } else if url.path().ends_with("/pulls") {
+                    listing_hops.load(Ordering::SeqCst)
+                } else {
+                    0
+                };
+                let (status, header, body) = if hop < hop_limit {
+                    let separator = if url.query().is_some() { "&" } else { "?" };
+                    (
+                        "301 Moved Permanently",
+                        format!("location: {path}{separator}hop={}\r\n", hop + 1),
+                        "{}".into(),
+                    )
+                } else {
+                    (status, header, body)
+                };
+                let response = format!("HTTP/1.1 {status}\r\n{header}content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        Self {
+            base,
+            requests,
+            pulls: data,
+            fail_page,
+            redirect_quota_detail,
+            detail_error_status,
+            detail_redirects,
+            listing_redirects,
+            next_link,
+            gate,
+            entered,
+            task,
+        }
+    }
+
+    fn sc(&self) -> Arc<dyn SourceControl> {
+        Arc::new(
+            intent_sourcecontrol::GitHubSourceControl::new("fixture-token", Some(&self.base))
+                .unwrap(),
+        )
+    }
+}
+
+fn counts(traffic: &Traffic) -> (u64, u64, u64) {
+    let snapshot = traffic.snapshot();
+    let sum = |op| {
+        snapshot
+            .counts
+            .iter()
+            .filter(|((_, o), _)| *o == op)
+            .map(|(_, v)| v.rest_requests)
+            .sum()
+    };
+    (
+        sum(Operation::Discovery),
+        sum(Operation::PrDetail),
+        sum(Operation::Rules),
+    )
+}
+
+async fn consumer(svc: &Services, branch: &str, repo: &str) -> intent_core::Workspace {
+    let mut ws = workspace(&WorkspaceId::new());
+    ws.branch = branch.into();
+    ws.base_ref = None;
+    ws.repository_owner = Some("o".into());
+    ws.repository_name = Some(repo.into());
+    svc.store().insert_workspace(&ws).await.unwrap();
+    ws
+}
+
+#[tokio::test]
+async fn shared_discovery_one_vs_many_workspaces_and_roots_http_counts() {
+    for consumers in [1, 20] {
+        let api = Api::new(vec![]).await;
+        let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+        let sc = api.sc();
+        let traffic = Traffic::default();
+        with_traffic(traffic.clone(), async {
+            for i in 0..consumers {
+                let ws = consumer(&svc, &format!("branch-{i}"), "r").await;
+                svc.refresh_workspace_pr_with_sc(ws.clone(), &sc)
+                    .await
+                    .unwrap();
+                let checkout =
+                    SweepRepo::init(&format!("root-{i}"), Some("https://github.com/o/r.git"));
+                let root = sweep_root(&ws.id, &checkout.dir, Some(("o", "r")));
+                svc.store().upsert_workspace_git_root(&root).await.unwrap();
+                svc.refresh_git_root_pr(root, &sc).await.unwrap();
+            }
+        })
+        .await;
+        assert_eq!(
+            counts(&traffic),
+            (1, 0, 0),
+            "consumers={consumers}; HTTP={:?}",
+            api.requests.lock().unwrap()
+        );
+    }
+}
+
+#[tokio::test]
+async fn shared_discovery_two_repositories_http_counts() {
+    let api = Api::new(vec![]).await;
+    let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let traffic = Traffic::default();
+    with_traffic(traffic.clone(), async {
+        for i in 0..12 {
+            let ws = consumer(
+                &svc,
+                &format!("branch-{i}"),
+                if i % 2 == 0 { "r" } else { "other" },
+            )
+            .await;
+            svc.refresh_workspace_pr_with_sc(ws, &api.sc())
+                .await
+                .unwrap();
+        }
+    })
+    .await;
+    assert_eq!(counts(&traffic), (2, 0, 0));
+}
+
+#[tokio::test]
+async fn shared_discovery_concurrent_http_counts() {
+    let api = Api::new(vec![]).await;
+    let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let (a, b) = (
+        consumer(&svc, "a", "r").await,
+        consumer(&svc, "b", "r").await,
+    );
+    let sc = api.sc();
+    let traffic = Traffic::default();
+    with_traffic(traffic.clone(), async {
+        let (a, b) = tokio::join!(
+            svc.refresh_workspace_pr_with_sc(a, &sc),
+            svc.refresh_workspace_pr_with_sc(b, &sc)
+        );
+        a.unwrap();
+        b.unwrap();
+    })
+    .await;
+    assert_eq!(counts(&traffic), (1, 0, 0));
+}
+
+#[tokio::test]
+async fn shared_discovery_complete_pages_match_final_page() {
+    let mut data: Vec<_> = (1..=200).map(|n| pull(n, "other")).collect();
+    data.push(pull(201, "last"));
+    let api = Api::new(data).await;
+    let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let ws = consumer(&svc, "last", "r").await;
+    let traffic = Traffic::default();
+    with_traffic(
+        traffic.clone(),
+        svc.refresh_workspace_pr_with_sc(ws.clone(), &api.sc()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        svc.store().get_workspace(&ws.id).await.unwrap().pr_number,
+        Some(201)
+    );
+    assert_eq!(counts(&traffic).0, 3, "one complete 100-item page chain");
+    assert!(api
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|p| !p.contains("head=")));
+}
+
+#[tokio::test]
+async fn shared_discovery_expired_concurrent_reads_and_local_rematch() {
+    let api = Api::new(vec![pull(42, "feature")]).await;
+    let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let repo = RepoRef::new("o", "r");
+    let traffic = Traffic::default();
+    with_traffic(traffic.clone(), async {
+        assert!(svc
+            .discover_shared_pr(sc.as_ref(), &repo, "absent", None, None)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            svc.discover_shared_pr(sc.as_ref(), &repo, "feature", None, None)
+                .await
+                .unwrap()
+                .unwrap()
+                .number,
+            42
+        );
+        assert_eq!(counts(&traffic), (1, 1, 0));
+        svc.pr_discovery.expire();
+        let (a, b) = tokio::join!(
+            svc.discover_shared_pr(sc.as_ref(), &repo, "absent", None, None),
+            svc.discover_shared_pr(sc.as_ref(), &repo, "feature", None, None)
+        );
+        assert!(a.unwrap().is_none());
+        assert_eq!(b.unwrap().unwrap().number, 42);
+        assert_eq!(counts(&traffic), (2, 2, 0));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn shared_discovery_exact_boundary_error_cap_and_corrupt_cursor_are_unknown() {
+    for (size, failed, link, expected_pages, complete) in [
+        (0, 0, None, 1, true),
+        (100, 0, None, 2, true),
+        (101, 2, None, 2, false),
+        (1001, 0, None, 10, false),
+        (3, 0, Some("1"), 1, false),
+        (3, 0, Some("bad"), 1, false),
+        (100, 0, Some("2"), 2, false),
+    ] {
+        let api = Api::new((1..=size).map(|n| pull(n, "feature")).collect()).await;
+        api.fail_page.store(failed, Ordering::SeqCst);
+        *api.next_link.lock().unwrap() = link.map(String::from);
+        let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+        let sc = api.sc();
+        let repo = RepoRef::new("o", "r");
+        let traffic = Traffic::default();
+        with_traffic(traffic.clone(), async {
+            for _ in 0..20 {
+                let result = svc
+                    .discover_shared_pr(sc.as_ref(), &repo, "missing", None, None)
+                    .await;
+                assert_eq!(
+                    result.is_ok(),
+                    complete,
+                    "size={size},failed={failed},link={link:?}: {result:?}"
+                );
+                if complete {
+                    assert!(result.unwrap().is_none());
+                }
+            }
+        })
+        .await;
+        assert_eq!(counts(&traffic), (expected_pages, 0, 0));
+        assert!(api
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|p| !p.contains("head=")));
+    }
+}
+
+#[tokio::test]
+async fn shared_discovery_context_isolation_and_changed_authorization_during_fetch() {
+    let api = Api::new(vec![]).await;
+    let other = Api::new(vec![]).await;
+    let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let repo = RepoRef::new("o", "r");
+    let token =
+        intent_sourcecontrol::GitHubSourceControl::new("different-account", Some(&api.base))
+            .unwrap();
+    let traffic = Traffic::default();
+    with_traffic(traffic.clone(), async {
+        for (provider, repo) in [
+            (sc.clone(), RepoRef::new("O", "R")),
+            (api.sc(), repo.clone()),
+            (Arc::new(token) as Arc<dyn SourceControl>, repo.clone()),
+            (other.sc(), repo.clone()),
+            (sc.clone(), RepoRef::new("o", "other")),
+        ] {
+            svc.discover_shared_pr(provider.as_ref(), &repo, "a", None, None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(counts(&traffic), (4, 0, 0));
+        svc.pr_discovery.expire();
+        api.gate.forget_permits(api.gate.available_permits());
+        // Drain the notification from earlier requests before parking the fill.
+        api.entered.notified().await;
+        let fetch = svc.discover_shared_pr(sc.as_ref(), &repo, "a", None, None);
+        let change = async {
+            api.entered.notified().await;
+            svc.on_settings_applied(&[json!({"path":"sourceControl.github.token"})]);
+            api.gate.add_permits(10000);
+        };
+        let (result, ()) = tokio::join!(fetch, change);
+        assert!(
+            result.is_err(),
+            "an obsolete authorization must not publish a fill"
+        );
+        assert!(svc
+            .discover_shared_pr(sc.as_ref(), &repo, "a", None, None)
+            .await
+            .is_err());
+        svc.discover_shared_pr(api.sc().as_ref(), &repo, "a", None, None)
+            .await
+            .unwrap();
+        assert_eq!(counts(&traffic), (6, 0, 0));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn shared_discovery_matching_precedence_slashes_highest_and_exclusions() {
+    let api = Api::new(vec![
+        pull(1, "feature/x"),
+        pull(8, "feature/x"),
+        pull(20, "base/y"),
+        pull(30, "origin/base/y"),
+        pull(50, "y"),
+    ])
+    .await;
+    let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let repo = RepoRef::new("o", "r");
+    let traffic = Traffic::default();
+    with_traffic(traffic.clone(), async {
+        for (branch, base, exclude, expected) in [
+            ("feature/x", Some("origin/base/y"), None, Some(8)),
+            ("feature/x", Some("origin/base/y"), Some(8), Some(1)),
+            ("absent", Some("origin/base/y"), None, Some(30)),
+            ("absent", Some("upstream/base/y"), None, Some(20)),
+            ("absent", Some("feature/y"), None, None),
+            ("", Some("fork/base/y"), None, Some(20)),
+        ] {
+            assert_eq!(
+                svc.discover_shared_pr(sc.as_ref(), &repo, branch, base, exclude)
+                    .await
+                    .unwrap()
+                    .map(|p| p.number),
+                expected
+            );
+        }
+    })
+    .await;
+    assert_eq!(counts(&traffic), (1, 4, 0));
+}
+
+#[intent_test_macros::daemon_test]
+async fn shared_discovery_explicit_refresh_and_pr_creation_invalidate_only_repository() {
+    let api = Api::new(vec![]).await;
+    let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let svc = svc.with_source_control(sc.clone());
+    let a = consumer(&svc, "feature", "r").await;
+    let b = consumer(&svc, "absent", "other").await;
+    let traffic = Traffic::default();
+    with_traffic(traffic.clone(), async {
+        svc.refresh_workspace_pr_with_sc(a.clone(), &sc)
+            .await
+            .unwrap();
+        svc.refresh_workspace_pr_with_sc(b.clone(), &sc)
+            .await
+            .unwrap();
+        api.pulls.lock().unwrap().push(pull(42, "feature"));
+        let (one, two) = tokio::join!(
+            svc.refresh_workspace_pr(&a.id),
+            svc.refresh_workspace_pr(&a.id)
+        );
+        one.unwrap();
+        two.unwrap();
+        assert_eq!(
+            svc.store().get_workspace(&a.id).await.unwrap().pr_number,
+            Some(42)
+        );
+        assert_eq!(counts(&traffic), (3, 1, 0));
+        api.pulls.lock().unwrap().push(pull(43, "created"));
+        svc.github_pulls_create(
+            "o".into(),
+            "r".into(),
+            "Created".into(),
+            String::new(),
+            "created".into(),
+            "main".into(),
+            false,
+        )
+        .await
+        .unwrap();
+        svc.refresh_workspace_pr_with_sc(b, &sc).await.unwrap();
+        let created = svc
+            .discover_shared_pr(sc.as_ref(), &RepoRef::new("o", "r"), "created", None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(created.number, 43);
+        assert_eq!(counts(&traffic), (4, 2, 0));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn shared_discovery_merged_reuse_reopened_closed_and_missing_open_confirmation() {
+    for terminal in ["merged", "closed"] {
+        let mut record = pull(42, "feature");
+        record["state"] = json!("closed");
+        record["merged"] = json!(terminal == "merged");
+        let api = Api::new(vec![record]).await;
+        let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+        let sc = api.sc();
+        let mut ws = consumer(&svc, "feature", "r").await;
+        ws.pr_number = Some(42);
+        svc.store().update_workspace(&ws).await.unwrap();
+        let traffic = Traffic::default();
+        with_traffic(traffic.clone(), async {
+            // Listing absence alone cannot mark the known-open link terminal.
+            svc.refresh_workspace_pr_with_sc(ws.clone(), &sc)
+                .await
+                .unwrap();
+            let persisted = svc.store().get_workspace(&ws.id).await.unwrap();
+            assert_eq!(
+                persisted.pr_status,
+                Some(if terminal == "merged" {
+                    intent_core::PullRequestStatus::Merged
+                } else {
+                    intent_core::PullRequestStatus::Closed
+                })
+            );
+            svc.refresh_workspace_pr_with_sc(persisted, &sc)
+                .await
+                .unwrap();
+            assert_eq!(
+                counts(&traffic),
+                (1, 1, 0),
+                "terminal confirmation is shared"
+            );
+            if terminal == "merged" {
+                api.pulls.lock().unwrap().push(pull(43, "feature"));
+            } else {
+                *api.pulls.lock().unwrap() = vec![pull(42, "feature")];
+            }
+            svc.pr_discovery.expire();
+            svc.refresh_workspace_pr_with_sc(svc.store().get_workspace(&ws.id).await.unwrap(), &sc)
+                .await
+                .unwrap();
+            let after = svc.store().get_workspace(&ws.id).await.unwrap();
+            assert_eq!(after.pr_status, Some(intent_core::PullRequestStatus::Open));
+            assert_eq!(
+                after.pr_number,
+                Some(if terminal == "merged" { 43 } else { 42 })
+            );
+            assert_eq!(counts(&traffic), (2, 2, 0));
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn shared_discovery_failed_listing_preserves_positive_link_and_rich_details() {
+    let mut record = pull(42, "feature");
+    record["mergeable"] = json!(true);
+    record["mergeable_state"] = json!("clean");
+    let api = Api::new(vec![record]).await;
+    let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let ws = consumer(&svc, "feature", "r").await;
+    svc.refresh_workspace_pr_with_sc(ws.clone(), &sc)
+        .await
+        .unwrap();
+    let mut linked = svc.store().get_workspace(&ws.id).await.unwrap();
+    linked.pull_requests.as_mut().unwrap()[0].is_in_merge_queue = Some(true);
+    svc.store().update_workspace(&linked).await.unwrap();
+    svc.pr_discovery.expire();
+    api.fail_page.store(1, Ordering::SeqCst);
+    svc.refresh_workspace_pr_with_sc(linked, &sc).await.unwrap();
+    let after = svc.store().get_workspace(&ws.id).await.unwrap();
+    assert_eq!(after.pr_number, Some(42));
+    let info = &after.pull_requests.unwrap()[0];
+    assert_eq!(info.mergeable, Some(true));
+    assert_eq!(info.mergeable_state.as_deref(), Some("clean"));
+    assert_eq!(info.is_in_merge_queue, Some(true));
+}
+
+#[tokio::test]
+async fn shared_discovery_audited_distribution_http_before_after_counts() {
+    // A controlled one-repository fixture with the audited distribution:
+    // 224 roots, 85 linked (75 merged), 120 eligible unlinked, 19 unknown HEADs.
+    // These are measured fixture counts, not an account-wide saving estimate.
+    let records = (0..85)
+        .map(|i| {
+            let mut p = pull(i + 1, &format!("b-{i}"));
+            if i < 75 {
+                p["state"] = json!("closed");
+                p["merged"] = json!(true);
+            }
+            p
+        })
+        .collect();
+    let api = Api::new(records).await;
+    let sc = api.sc();
+    let repo = RepoRef::new("o", "r");
+    let legacy = Traffic::default();
+    let mut known = Vec::new();
+    with_traffic(legacy.clone(), async {
+        // Execute the old GET + per-branch query distribution through the
+        // same HTTP adapter, independently of the optimized service cache.
+        for i in 0..224 {
+            if i < 85 {
+                known.push(sc.get_pr(&repo, i + 1).await.unwrap());
+            }
+            if i < 75 || (85..205).contains(&i) {
+                crate::pr_ops::discover_matching_open_pr(
+                    sc.as_ref(),
+                    &repo,
+                    &format!("b-{i}"),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            }
+        }
+    })
+    .await;
+    assert_eq!(counts(&legacy), (195, 85, 0));
+    let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let a = consumer(&svc, "primary-a", "r").await;
+    let b = consumer(&svc, "primary-b", "r").await;
+    let mut checkouts = Vec::new();
+    let mut roots = Vec::new();
+    for i in 0..224 {
+        let checkout = SweepRepo::init(&format!("b-{i}"), Some("https://github.com/o/r.git"));
+        if i >= 205 {
+            std::fs::remove_file(checkout.dir.join(".git/HEAD")).unwrap();
+        }
+        let mut root = sweep_root(
+            if i % 2 == 0 { &a.id } else { &b.id },
+            &checkout.dir,
+            Some(("o", "r")),
+        );
+        if let Some(pr) = known.get(i) {
+            root.pr_number = Some(pr.number);
+            root.pr_url = Some(pr.url.clone());
+            root.pr_status = Some(crate::pr_ops::derive_pr_status(pr));
+            root.pull_requests = Some(vec![crate::pr_ops::build_pr_info(pr)]);
+        }
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+        roots.push(root);
+        checkouts.push(checkout);
+    }
+    for expected in [(1, 85, 0), (1, 10, 0), (1, 10, 0)] {
+        let measured = Traffic::default();
+        with_traffic(measured.clone(), async {
+            for root in &roots {
+                svc.refresh_git_root_pr(root.clone(), &sc).await.unwrap();
+            }
+        })
+        .await;
+        assert_eq!(counts(&measured), expected);
+        let snapshot = measured.snapshot();
+        assert!(snapshot
+            .counts
+            .values()
+            .all(|c| c.graphql_requests == 0 && c.graphql_points == 0));
+        svc.pr_discovery.expire();
+    }
+    assert_eq!(checkouts.len(), 224);
+}
+
+#[tokio::test]
+async fn shared_discovery_old_open_healing_and_missing_link_reads_are_shared() {
+    let mut ended = pull(9, "old");
+    ended["state"] = json!("closed");
+    ended["merged"] = json!(true);
+    let api = Api::new(vec![ended, pull(42, "feature")]).await;
+    let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let traffic = Traffic::default();
+    with_traffic(traffic.clone(), async {
+        for _ in 0..2 {
+            let ws = consumer(&svc, "primary", "r").await;
+            let checkout = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+            let mut root = sweep_root(&ws.id, &checkout.dir, Some(("o", "r")));
+            root.pr_number = Some(42);
+            root.pull_requests = Some(vec![pool_entry(
+                9,
+                intent_core::PullRequestStatus::Open,
+                "2020-01-01T00:00:00Z",
+            )]);
+            svc.store().upsert_workspace_git_root(&root).await.unwrap();
+            svc.refresh_git_root_pr(root, &sc).await.unwrap();
+            let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+            assert_eq!(
+                roots[0]
+                    .pull_requests
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .find(|p| p.number == 9)
+                    .unwrap()
+                    .status,
+                intent_core::PullRequestStatus::Merged
+            );
+        }
+    })
+    .await;
+    assert_eq!(counts(&traffic), (1, 2, 0));
+}
+
+#[tokio::test]
+async fn shared_discovery_restart_backlog_is_bounded_and_eventually_fair() {
+    let api = Api::new(vec![]).await;
+    let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let mut admitted = std::collections::HashSet::new();
+    for _ in 0..6 {
+        let traffic = Traffic::default();
+        with_traffic(traffic.clone(), async {
+            for i in 0..170 {
+                let repo = RepoRef::new("o", format!("repository-{i}"));
+                if svc
+                    .discover_shared_pr(sc.as_ref(), &repo, "branch", None, None)
+                    .await
+                    .is_ok()
+                {
+                    admitted.insert(i);
+                }
+            }
+            let before = counts(&traffic);
+            for _ in 0..20 {
+                let _ = svc
+                    .discover_shared_pr(
+                        sc.as_ref(),
+                        &RepoRef::new("o", "repository-169"),
+                        "another-branch",
+                        None,
+                        None,
+                    )
+                    .await;
+            }
+            assert_eq!(
+                counts(&traffic),
+                before,
+                "a deferred repository cannot fan out by branch"
+            );
+        })
+        .await;
+        assert!(
+            counts(&traffic).0 <= 128,
+            "HTTP attempts stay inside the shared window budget"
+        );
+        assert_eq!((counts(&traffic).1, counts(&traffic).2), (0, 0));
+        svc.pr_discovery.expire();
+    }
+    assert_eq!(
+        admitted.len(),
+        170,
+        "later repositories cannot starve behind the first workspace"
+    );
+}
+
+#[tokio::test]
+async fn shared_discovery_quota_pause_blocks_list_and_record_attempts() {
+    let api = Api::new(vec![pull(42, "feature")]).await;
+    let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let repo = RepoRef::new("o", "r");
+    svc.sweep_rate_limit
+        .pause_for(std::time::Duration::from_secs(60), true);
+    let traffic = Traffic::default();
+    with_traffic(traffic.clone(), async {
+        for _ in 0..20 {
+            assert!(svc
+                .discover_shared_pr(sc.as_ref(), &repo, "feature", None, None)
+                .await
+                .is_err());
+            assert!(svc.shared_pr_record(sc.as_ref(), &repo, 42).await.is_err());
+        }
+        assert_eq!(counts(&traffic), (0, 0, 0));
+        svc.sweep_rate_limit.lift();
+        crate::pr_discovery::explicitly_refresh(async {
+            assert_eq!(
+                svc.discover_shared_pr(sc.as_ref(), &repo, "feature", None, None)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .number,
+                42
+            );
+        })
+        .await;
+        assert_eq!(counts(&traffic), (1, 1, 0));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn shared_discovery_invalidated_in_flight_result_cannot_publish_absence() {
+    let api = Api::new(vec![]).await;
+    api.gate.forget_permits(10000);
+    let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let repo = RepoRef::new("o", "r");
+    let traffic = Traffic::default();
+    with_traffic(traffic.clone(), async {
+        let read = svc.discover_shared_pr(sc.as_ref(), &repo, "feature", None, None);
+        let invalidate = async {
+            api.entered.notified().await;
+            svc.pr_discovery.invalidate(sc.as_ref(), &repo);
+            api.gate.add_permits(10000);
+        };
+        let (result, ()) = tokio::join!(read, invalidate);
+        assert!(result.is_err());
+        api.pulls.lock().unwrap().push(pull(42, "feature"));
+        assert_eq!(
+            svc.discover_shared_pr(sc.as_ref(), &repo, "feature", None, None)
+                .await
+                .unwrap()
+                .unwrap()
+                .number,
+            42
+        );
+        assert_eq!(counts(&traffic), (2, 1, 0));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn shared_discovery_git_head_change_rematches_shared_listing() {
+    let api = Api::new(vec![pull(42, "next")]).await;
+    let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let ws = consumer(&svc, "unused", "r").await;
+    let checkout = SweepRepo::init("first", Some("https://github.com/o/r.git"));
+    let root = sweep_root(&ws.id, &checkout.dir, Some(("o", "r")));
+    svc.store().upsert_workspace_git_root(&root).await.unwrap();
+    let traffic = Traffic::default();
+    with_traffic(traffic.clone(), async {
+        svc.refresh_git_root_pr(root.clone(), &sc).await.unwrap();
+        std::fs::write(checkout.dir.join(".git/HEAD"), "ref: refs/heads/next\n").unwrap();
+        svc.refresh_git_root_pr(root, &sc).await.unwrap();
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        assert_eq!(roots[0].pr_number, Some(42));
+        assert_eq!(counts(&traffic), (1, 1, 0));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn shared_discovery_old_open_history_rotates_past_quiet_entries() {
+    let api = Api::new((1..=12).map(|n| pull(n, "old")).collect()).await;
+    let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let repo = RepoRef::new("o", "r");
+    let mut pool = Some(
+        (1..=12)
+            .map(|n| {
+                pool_entry(
+                    n,
+                    intent_core::PullRequestStatus::Open,
+                    "2026-01-01T00:00:00Z",
+                )
+            })
+            .collect(),
+    );
+    let traffic = Traffic::default();
+    with_traffic(traffic.clone(), async {
+        for _ in 0..3 {
+            let (_, limited) = crate::pr_ops::refresh_stale_pool_entries(
+                &svc,
+                sc.as_ref(),
+                &repo,
+                &mut pool,
+                &mut Vec::new(),
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+            assert!(limited.is_none());
+        }
+    })
+    .await;
+    assert_eq!(counts(&traffic), (0, 12, 0));
+    for number in 1..=12 {
+        assert!(api
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p == &format!("/repos/o/r/pulls/{number}")));
+    }
+}
+
+#[tokio::test]
+async fn shared_discovery_redirected_quota_admission_opens_sweep_pause() {
+    let api = Api::new(vec![pull(42, "feature")]).await;
+    api.redirect_quota_detail.store(42, Ordering::SeqCst);
+    let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let svc = svc.with_source_control(sc.clone());
+    let repo = RepoRef::new("o", "r");
+    let traffic = Traffic::default();
+    with_traffic(traffic.clone(), async {
+        // Warm a complete listing without selecting a detail read.
+        assert!(svc
+            .discover_shared_pr(sc.as_ref(), &repo, "absent", None, None)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(counts(&traffic), (1, 0, 0));
+        let first = consumer(&svc, "feature", "r").await;
+        svc.refresh_all_workspace_prs(0).await;
+        assert_eq!(
+            counts(&traffic),
+            (1, 4, 0),
+            "one redirect plus three quota responses"
+        );
+        assert!(
+            svc.sweeps_rate_limited(),
+            "received quota error must open the shared sweep pause"
+        );
+        assert_eq!(
+            svc.store()
+                .get_workspace(&first.id)
+                .await
+                .unwrap()
+                .pr_number,
+            None
+        );
+        let before = api.requests.lock().unwrap().len();
+        let later = consumer(&svc, "later", "other").await;
+        let checkout = SweepRepo::init("later", Some("https://github.com/o/other.git"));
+        let root = sweep_root(&later.id, &checkout.dir, Some(("o", "other")));
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+        svc.refresh_all_workspace_prs(0).await;
+        assert!(svc.shared_pr_record(sc.as_ref(), &repo, 43).await.is_err());
+        assert_eq!(counts(&traffic), (1, 4, 0));
+        assert_eq!(
+            api.requests.lock().unwrap().len(),
+            before,
+            "paused workspace/root sweeps and detail reads send no further HTTP requests"
+        );
+    })
+    .await;
+}
+
+async fn exhaust_background_records(svc: &Services, sc: &dyn SourceControl, traffic: &Traffic) {
+    // Fix the window at exhausted capacity without depending on the buffered
+    // transport's asynchronous release of prior request leases.
+    svc.pr_discovery.exhaust_budget();
+    let repo = RepoRef::new("o", "background");
+    let denied = svc.shared_pr_record(sc, &repo, 1125).await.unwrap_err();
+    assert!(denied.to_string().contains("request budget"), "{denied:?}");
+    assert_eq!(counts(traffic), (0, 0, 0));
+}
+
+#[tokio::test]
+async fn shared_discovery_explicit_admission_bypasses_only_background_exhaustion() {
+    let mut data: Vec<_> = (1..=200).map(|n| pull(n, "other")).collect();
+    data.push(pull(201, "last"));
+    let api = Api::new(data).await;
+    let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let svc = svc.with_source_control(sc.clone());
+    let a = consumer(&svc, "last", "r").await;
+    let b = consumer(&svc, "last", "r").await;
+    let traffic = Traffic::default();
+    with_traffic(traffic.clone(), async {
+        exhaust_background_records(&svc, sc.as_ref(), &traffic).await;
+        assert!(svc
+            .refresh_workspace_pr_with_sc(a.clone(), &sc)
+            .await
+            .is_err());
+        assert_eq!(counts(&traffic), (0, 0, 0));
+        let (one, two) = tokio::join!(
+            svc.refresh_workspace_pr(&a.id),
+            svc.refresh_workspace_pr(&b.id)
+        );
+        one.expect("explicit refresh must reach healthy GitHub after background exhaustion");
+        two.unwrap();
+        assert_eq!(
+            counts(&traffic),
+            (3, 1, 0),
+            "concurrent explicit callers share complete pagination and detail"
+        );
+        assert_eq!(
+            svc.store().get_workspace(&a.id).await.unwrap().pr_number,
+            Some(201)
+        );
+        assert_eq!(
+            svc.store().get_workspace(&b.id).await.unwrap().pr_number,
+            Some(201)
+        );
+
+        // An already-linked explicit refresh must fetch changed detail rather
+        // than reuse the earlier listing or record after its demand begins.
+        api.pulls.lock().unwrap().last_mut().unwrap()["title"] =
+            json!("Changed after first refresh");
+        svc.refresh_workspace_pr(&a.id).await.unwrap();
+        assert_eq!(
+            svc.store()
+                .get_workspace(&a.id)
+                .await
+                .unwrap()
+                .active_pull_request
+                .unwrap()
+                .title,
+            "Changed after first refresh"
+        );
+        assert_eq!(counts(&traffic), (6, 2, 0));
+        let later = consumer(&svc, "later", "another-repo").await;
+        assert!(svc.refresh_workspace_pr_with_sc(later, &sc).await.is_err());
+        assert!(svc
+            .shared_pr_record(sc.as_ref(), &RepoRef::new("o", "background"), 1126)
+            .await
+            .is_err());
+        assert_eq!(
+            counts(&traffic),
+            (6, 2, 0),
+            "explicit admission must not replenish or bypass later background limits"
+        );
+        assert_eq!(api.requests.lock().unwrap().len(), 8);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn shared_discovery_explicit_admission_respects_quota_pause() {
+    let api = Api::new(vec![pull(42, "feature")]).await;
+    let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let svc = svc.with_source_control(sc.clone());
+    let ws = consumer(&svc, "feature", "r").await;
+    let traffic = Traffic::default();
+    with_traffic(traffic.clone(), async {
+        exhaust_background_records(&svc, sc.as_ref(), &traffic).await;
+        svc.sweep_rate_limit
+            .pause_for(std::time::Duration::from_secs(60), true);
+        let error = svc.refresh_workspace_pr(&ws.id).await.unwrap_err();
+        assert!(error.to_string().contains("quota paused"), "{error:?}");
+        let error = crate::pr_discovery::explicitly_refresh(svc.shared_pr_record(
+            sc.as_ref(),
+            &RepoRef::new("o", "r"),
+            42,
+        ))
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("quota paused"), "{error:?}");
+        assert_eq!(counts(&traffic), (0, 0, 0));
+        assert_eq!(api.requests.lock().unwrap().len(), 0);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn shared_discovery_explicit_admission_respects_invalidated_authorization() {
+    let api = Api::new(vec![pull(42, "feature")]).await;
+    let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let svc = svc.with_source_control(sc.clone());
+    let ws = consumer(&svc, "feature", "r").await;
+    let traffic = Traffic::default();
+    with_traffic(traffic.clone(), async {
+        exhaust_background_records(&svc, sc.as_ref(), &traffic).await;
+        svc.on_settings_applied(&[json!({"path":"sourceControl.github.token"})]);
+        let error = svc.refresh_workspace_pr(&ws.id).await.unwrap_err();
+        assert!(
+            error.to_string().contains("authorization changed"),
+            "{error:?}"
+        );
+        assert!(
+            crate::pr_discovery::explicitly_refresh(svc.shared_pr_record(
+                sc.as_ref(),
+                &RepoRef::new("o", "r"),
+                42
+            ))
+            .await
+            .is_err()
+        );
+        assert_eq!(counts(&traffic), (0, 0, 0));
+        assert_eq!(api.requests.lock().unwrap().len(), 0);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn shared_discovery_explicit_admission_rechecks_guards_between_pages() {
+    for invalidate_auth in [false, true] {
+        let api = Api::new((1..=100).map(|n| pull(n, "other")).collect()).await;
+        let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+        let sc = api.sc();
+        let svc = svc.with_source_control(sc);
+        let ws = consumer(&svc, "feature", "r").await;
+        svc.pr_discovery.exhaust_budget();
+        api.gate.forget_permits(10000);
+        let traffic = Traffic::default();
+        with_traffic(traffic.clone(), async {
+            let refresh = svc.refresh_workspace_pr(&ws.id);
+            tokio::pin!(refresh);
+            tokio::select! {
+                result = &mut refresh => panic!("explicit refresh must reach its first page: {result:?}"),
+                () = api.entered.notified() => {}
+            }
+            if invalidate_auth {
+                svc.on_settings_applied(&[json!({"path":"sourceControl.github.token"})]);
+            } else {
+                svc.sweep_rate_limit.pause_for(std::time::Duration::from_secs(60), true);
+            }
+            api.gate.add_permits(10000);
+            assert!(refresh.await.is_err());
+            assert_eq!(counts(&traffic), (1, 0, 0), "changed guard must prevent the next page");
+            assert_eq!(api.requests.lock().unwrap().len(), 1);
+            assert_eq!(svc.store().get_workspace(&ws.id).await.unwrap().pr_number, None);
+        }).await;
+    }
+}
+
+async fn overlapping_explicit_background_denial(detail: bool) {
+    let api = Api::new(vec![pull(42, "feature")]).await;
+    let (_t, svc, id) = refresh_setup(
+        StubForge::default(),
+        if detail { "feature" } else { "absent" },
+        detail.then_some(42),
+        false,
+    )
+    .await;
+    let sc = api.sc();
+    let svc = svc.with_source_control(sc.clone());
+    let repo = RepoRef::new("o", "r");
+    let traffic = Traffic::default();
+    with_traffic(traffic.clone(), async {
+        // Deterministic seam for refresh_workspace_pr: use its exact explicit
+        // scope and private worker, delaying the worker as its real store and
+        // provider awaits can. Spawning the sweep avoids inheriting FORCE_AFTER.
+        let overlap = crate::pr_discovery::explicitly_refresh(async {
+            if detail {
+                // Linked refreshes consult listing first. Warm it within this
+                // demand, before the background record denial, so only the
+                // record path under test requires another HTTP request.
+                svc.discover_shared_pr(sc.as_ref(), &repo, "absent", None, None)
+                    .await
+                    .unwrap();
+            }
+            svc.pr_discovery.exhaust_budget();
+            let (background, provider, repository) = (svc.clone(), sc.clone(), repo.clone());
+            let denied = tokio::spawn(async move {
+                if detail {
+                    background
+                        .shared_pr_record(provider.as_ref(), &repository, 42)
+                        .await
+                        .map(|_| ())
+                } else {
+                    background
+                        .discover_shared_pr(provider.as_ref(), &repository, "absent", None, None)
+                        .await
+                        .map(|_| ())
+                }
+            })
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert!(denied.to_string().contains("request budget"), "{denied:?}");
+            assert_eq!(counts(&traffic), (u64::from(detail), 0, 0));
+            svc.refresh_workspace_pr_cached(&id).await
+        })
+        .await;
+        let overlap_counts = counts(&traffic);
+        // Keep the later-demand control even when the overlap assertion fails.
+        svc.refresh_workspace_pr(&id).await.unwrap();
+        assert_eq!(
+            counts(&traffic),
+            (
+                overlap_counts.0 + 1,
+                overlap_counts.1 + u64::from(detail),
+                0
+            )
+        );
+        assert!(
+            overlap.is_ok(),
+            "explicit demand must not reuse an overlapping background denial: {overlap:?}"
+        );
+        assert_eq!(overlap_counts, (1, u64::from(detail), 0));
+        let before = counts(&traffic);
+        assert!(svc.shared_pr_record(sc.as_ref(), &repo, 99).await.is_err());
+        assert!(svc
+            .discover_shared_pr(
+                sc.as_ref(),
+                &RepoRef::new("o", "another"),
+                "absent",
+                None,
+                None
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            counts(&traffic),
+            before,
+            "later background work stays deferred"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn shared_discovery_explicit_overlap_skips_background_listing_denial() {
+    overlapping_explicit_background_denial(false).await;
+}
+
+#[tokio::test]
+async fn shared_discovery_explicit_overlap_skips_background_detail_denial() {
+    overlapping_explicit_background_denial(true).await;
+}
+
+#[tokio::test]
+async fn shared_discovery_explicit_overlap_keeps_success_and_forge_error_sharing() {
+    for detail in [false, true] {
+        let statuses: &[usize] = if detail {
+            &[0, 403, 429, 500]
+        } else {
+            &[0, 422]
+        };
+        for &status in statuses {
+            let forge_error = status != 0;
+            let api = Api::new(vec![pull(42, "feature")]).await;
+            if forge_error {
+                if detail {
+                    api.redirect_quota_detail.store(42, Ordering::SeqCst);
+                    api.detail_error_status.store(status, Ordering::SeqCst);
+                } else {
+                    api.fail_page.store(1, Ordering::SeqCst);
+                }
+            }
+            let (_t, svc, id) = refresh_setup(
+                StubForge::default(),
+                if detail { "feature" } else { "absent" },
+                detail.then_some(42),
+                false,
+            )
+            .await;
+            let sc = api.sc();
+            let svc = svc.with_source_control(sc.clone());
+            let repo = RepoRef::new("o", "r");
+            let traffic = Traffic::default();
+            with_traffic(
+                traffic.clone(),
+                crate::pr_discovery::explicitly_refresh(async {
+                    if detail {
+                        svc.discover_shared_pr(sc.as_ref(), &repo, "absent", None, None)
+                            .await
+                            .unwrap();
+                    }
+                    let (background, provider, repository) =
+                        (svc.clone(), sc.clone(), repo.clone());
+                    let result = tokio::spawn(with_traffic(traffic.clone(), async move {
+                        if detail {
+                            background
+                                .shared_pr_record(provider.as_ref(), &repository, 42)
+                                .await
+                                .map(|_| ())
+                        } else {
+                            background
+                                .discover_shared_pr(
+                                    provider.as_ref(),
+                                    &repository,
+                                    "absent",
+                                    None,
+                                    None,
+                                )
+                                .await
+                                .map(|_| ())
+                        }
+                    }))
+                    .await
+                    .unwrap();
+                    assert_eq!(result.is_err(), forge_error);
+                    // All remaining background capacity is now spent, but the
+                    // genuine forge result should still satisfy this demand.
+                    svc.pr_discovery.exhaust_budget();
+                    let before = counts(&traffic);
+                    let refreshed = svc.refresh_workspace_pr_cached(&id).await;
+                    assert_eq!(refreshed.is_err(), forge_error, "{refreshed:?}");
+                    if detail && forge_error && status != 500 {
+                        assert!(matches!(refreshed, Err(Error::RateLimited(_))));
+                    }
+                    assert_eq!(
+                        counts(&traffic),
+                        before,
+                        "reuse genuine same-demand outcomes"
+                    );
+                    assert_eq!(
+                        before,
+                        (
+                            1,
+                            if detail {
+                                if status == 403 {
+                                    2
+                                } else if forge_error {
+                                    4
+                                } else {
+                                    1
+                                }
+                            } else {
+                                0
+                            },
+                            0
+                        )
+                    );
+                }),
+            )
+            .await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn shared_discovery_explicit_overlap_skips_terminal_redirect_admission_denial() {
+    let api = Api::new(vec![pull(42, "feature")]).await;
+    api.detail_redirects.store(4, Ordering::SeqCst);
+    let (_t, svc, id) = refresh_setup(StubForge::default(), "feature", Some(42), false).await;
+    let sc = api.sc();
+    let svc = svc.with_source_control(sc.clone());
+    let repo = RepoRef::new("o", "r");
+    let traffic = Traffic::default();
+    with_traffic(
+        traffic.clone(),
+        crate::pr_discovery::explicitly_refresh(async {
+            // Same documented public pre-discovery await seam as the reservation
+            // tests above; here reservation succeeds and a later hop is denied.
+            svc.discover_shared_pr(sc.as_ref(), &repo, "absent", None, None)
+                .await
+                .unwrap();
+            let (background, provider, repository) = (svc.clone(), sc.clone(), repo.clone());
+            let denied = tokio::spawn(with_traffic(traffic.clone(), async move {
+                background
+                    .shared_pr_record(provider.as_ref(), &repository, 42)
+                    .await
+            }))
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert!(
+                matches!(denied, intent_sourcecontrol::Error::Api(_)),
+                "{denied:?}"
+            );
+            assert_eq!(
+                counts(&traffic),
+                (1, 4, 0),
+                "four redirects exhaust background lease"
+            );
+            svc.refresh_workspace_pr_cached(&id)
+                .await
+                .expect("explicit refresh must retry a terminal local redirect denial");
+            assert_eq!(
+                counts(&traffic),
+                (1, 9, 0),
+                "explicit admission reaches the fifth-hop PR"
+            );
+            assert_eq!(api.requests.lock().unwrap().len(), 10);
+            assert_eq!(
+                svc.store().get_workspace(&id).await.unwrap().pr_number,
+                Some(42)
+            );
+        }),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn shared_discovery_explicit_overlap_retries_partial_listing_after_local_denial() {
+    let api = Api::new((1..=801).map(|n| pull(n, "other")).collect()).await;
+    api.listing_redirects.store(4, Ordering::SeqCst);
+    let (_t, svc, id) = refresh_setup(StubForge::default(), "absent", None, false).await;
+    let sc = api.sc();
+    let svc = svc.with_source_control(sc.clone());
+    let traffic = Traffic::default();
+    with_traffic(
+        traffic.clone(),
+        crate::pr_discovery::explicitly_refresh(async {
+            let (background, provider) = (svc.clone(), sc.clone());
+            let denied = tokio::spawn(with_traffic(traffic.clone(), async move {
+                background
+                    .discover_shared_pr(
+                        provider.as_ref(),
+                        &RepoRef::new("o", "r"),
+                        "absent",
+                        None,
+                        None,
+                    )
+                    .await
+            }))
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert!(matches!(denied, intent_sourcecontrol::Error::Api(_)));
+            assert_eq!(
+                counts(&traffic),
+                (40, 0, 0),
+                "eight pages exhaust the background lease before page nine"
+            );
+            svc.refresh_workspace_pr_cached(&id).await.unwrap();
+            assert_eq!(
+                counts(&traffic),
+                (85, 0, 0),
+                "explicit refresh fetches all nine pages, five sends each"
+            );
+            assert_eq!(api.requests.lock().unwrap().len(), 85);
+            assert_eq!(
+                svc.store().get_workspace(&id).await.unwrap().pr_number,
+                None
+            );
+        }),
+    )
+    .await;
+}

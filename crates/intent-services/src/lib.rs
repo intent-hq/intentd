@@ -123,6 +123,7 @@ mod npx_cli;
 mod one_shot_acp;
 pub mod pagination;
 pub mod pi_cli;
+mod pr_discovery;
 mod pr_monitor;
 mod pr_ops;
 pub mod presence;
@@ -1210,6 +1211,7 @@ pub struct Services {
     /// read within `prCache.maxAgeSeconds` (see [`pr_monitor::PrCache`]).
     /// In-memory only; shared across clones.
     pr_cache: pr_monitor::PrCache,
+    pr_discovery: pr_discovery::Discovery,
     /// The issue cache behind `github.issues.get`: each issue's last forge
     /// read, served within `prCache.maxAgeSeconds` like the PR cache and
     /// retained under the same unmonitored policy (see
@@ -1532,6 +1534,7 @@ impl Services {
             suspend_tracker: None,
             pr_monitor_catch_up: Arc::new(Mutex::new(HashMap::new())),
             pr_cache: Arc::new(Mutex::new(HashMap::new())),
+            pr_discovery: pr_discovery::Discovery::default(),
             issue_cache: Arc::new(Mutex::new(HashMap::new())),
             pr_cache_max_age_seconds: None,
             pr_read_park: None,
@@ -4853,7 +4856,11 @@ impl Services {
             };
             match refreshed {
                 Err(Error::RateLimited(detail)) => {
-                    self.pause_sweeps_for_rate_limit(sc, &detail).await;
+                    intent_sourcecontrol::traffic::with_caller(
+                        intent_sourcecontrol::traffic::Caller::GitRootRefresh,
+                        self.pause_sweeps_for_rate_limit(sc, &detail),
+                    )
+                    .await;
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -5105,6 +5112,18 @@ impl Services {
     /// the next `workspace.list`.
     async fn refresh_git_root_pr(
         &self,
+        root: intent_core::WorkspaceGitRoot,
+        sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
+    ) -> Result<pr_ops::PrRefreshOutcome> {
+        intent_sourcecontrol::traffic::with_caller(
+            intent_sourcecontrol::traffic::Caller::GitRootRefresh,
+            self.refresh_git_root_pr_accounted(root, sc),
+        )
+        .await
+    }
+
+    async fn refresh_git_root_pr_accounted(
+        &self,
         mut root: intent_core::WorkspaceGitRoot,
         sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
     ) -> Result<pr_ops::PrRefreshOutcome> {
@@ -5134,8 +5153,8 @@ impl Services {
         // delta persist below and the sweep pauses globally (monorepo#2961).
         let mut discovery_rate_limited: Option<String> = None;
         let mut outcome = if let Some(number) = root.pr_number {
-            let pr = sc
-                .get_pr(&repo_ref, number)
+            let pr = self
+                .linked_pr_record(sc.as_ref(), &repo_ref, number)
                 .await
                 .map_err(pr_ops::map_sc_err)?;
             fetched_fresh.push(number);
@@ -5176,14 +5195,15 @@ impl Services {
                     intent_core::PullRequestStatus::Merged | intent_core::PullRequestStatus::Closed
                 ) && !branch.is_empty()
                 {
-                    let discovered = match pr_ops::discover_matching_open_pr(
-                        sc.as_ref(),
-                        &repo_ref,
-                        &branch,
-                        None,
-                        Some(number),
-                    )
-                    .await
+                    let discovered = match self
+                        .discover_shared_pr(
+                            sc.as_ref(),
+                            &repo_ref,
+                            &branch,
+                            None,
+                            (pr.state == intent_sourcecontrol::PrState::Merged).then_some(number),
+                        )
+                        .await
                     {
                         Ok(found) => found,
                         // A rate-limited discovery still degrades to the
@@ -5231,10 +5251,10 @@ impl Services {
         } else if branch.is_empty() {
             PrRefreshOutcome::Skipped
         } else {
-            let found =
-                pr_ops::discover_matching_open_pr(sc.as_ref(), &repo_ref, &branch, None, None)
-                    .await
-                    .map_err(pr_ops::map_sc_err)?;
+            let found = self
+                .discover_shared_pr(sc.as_ref(), &repo_ref, &branch, None, None)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
             match found {
                 Some(pr) => {
                     fetched_fresh.push(pr.number);
@@ -5258,6 +5278,7 @@ impl Services {
         let mut rate_limited = discovery_rate_limited;
         if rate_limited.is_none() {
             let (heal_changed, heal_rate_limited) = pr_ops::refresh_stale_pool_entries(
+                self,
                 sc.as_ref(),
                 &repo_ref,
                 &mut root.pull_requests,
@@ -5332,6 +5353,16 @@ impl Services {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<pr_ops::PrRefreshOutcome> {
+        // Start the refresh generation before store/provider awaits so
+        // simultaneous callers can share a fill even if their reads finish
+        // at different times.
+        pr_discovery::explicitly_refresh(self.refresh_workspace_pr_cached(workspace_id)).await
+    }
+
+    async fn refresh_workspace_pr_cached(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<pr_ops::PrRefreshOutcome> {
         // Check eligibility before resolving provider (PRRT_kwDOS9Wxuc6QZ0zr):
         // avoids errors/warnings for remote/archived/ineligible workspaces when
         // source control is unconfigured.
@@ -5367,6 +5398,18 @@ impl Services {
     /// resurrected.
     async fn refresh_workspace_pr_with_sc(
         &self,
+        ws: Workspace,
+        sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
+    ) -> Result<pr_ops::PrRefreshOutcome> {
+        intent_sourcecontrol::traffic::with_caller(
+            intent_sourcecontrol::traffic::Caller::WorkspaceRefresh,
+            self.refresh_workspace_pr_with_sc_accounted(ws, sc),
+        )
+        .await
+    }
+
+    async fn refresh_workspace_pr_with_sc_accounted(
+        &self,
         mut ws: Workspace,
         sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
     ) -> Result<pr_ops::PrRefreshOutcome> {
@@ -5380,8 +5423,8 @@ impl Services {
         };
 
         if let Some(number) = ws.pr_number {
-            let pr = sc
-                .get_pr(&repo_ref, number)
+            let pr = self
+                .linked_pr_record(sc.as_ref(), &repo_ref, number)
                 .await
                 .map_err(pr_ops::map_sc_err)?;
             // Clear a stale link only on a positive mismatch against BOTH
@@ -5433,14 +5476,15 @@ impl Services {
                 intent_core::PullRequestStatus::Merged | intent_core::PullRequestStatus::Closed
             ) && (!ws.branch.is_empty() || ws.base_ref.is_some())
             {
-                let discovered = match pr_ops::discover_matching_open_pr(
-                    sc.as_ref(),
-                    &repo_ref,
-                    &ws.branch,
-                    ws.base_ref.as_deref(),
-                    Some(number),
-                )
-                .await
+                let discovered = match self
+                    .discover_shared_pr(
+                        sc.as_ref(),
+                        &repo_ref,
+                        &ws.branch,
+                        ws.base_ref.as_deref(),
+                        (pr.state == intent_sourcecontrol::PrState::Merged).then_some(number),
+                    )
+                    .await
                 {
                     Ok(found) => found,
                     // A rate-limited discovery still degrades to the plain
@@ -5514,15 +5558,16 @@ impl Services {
             if ws.branch.is_empty() && ws.base_ref.is_none() {
                 return Ok(PrRefreshOutcome::Skipped);
             }
-            let found = pr_ops::discover_matching_open_pr(
-                sc.as_ref(),
-                &repo_ref,
-                &ws.branch,
-                ws.base_ref.as_deref(),
-                None,
-            )
-            .await
-            .map_err(pr_ops::map_sc_err)?;
+            let found = self
+                .discover_shared_pr(
+                    sc.as_ref(),
+                    &repo_ref,
+                    &ws.branch,
+                    ws.base_ref.as_deref(),
+                    None,
+                )
+                .await
+                .map_err(pr_ops::map_sc_err)?;
             match found {
                 Some(pr) => {
                     let mut info = pr_ops::build_pr_info(&pr);
@@ -5788,7 +5833,11 @@ impl Services {
         // A paused tick consults the shared quota probe here: the pause
         // lifts early once the quota has recovered (monorepo#2961).
         if let Some(sc) = sc.as_ref() {
-            self.maybe_lift_rate_limit_pause(sc).await;
+            intent_sourcecontrol::traffic::with_caller(
+                intent_sourcecontrol::traffic::Caller::WorkspaceRefresh,
+                self.maybe_lift_rate_limit_pause(sc),
+            )
+            .await;
         }
         for ws in workspaces {
             // STAB-3 fix: refresh all workspaces (discovery + update), not just
@@ -5819,7 +5868,11 @@ impl Services {
                 };
                 match refreshed {
                     Err(Error::RateLimited(detail)) => {
-                        self.pause_sweeps_for_rate_limit(sc, &detail).await;
+                        intent_sourcecontrol::traffic::with_caller(
+                            intent_sourcecontrol::traffic::Caller::WorkspaceRefresh,
+                            self.pause_sweeps_for_rate_limit(sc, &detail),
+                        )
+                        .await;
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -30743,6 +30796,7 @@ impl WorkspaceApi for Services {
                 )
                 .await
                 .map_err(pr_ops::map_sc_err)?;
+            self.pr_discovery.invalidate(sc.as_ref(), &repo_ref);
             Ok(serde_json::json!({ "pull": github_ops::pull_to_json(&pr) }))
         })
     }
@@ -34607,6 +34661,7 @@ impl Services {
             .create_pr(&repo_ref, input)
             .await
             .map_err(pr_ops::map_sc_err)?;
+        self.pr_discovery.invalidate(sc.as_ref(), &repo_ref);
 
         let mut info = pr_ops::build_pr_info(&pr);
         pr_ops::upsert_pr_info(&mut ws.pull_requests, &mut info);

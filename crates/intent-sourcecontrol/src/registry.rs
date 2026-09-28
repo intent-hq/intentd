@@ -130,10 +130,16 @@ impl SourceControlRegistry {
     pub async fn from_settings(settings: &SourceControlSettings) -> Result<Arc<dyn SourceControl>> {
         match settings.active_provider.as_str() {
             "github" => {
+                let generation = crate::cache_scope::generation();
                 let gh = GitHubSourceControl::new(
                     &resolve_github_token(&settings.github).await?,
                     settings.github.api_base_url.as_deref(),
                 )?;
+                if generation != crate::cache_scope::generation() {
+                    return Err(Error::Auth(
+                        "github authorization changed during resolution".into(),
+                    ));
+                }
                 Ok(Arc::new(gh))
             }
             other => Err(Error::Config(format!(

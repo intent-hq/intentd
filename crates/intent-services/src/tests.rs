@@ -17323,6 +17323,7 @@ mod drafts_events {
 
 pub(crate) mod pr {
     mod accept_member;
+    mod discovery_http;
 
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -23362,6 +23363,111 @@ pub(crate) mod pr {
         assert_eq!(list[0].status, intent_core::PullRequestStatus::Open);
     }
 
+    #[tokio::test]
+    async fn traffic_workspace_error_quota_probe_keeps_background_caller() {
+        use intent_sourcecontrol::traffic::{with_traffic, Caller, Operation, Traffic};
+        let base = spawn_rate_limited_api().await;
+        let sc =
+            Arc::new(intent_sourcecontrol::GitHubSourceControl::new("fake", Some(&base)).unwrap());
+        let (_t, svc, _) = refresh_setup(StubForge::default(), "feature", Some(42), false).await;
+        let svc = svc.with_source_control(sc);
+        let traffic = Traffic::default();
+        with_traffic(traffic.clone(), svc.refresh_all_workspace_prs(0)).await;
+        assert!(svc.sweeps_rate_limited());
+        let snapshot = traffic.snapshot();
+        let probes = snapshot
+            .counts
+            .get(&(Caller::WorkspaceRefresh, Operation::QuotaProbe))
+            .expect("background error probes retain caller");
+        assert_eq!((probes.rest_requests, probes.graphql_requests), (1, 1));
+        assert!(snapshot
+            .counts
+            .keys()
+            .all(|(caller, _)| *caller == Caller::WorkspaceRefresh));
+        with_traffic(traffic.clone(), svc.refresh_all_workspace_prs(0)).await;
+        assert_eq!(
+            traffic.snapshot(),
+            snapshot,
+            "paused sweep reuses the shared probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn traffic_root_error_quota_probe_keeps_background_caller() {
+        use intent_sourcecontrol::traffic::{with_traffic, Caller, Operation, Traffic};
+        let base = spawn_rate_limited_api().await;
+        let sc: Arc<dyn SourceControl> =
+            Arc::new(intent_sourcecontrol::GitHubSourceControl::new("fake", Some(&base)).unwrap());
+        let primary = SweepRepo::init("main", None);
+        let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        let mut root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        root.pr_number = Some(42);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+        let traffic = Traffic::default();
+        with_traffic(
+            traffic.clone(),
+            svc.sweep_workspace_git_roots(&ws, Some(&sc)),
+        )
+        .await;
+        assert!(svc.sweeps_rate_limited());
+        let snapshot = traffic.snapshot();
+        let probes = snapshot
+            .counts
+            .get(&(Caller::GitRootRefresh, Operation::QuotaProbe))
+            .expect("root error probes retain caller");
+        assert_eq!((probes.rest_requests, probes.graphql_requests), (1, 1));
+        assert!(snapshot
+            .counts
+            .keys()
+            .all(|(caller, _)| *caller == Caller::GitRootRefresh));
+        with_traffic(
+            traffic.clone(),
+            svc.sweep_workspace_git_roots(&ws, Some(&sc)),
+        )
+        .await;
+        assert_eq!(
+            traffic.snapshot(),
+            snapshot,
+            "paused root sweep performs no requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn traffic_recovery_quota_probe_keeps_workspace_caller_and_pause() {
+        use intent_sourcecontrol::traffic::{with_traffic, Caller, Operation, Traffic};
+        let base = spawn_rate_limited_api().await;
+        let sc =
+            Arc::new(intent_sourcecontrol::GitHubSourceControl::new("fake", Some(&base)).unwrap());
+        let (_t, svc, _) = refresh_setup(StubForge::default(), "feature", Some(42), false).await;
+        let svc = svc.with_source_control(sc);
+        svc.sweep_rate_limit
+            .pause_for(std::time::Duration::from_secs(300), true);
+        let traffic = Traffic::default();
+        with_traffic(traffic.clone(), svc.refresh_all_workspace_prs(0)).await;
+        assert!(
+            svc.sweeps_rate_limited(),
+            "unknown quota must not lift the pause"
+        );
+        let snapshot = traffic.snapshot();
+        let probes = snapshot
+            .counts
+            .get(&(Caller::WorkspaceRefresh, Operation::QuotaProbe))
+            .expect("recovery probe retains workspace caller");
+        assert_eq!((probes.rest_requests, probes.graphql_requests), (1, 1));
+        assert_eq!(
+            snapshot.counts.len(),
+            1,
+            "paused recovery must not refresh PRs"
+        );
+        with_traffic(traffic.clone(), svc.refresh_all_workspace_prs(0)).await;
+        assert_eq!(
+            traffic.snapshot(),
+            snapshot,
+            "recovery probes stay coalesced"
+        );
+    }
+
     // ---- forge rate-limit backoff (monorepo#2961) -------------------------
 
     /// A rate-limited forge call during the git-root sweep pauses ALL
@@ -23526,7 +23632,9 @@ pub(crate) mod pr {
             ),
         ]);
         let mut fetched_fresh = Vec::new();
+        let (_db, svc) = github_svc().await;
         let (changed, rate_limited) = crate::pr_ops::refresh_stale_pool_entries(
+            &svc,
             &sc,
             &repo,
             &mut list,
