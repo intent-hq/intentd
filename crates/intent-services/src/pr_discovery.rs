@@ -143,6 +143,11 @@ impl Budget {
         state
             .pending
             .retain(|(key, _, at)| key.scope.is_current() && now.duration_since(*at) < WINDOW * 10);
+        // Queue position is FIFO age; this timestamp is last activity.
+        // Retrying active work must not expire behind a sustained backlog.
+        if let Some((_, _, last_active)) = state.pending.iter_mut().find(|(k, _, _)| k == key) {
+            *last_active = now;
+        }
         // Reserve older denied work first, even when the sweep visits a busy
         // workspace first again. Unclaimed reservations expire next window.
         while let Some((_, cost, _)) = state.pending.front() {
@@ -311,6 +316,7 @@ impl Discovery {
         };
         let revision = slot.revision.load(Ordering::SeqCst);
         let force_after = FORCE_AFTER.try_with(|at| *at).ok();
+        let merged = matches!(entry.as_ref().map(|e| &e.result), Some(Ok(Value::Record(pr))) if pr.state == PrState::Merged);
         // A monitor/hover may have observed a newer record since our last
         // background fill. Borrow that record before returning our own hit.
         if force_after.is_none() {
@@ -323,7 +329,8 @@ impl Discovery {
                     WINDOW,
                 ) {
                     let at = Instant::from_std(at);
-                    if entry.as_ref().is_none_or(|cached| cached.started <= at)
+                    if (!merged || pr.state == PrState::Merged)
+                        && entry.as_ref().is_none_or(|cached| cached.started <= at)
                         && (pr.state == PrState::Merged || !self.newer_listing(&key, at))
                     {
                         let value = Value::Record(Arc::new(pr));
@@ -340,8 +347,6 @@ impl Discovery {
             }
         }
         if let Some(cached) = entry.as_ref() {
-            let merged =
-                matches!(&cached.result, Ok(Value::Record(pr)) if pr.state == PrState::Merged);
             if cached.revision == revision
                 && key.scope.is_current()
                 && (merged
@@ -657,5 +662,24 @@ mod tests {
             keys.len(),
             "continuously active late repositories and records must not starve"
         );
+    }
+    #[tokio::test(start_paused = true)]
+    async fn shared_discovery_repair_fifo_expires_only_abandoned_waiters() {
+        let budget = Arc::new(Mutex::new(Budget::default()));
+        let scope = scope();
+        let active = key(&scope, 0, None);
+        let abandoned = key(&scope, 1, None);
+        budget.lock().unwrap().available = 0;
+        assert!(Budget::reserve(&budget, &active).is_err());
+        assert!(Budget::reserve(&budget, &abandoned).is_err());
+        for _ in 0..11 {
+            tokio::time::advance(WINDOW).await;
+            // Keep this window exhausted, so only liveness/retention runs.
+            budget.lock().unwrap().started = Instant::now();
+            assert!(Budget::reserve(&budget, &active).is_err());
+        }
+        let state = budget.lock().unwrap();
+        assert_eq!(state.pending.len(), 1);
+        assert!(state.pending.front().is_some_and(|(k, _, _)| k == &active));
     }
 }

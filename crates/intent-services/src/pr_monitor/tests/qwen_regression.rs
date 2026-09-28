@@ -1791,68 +1791,80 @@ async fn shared_discovery_repair_authorization_changes_during_monitor_poll() {
 
 #[tokio::test]
 async fn shared_discovery_repair_late_open_observation_cannot_erase_merged_confirmation() {
-    let (_db, _root, svc, _, _, _) = setup().await;
-    let mock = MockQwen::start(10978).await;
-    mock.edit(|s| s.pr["state"] = json!("OPEN"));
-    let repo = RepoRef::new("QwenLM", "qwen-code");
-    let gate = mock.gate("/rules/branches/");
-    let monitored = HashSet::new();
-    let old_full = read_pr_via(
-        mock.sc.as_ref(),
-        &repo,
-        10978,
-        &svc.pr_cache,
-        PrReadPolicy::REFRESH,
-        &monitored,
-    );
-    let confirm = async {
-        gate.entered.notified().await;
-        mock.edit(|s| s.pr["state"] = json!("MERGED"));
-        let merged = svc
-            .shared_pr_record(mock.sc.as_ref(), &repo, 10978)
-            .await
-            .unwrap();
-        assert_eq!(merged.state, PrState::Merged);
-        gate.release.add_permits(100);
-    };
-    let (old, ()) = tokio::join!(old_full, confirm);
-    assert_eq!(
-        old.unwrap().pr.state,
-        PrState::Open,
-        "fixture really parked an older Open observation"
-    );
-    let before = mock.calls("");
-    assert_eq!(
-        svc.shared_pr_record(mock.sc.as_ref(), &repo, 10978)
-            .await
-            .unwrap()
-            .state,
-        PrState::Merged
-    );
-    assert_eq!(
-        mock.calls(""),
-        before,
-        "confirmed merged state needs no extra read"
-    );
-    // Even a later non-terminal donor cannot undo irreversible merged state.
-    mock.edit(|s| s.pr["state"] = json!("OPEN"));
-    read_pr_via(
-        mock.sc.as_ref(),
-        &repo,
-        10978,
-        &svc.pr_cache,
-        PrReadPolicy::REFRESH,
-        &monitored,
-    )
-    .await
-    .unwrap();
-    let before = mock.calls("");
-    assert_eq!(
-        svc.shared_pr_record(mock.sc.as_ref(), &repo, 10978)
-            .await
-            .unwrap()
-            .state,
-        PrState::Merged
-    );
-    assert_eq!(mock.calls(""), before);
+    for terminal in [PrState::Merged, PrState::Closed] {
+        let (_db, _root, svc, _, _, _) = setup().await;
+        let mock = MockQwen::start(10978).await;
+        mock.edit(|s| s.pr["state"] = json!("OPEN"));
+        let repo = RepoRef::new("QwenLM", "qwen-code");
+        let gate = mock.gate("/rules/branches/");
+        let monitored = HashSet::new();
+        let old_full = read_pr_via(
+            mock.sc.as_ref(),
+            &repo,
+            10978,
+            &svc.pr_cache,
+            PrReadPolicy::REFRESH,
+            &monitored,
+        );
+        let confirm = async {
+            gate.entered.notified().await;
+            mock.edit(|s| {
+                s.pr["state"] = json!(if terminal == PrState::Merged {
+                    "MERGED"
+                } else {
+                    "CLOSED"
+                })
+            });
+            let merged = svc
+                .shared_pr_record(mock.sc.as_ref(), &repo, 10978)
+                .await
+                .unwrap();
+            assert_eq!(merged.state, terminal);
+            gate.release.add_permits(100);
+        };
+        let (old, ()) = tokio::join!(old_full, confirm);
+        assert_eq!(
+            old.unwrap().pr.state,
+            PrState::Open,
+            "fixture really parked an older Open observation"
+        );
+        let before = mock.calls("");
+        assert_eq!(
+            svc.shared_pr_record(mock.sc.as_ref(), &repo, 10978)
+                .await
+                .unwrap()
+                .state,
+            terminal
+        );
+        assert_eq!(
+            mock.calls(""),
+            before,
+            "confirmed merged state needs no extra read"
+        );
+        // Even a later non-terminal donor cannot undo irreversible merged state.
+        mock.edit(|s| s.pr["state"] = json!("OPEN"));
+        read_pr_via(
+            mock.sc.as_ref(),
+            &repo,
+            10978,
+            &svc.pr_cache,
+            PrReadPolicy::REFRESH,
+            &monitored,
+        )
+        .await
+        .unwrap();
+        let before = mock.calls("");
+        assert_eq!(
+            svc.shared_pr_record(mock.sc.as_ref(), &repo, 10978)
+                .await
+                .unwrap()
+                .state,
+            if terminal == PrState::Merged {
+                PrState::Merged
+            } else {
+                PrState::Open
+            }
+        );
+        assert_eq!(mock.calls(""), before);
+    }
 }

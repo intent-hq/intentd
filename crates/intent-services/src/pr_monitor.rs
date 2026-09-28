@@ -707,6 +707,9 @@ impl PrReadPolicy {
 #[derive(Debug, Clone)]
 pub struct PrCacheEntry {
     authorization: Option<intent_sourcecontrol::cache_scope::CacheScope>,
+    /// Start of the request that observed `pr`, before any checklist sub-reads.
+    /// Comparable with discovery reads even when a full fetch finishes late.
+    record_started_at: Instant,
     /// The PR record as of the newest read that confirmed this entry: the
     /// full fetch, or a later cheap poll whose record carried the same
     /// fingerprint.
@@ -732,6 +735,7 @@ impl PrCacheEntry {
     fn new(pr: PullRequest, snapshot: SharedPrSnapshot, now: Instant) -> Self {
         Self {
             authorization: None,
+            record_started_at: now,
             fingerprint: PrFingerprint::of(&pr),
             pr,
             snapshot,
@@ -787,8 +791,10 @@ pub(crate) fn cached_record_for_discovery(
     max_age: Duration,
 ) -> Option<(PullRequest, Instant)> {
     let entry = cached_pr_within(cache, &pr_key_for(repo, number.cast_signed()), max_age)?;
-    (authorization.is_current() && entry.authorization.as_ref() == Some(authorization))
-        .then_some((entry.pr, entry.refreshed_at))
+    (authorization.is_current()
+        && entry.authorization.as_ref() == Some(authorization)
+        && entry.record_started_at.elapsed() < max_age)
+        .then_some((entry.pr, entry.record_started_at))
 }
 
 /// Store an on-demand full read and bump the slot's generation, so a sweep
@@ -802,10 +808,12 @@ fn store_on_demand(
     snapshot: SharedPrSnapshot,
     monitored: &HashSet<PrKey>,
     authorization: Option<intent_sourcecontrol::cache_scope::CacheScope>,
+    record_started_at: Instant,
 ) -> PrCacheEntry {
     let now = Instant::now();
     let mut entry = PrCacheEntry::new(pr, snapshot, now);
     entry.authorization = authorization;
+    entry.record_started_at = record_started_at;
     let mut cache = cache.lock().unwrap();
     let slot = cache.entry(key).or_default();
     slot.generation += 1;
@@ -1038,6 +1046,8 @@ pub(crate) async fn read_pr_via_with_fetched(
     policy: PrReadPolicy,
     monitored: &HashSet<PrKey>,
 ) -> Result<(PrCacheEntry, bool)> {
+    let authorization = sc.cache_scope();
+    ensure_current_pr_authorization(&authorization)?;
     let key = pr_key_for(repo_ref, number.cast_signed());
     let max_age = match policy {
         PrReadPolicy::Poll => {
@@ -1046,7 +1056,9 @@ pub(crate) async fn read_pr_via_with_fetched(
         }
         PrReadPolicy::Serve { max_age } => max_age,
     };
-    if let Some(entry) = cached_pr_within(cache, &key, max_age) {
+    if let Some(entry) =
+        cached_pr_within(cache, &key, max_age).filter(|entry| entry.authorization == authorization)
+    {
         intent_sourcecontrol::traffic::record_reuse(
             intent_sourcecontrol::traffic::Operation::PrDetail,
             intent_sourcecontrol::traffic::Reuse::CacheHit,
@@ -1054,9 +1066,19 @@ pub(crate) async fn read_pr_via_with_fetched(
         tracing::trace!(pr_number = number, "pr cache: serving the cached read");
         return Ok((entry, false));
     }
+    let record_started_at = Instant::now();
     let (pr, snapshot) = fetch_pr_full(sc, repo_ref, number).await?;
+    ensure_current_pr_authorization(&authorization)?;
     Ok((
-        store_on_demand(cache, key, pr, snapshot, monitored, sc.cache_scope()),
+        store_on_demand(
+            cache,
+            key,
+            pr,
+            snapshot,
+            monitored,
+            authorization,
+            record_started_at,
+        ),
         true,
     ))
 }
@@ -1075,6 +1097,20 @@ fn cached_pr_within(cache: &PrCache, key: &PrKey, max_age: Duration) -> Option<P
         .cloned()
 }
 
+fn ensure_current_pr_authorization(
+    authorization: &Option<intent_sourcecontrol::cache_scope::CacheScope>,
+) -> Result<()> {
+    if authorization
+        .as_ref()
+        .is_some_and(|scope| !scope.is_current())
+    {
+        return Err(Error::Internal(
+            "PR authorization changed during read".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// [`read_pr_via`] under [`PrReadPolicy::Poll`].
 async fn poll_pr(
     sc: &dyn SourceControl,
@@ -1084,6 +1120,9 @@ async fn poll_pr(
     key: PrKey,
     monitored: &HashSet<PrKey>,
 ) -> Result<PrCacheEntry> {
+    let authorization = sc.cache_scope();
+    ensure_current_pr_authorization(&authorization)?;
+    let record_started_at = Instant::now();
     let generation = cache
         .lock()
         .unwrap()
@@ -1099,14 +1138,21 @@ async fn poll_pr(
         .await
         .map_err(pr_ops::map_sc_err)?,
     };
+    ensure_current_pr_authorization(&authorization)?;
     let fingerprint = PrFingerprint::of(&pr);
     let now = Instant::now();
     let reused = {
         let mut cache = cache.lock().unwrap();
         match cache.get_mut(&key).and_then(|slot| slot.entry.as_mut()) {
-            Some(entry) if entry.reusable(&fingerprint, now) => {
+            Some(entry)
+                if entry.authorization == authorization
+                    && entry.record_started_at <= record_started_at
+                    && entry.reusable(&fingerprint, now) =>
+            {
                 entry.cheap_polls += 1;
                 entry.refreshed_at = now;
+                entry.record_started_at = record_started_at;
+                entry.authorization = authorization.clone();
                 entry.pr = pr.clone();
                 Some(entry.clone())
             }
@@ -1136,8 +1182,10 @@ async fn poll_pr(
             .await?
         }
     };
+    ensure_current_pr_authorization(&authorization)?;
     let mut entry = PrCacheEntry::new(pr, snapshot, now);
-    entry.authorization = sc.cache_scope();
+    entry.authorization = authorization;
+    entry.record_started_at = record_started_at;
     let mut cache = cache.lock().unwrap();
     let slot = cache.entry(key).or_default();
     if slot.generation == generation {
@@ -8215,6 +8263,7 @@ mod tests {
                 snapshot.clone(),
                 &HashSet::new(),
                 None,
+                Instant::now(),
             );
         })));
         let polled = read_pr_via(&forge, &repo, 42, &cache, PrReadPolicy::Poll, &NONE)
