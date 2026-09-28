@@ -109,6 +109,14 @@ struct RepositoryRequestScope {
     read: AdmissionResult<Arc<RepositoryReadRequest>>,
 }
 
+impl Drop for RepositoryRequestScope {
+    fn drop(&mut self) {
+        // Metadata may retain the request allocation, but only the original
+        // MCP scope owners may keep it live through body and preparation.
+        self.original.retirement.retire();
+    }
+}
+
 struct RetireCancelledScope {
     retirement: RepositoryRetirement,
     completed: bool,
