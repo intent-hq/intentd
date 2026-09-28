@@ -442,7 +442,7 @@ async fn shared_discovery_matching_precedence_slashes_highest_and_exclusions() {
     assert_eq!(counts(&traffic), (1, 4, 0));
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn shared_discovery_explicit_refresh_and_pr_creation_invalidate_only_repository() {
     let api = Api::new(vec![]).await;
     let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
