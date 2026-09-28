@@ -273,3 +273,152 @@ fn checkpoint_non_utf8_filename_roundtrip() {
     restore(dir.path(), &snapshot, &dst).unwrap();
     assert_eq!(fs::read(dst.join(name)).unwrap(), [1, 0, 255]);
 }
+
+fn submodule_fixture() -> (crate::testutil::TempDir, crate::testutil::TempDir) {
+    let parent = init_repo("checkpoint-type-parent");
+    let child = init_repo("checkpoint-type-child");
+    commit_file(parent.path(), "root", "root");
+    commit_file(child.path(), "child", "child");
+    crate::testutil::add_submodule(parent.path(), child.path(), "sub");
+    (parent, child)
+}
+
+fn assert_replacement_roundtrip(path: &Path, expected: Option<&[u8]>) {
+    let before = fingerprint(path);
+    let repo = Repository::open(path).unwrap();
+    let refs_before: Vec<_> = repo
+        .references()
+        .unwrap()
+        .map(|r| {
+            let r = r.unwrap();
+            (r.name_bytes().to_vec(), r.target())
+        })
+        .collect();
+    let snapshot = capture(path, &CaptureOptions::default()).unwrap();
+    assert_eq!(fingerprint(path), before);
+    assert!(
+        snapshot.wip.is_some(),
+        "replacement/deletion must produce WIP"
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let dst = temp.path().join("restore");
+    restore(path, &snapshot, &dst).unwrap();
+    let restored = Repository::open(&dst).unwrap();
+    assert_eq!(
+        restored.index().unwrap().write_tree().unwrap(),
+        repo.index().unwrap().write_tree().unwrap()
+    );
+    match expected {
+        Some(bytes) => assert_eq!(fs::read(dst.join("sub")).unwrap(), bytes),
+        None => assert!(
+            !dst.join("sub").exists(),
+            "deleted worktree path must stay absent"
+        ),
+    }
+    assert_eq!(fingerprint(path), before);
+    let refs_after: Vec<_> = repo
+        .references()
+        .unwrap()
+        .map(|r| {
+            let r = r.unwrap();
+            (r.name_bytes().to_vec(), r.target())
+        })
+        .collect();
+    assert_eq!(refs_after, refs_before);
+}
+
+#[test]
+fn checkpoint_submodule_replaced_by_file_roundtrips_staged_and_unstaged() {
+    for staged in [false, true] {
+        let (parent, _child) = submodule_fixture();
+        fs::remove_dir_all(parent.path().join("sub")).unwrap();
+        fs::write(parent.path().join("sub"), b"staged replacement\r\n").unwrap();
+        if staged {
+            stage(parent.path(), "sub");
+        }
+        fs::write(parent.path().join("sub"), [0, 255, 4, 13, 10]).unwrap();
+        assert_replacement_roundtrip(parent.path(), Some(&[0, 255, 4, 13, 10]));
+    }
+}
+
+#[test]
+fn checkpoint_submodule_deletion_roundtrips_staged_and_unstaged() {
+    for staged in [false, true] {
+        let (parent, _child) = submodule_fixture();
+        fs::remove_dir_all(parent.path().join("sub")).unwrap();
+        if staged {
+            let repo = Repository::open(parent.path()).unwrap();
+            let mut index = repo.index().unwrap();
+            index.remove_path(Path::new("sub")).unwrap();
+            index.write().unwrap();
+        }
+        assert_replacement_roundtrip(parent.path(), None);
+    }
+}
+
+#[test]
+fn checkpoint_submodule_plain_directory_is_not_silently_discarded() {
+    let (parent, _child) = submodule_fixture();
+    fs::remove_dir_all(parent.path().join("sub")).unwrap();
+    write_file(parent.path(), "sub/important", "replacement data");
+    let before = fingerprint(parent.path());
+    let err = capture(parent.path(), &CaptureOptions::default()).unwrap_err();
+    assert!(err.to_string().contains("submodule"), "{err}");
+    assert_eq!(fingerprint(parent.path()), before);
+    assert_eq!(
+        fs::read_to_string(parent.path().join("sub/important")).unwrap(),
+        "replacement data"
+    );
+}
+
+#[test]
+fn checkpoint_submodule_retains_pin_for_initialized_and_empty_uninitialized_directories() {
+    let (parent, _child) = submodule_fixture();
+    let initial = capture(parent.path(), &CaptureOptions::default()).unwrap();
+    commit_file(&parent.path().join("sub"), "new", "unpublished child");
+    let before = fingerprint(parent.path());
+    let moved = capture(parent.path(), &CaptureOptions::default()).unwrap();
+    assert!(
+        moved.wip.is_none(),
+        "child HEAD must not replace the parent pin"
+    );
+    assert_eq!(moved.head, initial.head);
+    assert_eq!(fingerprint(parent.path()), before);
+    fs::remove_dir_all(parent.path().join("sub")).unwrap();
+    fs::create_dir(parent.path().join("sub")).unwrap();
+    let before = fingerprint(parent.path());
+    let uninitialized = capture(parent.path(), &CaptureOptions::default()).unwrap();
+    assert!(
+        uninitialized.wip.is_none(),
+        "uninitialized gitlinks remain intact"
+    );
+    assert_eq!(fingerprint(parent.path()), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_submodule_replaced_by_symlink_roundtrips_staged_and_unstaged() {
+    use std::os::unix::fs::symlink;
+    for staged in [false, true] {
+        let (parent, _child) = submodule_fixture();
+        fs::remove_dir_all(parent.path().join("sub")).unwrap();
+        symlink("root", parent.path().join("sub")).unwrap();
+        if staged {
+            stage(parent.path(), "sub");
+        }
+        let before = fingerprint(parent.path());
+        let snapshot = capture(parent.path(), &CaptureOptions::default()).unwrap();
+        assert!(snapshot.wip.is_some());
+        let temp = tempfile::tempdir().unwrap();
+        let dst = temp.path().join("restore");
+        restore(parent.path(), &snapshot, &dst).unwrap();
+        assert_eq!(fs::read_link(dst.join("sub")).unwrap(), Path::new("root"));
+        let original = Repository::open(parent.path()).unwrap();
+        let restored = Repository::open(&dst).unwrap();
+        assert_eq!(
+            restored.index().unwrap().write_tree().unwrap(),
+            original.index().unwrap().write_tree().unwrap()
+        );
+        assert_eq!(fingerprint(parent.path()), before);
+    }
+}

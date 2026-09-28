@@ -246,3 +246,82 @@ fn checkpoint_restore_rejects_submodule_symlink_escape_without_touching_outside(
         "keep"
     );
 }
+
+#[test]
+fn checkpoint_deleted_submodule_roundtrip_preserves_staging() {
+    for staged in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let (root, _) = superproject_with_submodule(temp.path());
+        fs::remove_dir_all(root.join("sub")).unwrap();
+        if staged {
+            run_git(&root, &["rm", "--cached", "sub"]);
+        }
+        let before = (index_bytes(&root), run_git(&root, &["show-ref"]));
+        let requests = inputs(&root);
+        assert_eq!(requests.len(), 1);
+        let repos = capture_repositories(&root, &requests).unwrap();
+        assert!(repos[0].snapshot.wip.is_some());
+        assert!(repos[0].submodules.is_empty());
+        let sources = HashMap::from([(repos[0].repo_key.clone(), root.clone())]);
+        let dst = temp.path().join("restore");
+        restore_repositories(&repos, &sources, &dst).unwrap();
+        assert!(!dst.join("sub").exists());
+        let staged_tree = |path| {
+            git2::Repository::open(path)
+                .unwrap()
+                .index()
+                .unwrap()
+                .write_tree()
+                .unwrap()
+        };
+        assert_eq!(staged_tree(&dst), staged_tree(&root));
+        assert_eq!(
+            run_git(&dst, &["--no-optional-locks", "status", "--porcelain"]),
+            run_git(&root, &["--no-optional-locks", "status", "--porcelain"])
+        );
+        assert_eq!((index_bytes(&root), run_git(&root, &["show-ref"])), before);
+    }
+}
+
+#[test]
+fn checkpoint_inventory_rejects_submodule_file_replacement_without_mutation() {
+    for staged in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let (root, _) = superproject_with_submodule(temp.path());
+        let requests = inputs(&root);
+        fs::remove_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("sub"), [0, 255, 4]).unwrap();
+        if staged {
+            run_git(&root, &["add", "sub"]);
+        }
+        let before = (index_bytes(&root), run_git(&root, &["show-ref"]));
+        // Inventory deliberately fails closed on non-directory child paths;
+        // the standalone Git codec can still roundtrip the replacement.
+        assert!(capture_repositories(&root, &requests[..1]).is_err());
+        assert_eq!((index_bytes(&root), run_git(&root, &["show-ref"])), before);
+        assert_eq!(fs::read(root.join("sub")).unwrap(), [0, 255, 4]);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_inventory_rejects_submodule_symlink_without_mutation() {
+    for staged in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let (root, _) = superproject_with_submodule(temp.path());
+        let requests = inputs(&root);
+        fs::remove_dir_all(root.join("sub")).unwrap();
+        std::os::unix::fs::symlink("README.md", root.join("sub")).unwrap();
+        if staged {
+            run_git(&root, &["add", "sub"]);
+        }
+        let before = (index_bytes(&root), run_git(&root, &["show-ref"]));
+        let err = capture_repositories(&root, &requests[..1]).unwrap_err();
+        assert!(err.to_string().contains("symlink"));
+        assert_eq!((index_bytes(&root), run_git(&root, &["show-ref"])), before);
+        assert_eq!(
+            fs::read_link(root.join("sub")).unwrap(),
+            Path::new("README.md")
+        );
+    }
+}

@@ -218,7 +218,39 @@ fn read_cut(path: &Path, options: &CaptureOptions) -> Result<Cut> {
         .add_all(["*"], git2::IndexAddOption::DEFAULT, Some(&mut skip))
         .map_err(map_git_err)?;
     for entry in gitlinks {
-        index.add(&entry).map_err(map_git_err)?;
+        let relative = path_from_bytes(&entry.path);
+        let full = workdir.join(&relative);
+        match std::fs::symlink_metadata(&full) {
+            Ok(metadata) if metadata.is_dir() => {
+                // Only directories still representing submodules retain their
+                // staged pin. Empty directories are uninitialized checkouts.
+                if !full
+                    .join(".git")
+                    .try_exists()
+                    .map_err(|e| invalid(e.to_string()))?
+                    && std::fs::read_dir(&full)
+                        .map_err(|e| invalid(e.to_string()))?
+                        .next()
+                        .transpose()
+                        .map_err(|e| invalid(e.to_string()))?
+                        .is_some()
+                {
+                    return Err(invalid("unsupported submodule directory replacement"));
+                }
+                index.add(&entry).map_err(map_git_err)?;
+            }
+            Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
+                // add_all selected the replacement blob; the raw-byte pass
+                // below preserves it instead of overwriting it with a gitlink.
+            }
+            Ok(_) => return Err(invalid("unsupported submodule file type")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if index.get_path(&relative, 0).is_some() {
+                    index.remove_path(&relative).map_err(map_git_err)?;
+                }
+            }
+            Err(e) => return Err(invalid(e.to_string())),
+        }
     }
     // add_all selects Git-visible paths, but its clean filters normalize file
     // bytes (e.g. CRLF). A checkpoint preserves the actual worktree; overwrite
