@@ -2,7 +2,7 @@
 use super::*;
 use serde_json::json;
 
-async fn start_roster() -> (Server, Services) {
+pub(super) async fn start_roster() -> (Server, Services) {
     let (_, bus, store, settings, dir) = make_services(None, None).await;
     let reverse_registry = Arc::new(PrimaryReverseRegistry::new());
     let services = Services::new(store.clone())

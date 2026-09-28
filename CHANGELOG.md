@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.114] - 2026-09-28
+
+### 🚀 Features
+
+- Apply reasoning effort to quick-action completions ([#2146](https://github.com/intent-hq/intentd/pull/2146))
+- Persist provider fast mode and apply it before each turn ([#2147](https://github.com/intent-hq/intentd/pull/2147))
+
+### 🐛 Bug Fixes
+
+- Teach workspace app file links in harness v2.10 ([#2145](https://github.com/intent-hq/intentd/pull/2145))
+- Preserve RPC behavior with workspace routing context ([#2150](https://github.com/intent-hq/intentd/pull/2150))
+
+
 ## [0.9.113] - 2026-09-27
 
 ### 🚀 Features

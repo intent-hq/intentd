@@ -8,12 +8,18 @@
 //! plain-`ws://` accept path serves JSON-RPC with no TLS and no bearer token.
 
 mod common;
+#[path = "wss_integration/discovery_context.rs"]
+mod discovery_context;
 #[path = "wss_integration/host_roles.rs"]
 mod host_roles;
 #[path = "wss_integration/human_attribution.rs"]
 mod human_attribution;
 #[path = "wss_integration/imported_queue_authorization.rs"]
 mod imported_queue_authorization;
+#[path = "wss_integration/integration_context.rs"]
+mod integration_context;
+#[path = "wss_integration/resource_context.rs"]
+mod resource_context;
 #[path = "wss_integration/sharing.rs"]
 mod sharing;
 
@@ -214,6 +220,11 @@ async fn make_services(
         .with_assets_root(dir.path().join("assets"))
         .with_workspaces_root(workspaces_root)
         .with_settings_registry(registry.clone())
+        .with_secret_store(Arc::new(intent_services::InMemorySecretStore::default()))
+        .with_specialist_dirs(
+            Some(dir.path().join("user-specialists")),
+            Some(dir.path().join("bundled-specialists")),
+        )
         .with_event_bus(bus.clone());
     if let Some(bin) = auggie_bin {
         services = services.with_auggie_bin(bin);

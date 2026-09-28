@@ -17,6 +17,15 @@ async fn person_connection(
 
 #[tokio::test]
 async fn scoped_owner_permission_recovery_keeps_transport_denials_and_revocation() {
+    permission_recovery(false).await;
+}
+
+#[tokio::test]
+async fn resource_context_permission_snapshot_response_and_role_checks() {
+    permission_recovery(true).await;
+}
+
+async fn permission_recovery(routed: bool) {
     let script = gate("scoped owner permission recovery").expect("mock ACP prerequisite");
     let dir = temp_data_dir();
     let ws = WorkspaceId::new();
@@ -134,7 +143,10 @@ async fn scoped_owner_permission_recovery_keeps_transport_denials_and_revocation
     let request_id = requested["params"]["event"]["data"]["requestId"]
         .as_str()
         .unwrap();
-    for filter in [json!({}), json!({"agentId":agent_id})] {
+    for mut filter in [json!({}), json!({"agentId":agent_id})] {
+        if routed {
+            filter["workspaceId"] = json!(other);
+        }
         let pending = wss_rpc(&mut guest, 4, "agent.pendingPermissions", filter).await;
         assert_eq!(pending["requests"].as_array().unwrap().len(), 1);
         assert_eq!(pending["requests"][0]["requestId"], request_id);
@@ -150,8 +162,11 @@ async fn scoped_owner_permission_recovery_keeps_transport_denials_and_revocation
     let mut ordinary = person_connection(port, cfg.clone(), &collaborator_token).await;
     let pending = wss_rpc(&mut ordinary, 1, "agent.pendingPermissions", json!({})).await;
     assert_eq!(pending["requests"], json!([]));
-    let answer =
+    let mut answer =
         json!({"requestId":request_id,"outcome":{"outcome":"selected","optionId":"allow_once"}});
+    if routed {
+        answer["workspaceId"] = json!(other);
+    }
     let refused =
         wss_rpc_envelope(&mut ordinary, 2, "agent.respondPermission", answer.clone()).await;
     assert_eq!(refused["error"]["code"], -32003, "{refused}");
