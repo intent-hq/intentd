@@ -161,6 +161,10 @@ pub fn read_repository_context_with_resolver(
 /// Observe one exact local root without inventing admission, selection or a
 /// context revision. Uses the same Git snapshot and consistency checks as the
 /// public admitted-context reader; private transport values stay in-process.
+#[expect(
+    clippy::allow_attributes,
+    reason = "This private API is used by the external fixture but not the library targets"
+)]
 #[allow(
     dead_code,
     reason = "Private read observation consumers are not integrated yet"
@@ -184,6 +188,10 @@ pub(crate) fn observe_repository_root_with_resolver(
 /// Deterministic local Git mutation after observation, before the SAME final
 /// consistency check. This schedules a test writer; it supplies no source facts.
 #[cfg(test)]
+#[expect(
+    clippy::allow_attributes,
+    reason = "This hook is used by the external fixture but not the library test target"
+)]
 #[allow(dead_code, reason = "Used by the external reader fixture target")]
 pub(crate) fn observe_repository_root_before_check(
     root: &RepositoryRootId,

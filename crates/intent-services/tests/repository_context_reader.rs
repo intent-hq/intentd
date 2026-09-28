@@ -1205,7 +1205,7 @@ fn observation_checks_real_config_head_and_root_again_after_local_read() {
                     f.git(&f.path, &["checkout", "--detach"]);
                 }
                 "git-directory" => {
-                    std::fs::rename(f.path.join(".git"), f.path.join("old-git")).unwrap()
+                    std::fs::rename(f.path.join(".git"), f.path.join("old-git")).unwrap();
                 }
                 _ => unreachable!(),
             },
