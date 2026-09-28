@@ -7725,3 +7725,6 @@ mod oversized_response {
         );
     }
 }
+
+#[path = "tests/discovery_context.rs"]
+mod discovery_context;

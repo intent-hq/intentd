@@ -5,6 +5,12 @@
 //! Envelope validation, the notification-vs-request distinction, and the
 //! `-32700/-32600/-32601/-32602/-32603` error matrix all live here so every
 //! transport (UDS today, WS/TLS later) shares one code path.
+//!
+//! Discovery/configuration requests may carry optional routing-only `workspaceId`
+//! (docs/protocol/workspace-routing.md). These handlers deliberately consume only
+//! their semantic selectors: catalogs/settings/capabilities/client registry remain
+//! daemon-wide, and specialist project writes still require explicit scope/path.
+//! No workspace lookup or extra service argument is needed for this metadata.
 
 use intent_core::{
     AgentCreateExtra, AgentDelegateInput, AgentId, AgentWakeCreateOptions, AgentWakeOrCreateInput,
@@ -3630,7 +3636,8 @@ async fn dispatch(
             Ok(r)
         }
         "settings.list" => {
-            // Global namespace (no workspaceId); sensitive values are redacted.
+            // Daemon-wide storage; optional routing context does not scope settings.
+            // Sensitive values are redacted.
             let r = api.settings_list().await.map_err(domain_to_rpc)?;
             Ok(r)
         }
@@ -3662,7 +3669,7 @@ async fn dispatch(
             }
         }
         "system.capabilities" => {
-            // Machine-level capabilities, no workspaceId (PROTOCOL §5.7).
+            // Machine-level capabilities; optional workspaceId is routing-only (§5.7).
             // Router method (unlike the system.* control fast-path): the
             // cowSupported probe lives in the service layer's aggregate cache.
             let r = api.system_capabilities().await.map_err(domain_to_rpc)?;
@@ -4259,7 +4266,7 @@ async fn dispatch(
             }
         }
         "specialist.list" => {
-            // Matches the TS WSS `specialist.list` signature: no params; merges
+            // Optional workspaceId is routing-only. This method merges
             // user > bundled tiers only (the project tier is not part of the live
             // wire contract iOS calls). `specialist.get` still accepts an optional
             // `workspacePath` for the project tier (PROTOCOL §5.11). The optional
