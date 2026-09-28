@@ -37,7 +37,27 @@ const MAX_RECENT_STDERR_ENTRY_CHARS: usize = 10_000;
 /// Outbound writer channel capacity.
 const WRITER_CHANNEL_CAPACITY: usize = 256;
 
-type PendingMap = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, JsonRpcError>>>>>;
+struct PendingRequest {
+    sender: oneshot::Sender<Result<Value, JsonRpcError>>,
+    session_id: Option<String>,
+}
+
+type PendingMap = Arc<Mutex<HashMap<i64, PendingRequest>>>;
+type SessionConfigOptions = Arc<Mutex<HashMap<String, Value>>>;
+
+fn retain_config_options(configs: &SessionConfigOptions, session_id: Option<&str>, value: &Value) {
+    if let (Some(session_id), Some(options)) = (
+        session_id,
+        value
+            .get("configOptions")
+            .filter(|options| options.is_array()),
+    ) {
+        configs
+            .lock()
+            .unwrap()
+            .insert(session_id.to_owned(), options.clone());
+    }
+}
 
 fn authentication_required() -> JsonRpcError {
     JsonRpcError {
@@ -278,9 +298,14 @@ fn truncate_middle(s: &str, max: usize) -> String {
 /// pending entry was already removed (the caller dropped its request future —
 /// see [`PendingEntryGuard`]) still advances the watermark. This is
 /// client-side bookkeeping only; nothing changes on the wire.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "reader-owned state is passed to the ordered dispatcher"
+)]
 fn dispatch(
     value: &Value,
     pending: &PendingMap,
+    config_options: &SessionConfigOptions,
     requests: Option<&mpsc::UnboundedSender<IncomingRequest>>,
     notifications: Option<&mpsc::UnboundedSender<IncomingNotification>>,
     response_seq: &AtomicU64,
@@ -294,20 +319,28 @@ fn dispatch(
     if let Some(method) = method {
         let method = method.to_string();
         let params = obj.get("params").cloned().unwrap_or(Value::Null);
-        match id {
-            Some(id) => {
-                // Count BEFORE forwarding: the watermark must never read
-                // lower than the number of requests already handed to a
-                // handler that may side-effect (fs writes, terminal exec).
-                client_request_seq.fetch_add(1, Ordering::SeqCst);
-                if let Some(tx) = requests {
-                    let _ = tx.send(IncomingRequest { id, method, params });
-                }
+        if let Some(id) = id {
+            // Count BEFORE forwarding: the watermark must never read
+            // lower than the number of requests already handed to a
+            // handler that may side-effect (fs writes, terminal exec).
+            client_request_seq.fetch_add(1, Ordering::SeqCst);
+            if let Some(tx) = requests {
+                let _ = tx.send(IncomingRequest { id, method, params });
             }
-            None => {
-                if let Some(tx) = notifications {
-                    let _ = tx.send(IncomingNotification { method, params });
-                }
+        } else {
+            if method == "session/update"
+                && params["update"]["sessionUpdate"] == "config_option_update"
+            {
+                // Observe before routing: idle/replay drains may discard the
+                // notification, but the next turn still needs its metadata.
+                retain_config_options(
+                    config_options,
+                    params["sessionId"].as_str(),
+                    &params["update"],
+                );
+            }
+            if let Some(tx) = notifications {
+                let _ = tx.send(IncomingNotification { method, params });
             }
         }
         return;
@@ -317,11 +350,11 @@ fn dispatch(
     response_seq.fetch_add(1, Ordering::SeqCst);
     response_notify.notify_waiters();
     let Some(key) = id.as_i64() else { return };
-    let Some(sender) = pending.lock().unwrap().remove(&key) else {
+    let Some(request) = pending.lock().unwrap().remove(&key) else {
         return;
     };
     if let Some(err) = obj.get("error") {
-        let _ = sender.send(Err(JsonRpcError {
+        let _ = request.sender.send(Err(JsonRpcError {
             code: err.get("code").and_then(Value::as_i64).unwrap_or(0),
             message: err
                 .get("message")
@@ -332,7 +365,17 @@ fn dispatch(
         }));
     } else {
         let result = obj.get("result").cloned().unwrap_or(Value::Null);
-        let _ = sender.send(Ok(result));
+        // Record responses in the same stdout order as notifications. Updating
+        // after await in a caller could overwrite a newer capability update.
+        retain_config_options(
+            config_options,
+            request
+                .session_id
+                .as_deref()
+                .or_else(|| result["sessionId"].as_str()),
+            &result,
+        );
+        let _ = request.sender.send(Ok(result));
     }
 }
 
@@ -352,6 +395,7 @@ fn dispatch(
 pub struct Connection {
     writer_tx: mpsc::Sender<String>,
     pending: PendingMap,
+    config_options: SessionConfigOptions,
     next_id: AtomicI64,
     response_seq: Arc<AtomicU64>,
     response_notify: Arc<Notify>,
@@ -381,6 +425,7 @@ impl Connection {
         R: AsyncRead + Unpin + Send + 'static,
     {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let config_options = SessionConfigOptions::default();
         let response_seq = Arc::new(AtomicU64::new(0));
         let response_notify = Arc::new(Notify::new());
         let client_request_seq = Arc::new(AtomicU64::new(0));
@@ -405,6 +450,7 @@ impl Connection {
 
         // Reader task: frame on `\n`, parse, dispatch.
         let pending_reader = Arc::clone(&pending);
+        let configs_reader = Arc::clone(&config_options);
         let seq_reader = Arc::clone(&response_seq);
         let notify_reader = Arc::clone(&response_notify);
         let client_req_seq_reader = Arc::clone(&client_request_seq);
@@ -424,7 +470,7 @@ impl Connection {
                     auth_required_reader.store(true, Ordering::SeqCst);
                     auth_error_reader.store(true, Ordering::SeqCst);
                     for (_, sender) in pending_reader.lock().unwrap().drain() {
-                        let _ = sender.send(Err(authentication_required()));
+                        let _ = sender.sender.send(Err(authentication_required()));
                     }
                     // Continue draining stdout, but never parse OAuth banners
                     // printed after the browser guard. The caller reaps the child.
@@ -437,6 +483,7 @@ impl Connection {
                     Ok(value) => dispatch(
                         &value,
                         &pending_reader,
+                        &configs_reader,
                         requests.as_ref(),
                         notifications.as_ref(),
                         &seq_reader,
@@ -458,7 +505,7 @@ impl Connection {
             {
                 let mut map = pending_reader.lock().unwrap();
                 for (_, sender) in map.drain() {
-                    let _ = sender.send(Err(JsonRpcError {
+                    let _ = sender.sender.send(Err(JsonRpcError {
                         code: 0,
                         message: "agent stdout closed".to_string(),
                         data: None,
@@ -535,6 +582,7 @@ impl Connection {
         Self {
             writer_tx,
             pending,
+            config_options,
             next_id: AtomicI64::new(1),
             response_seq,
             response_notify,
@@ -646,7 +694,16 @@ impl Connection {
         timeout: Duration,
     ) -> AcpResult<Value> {
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(id, tx);
+        self.pending.lock().unwrap().insert(
+            id,
+            PendingRequest {
+                sender: tx,
+                session_id: params
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            },
+        );
         // Drop-guard cleanup: covers the error/timeout arms below AND the
         // caller dropping this future mid-flight (cancel-safety for the
         // pending map — see `PendingEntryGuard`).
@@ -672,6 +729,17 @@ impl Connection {
             Ok(Err(_)) => Err(AcpError::Transport("response channel dropped".to_string())),
             Err(_) => Err(AcpError::Timeout(method.to_string())),
         }
+    }
+
+    /// Latest advertised options for this session, observed in stdout order
+    /// from both responses and `config_option_update` notifications. An explicit
+    /// empty list clears previous capabilities; an omitted field preserves them.
+    /// This only records metadata and never sends a control to a running turn.
+    ///
+    /// # Panics
+    /// Panics if the internal metadata mutex is poisoned.
+    pub fn session_config_options(&self, session_id: &str) -> Option<Value> {
+        self.config_options.lock().unwrap().get(session_id).cloned()
     }
 
     /// Number of in-flight request correlation entries (test observability

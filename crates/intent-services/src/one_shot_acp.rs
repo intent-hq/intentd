@@ -25,6 +25,8 @@
 //! (`configOptions[id="model"]`, the same mechanism the persistent agent
 //! path uses for claude-code and pi); a failed or unsupported attempt is
 //! logged and the completion proceeds on the adapter's default model.
+//! Effort uses the resulting live thought-level selector: explicit invalid
+//! or failed values stop before the prompt; saved defaults fall back safely.
 //!
 //! The caller may attach a provider-specific `session/new` `_meta` (the
 //! claude-code utility shape that replaces the preset system prompt and
@@ -34,6 +36,7 @@
 
 use std::time::Duration;
 
+use intent_acp::session::SessionConfigOption;
 use intent_acp::{Connection, IncomingRequest, JsonRpcError, PermissionOutcome};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -43,8 +46,18 @@ use crate::acp_adapter::{
     AcpAdapterCommand, AdapterSlots, SpawnError,
 };
 
+use crate::agent_session::{discover_thought_level, ThoughtLevelOption};
+
 /// The one-shot launch description (shared with the model probe).
 pub(crate) use crate::acp_adapter::AcpAdapterCommand as OneShotCommand;
+
+/// Keep the explicit request and both saved candidates until model selection
+/// finishes. Cached effort metadata may describe a different model.
+#[derive(Debug, Default)]
+pub(crate) struct OneShotEffort {
+    pub explicit: Option<String>,
+    pub saved: Vec<String>,
+}
 
 /// Machine-readable one-shot failure reasons. The caller maps these onto the
 /// `agent.completeOnce` contract (`{ available: false, reason }` vs an error).
@@ -54,6 +67,10 @@ pub(crate) enum OneShotError {
     /// adapter bound — nothing was ever spawned, and no model was ever asked
     /// (monorepo#2062).
     QueueTimeout { waited_ms: u64, limit: u32 },
+    /// Explicit effort is not supported by the actual live session.
+    InvalidEffort(String),
+    /// Explicit effort could not be applied; do not send the prompt.
+    ApplyEffort(String),
     /// The adapter process could not be spawned.
     Spawn(String),
     /// A request failed at the transport level or timed out.
@@ -79,6 +96,7 @@ impl std::fmt::Display for OneShotError {
                 "timed out after {waited_ms}ms waiting for a free adapter slot \
                  (limit {limit}); no completion was started"
             ),
+            OneShotError::InvalidEffort(e) | OneShotError::ApplyEffort(e) => f.write_str(e),
             OneShotError::Spawn(e) => write!(f, "failed to spawn adapter: {e}"),
             OneShotError::Transport(e) => write!(f, "one-shot transport failed: {e}"),
             OneShotError::Rpc(e) => write!(f, "adapter returned an error: {e}"),
@@ -92,6 +110,12 @@ impl std::fmt::Display for OneShotError {
     }
 }
 
+/// Lazy setting read, polled only after session and model setup.
+pub(crate) type FastModePreference<'a> = (
+    &'a str,
+    std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>,
+);
+
 /// Run one ephemeral ACP completion: claim a slot in the daemon-wide adapter
 /// bound, spawn `cmd`, drive the turn with `prompt` as a single text content
 /// block, and return the concatenated assistant text. `prompt_timeout` bounds
@@ -101,7 +125,8 @@ impl std::fmt::Display for OneShotError {
 /// `session/new` via `session/set_config_option` (a failure never fails the
 /// completion). `session_meta`, when set, rides `session/new` as `_meta`
 /// verbatim (absent otherwise). The child is reaped before returning on
-/// every path.
+/// every path. `fast_mode` reads the daemon preference only at the pre-prompt
+/// boundary, so changes made while queued or opening the session are included.
 ///
 /// Reusing the caller's own timeout as the queue budget keeps the contract
 /// legible — you wait for a slot at most as long as you were willing to wait
@@ -109,19 +134,23 @@ impl std::fmt::Display for OneShotError {
 /// [`OneShotError::QueueTimeout`], never a hang and never something a client
 /// could mistake for a slow model.
 pub(crate) async fn run_one_shot_acp(
+    fast_mode: Option<FastModePreference<'_>>,
     cmd: OneShotCommand,
     prompt: &str,
     config_option_model: Option<&str>,
     session_meta: Option<Value>,
     prompt_timeout: Duration,
+    effort: &OneShotEffort,
 ) -> Result<String, OneShotError> {
     run_one_shot_acp_in(
+        fast_mode,
         adapter_slots(),
         cmd,
         prompt,
         config_option_model,
         session_meta,
         prompt_timeout,
+        effort,
     )
     .await
 }
@@ -132,13 +161,16 @@ pub(crate) async fn run_one_shot_acp(
 /// private [`AdapterSlots`], so slot pressure from sibling tests sharing the
 /// global bound cannot turn its asserted failure into a queue timeout
 /// (monorepo#2379).
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn run_one_shot_acp_in(
+    fast_mode: Option<FastModePreference<'_>>,
     slots: &AdapterSlots,
     cmd: OneShotCommand,
     prompt: &str,
     config_option_model: Option<&str>,
     session_meta: Option<Value>,
     prompt_timeout: Duration,
+    effort: &OneShotEffort,
 ) -> Result<String, OneShotError> {
     let mut adapter = spawn_adapter_in(slots, &cmd, prompt_timeout)
         .await
@@ -151,6 +183,7 @@ pub(crate) async fn run_one_shot_acp_in(
         })?;
 
     let result = drive_one_shot(
+        fast_mode,
         &adapter.conn,
         &mut adapter.notifications,
         &mut adapter.requests,
@@ -159,6 +192,7 @@ pub(crate) async fn run_one_shot_acp_in(
         config_option_model,
         session_meta,
         prompt_timeout,
+        effort,
     )
     .await;
 
@@ -176,6 +210,7 @@ pub(crate) async fn run_one_shot_acp_in(
 /// agent→client requests concurrently through every phase.
 #[expect(clippy::too_many_arguments)]
 async fn drive_one_shot(
+    fast_mode: Option<FastModePreference<'_>>,
     conn: &Connection,
     notifications: &mut mpsc::UnboundedReceiver<intent_acp::IncomingNotification>,
     requests: &mut mpsc::UnboundedReceiver<IncomingRequest>,
@@ -184,6 +219,7 @@ async fn drive_one_shot(
     config_option_model: Option<&str>,
     session_meta: Option<Value>,
     prompt_timeout: Duration,
+    effort: &OneShotEffort,
 ) -> Result<String, OneShotError> {
     // One responder for the whole lifecycle: a response send still pending
     // when a phase resolves is carried into the next phase's loop instead of
@@ -194,7 +230,7 @@ async fn drive_one_shot(
     // `session/request_permission` during `initialize` or `session/new`
     // still gets the immediate auto-deny instead of stalling setup into a
     // misreported SetupTimeout.
-    let session_id = serve_requests_while(
+    let (session_id, mut thought_level, mut config_options) = serve_requests_while(
         &mut responder,
         requests,
         tokio::time::timeout(
@@ -212,14 +248,42 @@ async fn drive_one_shot(
     .unwrap_or(Err(OneShotError::SetupTimeout))?;
 
     if let Some(model) = config_option_model {
-        apply_config_option_model(
+        if let Some(response) = apply_config_option_model(
             &mut responder,
             requests,
             &session_id,
             model,
             cmd.session_new_timeout(),
         )
-        .await;
+        .await
+        {
+            crate::fast_mode::refresh_options(&mut config_options, Some(&response));
+            // A valid replacement list without thought_level clears the old
+            // selector. Missing/malformed lists preserve it for old adapters.
+            if let Some(options) = parse_config_options(&response) {
+                thought_level = discover_thought_level(Some(&options));
+            }
+        }
+    }
+    apply_effort(
+        &mut responder,
+        requests,
+        &session_id,
+        thought_level.as_ref(),
+        effort,
+        cmd.session_new_timeout(),
+    )
+    .await?;
+    // Fast preferences are sampled after both model and effort selection.
+    if let Some((provider, preference)) = fast_mode {
+        let enabled = preference.await;
+        serve_requests_while(
+            &mut responder,
+            requests,
+            crate::fast_mode::apply(conn, &session_id, provider, enabled, &mut config_options),
+        )
+        .await
+        .map_err(|e| OneShotError::Transport(e.to_string()))?;
     }
 
     let params = json!({
@@ -371,7 +435,7 @@ async fn apply_config_option_model(
     session_id: &str,
     model: &str,
     timeout: Duration,
-) {
+) -> Option<Value> {
     let conn = responder.conn;
     let params = json!({ "sessionId": session_id, "configId": "model", "value": model });
     // The outer timeout also bounds the send itself (see the prompt phase).
@@ -389,11 +453,15 @@ async fn apply_config_option_model(
             "session/set_config_option".into(),
         ))
     });
-    if let Err(err) = outcome {
-        tracing::debug!(
-            "one-shot session/set_config_option(model={model}) failed; \
+    match outcome {
+        Ok(response) => Some(response),
+        Err(err) => {
+            tracing::debug!(
+                "one-shot session/set_config_option(model={model}) failed; \
              continuing with the adapter default: {err}"
-        );
+            );
+            None
+        }
     }
 }
 
@@ -405,7 +473,7 @@ async fn setup_session(
     session_meta: Option<Value>,
     initialize_timeout: Duration,
     session_new_timeout: Duration,
-) -> Result<String, OneShotError> {
+) -> Result<(String, Option<ThoughtLevelOption>, Option<Value>), OneShotError> {
     conn.request_timeout("initialize", initialize_params(), initialize_timeout)
         .await
         .map_err(map_acp_error)?;
@@ -421,11 +489,108 @@ async fn setup_session(
         .request_timeout("session/new", session_params, session_new_timeout)
         .await
         .map_err(map_acp_error)?;
-    result
+    let session_id = result
         .get("sessionId")
         .and_then(Value::as_str)
         .map(str::to_string)
-        .ok_or_else(|| OneShotError::Transport("session/new returned no sessionId".to_string()))
+        .ok_or_else(|| OneShotError::Transport("session/new returned no sessionId".to_string()))?;
+    let thought_level =
+        parse_config_options(&result).and_then(|options| discover_thought_level(Some(&options)));
+    Ok((
+        session_id,
+        thought_level,
+        result.get("configOptions").cloned(),
+    ))
+}
+
+fn parse_config_options(response: &Value) -> Option<Vec<SessionConfigOption>> {
+    serde_json::from_value(response.get("configOptions")?.clone()).ok()
+}
+
+/// Validate against the final live selector and apply before any prompt.
+/// Explicit errors stop execution. Stale saved defaults degrade gracefully.
+async fn apply_effort(
+    responder: &mut Responder<'_>,
+    requests: &mut mpsc::UnboundedReceiver<IncomingRequest>,
+    session_id: &str,
+    selector: Option<&ThoughtLevelOption>,
+    effort: &OneShotEffort,
+    timeout: Duration,
+) -> Result<(), OneShotError> {
+    let candidates: Vec<&str> = match effort.explicit.as_deref() {
+        Some(value) => vec![value],
+        None => effort.saved.iter().map(String::as_str).collect(),
+    };
+    for requested in candidates {
+        let supported = selector.and_then(|s| {
+            s.values
+                .iter()
+                .find(|v| v.eq_ignore_ascii_case(requested))
+                .map(String::as_str)
+                .or_else(|| s.values.is_empty().then_some(requested))
+                .map(|value| (s, value))
+        });
+        let Some((selector, value)) = supported else {
+            if effort.explicit.is_some() {
+                let detail = selector.map_or_else(
+                    || "effort is unsupported by this session".to_owned(),
+                    |s| format!("available choices: {}", s.values.join(", ")),
+                );
+                return Err(OneShotError::InvalidEffort(format!(
+                    "reasoningEffort {requested:?} is not supported; {detail}"
+                )));
+            }
+            tracing::warn!(
+                effort = requested,
+                "unsupported saved quick-action effort; trying the next default"
+            );
+            continue;
+        };
+        if selector.current_value.eq_ignore_ascii_case(value) {
+            return Ok(());
+        }
+        let conn = responder.conn;
+        let params =
+            json!({"sessionId": session_id, "configId": selector.config_id, "value": value});
+        let result = serve_requests_while(
+            responder,
+            requests,
+            tokio::time::timeout(
+                timeout,
+                conn.request_timeout("session/set_config_option", params, timeout),
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(intent_acp::AcpError::Timeout(
+                "session/set_config_option".into(),
+            ))
+        });
+        let failure = match result {
+            Err(err) => Some(err.to_string()),
+            Ok(response) => response
+                .get("configOptions")
+                .and_then(Value::as_array)
+                .and_then(|options| options.iter().find(|o| o["id"] == selector.config_id))
+                .and_then(|o| o["currentValue"].as_str())
+                .filter(|actual| !actual.eq_ignore_ascii_case(value))
+                .map(|actual| format!("provider returned {actual:?} instead of {value:?}")),
+        };
+        if let Some(failure) = failure {
+            if effort.explicit.is_some() {
+                return Err(OneShotError::ApplyEffort(format!(
+                    "failed to apply reasoningEffort: {failure}"
+                )));
+            }
+            tracing::warn!(
+                effort = requested,
+                error = failure,
+                "saved quick-action effort could not be applied; keeping provider default"
+            );
+        }
+        return Ok(());
+    }
+    Ok(())
 }
 
 /// Append the text of an `agent_message_chunk` `session/update` to the
@@ -489,7 +654,11 @@ async fn attribute_early_exit(
 ) -> OneShotError {
     if matches!(
         err,
-        OneShotError::Spawn(_) | OneShotError::Rpc(_) | OneShotError::QueueTimeout { .. }
+        OneShotError::Spawn(_)
+            | OneShotError::Rpc(_)
+            | OneShotError::QueueTimeout { .. }
+            | OneShotError::InvalidEffort(_)
+            | OneShotError::ApplyEffort(_)
     ) {
         return err;
     }
@@ -517,3 +686,6 @@ fn map_acp_error(err: intent_acp::AcpError) -> OneShotError {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod effort_tests;

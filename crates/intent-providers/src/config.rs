@@ -288,6 +288,17 @@ pub struct ProviderConfig {
 }
 
 impl ProviderConfig {
+    /// ACP session selector supported by the pinned adapter. This is a
+    /// capability, not a guarantee of model or account eligibility.
+    #[must_use]
+    pub fn fast_mode_config_id(&self) -> Option<&'static str> {
+        match self.id {
+            "claude-code" => Some("fast"),
+            "codex" => Some("fast-mode"),
+            _ => None,
+        }
+    }
+
     const fn empty(id: &'static str, display_name: &'static str, command: &'static str) -> Self {
         Self {
             id,

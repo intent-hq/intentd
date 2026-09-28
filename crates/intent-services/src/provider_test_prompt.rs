@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::one_shot_acp::{run_one_shot_acp, OneShotError};
+use crate::one_shot_acp::{run_one_shot_acp, OneShotEffort, OneShotError};
 
 /// The literal prompt the probe sends. The answer is never surfaced — any
 /// successfully completed turn is a pass.
@@ -69,7 +69,9 @@ fn failure_reason(err: &OneShotError) -> &'static str {
         OneShotError::Rpc(_)
         | OneShotError::Transport(_)
         | OneShotError::Exited(_)
-        | OneShotError::Empty => "error",
+        | OneShotError::Empty
+        | OneShotError::InvalidEffort(_)
+        | OneShotError::ApplyEffort(_) => "error",
     }
 }
 
@@ -93,6 +95,7 @@ fn failure(reason: &str, message: impl Into<String>) -> Value {
 /// (the caller maps it to `-32602`). Every runtime failure is a structured
 /// `{ ok: false, reason, message }` result, not a wire error.
 pub async fn provider_test_prompt<S: std::hash::BuildHasher>(
+    api: Option<&dyn intent_core::WorkspaceApi>,
     provider_id: &str,
     model: Option<&str>,
     provider_paths: &HashMap<String, String, S>,
@@ -194,11 +197,30 @@ pub async fn provider_test_prompt<S: std::hash::BuildHasher>(
         (cmd, None)
     };
     let outcome = run_one_shot_acp(
+        Some((
+            provider_id,
+            Box::pin(async {
+                match api {
+                    Some(api) => api
+                        .settings_get("providers.fastMode".into())
+                        .await
+                        .ok()
+                        .and_then(|v| {
+                            v.get("value")
+                                .and_then(|m| m.get(provider_id))
+                                .and_then(Value::as_bool)
+                        })
+                        .unwrap_or(false),
+                    None => false,
+                }
+            }),
+        )),
         cmd,
         TEST_PROMPT,
         crate::complete_ops::config_option_model(provider, model),
         None,
         TEST_PROMPT_TIMEOUT,
+        &OneShotEffort::default(),
     )
     .await;
     Ok(match outcome {
@@ -278,7 +300,7 @@ mod tests {
     async fn unsupported_provider_returns_structured_unsupported() {
         let paths: HashMap<String, String> = HashMap::new();
         for provider in ["unsloth", "antigravity"] {
-            let v = provider_test_prompt(provider, None, &paths, None)
+            let v = provider_test_prompt(None, provider, None, &paths, None)
                 .await
                 .unwrap();
             assert_eq!(v["ok"], false);
@@ -292,7 +314,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_provider_is_an_error() {
         let paths: HashMap<String, String> = HashMap::new();
-        let err = provider_test_prompt("not-a-provider", None, &paths, None)
+        let err = provider_test_prompt(None, "not-a-provider", None, &paths, None)
             .await
             .unwrap_err();
         assert!(err.contains("Unknown providerId"), "{err}");

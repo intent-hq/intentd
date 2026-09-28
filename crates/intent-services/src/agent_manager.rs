@@ -2383,6 +2383,7 @@ struct AgentHandle {
     /// `ensure_started` re-apply a mid-session `reasoningEffort` change on the
     /// LIVE child, so it lands before the next prompt without a respawn.
     thought_level: Option<ThoughtLevelOption>,
+    config_options: Option<Value>,
     /// Set only after the latest turn-boundary application was acknowledged
     /// (or already current). A rejection/unsupported option leaves it empty.
     confirmed_effort: Option<AppliedEffort>,
@@ -3405,6 +3406,7 @@ impl AgentManager {
             spawned_model: opts.model.map(std::string::ToString::to_string),
             spawned_provider: opts.provider.command.to_string(),
             thought_level: None,
+            config_options: None,
             confirmed_effort: None,
             wake_gate: Arc::new(AtomicUsize::new(0)),
             wake_listener: None,
@@ -4075,6 +4077,10 @@ impl AgentManager {
         stored_effort: Option<&str>,
         default_override: Option<&str>,
     ) {
+        if let Some(handle) = self.handles.lock().unwrap().get_mut(&session_record.id) {
+            handle.config_options.clone_from(&opened.config_options);
+            crate::fast_mode::refresh_options(&mut handle.config_options, model_response.as_ref());
+        }
         let mut thought_level = opened.thought_level.clone();
         if let Some(options) = model_response
             .and_then(|mut response| response.get_mut("configOptions").map(Value::take))
@@ -4112,6 +4118,39 @@ impl AgentManager {
         }
         self.apply_thought_level(conn, &session_record.id, &opened.session_id, stored_effort)
             .await;
+    }
+
+    /// Apply the latest preference after model/effort selection and before a
+    /// new turn. Always send explicit off, even if the advertised value is
+    /// already off: native or resumed tier inheritance must be cleared.
+    async fn apply_fast_mode(
+        &self,
+        agent_id: &AgentId,
+        session_id: &str,
+        provider: &str,
+    ) -> Result<()> {
+        let Some((conn, mut options)) = self
+            .handles
+            .lock()
+            .unwrap()
+            .get(agent_id)
+            .map(|h| (h.connection.clone(), h.config_options.clone()))
+        else {
+            return Ok(());
+        };
+        let enabled = self
+            .services
+            .effective_settings()
+            .providers
+            .fast_mode
+            .get(provider)
+            .copied()
+            .unwrap_or(false);
+        crate::fast_mode::apply(&conn, session_id, provider, enabled, &mut options).await?;
+        if let Some(handle) = self.handles.lock().unwrap().get_mut(agent_id) {
+            handle.config_options = options;
+        }
+        Ok(())
     }
 
     /// Send the session's `reasoningEffort` to the provider through the
@@ -4174,6 +4213,12 @@ impl AgentManager {
             .await
             {
                 Ok(response) => {
+                    if let Some(handle) = self.handles.lock().unwrap().get_mut(agent_id) {
+                        crate::fast_mode::refresh_options(
+                            &mut handle.config_options,
+                            Some(&response),
+                        );
+                    }
                     // Older adapters acknowledge with {}. When a value is
                     // echoed, it must actually confirm the requested setting.
                     if let Some(actual) = response
@@ -6960,12 +7005,38 @@ impl AgentManager {
     /// exactly the marked entry, bypassing the batch flush and the head pop;
     /// every other gate — busy, ready-to-send, archived, quarantine, retired
     /// — still applies.
-    async fn try_drain_queue_inner(
+    fn try_drain_queue_inner(
+        self: Arc<Self>,
+        agent_id: AgentId,
+        workspace_id: WorkspaceId,
+        redrive_error_park: bool,
+    ) -> intent_core::BoxFuture<'static, ()> {
+        Box::pin(async move {
+            let services = self.services.clone();
+            services
+                .instruction_admission(self.try_drain_queue_authorized(
+                    agent_id,
+                    workspace_id,
+                    redrive_error_park,
+                ))
+                .await;
+        })
+    }
+
+    async fn try_drain_queue_authorized(
         self: Arc<Self>,
         agent_id: AgentId,
         workspace_id: WorkspaceId,
         redrive_error_park: bool,
     ) {
+        if self
+            .services
+            .discard_revoked_instructions(&agent_id)
+            .await
+            .is_err()
+        {
+            return;
+        }
         let Ok(_mutation) = self.services.workspace_mutations.enter(&workspace_id) else {
             return;
         };
@@ -7321,6 +7392,9 @@ impl AgentManager {
     ) -> Result<Value> {
         // monorepo#564: fail closed on a nonexistent target BEFORE touching
         // the queue.
+        self.services
+            .discard_revoked_instructions(&agent_id)
+            .await?;
         let session = self.services.require_agent_session(&agent_id).await?;
         // Bind the activation to the target's OWN session workspace
         // (intent-hq/intent#5017): the router forwards the CALLER's
@@ -7368,15 +7442,25 @@ impl AgentManager {
                 "queuedMessage": entry,
             }));
         }
+        let destination_owner = self
+            .services
+            .destination_owner_queue_authorization(&agent_id, &message_id)
+            .await?;
         // Atomic dequeue under the queue lock: no concurrent drain can
         // deliver the same entry twice. The entry stays listed in queue
         // snapshots (§6.5 drain ordering) until `draining` is dropped.
         let (mut entry, draining) = self
             .services
-            .take_queued_message_draining_gated(&agent_id, &message_id, gate.as_ref())?
+            .take_queued_message_draining_gated(
+                &agent_id,
+                &message_id,
+                gate.as_ref(),
+                destination_owner.as_ref(),
+            )?
             .ok_or_else(|| {
                 Error::InvalidParams(format!("queued message not found: {message_id}"))
             })?;
+        drop(destination_owner);
         // Stale-redrive parity with the drain paths (#576): a delegated
         // agent's entry that predates the delivered completion report is
         // annotated and keeps the report queryable.
@@ -7982,18 +8066,24 @@ impl AgentManager {
         }
         let mgr = self.clone();
         let id = agent_id.clone();
-        let handle = intent_core::spawn_daemon(async move {
-            // Clear the durable stop-redelivery mirror before the turn runs
-            // (intent-hq/monorepo#1899): the payload was consumed into this
-            // turn's prompt above, so a restart after this point must not
-            // rehydrate — and redeliver — it a second time. The sync re-reads
-            // the map, so a repeat stop that re-armed in the gap upserts the
-            // new payload instead of deleting.
-            if consumed_redelivery {
-                mgr.sync_stop_redelivery(&id).await;
-            }
-            run_message_worker(mgr, id, workspace_id, content, options, user_persisted).await;
-        });
+        let execution = mgr.services.clone();
+        let principal = intent_core::lift_from_principal_id(options.message_metadata.as_ref());
+        let handle = intent_core::spawn_daemon(crate::host_execution::background_execution(
+            execution,
+            principal,
+            async move {
+                // Clear the durable stop-redelivery mirror before the turn runs
+                // (intent-hq/monorepo#1899): the payload was consumed into this
+                // turn's prompt above, so a restart after this point must not
+                // rehydrate — and redeliver — it a second time. The sync re-reads
+                // the map, so a repeat stop that re-armed in the gap upserts the
+                // new payload instead of deleting.
+                if consumed_redelivery {
+                    mgr.sync_stop_redelivery(&id).await;
+                }
+                run_message_worker(mgr, id, workspace_id, content, options, user_persisted).await;
+            },
+        ));
         self.workers.lock().unwrap().insert(agent_id, handle);
     }
 
@@ -8973,6 +9063,20 @@ impl AgentManager {
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
     ) -> Result<String> {
+        self.ensure_started_with_codex_node(
+            agent_id,
+            workspace_id,
+            intent_providers::find_codex_node,
+        )
+        .await
+    }
+
+    async fn ensure_started_with_codex_node(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        find_codex_node: fn() -> Option<PathBuf>,
+    ) -> Result<String> {
         // Teardown fence (ghost-agent race): refuse to (re)spawn an agent a
         // `workspace.delete` batch stop (`stop_many`) is tearing down — its
         // session row is about to be cascade-deleted, so a lazy spawn here
@@ -9014,11 +9118,12 @@ impl AgentManager {
         let (session, rehomed) = self
             .rehome_if_provider_disabled(agent_id, workspace_id, session, &settings)
             .await?;
-        let mut resolved = resolve_spawn(
+        let mut resolved = resolve_spawn_with_codex_node(
             &session,
             workspace.as_ref(),
             &settings,
             self.chief_cwd_root.as_deref(),
+            find_codex_node,
         )?;
 
         // Check if the agent's model/provider has changed (via agent.setModel).
@@ -9089,6 +9194,8 @@ impl AgentManager {
                     }
                     self.maybe_persist_effort_change_notice(agent_id, workspace_id, &resolved)
                         .await;
+                    self.apply_fast_mode(agent_id, &acp, resolved.provider.id)
+                        .await?;
                     return Ok(acp);
                 }
                 // The child/transport died while the agent sat idle
@@ -9317,6 +9424,8 @@ impl AgentManager {
             .await;
         self.maybe_persist_effort_change_notice(agent_id, workspace_id, &resolved)
             .await;
+        self.apply_fast_mode(agent_id, &acp_session_id, resolved.provider.id)
+            .await?;
         self.spawn_attempt_provider.lock().unwrap().remove(agent_id);
         Ok(acp_session_id)
     }
@@ -10566,6 +10675,7 @@ pub(crate) fn workspace_naming_tool_reference(provider_id: &str) -> &'static str
 /// [`ProviderConfig::primary_binary_provider_id`]) → native-installer location
 /// where one exists (e.g. `~/.opencode/bin`) → `~/.augment/bin/<command>`
 /// (auggie back-compat tier) → enhanced PATH scan.
+#[cfg(test)]
 fn resolve_spawn(
     session: &AgentSession,
     workspace: Option<&intent_core::Workspace>,
@@ -11579,6 +11689,22 @@ async fn run_message_worker(
                 }
             }
         }
+        // This is a separate drain from the explicit send/kick paths. Hold
+        // admission through selection and turn preparation, never through the
+        // already-running provider turn above. Removal either sweeps first or
+        // waits for this instruction to become admitted work.
+        let instruction_authority = mgr.services.human_instruction_authority.read().await;
+        if mgr
+            .services
+            .discard_revoked_instructions(&agent_id)
+            .await
+            .is_err()
+        {
+            mgr.release_in_flight_slot(&agent_id);
+            break 'outer;
+        }
+        #[cfg(test)]
+        mgr.services.queue_drain_commit_pause.pause().await;
         // Batch flush (`agents.flushQueuedMessages`): same contract as the
         // `try_drain_queue` flush arm — ≥2 ready entries drain into one
         // combined provider turn; otherwise the single-entry arm below runs
@@ -11708,6 +11834,7 @@ async fn run_message_worker(
                 None => (Vec::new(), None),
             };
         if raced.is_empty() {
+            drop(instruction_authority);
             // monorepo#1297: heal a busy-misclassified terminal idle. The
             // turn's `agent:idle` is published while this worker still holds
             // the busy slot (`end_turn` above runs after `run_prompt_turn`
@@ -11764,6 +11891,7 @@ async fn run_message_worker(
                         // pre-release archived arm above.
                         mgr.clear_worker(&agent_id);
                         mgr.end_turn(&agent_id).await;
+                        drop(instruction_authority);
                         mgr.clone()
                             .try_drain_queue(agent_id.clone(), workspace_id.clone())
                             .await;
@@ -12471,9 +12599,13 @@ fn antigravity_setup_error(method: &str, error: &intent_acp::AcpError, rejection
                 "Antigravity {method}: agent stdout closed; no prompt was sent"
             ))
         }
-        AcpError::Auth(_) => Error::InvalidParams(crate::provider_auth::not_authenticated_message(
+        AcpError::Auth(_) => crate::host_execution::ai_authorization_error(
+            Error::InvalidParams(crate::provider_auth::not_authenticated_message(
+                "antigravity",
+            )),
             "antigravity",
-        )),
+            intent_core::execution::ExecutionAuthorizationReason::Rejected,
+        ),
         _ => Error::InvalidParams(rejection),
     }
 }
@@ -12740,6 +12872,7 @@ async fn publish_terminal_failure_events(
     error_msg: &str,
     turn_id: Option<&str>,
     provider_source: FailedProviderSource,
+    authorization: Option<&intent_core::execution::ExecutionAuthorizationFailure>,
 ) {
     use intent_core::events::{AGENT_FAILED, AGENT_STREAM_END};
 
@@ -12752,6 +12885,9 @@ async fn publish_terminal_failure_events(
         "failed",
     );
     let mut failed_data = json!({ "agentId": agent_id.0, "error": error_msg });
+    if let Some(auth) = authorization {
+        failed_data["executionAuthorization"] = json!(auth);
+    }
     let mut end_data = json!({ "agentId": agent_id.0 });
     if let Some(tid) = turn_id {
         failed_data["turnId"] = json!(tid);
@@ -13272,6 +13408,7 @@ async fn handle_terminal_spawn_failure(
         &error_text,
         options.turn_id.as_deref(),
         FailedProviderSource::SpawnAttempt,
+        error.execution_authorization(),
     )
     .await;
     publish_error_status_and_requeue(
@@ -13318,6 +13455,7 @@ async fn handle_drain_persist_failure(
         &error_text,
         options.turn_id.as_deref(),
         FailedProviderSource::CommittedTurn,
+        None,
     )
     .await;
     publish_error_status_and_requeue(
@@ -13850,6 +13988,7 @@ async fn handle_terminal_turn_failure(
             &error_text,
             options.turn_id.as_deref(),
             FailedProviderSource::CommittedTurn,
+            error.execution_authorization(),
         )
         .await;
     }
@@ -16215,6 +16354,7 @@ mod dead_child_respawn_tests {
             spawned_model: None,
             spawned_provider: "node".to_string(),
             thought_level: None,
+            config_options: None,
             confirmed_effort: None,
             wake_gate: Arc::new(AtomicUsize::new(0)),
             wake_listener: None,
@@ -17696,6 +17836,7 @@ mod thought_level_tests {
                 session_id: "sid-1".into(),
                 modes: None,
                 thought_level: Some(option("medium")),
+                config_options: None,
             };
             mgr.services
                 .persist_session_effort_levels(
@@ -17744,6 +17885,7 @@ mod thought_level_tests {
                 session_id: "sid-1".into(),
                 modes: None,
                 thought_level: Some(option("medium")),
+                config_options: None,
             };
             mgr.services
                 .persist_session_effort_levels(
@@ -20180,3 +20322,7 @@ mod agent_retry_tests {
 #[cfg(all(test, unix))]
 #[path = "agent_manager/effort_notice_tests.rs"]
 mod effort_notice_tests;
+
+#[cfg(all(test, unix))]
+#[path = "agent_manager/fast_mode_tests.rs"]
+mod fast_mode_tests;

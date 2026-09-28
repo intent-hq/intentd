@@ -157,6 +157,7 @@ async fn effort_notice_uses_saved_default_only_for_matching_resumed_identity() {
         .is_empty());
     let record = mgr.services.store.get_agent_session(&id).await.unwrap();
     let opened = AcpSessionOpened {
+        config_options: None,
         session_id: "sid-1".into(),
         modes: None,
         thought_level: Some(option("high")),
@@ -261,6 +262,7 @@ async fn effort_notice_does_not_claim_auto_without_a_known_resumed_default() {
     turn(&mgr, &id, &conn, Some("high")).await;
     let record = mgr.services.store.get_agent_session(&id).await.unwrap();
     let mut opened = AcpSessionOpened {
+        config_options: None,
         session_id: "sid-1".into(),
         modes: None,
         thought_level: Some(option("high")),

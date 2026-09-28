@@ -15,6 +15,7 @@ use crate::reverse::ReverseChannel;
 pub(crate) struct Connection {
     pub(crate) authorized: bool,
     operation: Option<Operation>,
+    last_status: Option<Value>,
 }
 
 pub(crate) struct Request {
@@ -148,9 +149,12 @@ impl Connection {
                 }
             }
         }
-        self.operation
-            .as_ref()
-            .map(|op| success_frame(&id, &json!(op.status())))
+        let status = self.operation.as_ref().map(|op| json!(op.status()));
+        if status != self.last_status {
+            let _ = api.notify_execution_setup_changed().await;
+            self.last_status.clone_from(&status);
+        }
+        status.map(|status| success_frame(&id, &status))
     }
 }
 

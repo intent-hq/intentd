@@ -10,10 +10,9 @@
 //!   CLIs, dev tooling) and connections without the capability (FE auxiliary
 //!   `JsonRpcClient`s) are never candidates — this is what fixes the REV-1
 //!   misrouting where the first arrival won regardless of what it could do.
-//!   A connection bound to a non-administrator principal is never a
-//!   candidate either (multiplayer w3; [`super::ReverseChannel::is_administrator`]):
-//!   its `client.hello` is not bound onto the entry, so it is also absent from
-//!   the presence projections and the `client:*` transitions.
+//!   Guest hellos enter only the device roster. Current members can host
+//!   ordinary workspace browsers; each dispatch rechecks their authority.
+//!   Chief and host reverse requests select only administrator connections.
 //! - [`ReverseTarget::Default`] → the **first-connected** eligible connection
 //!   (unchanged single-desktop behaviour); none → `NoClient`.
 //! - [`ReverseTarget::Client`] / [`ReverseTarget::Pinned`] → the **newest**
@@ -54,7 +53,7 @@ use super::{request_timeout, ReverseChannel};
 /// Global events (empty `workspaceId`, like `settings:changed`) published
 /// when a logical client gains its first / loses its last live hello'd
 /// connection (REV-2, §6). Defined in the canonical taxonomy so the
-/// collaborator allowlist golden classifies them (owner-only, multiplayer w3).
+/// collaborator allowlist golden classifies them (guests receive only their own).
 pub use intent_core::events::{CLIENT_CONNECTED, CLIENT_DISCONNECTED};
 
 /// Which listener accepted a registered connection.
@@ -122,6 +121,11 @@ pub enum ClientTransition {
     /// re-hello under another `clientId`, panic, or task abort
     /// (⇒ `client:disconnected`).
     Disconnected(ReverseClientIdentity),
+    /// Authenticated roster transition; independent of browser eligibility.
+    Device {
+        event_type: &'static str,
+        data: Value,
+    },
 }
 
 impl ClientTransition {
@@ -131,16 +135,25 @@ impl ClientTransition {
         match self {
             ClientTransition::Connected(_) => CLIENT_CONNECTED,
             ClientTransition::Disconnected(_) => CLIENT_DISCONNECTED,
+            ClientTransition::Device { event_type, .. } => event_type,
         }
     }
 
     /// The identity carried by the transition.
     #[must_use]
-    pub fn identity(&self) -> &ReverseClientIdentity {
+    pub fn identity(&self) -> Option<&ReverseClientIdentity> {
         match self {
             ClientTransition::Connected(identity) | ClientTransition::Disconnected(identity) => {
-                identity
+                Some(identity)
             }
+            ClientTransition::Device { .. } => None,
+        }
+    }
+
+    fn data(&self) -> Value {
+        match self {
+            Self::Device { data, .. } => data.clone(),
+            Self::Connected(identity) | Self::Disconnected(identity) => identity.event_data(),
         }
     }
 }
@@ -172,6 +185,12 @@ impl LiveClient {
     #[must_use]
     pub fn to_wire(&self) -> ReverseLiveClient {
         ReverseLiveClient {
+            principal_id: None,
+            host_role: None,
+            login: None,
+            display_name: None,
+            avatar_url: None,
+            identity: None,
             client_id: self.client_id.clone(),
             name: self.name.clone(),
             capabilities: self.capabilities.clone(),
@@ -218,6 +237,8 @@ struct State {
     /// host-identity lookup on the `browser.*` write path) so it never walks
     /// `entries`. Maintained by `bind` / removal alongside `presence`.
     bound: HashMap<u64, ClientId>,
+    /// Maintained on mutation, so roster reads clone only the returned rows.
+    devices: Vec<ReverseLiveClient>,
 }
 
 impl State {
@@ -307,15 +328,15 @@ struct Entry {
     /// (`0` before the first hello). Orders hellos across connections so
     /// "newest hello wins" keys on hello order, not registration order.
     hello_seq: u64,
+    device: Option<devices::DeviceBinding>,
+    device_managed: bool,
 }
 
 impl Entry {
-    /// An eligible reverse target advertised `browserExec` **and** is the
-    /// administrator's connection (multiplayer w3): a connection bound to a
-    /// non-administrator principal never hosts tabs or serves reverse RPCs,
-    /// whatever its hello claims.
+    /// Browser targets need both the advertised capability and independently
+    /// authenticated owner/member authority. Request dispatch rechecks members.
     fn is_eligible(&self) -> bool {
-        self.channel.is_administrator()
+        self.channel.may_host_browser()
             && self
                 .identity
                 .as_ref()
@@ -341,10 +362,13 @@ impl Inner {
         let mut state = self.lock();
         let pos = state.entries.iter().position(|e| e.id == id)?;
         let entry = state.entries.remove(pos)?;
+        if entry.device_managed {
+            state.refresh_devices(&self.transitions);
+        }
         state.bound.remove(&id);
         if let Some(identity) = entry.identity {
             state.presence_remove(&identity.client_id);
-            if !state.presence.contains_key(&identity.client_id) {
+            if !entry.device_managed && !state.presence.contains_key(&identity.client_id) {
                 let _ = self
                     .transitions
                     .send(ClientTransition::Disconnected(identity));
@@ -360,15 +384,23 @@ fn resolve_entry<'a>(
     entries: &'a VecDeque<Entry>,
     target: &ReverseTarget,
 ) -> Result<&'a Entry, ReverseDispatchError> {
+    resolve_entry_matching(entries, target, |_| true)
+}
+
+fn resolve_entry_matching<'a>(
+    entries: &'a VecDeque<Entry>,
+    target: &ReverseTarget,
+    allowed: impl Fn(&Entry) -> bool,
+) -> Result<&'a Entry, ReverseDispatchError> {
     match target {
         ReverseTarget::Default => entries
             .iter()
-            .find(|e| e.is_eligible())
+            .find(|e| e.is_eligible() && allowed(e))
             .ok_or(ReverseDispatchError::NoClient),
         ReverseTarget::Client(client_id) | ReverseTarget::Pinned(client_id) => entries
             .iter()
             .rev()
-            .find(|e| e.is_eligible() && e.has_client(client_id))
+            .find(|e| e.is_eligible() && e.has_client(client_id) && allowed(e))
             .ok_or_else(|| ReverseDispatchError::ClientOffline {
                 client_id: client_id.clone(),
                 name: entries
@@ -411,6 +443,8 @@ impl PrimaryReverseRegistry {
             connected_at: now_iso(),
             identity: None,
             hello_seq: 0,
+            device: None,
+            device_managed: false,
         });
         PrimaryReverseGuard {
             registry: Some(self.inner.clone()),
@@ -615,13 +649,53 @@ impl AgentReverseDispatch for PrimaryReverseRegistry {
             .collect()
     }
 
+    fn authenticated_clients(&self) -> Vec<ReverseLiveClient> {
+        self.inner.lock().devices.clone()
+    }
+
+    fn client_profile_changed(&self, principal: &intent_core::PrincipalId) {
+        let state = self.inner.lock();
+        for row in state
+            .devices
+            .iter()
+            .filter(|row| row.principal_id.as_ref() == Some(principal))
+        {
+            State::queue_device(
+                &self.inner.transitions,
+                intent_core::events::CLIENT_UPDATED,
+                row,
+            );
+        }
+    }
+
+    fn client_principal_removed(&self, principal: &intent_core::PrincipalId) {
+        let mut state = self.inner.lock();
+        for entry in &mut state.entries {
+            if entry
+                .device
+                .as_ref()
+                .is_some_and(|d| &d.principal_id == principal)
+            {
+                entry.device = None;
+            }
+        }
+        state.refresh_devices(&self.inner.transitions);
+    }
+
     fn dispatch<'a>(
         &'a self,
         method: &'a str,
         params: Value,
         target: ReverseTarget,
     ) -> BoxFuture<'a, Result<Value, ReverseDispatchError>> {
-        let channel = resolve_entry(&self.inner.lock().entries, &target).map(|e| e.channel.clone());
+        let member_scope = method == "browser.exec"
+            && params["workspaceId"]
+                .as_str()
+                .is_some_and(|ws| !ws.is_empty() && !intent_core::WorkspaceId::from(ws).is_chief());
+        let channel = resolve_entry_matching(&self.inner.lock().entries, &target, |entry| {
+            member_scope || entry.channel.is_administrator()
+        })
+        .map(|e| e.channel.clone());
         Box::pin(async move {
             let channel = channel?;
             let timeout = request_timeout(method, &params);
@@ -652,7 +726,7 @@ async fn publish_client_event(api: &dyn WorkspaceApi, transition: &ClientTransit
         .publish_event(intent_core::PublishEvent {
             workspace_id: WorkspaceId::from_string(String::new()),
             event_type: event_type.to_string(),
-            data: transition.identity().event_data(),
+            data: transition.data(),
         })
         .await
     {
@@ -695,8 +769,7 @@ impl PrimaryReverseGuard {
     /// connection was the last of, then a `Connected` for a new `clientId`
     /// with no other live connection) under the registry lock.
     ///
-    /// A non-administrator connection's hello is not bound at all (multiplayer
-    /// w3): the entry keeps no identity, so it never appears in
+    /// A guest connection's hello is not bound at all: the entry keeps no identity, so it never appears in
     /// [`PrimaryReverseRegistry::live_clients`] / `host_presence`, never
     /// reports as a tab host, and never queues a `client:*` transition —
     /// whatever `clientId` or `browserExec` it advertised.
@@ -712,9 +785,10 @@ impl PrimaryReverseGuard {
         let Some(pos) = state.entries.iter().position(|e| e.id == self.id) else {
             return;
         };
-        if !state.entries[pos].channel.is_administrator() {
+        if !state.entries[pos].channel.may_host_browser() {
             return;
         }
+        let device_managed = state.entries[pos].device_managed;
         state.entries[pos].hello_seq = inner.next_hello_seq.fetch_add(1, Ordering::Relaxed) + 1;
         let previous = state.entries[pos].identity.replace(identity.clone());
         state.bound.insert(self.id, identity.client_id.clone());
@@ -728,7 +802,7 @@ impl PrimaryReverseGuard {
         }
         if let Some(previous) = previous {
             state.presence_remove(&previous.client_id);
-            if !state.presence.contains_key(&previous.client_id) {
+            if !device_managed && !state.presence.contains_key(&previous.client_id) {
                 let _ = inner
                     .transitions
                     .send(ClientTransition::Disconnected(previous));
@@ -736,11 +810,35 @@ impl PrimaryReverseGuard {
         }
         let first_connection = !state.presence.contains_key(&identity.client_id);
         state.presence_add(&identity);
-        if first_connection {
+        if first_connection && !device_managed {
             let _ = inner
                 .transitions
                 .send(ClientTransition::Connected(identity));
         }
+    }
+}
+
+impl PrimaryReverseGuard {
+    /// Withdraw browser hosting after an authority change, retaining the
+    /// registration so a later legitimate role upgrade can bind it again.
+    pub(crate) fn unbind(&self) {
+        let Some(inner) = &self.registry else { return };
+        let mut state = inner.lock();
+        let Some(entry) = state.entries.iter_mut().find(|e| e.id == self.id) else {
+            return;
+        };
+        let Some(identity) = entry.identity.take() else {
+            return;
+        };
+        let device_managed = entry.device_managed;
+        state.bound.remove(&self.id);
+        state.presence_remove(&identity.client_id);
+        if !device_managed && !state.presence.contains_key(&identity.client_id) {
+            let _ = inner
+                .transitions
+                .send(ClientTransition::Disconnected(identity));
+        }
+        state.refresh_devices(&inner.transitions);
     }
 }
 
@@ -756,3 +854,5 @@ impl Drop for PrimaryReverseGuard {
 
 #[cfg(test)]
 mod tests;
+
+mod devices;

@@ -970,9 +970,15 @@ pub(crate) fn provider_is_disabled(
     provider_id: &str,
     enabled: Option<&std::collections::BTreeMap<String, bool>>,
 ) -> bool {
-    let disableable =
-        intent_providers::find_provider(provider_id).is_some_and(|p| p.can_be_disabled);
-    disableable && enabled.is_some_and(|m| m.get(provider_id) == Some(&false))
+    intent_providers::find_provider(provider_id)
+        .is_some_and(|provider| provider_config_is_disabled(provider, enabled))
+}
+
+fn provider_config_is_disabled(
+    provider: &intent_providers::ProviderConfig,
+    enabled: Option<&std::collections::BTreeMap<String, bool>>,
+) -> bool {
+    provider.can_be_disabled && enabled.is_some_and(|m| m.get(provider.id) == Some(&false))
 }
 
 /// Where a turn-start re-home lands (intent-hq/intent#5737): the target
@@ -1101,10 +1107,14 @@ pub(crate) fn ensure_provider_authenticated(
     if auth_verdict != Some(false) {
         return Ok(());
     }
-    Err(Error::InvalidParams(format!(
-        "{method}: {}",
-        crate::provider_auth::not_authenticated_message(provider_id)
-    )))
+    Err(crate::host_execution::ai_authorization_error(
+        Error::InvalidParams(format!(
+            "{method}: {}",
+            crate::provider_auth::not_authenticated_message(provider_id)
+        )),
+        provider_id,
+        intent_core::execution::ExecutionAuthorizationReason::Missing,
+    ))
 }
 
 /// The runnability half of [`ensure_provider_available`], with the npx probe
@@ -1188,7 +1198,7 @@ enum PopCommit {
 #[derive(Debug, Clone)]
 pub(crate) struct QueueEntryGate {
     principal_id: PrincipalId,
-    is_administrator: bool,
+    host_role: intent_core::HostRole,
     author_only: bool,
     fallback: Option<PrincipalId>,
 }
@@ -1203,7 +1213,7 @@ impl QueueEntryGate {
         );
         let caller = intent_core::Caller::Wire {
             principal_id: self.principal_id.clone(),
-            is_administrator: self.is_administrator,
+            host_role: self.host_role,
         };
         if !intent_core::queue_attribution_visible_to(&caller, &attribution) {
             return Err(Error::InvalidParams(format!(
@@ -1416,9 +1426,14 @@ impl QueuedMessage {
     }
 
     /// The ready-to-send predicate shared by every drain path and idle gate
-    /// (PROTOCOL §5.5/§6.5): not under edit and not held.
+    /// (PROTOCOL §5.5/§6.5): not under edit, held, or awaiting a destination
+    /// owner's explicit authorization for an imported human instruction.
     pub(crate) fn ready_to_send(&self) -> bool {
-        !self.editing && !self.is_held()
+        !self.editing
+            && !self.is_held()
+            && !intent_core::human_author::is_unbound_historical_human(
+                self.message_metadata.as_ref(),
+            )
     }
 }
 
@@ -6037,7 +6052,11 @@ impl Services {
                 })?;
             let metadata = match obj.get("metadata") {
                 Some(Value::Null) | None => None,
-                Some(v) => Some(v.clone()),
+                Some(v) => {
+                    let mut metadata = v.clone();
+                    intent_core::human_author::strip_historical_human_author(&mut metadata);
+                    Some(metadata)
+                }
             };
             let created_at = match obj.get("timestamp").or_else(|| obj.get("createdAt")) {
                 Some(Value::String(s)) => s.clone(),
@@ -6499,12 +6518,12 @@ impl Services {
     ) -> Result<Option<QueueEntryGate>> {
         let Some(intent_core::Caller::Wire {
             principal_id,
-            is_administrator,
+            host_role,
         }) = intent_core::current_caller()
         else {
             return Ok(None);
         };
-        if is_administrator && !author_only {
+        if host_role == intent_core::HostRole::Owner && !author_only {
             return Ok(None);
         }
         let workspace_id = self.agent_workspace(agent_id).await?;
@@ -6513,10 +6532,60 @@ impl Services {
             .await;
         Ok(Some(QueueEntryGate {
             principal_id,
-            is_administrator,
+            host_role,
             author_only,
             fallback,
         }))
+    }
+
+    /// Resolve current owner/credential authority and retain both guards through
+    /// the imported entry's synchronous pop. Normal local/nonhuman entries keep
+    /// their existing path. An entry that appears later fails closed at pop.
+    pub(crate) async fn destination_owner_queue_authorization(
+        &self,
+        agent_id: &AgentId,
+        message_id: &str,
+    ) -> Result<Option<DestinationOwnerQueueAuthorization>> {
+        use intent_core::caller::{current_wire_credential, WireCredential};
+        if !self
+            .find_queued_message(agent_id, message_id)
+            .is_some_and(|entry| {
+                intent_core::human_author::is_unbound_historical_human(
+                    entry.message_metadata.as_ref(),
+                )
+            })
+        {
+            return Ok(None);
+        }
+        let Some(intent_core::Caller::Wire { principal_id, .. }) = intent_core::current_caller()
+        else {
+            return Ok(None);
+        };
+        let credential = current_wire_credential();
+        if credential
+            .as_ref()
+            .is_some_and(|c| c.principal_id() != &principal_id)
+        {
+            return Err(Error::Forbidden(
+                "admitted credential principal mismatch".into(),
+            ));
+        }
+        let lease = match credential.as_ref() {
+            Some(WireCredential::Legacy { authority, .. }) => Some(authority.authorize().await?),
+            _ => None,
+        };
+        let token_hash = match credential.as_ref() {
+            Some(WireCredential::Principal { token_hash, .. }) => Some(token_hash.as_str()),
+            _ => None,
+        };
+        Ok(self
+            .store
+            .owner_queue_permit(&principal_id, token_hash)
+            .await?
+            .map(|owner| DestinationOwnerQueueAuthorization {
+                _owner: owner,
+                _credential: lease,
+            }))
     }
 
     /// Test seam (intentd#2068): park a GATED per-id queue mutation between
@@ -7089,19 +7158,29 @@ impl Services {
     ) -> Result<Value> {
         // Fail closed on a nonexistent target BEFORE touching the queue
         // (monorepo#564).
+        self.discard_revoked_instructions(&agent_id).await?;
         let session = self.require_agent_session(&agent_id).await?;
         let _mutation = self.workspace_mutations.enter(&session.workspace_id)?;
         let workspace_id = session.workspace_id.clone();
         let gate = self.queue_entry_gate(&agent_id, false).await?;
         self.park_queue_mutation_gate(gate.as_ref()).await;
+        let destination_owner = self
+            .destination_owner_queue_authorization(&agent_id, &message_id)
+            .await?;
         // Atomic dequeue; the entry stays listed in queue snapshots (§6.5
         // drain ordering) until `draining` is dropped right before the shrunk
         // publish below.
         let (mut entry, draining) = self
-            .take_queued_message_draining_gated(&agent_id, &message_id, gate.as_ref())?
+            .take_queued_message_draining_gated(
+                &agent_id,
+                &message_id,
+                gate.as_ref(),
+                destination_owner.as_ref(),
+            )?
             .ok_or_else(|| {
                 Error::InvalidParams(format!("queued message not found: {message_id}"))
             })?;
+        drop(destination_owner);
         // Identity link: parity with the runtime path.
         crate::agent_manager::stamp_queued_message_id(&mut entry);
         // Durable shrink now; the shrunk `agent:queue:updated` is published
@@ -15105,7 +15184,7 @@ impl Services {
         agent_id: &AgentId,
         message_id: &str,
     ) -> Option<(QueuedMessage, DrainingGuard)> {
-        self.take_queued_message_draining_gated(agent_id, message_id, None)
+        self.take_queued_message_draining_gated(agent_id, message_id, None, None)
             .ok()
             .flatten()
     }
@@ -15121,12 +15200,14 @@ impl Services {
     /// against the entry INSIDE the pop's critical section (draining overlay
     /// lock → `agent_queues` lock): a refused entry is left in place untouched
     /// and the refusal surfaces as `Err`; `Ok(None)` is the ordinary absent
-    /// id. `None` for `gate` pops unconditionally.
+    /// id. Historical unbound humans additionally require an affirmative
+    /// current destination owner; an absent gate never grants that authority.
     pub(crate) fn take_queued_message_draining_gated(
         &self,
         agent_id: &AgentId,
         message_id: &str,
         gate: Option<&QueueEntryGate>,
+        destination_owner: Option<&DestinationOwnerQueueAuthorization>,
     ) -> Result<Option<(QueuedMessage, DrainingGuard)>> {
         let mut refused = None;
         let popped = self.pop_draining(
@@ -15143,6 +15224,15 @@ impl Services {
                         refused = Some(e);
                         return None;
                     }
+                }
+                if intent_core::human_author::is_unbound_historical_human(
+                    queue[idx].message_metadata.as_ref(),
+                ) && destination_owner.is_none()
+                {
+                    refused = Some(Error::Forbidden(
+                        "imported human instruction requires the destination owner".into(),
+                    ));
+                    return None;
                 }
                 Some(queue.remove(idx))
             },
@@ -16666,4 +16756,11 @@ impl Services {
 
         Ok(())
     }
+}
+
+/// Opaque positive authorization; only the durable role/credential validator can
+/// construct one, and its guards remain held while the queue lock is acquired.
+pub(crate) struct DestinationOwnerQueueAuthorization {
+    _owner: intent_store::OwnerQueuePermit,
+    _credential: Option<intent_core::caller::CredentialLease>,
 }
