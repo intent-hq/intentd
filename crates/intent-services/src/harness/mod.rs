@@ -2,7 +2,7 @@
 //! owner of every system-generated string that shapes an agent's system
 //! prompt or per-turn prompt envelope.
 //!
-//! One trait, one module per version. [`Harness`] exposes a method per text
+//! One trait, versioned registry entries. [`Harness`] exposes a method per text
 //! surface; each version implements it ([`v1`] = the post-#2457 set,
 //! byte-pinned by `crate::v1_goldens` and
 //! `agent_manager::v1_turn_envelope_goldens`; [`v1_1`] reuses v1's text
@@ -34,7 +34,7 @@
 //! Each version also owns a [`Doctrine`] — its bundled instruction/specialist
 //! markdown set under `resources/agent-instructions/<ver>/` and
 //! `resources/specialists/<ver>/` — and the [`REGISTRY`] maps the stamped
-//! session `harnessVersion` (`"1.0"` through `"2.9"`) to the pair, so a session
+//! session `harnessVersion` (`"1.0"` through `"3.0"`) to the pair, so a session
 //! keeps assembling the exact doctrine
 //! it was created with even after the binary ships a newer set. All past
 //! versions stay bundled.
@@ -52,7 +52,7 @@ pub(crate) mod v2_7;
 pub(crate) mod v2_8;
 pub(crate) mod v2_9;
 
-// Pure candidate only: no registry entry, version activation or delivery hook.
+// Context rendering is admitted separately from the versioned text bundle.
 #[cfg_attr(not(test), expect(dead_code))]
 pub(crate) mod repository_guidance_v3;
 
@@ -501,10 +501,20 @@ pub(crate) struct Doctrine {
 /// drift.
 pub(crate) const LATEST_VERSION: &str = intent_core::CURRENT_HARNESS_VERSION;
 
+/// Version 3.0 identifies optional repository-context guidance at consuming
+/// boundaries. Its ordinary text, doctrine and feature defaults remain 2.9's;
+/// this entry does not enable the callback selector.
+static V3_ENTRY: HarnessEntry = HarnessEntry {
+    version: "3.0",
+    harness: v2_9::ENTRY.harness,
+    doctrine: v2_9::ENTRY.doctrine,
+    default_features: AgentFeaturesSettings::default,
+    feature_labels: v1::FEATURE_LABELS,
+};
+
 /// Every bundled harness version, oldest first. All past versions stay
 /// bundled so an old session keeps resolving the doctrine it was created
-/// with. Adding a version = a `resources/**/<ver>/` directory + a module +
-/// one row here.
+/// with. A version with unchanged text and doctrine may reuse their references.
 static REGISTRY: &[&HarnessEntry] = &[
     &v1::ENTRY,
     &v1_1::ENTRY,
@@ -518,6 +528,7 @@ static REGISTRY: &[&HarnessEntry] = &[
     &v2_7::ENTRY,
     &v2_8::ENTRY,
     &v2_9::ENTRY,
+    &V3_ENTRY,
 ];
 
 /// The registry row for [`LATEST_VERSION`]. A unit test pins that the row
@@ -574,7 +585,22 @@ mod tests {
     fn registry_resolves_stamped_current_version() {
         let entry = resolve_entry(intent_core::CURRENT_HARNESS_VERSION);
         assert_eq!(entry.version, intent_core::CURRENT_HARNESS_VERSION);
-        assert_eq!(entry.version, "2.9");
+        assert_eq!(entry.version, "3.0");
+        let previous = resolve_entry("2.9");
+        assert_eq!(previous.version, "2.9");
+        let member = |h: &dyn Harness| {
+            h.host_member_sender_preamble(HostMemberSender {
+                login: Some("same"),
+                display_name: Some("Same Person"),
+                principal_id: "person-1",
+                identity: None,
+            })
+        };
+        assert_eq!(member(entry.harness), member(previous.harness));
+        assert_ne!(member(entry.harness), member(resolve_entry("2.8").harness));
+        assert!(std::ptr::eq(entry.doctrine, previous.doctrine));
+        assert_eq!((entry.default_features)(), (previous.default_features)());
+        assert_eq!(entry.feature_labels, previous.feature_labels);
         assert_eq!(next_steps(entry.harness), next_steps(&v2_4::V2_4));
         assert_ne!(next_steps(entry.harness), next_steps(&v2_3::V2_3));
         assert_ne!(next_steps(entry.harness), next_steps(&v1::V1));

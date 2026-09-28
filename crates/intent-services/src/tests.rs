@@ -46861,6 +46861,7 @@ mod harness_versioning {
         let (_tmp, svc, ws) = setup().await;
         let created = create_agent(&svc, &ws, None).await;
         let agent = &created["agent"];
+        assert_eq!(agent["harnessVersion"], "3.0");
         assert_eq!(
             agent["harnessVersion"],
             intent_core::CURRENT_HARNESS_VERSION,
@@ -46885,6 +46886,50 @@ mod harness_versioning {
         let persisted = session.harness_features.expect("persisted snapshot");
         assert_eq!(persisted["taskGraph"], serde_json::json!(true));
         assert_eq!(persisted["peerAgents"], serde_json::json!(true));
+        let full = svc.agent_get_session_op(id).await.expect("getSession");
+        assert_eq!(full.harness_version, "3.0");
+        assert_eq!(full.harness_features.as_ref(), Some(&persisted));
+        assert_eq!(agent["harnessFeatures"], persisted);
+    }
+
+    #[tokio::test]
+    async fn child_of_saved_2_9_keeps_parent_stamp_and_snapshot() {
+        let (_tmp, svc, ws) = setup().await;
+        let created = create_agent(&svc, &ws, None).await;
+        let parent_id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+        let mut saved_features = created["agent"]["harnessFeatures"].clone();
+        saved_features["hostExec"] = serde_json::json!(false);
+        saved_features["peerAgents"] = serde_json::json!(false);
+        sqlx::query(
+            "UPDATE agent_session SET harness_version = '2.9', harness_features = ? WHERE id = ?",
+        )
+        .bind(saved_features.to_string())
+        .bind(&parent_id.0)
+        .execute(svc.store().write_pool())
+        .await
+        .unwrap();
+        let child = create_agent(&svc, &ws, Some(parent_id.clone())).await;
+        assert_eq!(child["agent"]["harnessVersion"], "3.0");
+        assert_eq!(child["agent"]["harnessFeatures"]["hostExec"], true);
+        assert_eq!(child["agent"]["harnessFeatures"]["peerAgents"], true);
+        let child_id = AgentId::from(child["agent"]["id"].as_str().unwrap());
+        let child_row = svc.store().get_agent_session(&child_id).await.unwrap();
+        assert_eq!(child_row.harness_version, "3.0");
+        assert_eq!(child_row.parent_agent_id.as_ref(), Some(&parent_id));
+        assert_eq!(
+            child_row.harness_features.as_ref(),
+            Some(&child["agent"]["harnessFeatures"])
+        );
+        let child_full = svc.agent_get_session_op(child_id).await.unwrap();
+        assert_eq!(child_full.harness_version, "3.0");
+        assert_eq!(child_full.harness_features, child_row.harness_features);
+        let parent = svc.store().get_agent_session(&parent_id).await.unwrap();
+        assert_eq!(parent.harness_version, "2.9");
+        assert_eq!(parent.harness_features.as_ref(), Some(&saved_features));
+        assert!(!svc.session_agent_features(&parent).peer_agents);
+        let parent_full = svc.agent_get_session_op(parent_id).await.unwrap();
+        assert_eq!(parent_full.harness_version, "2.9");
+        assert_eq!(parent_full.harness_features.as_ref(), Some(&saved_features));
     }
 
     /// Delegation mints LATEST, never inherits: a child created by a parent

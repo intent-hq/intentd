@@ -2158,17 +2158,46 @@ impl NativeHarness {
                 ),
             ],
         );
-        let mut row = json!({
-            "id":intent_core::AgentId::new(),"workspaceId":git.workspace.id,
-            "name":"original manager read","provider":"claude-code","status":"idle",
-            "harnessVersion":stamp,"createdAt":"2026-09-28T00:00:00Z",
-            "updatedAt":"2026-09-28T00:00:00Z"
-        });
-        if stamp == "<missing>" {
-            row.as_object_mut().unwrap().remove("harnessVersion");
-        }
-        let row: intent_core::AgentSession = serde_json::from_value(row).unwrap();
-        original.store.insert_agent_session(&row).await.unwrap();
+        let row = if stamp == "<created>" {
+            // Exercise the real creation path; never assign its harness stamp.
+            let created = original
+                .agent_create_op(
+                    git.workspace.id.clone(),
+                    Some("created manager read".into()),
+                    Some("fixture-model".into()),
+                    None,
+                    None,
+                    None,
+                    false,
+                    intent_core::AgentCreateExtra {
+                        provider: Some("claude-code".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(created["agent"]["harnessVersion"], "3.0");
+            let id = intent_core::AgentId::from(created["agent"]["id"].as_str().unwrap());
+            let row = original.store.get_agent_session(&id).await.unwrap();
+            assert_eq!(
+                row.harness_features.as_ref(),
+                Some(&created["agent"]["harnessFeatures"])
+            );
+            row
+        } else {
+            let mut row = json!({
+                "id":intent_core::AgentId::new(),"workspaceId":git.workspace.id,
+                "name":"original manager read","provider":"claude-code","status":"idle",
+                "harnessVersion":stamp,"createdAt":"2026-09-28T00:00:00Z",
+                "updatedAt":"2026-09-28T00:00:00Z"
+            });
+            if stamp == "<missing>" {
+                row.as_object_mut().unwrap().remove("harnessVersion");
+            }
+            let row: intent_core::AgentSession = serde_json::from_value(row).unwrap();
+            original.store.insert_agent_session(&row).await.unwrap();
+            row
+        };
         let manager = Arc::new(AgentManager::new(
             original.as_ref().clone(),
             Arc::new(BusEventSink::new(bus)),
@@ -4553,6 +4582,45 @@ mod live_context {
         assert_eq!(h.f.writes().await, 1);
         let inspect = h.node.call("fixture/inspect", json!({})).await;
         assert_eq!(count_requests(&inspect, "session/new"), 1);
+        h.finish().await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn confirmed_context_actual_created_3_0_reaches_original_guidance_boundary() {
+        let h = NativeHarness::observed("<created>", true, false, None, None).await;
+        let created = h.f.stored().await;
+        assert_eq!(created.harness_version, "3.0");
+        assert!(created.harness_features.is_some());
+        select(&h, RepositorySelectionChange::Automatic).await;
+        let id = h.start().await;
+        let name = h.confirmed(0).await;
+        let reply = h.call(0, &name, "return await ws.pr.snapshot(4);").await;
+        assert!(reply.to_string().contains("actual review"), "{reply}");
+        assert!(reply.to_string().contains(FACTS), "{reply}");
+        let http = h.http.count();
+        assert!(http > 0);
+        dispatch(&h, &id, capture(&h).await, "actual created prompt")
+            .await
+            .unwrap();
+        let frames = prompts(&h).await;
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["params"]["sessionId"], id);
+        assert!(frames[0].to_string().contains(FACTS));
+        assert_eq!(
+            h.http.count(),
+            http,
+            "prompt facts acquire no private review"
+        );
+        let saved = h.f.stored().await;
+        assert_eq!(saved.harness_version, created.harness_version);
+        assert_eq!(saved.harness_features, created.harness_features);
+        let full = h
+            .original
+            .agent_get_session_op(created.id.clone())
+            .await
+            .unwrap();
+        assert_eq!(full.harness_version, "3.0");
+        assert_eq!(full.harness_features, created.harness_features);
         h.finish().await;
     }
 
