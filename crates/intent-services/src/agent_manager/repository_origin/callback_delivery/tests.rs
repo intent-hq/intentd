@@ -3749,3 +3749,364 @@ async fn confirmed_read_hard_stop_retires_delivery_but_keeps_accepted_ordinary_r
     assert_eq!(h.f.writes().await, 1);
     h.finish().await;
 }
+
+// Combined alias coverage uses the delivered original manager endpoint. All
+// helpers above, the production decorator and the imported aliases stay exact.
+mod confirmed_aliases {
+    use super::*;
+
+    const MR: &str = "/api/v4/projects/group%2Fproject/merge_requests/4";
+
+    fn expression(namespace: &str, raw: bool) -> String {
+        if raw {
+            format!("host({{method:'{namespace}.snapshot',args:{{prNumber:4}}}})")
+        } else {
+            format!("ws.{namespace}.snapshot(4)")
+        }
+    }
+
+    fn json_result(reply: &Value) -> Value {
+        // The retained Query's MCP client returns CallToolResult directly.
+        assert_eq!(reply["isError"], false, "{reply}");
+        let text = reply["content"][0]["text"].as_str().unwrap();
+        let encoded: String = serde_json::from_str(text).unwrap();
+        serde_json::from_str(&encoded).unwrap()
+    }
+
+    fn delivery_refused(reply: &Value) {
+        assert_eq!(
+            reply,
+            &json!({"content":[{"type":"text","text":"Private result delivery refused"}],"isError":true}),
+            "{reply}"
+        );
+    }
+
+    fn no_spill(h: &NativeHarness) {
+        h.auth
+            .registry
+            .apply(&[("workspaceApi.maxOutputChars".into(), json!(0))])
+            .unwrap();
+    }
+
+    fn original_records(control: &NativeControl, h: &NativeHarness, count: usize) {
+        let records = control.records.lock().unwrap();
+        assert_eq!(records.len(), count);
+        assert!(records
+            .iter()
+            .all(|record| Arc::ptr_eq(&record.request, &records[0].request)));
+        assert!(records[0].request.retains(h.original.as_ref()));
+    }
+
+    async fn one_original_session(h: &NativeHarness) {
+        let inspect = h.node.call("fixture/inspect", json!({})).await;
+        assert_eq!(count_requests(&inspect, "session/new"), 1);
+        assert_eq!(count_requests(&inspect, "session/load"), 0);
+        assert_eq!(count_requests(&inspect, METHOD), 1);
+        assert_eq!(inspect["initializations"], json!([1]));
+        assert_eq!(h.f.writes().await, 1);
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn confirmed_alias_public_raw_parity_reuses_original_cache() {
+        for first in ["pr", "mr"] {
+            for observed in [false, true] {
+                let control = observed.then(|| Arc::new(NativeControl::default()));
+                let h = NativeHarness::observed("3.0", true, false, control.clone(), None).await;
+                no_spill(&h);
+                h.start().await;
+                let name = h.confirmed(0).await;
+                let other = if first == "pr" { "mr" } else { "pr" };
+                let code = format!(
+                    "const first=await ws.{first}.snapshot(4);
+                    return JSON.stringify({{same:ws.pr===ws.mr,values:[first,
+                        await ws.{other}.snapshot(4),await {},await {}]}});",
+                    expression("pr", true),
+                    expression("mr", true)
+                );
+                let gate = control
+                    .as_ref()
+                    .map(|control| control.at(Boundary::HostPromise, true));
+                let task = h.call_task(0, &name, &code);
+                if let Some(gate) = &gate {
+                    gate.reached().await;
+                    assert_eq!(h.http.count(), 4, "one complete original fetch");
+                    gate.release.add_permits(1);
+                }
+                let reply = task.await.unwrap();
+                let value = json_result(&reply);
+                assert_eq!(value["same"], true);
+                let values = value["values"].as_array().unwrap();
+                assert_eq!(values.len(), 4);
+                assert!(values.windows(2).all(|pair| pair[0] == pair[1]));
+                let snapshot = &values[0];
+                assert_eq!(snapshot["repo"], "group/project");
+                assert_eq!(snapshot["prNumber"], 4);
+                assert_eq!(snapshot["title"], "actual review");
+                assert_eq!(snapshot["resource"]["repository"]["provider"], "gitlab");
+                assert_eq!(
+                    snapshot["resource"]["repository"]["instanceBaseUrl"],
+                    "https://gitlab.test/forge"
+                );
+                assert_eq!(snapshot["details"]["resource"], snapshot["resource"]);
+                assert_eq!(snapshot["details"]["source"]["projectId"], "42");
+                assert_eq!(snapshot["availability"]["checks"], "available");
+                assert!(snapshot["requirements"].is_object());
+                assert_eq!(h.http.count(), 4, "all later alias calls reuse the cache");
+                assert_eq!(h.original.pr_cache.lock().unwrap().len(), 1);
+                assert!(!reply.to_string().contains("stored-pat"));
+                if let Some(control) = &control {
+                    original_records(control, &h, 5);
+                    assert_eq!(
+                        control
+                            .events
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .filter(|event| **event == (Boundary::TcpResponse, 5))
+                            .count(),
+                        1
+                    );
+                }
+                one_original_session(&h).await;
+                h.finish().await;
+            }
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn confirmed_alias_mixed_names_share_one_acquisition_budget() {
+        for count in [63, 64] {
+            let control = Arc::new(NativeControl::default());
+            let h = NativeHarness::observed("3.0", true, false, Some(control.clone()), None).await;
+            no_spill(&h);
+            h.start().await;
+            let code = format!(
+                "const calls=[()=>ws.pr.snapshot(4),()=>ws.mr.snapshot(4),
+                    ()=>{},()=>{}];
+                for(let i=0;i<{count};i++) {{
+                    try {{await calls[i%4]();}} catch(e) {{
+                        try {{await calls[(i+1)%4]();}} catch(e) {{}}
+                    }}
+                }}
+                return 'bounded mixed original success';",
+                expression("pr", true),
+                expression("mr", true)
+            );
+            let reply = h.call(0, &h.confirmed(0).await, &code).await;
+            if count == 63 {
+                assert!(reply.to_string().contains("bounded mixed original success"));
+                original_records(&control, &h, 64);
+                assert!(control
+                    .events
+                    .lock()
+                    .unwrap()
+                    .contains(&(Boundary::TcpResponse, 64)));
+            } else {
+                // Catching the 65th reservation or changing spelling cannot
+                // discard the original poisoned ledger or allocate a new one.
+                delivery_refused(&reply);
+            }
+            assert_eq!(
+                h.http.count(),
+                4,
+                "refused reservations never acquire again"
+            );
+            assert_eq!(h.original.pr_cache.lock().unwrap().len(), 1);
+            one_original_session(&h).await;
+            h.finish().await;
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn confirmed_alias_later_tcp_and_artifact_keep_original_obligations() {
+        // Both mutations surround TCP/artifact admission. Attachment controls
+        // add the missing mixed-alias effect check without a full cross product.
+        let cases = [
+            (Boundary::TcpResponse, false, false),
+            (Boundary::TcpResponse, true, false),
+            (Boundary::TcpResponse, false, true),
+            (Boundary::TcpResponse, true, true),
+            (Boundary::ArtifactStart, false, false),
+            (Boundary::ArtifactStart, true, false),
+            (Boundary::ArtifactStart, false, true),
+            (Boundary::ArtifactStart, true, true),
+            (Boundary::Attachments, false, false),
+            (Boundary::Attachments, true, false),
+        ];
+        for (boundary, after, change_source) in cases {
+            let control = Arc::new(NativeControl::default());
+            let h = NativeHarness::observed("3.0", true, false, Some(control.clone()), None).await;
+            h.auth
+                .registry
+                .apply(&[("workspaceApi.maxOutputChars".into(), json!(1000))])
+                .unwrap();
+            h.http
+                .status("/api/v4/projects/group%2Fproject/merge_requests/99", 404);
+            h.start().await;
+            let name = h.confirmed(0).await;
+            let first = if after { "mr" } else { "pr" };
+            let other = if after { "pr" } else { "mr" };
+            let output = match boundary {
+                Boundary::ArtifactStart => "return 'original mixed output'.repeat(300);",
+                Boundary::Attachments => "return {__mcpContentItems:[{type:'resource',resource:{uri:'fixture://original',mimeType:'application/json',text:JSON.stringify({title:'original mixed output'})}}]};",
+                _ => "return 'original mixed output';",
+            };
+            let code = format!(
+                "await ws.workspace.setStatusMessage('completed ordinary effect');
+                await ws.{first}.snapshot(4);
+                try {{await host({{method:'{other}.snapshot',args:{{prNumber:99}}}});}}
+                catch(e) {{}}
+                {output}"
+            );
+            let gate = control.at(boundary, after);
+            let task = h.call_task(0, &name, &code);
+            gate.reached().await;
+            let requests_before_retirement = h.http.count();
+            assert!(
+                requests_before_retirement > 4,
+                "the caught error reached its original producer"
+            );
+            original_records(&control, &h, 4);
+            let original_records = control.records.lock().unwrap().clone();
+            let folder = h.git.dir.path().join("tool-outputs");
+            assert!(
+                !folder.exists(),
+                "START admission precedes the artifact effect"
+            );
+            assert_eq!(
+                h.original
+                    .turn_attachments()
+                    .pending_count_by_mime(&h.f.row.id, "application/json"),
+                0
+            );
+            if change_source {
+                h.git.git(
+                    &h.git.path,
+                    &[
+                        "-c",
+                        "user.name=Fixture",
+                        "-c",
+                        "user.email=fixture@example.invalid",
+                        "commit",
+                        "--allow-empty",
+                        "-m",
+                        "replacement head after mixed reads",
+                    ],
+                );
+            } else {
+                assert!(h.f.manager.interrupt(&h.f.row.id).await);
+            }
+            gate.release.add_permits(1);
+            let reply = task.await.unwrap();
+            if boundary == Boundary::TcpResponse && after {
+                assert_eq!(reply["isError"], false, "{reply}");
+                assert!(reply.to_string().contains("original mixed output"));
+            } else {
+                delivery_refused(&reply);
+            }
+            assert_eq!(h.http.count(), requests_before_retirement);
+            {
+                let final_records = control.records.lock().unwrap();
+                assert_eq!(final_records.len(), original_records.len());
+                assert!(final_records
+                    .iter()
+                    .zip(&original_records)
+                    .all(|(last, original)| {
+                        // The observer allocates wrappers; these are the actual
+                        // original objects retained inside each opaque record.
+                        Arc::ptr_eq(&last.request, &original.request)
+                            && Arc::ptr_eq(&last.operation, &original.operation)
+                            && Arc::ptr_eq(&last.eligibility, &original.eligibility)
+                    }));
+            }
+            assert_eq!(
+                h.original
+                    .store
+                    .get_workspace(&h.git.workspace.id)
+                    .await
+                    .unwrap()
+                    .status_message
+                    .as_deref(),
+                Some("completed ordinary effect")
+            );
+            assert_eq!(
+                folder.exists(),
+                boundary == Boundary::ArtifactStart && after
+            );
+            if folder.exists() {
+                let files = std::fs::read_dir(&folder)
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                assert_eq!(files.len(), 1);
+                assert!(std::fs::read_to_string(files[0].path())
+                    .unwrap()
+                    .contains("original mixed output"));
+            }
+            assert_eq!(
+                h.original
+                    .turn_attachments()
+                    .pending_count_by_mime(&h.f.row.id, "application/json"),
+                usize::from(boundary == Boundary::Attachments && after)
+            );
+            one_original_session(&h).await;
+            h.finish().await;
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn confirmed_alias_partial_quota_preserves_original_public_outcome() {
+        let mut results = Vec::new();
+        for first in ["pr", "mr"] {
+            let control = Arc::new(NativeControl::default());
+            let h = NativeHarness::observed("3.0", true, false, Some(control.clone()), None).await;
+            no_spill(&h);
+            h.http.status(&format!("{MR}/approvals"), 429);
+            h.start().await;
+            let other = if first == "pr" { "mr" } else { "pr" };
+            let code = format!(
+                "const first=await ws.{first}.snapshot(4);
+                const errors=[];
+                try {{await ws.{other}.snapshot(4);}} catch(e) {{errors.push(e.message);}}
+                try {{await {};}} catch(e) {{errors.push(e.message);}}
+                return JSON.stringify({{first,errors}});",
+                expression(first, true)
+            );
+            let gate = control.at(Boundary::HostPromise, true);
+            let task = h.call_task(0, &h.confirmed(0).await, &code);
+            gate.reached().await;
+            // MR, project, approvals; original quota prevents discussions.
+            assert_eq!(h.http.count(), 3);
+            gate.release.add_permits(1);
+            let reply = task.await.unwrap();
+            let value = json_result(&reply);
+            let snapshot = &value["first"];
+            assert_eq!(snapshot["title"], "actual review");
+            assert_eq!(snapshot["availability"]["approvals"], "rate-limited");
+            assert_eq!(snapshot["availability"]["discussions"], "rate-limited");
+            assert_eq!(snapshot["reviews"]["approvals"], Value::Null);
+            assert_eq!(snapshot["availability"]["checks"], "available");
+            assert!(snapshot.get("pausedUntil").is_none());
+            assert!(h.original.sweep_rate_limit_paused_until().is_none());
+            let errors = value["errors"].as_array().unwrap();
+            assert_eq!(errors.len(), 2);
+            assert_eq!(errors[0], errors[1]);
+            assert!(errors[0].as_str().unwrap().contains("Backoff"));
+            assert_eq!(h.http.count(), 3, "neither alias retries HTTP");
+            assert_eq!(h.original.pr_cache.lock().unwrap().len(), 1);
+            original_records(&control, &h, 6);
+            assert!(control
+                .events
+                .lock()
+                .unwrap()
+                .contains(&(Boundary::TcpResponse, 6)));
+            assert!(!reply.to_string().contains("stored-pat"));
+            one_original_session(&h).await;
+            results.push(value);
+            h.finish().await;
+        }
+        assert_eq!(results[0], results[1]);
+        // Numeric raw quota receipts remain separately inherited producer proof;
+        // public availability and HTTP counts are not an observation of them.
+    }
+}
