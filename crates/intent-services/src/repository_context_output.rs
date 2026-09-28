@@ -23,7 +23,9 @@ use crate::harness::repository_guidance_v3::{render, GuidanceContext, GuidanceCo
 use crate::repository_admission::read_request::{
     RepositoryOptionalMetadata, RepositoryOptionalScope, RepositoryReadRequest,
 };
-use crate::repository_admission::request_context::RepositoryPromptRequest;
+use crate::repository_admission::request_context::{
+    RepositoryManagerPromptRequest, RepositoryPromptRequest,
+};
 use crate::repository_admission::AdmissionResult;
 use crate::repository_context_live::{PreparedContextFacts, RepositoryContextOwner};
 use crate::repository_read_source::{
@@ -41,7 +43,17 @@ impl RepositoryContextOwner {
     pub(crate) fn capture_prompt(self: &Arc<Self>) -> AdmissionResult<RepositoryPromptContext> {
         Ok(RepositoryPromptContext {
             owner: self.clone(),
-            original: self.callback.capture_prompt()?,
+            original: PromptOrigin::Strict(self.callback.capture_prompt()?),
+        })
+    }
+
+    /// Capture at the original confirmed handle, before prompt work is queued.
+    pub(crate) fn capture_manager_prompt(
+        self: &Arc<Self>,
+    ) -> AdmissionResult<RepositoryPromptContext> {
+        Ok(RepositoryPromptContext {
+            owner: self.clone(),
+            original: PromptOrigin::Manager(self.callback.capture_manager_prompt()?),
         })
     }
 }
@@ -333,38 +345,72 @@ async fn render_original(facts: &PreparedContextFacts) -> Option<String> {
 /// Owns a distinct real non-MCP parent through preparation and prompt transfer.
 pub(crate) struct RepositoryPromptContext {
     owner: Arc<RepositoryContextOwner>,
-    original: RepositoryPromptRequest,
+    original: PromptOrigin,
 }
+
+enum PromptOrigin {
+    Strict(RepositoryPromptRequest),
+    Manager(RepositoryManagerPromptRequest),
+}
+impl PromptOrigin {
+    fn original(&self) -> &RepositoryPromptRequest {
+        match self {
+            Self::Strict(original) => original,
+            Self::Manager(original) => original.original(),
+        }
+    }
+    fn construction_check(&self) -> AdmissionResult<()> {
+        match self {
+            Self::Strict(_) => Ok(()),
+            Self::Manager(original) => original.check_entry(),
+        }
+    }
+    fn run<'a, T: Send + 'a>(
+        &'a self,
+        body: BoxFuture<'a, AdmissionResult<T>>,
+    ) -> BoxFuture<'a, AdmissionResult<T>> {
+        match self {
+            Self::Strict(original) => match original.run(body) {
+                Ok(future) => future,
+                Err(error) => Box::pin(async move { Err(error) }),
+            },
+            Self::Manager(original) => original.run(body),
+        }
+    }
+}
+
 impl RepositoryPromptContext {
-    pub(crate) async fn prepare(self) -> Option<intent_acp::session::PromptGuidance> {
-        let prepared = {
-            self.original
+    pub(crate) fn prepare(self) -> BoxFuture<'static, Option<intent_acp::session::PromptGuidance>> {
+        let entry = self.original.construction_check();
+        Box::pin(async move {
+            entry.ok()?;
+            let prepared = self
+                .original
                 .run(Box::pin(async {
-                    let scope = self.original.read().capture_optional()?;
+                    let scope = self.original.original().read().capture_optional()?;
                     scope.run_optional(|local| self.owner.prepare(local))?.await
                 }))
-                .ok()?
                 .await
-                .ok()?
-        };
-        let facts = prepared.value().clone();
-        let text = self
-            .original
-            .run(Box::pin(render_original(&facts)))
-            .ok()?
-            .await?;
-        let prepared = Arc::new(prepared.map(|_| ()));
-        intent_acp::session::PromptGuidance::new(
-            text,
-            Box::new(PromptAdmission {
-                original: self.original,
-                optional: ContextOptional { prepared, facts },
-            }),
-        )
+                .ok()?;
+            let facts = prepared.value().clone();
+            let text = self
+                .original
+                .run(Box::pin(async { Ok(render_original(&facts).await) }))
+                .await
+                .ok()??;
+            let prepared = Arc::new(prepared.map(|_| ()));
+            intent_acp::session::PromptGuidance::new(
+                text,
+                Box::new(PromptAdmission {
+                    original: self.original,
+                    optional: ContextOptional { prepared, facts },
+                }),
+            )
+        })
     }
 }
 struct PromptAdmission {
-    original: RepositoryPromptRequest,
+    original: PromptOrigin,
     optional: ContextOptional,
 }
 impl AcpPromptAdmission for PromptAdmission {
@@ -373,9 +419,13 @@ impl AcpPromptAdmission for PromptAdmission {
         original: &'a AcpPromptBoundary,
         packet: PreparedAcpPromptTransfer<'a>,
     ) -> BoxFuture<'a, AcpPromptAdmissionOutcome> {
+        let entry = self.original.construction_check();
         Box::pin(async move {
+            if entry.is_err() {
+                return AcpPromptAdmissionOutcome::OmitOptional;
+            }
             let run = self.original.run(Box::pin(with_context_only(
-                OptionalContextOrigin::Prompt(&self.original),
+                OptionalContextOrigin::Prompt(self.original.original()),
                 &self.optional,
                 |include| {
                     packet.transfer(
@@ -388,12 +438,7 @@ impl AcpPromptAdmission for PromptAdmission {
                     )
                 },
             )));
-            match run {
-                Ok(future) => future
-                    .await
-                    .unwrap_or(AcpPromptAdmissionOutcome::OmitOptional),
-                Err(_) => AcpPromptAdmissionOutcome::OmitOptional,
-            }
+            run.await.unwrap_or(AcpPromptAdmissionOutcome::OmitOptional)
         })
     }
 }

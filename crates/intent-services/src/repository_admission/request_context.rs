@@ -169,6 +169,102 @@ impl Drop for RepositoryPromptRequest {
     }
 }
 
+impl RepositoryCallbackContext {
+    /// Capture a distinct prompt from this confirmed manager allocation only.
+    /// The ambient daemon is an entry condition, never a source of identity.
+    pub(crate) fn capture_manager_prompt(&self) -> AdmissionResult<RepositoryManagerPromptRequest> {
+        manager_prompt_entry()?;
+        let original = self.capture();
+        let captured = original.captured.as_ref().map_err(|error| *error)?;
+        if !matches!(captured.caller, Caller::Agent { .. }) {
+            return Err(AdmissionError::Denied);
+        }
+        let owner = self
+            .read_owner
+            .clone()
+            .unwrap_or(Err(AdmissionError::Unavailable))?;
+        let read = RepositoryReadRequest::capture(owner, original.clone())?;
+        Ok(RepositoryManagerPromptRequest {
+            original: RepositoryPromptRequest { original, read },
+        })
+    }
+}
+
+fn manager_prompt_entry() -> AdmissionResult<()> {
+    if current_caller() != Some(Caller::Daemon)
+        || current_wire_credential().is_some()
+        || CAPTURED_REQUEST.try_with(|_| ()).is_ok()
+        || CAPTURED_READ_REQUEST.try_with(|_| ()).is_ok()
+        || OPTIONAL_EXECUTION.try_with(|_| ()).is_ok()
+    {
+        return Err(AdmissionError::Denied);
+    }
+    Ok(())
+}
+
+/// Owns one original request; neither cloning nor an ID can mint this entry.
+pub(crate) struct RepositoryManagerPromptRequest {
+    original: RepositoryPromptRequest,
+}
+
+impl RepositoryManagerPromptRequest {
+    pub(crate) fn original(&self) -> &RepositoryPromptRequest {
+        &self.original
+    }
+
+    /// Also used before constructing the owning preparation/admission futures.
+    pub(crate) fn check_entry(&self) -> AdmissionResult<()> {
+        manager_prompt_entry()?;
+        let captured = self
+            .original
+            .original
+            .captured
+            .as_ref()
+            .map_err(|error| *error)?;
+        self.original.original.check_read_owner(
+            captured.store.as_ref().ok_or(AdmissionError::Unavailable)?,
+            &captured.registry,
+        )
+    }
+
+    pub(crate) fn run<'a, T: Send + 'a>(
+        &'a self,
+        body: intent_core::BoxFuture<'a, AdmissionResult<T>>,
+    ) -> intent_core::BoxFuture<'a, AdmissionResult<T>> {
+        let entry = self.check_entry();
+        Box::pin(async move {
+            entry?;
+            let caller = self
+                .original
+                .original
+                .captured
+                .as_ref()
+                .map_err(|error| *error)?
+                .caller
+                .clone();
+            let mut scoped = Box::pin(with_caller(caller, async move {
+                let mut operation = self.original.run(body)?;
+                std::future::poll_fn(|context| {
+                    if let Err(error) = self.original.read.check_current() {
+                        return std::task::Poll::Ready(Err(error));
+                    }
+                    operation.as_mut().poll(context)
+                })
+                .await
+            }));
+            std::future::poll_fn(|context| {
+                // Every poll must still originate at the dedicated manager
+                // entry, including a future moved after an earlier Pending.
+                if let Err(error) = self.check_entry() {
+                    return std::task::Poll::Ready(Err(error));
+                }
+                std::future::Future::poll(scoped.as_mut(), context)
+            })
+            .await
+        })
+    }
+}
+
 impl McpRequestContext for RepositoryCallbackContext {
     fn capture(&self) -> Arc<dyn McpRequestScope> {
         let original = self.capture();

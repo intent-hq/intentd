@@ -1097,3 +1097,377 @@ async fn context_output_mixed_original_worktree_locks_omit_only_optional_and_kee
         f.owner.drain_jobs().await;
     }
 }
+
+async fn manager_prompt_worker<T: Send + 'static>(
+    services: Arc<crate::Services>,
+    body: impl std::future::Future<Output = T> + Send + 'static,
+) -> T {
+    intent_core::spawn_daemon(crate::host_execution::background_execution(
+        services.as_ref().clone(),
+        None,
+        body,
+    ))
+    .await
+    .unwrap()
+}
+
+#[intent_test_macros::daemon_test]
+async fn manager_prompt_output_actual_daemon_capture_prepare_and_separate_transfer() {
+    for mode in [
+        "current",
+        "stale",
+        "retired",
+        "provider-changed",
+        "consumer-error",
+    ] {
+        let http = ReadServer::new().await;
+        let f = LiveFixture::new(&http).await;
+        let services = f.owner.services.clone();
+        let owner = f.owner.clone();
+        let capture = manager_prompt_worker(services.clone(), async move {
+            assert_eq!(current_caller(), Some(Caller::Daemon));
+            assert!(
+                owner.capture_prompt().is_err(),
+                "expected strict Daemon baseline denial"
+            );
+            owner.capture_manager_prompt().unwrap()
+        })
+        .await;
+        let guidance = manager_prompt_worker(services.clone(), async move {
+            assert_eq!(current_caller(), Some(Caller::Daemon));
+            let guidance = capture.prepare().await;
+            assert_eq!(current_caller(), Some(Caller::Daemon));
+            assert!(guidance.is_some());
+            guidance
+        })
+        .await;
+        match mode {
+            "stale" => f.owner.invalidate(),
+            "retired" => f.physical.interrupt_requests(),
+            "provider-changed" => {
+                f.base
+                    .auth
+                    .service
+                    .gitlab_secret_store
+                    .store(
+                        intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT,
+                        "manager-replacement",
+                    )
+                    .unwrap();
+                f.base
+                    .auth
+                    .service
+                    .reconcile_gitlab_repository_binding()
+                    .await
+                    .unwrap();
+            }
+            _ => {}
+        }
+        let (frame, ok) = manager_prompt_worker(services, async move {
+            assert_eq!(current_caller(), Some(Caller::Daemon));
+            let result = prompt_exchange(guidance, mode == "consumer-error").await;
+            assert_eq!(current_caller(), Some(Caller::Daemon));
+            result
+        })
+        .await;
+        assert_eq!(frame["method"], "session/prompt");
+        assert!(frame.to_string().contains("original user prompt"));
+        assert_eq!(
+            frame.to_string().contains(FACTS),
+            matches!(mode, "current" | "consumer-error"),
+            "{mode}: {frame}"
+        );
+        assert_eq!(ok, mode != "consumer-error");
+        assert_eq!(http.count(), 0);
+        f.owner.drain_jobs().await;
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn manager_prompt_output_preparation_construction_poll_and_final_caller_refusals() {
+    use intent_core::caller::{with_caller, with_wire_credential, WireCredential};
+    for mode in [
+        "prepare-construction",
+        "prepare-poll",
+        "prepare-wire",
+        "final-foreign",
+        "final-wire",
+        "final-unbound",
+    ] {
+        let http = ReadServer::new().await;
+        let f = LiveFixture::new(&http).await;
+        let services = f.owner.services.clone();
+        let owner = f.owner.clone();
+        let capture = manager_prompt_worker(services.clone(), async move {
+            owner.capture_manager_prompt().unwrap()
+        })
+        .await;
+        let escaped = capture.original.original().read().clone();
+        let foreign = Caller::Agent {
+            agent_id: intent_core::AgentId::new(),
+        };
+        let wire = WireCredential::Principal {
+            principal_id: intent_core::PrincipalId::new(),
+            token_hash: "original prompt test".into(),
+        };
+        let guidance = if mode == "prepare-construction" {
+            let (future,) = with_caller(foreign.clone(), async { (capture.prepare(),) }).await;
+            manager_prompt_worker(services.clone(), future).await
+        } else if mode == "prepare-poll" {
+            let (future,) =
+                manager_prompt_worker(services.clone(), async { (capture.prepare(),) }).await;
+            with_caller(foreign.clone(), future).await
+        } else if mode == "prepare-wire" {
+            let (future,) =
+                manager_prompt_worker(services.clone(), async { (capture.prepare(),) }).await;
+            with_wire_credential(Some(wire.clone()), future).await
+        } else {
+            manager_prompt_worker(services.clone(), async { capture.prepare().await }).await
+        };
+        assert_eq!(guidance.is_some(), mode.starts_with("final-"));
+        let (frame, ok) = match mode {
+            "final-foreign" => with_caller(foreign, prompt_exchange(guidance, false)).await,
+            "final-wire" => {
+                with_wire_credential(Some(wire), prompt_exchange(guidance, false)).await
+            }
+            "final-unbound" => tokio::spawn(prompt_exchange(guidance, false))
+                .await
+                .unwrap(),
+            _ => manager_prompt_worker(services, prompt_exchange(guidance, false)).await,
+        };
+        assert!(ok);
+        assert!(!frame.to_string().contains(FACTS), "{mode}: {frame}");
+        assert!(frame.to_string().contains("original user prompt"));
+        with_caller(
+            Caller::Agent {
+                agent_id: f.session.id.clone(),
+            },
+            async {
+                assert!(
+                    escaped.check_current().is_err(),
+                    "last prompt owner has retired"
+                );
+            },
+        )
+        .await;
+        f.owner.drain_jobs().await;
+        assert_eq!(http.count(), 0);
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn manager_prompt_output_unpolled_and_cancelled_preparation_retire_original_only() {
+    use intent_core::caller::with_caller;
+    for polled in [false, true] {
+        let http = ReadServer::new().await;
+        let f = LiveFixture::new(&http).await;
+        let services = f.owner.services.clone();
+        let owner = f.owner.clone();
+        let capture = manager_prompt_worker(services.clone(), async move {
+            owner.capture_manager_prompt().unwrap()
+        })
+        .await;
+        let escaped = capture.original.original().read().clone();
+        let (future,) =
+            manager_prompt_worker(services.clone(), async move { (capture.prepare(),) }).await;
+        if polled {
+            let locks = services.worktree_locks.clone();
+            let path = f.base.git.path.clone();
+            let held = Hold::new();
+            let h = held.clone();
+            let holder =
+                tokio::spawn(
+                    async move { locks.with_lock(&path, || async { h.wait().await }).await },
+                );
+            held.reached().await;
+            manager_prompt_worker(services.clone(), async move {
+                let mut future = future;
+                std::future::poll_fn(|cx| {
+                    assert!(future.as_mut().poll(cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                drop(future);
+                assert_eq!(current_caller(), Some(Caller::Daemon));
+            })
+            .await;
+            held.resume();
+            holder.await.unwrap();
+        } else {
+            drop(future);
+        }
+        with_caller(
+            Caller::Agent {
+                agent_id: f.session.id.clone(),
+            },
+            async {
+                assert!(escaped.check_current().is_err());
+            },
+        )
+        .await;
+        f.owner.drain_jobs().await;
+        let (frame, ok) = manager_prompt_worker(services, prompt_exchange(None, false)).await;
+        assert!(ok);
+        assert!(!frame.to_string().contains(FACTS));
+        assert!(f.owner.capture_prompt().is_err());
+        assert_eq!(http.count(), 0);
+    }
+}
+
+// This fixture creates the real private admission from the same captured
+// manager request and factual preparation, so only the ambient entry is varied.
+async fn manager_prompt_admission(owner: Arc<RepositoryContextOwner>) -> (String, PromptAdmission) {
+    let original = PromptOrigin::Manager(owner.callback.capture_manager_prompt().unwrap());
+    let prepared = original
+        .run(Box::pin(async {
+            let scope = original.original().read().capture_optional()?;
+            scope.run_optional(|local| owner.prepare(local))?.await
+        }))
+        .await
+        .unwrap();
+    let facts = prepared.value().clone();
+    let text = original
+        .run(Box::pin(async { Ok(render_original(&facts).await) }))
+        .await
+        .unwrap()
+        .unwrap();
+    (
+        text,
+        PromptAdmission {
+            original,
+            optional: ContextOptional {
+                prepared: Arc::new(prepared.map(|_| ())),
+                facts,
+            },
+        },
+    )
+}
+
+struct ManagerPromptAdmissionProbe {
+    original: PromptAdmission,
+    mode: &'static str,
+    scope: Arc<dyn McpRequestScope>,
+    transferred: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl AcpPromptAdmission for ManagerPromptAdmissionProbe {
+    fn admit<'a>(
+        &'a self,
+        boundary: &'a AcpPromptBoundary,
+        packet: PreparedAcpPromptTransfer<'a>,
+    ) -> BoxFuture<'a, AcpPromptAdmissionOutcome> {
+        Box::pin(async move {
+            use intent_core::caller::{with_caller, with_wire_credential, WireCredential};
+            let wire = WireCredential::Principal {
+                principal_id: intent_core::PrincipalId::new(),
+                token_hash: "manager admission fixture".into(),
+            };
+            let future = match self.mode {
+                "construct-foreign" => {
+                    with_caller(
+                        Caller::Agent {
+                            agent_id: intent_core::AgentId::new(),
+                        },
+                        async { (self.original.admit(boundary, packet),) },
+                    )
+                    .await
+                    .0
+                }
+                "construct-wire" => {
+                    with_wire_credential(Some(wire.clone()), async {
+                        (self.original.admit(boundary, packet),)
+                    })
+                    .await
+                    .0
+                }
+                "construct-nested" => {
+                    let mut future = None;
+                    self.scope
+                        .scope(Box::pin(async {
+                            future = Some(self.original.admit(boundary, packet));
+                        }))
+                        .await;
+                    future.unwrap()
+                }
+                _ => self.original.admit(boundary, packet),
+            };
+            let result = match self.mode {
+                "poll-wire" => with_wire_credential(Some(wire), future).await,
+                "poll-nested" => {
+                    let mut result = None;
+                    self.scope
+                        .scope(Box::pin(async {
+                            result = Some(future.await);
+                        }))
+                        .await;
+                    result.unwrap()
+                }
+                _ => future.await,
+            };
+            assert_eq!(current_caller(), Some(Caller::Daemon));
+            if matches!(result, AcpPromptAdmissionOutcome::Transferred(_)) {
+                self.transferred
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            match self.mode {
+                "after-panic" => panic!("after original manager transfer"),
+                "after-omit" => AcpPromptAdmissionOutcome::OmitOptional,
+                _ => result,
+            }
+        })
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn manager_prompt_output_final_construction_poll_and_consumed_packet_never_replay() {
+    for mode in [
+        "construct-foreign",
+        "construct-wire",
+        "construct-nested",
+        "poll-wire",
+        "poll-nested",
+        "after-panic",
+        "after-omit",
+    ] {
+        let http = ReadServer::new().await;
+        let f = LiveFixture::new(&http).await;
+        let services = f.owner.services.clone();
+        let owner = f.owner.clone();
+        let (text, original) =
+            manager_prompt_worker(services.clone(), manager_prompt_admission(owner)).await;
+        let escaped = original.original.original().read().clone();
+        let transferred = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let guidance = intent_acp::session::PromptGuidance::new(
+            text,
+            Box::new(ManagerPromptAdmissionProbe {
+                original,
+                mode,
+                scope: f.owner.mcp_context().capture(),
+                transferred: transferred.clone(),
+            }),
+        );
+        let (frame, ok) = manager_prompt_worker(services, prompt_exchange(guidance, false)).await;
+        let consumed = mode.starts_with("after-");
+        assert!(ok, "a post-transfer callback failure cannot replay base");
+        assert_eq!(
+            frame.to_string().contains(FACTS),
+            consumed,
+            "{mode}: {frame}"
+        );
+        assert_eq!(
+            transferred.load(std::sync::atomic::Ordering::SeqCst),
+            usize::from(consumed)
+        );
+        assert!(frame.to_string().contains("original user prompt"));
+        intent_core::with_caller(
+            Caller::Agent {
+                agent_id: f.session.id.clone(),
+            },
+            async {
+                assert!(escaped.check_current().is_err());
+            },
+        )
+        .await;
+        f.owner.drain_jobs().await;
+        assert_eq!(http.count(), 0);
+    }
+}

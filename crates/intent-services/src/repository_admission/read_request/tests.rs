@@ -872,3 +872,323 @@ async fn optional_prompt_entry_is_distinct_prequeue_owned_and_keeps_original_cal
     })
     .await;
 }
+
+#[tokio::test]
+async fn manager_prompt_original_daemon_entry_restores_only_the_registered_caller() {
+    let f = OptionalFixture::new().await;
+    intent_core::spawn_daemon(async move {
+        assert_eq!(current_caller(), Some(Caller::Daemon));
+        // Expected baseline denial, not a behavioral red for a missing API.
+        assert!(matches!(
+            f.context.capture_prompt(),
+            Err(AdmissionError::Denied)
+        ));
+        let prompt = f.context.capture_manager_prompt().unwrap();
+        let (scope, read) = f.context.capture_owned();
+        assert!(!Arc::ptr_eq(prompt.original().read(), &read.unwrap()));
+        let captured = prompt.original().read().clone();
+        let answer = prompt
+            .run(Box::pin(async {
+                assert_eq!(current_caller(), Some(f.caller.clone()));
+                assert!(Arc::ptr_eq(&current_read_request().unwrap(), &captured));
+                let local = captured.capture_optional()?;
+                local
+                    .run_optional(|_| async { Ok(31) })?
+                    .await
+                    .map(|v| *v.value())
+            }))
+            .await;
+        assert_eq!(answer, Ok(31));
+        assert_eq!(current_caller(), Some(Caller::Daemon));
+        drop(prompt);
+        with_caller(f.caller.clone(), async {
+            assert_eq!(captured.check_current(), Err(AdmissionError::Retired));
+        })
+        .await;
+        drop(scope);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn manager_prompt_capture_rejects_foreign_wire_unbound_and_nested_entries() {
+    use intent_core::caller::{with_wire_credential, WireCredential};
+    let f = OptionalFixture::new().await;
+    assert!(matches!(
+        f.context.capture_manager_prompt(),
+        Err(AdmissionError::Denied)
+    ));
+    // The old unbound strict entry remains supported.
+    drop(f.context.capture_prompt().unwrap());
+    for caller in [
+        f.caller.clone(),
+        Caller::Agent {
+            agent_id: AgentId::new(),
+        },
+        Caller::Wire {
+            principal_id: intent_core::PrincipalId::new(),
+            host_role: intent_core::HostRole::Owner,
+        },
+    ] {
+        assert!(
+            with_caller(caller, async { f.context.capture_manager_prompt() })
+                .await
+                .is_err()
+        );
+    }
+    with_caller(Caller::Daemon, async {
+        let wire = WireCredential::Principal {
+            principal_id: intent_core::PrincipalId::new(),
+            token_hash: "manager fixture".into(),
+        };
+        assert!(
+            with_wire_credential(Some(wire), async { f.context.capture_manager_prompt() })
+                .await
+                .is_err()
+        );
+        let scope = McpRequestContext::capture(&f.context);
+        scope
+            .scope(Box::pin(async {
+                assert!(matches!(
+                    f.context.capture_manager_prompt(),
+                    Err(AdmissionError::Denied)
+                ));
+            }))
+            .await;
+    })
+    .await;
+    let scope = McpRequestContext::capture(&f.context);
+    with_caller(
+        f.caller.clone(),
+        scope.scope(Box::pin(async {
+            let optional = current_read_request().unwrap().capture_optional().unwrap();
+            optional
+                .run_optional(|_| async {
+                    with_caller(Caller::Daemon, async {
+                        assert!(matches!(
+                            f.context.capture_manager_prompt(),
+                            Err(AdmissionError::Denied)
+                        ));
+                    })
+                    .await;
+                    Ok(())
+                })
+                .unwrap()
+                .await
+                .unwrap();
+        })),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn manager_prompt_run_checks_construction_and_every_poll_without_laundering() {
+    use intent_core::caller::{with_wire_credential, WireCredential};
+    let f = OptionalFixture::new().await;
+    let prompt = with_caller(Caller::Daemon, async {
+        f.context.capture_manager_prompt().unwrap()
+    })
+    .await;
+    let wrong = Caller::Agent {
+        agent_id: AgentId::new(),
+    };
+    let body_calls = std::sync::atomic::AtomicUsize::new(0);
+    let body = || -> intent_core::BoxFuture<'_, AdmissionResult<()>> {
+        Box::pin(async {
+            body_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+    };
+    // Carry the unpolled future out of the construction scope deliberately.
+    let (bad_construction,) = with_caller(wrong.clone(), async { (prompt.run(body()),) }).await;
+    assert_eq!(
+        with_caller(Caller::Daemon, bad_construction).await,
+        Err(AdmissionError::Denied)
+    );
+    let missing_construction = prompt.run(body());
+    assert_eq!(
+        with_caller(Caller::Daemon, missing_construction).await,
+        Err(AdmissionError::Denied)
+    );
+    let wire = WireCredential::Principal {
+        principal_id: intent_core::PrincipalId::new(),
+        token_hash: "manager poll fixture".into(),
+    };
+    let (wired_construction,) = with_caller(
+        Caller::Daemon,
+        with_wire_credential(Some(wire.clone()), async { (prompt.run(body()),) }),
+    )
+    .await;
+    assert_eq!(
+        with_caller(Caller::Daemon, wired_construction).await,
+        Err(AdmissionError::Denied)
+    );
+    let (future,) = with_caller(Caller::Daemon, async { (prompt.run(body()),) }).await;
+    assert_eq!(
+        with_caller(wrong, future).await,
+        Err(AdmissionError::Denied)
+    );
+    let (future,) = with_caller(Caller::Daemon, async { (prompt.run(body()),) }).await;
+    assert_eq!(future.await, Err(AdmissionError::Denied));
+    let (future,) = with_caller(Caller::Daemon, async { (prompt.run(body()),) }).await;
+    assert_eq!(
+        with_caller(
+            Caller::Daemon,
+            with_wire_credential(Some(wire.clone()), future)
+        )
+        .await,
+        Err(AdmissionError::Denied)
+    );
+    let scope = McpRequestContext::capture(&f.context);
+    let (nested_construction,) = with_caller(Caller::Daemon, async {
+        let mut result = None;
+        scope
+            .scope(Box::pin(async {
+                result = Some(prompt.run(body()));
+            }))
+            .await;
+        (result.unwrap(),)
+    })
+    .await;
+    assert_eq!(
+        with_caller(Caller::Daemon, nested_construction).await,
+        Err(AdmissionError::Denied)
+    );
+    let (future,) = with_caller(Caller::Daemon, async { (prompt.run(body()),) }).await;
+    with_caller(
+        Caller::Daemon,
+        scope.scope(Box::pin(async {
+            assert_eq!(future.await, Err(AdmissionError::Denied));
+        })),
+    )
+    .await;
+    assert_eq!(body_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let (mut future,) = with_caller(Caller::Daemon, async {
+        (prompt.run(Box::pin(async {
+            body_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::pending::<AdmissionResult<()>>().await
+        })),)
+    })
+    .await;
+    with_caller(
+        Caller::Daemon,
+        std::future::poll_fn(|cx| {
+            assert!(future.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        }),
+    )
+    .await;
+    assert_eq!(
+        with_caller(Caller::Daemon, with_wire_credential(Some(wire), future)).await,
+        Err(AdmissionError::Denied)
+    );
+    assert_eq!(body_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn manager_prompt_missing_failed_foreign_pending_and_replaced_owners_never_repair() {
+    use crate::repository_admission::request_context::RepositoryCallbackContext;
+    let f = OptionalFixture::new().await;
+    let other = OptionalFixture::new().await;
+    let owner =
+        RepositoryReadOwner::retain_original(Arc::new(23_u8), f.store.clone(), f.registry.clone())
+            .unwrap();
+    let foreign = RepositoryReadOwner::retain_original(
+        Arc::new(23_u8),
+        other.store.clone(),
+        other.registry.clone(),
+    )
+    .unwrap();
+    let absent =
+        RepositoryCallbackContext::new(&f.registry, None).with_read_owner(Ok(owner.clone()));
+    let failed = f
+        .physical
+        .callback()
+        .with_read_owner(Err(AdmissionError::Unavailable))
+        .with_read_owner(Ok(owner.clone()));
+    let mismatched = f.physical.callback().with_read_owner(Ok(foreign));
+    with_caller(Caller::Daemon, async {
+        for context in [&absent, &failed, &mismatched] {
+            assert!(context.capture_manager_prompt().is_err());
+        }
+    })
+    .await;
+    let old = with_caller(Caller::Daemon, async {
+        f.context.capture_manager_prompt().unwrap()
+    })
+    .await;
+    let Caller::Agent { agent_id } = &f.caller else {
+        unreachable!()
+    };
+    let row = f.store.get_agent_session(agent_id).await.unwrap();
+    f.physical.retirement().retire();
+    let creation = RepositoryCreationOwner::allocate(
+        &f.registry,
+        &f.store,
+        row.workspace_id.clone(),
+        agent_id.clone(),
+        RepositoryCreationIntent::Loaded {
+            session_id: row.acp_session_id.clone().unwrap(),
+        },
+    )
+    .unwrap();
+    let pending = creation.callback().with_read_owner(Ok(owner.clone()));
+    with_caller(Caller::Daemon, async {
+        assert!(pending.capture_manager_prompt().is_err());
+    })
+    .await;
+    let replacement = creation
+        .initialize(&f.store, || async { Ok(row.acp_session_id.unwrap()) })
+        .await
+        .unwrap();
+    let replacement_context = replacement.callback().with_read_owner(Ok(owner));
+    with_caller(Caller::Daemon, async {
+        assert!(f.context.capture_manager_prompt().is_err());
+        assert!(pending.capture_manager_prompt().is_err());
+        assert_eq!(
+            old.run(Box::pin(async { Ok(()) })).await,
+            Err(AdmissionError::Retired)
+        );
+        drop(replacement_context.capture_manager_prompt().unwrap());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn manager_prompt_drop_joins_original_consuming_fence_and_retires_escaped_reads() {
+    let f = OptionalFixture::new().await;
+    let prompt = with_caller(Caller::Daemon, async {
+        f.context.capture_manager_prompt().unwrap()
+    })
+    .await;
+    let escaped = prompt.original().read().clone();
+    let parent = escaped.original.retirement();
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let held = parent.clone();
+    let action = std::thread::spawn(move || {
+        held.dispatch(|| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(OPTIONAL_TEST_BUDGET).unwrap();
+            Ok(())
+        })
+    });
+    entered_rx.recv_timeout(OPTIONAL_TEST_BUDGET).unwrap();
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+    let retiring = std::thread::spawn(move || {
+        drop(prompt);
+        done_tx.send(()).unwrap();
+    });
+    tokio::time::timeout(OPTIONAL_TEST_BUDGET, parent.cancelled())
+        .await
+        .unwrap();
+    assert!(done_rx.try_recv().is_err());
+    release_tx.send(()).unwrap();
+    action.join().unwrap().unwrap();
+    retiring.join().unwrap();
+    with_caller(f.caller, async {
+        assert_eq!(escaped.check_current(), Err(AdmissionError::Retired));
+    })
+    .await;
+}
