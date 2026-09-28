@@ -2,8 +2,9 @@
 //!
 //! The caller supplies already-admitted roots, authority, connection facts and
 //! stored-choice provenance. Neither a path nor a DTO establishes permission.
-//! Run this blocking reader off the async request path. It registers no RPC,
-//! watcher or cache and performs no credential lookup, Git write or remote call.
+//! Private root observations precede target enrichment and carry no admission
+//! or revision. Run this blocking reader off the async request path. It registers
+//! no RPC, watcher or cache and performs no credential lookup, Git write or remote call.
 //!
 //! Qualified project resolution remains provider-owned. The callback receives
 //! the original effective URL, including port/prefix/escapes; the legacy Git URL
@@ -64,6 +65,18 @@ pub struct RepositoryContextRead {
     pub change_inputs: Vec<RepositoryChangeInputs>,
     /// Internal original transport facts. Never serialize or log this member.
     pub(crate) private_roots: Vec<RepositoryPrivateRoot>,
+}
+
+/// Local facts before target enrichment. Resolved projects remain observations,
+/// not selected targets or supplied permission, account or connection facts.
+/// Deliberately neither Debug nor Serde because it retains private transports.
+pub(crate) struct RepositoryObservedRoot {
+    pub root: RepositoryRootId,
+    pub branch: Option<String>,
+    pub head_sha: Option<String>,
+    pub remotes: Vec<RepositoryRemote>,
+    pub change_inputs: RepositoryChangeInputs,
+    pub private_root: RepositoryPrivateRoot,
 }
 
 /// Original effective values from the same consistency-checked Git read.
@@ -142,36 +155,79 @@ pub fn read_repository_context_with_resolver(
     resolver: &CanonicalRemoteResolver,
     environment: &GitConfigEnvironment,
 ) -> Result<RepositoryContextRead> {
-    read_repository_context(
-        input,
-        &|url| match resolver.resolve(url) {
-            Ok(project) => RepositoryEndpointResolution::Resolved {
-                target: RepositoryTarget {
-                    provider: match project.provider {
-                        RemoteProvider::Github => RepositoryProvider::Github,
-                        RemoteProvider::Gitlab => RepositoryProvider::Gitlab,
-                    },
-                    instance_base_url: project.instance_base_url,
-                    project_path: project.project_path,
+    read_repository_context(input, &|url| resolve_endpoint(resolver, url), environment)
+}
+
+/// Observe one exact local root without inventing admission, selection or a
+/// context revision. Uses the same Git snapshot and consistency checks as the
+/// public admitted-context reader; private transport values stay in-process.
+#[allow(
+    dead_code,
+    reason = "Private read observation consumers are not integrated yet"
+)]
+pub(crate) fn observe_repository_root_with_resolver(
+    root: &RepositoryRootId,
+    path: &Path,
+    resolver: &CanonicalRemoteResolver,
+    environment: &GitConfigEnvironment,
+) -> Result<RepositoryObservedRoot> {
+    read_root_with(
+        root,
+        path,
+        &|url| resolve_endpoint(resolver, url),
+        environment,
+        |_| Ok(()),
+    )
+    .map(|(observed, ())| observed)
+}
+
+/// Deterministic local Git mutation after observation, before the SAME final
+/// consistency check. This schedules a test writer; it supplies no source facts.
+#[cfg(test)]
+#[allow(dead_code, reason = "Used by the external reader fixture target")]
+pub(crate) fn observe_repository_root_before_check(
+    root: &RepositoryRootId,
+    path: &Path,
+    resolver: &CanonicalRemoteResolver,
+    environment: &GitConfigEnvironment,
+    before_check: impl FnOnce(),
+) -> Result<RepositoryObservedRoot> {
+    read_root_with(
+        root,
+        path,
+        &|url| resolve_endpoint(resolver, url),
+        environment,
+        |_| {
+            before_check();
+            Ok(())
+        },
+    )
+    .map(|(observed, ())| observed)
+}
+
+fn resolve_endpoint(resolver: &CanonicalRemoteResolver, url: &str) -> RepositoryEndpointResolution {
+    match resolver.resolve(url) {
+        Ok(project) => RepositoryEndpointResolution::Resolved {
+            target: RepositoryTarget {
+                provider: match project.provider {
+                    RemoteProvider::Github => RepositoryProvider::Github,
+                    RemoteProvider::Gitlab => RepositoryProvider::Gitlab,
                 },
-            },
-            Err(reason) => RepositoryEndpointResolution::Unresolved {
-                reason: match reason {
-                    UnresolvedRemote::UnknownInstance => {
-                        RepositoryUnresolvedReason::UnknownInstance
-                    }
-                    UnresolvedRemote::UnsupportedTransport => {
-                        RepositoryUnresolvedReason::UnsupportedTransport
-                    }
-                    UnresolvedRemote::AmbiguousMapping => {
-                        RepositoryUnresolvedReason::AmbiguousMapping
-                    }
-                    UnresolvedRemote::InvalidRemote => RepositoryUnresolvedReason::InvalidRemote,
-                },
+                instance_base_url: project.instance_base_url,
+                project_path: project.project_path,
             },
         },
-        environment,
-    )
+        Err(reason) => RepositoryEndpointResolution::Unresolved {
+            reason: match reason {
+                UnresolvedRemote::UnknownInstance => RepositoryUnresolvedReason::UnknownInstance,
+                UnresolvedRemote::UnsupportedTransport => {
+                    RepositoryUnresolvedReason::UnsupportedTransport
+                }
+                UnresolvedRemote::AmbiguousMapping => RepositoryUnresolvedReason::AmbiguousMapping,
+                UnresolvedRemote::InvalidRemote => RepositoryUnresolvedReason::InvalidRemote,
+            },
+        },
+    }
 }
 
 fn invalid(message: &str) -> Error {
@@ -330,8 +386,65 @@ fn read_root(
     RepositoryChangeInputs,
     RepositoryPrivateRoot,
 )> {
-    let path = input
-        .path
+    let (observed, (selection, targets)) =
+        read_root_with(&input.root, &input.path, resolve, environment, |remotes| {
+            let selection = resolve_review_selection(
+                &input.saved_selection,
+                remotes,
+                input.explicit_target.as_ref(),
+            );
+            let mut required_targets = BTreeSet::new();
+            for endpoint in remotes.iter().flat_map(|r| r.fetch.iter().chain(&r.push)) {
+                if let RepositoryEndpointResolution::Resolved { target } = &endpoint.resolution {
+                    required_targets.insert(target.clone());
+                }
+            }
+            if let intent_core::ReviewSelectionOutcome::Resolved { target, .. } = &selection.outcome
+            {
+                required_targets.insert(target.clone());
+            }
+            let mut supplied = BTreeMap::new();
+            for target in &input.targets {
+                if supplied.insert(target.target.clone(), target).is_some() {
+                    return Err(invalid("duplicate target facts"));
+                }
+            }
+            let targets = required_targets
+                .into_iter()
+                .map(|target| {
+                    supplied
+                        .get(&target)
+                        .map(|v| (*v).clone())
+                        .ok_or_else(|| invalid("resolved project lacks admitted target facts"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok((selection, targets))
+        })?;
+    Ok((
+        RepositoryRootContext {
+            root: observed.root,
+            branch: observed.branch,
+            head_sha: observed.head_sha,
+            remotes: observed.remotes,
+            targets,
+            review_selection: selection,
+        },
+        observed.change_inputs,
+        observed.private_root,
+    ))
+}
+
+/// The continuation enriches the already-read remotes before the original
+/// final consistency check. Its failure keeps the public reader's existing
+/// error precedence; successful enrichment never starts a second Git read.
+fn read_root_with<T>(
+    root: &RepositoryRootId,
+    path: &Path,
+    resolve: &impl Fn(&str) -> RepositoryEndpointResolution,
+    environment: &GitConfigEnvironment,
+    enrich: impl FnOnce(&[RepositoryRemote]) -> Result<T>,
+) -> Result<(RepositoryObservedRoot, T)> {
+    let path = path
         .canonicalize()
         .map_err(|_| invalid("root is unavailable"))?;
     let git = GitRead {
@@ -426,35 +539,7 @@ fn read_root(
             push,
         });
     }
-    let selection = resolve_review_selection(
-        &input.saved_selection,
-        &remotes,
-        input.explicit_target.as_ref(),
-    );
-    let mut required_targets = BTreeSet::new();
-    for endpoint in remotes.iter().flat_map(|r| r.fetch.iter().chain(&r.push)) {
-        if let RepositoryEndpointResolution::Resolved { target } = &endpoint.resolution {
-            required_targets.insert(target.clone());
-        }
-    }
-    if let intent_core::ReviewSelectionOutcome::Resolved { target, .. } = &selection.outcome {
-        required_targets.insert(target.clone());
-    }
-    let mut supplied = BTreeMap::new();
-    for target in &input.targets {
-        if supplied.insert(target.target.clone(), target).is_some() {
-            return Err(invalid("duplicate target facts"));
-        }
-    }
-    let targets = required_targets
-        .into_iter()
-        .map(|target| {
-            supplied
-                .get(&target)
-                .map(|v| (*v).clone())
-                .ok_or_else(|| invalid("resolved project lacks admitted target facts"))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let enriched = enrich(&remotes)?;
 
     // Do not return a torn read or silently advance the caller's revision.
     if before != git.config()?
@@ -473,7 +558,7 @@ fn read_root(
     digest.update(serde_json::to_vec(&head).map_err(|_| invalid("HEAD encoding failed"))?);
     let fingerprint = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest.finalize());
     let changes = RepositoryChangeInputs {
-        root: input.root.clone(),
+        root: root.clone(),
         git_entry: path.join(".git"),
         config_files: config_files.into_iter().collect(),
         head_paths: vec![
@@ -486,20 +571,19 @@ fn read_root(
         fingerprint,
     };
     Ok((
-        RepositoryRootContext {
-            root: input.root.clone(),
+        RepositoryObservedRoot {
+            root: root.clone(),
             branch: head.0,
             head_sha: head.1,
             remotes,
-            targets,
-            review_selection: selection,
+            change_inputs: changes,
+            private_root: RepositoryPrivateRoot {
+                root: root.clone(),
+                source_ref,
+                remotes: private_remotes,
+            },
         },
-        changes,
-        RepositoryPrivateRoot {
-            root: input.root.clone(),
-            source_ref,
-            remotes: private_remotes,
-        },
+        enriched,
     ))
 }
 

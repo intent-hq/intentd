@@ -22,8 +22,9 @@ use intent_sourcecontrol::{
     GitlabInstance,
 };
 use repository_context_reader::{
+    observe_repository_root_before_check, observe_repository_root_with_resolver,
     read_repository_context, read_repository_context_with_resolver, AdmittedRepositoryRoot,
-    GitConfigEnvironment, RepositoryContextInput, RepositoryContextRead,
+    GitConfigEnvironment, RepositoryContextInput, RepositoryContextRead, RepositoryObservedRoot,
 };
 
 const A: &str = "https://github.com/team/a.git";
@@ -819,4 +820,453 @@ fn configured_url_that_collides_with_a_remote_name_is_not_reinterpreted() {
         .err()
         .unwrap();
     assert!(error.to_string().contains("collides with a remote name"));
+}
+
+fn observed_root_id() -> RepositoryRootId {
+    RepositoryRootId {
+        workspace_id: WorkspaceId::from("workspace-A"),
+        kind: RepositoryRootKind::Primary,
+    }
+}
+
+fn assert_same_observations(observed: &RepositoryObservedRoot, admitted: &RepositoryContextRead) {
+    let public = &admitted.context.roots[0];
+    assert_eq!(observed.root, public.root);
+    assert_eq!(observed.branch, public.branch);
+    assert_eq!(observed.head_sha, public.head_sha);
+    assert_eq!(observed.remotes, public.remotes);
+    assert_eq!(observed.change_inputs, admitted.change_inputs[0]);
+    let private = &admitted.private_roots[0];
+    assert_eq!(observed.private_root.root, private.root);
+    assert_eq!(observed.private_root.source_ref, private.source_ref);
+    assert_eq!(observed.private_root.remotes.len(), private.remotes.len());
+    for (observed, admitted) in observed.private_root.remotes.iter().zip(&private.remotes) {
+        assert_eq!(observed.name, admitted.name);
+        assert_eq!(observed.fetch, admitted.fetch);
+        assert_eq!(observed.push, admitted.push);
+    }
+}
+
+#[test]
+fn observation_needs_no_admission_but_public_enrichment_keeps_actual_supplied_facts() {
+    let f = Fixture::new();
+    f.config("remote.origin.url", GL);
+    let observed = observe_repository_root_with_resolver(
+        &observed_root_id(),
+        &f.path,
+        &canonical_resolver(),
+        &f.env,
+    )
+    .unwrap();
+    assert_eq!(observed.root, observed_root_id());
+    assert_eq!(observed.branch.as_deref(), Some("main"));
+    assert_eq!(
+        observed.head_sha.as_deref(),
+        Some(f.git(&f.path, &["rev-parse", "HEAD"]).trim())
+    );
+    assert_eq!(
+        observed.remotes[0].fetch[0].resolution,
+        RepositoryEndpointResolution::Resolved {
+            target: target("gl")
+        }
+    );
+    let mut input = f.input();
+    input.revision = RepositoryContextRevision::new("original-sequencer", 73);
+    input.roots[0].targets.clear();
+    let error = read_repository_context_with_resolver(&input, &canonical_resolver(), &f.env)
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("lacks admitted target facts"));
+    let mut supplied = facts("gl");
+    supplied.availability = RepositoryAvailability::Disconnected;
+    supplied.connection = None;
+    supplied.capabilities.clear();
+    input.roots[0].targets.push(supplied.clone());
+    let admitted =
+        read_repository_context_with_resolver(&input, &canonical_resolver(), &f.env).unwrap();
+    assert_same_observations(&observed, &admitted);
+    assert_eq!(admitted.context.revision, input.revision);
+    assert_eq!(admitted.context.scope, input.scope);
+    assert_eq!(admitted.context.roots[0].targets, vec![supplied.clone()]);
+    input.roots[0].targets.push(supplied);
+    let error = read_repository_context_with_resolver(&input, &canonical_resolver(), &f.env)
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("duplicate target facts"));
+}
+
+#[test]
+fn observation_retains_original_transports_and_matches_only_sanitized_public_projection() {
+    let f = Fixture::new();
+    let fetch = "https://user:fixture-secret@git.example:8443/gitlab/team/sub/app.git";
+    let query = "https://git.example:8443/gitlab/team/sub/app.git?token=fixture-query#fragment";
+    f.config("remote.origin.url", fetch);
+    f.config("remote.origin.pushurl", query);
+    f.git(
+        &f.path,
+        &[
+            "config",
+            "--add",
+            "remote.origin.pushurl",
+            "git@unmapped:team/sub/app.git",
+        ],
+    );
+    let observed = observe_repository_root_with_resolver(
+        &observed_root_id(),
+        &f.path,
+        &canonical_resolver(),
+        &f.env,
+    )
+    .unwrap();
+    assert_eq!(
+        observed.private_root.source_ref.as_deref(),
+        Some("refs/heads/main")
+    );
+    assert_eq!(observed.private_root.remotes[0].fetch, vec![fetch]);
+    assert_eq!(
+        observed.private_root.remotes[0].push,
+        vec![query, "git@unmapped:team/sub/app.git"]
+    );
+    assert_eq!(
+        observed.remotes[0].fetch[0].resolution,
+        RepositoryEndpointResolution::Resolved {
+            target: target("gl")
+        }
+    );
+    assert_eq!(
+        observed.remotes[0].push[0].resolution,
+        RepositoryEndpointResolution::Unresolved {
+            reason: RepositoryUnresolvedReason::InvalidRemote
+        }
+    );
+    let admitted =
+        read_repository_context_with_resolver(&f.input(), &canonical_resolver(), &f.env).unwrap();
+    assert_same_observations(&observed, &admitted);
+    let public = serde_json::to_string(&admitted.context).unwrap();
+    for private in ["fixture-secret", "fixture-query", "fragment", "privateRoot"] {
+        assert!(!public.contains(private));
+    }
+}
+
+#[test]
+fn observation_uses_effective_linked_config_includes_rewrites_and_explicit_transport_mappings() {
+    let mut f = Fixture::new();
+    let included = f.path.join(".git/observation-include");
+    std::fs::write(
+        &included,
+        "[remote \"included\"]\nurl = git@configured-alias:team/sub/app.git\n",
+    )
+    .unwrap();
+    f.config("include.path", "observation-include");
+    f.config("extensions.worktreeConfig", "true");
+    f.config("url.https://git.example:8443/gitlab/.insteadOf", "fixture:");
+    let linked = f.guard.path().join("observed-linked");
+    f.git(
+        &f.path,
+        &["worktree", "add", "-b", "feature", linked.to_str().unwrap()],
+    );
+    f.git(
+        &linked,
+        &[
+            "config",
+            "--worktree",
+            "remote.origin.url",
+            "fixture:team/sub/app.git",
+        ],
+    );
+    f.git(
+        &linked,
+        &[
+            "config",
+            "--worktree",
+            "remote.origin.pushurl",
+            "ssh://git@configured-alias:2222/repos/team/sub/app.git",
+        ],
+    );
+    let absent = f.guard.path().join("absent-config-candidate");
+    f.env.extra_config_paths.push(absent.clone());
+    let observed = observe_repository_root_with_resolver(
+        &observed_root_id(),
+        &linked,
+        &canonical_resolver(),
+        &f.env,
+    )
+    .unwrap();
+    assert_eq!(observed.branch.as_deref(), Some("feature"));
+    assert_eq!(
+        observed.private_root.source_ref.as_deref(),
+        Some("refs/heads/feature")
+    );
+    assert_ne!(
+        observed.change_inputs.git_dir,
+        observed.change_inputs.common_dir
+    );
+    assert_eq!(observed.change_inputs.git_entry, linked.join(".git"));
+    assert!(observed.change_inputs.config_files.contains(&included));
+    assert!(observed.change_inputs.config_files.contains(&absent));
+    assert!(observed
+        .change_inputs
+        .config_files
+        .contains(&observed.change_inputs.git_dir.join("config.worktree")));
+    assert_eq!(observed.remotes.len(), 2);
+    for remote in &observed.remotes {
+        for endpoint in remote.fetch.iter().chain(&remote.push) {
+            assert_eq!(
+                endpoint.resolution,
+                RepositoryEndpointResolution::Resolved {
+                    target: target("gl")
+                }
+            );
+        }
+    }
+    assert!(observed
+        .private_root
+        .remotes
+        .iter()
+        .any(|r| r.fetch.iter().any(|url| url == GL)));
+    let mut input = f.input();
+    input.roots[0].path = linked;
+    assert_same_observations(
+        &observed,
+        &read_repository_context_with_resolver(&input, &canonical_resolver(), &f.env).unwrap(),
+    );
+}
+
+#[test]
+fn observation_reports_unmapped_ambiguous_invalid_and_unsupported_transports_without_selection() {
+    let f = Fixture::new();
+    let gl =
+        RemoteInstance::gitlab(GitlabInstance::parse("https://git.example:8443/gitlab").unwrap());
+    let other =
+        RemoteInstance::gitlab(GitlabInstance::parse("https://other.example/forge").unwrap());
+    let resolver = CanonicalRemoteResolver::new(
+        vec![gl.clone(), other.clone()],
+        vec![
+            RemoteTransportMapping::new(gl, "git@ambiguous:").unwrap(),
+            RemoteTransportMapping::new(other, "git@ambiguous:").unwrap(),
+        ],
+    )
+    .unwrap();
+    f.config("remote.origin.url", GL);
+    for (url, reason) in [
+        (
+            "git@unmapped:team/sub/app.git",
+            RepositoryUnresolvedReason::UnknownInstance,
+        ),
+        (
+            "git@ambiguous:team/sub/app.git",
+            RepositoryUnresolvedReason::AmbiguousMapping,
+        ),
+        (
+            "https://git.example:8443/gitlab/team/sub/a%70p.git",
+            RepositoryUnresolvedReason::InvalidRemote,
+        ),
+        (
+            "git://github.com/team/a.git",
+            RepositoryUnresolvedReason::UnsupportedTransport,
+        ),
+        (
+            "file:///local/project",
+            RepositoryUnresolvedReason::UnsupportedTransport,
+        ),
+        (
+            "/local/project",
+            RepositoryUnresolvedReason::UnsupportedTransport,
+        ),
+    ] {
+        f.config("remote.other.url", url);
+        let observed =
+            observe_repository_root_with_resolver(&observed_root_id(), &f.path, &resolver, &f.env)
+                .unwrap();
+        let remote = observed.remotes.iter().find(|r| r.name == "other").unwrap();
+        assert_eq!(
+            remote.fetch[0].resolution,
+            RepositoryEndpointResolution::Unresolved { reason }
+        );
+        assert_same_observations(
+            &observed,
+            &read_repository_context_with_resolver(&f.input(), &resolver, &f.env).unwrap(),
+        );
+    }
+}
+
+#[test]
+fn observation_preserves_attached_detached_unborn_and_conditional_include_facts() {
+    let f = Fixture::new();
+    let included = f.path.join(".git/conditional-observation");
+    std::fs::write(&included, format!("[remote \"conditional\"]\nurl = {A}\n")).unwrap();
+    f.config("includeIf.onbranch:main.path", "conditional-observation");
+    let observe = |path: &Path| {
+        observe_repository_root_with_resolver(
+            &observed_root_id(),
+            path,
+            &canonical_resolver(),
+            &f.env,
+        )
+        .unwrap()
+    };
+    let attached = observe(&f.path);
+    assert_eq!(attached.branch.as_deref(), Some("main"));
+    assert_eq!(
+        attached.private_root.source_ref.as_deref(),
+        Some("refs/heads/main")
+    );
+    assert!(attached.head_sha.is_some());
+    assert_eq!(attached.remotes.len(), 1);
+    f.git(&f.path, &["checkout", "--detach"]);
+    let detached = observe(&f.path);
+    assert!(detached.branch.is_none());
+    assert!(detached.private_root.source_ref.is_none());
+    assert_eq!(detached.head_sha, attached.head_sha);
+    assert!(detached.remotes.is_empty());
+    assert!(detached.change_inputs.config_files.contains(&included));
+    assert_ne!(
+        detached.change_inputs.fingerprint,
+        attached.change_inputs.fingerprint
+    );
+    assert_same_observations(
+        &detached,
+        &read_repository_context_with_resolver(&f.input(), &canonical_resolver(), &f.env).unwrap(),
+    );
+    let unborn = f.guard.path().join("observed-unborn");
+    init(&unborn, false);
+    let observed = observe(&unborn);
+    assert_eq!(observed.branch.as_deref(), Some("main"));
+    assert_eq!(
+        observed.private_root.source_ref.as_deref(),
+        Some("refs/heads/main")
+    );
+    assert!(observed.head_sha.is_none());
+    let mut input = f.input();
+    input.roots[0].path = unborn;
+    assert_same_observations(
+        &observed,
+        &read_repository_context_with_resolver(&input, &canonical_resolver(), &f.env).unwrap(),
+    );
+}
+
+#[test]
+fn observation_refuses_missing_nonroot_and_invalid_local_config_without_fallback() {
+    let f = Fixture::new();
+    let child = f.path.join("child");
+    std::fs::create_dir(&child).unwrap();
+    for path in [
+        f.guard.path().join("absent"),
+        child,
+        f.guard.path().to_path_buf(),
+    ] {
+        assert!(observe_repository_root_with_resolver(
+            &observed_root_id(),
+            &path,
+            &canonical_resolver(),
+            &f.env
+        )
+        .is_err());
+    }
+    f.config(
+        "remote.origin.url",
+        "https://fixture-secret@github.com/team/a.git\nhttps://github.com/team/b.git",
+    );
+    let error = observe_repository_root_with_resolver(
+        &observed_root_id(),
+        &f.path,
+        &canonical_resolver(),
+        &f.env,
+    )
+    .err()
+    .unwrap();
+    assert!(error.to_string().contains("control character"));
+    assert!(!error.to_string().contains("fixture-secret"));
+    std::fs::write(f.path.join(".git/config"), "[invalid fixture-secret").unwrap();
+    let error = observe_repository_root_with_resolver(
+        &observed_root_id(),
+        &f.path,
+        &canonical_resolver(),
+        &f.env,
+    )
+    .err()
+    .unwrap();
+    assert!(!error.to_string().contains("fixture-secret"));
+}
+
+#[test]
+fn observation_checks_real_config_head_and_root_again_after_local_read() {
+    for change in ["config", "head", "git-directory"] {
+        let f = Fixture::new();
+        f.config("remote.origin.url", A);
+        let error = observe_repository_root_before_check(
+            &observed_root_id(),
+            &f.path,
+            &canonical_resolver(),
+            &f.env,
+            || match change {
+                "config" => f.config("remote.origin.url", B),
+                "head" => {
+                    f.git(&f.path, &["checkout", "--detach"]);
+                }
+                "git-directory" => {
+                    std::fs::rename(f.path.join(".git"), f.path.join("old-git")).unwrap()
+                }
+                _ => unreachable!(),
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains(if change == "git-directory" {
+            "Git read failed"
+        } else {
+            "changed during read"
+        }));
+    }
+}
+
+#[test]
+fn public_enrichment_errors_still_precede_the_same_final_consistency_check() {
+    for facts_case in ["missing", "duplicate", "complete"] {
+        let f = Fixture::new();
+        f.config("remote.origin.url", A);
+        let mut input = f.input();
+        if facts_case == "missing" {
+            input.roots[0].targets.clear();
+        }
+        if facts_case == "duplicate" {
+            input.roots[0].targets.push(facts("a"));
+        }
+        let changed = Cell::new(false);
+        let calls = Cell::new(0);
+        let resolver = |url: &str| {
+            calls.set(calls.get() + 1);
+            if !changed.replace(true) {
+                f.config("remote.origin.url", B);
+            }
+            resolve(url)
+        };
+        let error = read_repository_context(&input, &resolver, &f.env)
+            .err()
+            .unwrap();
+        let expected = match facts_case {
+            "missing" => "lacks admitted target facts",
+            "duplicate" => "duplicate target facts",
+            _ => "changed during read",
+        };
+        assert!(error.to_string().contains(expected), "{error}");
+        assert_eq!(
+            calls.get(),
+            2,
+            "one original fetch/push resolution, no second read"
+        );
+        let observed = observe_repository_root_with_resolver(
+            &observed_root_id(),
+            &f.path,
+            &canonical_resolver(),
+            &f.env,
+        )
+        .unwrap();
+        assert_eq!(
+            observed.remotes[0].fetch[0].resolution,
+            RepositoryEndpointResolution::Resolved {
+                target: target("b")
+            }
+        );
+    }
 }
