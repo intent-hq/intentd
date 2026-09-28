@@ -43,15 +43,12 @@ git_tag_enable = true
 changelog_update = true
 # Keep the changelog at the repository root rather than crates/intentd/.
 changelog_path = "./CHANGELOG.md"
-# intentd's changelog covers the whole workspace: commits that only touch the
-# library crates change the shipped binary, so they must show up here
+# intentd's changelog covers the daemon and its libraries: commits that only
+# touch library crates change the shipped binary, so they must show up here
 # (monorepo#889 — e.g. intentd#592 touched only intent-git/intent-services
-# and was missing from the v0.2.9 changelog). intentd-sitter is included too so
-# sitter work is visible in release notes (monorepo#4093 — e.g. intentd#1619
-# touched only intentd-sitter + scripts/ and was missing from the v0.9.2
-# changelog). Residual gap: commits touching ONLY the repo-root
-# scripts/install.{sh,ps1} are still invisible — see the caveat on the
-# intentd-sitter [[package]] entry below.
+# and was missing from the v0.2.9 changelog). Sitter ships independently and
+# is deliberately excluded: sitter-only commits do not belong in daemon
+# notes. Commits that also touch the daemon or its libraries remain visible.
 changelog_include = [
     "intent-acp",
     "intent-context",
@@ -68,7 +65,6 @@ changelog_include = [
     "intent-sourcecontrol",
     "intent-store",
     "intent-transport",
-    "intentd-sitter",
 ]
 version_group = "intentd"
 
@@ -171,14 +167,13 @@ version_group = "intentd"
 # (release-sitter.yml) and keeps its independent 0.1.x version line, so —
 # unlike the lib crates — it is deliberately NOT in the "intentd"
 # version_group: release-plz bumps its version from its own conventional
-# commits instead of pinning it to the daemon's version. It is opted in only
-# so sitter commits are diffed against the last daemon `v*` tag (the shared
-# workspace git_tag_name) and flow into intentd's changelog via
-# changelog_include above (monorepo#4093). Like the lib crates it is never
-# tagged, released, or given its own changelog by release-plz. Side effect:
-# the Release PR now also advances crates/intentd-sitter/Cargo.toml when
-# sitter files changed, so cutting a sitter release no longer needs a manual
-# version bump — push the `sitter-v<Cargo.toml version>` tag.
+# commits instead of pinning it to the daemon's version. It remains opted in
+# for automated version bumps, retaining the shared workspace git_tag_name
+# baseline policy. Its commits are not included in intentd's changelog.
+# Like the lib crates it is never tagged, released, or given its own changelog
+# by release-plz. The Release PR advances crates/intentd-sitter/Cargo.toml when
+# sitter files change; publish through the existing
+# `sitter-v<Cargo.toml version>` tag route.
 #
 # Caveat: only commits touching files under crates/intentd-sitter are
 # detected. The installer scripts live at the repo-root scripts/ (outside the
@@ -196,6 +191,10 @@ git_only = true
 
 # Changelog rendering aligned with the monorepo cliff.toml conventions
 # (same groups and body layout; release-plz runs git-cliff under the hood).
+# release-plz also synthesizes dependency-update commits with id 0000000.
+# Omit only its sitter-only daemon entry before grouping, avoiding empty headings.
+# Real commits and mixed/library dependency summaries remain visible. This changes
+# rendering only: the daemon still depends on sitter and can bump when sitter does.
 [changelog]
 header = """
 # Changelog\n
@@ -207,7 +206,13 @@ body = """
 {% else %}\
     ## [unreleased]
 {% endif %}\
-{% for group, commits in commits | group_by(attribute="group") %}
+{% set visible_commits = [] %}\
+{% for commit in commits %}\
+    {% if package != "intentd" or commit.id != "0000000" or commit.message != "updated the following local packages: intentd-sitter" %}\
+        {% set_global visible_commits = visible_commits | concat(with=commit) %}\
+    {% endif %}\
+{% endfor %}\
+{% for group, commits in visible_commits | group_by(attribute="group") %}
     ### {{ group | striptags | trim | upper_first }}
     {% for commit in commits %}
         - {% if commit.scope %}*({{ commit.scope }})* {% endif %}\
