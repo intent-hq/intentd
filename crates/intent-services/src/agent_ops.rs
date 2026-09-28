@@ -13830,7 +13830,7 @@ impl Services {
                 msg
             }
             Err(append_err) => {
-                manager.release_slot(agent_id).await;
+                manager.release_slot(agent_id, admission).await;
                 // Fail closed on a vanished session (intent-hq/monorepo#2762):
                 // the only FK on `agent_message` is `agent_id →
                 // agent_session(id)`, so an append failure against a gone row

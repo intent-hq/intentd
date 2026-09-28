@@ -22616,10 +22616,10 @@ async fn wake_or_create_queued_skips_watch_when_caller_deleted() {
     flag_agent_deleted(&svc, &caller).await;
     // Occupy the assignee's in-flight slot so `deliver_wake_message` takes the
     // enqueue branch deterministically.
-    assert!(
-        manager.try_begin_turn(&target, &ws).await.is_some(),
-        "claim slot"
-    );
+    let admission = manager
+        .try_begin_turn(&target, &ws)
+        .await
+        .expect("claim slot");
 
     let input = AgentWakeOrCreateInput {
         caller_agent_id: Some(caller.clone()),
@@ -22638,7 +22638,7 @@ async fn wake_or_create_queued_skips_watch_when_caller_deleted() {
     assert!(svc.list_watches_for_parent(&caller).is_empty());
     assert!(svc.find_watches_for_child(&target).is_empty());
 
-    manager.release_slot(&target).await;
+    manager.release_slot(&target, admission).await;
 }
 
 /// monorepo#994: the #932 pre-gate is ALSO skipped for a Deleted caller —
@@ -22683,10 +22683,10 @@ async fn wake_or_create_queued_registers_watch() {
         .expect("assign");
     // Occupy the assignee's in-flight slot so `deliver_wake_message` takes the
     // enqueue branch deterministically.
-    assert!(
-        manager.try_begin_turn(&target, &ws).await.is_some(),
-        "claim slot"
-    );
+    let admission = manager
+        .try_begin_turn(&target, &ws)
+        .await
+        .expect("claim slot");
 
     let input = AgentWakeOrCreateInput {
         caller_agent_id: Some(caller.clone()),
@@ -22713,7 +22713,7 @@ async fn wake_or_create_queued_registers_watch() {
     assert_eq!(watches[0].id, sub_id);
     assert_eq!(watches[0].child_agent_id, target);
 
-    manager.release_slot(&target).await;
+    manager.release_slot(&target, admission).await;
 }
 
 /// SUB-2 (PR #104 thread `PRRT_kwDOS9Wxuc6QIRcq`), updated for pair
@@ -22748,10 +22748,10 @@ async fn wake_or_create_queued_adopts_existing_watch() {
 
     // Occupy the assignee's in-flight slot so the wakeOrCreate takes the
     // queued branch deterministically.
-    assert!(
-        manager.try_begin_turn(&target, &ws).await.is_some(),
-        "claim slot"
-    );
+    let admission = manager
+        .try_begin_turn(&target, &ws)
+        .await
+        .expect("claim slot");
 
     let queued = svc
         .agent_wake_or_create_op(
@@ -22785,7 +22785,7 @@ async fn wake_or_create_queued_adopts_existing_watch() {
     );
     assert_eq!(watches[0].id, seeded_sub_id);
 
-    manager.release_slot(&target).await;
+    manager.release_slot(&target, admission).await;
 }
 
 /// SUB-2 (Copilot #104 follow-up, thread `PRRT_kwDOS9Wxuc6QKWuU`):
@@ -23899,10 +23899,10 @@ async fn turn_start_opens_new_waiting_period_for_armed_watch() {
 
     // The child starts a REAL turn (e.g. a user message or hook-dispatch
     // wake): the period is over and the marker clears at the claim.
-    assert!(
-        manager.try_begin_turn(&child, &ws).await.is_some(),
-        "claim slot"
-    );
+    let admission = manager
+        .try_begin_turn(&child, &ws)
+        .await
+        .expect("claim slot");
     assert!(
         !svc.store()
             .has_advisory_wake_delivery(&parent, &child)
@@ -23910,7 +23910,7 @@ async fn turn_start_opens_new_waiting_period_for_armed_watch() {
             .expect("marker read"),
         "turn start clears the once-per-period advisory marker"
     );
-    manager.release_slot(&child).await;
+    manager.release_slot(&child, admission).await;
 
     // Period 2: the child stalls monitoring-idle again — the SAME armed
     // watch hears a FRESH advisory instead of waiting in silence (the
@@ -23999,10 +23999,10 @@ async fn turn_start_opens_new_waiting_period_for_grouped_watch() {
     manager.stop(&parent).await;
 
     // Real turn: marker clears, period 2 opens.
-    assert!(
-        manager.try_begin_turn(&child, &ws).await.is_some(),
-        "claim slot"
-    );
+    let admission = manager
+        .try_begin_turn(&child, &ws)
+        .await
+        .expect("claim slot");
     assert!(
         !svc.store()
             .has_advisory_wake_delivery(&parent, &child)
@@ -24010,7 +24010,7 @@ async fn turn_start_opens_new_waiting_period_for_grouped_watch() {
             .expect("marker read"),
         "turn start clears the grouped pair's marker too"
     );
-    manager.release_slot(&child).await;
+    manager.release_slot(&child, admission).await;
 
     // Period 2: the SAME armed watch (same id) delivers a second advisory —
     // the per-period stable id keeps it out of the durable-wake dedup.

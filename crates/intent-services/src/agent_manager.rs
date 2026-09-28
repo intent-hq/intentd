@@ -6119,6 +6119,66 @@ impl AgentManager {
         }
     }
 
+    fn owns_admission(&self, agent_id: &AgentId, admission: TurnAdmission) -> bool {
+        self.turn_admissions.lock().unwrap().get(agent_id) == Some(&admission)
+    }
+
+    /// Pre-spawn exits belong to the admitted request, not whichever turn
+    /// happens to own this agent now. Keep status persistence ordered with
+    /// retirement and new claims as well as checking the slot identity.
+    async fn finish_admission(
+        &self,
+        agent_id: &AgentId,
+        admission: TurnAdmission,
+        persist_idle: bool,
+    ) {
+        let gate = self.turn_start_gates.for_agent(agent_id);
+        let _starting = gate.lock().await;
+        if !self.owns_admission(agent_id, admission) {
+            return;
+        }
+        if persist_idle {
+            self.end_turn(agent_id).await;
+        } else {
+            self.release_in_flight_slot(agent_id);
+        }
+    }
+
+    async fn fail_admitted_persist(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        content: &str,
+        options: &TurnOptions,
+        admission: TurnAdmission,
+    ) {
+        let gate = self.turn_start_gates.for_agent(agent_id);
+        let _starting = gate.lock().await;
+        if !self.owns_admission(agent_id, admission) {
+            return;
+        }
+        handle_drain_persist_failure(self, agent_id, workspace_id, content, options).await;
+        self.release_in_flight_slot(agent_id);
+    }
+
+    async fn prepare_admitted_flush_turn(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        entries: Vec<QueuedMessage>,
+        draining: DrainingGuard,
+        admission: TurnAdmission,
+    ) -> FlushPrep {
+        let gate = self.turn_start_gates.for_agent(agent_id);
+        let _starting = gate.lock().await;
+        if !self.owns_admission(agent_id, admission) {
+            return FlushPrep::Parked;
+        }
+        // Flush preparation can requeue entries and persist Error on append
+        // failure. Order all of those effects before retirement detaches.
+        prepare_flush_turn(self, agent_id, workspace_id, entries, draining).await
+    }
+
     /// Remove `agent_id` from `busy` and `agent_ws` atomically with respect to
     /// `list_busy` (both maps mutated under the `busy` lock, busy → `agent_ws`
     /// order). Returns `None` when the agent was not busy, otherwise the
@@ -6877,7 +6937,7 @@ impl AgentManager {
                 // `agent.sendMessage` fallback (PROTOCOL §5.5). Self-drain:
                 // the slot we just released will be reclaimed below if the
                 // queue is ready and the agent is otherwise free.
-                self.end_turn(&agent_id).await;
+                self.finish_admission(&agent_id, admission, true).await;
                 // Check-then-act race guard (monorepo#564): if the session
                 // vanished between the up-front validation and the append
                 // (concurrent delete), fail closed like the guard rather than
@@ -7261,7 +7321,16 @@ impl AgentManager {
                 self.services
                     .dequeue_flush_batch_draining(&agent_id, mode, archived_drain, 2)
             {
-                match prepare_flush_turn(&self, &agent_id, &workspace_id, batch, draining).await {
+                match self
+                    .prepare_admitted_flush_turn(
+                        &agent_id,
+                        &workspace_id,
+                        batch,
+                        draining,
+                        admission,
+                    )
+                    .await
+                {
                     FlushPrep::Turn { content, options } => {
                         self.spawn_worker(
                             agent_id,
@@ -7276,7 +7345,7 @@ impl AgentManager {
                         // Release the slot without overwriting the Error
                         // status just persisted, so `agent.retry` (or a
                         // future message) can redrive.
-                        self.release_in_flight_slot(&agent_id);
+                        self.finish_admission(&agent_id, admission, false).await;
                     }
                 }
                 return;
@@ -7291,7 +7360,7 @@ impl AgentManager {
         let Some((mut next, draining)) = dequeued else {
             // Raced with another mutation (e.g. remove) that emptied the
             // ready-to-send queue between the check above and the dequeue.
-            self.end_turn(&agent_id).await;
+            self.finish_admission(&agent_id, admission, true).await;
             // monorepo#1280: the racing retraction saw this drain's
             // in-flight slot (`agent_is_busy` true) and skipped its own
             // redelivery, expecting a turn to end with a terminal
@@ -7374,11 +7443,14 @@ impl AgentManager {
             ..TurnOptions::default()
         };
         if !user_persisted {
-            handle_drain_persist_failure(&self, &agent_id, &workspace_id, &next.content, &options)
-                .await;
-            // Release the slot without overwriting the Error status just
-            // persisted, so `agent.retry` (or a future message) can redrive.
-            self.release_in_flight_slot(&agent_id);
+            self.fail_admitted_persist(
+                &agent_id,
+                &workspace_id,
+                &next.content,
+                &options,
+                admission,
+            )
+            .await;
             return;
         }
         drop(draining);
@@ -7602,7 +7674,7 @@ impl AgentManager {
                     // Transactional guarantee: release the slot and restore
                     // the entry at the FRONT (`persisted: false`, so a retry
                     // re-attempts the append), then surface the failure.
-                    self.end_turn(&agent_id).await;
+                    self.finish_admission(&agent_id, admission, true).await;
                     self.services.requeue_front(&agent_id, entry);
                     drop(draining);
                     self.services.publish_queue_updated(&agent_id).await;
@@ -8059,9 +8131,7 @@ impl AgentManager {
         // Hold through spawn + registration: retirement either sees this
         // worker in its abort sweep or prevents it from starting at all.
         let retired = self.retired.lock().unwrap();
-        if retired.contains(&agent_id)
-            || self.turn_admissions.lock().unwrap().get(&agent_id) != Some(&admission)
-        {
+        if retired.contains(&agent_id) || !self.owns_admission(&agent_id, admission) {
             // Teardown owns the cancelled slot. Never release a newer claim
             // installed by restore while this old send was persisting.
             return;
@@ -8344,9 +8414,7 @@ impl AgentManager {
         let mgr = self.clone();
         let (id, ws) = (agent_id.clone(), workspace_id.clone());
         let retired = self.retired.lock().unwrap();
-        if retired.contains(agent_id)
-            || self.turn_admissions.lock().unwrap().get(agent_id) != Some(&admission)
-        {
+        if retired.contains(agent_id) || !self.owns_admission(agent_id, admission) {
             return true;
         }
         self.registry.mark_active(agent_id);
@@ -8585,8 +8653,8 @@ impl AgentManager {
     /// [`AgentManager::finish_prepersisted_turn_spawn`]). Public-in-crate seam
     /// so `Services::deliver_wake_message` can hand control back to the drain
     /// loop after a store error, mirroring the `send_message` self-drain path.
-    pub(crate) async fn release_slot(&self, agent_id: &AgentId) {
-        self.end_turn(agent_id).await;
+    pub(crate) async fn release_slot(&self, agent_id: &AgentId, admission: TurnAdmission) {
+        self.finish_admission(agent_id, admission, true).await;
     }
 
     /// Whether the cached handle's child process + transport still look live

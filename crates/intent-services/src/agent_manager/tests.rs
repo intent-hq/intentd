@@ -9428,6 +9428,126 @@ async fn user_retire_invalidates_admitted_send_across_restore() {
 }
 
 #[tokio::test]
+async fn user_retire_stale_idle_cleanup_preserves_restored_claim() {
+    assert_retired_cleanup_preserves_fresh_turn(RetiredCleanup::Idle).await;
+}
+
+#[tokio::test]
+async fn user_retire_stale_slot_cleanup_preserves_restored_claim() {
+    assert_retired_cleanup_preserves_fresh_turn(RetiredCleanup::Slot).await;
+}
+
+#[tokio::test]
+async fn user_retire_stale_persist_failure_preserves_restored_claim() {
+    assert_retired_cleanup_preserves_fresh_turn(RetiredCleanup::PersistFailure).await;
+}
+
+#[tokio::test]
+async fn user_retire_stale_flush_preserves_restored_claim() {
+    assert_retired_cleanup_preserves_fresh_turn(RetiredCleanup::Flush).await;
+}
+
+enum RetiredCleanup {
+    Idle,
+    Slot,
+    PersistFailure,
+    Flush,
+}
+
+async fn assert_retired_cleanup_preserves_fresh_turn(cleanup: RetiredCleanup) {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let ws = WorkspaceId::from("ws-retire-cleanup");
+    let id = AgentId::from("retire-cleanup");
+    seed_agent(&mgr, &ws, &id).await;
+    let cancelled = mgr.try_begin_turn(&id, &ws).await.unwrap();
+    let flush = if matches!(cleanup, RetiredCleanup::Flush) {
+        mgr.services.enqueue_message(
+            &id,
+            "old flush".into(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::Automatic,
+        );
+        mgr.services.dequeue_message_draining(&id)
+    } else {
+        None
+    };
+    // The old request is paused after admission while its append/drain awaits.
+    intent_core::with_caller(
+        intent_core::Caller::Wire {
+            principal_id: intent_core::PrincipalId::new(),
+            host_role: intent_core::HostRole::Owner,
+        },
+        mgr.services
+            .agent_retire(id.clone(), Some(ws.clone()), None),
+    )
+    .await
+    .unwrap();
+    mgr.services
+        .agent_restore_op(id.clone(), Some(ws.clone()))
+        .await
+        .unwrap();
+    let fresh = mgr.try_begin_turn(&id, &ws).await.unwrap();
+    assert_ne!(cancelled, fresh);
+    // Resume exactly the old request's error/empty-drain exit after Restore
+    // and a new claim. No scheduler timing or provider process is involved.
+    match cleanup {
+        RetiredCleanup::Idle => mgr.release_slot(&id, cancelled).await,
+        RetiredCleanup::Slot => mgr.finish_admission(&id, cancelled, false).await,
+        RetiredCleanup::PersistFailure => {
+            mgr.fail_admitted_persist(
+                &id,
+                &ws,
+                "old send",
+                &super::TurnOptions::default(),
+                cancelled,
+            )
+            .await;
+        }
+        RetiredCleanup::Flush => {
+            let (entry, draining) = flush.unwrap();
+            let prep = mgr
+                .prepare_admitted_flush_turn(&id, &ws, vec![entry], draining, cancelled)
+                .await;
+            assert!(matches!(prep, super::FlushPrep::Parked));
+            mgr.finish_admission(&id, cancelled, false).await;
+            assert!(
+                mgr.services
+                    .store
+                    .get_agent_messages(&id, None)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "cancelled flush must not persist messages for the new turn"
+            );
+        }
+    }
+    assert!(mgr.is_busy(&id), "stale cleanup must preserve fresh slot");
+    assert_eq!(mgr.turn_admissions.lock().unwrap().get(&id), Some(&fresh));
+    assert_eq!(
+        mgr.services.agent_activity.lock().unwrap().get(&ws),
+        Some(&1)
+    );
+    let row = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(
+        row.status,
+        AgentStatus::Active,
+        "stale failure must not overwrite fresh status"
+    );
+    assert!(row.stop_reason.is_none());
+    assert!(
+        !mgr.services.has_ready_to_send(&id),
+        "cancelled send is not requeued into new turn"
+    );
+    mgr.end_turn(&id).await;
+}
+
+#[tokio::test]
 async fn user_retire_active_descendant_rejection_does_not_stop_target() {
     let (_tmp, mgr) = manager().await;
     let mgr = Arc::new(mgr);
