@@ -397,7 +397,7 @@ async fn real_workspace_delete_cascade_and_same_id_recreation_retires_both() {
 }
 
 #[tokio::test]
-async fn registered_root_delete_recreate_is_atomic_with_workspace_invalidation() {
+async fn registered_root_delete_recreate_is_atomic_with_precise_invalidation() {
     let f = Fixture::new().await;
     let root: intent_core::WorkspaceGitRoot = serde_json::from_value(serde_json::json!({
         "id":"gitroot-lifecycle", "workspaceId":f.workspace.id,
@@ -415,7 +415,7 @@ async fn registered_root_delete_recreate_is_atomic_with_workspace_invalidation()
     assert!(old.load(Ordering::SeqCst));
     f.store.delete_workspace_git_root(&root.id).await.unwrap();
     assert!(!old.load(Ordering::SeqCst));
-    assert!(!workspace.load(Ordering::SeqCst));
+    assert!(workspace.load(Ordering::SeqCst));
     f.store.upsert_workspace_git_root(&root).await.unwrap();
     assert!(f.probe.capture(vec![key]).is_some());
 }
@@ -887,4 +887,346 @@ async fn retired_file_incarnation_survives_last_store_drop() {
         Store::open(&path).await.is_err(),
         "dropping the last Store must not erase a retired live incarnation"
     );
+}
+
+fn precise_root(f: &Fixture, id: &str, path: &str) -> intent_core::WorkspaceGitRoot {
+    serde_json::from_value(serde_json::json!({
+        "id":id,"workspaceId":f.workspace.id,"path":path,"source":"agent",
+        "createdAt":"same-time","updatedAt":"same-time"
+    }))
+    .unwrap()
+}
+
+fn precise_selection(root: &intent_core::WorkspaceGitRoot) -> RepositoryLifecycleKey {
+    RepositoryLifecycleKey::Selection {
+        workspace_id: root.workspace_id.clone(),
+        git_root_id: Some(root.id.clone()),
+    }
+}
+
+#[tokio::test]
+async fn precise_registration_insert_preserves_workspace_and_retires_its_selection() {
+    let f = Fixture::new().await;
+    let root = precise_root(&f, "precise-root", "/registered");
+    let workspace = f.probe.capture(vec![f.workspace_key()]).unwrap();
+    let selection = f.probe.capture(vec![precise_selection(&root)]).unwrap();
+    f.store.upsert_workspace_git_root(&root).await.unwrap();
+    assert_eq!(
+        (
+            workspace.load(Ordering::SeqCst),
+            selection.load(Ordering::SeqCst)
+        ),
+        (true, false)
+    );
+}
+
+#[tokio::test]
+async fn precise_registration_delete_preserves_workspace_and_retires_its_selection() {
+    let f = Fixture::new().await;
+    let root = precise_root(&f, "precise-root", "/registered");
+    f.store.upsert_workspace_git_root(&root).await.unwrap();
+    let workspace = f.probe.capture(vec![f.workspace_key()]).unwrap();
+    let selection = f.probe.capture(vec![precise_selection(&root)]).unwrap();
+    f.store.delete_workspace_git_root(&root.id).await.unwrap();
+    assert_eq!(
+        (
+            workspace.load(Ordering::SeqCst),
+            selection.load(Ordering::SeqCst)
+        ),
+        (true, false)
+    );
+}
+
+fn precise_keys(root: &intent_core::WorkspaceGitRoot) -> Vec<RepositoryLifecycleKey> {
+    vec![
+        RepositoryLifecycleKey::RootInventory(root.workspace_id.clone()),
+        RepositoryLifecycleKey::GitRoot(root.id.clone()),
+        precise_selection(root),
+    ]
+}
+
+#[tokio::test]
+async fn precise_registration_mutates_only_inventory_root_and_registered_choice() {
+    let f = Fixture::new().await;
+    let root = precise_root(&f, "precise-root", "/registered");
+    let other = precise_root(&f, "other-root", "/other");
+    let primary = RepositoryLifecycleKey::Selection {
+        workspace_id: f.workspace.id.clone(),
+        git_root_id: None,
+    };
+    for insert in [true, false] {
+        let matching: Vec<_> = precise_keys(&root)
+            .into_iter()
+            .map(|key| f.probe.capture(vec![key]).unwrap())
+            .collect();
+        let unrelated = f
+            .probe
+            .capture(vec![
+                f.workspace_key(),
+                f.agent_key(),
+                primary.clone(),
+                RepositoryLifecycleKey::GitRoot(other.id.clone()),
+                precise_selection(&other),
+                RepositoryLifecycleKey::RootInventory(WorkspaceId::from("elsewhere")),
+            ])
+            .unwrap();
+        if insert {
+            f.store.upsert_workspace_git_root(&root).await.unwrap();
+        } else {
+            f.store.delete_workspace_git_root(&root.id).await.unwrap();
+        }
+        assert!(matching.iter().all(|leaf| !leaf.load(Ordering::SeqCst)));
+        assert!(unrelated.load(Ordering::SeqCst));
+        assert!(f.probe.capture(precise_keys(&root)).is_some());
+    }
+}
+
+#[tokio::test]
+async fn precise_registration_metadata_and_missing_delete_preserve_original_coverage() {
+    let f = Fixture::new().await;
+    let root = precise_root(&f, "original-root", "/registered");
+    f.store.upsert_workspace_git_root(&root).await.unwrap();
+    let current = f.probe.capture(precise_keys(&root)).unwrap();
+    let starts = f.probe.starts();
+    let mut metadata = root.clone();
+    metadata.id = intent_core::WorkspaceGitRootId::from("submitted-other-id");
+    metadata.repo_name = Some("ordinary metadata".into());
+    let (stored, inserted) = f.store.upsert_workspace_git_root(&metadata).await.unwrap();
+    assert!(!inserted);
+    assert_eq!(stored.id, root.id);
+    assert_eq!(stored.workspace_id, root.workspace_id);
+    assert_eq!(stored.path, root.path);
+    f.store.update_workspace_git_root_pr(&stored).await.unwrap();
+    assert!(f
+        .store
+        .delete_workspace_git_root(&metadata.id)
+        .await
+        .is_err());
+    assert!(current.load(Ordering::SeqCst));
+    assert_eq!(f.probe.starts(), starts);
+}
+
+#[tokio::test]
+async fn precise_registration_competitors_invalidate_only_the_actual_inserted_identity() {
+    let f = Fixture::new().await;
+    let independent = Store::open(&f.dir.path().join("lifecycle.db"))
+        .await
+        .unwrap();
+    let a = precise_root(&f, "candidate-a", "/same");
+    let b = precise_root(&f, "candidate-b", "/same");
+    let a_leaf = f.probe.capture(vec![precise_selection(&a)]).unwrap();
+    let b_leaf = f.probe.capture(vec![precise_selection(&b)]).unwrap();
+    let inventory = f
+        .probe
+        .capture(vec![RepositoryLifecycleKey::RootInventory(
+            f.workspace.id.clone(),
+        )])
+        .unwrap();
+    let starts = f.probe.starts();
+    let (left, right) = tokio::join!(
+        f.store.upsert_workspace_git_root(&a),
+        independent.upsert_workspace_git_root(&b)
+    );
+    let (left, inserted_left) = left.unwrap();
+    let (right, inserted_right) = right.unwrap();
+    assert_ne!(inserted_left, inserted_right);
+    assert_eq!(left.id, right.id);
+    assert_eq!(f.probe.starts(), starts + 1);
+    assert!(!inventory.load(Ordering::SeqCst));
+    assert_eq!(a_leaf.load(Ordering::SeqCst), left.id != a.id);
+    assert_eq!(b_leaf.load(Ordering::SeqCst), left.id != b.id);
+}
+
+#[tokio::test]
+async fn precise_registration_recreation_keeps_tombstone_and_other_choices() {
+    let f = Fixture::new().await;
+    let root = precise_root(&f, "same-id", "/same");
+    f.store.upsert_workspace_git_root(&root).await.unwrap();
+    let primary = intent_core::RepositoryRootId {
+        workspace_id: f.workspace.id.clone(),
+        kind: intent_core::RepositoryRootKind::Primary,
+    };
+    let registered = intent_core::RepositoryRootId {
+        workspace_id: f.workspace.id.clone(),
+        kind: intent_core::RepositoryRootKind::Registered {
+            git_root_id: root.id.clone(),
+        },
+    };
+    let primary_snapshot = f
+        .store
+        .repository_selection_snapshot(&primary)
+        .await
+        .unwrap();
+    f.store
+        .reset_repository_selection(&primary_snapshot)
+        .await
+        .result
+        .unwrap();
+    let primary_snapshot = f
+        .store
+        .repository_selection_snapshot(&primary)
+        .await
+        .unwrap();
+    let original = f
+        .store
+        .repository_selection_snapshot(&registered)
+        .await
+        .unwrap();
+    f.store
+        .write_repository_selection(
+            &original,
+            crate::RepositorySelectionChange::ExplicitRemote {
+                remote_name: "old".into(),
+            },
+        )
+        .await
+        .result
+        .unwrap();
+    let original = f
+        .store
+        .repository_selection_snapshot(&registered)
+        .await
+        .unwrap();
+    f.store.delete_workspace_git_root(&root.id).await.unwrap();
+    f.store.upsert_workspace_git_root(&root).await.unwrap();
+    let current = f
+        .store
+        .repository_selection_snapshot(&registered)
+        .await
+        .unwrap();
+    assert!(current.root_incarnation().unwrap().get() > original.root_incarnation().unwrap().get());
+    assert!(matches!(
+        current.selection(),
+        Some(crate::RepositoryStoredSelection::Saved(
+            intent_core::SavedReviewSelection::UnresolvedHistorical { .. }
+        ))
+    ));
+    assert!(matches!(
+        f.store.reset_repository_selection(&original).await.result,
+        Ok(crate::RepositorySelectionWriteResult::Conflict(_))
+    ));
+    let after = f
+        .store
+        .repository_selection_snapshot(&primary)
+        .await
+        .unwrap();
+    assert_eq!(after.selection(), primary_snapshot.selection());
+    assert_eq!(
+        after.selection_revision(),
+        primary_snapshot.selection_revision()
+    );
+    assert_eq!(
+        after.root_incarnation(),
+        primary_snapshot.root_incarnation()
+    );
+}
+
+#[tokio::test]
+async fn precise_registration_failed_sql_keeps_only_original_unknown_keys() {
+    let f = Fixture::new().await;
+    let root = precise_root(&f, "same-id", "/original");
+    f.store.upsert_workspace_git_root(&root).await.unwrap();
+    let mut collision = root.clone();
+    collision.path = "/collision".into();
+    let original = f.probe.capture(precise_keys(&root)).unwrap();
+    let unrelated = f
+        .probe
+        .capture(vec![f.workspace_key(), f.agent_key()])
+        .unwrap();
+    assert!(f.store.upsert_workspace_git_root(&collision).await.is_err());
+    assert_eq!(
+        f.store.get_workspace_git_root(&root.id).await.unwrap().path,
+        root.path
+    );
+    assert!(!original.load(Ordering::SeqCst));
+    assert!(unrelated.load(Ordering::SeqCst));
+    assert!(f.probe.capture(precise_keys(&root)).is_none());
+    let other = precise_root(&f, "another", "/another");
+    f.store.upsert_workspace_git_root(&other).await.unwrap();
+    assert!(
+        f.probe.capture(precise_keys(&root)).is_none(),
+        "another known completion cannot settle the collision"
+    );
+    assert!(f
+        .probe
+        .capture(vec![RepositoryLifecycleKey::GitRoot(other.id)])
+        .is_some());
+}
+
+async fn precise_canceled_delete(installed: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.db");
+    let store = Store::open(&path).await.unwrap();
+    let mut workspace = intent_core::chief_workspace();
+    workspace.id = WorkspaceId::new();
+    store.insert_workspace(&workspace).await.unwrap();
+    let root: intent_core::WorkspaceGitRoot = serde_json::from_value(serde_json::json!({
+        "id":"canceled-root","workspaceId":workspace.id,"path":"/root","source":"agent",
+        "createdAt":"same-time","updatedAt":"same-time"
+    }))
+    .unwrap();
+    store.upsert_workspace_git_root(&root).await.unwrap();
+    let probe = Arc::new(Probe::default());
+    let observer: Arc<dyn RepositoryLifecycleObserver> = probe.clone();
+    if installed {
+        store
+            .install_repository_lifecycle_observer(observer.clone())
+            .await
+            .unwrap();
+    }
+    let pool = store.write_pool().clone();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let notify = started.clone();
+    let (release, blocked) = std::sync::mpsc::sync_channel(1);
+    let mut blocked = Some(blocked);
+    let mut connection = pool.acquire().await.unwrap();
+    connection
+        .lock_handle()
+        .await
+        .unwrap()
+        .set_update_hook(move |update| {
+            if update.table == "workspace_git_root" {
+                if let Some(blocked) = blocked.take() {
+                    notify.notify_one();
+                    blocked
+                        .recv_timeout(std::time::Duration::from_secs(20))
+                        .unwrap();
+                }
+            }
+        });
+    drop(connection);
+    let id = root.id.clone();
+    let worker = tokio::spawn(async move { store.delete_workspace_git_root(&id).await });
+    tokio::time::timeout(std::time::Duration::from_secs(10), started.notified())
+        .await
+        .unwrap();
+    worker.abort();
+    assert!(worker.await.unwrap_err().is_cancelled());
+    release.send(()).unwrap();
+    let mut connection = pool.acquire().await.unwrap();
+    connection.lock_handle().await.unwrap().remove_update_hook();
+    drop(connection);
+    let reopened = Store::open(&path).await.unwrap();
+    assert!(reopened.get_workspace_git_root(&root.id).await.is_err());
+    if installed {
+        assert!(reopened.has_repository_lifecycle_observer(&observer));
+        assert!(probe.capture(precise_keys(&root)).is_none());
+        reopened.upsert_workspace_git_root(&root).await.unwrap();
+        assert!(probe.capture(precise_keys(&root)).is_none());
+    } else {
+        assert!(reopened
+            .install_repository_lifecycle_observer(observer)
+            .await
+            .is_err());
+    }
+}
+
+#[tokio::test]
+async fn precise_registration_canceled_sqlite_delete_retains_installed_unknown_on_reopen() {
+    precise_canceled_delete(true).await;
+}
+
+#[tokio::test]
+async fn precise_registration_canceled_sqlite_delete_blocks_first_observer_on_reopen() {
+    precise_canceled_delete(false).await;
 }

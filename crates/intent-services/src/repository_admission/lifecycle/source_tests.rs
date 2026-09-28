@@ -715,3 +715,531 @@ async fn unknown_domain_survives_last_managed_handle_drop() {
         drop(subscription);
     }
 }
+
+mod precise_registered_tests {
+    use super::*;
+    use crate::repository_admission::lifecycle::physical_owner::{
+        RepositoryCreationIntent, RepositoryCreationOwner, RepositoryPhysicalOwner,
+    };
+    use crate::repository_admission::read_request::{
+        PreparedRepositoryOptional, RepositoryReadOwner, RepositoryReadRequest,
+    };
+    use crate::repository_admission::request_context::{
+        current_read_request, RepositoryCallbackContext,
+    };
+    use intent_acp::mcp_server::request_context::McpRequestContext;
+    use intent_core::caller::with_caller;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+    struct RegisteredFixture {
+        f: Fixture,
+        services: Arc<Services>,
+        registry: Arc<RepositoryLifecycleRegistry>,
+        physical: RepositoryPhysicalOwner,
+        context: RepositoryCallbackContext,
+        caller: Caller,
+        optional: WorkspaceGitRoot,
+        required: WorkspaceGitRoot,
+    }
+
+    fn row(f: &Fixture, id: &str, path: &std::path::Path) -> WorkspaceGitRoot {
+        serde_json::from_value(serde_json::json!({
+            "id":id,"workspaceId":f.workspace.id,"path":path,"source":"agent",
+            "createdAt":"same-time","updatedAt":"same-time"
+        }))
+        .unwrap()
+    }
+
+    impl RegisteredFixture {
+        async fn new() -> Self {
+            let f = Fixture::new().await;
+            let optional = row(&f, "optional-root", &f.dir.path().join("optional"));
+            let required = row(&f, "required-root", &f.path);
+            f.store.upsert_workspace_git_root(&optional).await.unwrap();
+            f.store.upsert_workspace_git_root(&required).await.unwrap();
+            let agent = intent_core::AgentId::new();
+            let session:intent_core::AgentSession=serde_json::from_value(serde_json::json!({
+                "id":agent,"workspaceId":f.workspace.id,"name":"registered source","status":"active",
+                "createdAt":"same-time","updatedAt":"same-time"
+            })).unwrap();
+            f.store.insert_agent_session(&session).await.unwrap();
+            let services = Arc::new(Services::new(f.store.clone()));
+            let registry = services.repository_lifecycle_registry().await.unwrap();
+            // Real Store one-use confirmation and physical owner; ACP completion
+            // is explicitly scripted. No production NativeRead route is added.
+            let physical = RepositoryCreationOwner::allocate(
+                &registry,
+                &f.store,
+                f.workspace.id.clone(),
+                agent.clone(),
+                RepositoryCreationIntent::FirstSet,
+            )
+            .unwrap()
+            .initialize(&f.store, || async {
+                Ok("scripted original ACP completion".into())
+            })
+            .await
+            .unwrap();
+            let context = physical
+                .callback()
+                .with_read_owner(RepositoryReadOwner::capture(services.clone()));
+            Self {
+                f,
+                services,
+                registry,
+                physical,
+                context,
+                caller: Caller::Agent { agent_id: agent },
+                optional,
+                required,
+            }
+        }
+
+        async fn required_source(&self, registered: Option<&WorkspaceGitRoot>) {
+            let mut parameters = input(&self.f);
+            if let Some(root) = registered {
+                parameters.facts.preparation.root.kind = RepositoryRootKind::Registered {
+                    git_root_id: root.id.clone(),
+                };
+                parameters.context.roots[0].root = parameters.facts.preparation.root.clone();
+            }
+            with_captured_repository_source(
+                &self.services,
+                internal(self.caller.clone()).await,
+                "required original source".into(),
+                vec![NativeReviewStage::Commit],
+                parameters,
+                |admission| async move {
+                    revalidate_repository_stage(&admission, NativeReviewStage::Commit).await?;
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+            // Source cleanup closes its operation child. The original request
+            // retains its actual root subscriptions for later consumption.
+        }
+
+        async fn prepare_optional(
+            &self,
+            read: &Arc<RepositoryReadRequest>,
+        ) -> PreparedRepositoryOptional<intent_store::RepositorySelectionSnapshot> {
+            let scope = read.capture_optional().unwrap();
+            scope
+                .run_optional(|metadata| async move {
+                    metadata.subscribe_metadata(&[
+                        RepositoryLifecycleKey::Database,
+                        RepositoryLifecycleKey::RootInventory(self.f.workspace.id.clone()),
+                    ])?;
+                    let roots = self
+                        .f
+                        .store
+                        .list_workspace_git_roots(&self.f.workspace.id)
+                        .await
+                        .map_err(|_| AdmissionError::Unavailable)?;
+                    let selected = roots
+                        .into_iter()
+                        .find(|r| r.id == self.optional.id)
+                        .ok_or(AdmissionError::Unavailable)?;
+                    metadata.subscribe_metadata(&[
+                        RepositoryLifecycleKey::Database,
+                        RepositoryLifecycleKey::GitRoot(selected.id.clone()),
+                        RepositoryLifecycleKey::Selection {
+                            workspace_id: selected.workspace_id.clone(),
+                            git_root_id: Some(selected.id.clone()),
+                        },
+                    ])?;
+                    let root = intent_core::RepositoryRootId {
+                        workspace_id: selected.workspace_id,
+                        kind: RepositoryRootKind::Registered {
+                            git_root_id: selected.id,
+                        },
+                    };
+                    self.f
+                        .store
+                        .repository_selection_snapshot(&root)
+                        .await
+                        .map_err(|_| AdmissionError::Unavailable)
+                })
+                .unwrap()
+                .await
+                .unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn precise_registered_optional_delete_omits_only_local_evidence() {
+        let f = RegisteredFixture::new().await;
+        let scope = McpRequestContext::capture(&f.context);
+        let sibling = McpRequestContext::capture(&f.context);
+        with_caller(
+            f.caller.clone(),
+            scope.scope(Box::pin(async {
+                let read = current_read_request().unwrap();
+                assert!(read.retains(f.services.as_ref()));
+                f.required_source(None).await;
+                f.required_source(Some(&f.required)).await;
+                let required = read.child().unwrap();
+                let ready = f.prepare_optional(&read).await;
+                assert!(ready.value().binding().is_some());
+                assert_eq!(
+                    required.transfer_with_optional(Some(ready.metadata()), Ok),
+                    Ok(true)
+                );
+                f.f.store
+                    .delete_workspace_git_root(&f.optional.id)
+                    .await
+                    .unwrap();
+                let calls = AtomicUsize::new(0);
+                let output = required
+                    .transfer_with_optional(Some(ready.metadata()), |include| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(if include {
+                            "base plus original metadata"
+                        } else {
+                            "base"
+                        })
+                    })
+                    .unwrap();
+                assert_eq!(output, "base");
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert!(read.check_current().is_ok());
+                f.f.store
+                    .upsert_workspace_git_root(&f.optional)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    required.transfer_with_optional(Some(ready.metadata()), Ok),
+                    Ok(false)
+                );
+            })),
+        )
+        .await;
+        with_caller(
+            f.caller.clone(),
+            sibling.scope(Box::pin(async {
+                f.required_source(None).await;
+                f.required_source(Some(&f.required)).await;
+                assert_eq!(
+                    current_read_request()
+                        .unwrap()
+                        .child()
+                        .unwrap()
+                        .transfer(|| Ok(37)),
+                    Ok(37)
+                );
+            })),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn precise_registered_required_member_refuses_the_whole_parent() {
+        let f = RegisteredFixture::new().await;
+        let scope = McpRequestContext::capture(&f.context);
+        let sibling = McpRequestContext::capture(&f.context);
+        with_caller(
+            f.caller.clone(),
+            scope.scope(Box::pin(async {
+                let read = current_read_request().unwrap();
+                f.required_source(None).await;
+                f.required_source(Some(&f.required)).await;
+                let required = read.child().unwrap();
+                let ready = f.prepare_optional(&read).await;
+                assert_eq!(
+                    required.transfer_with_optional(Some(ready.metadata()), Ok),
+                    Ok(true)
+                );
+                f.f.store
+                    .delete_workspace_git_root(&f.required.id)
+                    .await
+                    .unwrap();
+                let calls = AtomicUsize::new(0);
+                assert_eq!(
+                    required.transfer_with_optional(Some(ready.metadata()), |_| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }),
+                    Err(AdmissionError::Retired)
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+                f.f.store
+                    .upsert_workspace_git_root(&f.required)
+                    .await
+                    .unwrap();
+                assert_eq!(read.check_current(), Err(AdmissionError::Retired));
+            })),
+        )
+        .await;
+        // A distinct already-captured primary request under the SAME physical
+        // owner remains valid. It never repairs the retired required aggregate.
+        with_caller(
+            f.caller.clone(),
+            sibling.scope(Box::pin(async {
+                f.required_source(None).await;
+                assert_eq!(
+                    current_read_request()
+                        .unwrap()
+                        .child()
+                        .unwrap()
+                        .transfer(|| Ok(41)),
+                    Ok(41)
+                );
+            })),
+        )
+        .await;
+    }
+
+    async fn wait_blocked(read: &Arc<RepositoryReadRequest>, key: RepositoryLifecycleKey) {
+        tokio::time::timeout(BUDGET, async {
+            loop {
+                let optional = read.capture_optional().unwrap();
+                match optional
+                    .metadata()
+                    .subscribe_metadata(&[RepositoryLifecycleKey::Database, key.clone()])
+                {
+                    Err(AdmissionError::Unavailable) => break,
+                    Ok(()) => {}
+                    Err(error) => panic!("unexpected probe outcome: {error:?}"),
+                }
+                drop(optional);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn held_mutation(required_root: bool) {
+        let f = RegisteredFixture::new().await;
+        let scope = McpRequestContext::capture(&f.context);
+        let probe_scope = McpRequestContext::capture(&f.context);
+        let mut other_workspace = f.f.workspace.clone();
+        other_workspace.id = intent_core::WorkspaceId::new();
+        f.f.store.insert_workspace(&other_workspace).await.unwrap();
+        with_caller(
+            f.caller.clone(),
+            scope.scope(Box::pin(async {
+                let read = current_read_request().unwrap();
+                f.required_source(None).await;
+                f.required_source(Some(&f.required)).await;
+                let required = Arc::new(read.child().unwrap());
+                let ready = f.prepare_optional(&read).await;
+                let (entered, entry) = oneshot::channel();
+                let (release, blocked) = std::sync::mpsc::sync_channel(1);
+                let consumer = required.clone();
+                let metadata = ready.metadata().clone();
+                let caller = f.caller.clone();
+                let original_scope = scope.clone();
+                let runtime = tokio::runtime::Handle::current();
+                let action = std::thread::spawn(move || {
+                    let (result_tx, result_rx) = std::sync::mpsc::channel();
+                    runtime.block_on(with_caller(
+                        caller,
+                        original_scope.scope(Box::pin(async move {
+                            let result =
+                                consumer.transfer_with_optional(Some(&metadata), |include| {
+                                    assert!(include);
+                                    entered.send(()).unwrap();
+                                    blocked.recv_timeout(BUDGET).unwrap();
+                                    Ok(include)
+                                });
+                            result_tx.send(result).unwrap();
+                        })),
+                    ));
+                    result_rx.recv().unwrap()
+                });
+                tokio::time::timeout(BUDGET, entry).await.unwrap().unwrap();
+                let changed = if required_root {
+                    f.required.clone()
+                } else {
+                    f.optional.clone()
+                };
+                let store = f.f.store.clone();
+                let id = changed.id.clone();
+                let writer =
+                    tokio::spawn(async move { store.delete_workspace_git_root(&id).await });
+                let sentinel = RepositoryLifecycleKey::RootInventory(other_workspace.id.clone());
+                let mut second_retire = None;
+                let mut second_done = None;
+                probe_scope
+                    .scope(Box::pin(async {
+                        let probe = current_read_request().unwrap();
+                        wait_blocked(
+                            &probe,
+                            RepositoryLifecycleKey::RootInventory(f.f.workspace.id.clone()),
+                        )
+                        .await;
+                        assert!(
+                            f.f.store.get_workspace_git_root(&changed.id).await.is_ok(),
+                            "no DML before the consuming action ends"
+                        );
+                        let registry = f.registry.clone();
+                        let root_key = RepositoryLifecycleKey::GitRoot(changed.id.clone());
+                        let sentinel_key = sentinel.clone();
+                        let (done_tx, done_rx) = std::sync::mpsc::channel();
+                        let second = std::thread::spawn(move || {
+                            let ticket =
+                                registry.begin_mutation(&[root_key, sentinel_key]).unwrap();
+                            done_tx.send(()).unwrap();
+                            ticket.settle_confirmed();
+                        });
+                        wait_blocked(&probe, sentinel).await;
+                        assert!(
+                            done_rx.try_recv().is_err(),
+                            "every concurrent retirer joins the same held action"
+                        );
+                        assert!(!writer.is_finished());
+                        // A real unrelated workspace read and unrelated registry owner
+                        // progress while the original mutation waits outside map locks.
+                        tokio::time::timeout(BUDGET, f.f.store.get_workspace(&other_workspace.id))
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        f.registry
+                            .begin_mutation(&[RepositoryLifecycleKey::GitRoot(
+                                WorkspaceGitRootId::new(),
+                            )])
+                            .unwrap()
+                            .settle_confirmed();
+                        second_done = Some(done_rx);
+                        second_retire = Some(second);
+                    }))
+                    .await;
+                release.send(()).unwrap();
+                assert_eq!(action.join().unwrap(), Ok(true));
+                tokio::time::timeout(BUDGET, writer)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                second_done.unwrap().recv_timeout(BUDGET).unwrap();
+                second_retire.unwrap().join().unwrap();
+                let result = required.transfer_with_optional(Some(ready.metadata()), Ok);
+                if required_root {
+                    assert_eq!(result, Err(AdmissionError::Retired));
+                } else {
+                    assert_eq!(result, Ok(false));
+                }
+            })),
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn precise_registered_optional_writer_and_concurrent_retire_join_consumption() {
+        held_mutation(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn precise_registered_required_writer_and_concurrent_retire_join_consumption() {
+        held_mutation(true).await;
+    }
+
+    #[tokio::test]
+    async fn precise_registered_broad_retirement_still_closes_required_and_optional() {
+        for mode in 0..6 {
+            let f = RegisteredFixture::new().await;
+            let scope = McpRequestContext::capture(&f.context);
+            with_caller(
+                f.caller.clone(),
+                scope.scope(Box::pin(async {
+                    let read = current_read_request().unwrap();
+                    f.required_source(None).await;
+                    let required = read.child().unwrap();
+                    let ready = f.prepare_optional(&read).await;
+                    match mode {
+                        0 => f.physical.retirement().retire(),
+                        1 => {
+                            f.f.store
+                                .update_workspace_with_branch(&f.f.workspace, Some("changed"))
+                                .await
+                                .unwrap();
+                        }
+                        2 => {
+                            f.f.store.delete_workspace(&f.f.workspace.id).await.unwrap();
+                        }
+                        3 => {
+                            let Caller::Agent { agent_id } = &f.caller else {
+                                unreachable!()
+                            };
+                            f.f.store
+                                .set_agent_session_model(
+                                    &f.f.workspace.id,
+                                    agent_id,
+                                    "changed",
+                                    None,
+                                    "same-time",
+                                )
+                                .await
+                                .unwrap();
+                        }
+                        4 => {
+                            f.f.store
+                                .begin_repository_pending_delete(&[
+                                    RepositoryLifecycleKey::Workspace(f.f.workspace.id.clone()),
+                                ])
+                                .await
+                                .unwrap()
+                                .settle_confirmed();
+                        }
+                        _ => {
+                            let _independent =
+                                Store::open(&f.f.dir.path().join("store.db")).await.unwrap();
+                        }
+                    }
+                    let calls = AtomicUsize::new(0);
+                    assert_eq!(
+                        required.transfer_with_optional(Some(ready.metadata()), |_| {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        }),
+                        Err(AdmissionError::Retired),
+                        "mode {mode}"
+                    );
+                    assert_eq!(
+                        ready.metadata().check_current(),
+                        Err(AdmissionError::Retired)
+                    );
+                    assert_eq!(calls.load(Ordering::SeqCst), 0);
+                })),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn precise_registered_subscription_precedes_actual_worktree_wait() {
+        let f = RegisteredFixture::new().await;
+        let scope = McpRequestContext::capture(&f.context);
+        let locks = f.services.worktree_locks.clone();
+        let path = f.f.path.clone();
+        let (entered, entry) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let blocker = tokio::spawn(async move {
+            locks
+                .with_lock(&path, || async {
+                    entered.send(()).unwrap();
+                    released.await.unwrap();
+                })
+                .await;
+        });
+        entry.await.unwrap();
+        with_caller(f.caller.clone(),scope.scope(Box::pin(async {
+            let reached=Arc::new(Notify::new());let mut parameters=input(&f.f);
+            parameters.facts.preparation.root.kind=RepositoryRootKind::Registered{git_root_id:f.required.id.clone()};
+            parameters.context.roots[0].root=parameters.facts.preparation.root.clone();parameters.before_lock=Some(reached.clone());
+            let calls=AtomicUsize::new(0);
+            let future=with_captured_repository_source(&f.services,internal(f.caller.clone()).await,"queued registered source".into(),vec![NativeReviewStage::Commit],parameters,|_|async{calls.fetch_add(1,Ordering::SeqCst);Ok(())});
+            tokio::pin!(future);
+            tokio::select! {()=reached.notified()=>{},_=&mut future=>panic!("did not reach the real lock wait")}
+            f.f.store.delete_workspace_git_root(&f.required.id).await.unwrap();
+            f.f.store.upsert_workspace_git_root(&f.required).await.unwrap();
+            release.send(()).unwrap();blocker.await.unwrap();
+            assert_eq!(future.await,Err(AdmissionError::Retired));
+            assert_eq!(calls.load(Ordering::SeqCst),0);
+        }))).await;
+    }
+}

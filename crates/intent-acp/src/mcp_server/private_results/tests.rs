@@ -1760,3 +1760,422 @@ pub(crate) mod optional {
         }
     }
 }
+
+/// Actual last-owner destruction in a neutral ACP fixture. The factory, policy,
+/// producer, evidence and probe never own the captured scope strongly. This is
+/// not an execution of the Services/R lifetime implementation.
+mod captured_scope_lifetime {
+    use super::optional::{self, Joint, Source, State};
+    use super::*;
+    use crate::mcp_server::repository_guidance::{tests::session, ConnectionLifetime};
+    use std::sync::Weak;
+
+    #[derive(Default)]
+    struct Probe {
+        captures: AtomicUsize,
+        drops: AtomicUsize,
+        final_calls: AtomicUsize,
+        live_at_final: AtomicBool,
+        in_admission: AtomicBool,
+        scope: Mutex<Weak<LastOwnerScope>>,
+    }
+
+    impl Probe {
+        fn alive(&self) -> bool {
+            // This temporary upgrade is dropped before returning to the test.
+            self.scope.lock().unwrap().upgrade().is_some()
+        }
+        fn released(&self) {
+            assert!(!self.alive());
+            assert_eq!(self.drops.load(Ordering::SeqCst), 1);
+            assert!(!self.in_admission.load(Ordering::SeqCst));
+        }
+    }
+
+    struct Factory {
+        state: Arc<State>,
+        probe: Arc<Probe>,
+        with_policy: bool,
+    }
+
+    struct LastOwnerScope {
+        state: Arc<State>,
+        probe: Arc<Probe>,
+        policy: Arc<TrackedPolicy>,
+        with_policy: bool,
+    }
+
+    impl Drop for LastOwnerScope {
+        fn drop(&mut self) {
+            assert!(
+                !self.probe.in_admission.load(Ordering::SeqCst),
+                "captured owner cleanup must occur outside the consuming admission"
+            );
+            self.state.required.retire();
+            self.probe.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl McpRequestContext for Factory {
+        fn capture(&self) -> Arc<dyn McpRequestScope> {
+            self.probe.captures.fetch_add(1, Ordering::SeqCst);
+            let captured = Arc::new_cyclic(|original| LastOwnerScope {
+                state: self.state.clone(),
+                probe: self.probe.clone(),
+                policy: Arc::new(TrackedPolicy {
+                    inner: Joint(self.state.clone()),
+                    original: original.clone(),
+                    probe: self.probe.clone(),
+                }),
+                with_policy: self.with_policy,
+            });
+            *self.probe.scope.lock().unwrap() = Arc::downgrade(&captured);
+            captured
+        }
+    }
+
+    impl McpRequestScope for LastOwnerScope {
+        fn private_result_policy(&self) -> Option<Arc<dyn McpPrivatePolicy>> {
+            self.with_policy
+                .then(|| self.policy.clone() as Arc<dyn McpPrivatePolicy>)
+        }
+        fn scope<'a>(&'a self, body: McpContextFuture<'a>) -> McpContextFuture<'a> {
+            Box::pin(async move {
+                self.state.scope_runs.fetch_add(1, Ordering::SeqCst);
+                body.await;
+            })
+        }
+    }
+
+    struct TrackedPolicy {
+        inner: Joint,
+        original: Weak<LastOwnerScope>,
+        probe: Arc<Probe>,
+    }
+
+    struct AdmissionGuard(Arc<Probe>);
+    impl Drop for AdmissionGuard {
+        fn drop(&mut self) {
+            self.0.in_admission.store(false, Ordering::SeqCst);
+        }
+    }
+
+    impl McpPrivatePolicy for TrackedPolicy {
+        fn capture_host(&self, call: McpHostCall) -> Box<dyn McpPrivateHostScope> {
+            self.inner.capture_host(call)
+        }
+        fn capture_optional_context(&self) -> Option<Box<dyn McpOptionalContextScope>> {
+            assert!(self.original.upgrade().is_some());
+            self.inner.capture_optional_context()
+        }
+        fn admit<'a>(
+            &'a self,
+            boundary: &'a McpPrivateBoundary,
+            originals: &'a [McpReadEvidence],
+            packet: PreparedMcpTransfer<'a>,
+        ) -> BoxFuture<'a, McpPrivateAdmission> {
+            self.inner.admit(boundary, originals, packet)
+        }
+        fn admit_optional<'a>(
+            &'a self,
+            boundary: &'a McpPrivateBoundary,
+            sealed: McpSealedReads<'a>,
+            optional: &'a McpOptionalEvidence,
+            packet: PreparedMcpVariants<'a>,
+        ) -> BoxFuture<'a, McpPrivateAdmission> {
+            Box::pin(async move {
+                assert!(sealed.is_empty());
+                self.probe.final_calls.fetch_add(1, Ordering::SeqCst);
+                self.probe
+                    .live_at_final
+                    .store(self.original.upgrade().is_some(), Ordering::SeqCst);
+                self.probe.in_admission.store(true, Ordering::SeqCst);
+                let _guard = AdmissionGuard(self.probe.clone());
+                self.inner
+                    .admit_optional(boundary, sealed, optional, packet)
+                    .await
+            })
+        }
+    }
+
+    fn fixture(api: Arc<Api>, with_policy: bool) -> (WorkspaceMcpServer, Arc<State>, Arc<Probe>) {
+        let state = State::new();
+        let probe = Arc::new(Probe::default());
+        let server = WorkspaceMcpServer::new(api, "workspace-1".into())
+            .with_caller_agent_id(Some("agent-1".into()))
+            .with_request_context(Arc::new(Factory {
+                state: state.clone(),
+                probe: probe.clone(),
+                with_policy,
+            }))
+            .with_repository_guidance(&session(Some("3.0")), Arc::new(Source(state.clone())));
+        (server, state, probe)
+    }
+
+    async fn ready(server: &WorkspaceMcpServer, probe: &Probe) -> DeliveryResponse {
+        // Move the original capture into the actual dispatch path. No test
+        // variable or factory retains a strong captured-scope clone afterward.
+        let response = optional::response(server, "return 'ordinary';").await;
+        assert!(response.output.is_none());
+        assert!(response.sealed_empty.is_some());
+        assert_eq!(probe.captures.load(Ordering::SeqCst), 1);
+        assert!(probe.alive());
+        assert_eq!(probe.drops.load(Ordering::SeqCst), 0);
+        response
+    }
+
+    #[tokio::test]
+    async fn successful_empty_keeps_last_captured_scope_through_optional_transfer() {
+        let (server, state, probe) = fixture(Arc::new(Api::new()), true);
+        let response = ready(&server, &probe).await;
+        let (outcome, value) = optional::deliver(response).await;
+        assert_eq!(
+            probe.final_calls.load(Ordering::SeqCst),
+            1,
+            "final probe was reached"
+        );
+        assert!(
+            probe.live_at_final.load(Ordering::SeqCst),
+            "qualified preparation dropped the last original captured scope before final admission"
+        );
+        assert_eq!(outcome, DeliveryOutcome::Admitted);
+        assert!(optional::has_guidance(&value));
+        assert!(value.to_string().contains("ordinary"));
+        assert_eq!(state.scope_runs.load(Ordering::SeqCst), 1);
+        assert_eq!(state.constructor.load(Ordering::SeqCst), 1);
+        assert_eq!(state.optional_calls.load(Ordering::SeqCst), 1);
+        probe.released();
+    }
+
+    #[tokio::test]
+    async fn queued_empty_keeps_owner_until_original_cancel_close_or_consumption() {
+        for finish in 0..3 {
+            let (server, state, probe) = fixture(Arc::new(Api::new()), true);
+            let response = ready(&server, &probe).await;
+            let (tx, mut rx) = mpsc::channel(1);
+            tx.send(PreparedBridgeLine::plain(json!({"queued":true})))
+                .await
+                .unwrap();
+            let lifetime = ConnectionLifetime::new();
+            let token = lifetime.token();
+            let mut delivery = Box::pin(response.enqueue(tx, &token));
+            tokio::select! {
+                () = state.leaf_dropped.notified() => {},
+                result = &mut delivery => panic!("full original queue completed: {result:?}"),
+            }
+            assert!(
+                std::future::poll_fn(|cx| Poll::Ready(delivery.as_mut().poll(cx)))
+                    .await
+                    .is_pending()
+            );
+            assert!(probe.alive());
+            assert_eq!(probe.drops.load(Ordering::SeqCst), 0);
+            assert_eq!(probe.final_calls.load(Ordering::SeqCst), 0);
+            match finish {
+                0 => {
+                    drop(delivery);
+                    assert!(rx
+                        .recv()
+                        .await
+                        .unwrap()
+                        .into_line(&token)
+                        .contains("queued"));
+                    assert!(rx.recv().await.is_none());
+                }
+                1 => {
+                    rx.close();
+                    assert_eq!(delivery.await, DeliveryOutcome::ConsumerClosed);
+                    assert!(rx
+                        .recv()
+                        .await
+                        .unwrap()
+                        .into_line(&token)
+                        .contains("queued"));
+                    assert!(rx.recv().await.is_none());
+                }
+                _ => {
+                    assert!(rx
+                        .recv()
+                        .await
+                        .unwrap()
+                        .into_line(&token)
+                        .contains("queued"));
+                    assert_eq!(delivery.await, DeliveryOutcome::Admitted);
+                    probe.released();
+                    // The queued packet owns bytes/correlation only, not the
+                    // request scope; its original decision has completed.
+                    let value: Value =
+                        serde_json::from_str(&rx.recv().await.unwrap().into_line(&token)).unwrap();
+                    assert!(optional::has_guidance(&value));
+                    assert!(rx.recv().await.is_none());
+                }
+            }
+            probe.released();
+            assert_eq!(state.scope_runs.load(Ordering::SeqCst), 1);
+            assert_eq!(state.constructor.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                probe.final_calls.load(Ordering::SeqCst),
+                usize::from(finish == 2)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn held_empty_decision_releases_outside_admission_without_post_transfer_replay() {
+        for after_transfer in [false, true] {
+            for cancel in [false, true] {
+                let (server, state, probe) = fixture(Arc::new(Api::new()), true);
+                let gate = state.pause_admission(after_transfer);
+                let response = ready(&server, &probe).await;
+                let (tx, mut rx) = mpsc::channel(1);
+                let lifetime = ConnectionLifetime::new();
+                let token = lifetime.token();
+                let mut delivery = Box::pin(response.enqueue(tx, &token));
+                tokio::select! {
+                    () = gate.reached() => {},
+                    result = &mut delivery => panic!("held admission completed: {result:?}"),
+                }
+                assert!(probe.alive());
+                assert!(probe.in_admission.load(Ordering::SeqCst));
+                assert_eq!(probe.drops.load(Ordering::SeqCst), 0);
+                if cancel {
+                    drop(delivery);
+                } else {
+                    gate.release.add_permits(1);
+                    assert_eq!(delivery.await, DeliveryOutcome::Admitted);
+                }
+                probe.released();
+                if after_transfer || !cancel {
+                    let value: Value =
+                        serde_json::from_str(&rx.recv().await.unwrap().into_line(&token)).unwrap();
+                    assert!(optional::has_guidance(&value));
+                }
+                assert!(rx.recv().await.is_none());
+                assert_eq!(probe.final_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(state.constructor.load(Ordering::SeqCst), 1);
+                assert_eq!(state.scope_runs.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_owner_does_not_revive_explicitly_retired_original() {
+        let (server, state, probe) = fixture(Arc::new(Api::new()), true);
+        let gate = state.pause_admission(false);
+        let response = ready(&server, &probe).await;
+        let mut delivery = Box::pin(optional::deliver(response));
+        tokio::select! {
+            () = gate.reached() => {},
+            _ = &mut delivery => panic!("held admission completed"),
+        }
+        assert!(probe.alive());
+        state.required.retire();
+        gate.release.add_permits(1);
+        let (outcome, value) = delivery.await;
+        assert_eq!(outcome, DeliveryOutcome::Admitted);
+        assert!(!optional::has_guidance(&value));
+        assert!(value.to_string().contains("ordinary"));
+        assert_eq!(state.scope_runs.load(Ordering::SeqCst), 1);
+        probe.released();
+    }
+
+    #[tokio::test]
+    async fn omitted_preparation_and_unpolled_delivery_release_last_owner() {
+        for mode in [1, 2, 3, 6] {
+            let (server, state, probe) = fixture(Arc::new(Api::new()), true);
+            state.mode.store(mode, Ordering::SeqCst);
+            let response = ready(&server, &probe).await;
+            let (outcome, value) = optional::deliver(response).await;
+            assert_eq!(outcome, DeliveryOutcome::Admitted);
+            assert!(!optional::has_guidance(&value));
+            assert!(value.to_string().contains("ordinary"));
+            assert_eq!(probe.final_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(state.scope_runs.load(Ordering::SeqCst), 1);
+            probe.released();
+        }
+        for unpolled in [false, true] {
+            let (server, state, probe) = fixture(Arc::new(Api::new()), true);
+            let response = ready(&server, &probe).await;
+            if unpolled {
+                let (tx, mut rx) = mpsc::channel(1);
+                let lifetime = ConnectionLifetime::new();
+                let token = lifetime.token();
+                let delivery = response.enqueue(tx, &token);
+                drop(delivery);
+                assert!(rx.recv().await.is_none());
+            } else {
+                drop(response);
+            }
+            assert_eq!(state.capture.load(Ordering::SeqCst), 0);
+            assert_eq!(state.constructor.load(Ordering::SeqCst), 0);
+            assert_eq!(probe.final_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(state.scope_runs.load(Ordering::SeqCst), 1);
+            probe.released();
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_preparation_timeout_or_cancel_releases_original_without_detachment() {
+        for timeout in [false, true] {
+            let (server, state, probe) = fixture(Arc::new(Api::new()), true);
+            let gate = state.pause_source();
+            let response = ready(&server, &probe).await;
+            let mut delivery = Box::pin(optional::deliver(response));
+            tokio::select! {
+                () = gate.reached() => {},
+                _ = &mut delivery => panic!("held preparation completed"),
+            }
+            assert!(probe.alive());
+            if timeout {
+                tokio::time::pause();
+                tokio::time::advance(Duration::from_secs(2)).await;
+                let (outcome, value) = delivery.await;
+                tokio::time::resume();
+                assert_eq!(outcome, DeliveryOutcome::Admitted);
+                assert!(!optional::has_guidance(&value));
+                assert!(value.to_string().contains("ordinary"));
+            } else {
+                drop(delivery);
+            }
+            tokio::time::timeout(WAIT, state.leaf_dropped.notified())
+                .await
+                .unwrap();
+            probe.released();
+            assert_eq!(probe.final_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(state.constructor.load(Ordering::SeqCst), 1);
+            assert_eq!(state.scope_runs.load(Ordering::SeqCst), 1);
+            gate.release.add_permits(1);
+            assert_eq!(state.leaves_dropped.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_invocation_and_failed_seal_never_gain_empty_retention() {
+        for failed_seal in [false, true] {
+            let api = Arc::new(Api::new());
+            api.unbound.store(failed_seal, Ordering::SeqCst);
+            let (server, state, probe) = fixture(api, failed_seal);
+            let code = if failed_seal {
+                optional::READ
+            } else {
+                "return 'ordinary';"
+            };
+            let response = optional::response(&server, code).await;
+            assert!(response.sealed_empty.is_none());
+            assert!(response.output.is_none());
+            let (outcome, value) = optional::deliver(response).await;
+            assert_eq!(outcome, DeliveryOutcome::Admitted);
+            assert!(!optional::has_guidance(&value));
+            if failed_seal {
+                assert_eq!(value["result"], refusal_tool_result());
+            } else {
+                assert!(value.to_string().contains("ordinary"));
+            }
+            assert_eq!(state.capture.load(Ordering::SeqCst), 0);
+            assert_eq!(state.constructor.load(Ordering::SeqCst), 0);
+            assert_eq!(probe.final_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(state.scope_runs.load(Ordering::SeqCst), 1);
+            probe.released();
+        }
+    }
+}

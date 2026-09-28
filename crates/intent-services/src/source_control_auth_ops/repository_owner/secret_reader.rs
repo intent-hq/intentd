@@ -313,6 +313,18 @@ impl RepositoryConnectionFacts {
         RepositoryReadEligibility::with_output(&[], optional, transfer)
     }
 
+    /// Requires the genuine original prompt owner/capture and its original
+    /// pending-ID, one-permit consuming boundary through the prebuilt transfer.
+    /// This entry supplies no prompt provenance or permission; a prompt must
+    /// not fabricate MCP-sealed-zero evidence. The boolean only selects the
+    /// original optional payload, and the consuming action cannot be retried.
+    pub(crate) fn with_prompt_current(
+        optional: Option<&Self>,
+        transfer: impl FnOnce(bool) -> Result<()> + Send,
+    ) -> Result<()> {
+        RepositoryReadEligibility::with_output(&[], optional, transfer)
+    }
+
     fn retained_owner(&self) -> Option<&Arc<RepositoryOwner>> {
         if matches!(
             self.attachment,

@@ -30,6 +30,8 @@ pub enum RepositoryLifecycleKey {
     Database,
     /// Human authority changes; only original Wire read requests subscribe.
     WireAuthority,
+    /// Registered-root enumeration in this workspace, not workspace authority.
+    RootInventory(WorkspaceId),
     /// A saved choice only; physical owners do not subscribe to this key.
     Selection {
         workspace_id: WorkspaceId,

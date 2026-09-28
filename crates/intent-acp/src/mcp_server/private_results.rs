@@ -738,6 +738,9 @@ pub(crate) struct DeliveryResponse {
     // Constructed only after a successful empty seal, only for qualified
     // optional output. Failed seals use the fixed control response instead.
     sealed_empty: Option<McpPrivateInvocation>,
+    // Ownership only: successful-empty output must keep its original scope
+    // alive after guidance preparation without re-entering required execution.
+    retained_empty_context: Option<CapturedRequestContext>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -754,6 +757,7 @@ impl DeliveryResponse {
             output: None,
             context: None,
             sealed_empty: None,
+            retained_empty_context: None,
         }
     }
 
@@ -769,12 +773,14 @@ impl DeliveryResponse {
                 let sealed_empty = (output.is_none() && response.requires_qualified_guidance())
                     .then(|| context.private_invocation.clone())
                     .flatten();
+                let retained_empty_context = sealed_empty.as_ref().map(|_| context.clone());
                 let context = output.is_some().then(|| context.clone());
                 Self {
                     response,
                     output,
                     context,
                     sealed_empty,
+                    retained_empty_context,
                 }
             }
             Err(()) => Self::ordinary(BridgeResponse::plain(refusal_response(&response.value))),
@@ -805,6 +811,9 @@ impl DeliveryResponse {
         sender: mpsc::Sender<PreparedBridgeLine>,
         connection: &ConnectionToken,
     ) -> DeliveryOutcome {
+        // Drop only after the original decision (or its cancellation), outside
+        // admission/transfer guards. Never move this owner into the writer packet.
+        let _retained_empty_context = self.retained_empty_context.take();
         if let Some(context) = self.context.take() {
             context.run(self.enqueue_inner(sender, connection)).await
         } else if let Some(invocation) = self.sealed_empty.clone() {

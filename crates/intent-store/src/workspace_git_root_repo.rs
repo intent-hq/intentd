@@ -133,8 +133,12 @@ impl Store {
                 .map_err(|e| Error::Internal(format!("read root binding failed: {e}")))?;
         if existing.is_none() {
             lifecycle.begin(&[
-                crate::RepositoryLifecycleKey::Workspace(root.workspace_id.clone()),
+                crate::RepositoryLifecycleKey::RootInventory(root.workspace_id.clone()),
                 crate::RepositoryLifecycleKey::GitRoot(root.id.clone()),
+                crate::RepositoryLifecycleKey::Selection {
+                    workspace_id: root.workspace_id.clone(),
+                    git_root_id: Some(root.id.clone()),
+                },
             ])?;
         }
         let pool = self.write_pool();
@@ -371,8 +375,12 @@ impl Store {
         let mut lifecycle = self.repository_lifecycle_write().await?;
         let root = self.get_workspace_git_root(id).await?;
         lifecycle.begin(&[
-            crate::RepositoryLifecycleKey::Workspace(root.workspace_id),
-            crate::RepositoryLifecycleKey::GitRoot(id.clone()),
+            crate::RepositoryLifecycleKey::RootInventory(root.workspace_id.clone()),
+            crate::RepositoryLifecycleKey::GitRoot(root.id.clone()),
+            crate::RepositoryLifecycleKey::Selection {
+                workspace_id: root.workspace_id,
+                git_root_id: Some(root.id),
+            },
         ])?;
         let res = sqlx::query("DELETE FROM workspace_git_root WHERE id = ?")
             .bind(&id.0)
