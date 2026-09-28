@@ -177,6 +177,8 @@ mod v1_1_goldens;
 #[cfg(test)]
 mod v1_goldens;
 #[cfg(test)]
+mod v2_10_goldens;
+#[cfg(test)]
 mod v2_1_goldens;
 #[cfg(test)]
 mod v2_2_goldens;
