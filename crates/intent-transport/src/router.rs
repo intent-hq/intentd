@@ -5,6 +5,17 @@
 //! Envelope validation, the notification-vs-request distinction, and the
 //! `-32700/-32600/-32601/-32602/-32603` error matrix all live here so every
 //! transport (UDS today, WS/TLS later) shares one code path.
+//!
+//! Discovery/configuration requests may carry optional routing-only `workspaceId`
+//! (docs/protocol/workspace-routing.md). These handlers deliberately consume only
+//! their semantic selectors: catalogs/settings/capabilities/client registry remain
+//! daemon-wide, and specialist project writes still require explicit scope/path.
+//! No workspace lookup or extra service argument is needed for this metadata.
+//!
+//! Selected resource continuations likewise accept optional routing context:
+//! agent/terminal/upload/export/search IDs keep selecting the resource, and the
+//! service authorizes its actual owner. In particular, source export follow-ups
+//! retain their exportId/seq/archiveSource semantics without a workspace lookup.
 
 use intent_core::{
     AgentCreateExtra, AgentDelegateInput, AgentId, AgentWakeCreateOptions, AgentWakeOrCreateInput,
@@ -2620,6 +2631,8 @@ async fn dispatch(
                 "removed": r.get("removed").cloned().unwrap_or(Value::Bool(false)),
             }))
         }
+        // Path-based Git calls accept optional routing-only `workspaceId`.
+        // The explicit path still selects the filesystem target on this daemon.
         "git.getBranches" => {
             let repo_path = require_str_param(params, "repoPath")?;
             let include_remote = parse_bool(params, "includeRemote");
@@ -2898,7 +2911,9 @@ async fn dispatch(
         }
         // `github.*` explicit-addressing surface (PROTOCOL §5.27): every data
         // method takes `(owner, repo[, number])` rather than resolving from the
-        // workspace. `limit` falls back to the FE's `perPage` spelling.
+        // workspace. Optional `workspaceId` is routing metadata and must not
+        // change these selectors or leaf credential resolution. `limit` falls back
+        // to the FE's `perPage` spelling.
         "github.pulls.create" => {
             let owner = require_str_param(params, "owner")?;
             let repo = require_str_param(params, "repo")?;
@@ -3305,6 +3320,8 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)
         }
+        // `host` names the forge, never an intentd routing destination.
+        // Optional `workspaceId` leaves provider/host credential selection intact.
         "sourceControl.authStatus" => {
             let provider = require_str_param(params, "provider")?;
             let host = opt_str_strict(params, "host")?;
@@ -3380,7 +3397,8 @@ async fn dispatch(
             let r = api.presence_snapshot(id).await.map_err(workspace_err)?;
             Ok(r)
         }
-        // `linear.*` (§5.28) is daemon-owned and global: no `workspaceId`. A key
+        // `linear.*` (§5.28) uses leaf-configured credentials. Optional
+        // `workspaceId` is routing metadata only; it never selects credentials. A key
         // that is absent or fails the `viewer` probe ("not configured") and any
         // other Linear failure surface as `-32603`; an invalid `filter` is
         // `-32602` with the descriptive message verbatim.
@@ -3453,7 +3471,10 @@ async fn dispatch(
             // up front so we never call the engine with a bogus payload.
             let _title = require_non_empty_str(params, "title")?;
             let _team_id = require_non_empty_str(params, "teamId")?;
-            let request = Value::Object(params.clone());
+            let mut request = params.clone();
+            // Routing context belongs to the leaf transport, not the provider body.
+            request.remove("workspaceId");
+            let request = Value::Object(request);
             match api.linear_create_issue(request).await {
                 Ok(v) => Ok(v),
                 Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
@@ -3464,14 +3485,18 @@ async fn dispatch(
             // `issueId` is required; every other field is optional and only
             // forwarded when present.
             let _issue_id = require_non_empty_str(params, "issueId")?;
-            let request = Value::Object(params.clone());
+            let mut request = params.clone();
+            // Routing context belongs to the leaf transport, not the provider body.
+            request.remove("workspaceId");
+            let request = Value::Object(request);
             match api.linear_update_issue(request).await {
                 Ok(v) => Ok(v),
                 Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
-        // `sentry.*` (§5.29) is daemon-owned and global: no `workspaceId`. A
+        // `sentry.*` (§5.29) accepts optional routing-only `workspaceId`;
+        // explicit issue/project selectors and leaf credentials are unchanged. A
         // credential pair that is absent or fails the org probe ("not
         // configured") and any other Sentry failure surface as `-32603`; an
         // invalid `status` is `-32602` with the descriptive message verbatim.
@@ -3630,7 +3655,8 @@ async fn dispatch(
             Ok(r)
         }
         "settings.list" => {
-            // Global namespace (no workspaceId); sensitive values are redacted.
+            // Daemon-wide storage; optional routing context does not scope settings.
+            // Sensitive values are redacted.
             let r = api.settings_list().await.map_err(domain_to_rpc)?;
             Ok(r)
         }
@@ -3662,7 +3688,7 @@ async fn dispatch(
             }
         }
         "system.capabilities" => {
-            // Machine-level capabilities, no workspaceId (PROTOCOL §5.7).
+            // Machine-level capabilities; optional workspaceId is routing-only (§5.7).
             // Router method (unlike the system.* control fast-path): the
             // cowSupported probe lives in the service layer's aggregate cache.
             let r = api.system_capabilities().await.map_err(domain_to_rpc)?;
@@ -4259,7 +4285,7 @@ async fn dispatch(
             }
         }
         "specialist.list" => {
-            // Matches the TS WSS `specialist.list` signature: no params; merges
+            // Optional workspaceId is routing-only. This method merges
             // user > bundled tiers only (the project tier is not part of the live
             // wire contract iOS calls). `specialist.get` still accepts an optional
             // `workspacePath` for the project tier (PROTOCOL §5.11). The optional

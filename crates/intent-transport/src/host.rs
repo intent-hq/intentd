@@ -89,6 +89,9 @@ pub(crate) enum HostMethod {
 /// `params` is the raw params object (already coerced to an empty map when the
 /// frame had no params or non-object params), consumed by the methods that
 /// take input (`ListDirectory`/`CreateDirectory`/`DirectoryStatus`).
+/// Approved host/tool and provider-readiness reads accept optional `workspaceId`
+/// as routing metadata. It does not scope host results, change authorization,
+/// or suppress provider discovery's existing default-settings self-heal.
 pub(crate) struct HostRequest {
     pub method: HostMethod,
     pub id_present: bool,

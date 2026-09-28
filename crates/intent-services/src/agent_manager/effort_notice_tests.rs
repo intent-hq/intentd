@@ -122,7 +122,7 @@ async fn effort_notice_retries_after_application_failure_without_advancing_basel
         let mut handles = mgr.handles.lock().unwrap();
         let handle = handles.get_mut(&id).unwrap();
         handle.thought_level = Some(option("medium"));
-        handle.connection.clone()
+        handle.execution.connection().unwrap()
     };
     turn(&mgr, &id, &conn, Some("high")).await;
     let rows = notices(&mgr, &id).await;

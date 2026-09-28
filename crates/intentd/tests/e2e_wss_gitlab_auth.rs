@@ -1571,44 +1571,50 @@ async fn gitlab_revoke_is_host_scoped_and_idempotent_over_wss() {
 /// never an error carrying the bound instance's secret off-host.
 #[tokio::test]
 async fn gitlab_env_token_is_bound_to_the_configured_host_over_wss() {
-    const OTHER_HOST: &str = "gitlab.acme.internal";
-    let mock = spawn_mock_gitlab().await;
-    let h = boot_with_env(&mock, &[("GITLAB_TOKEN", PAT_TOKEN)]).await;
-    let mut rpc = connect_ws(h.port, h.cfg.clone()).await;
-    let gitlab = json!({ "provider": "gitlab" });
-    let other = json!({ "provider": "gitlab", "host": OTHER_HOST });
+    for context in [None, Some("workspace-route")] {
+        const OTHER_HOST: &str = "gitlab.acme.internal";
+        let mock = spawn_mock_gitlab().await;
+        let h = boot_with_env(&mock, &[("GITLAB_TOKEN", PAT_TOKEN)]).await;
+        let mut rpc = connect_ws(h.port, h.cfg.clone()).await;
+        let mut gitlab = json!({ "provider": "gitlab" });
+        let mut other = json!({ "provider": "gitlab", "host": OTHER_HOST });
 
-    // The bound instance resolves the env credential (provenance "env").
-    let v = wss_rpc(&mut rpc, 10, "sourceControl.authStatus", gitlab.clone()).await;
-    let r = &v["result"];
-    assert_eq!(r["isConfigured"], json!(true), "{r}");
-    assert_eq!(r["method"], json!("env"));
-    assert_eq!(r["host"], json!(HOST));
-    assert_eq!(r["user"]["login"], json!("glab-octocat"));
-    let probes = mock.flags.user_requests.load(Ordering::SeqCst);
-    assert!(probes >= 1, "the bound probe reached the instance");
+        if let Some(context) = context {
+            gitlab["workspaceId"] = json!(context);
+            other["workspaceId"] = json!(context);
+        }
+        // The bound instance resolves the env credential (provenance "env").
+        let v = wss_rpc(&mut rpc, 10, "sourceControl.authStatus", gitlab.clone()).await;
+        let r = &v["result"];
+        assert_eq!(r["isConfigured"], json!(true), "{r}");
+        assert_eq!(r["method"], json!("env"));
+        assert_eq!(r["host"], json!(HOST));
+        assert_eq!(r["user"]["login"], json!("glab-octocat"));
+        let probes = mock.flags.user_requests.load(Ordering::SeqCst);
+        assert!(probes >= 1, "the bound probe reached the instance");
 
-    // Another host: not configured, no error, and nothing leaves the daemon
-    // (the bound instance's API override is not applied to another host, so
-    // the only observable request path is the one that must stay silent).
-    let v = wss_rpc(&mut rpc, 11, "sourceControl.authStatus", other.clone()).await;
-    let r = &v["result"];
-    assert!(v.get("error").is_none(), "{v}");
-    assert_eq!(r["isConfigured"], json!(false), "{r}");
-    assert_eq!(r["method"], Value::Null);
-    assert!(r.get("user").is_none(), "{r}");
-    assert_eq!(r["host"], json!(OTHER_HOST));
-    let v = wss_rpc(&mut rpc, 12, "sourceControl.getUser", other).await;
-    assert_eq!(v["result"], json!({ "user": null }), "{v}");
-    assert_eq!(
-        mock.flags.user_requests.load(Ordering::SeqCst),
-        probes,
-        "an unbound host's probe never reaches an instance"
-    );
+        // Another host: not configured, no error, and nothing leaves the daemon
+        // (the bound instance's API override is not applied to another host, so
+        // the only observable request path is the one that must stay silent).
+        let v = wss_rpc(&mut rpc, 11, "sourceControl.authStatus", other.clone()).await;
+        let r = &v["result"];
+        assert!(v.get("error").is_none(), "{v}");
+        assert_eq!(r["isConfigured"], json!(false), "{r}");
+        assert_eq!(r["method"], Value::Null);
+        assert!(r.get("user").is_none(), "{r}");
+        assert_eq!(r["host"], json!(OTHER_HOST));
+        let v = wss_rpc(&mut rpc, 12, "sourceControl.getUser", other).await;
+        assert_eq!(v["result"], json!({ "user": null }), "{v}");
+        assert_eq!(
+            mock.flags.user_requests.load(Ordering::SeqCst),
+            probes,
+            "an unbound host's probe never reaches an instance"
+        );
 
-    // The bound instance is untouched by the other host's probes.
-    let v = wss_rpc(&mut rpc, 13, "sourceControl.getUser", gitlab).await;
-    assert_eq!(v["result"]["user"]["login"], json!("glab-octocat"), "{v}");
+        // The bound instance is untouched by the other host's probes.
+        let v = wss_rpc(&mut rpc, 13, "sourceControl.getUser", gitlab).await;
+        assert_eq!(v["result"]["user"]["login"], json!("glab-octocat"), "{v}");
+    }
 }
 
 /// Two probes that overlap on the same near-expiry device credential must

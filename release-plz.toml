@@ -59,6 +59,7 @@ changelog_include = [
     "intent-git",
     "intent-js",
     "intent-linear",
+    "intent-nodes",
     "intent-providers",
     "intent-pty",
     "intent-search",
@@ -108,6 +109,12 @@ version_group = "intentd"
 
 [[package]]
 name = "intent-linear"
+release = true
+git_only = true
+version_group = "intentd"
+
+[[package]]
+name = "intent-nodes"
 release = true
 git_only = true
 version_group = "intentd"

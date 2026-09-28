@@ -2423,9 +2423,16 @@ async fn agent_notifications_muted_round_trip_and_idle_stamp_over_wss() {
 /// (per-process counter), proving interrupt-not-kill keep-alive semantics.
 #[intent_test_macros::daemon_test]
 async fn agent_stop_keep_alive_resume_over_wss() {
-    let Some(script) = gate("WSS agent.stop keep-alive E2E") else {
-        return;
-    };
+    stop_keep_alive_resume(false).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn resource_context_agent_stop_keeps_child_alive_and_resumes() {
+    stop_keep_alive_resume(true).await;
+}
+
+async fn stop_keep_alive_resume(routed: bool) {
+    let script = gate("WSS agent.stop keep-alive E2E").expect("mock ACP prerequisite");
 
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
@@ -2591,7 +2598,11 @@ async fn agent_stop_keep_alive_resume_over_wss() {
     // Stop the agent mid-turn — interrupt (not kill); terminal stream:end fires
     // carrying `stopReason: "interrupted"` + the interrupted row's `messageId`
     // (distinguishable from a normal turn end, which carries neither).
-    let stopped = wss_rpc(&mut rpc, 12, "agent.stop", json!({ "agentId": agent_id })).await;
+    let mut stop_params = json!({ "agentId": agent_id });
+    if routed {
+        stop_params["workspaceId"] = json!(ws_id);
+    }
+    let stopped = wss_rpc(&mut rpc, 12, "agent.stop", stop_params).await;
     assert_eq!(stopped["success"], true, "stop ok: {stopped}");
     let mut interrupted_message_id = None;
     for _ in 0..50 {
