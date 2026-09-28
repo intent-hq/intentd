@@ -25102,6 +25102,214 @@ mod file_tracking {
         (tmp, svc, ws_id, secondary, root_id)
     }
 
+    /// Two branches independently made the same change from a common seed.
+    /// Merging them needs a second parent but no change to HEAD's tree.
+    fn ancestry_only_merge(dir: &std::path::Path) -> (git2::Oid, git2::Oid, git2::Oid) {
+        let git = Repository::open(dir).unwrap();
+        let seed = git.head().unwrap().peel_to_commit().unwrap();
+        commit_file(dir, "shared.txt", "same change\n", "ours");
+        let ours = git.head().unwrap().peel_to_commit().unwrap();
+        let tree = ours.tree().unwrap();
+        let sig = Signature::now("Test", "test@example.com").unwrap();
+        let incoming = git
+            .commit(
+                Some("refs/heads/incoming"),
+                &sig,
+                &sig,
+                "theirs",
+                &tree,
+                &[&seed],
+            )
+            .unwrap();
+        assert_eq!(git.merge_base(ours.id(), incoming).unwrap(), seed.id());
+        assert_ne!(ours.id(), incoming);
+        git.merge(&[&git.find_annotated_commit(incoming).unwrap()], None, None)
+            .unwrap();
+        assert_eq!(git.state(), git2::RepositoryState::Merge);
+        assert_eq!(git.index().unwrap().write_tree().unwrap(), tree.id());
+        assert!(intent_git::commit::staged_paths(dir).unwrap().is_empty());
+        (ours.id(), incoming, tree.id())
+    }
+
+    async fn assert_ancestry_only_agent_commit(secondary_target: bool) {
+        let primary = init_git_repo();
+        let (_t, svc, ws, secondary, root_id) = svc_with_registered_root(&primary).await;
+        let (target, other, root_id) = if secondary_target {
+            (&secondary.dir, &primary.dir, Some(root_id))
+        } else {
+            (&primary.dir, &secondary.dir, None)
+        };
+        let other_head = Repository::open(other).unwrap().head().unwrap().target();
+        let (ours, incoming, tree) = ancestry_only_merge(target);
+        let git = Repository::open(target).unwrap();
+        let merge_head = std::fs::read(git.path().join("MERGE_HEAD")).unwrap();
+        let index = std::fs::read(git.path().join("index")).unwrap();
+        std::fs::write(target.join("unstaged.txt"), "leave this alone\n").unwrap();
+
+        // Neither a pending merge nor an empty delta grants permission to
+        // auto-commit or to commit a partial file set.
+        svc.set_workspace_auto_commit(ws.clone(), false)
+            .await
+            .unwrap();
+        for (files, user_requested, expected) in [
+            (None, false, "Auto-commit is disabled"),
+            (
+                Some(vec!["shared.txt".to_string()]),
+                true,
+                "cannot do a partial commit during a merge",
+            ),
+        ] {
+            let err = svc
+                .git_agent_commit(
+                    ws.clone(),
+                    "refused merge".into(),
+                    Some(AgentId::from("agent-merge")),
+                    None,
+                    files,
+                    user_requested,
+                    root_id.clone(),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::Internal(_)), "{err}");
+            assert!(err.to_string().contains(expected), "{err}");
+            assert_eq!(git.head().unwrap().target(), Some(ours));
+            assert_eq!(std::fs::read(git.path().join("index")).unwrap(), index);
+            assert_eq!(
+                std::fs::read(git.path().join("MERGE_HEAD")).unwrap(),
+                merge_head
+            );
+        }
+
+        // Even with auto-commit enabled, an unattributed empty set cannot
+        // complete the merge. Only the explicit staged-only request can.
+        svc.set_workspace_auto_commit(ws.clone(), true)
+            .await
+            .unwrap();
+        let err = svc
+            .git_agent_commit(
+                ws.clone(),
+                "unattributed merge".into(),
+                Some(AgentId::from("agent-merge")),
+                None,
+                None,
+                false,
+                root_id.clone(),
+            )
+            .await
+            .unwrap_err();
+        let expected = if secondary_target {
+            "requires an explicit `files` list"
+        } else {
+            "No uncommitted changes found for this agent"
+        };
+        assert!(err.to_string().contains(expected), "{err}");
+        assert_eq!(git.head().unwrap().target(), Some(ours));
+        assert_eq!(std::fs::read(git.path().join("index")).unwrap(), index);
+        assert_eq!(
+            std::fs::read(git.path().join("MERGE_HEAD")).unwrap(),
+            merge_head
+        );
+        assert!(svc
+            .store()
+            .events_by_type(&ws, "git:commit", 10)
+            .await
+            .unwrap()
+            .is_empty());
+
+        svc.set_workspace_auto_commit(ws.clone(), false)
+            .await
+            .unwrap();
+        let result = svc
+            .git_agent_commit(
+                ws.clone(),
+                "fix: record shared ancestry".into(),
+                Some(AgentId::from("agent-merge")),
+                Some(NoteId::from("note-merge")),
+                secondary_target.then(Vec::new),
+                true,
+                root_id.clone(),
+            )
+            .await
+            .expect("an authorized staged-only ancestry merge must succeed");
+        assert!(result.files.is_empty());
+        assert_eq!(result.file_count, 0);
+        let commit = git
+            .find_commit(git2::Oid::from_str(&result.hash).unwrap())
+            .unwrap();
+        assert_eq!(git.head().unwrap().target(), Some(commit.id()));
+        assert_eq!(
+            commit.parent_ids().collect::<Vec<_>>(),
+            vec![ours, incoming]
+        );
+        assert_eq!(commit.tree_id(), tree);
+        assert_eq!(commit.author().name().unwrap(), "Test");
+        assert_eq!(commit.author().email().unwrap(), "test@example.com");
+        assert_eq!(commit.committer().name().unwrap(), "Test");
+        assert_eq!(commit.committer().email().unwrap(), "test@example.com");
+        let message = commit.message().unwrap();
+        assert!(message.contains("Agent-Id: agent-merge"), "{message}");
+        assert!(message.contains("Linked-Note-Id: note-merge"), "{message}");
+        assert_eq!(git.state(), git2::RepositoryState::Clean);
+        assert!(!git.path().join("MERGE_HEAD").exists());
+        assert_eq!(
+            std::fs::read_to_string(target.join("unstaged.txt")).unwrap(),
+            "leave this alone\n"
+        );
+        assert!(commit.tree().unwrap().get_name("unstaged.txt").is_none());
+        assert_eq!(
+            Repository::open(other).unwrap().head().unwrap().target(),
+            other_head
+        );
+
+        let events = svc
+            .store()
+            .events_by_type(&ws, "git:commit", 10)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data["commit"], result.hash);
+        assert_eq!(events[0].data["files"], serde_json::json!([]));
+        assert_eq!(
+            events[0].data.get("gitRootId"),
+            root_id
+                .as_ref()
+                .map(|id| serde_json::json!(id.as_str()))
+                .as_ref()
+        );
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn agent_commit_ancestry_only_primary() {
+        assert_ancestry_only_agent_commit(false).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn agent_commit_ancestry_only_registered_root() {
+        assert_ancestry_only_agent_commit(true).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn agent_commit_empty_without_merge_is_rejected() {
+        let primary = init_git_repo();
+        let (_t, svc, ws, secondary, root_id) = svc_with_registered_root(&primary).await;
+        for (dir, root_id) in [(&primary.dir, None), (&secondary.dir, Some(root_id))] {
+            let git = Repository::open(dir).unwrap();
+            let before = git.head().unwrap().target();
+            let err = svc
+                .git_agent_commit(ws.clone(), "empty".into(), None, None, None, true, root_id)
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("No staged changes found to commit"),
+                "{err}"
+            );
+            assert_eq!(git.head().unwrap().target(), before);
+            assert_eq!(git.state(), git2::RepositoryState::Clean);
+        }
+    }
+
     /// `git.agentCommit` with a `gitRootId` and explicit `files` commits in
     /// the registered secondary root (pathspec-limited, with attribution
     /// trailers), leaves the primary worktree untouched, and the emitted
