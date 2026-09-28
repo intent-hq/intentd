@@ -32,6 +32,15 @@ pub(crate) struct Transport {
 
 impl Transport {
     pub fn new(token: Option<&str>, base: Option<&str>) -> Result<Self> {
+        Self::with_timeouts(token, base, CONNECT_TIMEOUT, READ_WRITE_TIMEOUT)
+    }
+
+    fn with_timeouts(
+        token: Option<&str>,
+        base: Option<&str>,
+        connect_timeout: std::time::Duration,
+        read_write_timeout: std::time::Duration,
+    ) -> Result<Self> {
         let base: Uri = base
             .unwrap_or("https://api.github.com")
             .parse()
@@ -47,9 +56,9 @@ impl Transport {
             .enable_http1()
             .build();
         let mut connector = hyper_timeout::TimeoutConnector::new(connector);
-        connector.set_connect_timeout(Some(CONNECT_TIMEOUT));
-        connector.set_read_timeout(Some(READ_WRITE_TIMEOUT));
-        connector.set_write_timeout(Some(READ_WRITE_TIMEOUT));
+        connector.set_connect_timeout(Some(connect_timeout));
+        connector.set_read_timeout(Some(read_write_timeout));
+        connector.set_write_timeout(Some(read_write_timeout));
         Ok(Self {
             pool: Client::builder(TokioExecutor::new()).build(connector),
             base,
@@ -154,4 +163,124 @@ fn classify(uri: &Uri, method: &http::Method, probe: bool) -> (Operation, bool, 
         graphql || page.is_some(),
         page.is_some_and(|p| p > 1),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traffic::{with_caller, with_traffic, Caller, Traffic};
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
+
+    async fn request(stream: &mut TcpStream) -> Option<String> {
+        let mut bytes = Vec::new();
+        loop {
+            let mut byte = [0];
+            if stream.read(&mut byte).await.ok()? == 0 {
+                return None;
+            }
+            bytes.push(byte[0]);
+            if bytes.ends_with(b"\r\n\r\n") {
+                return String::from_utf8(bytes).ok();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_facades_share_connections_and_preserve_headers() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let connections = Arc::new(AtomicUsize::new(0));
+        let count = connections.clone();
+        let server = tokio::spawn(async move {
+            let mut children = tokio::task::JoinSet::new();
+            while let Ok((mut stream, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::SeqCst);
+                children.spawn(async move {
+                    while let Some(head) = request(&mut stream).await {
+                        assert!(head.contains("authorization: Bearer test-secret"));
+                        assert!(head.contains("user-agent: octocrab"));
+                        stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\ncontent-type: application/json\r\n\r\n[]").await.unwrap();
+                    }
+                });
+            }
+        });
+        let transport = Transport::new(Some("test-secret"), Some(&base)).unwrap();
+        let traffic = Traffic::default();
+        with_traffic(traffic.clone(), async {
+            for caller in [
+                Caller::PrMonitor,
+                Caller::WorkspaceRefresh,
+                Caller::GitRootRefresh,
+            ] {
+                with_caller(caller, async {
+                    let _: serde_json::Value = transport
+                        .client(false, None)
+                        .get("/repos/o/r/pulls", None::<&()>)
+                        .await
+                        .unwrap();
+                })
+                .await;
+            }
+        })
+        .await;
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            1,
+            "facades must reuse the shared pool"
+        );
+        assert_eq!(
+            traffic.snapshot().counts.len(),
+            3,
+            "attribution remains caller-scoped"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_stalled_http_read_still_times_out_and_counts_every_retry() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut connections = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                connections.push(stream);
+            }
+        });
+        let transport = Transport::with_timeouts(
+            None,
+            Some(&base),
+            Duration::from_secs(1),
+            Duration::from_millis(25),
+        )
+        .unwrap();
+        let traffic = Traffic::default();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            with_traffic(traffic.clone(), async {
+                transport
+                    .client(false, None)
+                    .get::<serde_json::Value, _, ()>("/repos/o/r/pulls", None)
+                    .await
+            }),
+        )
+        .await
+        .expect("socket read timeout must end the request");
+        server.abort();
+        assert!(result.is_err());
+        let snapshot = traffic.snapshot();
+        let counts = &snapshot.counts[&(Caller::OnDemand, Operation::Discovery)];
+        assert_eq!(counts.rest_requests, 4);
+        assert_eq!(counts.transport_errors, 4);
+    }
 }

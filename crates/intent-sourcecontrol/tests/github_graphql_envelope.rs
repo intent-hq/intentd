@@ -1308,3 +1308,25 @@ async fn traffic_quota_probes_are_separate_and_enterprise_paths_are_classified()
         1
     );
 }
+
+#[tokio::test]
+async fn traffic_transport_strips_authentication_on_cross_origin_redirects() {
+    let destination = spawn_mock_with(Arc::new(|request| {
+        assert!(
+            !request.to_ascii_lowercase().contains("authorization:"),
+            "redirect must not disclose credentials"
+        );
+        (200, "[]".into())
+    }))
+    .await;
+    let location = format!("location: {}/repos/o/r/pulls\r\n", destination.base_uri);
+    let origin = spawn_mock_with_headers(Arc::new(move |request| {
+        assert!(request.contains("authorization: Bearer private-token"));
+        (307, location.clone(), "{}".into())
+    }))
+    .await;
+    let sc = GitHubSourceControl::new("private-token", Some(&origin.base_uri)).unwrap();
+    sc.list_prs(&RepoRef::new("o", "r"), PrQuery::default())
+        .await
+        .unwrap();
+}
