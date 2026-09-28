@@ -2,9 +2,9 @@
 //! concurrency [`ProcessRegistry`] and a concrete [`EventSink`] over the M2
 //! event bus (§6.8).
 //!
-//! [`AgentManager`] owns one [`AgentHandle`] per [`AgentId`] (the spawned child,
-//! its ACP [`Connection`], the streaming-notification receiver, and the
-//! client-served request loop). Each connection carries its own JSON-RPC id
+//! [`AgentManager`] owns one [`AgentHandle`] per [`AgentId`], with execution
+//! resources behind [`intent_core::agent_runtime::AgentRuntime`]. The local
+//! adapter owns ACP, process and bridge resources. Each connection has its own JSON-RPC id
 //! space + pending-request map (`intent-acp`), so response correlation is
 //! per-connection and the manager keys everything by `AgentId` — the stable
 //! analog of the TS registry's `pid`. The [`ProcessRegistry`] ports
@@ -74,6 +74,11 @@ use crate::Services;
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+pub(crate) mod runtime;
+#[cfg(test)]
+use runtime::DetachedChild;
+use runtime::{ChildState, LocalResources, RuntimeHandle, RuntimeTeardown};
 
 /// Deterministic system note appended to a STALE queued-message redrive (#576)
 /// so a delegated child that already delivered its completion report does not
@@ -412,16 +417,11 @@ const SESSION_CANCEL_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// caller the child is likely not settleable and a respawn path is more
 /// appropriate than a warn-and-continue turn.
 async fn cancel_and_settle_idle_prompt(
-    conn: &Connection,
+    conn: &runtime::Runtime<'_>,
     agent_id: &AgentId,
     acp_session_id: &str,
 ) -> bool {
-    match tokio::time::timeout(
-        SESSION_CANCEL_WRITE_TIMEOUT,
-        intent_acp::session::cancel(conn, acp_session_id),
-    )
-    .await
-    {
+    match tokio::time::timeout(SESSION_CANCEL_WRITE_TIMEOUT, conn.cancel(acp_session_id)).await {
         Ok(Ok(())) => true,
         Ok(Err(e)) if is_cancel_transport_closed(&e) => {
             tracing::debug!(
@@ -2327,45 +2327,17 @@ struct AppliedEffort {
     default_value: String,
 }
 
-/// One live agent: its ACP [`Connection`] (own id space + pending map), the
-/// streaming-notification receiver consumed during a turn, the client-served
-/// request loop, the owned child (its process group is killed on teardown via
-/// [`kill_child_tree`], with `kill_on_drop` as a direct-child safety net), and
-/// the per-agent MCP bridge + generated config that back the agent→BE tool loop.
-///
-/// Ownership invariant: a handle never drops while still owning its child.
-/// Every teardown path moves the child out first ([`DetachedChild::take`])
-/// and awaits its owned cleanup; a handle dropped any other way — the fresh
-/// local handle `create_agent` holds across the stale reap when that await
-/// is cancelled, or a map dropped wholesale — hands the child to the same
-/// owned cleanup from [`Drop`], so the tree is still swept before its npx
-/// launch dir goes away.
+/// Orchestration metadata for one live agent, backed by an execution runtime.
+/// The runtime owns the provider connection, child, request handler and bridge.
+/// Removing this handle starts cancellation-safe resource cleanup even while
+/// an in-flight prompt retains a runtime reference. Local teardown preserves
+/// the process-tree sweep and launch-directory lifetime guarantees.
 ///
 /// `spawned_model` and `spawned_provider` track the model/provider the child was
 /// spawned with, enabling `ensure_started` to detect model changes (via `agent.setModel`)
 /// and respawn the child with the new model before the next turn.
 struct AgentHandle {
-    connection: Arc<Connection>,
-    notifications: Arc<TokioMutex<mpsc::UnboundedReceiver<IncomingNotification>>>,
-    serve_task: JoinHandle<()>,
-    child: Option<Child>,
-    /// The child's pid captured at spawn: `Child::id()` reads `None` once a
-    /// `try_wait` liveness probe reaps the exit status, and the pgid-based
-    /// teardown (`kill_child_tree`) still needs it to sweep same-group
-    /// descendants that outlive the leader (monorepo#764).
-    child_pid: Option<u32>,
-    _mcp_bridge: Option<McpBridge>,
-    _mcp_config: Option<TempConfigFile>,
-    _rules_config: Option<TempConfigFile>,
-    /// Bundled pi-extension MCP delivery files (extension + wrapper script),
-    /// removed when the handle drops (pi only).
-    _pi_extension: Option<PiExtensionDelivery>,
-    /// The neutral directory an npx launch started in (intent-hq/intent#5738;
-    /// `None` for other launch tiers). It is the live tree's cwd, so it
-    /// always leaves the handle together with the child
-    /// ([`DetachedChild::take`], explicitly or from [`Drop`]) and only the
-    /// detached child's owned cleanup may release it.
-    npx_launch_dir: Option<NpxLaunchDir>,
+    execution: RuntimeHandle,
     antigravity_profile: Option<crate::antigravity::SessionProfile>,
     /// MCP servers (workspace bridge + user servers) delivered via the ACP
     /// `session/new` / `session/load` `mcpServers` field for providers that
@@ -2399,14 +2371,10 @@ struct AgentHandle {
 
 impl Drop for AgentHandle {
     fn drop(&mut self) {
-        self.serve_task.abort();
         if let Some(listener) = &self.wake_listener {
             listener.abort();
         }
-        // Cancellation-safe fallback for a handle that still owns its child:
-        // the detached child's own `Drop` starts the owned tree kill (no-op
-        // once a teardown path has already taken the child).
-        drop(DetachedChild::take(self));
+        // RuntimeHandle::drop starts owned execution cleanup.
     }
 }
 
@@ -2923,7 +2891,7 @@ impl AgentManager {
                     AgentSpawnDetails {
                         provider: handle.spawned_provider.clone(),
                         model: handle.spawned_model.clone(),
-                        root_pid: handle.child_pid,
+                        root_pid: handle.execution.runtime.spawned_pid(),
                     },
                 )
             })
@@ -2956,13 +2924,11 @@ impl AgentManager {
             .unwrap()
             .iter_mut()
             .filter_map(|(agent_id, handle)| {
-                let pid = handle.child_pid?;
-                if let Some(child) = handle.child.as_mut() {
-                    if !matches!(child.try_wait(), Ok(None)) {
-                        return None;
-                    }
-                }
-                Some((pid, agent_id.clone()))
+                handle
+                    .execution
+                    .runtime
+                    .root_pid()
+                    .map(|pid| (pid, agent_id.clone()))
             })
             .collect()
     }
@@ -3391,16 +3357,18 @@ impl AgentManager {
         self.registry
             .register(agent_id.clone(), self.make_kill(agent_id.clone()));
         let handle = AgentHandle {
-            connection,
-            notifications: Arc::new(TokioMutex::new(note_rx)),
-            serve_task,
-            child: Some(child),
-            child_pid,
-            _mcp_bridge: Some(bridge),
-            _mcp_config: mcp_config,
-            _rules_config: rules_config,
-            _pi_extension: pi_extension,
-            npx_launch_dir,
+            execution: RuntimeHandle::local(LocalResources {
+                connection,
+                notifications: Arc::new(TokioMutex::new(note_rx)),
+                serve_task,
+                child: Some(child),
+                child_pid,
+                _mcp_bridge: Some(bridge),
+                _mcp_config: mcp_config,
+                _rules_config: rules_config,
+                _pi_extension: pi_extension,
+                npx_launch_dir,
+            }),
             antigravity_profile,
             session_mcp_servers,
             spawned_model: opts.model.map(std::string::ToString::to_string),
@@ -3424,7 +3392,7 @@ impl AgentManager {
         // orphaned and neither launch dir is removed early.
         let stale = self.handles.lock().unwrap().remove(&agent_id);
         if let Some(mut stale) = stale {
-            if let Some(child) = DetachedChild::take(&mut stale) {
+            if let Some(child) = RuntimeTeardown::take(&mut stale) {
                 child.kill_tree().await;
             }
         }
@@ -3451,7 +3419,7 @@ impl AgentManager {
         };
         if let Some(mut handle) = fenced {
             self.registry.deregister(&agent_id);
-            if let Some(child) = DetachedChild::take(&mut handle) {
+            if let Some(child) = RuntimeTeardown::take(&mut handle) {
                 child.kill_tree().await;
             }
             return Err(Error::NotFound(format!(
@@ -3690,7 +3658,9 @@ impl AgentManager {
                 .get(agent_id)
                 .ok_or_else(|| Error::NotFound(format!("agent {agent_id}")))?;
             (
-                handle.connection.clone(),
+                handle.execution.connection().ok_or_else(|| {
+                    Error::Internal("session initialization requires a local runtime".into())
+                })?,
                 handle.session_mcp_servers.clone(),
                 handle.wake_gate.clone(),
                 handle.antigravity_profile.clone(),
@@ -3814,7 +3784,7 @@ impl AgentManager {
                     .lock()
                     .unwrap()
                     .get(agent_id)
-                    .map(|h| h.notifications.clone());
+                    .map(|h| h.execution.runtime.notifications());
                 if let Some(notes) = notes {
                     let mut guard = notes.lock().await;
                     Services::drain_replay_notifications(&mut guard).await;
@@ -4129,13 +4099,11 @@ impl AgentManager {
         session_id: &str,
         provider: &str,
     ) -> Result<()> {
-        let Some((conn, mut options)) = self
-            .handles
-            .lock()
-            .unwrap()
-            .get(agent_id)
-            .map(|h| (h.connection.clone(), h.config_options.clone()))
-        else {
+        let Some((conn, mut options)) = self.handles.lock().unwrap().get(agent_id).and_then(|h| {
+            h.execution
+                .connection()
+                .map(|conn| (conn, h.config_options.clone()))
+        }) else {
             return Ok(());
         };
         let enabled = self
@@ -4943,7 +4911,10 @@ impl AgentManager {
             let handle = map
                 .get(agent_id)
                 .ok_or_else(|| Error::NotFound(format!("agent {agent_id}")))?;
-            (handle.connection.clone(), handle.notifications.clone())
+            (
+                handle.execution.runtime.clone(),
+                handle.execution.runtime.notifications(),
+            )
         };
         self.registry.mark_active(agent_id);
         let mut guard = notes.lock().await;
@@ -5030,7 +5001,7 @@ impl AgentManager {
             tracing::warn!(error = %e, "stop-redelivery persistence sync failed for batch stop");
         }
         if !children.is_empty() {
-            DetachedChild::kill_trees(children).await;
+            RuntimeTeardown::kill_trees(children).await;
         }
         fence
     }
@@ -5041,7 +5012,7 @@ impl AgentManager {
     /// `stop()` kills the single tree inline (SIGTERM→grace→SIGKILL);
     /// `shutdown()` collects every detached child and kills all process groups
     /// concurrently under ONE shared grace window.
-    async fn detach(&self, agent_id: &AgentId) -> (bool, Option<DetachedChild>) {
+    async fn detach(&self, agent_id: &AgentId) -> (bool, Option<RuntimeTeardown>) {
         self.detach_with_redelivery(agent_id, None, true).await
     }
 
@@ -5066,7 +5037,7 @@ impl AgentManager {
         agent_id: &AgentId,
         redelivery: Option<crate::agent_ops::QueuedPrepend>,
         sync_store: bool,
-    ) -> (bool, Option<DetachedChild>) {
+    ) -> (bool, Option<RuntimeTeardown>) {
         // Pin the live-turn slot BEFORE aborting the worker (the abort drops
         // LiveTurnGuard; the pin keeps the slot published until the flush
         // below persists the row — monorepo#2056), then flush the partial
@@ -5134,7 +5105,7 @@ impl AgentManager {
         self.end_turn(agent_id).await;
         let handle = self.handles.lock().unwrap().remove(agent_id);
         let removed = handle.is_some();
-        let child = handle.and_then(|mut h| DetachedChild::take(&mut h));
+        let child = handle.and_then(|mut h| RuntimeTeardown::take(&mut h));
         self.registry.deregister(agent_id);
         (removed, child)
     }
@@ -5193,14 +5164,14 @@ impl AgentManager {
         interrupted_by: Option<InterruptedBy>,
     ) -> InterruptOutcome {
         let suppress_idle_emit = reason == InterruptReason::PreemptedByMessage;
-        // The live connection is the interrupt capability; grab it WITHOUT
-        // removing the handle so the child stays alive for resume.
+        // The runtime is the interrupt capability; grab it WITHOUT removing
+        // the handle so execution stays available for resume.
         let conn = self
             .handles
             .lock()
             .unwrap()
             .get(agent_id)
-            .map(|h| h.connection.clone());
+            .map(|h| h.execution.runtime.clone());
         let Some(conn) = conn else {
             // No live session to interrupt → keep-alive is a no-op; fall back to
             // the hard kill path (itself a no-op when the agent is already gone).
@@ -5338,11 +5309,7 @@ impl AgentManager {
         // `mark_idle` below no-op (handle removed, registry deregistered) —
         // fine, a killed child leaves no stragglers to drain and nothing for
         // the idle sweep to hold.
-        match tokio::time::timeout(
-            SESSION_CANCEL_WRITE_TIMEOUT,
-            intent_acp::session::cancel(&conn, &acp_session_id),
-        )
-        .await
+        match tokio::time::timeout(SESSION_CANCEL_WRITE_TIMEOUT, conn.cancel(&acp_session_id)).await
         {
             Ok(Ok(())) => {}
             Ok(Err(e)) if is_cancel_transport_closed(&e) => {
@@ -5411,7 +5378,7 @@ impl AgentManager {
             .lock()
             .unwrap()
             .get(agent_id)
-            .map(|h| h.notifications.clone());
+            .map(|h| h.execution.runtime.notifications());
         if let Some(notes) = notes {
             let mut guard = notes.lock().await;
             Services::drain_replay_notifications(&mut guard).await;
@@ -8148,7 +8115,10 @@ impl AgentManager {
             let Some(handle) = map.get(agent_id) else {
                 return false;
             };
-            (handle.notifications.clone(), handle.wake_gate.clone())
+            (
+                handle.execution.runtime.notifications(),
+                handle.wake_gate.clone(),
+            )
         };
         if gate.load(AtomicOrdering::SeqCst) > 0 {
             return true;
@@ -8539,13 +8509,7 @@ impl AgentManager {
         let Some(handle) = handles.get_mut(agent_id) else {
             return false;
         };
-        if !handle.connection.is_alive() {
-            return false;
-        }
-        match handle.child.as_mut() {
-            Some(child) => !matches!(child.try_wait(), Ok(Some(_))),
-            None => true,
-        }
+        handle.execution.runtime.is_alive()
     }
 
     /// Persist the informational `model_changed` transcript row when this
@@ -9167,7 +9131,7 @@ impl AgentManager {
                         .lock()
                         .unwrap()
                         .get(agent_id)
-                        .map(|h| h.connection.clone());
+                        .and_then(|h| h.execution.connection());
                     if let Some(conn) = conn {
                         let effort = Self::session_model_effort(
                             &resolved.provider,
@@ -9533,7 +9497,7 @@ impl AgentManager {
                 children.push(child);
             }
         }
-        DetachedChild::kill_trees(children).await;
+        RuntimeTeardown::kill_trees(children).await;
         // The daemon-managed Unsloth server is not an agent child — tear it
         // down explicitly so a clean shutdown never orphans it.
         self.unsloth.shutdown().await;
@@ -9699,7 +9663,7 @@ impl AgentManager {
     async fn kill_child_only(&self, agent_id: &AgentId) {
         let handle = self.handles.lock().unwrap().remove(agent_id);
         if let Some(mut handle) = handle {
-            if let Some(child) = DetachedChild::take(&mut handle) {
+            if let Some(child) = RuntimeTeardown::take(&mut handle) {
                 child.kill_tree().await;
             }
         }
@@ -9719,7 +9683,7 @@ impl AgentManager {
                     .upgrade()
                     .and_then(|h| h.lock().unwrap().remove(&id));
                 if let Some(mut handle) = removed {
-                    if let Some(child) = DetachedChild::take(&mut handle) {
+                    if let Some(child) = RuntimeTeardown::take(&mut handle) {
                         child.kill_tree().await;
                     }
                 }
@@ -9778,23 +9742,9 @@ impl AgentManager {
                     let Some(handle) = map.get_mut(&agent_id) else {
                         return false;
                     };
-                    let Some(child) = handle.child.as_mut() else {
-                        return false;
-                    };
-                    // A respawn installed a NEWER child under this agent id
-                    // (which armed its own watcher) — stand down. A child
-                    // already reaped by a prior `try_wait` reports
-                    // `id() == None` and falls through: `try_wait` then
-                    // returns its cached exit status.
-                    if let Some(current) = child.id() {
-                        if Some(current) != child_pid {
-                            return false;
-                        }
-                    }
-                    match child.try_wait() {
-                        // Alive — keep polling. A transient probe error is
-                        // treated as alive so it never forces a teardown.
-                        Ok(None) | Err(_) => None,
+                    match handle.execution.child_exit(child_pid) {
+                        ChildState::Absent => return false,
+                        ChildState::Alive => None,
                         // Exited. Mid-turn (busy) the in-flight turn's
                         // terminal-failure path owns the teardown: keep
                         // polling until it removes the handle (or the agent
@@ -9808,7 +9758,7 @@ impl AgentManager {
                         // handle (which requires this lock), so a deregister
                         // outside the lock could land AFTER that fresh
                         // `register` and clobber the new child's slot.
-                        Ok(Some(status)) => {
+                        ChildState::Exited(status) => {
                             if is_busy {
                                 None
                             } else {
@@ -9817,7 +9767,7 @@ impl AgentManager {
                                 Some((
                                     status,
                                     dead.map(|mut h| {
-                                        (DetachedChild::take(&mut h), Arc::clone(&h.connection))
+                                        (RuntimeTeardown::take(&mut h), h.execution.connection())
                                     }),
                                 ))
                             }
@@ -9825,8 +9775,7 @@ impl AgentManager {
                     }
                 };
                 if let Some((status, dead)) = exited {
-                    let (dead_child, dead_conn) =
-                        dead.map_or((None, None), |(child, conn)| (child, Some(conn)));
+                    let (dead_child, dead_conn) = dead.unwrap_or((None, None));
                     // The direct child is already reaped (`try_wait` above),
                     // but same-group descendants can survive it: sweep the
                     // process group via the spawn-time pid. Swept BEFORE the
@@ -9892,103 +9841,6 @@ const PROCESS_GROUP_TERM_GRACE: Duration = Duration::from_secs(2);
 /// before returning (`SIGKILLed` children reap almost instantly).
 #[cfg(unix)]
 const KILL_SWEEP_REAP_GRACE: Duration = Duration::from_millis(500);
-
-/// A provider child handed out of its [`AgentHandle`] for a bounded
-/// process-tree kill, together with its spawn-time pid (the process-group
-/// id, still valid once the leader has been `try_wait`ed) and the npx launch
-/// dir it runs in (intent-hq/intent#5738): that dir is the live tree's cwd,
-/// so it must outlive [`kill_child_tree`] / [`kill_child_trees`] rather than
-/// drop with the handle before the tree has been signalled.
-///
-/// Cleanup ownership is persistent, not the awaiting caller's: [`Self::kill_tree`]
-/// and [`Self::kill_trees`] move the child, its pgid and the launch dir into
-/// ONE owned task on the current runtime and await that task. Cancelling the
-/// caller — `stop()` aborting a worker inside `kill_child_only` after the
-/// handle left the map, an RPC deadline dropping a `stop` / `stop_many`
-/// future — leaves the task, and the descendant snapshot it already took,
-/// running to completion (a second kill could not rediscover escaped
-/// descendants once the leader is dead). [`Drop`] starts the same task for a
-/// detached child that was never killed explicitly. When no runtime can run
-/// the task, or it shuts down before the task finishes, the launch dir is
-/// retained on disk rather than removed from under a possibly live tree, and
-/// the child falls back to `kill_on_drop` — the same boundary as the
-/// ephemeral adapter's `AdapterChild`.
-struct DetachedChild {
-    /// `None` once moved into the owned cleanup task.
-    child: Option<Child>,
-    spawn_pid: Option<u32>,
-    /// `None` once moved into the owned cleanup task.
-    npx_launch_dir: Option<NpxLaunchDir>,
-}
-
-impl DetachedChild {
-    /// Move the child (and its launch dir) out of `handle`; `None` when the
-    /// handle owns no child.
-    fn take(handle: &mut AgentHandle) -> Option<Self> {
-        let child = handle.child.take()?;
-        Some(Self {
-            child: Some(child),
-            spawn_pid: handle.child_pid,
-            npx_launch_dir: handle.npx_launch_dir.take(),
-        })
-    }
-
-    /// [`kill_child_tree`] on an owned task, releasing the launch dir only
-    /// afterwards; awaits the task, but the task outlives a cancelled await.
-    async fn kill_tree(mut self) {
-        if let Some(cleanup) = self.start_cleanup() {
-            let _ = cleanup.await;
-        }
-    }
-
-    /// Move the child and the launch dir into the owned cleanup task. `None`
-    /// when there is nothing left to clean up or no runtime to run it on
-    /// (then the dir is retained and the child left to `kill_on_drop`).
-    fn start_cleanup(&mut self) -> Option<JoinHandle<()>> {
-        let child = self.child.take()?;
-        let spawn_pid = self.spawn_pid;
-        let launch_dir = RetainUnlessSwept(self.npx_launch_dir.take());
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            drop(launch_dir);
-            drop(child);
-            return None;
-        };
-        Some(spawn_owned_cleanup(&runtime, async move {
-            kill_child_tree(child, spawn_pid).await;
-            launch_dir.remove();
-        }))
-    }
-
-    /// [`kill_child_trees`] over the batch on ONE owned task, releasing every
-    /// launch dir only after the shared sweep completes; a cancelled await
-    /// leaves the batch sweep running.
-    async fn kill_trees(children: Vec<Self>) {
-        let mut trees = Vec::with_capacity(children.len());
-        let mut launch_dirs = Vec::with_capacity(children.len());
-        for mut detached in children {
-            if let Some(child) = detached.child.take() {
-                trees.push((child, detached.spawn_pid));
-            }
-            launch_dirs.push(RetainUnlessSwept(detached.npx_launch_dir.take()));
-        }
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        let _ = spawn_owned_cleanup(&runtime, async move {
-            kill_child_trees(trees).await;
-            for dir in launch_dirs {
-                dir.remove();
-            }
-        })
-        .await;
-    }
-}
-
-impl Drop for DetachedChild {
-    fn drop(&mut self) {
-        drop(self.start_cleanup());
-    }
-}
 
 /// Spawn `cleanup` on `runtime` as a task no caller owns: it runs with
 /// [`intent_core::Caller::Daemon`] bound (like [`intent_core::spawn_daemon`])
@@ -11270,7 +11122,7 @@ async fn run_message_worker(
                                     .lock()
                                     .unwrap()
                                     .get(&agent_id)
-                                    .map(|h| h.connection.clone());
+                                    .map(|h| h.execution.runtime.clone());
                                 // Response watermark BEFORE `session/cancel`:
                                 // the idle timeout dropped `req_fut`, so the
                                 // hung prompt's pending-map entry is already
@@ -11335,7 +11187,7 @@ async fn run_message_worker(
                                         .lock()
                                         .unwrap()
                                         .get(&agent_id)
-                                        .map(|h| h.notifications.clone());
+                                        .map(|h| h.execution.runtime.notifications());
                                     if let Some(notes) = notes {
                                         let mut guard = notes.lock().await;
                                         Services::drain_replay_notifications(&mut guard).await;
@@ -13539,7 +13391,7 @@ async fn stderr_capture_hint(
         .lock()
         .unwrap()
         .get(agent_id)
-        .map(|h| Arc::clone(&h.connection));
+        .and_then(|h| h.execution.connection());
     let connection = connection?;
     // Sweep the child's process group BEFORE awaiting settle (same ordering
     // as the idle-exit watcher): a same-group descendant holding the stderr
@@ -16302,16 +16154,18 @@ mod dead_child_respawn_tests {
         let (_note_tx, note_rx) = mpsc::unbounded_channel::<IncomingNotification>();
         let child_pid = child.as_ref().and_then(tokio::process::Child::id);
         AgentHandle {
-            connection,
-            notifications: Arc::new(TokioMutex::new(note_rx)),
-            serve_task: tokio::spawn(async {}),
-            child,
-            child_pid,
-            _mcp_bridge: None,
-            _mcp_config: None,
-            _rules_config: None,
-            _pi_extension: None,
-            npx_launch_dir,
+            execution: RuntimeHandle::local(LocalResources {
+                connection,
+                notifications: Arc::new(TokioMutex::new(note_rx)),
+                serve_task: tokio::spawn(async {}),
+                child,
+                child_pid,
+                _mcp_bridge: None,
+                _mcp_config: None,
+                _rules_config: None,
+                _pi_extension: None,
+                npx_launch_dir,
+            }),
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
@@ -16343,7 +16197,18 @@ mod dead_child_respawn_tests {
         assert_eq!(acp, "acp-cached", "live child reuses the cached session");
         // No respawn happened: the fake handle (no owned child) is untouched.
         let handles = mgr.handles.lock().unwrap();
-        assert!(handles.get(&agent_id).unwrap().child.is_none());
+        assert!(handles
+            .get(&agent_id)
+            .unwrap()
+            .execution
+            .local
+            .as_ref()
+            .unwrap()
+            .resources
+            .lock()
+            .unwrap()
+            .child
+            .is_none());
     }
 
     /// Handle present but the child already exited → `ensure_started` must
@@ -16379,7 +16244,18 @@ mod dead_child_respawn_tests {
         {
             let handles = mgr.handles.lock().unwrap();
             assert!(
-                handles.get(&agent_id).unwrap().child.is_some(),
+                handles
+                    .get(&agent_id)
+                    .unwrap()
+                    .execution
+                    .local
+                    .as_ref()
+                    .unwrap()
+                    .resources
+                    .lock()
+                    .unwrap()
+                    .child
+                    .is_some(),
                 "respawn installed a real child-owning handle"
             );
         }
@@ -16860,7 +16736,18 @@ mod disabled_provider_rehome_tests {
         {
             let handles = mgr.handles.lock().unwrap();
             assert!(
-                handles.get(&agent_id).unwrap().child.is_some(),
+                handles
+                    .get(&agent_id)
+                    .unwrap()
+                    .execution
+                    .local
+                    .as_ref()
+                    .unwrap()
+                    .resources
+                    .lock()
+                    .unwrap()
+                    .child
+                    .is_some(),
                 "re-home replaced the fake handle with a real child"
             );
         }
@@ -17766,7 +17653,7 @@ mod thought_level_tests {
             let mut handles = mgr.handles.lock().unwrap();
             let handle = handles.get_mut(&agent_id).unwrap();
             handle.thought_level = thought_level;
-            handle.connection.clone()
+            handle.execution.connection().unwrap()
         };
         (mgr, agent_id, conn, calls, db, task)
     }
@@ -18990,7 +18877,10 @@ mod cancel_and_settle_tests {
         let conn = Connection::new(c2a_client, a2c_client, None, ConnectionHooks::default());
         let agent_id = AgentId::from("agent-idle-settle");
 
-        assert!(cancel_and_settle_idle_prompt(&conn, &agent_id, "acp-1").await);
+        assert!(
+            cancel_and_settle_idle_prompt(&runtime::ConnectionRuntime(&conn), &agent_id, "acp-1")
+                .await
+        );
 
         // The cancel frame reached the agent side of the pipe.
         let mut lines = BufReader::new(c2a_agent).lines();
@@ -19026,7 +18916,10 @@ mod cancel_and_settle_tests {
         }
         assert!(!conn.is_alive(), "writer task exited on broken pipe");
 
-        assert!(!cancel_and_settle_idle_prompt(&conn, &agent_id, "acp-1").await);
+        assert!(
+            !cancel_and_settle_idle_prompt(&runtime::ConnectionRuntime(&conn), &agent_id, "acp-1")
+                .await
+        );
     }
 }
 

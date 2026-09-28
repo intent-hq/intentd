@@ -3039,7 +3039,7 @@ impl Services {
     /// Returns `Error::Internal` if the `session/prompt` request fails or the transport drops mid-turn.
     pub async fn run_prompt_turn(
         &self,
-        conn: &Connection,
+        conn: &crate::agent_manager::runtime::Runtime<'_>,
         notifications: &mut mpsc::UnboundedReceiver<IncomingNotification>,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
@@ -3191,7 +3191,7 @@ impl Services {
         );
         let mut stall_emitted = false;
         let result = loop {
-            let prompt_fut = session::prompt(conn, acp_session_id, prompt.clone(), &activity);
+            let prompt_fut = conn.prompt(acp_session_id, prompt.clone(), &activity);
             tokio::pin!(prompt_fut);
             let attempt_result = loop {
                 tokio::select! {
@@ -5677,5 +5677,31 @@ impl Services {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+impl Services {
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) async fn run_connection_prompt_turn(
+        &self,
+        connection: &Connection,
+        notifications: &mut mpsc::UnboundedReceiver<IncomingNotification>,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        acp_session_id: &str,
+        prompt: Vec<ContentBlock>,
+        turn_id: Option<&str>,
+    ) -> Result<StopReason> {
+        self.run_prompt_turn(
+            &crate::agent_manager::runtime::ConnectionRuntime(connection),
+            notifications,
+            agent_id,
+            workspace_id,
+            acp_session_id,
+            prompt,
+            turn_id,
+        )
+        .await
     }
 }
