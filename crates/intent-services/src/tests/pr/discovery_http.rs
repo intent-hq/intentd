@@ -13,6 +13,7 @@ struct Api {
     pulls: Arc<Mutex<Vec<serde_json::Value>>>,
     fail_page: Arc<AtomicUsize>,
     redirect_quota_detail: Arc<AtomicUsize>,
+    detail_redirects: Arc<AtomicUsize>,
     next_link: Arc<Mutex<Option<String>>>,
     gate: Arc<tokio::sync::Semaphore>,
     entered: Arc<tokio::sync::Notify>,
@@ -41,6 +42,8 @@ impl Api {
         let fail_page = Arc::new(AtomicUsize::new(0));
         let redirect_quota_detail = Arc::new(AtomicUsize::new(0));
         let quota_detail = redirect_quota_detail.clone();
+        let detail_redirects = Arc::new(AtomicUsize::new(0));
+        let hops = detail_redirects.clone();
         let next_link = Arc::new(Mutex::new(None::<String>));
         let gate = Arc::new(tokio::sync::Semaphore::new(10000));
         let entered = Arc::new(tokio::sync::Notify::new());
@@ -146,6 +149,20 @@ impl Api {
                 } else {
                     (status, header, body)
                 };
+                let hop = query
+                    .get("hop")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let (status, header, body) =
+                    if url.path().ends_with("/pulls/42") && hop < hops.load(Ordering::SeqCst) {
+                        (
+                            "301 Moved Permanently",
+                            format!("location: {}?hop={}\r\n", url.path(), hop + 1),
+                            "{}".into(),
+                        )
+                    } else {
+                        (status, header, body)
+                    };
                 let response = format!("HTTP/1.1 {status}\r\n{header}content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
                 socket.write_all(response.as_bytes()).await.unwrap();
             }
@@ -156,6 +173,7 @@ impl Api {
             pulls: data,
             fail_page,
             redirect_quota_detail,
+            detail_redirects,
             next_link,
             gate,
             entered,
@@ -1317,4 +1335,57 @@ async fn shared_discovery_explicit_overlap_keeps_success_and_forge_error_sharing
             .await;
         }
     }
+}
+
+#[tokio::test]
+async fn shared_discovery_explicit_overlap_skips_terminal_redirect_admission_denial() {
+    let api = Api::new(vec![pull(42, "feature")]).await;
+    api.detail_redirects.store(4, Ordering::SeqCst);
+    let (_t, svc, id) = refresh_setup(StubForge::default(), "feature", Some(42), false).await;
+    let sc = api.sc();
+    let svc = svc.with_source_control(sc.clone());
+    let repo = RepoRef::new("o", "r");
+    let traffic = Traffic::default();
+    with_traffic(
+        traffic.clone(),
+        crate::pr_discovery::explicitly_refresh(async {
+            // Same documented public pre-discovery await seam as the reservation
+            // tests above; here reservation succeeds and a later hop is denied.
+            svc.discover_shared_pr(sc.as_ref(), &repo, "absent", None, None)
+                .await
+                .unwrap();
+            let (background, provider, repository) = (svc.clone(), sc.clone(), repo.clone());
+            let denied = tokio::spawn(with_traffic(traffic.clone(), async move {
+                background
+                    .shared_pr_record(provider.as_ref(), &repository, 42)
+                    .await
+            }))
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert!(
+                matches!(denied, intent_sourcecontrol::Error::Api(_)),
+                "{denied:?}"
+            );
+            assert_eq!(
+                counts(&traffic),
+                (1, 4, 0),
+                "four redirects exhaust background lease"
+            );
+            svc.refresh_workspace_pr_cached(&id)
+                .await
+                .expect("explicit refresh must retry a terminal local redirect denial");
+            assert_eq!(
+                counts(&traffic),
+                (1, 9, 0),
+                "explicit admission reaches the fifth-hop PR"
+            );
+            assert_eq!(api.requests.lock().unwrap().len(), 10);
+            assert_eq!(
+                svc.store().get_workspace(&id).await.unwrap().pr_number,
+                Some(42)
+            );
+        }),
+    )
+    .await;
 }
