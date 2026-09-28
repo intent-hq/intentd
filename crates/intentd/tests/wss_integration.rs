@@ -16,6 +16,8 @@ mod host_roles;
 mod human_attribution;
 #[path = "wss_integration/imported_queue_authorization.rs"]
 mod imported_queue_authorization;
+#[path = "wss_integration/integration_context.rs"]
+mod integration_context;
 #[path = "wss_integration/resource_context.rs"]
 mod resource_context;
 #[path = "wss_integration/sharing.rs"]
