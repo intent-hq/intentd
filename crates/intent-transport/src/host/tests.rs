@@ -1368,3 +1368,30 @@ async fn provider_safe_read_gate_uses_durable_member_authority_only() {
         assert_eq!(reply["error"]["code"], -32003, "{method}: {reply}");
     }
 }
+
+#[test]
+fn discovery_context_host_classifier_retains_semantic_selectors() {
+    for method in [
+        "host.status",
+        "host.checkGit",
+        "host.checkNode",
+        "host.checkGh",
+        "host.checkAuggie",
+        "host.findBinary",
+        "host.toolAvailability",
+        "host.env",
+        "host.providerDiscovery",
+        "host.providerAuthStatus",
+    ] {
+        for context in [None, Some("workspace-a"), Some("workspace-b")] {
+            let mut params =
+                json!({"providerId":"auggie","force":true,"name":"node","tools":["git"]});
+            if let Some(ws) = context {
+                params["workspaceId"] = json!(ws);
+            }
+            let request =
+                classify(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params})).unwrap();
+            assert_eq!(request.params, *params.as_object().unwrap(), "{method}");
+        }
+    }
+}

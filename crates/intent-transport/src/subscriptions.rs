@@ -204,6 +204,8 @@ pub(crate) fn classify(value: &Value) -> Option<SubFastPath> {
         // falls through to the router (coexistence; naming reconciliation is
         // TB-6, design R1). The alias likewise requires `workspaceId` on
         // `agent.unsubscribe`, so a bare `{ subscriptionId }` is ours.
+        // Workspace-aware collection clients use `events.unsubscribe` instead:
+        // adding workspaceId to this bare alias would select the service path.
         "agent.subscribe" if !params.contains_key("eventTypes") => Some(SubFastPath::Subscribe {
             id,
             channel: Channel::Agent,
@@ -289,6 +291,8 @@ pub(crate) fn parse_comment_subscribe_params(
     })
 }
 
+/// Optional routing-only `workspaceId` does not alter the agent selector,
+/// resume cursor, projection, encoding, or connection-owned replacement group.
 /// Validate `chat.subscribe` params. A missing/empty `agentId` is a `-32602`
 /// error (the chat channel is per-agent, CS-0). `sinceMessageId` is optional:
 /// absent / `null` / empty string all mean "no resume" (standard snapshot,

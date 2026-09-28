@@ -324,6 +324,8 @@ pub(crate) fn parse_subscribe_params(
 
 /// Validate `events.unsubscribe` params. A missing/empty `subscriptionId` throws
 /// (`-32602`); a present-but-unknown id is handled by the caller as `success:false`.
+/// Optional workspace routing context is not a registry scope: removal (including
+/// collection subscriptions and note-presence leases) remains connection-owned.
 pub(crate) fn parse_unsubscribe_id(params: &Map<String, Value>) -> Result<String, String> {
     match params.get("subscriptionId").and_then(Value::as_str) {
         Some(s) if !s.is_empty() => Ok(s.to_string()),
