@@ -13,7 +13,9 @@ struct Api {
     pulls: Arc<Mutex<Vec<serde_json::Value>>>,
     fail_page: Arc<AtomicUsize>,
     redirect_quota_detail: Arc<AtomicUsize>,
+    detail_error_status: Arc<AtomicUsize>,
     detail_redirects: Arc<AtomicUsize>,
+    listing_redirects: Arc<AtomicUsize>,
     next_link: Arc<Mutex<Option<String>>>,
     gate: Arc<tokio::sync::Semaphore>,
     entered: Arc<tokio::sync::Notify>,
@@ -42,8 +44,12 @@ impl Api {
         let fail_page = Arc::new(AtomicUsize::new(0));
         let redirect_quota_detail = Arc::new(AtomicUsize::new(0));
         let quota_detail = redirect_quota_detail.clone();
+        let detail_error_status = Arc::new(AtomicUsize::new(429));
+        let error_status = detail_error_status.clone();
         let detail_redirects = Arc::new(AtomicUsize::new(0));
         let hops = detail_redirects.clone();
+        let listing_redirects = Arc::new(AtomicUsize::new(0));
+        let listing_hops = listing_redirects.clone();
         let next_link = Arc::new(Mutex::new(None::<String>));
         let gate = Arc::new(tokio::sync::Semaphore::new(10000));
         let entered = Arc::new(tokio::sync::Notify::new());
@@ -142,7 +148,11 @@ impl Api {
                     )
                 } else if limited != 0 && url.path() == format!("/repos/o/moved/pulls/{limited}") {
                     (
-                        "429 Too Many Requests",
+                        match error_status.load(Ordering::SeqCst) {
+                            403 => "403 Forbidden",
+                            500 => "500 Internal Server Error",
+                            _ => "429 Too Many Requests",
+                        },
                         "retry-after: 60\r\nx-ratelimit-remaining: 0\r\n".into(),
                         json!({"message":"You have exceeded a secondary rate limit."}).to_string(),
                     )
@@ -153,16 +163,23 @@ impl Api {
                     .get("hop")
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or(0);
-                let (status, header, body) =
-                    if url.path().ends_with("/pulls/42") && hop < hops.load(Ordering::SeqCst) {
-                        (
-                            "301 Moved Permanently",
-                            format!("location: {}?hop={}\r\n", url.path(), hop + 1),
-                            "{}".into(),
-                        )
-                    } else {
-                        (status, header, body)
-                    };
+                let hop_limit = if url.path().ends_with("/pulls/42") {
+                    hops.load(Ordering::SeqCst)
+                } else if url.path().ends_with("/pulls") {
+                    listing_hops.load(Ordering::SeqCst)
+                } else {
+                    0
+                };
+                let (status, header, body) = if hop < hop_limit {
+                    let separator = if url.query().is_some() { "&" } else { "?" };
+                    (
+                        "301 Moved Permanently",
+                        format!("location: {path}{separator}hop={}\r\n", hop + 1),
+                        "{}".into(),
+                    )
+                } else {
+                    (status, header, body)
+                };
                 let response = format!("HTTP/1.1 {status}\r\n{header}content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
                 socket.write_all(response.as_bytes()).await.unwrap();
             }
@@ -173,7 +190,9 @@ impl Api {
             pulls: data,
             fail_page,
             redirect_quota_detail,
+            detail_error_status,
             detail_redirects,
+            listing_redirects,
             next_link,
             gate,
             entered,
@@ -1248,11 +1267,18 @@ async fn shared_discovery_explicit_overlap_skips_background_detail_denial() {
 #[tokio::test]
 async fn shared_discovery_explicit_overlap_keeps_success_and_forge_error_sharing() {
     for detail in [false, true] {
-        for forge_error in [false, true] {
+        let statuses: &[usize] = if detail {
+            &[0, 403, 429, 500]
+        } else {
+            &[0, 422]
+        };
+        for &status in statuses {
+            let forge_error = status != 0;
             let api = Api::new(vec![pull(42, "feature")]).await;
             if forge_error {
                 if detail {
                     api.redirect_quota_detail.store(42, Ordering::SeqCst);
+                    api.detail_error_status.store(status, Ordering::SeqCst);
                 } else {
                     api.fail_page.store(1, Ordering::SeqCst);
                 }
@@ -1306,7 +1332,7 @@ async fn shared_discovery_explicit_overlap_keeps_success_and_forge_error_sharing
                     let before = counts(&traffic);
                     let refreshed = svc.refresh_workspace_pr_cached(&id).await;
                     assert_eq!(refreshed.is_err(), forge_error, "{refreshed:?}");
-                    if detail && forge_error {
+                    if detail && forge_error && status != 500 {
                         assert!(matches!(refreshed, Err(Error::RateLimited(_))));
                     }
                     assert_eq!(
@@ -1319,7 +1345,9 @@ async fn shared_discovery_explicit_overlap_keeps_success_and_forge_error_sharing
                         (
                             1,
                             if detail {
-                                if forge_error {
+                                if status == 403 {
+                                    2
+                                } else if forge_error {
                                     4
                                 } else {
                                     1
@@ -1384,6 +1412,54 @@ async fn shared_discovery_explicit_overlap_skips_terminal_redirect_admission_den
             assert_eq!(
                 svc.store().get_workspace(&id).await.unwrap().pr_number,
                 Some(42)
+            );
+        }),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn shared_discovery_explicit_overlap_retries_partial_listing_after_local_denial() {
+    let api = Api::new((1..=801).map(|n| pull(n, "other")).collect()).await;
+    api.listing_redirects.store(4, Ordering::SeqCst);
+    let (_t, svc, id) = refresh_setup(StubForge::default(), "absent", None, false).await;
+    let sc = api.sc();
+    let svc = svc.with_source_control(sc.clone());
+    let traffic = Traffic::default();
+    with_traffic(
+        traffic.clone(),
+        crate::pr_discovery::explicitly_refresh(async {
+            let (background, provider) = (svc.clone(), sc.clone());
+            let denied = tokio::spawn(with_traffic(traffic.clone(), async move {
+                background
+                    .discover_shared_pr(
+                        provider.as_ref(),
+                        &RepoRef::new("o", "r"),
+                        "absent",
+                        None,
+                        None,
+                    )
+                    .await
+            }))
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert!(matches!(denied, intent_sourcecontrol::Error::Api(_)));
+            assert_eq!(
+                counts(&traffic),
+                (40, 0, 0),
+                "eight pages exhaust the background lease before page nine"
+            );
+            svc.refresh_workspace_pr_cached(&id).await.unwrap();
+            assert_eq!(
+                counts(&traffic),
+                (85, 0, 0),
+                "explicit refresh fetches all nine pages, five sends each"
+            );
+            assert_eq!(api.requests.lock().unwrap().len(), 85);
+            assert_eq!(
+                svc.store().get_workspace(&id).await.unwrap().pr_number,
+                None
             );
         }),
     )

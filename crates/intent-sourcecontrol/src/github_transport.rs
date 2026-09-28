@@ -142,9 +142,11 @@ impl Transport {
         let context = traffic::context();
         let admission = crate::request_budget::current();
         let retry_admission = admission.clone();
+        let terminal_denial = crate::request_budget::terminal_denial();
         let counted = tower::service_fn(move |mut request: http::Request<OctoBody>| {
             let mut pool = pool.clone();
             let admission = admission.clone();
+            let terminal_denial = terminal_denial.clone();
             let mut context = context.clone();
             let (operation, graphql, page, continuation) =
                 classify(request.uri(), request.method(), quota_probe, &graphql_path);
@@ -158,6 +160,9 @@ impl Transport {
                     .is_none()
                     && admission.as_ref().is_some_and(|admit| !admit())
                 {
+                    if let Some(denied) = terminal_denial {
+                        denied.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
                     return Err(AttemptError::Denied);
                 }
                 context.start(operation, graphql, page);
@@ -386,9 +391,9 @@ mod tests {
         let called = admissions.clone();
         let remaining = Arc::new(AtomicUsize::new(allowance.unwrap_or(0)));
         let available = remaining.clone();
-        let result = with_traffic(traffic.clone(), async {
+        let (result, terminal_denial) = with_traffic(traffic.clone(), async {
             if allowance.is_some() {
-                crate::request_budget::with_admission(
+                crate::request_budget::with_admission_tracking(
                     Arc::new(move || {
                         called.fetch_add(1, Ordering::SeqCst);
                         available
@@ -399,12 +404,17 @@ mod tests {
                 )
                 .await
             } else {
-                sc.get_pr(&repo, 42).await
+                (sc.get_pr(&repo, 42).await, false)
             }
         })
         .await;
         server.abort();
         let error = result.unwrap_err();
+        assert_eq!(
+            terminal_denial,
+            expected == 0,
+            "received quota responses are not local denials"
+        );
         assert_eq!(attempts.load(Ordering::SeqCst), expected, "{error:?}");
         let snapshot = traffic.snapshot();
         let accounted: u64 = snapshot.counts.values().map(|c| c.rest_requests).sum();

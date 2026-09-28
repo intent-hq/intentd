@@ -4,10 +4,11 @@
 //! also remember failures for a window: a broken repository never falls back
 //! to a request per branch. Lists never enter the richer PR-detail cache.
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use intent_sourcecontrol::request_budget::with_admission_tracking;
 use intent_sourcecontrol::traffic::{record_reuse, Operation, Reuse};
 use intent_sourcecontrol::{
     cache_scope::CacheScope, Error, PrQuery, PrState, PullRequest, RepoRef, Result, SourceControl,
@@ -82,8 +83,8 @@ struct Entry {
     finished: Option<Instant>,
     revision: u64,
     result: Result<Value>,
-    // No HTTP was admitted: this is a background scheduling result, not a
-    // forge response. An overlapping explicit demand must try its own admission.
+    // Background admission stopped this fill without a terminal forge result.
+    // An overlapping explicit demand must try its own admission.
     background_deferred: bool,
 }
 
@@ -400,20 +401,25 @@ impl Discovery {
                 .map_err(|_| unknown("PR refresh stopped"))?;
             let owner = services.clone();
             let scope = key.scope.clone();
+            let budget_denied = Arc::new(AtomicBool::new(false));
+            let denied = budget_denied.clone();
             let admission = Arc::new(move || {
-                scope.is_current()
-                    && !owner.sweeps_rate_limited()
-                    && lease.as_ref().is_none_or(|lease| {
-                        lease.window.elapsed() < WINDOW
-                            && lease
-                                .remaining
-                                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                                    n.checked_sub(1)
-                                })
-                                .is_ok()
-                    })
+                if !scope.is_current() || owner.sweeps_rate_limited() {
+                    return false;
+                }
+                let allowed = lease.as_ref().is_none_or(|lease| {
+                    lease.window.elapsed() < WINDOW
+                        && lease
+                            .remaining
+                            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                            .is_ok()
+                });
+                if !allowed {
+                    denied.store(true, Ordering::SeqCst);
+                }
+                allowed
             });
-            intent_sourcecontrol::request_budget::with_admission(admission, async {
+            let (result, terminal_denial) = with_admission_tracking(admission, async {
                 if let Some(number) = key.number {
                     return sc
                         .get_pr(&key.repo, number)
@@ -464,7 +470,11 @@ impl Discovery {
                 }
                 Err(unknown("open PR pagination budget exhausted"))
             })
-            .await
+            .await;
+            // A refused retry can still return a real 429/500 response. Only
+            // a terminal local denial may be bypassed by an explicit demand.
+            background_deferred = terminal_denial && budget_denied.load(Ordering::SeqCst);
+            result
         }
         .await;
         if !key.scope.is_current() || revision != slot.revision.load(Ordering::SeqCst) {
