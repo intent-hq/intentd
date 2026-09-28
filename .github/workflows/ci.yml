@@ -1623,6 +1623,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
+      - name: Test release quota failure guidance (offline)
+        run: python3 -S scripts/test-release-plz-release.py
       - name: Test aggregate-channel-notes.sh
         run: ./scripts/test-aggregate-channel-notes.sh
       - name: Test notify-fixed-issues.sh

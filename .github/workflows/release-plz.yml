@@ -83,10 +83,31 @@ jobs:
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-11 (PR 185, --force-non-host)
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
-      - name: Run release-plz release
-        uses: release-plz/action@aec534bbd8631793b9b3b8f1ee6cd886c322e17f # v0.5.133
+      # Keep installation and git identity pins from release-plz/action
+      # v0.5.133. The wrapper reports quota failures without replaying tags.
+      - name: Install cargo-semver-checks
+        uses: taiki-e/install-action@7b8d4719ee4aaa279bdf55df38dacb9ebfe12a6c # v2.87.6
         with:
-          command: release
+          tool: cargo-semver-checks@0.50
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@b874e25ea559687bec77e281e9b271aa1367b624 # v1.23.0
+        env:
+          BINSTALL_VERSION: 1.23.0
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+      - name: Install release-plz
+        shell: bash
+        run: cargo-binstall release-plz@0.3.162 --force --strategies=crate-meta-data,compile --no-confirm
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+      - name: Configure git user from release token
+        uses: release-plz/git-config@59144859caf016f8b817a2ac9b051578729173c4
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+      - name: Run release-plz release
+        shell: bash
+        run: python3 -S scripts/release-plz-release.py
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
 
