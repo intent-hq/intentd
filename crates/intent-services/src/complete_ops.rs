@@ -632,6 +632,17 @@ impl Services {
         let (turn_prompt, session_meta) =
             one_shot_session_shape(provider_id, prompt, system_prompt);
         match run_one_shot_acp(
+            Some((
+                provider_id,
+                Box::pin(async {
+                    self.effective_settings()
+                        .providers
+                        .fast_mode
+                        .get(provider_id)
+                        .copied()
+                        .unwrap_or(false)
+                }),
+            )),
             cmd,
             &turn_prompt,
             config_option_model(provider, model),
@@ -661,6 +672,48 @@ impl Services {
 mod tests {
     use super::*;
     use intent_store::Store;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fast_mode_complete_once_reads_live_daemon_preferences() {
+        use std::os::unix::fs::PermissionsExt;
+        for provider in ["claude-code", "codex"] {
+            let dir = crate::test_support::test_tempdir("fast-mode-complete-");
+            let bin = dir.path().join("adapter.mjs");
+            std::fs::write(&bin, format!("#!/usr/bin/env node\nif(process.argv.includes('--version')){{console.log('11.0.0');process.exit(0);}}\nconst provider = {provider:?}; const failOff = false; const logPath = {};\n{}", json!(dir.path().join("calls.jsonl")), include_str!("../tests/fixtures/fast-mode.mjs"))).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let (_tmp, services) = services_with_settings(&[
+                ("model.defaultProvider", json!(provider)),
+                ("quickActions.defaultReasoningEffort", json!("high")),
+                ("providers.paths", json!({provider:bin})),
+            ])
+            .await;
+            let services = services.with_one_shot_npx(Some(bin));
+            for enabled in [false, true, false] {
+                services
+                    .settings_registry()
+                    .unwrap()
+                    .apply(&[("providers.fastMode".into(), json!({provider:enabled}))])
+                    .unwrap();
+                let result = services
+                    .agent_complete_once_op(
+                        "inspect".into(),
+                        None,
+                        Some("supported".into()),
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let state: Value = serde_json::from_str(result["text"].as_str().unwrap()).unwrap();
+                assert_eq!(state["fastMode"], enabled);
+                assert_eq!(state["model"], "supported");
+                assert_eq!(state["effort"], "high");
+            }
+        }
+    }
 
     /// RAII temp `SQLite` store: the db (and its `-wal`/`-shm` sidecars) live in
     /// a guarded temp dir removed on drop — including on panic — unless
@@ -1201,6 +1254,7 @@ rl.on('line', (line) => {
                 // Test prompts finalize policy after their provider env merge.
                 let cmd = apply_one_shot_launch_policy(codex, cmd);
                 let reply = run_one_shot_acp(
+                    None,
                     cmd,
                     "hello",
                     config_option_model(codex, model),

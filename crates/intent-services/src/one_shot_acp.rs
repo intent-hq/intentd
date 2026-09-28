@@ -110,6 +110,12 @@ impl std::fmt::Display for OneShotError {
     }
 }
 
+/// Lazy setting read, polled only after session and model setup.
+pub(crate) type FastModePreference<'a> = (
+    &'a str,
+    std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>,
+);
+
 /// Run one ephemeral ACP completion: claim a slot in the daemon-wide adapter
 /// bound, spawn `cmd`, drive the turn with `prompt` as a single text content
 /// block, and return the concatenated assistant text. `prompt_timeout` bounds
@@ -119,7 +125,8 @@ impl std::fmt::Display for OneShotError {
 /// `session/new` via `session/set_config_option` (a failure never fails the
 /// completion). `session_meta`, when set, rides `session/new` as `_meta`
 /// verbatim (absent otherwise). The child is reaped before returning on
-/// every path.
+/// every path. `fast_mode` reads the daemon preference only at the pre-prompt
+/// boundary, so changes made while queued or opening the session are included.
 ///
 /// Reusing the caller's own timeout as the queue budget keeps the contract
 /// legible — you wait for a slot at most as long as you were willing to wait
@@ -127,6 +134,7 @@ impl std::fmt::Display for OneShotError {
 /// [`OneShotError::QueueTimeout`], never a hang and never something a client
 /// could mistake for a slow model.
 pub(crate) async fn run_one_shot_acp(
+    fast_mode: Option<FastModePreference<'_>>,
     cmd: OneShotCommand,
     prompt: &str,
     config_option_model: Option<&str>,
@@ -135,6 +143,7 @@ pub(crate) async fn run_one_shot_acp(
     effort: &OneShotEffort,
 ) -> Result<String, OneShotError> {
     run_one_shot_acp_in(
+        fast_mode,
         adapter_slots(),
         cmd,
         prompt,
@@ -152,7 +161,9 @@ pub(crate) async fn run_one_shot_acp(
 /// private [`AdapterSlots`], so slot pressure from sibling tests sharing the
 /// global bound cannot turn its asserted failure into a queue timeout
 /// (monorepo#2379).
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn run_one_shot_acp_in(
+    fast_mode: Option<FastModePreference<'_>>,
     slots: &AdapterSlots,
     cmd: OneShotCommand,
     prompt: &str,
@@ -172,6 +183,7 @@ pub(crate) async fn run_one_shot_acp_in(
         })?;
 
     let result = drive_one_shot(
+        fast_mode,
         &adapter.conn,
         &mut adapter.notifications,
         &mut adapter.requests,
@@ -198,6 +210,7 @@ pub(crate) async fn run_one_shot_acp_in(
 /// agent→client requests concurrently through every phase.
 #[expect(clippy::too_many_arguments)]
 async fn drive_one_shot(
+    fast_mode: Option<FastModePreference<'_>>,
     conn: &Connection,
     notifications: &mut mpsc::UnboundedReceiver<intent_acp::IncomingNotification>,
     requests: &mut mpsc::UnboundedReceiver<IncomingRequest>,
@@ -217,7 +230,7 @@ async fn drive_one_shot(
     // `session/request_permission` during `initialize` or `session/new`
     // still gets the immediate auto-deny instead of stalling setup into a
     // misreported SetupTimeout.
-    let (session_id, mut thought_level) = serve_requests_while(
+    let (session_id, mut thought_level, mut config_options) = serve_requests_while(
         &mut responder,
         requests,
         tokio::time::timeout(
@@ -244,6 +257,7 @@ async fn drive_one_shot(
         )
         .await
         {
+            crate::fast_mode::refresh_options(&mut config_options, Some(&response));
             // A valid replacement list without thought_level clears the old
             // selector. Missing/malformed lists preserve it for old adapters.
             if let Some(options) = parse_config_options(&response) {
@@ -260,6 +274,17 @@ async fn drive_one_shot(
         cmd.session_new_timeout(),
     )
     .await?;
+    // Fast preferences are sampled after both model and effort selection.
+    if let Some((provider, preference)) = fast_mode {
+        let enabled = preference.await;
+        serve_requests_while(
+            &mut responder,
+            requests,
+            crate::fast_mode::apply(conn, &session_id, provider, enabled, &mut config_options),
+        )
+        .await
+        .map_err(|e| OneShotError::Transport(e.to_string()))?;
+    }
 
     let params = json!({
         "sessionId": session_id,
@@ -448,7 +473,7 @@ async fn setup_session(
     session_meta: Option<Value>,
     initialize_timeout: Duration,
     session_new_timeout: Duration,
-) -> Result<(String, Option<ThoughtLevelOption>), OneShotError> {
+) -> Result<(String, Option<ThoughtLevelOption>, Option<Value>), OneShotError> {
     conn.request_timeout("initialize", initialize_params(), initialize_timeout)
         .await
         .map_err(map_acp_error)?;
@@ -471,7 +496,11 @@ async fn setup_session(
         .ok_or_else(|| OneShotError::Transport("session/new returned no sessionId".to_string()))?;
     let thought_level =
         parse_config_options(&result).and_then(|options| discover_thought_level(Some(&options)));
-    Ok((session_id, thought_level))
+    Ok((
+        session_id,
+        thought_level,
+        result.get("configOptions").cloned(),
+    ))
 }
 
 fn parse_config_options(response: &Value) -> Option<Vec<SessionConfigOption>> {

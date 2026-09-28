@@ -537,6 +537,7 @@ pub(crate) async fn handle_with_host_environment(
             // same V8 heap cap a real ACP spawn gets (intent-hq/intent#4330).
             let node_max_old_space_mb = read_setting_u32(api, "agents.acpNodeMaxOldSpaceMb").await;
             match intent_services::provider_test_prompt::provider_test_prompt(
+                Some(api),
                 &provider_id,
                 model.as_deref(),
                 &provider_paths,

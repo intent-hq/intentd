@@ -1209,6 +1209,13 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             None,
         ),
         object(
+            "providers.fastMode",
+            "Fast mode",
+            "Per-provider Fast mode preference, applied before the next turn when supported by the selected model and account",
+            "providers",
+            Some(json!({})),
+        ),
+        object(
             "providers.paths",
             "Provider paths",
             "Per-provider CLI path overrides",
