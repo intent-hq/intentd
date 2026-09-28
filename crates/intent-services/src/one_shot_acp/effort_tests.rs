@@ -14,8 +14,16 @@ async fn run(
     let cmd = OneShotCommand::binary("node".into(), vec![fixture.to_string_lossy().into_owned()])
         .env("MOCK_EFFORT_BEHAVIOR", behavior.to_string())
         .env("MOCK_EFFORT_LOG", log.as_os_str());
-    let result =
-        run_one_shot_acp(cmd, "hello", model, None, Duration::from_secs(30), &effort).await;
+    let result = run_one_shot_acp(
+        None,
+        cmd,
+        "hello",
+        model,
+        None,
+        Duration::from_secs(30),
+        &effort,
+    )
+    .await;
     let requests = std::fs::read_to_string(log)
         .unwrap()
         .lines()

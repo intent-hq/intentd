@@ -297,6 +297,7 @@ pub(crate) struct AcpSessionOpened {
     /// next prompt. `None` when the provider advertises no such option or when
     /// a concurrent recreate won the CAS (see `modes`).
     pub thought_level: Option<ThoughtLevelOption>,
+    pub config_options: Option<Value>,
 }
 
 /// A provider's reasoning-effort selector: the `thought_level`-category select
@@ -2769,6 +2770,7 @@ impl Services {
         Ok(AcpSessionOpened {
             session_id: candidate,
             modes: resp.modes,
+            config_options: resp.config_options.map(|options| json!(options)),
             thought_level,
         })
     }
@@ -2808,6 +2810,7 @@ impl Services {
         Ok(AcpSessionOpened {
             session_id: acp_session_id,
             modes: resp.modes,
+            config_options: resp.config_options.map(|options| json!(options)),
             thought_level,
         })
     }
@@ -2871,6 +2874,9 @@ impl Services {
             (None, None)
         };
         Ok(AcpSessionOpened {
+            config_options: (canonical == new_acp_session_id)
+                .then(|| json!(resp.config_options))
+                .filter(|v| !v.is_null()),
             session_id: canonical,
             modes,
             thought_level,
@@ -2979,6 +2985,7 @@ impl Services {
         Ok(Some(AcpSessionOpened {
             session_id: acp_session_id,
             modes: resp.modes,
+            config_options: resp.config_options.map(|options| json!(options)),
             thought_level,
         }))
     }

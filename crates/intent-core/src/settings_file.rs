@@ -100,6 +100,8 @@ pub struct ProvidersSettings {
     pub enabled: Option<BTreeMap<String, bool>>,
     /// `providers.paths` — per-provider CLI path overrides.
     pub paths: BTreeMap<String, String>,
+    /// Session-only Fast mode preference; absent providers default to off.
+    pub fast_mode: BTreeMap<String, bool>,
 }
 
 /// `[model]` — model defaults (`model.*`). The per-workspace override layer
@@ -1407,6 +1409,17 @@ impl SettingsFile {
     pub fn validate(&self) -> Result<()> {
         fn bad(key: &str, msg: &str) -> Error {
             Error::InvalidInput(format!("invalid config.toml at `{key}`: {msg}"))
+        }
+        if self
+            .providers
+            .fast_mode
+            .keys()
+            .any(|id| !matches!(id.as_str(), "claude-code" | "codex"))
+        {
+            return Err(bad(
+                "providers.fastMode",
+                "only claude-code and codex support Fast mode",
+            ));
         }
         let v = self.notifications.volume;
         if !(0.0..=1.0).contains(&v) {

@@ -34,6 +34,87 @@ fn mock_adapter(body: &str) -> (OneShotCommand, tempfile::TempDir) {
     (cmd, dir)
 }
 
+#[tokio::test]
+async fn fast_mode_one_shot_samples_after_model_selection_and_preserves_native_state() {
+    const FIXTURE: &str = include_str!("../../tests/fixtures/fast-mode.mjs");
+    for provider in ["claude-code", "codex", "pi"] {
+        for model in ["supported", "unsupported"] {
+            for enabled in [false, true, false] {
+                let log_dir = test_tempdir("fast-mode-one-shot-");
+                let log = log_dir.path().join("calls.jsonl");
+                let (cmd, _dir) = mock_adapter(&format!("const provider = {provider:?}; const failOff = false; const logPath = {};\n{FIXTURE}", json!(log)));
+                let sampled_log = log.clone();
+                let preference = Box::pin(async move {
+                    let calls = std::fs::read_to_string(&sampled_log).unwrap();
+                    assert!(
+                        calls.contains("\"configId\":\"model\""),
+                        "sample only after model selection"
+                    );
+                    enabled
+                });
+                let reply = run_one_shot_acp(
+                    Some((provider, preference)),
+                    cmd,
+                    "inspect",
+                    Some(model),
+                    None,
+                    Duration::from_secs(30),
+                    &OneShotEffort::default(),
+                )
+                .await
+                .unwrap();
+                let state: Value = serde_json::from_str(&reply).unwrap();
+                assert_eq!(state["model"], model);
+                assert_eq!(state["effort"], "medium");
+                if provider == "pi" || (provider == "claude-code" && model == "unsupported") {
+                    assert_eq!(state["controls"], json!([]));
+                } else {
+                    assert_eq!(
+                        state["controls"],
+                        json!([if enabled { "on" } else { "off" }])
+                    );
+                    assert_eq!(
+                        state["serviceTier"],
+                        if enabled && model == "supported" {
+                            json!("fast")
+                        } else {
+                            Value::Null
+                        }
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn fast_mode_one_shot_failed_off_never_prompts_at_inherited_tier() {
+    for provider in ["claude-code", "codex"] {
+        let log_dir = test_tempdir("fast-mode-one-shot-fail-");
+        let log = log_dir.path().join("calls.jsonl");
+        let (cmd, _dir) = mock_adapter(&format!(
+            "const provider = {provider:?}; const failOff = true; const logPath = {};\n{}",
+            json!(log),
+            include_str!("../../tests/fixtures/fast-mode.mjs")
+        ));
+        let error = run_one_shot_acp(
+            Some((provider, Box::pin(async { false }))),
+            cmd,
+            "inspect",
+            Some("supported"),
+            None,
+            Duration::from_secs(30),
+            &OneShotEffort::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("could not apply Fast mode off"));
+        assert!(!std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("session/prompt"));
+    }
+}
+
 /// Shared preamble: an NDJSON JSON-RPC loop that answers `initialize` and
 /// `session/new`, then hands `session/prompt` to `onPrompt(id, msg)`.
 const ADAPTER_PRELUDE: &str = r"
@@ -70,6 +151,7 @@ const onPrompt = (id) => {{
 "
     ));
     let text = run_one_shot_acp(
+        None,
         cmd,
         "say hi",
         None,
@@ -105,6 +187,7 @@ async fn session_meta_rides_session_new_verbatim() {
         "claudeCode": { "options": { "tools": [] } },
     });
     let text = run_one_shot_acp(
+        None,
         cmd,
         "hello",
         None,
@@ -123,6 +206,7 @@ async fn session_meta_rides_session_new_verbatim() {
 async fn session_new_omits_meta_when_none_given() {
     let (cmd, _dir) = mock_adapter(&format!("{ADAPTER_PRELUDE}{SESSION_NEW_ECHO_ADAPTER}"));
     let text = run_one_shot_acp(
+        None,
         cmd,
         "hello",
         None,
@@ -189,6 +273,7 @@ async fn one_shot_npx_launch_runs_outside_the_catalog_workspace_but_keeps_it_as_
 
     let slots = AdapterSlots::new(1);
     let text = run_one_shot_acp_in(
+        None,
         &slots,
         cmd,
         "where",
@@ -254,6 +339,7 @@ const onPrompt = () => {{}};
     // PromptTimeout into a QueueTimeout (monorepo#2379).
     let slots = AdapterSlots::new(1);
     let err = run_one_shot_acp_in(
+        None,
         &slots,
         cmd,
         "hang",
@@ -334,6 +420,7 @@ const onPrompt = () => {{
     let outcome = tokio::time::timeout(
         Duration::from_secs(15),
         run_one_shot_acp_in(
+            None,
             &slots,
             cmd,
             "flood",
@@ -611,6 +698,7 @@ const onPrompt = (id) => {{
 "
     ));
     let text = run_one_shot_acp(
+        None,
         cmd,
         "touch a file",
         None,
@@ -658,6 +746,7 @@ rl.on('line', (line) => {{
 "
     ));
     let text = run_one_shot_acp(
+        None,
         cmd,
         "hello",
         None,
@@ -693,6 +782,7 @@ const onPrompt = (id) => {{
 "
     ));
     let text = run_one_shot_acp(
+        None,
         cmd,
         "hello",
         Some("opus-x"),
@@ -726,6 +816,7 @@ const onPrompt = (id) => {{
 "
     ));
     let text = run_one_shot_acp(
+        None,
         cmd,
         "hello",
         Some("bogus-model"),
@@ -746,6 +837,7 @@ async fn nonzero_exit_surfaces_typed_exited_error() {
         vec!["-c".to_string(), "echo boom >&2; exit 7".to_string()],
     );
     let err = run_one_shot_acp(
+        None,
         cmd,
         "anything",
         None,
@@ -772,6 +864,7 @@ async fn garbage_stdout_surfaces_typed_transport_error() {
         vec!["-c".to_string(), "echo not json; exit 0".to_string()],
     );
     let err = run_one_shot_acp(
+        None,
         cmd,
         "anything",
         None,
@@ -794,6 +887,7 @@ async fn missing_adapter_binary_surfaces_typed_spawn_error() {
         Vec::new(),
     );
     let err = run_one_shot_acp(
+        None,
         cmd,
         "anything",
         None,
@@ -888,6 +982,7 @@ const onPrompt = (id) => {{
             let cmd = launch();
             tokio::spawn(async move {
                 run_one_shot_acp(
+                    None,
                     cmd,
                     "go",
                     None,
@@ -913,6 +1008,7 @@ const onPrompt = (id) => {{
     // A caller arriving into that full queue with a short timeout fails as a
     // queue timeout — and still spawns nothing.
     let queued_out = run_one_shot_acp(
+        None,
         launch(),
         "go",
         None,
@@ -957,4 +1053,69 @@ const onPrompt = (id) => {{
         burst,
         "every queued caller must eventually run"
     );
+}
+
+#[tokio::test]
+async fn fast_mode_one_shot_applies_after_quick_action_effort() {
+    for provider in ["claude-code", "codex"] {
+        for enabled in [false, true] {
+            let log_dir = test_tempdir("fast-mode-effort-");
+            let log = log_dir.path().join("calls.jsonl");
+            let (cmd, _dir) = mock_adapter(&format!(
+                "const provider = {provider:?}; const failOff = false; const logPath = {};\n{}",
+                json!(log),
+                include_str!("../../tests/fixtures/fast-mode.mjs")
+            ));
+            let sampled_log = log.clone();
+            let preference = Box::pin(async move {
+                let calls = std::fs::read_to_string(sampled_log).unwrap();
+                let last: Value = serde_json::from_str(calls.lines().last().unwrap()).unwrap();
+                assert_eq!(
+                    last["params"]["configId"], "effort",
+                    "sample only after effort selection"
+                );
+                assert_eq!(last["params"]["value"], "high");
+                enabled
+            });
+            let reply = run_one_shot_acp(
+                Some((provider, preference)),
+                cmd,
+                "inspect",
+                Some("supported"),
+                None,
+                Duration::from_secs(30),
+                &OneShotEffort {
+                    explicit: Some("high".into()),
+                    saved: vec![],
+                },
+            )
+            .await
+            .unwrap();
+            let state: Value = serde_json::from_str(&reply).unwrap();
+            assert_eq!(state["model"], "supported");
+            assert_eq!(state["effort"], "high");
+            assert_eq!(state["fastMode"], enabled);
+            let calls: Vec<Value> = std::fs::read_to_string(log)
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            let controls: Vec<&str> = calls
+                .iter()
+                .filter_map(|c| c["params"]["configId"].as_str())
+                .collect();
+            assert_eq!(
+                controls,
+                [
+                    "model",
+                    "effort",
+                    if provider == "claude-code" {
+                        "fast"
+                    } else {
+                        "fast-mode"
+                    }
+                ]
+            );
+        }
+    }
 }

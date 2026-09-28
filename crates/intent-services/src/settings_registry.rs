@@ -48,6 +48,7 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "providers.active",
     "providers.enabled",
     "providers.paths",
+    "providers.fastMode",
     "model.default",
     "model.defaultProvider",
     "model.providerDefaults",
@@ -963,6 +964,58 @@ mod tests {
 
     fn set(path: &str, value: Value) -> Vec<(String, Value)> {
         vec![(path.to_string(), value)]
+    }
+
+    #[test]
+    fn fast_mode_persistence_atomic_validation_and_reset() {
+        let (_dir, path) = temp_config(Some(""));
+        let reg = SettingsRegistry::load(&path).unwrap();
+        assert_eq!(reg.get("providers.fastMode"), Some(json!({})));
+        let prefs = json!({"claude-code":true,"codex":false});
+        reg.apply(&set("providers.fastMode", prefs.clone()))
+            .unwrap();
+        assert_eq!(
+            SettingsRegistry::load(&path)
+                .unwrap()
+                .get("providers.fastMode"),
+            Some(prefs.clone())
+        );
+        let before = std::fs::read_to_string(&path).unwrap();
+        for invalid in [
+            json!([]),
+            json!(true),
+            json!({"codex":"on"}),
+            json!({"codex":null}),
+            json!({"claude":true}),
+            json!({"auggie":false}),
+            json!({"unknown":true}),
+        ] {
+            assert!(reg
+                .apply(&[
+                    ("git.autoCommit".into(), json!(false)),
+                    ("providers.fastMode".into(), invalid)
+                ])
+                .is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+            assert_eq!(reg.get("providers.fastMode"), Some(prefs.clone()));
+        }
+        assert!(reg
+            .apply(&set("providers.fastMode.codex", json!(true)))
+            .is_err());
+        reg.apply(&set("providers.fastMode", Value::Null)).unwrap();
+        assert_eq!(reg.get("providers.fastMode"), Some(json!({})));
+        assert_eq!(
+            reg.origin("providers.fastMode"),
+            Some(SettingOrigin::Default)
+        );
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("fastMode"));
+        let changed = reg.reload("[providers.fastMode]\ncodex = true\n").unwrap();
+        assert!(changed.changed.contains("providers.fastMode"));
+        assert_eq!(reg.get("providers.fastMode"), Some(json!({"codex":true})));
+        assert!(reg
+            .reload("[providers.fastMode]\ncodex = \"yes\"\n")
+            .is_err());
+        assert_eq!(reg.get("providers.fastMode"), Some(json!({"codex":true})));
     }
 
     #[test]
