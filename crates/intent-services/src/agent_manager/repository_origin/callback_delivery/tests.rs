@@ -1,5 +1,6 @@
 //! Real manager/Store/R, Rust MCP endpoints and the frozen adapter/SDK.
-//! The SDK's native child is a scripted control peer, never a provider process.
+//! Existing control suites use a scripted SDK child. The separately ignored
+//! `genuine_native_startup` module requires the fixed isolated native runner.
 
 use super::super::tests::{callback, current, handle, Fixture};
 use super::*;
@@ -6265,5 +6266,588 @@ if(frame.method==='session/prompt' && promptErrors.length) {
         assert!(h.start().await.is_err());
         assert!(!h.f.manager.contains(&h.f.row.id));
         assert!(!h.scratch.path().join("launches.jsonl").exists());
+    }
+}
+
+/// Startup only: no prompt dispatch, optional preparation, private read or model turn.
+/// These cases are compiled normally but may execute only under the fixed runner.
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+mod genuine_native_startup {
+    use super::*;
+    use crate::agent_manager::{AgentManager, BusEventSink, StartedSession};
+    use sha2::{Digest, Sha256};
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::fs;
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::prelude::*;
+
+    const RUNTIME_ID: &str = "a08355be6f7f7aafd77977b0cdf030dc32f3fdce9178ec1883e0b04d71629597";
+    const MANIFEST_SHA: &str = "6bb9e9870a2268114f1fe6281ffc0bc06cc07edb8fa3abd8367d4949492ab098";
+    const BRIDGE_SHA: &str = "1f27c8d949c33878ee43e5d129d817f26cb985383d184be337599a9e9a8aad20";
+    const LAUNCHER: &str = "/runtime/bin/claude-agent-acp";
+    const BRIDGE: &str = "/bridge/intentd";
+    const ELF: &str = "/probe/services-test";
+    const PROOF: &str = "/probe/services-contract.json";
+    const PREFIX: &str = "agent_manager::repository_origin::callback_delivery::tests::genuine_native_startup::normal_services_native_";
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct RunnerProof {
+        format: String,
+        case: String,
+        test_elf_sha256: String,
+        host_namespaces: BTreeMap<String, String>,
+    }
+
+    fn digest(path: &Path) -> String {
+        let mut file = fs::File::open(path).unwrap();
+        let mut hash = Sha256::new();
+        let mut buffer = [0_u8; 16_384];
+        loop {
+            let n = file.read(&mut buffer).unwrap();
+            if n == 0 {
+                break;
+            }
+            hash.update(&buffer[..n]);
+        }
+        hash.finalize()
+            .iter()
+            .fold(String::new(), |mut text, byte| {
+                use std::fmt::Write;
+                write!(text, "{byte:02x}").unwrap();
+                text
+            })
+    }
+
+    fn milestone(event: &str, facts: &Value) {
+        let line = json!({"nativeServicesStartup":1,"event":event,"facts":facts}).to_string();
+        assert!(line.len() <= 16384, "bounded startup milestone");
+        println!("{line}");
+    }
+
+    fn expected_env() -> BTreeMap<String, String> {
+        [
+            ("HOME", "/home/probe"),
+            ("XDG_CONFIG_HOME", "/home/probe/.config"),
+            ("XDG_CACHE_HOME", "/home/probe/.cache"),
+            ("TMPDIR", "/tmp"),
+            ("CLAUDE_CONFIG_DIR", "/home/probe/.claude"),
+            ("INTENTD_DATA_DIR", "/home/probe/intentd"),
+            (
+                "CLAUDE_CODE_EXECUTABLE",
+                "/runtime/runtime/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude",
+            ),
+            ("PATH", "/runtime/node/bin:/usr/bin:/bin"),
+            ("PWD", "/work"),
+            ("LANG", "C.UTF-8"),
+            ("LC_ALL", "C.UTF-8"),
+            ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
+            ("DISABLE_TELEMETRY", "1"),
+            ("DISABLE_ERROR_REPORTING", "1"),
+            ("INTENT_NATIVE_SERVICES_RUN", "1"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.into(), value.into()))
+        .collect()
+    }
+
+    fn inventory(root: &Path, relative: &Path, found: &mut BTreeSet<String>) {
+        for item in fs::read_dir(root.join(relative)).unwrap() {
+            let path = relative.join(item.unwrap().file_name());
+            if fs::symlink_metadata(root.join(&path)).unwrap().is_dir() {
+                inventory(root, &path, found);
+            } else {
+                found.insert(path.to_str().unwrap().into());
+            }
+        }
+    }
+
+    /// This check precedes even Services construction. An environment flag alone
+    /// is insufficient: exact argv, readonly inputs, six isolated namespaces and
+    /// the complete accepted runtime manifest are all required. The fixed runner
+    /// independently pins this ELF and proves containment before exec; this is
+    /// defense in depth, not a general-purpose host execution permission.
+    fn require_runner(case: &str) {
+        assert_eq!(std::env::vars().collect::<BTreeMap<_, _>>(), expected_env());
+        assert_eq!(std::env::current_exe().unwrap(), Path::new(ELF));
+        assert_eq!(std::env::current_dir().unwrap(), Path::new("/work"));
+        assert_eq!(
+            std::env::args().collect::<Vec<_>>(),
+            [
+                ELF.to_string(),
+                format!("{PREFIX}{case}_startup"),
+                "--exact".into(),
+                "--ignored".into(),
+                "--nocapture".into(),
+                "--test-threads=1".into()
+            ]
+        );
+        let mounts = fs::read_to_string("/proc/self/mountinfo").unwrap();
+        for path in ["/", "/runtime", BRIDGE, ELF, PROOF] {
+            assert!(
+                mounts.lines().any(|line| {
+                    let fields: Vec<_> = line.split_whitespace().collect();
+                    fields.get(4) == Some(&path)
+                        && fields
+                            .get(5)
+                            .is_some_and(|flags| flags.split(',').any(|f| f == "ro"))
+                }),
+                "required readonly mount: {path}"
+            );
+        }
+        for path in ["/etc", "/run", "/sys", "/root", "/home/clement"] {
+            assert!(
+                !Path::new(path).exists(),
+                "unexpected host exposure: {path}"
+            );
+        }
+        let metadata = fs::symlink_metadata(PROOF).unwrap();
+        assert!(metadata.is_file() && metadata.len() <= 4096);
+        let proof: RunnerProof = serde_json::from_slice(&fs::read(PROOF).unwrap()).unwrap();
+        assert_eq!(proof.format, "intent-services-native-startup-v1");
+        assert_eq!(proof.case, case);
+        assert_eq!(proof.host_namespaces.len(), 6);
+        for ns in ["user", "net", "mnt", "pid", "ipc", "uts"] {
+            let actual = fs::read_link(format!("/proc/self/ns/{ns}")).unwrap();
+            let host = proof
+                .host_namespaces
+                .get(ns)
+                .expect("original host namespace");
+            assert!(host.starts_with(&format!("{ns}:[")) && host.ends_with(']'));
+            assert_ne!(actual.to_str().unwrap(), host, "unisolated {ns}");
+        }
+        let status = fs::read_to_string("/proc/self/status").unwrap();
+        assert!(status
+            .lines()
+            .any(|line| line == "CapEff:\t0000000000000000"));
+        for line in fs::read_to_string("/proc/net/dev").unwrap().lines().skip(2) {
+            assert_eq!(line.split(':').next().unwrap().trim(), "lo");
+        }
+        for line in fs::read_to_string("/proc/net/route")
+            .unwrap()
+            .lines()
+            .skip(1)
+        {
+            assert_eq!(line.split_whitespace().next(), Some("lo"));
+        }
+        assert_eq!(proof.test_elf_sha256.len(), 64);
+        assert_eq!(digest(Path::new(ELF)), proof.test_elf_sha256);
+        assert_eq!(digest(Path::new(BRIDGE)), BRIDGE_SHA);
+        assert_eq!(fs::metadata(BRIDGE).unwrap().len(), 278_795_624);
+        let root = Path::new("/runtime");
+        assert_eq!(digest(&root.join("manifest.json")), MANIFEST_SHA);
+        let manifest: Value =
+            serde_json::from_slice(&fs::read(root.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["identity"], RUNTIME_ID);
+        let files = manifest["inventory"]["files"].as_object().unwrap();
+        assert_eq!(files.len(), 6366);
+        let mut found = BTreeSet::new();
+        inventory(root, Path::new(""), &mut found);
+        let mut expected: BTreeSet<_> = files.keys().cloned().collect();
+        expected.insert("manifest.json".into());
+        let marker_name = ".intent-claude-runtime-install.json";
+        expected.insert(marker_name.into());
+        assert_eq!(found, expected, "exact accepted runtime payload");
+        let uid: u32 = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Uid:\t"))
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let marker = root.join(marker_name);
+        let marker_metadata = fs::symlink_metadata(&marker).unwrap();
+        assert!(marker_metadata.is_file());
+        assert_eq!(marker_metadata.mode() & 0o777, 0o600);
+        assert_eq!(marker_metadata.uid(), uid);
+        assert_eq!(fs::metadata(root).unwrap().uid(), uid);
+        assert_eq!(
+            fs::read_to_string(marker).unwrap(),
+            format!(
+                "{{\"format\":\"intent-claude-runtime-owned-v1\",\"identity\":\"{RUNTIME_ID}\",\"uid\":{uid}}}\n"
+            )
+        );
+        for (name, entry) in files {
+            let path = root.join(name);
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            if entry["mode"] == "120000" {
+                assert!(metadata.is_symlink());
+                assert_eq!(
+                    fs::read_link(&path).unwrap().to_str().unwrap(),
+                    entry["target"].as_str().unwrap()
+                );
+                assert!(path.canonicalize().unwrap().starts_with(root));
+            } else {
+                assert!(metadata.is_file());
+                assert_eq!(metadata.len(), entry["bytes"].as_u64().unwrap());
+                assert_eq!(
+                    metadata.mode() & 0o777,
+                    if entry["mode"] == "100755" {
+                        0o755
+                    } else {
+                        0o644
+                    }
+                );
+                assert_eq!(digest(&path), entry["sha256"].as_str().unwrap());
+            }
+        }
+        milestone(
+            "runner-verified",
+            &json!({"case":case,"runtimeIdentity":RUNTIME_ID,"testElf":proof.test_elf_sha256,"bridge":BRIDGE_SHA}),
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct Acknowledgments(Arc<Mutex<Vec<String>>>);
+
+    #[derive(Default)]
+    struct OutcomeFields {
+        retained: bool,
+        outcome: Option<String>,
+    }
+    impl tracing::field::Visit for OutcomeFields {
+        fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+            if field.name() == "retained" {
+                self.retained = value;
+            }
+        }
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "outcome" {
+                let value = format!("{value:?}");
+                assert!(value.len() <= 8192, "bounded original callback receipt");
+                self.outcome = Some(value);
+            }
+        }
+    }
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Acknowledgments {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target()
+                != "intent_services::agent_manager::repository_origin::callback_delivery"
+            {
+                return;
+            }
+            let mut fields = OutcomeFields::default();
+            event.record(&mut fields);
+            if fields.retained {
+                let mut outcomes = self.0.lock().unwrap();
+                assert!(outcomes.len() < 2);
+                outcomes.push(fields.outcome.expect("retained original receipt"));
+            }
+        }
+    }
+
+    struct Harness {
+        _scratch: tempfile::TempDir,
+        services: Arc<Services>,
+        manager: Arc<AgentManager>,
+        row: intent_core::AgentSession,
+        acknowledgments: Acknowledgments,
+    }
+    impl Harness {
+        async fn new(legacy: bool) -> Self {
+            let scratch = crate::test_support::test_tempdir("genuine-native-startup");
+            let cwd = scratch.path().join("workspace");
+            fs::create_dir(&cwd).unwrap();
+            let store = Store::open(&scratch.path().join("store.db")).await.unwrap();
+            let mut workspace = intent_core::chief_workspace();
+            workspace.id = intent_core::WorkspaceId::new();
+            workspace.repository_path = Some(cwd.to_str().unwrap().into());
+            workspace.path = Some(cwd.to_str().unwrap().into());
+            store.insert_workspace(&workspace).await.unwrap();
+            let registry = Arc::new(
+                crate::SettingsRegistry::load(scratch.path().join("config.toml")).unwrap(),
+            );
+            registry
+                .apply(&[
+                    ("providers.paths".into(), json!({"claude-code":LAUNCHER})),
+                    (
+                        "sourceControl.github.exposeGitCredentialToChildren".into(),
+                        json!(false),
+                    ),
+                ])
+                .unwrap();
+            let bus = crate::events::EventBus::new(store.clone());
+            let services = Arc::new(
+                Services::new(store)
+                    .with_settings_registry(registry)
+                    .with_event_bus(bus.clone())
+                    .with_workspaces_root(scratch.path().join("workspaces")),
+            );
+            let row = if legacy {
+                let row: intent_core::AgentSession = serde_json::from_value(json!({
+                    "id":intent_core::AgentId::new(),"workspaceId":workspace.id,"name":"historical native startup",
+                    "provider":"claude-code","harnessVersion":"2.9","status":"idle",
+                    "createdAt":"2026-09-27T00:00:00Z","updatedAt":"2026-09-27T00:00:00Z"
+                })).unwrap();
+                services.store.insert_agent_session(&row).await.unwrap();
+                row
+            } else {
+                let created = services
+                    .agent_create_op(
+                        workspace.id,
+                        Some("native startup".into()),
+                        Some("default".into()),
+                        None,
+                        None,
+                        None,
+                        false,
+                        intent_core::AgentCreateExtra {
+                            provider: Some("claude-code".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(created["agent"]["harnessVersion"], "3.0");
+                services
+                    .store
+                    .get_agent_session(&intent_core::AgentId::from(
+                        created["agent"]["id"].as_str().unwrap(),
+                    ))
+                    .await
+                    .unwrap()
+            };
+            let manager = Arc::new(
+                AgentManager::new(
+                    services.as_ref().clone(),
+                    Arc::new(BusEventSink::new(bus)),
+                    2,
+                )
+                .with_mcp_bridge_exe(BRIDGE)
+                .with_agent_config_root(scratch.path().join("configs")),
+            );
+            services.attach_agent_manager(&manager);
+            assert!(manager.handles.lock().unwrap().is_empty());
+            Self {
+                _scratch: scratch,
+                services,
+                manager,
+                row,
+                acknowledgments: Acknowledgments::default(),
+            }
+        }
+
+        async fn start(&self) -> StartedSession {
+            let manager = self.manager.clone();
+            let row = self.row.clone();
+            let execution = self.services.as_ref().clone();
+            let subscriber = tracing_subscriber::registry().with(self.acknowledgments.clone());
+            intent_core::spawn_daemon(crate::host_execution::background_execution(
+                execution,
+                None,
+                async move {
+                    manager
+                        .ensure_started_owned(&row.id, &row.workspace_id)
+                        .await
+                }
+                .with_subscriber(subscriber),
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+        }
+
+        async fn exercise(&self, legacy: bool) {
+            let first = self.start().await;
+            let stored = self
+                .services
+                .store
+                .get_agent_session(&self.row.id)
+                .await
+                .unwrap();
+            assert_eq!(
+                stored.acp_session_id.as_deref(),
+                Some(first.session_id.as_str())
+            );
+            assert_eq!(stored.harness_version, if legacy { "2.9" } else { "3.0" });
+            let (origin, pending, pid) = {
+                let handles = self.manager.handles.lock().unwrap();
+                let handle = &handles[&self.row.id];
+                assert!(handle.child.is_some());
+                assert!(Arc::ptr_eq(&handle.connection, &first.turn.connection));
+                assert!(Arc::ptr_eq(&handle.repository_origin, &first.turn.origin));
+                #[expect(
+                    clippy::used_underscore_binding,
+                    reason = "Observe the actual retained pending bridge without adding a production getter"
+                )]
+                let pending = handle._mcp_bridge.as_ref().unwrap().connect_addr();
+                (
+                    handle.repository_origin.clone(),
+                    pending,
+                    handle.child_pid.unwrap(),
+                )
+            };
+            let (endpoint, attempt) = {
+                let state = origin.state.lock().unwrap();
+                assert!(!state.retired && state.owner.is_some());
+                (state.endpoint.clone(), state.attempt.clone().unwrap())
+            };
+            let confirmed = endpoint.as_ref().map(|endpoint| {
+                endpoint
+                    .bridge
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .connect_addr()
+            });
+            milestone(
+                "ordinary-started",
+                &json!({"legacy":legacy,"agent":stored.id,"workspace":stored.workspace_id,
+                "sessionId":first.session_id,"adapterPid":pid,"pendingEndpoint":pending}),
+            );
+            if legacy {
+                assert!(endpoint.is_none() && first.turn.prompt.is_none());
+                assert!(self.acknowledgments.0.lock().unwrap().is_empty());
+            } else {
+                let endpoint = endpoint.as_ref().expect("confirmed original endpoint");
+                let live = endpoint.live.as_ref().unwrap();
+                assert!(live.acknowledged.load(Ordering::SeqCst));
+                assert!(!live.retired.load(Ordering::SeqCst));
+                assert!(Weak::ptr_eq(
+                    &live.connection,
+                    &Arc::downgrade(&first.turn.connection)
+                ));
+                let owner = live.owner.as_ref().unwrap();
+                {
+                    let state = origin.state.lock().unwrap();
+                    let blueprint = state.blueprint.as_ref().unwrap();
+                    let original = &blueprint.server.original.as_ref().unwrap().0;
+                    assert!(Arc::ptr_eq(&owner.services, original));
+                    assert!(blueprint
+                        .server
+                        .read_owner
+                        .as_ref()
+                        .unwrap()
+                        .retains(original.as_ref()));
+                }
+                let captured = first.turn.prompt.as_ref().unwrap();
+                assert!(Arc::ptr_eq(&captured.binding, live));
+                let first_capture = captured.captured.as_ref().unwrap().as_ref().unwrap();
+                assert_ne!(&pending, confirmed.as_ref().unwrap());
+                let receipts = self.acknowledgments.0.lock().unwrap().clone();
+                assert_eq!(receipts.len(), 1);
+                assert!(
+                    receipts[0].contains("Acknowledged") && receipts[0].contains(&first.session_id)
+                );
+                milestone(
+                    "original-acknowledged",
+                    &json!({"sessionId":first.session_id,"confirmedEndpoint":confirmed,"receipt":receipts[0],"sameServicesReadAnchorConnection":true}),
+                );
+                let reused = self.start().await;
+                assert_eq!(reused.session_id, first.session_id);
+                assert!(Arc::ptr_eq(&reused.turn.connection, &first.turn.connection));
+                assert!(Arc::ptr_eq(&reused.turn.origin, &origin));
+                let second = reused.turn.prompt.as_ref().unwrap();
+                assert!(Arc::ptr_eq(&second.binding, live));
+                let second_capture = second.captured.as_ref().unwrap().as_ref().unwrap();
+                // Both opaque nonclone captures are live simultaneously. The
+                // unchanged R constructor owns the distinct original requests.
+                assert!(!std::ptr::eq(first_capture, second_capture));
+                let state = origin.state.lock().unwrap();
+                assert!(Arc::ptr_eq(state.endpoint.as_ref().unwrap(), endpoint));
+                assert!(Arc::ptr_eq(state.attempt.as_ref().unwrap(), &attempt));
+                assert_eq!(self.acknowledgments.0.lock().unwrap().len(), 1);
+                milestone(
+                    "original-reused",
+                    &json!({"sameConnectionOriginSession":true,"distinctOwnedCaptures":true,"registrationCount":1}),
+                );
+            }
+            // Hold the returned original tuple through actual owned teardown.
+            self.manager.kill_child_only(&self.row.id).await;
+            assert!(!self.manager.contains(&self.row.id));
+            assert!(origin.state.lock().unwrap().retired);
+            if let Some(endpoint) = &endpoint {
+                assert!(endpoint.cancelled.load(Ordering::SeqCst));
+                assert!(endpoint.bridge.lock().unwrap().is_none());
+                let live = endpoint.live.as_ref().unwrap();
+                assert!(live.retired.load(Ordering::SeqCst));
+                assert!(live.capture().is_err());
+                live.owner.as_ref().unwrap().drain_jobs().await;
+            }
+            assert!(origin.capture_prompt(&first.turn.connection).is_none());
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while first.turn.connection.is_alive() {
+                    tokio::task::yield_now().await;
+                }
+                while tokio::net::TcpStream::connect(&pending).await.is_ok() {
+                    tokio::task::yield_now().await;
+                }
+                if let Some(confirmed) = &confirmed {
+                    while tokio::net::TcpStream::connect(confirmed).await.is_ok() {
+                        tokio::task::yield_now().await;
+                    }
+                }
+            })
+            .await
+            .expect("original transport and both original listeners closed");
+            assert_eq!(
+                self.services
+                    .store
+                    .get_agent_session(&self.row.id)
+                    .await
+                    .unwrap()
+                    .acp_session_id,
+                Some(first.session_id.clone())
+            );
+            drop(first);
+            milestone(
+                "owned-retired",
+                &json!({"legacy":legacy,"handleAbsent":true,"originalTransportClosed":true,"contextJobs":"none prepared; drain completed"}),
+            );
+        }
+
+        async fn cleanup(&self) {
+            let owner = self
+                .manager
+                .handles
+                .lock()
+                .unwrap()
+                .get(&self.row.id)
+                .and_then(|h| h.repository_origin.state.lock().unwrap().endpoint.clone())
+                .and_then(|e| e.live.as_ref().and_then(|l| l.owner.as_ref().ok()).cloned());
+            self.manager.shutdown().await;
+            if let Some(owner) = owner {
+                owner.drain_jobs().await;
+            }
+        }
+    }
+
+    async fn run(case: &str, legacy: bool) {
+        require_runner(case);
+        let harness = Arc::new(Harness::new(legacy).await);
+        let original = harness.clone();
+        // Joining the owned task captures an assertion panic so shutdown still
+        // runs against this original manager before the panic is propagated.
+        let outcome = tokio::spawn(async move { original.exercise(legacy).await }).await;
+        harness.cleanup().await;
+        if let Err(error) = outcome {
+            std::panic::resume_unwind(error.into_panic());
+        }
+        milestone(
+            "completed",
+            &json!({"case":case,"scope":"native startup and original ownership only; no prompt or model turn"}),
+        );
+    }
+
+    #[intent_test_macros::daemon_test]
+    #[ignore = "requires the fixed, verified OS-isolated native startup runner"]
+    async fn normal_services_native_confirmed_startup() {
+        run("confirmed", false).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    #[ignore = "requires the fixed, verified OS-isolated native startup runner"]
+    async fn normal_services_native_legacy_startup() {
+        run("legacy", true).await;
     }
 }
