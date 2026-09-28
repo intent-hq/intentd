@@ -98,6 +98,26 @@ pub(crate) fn is_terminal_status(status: AgentStatus) -> bool {
     )
 }
 
+/// Serialize each retirement transition with restore without blocking other
+/// targets. Weak entries keep completed transitions out of the lock registry.
+#[derive(Clone, Default)]
+pub(crate) struct AgentRetirementGates {
+    gates: Arc<Mutex<HashMap<AgentId, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
+}
+
+impl AgentRetirementGates {
+    pub(crate) fn for_agent(&self, agent_id: &AgentId) -> Arc<tokio::sync::Mutex<()>> {
+        let mut gates = self.gates.lock().expect("retirement gate map poisoned");
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        if let Some(gate) = gates.get(agent_id).and_then(std::sync::Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        gates.insert(agent_id.clone(), Arc::downgrade(&gate));
+        gate
+    }
+}
+
 /// Per-agent ordering gate for pending-question marker writes and their
 /// matching `agent:updated` events. Different agents never contend.
 #[derive(Clone, Default)]
@@ -5238,7 +5258,12 @@ impl Services {
         workspace_id: Option<WorkspaceId>,
         reason: Option<String>,
     ) -> Result<Value> {
-        let session = self.store.get_agent_session_summary(&agent_id).await?;
+        let session = {
+            // An idempotent retry also waits for the winning retire's cleanup.
+            let gate = self.agent_retirement_gates.for_agent(&agent_id);
+            let _retirement = gate.lock().await;
+            self.store.get_agent_session_summary(&agent_id).await?
+        };
         if let Some(ws) = workspace_id.as_ref() {
             if session.workspace_id != *ws {
                 return Err(Error::NotFound(format!("agent session {agent_id}")));
@@ -5353,6 +5378,8 @@ impl Services {
         session: &AgentSession,
         reason: Option<&str>,
     ) -> Result<Option<String>> {
+        let gate = self.agent_retirement_gates.for_agent(&session.id);
+        let _retirement = gate.lock().await;
         let now = now_iso();
         // Unread state observed BEFORE the retire write (derived + stored
         // flag): a retired session drops out of the unread derivation, so
@@ -5369,6 +5396,19 @@ impl Services {
             .await?;
         if !transitioned {
             return Ok(None);
+        }
+        // The persisted mark closes new requests before teardown. A wire
+        // caller retires another agent, whose current worker must be aborted;
+        // MCP self-retirement instead lets its own response unwind normally.
+        // The runtime fence also rejects send/wake work that passed a store
+        // check before this transition and reaches worker installation later.
+        if matches!(
+            intent_core::current_caller(),
+            Some(intent_core::Caller::Wire { .. })
+        ) {
+            if let Some(manager) = self.agent_manager() {
+                manager.retire(&session.id).await;
+            }
         }
         self.invalidate_agent_list_cache(&session.workspace_id);
         // Drop the retired agent's event subscriptions: the wake target is
@@ -5458,6 +5498,8 @@ impl Services {
         agent_id: AgentId,
         workspace_id: Option<WorkspaceId>,
     ) -> Result<Value> {
+        let gate = self.agent_retirement_gates.for_agent(&agent_id);
+        let _retirement = gate.lock().await;
         let session = self.store.get_agent_session_summary(&agent_id).await?;
         if let Some(ws) = workspace_id.as_ref() {
             if session.workspace_id != *ws {
@@ -5477,6 +5519,9 @@ impl Services {
             .await?;
         if !transitioned {
             return Ok(json!({ "success": true, "restored": false }));
+        }
+        if let Some(manager) = self.agent_manager() {
+            manager.restore_retired(&agent_id);
         }
         self.invalidate_agent_list_cache(&session.workspace_id);
         crate::publish_event(
@@ -13743,7 +13788,7 @@ impl Services {
         //   3. Spawn the worker with the same content in-memory (the worker
         //      path does not re-persist).
         let content_owned = content.to_string();
-        if !manager.try_begin_turn(agent_id, workspace_id).await {
+        let Some(admission) = manager.try_begin_turn(agent_id, workspace_id).await else {
             // Fast enqueue branch: the manager is already draining a turn. The
             // metadata rides along on the queue entry so the drain re-persist
             // keeps the wake tag.
@@ -13763,7 +13808,7 @@ impl Services {
                 "queued": true,
                 "queuedMessage": queued.to_value(position),
             }));
-        }
+        };
         let blocks = json!([build_block()]);
         let created_at = now_iso();
         // Row-level metadata rides along with the in-block fold (monorepo#1217)
@@ -13785,7 +13830,7 @@ impl Services {
                 msg
             }
             Err(append_err) => {
-                manager.release_slot(agent_id).await;
+                manager.release_slot(agent_id, admission).await;
                 // Fail closed on a vanished session (intent-hq/monorepo#2762):
                 // the only FK on `agent_message` is `agent_id →
                 // agent_session(id)`, so an append failure against a gone row
@@ -13857,6 +13902,7 @@ impl Services {
                 message_metadata: message_metadata.cloned(),
                 ..Default::default()
             },
+            admission,
         );
         Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
     }
