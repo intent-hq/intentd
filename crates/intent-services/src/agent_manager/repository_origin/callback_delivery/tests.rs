@@ -6777,21 +6777,70 @@ mod genuine_native_startup {
                 live.owner.as_ref().unwrap().drain_jobs().await;
             }
             assert!(origin.capture_prompt(&first.turn.connection).is_none());
-            tokio::time::timeout(Duration::from_secs(2), async {
-                while first.turn.connection.is_alive() {
+            let original_connection = Arc::downgrade(&first.turn.connection);
+            let original_session_id = first.session_id.clone();
+            let mut observation = json!({
+                "stage":"original-connection-release", "connection":"retained",
+                "pending-listener":{"state":"not-reached","lastResult":null},
+                "confirmed-listener":{"state":"not-reached","lastResult":null}
+            });
+            // Releasing the caller's tuple permits final Connection Drop. Its
+            // lazy writer-channel flag is not a process-exit or retirement fence.
+            let started = tokio::time::Instant::now();
+            let deadline = started + Duration::from_secs(2);
+            drop(first);
+            let diagnostic = |event: &str, observation: &Value| {
+                let line = json!({"nativeServicesTeardownDiagnostic":1,"event":event,
+                    "elapsedMs":started.elapsed().as_millis(),"observation":observation})
+                .to_string();
+                assert!(line.len() <= 4096, "bounded teardown diagnostic");
+                println!("{line}");
+            };
+            let retired = tokio::time::timeout_at(deadline, async {
+                diagnostic("entry", &observation);
+                while original_connection.upgrade().is_some() {
                     tokio::task::yield_now().await;
                 }
-                while tokio::net::TcpStream::connect(&pending).await.is_ok() {
-                    tokio::task::yield_now().await;
-                }
-                if let Some(confirmed) = &confirmed {
-                    while tokio::net::TcpStream::connect(confirmed).await.is_ok() {
-                        tokio::task::yield_now().await;
+                observation["connection"] = json!("released");
+                diagnostic("completion", &observation);
+                for (stage, address) in [
+                    ("pending-listener", Some(&pending)),
+                    ("confirmed-listener", confirmed.as_ref()),
+                ] {
+                    let Some(address) = address else { continue };
+                    observation["stage"] = json!(stage);
+                    observation[stage]["state"] = json!("entered");
+                    diagnostic("entry", &observation);
+                    loop {
+                        observation[stage]["state"] = json!("connecting");
+                        match tokio::net::TcpStream::connect(address).await {
+                            Ok(_) => {
+                                observation[stage]["state"] = json!("connected");
+                                observation[stage]["lastResult"] = json!({"connected":true});
+                                tokio::task::yield_now().await;
+                            }
+                            Err(error) => {
+                                observation[stage]["state"] = json!("error");
+                                observation[stage]["lastResult"] = json!({
+                                    "errorKind":format!("{:?}", error.kind()),
+                                    "rawOsError":error.raw_os_error()
+                                });
+                                if error.kind() != std::io::ErrorKind::ConnectionRefused {
+                                    diagnostic("failure", &observation);
+                                    panic!("{stage}: expected ConnectionRefused, observed {error}");
+                                }
+                                diagnostic("completion", &observation);
+                                break;
+                            }
+                        }
                     }
                 }
             })
-            .await
-            .expect("original transport and both original listeners closed");
+            .await;
+            if retired.is_err() {
+                diagnostic("timeout", &observation);
+            }
+            retired.expect("original connection released and original listeners refused");
             assert_eq!(
                 self.services
                     .store
@@ -6799,12 +6848,15 @@ mod genuine_native_startup {
                     .await
                     .unwrap()
                     .acp_session_id,
-                Some(first.session_id.clone())
+                Some(original_session_id)
             );
-            drop(first);
+            // Allocation release and address refusal are observations, not joins
+            // of ACP tasks, accept loops, accepted sockets or a process census.
             milestone(
                 "owned-retired",
-                &json!({"legacy":legacy,"handleAbsent":true,"originalTransportClosed":true,"contextJobs":"none prepared; drain completed"}),
+                &json!({"legacy":legacy,"handleAbsent":true,"originalConnectionReleased":true,
+                    "pendingListenerRefused":true,"confirmedListenerRefused":confirmed.as_ref().map(|_| true),
+                    "contextJobs":"none prepared; drain completed"}),
             );
         }
 
