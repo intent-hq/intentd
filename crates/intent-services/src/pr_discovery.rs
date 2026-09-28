@@ -253,6 +253,13 @@ impl Discovery {
         self.budget.lock().unwrap().started -= WINDOW;
     }
 
+    #[cfg(test)]
+    pub(crate) fn exhaust_budget(&self) {
+        let mut budget = self.budget.lock().unwrap();
+        budget.available = 0;
+        budget.grants.clear();
+    }
+
     fn slot(&self, key: &Key) -> Result<Arc<Slot>> {
         let now = Instant::now();
         let mut slots = self.slots.lock().unwrap();

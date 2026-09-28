@@ -959,3 +959,174 @@ async fn shared_discovery_redirected_quota_admission_opens_sweep_pause() {
     })
     .await;
 }
+
+async fn exhaust_background_records(svc: &Services, sc: &dyn SourceControl, traffic: &Traffic) {
+    // Fix the window at exhausted capacity without depending on the buffered
+    // transport's asynchronous release of prior request leases.
+    svc.pr_discovery.exhaust_budget();
+    let repo = RepoRef::new("o", "background");
+    let denied = svc.shared_pr_record(sc, &repo, 1125).await.unwrap_err();
+    assert!(denied.to_string().contains("request budget"), "{denied:?}");
+    assert_eq!(counts(traffic), (0, 0, 0));
+}
+
+#[tokio::test]
+async fn shared_discovery_explicit_admission_bypasses_only_background_exhaustion() {
+    let mut data: Vec<_> = (1..=200).map(|n| pull(n, "other")).collect();
+    data.push(pull(201, "last"));
+    let api = Api::new(data).await;
+    let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let svc = svc.with_source_control(sc.clone());
+    let a = consumer(&svc, "last", "r").await;
+    let b = consumer(&svc, "last", "r").await;
+    let traffic = Traffic::default();
+    with_traffic(traffic.clone(), async {
+        exhaust_background_records(&svc, sc.as_ref(), &traffic).await;
+        assert!(svc
+            .refresh_workspace_pr_with_sc(a.clone(), &sc)
+            .await
+            .is_err());
+        assert_eq!(counts(&traffic), (0, 0, 0));
+        let (one, two) = tokio::join!(
+            svc.refresh_workspace_pr(&a.id),
+            svc.refresh_workspace_pr(&b.id)
+        );
+        one.expect("explicit refresh must reach healthy GitHub after background exhaustion");
+        two.unwrap();
+        assert_eq!(
+            counts(&traffic),
+            (3, 1, 0),
+            "concurrent explicit callers share complete pagination and detail"
+        );
+        assert_eq!(
+            svc.store().get_workspace(&a.id).await.unwrap().pr_number,
+            Some(201)
+        );
+        assert_eq!(
+            svc.store().get_workspace(&b.id).await.unwrap().pr_number,
+            Some(201)
+        );
+
+        // An already-linked explicit refresh must fetch changed detail rather
+        // than reuse the earlier listing or record after its demand begins.
+        api.pulls.lock().unwrap().last_mut().unwrap()["title"] =
+            json!("Changed after first refresh");
+        svc.refresh_workspace_pr(&a.id).await.unwrap();
+        assert_eq!(
+            svc.store()
+                .get_workspace(&a.id)
+                .await
+                .unwrap()
+                .active_pull_request
+                .unwrap()
+                .title,
+            "Changed after first refresh"
+        );
+        assert_eq!(counts(&traffic), (6, 2, 0));
+        let later = consumer(&svc, "later", "another-repo").await;
+        assert!(svc.refresh_workspace_pr_with_sc(later, &sc).await.is_err());
+        assert!(svc
+            .shared_pr_record(sc.as_ref(), &RepoRef::new("o", "background"), 1126)
+            .await
+            .is_err());
+        assert_eq!(
+            counts(&traffic),
+            (6, 2, 0),
+            "explicit admission must not replenish or bypass later background limits"
+        );
+        assert_eq!(api.requests.lock().unwrap().len(), 8);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn shared_discovery_explicit_admission_respects_quota_pause() {
+    let api = Api::new(vec![pull(42, "feature")]).await;
+    let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let svc = svc.with_source_control(sc.clone());
+    let ws = consumer(&svc, "feature", "r").await;
+    let traffic = Traffic::default();
+    with_traffic(traffic.clone(), async {
+        exhaust_background_records(&svc, sc.as_ref(), &traffic).await;
+        svc.sweep_rate_limit
+            .pause_for(std::time::Duration::from_secs(60), true);
+        let error = svc.refresh_workspace_pr(&ws.id).await.unwrap_err();
+        assert!(error.to_string().contains("quota paused"), "{error:?}");
+        let error = crate::pr_discovery::explicitly_refresh(svc.shared_pr_record(
+            sc.as_ref(),
+            &RepoRef::new("o", "r"),
+            42,
+        ))
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("quota paused"), "{error:?}");
+        assert_eq!(counts(&traffic), (0, 0, 0));
+        assert_eq!(api.requests.lock().unwrap().len(), 0);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn shared_discovery_explicit_admission_respects_invalidated_authorization() {
+    let api = Api::new(vec![pull(42, "feature")]).await;
+    let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let svc = svc.with_source_control(sc.clone());
+    let ws = consumer(&svc, "feature", "r").await;
+    let traffic = Traffic::default();
+    with_traffic(traffic.clone(), async {
+        exhaust_background_records(&svc, sc.as_ref(), &traffic).await;
+        svc.on_settings_applied(&[json!({"path":"sourceControl.github.token"})]);
+        let error = svc.refresh_workspace_pr(&ws.id).await.unwrap_err();
+        assert!(
+            error.to_string().contains("authorization changed"),
+            "{error:?}"
+        );
+        assert!(
+            crate::pr_discovery::explicitly_refresh(svc.shared_pr_record(
+                sc.as_ref(),
+                &RepoRef::new("o", "r"),
+                42
+            ))
+            .await
+            .is_err()
+        );
+        assert_eq!(counts(&traffic), (0, 0, 0));
+        assert_eq!(api.requests.lock().unwrap().len(), 0);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn shared_discovery_explicit_admission_rechecks_guards_between_pages() {
+    for invalidate_auth in [false, true] {
+        let api = Api::new((1..=100).map(|n| pull(n, "other")).collect()).await;
+        let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+        let sc = api.sc();
+        let svc = svc.with_source_control(sc);
+        let ws = consumer(&svc, "feature", "r").await;
+        svc.pr_discovery.exhaust_budget();
+        api.gate.forget_permits(10000);
+        let traffic = Traffic::default();
+        with_traffic(traffic.clone(), async {
+            let refresh = svc.refresh_workspace_pr(&ws.id);
+            tokio::pin!(refresh);
+            tokio::select! {
+                result = &mut refresh => panic!("explicit refresh must reach its first page: {result:?}"),
+                () = api.entered.notified() => {}
+            }
+            if invalidate_auth {
+                svc.on_settings_applied(&[json!({"path":"sourceControl.github.token"})]);
+            } else {
+                svc.sweep_rate_limit.pause_for(std::time::Duration::from_secs(60), true);
+            }
+            api.gate.add_permits(10000);
+            assert!(refresh.await.is_err());
+            assert_eq!(counts(&traffic), (1, 0, 0), "changed guard must prevent the next page");
+            assert_eq!(api.requests.lock().unwrap().len(), 1);
+            assert_eq!(svc.store().get_workspace(&ws.id).await.unwrap().pr_number, None);
+        }).await;
+    }
+}
