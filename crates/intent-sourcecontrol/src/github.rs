@@ -1471,6 +1471,49 @@ fn map_rollup_context(value: &Value) -> Option<RollupCheck> {
     }
 }
 
+/// A malformed/partial policy must never become a cacheable empty ruleset.
+/// Unknown future rule types remain ignored, matching the existing projection.
+fn validate_branch_rules(value: &Value) -> Result<()> {
+    let invalid = || Error::Decode("incomplete branch rules response".into());
+    let items = value.as_array().ok_or_else(invalid)?;
+    for item in items {
+        let kind = item
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(invalid)?;
+        let params = item.get("parameters");
+        match kind {
+            "pull_request" => {
+                if params
+                    .and_then(|p| p.get("required_approving_review_count"))
+                    .and_then(Value::as_u64)
+                    .is_none()
+                    || params
+                        .and_then(|p| p.get("required_review_thread_resolution"))
+                        .and_then(Value::as_bool)
+                        .is_none()
+                {
+                    return Err(invalid());
+                }
+            }
+            "required_status_checks" => {
+                let checks = params
+                    .and_then(|p| p.get("required_status_checks"))
+                    .and_then(Value::as_array)
+                    .ok_or_else(invalid)?;
+                if checks
+                    .iter()
+                    .any(|c| c.get("context").and_then(Value::as_str).is_none())
+                {
+                    return Err(invalid());
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Map the `GET /repos/{o}/{r}/rules/branches/{branch}` payload (a flat array
 /// of the rules that apply to the branch) onto the merge-relevant subset.
 /// Unknown rule types are ignored; the strictest value wins when several
@@ -2063,8 +2106,12 @@ impl SourceControl for GitHubSourceControl {
             repo,
             &format!("/rules/branches/{}", encode_path_segments(branch)),
         );
-        let v: Value = self.client().get(&route, None::<&()>).await?;
-        Ok(map_branch_rules(&v))
+        crate::branch_rules_cache::read(self.cache_scope.clone(), repo, branch, async {
+            let v: Value = self.client().get(&route, None::<&()>).await?;
+            validate_branch_rules(&v)?;
+            Ok(map_branch_rules(&v))
+        })
+        .await
     }
 
     async fn pr_observation(&self, repo: &RepoRef, number: u64) -> Result<Option<PrObservation>> {

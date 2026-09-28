@@ -38,13 +38,18 @@ async fn full_poll(svc: &Services, mock: &MockQwen) {
     let before = mock.calls("GetPrObservation");
     let rules = mock.calls("/rules/branches/");
     let runs = mock.calls("/check-runs");
-    svc.poll_pr_monitors().await;
+    let traffic = intent_sourcecontrol::traffic::Traffic::default();
+    intent_sourcecontrol::traffic::with_traffic(traffic.clone(), svc.poll_pr_monitors()).await;
     assert!(
         mock.calls("GetPrObservation") > before,
         "must re-read the forge"
     );
     assert!(
-        mock.calls("/rules/branches/") > rules || mock.calls("/check-runs") > runs,
+        mock.calls("/rules/branches/") > rules
+            || mock.calls("/check-runs") > runs
+            || traffic.snapshot().counts.iter().any(|((_, op), counts)| *op
+                == intent_sourcecontrol::traffic::Operation::Rules
+                && counts.cache_hits + counts.in_flight_reuses > 0),
         "must compose a full checklist, not reuse the cached one"
     );
 }
@@ -2033,6 +2038,96 @@ async fn shared_rules_errors_stay_unknown_and_rate_limits_propagate() {
         .await
         .unwrap();
         assert!(recovered.snapshot.requirements.rules_known);
-        assert_eq!(mock.calls("/rules/branches/"), 2);
+        assert_eq!(
+            mock.calls("/rules/branches/"),
+            if status == 429 { 5 } else { 2 }
+        );
     }
+}
+
+#[tokio::test]
+async fn shared_rules_four_repository_fixture_before_after_http_counts() {
+    use intent_sourcecontrol::traffic::{with_traffic, Caller, Operation, Traffic};
+    for optimized in [false, true] {
+        let mock = MockQwen::start(10978).await;
+        let traffic = Traffic::default();
+        let cache = PrCache::default();
+        let monitored = HashSet::new();
+        with_traffic(traffic.clone(), async {
+            for number in 1..=15 {
+                mock.edit(|s| s.pr["number"] = json!(number));
+                let repo = RepoRef::new("fixture", format!("repo-{}", number % 4));
+                if optimized {
+                    let entry = read_pr_via(
+                        mock.sc.as_ref(),
+                        &repo,
+                        number,
+                        &cache,
+                        PrReadPolicy::Serve {
+                            max_age: Duration::from_secs(60),
+                        },
+                        &monitored,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(entry.pr.number, number);
+                    assert!(entry.snapshot.requirements.rules_known);
+                } else {
+                    // Retained uncached acquisition: one complete observation
+                    // and a fresh effective REST rule read for each PR.
+                    let (pr, snapshot) = fetch_pr_full(mock.sc.as_ref(), &repo, number)
+                        .await
+                        .unwrap();
+                    assert_eq!(pr.number, number);
+                    assert!(snapshot.requirements.rules_known);
+                }
+            }
+        })
+        .await;
+        let snapshot = traffic.snapshot();
+        let rules = &snapshot.counts[&(Caller::OnDemand, Operation::Rules)];
+        assert_eq!(rules.rest_requests, if optimized { 4 } else { 15 });
+        assert_eq!(rules.cache_hits, if optimized { 11 } else { 0 });
+        assert_eq!(
+            mock.calls("/rules/branches/"),
+            if optimized { 4 } else { 15 }
+        );
+        assert_eq!(
+            snapshot.counts[&(Caller::OnDemand, Operation::PrDetail)].graphql_requests,
+            15
+        );
+        assert_eq!(
+            snapshot.counts[&(Caller::OnDemand, Operation::PrDetail)].graphql_cost_observations,
+            0
+        );
+        assert!(!snapshot
+            .counts
+            .contains_key(&(Caller::OnDemand, Operation::Discovery)));
+    }
+}
+
+#[tokio::test]
+async fn shared_rules_standalone_fallback_uses_same_authorized_policy_cache() {
+    let mock = MockQwen::start(10978).await;
+    mock.edit(|s| s.mode = ReadMode::Standalone);
+    let repo = RepoRef::new("QwenLM", "qwen-code");
+    let cache = PrCache::default();
+    let monitored = HashSet::new();
+    for number in 1..=2 {
+        mock.edit(|s| s.pr["number"] = json!(number));
+        let entry = read_pr_via(
+            mock.sc.as_ref(),
+            &repo,
+            number,
+            &cache,
+            PrReadPolicy::Poll,
+            &monitored,
+        )
+        .await
+        .unwrap();
+        assert_eq!(entry.pr.number, number);
+        assert!(entry.snapshot.requirements.rules_known);
+    }
+    assert_eq!(mock.calls("/rules/branches/"), 1);
+    assert_eq!(mock.calls("GetMergeRequirements"), 2);
 }

@@ -10,6 +10,7 @@
 //! No `pr.*` wire methods or routing live here — those map onto this trait in a
 //! later milestone (§7.5).
 
+pub mod branch_rules_cache;
 pub mod cache_scope;
 pub mod device_flow;
 pub mod error;

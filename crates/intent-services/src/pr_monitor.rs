@@ -1046,41 +1046,48 @@ pub(crate) async fn read_pr_via_with_fetched(
     policy: PrReadPolicy,
     monitored: &HashSet<PrKey>,
 ) -> Result<(PrCacheEntry, bool)> {
-    let authorization = sc.cache_scope();
-    ensure_current_pr_authorization(authorization.as_ref())?;
-    let key = pr_key_for(repo_ref, number.cast_signed());
-    let max_age = match policy {
-        PrReadPolicy::Poll => {
-            let entry = poll_pr(sc, repo_ref, number, cache, key, monitored).await?;
-            return Ok((entry, true));
-        }
+    let rules_max_age = match policy {
+        PrReadPolicy::Poll => intent_sourcecontrol::branch_rules_cache::MAX_AGE,
         PrReadPolicy::Serve { max_age } => max_age,
     };
-    if let Some(entry) =
-        cached_pr_within(cache, &key, max_age).filter(|entry| entry.authorization == authorization)
-    {
-        intent_sourcecontrol::traffic::record_reuse(
-            intent_sourcecontrol::traffic::Operation::PrDetail,
-            intent_sourcecontrol::traffic::Reuse::CacheHit,
-        );
-        tracing::trace!(pr_number = number, "pr cache: serving the cached read");
-        return Ok((entry, false));
-    }
-    let record_started_at = Instant::now();
-    let (pr, snapshot) = fetch_pr_full(sc, repo_ref, number).await?;
-    ensure_current_pr_authorization(authorization.as_ref())?;
-    Ok((
-        store_on_demand(
-            cache,
-            key,
-            pr,
-            snapshot,
-            monitored,
-            authorization,
-            record_started_at,
-        ),
-        true,
-    ))
+    intent_sourcecontrol::branch_rules_cache::with_freshness(rules_max_age, async {
+        let authorization = sc.cache_scope();
+        ensure_current_pr_authorization(authorization.as_ref())?;
+        let key = pr_key_for(repo_ref, number.cast_signed());
+        let max_age = match policy {
+            PrReadPolicy::Poll => {
+                let entry = poll_pr(sc, repo_ref, number, cache, key, monitored).await?;
+                return Ok((entry, true));
+            }
+            PrReadPolicy::Serve { max_age } => max_age,
+        };
+        if let Some(entry) = cached_pr_within(cache, &key, max_age)
+            .filter(|entry| entry.authorization == authorization)
+        {
+            intent_sourcecontrol::traffic::record_reuse(
+                intent_sourcecontrol::traffic::Operation::PrDetail,
+                intent_sourcecontrol::traffic::Reuse::CacheHit,
+            );
+            tracing::trace!(pr_number = number, "pr cache: serving the cached read");
+            return Ok((entry, false));
+        }
+        let record_started_at = Instant::now();
+        let (pr, snapshot) = fetch_pr_full(sc, repo_ref, number).await?;
+        ensure_current_pr_authorization(authorization.as_ref())?;
+        Ok((
+            store_on_demand(
+                cache,
+                key,
+                pr,
+                snapshot,
+                monitored,
+                authorization,
+                record_started_at,
+            ),
+            true,
+        ))
+    })
+    .await
 }
 
 /// The cached entry for `key` when a forge read confirmed it current less
