@@ -432,7 +432,9 @@ class ServicesStartupRunnerTests(unittest.TestCase):
             "original-reused": {"sameConnectionOriginSession": True, "distinctOwnedCaptures": True,
                                 "registrationCount": 1},
             "owned-retired": {"legacy": case == "legacy", "handleAbsent": True,
-                              "originalTransportClosed": True, "contextJobs": "none prepared; drain completed"},
+                              "originalConnectionReleased": True, "pendingListenerRefused": True,
+                              "confirmedListenerRefused": None if case == "legacy" else True,
+                              "contextJobs": "none prepared; drain completed"},
             "completed": {"case": case},
         }
         return [{"nativeServicesStartup": 1, "event": event, "facts": facts[event]}
@@ -535,7 +537,7 @@ class ServicesStartupRunnerTests(unittest.TestCase):
                    "ordinary-started": {"sessionId": ""},
                    "original-acknowledged": {"sessionId": "foreign"},
                    "original-reused": {"registrationCount": 2},
-                   "owned-retired": {"originalTransportClosed": False},
+                   "owned-retired": {"originalConnectionReleased": False},
                    "completed": {"case": "legacy"}}
         for event, update in changes.items():
             events = self.events("confirmed")
@@ -576,6 +578,113 @@ class ServicesStartupRunnerTests(unittest.TestCase):
         with patch.object(probe, "run_bounded") as launch, self.assertRaises(probe.Refusal):
             probe.execute(args)
         launch.assert_not_called()
+
+
+    def test_retirement_facts_require_each_exact_key_value_and_type(self):
+        for case in ("confirmed", "legacy"):
+            good = next(x["facts"] for x in self.events(case) if x["event"] == "owned-retired")
+            for key in good:
+                variants = [{k: v for k, v in good.items() if k != key}]
+                for value in (False, True, None, 0, 1, "true", [], {}):
+                    if type(value) is type(good[key]) and value == good[key]:
+                        continue
+                    variants.append({**good, key: value})
+                for facts in variants:
+                    events = self.events(case)
+                    next(x for x in events if x["event"] == "owned-retired")["facts"] = facts
+                    with self.subTest(case=case, key=key, facts=facts), self.assertRaises(probe.Refusal):
+                        probe.validate_services_result(case, self.result(case, events), 45)
+
+    def test_old_retirement_schema_and_extra_transport_claim_are_refused(self):
+        for case in ("confirmed", "legacy"):
+            good = next(x["facts"] for x in self.events(case) if x["event"] == "owned-retired")
+            for facts in (
+                {"legacy": case == "legacy", "handleAbsent": True,
+                 "originalTransportClosed": True, "contextJobs": "none prepared; drain completed"},
+                {**good, "originalTransportClosed": True},
+                {**good, "unexpected": "claim"},
+            ):
+                events = self.events(case)
+                next(x for x in events if x["event"] == "owned-retired")["facts"] = facts
+                with self.subTest(case=case, facts=facts), self.assertRaises(probe.Refusal):
+                    probe.validate_services_result(case, self.result(case, events), 45)
+
+    def test_teardown_diagnostics_never_replace_a_successful_retirement_event(self):
+        diagnostic = json.dumps({"nativeServicesTeardownDiagnostic": 1, "event": "owned-retired",
+                                 "elapsedMs": 1, "observation": {"originalConnectionReleased": True}})
+        for case in ("confirmed", "legacy"):
+            good = self.result(case)
+            good["stdout"] = diagnostic + "\n" + good["stdout"] + diagnostic + "\n"
+            self.assertEqual(probe.validate_services_result(case, good, 45), self.events(case))
+            events = [x for x in self.events(case) if x["event"] != "owned-retired"]
+            bad = self.result(case, events)
+            bad["stdout"] += diagnostic + "\n"
+            with self.assertRaises(probe.Refusal):
+                probe.validate_services_result(case, bad, 45)
+            with self.assertRaises(probe.Refusal):
+                probe.validate_services_result(case, {**good, "stdout": diagnostic}, 45)
+
+class ServicesFingerprintInputTests(unittest.TestCase):
+    """Inert private files exercise raw authority separately from rounded metadata."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="services-fingerprints-inert-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.original = b'{"rustc":16696009966390864400,"nested":[true,null,{"value":7}]}\n'
+        self.metadata = {}
+        inventory = {}
+        for i in range(944):
+            path = self.root / (str(i) + ".json")
+            path.write_bytes(self.original)
+            inventory[str(path)] = {"bytes": len(self.original), "sha256": probe.hash_file(path)}
+            self.metadata[str(path)] = {"rustc": 16696009966390864000,
+                                      "nested": [True, None, {"value": 7}]}
+        self.sample = self.root / "0.json"
+        self.inventory = self.root / "raw-manifest.json"
+        self.inventory.write_text(json.dumps(inventory))
+        self.enterContext(patch.object(probe, "SERVICES_RAW_FINGERPRINTS", self.inventory))
+        self.enterContext(patch.object(probe, "SERVICES_RAW_FINGERPRINTS_SHA", probe.hash_file(self.inventory)))
+
+    def test_exact_raw_bytes_accept_only_qualified_binary64_metadata(self):
+        self.assertNotEqual(json.loads(self.original)["rustc"], self.metadata[str(self.sample)]["rustc"])
+        self.assertEqual(float(json.loads(self.original)["rustc"]), float(self.metadata[str(self.sample)]["rustc"]))
+        probe.check_services_fingerprints(self.metadata)
+
+    def test_raw_low_bit_or_whitespace_change_is_refused_even_when_metadata_is_equal(self):
+        variants = (self.original.replace(b"16696009966390864400", b"16696009966390864401"),
+                    self.original + b"\n")
+        for data in variants:
+            self.assertEqual(json.loads(data, parse_int=float), json.loads(self.original, parse_int=float))
+            self.sample.write_bytes(data)
+            with self.subTest(data=data), self.assertRaises(probe.Refusal):
+                probe.check_services_fingerprints(self.metadata)
+
+    def test_missing_foreign_and_missing_file_paths_refuse(self):
+        missing = {k: v for k, v in self.metadata.items() if k != str(self.sample)}
+        foreign = {**missing, str(self.root / "foreign.json"): self.metadata[str(self.sample)]}
+        for metadata in (missing, foreign):
+            with self.assertRaises(probe.Refusal):
+                probe.check_services_fingerprints(metadata)
+        self.sample.unlink()
+        with self.assertRaises(OSError):
+            probe.check_services_fingerprints(self.metadata)
+
+    def test_replaced_raw_manifest_cannot_become_trusted_identity(self):
+        original = self.inventory.read_bytes()
+        for data in (original + b"\n", b"{}"):
+            self.inventory.write_bytes(data)
+            with self.assertRaises(probe.Refusal):
+                probe.check_services_fingerprints(self.metadata)
+
+    def test_reviewed_metadata_still_requires_same_values_shapes_and_types(self):
+        good = self.metadata[str(self.sample)]
+        variants = ({**good, "rustc": good["rustc"] + 8192},
+                    {**good, "nested": [1, None, {"value": 7}]},
+                    {**good, "nested": [True, None]},
+                    {**good, "extra": None})
+        for value in variants:
+            with self.subTest(value=value), self.assertRaises(probe.Refusal):
+                probe.check_services_fingerprints({**self.metadata, str(self.sample): value})
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -41,10 +41,12 @@ ENV = {"HOME": "/home/probe", "XDG_CONFIG_HOME": "/home/probe/.config",
        "DISABLE_ERROR_REPORTING": "1"}
 OUTER_ENV = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
 OUTPUT_LIMIT = 262144
-SERVICES_PREPARATION = Path("/home/clement/intent/workspaces/ideate-future/intent/.dev/slice-b/harness-native-startup-env-correction/.dev/preparation")
+SERVICES_PREPARATION = Path("/home/clement/intent/workspaces/ideate-future/intent/.dev/slice-b/harness-native-startup-retirement/.dev/preparation")
 SERVICES_ELF = SERVICES_PREPARATION / "artifacts/intent-services-lib-test"
-SERVICES_SHA = "748e1d25d534087abe2f996f4846998b89a5bde58f42f9e49d5ec0132e60a550"
-SERVICES_BYTES = 546349192
+SERVICES_SHA = "aebd0567579151162795198719f4ff19184b4efd1e9fef3cf2fb532aad8dfe98"
+SERVICES_BYTES = 546417312
+SERVICES_RAW_FINGERPRINTS = Path("/home/clement/intent/workspaces/ideate-future/intent/.dev/slice-b/claude-services-native-retirement/evidence/observed-raw-fingerprint-hashes.json")
+SERVICES_RAW_FINGERPRINTS_SHA = "a0cd4c0a8f06e1e7567716f0944fa48ac6cf2ad27b3ca02c0ec57d20c555a224"
 SERVICES_SELECTORS = {
     "confirmed": "agent_manager::repository_origin::callback_delivery::tests::genuine_native_startup::normal_services_native_confirmed_startup",
     "legacy": "agent_manager::repository_origin::callback_delivery::tests::genuine_native_startup::normal_services_native_legacy_startup",
@@ -56,22 +58,22 @@ SERVICES_EVENTS = {
 SERVICES_ENV = {**ENV, "INTENT_NATIVE_SERVICES_RUN": "1"}
 # Immutable local build attribution, not registry provenance or reproducibility.
 SERVICES_MANIFESTS = {
-    "compile-v1/before.json": "3d70ef6bafd5f49695fe83279c9922853909ab8c37038afbc6ff18970ac277b4",
-    "compile-v1/after.json": "3d70ef6bafd5f49695fe83279c9922853909ab8c37038afbc6ff18970ac277b4",
-    "compile-v1/environment.json": "ad6efd0c6566fb3c3751f732efe9c14faae22f336ec7ef785edee0f3ca68f425",
-    "compile-v1/results.json": "2e1a9b397b20d6b3ba003931b0a6036c6587fc73feb8d099a0e3cde245712065",
-    "compile-v1/compile.stdout": "83269d4d26d13801c0444b0083dc6d4dfc139181b5195d9e37b4618f17cf3740",
-    "attribution/elf.json": "7191e5adfa2411172f4de23c88dd787c51ee03beb9ccc41fd9b0f725b5417f22",
-    "attribution/cargo-selected.json": "f28258cd59b844484bd1e6362ce5d31d9dd9f6fb75d72d75ed3084a4a44cd030",
-    "attribution/cargo-build-scripts.json": "5dca9152b6f4d468e7063383c6951bc2e04fbdcbea08495ea3c911d7d29f8839",
-    "attribution/cargo-config-search.json": "c4c584209f24575d6aca2af0d14c8dd6f344b970b5985b9d6a617fe416297914",
-    "attribution/dependency-files.json": "78caa7dfbbd04b38e2d262736ad54f5688754186c4cd13ed4f3588adfa2d542d",
+    "compile-v1/before.json": "605574e369e6ac305422e675e5f82cfac606bbea0f86ab21b3e56845f8d5fdf3",
+    "compile-v1/after.json": "605574e369e6ac305422e675e5f82cfac606bbea0f86ab21b3e56845f8d5fdf3",
+    "compile-v1/plan.json": "f1590659928845b72a0ce71ac87a6ba95fdd0dd798077b16670ca445334339c3",
+    "compile-v1/results.json": "7cdcf137e4fabeff7e7634c4923a8645524a272feaf7802a5d633bfacdc307a8",
+    "compile-v1/compile.stdout": "c71b947f0a16d4f54caf2ee44b47de2d3aff07cee8aab3daa907e6da81447d63",
+    "attribution/elf.json": "d53c3d12c4b72333169d9a7065c61fb6acfe54e171c69d54da82bfb0e51a8949",
+    "attribution/cargo-selected.json": "dad97712bb61ef74c11401a839a85072450f40795bfe9bd9ee7ea8db0ca33335",
+    "attribution/cargo-build-scripts.json": "033ab0cb1cfc05ea1e6a75a5bfe9e17873cf2f23c0b2c790c339df13f9a8f32a",
+    "attribution/cargo-config-search.json": "f2541c911c79c8a41a78f69cd30ddd3efaea45b8b05618f14a468f79cb5baaa7",
+    "attribution/dependency-files.json": "370aa25488083103b2d232ef2d06525bbcc63147e7d5dc2ecdcbc0393aec3174",
     "attribution/dependency-packages.json": "7c69e7ddf5b324b5112dce515ceb42271b604db63d8f6ec8044cfc593c039f2c",
-    "attribution/generated-compiler-inputs.json": "312023590ffd083728ca88636720f9415726c7d5a3b0a28aca47a4db9dc7bc46",
-    "attribution/cargo-fingerprints.json": "95db41d135a4c068dbb002f7096d9d5e4883474b5b26caf7f7ac7b62518a7f48",
+    "attribution/generated-compiler-inputs.json": "d292f0bd35a17e2a546864b59e1f194faa4904cb465da9ad2b7dd86c33c6490b",
+    "attribution/cargo-fingerprints.json": "431ad14f3aa00e0c9f37928c304e617723ff3ada71dad636bf28240701907920",
     "attribution/toolchain-inputs.json": "023837e4fc5f303cfc9c6cd0b3a8eebc604c9583b93842bc1e74febc413ec155",
-    "attribution/compiler-dependency-records.json": "c6458002c12b70e5f1b4130168297912a132ea72eeeaf5696f5d63fd2a313d48",
-    "attribution/os-closure.json": "07fcf4ae74187447984653fd303ac7e540238c33d759174f546219b27188bfb9",
+    "attribution/compiler-dependency-records.json": "fade2877b85c77532d49f072aa66ad99fa519027709dfc201182735c1bc06805",
+    "attribution/os-closure.json": "1e3ff3f5e8445a4e75dd214a88b8974d05d92752e09cc6b1385ea22be51dca2d",
 }
 
 class Refusal(Exception):
@@ -507,6 +509,26 @@ def check_services_elf():
         require(stream.read(6) == b"\x7fELF\x02\x01", "Services input is not the pinned ELF")
     return path
 
+def check_services_fingerprints(metadata):
+    """Current exact bytes, plus only the reviewed binary64 fingerprint metadata.
+
+    The historical Node metadata cannot prove its original integer token spelling.
+    The separately pinned reviewer inventory authenticates current raw file bytes;
+    rounding is confined to this comparison and never substitutes for byte checks.
+    """
+    inventory = json.loads(source_bytes(SERVICES_RAW_FINGERPRINTS, SERVICES_RAW_FINGERPRINTS_SHA))
+    require(isinstance(inventory, dict) and len(inventory) == 944
+            and set(inventory) == set(metadata), "Cargo fingerprint inventory changed")
+    for path, row in inventory.items():
+        require(set(row) == {"bytes", "sha256"}, "invalid raw fingerprint record")
+        data = source_bytes(Path(path), row["sha256"])
+        require(len(data) == row["bytes"], "raw fingerprint size changed")
+        current = json.loads(data, parse_int=float)
+        reviewed = json.loads(json.dumps(metadata[path]), parse_int=float)
+        require(json.dumps(current, sort_keys=True, allow_nan=False)
+                == json.dumps(reviewed, sort_keys=True, allow_nan=False),
+                "reviewed Cargo fingerprint metadata changed")
+
 def check_services_inputs():
     """Verify the accepted local compilation inputs; never build or launch them."""
     check_services_elf()
@@ -542,8 +564,7 @@ def check_services_inputs():
     for name in ("toolchain-inputs", "cargo-config-search"):
         for row in records["attribution/" + name + ".json"]:
             local_input(row)
-    for path, value in records["attribution/cargo-fingerprints.json"].items():
-        require(json.loads(Path(path).read_bytes()) == value, "Cargo fingerprint changed")
+    check_services_fingerprints(records["attribution/cargo-fingerprints.json"])
     for path, value in records["attribution/compiler-dependency-records.json"].items():
         require(Path(path).read_text() == value, "compiler dependency record changed")
     packages = records["attribution/dependency-packages.json"]
@@ -635,8 +656,12 @@ def validate_services_result(case, result, deadline):
                 and type(reused.get("registrationCount")) is int and reused["registrationCount"] == 1,
                 "original startup reuse evidence missing")
     retired = facts["owned-retired"]
-    require(retired.get("legacy") is (case == "legacy") and retired.get("handleAbsent") is True
-            and retired.get("originalTransportClosed") is True
+    require(set(retired) == {"legacy", "handleAbsent", "originalConnectionReleased",
+                             "pendingListenerRefused", "confirmedListenerRefused", "contextJobs"}
+            and retired.get("legacy") is (case == "legacy") and retired.get("handleAbsent") is True
+            and retired.get("originalConnectionReleased") is True
+            and retired.get("pendingListenerRefused") is True
+            and retired.get("confirmedListenerRefused") is (None if case == "legacy" else True)
             and retired.get("contextJobs") == "none prepared; drain completed"
             and facts["completed"].get("case") == case, "original retirement incomplete")
     lines = result["stdout"].splitlines()
