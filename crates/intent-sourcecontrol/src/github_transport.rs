@@ -321,6 +321,108 @@ mod tests {
         }
     }
 
+    async fn quota_admission_case(redirect: bool, allowance: Option<usize>, expected: usize) {
+        use crate::{GitHubSourceControl, RepoRef, SourceControl};
+
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let seen = attempts.clone();
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let head = request(&mut socket).await.unwrap();
+                seen.fetch_add(1, Ordering::SeqCst);
+                let (status, headers, body) =
+                    if redirect && head.starts_with("GET /repos/o/old/pulls/42 ") {
+                        (
+                            "301 Moved Permanently",
+                            "location: /repos/o/new/pulls/42\r\n",
+                            "{}",
+                        )
+                    } else {
+                        (
+                            "429 Too Many Requests",
+                            "retry-after: 60\r\nx-ratelimit-remaining: 0\r\n",
+                            r#"{"message":"You have exceeded a secondary rate limit."}"#,
+                        )
+                    };
+                let response = format!("HTTP/1.1 {status}\r\n{headers}content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let sc = GitHubSourceControl::new("fixture", Some(&base)).unwrap();
+        let repo = RepoRef::new("o", "old");
+        let traffic = Traffic::default();
+        let admissions = Arc::new(AtomicUsize::new(0));
+        let called = admissions.clone();
+        let remaining = Arc::new(AtomicUsize::new(allowance.unwrap_or(0)));
+        let available = remaining.clone();
+        let result = with_traffic(traffic.clone(), async {
+            if allowance.is_some() {
+                crate::request_budget::with_admission(
+                    Arc::new(move || {
+                        called.fetch_add(1, Ordering::SeqCst);
+                        available
+                            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                            .is_ok()
+                    }),
+                    sc.get_pr(&repo, 42),
+                )
+                .await
+            } else {
+                sc.get_pr(&repo, 42).await
+            }
+        })
+        .await;
+        server.abort();
+        let error = result.unwrap_err();
+        assert_eq!(attempts.load(Ordering::SeqCst), expected, "{error:?}");
+        let snapshot = traffic.snapshot();
+        let accounted: u64 = snapshot.counts.values().map(|c| c.rest_requests).sum();
+        assert_eq!(accounted, expected as u64);
+        if let Some(allowance) = allowance {
+            assert_eq!(remaining.load(Ordering::SeqCst), allowance - expected);
+        }
+        if expected == 0 {
+            assert_eq!(
+                admissions.load(Ordering::SeqCst),
+                1,
+                "local denial must not retry"
+            );
+            assert!(
+                matches!(error, Error::Api(ref message) if message.contains("budget exhausted")),
+                "{error:?}"
+            );
+        } else {
+            assert!(
+                matches!(error, Error::RateLimited(ref message) if message == "You have exceeded a secondary rate limit."),
+                "observed quota response must survive admission denial: {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn quota_admission_redirected_rate_limit_preserves_error() {
+        quota_admission_case(true, Some(4), 4).await;
+    }
+
+    #[tokio::test]
+    async fn quota_admission_unredirected_control() {
+        quota_admission_case(false, Some(4), 4).await;
+    }
+
+    #[tokio::test]
+    async fn quota_admission_unbounded_redirect_control() {
+        quota_admission_case(true, None, 5).await;
+    }
+
+    #[tokio::test]
+    async fn quota_admission_pure_local_denial_is_not_rate_limited() {
+        quota_admission_case(true, Some(0), 0).await;
+    }
+
     #[tokio::test]
     async fn caller_facades_share_connections_and_preserve_headers() {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))

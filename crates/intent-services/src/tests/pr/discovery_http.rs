@@ -12,6 +12,7 @@ struct Api {
     requests: Arc<Mutex<Vec<String>>>,
     pulls: Arc<Mutex<Vec<serde_json::Value>>>,
     fail_page: Arc<AtomicUsize>,
+    redirect_quota_detail: Arc<AtomicUsize>,
     next_link: Arc<Mutex<Option<String>>>,
     gate: Arc<tokio::sync::Semaphore>,
     entered: Arc<tokio::sync::Notify>,
@@ -38,6 +39,8 @@ impl Api {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let data = Arc::new(Mutex::new(pulls));
         let fail_page = Arc::new(AtomicUsize::new(0));
+        let redirect_quota_detail = Arc::new(AtomicUsize::new(0));
+        let quota_detail = redirect_quota_detail.clone();
         let next_link = Arc::new(Mutex::new(None::<String>));
         let gate = Arc::new(tokio::sync::Semaphore::new(10000));
         let entered = Arc::new(tokio::sync::Notify::new());
@@ -125,6 +128,24 @@ impl Api {
                 let header = link.lock().unwrap().as_ref().map_or(String::new(), |link| {
                     format!("link: <http://fixture/repos/o/r/pulls?page={link}>; rel=\"next\"\r\n")
                 });
+                let limited = quota_detail.load(Ordering::SeqCst);
+                let (status, header, body) = if limited != 0
+                    && url.path() == format!("/repos/o/r/pulls/{limited}")
+                {
+                    (
+                        "301 Moved Permanently",
+                        format!("location: /repos/o/moved/pulls/{limited}\r\n"),
+                        "{}".into(),
+                    )
+                } else if limited != 0 && url.path() == format!("/repos/o/moved/pulls/{limited}") {
+                    (
+                        "429 Too Many Requests",
+                        "retry-after: 60\r\nx-ratelimit-remaining: 0\r\n".into(),
+                        json!({"message":"You have exceeded a secondary rate limit."}).to_string(),
+                    )
+                } else {
+                    (status, header, body)
+                };
                 let response = format!("HTTP/1.1 {status}\r\n{header}content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
                 socket.write_all(response.as_bytes()).await.unwrap();
             }
@@ -134,6 +155,7 @@ impl Api {
             requests,
             pulls: data,
             fail_page,
+            redirect_quota_detail,
             next_link,
             gate,
             entered,
@@ -883,4 +905,57 @@ async fn shared_discovery_old_open_history_rotates_past_quiet_entries() {
             .iter()
             .any(|p| p == &format!("/repos/o/r/pulls/{number}")));
     }
+}
+
+#[tokio::test]
+async fn shared_discovery_redirected_quota_admission_opens_sweep_pause() {
+    let api = Api::new(vec![pull(42, "feature")]).await;
+    api.redirect_quota_detail.store(42, Ordering::SeqCst);
+    let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let svc = svc.with_source_control(sc.clone());
+    let repo = RepoRef::new("o", "r");
+    let traffic = Traffic::default();
+    with_traffic(traffic.clone(), async {
+        // Warm a complete listing without selecting a detail read.
+        assert!(svc
+            .discover_shared_pr(sc.as_ref(), &repo, "absent", None, None)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(counts(&traffic), (1, 0, 0));
+        let first = consumer(&svc, "feature", "r").await;
+        svc.refresh_all_workspace_prs(0).await;
+        assert_eq!(
+            counts(&traffic),
+            (1, 4, 0),
+            "one redirect plus three quota responses"
+        );
+        assert!(
+            svc.sweeps_rate_limited(),
+            "received quota error must open the shared sweep pause"
+        );
+        assert_eq!(
+            svc.store()
+                .get_workspace(&first.id)
+                .await
+                .unwrap()
+                .pr_number,
+            None
+        );
+        let before = api.requests.lock().unwrap().len();
+        let later = consumer(&svc, "later", "other").await;
+        let checkout = SweepRepo::init("later", Some("https://github.com/o/other.git"));
+        let root = sweep_root(&later.id, &checkout.dir, Some(("o", "other")));
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+        svc.refresh_all_workspace_prs(0).await;
+        assert!(svc.shared_pr_record(sc.as_ref(), &repo, 43).await.is_err());
+        assert_eq!(counts(&traffic), (1, 4, 0));
+        assert_eq!(
+            api.requests.lock().unwrap().len(),
+            before,
+            "paused workspace/root sweeps and detail reads send no further HTTP requests"
+        );
+    })
+    .await;
 }
