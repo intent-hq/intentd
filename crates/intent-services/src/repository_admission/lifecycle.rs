@@ -323,6 +323,31 @@ impl RepositoryLifecycleMutationTicket for Mutation {
 // No Drop settlement: cancellation or an unknown outcome keeps these keys
 // blocked. Reconciliation requires a later original-owner integration.
 impl RepositoryLifecycleObserver for RepositoryLifecycleRegistry {
+    fn begin_pending_delete(
+        &self,
+        keys: &[RepositoryLifecycleKey],
+    ) -> intent_core::Result<Box<dyn RepositoryLifecycleMutationTicket>> {
+        let denied = || intent_core::Error::Internal("repository lifecycle unavailable".into());
+        if keys.is_empty() {
+            return Err(denied());
+        }
+        let keys: HashSet<_> = keys.iter().cloned().collect();
+        let mut state = self.state.lock().map_err(|_| denied())?;
+        let id = state.next().map_err(|_| denied())?;
+        state.pending.insert(id, keys.clone());
+        // A reversible grace marker ends requests, preserving original physical
+        // owners and pending creators. Fresh requests still wait for settlement.
+        state.detach(|entry| overlaps(&keys, &entry.keys));
+        let retire = state.pending_leaves(|entry| overlaps(&keys, &entry.keys));
+        drop(state);
+        // Every caller joins the original leaves, including prior detachments.
+        finish_retirement(&self.state, &retire);
+        Ok(Box::new(Mutation {
+            state: self.state.clone(),
+            id,
+        }))
+    }
+
     fn begin_initialization(
         &self,
         original_owner: Box<dyn std::any::Any + Send>,

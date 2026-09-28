@@ -358,7 +358,16 @@ mod pending_delete {
 
     impl Fixture {
         async fn new() -> Self {
-            let dir = crate::test_support::test_tempdir("pending-delete-observer-");
+            // This source is also compiled by the standalone admission harness,
+            // which has no crate test_support module. Preserve scratch cleanup
+            // and the same keep-on-failure opt-in without another module copy.
+            let mut dir = tempfile::Builder::new()
+                .prefix("pending-delete-observer-")
+                .tempdir()
+                .unwrap();
+            if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
+                dir.disable_cleanup(true);
+            }
             let store = Store::open(&dir.path().join("store.db")).await.unwrap();
             let first = Self::insert_subject(&store).await;
             let other = Self::insert_subject(&store).await;
@@ -797,11 +806,12 @@ mod pending_delete {
             ),])
             .await
             .is_err());
-        let state = f.registry.state.lock().unwrap();
-        assert!(state.pending.is_empty());
-        assert!(state.retiring.is_empty());
-        assert!(state.origins.values().all(|o| !o.retired));
-        drop(state);
+        {
+            let state = f.registry.state.lock().unwrap();
+            assert!(state.pending.is_empty());
+            assert!(state.retiring.is_empty());
+            assert!(state.origins.values().all(|o| !o.retired));
+        }
         assert!(current(&request, &f.first).await);
     }
 }
