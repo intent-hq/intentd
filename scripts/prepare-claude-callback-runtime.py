@@ -413,7 +413,12 @@ def owned_root(root, create=False):
             "installation root must be owned by this uid with mode0700")
     marker = root / ROOT_MARKER
     if not marker.exists() and not marker.is_symlink():
-        require(create and set(p.name for p in root.iterdir()) <= {".install.lock"},
+        entries = set(p.name for p in root.iterdir())
+        # A concurrent first installer may establish ownership during this
+        # inventory. An appeared marker is only a reason to join the lock;
+        # its exact bytes/mode/link state must still pass the locked check.
+        require(create and (entries <= {".install.lock"}
+                            or marker.exists() or marker.is_symlink()),
                 "unowned installation root")
     flags = os.O_RDWR | os.O_NOFOLLOW | (os.O_CREAT if create else 0)
     fd = os.open(root / ".install.lock", flags, 0o600)

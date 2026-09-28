@@ -94,6 +94,32 @@ def held_worker(contract, bundle, root, pipe):
         pipe.send("cancelled")
 
 
+def ownership_worker(contract, bundle, root, pipe, pause_after_absence=False):
+    """Pause A at the actual pre-lock inventory, after both absent predicates."""
+    original = Path.iterdir
+    armed = pause_after_absence
+
+    def inventory(path):
+        nonlocal armed
+        if path == root and armed:
+            armed = False
+            marker = root / runtime.ROOT_MARKER
+            assert not marker.exists() and not marker.is_symlink()
+            pipe.send(("paused-after-absence", os.getpid()))
+            assert pipe.poll(10), "owner observation was not resumed"
+            assert pipe.recv() == "resume"
+        return original(path)
+
+    try:
+        with patch.object(Path, "iterdir", inventory):
+            launcher = runtime.install(contract, bundle, root)
+        pipe.send(("installed", str(launcher)))
+    except BaseException as error:
+        pipe.send(("refused", type(error).__name__, str(error)))
+    finally:
+        pipe.close()
+
+
 class OfflineTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="claude-runtime-offline-")
@@ -326,6 +352,95 @@ class OfflineTests(unittest.TestCase):
                 if child.is_alive():
                     child.kill()
                 child.join()
+
+    def test_first_install_revalidates_ownership_after_another_installer_publishes(self):
+        ctx = multiprocessing.get_context("fork")
+        a_reply, a_child = ctx.Pipe()
+        b_reply, b_child = ctx.Pipe()
+        a = ctx.Process(target=ownership_worker,
+                        args=(self.contract, self.bundle, self.install_root, a_child, True))
+        b = ctx.Process(target=ownership_worker,
+                        args=(self.contract, self.bundle, self.install_root, b_child))
+        started = []
+        try:
+            a.start()
+            started.append(a)
+            self.assertTrue(a_reply.poll(10), "A did not reach its absent-marker observation")
+            self.assertEqual(a_reply.recv(), ("paused-after-absence", a.pid))
+            self.assertFalse((self.install_root / runtime.ROOT_MARKER).exists())
+            b.start()
+            started.append(b)
+            self.assertTrue(b_reply.poll(10), "B did not complete while A was paused")
+            expected = ("installed", str(self.install_root / self.contract.identity
+                                         / "bin/claude-agent-acp"))
+            self.assertEqual(b_reply.recv(), expected)
+            b.join(timeout=10)
+            self.assertEqual(b.exitcode, 0)
+            self.assertNotEqual(a.pid, b.pid)
+            destination = self.install_root / self.contract.identity
+            runtime.verify_install(self.contract, destination)
+            published = destination.stat()
+            a_reply.send("resume")
+            self.assertTrue(a_reply.poll(10), "A did not finish after B published")
+            self.assertEqual(a_reply.recv(), expected,
+                             "A must join the original lock and accept B's owned installation")
+            a.join(timeout=10)
+            self.assertEqual(a.exitcode, 0)
+            self.assertEqual((destination.stat().st_dev, destination.stat().st_ino),
+                             (published.st_dev, published.st_ino))
+            self.assertEqual({p.name for p in self.install_root.iterdir()},
+                             {runtime.ROOT_MARKER, ".install.lock", self.contract.identity})
+            runtime.verify_install(self.contract, destination)
+        finally:
+            for process in started:
+                if process.is_alive():
+                    process.kill()
+                process.join(timeout=10)
+            for pipe in (a_reply, a_child, b_reply, b_child):
+                pipe.close()
+
+    def test_marker_appearing_after_absence_must_still_be_authentic(self):
+        ctx = multiprocessing.get_context("fork")
+        for kind in ("extra-without-marker", "forged-marker", "linked-marker", "hardlinked-marker"):
+            with self.subTest(kind=kind):
+                root = self.root / kind
+                reply, child_pipe = ctx.Pipe()
+                child = ctx.Process(target=ownership_worker,
+                                    args=(self.contract, self.bundle, root, child_pipe, True))
+                child.start()
+                try:
+                    self.assertTrue(reply.poll(10), "A did not reach the observation boundary")
+                    self.assertEqual(reply.recv(), ("paused-after-absence", child.pid))
+                    sentinel = root / "not-owned"
+                    sentinel.write_bytes(b"preserve")
+                    marker = root / runtime.ROOT_MARKER
+                    if kind == "forged-marker":
+                        runtime.write_file(marker, b'{"forged":true}\n', 0o600)
+                    elif kind in ("linked-marker", "hardlinked-marker"):
+                        external = self.root / (kind + "-external")
+                        runtime.write_file(external, runtime.owner_bytes(), 0o600)
+                        if kind == "linked-marker":
+                            marker.symlink_to(external)
+                        else:
+                            os.link(external, marker)
+                    reply.send("resume")
+                    self.assertTrue(reply.poll(10), "A did not reject invalid ownership")
+                    outcome = reply.recv()
+                    self.assertEqual(outcome[0], "refused", outcome)
+                    self.assertIn(outcome[1], ("InvalidRuntime", "OSError"), outcome)
+                    child.join(timeout=10)
+                    self.assertEqual(child.exitcode, 0)
+                    self.assertEqual(sentinel.read_bytes(), b"preserve")
+                    self.assertFalse((root / self.contract.identity).exists())
+                    self.assertFalse(list(root.glob(".stage-*")))
+                    if kind == "extra-without-marker":
+                        self.assertEqual({p.name for p in root.iterdir()}, {"not-owned"})
+                finally:
+                    if child.is_alive():
+                        child.kill()
+                    child.join(timeout=10)
+                    reply.close()
+                    child_pipe.close()
 
     def test_signal_before_publish_cleans_exact_private_stage(self):
         ctx = multiprocessing.get_context("fork")
