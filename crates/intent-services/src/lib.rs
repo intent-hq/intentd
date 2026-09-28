@@ -103,6 +103,7 @@ mod github_browse_ops;
 mod source_control_auth_ops;
 
 mod agent_list_cache;
+pub mod checkpoint;
 mod fast_mode;
 mod harness;
 mod history_xml;

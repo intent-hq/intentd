@@ -17,6 +17,7 @@ pub use local_changes::{local_changes, LocalChanges, MAX_UNPUSHED_COUNT};
 
 pub mod auth;
 pub mod branches;
+pub mod checkpoint;
 pub mod commit;
 pub mod conflicts;
 pub mod cow;
