@@ -10,11 +10,14 @@ use intent_acp::mcp_server::request_context::{
     McpContextFuture, McpRequestContext, McpRequestScope,
 };
 use intent_core::caller::{current_caller, current_wire_credential, Caller};
+use intent_store::{RepositoryLifecycleObserver, Store};
 
+use super::lifecycle::physical_owner::RepositoryPhysicalOwner;
 use super::lifecycle::{
     RepositoryLifecycleRegistry, RepositoryPhysicalOrigin, RepositorySourceLifetime,
     RepositorySubscription,
 };
+use super::read_request::{RepositoryReadOwner, RepositoryReadRequest};
 use super::{AdmissionError, AdmissionResult, RepositoryRetirement};
 
 /// A distinct callback allocation may receive a confirmed origin. The physical
@@ -22,6 +25,8 @@ use super::{AdmissionError, AdmissionResult, RepositoryRetirement};
 pub(crate) struct RepositoryCallbackContext {
     registry: Weak<RepositoryLifecycleRegistry>,
     origin: Option<RepositoryPhysicalOrigin>,
+    store: Option<Store>,
+    read_owner: Option<AdmissionResult<Arc<RepositoryReadOwner>>>,
 }
 
 impl RepositoryCallbackContext {
@@ -32,7 +37,31 @@ impl RepositoryCallbackContext {
         Self {
             registry: Arc::downgrade(registry),
             origin,
+            store: None,
+            read_owner: None,
         }
+    }
+
+    pub(super) fn for_physical_owner(owner: &RepositoryPhysicalOwner) -> Self {
+        let (registry, origin, store) = owner.callback_binding();
+        Self {
+            registry: Arc::downgrade(registry),
+            origin: Some(origin),
+            store: Some(store.clone()),
+            read_owner: None,
+        }
+    }
+
+    /// Attach once, retaining success or failure. A later Services lookup must
+    /// never repair this callback's original unavailable read anchor.
+    pub(crate) fn with_read_owner(
+        mut self,
+        original: AdmissionResult<Arc<RepositoryReadOwner>>,
+    ) -> Self {
+        if self.read_owner.is_none() {
+            self.read_owner = Some(original);
+        }
+        self
     }
 
     /// Capture even an unavailable result. No later scope may fill a missing
@@ -47,6 +76,7 @@ impl RepositoryCallbackContext {
                 registry,
                 origin,
                 caller,
+                store: self.store.clone(),
                 subscriptions: Arc::new(Mutex::new(vec![subscription])),
             })
         })();
@@ -59,15 +89,25 @@ impl RepositoryCallbackContext {
 
 impl McpRequestContext for RepositoryCallbackContext {
     fn capture(&self) -> Arc<dyn McpRequestScope> {
-        Arc::new(RepositoryRequestScope(self.capture()))
+        let original = self.capture();
+        let read = self
+            .read_owner
+            .clone()
+            .unwrap_or(Err(AdmissionError::Unavailable))
+            .and_then(|owner| RepositoryReadRequest::capture(owner, original.clone()));
+        Arc::new(RepositoryRequestScope { original, read })
     }
 }
 
 tokio::task_local! {
     static CAPTURED_REQUEST: Arc<RepositoryCapturedRequest>;
+    static CAPTURED_READ_REQUEST: AdmissionResult<Arc<RepositoryReadRequest>>;
 }
 
-struct RepositoryRequestScope(Arc<RepositoryCapturedRequest>);
+struct RepositoryRequestScope {
+    original: Arc<RepositoryCapturedRequest>,
+    read: AdmissionResult<Arc<RepositoryReadRequest>>,
+}
 
 struct RetireCancelledScope {
     retirement: RepositoryRetirement,
@@ -93,12 +133,15 @@ impl McpRequestScope for RepositoryRequestScope {
         // Construct the guard before the future: even an unpolled cancelled
         // scope must retire this request, without retiring the physical owner.
         let guard = RetireCancelledScope {
-            retirement: self.0.retirement.clone(),
+            retirement: self.original.retirement.clone(),
             completed: false,
         };
-        let captured = self.0.clone();
+        let captured = self.original.clone();
+        let read = self.read.clone();
         Box::pin(async move {
-            CAPTURED_REQUEST.scope(captured, request).await;
+            CAPTURED_REQUEST
+                .scope(captured, CAPTURED_READ_REQUEST.scope(read, request))
+                .await;
             // The same scope also surrounds separately bounded preparation.
             // Normal completion keeps it live until the final scope Arc drops.
             guard.complete();
@@ -112,6 +155,16 @@ pub(crate) fn current_source_lifetime() -> AdmissionResult<RepositorySourceLifet
     CAPTURED_REQUEST
         .try_with(|request| request.source_lifetime())
         .map_err(|_| AdmissionError::Unavailable)?
+}
+
+/// Ownership evidence only, under the restored original caller. A successful
+/// result supplies no read permission, source facts or response admission.
+pub(crate) fn current_read_request() -> AdmissionResult<Arc<RepositoryReadRequest>> {
+    let read = CAPTURED_READ_REQUEST
+        .try_with(Clone::clone)
+        .map_err(|_| AdmissionError::Unavailable)??;
+    read.check_current()?;
+    Ok(read)
 }
 
 /// Permanent observed denial ends this original request, not just one lock
@@ -129,6 +182,7 @@ struct Captured {
     registry: Arc<RepositoryLifecycleRegistry>,
     origin: RepositoryPhysicalOrigin,
     caller: Caller,
+    store: Option<Store>,
     subscriptions: Arc<Mutex<Vec<RepositorySubscription>>>,
 }
 
@@ -138,6 +192,37 @@ pub(crate) struct RepositoryCapturedRequest {
 }
 
 impl RepositoryCapturedRequest {
+    pub(super) fn check_read_owner(
+        &self,
+        store: &Store,
+        registry: &Arc<RepositoryLifecycleRegistry>,
+    ) -> AdmissionResult<()> {
+        let captured = self.captured.as_ref().map_err(|error| *error)?;
+        let original_store = captured.store.as_ref().ok_or(AdmissionError::Unavailable)?;
+        if !Arc::ptr_eq(registry, &captured.registry)
+            || !original_store.shares_repository_lifecycle_domain(store)
+        {
+            return Err(AdmissionError::Denied);
+        }
+        let observer: Arc<dyn RepositoryLifecycleObserver> = captured.registry.clone();
+        if !original_store.has_repository_lifecycle_observer(&observer)
+            || !store.has_repository_lifecycle_observer(&observer)
+        {
+            return Err(AdmissionError::Unavailable);
+        }
+        self.retirement.check_current()
+    }
+
+    pub(super) fn check_read_caller(&self) -> AdmissionResult<()> {
+        let captured = self.captured.as_ref().map_err(|error| *error)?;
+        if current_caller().as_ref() != Some(&captured.caller)
+            || current_wire_credential().is_some()
+        {
+            return Err(AdmissionError::Denied);
+        }
+        self.retirement.check_current()
+    }
+
     /// Invoke under the authentic transport caller scope. Neither a callback
     /// projection nor an installed invalidation observer supplies permission.
     pub(crate) fn source_lifetime(&self) -> AdmissionResult<RepositorySourceLifetime> {

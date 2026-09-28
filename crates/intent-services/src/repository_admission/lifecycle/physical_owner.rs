@@ -406,6 +406,7 @@ impl RepositoryCreationOwner {
         proof.consumed = true;
         let owner = RepositoryPhysicalOwner {
             registry: self.registry.clone(),
+            store: self.store.clone(),
             token,
             id,
             _creation_retirement: self.retirement.clone(),
@@ -599,6 +600,7 @@ pub(super) fn begin_initialization(
 /// The nonclone strong lifetime belongs to the actual physical handle.
 pub(crate) struct RepositoryPhysicalOwner {
     registry: Arc<RepositoryLifecycleRegistry>,
+    store: Store,
     token: Arc<()>,
     id: u64,
     // The original pending retirement handle stays weak, but can follow the
@@ -646,7 +648,17 @@ impl RepositoryPhysicalOwner {
     }
 
     pub(crate) fn callback(&self) -> RepositoryCallbackContext {
-        RepositoryCallbackContext::new(&self.registry, Some(self.origin()))
+        RepositoryCallbackContext::for_physical_owner(self)
+    }
+
+    pub(in crate::repository_admission) fn callback_binding(
+        &self,
+    ) -> (
+        &Arc<RepositoryLifecycleRegistry>,
+        RepositoryPhysicalOrigin,
+        &Store,
+    ) {
+        (&self.registry, self.origin(), &self.store)
     }
 
     pub(crate) fn retirement(&self) -> RepositoryPhysicalRetirement {

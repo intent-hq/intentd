@@ -18,6 +18,35 @@ fn fixture() -> (Arc<RepositoryLifecycleRegistry>, FixtureOriginOwner, Caller) {
 }
 
 #[tokio::test]
+async fn failed_read_attachment_keeps_original_body_source_and_preparation() {
+    let (registry, owner, caller) = fixture();
+    let callback = RepositoryCallbackContext::new(&registry, Some(owner.origin()))
+        .with_read_owner(Err(AdmissionError::Denied))
+        .with_read_owner(Err(AdmissionError::Retired));
+    let scope = McpRequestContext::capture(&callback);
+    let mut bodies = 0;
+    for _ in 0..2 {
+        with_caller(
+            caller.clone(),
+            scope.scope(Box::pin(async {
+                assert!(matches!(
+                    current_read_request(),
+                    Err(AdmissionError::Denied)
+                ));
+                assert!(current_source_lifetime().is_ok());
+                bodies += 1;
+            })),
+        )
+        .await;
+    }
+    assert_eq!(bodies, 2);
+    assert!(matches!(
+        current_read_request(),
+        Err(AdmissionError::Unavailable)
+    ));
+}
+
+#[tokio::test]
 async fn absent_projection_and_its_captures_never_gain_a_later_origin() {
     let (registry, owner, caller) = fixture();
     let absent = RepositoryCallbackContext::new(&registry, None);
@@ -217,7 +246,10 @@ async fn dropping_an_unpolled_or_pending_acp_scope_retires_escaped_request_clone
         let (registry, owner, caller) = fixture();
         let callback = RepositoryCallbackContext::new(&registry, Some(owner.origin()));
         let captured = callback.capture();
-        let scope = RepositoryRequestScope(captured.clone());
+        let scope = RepositoryRequestScope {
+            original: captured.clone(),
+            read: Err(AdmissionError::Unavailable),
+        };
         let mut body_started = false;
         let mut future = scope.scope(Box::pin(async {
             body_started = true;

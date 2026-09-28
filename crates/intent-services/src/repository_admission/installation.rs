@@ -5,8 +5,19 @@ use std::sync::Arc;
 use intent_store::RepositoryLifecycleObserver;
 
 use crate::repository_admission::lifecycle::RepositoryLifecycleRegistry;
+use crate::repository_admission::read_request::RepositoryReadOwner;
 use crate::repository_admission::{AdmissionError, AdmissionResult};
 use crate::Services;
+
+impl RepositoryReadOwner {
+    /// Retain the exact supplied Services allocation after its existing observer
+    /// installation. No SQL, Git, secret, caller or target observation occurs.
+    pub(crate) fn capture(original: Arc<Services>) -> AdmissionResult<Arc<Self>> {
+        let store = original.store().clone();
+        let registry = original.repository_lifecycle_registry.clone();
+        Self::retain_original(original, store, registry)
+    }
+}
 
 impl Services {
     /// Return this instance's original registry only after its Store accepts

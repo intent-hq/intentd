@@ -64,6 +64,46 @@ async fn current(
 }
 
 #[tokio::test]
+async fn read_forwarding_keeps_creator_store_and_only_one_weak_physical_capture() {
+    use intent_acp::mcp_server::request_context::McpRequestContext;
+
+    let f = Fixture::new(None).await;
+    let clone = f.store.clone();
+    let creator = f.creator(RepositoryCreationIntent::FirstSet);
+    let owner = creator
+        .initialize(&clone, || async { Ok("original".into()) })
+        .await
+        .unwrap();
+    let (registry, _, forwarded) = owner.callback_binding();
+    assert!(Arc::ptr_eq(registry, &f.registry));
+    assert!(forwarded.shares_repository_lifecycle_domain(&f.store));
+    let callback = owner.callback();
+    let before = f.registry.state.lock().unwrap().next_id;
+    let scope = McpRequestContext::capture(&callback);
+    {
+        let state = f.registry.state.lock().unwrap();
+        assert_eq!(state.next_id, before + 1);
+        assert_eq!(state.subscriptions.len(), 1);
+    }
+    drop(owner);
+    let mut ran = false;
+    with_caller(
+        f.caller(),
+        scope.scope(Box::pin(async {
+            assert!(matches!(
+                crate::repository_admission::request_context::current_source_lifetime(),
+                Err(AdmissionError::Retired)
+            ));
+            ran = true;
+        })),
+    )
+    .await;
+    assert!(ran);
+    assert!(!current(&callback.capture(), f.caller()).await);
+    assert!(f.registry.state.lock().unwrap().origins.is_empty());
+}
+
+#[tokio::test]
 async fn committed_original_creation_mints_distinct_live_callback_and_request_lifetime() {
     let f = Fixture::new(None).await;
     let creator = f.creator(RepositoryCreationIntent::FirstSet);
