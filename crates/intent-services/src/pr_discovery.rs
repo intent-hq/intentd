@@ -74,7 +74,7 @@ impl Index {
 #[derive(Clone)]
 enum Value {
     Listing(Arc<Index>),
-    Record(PullRequest),
+    Record(Arc<PullRequest>),
 }
 
 struct Entry {
@@ -175,9 +175,11 @@ impl Budget {
     }
 }
 
+type Slots = Arc<Mutex<HashMap<Key, (Instant, Arc<Slot>)>>>;
+
 #[derive(Clone)]
 pub(crate) struct Discovery {
-    slots: Arc<Mutex<HashMap<Key, (Instant, Arc<Slot>)>>>,
+    slots: Slots,
     budget: Arc<Mutex<Budget>>,
     concurrent: Arc<tokio::sync::Semaphore>,
 }
@@ -301,12 +303,11 @@ impl Discovery {
         } else {
             Operation::PrDetail
         };
-        let mut entry = match slot.entry.try_lock() {
-            Ok(guard) => guard,
-            Err(_) => {
-                record_reuse(operation, Reuse::InFlight);
-                slot.entry.lock().await
-            }
+        let mut entry = if let Ok(guard) = slot.entry.try_lock() {
+            guard
+        } else {
+            record_reuse(operation, Reuse::InFlight);
+            slot.entry.lock().await
         };
         let revision = slot.revision.load(Ordering::SeqCst);
         let force_after = FORCE_AFTER.try_with(|at| *at).ok();
@@ -325,7 +326,7 @@ impl Discovery {
                     if entry.as_ref().is_none_or(|cached| cached.started <= at)
                         && (pr.state == PrState::Merged || !self.newer_listing(&key, at))
                     {
-                        let value = Value::Record(pr);
+                        let value = Value::Record(Arc::new(pr));
                         *entry = Some(Entry {
                             started: at,
                             finished: Some(Instant::now()),
@@ -384,7 +385,10 @@ impl Discovery {
             });
             intent_sourcecontrol::request_budget::with_admission(admission, async {
                 if let Some(number) = key.number {
-                    return sc.get_pr(&key.repo, number).await.map(Value::Record);
+                    return sc
+                        .get_pr(&key.repo, number)
+                        .await
+                        .map(|pr| Value::Record(Arc::new(pr)));
                 }
                 let mut index = Index::default();
                 let mut cursor = None;
@@ -460,7 +464,7 @@ impl Services {
             // Keep discovery alive even when every consumer currently has an
             // open link. Listing failure is unknown, but may not suppress a
             // separately successful linked-status confirmation.
-            match self
+            if let Err(e @ Error::RateLimited(_)) = self
                 .pr_discovery
                 .read(
                     self,
@@ -473,8 +477,7 @@ impl Services {
                 )
                 .await
             {
-                Err(e @ Error::RateLimited(_)) => return Err(e),
-                _ => {}
+                return Err(e);
             }
             if !scope.is_current() {
                 return Err(unknown("PR refresh authorization changed"));
@@ -545,7 +548,7 @@ impl Services {
         else {
             unreachable!()
         };
-        Ok(pr)
+        Ok((*pr).clone())
     }
 }
 

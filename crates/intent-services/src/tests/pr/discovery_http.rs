@@ -633,8 +633,7 @@ async fn shared_discovery_audited_distribution_http_before_after_counts() {
             &checkout.dir,
             Some(("o", "r")),
         );
-        if i < 85 {
-            let pr = &known[i];
+        if let Some(pr) = known.get(i) {
             root.pr_number = Some(pr.number);
             root.pr_url = Some(pr.url.clone());
             root.pr_status = Some(crate::pr_ops::derive_pr_status(pr));
