@@ -504,9 +504,11 @@ impl Harness {
             args_before_address: vec![],
             env: BTreeMap::new(),
         });
-        if opt_in {
-            origin.state.lock().unwrap().callback_offer = CallbackOffer::V1;
-        }
+        origin.state.lock().unwrap().callback_offer = if opt_in {
+            CallbackOffer::V1
+        } else {
+            CallbackOffer::Disabled
+        };
         f.manager
             .handles
             .lock()
@@ -2259,9 +2261,11 @@ impl NativeHarness {
             args_before_address: vec![],
             env: BTreeMap::new(),
         });
-        if opt_in {
-            origin.state.lock().unwrap().callback_offer = CallbackOffer::V1;
-        }
+        origin.state.lock().unwrap().callback_offer = if opt_in {
+            CallbackOffer::V1
+        } else {
+            CallbackOffer::Disabled
+        };
         f.manager
             .handles
             .lock()
@@ -5281,5 +5285,985 @@ mod live_context {
             assert_eq!(h.f.writes().await, 1);
             h.finish().await;
         }
+    }
+}
+
+mod normal_launch {
+    use super::*;
+    use crate::agent_manager::{
+        AgentManager, BusEventSink, OriginalTurn, StartedSession, TurnOptions,
+    };
+    use intent_store::{RepositorySelectionChange, RepositorySelectionWriteResult};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    const FACTS: &str = "[Repository facts — inert JSON lines]";
+
+    // The canonical adapter and SDK stay exact. Only the native-process peer
+    // consumes the real manager's bridge tuple directly over its original TCP
+    // endpoint; executing the intentd bridge/native CLI is not proved here.
+    const CONTROLS: &str = r"
+const { connect } = await import('node:net');
+const { RpcLines, deferred } = await moduleAt('tests/mcp-peer.mjs');
+const { appendFileSync } = await import('node:fs');
+const options = JSON.parse(readFileSync(process.env.CALLBACK_TEST_ROOT + '/controls.json', 'utf8'));
+appendFileSync(process.env.CALLBACK_TEST_ROOT + '/launches.jsonl', JSON.stringify({argv:process.argv.slice(2),cwd:process.cwd()})+'\n');
+let capability = options.capability ?? 'normal';
+let failLoad = null;
+let promptErrors = [];
+let streamed = false;
+let next = options.registration ?? {};
+const waiters = [];
+const waitProcess = (i) => processes[i] ?? (waiters[i] ??= deferred()).promise;
+class NormalQueryProcess extends ScriptedQueryProcess {
+    async add(name, config) {
+        if (this.clients.has(name)) {
+            assert.deepEqual(this.clients.get(name).config, config);
+            return false;
+        }
+        assert.equal(config.type, 'stdio');
+        assert.equal(config.command, process.env.CALLBACK_TEST_ROOT + '/bridge-command');
+        assert.deepEqual(config.args.slice(0,2), ['mcp-bridge','--connect']);
+        assert.equal(config.args.length,3);
+        const match = /^127\.0\.0\.1:(\d+)$/.exec(config.args[2]);
+        assert.ok(match, 'only the original loopback endpoint');
+        const socket = connect(Number(match[1]), '127.0.0.1');
+        await new Promise((resolve,reject)=>{socket.once('connect',resolve);socket.once('error',reject);});
+        socket.on('error',()=>{});
+        const rpc = new RpcLines(socket,socket);
+        await rpc.request('initialize',{protocolVersion:'2024-11-05',capabilities:{},clientInfo:{name:'normal-launch-scripted-native',version:'1'}});
+        const tools = await rpc.request('tools/list');
+        this.clients.set(name,{rpc,tools,config,close(){rpc.close();socket.destroy();}});
+        return true;
+    }
+}
+const initialize = agent.initialize.bind(agent);
+agent.initialize = async p => {
+    if (capability === 'initialize-error') throw new Error('original initialize failure');
+    const result = await initialize(p);
+    if (capability === 'absent') delete result._meta?.intentCallbackRegistration;
+    if (capability === 'wrong') result._meta = {intentCallbackRegistration:{version:2,method:'_intent/session/register_mcp_callback'}};
+    if (capability === 'malformed') result._meta = {intentCallbackRegistration:{version:'1',method:'_intent/session/register_mcp_callback'}};
+    if (capability === 'unsolicited') result._meta = {intentCallbackRegistration:{version:1,method:'_intent/session/register_mcp_callback'}};
+    return result;
+};
+agent.prompt = async () => ({stopReason:'end_turn'});
+";
+
+    struct NormalHarness {
+        f: Arc<Fixture>,
+        original: Arc<crate::Services>,
+        auth: crate::source_control_auth_ops::repository_owner::secret_reader::tests::Fixture,
+        git: crate::repository_admission_source_tests::fixtures::Fixture,
+        http: crate::repository_read_source::tests::ReadServer,
+        scratch: tempfile::TempDir,
+        launcher: PathBuf,
+    }
+
+    fn quoted(path: &Path) -> String {
+        format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"))
+    }
+
+    fn launcher(scratch: &Path, adapter: &Path) -> PathBuf {
+        let base =
+            include_str!("../../../../../intent-acp/tests/fixtures/claude_callback_peer.mjs");
+        let script = base
+            .replace("const requests = [];", &format!("const requests = [];\n{CONTROLS}"))
+            .replace("new ScriptedQueryProcess(options)", "new NormalQueryProcess(options)")
+            .replace("processes.push(child);", r"
+if(next.hold) child.hold=deferred();
+child.error=next.error ?? null;
+next={};
+processes.push(child); waiters[processes.length-1]?.resolve(child);
+")
+            .replace(r#"case "fixture/inspect": return {"#, r#"
+case "fixture/next": next=p; return {};
+case "fixture/names": return [...processes[p.query ?? 0].clients.keys()];
+case "fixture/configs": return [...processes[p.query ?? 0].clients.values()].map(c=>c.config);
+case "fixture/prompts": return requests.filter(r=>r.method==='session/prompt');
+case "fixture/fail-load": failLoad=p.error ?? 'lost original session'; return {};
+case "fixture/faults": promptErrors=p.errors; streamed=p.stream ?? false; return {};
+case "fixture/entered": return (await waitProcess(p.query ?? 0)).setEntered.promise;
+case "fixture/release": processes[p.query ?? 0].hold?.resolve(); return {};
+case "fixture/inspect": return {"#)
+            .replace("requests.push({ method: frame.method, params: frame.params });", r"
+requests.push({id:frame.id,method:frame.method,params:frame.params});
+if(frame.method==='session/load' && failLoad) {
+    const message=failLoad;failLoad=null;
+    process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:frame.id,error:{code:-32603,message}})+'\n');return;
+}
+if(frame.method==='session/prompt' && promptErrors.length) {
+    if(streamed) process.stdout.write(JSON.stringify({jsonrpc:'2.0',method:'session/update',params:{sessionId:frame.params.sessionId,update:{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'completed original output'}}}})+'\n');
+    process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:frame.id,error:{code:-32603,message:promptErrors.shift()}})+'\n');return;
+}
+");
+        assert_ne!(script, base);
+        let peer = scratch.join("peer.mjs");
+        std::fs::write(&peer, script).unwrap();
+        let path = scratch.join("adapter");
+        let text = format!(
+            "#!/bin/sh\nexec /usr/bin/env -i PATH=/usr/bin:/bin HOME={root} CLAUDE_CONFIG_DIR={root} XDG_CONFIG_HOME={root} TMPDIR={root} CALLBACK_TEST_ROOT={root} NODE_DISABLE_COMPILE_CACHE=1 DD_TRACE_ENABLED=false DD_INJECTION_ENABLED=false DD_INSTRUMENT_SERVICE_WITH_APM=false DD_INJECT_NATIVE=never DD_INSTRUMENTATION_TELEMETRY_ENABLED=false DO_NOT_TRACK=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 /usr/bin/node --permission --allow-fs-read={adapter} --allow-fs-read={root} --allow-fs-write={root} {peer} {adapter} \"$@\"\n",
+            root=quoted(scratch), adapter=quoted(adapter), peer=quoted(&peer),
+        );
+        std::fs::write(&path, text).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    impl NormalHarness {
+        async fn new(stamp: Option<&str>, options: Value) -> Self {
+            let scratch = crate::test_support::test_tempdir("normal-callback-launch");
+            std::fs::write(scratch.path().join("controls.json"), options.to_string()).unwrap();
+            let adapter = std::fs::canonicalize(
+                std::env::var("INTENT_ACP_CALLBACK_ADAPTER_FIXTURE").unwrap(),
+            )
+            .unwrap();
+            let launcher = launcher(scratch.path(), &adapter);
+            let http = crate::repository_read_source::tests::ReadServer::new().await;
+            let mut auth = crate::source_control_auth_ops::repository_owner::secret_reader::tests::Fixture::new(&http.fixture).await;
+            auth.registry
+                .apply(&[
+                    ("providers.paths".into(), json!({"claude-code":launcher})),
+                    (
+                        "sourceControl.github.exposeGitCredentialToChildren".into(),
+                        json!(false),
+                    ),
+                ])
+                .unwrap();
+            let mut git = crate::repository_admission_source_tests::fixtures::Fixture::new().await;
+            let path = scratch.path().join("repo");
+            std::fs::rename(&git.path, &path).unwrap();
+            git.path = path;
+            git.workspace.repository_path = Some(git.path.to_str().unwrap().into());
+            let bus = crate::events::EventBus::new(auth.service.store.clone());
+            let original = Arc::new(
+                auth.service
+                    .as_ref()
+                    .clone()
+                    .with_workspaces_root(scratch.path().join("workspaces"))
+                    .with_event_bus(bus.clone()),
+            );
+            auth.service = original.clone();
+            original
+                .store
+                .insert_workspace(&git.workspace)
+                .await
+                .unwrap();
+            git.store = original.store.clone();
+            git.git(
+                &git.path,
+                &[
+                    "remote",
+                    "add",
+                    "origin",
+                    &format!(
+                        "{}/group/project.git",
+                        http.fixture.descriptor.instance().as_str()
+                    ),
+                ],
+            );
+            let row = if let Some(stamp) = stamp {
+                let mut row = json!({"id":intent_core::AgentId::new(),"workspaceId":git.workspace.id,"name":"saved normal launch","provider":"claude-code","model":"fixture-model","status":"idle","createdAt":"2026-09-28T00:00:00Z","updatedAt":"2026-09-28T00:00:00Z"});
+                if stamp == "<retired3.0>" {
+                    row["harnessVersion"] = json!("3.0");
+                    row["retiredAt"] = json!("2026-09-28T00:00:00Z");
+                } else if stamp != "<missing>" {
+                    row["harnessVersion"] = json!(stamp);
+                }
+                let row = serde_json::from_value(row).unwrap();
+                original.store.insert_agent_session(&row).await.unwrap();
+                row
+            } else {
+                let result = original
+                    .agent_create_op(
+                        git.workspace.id.clone(),
+                        Some("normal launch".into()),
+                        Some("fixture-model".into()),
+                        None,
+                        None,
+                        None,
+                        false,
+                        intent_core::AgentCreateExtra {
+                            provider: Some("claude-code".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(result["agent"]["harnessVersion"], "3.0");
+                original
+                    .store
+                    .get_agent_session(&intent_core::AgentId::from(
+                        result["agent"]["id"].as_str().unwrap(),
+                    ))
+                    .await
+                    .unwrap()
+            };
+            let manager = Arc::new(
+                AgentManager::new(
+                    original.as_ref().clone(),
+                    Arc::new(BusEventSink::new(bus)),
+                    4,
+                )
+                .with_mcp_bridge_exe(scratch.path().join("bridge-command"))
+                .with_agent_config_root(scratch.path().join("configs")),
+            );
+            original.attach_agent_manager(&manager);
+            let f = Arc::new(Fixture {
+                dir: crate::test_support::test_tempdir("normal-launch-accounting"),
+                manager,
+                row,
+            });
+            f.count_writes().await;
+            let h = Self {
+                f,
+                original,
+                auth,
+                git,
+                http,
+                scratch,
+                launcher,
+            };
+            h.select(RepositorySelectionChange::Automatic).await;
+            h
+        }
+        async fn select(&self, change: RepositorySelectionChange) {
+            let before = self
+                .original
+                .store
+                .repository_selection_snapshot(&self.git.root())
+                .await
+                .unwrap();
+            assert!(matches!(
+                self.original
+                    .store
+                    .write_repository_selection(&before, change)
+                    .await
+                    .result
+                    .unwrap(),
+                RepositorySelectionWriteResult::Applied(_)
+                    | RepositorySelectionWriteResult::Unchanged(_)
+            ));
+        }
+        fn connection(&self) -> Arc<Connection> {
+            self.f.manager.handles.lock().unwrap()[&self.f.row.id]
+                .connection
+                .clone()
+        }
+        fn origin(&self) -> Arc<RepositoryOrigin> {
+            self.f.manager.handles.lock().unwrap()[&self.f.row.id]
+                .repository_origin
+                .clone()
+        }
+        async fn daemon<T: Send + 'static>(
+            &self,
+            body: impl std::future::Future<Output = T> + Send + 'static,
+        ) -> T {
+            intent_core::spawn_daemon(crate::host_execution::background_execution(
+                self.original.as_ref().clone(),
+                None,
+                body,
+            ))
+            .await
+            .unwrap()
+        }
+        async fn start(&self) -> intent_core::Result<StartedSession> {
+            let f = self.f.clone();
+            let result = self
+                .daemon(async move {
+                    f.manager
+                        .ensure_started_owned(&f.row.id, &f.row.workspace_id)
+                        .await
+                })
+                .await;
+            if result.is_err() {
+                let stderr = self
+                    .f
+                    .manager
+                    .handles
+                    .lock()
+                    .unwrap()
+                    .get(&self.f.row.id)
+                    .map(|h| h.connection.recent_stderr());
+                eprintln!("normal launch stderr: {stderr:?}");
+            }
+            result
+        }
+        async fn create_only(&self) {
+            let f = self.f.clone();
+            let cwd = self.git.path.clone();
+            self.daemon(async move {
+                let row = f.stored().await;
+                let workspace = f
+                    .manager
+                    .services
+                    .store
+                    .get_workspace(&row.workspace_id)
+                    .await
+                    .unwrap();
+                let settings = f.manager.services.effective_settings();
+                let r =
+                    crate::agent_manager::resolve_spawn(&row, Some(&workspace), &settings, None)
+                        .unwrap();
+                let mut o = intent_acp::SpawnOptions::new(&r.provider);
+                o.cwd = Some(&cwd);
+                o.model = r.model.as_deref();
+                o.provider_binary = r.provider_binary.as_deref();
+                f.manager
+                    .create_agent(
+                        row.id,
+                        row.workspace_id,
+                        row.name,
+                        "default",
+                        cwd.clone(),
+                        &o,
+                    )
+                    .await
+                    .unwrap();
+            })
+            .await;
+        }
+        async fn rpc(&self, method: &str, params: Value) -> Value {
+            let c = self.connection();
+            c.request_timeout(method, params, WAIT)
+                .await
+                .unwrap_or_else(|e| panic!("{method}: {e}; {:?}", c.recent_stderr()))
+        }
+        async fn confirmed(&self, query: usize) -> String {
+            let names = self.rpc("fixture/names", json!({"query":query})).await;
+            let names = names
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|n| n.starts_with("intent-callback-"))
+                .collect::<Vec<_>>();
+            assert_eq!(names.len(), 1);
+            names[0].into()
+        }
+        async fn call(&self, query: usize, name: &str, code: &str) -> Value {
+            self.rpc(
+                "fixture/call",
+                json!({"query":query,"name":name,"code":code}),
+            )
+            .await
+        }
+        async fn capture(&self) -> OriginalTurn {
+            let f = self.f.clone();
+            self.daemon(async move { f.manager.capture_turn(&f.row.id).unwrap() })
+                .await
+        }
+        async fn dispatch(
+            &self,
+            id: &str,
+            turn: OriginalTurn,
+            text: &str,
+        ) -> intent_core::Result<intent_acp::session::StopReason> {
+            let f = self.f.clone();
+            let id = id.to_owned();
+            let text = text.to_owned();
+            self.daemon(async move {
+                f.manager
+                    .run_turn_owned(
+                        &f.row.id,
+                        &f.row.workspace_id,
+                        &id,
+                        serde_json::from_value(json!([{"type":"text","text":text}])).unwrap(),
+                        None,
+                        turn,
+                    )
+                    .await
+            })
+            .await
+        }
+        async fn prompts(&self) -> Vec<Value> {
+            serde_json::from_value(self.rpc("fixture/prompts", json!({})).await).unwrap()
+        }
+        fn decorate(&self, control: Arc<NativeControl>) {
+            let origin = self.origin();
+            let mut state = origin.state.lock().unwrap();
+            Arc::get_mut(state.blueprint.as_mut().unwrap())
+                .unwrap()
+                .server
+                .context_decorator = Some(Arc::new(move |c| control.wrap(c)));
+        }
+        async fn finish(self) {
+            let owner = self
+                .origin()
+                .state
+                .lock()
+                .unwrap()
+                .endpoint
+                .as_ref()
+                .and_then(|e| e.live.as_ref())
+                .and_then(|l| l.owner.as_ref().ok())
+                .cloned();
+            self.f.manager.kill_child_only(&self.f.row.id).await;
+            if let Some(owner) = owner {
+                owner.drain_jobs().await;
+            }
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn normal_callback_launch_created_session_uses_real_settings_spawn_and_worker() {
+        let h = NormalHarness::new(None, json!({})).await;
+        assert!(h.f.manager.handles.lock().unwrap().is_empty());
+        let s = h.start().await.unwrap();
+        assert!(s
+            .turn
+            .prompt
+            .as_ref()
+            .unwrap()
+            .captured
+            .as_ref()
+            .unwrap()
+            .is_ok());
+        let c = h.connection();
+        assert!(Arc::ptr_eq(&c, &s.turn.connection));
+        assert_eq!(
+            h.rpc("fixture/permissions", json!({})).await,
+            json!({"filesystem":"denied","native":"denied"})
+        );
+        let launches = std::fs::read_to_string(h.scratch.path().join("launches.jsonl")).unwrap();
+        assert_eq!(launches.lines().count(), 1);
+        let launch: Value = serde_json::from_str(launches.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            launch["argv"].as_array().unwrap().len(),
+            1,
+            "direct override has no npx arguments"
+        );
+        assert_eq!(launch["cwd"], json!(h.git.path));
+        let name = h.confirmed(0).await;
+        let a = h.call(0, &name, "const a=await ws.mr.snapshot(4); const b=await ws.pr.snapshot(4); if(JSON.stringify(a)!==JSON.stringify(b)) throw Error('alias mismatch'); return a;").await;
+        assert!(
+            a.to_string().contains("actual review") && a.to_string().contains(FACTS),
+            "{a}"
+        );
+        assert_eq!(
+            h.http.count(),
+            4,
+            "both aliases reuse one request's real fetch"
+        );
+        let pending = h
+            .call(0, "workspace-mcp", "return await ws.pr.snapshot(4);")
+            .await;
+        assert!(pending
+            .to_string()
+            .contains(crate::repository_read_source::REFUSAL));
+        h.dispatch(&s.session_id, s.turn, "normal original prompt")
+            .await
+            .unwrap();
+        h.f.manager
+            .send_message(
+                h.f.row.id.clone(),
+                h.f.row.workspace_id.clone(),
+                "normal worker continuation".into(),
+                None,
+                TurnOptions::default(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(WAIT, async {
+            while h.f.manager.is_busy(&h.f.row.id)
+                || !h.f.manager.workers.lock().unwrap().is_empty()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let prompts = h.prompts().await;
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts
+            .iter()
+            .all(|p| p.to_string().contains(FACTS) && p["params"]["sessionId"] == s.session_id));
+        assert_ne!(prompts[0]["id"], prompts[1]["id"]);
+        assert_eq!(h.f.writes().await, 1);
+        assert_eq!(h.f.stored().await.harness_version, "3.0");
+        {
+            let origin = h.origin();
+            let state = origin.state.lock().unwrap();
+            let live = state.endpoint.as_ref().unwrap().live.as_ref().unwrap();
+            assert!(Arc::ptr_eq(
+                &live.owner.as_ref().unwrap().services,
+                &state
+                    .blueprint
+                    .as_ref()
+                    .unwrap()
+                    .server
+                    .original
+                    .as_ref()
+                    .unwrap()
+                    .0
+            ));
+        }
+        h.finish().await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn normal_callback_launch_legacy_and_original_eligibility_stay_ordinary() {
+        for stamp in ["<missing>", "1.0", "2.9", "unknown-future", "<retired3.0>"] {
+            let h = NormalHarness::new(Some(stamp), json!({"capability":"unsolicited"})).await;
+            let s = h.start().await.unwrap();
+            assert!(s.turn.prompt.is_none());
+            assert!(h.origin().state.lock().unwrap().endpoint.is_none());
+            h.dispatch(&s.session_id, s.turn, "saved ordinary prompt")
+                .await
+                .unwrap();
+            let observed = h.rpc("fixture/inspect", json!({})).await;
+            assert_eq!(count_requests(&observed, METHOD), 0);
+            assert!(observed["requests"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["method"] == "initialize")
+                .unwrap()["params"]["clientCapabilities"]["_meta"]
+                .is_null());
+            assert!(!h.prompts().await[0].to_string().contains(FACTS));
+            h.finish().await;
+        }
+        let h = NormalHarness::new(None, json!({})).await;
+        h.create_only().await;
+        let origin = h.origin();
+        let row = h.f.stored().await;
+        let p = intent_providers::provider_config("claude-code");
+        assert_eq!(origin.callback_offer(&row, p), CallbackOffer::V1);
+        for changed in [0, 1, 2] {
+            let mut altered = row.clone();
+            match changed {
+                0 => altered.retired_at = Some("2026-09-28T00:00:00Z".into()),
+                1 => altered.workspace_id = intent_core::WorkspaceId::new(),
+                _ => altered.id = intent_core::AgentId::new(),
+            }
+            assert_eq!(origin.callback_offer(&altered, p), CallbackOffer::Disabled);
+        }
+        assert_eq!(
+            origin.callback_offer(&row, intent_providers::provider_config("codex")),
+            CallbackOffer::Disabled
+        );
+        assert_eq!(
+            RepositoryOrigin::unavailable().callback_offer(&row, p),
+            CallbackOffer::Disabled
+        );
+        origin.retire();
+        assert_eq!(origin.callback_offer(&row, p), CallbackOffer::Disabled);
+        h.finish().await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn normal_callback_launch_negotiation_failure_and_timeout_never_acknowledge() {
+        for mode in [
+            "absent",
+            "wrong",
+            "malformed",
+            "initialize-error",
+            "registration-error",
+            "registration-timeout",
+        ] {
+            let options = match mode {
+                "registration-error" => json!({"registration":{"error":"original SDK refusal"}}),
+                "registration-timeout" => json!({"registration":{"hold":true}}),
+                _ => json!({"capability":mode}),
+            };
+            let h = NormalHarness::new(None, options).await;
+            let started = h.start().await;
+            if mode == "initialize-error" {
+                assert!(started.is_err());
+                assert_eq!(h.f.writes().await, 0);
+            } else {
+                let s = started.unwrap();
+                assert!(s.turn.prompt.is_none());
+                h.dispatch(
+                    &s.session_id,
+                    s.turn,
+                    "ordinary despite missing optional registration",
+                )
+                .await
+                .unwrap();
+                assert!(!h.prompts().await[0].to_string().contains(FACTS));
+                let observed = h.rpc("fixture/inspect", json!({})).await;
+                assert_eq!(
+                    count_requests(&observed, METHOD),
+                    usize::from(mode.starts_with("registration-"))
+                );
+                assert_eq!(h.f.writes().await, 1);
+                let denied = h
+                    .call(
+                        0,
+                        "workspace-mcp",
+                        "try{return await ws.pr.snapshot(4)}catch(e){return e.message}",
+                    )
+                    .await;
+                assert!(denied
+                    .to_string()
+                    .contains(crate::repository_read_source::REFUSAL));
+                if mode == "registration-timeout" {
+                    h.rpc("fixture/release", json!({})).await;
+                }
+            }
+            assert!(h.origin().state.lock().unwrap().endpoint.is_none());
+            h.finish().await;
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn normal_callback_launch_load_recreate_and_retry_keep_original_capture() {
+        let h = NormalHarness::new(None, json!({})).await;
+        let first = h.start().await.unwrap();
+        h.dispatch(&first.session_id, first.turn, "warmup")
+            .await
+            .unwrap();
+        let f = h.f.clone();
+        let cwd = h.git.path.clone();
+        let loaded = h
+            .daemon(async move {
+                f.manager
+                    .start_session_owned(
+                        &f.row.id,
+                        cwd,
+                        intent_providers::provider_config("claude-code"),
+                    )
+                    .await
+                    .unwrap()
+            })
+            .await;
+        assert_eq!(loaded.session_id, first.session_id);
+        assert_eq!(h.f.writes().await, 1);
+        h.dispatch(&loaded.session_id, loaded.turn, "loaded")
+            .await
+            .unwrap();
+        h.rpc(
+            "fixture/fail-load",
+            json!({"error":"lost original session"}),
+        )
+        .await;
+        let f = h.f.clone();
+        let cwd = h.git.path.clone();
+        let fresh = h
+            .daemon(async move {
+                f.manager
+                    .start_session_owned(
+                        &f.row.id,
+                        cwd,
+                        intent_providers::provider_config("claude-code"),
+                    )
+                    .await
+                    .unwrap()
+            })
+            .await;
+        assert_ne!(fresh.session_id, first.session_id);
+        assert_eq!(h.f.writes().await, 2);
+        h.dispatch(&fresh.session_id, fresh.turn, "new warmup")
+            .await
+            .unwrap();
+        h.rpc(
+            "fixture/faults",
+            json!({"errors":["Internal error: fetch failed (ECONNRESET)"]}),
+        )
+        .await;
+        h.dispatch(&fresh.session_id, h.capture().await, "ordinary retry")
+            .await
+            .unwrap();
+        let prompts = h.prompts().await;
+        assert_eq!(prompts.len(), 5);
+        assert_ne!(prompts[3]["id"], prompts[4]["id"]);
+        assert!(prompts.iter().all(|p| p.to_string().contains(FACTS)));
+        h.rpc(
+            "fixture/fail-load",
+            json!({"error":"Authentication required: please run claude auth login"}),
+        )
+        .await;
+        let f = h.f.clone();
+        let cwd = h.git.path.clone();
+        let denied = h
+            .daemon(async move {
+                f.manager
+                    .start_session_owned(
+                        &f.row.id,
+                        cwd,
+                        intent_providers::provider_config("claude-code"),
+                    )
+                    .await
+            })
+            .await;
+        assert!(denied.is_err());
+        assert_eq!(h.f.writes().await, 2);
+        let observed = h.rpc("fixture/inspect", json!({})).await;
+        assert_eq!(count_requests(&observed, "session/new"), 2);
+        assert_eq!(count_requests(&observed, "session/load"), 3);
+        h.finish().await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn normal_callback_launch_optional_and_required_keep_completed_effect_truth() {
+        for required in [false, true] {
+            let h = NormalHarness::new(None, json!({})).await;
+            h.create_only().await;
+            let control = Arc::new(NativeControl::default());
+            h.decorate(control.clone());
+            h.start().await.unwrap();
+            let name = h.confirmed(0).await;
+            let zero = h.call(0, &name, "return 'authentic zero';").await;
+            assert!(
+                zero.to_string().contains("authentic zero") && zero.to_string().contains(FACTS)
+            );
+            let gate = control.at(Boundary::TcpResponse, false);
+            let conn = h.connection();
+            let task = tokio::spawn(async move {
+                conn.request_timeout("fixture/call",json!({"query":0,"name":name,"code":"await ws.workspace.setStatusMessage('completed original effect'); await ws.pr.snapshot(4); return 'completed private result';"}),WAIT).await.unwrap()
+            });
+            gate.reached().await;
+            if required {
+                h.select(RepositorySelectionChange::ExplicitRemote {
+                    remote_name: "gone-now".into(),
+                })
+                .await;
+            } else {
+                h.auth
+                    .registry
+                    .apply(&[("git.autoCommit".into(), json!(false))])
+                    .unwrap();
+            }
+            gate.release.add_permits(1);
+            let result = task.await.unwrap();
+            assert!(!result.to_string().contains(FACTS), "{result}");
+            assert_eq!(
+                result.to_string().contains("completed private result"),
+                !required,
+                "{result}"
+            );
+            assert_eq!(
+                h.original
+                    .store
+                    .get_workspace(&h.f.row.workspace_id)
+                    .await
+                    .unwrap()
+                    .status_message
+                    .as_deref(),
+                Some("completed original effect")
+            );
+            if required {
+                assert!(result
+                    .to_string()
+                    .contains("Private result delivery refused"));
+                h.select(RepositorySelectionChange::Automatic).await;
+                let failed = h
+                    .call(
+                        0,
+                        &h.confirmed(0).await,
+                        "for(let i=0;i<64;i++){try{await ws.pr.snapshot(4)}catch(e){}} return 'caught is not zero';",
+                    )
+                    .await;
+                assert!(failed
+                    .to_string()
+                    .contains("Private result delivery refused"));
+                assert!(!failed.to_string().contains("caught is not zero"));
+                assert!(!failed.to_string().contains(FACTS));
+            }
+            h.finish().await;
+        }
+    }
+
+    // Direct bounded-preparation companion on a normally launched owner. The
+    // ordinary Services settings reads intentionally precede the held snapshot.
+    #[intent_test_macros::daemon_test]
+    async fn normal_callback_launch_budget_omits_only_guidance_and_drains_owned_job() {
+        let h = NormalHarness::new(None, json!({})).await;
+        let mut started = h.start().await.unwrap();
+        let owner = h
+            .origin()
+            .state
+            .lock()
+            .unwrap()
+            .endpoint
+            .as_ref()
+            .unwrap()
+            .live
+            .as_ref()
+            .unwrap()
+            .owner
+            .as_ref()
+            .unwrap()
+            .clone();
+        let held = crate::repository_context_live::tests::BlockingHold::new();
+        let registry = h.auth.registry.clone();
+        let block = held.clone();
+        let holder = tokio::task::spawn_blocking(move || {
+            registry.context_hold_snapshot_for_test(|| block.wait());
+        });
+        held.reached().await;
+        h.daemon(async move {
+            let guidance = started.turn.prompt.as_mut().unwrap().prepare().await;
+            assert!(guidance.is_none());
+            intent_acp::session::prompt_with_guidance(
+                &started.turn.connection,
+                &started.session_id,
+                serde_json::from_value(
+                    json!([{"type":"text","text":"base after actual H budget"}]),
+                )
+                .unwrap(),
+                &intent_acp::session::ActivityTracker::new(),
+                guidance,
+            )
+            .await
+            .unwrap();
+        })
+        .await;
+        assert!(!h.prompts().await[0].to_string().contains(FACTS));
+        h.origin().interrupt_requests();
+        let mut drain = Box::pin(owner.drain_jobs());
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(drain.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        held.release();
+        holder.await.unwrap();
+        tokio::time::timeout(WAIT, drain).await.unwrap();
+        assert_eq!(h.http.count(), 0);
+        h.finish().await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn normal_callback_launch_retirement_keeps_original_registration_and_prompt() {
+        let h = NormalHarness::new(None, json!({"registration":{"hold":true}})).await;
+        h.create_only().await;
+        let original = h.origin();
+        let f = h.f.clone();
+        let start = tokio::spawn(async move {
+            f.manager
+                .ensure_started_owned(&f.row.id, &f.row.workspace_id)
+                .await
+        });
+        h.rpc("fixture/entered", json!({})).await;
+        original.retire();
+        h.rpc("fixture/release", json!({})).await;
+        let s = start.await.unwrap().unwrap();
+        assert!(s.turn.prompt.is_none());
+        assert!(original.state.lock().unwrap().endpoint.is_none());
+        h.f.manager.kill_child_only(&h.f.row.id).await;
+        std::fs::write(h.scratch.path().join("controls.json"), "{}").unwrap();
+        let fresh = h.start().await.unwrap();
+        assert!(!Arc::ptr_eq(&original, &h.origin()));
+        let turn = h.capture().await;
+        let notes = turn.notifications.clone();
+        let locked = notes.lock().await;
+        let f = h.f.clone();
+        let id = fresh.session_id.clone();
+        let conn = turn.connection.clone();
+        let task = intent_core::spawn_daemon(crate::host_execution::background_execution(
+            h.original.as_ref().clone(),
+            None,
+            async move {
+                f.manager
+                    .run_turn_owned(
+                        &f.row.id,
+                        &f.row.workspace_id,
+                        &id,
+                        serde_json::from_value(
+                            json!([{"type":"text","text":"captured before retirement"}]),
+                        )
+                        .unwrap(),
+                        None,
+                        turn,
+                    )
+                    .await
+            },
+        ));
+        h.origin().retire();
+        drop(locked);
+        task.await.unwrap().unwrap();
+        assert!(Arc::ptr_eq(&conn, &h.connection()));
+        let prompts = h.prompts().await;
+        assert_eq!(prompts.len(), 1);
+        assert!(!prompts[0].to_string().contains(FACTS));
+        assert_eq!(prompts[0]["params"]["sessionId"], fresh.session_id);
+        h.finish().await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn normal_callback_launch_settings_resolution_preserves_fallback_and_disabled_provider() {
+        for supplied in ["valid", "relative-invalid", "absent"] {
+            let h = NormalHarness::new(None, json!({})).await;
+            let value = match supplied {
+                "valid" => json!({"claude-code":h.launcher}),
+                "absent" => json!({}),
+                _ => json!({"claude-code":supplied}),
+            };
+            h.auth
+                .registry
+                .apply(&[("providers.paths".into(), value)])
+                .unwrap();
+            let row = h.f.stored().await;
+            let settings = h.original.effective_settings();
+            let r =
+                crate::agent_manager::resolve_spawn(&row, Some(&h.git.workspace), &settings, None)
+                    .unwrap();
+            if supplied == "valid" {
+                assert_eq!(r.provider_binary.as_ref(), Some(&h.launcher));
+                assert!(r.npx_fallback_binary.is_none());
+                continue;
+            }
+            assert!(r.provider_binary.is_none());
+            let binary = r.npx_fallback_binary.unwrap();
+            assert!(
+                binary.starts_with(std::env::var("NORMAL_CALLBACK_TEST_BIN").unwrap()),
+                "only the confined stub may run"
+            );
+            assert_eq!(
+                r.npx_fallback_package,
+                Some(intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE)
+            );
+            // Exercise the unchanged normal manager spawn, including the npx
+            // version gate and neutral cwd. The confined stub records argv and
+            // exits; it never installs or pretends to be an ACP adapter.
+            assert!(h.start().await.is_err());
+            let conn = h.connection();
+            let observed = tokio::time::timeout(WAIT, async {
+                loop {
+                    if let Some(value) = conn
+                        .recent_stderr()
+                        .iter()
+                        .find_map(|line| serde_json::from_str::<Value>(line).ok())
+                    {
+                        break value;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                observed["args"],
+                json!([
+                    "--workspaces=false",
+                    "-y",
+                    intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE
+                ])
+            );
+            let cwd = PathBuf::from(observed["cwd"].as_str().unwrap());
+            assert!(cwd.starts_with(h.scratch.path().join("configs")));
+            assert!(cwd
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with(intent_core::NPX_LAUNCH_DIR_PREFIX));
+            assert_ne!(cwd, h.git.path);
+            assert_eq!(
+                observed["sentinel"],
+                json!({"name":"intentd-npx-launch","private":true})
+            );
+            assert!(h.origin().state.lock().unwrap().endpoint.is_none());
+            assert_eq!(h.f.writes().await, 0);
+            assert!(!h.scratch.path().join("launches.jsonl").exists());
+            h.finish().await;
+        }
+        let h = NormalHarness::new(None, json!({})).await;
+        h.auth.registry.apply(&[("providers.enabled".into(),json!({"claude-code":false,"auggie":false,"codex":false,"opencode":false,"unsloth":false,"pi":false,"droid":false,"grok":false,"antigravity":false}))]).unwrap();
+        assert!(h.start().await.is_err());
+        assert!(!h.f.manager.contains(&h.f.row.id));
+        assert!(!h.scratch.path().join("launches.jsonl").exists());
     }
 }

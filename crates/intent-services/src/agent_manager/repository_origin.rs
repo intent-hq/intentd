@@ -83,6 +83,12 @@ impl RepositoryOrigin {
                 agent: session.id.clone(),
             }),
             state: Mutex::new(State {
+                callback_offer: if session.harness_version == "3.0" && session.retired_at.is_none()
+                {
+                    CallbackOffer::V1
+                } else {
+                    CallbackOffer::Disabled
+                },
                 creation_retirements: vec![creator.retirement()],
                 pending: Some((intent, creator)),
                 ..State::default()
@@ -191,13 +197,22 @@ impl RepositoryOrigin {
         session: &AgentSession,
         provider: &intent_providers::ProviderConfig,
     ) -> CallbackOffer {
-        // The private production policy is always Default::default() (Disabled).
-        // Only disposable tests set V1; a future selector needs a separate release.
-        if session.harness_version == "3.0" && provider.id == "claude-code" {
-            let state = self.state.lock().unwrap();
-            if state.blueprint.is_some() {
-                return state.callback_offer;
-            }
+        // Offering the extension grants no authority. The original physical
+        // confirmation, caller, read anchor and final admission remain required.
+        let Some(original) = &self.original else {
+            return CallbackOffer::Disabled;
+        };
+        if session.harness_version != "3.0"
+            || session.retired_at.is_some()
+            || session.id != original.agent
+            || session.workspace_id != original.workspace
+            || provider.id != "claude-code"
+        {
+            return CallbackOffer::Disabled;
+        }
+        let state = self.state.lock().unwrap();
+        if !state.retired && state.blueprint.is_some() {
+            return state.callback_offer;
         }
         CallbackOffer::Disabled
     }
