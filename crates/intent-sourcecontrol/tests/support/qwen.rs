@@ -37,6 +37,9 @@ pub enum CheckFault {
 
 pub struct State {
     pub title: String,
+    pub base_branch: String,
+    pub rules_status: u16,
+    pub rules: Value,
     pub pr: Value,
     pub nodes: Vec<Value>,
     pub mode: ReadMode,
@@ -67,6 +70,9 @@ impl State {
         assert_eq!(nodes.len(), if number == 10978 { 40 } else { 136 });
         Self {
             title: "Qwen captured checks".into(),
+            base_branch: "main".into(),
+            rules_status: 200,
+            rules: json!([]),
             pr,
             nodes,
             mode: ReadMode::Folded,
@@ -87,7 +93,7 @@ impl State {
         pr["body"] = json!("");
         pr["isDraft"] = json!(false);
         pr["headRefName"] = json!("fixture");
-        pr["baseRefName"] = json!("main");
+        pr["baseRefName"] = json!(self.base_branch);
         pr["author"] = json!({"login": "fixture"});
         pr["mergeable"] = json!("MERGEABLE");
         pr["isInMergeQueue"] = json!(false);
@@ -253,10 +259,10 @@ impl State {
             };
             return (200, json!({"check_runs": runs}));
         }
-        if target.contains("/rules/branches/")
-            || target.contains("/comments")
-            || target.contains("/reviews")
-        {
+        if target.contains("/rules/branches/") {
+            return (self.rules_status, self.rules.clone());
+        }
+        if target.contains("/comments") || target.contains("/reviews") {
             return (200, json!([]));
         }
         if target.contains("/pulls/") {
