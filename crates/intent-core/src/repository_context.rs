@@ -228,6 +228,15 @@ pub enum SavedReviewSelection {
         target: RepositoryTarget,
         provenance: HistoricalTargetProvenance,
     },
+    /// Retained historical intent whose canonical target has not been proved.
+    /// Producers supply only source/record facts they actually possess; missing
+    /// facts stay absent. Neither these fields nor deserialization prove intent.
+    UnresolvedHistorical {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<HistoricalTargetSource>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        record_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -245,6 +254,7 @@ pub enum ReviewSelectionRequiredReason {
     AmbiguousTargets,
     UnresolvedCandidates,
     MissingSelectedRemote,
+    UnresolvedHistoricalChoice,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -326,6 +336,11 @@ pub fn resolve_review_selection(
                     source: ReviewSelectionSource::MigratedCanonical,
                 }
             }
+            SavedReviewSelection::UnresolvedHistorical { .. } => {
+                ReviewSelectionOutcome::SelectionRequired {
+                    reason: ReviewSelectionRequiredReason::UnresolvedHistoricalChoice,
+                }
+            }
         }
     };
     ReviewSelectionResolution {
@@ -375,6 +390,8 @@ pub enum RepositoryAvailability {
     Disconnected,
     Disabled,
     Unsupported,
+    /// Insufficient verified connection facts, not known absence or denial.
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1162,5 +1179,203 @@ mod tests {
         assert!(value.get("connection").is_none());
         assert!(value.get("providerProjectId").is_none());
         assert_eq!(value["capabilities"][0]["state"], "unavailable");
+    }
+
+    #[test]
+    fn unknown_availability_does_not_invent_connection_or_capability() {
+        let context = RepositoryTargetContext {
+            target: gitlab(),
+            provider_project_id: None,
+            connection: None,
+            availability: RepositoryAvailability::Unknown,
+            capabilities: vec![RepositoryCapability {
+                operation: RepositoryOperation::ReadReview,
+                state: RepositoryCapabilityState::Unknown,
+            }],
+        };
+        let expected = json!({
+            "target": gitlab(), "availability": "unknown",
+            "capabilities": [{"operation": "read-review", "state": "unknown"}]
+        });
+        assert_eq!(serde_json::to_value(&context).unwrap(), expected);
+        assert_eq!(
+            serde_json::from_value::<RepositoryTargetContext>(expected).unwrap(),
+            context
+        );
+    }
+
+    #[test]
+    fn existing_availability_and_saved_selection_wire_forms_stay_exact() {
+        for (availability, expected) in [
+            (RepositoryAvailability::Connected, "connected"),
+            (RepositoryAvailability::Disconnected, "disconnected"),
+            (RepositoryAvailability::Disabled, "disabled"),
+            (RepositoryAvailability::Unsupported, "unsupported"),
+        ] {
+            assert_eq!(serde_json::to_value(availability).unwrap(), json!(expected));
+            assert_eq!(
+                serde_json::from_value::<RepositoryAvailability>(json!(expected)).unwrap(),
+                availability
+            );
+        }
+        for (saved, expected) in [
+            (
+                SavedReviewSelection::Automatic,
+                json!({"mode": "automatic"}),
+            ),
+            (
+                selected("upstream"),
+                json!({"mode": "explicit-remote", "remoteName": "upstream"}),
+            ),
+            (
+                migrated(&gitlab()),
+                json!({
+                    "mode": "migrated-canonical", "target": gitlab(),
+                    "provenance": {
+                        "source": "workspace-metadata", "recordId": "workspace-1",
+                        "resolverVersion": "0.9.112", "evidenceId": "verified-legacy-target-1"
+                    }
+                }),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(&saved).unwrap(), expected);
+            assert_eq!(
+                serde_json::from_value::<SavedReviewSelection>(expected).unwrap(),
+                saved
+            );
+        }
+    }
+
+    #[test]
+    fn unresolved_history_serializes_only_known_source_and_record_facts() {
+        for (source, record_id, expected) in [
+            (None, None, json!({"mode": "unresolved-historical"})),
+            (
+                Some(HistoricalTargetSource::WorkspaceMetadata),
+                Some("workspace-1"),
+                json!({"mode": "unresolved-historical", "source": "workspace-metadata", "recordId": "workspace-1"}),
+            ),
+            (
+                Some(HistoricalTargetSource::RegisteredRootMetadata),
+                Some("root-1"),
+                json!({"mode": "unresolved-historical", "source": "registered-root-metadata", "recordId": "root-1"}),
+            ),
+            (
+                Some(HistoricalTargetSource::WorkspaceMetadata),
+                None,
+                json!({"mode": "unresolved-historical", "source": "workspace-metadata"}),
+            ),
+            (
+                None,
+                Some("retained-record"),
+                json!({"mode": "unresolved-historical", "recordId": "retained-record"}),
+            ),
+        ] {
+            let saved = SavedReviewSelection::UnresolvedHistorical {
+                source,
+                record_id: record_id.map(str::to_owned),
+            };
+            assert_eq!(serde_json::to_value(&saved).unwrap(), expected);
+            let restored: SavedReviewSelection = serde_json::from_value(expected).unwrap();
+            assert_eq!(restored, saved);
+            let resolution =
+                resolve_review_selection(&restored, &[remote("origin", &gitlab())], None);
+            assert_eq!(resolution.saved, saved);
+            assert_eq!(
+                serde_json::to_value(resolution.outcome).unwrap(),
+                json!({"state": "selection-required", "reason": "unresolved-historical-choice"})
+            );
+        }
+    }
+
+    #[test]
+    fn unresolved_history_never_heals_from_current_fetch_or_push_inventory() {
+        let saved = SavedReviewSelection::UnresolvedHistorical {
+            source: Some(HistoricalTargetSource::WorkspaceMetadata),
+            record_id: Some("workspace-1".into()),
+        };
+        for remotes in [
+            vec![remote("origin", &gitlab())],
+            vec![remote("renamed", &gitlab())],
+            vec![remote("origin", &gitlab()), remote("added", &gitlab())],
+            vec![remote("origin", &gitlab()), remote("added", &github("o/r"))],
+            vec![RepositoryRemote {
+                name: "origin".into(),
+                fetch: vec![],
+                push: vec![endpoint(&gitlab())],
+            }],
+            vec![RepositoryRemote {
+                name: "origin".into(),
+                fetch: vec![endpoint(&github("o/r"))],
+                push: vec![endpoint(&gitlab())],
+            }],
+        ] {
+            let resolution = resolve_review_selection(&saved, &remotes, None);
+            assert!(!resolution.no_remotes);
+            assert_eq!(resolution.saved, saved);
+            assert_required(
+                &resolution,
+                ReviewSelectionRequiredReason::UnresolvedHistoricalChoice,
+            );
+        }
+    }
+
+    #[test]
+    fn unresolved_history_without_remotes_retains_required_choice() {
+        let saved = SavedReviewSelection::UnresolvedHistorical {
+            source: None,
+            record_id: None,
+        };
+        let resolution = resolve_review_selection(&saved, &[], None);
+        assert_eq!(resolution.saved, saved);
+        assert!(resolution.no_remotes);
+        assert_eq!(
+            resolution.outcome,
+            ReviewSelectionOutcome::RepositoryUnavailable {
+                reason: RepositoryUnavailableReason::NoRemote,
+                selection_required: true,
+            }
+        );
+    }
+
+    #[test]
+    fn unresolved_history_allows_per_call_override_without_rewriting_saved_intent() {
+        let saved = SavedReviewSelection::UnresolvedHistorical {
+            source: Some(HistoricalTargetSource::RegisteredRootMetadata),
+            record_id: Some("root-1".into()),
+        };
+        for remotes in [vec![], vec![remote("origin", &github("o/r"))]] {
+            let before = resolve_review_selection(&saved, &remotes, None);
+            let explicit = resolve_review_selection(&saved, &remotes, Some(&gitlab()));
+            assert_target(&explicit, &gitlab(), ReviewSelectionSource::ExplicitCall);
+            assert_eq!(explicit.saved, saved);
+            assert_eq!(explicit.no_remotes, remotes.is_empty());
+            assert_eq!(before, resolve_review_selection(&saved, &remotes, None));
+        }
+    }
+
+    #[test]
+    fn unresolved_history_requires_explicit_reset_to_restore_automatic_selection() {
+        let mut saved = SavedReviewSelection::UnresolvedHistorical {
+            source: None,
+            record_id: None,
+        };
+        let remotes = [remote("origin", &gitlab())];
+        assert_required(
+            &resolve_review_selection(&saved, &remotes, None),
+            ReviewSelectionRequiredReason::UnresolvedHistoricalChoice,
+        );
+        saved = SavedReviewSelection::Automatic;
+        let resolution = resolve_review_selection(&saved, &remotes, None);
+        assert_target(&resolution, &gitlab(), ReviewSelectionSource::Automatic);
+        assert_eq!(resolution.saved, SavedReviewSelection::Automatic);
+        assert_required(
+            &resolve_review_selection(
+                &saved,
+                &[remotes[0].clone(), remote("upstream", &github("o/r"))],
+                None,
+            ),
+            ReviewSelectionRequiredReason::AmbiguousTargets,
+        );
     }
 }
