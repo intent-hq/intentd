@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import resource
+import select
 import selectors
 import signal
 import socket
@@ -105,21 +106,137 @@ def process_state(pid):
     try:
         raw = Path(f"/proc/{pid}/stat").read_text()
         parts = raw[raw.rfind(")") + 2:].split()
-        return {"start": parts[19], "state": parts[0]}
+        return {"start": parts[19], "state": parts[0], "parent": int(parts[1])}
     except (OSError, IndexError):
         return None
 
-def collect_children(pid, found):
-    state = process_state(pid)
-    if state is None:
-        return
-    found[pid] = state["start"]
-    try:
-        children = Path(f"/proc/{pid}/task/{pid}/children").read_text().split()
-    except OSError:
-        return
-    for child in children:
-        collect_children(int(child), found)
+class OriginalProcessTree:
+    """Own an unreaped Popen root and pidfds, never reusable numeric identities.
+
+    The root is not polled/reaped until all group signals finish. Its reserved
+    PID therefore pins its original process-group number. Sampled descendants
+    use pidfds exclusively, including children which leave that group. The CLI
+    additionally owns bwrap's PID namespace; its teardown covers unsampled
+    namespace members. Samples alone are not a census of arbitrary escaped trees.
+    """
+    def __init__(self, root):
+        self.root = root
+        self.seen = {}
+        self.handles = {}
+        self.closed = False
+        self.live = []
+        self.error = None
+
+    @staticmethod
+    def exited_handle(fd):
+        return bool(select.select([fd], [], [], 0)[0])
+
+    def root_exited(self):
+        # WNOWAIT keeps even an already-exited child allocated until finish().
+        try:
+            return os.waitid(os.P_PID, self.root.pid,
+                             os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+        except ChildProcessError as error:
+            raise Refusal("original child ownership was lost before cleanup") from error
+
+    def capture_root(self):
+        self.root_exited()
+        fd = os.pidfd_open(self.root.pid)
+        try:
+            self.root_exited()
+            state = process_state(self.root.pid)
+            require(state is not None, "original child observation missing")
+        except BaseException:
+            os.close(fd)
+            raise
+        self.handles[self.root.pid] = fd
+        self.seen[self.root.pid] = state["start"]
+
+    def sample(self, pid=None):
+        pid = self.root.pid if pid is None else pid
+        parent_fd = self.handles.get(pid)
+        if parent_fd is None or self.exited_handle(parent_fd):
+            return
+        state = process_state(pid)
+        if state is None or state["start"] != self.seen.get(pid):
+            return  # Never overwrite or traverse a reappearing numeric identity.
+        try:
+            children = Path(f"/proc/{pid}/task/{pid}/children").read_text().split()
+        except OSError:
+            return
+        for value in children:
+            child = int(value)
+            if child not in self.seen:
+                if self.exited_handle(parent_fd):
+                    return
+                try:
+                    fd = os.pidfd_open(child)
+                except ProcessLookupError:
+                    continue
+                try:
+                    observed = process_state(child)
+                    # Both original handles must still be live around the PPID
+                    # observation. Thus the observed parent number still denotes
+                    # this retained parent, not a recycled parent/child chain.
+                    if (observed is None or observed["parent"] != pid
+                            or self.exited_handle(fd) or self.exited_handle(parent_fd)):
+                        continue
+                    self.handles[child] = fd
+                    self.seen[child] = observed["start"]
+                finally:
+                    if self.handles.get(child) != fd:
+                        os.close(fd)
+            self.sample(child)
+
+    def finish(self):
+        if self.closed:
+            if self.error is not None:
+                raise self.error
+            return list(self.live)
+        lost = False
+        sampling_error = None
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM})
+        try:
+            try:
+                self.sample()
+            except BaseException as error:
+                sampling_error = error  # Teardown is still mandatory on sampling failure.
+            try:
+                self.root_exited()
+            except Refusal:
+                lost = True
+            if not lost:
+                # No poll/wait occurred: the original root still reserves PGID.
+                try:
+                    os.killpg(self.root.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            for fd in self.handles.values():
+                try:
+                    signal.pidfd_send_signal(fd, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass  # The ORIGINAL handle exited; never select a new PID.
+            require(not lost, "original child ownership was lost before cleanup")
+            self.root.wait(timeout=3)
+            until = time.monotonic() + 1
+            while True:
+                self.live = [pid for pid, fd in self.handles.items()
+                             if not self.exited_handle(fd)]
+                if not self.live or time.monotonic() >= until:
+                    break
+                time.sleep(.01)
+            if sampling_error is not None:
+                raise sampling_error
+            return list(self.live)
+        except BaseException as error:
+            self.error = error
+            raise
+        finally:
+            for fd in self.handles.values():
+                os.close(fd)
+            self.handles.clear()
+            self.closed = True
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 def process_limit():
     # RLIMIT_NPROC counts the shared host UID's threads, not just this tree.
@@ -148,19 +265,23 @@ def run_bounded(command, seconds, cap=OUTPUT_LIMIT):
     """Private execution primitive; public CLI never accepts a command/binary."""
     started = time.monotonic()
     nproc = process_limit()
+    require(signal.getsignal(signal.SIGCHLD) == signal.SIG_DFL,
+            "original child ownership requires default SIGCHLD handling")
     child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, env=OUTER_ENV, start_new_session=True,
                              preexec_fn=lambda: limits(nproc))
-    seen, chunks = {}, {"stdout": bytearray(), "stderr": bytearray()}
+    owner = OriginalProcessTree(child)
+    chunks = {"stdout": bytearray(), "stderr": bytearray()}
     reason = "exited"
     try:
+        owner.capture_root()
         with selectors.DefaultSelector() as selector:
             for name in chunks:
                 stream = getattr(child, name)
                 os.set_blocking(stream.fileno(), False)
                 selector.register(stream, selectors.EVENT_READ, name)
-            while selector.get_map() or child.poll() is None:
-                collect_children(child.pid, seen)
+            while selector.get_map() or not owner.root_exited():
+                owner.sample()
                 if time.monotonic() - started > seconds:
                     reason = "deadline"
                     break
@@ -179,35 +300,17 @@ def run_bounded(command, seconds, cap=OUTPUT_LIMIT):
     except KeyboardInterrupt:
         reason = "cancelled"
     finally:
-        collect_children(child.pid, seen)
         try:
-            os.killpg(child.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        for pid, start in seen.items():
-            state = process_state(pid)
-            if state and state["start"] == start and state["state"] != "Z":
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-        child.wait(timeout=3)
-        child.stdout.close()
-        child.stderr.close()
-    live = []
-    until = time.monotonic() + 1
-    while True:
-        live = [pid for pid, start in seen.items()
-                if (state := process_state(pid)) and state["start"] == start and state["state"] != "Z"]
-        if not live or time.monotonic() >= until:
-            break
-        time.sleep(0.01)
+            live = owner.finish()
+        finally:
+            child.stdout.close()
+            child.stderr.close()
     return {"command": command, "outer_environment": OUTER_ENV, "returncode": child.returncode,
             "uid_thread_limit": nproc,
             "reason": reason, "elapsed_seconds": time.monotonic() - started,
             "stdout": chunks["stdout"].decode("utf-8", errors="replace"),
             "stderr": chunks["stderr"].decode("utf-8", errors="replace"),
-            "observed_original_processes": {str(k): v for k, v in seen.items()},
+            "observed_original_processes": {str(k): v for k, v in owner.seen.items()},
             "live_original_processes_after_cleanup": live}
 
 INERT = r"""

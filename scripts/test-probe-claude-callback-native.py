@@ -9,6 +9,9 @@ import json
 import os
 from pathlib import Path
 import selectors
+import signal
+import subprocess
+import time
 import sys
 import tempfile
 import unittest
@@ -23,6 +26,8 @@ class ProbeTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="native-runner-inert-")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        budget = patch.object(probe, "process_limit", return_value=4096)
+        budget.start(); self.addCleanup(budget.stop)
 
     def args(self):
         return argparse.Namespace(case="containment", output=self.root / "result", bundle=None,
@@ -164,6 +169,247 @@ class ProbeTests(unittest.TestCase):
                                         "import time;time.sleep(20)"], 2)
         self.assertEqual(result["reason"], "cancelled")
         self.assertFalse(result["live_original_processes_after_cleanup"])
+
+
+class CleanupOwnershipTests(unittest.TestCase):
+    """Only original inert children are real; numeric reuse is instrumented."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="native-cleanup-inert-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        budget = patch.object(probe, "process_limit", return_value=4096)
+        budget.start(); self.addCleanup(budget.stop)
+
+    @staticmethod
+    def command(code):
+        return ["/usr/bin/python3", "-I", "-S", "-B", "-c", code]
+
+    def test_reaped_root_reappearance_is_never_adopted_or_signalled(self):
+        real_popen = subprocess.Popen
+        state = {"reaped": False}
+        original = {}
+        signals = []
+
+        class Original:
+            def __init__(self, child):
+                self.child = child
+                self.pid, self.stdout, self.stderr = child.pid, child.stdout, child.stderr
+            @property
+            def returncode(self):
+                return self.child.returncode
+            def poll(self):
+                value = self.child.poll()
+                if value is not None:
+                    state["reaped"] = True
+                return value
+            def wait(self, timeout=None):
+                value = self.child.wait(timeout=timeout)
+                state["reaped"] = True
+                return value
+
+        def start(*args, **kwargs):
+            child = real_popen(*args, **kwargs)
+            original["child"] = child
+            until = time.monotonic() + 2
+            while os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None:
+                if time.monotonic() >= until:
+                    raise AssertionError("inert original did not exit")
+                time.sleep(.005)
+            return Original(child)
+
+        def observed(pid):
+            self.assertEqual(pid, original["child"].pid)
+            return {"start": "replacement-root" if state["reaped"] else "original-root",
+                    "state": "S" if state["reaped"] else "Z", "parent": os.getpid()}
+
+        try:
+            with patch.object(probe.subprocess, "Popen", side_effect=start), \
+                 patch.object(probe, "process_state", side_effect=observed), \
+                 patch.object(probe.os, "killpg", side_effect=lambda pid, sig: signals.append(("group", pid, state["reaped"]))), \
+                 patch.object(probe.os, "kill", side_effect=lambda pid, sig: signals.append(("pid", pid, state["reaped"]))):
+                result = probe.run_bounded(self.command("pass"), 1)
+            self.assertEqual(result["returncode"], 0)
+            self.assertFalse([x for x in signals if x[2]], "cleanup selected the simulated replacement allocation")
+            self.assertEqual(result["observed_original_processes"],
+                             {str(original["child"].pid): "original-root"})
+        finally:
+            if "child" in original:
+                original["child"].wait(timeout=2)
+
+    def test_sampled_descendant_identity_is_immutable_and_signals_use_owned_handles(self):
+        real_popen, real_state = subprocess.Popen, probe.process_state
+        real_select, real_killpg = selectors.EpollSelector.select, os.killpg
+        ready = self.root / "ready"
+        original = {}
+        phase = {"replacement": False}
+        numeric_signals = []
+
+        def start(*args, **kwargs):
+            child = real_popen(*args, **kwargs)
+            original["root"] = child
+            until = time.monotonic() + 2
+            while not ready.exists() or not ready.read_text().strip():
+                if time.monotonic() >= until:
+                    raise AssertionError("inert descendant did not become ready")
+                time.sleep(.005)
+            pid = int(ready.read_text())
+            original["descendant"] = pid
+            original["fd"] = os.pidfd_open(pid)
+            original["start"] = real_state(pid)["start"]
+            return child
+
+        def observed(pid):
+            value = real_state(pid)
+            if pid == original.get("descendant") and value is not None and phase["replacement"]:
+                return {**value, "start": "simulated-replacement-child"}
+            return value
+
+        def select(selector, timeout=None):
+            result = real_select(selector, timeout)
+            # The real loop samples its original children before its first select.
+            phase["replacement"] = True
+            return result
+
+        def group(pid, sig):
+            self.assertEqual(pid, original["root"].pid)
+            real_killpg(pid, sig)
+
+        code = ("import os,time; child=os.fork(); "
+                + "\nif child==0:\n os.setsid()\n open(" + repr(str(ready)) + ", 'w').write(str(os.getpid()))"
+                + "\ntime.sleep(20)")
+        try:
+            with patch.object(probe.subprocess, "Popen", side_effect=start), \
+                 patch.object(probe, "process_state", side_effect=observed), \
+                 patch.object(selectors.EpollSelector, "select", select), \
+                 patch.object(probe.os, "killpg", side_effect=group), \
+                 patch.object(probe.os, "kill", side_effect=lambda pid, sig: numeric_signals.append(pid)):
+                result = probe.run_bounded(self.command(code), .12)
+            self.assertEqual(result["reason"], "deadline")
+            self.assertEqual(result["observed_original_processes"].get(str(original["descendant"])),
+                             original["start"], "sampled original identity was overwritten")
+            self.assertFalse(numeric_signals, "descendant cleanup used a reusable numeric PID")
+            self.assertFalse(result["live_original_processes_after_cleanup"])
+        finally:
+            # This test-owned pidfd always identifies the actual inert child;
+            # simulated replacement PIDs are NEVER sent a real signal.
+            if "fd" in original:
+                try:
+                    signal.pidfd_send_signal(original["fd"], signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                os.close(original["fd"])
+            child = original.get("root")
+            if child is not None:
+                if child.returncode is None:
+                    try:
+                        real_killpg(child.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                child.wait(timeout=2)
+
+    def test_normal_and_already_exited_originals_join_without_rebinding(self):
+        for code in ("pass", "print('original',flush=True)", "pass"):
+            with self.subTest(code=code):
+                result = probe.run_bounded(self.command(code), 2)
+                self.assertEqual((result["reason"], result["returncode"]), ("exited", 0))
+                self.assertFalse(result["live_original_processes_after_cleanup"])
+
+    def test_closed_pipes_keep_original_alive_until_completion_or_deadline(self):
+        for duration, budget, expected in ((.08, 2, "exited"), (20, .12, "deadline")):
+            with self.subTest(expected=expected):
+                result = probe.run_bounded(self.command(
+                    f"import os,time;os.close(1);os.close(2);time.sleep({duration})"), budget)
+                self.assertEqual(result["reason"], expected)
+                self.assertFalse(result["live_original_processes_after_cleanup"])
+                if expected == "exited":
+                    self.assertEqual(result["returncode"], 0)
+                    self.assertGreaterEqual(result["elapsed_seconds"], .07)
+
+    def test_repeated_cleanup_is_idempotent_and_closes_owned_handles(self):
+        child = subprocess.Popen(self.command("import time;time.sleep(20)"),
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 env=probe.OUTER_ENV, start_new_session=True)
+        owner = probe.OriginalProcessTree(child)
+        handles = []
+        try:
+            owner.capture_root()
+            handles = list(owner.handles.values())
+            real_killpg = os.killpg
+            with patch.object(probe.os, "killpg", wraps=real_killpg) as signal_group:
+                self.assertEqual(owner.finish(), [])
+                self.assertEqual(owner.finish(), [])
+            self.assertEqual(signal_group.call_count, 1)
+            self.assertTrue(owner.closed)
+            self.assertEqual(owner.handles, {})
+            for fd in handles:
+                with self.assertRaises(OSError):
+                    os.fstat(fd)
+        finally:
+            owner.finish()
+            child.stdout.close(); child.stderr.close()
+
+    def test_exception_after_handle_capture_closes_and_joins_original(self):
+        real_open = os.pidfd_open
+        handles = []
+        def opened(pid, flags=0):
+            fd = real_open(pid, flags); handles.append(fd); return fd
+        with patch.object(probe.os, "pidfd_open", side_effect=opened), \
+             patch.object(selectors.EpollSelector, "register", side_effect=RuntimeError("inert selector fixture")):
+            with self.assertRaisesRegex(RuntimeError, "inert selector fixture"):
+                probe.run_bounded(self.command("import time;time.sleep(20)"), 2)
+        self.assertTrue(handles)
+        for fd in handles:
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+
+    def test_sampling_failure_still_joins_and_repeated_cleanup_retains_failure(self):
+        child = subprocess.Popen(self.command("import time;time.sleep(20)"),
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 env=probe.OUTER_ENV, start_new_session=True)
+        owner = probe.OriginalProcessTree(child)
+        error = RuntimeError("inert sample failure")
+        try:
+            owner.capture_root()
+            handles = list(owner.handles.values())
+            real_killpg = os.killpg
+            with patch.object(owner, "sample", side_effect=error), \
+                 patch.object(probe.os, "killpg", wraps=real_killpg) as group:
+                for _ in range(2):
+                    with self.assertRaises(RuntimeError) as raised:
+                        owner.finish()
+                    self.assertIs(raised.exception, error)
+            self.assertEqual(group.call_count, 1)
+            self.assertIsNotNone(child.returncode)
+            self.assertTrue(owner.closed)
+            self.assertFalse(owner.handles)
+            for fd in handles:
+                with self.assertRaises(OSError):
+                    os.fstat(fd)
+        finally:
+            child.stdout.close(); child.stderr.close()
+
+    def test_unvalidated_root_handle_is_closed_without_becoming_owned(self):
+        child = subprocess.Popen(self.command("import time;time.sleep(20)"),
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 env=probe.OUTER_ENV, start_new_session=True)
+        owner = probe.OriginalProcessTree(child)
+        real_open = os.pidfd_open
+        opened = []
+        def capture(pid, flags=0):
+            fd = real_open(pid, flags); opened.append(fd); return fd
+        try:
+            with patch.object(owner, "root_exited", side_effect=[False, probe.Refusal("inert lost child")]), \
+                 patch.object(probe.os, "pidfd_open", side_effect=capture):
+                with self.assertRaisesRegex(probe.Refusal, "inert lost child"):
+                    owner.capture_root()
+            self.assertEqual(owner.handles, {})
+            self.assertEqual(owner.seen, {})
+            for fd in opened:
+                with self.assertRaises(OSError):
+                    os.fstat(fd)
+        finally:
+            owner.finish()
+            child.stdout.close(); child.stderr.close()
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
