@@ -408,12 +408,14 @@ mod read_owner {
                         (Err(AdmissionError::Retired), Err(AdmissionError::Retired)),
                         "escaped metadata must not outlive the final MCP scope"
                     );
-                    assert_eq!(
-                        original_source
-                            .retirement()
-                            .dispatch(|| Ok("late transfer")),
+                    assert!(matches!(
+                        original_source.subscribe(
+                            f.services.store(),
+                            &caller(&f),
+                            &[RepositoryLifecycleKey::Database],
+                        ),
                         Err(AdmissionError::Retired)
-                    );
+                    ));
                     assert!(sibling_read.check_current().is_ok());
                     assert!(read(&sibling, caller(&f)).await.is_ok());
                     let fresh = McpRequestContext::capture(&callback);
