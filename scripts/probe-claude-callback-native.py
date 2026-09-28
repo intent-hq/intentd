@@ -41,12 +41,15 @@ ENV = {"HOME": "/home/probe", "XDG_CONFIG_HOME": "/home/probe/.config",
        "DISABLE_ERROR_REPORTING": "1"}
 OUTER_ENV = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
 OUTPUT_LIMIT = 262144
-SERVICES_PREPARATION = Path("/home/clement/intent/workspaces/ideate-future/intent/.dev/slice-b/harness-native-startup-retirement/.dev/preparation")
+SERVICES_PREPARATION = Path("/home/clement/intent/workspaces/ideate-future/intent/.dev/slice-b/harness-native-startup-eventual-refusal/.dev/preparation")
 SERVICES_ELF = SERVICES_PREPARATION / "artifacts/intent-services-lib-test"
-SERVICES_SHA = "aebd0567579151162795198719f4ff19184b4efd1e9fef3cf2fb532aad8dfe98"
-SERVICES_BYTES = 546417312
-SERVICES_RAW_FINGERPRINTS = Path("/home/clement/intent/workspaces/ideate-future/intent/.dev/slice-b/claude-services-native-retirement/evidence/observed-raw-fingerprint-hashes.json")
-SERVICES_RAW_FINGERPRINTS_SHA = "a0cd4c0a8f06e1e7567716f0944fa48ac6cf2ad27b3ca02c0ec57d20c555a224"
+SERVICES_SHA = "bd5d22f325d43af834efdd8c2cc13db1c2d6b7eea30a4daa5eaa0c461f096168"
+SERVICES_BYTES = 546417904
+SERVICES_FINGERPRINT_BYTES = {
+    "attribution/raw-fingerprints.json": 947651,
+    "attribution/fingerprint-number-tokens.json": 2228250,
+    "attribution/fingerprint-qualification.json": 555,
+}
 SERVICES_SELECTORS = {
     "confirmed": "agent_manager::repository_origin::callback_delivery::tests::genuine_native_startup::normal_services_native_confirmed_startup",
     "legacy": "agent_manager::repository_origin::callback_delivery::tests::genuine_native_startup::normal_services_native_legacy_startup",
@@ -58,22 +61,24 @@ SERVICES_EVENTS = {
 SERVICES_ENV = {**ENV, "INTENT_NATIVE_SERVICES_RUN": "1"}
 # Immutable local build attribution, not registry provenance or reproducibility.
 SERVICES_MANIFESTS = {
-    "compile-v1/before.json": "605574e369e6ac305422e675e5f82cfac606bbea0f86ab21b3e56845f8d5fdf3",
-    "compile-v1/after.json": "605574e369e6ac305422e675e5f82cfac606bbea0f86ab21b3e56845f8d5fdf3",
-    "compile-v1/plan.json": "f1590659928845b72a0ce71ac87a6ba95fdd0dd798077b16670ca445334339c3",
-    "compile-v1/results.json": "7cdcf137e4fabeff7e7634c4923a8645524a272feaf7802a5d633bfacdc307a8",
-    "compile-v1/compile.stdout": "c71b947f0a16d4f54caf2ee44b47de2d3aff07cee8aab3daa907e6da81447d63",
-    "attribution/elf.json": "d53c3d12c4b72333169d9a7065c61fb6acfe54e171c69d54da82bfb0e51a8949",
-    "attribution/cargo-selected.json": "dad97712bb61ef74c11401a839a85072450f40795bfe9bd9ee7ea8db0ca33335",
-    "attribution/cargo-build-scripts.json": "033ab0cb1cfc05ea1e6a75a5bfe9e17873cf2f23c0b2c790c339df13f9a8f32a",
-    "attribution/cargo-config-search.json": "f2541c911c79c8a41a78f69cd30ddd3efaea45b8b05618f14a468f79cb5baaa7",
+    "compile-v1/before.json": "8ae9935dc29883d3f4b427fb16545f810b1963596dc8797dfc35dcf07e05265a",
+    "compile-v1/after.json": "8ae9935dc29883d3f4b427fb16545f810b1963596dc8797dfc35dcf07e05265a",
+    "compile-v1/plan.json": "e1f462321283f576de818c42fb9840fed0a61f0e56972f0d54f6f3b2c0ceb5aa",
+    "compile-v1/results.json": "b647973b9b613fe311d5458d7b93f11fc024df0ef13322e935a9876dd3e29189",
+    "compile-v1/compile.stdout": "0b26f31c0c8514db256c93e20d7adbb46f0ebd19f94e9379c7f7f3c245368277",
+    "attribution/elf.json": "362ab84887a4e4e0e893b3411b4e492c6000b39136a341e26834f1825a1aaacd",
+    "attribution/cargo-selected.json": "1ef34ce85f20111fa7eca5715f24f36657275d8e2e01ab6ac2171e02ef85690e",
+    "attribution/cargo-build-scripts.json": "04a8e0b091e32df1bb84fd0f60cde447e3a5854dff4cd9ff5e2f57be69bbcd04",
+    "attribution/cargo-config-search.json": "987c7406f40aa9c97aaba3a577a8c33759997e2967b537ff6360d4c4496753b4",
     "attribution/dependency-files.json": "370aa25488083103b2d232ef2d06525bbcc63147e7d5dc2ecdcbc0393aec3174",
     "attribution/dependency-packages.json": "7c69e7ddf5b324b5112dce515ceb42271b604db63d8f6ec8044cfc593c039f2c",
-    "attribution/generated-compiler-inputs.json": "d292f0bd35a17e2a546864b59e1f194faa4904cb465da9ad2b7dd86c33c6490b",
-    "attribution/cargo-fingerprints.json": "431ad14f3aa00e0c9f37928c304e617723ff3ada71dad636bf28240701907920",
+    "attribution/generated-compiler-inputs.json": "91003809e192d8d3524fc47526751d1cacff05361442a5236e6613ac735d967f",
     "attribution/toolchain-inputs.json": "023837e4fc5f303cfc9c6cd0b3a8eebc604c9583b93842bc1e74febc413ec155",
-    "attribution/compiler-dependency-records.json": "fade2877b85c77532d49f072aa66ad99fa519027709dfc201182735c1bc06805",
-    "attribution/os-closure.json": "1e3ff3f5e8445a4e75dd214a88b8974d05d92752e09cc6b1385ea22be51dca2d",
+    "attribution/compiler-dependency-records.json": "ce3b366ab3557406ba3369affa6fd364f9c8cddcd63074ace51ad21f294bbc8e",
+    "attribution/os-closure.json": "e305b253ff4c1c7b8b6907e98d0a34059217b3063bbad5ebccb5c6e699d5f9e4",
+    "attribution/raw-fingerprints.json": "1f5a7a8e6f449a773c6b768bec496cf2ae4ea3ec43940afa7d88836c8f62b9c0",
+    "attribution/fingerprint-number-tokens.json": "66f35e21ec4f04038de9359bab959d1e255ef19738f560809278b3e9cd5cd9df",
+    "attribution/fingerprint-qualification.json": "a5cc55e5e6e4b83fe58bafbad2da1031b192b70593a7144e4a7f3f8ab0d2d158"
 }
 
 class Refusal(Exception):
@@ -509,25 +514,88 @@ def check_services_elf():
         require(stream.read(6) == b"\x7fELF\x02\x01", "Services input is not the pinned ELF")
     return path
 
-def check_services_fingerprints(metadata):
-    """Current exact bytes, plus only the reviewed binary64 fingerprint metadata.
+def check_services_fingerprints():
+    """Authenticate current raw source/copy pairs; never round Cargo integers.
 
-    The historical Node metadata cannot prove its original integer token spelling.
-    The separately pinned reviewer inventory authenticates current raw file bytes;
-    rounding is confined to this comparison and never substitutes for byte checks.
+    The pinned collection and token index describe these current local files.
+    Earlier binary64 metadata remains historical, without recovered raw tokens.
     """
-    inventory = json.loads(source_bytes(SERVICES_RAW_FINGERPRINTS, SERVICES_RAW_FINGERPRINTS_SHA))
+    records = {}
+    for name, size in SERVICES_FINGERPRINT_BYTES.items():
+        data = source_bytes(SERVICES_PREPARATION / name, SERVICES_MANIFESTS[name])
+        require(len(data) == size, "fingerprint manifest size changed")
+        records[name] = json.loads(data)
+    inventory = records["attribution/raw-fingerprints.json"]
+    tokens = records["attribution/fingerprint-number-tokens.json"]
+    qualification = records["attribution/fingerprint-qualification.json"]
     require(isinstance(inventory, dict) and len(inventory) == 944
-            and set(inventory) == set(metadata), "Cargo fingerprint inventory changed")
-    for path, row in inventory.items():
-        require(set(row) == {"bytes", "sha256"}, "invalid raw fingerprint record")
-        data = source_bytes(Path(path), row["sha256"])
-        require(len(data) == row["bytes"], "raw fingerprint size changed")
-        current = json.loads(data, parse_int=float)
-        reviewed = json.loads(json.dumps(metadata[path]), parse_int=float)
-        require(json.dumps(current, sort_keys=True, allow_nan=False)
-                == json.dumps(reviewed, sort_keys=True, allow_nan=False),
-                "reviewed Cargo fingerprint metadata changed")
+            and isinstance(tokens, dict) and set(tokens) == set(inventory),
+            "Cargo fingerprint inventory changed")
+    source_root = SERVICES_PREPARATION.parents[1] / "target/debug"
+    copy_root = SERVICES_PREPARATION / "attribution/fingerprint-raw"
+    integer_count = large_count = 0
+    for key, row in inventory.items():
+        require(isinstance(row, dict) and set(row) == {"collectedAt", "source", "copy"}
+                and isinstance(row["collectedAt"], str)
+                and qualification["collectionStartedAt"] <= row["collectedAt"]
+                <= qualification["collectionFinishedAt"], "invalid raw fingerprint record")
+        try:
+            relative = Path(key).relative_to(source_root)
+        except ValueError as error:
+            raise Refusal("foreign fingerprint source path") from error
+        require(len(relative.parts) == 3 and relative.parts[0] == ".fingerprint"
+                and all(part not in (".", "..") for part in relative.parts)
+                and relative.suffix == ".json" and str(source_root / relative) == key,
+                "invalid fingerprint source path")
+        payloads = []
+        for kind, expected_path in (("source", source_root / relative), ("copy", copy_root / relative)):
+            item = row[kind]
+            require(isinstance(item, dict)
+                    and set(item) == {"path", "sha256", "bytes", "mode", "uid"}
+                    and item["path"] == str(expected_path)
+                    and type(item["bytes"]) is int and item["bytes"] > 0
+                    and type(item["uid"]) is int and item["uid"] == os.getuid()
+                    and isinstance(item["sha256"], str)
+                    and re.fullmatch(r"[a-f0-9]{64}", item["sha256"])
+                    and isinstance(item["mode"], str), "invalid raw fingerprint file identity")
+            info = expected_path.lstat()
+            require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+                    and info.st_size == item["bytes"] and info.st_uid == item["uid"]
+                    and oct(stat.S_IMODE(info.st_mode)) == item["mode"]
+                    and (kind != "copy" or item["mode"] == "0o444"),
+                    "raw fingerprint file metadata changed")
+            data = source_bytes(expected_path, item["sha256"])
+            after = expected_path.lstat()
+            require((info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+                    == (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns),
+                    "raw fingerprint file replaced during verification")
+            payloads.append(data)
+        require(payloads[0] == payloads[1], "fingerprint source/copy bytes differ")
+        data = payloads[0]
+        json.loads(data)  # Python integers retain the exact decimal value.
+        observed = []
+        for match in re.finditer(rb'"(?:[^"\\]|\\.)*"|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?', data):
+            lexeme = match.group()
+            if lexeme.startswith(b'"'):
+                continue
+            require(not any(c in lexeme for c in (b".", b"e", b"E")),
+                    "unexpected noninteger Cargo fingerprint token")
+            decimal = lexeme.decode("ascii")
+            value = int(decimal)
+            safe = abs(value) <= 9007199254740991
+            observed.append({"byteOffset": match.start(), "lexeme": decimal, "integer": True,
+                             "decimalInteger": str(value), "withinSafeInteger": safe})
+            integer_count += 1
+            large_count += not safe
+        require(json.dumps(observed, sort_keys=True) == json.dumps(tokens[key], sort_keys=True),
+                "fingerprint decimal token index changed")
+    require(qualification["files"] == len(inventory)
+            and qualification["integerTokenCount"] == integer_count
+            and qualification["nonBinary64IntegerCount"] == large_count
+            and qualification["parsedNumericMetadataRetained"] is False,
+            "fingerprint collection qualification changed")
+    return {"records": len(inventory), "integer_tokens": integer_count,
+            "large_integer_tokens": large_count, "qualification": qualification}
 
 def check_services_inputs():
     """Verify the accepted local compilation inputs; never build or launch them."""
@@ -564,7 +632,7 @@ def check_services_inputs():
     for name in ("toolchain-inputs", "cargo-config-search"):
         for row in records["attribution/" + name + ".json"]:
             local_input(row)
-    check_services_fingerprints(records["attribution/cargo-fingerprints.json"])
+    fingerprints = check_services_fingerprints()
     for path, value in records["attribution/compiler-dependency-records.json"].items():
         require(Path(path).read_text() == value, "compiler dependency record changed")
     packages = records["attribution/dependency-packages.json"]
@@ -600,7 +668,7 @@ def check_services_inputs():
             "dependency_packages": len(packages), "local_dependency_files": len(files),
             "registry_checksum_verified_files": 0, "registry_provenance_or_reproducibility": False,
             "generated_inputs": len(records["attribution/generated-compiler-inputs.json"]),
-            "fingerprints": len(records["attribution/cargo-fingerprints.json"]),
+            "fingerprints": fingerprints["records"], "raw_fingerprints": fingerprints,
             "toolchain_files": len(records["attribution/toolchain-inputs.json"])}
 
 def services_milestones(stdout):

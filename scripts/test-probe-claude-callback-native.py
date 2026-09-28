@@ -625,66 +625,175 @@ class ServicesStartupRunnerTests(unittest.TestCase):
                 probe.validate_services_result(case, {**good, "stdout": diagnostic}, 45)
 
 class ServicesFingerprintInputTests(unittest.TestCase):
-    """Inert private files exercise raw authority separately from rounded metadata."""
+    """Inert raw source/copy files exercise the independently pinned intake."""
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="services-fingerprints-inert-")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        self.preparation = self.root / ".dev/preparation"
+        self.attribution = self.preparation / "attribution"
+        self.attribution.mkdir(parents=True)
         self.original = b'{"rustc":16696009966390864400,"nested":[true,null,{"value":7}]}\n'
-        self.metadata = {}
-        inventory = {}
+        self.inventory = {}
+        self.tokens = {}
+        self.stamp = "2026-09-28T22:43:08.900Z"
+        def item(path):
+            return {"path": str(path), "sha256": probe.hash_file(path), "bytes": len(self.original),
+                    "mode": oct(probe.stat.S_IMODE(path.stat().st_mode)), "uid": os.getuid()}
         for i in range(944):
-            path = self.root / (str(i) + ".json")
-            path.write_bytes(self.original)
-            inventory[str(path)] = {"bytes": len(self.original), "sha256": probe.hash_file(path)}
-            self.metadata[str(path)] = {"rustc": 16696009966390864000,
-                                      "nested": [True, None, {"value": 7}]}
-        self.sample = self.root / "0.json"
-        self.inventory = self.root / "raw-manifest.json"
-        self.inventory.write_text(json.dumps(inventory))
-        self.enterContext(patch.object(probe, "SERVICES_RAW_FINGERPRINTS", self.inventory))
-        self.enterContext(patch.object(probe, "SERVICES_RAW_FINGERPRINTS_SHA", probe.hash_file(self.inventory)))
+            relative = Path(".fingerprint") / str(i) / "lib.json"
+            source = self.root / "target/debug" / relative
+            copy = self.attribution / "fingerprint-raw" / relative
+            for path, mode in ((source, 0o664), (copy, 0o444)):
+                path.parent.mkdir(parents=True)
+                path.write_bytes(self.original)
+                path.chmod(mode)
+            self.inventory[str(source)] = {"collectedAt": self.stamp,
+                                           "source": item(source), "copy": item(copy)}
+            self.tokens[str(source)] = [
+                {"byteOffset": 9, "lexeme": "16696009966390864400", "integer": True,
+                 "decimalInteger": "16696009966390864400", "withinSafeInteger": False},
+                {"byteOffset": self.original.index(b"7}"), "lexeme": "7", "integer": True,
+                 "decimalInteger": "7", "withinSafeInteger": True}]
+        self.sample = self.root / "target/debug/.fingerprint/0/lib.json"
+        self.copy = self.attribution / "fingerprint-raw/.fingerprint/0/lib.json"
+        self.documents = {
+            "attribution/raw-fingerprints.json": self.inventory,
+            "attribution/fingerprint-number-tokens.json": self.tokens,
+            "attribution/fingerprint-qualification.json": {
+                "collectionStartedAt": self.stamp, "collectionFinishedAt": self.stamp,
+                "files": 944, "integerTokenCount": 1888, "nonBinary64IntegerCount": 944,
+                "parsedNumericMetadataRetained": False}}
+        self.pins, self.sizes = {}, {}
+        self.enterContext(patch.object(probe, "SERVICES_PREPARATION", self.preparation))
+        self.enterContext(patch.object(probe, "SERVICES_MANIFESTS", self.pins))
+        self.enterContext(patch.object(probe, "SERVICES_FINGERPRINT_BYTES", self.sizes))
+        self.seal_fixture()
 
-    def test_exact_raw_bytes_accept_only_qualified_binary64_metadata(self):
-        self.assertNotEqual(json.loads(self.original)["rustc"], self.metadata[str(self.sample)]["rustc"])
-        self.assertEqual(float(json.loads(self.original)["rustc"]), float(self.metadata[str(self.sample)]["rustc"]))
-        probe.check_services_fingerprints(self.metadata)
+    def seal_fixture(self):
+        for name, value in self.documents.items():
+            path = self.preparation / name
+            path.write_text(json.dumps(value))
+            self.pins[name] = probe.hash_file(path)
+            self.sizes[name] = path.stat().st_size
 
-    def test_raw_low_bit_or_whitespace_change_is_refused_even_when_metadata_is_equal(self):
-        variants = (self.original.replace(b"16696009966390864400", b"16696009966390864401"),
-                    self.original + b"\n")
-        for data in variants:
+    def test_exact_raw_bytes_preserve_large_integers_and_readonly_copies(self):
+        result = probe.check_services_fingerprints()
+        self.assertEqual(json.loads(self.sample.read_bytes())["rustc"], 16696009966390864400)
+        self.assertEqual(self.sample.read_bytes(), self.copy.read_bytes())
+        self.assertEqual(result["records"], 944)
+        self.assertEqual(result["integer_tokens"], 1888)
+        self.assertEqual(result["large_integer_tokens"], 944)
+
+    def test_raw_low_bit_or_whitespace_change_is_refused_even_when_rounding_is_equal(self):
+        for data in (self.original.replace(b"16696009966390864400", b"16696009966390864401"),
+                     self.original + b"\n"):
             self.assertEqual(json.loads(data, parse_int=float), json.loads(self.original, parse_int=float))
             self.sample.write_bytes(data)
             with self.subTest(data=data), self.assertRaises(probe.Refusal):
-                probe.check_services_fingerprints(self.metadata)
+                probe.check_services_fingerprints()
 
     def test_missing_foreign_and_missing_file_paths_refuse(self):
-        missing = {k: v for k, v in self.metadata.items() if k != str(self.sample)}
-        foreign = {**missing, str(self.root / "foreign.json"): self.metadata[str(self.sample)]}
-        for metadata in (missing, foreign):
-            with self.assertRaises(probe.Refusal):
-                probe.check_services_fingerprints(metadata)
+        good = self.inventory.pop(str(self.sample))
+        self.seal_fixture()
+        with self.assertRaises(probe.Refusal):
+            probe.check_services_fingerprints()
+        foreign = str(self.root / "foreign.json")
+        self.inventory[foreign] = good
+        token = self.tokens.pop(str(self.sample))
+        self.tokens[foreign] = token
+        self.seal_fixture()
+        with self.assertRaises(probe.Refusal):
+            probe.check_services_fingerprints()
+        del self.inventory[foreign], self.tokens[foreign]
+        self.inventory[str(self.sample)] = good
+        self.tokens[str(self.sample)] = token
+        self.seal_fixture()
         self.sample.unlink()
         with self.assertRaises(OSError):
-            probe.check_services_fingerprints(self.metadata)
+            probe.check_services_fingerprints()
 
-    def test_replaced_raw_manifest_cannot_become_trusted_identity(self):
-        original = self.inventory.read_bytes()
-        for data in (original + b"\n", b"{}"):
-            self.inventory.write_bytes(data)
-            with self.assertRaises(probe.Refusal):
-                probe.check_services_fingerprints(self.metadata)
+    def test_replaced_raw_token_or_qualification_manifest_is_never_trusted(self):
+        for name in self.documents:
+            path = self.preparation / name
+            good = path.read_bytes()
+            for data in (good + b"\n", b"{}"):
+                path.write_bytes(data)
+                with self.subTest(name=name), self.assertRaises(probe.Refusal):
+                    probe.check_services_fingerprints()
+            path.write_bytes(good)
 
-    def test_reviewed_metadata_still_requires_same_values_shapes_and_types(self):
-        good = self.metadata[str(self.sample)]
-        variants = ({**good, "rustc": good["rustc"] + 8192},
-                    {**good, "nested": [1, None, {"value": 7}]},
-                    {**good, "nested": [True, None]},
-                    {**good, "extra": None})
+    def test_malformed_raw_records_are_refused(self):
+        good = self.inventory[str(self.sample)]
+        variants = (None, [], {}, {**good, "extra": None}, {**good, "source": None},
+                    {**good, "collectedAt": 7}, {**good, "collectedAt": "outside collection"},
+                    {**good, "source": {**good["source"], "bytes": True}},
+                    {**good, "copy": {**good["copy"], "sha256": "not a digest"}})
         for value in variants:
+            self.inventory[str(self.sample)] = value
+            self.seal_fixture()
             with self.subTest(value=value), self.assertRaises(probe.Refusal):
-                probe.check_services_fingerprints({**self.metadata, str(self.sample): value})
+                probe.check_services_fingerprints()
+
+    def test_recorded_mode_size_uid_and_copy_readonly_requirement(self):
+        good = self.inventory[str(self.sample)]
+        for kind in ("source", "copy"):
+            for field, value in (("mode", "0o600"), ("bytes", len(self.original) + 1),
+                                 ("uid", os.getuid() + 1)):
+                changed = {**good, kind: {**good[kind], field: value}}
+                self.inventory[str(self.sample)] = changed
+                self.seal_fixture()
+                with self.subTest(kind=kind, field=field), self.assertRaises(probe.Refusal):
+                    probe.check_services_fingerprints()
+        self.copy.chmod(0o644)
+        self.inventory[str(self.sample)] = {**good, "copy": {**good["copy"], "mode": "0o644"}}
+        self.seal_fixture()
+        with self.assertRaises(probe.Refusal):
+            probe.check_services_fingerprints()
+
+    def test_symlink_and_hardlink_source_or_copy_cannot_be_adopted(self):
+        for path, mode in ((self.sample, 0o664), (self.copy, 0o444)):
+            saved = path.with_name("saved")
+            path.rename(saved)
+            path.symlink_to(saved)
+            with self.subTest(path=str(path), link="symbolic"), self.assertRaises(probe.Refusal):
+                probe.check_services_fingerprints()
+            path.unlink()
+            os.link(saved, path)
+            with self.subTest(path=str(path), link="hard"), self.assertRaises(probe.Refusal):
+                probe.check_services_fingerprints()
+            path.unlink()
+            saved.rename(path)
+            self.assertEqual(probe.stat.S_IMODE(path.stat().st_mode), mode)
+
+    def test_foreign_source_copy_and_traversal_paths_refuse(self):
+        good = self.inventory[str(self.sample)]
+        for kind in ("source", "copy"):
+            for path in (str(self.root / "foreign.json"), str(self.sample.parent / "../0/lib.json")):
+                self.inventory[str(self.sample)] = {**good, kind: {**good[kind], "path": path}}
+                self.seal_fixture()
+                with self.subTest(kind=kind, path=path), self.assertRaises(probe.Refusal):
+                    probe.check_services_fingerprints()
+
+    def test_distinct_source_copy_bytes_refuse_even_with_individually_matching_digests(self):
+        self.copy.chmod(0o644)
+        data = self.original.replace(b"64400", b"64401")
+        self.copy.write_bytes(data)
+        self.copy.chmod(0o444)
+        self.inventory[str(self.sample)]["copy"]["sha256"] = probe.hash_file(self.copy)
+        self.seal_fixture()
+        with self.assertRaises(probe.Refusal):
+            probe.check_services_fingerprints()
+
+    def test_token_offsets_decimal_low_bits_and_types_remain_exact(self):
+        good = self.tokens[str(self.sample)][0]
+        for field, value in (("byteOffset", 10), ("lexeme", "16696009966390864401"),
+                             ("decimalInteger", "16696009966390864401"),
+                             ("withinSafeInteger", True), ("integer", 1)):
+            self.tokens[str(self.sample)][0] = {**good, field: value}
+            self.seal_fixture()
+            with self.subTest(field=field), self.assertRaises(probe.Refusal):
+                probe.check_services_fingerprints()
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
