@@ -333,3 +333,38 @@ async fn shared_rules_failed_forced_refresh_discards_previous_policy() {
     );
     assert_eq!(mock.calls("/rules/branches/"), 4);
 }
+
+#[tokio::test]
+async fn shared_rules_overlapping_forced_demands_share_one_newer_fill() {
+    let _serial = SERIAL.lock().await;
+    let mock = MockQwen::start(10978).await;
+    let repo = RepoRef::new("o", "r");
+    policy(&mock, 2);
+    let gate = mock.gate("/rules/branches/");
+    let traffic = Traffic::default();
+    with_traffic(traffic.clone(), async {
+        let old = shared(&mock.sc, &repo, "main");
+        let forced = async {
+            gate.entered.notified().await;
+            policy(&mock, 3);
+            let a = with_freshness(Duration::ZERO, mock.sc.branch_rules(&repo, "main"));
+            let b = with_freshness(Duration::ZERO, mock.sc.branch_rules(&repo, "main"));
+            tokio::pin!(a, b);
+            // Both freshness demands precede the replacement fetch, while
+            // neither may join the already-started old policy observation.
+            tokio::select! {biased; r = &mut a => panic!("early result {r:?}"), () = std::future::ready(()) => {}}
+            tokio::select! {biased; r = &mut b => panic!("early result {r:?}"), () = std::future::ready(()) => {}}
+            gate.release.add_permits(100);
+            let (a, b) = tokio::join!(a, b);
+            assert_eq!(a.as_ref().unwrap().required_approving_review_count, Some(3));
+            assert_eq!(a.unwrap(), b.unwrap());
+        };
+        let (old, ()) = tokio::join!(old, forced);
+        assert_eq!(old.unwrap().required_approving_review_count, Some(2));
+    }).await;
+    assert_eq!(mock.calls("/rules/branches/"), 2);
+    let counts = traffic.snapshot();
+    let rules = &counts.counts[&(Caller::OnDemand, Operation::Rules)];
+    assert_eq!(rules.rest_requests, 2);
+    assert_eq!(rules.in_flight_reuses, 1);
+}
