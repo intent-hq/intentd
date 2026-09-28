@@ -1,0 +1,102 @@
+# Deletes release records/assets only; Git tags are retained. Source and mirror
+# writers share the lock below; native queueing preserves pending publications
+# (up to GitHub's 100-entry limit). Never add the same lock to a nested workflow.
+# Queue semantics: https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency
+#
+# Activation: first land the shared command and replace its reviewed validation
+# SHA below with the final merged monorepo SHA. Drain ALL older release, mirror,
+# promotion and cleanup workflow runs (including queued runs and old-tag reruns)
+# before setting PRERELEASE_CLEANUP_ENABLED=true. Until then schedules preview;
+# manual apply is refused. Reverting/clearing the variable stops future apply.
+# Do not rerun pre-lock workflow revisions after activation.
+#
+# PRERELEASE_CLEANUP_TOKEN requires effective Contents read on intent-hq/intent,
+# intent-hq/cloudlands-fe and intent-hq/cloudlands-releases, and Contents write
+# on intent-hq/intentd and intent-hq/intentd-releases (read is included). Metadata
+# read is implicit. No Actions, Issues, Pull requests or Workflows write needed.
+# Use an identity whose grants limit writes to the daemon pair; one fine-grained
+# PAT permission setting applies equally to every selected repo. Do not grant
+# frontend or monorepo write merely to enable this cleanup. Missing token or
+# incomplete reads fail closed. Checkout never persists the credential.
+name: Cleanup prereleases
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Preview or apply retention (apply also requires activation)'
+        type: choice
+        required: true
+        default: preview
+        options:
+          - preview
+          - apply
+
+permissions:
+  contents: read
+
+concurrency:
+  group: intentd-release-writers
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ secrets.PRERELEASE_CLEANUP_TOKEN }}
+    steps:
+      - name: Check cleanup controls
+        id: controls
+        shell: bash
+        env:
+          CLEANUP_ENABLED: ${{ vars.PRERELEASE_CLEANUP_ENABLED }}
+          REQUESTED_MODE: ${{ inputs.mode || 'preview' }}
+        run: |
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "::error::PRERELEASE_CLEANUP_TOKEN is missing; no cleanup will run."
+            exit 1
+          fi
+          mode="$REQUESTED_MODE"
+          if [[ "$GITHUB_EVENT_NAME" == schedule ]]; then
+            mode=preview
+            if [[ "$CLEANUP_ENABLED" == true ]]; then mode=apply; fi
+          fi
+          if [[ "$mode" != preview && "$mode" != apply ]]; then
+            echo "::error::Unknown cleanup mode; no cleanup will run."
+            exit 1
+          fi
+          if [[ "$mode" == apply && "$CLEANUP_ENABLED" != true ]]; then
+            echo "::error::Apply requires PRERELEASE_CLEANUP_ENABLED=true after older workflows drain; no cleanup will run."
+            exit 1
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+      - name: Checkout reviewed cleanup command
+        uses: actions/checkout@v7
+        with:
+          repository: intent-hq/intent
+          ref: e039b4dca2ad7fa59139a0b1d2ca2aecca558448
+          token: ${{ secrets.PRERELEASE_CLEANUP_TOKEN }}
+          persist-credentials: false
+          path: monorepo
+          sparse-checkout: scripts
+      - name: Preview or apply daemon retention
+        id: cleanup
+        shell: bash
+        env:
+          CLEANUP_MODE: ${{ steps.controls.outputs.mode }}
+        run: |
+          args=(--component intentd)
+          if [[ "$CLEANUP_MODE" == apply ]]; then args+=(--apply); fi
+          python3 -S -B monorepo/scripts/cleanup_prereleases.py "${args[@]}" | tee cleanup-report.json
+      - name: Preserve cleanup audit
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: intentd-prerelease-cleanup-${{ github.run_id }}-${{ github.run_attempt }}
+          path: cleanup-report.json
+          if-no-files-found: ignore
+          retention-days: 30
