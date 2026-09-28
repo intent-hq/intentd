@@ -4,7 +4,8 @@
 //! before spawning; a future store adapter must read the original credential and
 //! durable roles. No such adapter or auth-writer hook is installed by this module.
 
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use intent_core::caller::{
     current_caller, current_wire_credential, Caller, CredentialLease, WireCredential,
@@ -218,8 +219,42 @@ pub(crate) trait RepositoryAuthoritySource: Send + Sync {
 /// This module supplies the mechanism, not the still-missing writer coverage.
 #[derive(Clone, Default)]
 pub(crate) struct RepositoryRetirement {
-    state: Arc<Mutex<bool>>,
-    ancestors: Vec<Arc<Mutex<bool>>>,
+    state: Arc<RetirementNode>,
+    ancestors: Vec<Arc<RetirementNode>>,
+}
+
+/// Optional children have no ancestor chain. The original parent retains only
+/// weak links, and every closer snapshots the same live links before joining.
+#[derive(Default)]
+struct RetirementNode {
+    fence: Mutex<bool>,
+    closed: AtomicBool,
+    optional: Mutex<Vec<Weak<RetirementNode>>>,
+    cancelled: tokio::sync::Notify,
+}
+
+impl RetirementNode {
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.cancelled.notify_waiters();
+        // Join admitted synchronous actions, never an async preparation task.
+        *self
+            .fence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        let children = {
+            let mut links = self
+                .optional
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            links.retain(|link| link.strong_count() != 0);
+            links.iter().filter_map(Weak::upgrade).collect::<Vec<_>>()
+        };
+        // Neither the parent fence nor the dependent-list lock crosses a wait.
+        for child in children {
+            child.close();
+        }
+    }
 }
 
 impl RepositoryRetirement {
@@ -237,7 +272,7 @@ impl RepositoryRetirement {
         let mut ancestors = self.ancestors.clone();
         ancestors.push(self.state.clone());
         Self {
-            state: Arc::new(Mutex::new(false)),
+            state: Arc::new(RetirementNode::default()),
             ancestors,
         }
     }
@@ -247,9 +282,7 @@ impl RepositoryRetirement {
         // request. Poison already excludes dispatch. No child lock precedes a
         // parent lock, including while retirement waits for an admitted start.
         for parent in &self.ancestors {
-            if let Ok(mut retired) = parent.lock() {
-                *retired = true;
-            }
+            parent.close();
         }
         self.end_scope();
     }
@@ -257,9 +290,69 @@ impl RepositoryRetirement {
     /// Normal lock/subscription cleanup ends only its local operation scope.
     /// Cancellation and permanent authority changes must use `retire` instead.
     pub(crate) fn end_scope(&self) {
-        if let Ok(mut retired) = self.state.lock() {
-            *retired = true;
+        self.state.close();
+    }
+
+    pub(super) fn is_closed(&self) -> bool {
+        self.state.closed.load(Ordering::Acquire)
+    }
+
+    pub(super) fn link_optional(&self, local: &Self) -> AdmissionResult<()> {
+        if !self.ancestors.is_empty()
+            || !local.ancestors.is_empty()
+            || Arc::ptr_eq(&self.state, &local.state)
+        {
+            return Err(AdmissionError::Denied);
         }
+        let parent = self
+            .state
+            .fence
+            .lock()
+            .map_err(|_| AdmissionError::Retired)?;
+        if *parent || self.is_closed() || local.is_closed() {
+            return Err(AdmissionError::Retired);
+        }
+        let mut links = self
+            .state
+            .optional
+            .lock()
+            .map_err(|_| AdmissionError::Retired)?;
+        links.retain(|link| link.strong_count() != 0);
+        links.push(Arc::downgrade(&local.state));
+        Ok(())
+    }
+
+    pub(super) fn unlink_optional(&self, local: &Self) {
+        let mut links = self
+            .state
+            .optional
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        links.retain(|link| {
+            link.strong_count() != 0 && !Weak::ptr_eq(link, &Arc::downgrade(&local.state))
+        });
+    }
+
+    pub(super) async fn cancelled(&self) {
+        loop {
+            let notified = self.state.cancelled.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_closed() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// The caller already holds the common required parent/source fences.
+    /// This leaf is independent: contention or poison may only omit it.
+    pub(super) fn with_optional<T>(&self, action: impl FnOnce(bool) -> T) -> T {
+        let guard = self.state.fence.try_lock();
+        let include = self.ancestors.is_empty()
+            && !self.is_closed()
+            && guard.as_ref().is_ok_and(|retired| !**retired);
+        action(include)
     }
 
     pub(crate) fn check_current(&self) -> AdmissionResult<()> {
@@ -273,13 +366,22 @@ impl RepositoryRetirement {
         let ancestors = self
             .ancestors
             .iter()
-            .map(|parent| parent.lock().map_err(|_| AdmissionError::Retired))
+            .map(|parent| parent.fence.lock().map_err(|_| AdmissionError::Retired))
             .collect::<AdmissionResult<Vec<_>>>()?;
-        if ancestors.iter().any(|retired| **retired) {
+        if ancestors.iter().any(|retired| **retired)
+            || self
+                .ancestors
+                .iter()
+                .any(|parent| parent.closed.load(Ordering::Acquire))
+        {
             return Err(AdmissionError::Retired);
         }
-        let retired = self.state.lock().map_err(|_| AdmissionError::Retired)?;
-        if *retired {
+        let retired = self
+            .state
+            .fence
+            .lock()
+            .map_err(|_| AdmissionError::Retired)?;
+        if *retired || self.is_closed() {
             return Err(AdmissionError::Retired);
         }
         // Original request -> lock-session child -> operation -> P directory.

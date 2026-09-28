@@ -137,6 +137,19 @@ impl RepositorySourceLifetime {
         }
     }
 
+    pub(super) fn for_optional_request(
+        registry: Arc<RepositoryLifecycleRegistry>,
+        origin: RepositoryPhysicalOrigin,
+        parent: &RepositoryRetirement,
+    ) -> AdmissionResult<(Self, RepositorySubscription)> {
+        let local = RepositoryRetirement::default();
+        let (_, subscription) = registry.capture_request(&origin, local.clone())?;
+        // Registry membership is established before linking; no registry lock
+        // is held during the parent fence wait. Failure drops the local entry.
+        parent.link_optional(&local)?;
+        Ok((Self::new(registry, Some(origin), local), subscription))
+    }
+
     pub(crate) fn retirement(&self) -> RepositoryRetirement {
         self.retirement.clone()
     }
@@ -147,6 +160,9 @@ impl RepositorySourceLifetime {
         caller: &Caller,
         keys: &[RepositoryLifecycleKey],
     ) -> AdmissionResult<RepositorySubscription> {
+        if self.request.is_some() {
+            super::request_context::require_mandatory_execution()?;
+        }
         let observer: Arc<dyn RepositoryLifecycleObserver> = self.registry.clone();
         if !store.has_repository_lifecycle_observer(&observer) {
             return Err(AdmissionError::Unavailable);

@@ -357,3 +357,29 @@ async fn request_retirement_waits_for_its_original_child_consuming_fence() {
     retirement.join().unwrap();
     retired.recv().unwrap();
 }
+
+// Marker isolation only; confirmed-owner capture is tested in read_request and
+// actual Services installation. This fixture does not create read authority.
+#[tokio::test]
+async fn optional_marker_denial_does_not_change_required_scope_completion() {
+    let (registry, owner, caller) = fixture();
+    let callback = RepositoryCallbackContext::new(&registry, Some(owner.origin()));
+    let scope = McpRequestContext::capture(&callback);
+    with_caller(
+        caller,
+        scope.scope(Box::pin(async {
+            let parent = CAPTURED_REQUEST.with(Clone::clone);
+            let local = RepositoryRetirement::default();
+            OPTIONAL_EXECUTION
+                .scope(local.clone(), async {
+                    assert!(current_source_lifetime().is_err());
+                    retire_current_request_on_denial(AdmissionError::Denied);
+                })
+                .await;
+            assert_eq!(local.check_current(), Err(AdmissionError::Retired));
+            assert!(parent.retirement.check_current().is_ok());
+            assert!(current_source_lifetime().is_ok());
+        })),
+    )
+    .await;
+}

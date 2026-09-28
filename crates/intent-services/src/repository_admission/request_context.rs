@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex, Weak};
 use intent_acp::mcp_server::request_context::{
     McpContextFuture, McpRequestContext, McpRequestScope,
 };
-use intent_core::caller::{current_caller, current_wire_credential, Caller};
+use intent_core::caller::{
+    current_caller, current_wire_credential, with_caller, with_wire_credential, Caller,
+};
 use intent_store::{RepositoryLifecycleObserver, Store};
 
 use super::lifecycle::physical_owner::RepositoryPhysicalOwner;
@@ -102,6 +104,41 @@ impl McpRequestContext for RepositoryCallbackContext {
 tokio::task_local! {
     static CAPTURED_REQUEST: Arc<RepositoryCapturedRequest>;
     static CAPTURED_READ_REQUEST: AdmissionResult<Arc<RepositoryReadRequest>>;
+    static OPTIONAL_EXECUTION: RepositoryRetirement;
+}
+
+/// Optional metadata may restore identity, but cannot acquire required coverage.
+pub(super) fn require_mandatory_execution() -> AdmissionResult<()> {
+    if OPTIONAL_EXECUTION.try_with(|_| ()).is_ok() {
+        return Err(AdmissionError::Denied);
+    }
+    Ok(())
+}
+
+pub(super) fn restore_optional<'a, T: Send + 'a>(
+    original: Arc<RepositoryCapturedRequest>,
+    read: Arc<RepositoryReadRequest>,
+    local: RepositoryRetirement,
+    future: intent_core::BoxFuture<'a, T>,
+) -> AdmissionResult<intent_core::BoxFuture<'a, T>> {
+    require_mandatory_execution()?;
+    original.check_read_caller()?;
+    let caller = original
+        .captured
+        .as_ref()
+        .map_err(|error| *error)?
+        .caller
+        .clone();
+    Ok(Box::pin(with_caller(
+        caller,
+        with_wire_credential(
+            None,
+            CAPTURED_REQUEST.scope(
+                original,
+                CAPTURED_READ_REQUEST.scope(Ok(read), OPTIONAL_EXECUTION.scope(local, future)),
+            ),
+        ),
+    )))
 }
 
 struct RepositoryRequestScope {
@@ -191,6 +228,12 @@ pub(crate) fn retire_current_request_on_denial(error: AdmissionError) {
         error,
         AdmissionError::Denied | AdmissionError::Retired | AdmissionError::BindingChanged
     ) {
+        if OPTIONAL_EXECUTION
+            .try_with(RepositoryRetirement::end_scope)
+            .is_ok()
+        {
+            return;
+        }
         let _ = CAPTURED_REQUEST.try_with(|request| request.retirement.retire());
     }
 }
@@ -240,9 +283,27 @@ impl RepositoryCapturedRequest {
         self.retirement.check_current()
     }
 
+    pub(super) fn optional_lifetime(
+        &self,
+    ) -> AdmissionResult<(RepositorySourceLifetime, RepositorySubscription)> {
+        require_mandatory_execution()?;
+        self.check_read_caller()?;
+        let captured = self.captured.as_ref().map_err(|error| *error)?;
+        RepositorySourceLifetime::for_optional_request(
+            captured.registry.clone(),
+            captured.origin.clone(),
+            &self.retirement,
+        )
+    }
+
+    pub(super) fn retirement(&self) -> RepositoryRetirement {
+        self.retirement.clone()
+    }
+
     /// Invoke under the authentic transport caller scope. Neither a callback
     /// projection nor an installed invalidation observer supplies permission.
     pub(crate) fn source_lifetime(&self) -> AdmissionResult<RepositorySourceLifetime> {
+        require_mandatory_execution()?;
         let captured = self.captured.as_ref().map_err(|error| *error)?;
         if current_caller().as_ref() != Some(&captured.caller)
             || current_wire_credential().is_some()

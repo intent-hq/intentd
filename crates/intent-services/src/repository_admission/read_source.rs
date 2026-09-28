@@ -739,6 +739,97 @@ pub(crate) async fn with_records<T: Send>(
     .await
 }
 
+/// INACTIVE: checks optional LOCAL lifetime only, never optional Git/settings/P
+/// facts. Do not expose context from this primitive before those producers exist.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "joint optional admission is deliberately not activated"
+    )
+)]
+pub(crate) async fn with_joint_local_records<T: Send>(
+    request: &Arc<RepositoryReadRequest>,
+    services: &Arc<Services>,
+    records: &[&ReadRecord],
+    optional: Option<&crate::repository_admission::read_request::RepositoryOptionalMetadata>,
+    transfer: impl FnOnce(bool) -> T + Send,
+) -> AdmissionResult<T> {
+    request.check_current()?;
+    let current = crate::repository_admission::request_context::current_read_request()?;
+    if !Arc::ptr_eq(request, &current) {
+        return Err(AdmissionError::Denied);
+    }
+    if records.is_empty()
+        || records
+            .iter()
+            .any(|r| !Arc::ptr_eq(&r.request, request) || !Arc::ptr_eq(&r.facts.services, services))
+    {
+        return Err(AdmissionError::Denied);
+    }
+    let mut child = request.child()?;
+    let mut roots = Vec::with_capacity(records.len());
+    for record in records {
+        subscribe(&mut child, &record.facts.git.root.workspace_id)?;
+        child.subscribe(&[
+            RepositoryLifecycleKey::Database,
+            record.facts.root.lifecycle_key(),
+        ])?;
+        roots.push(record.facts.root.clone());
+    }
+    RepositoryGitSource::with_group(
+        &services.store,
+        &services.worktree_locks,
+        roots,
+        child.retirement(),
+        |sources| async move {
+            for (record, source) in records.iter().zip(sources) {
+                record
+                    .facts
+                    .validate(request, &source)
+                    .await
+                    .inspect_err(|error| {
+                        if matches!(
+                            error,
+                            AdmissionError::Denied
+                                | AdmissionError::BindingChanged
+                                | AdmissionError::Retired
+                        ) {
+                            child.retirement().retire();
+                        }
+                    })?;
+            }
+            let mut operations = records
+                .iter()
+                .map(|r| r.operation.clone())
+                .collect::<Vec<_>>();
+            operations.sort_unstable_by_key(Arc::as_ptr);
+            operations.dedup_by(|a, b| Arc::ptr_eq(a, b));
+            let eligibility = records
+                .iter()
+                .map(|r| r.eligibility.as_ref())
+                .collect::<Vec<_>>();
+            child.transfer_with_optional(optional, |include| {
+                let states = operations
+                    .iter()
+                    .map(|op| op.lock().map_err(|_| AdmissionError::Retired))
+                    .collect::<AdmissionResult<Vec<_>>>()?;
+                if states.iter().any(|state| **state != ReadState::Finished) {
+                    return Err(AdmissionError::Retired);
+                }
+                let mut output = None;
+                RepositoryReadEligibility::with_all_current(&eligibility, || {
+                    output = Some(transfer(include));
+                    Ok(())
+                })
+                .map_err(|_| AdmissionError::Unavailable)?;
+                output.ok_or(AdmissionError::Retired)
+            })
+        },
+    )
+    .await
+}
+
 #[cfg(test)]
 #[path = "read_source/tests.rs"]
 pub(crate) mod tests;

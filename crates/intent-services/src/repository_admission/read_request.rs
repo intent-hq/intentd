@@ -5,7 +5,8 @@
 //! an owner from a caller, row, path or later Store.
 
 use std::any::Any;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use intent_acp::mcp_server::private_results::McpPrivatePolicy;
 use intent_core::caller::current_caller;
@@ -14,7 +15,9 @@ use intent_store::{RepositoryLifecycleKey, RepositoryLifecycleObserver, Store};
 use super::lifecycle::{
     RepositoryLifecycleRegistry, RepositorySourceLifetime, RepositorySubscription,
 };
-use super::request_context::RepositoryCapturedRequest;
+use super::request_context::{
+    require_mandatory_execution, restore_optional, RepositoryCapturedRequest,
+};
 use super::{AdmissionError, AdmissionResult, RepositoryRetirement};
 
 pub(crate) type ReadPolicyFactory =
@@ -105,6 +108,29 @@ impl RepositoryReadRequest {
             .is_some_and(|retained| std::ptr::eq(retained, original))
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "optional context capture is not activated by this local lifetime cut"
+        )
+    )]
+    pub(crate) fn capture_optional(self: &Arc<Self>) -> AdmissionResult<RepositoryOptionalScope> {
+        require_mandatory_execution()?;
+        self.check_current()?;
+        let (lifetime, subscription) = self.original.optional_lifetime()?;
+        let scope = RepositoryOptionalScope {
+            metadata: RepositoryOptionalMetadata(Arc::new(OptionalState {
+                request: self.clone(),
+                lifetime,
+                subscriptions: Mutex::new(vec![subscription]),
+                prepared: AtomicBool::new(false),
+            })),
+        };
+        scope.metadata.check_current()?;
+        Ok(scope)
+    }
+
     /// One fresh source child of this same original request, before any await.
     pub(crate) fn child(self: &Arc<Self>) -> AdmissionResult<RepositoryReadChild> {
         self.check_current()?;
@@ -143,14 +169,173 @@ impl RepositoryReadChild {
         &self,
         action: impl FnOnce() -> AdmissionResult<T>,
     ) -> AdmissionResult<T> {
+        require_mandatory_execution()?;
         self.request.check_current()?;
         self.lifetime.retirement().dispatch(action)
+    }
+    pub(crate) fn transfer_with_optional<T>(
+        &self,
+        optional: Option<&RepositoryOptionalMetadata>,
+        action: impl FnOnce(bool) -> AdmissionResult<T>,
+    ) -> AdmissionResult<T> {
+        require_mandatory_execution()?;
+        self.request.check_current()?;
+        if optional.is_some_and(|local| !Arc::ptr_eq(&local.0.request, &self.request)) {
+            return Err(AdmissionError::Denied);
+        }
+        self.lifetime.retirement().dispatch(|| match optional {
+            Some(local) => local.0.lifetime.retirement().with_optional(|include| {
+                action(include && local.0.prepared.load(Ordering::Acquire))
+            }),
+            None => action(false),
+        })
     }
 }
 
 impl Drop for RepositoryReadChild {
     fn drop(&mut self) {
         self.lifetime.retirement().end_scope();
+    }
+}
+
+struct OptionalState {
+    request: Arc<RepositoryReadRequest>,
+    lifetime: RepositorySourceLifetime,
+    subscriptions: Mutex<Vec<RepositorySubscription>>,
+    prepared: AtomicBool,
+}
+
+/// Identity metadata alone cannot keep the nonclone owner's scope alive.
+#[derive(Clone)]
+pub(crate) struct RepositoryOptionalMetadata(Arc<OptionalState>);
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "optional metadata producer remains inactive")
+)]
+impl RepositoryOptionalMetadata {
+    pub(crate) fn check_current(&self) -> AdmissionResult<()> {
+        self.0.request.check_current()?;
+        self.0.lifetime.retirement().check_current()
+    }
+
+    pub(crate) fn subscribe_metadata(
+        &self,
+        keys: &[RepositoryLifecycleKey],
+    ) -> AdmissionResult<()> {
+        self.check_current()?;
+        let caller = current_caller().ok_or(AdmissionError::Denied)?;
+        let subscription = self
+            .0
+            .lifetime
+            .subscribe(&self.0.request.owner.store, &caller, keys)?;
+        let mut subscriptions = self
+            .0
+            .subscriptions
+            .lock()
+            .map_err(|_| AdmissionError::Retired)?;
+        if self.0.lifetime.retirement().is_closed()
+            || self.0.request.original.retirement().is_closed()
+        {
+            return Err(AdmissionError::Retired);
+        }
+        subscriptions.push(subscription);
+        Ok(())
+    }
+}
+
+pub(crate) struct RepositoryOptionalScope {
+    metadata: RepositoryOptionalMetadata,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "optional preparation has no production context source yet"
+    )
+)]
+impl RepositoryOptionalScope {
+    pub(crate) fn metadata(&self) -> RepositoryOptionalMetadata {
+        self.metadata.clone()
+    }
+
+    /// Capture entry authority now; invoke the constructor only inside the
+    /// restored optional scope. Self already owns cleanup for an unpolled drop.
+    pub(crate) fn run_optional<'a, T, F, Fut>(
+        self,
+        make: F,
+    ) -> AdmissionResult<intent_core::BoxFuture<'a, AdmissionResult<PreparedRepositoryOptional<T>>>>
+    where
+        T: Send + 'a,
+        F: FnOnce(RepositoryOptionalMetadata) -> Fut + Send + 'a,
+        Fut: std::future::Future<Output = AdmissionResult<T>> + Send + 'a,
+    {
+        self.metadata.check_current()?;
+        let request = self.metadata.0.request.clone();
+        let original = request.original.clone();
+        let local = self.metadata.0.lifetime.retirement();
+        let parent = original.retirement();
+        restore_optional(
+            original,
+            request,
+            local.clone(),
+            Box::pin(async move {
+                let value = tokio::select! {
+                    biased;
+                    () = local.cancelled() => return Err(AdmissionError::Retired),
+                    () = parent.cancelled() => return Err(AdmissionError::Retired),
+                    result = async { make(self.metadata.clone()).await } => result?,
+                };
+                self.metadata.check_current()?;
+                self.metadata.0.prepared.store(true, Ordering::Release);
+                Ok(PreparedRepositoryOptional { scope: self, value })
+            }),
+        )
+    }
+}
+
+impl Drop for RepositoryOptionalScope {
+    fn drop(&mut self) {
+        let local = self.metadata.0.lifetime.retirement();
+        local.end_scope();
+        let subscriptions = std::mem::take(
+            &mut *self
+                .metadata
+                .0
+                .subscriptions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        drop(subscriptions);
+        self.metadata
+            .0
+            .request
+            .original
+            .retirement()
+            .unlink_optional(&local);
+    }
+}
+
+pub(crate) struct PreparedRepositoryOptional<T> {
+    scope: RepositoryOptionalScope,
+    value: T,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "prepared optional payload is not wired to production output"
+    )
+)]
+impl<T> PreparedRepositoryOptional<T> {
+    pub(crate) fn metadata(&self) -> &RepositoryOptionalMetadata {
+        &self.scope.metadata
+    }
+
+    pub(crate) fn value(&self) -> &T {
+        &self.value
     }
 }
 

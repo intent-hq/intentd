@@ -774,3 +774,284 @@ async fn foreign_services_caller_and_wire_cannot_supply_qualified_read_ownership
         assert!(!reply.to_string().contains(f.git.path.to_str().unwrap()));
     }
 }
+
+// Scheduling-only wrapper around the actual policy. The inactive planner's
+// callback is a counted local probe; the real packet still uses original.admit.
+#[derive(Clone, Copy)]
+enum JointMode {
+    Include,
+    OptionalStale,
+    RequiredGitStale,
+    Panic,
+}
+
+struct JointContext {
+    original: Arc<dyn intent_acp::mcp_server::request_context::McpRequestContext>,
+    mode: JointMode,
+    root: std::path::PathBuf,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    completed: Arc<std::sync::atomic::AtomicBool>,
+}
+struct JointScope {
+    original: Arc<dyn intent_acp::mcp_server::request_context::McpRequestScope>,
+    mode: JointMode,
+    root: std::path::PathBuf,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    completed: Arc<std::sync::atomic::AtomicBool>,
+}
+struct JointPolicy {
+    original: Arc<dyn intent_acp::mcp_server::private_results::McpPrivatePolicy>,
+    mode: JointMode,
+    root: std::path::PathBuf,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    completed: Arc<std::sync::atomic::AtomicBool>,
+}
+impl intent_acp::mcp_server::request_context::McpRequestContext for JointContext {
+    fn capture(&self) -> Arc<dyn intent_acp::mcp_server::request_context::McpRequestScope> {
+        Arc::new(JointScope {
+            original: self.original.capture(),
+            mode: self.mode,
+            root: self.root.clone(),
+            calls: self.calls.clone(),
+            completed: self.completed.clone(),
+        })
+    }
+}
+impl intent_acp::mcp_server::request_context::McpRequestScope for JointScope {
+    fn scope<'a>(
+        &'a self,
+        future: intent_acp::mcp_server::request_context::McpContextFuture<'a>,
+    ) -> intent_acp::mcp_server::request_context::McpContextFuture<'a> {
+        self.original.scope(future)
+    }
+    fn private_result_policy(
+        &self,
+    ) -> Option<Arc<dyn intent_acp::mcp_server::private_results::McpPrivatePolicy>> {
+        self.original.private_result_policy().map(|original| {
+            Arc::new(JointPolicy {
+                original,
+                mode: self.mode,
+                root: self.root.clone(),
+                calls: self.calls.clone(),
+                completed: self.completed.clone(),
+            }) as Arc<dyn intent_acp::mcp_server::private_results::McpPrivatePolicy>
+        })
+    }
+}
+impl intent_acp::mcp_server::private_results::McpPrivatePolicy for JointPolicy {
+    fn capture_host(
+        &self,
+        call: McpHostCall,
+    ) -> Box<dyn intent_acp::mcp_server::private_results::McpPrivateHostScope> {
+        self.original.capture_host(call)
+    }
+    fn admit<'a>(
+        &'a self,
+        boundary: &'a intent_acp::mcp_server::private_results::McpPrivateBoundary,
+        evidence: &'a [intent_acp::mcp_server::private_results::McpReadEvidence],
+        packet: intent_acp::mcp_server::private_results::PreparedMcpTransfer<'a>,
+    ) -> BoxFuture<'a, intent_acp::mcp_server::private_results::McpPrivateAdmission> {
+        Box::pin(async move {
+            use intent_core::caller::with_caller;
+            use intent_store::RepositoryLifecycleObserver;
+            use std::sync::atomic::Ordering;
+            if boundary.kind()
+                != intent_acp::mcp_server::private_results::McpPrivateBoundaryKind::DirectResponse
+            {
+                return self.original.admit(boundary, evidence, packet).await;
+            }
+            let records = evidence
+                .iter()
+                .map(|item| item.downcast_ref::<ReadRecord>().unwrap())
+                .collect::<Vec<_>>();
+            assert!(records.len() >= 2);
+            let distinct = records
+                .iter()
+                .copied()
+                .find(|record| !Arc::ptr_eq(&record.operation, &records[0].operation))
+                .expect("two original host calls have distinct operation allocations");
+            let request =
+                crate::repository_admission::request_context::current_read_request().unwrap();
+            let services = records[0].facts.services.clone();
+            let optional = request.capture_optional().unwrap();
+            let key = RepositoryLifecycleKey::GitRoot(intent_core::WorkspaceGitRootId::new());
+            optional
+                .metadata()
+                .subscribe_metadata(&[RepositoryLifecycleKey::Database, key.clone()])
+                .unwrap();
+            let ready = optional
+                .run_optional(|_| async { Ok("prebuilt optional fixture") })
+                .unwrap()
+                .await
+                .unwrap();
+            let mut ordered = vec![records[0], distinct, records[0]];
+            ordered.extend(records.iter().rev().copied());
+            assert!(with_joint_local_records(
+                &request,
+                &services,
+                &[],
+                Some(ready.metadata()),
+                |_| panic!("empty must not transfer")
+            )
+            .await
+            .is_err());
+            let foreign_services = Arc::new(services.as_ref().clone());
+            assert!(with_joint_local_records(
+                &request,
+                &foreign_services,
+                &ordered,
+                Some(ready.metadata()),
+                |_| panic!("foreign Services must not transfer")
+            )
+            .await
+            .is_err());
+            assert!(with_caller(
+                Caller::Agent {
+                    agent_id: AgentId::new()
+                },
+                with_joint_local_records(
+                    &request,
+                    &services,
+                    &ordered,
+                    Some(ready.metadata()),
+                    |_| panic!("foreign caller must not transfer")
+                )
+            )
+            .await
+            .is_err());
+            *records[0].operation.lock().unwrap() = ReadState::Acquiring;
+            assert!(with_joint_local_records(
+                &request,
+                &services,
+                &ordered,
+                Some(ready.metadata()),
+                |_| panic!("unfinished member must not transfer")
+            )
+            .await
+            .is_err());
+            *records[0].operation.lock().unwrap() = ReadState::Finished;
+            if matches!(self.mode, JointMode::OptionalStale) {
+                services
+                    .repository_lifecycle_registry()
+                    .await
+                    .unwrap()
+                    .begin_mutation(&[key])
+                    .unwrap()
+                    .settle_confirmed();
+            }
+            if matches!(self.mode, JointMode::RequiredGitStale) {
+                std::fs::write(
+                    self.root.join(".git/HEAD"),
+                    "ref: refs/heads/joint-changed\n",
+                )
+                .unwrap();
+            }
+            if matches!(self.mode, JointMode::Panic) {
+                let mut transfer = Box::pin(with_joint_local_records::<()>(
+                    &request,
+                    &services,
+                    &ordered,
+                    Some(ready.metadata()),
+                    |_| {
+                        self.calls.fetch_add(1, Ordering::SeqCst);
+                        panic!("joint consuming action fixture");
+                    },
+                ));
+                let result = std::future::poll_fn(|context| {
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        std::future::Future::poll(transfer.as_mut(), context)
+                    })) {
+                        Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+                        Ok(std::task::Poll::Ready(value)) => std::task::Poll::Ready(Ok(value)),
+                        Err(panic) => std::task::Poll::Ready(Err(panic)),
+                    }
+                })
+                .await;
+                drop(transfer);
+                assert!(result.is_err());
+            } else {
+                let result = with_joint_local_records(
+                    &request,
+                    &services,
+                    &ordered,
+                    Some(ready.metadata()),
+                    |include| {
+                        self.calls.fetch_add(1, Ordering::SeqCst);
+                        (include, Err::<(), _>("original consumer result"))
+                    },
+                )
+                .await;
+                match self.mode {
+                    JointMode::RequiredGitStale => assert!(result.is_err()),
+                    JointMode::Include => {
+                        assert_eq!(result.unwrap(), (true, Err("original consumer result")));
+                    }
+                    JointMode::OptionalStale => {
+                        assert_eq!(result.unwrap(), (false, Err("original consumer result")));
+                    }
+                    JointMode::Panic => unreachable!(),
+                }
+            }
+            // Scope/value destruction occurs after all joint/P guards release.
+            drop(ready);
+            self.completed.store(true, Ordering::SeqCst);
+            self.original.admit(boundary, evidence, packet).await
+        })
+    }
+}
+
+async fn joint_probe(mode: JointMode) {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let http = ReadServer::new().await;
+    let f = ActualRead::new(&http).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let completed = Arc::new(AtomicBool::new(false));
+    let server = WorkspaceMcpServer::new(f.api(), f.git.workspace.id.clone())
+        .with_caller_agent_id(Some(f.agent.clone()))
+        .with_request_context(Arc::new(JointContext {
+            original: Arc::new(f.context()),
+            mode,
+            root: f.git.path.clone(),
+            calls: calls.clone(),
+            completed: completed.clone(),
+        }));
+    let response = run(
+        &server,
+        "await ws.pr.snapshot(4); return await ws.pr.snapshot(4);",
+    )
+    .await;
+    assert!(
+        completed.load(Ordering::SeqCst),
+        "the complete final planner probe ran: {response}"
+    );
+    let successful = matches!(mode, JointMode::Include | JointMode::OptionalStale);
+    assert_eq!(
+        response.to_string().contains("actual review"),
+        successful,
+        "{response}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        usize::from(!matches!(mode, JointMode::RequiredGitStale))
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn joint_local_records_require_every_original_and_transfer_once() {
+    joint_probe(JointMode::Include).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn joint_local_records_optional_invalidation_keeps_required_public_output() {
+    joint_probe(JointMode::OptionalStale).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn joint_local_records_required_git_change_refuses_even_current_optional() {
+    joint_probe(JointMode::RequiredGitStale).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn joint_local_records_action_panic_never_retries_or_recovers_required_output() {
+    joint_probe(JointMode::Panic).await;
+}

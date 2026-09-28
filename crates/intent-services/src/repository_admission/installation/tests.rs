@@ -878,4 +878,47 @@ mod read_owner {
                 .is_ok());
         }
     }
+    #[tokio::test]
+    async fn optional_capture_keeps_actual_services_and_never_extends_physical_owner() {
+        let f = Fixture::new().await;
+        let owner = confirmed(&f).await;
+        let original = Arc::new(f.services.clone());
+        let context = owner
+            .callback()
+            .with_read_owner(RepositoryReadOwner::capture(original.clone()));
+        let scope = McpRequestContext::capture(&context);
+        let mut ready = None;
+        with_caller(
+            caller(&f),
+            scope.scope(Box::pin(async {
+                let read = current_read_request().unwrap();
+                assert!(read.retains(original.as_ref()));
+                assert!(!read.retains(&original.as_ref().clone()));
+                ready = Some(
+                    read.capture_optional()
+                        .unwrap()
+                        .run_optional(|local| async move {
+                            local.subscribe_metadata(&[RepositoryLifecycleKey::Database])?;
+                            Ok(())
+                        })
+                        .unwrap()
+                        .await
+                        .unwrap(),
+                );
+            })),
+        )
+        .await;
+        drop(owner);
+        with_caller(caller(&f), async {
+            assert_eq!(
+                ready.as_ref().unwrap().metadata().check_current(),
+                Err(AdmissionError::Retired)
+            );
+        })
+        .await;
+        assert_local_read(&f.services, &f.workspace).await;
+        assert!(McpRequestContext::capture(&context)
+            .private_result_policy()
+            .is_none());
+    }
 }
