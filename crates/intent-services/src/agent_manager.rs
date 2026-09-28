@@ -76,7 +76,7 @@ use crate::Services;
 pub(crate) mod tests;
 
 pub(crate) mod runtime;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use runtime::DetachedChild;
 use runtime::{ChildState, LocalResources, RuntimeHandle, RuntimeTeardown};
 
@@ -9918,7 +9918,6 @@ async fn kill_child_tree(mut child: Child, spawn_pid: Option<u32>) {
 /// Non-unix fallback: no process groups, so fall back to killing the direct
 /// child (`kill_on_drop` remains the safety net on drop).
 #[cfg(not(unix))]
-#[expect(clippy::unused_async)] // signature mirrors the unix variant so call sites stay identical
 async fn kill_child_tree(mut child: Child, _spawn_pid: Option<u32>) {
     let _ = child.start_kill();
 }

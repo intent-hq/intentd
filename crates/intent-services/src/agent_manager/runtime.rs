@@ -209,21 +209,21 @@ impl Drop for LocalAgentRuntime {
 /// Opaque teardown carried by orchestration. Local batches retain the existing
 /// shared process-tree sweep; custom runtimes supply their own owned cleanup.
 pub(super) enum RuntimeTeardown {
-    Local(DetachedChild),
+    Local(Box<DetachedChild>),
     Custom(BoxFuture<'static, ()>),
 }
 
 impl RuntimeTeardown {
     pub(super) fn take(handle: &mut AgentHandle) -> Option<Self> {
         match &handle.execution.local {
-            Some(local) => local.take_child().map(Self::Local),
+            Some(local) => local.take_child().map(Box::new).map(Self::Local),
             None => Some(Self::Custom(handle.execution.runtime.stop())),
         }
     }
 
     pub(super) async fn kill_tree(self) {
         match self {
-            Self::Local(child) => child.kill_tree().await,
+            Self::Local(child) => (*child).kill_tree().await,
             Self::Custom(cleanup) => cleanup.await,
         }
     }
@@ -233,7 +233,7 @@ impl RuntimeTeardown {
         let mut other = Vec::new();
         for teardown in teardowns {
             match teardown {
-                Self::Local(child) => children.push(child),
+                Self::Local(child) => children.push(*child),
                 Self::Custom(cleanup) => other.push(cleanup),
             }
         }
@@ -332,7 +332,7 @@ pub(super) struct DetachedChild {
 impl DetachedChild {
     /// Move the child (and its launch dir) out of `handle`; `None` when the
     /// handle owns no child.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn take(handle: &mut AgentHandle) -> Option<Self> {
         handle.execution.local.as_ref()?.take_child()
     }
