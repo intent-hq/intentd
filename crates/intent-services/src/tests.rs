@@ -17323,6 +17323,7 @@ mod drafts_events {
 
 pub(crate) mod pr {
     mod accept_member;
+    mod discovery_http;
 
     use std::path::PathBuf;
     use std::sync::Arc;
