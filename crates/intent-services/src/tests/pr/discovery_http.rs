@@ -1130,3 +1130,191 @@ async fn shared_discovery_explicit_admission_rechecks_guards_between_pages() {
         }).await;
     }
 }
+
+async fn overlapping_explicit_background_denial(detail: bool) {
+    let api = Api::new(vec![pull(42, "feature")]).await;
+    let (_t, svc, id) = refresh_setup(
+        StubForge::default(),
+        if detail { "feature" } else { "absent" },
+        detail.then_some(42),
+        false,
+    )
+    .await;
+    let sc = api.sc();
+    let svc = svc.with_source_control(sc.clone());
+    let repo = RepoRef::new("o", "r");
+    let traffic = Traffic::default();
+    with_traffic(traffic.clone(), async {
+        // Deterministic seam for refresh_workspace_pr: use its exact explicit
+        // scope and private worker, delaying the worker as its real store and
+        // provider awaits can. Spawning the sweep avoids inheriting FORCE_AFTER.
+        let overlap = crate::pr_discovery::explicitly_refresh(async {
+            if detail {
+                // Linked refreshes consult listing first. Warm it within this
+                // demand, before the background record denial, so only the
+                // record path under test requires another HTTP request.
+                svc.discover_shared_pr(sc.as_ref(), &repo, "absent", None, None)
+                    .await
+                    .unwrap();
+            }
+            svc.pr_discovery.exhaust_budget();
+            let (background, provider, repository) = (svc.clone(), sc.clone(), repo.clone());
+            let denied = tokio::spawn(async move {
+                if detail {
+                    background
+                        .shared_pr_record(provider.as_ref(), &repository, 42)
+                        .await
+                        .map(|_| ())
+                } else {
+                    background
+                        .discover_shared_pr(provider.as_ref(), &repository, "absent", None, None)
+                        .await
+                        .map(|_| ())
+                }
+            })
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert!(denied.to_string().contains("request budget"), "{denied:?}");
+            assert_eq!(counts(&traffic), (u64::from(detail), 0, 0));
+            svc.refresh_workspace_pr_cached(&id).await
+        })
+        .await;
+        let overlap_counts = counts(&traffic);
+        // Keep the later-demand control even when the overlap assertion fails.
+        svc.refresh_workspace_pr(&id).await.unwrap();
+        assert_eq!(
+            counts(&traffic),
+            (
+                overlap_counts.0 + 1,
+                overlap_counts.1 + u64::from(detail),
+                0
+            )
+        );
+        assert!(
+            overlap.is_ok(),
+            "explicit demand must not reuse an overlapping background denial: {overlap:?}"
+        );
+        assert_eq!(overlap_counts, (1, u64::from(detail), 0));
+        let before = counts(&traffic);
+        assert!(svc.shared_pr_record(sc.as_ref(), &repo, 99).await.is_err());
+        assert!(svc
+            .discover_shared_pr(
+                sc.as_ref(),
+                &RepoRef::new("o", "another"),
+                "absent",
+                None,
+                None
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            counts(&traffic),
+            before,
+            "later background work stays deferred"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn shared_discovery_explicit_overlap_skips_background_listing_denial() {
+    overlapping_explicit_background_denial(false).await;
+}
+
+#[tokio::test]
+async fn shared_discovery_explicit_overlap_skips_background_detail_denial() {
+    overlapping_explicit_background_denial(true).await;
+}
+
+#[tokio::test]
+async fn shared_discovery_explicit_overlap_keeps_success_and_forge_error_sharing() {
+    for detail in [false, true] {
+        for forge_error in [false, true] {
+            let api = Api::new(vec![pull(42, "feature")]).await;
+            if forge_error {
+                if detail {
+                    api.redirect_quota_detail.store(42, Ordering::SeqCst);
+                } else {
+                    api.fail_page.store(1, Ordering::SeqCst);
+                }
+            }
+            let (_t, svc, id) = refresh_setup(
+                StubForge::default(),
+                if detail { "feature" } else { "absent" },
+                detail.then_some(42),
+                false,
+            )
+            .await;
+            let sc = api.sc();
+            let svc = svc.with_source_control(sc.clone());
+            let repo = RepoRef::new("o", "r");
+            let traffic = Traffic::default();
+            with_traffic(
+                traffic.clone(),
+                crate::pr_discovery::explicitly_refresh(async {
+                    if detail {
+                        svc.discover_shared_pr(sc.as_ref(), &repo, "absent", None, None)
+                            .await
+                            .unwrap();
+                    }
+                    let (background, provider, repository) =
+                        (svc.clone(), sc.clone(), repo.clone());
+                    let result = tokio::spawn(with_traffic(traffic.clone(), async move {
+                        if detail {
+                            background
+                                .shared_pr_record(provider.as_ref(), &repository, 42)
+                                .await
+                                .map(|_| ())
+                        } else {
+                            background
+                                .discover_shared_pr(
+                                    provider.as_ref(),
+                                    &repository,
+                                    "absent",
+                                    None,
+                                    None,
+                                )
+                                .await
+                                .map(|_| ())
+                        }
+                    }))
+                    .await
+                    .unwrap();
+                    assert_eq!(result.is_err(), forge_error);
+                    // All remaining background capacity is now spent, but the
+                    // genuine forge result should still satisfy this demand.
+                    svc.pr_discovery.exhaust_budget();
+                    let before = counts(&traffic);
+                    let refreshed = svc.refresh_workspace_pr_cached(&id).await;
+                    assert_eq!(refreshed.is_err(), forge_error, "{refreshed:?}");
+                    if detail && forge_error {
+                        assert!(matches!(refreshed, Err(Error::RateLimited(_))));
+                    }
+                    assert_eq!(
+                        counts(&traffic),
+                        before,
+                        "reuse genuine same-demand outcomes"
+                    );
+                    assert_eq!(
+                        before,
+                        (
+                            1,
+                            if detail {
+                                if forge_error {
+                                    4
+                                } else {
+                                    1
+                                }
+                            } else {
+                                0
+                            },
+                            0
+                        )
+                    );
+                }),
+            )
+            .await;
+        }
+    }
+}
