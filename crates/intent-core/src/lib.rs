@@ -18,6 +18,7 @@ fn disable_node_compile_cache() {
 
 pub mod agent_configs;
 pub(crate) mod agent_logs;
+pub mod agent_runtime;
 pub mod caller;
 pub mod chief_cwd;
 pub mod clock;

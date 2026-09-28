@@ -362,6 +362,13 @@ impl Store {
             {
                 return Err(invalid("assignment ownership is tombstoned or mismatched"));
             }
+            if old.merge_target_agent_id != template.merge_target_agent_id
+                || old.inherited_checkpoint_id != template.inherited_checkpoint_id
+            {
+                return Err(invalid(
+                    "reassignment cannot replace inherited baseline or merge target",
+                ));
+            }
             if old.run_id == template.run_id {
                 admitted.assignment_epoch = old.assignment_epoch;
                 if old != admitted {

@@ -583,3 +583,30 @@ async fn deleting_workspace_tombstones_node_assignments_atomically() {
         .unwrap();
     assert!(retained.tombstoned);
 }
+
+#[tokio::test]
+async fn reassignment_cannot_replace_the_original_merge_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("nodes.db")).await.unwrap();
+    let (_, _, assignment) = ready(&store).await;
+    store
+        .stop_node_assignment(&assignment, false)
+        .await
+        .unwrap();
+    let mut replacement = assignment.clone();
+    replacement.run_id = uuid::Uuid::new_v4().to_string();
+    replacement.merge_target_agent_id = Some("different-parent".into());
+    assert!(store.assign_node_run(&replacement).await.is_err());
+    replacement.merge_target_agent_id = None;
+    replacement.inherited_checkpoint_id = Some(uuid::Uuid::new_v4().to_string());
+    assert!(store.assign_node_run(&replacement).await.is_err());
+    replacement.inherited_checkpoint_id = None;
+    assert_eq!(
+        store
+            .assign_node_run(&replacement)
+            .await
+            .unwrap()
+            .assignment_epoch,
+        NodeCounter(2)
+    );
+}
