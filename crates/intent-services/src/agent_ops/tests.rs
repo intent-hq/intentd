@@ -22616,7 +22616,10 @@ async fn wake_or_create_queued_skips_watch_when_caller_deleted() {
     flag_agent_deleted(&svc, &caller).await;
     // Occupy the assignee's in-flight slot so `deliver_wake_message` takes the
     // enqueue branch deterministically.
-    assert!(manager.try_begin_turn(&target, &ws).await, "claim slot");
+    assert!(
+        manager.try_begin_turn(&target, &ws).await.is_some(),
+        "claim slot"
+    );
 
     let input = AgentWakeOrCreateInput {
         caller_agent_id: Some(caller.clone()),
@@ -22680,7 +22683,10 @@ async fn wake_or_create_queued_registers_watch() {
         .expect("assign");
     // Occupy the assignee's in-flight slot so `deliver_wake_message` takes the
     // enqueue branch deterministically.
-    assert!(manager.try_begin_turn(&target, &ws).await, "claim slot");
+    assert!(
+        manager.try_begin_turn(&target, &ws).await.is_some(),
+        "claim slot"
+    );
 
     let input = AgentWakeOrCreateInput {
         caller_agent_id: Some(caller.clone()),
@@ -22742,7 +22748,10 @@ async fn wake_or_create_queued_adopts_existing_watch() {
 
     // Occupy the assignee's in-flight slot so the wakeOrCreate takes the
     // queued branch deterministically.
-    assert!(manager.try_begin_turn(&target, &ws).await, "claim slot");
+    assert!(
+        manager.try_begin_turn(&target, &ws).await.is_some(),
+        "claim slot"
+    );
 
     let queued = svc
         .agent_wake_or_create_op(
@@ -23890,7 +23899,10 @@ async fn turn_start_opens_new_waiting_period_for_armed_watch() {
 
     // The child starts a REAL turn (e.g. a user message or hook-dispatch
     // wake): the period is over and the marker clears at the claim.
-    assert!(manager.try_begin_turn(&child, &ws).await, "claim slot");
+    assert!(
+        manager.try_begin_turn(&child, &ws).await.is_some(),
+        "claim slot"
+    );
     assert!(
         !svc.store()
             .has_advisory_wake_delivery(&parent, &child)
@@ -23987,7 +23999,10 @@ async fn turn_start_opens_new_waiting_period_for_grouped_watch() {
     manager.stop(&parent).await;
 
     // Real turn: marker clears, period 2 opens.
-    assert!(manager.try_begin_turn(&child, &ws).await, "claim slot");
+    assert!(
+        manager.try_begin_turn(&child, &ws).await.is_some(),
+        "claim slot"
+    );
     assert!(
         !svc.store()
             .has_advisory_wake_delivery(&parent, &child)

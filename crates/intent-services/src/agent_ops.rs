@@ -106,7 +106,7 @@ pub(crate) struct AgentRetirementGates {
 }
 
 impl AgentRetirementGates {
-    fn for_agent(&self, agent_id: &AgentId) -> Arc<tokio::sync::Mutex<()>> {
+    pub(crate) fn for_agent(&self, agent_id: &AgentId) -> Arc<tokio::sync::Mutex<()>> {
         let mut gates = self.gates.lock().expect("retirement gate map poisoned");
         gates.retain(|_, gate| gate.strong_count() > 0);
         if let Some(gate) = gates.get(agent_id).and_then(std::sync::Weak::upgrade) {
@@ -13788,7 +13788,7 @@ impl Services {
         //   3. Spawn the worker with the same content in-memory (the worker
         //      path does not re-persist).
         let content_owned = content.to_string();
-        if !manager.try_begin_turn(agent_id, workspace_id).await {
+        let Some(admission) = manager.try_begin_turn(agent_id, workspace_id).await else {
             // Fast enqueue branch: the manager is already draining a turn. The
             // metadata rides along on the queue entry so the drain re-persist
             // keeps the wake tag.
@@ -13808,7 +13808,7 @@ impl Services {
                 "queued": true,
                 "queuedMessage": queued.to_value(position),
             }));
-        }
+        };
         let blocks = json!([build_block()]);
         let created_at = now_iso();
         // Row-level metadata rides along with the in-block fold (monorepo#1217)
@@ -13902,6 +13902,7 @@ impl Services {
                 message_metadata: message_metadata.cloned(),
                 ..Default::default()
             },
+            admission,
         );
         Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
     }
