@@ -37,6 +37,7 @@ mod message_thumbnails;
 mod metrics_repo;
 mod note_line_attribution_repo;
 mod note_repo;
+mod node_repo;
 mod note_version_repo;
 mod pr_monitor_repo;
 mod principal_repo;
