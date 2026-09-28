@@ -289,6 +289,8 @@ impl SettingsSnapshot {
 /// Layered runtime settings store. See the module docs for the full contract.
 pub struct SettingsRegistry {
     repository_gate: OnceLock<GitlabCredentialGate>,
+    #[cfg(test)]
+    pub(crate) context_publication_probe: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     path: PathBuf,
     inner: Mutex<Inner>,
     snapshot: RwLock<Arc<SettingsSnapshot>>,
@@ -351,6 +353,13 @@ impl SettingsRegistry {
         if let Some(gate) = self.repository_gate.get() {
             gate.settings_published(snapshot);
         }
+        #[cfg(test)]
+        {
+            let probe = self.context_publication_probe.lock().unwrap().take();
+            if let Some(probe) = probe {
+                probe();
+            }
+        }
     }
 
     /// Load (or initialize) `config.toml` at `path` and build the registry.
@@ -386,6 +395,8 @@ impl SettingsRegistry {
         let (tx, _rx) = watch::channel(SettingsChanged::default());
         Ok(Self {
             repository_gate: OnceLock::new(),
+            #[cfg(test)]
+            context_publication_probe: Mutex::new(None),
             path,
             inner: Mutex::new(inner),
             snapshot: RwLock::new(snapshot),
@@ -455,6 +466,27 @@ impl SettingsRegistry {
             .read()
             .expect("settings snapshot lock poisoned")
             .clone()
+    }
+
+    /// Optional delivery compares the ORIGINAL allocation under the same read
+    /// guard through its pure consuming action. Never take the writer/inner or
+    /// credential gates here; writers release P metadata before snapshot.write.
+    pub(crate) fn with_original_snapshot<T>(
+        &self,
+        original: &Arc<SettingsSnapshot>,
+        action: impl FnOnce(bool) -> T,
+    ) -> T {
+        let guard = self.snapshot.try_read();
+        let current = guard
+            .as_ref()
+            .is_ok_and(|value| Arc::ptr_eq(value, original));
+        action(current)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn context_hold_snapshot_for_test(&self, action: impl FnOnce()) {
+        let _guard = self.snapshot.write().unwrap();
+        action();
     }
 
     /// Effective JSON value for a dotted wire path (see

@@ -1269,3 +1269,59 @@ fn public_enrichment_errors_still_precede_the_same_final_consistency_check() {
         );
     }
 }
+
+#[test]
+fn live_enrichment_uses_effective_fetch_and_push_before_original_consistency_check() {
+    let f = Fixture::new();
+    f.config("remote.origin.url", A);
+    f.config("remote.origin.pushurl", B);
+    let id = f.input().roots[0].root.clone();
+    let seen = std::cell::RefCell::new(Vec::new());
+    let (context, observed) = repository_context_reader::read_context_root_with_resolver(
+        &id,
+        &f.path,
+        &SavedReviewSelection::Automatic,
+        None,
+        &canonical_resolver(),
+        &f.env,
+        |target| {
+            seen.borrow_mut().push(target.clone());
+            RepositoryTargetContext {
+                target: target.clone(),
+                provider_project_id: None,
+                connection: None,
+                availability: RepositoryAvailability::Unknown,
+                capabilities: vec![],
+            }
+        },
+    )
+    .unwrap();
+    assert_eq!(seen.borrow().len(), 2);
+    assert_eq!(context.targets.len(), 2);
+    assert!(
+        matches!(&context.review_selection.outcome,ReviewSelectionOutcome::Resolved{target,..} if target.project_path=="team/a")
+    );
+    assert_eq!(observed.private_root.remotes.len(), 1);
+    let result = repository_context_reader::read_context_root_with_resolver(
+        &id,
+        &f.path,
+        &SavedReviewSelection::Automatic,
+        None,
+        &canonical_resolver(),
+        &f.env,
+        |target| {
+            f.config("remote.origin.url", "https://github.com/team/changed.git");
+            RepositoryTargetContext {
+                target: target.clone(),
+                provider_project_id: None,
+                connection: None,
+                availability: RepositoryAvailability::Unknown,
+                capabilities: vec![],
+            }
+        },
+    );
+    assert!(
+        result.is_err(),
+        "enrichment cannot race the reader's original final check"
+    );
+}

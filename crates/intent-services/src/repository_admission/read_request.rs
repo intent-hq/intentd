@@ -51,6 +51,12 @@ impl RepositoryReadOwner {
         }))
     }
 
+    pub(crate) fn retains<T: Any + Send + Sync>(&self, original: &T) -> bool {
+        self.original
+            .downcast_ref::<T>()
+            .is_some_and(|retained| std::ptr::eq(retained, original))
+    }
+
     pub(crate) fn with_policy(mut self: Arc<Self>, factory: Arc<ReadPolicyFactory>) -> Arc<Self> {
         // The typed factory calls this before exposing the retained owner.
         Arc::get_mut(&mut self)
@@ -90,6 +96,19 @@ impl RepositoryReadRequest {
         self.original.check_read_caller()
     }
 
+    pub(crate) fn check_optional_current(&self) -> AdmissionResult<()> {
+        if !self.original.original_caller_matches() {
+            return Err(AdmissionError::Denied);
+        }
+        self.original.retirement().with_optional(|current| {
+            if current {
+                Ok(())
+            } else {
+                Err(AdmissionError::Retired)
+            }
+        })
+    }
+
     pub(crate) fn policy(self: &Arc<Self>) -> Option<Arc<dyn McpPrivatePolicy>> {
         self.owner
             .policy
@@ -108,13 +127,6 @@ impl RepositoryReadRequest {
             .is_some_and(|retained| std::ptr::eq(retained, original))
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "optional context capture is not activated by this local lifetime cut"
-        )
-    )]
     pub(crate) fn capture_optional(self: &Arc<Self>) -> AdmissionResult<RepositoryOptionalScope> {
         require_mandatory_execution()?;
         self.check_current()?;
@@ -209,14 +221,39 @@ struct OptionalState {
 #[derive(Clone)]
 pub(crate) struct RepositoryOptionalMetadata(Arc<OptionalState>);
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "optional metadata producer remains inactive")
-)]
 impl RepositoryOptionalMetadata {
     pub(crate) fn check_current(&self) -> AdmissionResult<()> {
         self.0.request.check_current()?;
         self.0.lifetime.retirement().check_current()
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.0.lifetime.retirement().end_scope();
+    }
+
+    pub(crate) fn request(&self) -> &Arc<RepositoryReadRequest> {
+        &self.0.request
+    }
+
+    /// Optional-only entry: acquire the original parent once, nonblocking. No
+    /// `check_current` call may wait on that same fence before this try operation.
+    pub(crate) fn transfer_optional<T>(&self, action: impl FnOnce(bool) -> T) -> T {
+        if !self.0.request.original.original_caller_matches() {
+            return action(false);
+        }
+        self.0
+            .request
+            .original
+            .retirement()
+            .with_optional(|parent| {
+                if !parent {
+                    return action(false);
+                }
+                self.0
+                    .lifetime
+                    .retirement()
+                    .with_optional(|local| action(local && self.0.prepared.load(Ordering::Acquire)))
+            })
     }
 
     pub(crate) fn subscribe_metadata(
@@ -248,13 +285,6 @@ pub(crate) struct RepositoryOptionalScope {
     metadata: RepositoryOptionalMetadata,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "optional preparation has no production context source yet"
-    )
-)]
 impl RepositoryOptionalScope {
     pub(crate) fn metadata(&self) -> RepositoryOptionalMetadata {
         self.metadata.clone()
@@ -322,16 +352,16 @@ pub(crate) struct PreparedRepositoryOptional<T> {
     value: T,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "prepared optional payload is not wired to production output"
-    )
-)]
 impl<T> PreparedRepositoryOptional<T> {
     pub(crate) fn metadata(&self) -> &RepositoryOptionalMetadata {
         &self.scope.metadata
+    }
+
+    pub(crate) fn map<U>(self, map: impl FnOnce(T) -> U) -> PreparedRepositoryOptional<U> {
+        PreparedRepositoryOptional {
+            scope: self.scope,
+            value: map(self.value),
+        }
     }
 
     pub(crate) fn value(&self) -> &T {

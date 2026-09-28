@@ -25,6 +25,7 @@ use crate::repository_admission::read_request::{RepositoryReadChild, RepositoryR
 use crate::repository_admission::{AdmissionError, AdmissionResult, RepositoryAgentIdentity};
 use crate::repository_admission_git_source::{RepositoryGitSource, RootRecord};
 use crate::repository_admission_sources::read_agent_identity;
+use crate::repository_context_live::SelectionFacts;
 use crate::repository_context_reader::{RepositoryChangeInputs, RepositoryObservedRoot};
 use crate::repository_credentials::authority::{
     CredentialFuture, RepositoryAuthorityFence, RepositoryCredentialTransport,
@@ -113,6 +114,49 @@ async fn member(
     })
 }
 
+pub(crate) async fn context_member(
+    services: &Services,
+    request: &RepositoryReadRequest,
+    workspace: &WorkspaceId,
+) -> AdmissionResult<(
+    RepositoryWorkspaceAuthoritySnapshot,
+    RepositoryAgentIdentity,
+)> {
+    request.check_optional_current()?;
+    let caller = current_caller().ok_or(AdmissionError::Denied)?;
+    if !matches!(caller, Caller::Agent { .. }) {
+        return Err(AdmissionError::Denied);
+    }
+    let before = services
+        .store
+        .repository_workspace_authority_snapshot(workspace)
+        .await
+        .map_err(|e| local(&e))?;
+    let agent = read_agent_identity(services, &caller)
+        .await?
+        .ok_or(AdmissionError::Denied)?;
+    if agent.workspace_id != *workspace
+        || before.workspace.value.is_none()
+        || before.workspace.revision.is_none()
+    {
+        return Err(AdmissionError::Denied);
+    }
+    services
+        .require_member(workspace)
+        .await
+        .map_err(|e| local(&e))?;
+    let after = services
+        .store
+        .repository_workspace_authority_snapshot(workspace)
+        .await
+        .map_err(|e| local(&e))?;
+    if before != after || read_agent_identity(services, &caller).await?.as_ref() != Some(&agent) {
+        return Err(AdmissionError::BindingChanged);
+    }
+    request.check_optional_current()?;
+    Ok((before, agent))
+}
+
 fn subscribe(child: &mut RepositoryReadChild, workspace: &WorkspaceId) -> AdmissionResult<()> {
     let Some(Caller::Agent { agent_id }) = current_caller() else {
         return Err(AdmissionError::Denied);
@@ -121,6 +165,10 @@ fn subscribe(child: &mut RepositoryReadChild, workspace: &WorkspaceId) -> Admiss
         RepositoryLifecycleKey::Database,
         RepositoryLifecycleKey::Workspace(workspace.clone()),
         RepositoryLifecycleKey::Agent(agent_id),
+        RepositoryLifecycleKey::Selection {
+            workspace_id: workspace.clone(),
+            git_root_id: None,
+        },
     ])
 }
 
@@ -138,10 +186,11 @@ fn resolver(
     CanonicalRemoteResolver::new(instances, Vec::new()).map_err(|_| AdmissionError::Unavailable)
 }
 
-fn target(observed: &RepositoryObservedRoot) -> AdmissionResult<intent_core::RepositoryTarget> {
-    match resolve_review_selection(&SavedReviewSelection::Automatic, &observed.remotes, None)
-        .outcome
-    {
+fn target(
+    observed: &RepositoryObservedRoot,
+    saved: &SavedReviewSelection,
+) -> AdmissionResult<intent_core::RepositoryTarget> {
+    match resolve_review_selection(saved, &observed.remotes, None).outcome {
         ReviewSelectionOutcome::Resolved { target, .. } => Ok(target),
         _ => Err(AdmissionError::Unavailable),
     }
@@ -228,6 +277,7 @@ impl CapturedReview {
                 self.child = Err(error);
             }
         }
+        let selection = SelectionFacts::read(services, &root_id).await?;
         let observed = root
             .observe_local(
                 &services.store,
@@ -239,7 +289,10 @@ impl CapturedReview {
             .require_member(&self.workspace)
             .await
             .map_err(|e| local(&e))?;
-        let selected = target(&observed)?;
+        if SelectionFacts::read(services, &root_id).await? != selection {
+            return Err(AdmissionError::BindingChanged);
+        }
+        let selected = target(&observed, &selection.saved()?)?;
         if selected.provider == RepositoryProvider::Github {
             let (owner, name) = selected
                 .project_path
@@ -255,8 +308,7 @@ impl CapturedReview {
             self.number,
             self.child?,
             self.settled,
-            root,
-            GitFacts::from(observed),
+            (root, GitFacts::from(observed), selection),
         )
         .await
     }
@@ -284,6 +336,7 @@ struct ReadFacts {
     root: RootRecord,
     member: MemberFacts,
     git: GitFacts,
+    selection: SelectionFacts,
     settled: RepositorySettledConnection,
     request: RepositoryAuthorityRequest,
 }
@@ -317,7 +370,8 @@ impl ReadFacts {
         let authority = member(&self.services, request, &self.git.root.workspace_id).await?;
         let observed = git.observe_root(resolver(Some(&self.settled))?).await?;
         if authority != self.member
-            || target(&observed)? != self.request.target
+            || SelectionFacts::read(&self.services, &self.git.root).await? != self.selection
+            || target(&observed, &self.selection.saved()?)? != self.request.target
             || GitFacts::from(observed) != self.git
         {
             return Err(AdmissionError::BindingChanged);
@@ -456,9 +510,9 @@ async fn read_review(
     number: u64,
     mut child: RepositoryReadChild,
     settled: credentials::Result<RepositorySettledConnection>,
-    original_root: RootRecord,
-    original_git: GitFacts,
+    original: (RootRecord, GitFacts, SelectionFacts),
 ) -> AdmissionResult<ReadOutcome> {
+    let (original_root, original_git, selection) = original;
     host.check_current()?;
     if number == 0 {
         return Err(AdmissionError::Denied);
@@ -483,7 +537,10 @@ async fn read_review(
         child.retirement(),
         |git| async move {
             let observed = git.observe_root(resolve).await?;
-            let selected_target = target(&observed)?;
+            if SelectionFacts::read(host.services(), &root_id).await? != selection {
+                return Err(AdmissionError::BindingChanged);
+            }
+            let selected_target = target(&observed, &selection.saved()?)?;
             let git_facts = GitFacts::from(observed);
             if git_facts != original_git || selected_target.provider != RepositoryProvider::Gitlab {
                 return Err(AdmissionError::BindingChanged);
@@ -526,6 +583,7 @@ async fn read_review(
                 root,
                 member: member_facts,
                 git: git_facts,
+                selection,
                 settled,
                 request,
             });
@@ -828,6 +886,217 @@ pub(crate) async fn with_joint_local_records<T: Send>(
         },
     )
     .await
+}
+
+/// Complete original optional evidence, retained separately from all packet
+/// bytes. The metadata and facts must belong to the same physical request.
+pub(crate) struct ContextOptional {
+    pub(crate) prepared:
+        Arc<crate::repository_admission::read_request::PreparedRepositoryOptional<()>>,
+    pub(crate) facts: Arc<crate::repository_context_live::PreparedContextFacts>,
+}
+impl ContextOptional {
+    fn belongs_to(&self, request: &Arc<RepositoryReadRequest>, services: &Arc<Services>) -> bool {
+        Arc::ptr_eq(self.prepared.metadata().request(), request)
+            && Arc::ptr_eq(&self.facts.request, request)
+            && Arc::ptr_eq(&self.facts.owner.services, services)
+    }
+}
+
+/// This token closes the worker's actual lock interval. Its drop signals the
+/// worker; blocking jobs are still owned and counted until their real exit.
+struct ContextLocks(
+    #[expect(dead_code, reason = "sender drop releases the tracked source worker")]
+    tokio::sync::oneshot::Sender<()>,
+);
+struct RequiredObservation {
+    facts: Arc<ReadFacts>,
+    operation: Arc<Mutex<ReadState>>,
+    eligibility: Arc<RepositoryReadEligibility>,
+}
+
+pub(crate) async fn with_context_records<T: Send>(
+    request: &Arc<RepositoryReadRequest>,
+    services: &Arc<Services>,
+    records: &[&ReadRecord],
+    optional: &ContextOptional,
+    transfer: impl FnOnce(bool) -> T + Send,
+) -> AdmissionResult<T> {
+    request.check_current()?;
+    let current = crate::repository_admission::request_context::current_read_request()?;
+    if !Arc::ptr_eq(request, &current)
+        || records.is_empty()
+        || records
+            .iter()
+            .any(|r| !Arc::ptr_eq(&r.request, request) || !Arc::ptr_eq(&r.facts.services, services))
+    {
+        return Err(AdmissionError::Denied);
+    }
+    if !optional.belongs_to(request, services) {
+        return with_records(request, services, records, || transfer(false)).await;
+    }
+    let mut child = request.child()?;
+    let mut roots = Vec::new();
+    for record in records {
+        subscribe(&mut child, &record.facts.git.root.workspace_id)?;
+        child.subscribe(&[
+            RepositoryLifecycleKey::Database,
+            record.facts.root.lifecycle_key(),
+        ])?;
+        roots.push(record.facts.root.clone());
+    }
+    let child = Arc::new(child);
+    let originals = records
+        .iter()
+        .map(|r| RequiredObservation {
+            facts: r.facts.clone(),
+            operation: r.operation.clone(),
+            eligibility: r.eligibility.clone(),
+        })
+        .collect::<Vec<_>>();
+    let mut operations = originals
+        .iter()
+        .map(|r| r.operation.clone())
+        .collect::<Vec<_>>();
+    operations.sort_unstable_by_key(Arc::as_ptr);
+    operations.dedup_by(|a, b| Arc::ptr_eq(a, b));
+    let eligibility = originals
+        .iter()
+        .map(|r| r.eligibility.clone())
+        .collect::<Vec<_>>();
+    let facts = optional.facts.clone();
+    let worker_facts = facts.clone();
+    let worker_services = services.clone();
+    let worker_request = request.clone();
+    let worker_child = child.clone();
+    let caller = current_caller().ok_or(AdmissionError::Denied)?;
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let _locks = ContextLocks(release_tx);
+    let worker = facts.owner.start_job(intent_core::caller::with_caller(
+        caller,
+        intent_core::caller::with_wire_credential(None, async move {
+            RepositoryGitSource::with_mixed_group(
+                &worker_services.store,
+                &worker_services.worktree_locks,
+                roots,
+                worker_facts.roots(),
+                worker_child.retirement(),
+                |sources, optional_sources| async move {
+                    for (record, source) in originals.iter().zip(&sources) {
+                        record.facts.validate(&worker_request, source).await?;
+                    }
+                    let include = match optional_sources {
+                        Some(sources) => worker_facts.revalidate(&sources).await.is_ok(),
+                        None => false,
+                    };
+                    if ready_tx.send(include).is_ok() {
+                        let _ = release_rx.await;
+                    }
+                    Ok(())
+                },
+            )
+            .await
+        }),
+    ));
+    let Ok(include) = ready_rx.await else {
+        return Err(worker
+            .await
+            .ok()
+            .and_then(Result::err)
+            .unwrap_or(AdmissionError::Unavailable));
+    };
+    let eligibility = eligibility.iter().map(Arc::as_ref).collect::<Vec<_>>();
+    child.transfer_with_optional(Some(optional.prepared.metadata()), |local_current| {
+        facts.with_revision(|revision_current| {
+            let states = operations.iter().map(|op| op.lock().map_err(|_| AdmissionError::Retired)).collect::<AdmissionResult<Vec<_>>>()?;
+            if states.iter().any(|state| **state != ReadState::Finished) { return Err(AdmissionError::Retired); }
+            let mut output = None;
+            let mut transfer = Some(transfer);
+            let mut batch = |provider: Option<&crate::source_control_auth_ops::repository_owner::RepositoryConnectionFacts>| {
+                crate::source_control_auth_ops::repository_owner::RepositoryReadEligibility::with_all_current_and_facts(
+                    &eligibility, provider, |include| {
+                        output = Some(transfer.take().expect("one context transfer")(include));
+                        Ok(())
+                    })
+            };
+            if include && local_current && revision_current { facts.with_settings(&mut batch) } else { batch(None) }
+                .map_err(|_| AdmissionError::Unavailable)?;
+            output.ok_or(AdmissionError::Retired)
+        })
+    })
+}
+
+/// Only ACP can construct `McpSealedReads`. The prompt arm owns a distinct real
+/// request, so neither an empty vector nor ordinary output chooses this branch.
+pub(crate) enum OptionalContextOrigin<'a> {
+    Mcp(intent_acp::mcp_server::private_results::McpSealedReads<'a>),
+    Prompt(&'a crate::repository_admission::request_context::RepositoryPromptRequest),
+}
+
+pub(crate) async fn with_context_only<T: Send>(
+    origin: OptionalContextOrigin<'_>,
+    optional: &ContextOptional,
+    transfer: impl FnOnce(bool) -> T + Send,
+) -> AdmissionResult<T> {
+    let facts = &optional.facts;
+    let prompt = match origin {
+        OptionalContextOrigin::Mcp(sealed) if sealed.is_empty() => false,
+        OptionalContextOrigin::Prompt(owner) if Arc::ptr_eq(owner.read(), &facts.request) => true,
+        _ => return Err(AdmissionError::Denied),
+    };
+    if !optional.belongs_to(&facts.request, &facts.owner.services) {
+        return Ok(transfer(false));
+    }
+    if !optional.prepared.metadata().transfer_optional(|live| live) {
+        return Ok(transfer(false));
+    }
+    let caller = current_caller().ok_or(AdmissionError::Denied)?;
+    let worker_facts = facts.clone();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let _locks = ContextLocks(release_tx);
+    let worker = facts.owner.start_job(intent_core::caller::with_caller(
+        caller,
+        intent_core::caller::with_wire_credential(None, async move {
+            let services = worker_facts.owner.services.clone();
+            RepositoryGitSource::with_mixed_group(
+                &services.store,
+                &services.worktree_locks,
+                Vec::new(),
+                worker_facts.roots(),
+                crate::repository_admission::RepositoryRetirement::default(),
+                |_, sources| async move {
+                    let include = match sources {
+                        Some(sources) => worker_facts.revalidate(&sources).await.is_ok(),
+                        None => false,
+                    };
+                    if ready_tx.send(include).is_ok() {
+                        let _ = release_rx.await;
+                    }
+                    Ok(())
+                },
+            )
+            .await
+        }),
+    ));
+    let include = ready_rx.await.unwrap_or(false);
+    // The tracked worker owns real locks until release/exit, even after cancellation.
+    drop(worker);
+    optional.prepared.metadata().transfer_optional(|local_current| {
+        let mut output = None;
+        let mut transfer = Some(transfer);
+        let mut batch = |provider: Option<&crate::source_control_auth_ops::repository_owner::RepositoryConnectionFacts>| {
+            let consume = |include| { output = Some(transfer.take().expect("one optional transfer")(include)); Ok(()) };
+            if prompt {
+                crate::source_control_auth_ops::repository_owner::RepositoryConnectionFacts::with_prompt_current(provider, consume)
+            } else {
+                crate::source_control_auth_ops::repository_owner::RepositoryConnectionFacts::with_optional_current(provider, consume)
+            }
+        };
+        if include && local_current { facts.with_current(&mut batch) } else { batch(None) }.map_err(|_| AdmissionError::Unavailable)?;
+        output.ok_or(AdmissionError::Unavailable)
+    })
 }
 
 #[cfg(test)]

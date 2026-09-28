@@ -14,6 +14,10 @@ mod repository_admission;
 )]
 #[path = "../src/repository_admission/git_source.rs"]
 mod repository_admission_git_source;
+#[expect(
+    dead_code,
+    reason = "live context enrichment is exercised in Services and the reader target; this harness retains original source adapter coverage"
+)]
 #[path = "../src/repository_context_reader.rs"]
 mod repository_context_reader;
 #[path = "../src/repository_credentials.rs"]

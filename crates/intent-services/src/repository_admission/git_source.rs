@@ -49,6 +49,13 @@ fn local_error(error: &intent_core::Error) -> AdmissionError {
 }
 
 impl RootRecord {
+    pub(crate) fn root(&self) -> &RepositoryRootId {
+        &self.root
+    }
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.canonical_path
+    }
+
     /// Internal control discovery under the original stored lock. This observes
     /// only local Git facts and neither constructs a lifetime nor grants access.
     pub(super) async fn observe_local(
@@ -191,6 +198,80 @@ impl RepositoryGitSource {
                 }));
             }
             action(sources).await
+        })
+        .await
+    }
+
+    /// Required paths retain their original blocking semantics; optional-only
+    /// paths try the very same lock allocations and omit as one context.
+    pub(crate) async fn with_mixed_group<T, F, Fut>(
+        store: &Store,
+        locks: &WorktreeLocks,
+        required: Vec<RootRecord>,
+        optional: Vec<RootRecord>,
+        retirement: RepositoryRetirement,
+        action: F,
+    ) -> AdmissionResult<T>
+    where
+        T: Send,
+        F: FnOnce(Vec<Arc<Self>>, Option<Vec<Arc<Self>>>) -> Fut + Send,
+        Fut: Future<Output = AdmissionResult<T>> + Send,
+    {
+        let _pending = RetireOnDrop(retirement.clone());
+        let optional_retirement = RepositoryRetirement::default();
+        let _optional = RetireOnDrop(optional_retirement.clone());
+        retirement.check_current()?;
+        for (i, record) in required.iter().enumerate() {
+            if required[..i].iter().any(|other| {
+                other.canonical_path == record.canonical_path && other.lock_path != record.lock_path
+            }) {
+                return Err(AdmissionError::BindingChanged);
+            }
+        }
+        let mut include = true;
+        for (i, record) in optional.iter().enumerate() {
+            if required.iter().chain(optional[..i].iter()).any(|other| {
+                other.canonical_path == record.canonical_path && other.lock_path != record.lock_path
+            }) {
+                include = false;
+            }
+        }
+        let mut paths = std::collections::BTreeMap::new();
+        for record in &optional {
+            paths.insert(record.lock_path.clone(), false);
+        }
+        for record in &required {
+            paths.insert(record.lock_path.clone(), true);
+        }
+        let paths = paths.into_iter().collect::<Vec<_>>();
+        lock_mixed(locks, &paths, include, move |mut include| async move {
+            let mut sources = Vec::with_capacity(required.len());
+            for record in required {
+                retirement.check_current()?;
+                if RootRecord::read(store, &record.root).await? != record {
+                    return Err(AdmissionError::BindingChanged);
+                }
+                sources.push(Arc::new(Self {
+                    store: store.clone(),
+                    record,
+                    retirement: retirement.clone(),
+                }));
+            }
+            let mut optional_sources = Vec::new();
+            if include {
+                for record in optional {
+                    if RootRecord::read(store, &record.root).await.as_ref() != Ok(&record) {
+                        include = false;
+                        break;
+                    }
+                    optional_sources.push(Arc::new(Self {
+                        store: store.clone(),
+                        record,
+                        retirement: optional_retirement.clone(),
+                    }));
+                }
+            }
+            action(sources, include.then_some(optional_sources)).await
         })
         .await
     }
@@ -445,6 +526,55 @@ where
                 .await
         } else {
             action().await
+        }
+    })
+}
+
+fn lock_mixed<'a, T, F, Fut>(
+    locks: &'a WorktreeLocks,
+    paths: &'a [(PathBuf, bool)],
+    include: bool,
+    action: F,
+) -> std::pin::Pin<Box<dyn Future<Output = AdmissionResult<T>> + Send + 'a>>
+where
+    T: Send + 'a,
+    F: FnOnce(bool) -> Fut + Send + 'a,
+    Fut: Future<Output = AdmissionResult<T>> + Send + 'a,
+{
+    Box::pin(async move {
+        let Some(((path, required), rest)) = paths.split_first() else {
+            return action(include).await;
+        };
+        if *required {
+            locks
+                .with_lock(path, || lock_mixed(locks, rest, include, action))
+                .await
+        } else if include {
+            let mut action = Some(action);
+            let attempted = locks
+                .try_with_lock(path, || {
+                    lock_mixed(
+                        locks,
+                        rest,
+                        true,
+                        action.take().expect("one lock continuation"),
+                    )
+                })
+                .await;
+            match attempted {
+                Some(result) => result,
+                None => {
+                    lock_mixed(
+                        locks,
+                        rest,
+                        false,
+                        action.take().expect("unentered continuation"),
+                    )
+                    .await
+                }
+            }
+        } else {
+            lock_mixed(locks, rest, false, action).await
         }
     })
 }

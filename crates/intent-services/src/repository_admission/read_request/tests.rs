@@ -818,3 +818,57 @@ async fn optional_pending_workspace_barrier_retires_original_but_preserves_fresh
     )
     .await;
 }
+
+#[tokio::test]
+async fn optional_prompt_entry_is_distinct_prequeue_owned_and_keeps_original_caller() {
+    let f = OptionalFixture::new().await;
+    let (mcp, read) = f.context.capture_owned();
+    let read = read.unwrap();
+    let prompt = with_caller(f.caller.clone(), async {
+        f.context.capture_prompt().unwrap()
+    })
+    .await;
+    assert!(!Arc::ptr_eq(prompt.read(), &read));
+    let escaped = prompt.read().clone();
+    with_caller(f.caller.clone(), async {
+        prompt
+            .run(Box::pin(async {
+                assert!(Arc::ptr_eq(&current_read_request().unwrap(), prompt.read()));
+                assert_eq!(
+                    intent_core::caller::current_caller(),
+                    Some(f.caller.clone())
+                );
+                assert!(intent_core::caller::current_wire_credential().is_none());
+                let scope = prompt.read().capture_optional().unwrap();
+                let prepared = scope
+                    .run_optional(|_| async { Ok(17) })
+                    .unwrap()
+                    .await
+                    .unwrap();
+                assert!(prepared.metadata().transfer_optional(|live| live));
+            }))
+            .unwrap()
+            .await;
+        assert!(read.check_current().is_ok());
+    })
+    .await;
+    drop(prompt);
+    with_caller(f.caller.clone(), async {
+        assert!(escaped.check_current().is_err());
+        assert!(read.check_current().is_ok());
+    })
+    .await;
+    assert!(with_caller(
+        Caller::Agent {
+            agent_id: AgentId::new()
+        },
+        async { f.context.capture_prompt() }
+    )
+    .await
+    .is_err());
+    drop(mcp);
+    with_caller(f.caller, async {
+        assert!(read.check_current().is_err());
+    })
+    .await;
+}

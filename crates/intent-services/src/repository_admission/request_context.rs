@@ -89,6 +89,86 @@ impl RepositoryCallbackContext {
     }
 }
 
+impl RepositoryCallbackContext {
+    /// An owning MCP scope and its exact typed sidecar, captured together.
+    pub(crate) fn capture_owned(
+        &self,
+    ) -> (
+        Arc<dyn McpRequestScope>,
+        AdmissionResult<Arc<RepositoryReadRequest>>,
+    ) {
+        let original = self.capture();
+        let read = self
+            .read_owner
+            .clone()
+            .unwrap_or(Err(AdmissionError::Unavailable))
+            .and_then(|owner| RepositoryReadRequest::capture(owner, original.clone()));
+        (
+            Arc::new(RepositoryRequestScope {
+                original,
+                read: read.clone(),
+            }),
+            read,
+        )
+    }
+
+    /// A real non-MCP entry: capture the same physical registration before a
+    /// prompt/continuation is queued. No invocation, ledger or seal is created.
+    pub(crate) fn capture_prompt(&self) -> AdmissionResult<RepositoryPromptRequest> {
+        let original = self.capture();
+        let captured = original.captured.as_ref().map_err(|e| *e)?;
+        if current_wire_credential().is_some()
+            || current_caller().is_some_and(|caller| caller != captured.caller)
+        {
+            return Err(AdmissionError::Denied);
+        }
+        let read = self
+            .read_owner
+            .clone()
+            .unwrap_or(Err(AdmissionError::Unavailable))
+            .and_then(|owner| RepositoryReadRequest::capture(owner, original.clone()))?;
+        Ok(RepositoryPromptRequest { original, read })
+    }
+}
+
+/// Nonclone prompt owner. Metadata cannot extend its cancellation/final drop.
+pub(crate) struct RepositoryPromptRequest {
+    original: Arc<RepositoryCapturedRequest>,
+    read: Arc<RepositoryReadRequest>,
+}
+
+impl RepositoryPromptRequest {
+    pub(crate) fn read(&self) -> &Arc<RepositoryReadRequest> {
+        &self.read
+    }
+    pub(crate) fn run<'a, T: Send + 'a>(
+        &'a self,
+        future: intent_core::BoxFuture<'a, T>,
+    ) -> AdmissionResult<intent_core::BoxFuture<'a, T>> {
+        let captured = self.original.captured.as_ref().map_err(|e| *e)?;
+        if current_wire_credential().is_some()
+            || current_caller().is_some_and(|caller| caller != captured.caller)
+        {
+            return Err(AdmissionError::Denied);
+        }
+        Ok(Box::pin(with_caller(
+            captured.caller.clone(),
+            with_wire_credential(
+                None,
+                CAPTURED_REQUEST.scope(
+                    self.original.clone(),
+                    CAPTURED_READ_REQUEST.scope(Ok(self.read.clone()), future),
+                ),
+            ),
+        )))
+    }
+}
+impl Drop for RepositoryPromptRequest {
+    fn drop(&mut self) {
+        self.original.retirement.retire();
+    }
+}
+
 impl McpRequestContext for RepositoryCallbackContext {
     fn capture(&self) -> Arc<dyn McpRequestScope> {
         let original = self.capture();
@@ -271,6 +351,13 @@ impl RepositoryCapturedRequest {
             return Err(AdmissionError::Unavailable);
         }
         self.retirement.check_current()
+    }
+
+    pub(super) fn original_caller_matches(&self) -> bool {
+        self.captured
+            .as_ref()
+            .is_ok_and(|capture| current_caller().as_ref() == Some(&capture.caller))
+            && current_wire_credential().is_none()
     }
 
     pub(super) fn check_read_caller(&self) -> AdmissionResult<()> {

@@ -143,6 +143,22 @@ mod repository_admission_source_tests;
 )]
 #[path = "repository_admission/source.rs"]
 mod repository_admission_sources;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Original context entry is private until manager integration"
+    )
+)]
+mod repository_context_live;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Original optional delivery is private until manager integration"
+    )
+)]
+mod repository_context_output;
 mod repository_context_reader;
 #[expect(
     dead_code,

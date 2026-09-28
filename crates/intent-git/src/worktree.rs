@@ -40,6 +40,21 @@ impl WorktreeLocks {
         map.entry(path.to_path_buf()).or_default().clone()
     }
 
+    /// Try the SAME registry and per-path lock. Busy or poisoned maps omit the
+    /// optional operation without invoking its closure or waiting for a writer.
+    pub async fn try_with_lock<F, Fut, T>(&self, path: &Path, f: F) -> Option<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let lock = {
+            let mut map = self.locks.try_lock().ok()?;
+            map.entry(path.to_path_buf()).or_default().clone()
+        };
+        let _guard = lock.try_lock().ok()?;
+        Some(f().await)
+    }
+
     /// Run `f` while holding the per-worktree lock for `path`, mirroring
     /// `withGitWorktreeLock(worktreePath, fn)`.
     pub async fn with_lock<F, Fut, T>(&self, path: &Path, f: F) -> T

@@ -383,3 +383,29 @@ async fn optional_marker_denial_does_not_change_required_scope_completion() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn owned_capture_keeps_original_failed_anchor_and_never_invents_prompt_provenance() {
+    let (registry, owner, caller) = fixture();
+    let callback = RepositoryCallbackContext::new(&registry, Some(owner.origin()))
+        .with_read_owner(Err(AdmissionError::Denied));
+    let (scope, read) = callback.capture_owned();
+    assert!(matches!(read, Err(AdmissionError::Denied)));
+    let mut completed = 0;
+    with_caller(
+        caller.clone(),
+        scope.scope(Box::pin(async {
+            completed += 1;
+            assert!(matches!(
+                current_read_request(),
+                Err(AdmissionError::Denied)
+            ));
+        })),
+    )
+    .await;
+    assert_eq!(completed, 1);
+    assert!(scope.private_result_policy().is_none());
+    assert!(with_caller(caller, async { callback.capture_prompt() })
+        .await
+        .is_err());
+}

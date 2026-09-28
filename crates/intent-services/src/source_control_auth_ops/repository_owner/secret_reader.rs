@@ -261,13 +261,6 @@ struct ConnectionFactsView<'a> {
     metadata: crate::repository_credentials::read::RepositoryConnectionMetadata<'a>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "live context consumption remains separately owned"
-    )
-)]
 impl RepositoryConnectionFacts {
     pub(crate) fn attachment(&self) -> super::RepositoryAttachmentState {
         self.attachment
@@ -877,13 +870,6 @@ fn output_lock<T>(
 
 impl crate::Services {
     /// Metadata only, including non-ready states. No read grant or source I/O.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "live context consumption remains separately owned"
-        )
-    )]
     pub(crate) fn gitlab_repository_connection_facts(
         &self,
     ) -> Result<super::RepositoryConnectionFacts> {

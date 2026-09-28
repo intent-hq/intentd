@@ -783,3 +783,6 @@ async fn unavailable_git_control_does_not_repair_old_source_but_allows_same_requ
 
 #[path = "tests/aliases.rs"]
 mod aliases;
+
+#[path = "tests/context_consumer.rs"]
+mod context_consumer;

@@ -70,6 +70,7 @@ pub struct RepositoryContextRead {
 /// Local facts before target enrichment. Resolved projects remain observations,
 /// not selected targets or supplied permission, account or connection facts.
 /// Deliberately neither Debug nor Serde because it retains private transports.
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct RepositoryObservedRoot {
     pub root: RepositoryRootId,
     pub branch: Option<String>,
@@ -81,6 +82,7 @@ pub(crate) struct RepositoryObservedRoot {
 
 /// Original effective values from the same consistency-checked Git read.
 /// Deliberately neither Debug nor Serde. These observations grant no authority.
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct RepositoryPrivateRoot {
     pub root: RepositoryRootId,
     /// Exact symbolic ref; the public shortened branch name is display only.
@@ -88,6 +90,7 @@ pub(crate) struct RepositoryPrivateRoot {
     pub remotes: Vec<RepositoryPrivateRemote>,
 }
 
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct RepositoryPrivateRemote {
     pub name: String,
     pub fetch: Vec<String>,
@@ -211,6 +214,48 @@ pub(crate) fn observe_repository_root_before_check(
         },
     )
     .map(|(observed, ())| observed)
+}
+
+/// Enrich a fresh unstamped observation before the SAME final Git/config
+/// consistency check. Target facts come only from the supplied actual owner.
+pub(crate) fn read_context_root_with_resolver(
+    root: &RepositoryRootId,
+    path: &Path,
+    saved: &SavedReviewSelection,
+    explicit: Option<&RepositoryTarget>,
+    resolver: &CanonicalRemoteResolver,
+    environment: &GitConfigEnvironment,
+    enrich: impl Fn(&RepositoryTarget) -> RepositoryTargetContext,
+) -> Result<(RepositoryRootContext, RepositoryObservedRoot)> {
+    let (observed, (selection, targets)) = read_root_with(
+        root,
+        path,
+        &|url| resolve_endpoint(resolver, url),
+        environment,
+        |remotes| {
+            let selection = resolve_review_selection(saved, remotes, explicit);
+            let mut targets = BTreeSet::new();
+            for endpoint in remotes.iter().flat_map(|r| r.fetch.iter().chain(&r.push)) {
+                if let RepositoryEndpointResolution::Resolved { target } = &endpoint.resolution {
+                    targets.insert(target.clone());
+                }
+            }
+            if let intent_core::ReviewSelectionOutcome::Resolved { target, .. } = &selection.outcome
+            {
+                targets.insert(target.clone());
+            }
+            Ok((selection, targets.iter().map(enrich).collect()))
+        },
+    )?;
+    let context = RepositoryRootContext {
+        root: observed.root.clone(),
+        branch: observed.branch.clone(),
+        head_sha: observed.head_sha.clone(),
+        remotes: observed.remotes.clone(),
+        targets,
+        review_selection: selection,
+    };
+    Ok((context, observed))
 }
 
 fn resolve_endpoint(resolver: &CanonicalRemoteResolver, url: &str) -> RepositoryEndpointResolution {
