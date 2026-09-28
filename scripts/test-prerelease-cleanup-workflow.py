@@ -107,7 +107,13 @@ class WorkflowContract(unittest.TestCase):
         self.assertIn("sitter-v", (WORKFLOWS / "release-sitter.yml").read_text())
         self.assertNotIn("intentd-release-writers", (WORKFLOWS / "release-sitter.yml").read_text())
 
-    def run_cleanup(self, event, enabled, mode="preview", token="offline-test-token", fail=False):
+    def test_job_rejects_other_repositories_and_refs_before_credentials(self):
+        job = workflow("cleanup-prereleases")["jobs"]["cleanup"]
+        self.assertEqual(job.get("if"),
+                         "github.repository == 'intent-hq/intentd' && github.ref == 'refs/heads/main'")
+
+    def run_cleanup(self, event, enabled, mode="preview", token="offline-test-token", fail=False,
+                    repository="intent-hq/intentd", ref="refs/heads/main"):
         job = workflow("cleanup-prereleases")["jobs"]["cleanup"]
         controls = next(s for s in job["steps"] if s.get("id") == "controls")
         command = next(s for s in job["steps"] if s.get("id") == "cleanup")
@@ -120,6 +126,7 @@ class WorkflowContract(unittest.TestCase):
             output = root / "output"
             output.touch()
             env = {**os.environ, "GITHUB_EVENT_NAME": event, "CLEANUP_ENABLED": enabled,
+                   "GITHUB_REPOSITORY": repository, "GITHUB_REF": ref,
                    "REQUESTED_MODE": mode, "GH_TOKEN": token, "GITHUB_OUTPUT": str(output)}
             guard = subprocess.run(["bash", "-euo", "pipefail", "-c", controls["run"]],
                                    cwd=root, env=env, capture_output=True, text=True)
@@ -130,6 +137,21 @@ class WorkflowContract(unittest.TestCase):
             result = subprocess.run(["bash", "-euo", "pipefail", "-c", command["run"]],
                                     cwd=root, env=env, capture_output=True, text=True)
             return result, json.loads((root / "cleanup-report.json").read_text())
+
+    def test_non_main_dispatches_never_reach_cleanup(self):
+        for ref in ("refs/heads/feature", "refs/tags/v1.2.3", "refs/tags/main"):
+            for mode in ("preview", "apply"):
+                with self.subTest(ref=ref, mode=mode):
+                    result, args = self.run_cleanup("workflow_dispatch", "true", mode, ref=ref)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIsNone(args)
+
+    def test_other_repository_never_reaches_cleanup(self):
+        for event in ("workflow_dispatch", "schedule"):
+            with self.subTest(event=event):
+                result, args = self.run_cleanup(event, "true", "apply", repository="fork/intentd")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIsNone(args)
 
     def test_dispatch_and_schedule_activation_matrix(self):
         for event, enabled, mode, apply in [

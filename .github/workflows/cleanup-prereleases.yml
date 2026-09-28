@@ -44,6 +44,8 @@ concurrency:
 
 jobs:
   cleanup:
+    # Skip noncanonical/manual feature or tag runs before exposing credentials.
+    if: github.repository == 'intent-hq/intentd' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -56,6 +58,10 @@ jobs:
           CLEANUP_ENABLED: ${{ vars.PRERELEASE_CLEANUP_ENABLED }}
           REQUESTED_MODE: ${{ inputs.mode || 'preview' }}
         run: |
+          if [[ "$GITHUB_REPOSITORY" != intent-hq/intentd || "$GITHUB_REF" != refs/heads/main ]]; then
+            echo "::error::Cleanup requires intent-hq/intentd on main; no cleanup will run."
+            exit 1
+          fi
           if [[ -z "$GH_TOKEN" ]]; then
             echo "::error::PRERELEASE_CLEANUP_TOKEN is missing; no cleanup will run."
             exit 1
