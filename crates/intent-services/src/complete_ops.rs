@@ -137,6 +137,8 @@ fn resolve_quick_action_effort(
     if effective_provider == Some(run_provider) {
         let quick = &settings.quick_actions;
         if let Some(value) = quick_action_type
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
             .and_then(|t| quick.type_reasoning_effort_overrides.get(t))
             .and_then(|v| nonblank(v))
         {
@@ -1978,6 +1980,12 @@ rl.on('line', (line) => {
                 explicit.filter(|s| !s.trim().is_empty())
             );
         }
+        assert_eq!(
+            resolve_quick_action_effort(&settings, Some(" commit "), Some("codex"), "codex", None)
+                .saved,
+            ["high", "low"],
+            "action type normalization must match model resolution"
+        );
         let other = resolve_quick_action_effort(
             &settings,
             Some("commit"),

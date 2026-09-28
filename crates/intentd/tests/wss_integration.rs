@@ -22369,6 +22369,10 @@ async fn wss_quick_action_effort_settings_and_execution_contract() {
     let srv = start(WsOptions::default()).await;
     srv.set_setting("model.defaultProvider", serde_json::json!("claude-code"));
     srv.set_setting("providers.paths", serde_json::json!({"claude-code":bin}));
+    srv.set_setting(
+        "quickActions.typeOverrides",
+        serde_json::json!({"commit":"action-model"}),
+    );
     let changes = serde_json::json!([
         {"path":"quickActions.defaultReasoningEffort","value":"low"},
         {"path":"quickActions.typeReasoningEffortOverrides","value":{"commit":"high","pr":"stale"}},
@@ -22399,12 +22403,15 @@ async fn wss_quick_action_effort_settings_and_execution_contract() {
         assert_eq!(read["result"]["value"], change["value"], "{read}");
     }
     // Explicit model does not bypass the independently resolved action effort.
-    for (kind, effort, expected) in [
-        ("commit", Value::Null, "high"),
-        ("commit", serde_json::json!(" "), "high"),
-        ("pr", Value::Null, "low"),
-        ("fast", Value::Null, "low"),
-        ("commit", serde_json::json!("low"), "low"),
+    for (kind, effort, expected, model) in [
+        ("commit", Value::Null, "high", Some("chosen")),
+        ("commit", serde_json::json!(" "), "high", Some("chosen")),
+        ("pr", Value::Null, "low", Some("chosen")),
+        ("fast", Value::Null, "low", Some("chosen")),
+        ("commit", serde_json::json!("low"), "low", Some("chosen")),
+        (" commit ", Value::Null, "high", Some("chosen")),
+        ("commit", Value::Null, "high", None),
+        (" commit ", Value::Null, "high", None),
     ] {
         std::fs::write(&log, "").unwrap();
         let reply = wss_call(
@@ -22412,7 +22419,7 @@ async fn wss_quick_action_effort_settings_and_execution_contract() {
             srv.cfg.clone(),
             &serde_json::json!({
                 "jsonrpc":"2.0","id":3,"method":"agent.completeOnce",
-                "params":{"prompt":"hi","model":"chosen","type":kind,"reasoningEffort":effort}
+                "params":{"prompt":"hi","model":model,"type":kind,"reasoningEffort":effort}
             })
             .to_string(),
         )
@@ -22424,7 +22431,7 @@ async fn wss_quick_action_effort_settings_and_execution_contract() {
                 .unwrap();
         assert_eq!(
             text,
-            serde_json::json!({"model":"chosen","effort":expected})
+            serde_json::json!({"model":model.unwrap_or("action-model"),"effort":expected})
         );
         let requests: Vec<Value> = std::fs::read_to_string(&log)
             .unwrap()
