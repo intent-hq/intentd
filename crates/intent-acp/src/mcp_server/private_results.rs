@@ -39,6 +39,33 @@ pub trait McpPrivatePolicy: Send + Sync {
     /// or any host await. Its qualified entry must use this call's reservation.
     fn capture_host(&self, call: McpHostCall) -> Box<dyn McpPrivateHostScope>;
 
+    /// Capture only an optional local leaf of this original request. Absence
+    /// disables qualified preparation before its source is invoked. A scope
+    /// must restore the original service context without the required request's
+    /// cancellation wrapper: optional drop must not retire that parent.
+    fn capture_optional_context(&self) -> Option<Box<dyn McpOptionalContextScope>> {
+        None
+    }
+
+    /// One final output admission. The default omits guidance, preserving the
+    /// required admission for a nonempty seal and ordinary output for an empty
+    /// seal. Real implementations must jointly validate original required and
+    /// optional facts, never nest independent same-parent fences.
+    fn admit_optional<'a>(
+        &'a self,
+        boundary: &'a McpPrivateBoundary,
+        sealed: McpSealedReads<'a>,
+        _optional: &'a McpOptionalEvidence,
+        packet: PreparedMcpVariants<'a>,
+    ) -> BoxFuture<'a, McpPrivateAdmission> {
+        let base = packet.without_guidance();
+        if sealed.is_empty() {
+            Box::pin(async move { base.transfer(boundary) })
+        } else {
+            self.admit(boundary, sealed.records(), base)
+        }
+    }
+
     /// Admit one prebuilt effect against EVERY supplied original read. Release
     /// all guards before resolving. `packet.transfer(boundary)` is the sole
     /// consuming action: it performs only ownership transfer. A borrowed packet
@@ -54,6 +81,91 @@ pub trait McpPrivatePolicy: Send + Sync {
         originals: &'a [McpReadEvidence],
         packet: PreparedMcpTransfer<'a>,
     ) -> BoxFuture<'a, McpPrivateAdmission>;
+}
+
+/// Optional-only execution context. Construct/drop must retain the original
+/// allocation and cancel only its optional leaf. No authority is supplied here.
+pub trait McpOptionalContextScope: Send + Sync {
+    fn scope<'a>(&'a self, body: McpContextFuture<'a>) -> McpContextFuture<'a>;
+}
+
+/// Producer-owned original evidence, never serialized or placed in a writer
+/// packet. Packaging a value is not a grant; the original policy validates it.
+pub struct McpOptionalEvidence(Box<dyn Any + Send + Sync>);
+
+impl McpOptionalEvidence {
+    #[must_use]
+    pub fn new<T: Any + Send + Sync>(original: T) -> Self {
+        Self(Box::new(original))
+    }
+
+    #[must_use]
+    pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
+        self.0.downcast_ref()
+    }
+}
+
+/// ACP-created proof of a complete successful seal. An empty slice is distinct
+/// from a failed seal; there is no public constructor or subset operation.
+pub struct McpSealedReads<'a> {
+    _original: &'a Invocation,
+    records: &'a [McpReadEvidence],
+}
+
+impl<'a> McpSealedReads<'a> {
+    #[must_use]
+    pub fn records(&self) -> &'a [McpReadEvidence] {
+        self.records
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+}
+
+/// A decision made only inside the original consuming admission.
+pub enum McpGuidanceChoice {
+    WithoutGuidance,
+    WithGuidance,
+}
+
+/// One borrowed original slot and one prebuilt choice. The policy cannot
+/// replace either payload, serialize, reserve again or detach the action.
+#[must_use]
+pub struct PreparedMcpVariants<'a> {
+    identity: Arc<()>,
+    action: Box<dyn FnOnce(McpGuidanceChoice) -> Result<Effect, McpPrivateAdmission> + Send + 'a>,
+}
+
+impl<'a> PreparedMcpVariants<'a> {
+    /// Permanently consume the ability to enrich before required admission.
+    pub fn without_guidance(self) -> PreparedMcpTransfer<'a> {
+        PreparedMcpTransfer {
+            identity: self.identity,
+            action: Box::new(move || (self.action)(McpGuidanceChoice::WithoutGuidance)),
+        }
+    }
+
+    /// Move a prebuilt variant once. This action performs no acquisition,
+    /// serialization, I/O, await, spawn or authority-bearing destruction.
+    #[must_use]
+    pub fn transfer(
+        self,
+        original: &McpPrivateBoundary,
+        choice: McpGuidanceChoice,
+    ) -> McpPrivateAdmission {
+        if !Arc::ptr_eq(&self.identity, &original.identity) {
+            return McpPrivateAdmission::ForeignBoundary;
+        }
+        match (self.action)(choice) {
+            Ok(effect) => McpPrivateAdmission::Transferred(McpTransferReceipt {
+                identity: self.identity,
+                effect,
+            }),
+            Err(result) => result,
+        }
+    }
 }
 
 /// Scope exactly one original host body; never skip, replace, retry or spawn it.
@@ -346,6 +458,57 @@ impl McpPrivateInvocation {
         self.0.ledger.lock().unwrap().failed = true;
     }
 
+    pub(super) fn capture_optional_context(
+        &self,
+        preparation_budget: Duration,
+    ) -> Option<Box<dyn McpOptionalContextScope>> {
+        // Omit before preparation when its full separate budget no longer fits.
+        // Required delivery still performs its own deadline/authority check.
+        if Instant::now() + preparation_budget >= self.0.deadline {
+            return None;
+        }
+        catch_unwind(AssertUnwindSafe(|| {
+            self.0.policy.capture_optional_context()
+        }))
+        .ok()
+        .flatten()
+    }
+
+    async fn admit_optional<'a>(
+        &'a self,
+        boundary: &'a McpPrivateBoundary,
+        records: &'a [McpReadEvidence],
+        evidence: &'a McpOptionalEvidence,
+        action: impl FnOnce(McpGuidanceChoice) -> Result<Effect, McpPrivateAdmission> + Send + 'a,
+    ) -> McpPrivateAdmission {
+        if self.0.ledger.lock().unwrap().failed || Instant::now() >= self.0.deadline {
+            return McpPrivateAdmission::Refused;
+        }
+        let sealed = McpSealedReads {
+            _original: &self.0,
+            records,
+        };
+        let packet = PreparedMcpVariants {
+            identity: boundary.identity.clone(),
+            action: Box::new(action),
+        };
+        let pending = async {
+            self.0
+                .policy
+                .admit_optional(boundary, sealed, evidence, packet)
+                .await
+        };
+        match tokio::time::timeout_at(self.0.deadline, catch_future(pending)).await {
+            Ok(Ok(McpPrivateAdmission::Transferred(receipt)))
+                if Arc::ptr_eq(&receipt.identity, &boundary.identity) =>
+            {
+                McpPrivateAdmission::Transferred(receipt)
+            }
+            Ok(Ok(McpPrivateAdmission::ConsumerClosed)) => McpPrivateAdmission::ConsumerClosed,
+            _ => McpPrivateAdmission::Refused,
+        }
+    }
+
     pub(crate) fn guarded_host(&self, ordinary: HostFn) -> GuardedHostFn {
         let invocation = self.clone();
         Arc::new(move |arg, identity| {
@@ -572,6 +735,9 @@ pub(crate) struct DeliveryResponse {
     response: BridgeResponse,
     output: Option<SealedPrivateOutput>,
     context: Option<CapturedRequestContext>,
+    // Constructed only after a successful empty seal, only for qualified
+    // optional output. Failed seals use the fixed control response instead.
+    sealed_empty: Option<McpPrivateInvocation>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -587,6 +753,7 @@ impl DeliveryResponse {
             response,
             output: None,
             context: None,
+            sealed_empty: None,
         }
     }
 
@@ -599,11 +766,15 @@ impl DeliveryResponse {
         {
             Ok(output) => {
                 let output = output.flatten();
-                let context = output.as_ref().map(|_| context.clone());
+                let sealed_empty = (output.is_none() && response.requires_qualified_guidance())
+                    .then(|| context.private_invocation.clone())
+                    .flatten();
+                let context = output.is_some().then(|| context.clone());
                 Self {
                     response,
                     output,
                     context,
+                    sealed_empty,
                 }
             }
             Err(()) => Self::ordinary(BridgeResponse::plain(refusal_response(&response.value))),
@@ -636,6 +807,19 @@ impl DeliveryResponse {
     ) -> DeliveryOutcome {
         if let Some(context) = self.context.take() {
             context.run(self.enqueue_inner(sender, connection)).await
+        } else if let Some(invocation) = self.sealed_empty.clone() {
+            // Empty ordinary output never re-enters a required scope. Its
+            // original policy/caller remain available solely for optional
+            // admission, whose failure can only omit the sidecar.
+            let caller = self.response.qualified_caller();
+            let scoped = McpPrivateInvocation::scope(
+                Some(invocation),
+                self.enqueue_inner(sender, connection),
+            );
+            match caller {
+                Some(caller) => intent_core::with_caller(caller, scoped).await,
+                None => scoped.await,
+            }
         } else {
             self.enqueue_inner(sender, connection).await
         }
@@ -647,7 +831,23 @@ impl DeliveryResponse {
         connection: &ConnectionToken,
     ) -> DeliveryOutcome {
         let control = PreparedBridgeLine::plain(refusal_response(&self.response.value));
-        let prepared = self.response.prepare_guidance().await.prepare_line();
+        let (prepared, evidence) = self
+            .response
+            .prepare_guidance()
+            .await
+            .prepare_delivery_line();
+        if let Some(evidence) = evidence {
+            return Self::enqueue_optional(
+                self.output.as_ref(),
+                self.sealed_empty.as_ref(),
+                prepared,
+                &evidence,
+                control,
+                sender,
+                connection,
+            )
+            .await;
+        }
         let Some(output) = self.output else {
             return if sender.send(prepared).await.is_ok() {
                 DeliveryOutcome::Admitted
@@ -688,6 +888,69 @@ impl DeliveryResponse {
                 return DeliveryOutcome::ConsumerClosed;
             }
         }
+        DeliveryOutcome::Admitted
+    }
+
+    async fn enqueue_optional(
+        output: Option<&SealedPrivateOutput>,
+        sealed_empty: Option<&McpPrivateInvocation>,
+        prepared: PreparedBridgeLine,
+        evidence: &McpOptionalEvidence,
+        control: PreparedBridgeLine,
+        sender: mpsc::Sender<PreparedBridgeLine>,
+        connection: &ConnectionToken,
+    ) -> DeliveryOutcome {
+        let invocation = output.map(|o| &o.invocation).or(sealed_empty);
+        let Some(invocation) = invocation else {
+            // No successful original policy capture: never publish qualified
+            // guidance through an ordinary/legacy helper.
+            return if sender.send(prepared.without_guidance()).await.is_ok() {
+                DeliveryOutcome::Admitted
+            } else {
+                DeliveryOutcome::ConsumerClosed
+            };
+        };
+        let Ok(permit) = sender.reserve_owned().await else {
+            return DeliveryOutcome::ConsumerClosed;
+        };
+        let mut original_slot = Some(permit);
+        let mut original_packet = Some(prepared);
+        let records = output.map_or(&[][..], |o| o.originals.as_ref());
+        let boundary = boundary(McpPrivateBoundaryKind::TcpResponse);
+        let result = invocation
+            .admit_optional(&boundary, records, evidence, |choice| {
+                if output.is_some() && !connection.is_live() {
+                    return Err(McpPrivateAdmission::ConsumerClosed);
+                }
+                let packet = original_packet.take().expect("one original variant packet");
+                let packet = match choice {
+                    McpGuidanceChoice::WithoutGuidance => packet.without_guidance(),
+                    McpGuidanceChoice::WithGuidance => packet,
+                };
+                original_slot
+                    .take()
+                    .expect("one original response permit")
+                    .send(packet);
+                Ok(Effect::Output)
+            })
+            .await;
+        if !matches!(result, McpPrivateAdmission::Transferred(_)) {
+            if let Some(permit) = original_slot.take() {
+                if output.is_none() {
+                    // ACP proved empty; optional failure cannot gate the
+                    // ordinary result or impose endpoint/required-read gates.
+                    permit.send(original_packet.take().unwrap().without_guidance());
+                    return DeliveryOutcome::Admitted;
+                }
+                if connection.is_live() {
+                    permit.send(control);
+                    return DeliveryOutcome::Refused;
+                }
+                return DeliveryOutcome::ConsumerClosed;
+            }
+        }
+        // Already-consumed bytes are factual even if a later panic, invalid
+        // receipt or cancellation prevented a normal policy return.
         DeliveryOutcome::Admitted
     }
 }

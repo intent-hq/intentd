@@ -282,3 +282,100 @@ async fn unbound_or_changed_caller_is_not_admitted_to_the_optional_source() {
     .is_none());
     assert_eq!(source.0.load(AtomicOrdering::Relaxed), 0);
 }
+
+#[test]
+fn qualified_evidence_cannot_escape_legacy_serialization_or_preparation_helpers() {
+    let fence = RepositoryGuidanceFence::default();
+    let lease = fence.replace_context(scope(), revision(1)).unwrap();
+    let lifetime = ConnectionLifetime::new();
+    for prepared in [false, true] {
+        let candidate = lease
+            .current_candidate(scope(), revision(1), "private optional text".into())
+            .unwrap()
+            .with_optional_evidence(McpOptionalEvidence::new(Arc::new(())));
+        let response = BridgeResponse {
+            value: operation_result(1),
+            guidance: Some(candidate),
+            guidance_request: None,
+        };
+        let line = if prepared {
+            response.prepare_line().into_line(&lifetime.token())
+        } else {
+            response.into_line(&lifetime.token())
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&line).unwrap(),
+            operation_result(1)
+        );
+    }
+}
+
+#[test]
+fn prepared_optional_variants_only_downgrade_after_evidence_is_separated() {
+    let fence = RepositoryGuidanceFence::default();
+    let lease = fence.replace_context(scope(), revision(1)).unwrap();
+    let lifetime = ConnectionLifetime::new();
+    for explicit_base in [false, true] {
+        let candidate = lease
+            .current_candidate(scope(), revision(1), "qualified optional fixture".into())
+            .unwrap()
+            .with_optional_evidence(McpOptionalEvidence::new(Arc::new(())));
+        let response = BridgeResponse {
+            value: operation_result(1),
+            guidance: Some(candidate),
+            guidance_request: None,
+        };
+        let (packet, evidence) = response.prepare_delivery_line();
+        assert!(evidence.is_some());
+        // This is only an encoding/downgrade unit test, not an authority grant.
+        let packet = if explicit_base {
+            packet.without_guidance()
+        } else {
+            assert!(lease.advance(scope(), revision(2)));
+            packet
+        };
+        let line = packet.into_line(&lifetime.token());
+        assert_eq!(
+            serde_json::from_str::<Value>(&line).unwrap(),
+            operation_result(1)
+        );
+    }
+}
+
+#[tokio::test]
+async fn qualified_unpolled_delivery_never_starts_source_or_optional_leaf() {
+    use crate::mcp_server::private_results::tests::{optional, Api};
+    use std::sync::atomic::Ordering;
+    let state = optional::State::new();
+    let server = optional::server(Arc::new(Api::new()), state.clone(), false);
+    let response = optional::response(&server, optional::READ).await;
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let life = ConnectionLifetime::new();
+    let token = life.token();
+    let pending = response.enqueue(tx, &token);
+    drop(pending);
+    assert_eq!(state.capture.load(Ordering::SeqCst), 0);
+    assert_eq!(state.constructor.load(Ordering::SeqCst), 0);
+    assert_eq!(state.leaves_dropped.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn qualified_mode_is_fixed_at_binding_before_source_preparation() {
+    use crate::mcp_server::private_results::tests::{optional, Api};
+    use crate::mcp_server::WorkspaceMcpServer;
+    use std::sync::atomic::Ordering;
+    let state = optional::State::new();
+    let server = WorkspaceMcpServer::new(Arc::new(Api::new()), "workspace-1".into())
+        .with_caller_agent_id(Some("agent-1".into()))
+        .with_repository_guidance(
+            &session(Some("3.0")),
+            Arc::new(optional::Source(state.clone())),
+        );
+    state.qualified.store(false, Ordering::SeqCst);
+    let (_, value) =
+        optional::deliver(optional::response(&server, "return 'ordinary';").await).await;
+    assert!(value.to_string().contains("ordinary"));
+    assert!(!optional::has_guidance(&value));
+    assert_eq!(state.qualifications.load(Ordering::SeqCst), 1);
+    assert_eq!(state.constructor.load(Ordering::SeqCst), 0);
+}

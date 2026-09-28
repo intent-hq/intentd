@@ -52,6 +52,10 @@ pub(crate) mod v2_7;
 pub(crate) mod v2_8;
 pub(crate) mod v2_9;
 
+// Pure candidate only: no registry entry, version activation or delivery hook.
+#[cfg_attr(not(test), expect(dead_code))]
+pub(crate) mod repository_guidance_v3;
+
 use crate::agent_ops::ready_delta::UnblockedTask;
 use crate::pr_monitor::PrMonitorSnapshot;
 use intent_core::settings_file::AgentFeaturesSettings;

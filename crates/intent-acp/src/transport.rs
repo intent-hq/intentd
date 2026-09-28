@@ -13,9 +13,12 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -41,11 +44,221 @@ const WRITER_CHANNEL_CAPACITY: usize = 256;
 
 type PendingMap = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, JsonRpcError>>>>>;
 
+/// Optional prompt admission gets one second AFTER the original writer slot is
+/// reserved. The ordinary response timeout still begins only after queueing.
+pub const PROMPT_ADMISSION_TIMEOUT: Duration = Duration::from_secs(1);
+
+const PROMPT_OPEN: u8 = 0;
+const PROMPT_QUEUED: u8 = 1;
+const PROMPT_RETIRED: u8 = 2;
+
+/// Allocation identity for one original prompt transfer, never an RPC/session ID.
+pub struct AcpPromptBoundary(Arc<()>);
+
+/// Created only by consuming the original queue slot. It proves queue ownership
+/// transfer, not a socket write, model receipt, or reusable approval.
+pub struct AcpPromptReceipt(Arc<()>);
+
+/// Choose one of the two already encoded forms of the SAME session prompt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PromptVariant {
+    Base,
+    WithGuidance,
+}
+
+/// Optional refusal does not authorize replacement of an already queued effect.
+pub enum AcpPromptAdmissionOutcome {
+    Transferred(AcpPromptReceipt),
+    ConsumerClosed,
+    ForeignBoundary,
+    OmitOptional,
+}
+
+/// A trusted owner of the original prompt capture. This neutral transport does
+/// not manufacture that capture or validate repository/provider authority.
+pub trait AcpPromptAdmission: Send + Sync {
+    /// Validate the original capture, then consume the borrowed packet while
+    /// retaining the required guards. Release guards before returning. Never
+    /// detach, retry, rebind, or reconstruct authority from public identifiers.
+    fn admit<'a>(
+        &'a self,
+        original: &'a AcpPromptBoundary,
+        packet: PreparedAcpPromptTransfer<'a>,
+    ) -> intent_core::BoxFuture<'a, AcpPromptAdmissionOutcome>;
+}
+
+struct PromptSlot {
+    permit: Option<mpsc::OwnedPermit<String>>,
+    base: Option<String>,
+    enriched: Option<String>,
+    queued: bool,
+}
+
+/// No public constructor, payload accessor, Clone, or reusable approval. All
+/// opaque owners, response state and unchosen bytes remain outside the action.
+#[must_use]
+pub struct PreparedAcpPromptTransfer<'a> {
+    original: &'a AcpPromptBoundary,
+    state: &'a AtomicU8,
+    writer: &'a mpsc::Sender<String>,
+    slot: &'a mut PromptSlot,
+}
+
+impl PreparedAcpPromptTransfer<'_> {
+    /// Atomically claim the still-original pending transfer and move one
+    /// pre-encoded String into its reserved slot. No lock, serialization, queue
+    /// reservation, await, I/O, spawn, or authority callback occurs here.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the private packet's encoded-variant invariant is broken.
+    #[must_use]
+    pub fn transfer(
+        self,
+        original: &AcpPromptBoundary,
+        variant: PromptVariant,
+    ) -> AcpPromptAdmissionOutcome {
+        if !Arc::ptr_eq(&self.original.0, &original.0) {
+            return AcpPromptAdmissionOutcome::ForeignBoundary;
+        }
+        if self.writer.is_closed()
+            || self.slot.permit.is_none()
+            || self
+                .state
+                .compare_exchange(
+                    PROMPT_OPEN,
+                    PROMPT_QUEUED,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_err()
+        {
+            return AcpPromptAdmissionOutcome::ConsumerClosed;
+        }
+        // This claim linearizes against original pending retirement. Once it
+        // wins, even a later auth/reader failure cannot erase the queue effect.
+        let line = match variant {
+            PromptVariant::Base => self.slot.base.take(),
+            PromptVariant::WithGuidance => self.slot.enriched.take(),
+        };
+        let permit = self
+            .slot
+            .permit
+            .take()
+            .expect("original unused prompt slot");
+        self.slot.queued = true;
+        permit.send(line.expect("original encoded prompt variant"));
+        AcpPromptAdmissionOutcome::Transferred(AcpPromptReceipt(Arc::clone(&original.0)))
+    }
+}
+
+/// Only qualified prompts register here. Ordinary pending-map behavior stays
+/// unchanged. Reader retirement precedes removal/draining of the original sender.
+#[derive(Default)]
+struct PromptPending {
+    closed: bool,
+    entries: HashMap<i64, Arc<AtomicU8>>,
+}
+
+impl PromptPending {
+    fn insert(&mut self, id: i64) -> Arc<AtomicU8> {
+        let state = Arc::new(AtomicU8::new(if self.closed {
+            PROMPT_RETIRED
+        } else {
+            PROMPT_OPEN
+        }));
+        self.entries.insert(id, Arc::clone(&state));
+        state
+    }
+
+    fn retire(&mut self, id: i64) {
+        if let Some(state) = self.entries.remove(&id) {
+            Self::retire_state(&state);
+        }
+    }
+
+    fn retire_state(state: &AtomicU8) {
+        let _ = state.compare_exchange(
+            PROMPT_OPEN,
+            PROMPT_RETIRED,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
+
+    fn close(&mut self) {
+        self.closed = true;
+        for (_, state) in self.entries.drain() {
+            Self::retire_state(&state);
+        }
+    }
+}
+
+struct PromptPendingGuard<'a> {
+    original: PendingEntryGuard,
+    prompts: &'a Mutex<PromptPending>,
+    state: Arc<AtomicU8>,
+}
+
+impl Drop for PromptPendingGuard<'_> {
+    fn drop(&mut self) {
+        PromptPending::retire_state(&self.state);
+        self.prompts.lock().unwrap().retire(self.original.id);
+    }
+}
+
+struct CaughtPromptAdmission<'a> {
+    future: Option<intent_core::BoxFuture<'a, AcpPromptAdmissionOutcome>>,
+    state: &'a AtomicU8,
+}
+
+impl Future for CaughtPromptAdmission<'_> {
+    type Output = Option<AcpPromptAdmissionOutcome>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match catch_unwind(AssertUnwindSafe(|| {
+            self.future
+                .as_mut()
+                .expect("live admission future")
+                .as_mut()
+                .poll(cx)
+        })) {
+            Ok(Poll::Ready(result)) => Poll::Ready(Some(result)),
+            // A policy yielding after transfer cannot postpone the ordinary
+            // response wait, spend a second admission budget, or cause replay.
+            Ok(Poll::Pending) if self.state.load(Ordering::SeqCst) == PROMPT_QUEUED => {
+                Poll::Ready(None)
+            }
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(_) => Poll::Ready(None),
+        }
+    }
+}
+
+impl Drop for CaughtPromptAdmission<'_> {
+    fn drop(&mut self) {
+        // Cleanup stays outside the consuming action, including cancellation
+        // before the policy future's first poll.
+        let future = self.future.take();
+        let _ = catch_unwind(AssertUnwindSafe(|| drop(future)));
+    }
+}
+
 fn authentication_required() -> JsonRpcError {
     JsonRpcError {
         code: -32000,
         message: "Authentication required; run intentd provider login antigravity".into(),
         data: None,
+    }
+}
+
+fn prompt_response(
+    response: Result<Result<Value, JsonRpcError>, oneshot::error::RecvError>,
+) -> AcpResult<Value> {
+    match response {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(AcpError::Rpc(error)),
+        Err(_) => Err(AcpError::Transport("response channel dropped".into())),
     }
 }
 
@@ -382,6 +595,7 @@ pub struct Connection {
     callback_routes: Arc<CallbackToolRoutes>,
     writer_tx: mpsc::Sender<String>,
     pending: PendingMap,
+    prompt_pending: Arc<Mutex<PromptPending>>,
     next_id: AtomicI64,
     response_seq: Arc<AtomicU64>,
     response_notify: Arc<Notify>,
@@ -411,6 +625,7 @@ impl Connection {
         R: AsyncRead + Unpin + Send + 'static,
     {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let prompt_pending = Arc::new(Mutex::new(PromptPending::default()));
         let response_seq = Arc::new(AtomicU64::new(0));
         let response_notify = Arc::new(Notify::new());
         let client_request_seq = Arc::new(AtomicU64::new(0));
@@ -435,6 +650,7 @@ impl Connection {
 
         // Reader task: frame on `\n`, parse, dispatch.
         let pending_reader = Arc::clone(&pending);
+        let prompt_pending_reader = Arc::clone(&prompt_pending);
         let seq_reader = Arc::clone(&response_seq);
         let notify_reader = Arc::clone(&response_notify);
         let client_req_seq_reader = Arc::clone(&client_request_seq);
@@ -453,6 +669,7 @@ impl Connection {
                 if auth_marker.is_some_and(|marker| line.trim() == marker) {
                     auth_required_reader.store(true, Ordering::SeqCst);
                     auth_error_reader.store(true, Ordering::SeqCst);
+                    prompt_pending_reader.lock().unwrap().close();
                     for (_, sender) in pending_reader.lock().unwrap().drain() {
                         let _ = sender.send(Err(authentication_required()));
                     }
@@ -464,15 +681,22 @@ impl Connection {
                     continue;
                 }
                 match serde_json::from_str::<Value>(&line) {
-                    Ok(value) => dispatch(
-                        &value,
-                        &pending_reader,
-                        requests.as_ref(),
-                        notifications.as_ref(),
-                        &seq_reader,
-                        &notify_reader,
-                        &client_req_seq_reader,
-                    ),
+                    Ok(value) => {
+                        if value.get("method").and_then(Value::as_str).is_none() {
+                            if let Some(id) = value.get("id").and_then(Value::as_i64) {
+                                prompt_pending_reader.lock().unwrap().retire(id);
+                            }
+                        }
+                        dispatch(
+                            &value,
+                            &pending_reader,
+                            requests.as_ref(),
+                            notifications.as_ref(),
+                            &seq_reader,
+                            &notify_reader,
+                            &client_req_seq_reader,
+                        );
+                    }
                     // Attribution without content: the agent id and the line
                     // length locate the offending child, the line itself is
                     // never logged.
@@ -485,6 +709,7 @@ impl Connection {
                 }
             }
             // stdout closed: fail every still-pending request.
+            prompt_pending_reader.lock().unwrap().close();
             {
                 let mut map = pending_reader.lock().unwrap();
                 for (_, sender) in map.drain() {
@@ -566,6 +791,7 @@ impl Connection {
             callback_routes: Arc::new(CallbackToolRoutes::default()),
             writer_tx,
             pending,
+            prompt_pending,
             next_id: AtomicI64::new(1),
             response_seq,
             response_notify,
@@ -768,6 +994,121 @@ impl Connection {
         }
     }
 
+    /// Only `session::prompt_with_guidance` constructs these matched parameters.
+    /// No public arbitrary-method or alternate-request admission entry exists.
+    pub(crate) async fn request_prompt_with_admission(
+        &self,
+        base_params: Value,
+        enriched_params: Value,
+        admission: Box<dyn AcpPromptAdmission>,
+        timeout: Duration,
+    ) -> AcpResult<Value> {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let (tx, mut rx) = oneshot::channel();
+        self.pending.lock().unwrap().insert(id, tx);
+        let state = self.prompt_pending.lock().unwrap().insert(id);
+        let _guard = PromptPendingGuard {
+            original: PendingEntryGuard {
+                pending: Arc::clone(&self.pending),
+                id,
+            },
+            prompts: &self.prompt_pending,
+            state: Arc::clone(&state),
+        };
+        if self.auth_required.load(Ordering::SeqCst) {
+            return Err(AcpError::Rpc(authentication_required()));
+        }
+        if state.load(Ordering::SeqCst) != PROMPT_OPEN {
+            return Err(AcpError::Transport("agent stdout closed".into()));
+        }
+        let base = encode_message(Some(id), "session/prompt", &base_params)?;
+        let enriched = encode_message(Some(id), "session/prompt", &enriched_params)?;
+        let permit = tokio::select! {
+            biased;
+            response = &mut rx => return prompt_response(response),
+            permit = self.writer_tx.clone().reserve_owned() => {
+                permit.map_err(|_| AcpError::Transport("writer task closed".into()))?
+            }
+        };
+        let boundary = AcpPromptBoundary(Arc::new(()));
+        let mut slot = PromptSlot {
+            permit: Some(permit),
+            base: Some(base),
+            enriched: Some(enriched),
+            queued: false,
+        };
+        // Construction, polling and cleanup may execute opaque owner code, so
+        // all occur outside the consuming action. The packet only borrows slot.
+        {
+            let packet = PreparedAcpPromptTransfer {
+                original: &boundary,
+                state: &state,
+                writer: &self.writer_tx,
+                slot: &mut slot,
+            };
+            let future = catch_unwind(AssertUnwindSafe(|| admission.admit(&boundary, packet)));
+            if let Ok(future) = future {
+                let future = CaughtPromptAdmission {
+                    future: Some(future),
+                    state: &state,
+                };
+                let outcome = tokio::select! {
+                    biased;
+                    response = &mut rx => return prompt_response(response),
+                    () = self.writer_tx.closed() => {
+                        return Err(AcpError::Transport("writer task closed".into()));
+                    }
+                    outcome = tokio::time::timeout(PROMPT_ADMISSION_TIMEOUT, future) => outcome,
+                };
+                if let Ok(Some(AcpPromptAdmissionOutcome::Transferred(receipt))) = outcome {
+                    // A foreign claim is never authority. Slot consumption below
+                    // remains factual even after a bad receipt or policy panic.
+                    let _original_receipt = Arc::ptr_eq(&boundary.0, &receipt.0);
+                }
+            }
+        }
+        if !slot.queued {
+            if self.auth_required.load(Ordering::SeqCst) {
+                return Err(AcpError::Rpc(authentication_required()));
+            }
+            match rx.try_recv() {
+                Ok(response) => return prompt_response(Ok(response)),
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    return Err(AcpError::Transport("response channel dropped".into()));
+                }
+                Err(oneshot::error::TryRecvError::Empty) => {}
+            }
+            let packet = PreparedAcpPromptTransfer {
+                original: &boundary,
+                state: &state,
+                writer: &self.writer_tx,
+                slot: &mut slot,
+            };
+            if !matches!(
+                packet.transfer(&boundary, PromptVariant::Base),
+                AcpPromptAdmissionOutcome::Transferred(_)
+            ) {
+                if self.auth_required.load(Ordering::SeqCst) {
+                    return Err(AcpError::Rpc(authentication_required()));
+                }
+                if state.load(Ordering::SeqCst) != PROMPT_RETIRED {
+                    return Err(AcpError::Transport(
+                        "original prompt transfer closed".into(),
+                    ));
+                }
+                // Reader retirement precedes dispatch/drain. Preserve that
+                // original receiver's exact result if it has not arrived yet.
+            }
+        }
+        drop(slot);
+        // Same post-send response timeout as request_with_id. Optional admission
+        // never spends this budget; the session's outer idle loop is unchanged.
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(response) => prompt_response(response),
+            Err(_) => Err(AcpError::Timeout("session/prompt".into())),
+        }
+    }
+
     /// Number of in-flight request correlation entries (test observability
     /// for the pending-map cancel-safety guarantee).
     #[cfg(test)]
@@ -938,6 +1279,593 @@ fn encode_message(id: Option<i64>, method: &str, params: &Value) -> AcpResult<St
         }),
     };
     Ok(format!("{}\n", serde_json::to_string(&msg)?))
+}
+
+#[cfg(test)]
+mod prompt_transfer_tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::atomic::AtomicUsize;
+
+    // Explicit neutral authority fixtures, not repository/Store/P validation.
+    #[derive(Clone, Copy)]
+    enum Mode {
+        Accept,
+        Refuse,
+        ConstructorPanic,
+        PollPanic,
+        Hang,
+        ForeignBoundary,
+        ForeignReceipt,
+        AfterPanic,
+        AfterHang,
+        AfterBadReceipt,
+        DropPanic,
+        Hold,
+    }
+
+    #[derive(Default)]
+    struct Observation {
+        calls: AtomicUsize,
+        polls: AtomicUsize,
+        future_drops: AtomicUsize,
+        owner_drops: AtomicUsize,
+        currency: AtomicBool,
+        boundaries: Mutex<Vec<Arc<()>>>,
+        entered: Notify,
+        release: Notify,
+    }
+
+    struct Policy {
+        mode: Mode,
+        seen: Arc<Observation>,
+    }
+
+    struct FutureDrop {
+        seen: Arc<Observation>,
+        panic: bool,
+    }
+    impl Drop for FutureDrop {
+        fn drop(&mut self) {
+            self.seen.future_drops.fetch_add(1, Ordering::SeqCst);
+            assert!(!self.panic, "injected future cleanup panic");
+        }
+    }
+    impl Drop for Policy {
+        fn drop(&mut self) {
+            self.seen.owner_drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl AcpPromptAdmission for Policy {
+        fn admit<'a>(
+            &'a self,
+            original: &'a AcpPromptBoundary,
+            packet: PreparedAcpPromptTransfer<'a>,
+        ) -> intent_core::BoxFuture<'a, AcpPromptAdmissionOutcome> {
+            self.seen.calls.fetch_add(1, Ordering::SeqCst);
+            self.seen
+                .boundaries
+                .lock()
+                .unwrap()
+                .push(Arc::clone(&original.0));
+            assert!(
+                !matches!(self.mode, Mode::ConstructorPanic),
+                "injected constructor panic"
+            );
+            let cleanup = FutureDrop {
+                seen: Arc::clone(&self.seen),
+                panic: matches!(self.mode, Mode::DropPanic),
+            };
+            Box::pin(async move {
+                let _cleanup = cleanup;
+                self.seen.polls.fetch_add(1, Ordering::SeqCst);
+                self.seen.entered.notify_one();
+                match self.mode {
+                    Mode::Refuse | Mode::DropPanic => AcpPromptAdmissionOutcome::OmitOptional,
+                    Mode::PollPanic => panic!("injected poll panic"),
+                    Mode::Hang => std::future::pending().await,
+                    Mode::ForeignBoundary => packet.transfer(
+                        &AcpPromptBoundary(Arc::new(())),
+                        PromptVariant::WithGuidance,
+                    ),
+                    Mode::ForeignReceipt => {
+                        AcpPromptAdmissionOutcome::Transferred(AcpPromptReceipt(Arc::new(())))
+                    }
+                    Mode::AfterPanic => {
+                        let _ = packet.transfer(original, PromptVariant::WithGuidance);
+                        panic!("injected panic after actual queue transfer");
+                    }
+                    Mode::AfterHang => {
+                        let _ = packet.transfer(original, PromptVariant::WithGuidance);
+                        std::future::pending().await
+                    }
+                    Mode::AfterBadReceipt => {
+                        let _ = packet.transfer(original, PromptVariant::WithGuidance);
+                        AcpPromptAdmissionOutcome::Transferred(AcpPromptReceipt(Arc::new(())))
+                    }
+                    Mode::Hold => {
+                        self.seen.release.notified().await;
+                        let variant = if self.seen.currency.load(Ordering::SeqCst) {
+                            PromptVariant::WithGuidance
+                        } else {
+                            PromptVariant::Base
+                        };
+                        packet.transfer(original, variant)
+                    }
+                    Mode::Accept | Mode::ConstructorPanic => {
+                        let variant = if self.seen.currency.load(Ordering::SeqCst) {
+                            PromptVariant::WithGuidance
+                        } else {
+                            PromptVariant::Base
+                        };
+                        packet.transfer(original, variant)
+                    }
+                }
+            })
+        }
+    }
+
+    fn policy(mode: Mode) -> (Box<dyn AcpPromptAdmission>, Arc<Observation>) {
+        let seen = Arc::new(Observation::default());
+        seen.currency.store(true, Ordering::SeqCst);
+        (
+            Box::new(Policy {
+                mode,
+                seen: Arc::clone(&seen),
+            }),
+            seen,
+        )
+    }
+
+    fn fixture() -> (
+        Connection,
+        BufReader<tokio::io::DuplexStream>,
+        tokio::io::DuplexStream,
+    ) {
+        let (input, output) = tokio::io::duplex(4096);
+        let (reply, read) = tokio::io::duplex(4096);
+        let conn = Connection::new(
+            input,
+            read,
+            None,
+            ConnectionHooks {
+                auth_required_stdout_marker: Some("TEST_AUTH_REQUIRED"),
+                ..ConnectionHooks::default()
+            },
+        );
+        (conn, BufReader::new(output), reply)
+    }
+
+    fn request(
+        conn: &Connection,
+        admission: Box<dyn AcpPromptAdmission>,
+        timeout: Duration,
+    ) -> impl Future<Output = AcpResult<Value>> + '_ {
+        conn.request_prompt_with_admission(
+            json!({"sessionId":"same-public-session","prompt":[{"type":"text","text":"original"}]}),
+            json!({"sessionId":"same-public-session","prompt":[{"type":"text","text":"original"},{"type":"text","text":"optional"}]}),
+            admission, timeout,
+        )
+    }
+
+    async fn poll_pending<F: Future>(mut future: Pin<&mut F>) {
+        std::future::poll_fn(|cx| {
+            assert!(future.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+    }
+
+    async fn read_frame<F: Future>(
+        reader: &mut BufReader<tokio::io::DuplexStream>,
+        mut future: Pin<&mut F>,
+    ) -> Value {
+        let mut line = String::new();
+        tokio::select! {
+            biased;
+            read = reader.read_line(&mut line) => { assert!(read.unwrap() > 0); }
+            _ = &mut future => panic!("request settled before the test replied"),
+            () = tokio::time::sleep(Duration::from_secs(3)) => panic!("no outbound frame"),
+        }
+        serde_json::from_str(&line).unwrap()
+    }
+
+    async fn reply(writer: &mut tokio::io::DuplexStream, id: &Value) {
+        writer
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({"jsonrpc":"2.0","id":id,"result":{"originalResult":true}})
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn no_frame(reader: &mut BufReader<tokio::io::DuplexStream>) {
+        let mut extra = String::new();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), reader.read_line(&mut extra))
+                .await
+                .is_err(),
+            "unexpected frame: {extra}"
+        );
+    }
+
+    async fn until(mut predicate: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !predicate() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    fn reserve_all(conn: &Connection) -> Vec<mpsc::OwnedPermit<String>> {
+        (0..WRITER_CHANNEL_CAPACITY)
+            .map(|_| conn.writer_tx.clone().try_reserve_owned().unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn prompt_variants_preserve_one_id_slot_result_and_post_effect_truth() {
+        for mode in [
+            Mode::Accept,
+            Mode::Refuse,
+            Mode::ConstructorPanic,
+            Mode::PollPanic,
+            Mode::ForeignBoundary,
+            Mode::ForeignReceipt,
+            Mode::AfterPanic,
+            Mode::AfterHang,
+            Mode::AfterBadReceipt,
+            Mode::DropPanic,
+        ] {
+            let (conn, mut reader, mut writer) = fixture();
+            let (admission, seen) = policy(mode);
+            let mut future = Box::pin(request(&conn, admission, Duration::from_secs(2)));
+            let frame = read_frame(&mut reader, future.as_mut()).await;
+            assert_eq!(frame["id"], 1);
+            assert_eq!(frame["method"], "session/prompt");
+            assert_eq!(frame["params"]["prompt"][0]["text"], "original");
+            let enriched = matches!(
+                mode,
+                Mode::Accept | Mode::AfterPanic | Mode::AfterHang | Mode::AfterBadReceipt
+            );
+            assert_eq!(
+                frame["params"]["prompt"].as_array().unwrap().len(),
+                if enriched { 2 } else { 1 }
+            );
+            assert_eq!(conn.pending_len(), 1);
+            assert_eq!(conn.next_id.load(Ordering::SeqCst), 2);
+            reply(&mut writer, &frame["id"]).await;
+            assert_eq!(future.await.unwrap(), json!({"originalResult":true}));
+            assert_eq!(seen.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(seen.owner_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                seen.future_drops.load(Ordering::SeqCst),
+                usize::from(!matches!(mode, Mode::ConstructorPanic))
+            );
+            assert_eq!(conn.pending_len(), 0);
+            assert!(conn.prompt_pending.lock().unwrap().entries.is_empty());
+            no_frame(&mut reader).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_backpressure_rechecks_optional_currency_using_original_slot() {
+        let (conn, mut reader, mut writer) = fixture();
+        let mut reserved = reserve_all(&conn);
+        let (admission, seen) = policy(Mode::Accept);
+        let mut future = Box::pin(request(&conn, admission, Duration::from_secs(2)));
+        poll_pending(future.as_mut()).await;
+        assert_eq!(conn.pending_len(), 1);
+        assert_eq!(seen.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(conn.writer_tx.capacity(), 0);
+        seen.currency.store(false, Ordering::SeqCst);
+        drop(reserved.pop());
+        let frame = read_frame(&mut reader, future.as_mut()).await;
+        assert_eq!(frame["params"]["prompt"].as_array().unwrap().len(), 1);
+        reply(&mut writer, &frame["id"]).await;
+        assert!(future.await.is_ok());
+        assert_eq!(conn.next_id.load(Ordering::SeqCst), 2);
+        assert_eq!(seen.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(conn.writer_tx.capacity(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prompt_optional_timeout_uses_base_without_spending_response_timeout() {
+        let (conn, mut reader, mut writer) = fixture();
+        let (admission, seen) = policy(Mode::Hang);
+        let mut future = Box::pin(request(&conn, admission, Duration::from_millis(50)));
+        poll_pending(future.as_mut()).await;
+        tokio::time::advance(PROMPT_ADMISSION_TIMEOUT).await;
+        let frame = read_frame(&mut reader, future.as_mut()).await;
+        assert_eq!(frame["params"]["prompt"].as_array().unwrap().len(), 1);
+        assert_eq!(seen.future_drops.load(Ordering::SeqCst), 1);
+        reply(&mut writer, &frame["id"]).await;
+        assert!(future.await.is_ok());
+        assert_eq!(seen.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn prompt_cancellation_unpolled_queue_and_admission_leave_no_send() {
+        for stage in 0..3 {
+            let (conn, mut reader, _writer) = fixture();
+            let reserved = if stage == 1 {
+                reserve_all(&conn)
+            } else {
+                Vec::new()
+            };
+            let (admission, seen) = policy(Mode::Hold);
+            let mut future = Box::pin(request(&conn, admission, Duration::from_secs(2)));
+            if stage > 0 {
+                poll_pending(future.as_mut()).await;
+            }
+            assert_eq!(conn.pending_len(), usize::from(stage > 0));
+            drop(future);
+            assert_eq!(conn.pending_len(), 0);
+            assert!(conn.prompt_pending.lock().unwrap().entries.is_empty());
+            assert_eq!(seen.owner_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(seen.calls.load(Ordering::SeqCst), usize::from(stage == 2));
+            assert_eq!(
+                seen.future_drops.load(Ordering::SeqCst),
+                usize::from(stage == 2)
+            );
+            drop(reserved);
+            no_frame(&mut reader).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_auth_drain_during_queue_or_admission_prevents_transfer() {
+        for during_queue in [true, false] {
+            let (conn, mut reader, mut writer) = fixture();
+            let reserved = if during_queue {
+                reserve_all(&conn)
+            } else {
+                Vec::new()
+            };
+            let (admission, seen) = policy(Mode::Hold);
+            let mut future = Box::pin(request(&conn, admission, Duration::from_secs(2)));
+            poll_pending(future.as_mut()).await;
+            writer.write_all(b"TEST_AUTH_REQUIRED\n").await.unwrap();
+            until(|| conn.auth_required.load(Ordering::SeqCst)).await;
+            seen.release.notify_one();
+            drop(reserved);
+            assert!(
+                matches!(future.await,Err(AcpError::Rpc(ref e)) if e.message.contains("Authentication required"))
+            );
+            assert_eq!(conn.pending_len(), 0);
+            no_frame(&mut reader).await;
+            let (admission, later) = policy(Mode::Accept);
+            assert!(matches!(
+                request(&conn, admission, Duration::from_secs(2)).await,
+                Err(AcpError::Rpc(_))
+            ));
+            assert_eq!(later.calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_stdout_close_and_writer_close_are_original_failures() {
+        for close_writer in [false, true] {
+            let (conn, reader, writer) = fixture();
+            let (admission, seen) = policy(Mode::Hold);
+            let mut future = Box::pin(request(&conn, admission, Duration::from_secs(2)));
+            poll_pending(future.as_mut()).await;
+            if close_writer {
+                drop(reader);
+                conn.notify("fixture", json!({})).await.unwrap();
+                until(|| !conn.is_alive()).await;
+            } else {
+                drop(writer);
+                until(|| conn.prompt_pending.lock().unwrap().closed).await;
+            }
+            assert!(future.await.is_err());
+            assert_eq!(conn.pending_len(), 0);
+            assert_eq!(seen.future_drops.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prompt_response_timeout_late_reply_and_new_request_keep_correlation() {
+        let (conn, mut reader, mut writer) = fixture();
+        let (admission, _) = policy(Mode::AfterHang);
+        let mut future = Box::pin(request(&conn, admission, Duration::from_millis(50)));
+        let first = read_frame(&mut reader, future.as_mut()).await;
+        tokio::time::advance(Duration::from_millis(51)).await;
+        assert!(matches!(future.await, Err(AcpError::Timeout(_))));
+        assert_eq!(conn.pending_len(), 0);
+        let (admission, _) = policy(Mode::Accept);
+        let mut next = Box::pin(request(&conn, admission, Duration::from_secs(2)));
+        let second = read_frame(&mut reader, next.as_mut()).await;
+        assert_eq!(second["id"], 2);
+        reply(&mut writer, &first["id"]).await;
+        assert!(conn.await_response_after(0, Duration::from_secs(2)).await);
+        poll_pending(next.as_mut()).await;
+        assert_eq!(conn.pending_len(), 1);
+        reply(&mut writer, &second["id"]).await;
+        assert!(next.await.is_ok());
+        assert_eq!(conn.response_seq(), 2);
+    }
+
+    #[tokio::test]
+    async fn prompt_cancel_after_transfer_preserves_effect_without_duplicate() {
+        let (conn, mut reader, mut writer) = fixture();
+        let (admission, seen) = policy(Mode::AfterHang);
+        let mut future = Box::pin(request(&conn, admission, Duration::from_secs(2)));
+        let frame = read_frame(&mut reader, future.as_mut()).await;
+        drop(future);
+        assert_eq!(conn.pending_len(), 0);
+        assert_eq!(seen.future_drops.load(Ordering::SeqCst), 1);
+        reply(&mut writer, &frame["id"]).await;
+        assert!(conn.await_response_after(0, Duration::from_secs(2)).await);
+        no_frame(&mut reader).await;
+    }
+
+    #[tokio::test]
+    async fn prompt_equal_public_ids_on_other_connection_do_not_replace_boundary() {
+        struct Foreign(AcpPromptBoundary);
+        impl AcpPromptAdmission for Foreign {
+            fn admit<'a>(
+                &'a self,
+                _: &'a AcpPromptBoundary,
+                packet: PreparedAcpPromptTransfer<'a>,
+            ) -> intent_core::BoxFuture<'a, AcpPromptAdmissionOutcome> {
+                Box::pin(async move { packet.transfer(&self.0, PromptVariant::WithGuidance) })
+            }
+        }
+        let (first, mut first_reader, mut first_writer) = fixture();
+        let (second, mut second_reader, mut second_writer) = fixture();
+        let (admission, seen) = policy(Mode::Hold);
+        let mut first_request = Box::pin(request(&first, admission, Duration::from_secs(2)));
+        poll_pending(first_request.as_mut()).await;
+        let foreign = AcpPromptBoundary(Arc::clone(&seen.boundaries.lock().unwrap()[0]));
+        let mut second_request = Box::pin(request(
+            &second,
+            Box::new(Foreign(foreign)),
+            Duration::from_secs(2),
+        ));
+        let second_frame = read_frame(&mut second_reader, second_request.as_mut()).await;
+        assert_eq!(second_frame["id"], 1);
+        assert_eq!(
+            second_frame["params"]["prompt"].as_array().unwrap().len(),
+            1
+        );
+        reply(&mut second_writer, &second_frame["id"]).await;
+        assert!(second_request.await.is_ok());
+        assert_eq!(first.pending_len(), 1);
+        seen.release.notify_one();
+        let first_frame = read_frame(&mut first_reader, first_request.as_mut()).await;
+        assert_eq!(first_frame["id"], second_frame["id"]);
+        assert_eq!(
+            first_frame["params"]["sessionId"],
+            second_frame["params"]["sessionId"]
+        );
+        assert_eq!(first_frame["params"]["prompt"].as_array().unwrap().len(), 2);
+        reply(&mut first_writer, &first_frame["id"]).await;
+        assert!(first_request.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn prompt_auth_after_queue_preserves_one_effect_and_original_auth_failure() {
+        let (conn, mut reader, mut writer) = fixture();
+        let (admission, _) = policy(Mode::AfterHang);
+        let mut future = Box::pin(request(&conn, admission, Duration::from_secs(2)));
+        let frame = read_frame(&mut reader, future.as_mut()).await;
+        assert_eq!(frame["params"]["prompt"].as_array().unwrap().len(), 2);
+        writer.write_all(b"TEST_AUTH_REQUIRED\n").await.unwrap();
+        assert!(
+            matches!(future.await, Err(AcpError::Rpc(ref e)) if e.message.contains("Authentication required"))
+        );
+        assert_eq!(conn.pending_len(), 0);
+        no_frame(&mut reader).await;
+    }
+
+    #[tokio::test]
+    async fn prompt_drained_original_pending_drops_unpolled_admission_without_send() {
+        struct Drain {
+            connection: Arc<Connection>,
+            seen: Arc<Observation>,
+        }
+        impl AcpPromptAdmission for Drain {
+            fn admit<'a>(
+                &'a self,
+                original: &'a AcpPromptBoundary,
+                packet: PreparedAcpPromptTransfer<'a>,
+            ) -> intent_core::BoxFuture<'a, AcpPromptAdmissionOutcome> {
+                self.connection.prompt_pending.lock().unwrap().retire(1);
+                self.connection
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .remove(&1)
+                    .unwrap()
+                    .send(Err(authentication_required()))
+                    .unwrap();
+                let cleanup = FutureDrop {
+                    seen: Arc::clone(&self.seen),
+                    panic: false,
+                };
+                Box::pin(async move {
+                    let _cleanup = cleanup;
+                    self.seen.polls.fetch_add(1, Ordering::SeqCst);
+                    packet.transfer(original, PromptVariant::WithGuidance)
+                })
+            }
+        }
+        let (connection, mut reader, _writer) = fixture();
+        let connection = Arc::new(connection);
+        let seen = Arc::new(Observation::default());
+        let admission = Box::new(Drain {
+            connection: Arc::clone(&connection),
+            seen: Arc::clone(&seen),
+        });
+        assert!(matches!(
+            request(&connection, admission, Duration::from_secs(2)).await,
+            Err(AcpError::Rpc(_))
+        ));
+        assert_eq!(seen.polls.load(Ordering::SeqCst), 0);
+        assert_eq!(seen.future_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(connection.pending_len(), 0);
+        no_frame(&mut reader).await;
+    }
+}
+
+#[cfg(test)]
+mod prompt_retirement_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn prompt_retirement_before_sender_settlement_preserves_original_error() {
+        struct Retire(Arc<Connection>);
+        impl AcpPromptAdmission for Retire {
+            fn admit<'a>(
+                &'a self,
+                _: &'a AcpPromptBoundary,
+                _: PreparedAcpPromptTransfer<'a>,
+            ) -> intent_core::BoxFuture<'a, AcpPromptAdmissionOutcome> {
+                self.0.prompt_pending.lock().unwrap().retire(1);
+                let sender = self.0.pending.lock().unwrap().remove(&1).unwrap();
+                // Explicitly schedule the reader's retire-before-settle gap.
+                tokio::spawn(async move {
+                    tokio::task::yield_now().await;
+                    let _ = sender.send(Err(JsonRpcError {
+                        code: -123,
+                        message: "original terminal error".into(),
+                        data: Some(json!({"original":true})),
+                    }));
+                });
+                Box::pin(async { AcpPromptAdmissionOutcome::OmitOptional })
+            }
+        }
+        let (conn, mut reader, _writer) = super::watermark_tests::silent_connection();
+        let conn = Arc::new(conn);
+        let error = conn
+            .request_prompt_with_admission(
+                json!({}),
+                json!({"optional":true}),
+                Box::new(Retire(Arc::clone(&conn))),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error,AcpError::Rpc(ref e) if e.code == -123 && e.data == Some(json!({"original":true})))
+        );
+        assert_eq!(conn.pending_len(), 0);
+        let mut line = String::new();
+        assert!(tokio::time::timeout(
+            Duration::from_millis(30),
+            BufReader::new(&mut reader).read_line(&mut line)
+        )
+        .await
+        .is_err());
+    }
 }
 
 #[cfg(test)]

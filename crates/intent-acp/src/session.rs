@@ -213,6 +213,83 @@ pub struct PromptOutcome {
     pub meta: Option<Meta>,
 }
 
+/// Bound on optional inert prompt text. This does not grant repository access.
+pub const MAX_PROMPT_GUIDANCE_BYTES: usize = 8 * 1024;
+
+/// Owned original admission and bounded inert text. There is no default runtime
+/// producer and no native system/developer-role claim attached to this carrier.
+pub struct PromptGuidance {
+    text: String,
+    admission: Box<dyn crate::transport::AcpPromptAdmission>,
+}
+
+impl PromptGuidance {
+    /// Empty or oversized optional text falls back to the exact ordinary path.
+    #[must_use]
+    pub fn new(
+        text: String,
+        admission: Box<dyn crate::transport::AcpPromptAdmission>,
+    ) -> Option<Self> {
+        if text.trim().is_empty() || text.len() > MAX_PROMPT_GUIDANCE_BYTES {
+            return None;
+        }
+        Some(Self { text, admission })
+    }
+}
+
+/// Add optional text to the SAME original prompt through one owned admission.
+/// The producer must capture its actual prompt authority before queue/await;
+/// this API only preserves the original transport transfer. `None` delegates
+/// directly to [`prompt`], including its lazy timing and ordinary wire bytes.
+///
+/// # Errors
+///
+/// Preserves [`prompt`]'s response, idle, transport and RPC error behavior.
+pub async fn prompt_with_guidance(
+    conn: &Connection,
+    session_id: &str,
+    prompt: Vec<ContentBlock>,
+    activity: &ActivityTracker,
+    guidance: Option<PromptGuidance>,
+) -> AcpResult<PromptOutcome> {
+    let Some(guidance) = guidance else {
+        return self::prompt(conn, session_id, prompt, activity).await;
+    };
+    let request = PromptRequest::new(SessionId::new(session_id), prompt);
+    let base = serde_json::to_value(&request)?;
+    let mut enriched_request = request;
+    enriched_request.prompt.push(ContentBlock::Text(
+        agent_client_protocol::schema::v1::TextContent::new(guidance.text),
+    ));
+    let enriched = serde_json::to_value(&enriched_request)?;
+    let idle_window = prompt_idle_timeout();
+    let fallback_timeout = Duration::from_secs(24 * 60 * 60);
+    let req_fut =
+        conn.request_prompt_with_admission(base, enriched, guidance.admission, fallback_timeout);
+    tokio::pin!(req_fut);
+    let poll_interval = Duration::from_secs(1);
+    loop {
+        tokio::select! {
+            res = &mut req_fut => {
+                let result = res?;
+                let response: PromptResponse = serde_json::from_value(result)
+                    .map_err(|e| AcpError::Protocol(format!("invalid session/prompt response: {e}")))?;
+                return Ok(PromptOutcome {
+                    stop_reason: response.stop_reason,
+                    usage: response.usage,
+                    meta: response.meta,
+                });
+            }
+            () = tokio::time::sleep(poll_interval) => {
+                let idle = Duration::from_millis(activity.idle_ms());
+                if idle >= idle_window {
+                    return Err(AcpError::PromptIdleTimeout(idle_window));
+                }
+            }
+        }
+    }
+}
+
 /// `session/prompt` with the user content blocks → drives a turn; the agent
 /// streams `session/update`s then returns a [`PromptOutcome`] carrying the
 /// [`StopReason`] and optional end-of-turn usage snapshot (§6.5).
@@ -958,6 +1035,143 @@ fn tool_status_word(status: ToolCallStatus) -> &'static str {
 }
 
 #[cfg(test)]
+mod prompt_guidance_tests {
+    use super::*;
+    use crate::transport::{
+        AcpPromptAdmission, AcpPromptAdmissionOutcome, AcpPromptBoundary, ConnectionHooks,
+        PreparedAcpPromptTransfer, PromptVariant,
+    };
+    use serde_json::json;
+    use std::sync::atomic::AtomicUsize;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    struct Accept(Arc<AtomicUsize>);
+    impl AcpPromptAdmission for Accept {
+        fn admit<'a>(
+            &'a self,
+            original: &'a AcpPromptBoundary,
+            packet: PreparedAcpPromptTransfer<'a>,
+        ) -> intent_core::BoxFuture<'a, AcpPromptAdmissionOutcome> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { packet.transfer(original, PromptVariant::WithGuidance) })
+        }
+    }
+
+    async fn exchange(
+        guidance: Option<PromptGuidance>,
+        ordinary: bool,
+        response: Value,
+    ) -> (String, PromptOutcome) {
+        let (input, output) = tokio::io::duplex(16 * 1024);
+        let (mut replies, read) = tokio::io::duplex(4096);
+        let conn = Connection::new(input, read, None, ConnectionHooks::default());
+        let blocks: Vec<ContentBlock> = serde_json::from_value(json!([
+            {"type":"text","text":"original user block"},
+            {"type":"image","data":"aGVsbG8=","mimeType":"image/png"}
+        ]))
+        .unwrap();
+        let activity = ActivityTracker::new();
+        let call = async {
+            if ordinary {
+                prompt(&conn, "original-session", blocks, &activity).await
+            } else {
+                prompt_with_guidance(&conn, "original-session", blocks, &activity, guidance).await
+            }
+        };
+        let peer = async {
+            let mut reader = BufReader::new(output);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let frame: Value = serde_json::from_str(&line).unwrap();
+            replies
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"jsonrpc":"2.0","id":frame["id"],"result":response})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            line
+        };
+        let (outcome, line) = tokio::join!(call, peer);
+        assert_eq!(conn.pending_len(), 0);
+        (line, outcome.unwrap())
+    }
+
+    #[tokio::test]
+    async fn prompt_guidance_none_empty_and_oversized_preserve_ordinary_bytes_and_lazy_path() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let response = json!({"stopReason":"end_turn"});
+        let (ordinary, _) = exchange(None, true, response.clone()).await;
+        for text in [
+            None,
+            Some(String::new()),
+            Some(" \n\t".to_string()),
+            Some("x".repeat(MAX_PROMPT_GUIDANCE_BYTES + 1)),
+        ] {
+            let guidance = text
+                .and_then(|text| PromptGuidance::new(text, Box::new(Accept(Arc::clone(&calls)))));
+            assert!(guidance.is_none());
+            let (line, outcome) = exchange(guidance, false, response.clone()).await;
+            assert_eq!(line, ordinary);
+            assert_eq!(
+                serde_json::to_value(outcome.stop_reason).unwrap(),
+                "end_turn"
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let (input, _output) = tokio::io::duplex(4096);
+        let (_reply, read) = tokio::io::duplex(4096);
+        let conn = Connection::new(input, read, None, ConnectionHooks::default());
+        let activity = ActivityTracker::new();
+        let guidance = PromptGuidance::new("optional".into(), Box::new(Accept(Arc::clone(&calls))));
+        let future =
+            prompt_with_guidance(&conn, "original-session", Vec::new(), &activity, guidance);
+        assert_eq!(conn.pending_len(), 0);
+        drop(future);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn prompt_guidance_preserves_content_response_usage_meta_and_stop_reason() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let guidance = PromptGuidance::new(
+            "optional inert text".into(),
+            Box::new(Accept(Arc::clone(&calls))),
+        );
+        let (line,outcome)=exchange(guidance,false,json!({
+            "stopReason":"end_turn", "usage":{"totalTokens":120,"inputTokens":70,"outputTokens":50},
+            "_meta":{"modelId":"test-model"}
+        })).await;
+        let frame: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(frame["method"], "session/prompt");
+        assert_eq!(frame["params"]["sessionId"], "original-session");
+        assert_eq!(
+            frame["params"]["prompt"],
+            json!([
+                {"type":"text","text":"original user block"},
+                {"type":"image","data":"aGVsbG8=","mimeType":"image/png"},
+                {"type":"text","text":"optional inert text"}
+            ])
+        );
+        assert_eq!(
+            serde_json::to_value(outcome.stop_reason).unwrap(),
+            "end_turn"
+        );
+        assert_eq!(outcome.usage.unwrap().total_tokens, 120);
+        assert_eq!(outcome.meta.unwrap()["modelId"], "test-model");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let guidance = PromptGuidance::new(
+            "x".repeat(MAX_PROMPT_GUIDANCE_BYTES),
+            Box::new(Accept(calls)),
+        );
+        assert!(guidance.is_some());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -983,6 +1197,38 @@ mod tests {
                 None => std::env::remove_var(self.key),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn prompt_guidance_idle_timeout_cleans_original_pending() {
+        struct Refuse;
+        impl crate::transport::AcpPromptAdmission for Refuse {
+            fn admit<'a>(
+                &'a self,
+                _: &'a crate::transport::AcpPromptBoundary,
+                _: crate::transport::PreparedAcpPromptTransfer<'a>,
+            ) -> intent_core::BoxFuture<'a, crate::transport::AcpPromptAdmissionOutcome>
+            {
+                Box::pin(async { crate::transport::AcpPromptAdmissionOutcome::OmitOptional })
+            }
+        }
+        let _guard = EnvGuard::new("INTENTD_PROMPT_IDLE_TIMEOUT_MS");
+        std::env::set_var("INTENTD_PROMPT_IDLE_TIMEOUT_MS", "0");
+        let (input, _output) = tokio::io::duplex(4096);
+        let (_reply, read) = tokio::io::duplex(4096);
+        let conn = Connection::new(input, read, None, crate::ConnectionHooks::default());
+        let guidance = PromptGuidance::new("optional".into(), Box::new(Refuse));
+        let error = prompt_with_guidance(
+            &conn,
+            "same-session",
+            Vec::new(),
+            &ActivityTracker::new(),
+            guidance,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, AcpError::PromptIdleTimeout(_)));
+        assert_eq!(conn.pending_len(), 0);
     }
 
     /// Default idle window is 30 minutes, matching the FE contract

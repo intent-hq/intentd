@@ -30,6 +30,11 @@ pub enum RepositoryLifecycleKey {
     Database,
     /// Human authority changes; only original Wire read requests subscribe.
     WireAuthority,
+    /// A saved choice only; physical owners do not subscribe to this key.
+    Selection {
+        workspace_id: WorkspaceId,
+        git_root_id: Option<WorkspaceGitRootId>,
+    },
     /// The originally captured workspace.
     Workspace(WorkspaceId),
     /// The originally captured agent row.
@@ -267,6 +272,70 @@ impl LifecycleWrite {
         Ok(())
     }
 
+    /// Capture the same installed observer under install serialization, then
+    /// release that serialization before joining detached selection consumers.
+    /// Active original ownership remains registered even without an observer.
+    pub(crate) fn begin_selection_change(
+        &mut self,
+        root: &intent_core::RepositoryRootId,
+    ) -> Result<()> {
+        if self.begun || self.serial.is_none() {
+            return Err(lifecycle_error(
+                "selection owner is not original and serialized",
+            ));
+        }
+        let observer = {
+            let state = self
+                .domain
+                .state
+                .lock()
+                .map_err(|_| lifecycle_error("database domain poisoned"))?;
+            if state.invalidated {
+                return Err(lifecycle_error("database incarnation was retired"));
+            }
+            state.observer.clone()
+        };
+        let git_root_id = match &root.kind {
+            intent_core::RepositoryRootKind::Primary => None,
+            intent_core::RepositoryRootKind::Registered { git_root_id } => {
+                Some(git_root_id.clone())
+            }
+        };
+        self.begun = true;
+        self.release_serialization();
+        if let Some(observer) = observer {
+            self.ticket = Some(
+                observer.begin_mutation(&[RepositoryLifecycleKey::Selection {
+                    workspace_id: root.workspace_id.clone(),
+                    git_root_id,
+                }])?,
+            );
+        }
+        Ok(())
+    }
+
+    /// Reacquire only this already-begun owner's domain; never begin or repair a
+    /// second ticket. The caller must compare again inside its write transaction.
+    pub(crate) async fn resume_serialization(&mut self) -> Result<()> {
+        if !self.begun || self.serial.is_some() {
+            return Err(lifecycle_error(
+                "selection owner cannot resume serialization",
+            ));
+        }
+        let serial = self.domain.writers.clone().lock_owned().await;
+        if self
+            .domain
+            .state
+            .lock()
+            .map_err(|_| lifecycle_error("database domain poisoned"))?
+            .invalidated
+        {
+            return Err(lifecycle_error("database incarnation was retired"));
+        }
+        self.serial = Some(serial);
+        Ok(())
+    }
+
     pub(crate) fn release_serialization(&mut self) {
         self.serial.take();
     }
@@ -446,3 +515,6 @@ mod wire_authority_tests;
 
 #[cfg(all(test, unix))]
 mod pending_delete_tests;
+
+#[cfg(all(test, unix))]
+mod selection_tests;

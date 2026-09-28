@@ -1,0 +1,131 @@
+{
+  "revision": {
+    "epoch": "daemon-boot-1",
+    "sequence": "9007199254740993"
+  },
+  "scope": {
+    "daemonId": "daemon-A",
+    "authorityScopeId": "caller-workspace-1",
+    "authorityGeneration": "9007199254740995"
+  },
+  "roots": [
+    {
+      "root": {
+        "workspaceId": "workspace-1",
+        "kind": "primary"
+      },
+      "branch": "feature",
+      "headSha": "local-B",
+      "remotes": [
+        {
+          "name": "origin",
+          "fetch": [
+            {
+              "url": "https://git.example:8443/gitlab/team/sub/app.git",
+              "resolution": {
+                "state": "resolved",
+                "target": {
+                  "provider": "gitlab",
+                  "instanceBaseUrl": "https://git.example:8443/gitlab",
+                  "projectPath": "team/sub/app"
+                }
+              }
+            }
+          ],
+          "push": [
+            {
+              "url": "git@git.example:team/sub/app.git",
+              "resolution": {
+                "state": "resolved",
+                "target": {
+                  "provider": "gitlab",
+                  "instanceBaseUrl": "https://git.example:8443/gitlab",
+                  "projectPath": "team/sub/app"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "name": "upstream",
+          "fetch": [
+            {
+              "url": "https://github.com/team/app.git",
+              "resolution": {
+                "state": "resolved",
+                "target": {
+                  "provider": "github",
+                  "instanceBaseUrl": "https://github.com",
+                  "projectPath": "team/app"
+                }
+              }
+            }
+          ],
+          "push": []
+        }
+      ],
+      "targets": [
+        {
+          "target": {
+            "provider": "gitlab",
+            "instanceBaseUrl": "https://git.example:8443/gitlab",
+            "projectPath": "team/sub/app"
+          },
+          "providerProjectId": "42",
+          "connection": {
+            "connectionId": "gitlab-connection",
+            "accountId": "account-A",
+            "connectionGeneration": "18446744073709551615"
+          },
+          "availability": "connected",
+          "capabilities": [
+            {
+              "operation": "read-review",
+              "state": "available"
+            },
+            {
+              "operation": "create-review",
+              "state": "unknown"
+            }
+          ]
+        },
+        {
+          "target": {
+            "provider": "github",
+            "instanceBaseUrl": "https://github.com",
+            "projectPath": "team/app"
+          },
+          "providerProjectId": "github-project-1",
+          "connection": {
+            "connectionId": "github-connection",
+            "accountId": "account-GH",
+            "connectionGeneration": "4"
+          },
+          "availability": "connected",
+          "capabilities": [
+            {
+              "operation": "read-review",
+              "state": "available"
+            }
+          ]
+        }
+      ],
+      "reviewSelection": {
+        "saved": {
+          "mode": "explicit-remote",
+          "remoteName": "origin"
+        },
+        "noRemotes": false,
+        "outcome": {
+          "state": "resolved",
+          "target": {
+            "provider": "gitlab",
+            "instanceBaseUrl": "https://git.example:8443/gitlab",
+            "projectPath": "team/sub/app"
+          },
+          "source": "explicit-remote"
+        }
+      }
+    }
+  ]
+}

@@ -2064,3 +2064,1539 @@ async fn settled_actual_ready_before_proof_publication_does_not_attest_a_snapsho
     assert_eq!(settled.selected().binding, original.selected().binding);
     assert_eq!(s.count(), 0);
 }
+
+// New metadata-only projection tests. Positive identities come from original
+// owner settlement; the existing provider controls inject caller authority.
+use crate::repository_credentials::{
+    RepositoryConnectionState as Lifecycle, RepositoryMutationKind as MutationKind,
+};
+
+fn connection_facts(service: &crate::Services) -> RepositoryConnectionFacts {
+    service.gitlab_repository_connection_facts().unwrap()
+}
+fn unready(facts: &RepositoryConnectionFacts, reason: Error) {
+    assert_eq!(facts.unavailable_reason(), Some(reason));
+    assert!(facts.settled().is_none());
+    assert!(facts.backoff_until().is_none());
+    assert!(facts.child_policy().is_none());
+}
+
+#[intent_test_macros::daemon_test]
+async fn facts_default_missing_boundary_and_pairing_are_not_secret_absence() {
+    let dir = crate::test_support::test_tempdir("connection-facts-default");
+    let db = intent_store::Store::open(&dir.path().join("store.db"))
+        .await
+        .unwrap();
+    // A missing config is materialized as a template with File origins by load.
+    // An existing empty document exercises real default-origin settings.
+    let config = dir.path().join("config.toml");
+    std::fs::write(&config, "").unwrap();
+    let registry = Arc::new(crate::SettingsRegistry::load(config).unwrap());
+    let secrets = FileSecretStore::with_path(dir.path().join("missing-secrets.json"));
+    let service = crate::Services::new_repository_fixture(db.clone(), secrets.clone(), None)
+        .with_settings_registry(registry.clone());
+    let missing = connection_facts(&service);
+    assert!(missing.attachment() == RepositoryAttachmentState::BoundaryMissing);
+    assert!(missing.approval() == RepositoryDescriptorState::Unavailable);
+    assert_eq!(missing.lifecycle(), Lifecycle::Unverified);
+    unready(&missing, Error::Unverified);
+    service
+        .gitlab_credential_gate
+        .install_settings_boundary(&registry, &service.secrets, &secrets, None)
+        .unwrap();
+    let defaults = connection_facts(&service);
+    assert!(defaults.attachment() == RepositoryAttachmentState::Paired);
+    assert!(defaults.approval() == RepositoryDescriptorState::Approved);
+    assert_eq!(
+        defaults.descriptor().unwrap().instance().as_str(),
+        "https://gitlab.com"
+    );
+    assert_eq!(
+        registry.snapshot().origin("sourceControl.gitlab.host"),
+        Some(crate::settings_registry::SettingOrigin::Default)
+    );
+    unready(&defaults, Error::Unverified);
+    registry
+        .pin(
+            "sourceControl.gitlab.host",
+            json!("gitlab.com"),
+            "--gitlab-host",
+        )
+        .unwrap();
+    assert_eq!(
+        registry.snapshot().origin("sourceControl.gitlab.host"),
+        Some(crate::settings_registry::SettingOrigin::Flag)
+    );
+    let pinned = connection_facts(&service);
+    assert_eq!(pinned.descriptor(), defaults.descriptor());
+    unready(&pinned, Error::Unverified);
+    assert!(
+        !secrets.path().exists(),
+        "projection does not open or create a store"
+    );
+
+    let other_registry = Arc::new(crate::SettingsRegistry::load(registry.config_path()).unwrap());
+    let other = crate::Services::new_repository_fixture(db, secrets.clone(), None)
+        .with_settings_registry(other_registry.clone())
+        .with_secret_store(Arc::new(crate::settings::InMemorySecretStore::default()));
+    other
+        .gitlab_credential_gate
+        .install_settings_boundary(&other_registry, &other.secrets, &secrets, None)
+        .unwrap();
+    let unpaired = connection_facts(&other);
+    assert!(unpaired.attachment() == RepositoryAttachmentState::Unpaired);
+    assert!(unpaired.approval() == RepositoryDescriptorState::Approved);
+    unready(&unpaired, Error::Unverified);
+
+    // Private negative fixture: production constructors always attach once.
+    let mut unattached = service.clone();
+    unattached.gitlab_credential_gate = super::super::GitlabCredentialGate::new();
+    let facts = connection_facts(&unattached);
+    assert!(facts.attachment() == RepositoryAttachmentState::Unattached);
+    assert!(facts.descriptor().is_none());
+    unready(&facts, Error::Unverified);
+}
+
+#[intent_test_macros::daemon_test]
+async fn facts_full_descriptor_matches_settled_without_async_gate_or_file_work() {
+    let mut s = Server::new().await;
+    s.descriptor = GitlabDescriptor::with_loopback_endpoint(
+        intent_sourcecontrol::GitlabInstance::parse("https://gitlab.test:8443/forge/team").unwrap(),
+        s.host.base_url(),
+    )
+    .unwrap();
+    let dir = crate::test_support::test_tempdir("connection-facts-port");
+    let db = intent_store::Store::open(&dir.path().join("store.db"))
+        .await
+        .unwrap();
+    let registry = Arc::new(crate::SettingsRegistry::load(dir.path().join("config.toml")).unwrap());
+    registry
+        .apply(&[
+            (
+                "sourceControl.gitlab.host".into(),
+                json!("gitlab.test:8443"),
+            ),
+            (
+                "sourceControl.gitlab.instanceBaseUrl".into(),
+                json!(s.descriptor.instance().as_str()),
+            ),
+            (
+                "sourceControl.gitlab.apiBaseUrl".into(),
+                json!(s.host.base_url()),
+            ),
+        ])
+        .unwrap();
+    let secrets = FileSecretStore::with_path(dir.path().join("secrets.json"));
+    secrets.store(SECRET_ACCOUNT, "stored-pat").unwrap();
+    let service = crate::Services::new_repository_fixture(db, secrets, None)
+        .with_settings_registry(registry.clone());
+    service
+        .gitlab_credential_gate
+        .install_settings_boundary(
+            &registry,
+            &service.secrets,
+            &service.gitlab_secret_store,
+            Some(s.descriptor.clone()),
+        )
+        .unwrap();
+    service.reconcile_gitlab_repository_binding().await.unwrap();
+    let original = service.gitlab_repository_settled_connection().unwrap();
+    let loads = Arc::new(AtomicUsize::new(0));
+    let counter = loads.clone();
+    *original.owner.evidence.read_probe.lock().unwrap() = Some(Arc::new(move || {
+        counter.fetch_add(1, Ordering::SeqCst);
+    }));
+    let requests = s.control.requests.lock().unwrap().len();
+    let _gate = service.gitlab_credential_gate.lock().await;
+    let facts = connection_facts(&service);
+    assert_eq!(facts.descriptor(), Some(&s.descriptor));
+    assert_eq!(facts.settled().unwrap().selected(), original.selected());
+    assert_eq!(
+        facts
+            .settled()
+            .unwrap()
+            .selected()
+            .binding
+            .account
+            .account_id,
+        "42"
+    );
+    assert_eq!(facts.lifecycle(), Lifecycle::Ready);
+    assert_eq!(facts.unavailable_reason(), None);
+    assert!(!facts.preflight_pending());
+    assert_eq!(facts.mutation(), None);
+    assert!(matches!(
+        facts.child_policy(),
+        Some((RepositoryChildPolicyState::Disabled, _))
+    ));
+    assert_eq!(loads.load(Ordering::SeqCst), 0);
+    assert_eq!(s.control.requests.lock().unwrap().len(), requests);
+    assert_eq!(
+        registry.snapshot().origin("sourceControl.gitlab.host"),
+        Some(crate::settings_registry::SettingOrigin::File)
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn facts_reservation_then_actual_pat_replace_preserves_old_observation() {
+    let s = Server::new().await;
+    let f = Fixture::new(&s).await;
+    let old = connection_facts(&f.service);
+    let selected = old.settled().unwrap().selected().clone();
+    *s.control.pause.lock().unwrap() = Some("pat-second");
+    let pause = SettledWritePause::install(&f.service, 1);
+    let service = f.service.clone();
+    let host = s.host.clone();
+    let write =
+        tokio::spawn(async move { service.gitlab_connect_pat(host, "pat-second".into()).await });
+    s.entered().await;
+    let reserved = connection_facts(&f.service);
+    assert!(reserved.preflight_pending());
+    assert_eq!(reserved.lifecycle(), Lifecycle::Ready);
+    assert_eq!(reserved.mutation(), None);
+    assert_eq!(reserved.settled().unwrap().selected(), &selected);
+    s.control.release.notify_one();
+    pause.entered().await;
+    let begun = connection_facts(&f.service);
+    assert_eq!(begun.lifecycle(), Lifecycle::Mutating);
+    assert_eq!(begun.mutation(), Some(MutationKind::Replace));
+    assert!(!begun.preflight_pending());
+    unready(&begun, Error::Mutating);
+    assert_eq!(begun.descriptor(), Some(&s.descriptor));
+    pause.resume();
+    timeout(BUDGET, write).await.unwrap().unwrap().unwrap();
+    let next = connection_facts(&f.service);
+    assert_eq!(
+        next.settled()
+            .unwrap()
+            .selected()
+            .binding
+            .account
+            .account_id,
+        "43"
+    );
+    assert_ne!(next.settled().unwrap().selected().binding, selected.binding);
+    assert_eq!(old.settled().unwrap().selected(), &selected);
+    settled_error(old.settled().unwrap().reobserve(), Error::Retired);
+}
+
+#[intent_test_macros::daemon_test]
+async fn facts_oauth_refresh_reports_actual_mutation_and_new_settled_revision() {
+    let s = ReadServer::new().await;
+    let f = ReadFixture::new(&s, true).await;
+    let old = connection_facts(&f.auth.service);
+    let selected = old.settled().unwrap().selected().clone();
+    *s.fixture.control.pause.lock().unwrap() = Some("grant_type=refresh_token");
+    f.auth
+        .service
+        .gitlab_secret_store
+        .store(EXPIRES_AT_SECRET_ACCOUNT, "0")
+        .unwrap();
+    let service = f.auth.service.clone();
+    let host = s.fixture.host.clone();
+    let refresh = tokio::spawn(async move {
+        service
+            .stored_proof_token(&crate::source_control_auth_ops::Target::Gitlab { host })
+            .await
+    });
+    s.fixture.entered().await;
+    let pending = connection_facts(&f.auth.service);
+    assert_eq!(pending.mutation(), Some(MutationKind::Refresh));
+    assert_eq!(pending.lifecycle(), Lifecycle::Mutating);
+    unready(&pending, Error::Mutating);
+    s.fixture.control.release.notify_one();
+    timeout(BUDGET, refresh).await.unwrap().unwrap().unwrap();
+    let fresh = connection_facts(&f.auth.service);
+    assert_eq!(
+        fresh.settled().unwrap().selected().binding,
+        selected.binding
+    );
+    assert!(fresh.settled().unwrap().selected().secret_revision > selected.secret_revision);
+    assert!(fresh.child_policy() == old.child_policy());
+    assert_eq!(old.settled().unwrap().selected(), &selected);
+    assert_eq!(s.count(), 0);
+}
+
+#[intent_test_macros::daemon_test]
+async fn facts_unknown_store_failure_cannot_be_fixed_by_external_byte_restore() {
+    let s = ReadServer::new().await;
+    let f = ReadFixture::new(&s, true).await;
+    let path = f.auth.service.gitlab_secret_store.path().to_path_buf();
+    let saved = std::fs::read(&path).unwrap();
+    let broken = path.clone();
+    let first = AtomicBool::new(true);
+    f.auth
+        .service
+        .gitlab_credential_gate
+        .set_write_probe(Arc::new(move || {
+            if first.swap(false, Ordering::SeqCst) {
+                std::fs::remove_file(&broken).unwrap();
+                std::fs::create_dir(&broken).unwrap();
+            }
+        }));
+    f.auth
+        .service
+        .gitlab_secret_store
+        .store(EXPIRES_AT_SECRET_ACCOUNT, "0")
+        .unwrap();
+    assert!(f
+        .auth
+        .service
+        .stored_proof_token(&crate::source_control_auth_ops::Target::Gitlab {
+            host: s.fixture.host.clone()
+        })
+        .await
+        .is_err());
+    let unknown = connection_facts(&f.auth.service);
+    assert_eq!(unknown.lifecycle(), Lifecycle::Indeterminate);
+    assert_eq!(unknown.mutation(), Some(MutationKind::Refresh));
+    unready(&unknown, Error::Indeterminate);
+    std::fs::remove_dir(&path).unwrap();
+    std::fs::write(path, saved).unwrap();
+    unready(&connection_facts(&f.auth.service), Error::Indeterminate);
+    assert_eq!(s.count(), 0);
+}
+
+#[intent_test_macros::daemon_test]
+async fn facts_aborted_pat_keeps_original_blocking_completion_unavailable() {
+    let s = Server::new().await;
+    let f = Fixture::new(&s).await;
+    let pause = SettledWritePause::install(&f.service, 1);
+    let service = f.service.clone();
+    let host = s.host.clone();
+    let call =
+        tokio::spawn(async move { service.gitlab_connect_pat(host, "pat-second".into()).await });
+    pause.entered().await;
+    call.abort();
+    assert!(call.await.unwrap_err().is_cancelled());
+    unready(&connection_facts(&f.service), Error::Mutating);
+    pause.resume();
+    // The original lease is held until the blocking persistence actually exits.
+    let _gate = timeout(BUDGET, f.service.gitlab_credential_gate.lock())
+        .await
+        .unwrap();
+    let unknown = connection_facts(&f.service);
+    assert_eq!(unknown.lifecycle(), Lifecycle::Indeterminate);
+    unready(&unknown, Error::Indeterminate);
+}
+
+#[intent_test_macros::daemon_test]
+async fn facts_disconnect_and_source_override_retain_config_not_old_identity() {
+    use intent_core::WorkspaceApi;
+    let s = Server::new().await;
+    let f = Fixture::new(&s).await;
+    let old = connection_facts(&f.service);
+    f.service
+        .settings_reset(SECRET_ACCOUNT.into())
+        .await
+        .unwrap();
+    let disconnected = connection_facts(&f.service);
+    assert_eq!(disconnected.lifecycle(), Lifecycle::Disconnected);
+    assert!(disconnected.approval() == RepositoryDescriptorState::Approved);
+    assert_eq!(disconnected.descriptor(), Some(&s.descriptor));
+    unready(&disconnected, Error::Disconnected);
+    settled_error(old.settled().unwrap().reobserve(), Error::Retired);
+    let overridden = (*f.service)
+        .clone()
+        .with_gitlab_secret_store(FileSecretStore::with_path(
+            f.service
+                .gitlab_secret_store
+                .path()
+                .with_file_name("other.json"),
+        ));
+    unready(&connection_facts(&overridden), Error::Retired);
+    assert_eq!(connection_facts(&f.service).lifecycle(), Lifecycle::Retired);
+}
+
+#[intent_test_macros::daemon_test]
+async fn facts_child_policy_is_separate_from_native_settlement() {
+    let s = ReadServer::new().await;
+    let f = ReadFixture::new(&s, false).await;
+    let original = connection_facts(&f.auth.service);
+    let selected = original.settled().unwrap().selected().clone();
+    let directory = f.auth.service.repository_connection_directory();
+    assert!(matches!(
+        original.child_policy(),
+        Some((RepositoryChildPolicyState::Disabled, _))
+    ));
+    let checkpoint = directory
+        .child_policy_checkpoint(selected.binding.clone())
+        .unwrap();
+    let pending = directory.begin_child_policy(&checkpoint).unwrap();
+    let snapshot = connection_facts(&f.auth.service);
+    assert!(matches!(
+        snapshot.child_policy(),
+        Some((RepositoryChildPolicyState::Mutating, _))
+    ));
+    assert_eq!(snapshot.settled().unwrap().selected(), &selected);
+    let (eligibility, _, _) = f.operation(&s, RepositoryResourceKind::Issue);
+    eligibility.check().unwrap();
+    directory.mark_child_policy_indeterminate(&pending).unwrap();
+    assert!(matches!(
+        connection_facts(&f.auth.service).child_policy(),
+        Some((RepositoryChildPolicyState::Indeterminate, _))
+    ));
+    directory.finish_child_policy(&pending, true).unwrap();
+    let enabled = connection_facts(&f.auth.service);
+    assert!(matches!(
+        enabled.child_policy(),
+        Some((RepositoryChildPolicyState::Enabled, _))
+    ));
+    directory
+        .set_child_policy(&selected.binding, false)
+        .unwrap();
+    let disabled = connection_facts(&f.auth.service);
+    assert!(matches!(
+        disabled.child_policy(),
+        Some((RepositoryChildPolicyState::Disabled, _))
+    ));
+    assert_ne!(
+        disabled.child_policy().unwrap().1,
+        enabled.child_policy().unwrap().1
+    );
+    assert_eq!(disabled.settled().unwrap().selected(), &selected);
+    eligibility.check().unwrap();
+    assert_eq!(s.count(), 0);
+}
+
+#[intent_test_macros::daemon_test]
+async fn facts_quota_uses_captured_deadline_not_elapsed_remaining_duration() {
+    let s = ReadServer::new().await;
+    let f = ReadFixture::new(&s, true).await;
+    s.status(ISSUE, 429);
+    let (eligibility, op, target) = f.operation(&s, RepositoryResourceKind::Issue);
+    let (result, quota, receipt) = op.read_issue().await.into_parts();
+    assert!(matches!(&result, Err(ScError::RateLimited(_))));
+    let original = connection_facts(&f.auth.service);
+    let deadline = original.backoff_until().unwrap();
+    tokio::task::yield_now().await;
+    assert_eq!(
+        connection_facts(&f.auth.service).backoff_until(),
+        Some(deadline)
+    );
+    eligibility.check().unwrap();
+    f.refresh(&s).await;
+    let fresh = connection_facts(&f.auth.service);
+    assert_eq!(fresh.backoff_until(), Some(deadline));
+    assert_eq!(
+        fresh.settled().unwrap().selected().binding,
+        original.settled().unwrap().selected().binding
+    );
+    assert!(
+        fresh.settled().unwrap().selected().secret_revision
+            > original.settled().unwrap().selected().secret_revision
+    );
+    let (_, next, _) = f.operation(&s, RepositoryResourceKind::Issue);
+    assert!(matches!(
+        next.read_issue().await.into_parts().0,
+        Err(ScError::AdmissionUnavailable(
+            intent_sourcecontrol::error::AdmissionUnavailable::Backoff
+        ))
+    ));
+    assert_eq!(quota.remaining, Some(0));
+    assert_eq!(
+        applied(&eligibility, &receipt, &target).unwrap(),
+        D::NoDenial
+    );
+    assert_eq!(s.count(), 1);
+}
+
+#[intent_test_macros::daemon_test]
+async fn facts_current_rejection_is_disconnected_not_a_fabricated_denial_reason() {
+    let s = ReadServer::new().await;
+    let f = ReadFixture::new(&s, false).await;
+    let old = connection_facts(&f.auth.service);
+    s.status(MR, 401);
+    let (eligibility, op, target) = f.operation(&s, RepositoryResourceKind::MergeRequest);
+    let (result, quota, receipt) = op.review_details().await.into_parts();
+    denial(&result, ProviderFailureKind::CredentialRejected, 401);
+    assert_eq!(
+        applied(&eligibility, &receipt, &target).unwrap(),
+        D::AcceptedCredentialRejection
+    );
+    let facts = connection_facts(&f.auth.service);
+    assert_eq!(facts.lifecycle(), Lifecycle::Disconnected);
+    unready(&facts, Error::Disconnected);
+    assert_eq!(facts.descriptor(), old.descriptor());
+    assert_eq!(quota.remaining, Some(23));
+    settled_error(old.settled().unwrap().reobserve(), Error::Retired);
+    assert_eq!(s.count(), 1);
+}
+
+#[intent_test_macros::daemon_test]
+async fn facts_resource_denials_do_not_erase_current_connection_metadata() {
+    for status in [403, 404] {
+        let s = ReadServer::new().await;
+        let f = ReadFixture::new(&s, false).await;
+        let old = connection_facts(&f.auth.service);
+        s.status(MR, status);
+        let (eligibility, op, target) = f.operation(&s, RepositoryResourceKind::MergeRequest);
+        let (result, quota, receipt) = op.review_details().await.into_parts();
+        assert!(result.is_err());
+        assert!(matches!(
+            applied(&eligibility, &receipt, &target).unwrap(),
+            D::CurrentProjectDenial | D::CurrentResourceDenial
+        ));
+        let facts = connection_facts(&f.auth.service);
+        assert_eq!(
+            facts.settled().unwrap().selected(),
+            old.settled().unwrap().selected()
+        );
+        assert_eq!(facts.unavailable_reason(), None);
+        assert_eq!(quota.remaining, Some(23));
+        assert_eq!(s.count(), 1);
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn facts_metadata_faults_and_poison_fail_without_exporting_a_binding() {
+    for case in 0..5 {
+        let s = Server::new().await;
+        let f = Fixture::new(&s).await;
+        let original = f.service.gitlab_repository_settled_connection().unwrap();
+        let owner = &original.owner;
+        let expected = match case {
+            0 => {
+                owner.evidence.invalidate().unwrap();
+                Error::Unverified
+            }
+            1 => {
+                let mut proof = owner.evidence.published.lock().unwrap();
+                let old = proof.as_ref().unwrap();
+                let mut request = old.request.clone();
+                request.secret_revision += 1;
+                *proof = Some(Arc::new(AttestedSource {
+                    request,
+                    descriptor: old.descriptor.clone(),
+                    fingerprint: old.fingerprint,
+                }));
+                Error::SecretMismatch
+            }
+            2 => {
+                *owner.descriptor.lock().unwrap() = Some(GitlabDescriptor::new(
+                    intent_sourcecontrol::GitlabInstance::parse("https://gitlab.test/other")
+                        .unwrap(),
+                ));
+                Error::BoundaryMismatch
+            }
+            3 => {
+                owner
+                    .settings
+                    .get()
+                    .unwrap()
+                    .config
+                    .lock()
+                    .unwrap()
+                    .instance_base_url = Some("invalid://root".into());
+                Error::BoundaryMismatch
+            }
+            _ => {
+                let other = Server::new().await;
+                let mut proof = owner.evidence.published.lock().unwrap();
+                let old = proof.as_ref().unwrap();
+                *proof = Some(Arc::new(AttestedSource {
+                    request: old.request.clone(),
+                    descriptor: other.descriptor.clone(),
+                    fingerprint: old.fingerprint,
+                }));
+                Error::BoundaryMismatch
+            }
+        };
+        let facts = connection_facts(&f.service);
+        assert_eq!(facts.lifecycle(), Lifecycle::Ready);
+        unready(&facts, expected);
+        if matches!(case, 2 | 3) {
+            assert!(facts.approval() == RepositoryDescriptorState::Unapproved);
+            assert!(facts.descriptor().is_none());
+        }
+    }
+    for rank in 0..4 {
+        let s = Server::new().await;
+        let f = Fixture::new(&s).await;
+        let owner = f
+            .service
+            .gitlab_credential_gate
+            .repository
+            .get()
+            .unwrap()
+            .clone();
+        assert!(std::thread::spawn(move || {
+            match rank {
+                0 => {
+                    let _g = owner.settings.get().unwrap().config.lock().unwrap();
+                    panic!("negative config poison");
+                }
+                1 => {
+                    let _g = owner.descriptor.lock().unwrap();
+                    panic!("negative descriptor poison");
+                }
+                2 => {
+                    let _ = owner
+                        .directory
+                        .with_connection_metadata::<()>(|_| panic!("negative directory poison"));
+                }
+                _ => {
+                    let _g = owner.evidence.published.lock().unwrap();
+                    panic!("negative proof poison");
+                }
+            }
+        })
+        .join()
+        .is_err());
+        assert_eq!(
+            f.service.gitlab_repository_connection_facts().err(),
+            Some(Error::Indeterminate)
+        );
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn facts_observed_source_loss_is_not_repaired_by_restoring_file_bytes() {
+    let s = Server::new().await;
+    let f = Fixture::new(&s).await;
+    let old = connection_facts(&f.service);
+    let selected = old.settled().unwrap().selected();
+    let saved = std::fs::read(f.service.gitlab_secret_store.path()).unwrap();
+    f.service
+        .gitlab_secret_store
+        .store(SECRET_ACCOUNT, "unmanaged")
+        .unwrap();
+    assert!(
+        connection_facts(&f.service).settled().is_some(),
+        "unobserved external change is outside metadata knowledge"
+    );
+    let reader = f.service.gitlab_repository_secret_reader().unwrap();
+    assert_eq!(
+        reader.load(selected).await.unwrap_err(),
+        Error::SecretMismatch
+    );
+    unready(&connection_facts(&f.service), Error::Unverified);
+    std::fs::write(f.service.gitlab_secret_store.path(), saved).unwrap();
+    unready(&connection_facts(&f.service), Error::Unverified);
+    assert_eq!(old.settled().unwrap().selected(), selected);
+}
+
+#[intent_test_macros::daemon_test]
+async fn facts_actual_ready_before_proof_interval_is_not_settled() {
+    let s = ReadServer::new().await;
+    let f = ReadFixture::new(&s, true).await;
+    let original = f
+        .auth
+        .service
+        .gitlab_repository_settled_connection()
+        .unwrap();
+    let pause = SettledWritePause::install(&f.auth.service, 2);
+    f.auth
+        .service
+        .gitlab_secret_store
+        .store(EXPIRES_AT_SECRET_ACCOUNT, "0")
+        .unwrap();
+    let service = f.auth.service.clone();
+    let host = s.fixture.host.clone();
+    let refresh = tokio::spawn(async move {
+        service
+            .stored_proof_token(&crate::source_control_auth_ops::Target::Gitlab { host })
+            .await
+    });
+    pause.entered().await;
+    let (locked, ready) = tokio::sync::oneshot::channel();
+    let (release, hold) = std::sync::mpsc::channel::<()>();
+    let owner = original.owner.clone();
+    let holder = std::thread::spawn(move || {
+        let _descriptor = owner.descriptor.lock().unwrap();
+        let _ = locked.send(());
+        let _ = hold.recv();
+    });
+    timeout(BUDGET, ready).await.unwrap().unwrap();
+    let service = f.auth.service.clone();
+    let observation = tokio::task::spawn_blocking(move || connection_facts(&service));
+    timeout(BUDGET, async {
+        loop {
+            if matches!(
+                original.owner.settings.get().unwrap().config.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    pause.resume();
+    timeout(BUDGET, async {
+        loop {
+            match original.owner.directory.binding() {
+                Ok(_) => break,
+                Err(Error::Mutating) => tokio::task::yield_now().await,
+                other => panic!("unexpected state: {other:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(original.owner.evidence.published.lock().unwrap().is_none());
+    drop(release);
+    holder.join().unwrap();
+    let gap = timeout(BUDGET, observation).await.unwrap().unwrap();
+    assert_eq!(gap.lifecycle(), Lifecycle::Ready);
+    unready(&gap, Error::Unverified);
+    timeout(BUDGET, refresh).await.unwrap().unwrap().unwrap();
+    let next = connection_facts(&f.auth.service);
+    assert!(
+        next.settled().unwrap().selected().secret_revision > original.selected().secret_revision
+    );
+    assert_eq!(
+        next.settled().unwrap().selected().binding,
+        original.selected().binding
+    );
+    assert_eq!(s.count(), 0);
+}
+
+#[intent_test_macros::daemon_test]
+async fn facts_disconnect_reservation_and_begun_effect_have_distinct_metadata() {
+    let s = Server::new().await;
+    let f = Fixture::new(&s).await;
+    let original = connection_facts(&f.service);
+    let guard = f.service.gitlab_credential_gate.lock().await;
+    let pause = SettledWritePause::install(&f.service, 1);
+    let service = f.service.clone();
+    let host = s.host.clone();
+    let disconnect = tokio::spawn(async move { service.gitlab_revoke_owned(host).await });
+    timeout(BUDGET, async {
+        loop {
+            let facts = connection_facts(&f.service);
+            if facts.preflight_pending() {
+                assert_eq!(facts.lifecycle(), Lifecycle::Ready);
+                assert_eq!(facts.mutation(), None);
+                assert_eq!(
+                    facts.settled().unwrap().selected(),
+                    original.settled().unwrap().selected()
+                );
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(guard);
+    pause.entered().await;
+    let begun = connection_facts(&f.service);
+    assert_eq!(begun.lifecycle(), Lifecycle::Mutating);
+    assert_eq!(begun.mutation(), Some(MutationKind::Disconnect));
+    unready(&begun, Error::Mutating);
+    pause.resume();
+    timeout(BUDGET, disconnect).await.unwrap().unwrap().unwrap();
+    let final_facts = connection_facts(&f.service);
+    assert_eq!(final_facts.lifecycle(), Lifecycle::Disconnected);
+    assert_eq!(final_facts.mutation(), None);
+    unready(&final_facts, Error::Disconnected);
+    assert_eq!(final_facts.descriptor(), original.descriptor());
+    settled_error(original.settled().unwrap().reobserve(), Error::Retired);
+}
+
+#[intent_test_macros::daemon_test]
+async fn facts_same_account_reconnect_and_compensation_keep_old_observation_retired() {
+    use intent_core::WorkspaceApi;
+    for compensated in [false, true] {
+        let s = Server::new().await;
+        let f = Fixture::new(&s).await;
+        let original = connection_facts(&f.service);
+        if compensated {
+            let path = f.registry.config_path().to_path_buf();
+            let saved = path.with_file_name("config.saved");
+            let first = AtomicBool::new(true);
+            f.service
+                .gitlab_credential_gate
+                .set_write_probe(Arc::new(move || {
+                    if first.swap(false, Ordering::SeqCst) {
+                        std::fs::rename(&path, &saved).unwrap();
+                        std::fs::create_dir(&path).unwrap();
+                    }
+                }));
+            assert!(f
+                .service
+                .settings_update(json!([
+                    {"path":SECRET_ACCOUNT,"value":"pat-second"},
+                    {"path":"sourceControl.gitlab.oauthClientId","value":"new-client"}
+                ]))
+                .await
+                .is_err());
+        } else {
+            f.service
+                .gitlab_connect_pat(s.host.clone(), "pat-first".into())
+                .await
+                .unwrap();
+        }
+        let next = connection_facts(&f.service);
+        assert_eq!(next.lifecycle(), Lifecycle::Ready);
+        assert_eq!(
+            next.settled().unwrap().selected().binding.account,
+            original.settled().unwrap().selected().binding.account
+        );
+        assert_ne!(
+            next.settled().unwrap().selected().binding.scope,
+            original.settled().unwrap().selected().binding.scope
+        );
+        assert!(matches!(
+            next.child_policy(),
+            Some((RepositoryChildPolicyState::Disabled, _))
+        ));
+        settled_error(original.settled().unwrap().reobserve(), Error::Retired);
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn facts_captured_installation_absence_is_refused_after_actual_publication() {
+    let dir = crate::test_support::test_tempdir("connection-facts-installation");
+    let db = intent_store::Store::open(&dir.path().join("store.db"))
+        .await
+        .unwrap();
+    let registry = Arc::new(crate::SettingsRegistry::load(dir.path().join("config.toml")).unwrap());
+    let secrets = FileSecretStore::with_path(dir.path().join("missing.json"));
+    let service = crate::Services::new_repository_fixture(db, secrets.clone(), None)
+        .with_settings_registry(registry.clone());
+    let gate = &service.gitlab_credential_gate;
+    let owner = gate.repository.get().unwrap();
+    let original_attachment = owner.settings.get();
+    assert!(original_attachment.is_none());
+    gate.install_settings_boundary(&registry, &service.secrets, &secrets, None)
+        .unwrap();
+    let directory = service.repository_connection_directory();
+    // Private negative capture fixtures retain absence from before publication.
+    // They exercise the same held-metadata phase as the no-argument factory.
+    assert_eq!(
+        RepositoryConnectionFacts::observe_captured(
+            gate,
+            &directory,
+            Some(owner),
+            original_attachment
+        )
+        .err(),
+        Some(Error::Unverified)
+    );
+    assert_eq!(
+        RepositoryConnectionFacts::observe_captured(gate, &directory, None, None).err(),
+        Some(Error::Unverified)
+    );
+    let fresh = connection_facts(&service);
+    assert!(fresh.attachment() == RepositoryAttachmentState::Paired);
+    assert!(fresh.approval() == RepositoryDescriptorState::Approved);
+    unready(&fresh, Error::Unverified);
+    assert!(!secrets.path().exists());
+}
+
+// Companion tests use the real paired owner and local provider. Caller authority
+// remains explicitly injected; optional-only calls do not certify an ACP seal.
+fn optional_choice(
+    required: &[&RepositoryReadEligibility],
+    optional: Option<&RepositoryConnectionFacts>,
+) -> Result<bool> {
+    let mut choice = None;
+    let result = RepositoryReadEligibility::with_all_current_and_facts(required, optional, |v| {
+        assert!(choice.replace(v).is_none());
+        Ok(())
+    });
+    match result {
+        Ok(()) => Ok(choice.expect("one prebuilt transfer")),
+        Err(error) => {
+            assert!(choice.is_none(), "required failure cannot transfer");
+            Err(error)
+        }
+    }
+}
+fn optional_only(facts: Option<&RepositoryConnectionFacts>) -> bool {
+    let mut choice = None;
+    RepositoryConnectionFacts::with_optional_current(facts, |v| {
+        assert!(choice.replace(v).is_none());
+        Ok(())
+    })
+    .unwrap();
+    choice.unwrap()
+}
+
+struct HeldOutputRank {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+impl Drop for HeldOutputRank {
+    fn drop(&mut self) {
+        drop(self.release.take());
+        self.worker.take().unwrap().join().unwrap();
+    }
+}
+async fn hold_output_rank(original: Arc<RepositoryReadEligibility>, rank: usize) -> HeldOutputRank {
+    let (entered, ready) = tokio::sync::oneshot::channel();
+    let (release, wait) = std::sync::mpsc::channel::<()>();
+    let worker = std::thread::spawn(move || {
+        let mut entered = Some(entered);
+        let mut hold = move || {
+            entered.take().unwrap().send(()).unwrap();
+            let _ = wait.recv();
+        };
+        match rank {
+            0 => {
+                let _guard = original
+                    .owner
+                    .settings
+                    .get()
+                    .unwrap()
+                    .config
+                    .lock()
+                    .unwrap();
+                hold();
+            }
+            1 => {
+                let _guard = original.owner.descriptor.lock().unwrap();
+                hold();
+            }
+            2 => original
+                .scope
+                .with_current(&mut |_| {
+                    hold();
+                    Ok(())
+                })
+                .unwrap(),
+            _ => {
+                let _guard = original.owner.evidence.published.lock().unwrap();
+                hold();
+            }
+        }
+    });
+    let held = HeldOutputRank {
+        release: Some(release),
+        worker: Some(worker),
+    };
+    timeout(BUDGET, ready).await.unwrap().unwrap();
+    held
+}
+
+#[intent_test_macros::daemon_test]
+async fn optional_output_empty_and_ordinary_branches_are_distinct() {
+    let s = ReadServer::new().await;
+    let f = ReadFixture::new(&s, false).await;
+    let facts = connection_facts(&f.auth.service);
+    assert_eq!(optional_choice(&[], Some(&facts)), Err(Error::Unverified));
+    batch_refuses(&[], Error::Unverified);
+    assert!(optional_only(Some(&facts)));
+    assert!(!optional_only(None));
+    assert_eq!(s.count(), 0);
+}
+
+#[intent_test_macros::daemon_test]
+async fn optional_output_shared_owner_retains_each_scope_and_all_guards() {
+    let s = ReadServer::new().await;
+    let f = ReadFixture::new(&s, false).await;
+    let a = batch_scope(&f, &s, "group/project");
+    let b = batch_scope(&f, &s, "other/project");
+    let facts = connection_facts(&f.auth.service);
+    let packet = Box::new("original prebuilt output");
+    let mut moved = None;
+    RepositoryReadEligibility::with_all_current_and_facts(&[&a, &b, &a], Some(&facts), |include| {
+        assert!(include);
+        assert!(a.owner.settings.get().unwrap().config.try_lock().is_err());
+        assert!(a.owner.descriptor.try_lock().is_err());
+        assert!(a.owner.evidence.published.try_lock().is_err());
+        assert!(moved.replace(packet).is_none());
+        Ok(())
+    })
+    .unwrap();
+    assert!(moved.is_some());
+    a.check().unwrap();
+    assert!(!optional_choice(&[&b], None).unwrap());
+    f.auth
+        .service
+        .gitlab_connect_pat(s.fixture.host.clone(), "pat-second".into())
+        .await
+        .unwrap();
+    let fresh = batch_scope(&f, &s, "group/project");
+    for required in [[&fresh, &b], [&b, &fresh]] {
+        assert_eq!(
+            optional_choice(&required, Some(&facts)),
+            Err(Error::Retired)
+        );
+    }
+    assert_eq!(s.count(), 0);
+}
+
+#[intent_test_macros::daemon_test]
+async fn optional_output_busy_optional_locks_never_delay_required_at_any_rank() {
+    for rank in 0..4 {
+        let s = ReadServer::new().await;
+        let f = ReadFixture::new(&s, false).await;
+        let other = ReadFixture::new(&s, false).await;
+        let good = Arc::new(batch_scope(&f, &s, "group/project"));
+        let optional = Arc::new(batch_scope(&other, &s, "group/project"));
+        let facts = Arc::new(connection_facts(&other.auth.service));
+        let held = hold_output_rank(optional, rank).await;
+        let captured = facts.clone();
+        let admission =
+            tokio::task::spawn_blocking(move || optional_choice(&[&good], Some(&captured)));
+        // Required output must finish BEFORE releasing the additional busy lock.
+        let result = timeout(BUDGET, admission).await;
+        drop(held);
+        assert!(!result.unwrap().unwrap().unwrap(), "rank {rank}");
+        assert!(optional_only(Some(&facts)));
+        assert_eq!(s.count(), 0);
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn optional_output_poison_is_optional_only_until_a_required_member_shares_it() {
+    for rank in 0..4 {
+        let s = ReadServer::new().await;
+        let f = ReadFixture::new(&s, false).await;
+        let other = ReadFixture::new(&s, false).await;
+        let good = batch_scope(&f, &s, "group/project");
+        let bad = Arc::new(batch_scope(&other, &s, "group/project"));
+        let facts = connection_facts(&other.auth.service);
+        let poison = bad.clone();
+        assert!(std::thread::spawn(move || match rank {
+            0 => {
+                let _guard = poison.owner.settings.get().unwrap().config.lock().unwrap();
+                panic!("private config fault");
+            }
+            1 => {
+                let _guard = poison.owner.descriptor.lock().unwrap();
+                panic!("private descriptor fault");
+            }
+            2 => {
+                let _ = poison
+                    .scope
+                    .with_current(&mut |_| panic!("private directory fault"));
+            }
+            _ => {
+                let _guard = poison.owner.evidence.published.lock().unwrap();
+                panic!("private proof fault");
+            }
+        })
+        .join()
+        .is_err());
+        assert!(!optional_choice(&[&good], Some(&facts)).unwrap());
+        assert!(!optional_only(Some(&facts)));
+        for required in [[&good, bad.as_ref()], [bad.as_ref(), &good]] {
+            assert_eq!(
+                optional_choice(&required, Some(&facts)),
+                Err(Error::Indeterminate)
+            );
+        }
+        good.check().unwrap();
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn optional_output_shared_directory_does_not_merge_foreign_owner_attestation() {
+    let s = ReadServer::new().await;
+    let f = ReadFixture::new(&s, false).await;
+    let other = ReadFixture::new(&s, false).await;
+    let good = batch_scope(&f, &s, "group/project");
+    // Private negative association, not an attestation factory: second owner is
+    // real but did not settle this directory's binding.
+    let foreign = RepositoryReadEligibility {
+        owner: other
+            .auth
+            .service
+            .gitlab_credential_gate
+            .repository
+            .get()
+            .unwrap()
+            .clone(),
+        scope: RepositoryReadScope::capture(
+            f.auth.service.repository_connection_directory(),
+            &f.admission(&s),
+        )
+        .unwrap(),
+    };
+    let facts = connection_facts(&other.auth.service);
+    assert_eq!(
+        optional_choice(&[&good, &foreign], Some(&facts)),
+        Err(Error::SecretMismatch)
+    );
+    assert_eq!(
+        optional_choice(&[&foreign, &good], None),
+        Err(Error::SecretMismatch)
+    );
+    assert!(optional_choice(&[&good], Some(&facts)).unwrap());
+}
+
+#[intent_test_macros::daemon_test]
+async fn optional_output_reversed_owner_and_directory_orders_make_progress() {
+    let s = ReadServer::new().await;
+    let f = ReadFixture::new(&s, false).await;
+    let other = ReadFixture::new(&s, false).await;
+    let a = Arc::new(batch_scope(&f, &s, "group/project"));
+    let b = Arc::new(batch_scope(&other, &s, "group/project"));
+    let facts = Arc::new(connection_facts(&f.auth.service));
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let mut work = Vec::new();
+    for pair in [[a.clone(), b.clone()], [b, a]] {
+        let facts = facts.clone();
+        let barrier = barrier.clone();
+        work.push(tokio::task::spawn_blocking(move || {
+            barrier.wait();
+            for _ in 0..4 {
+                assert!(optional_choice(&[&pair[0], &pair[1]], Some(&facts)).unwrap());
+            }
+        }));
+    }
+    for task in work {
+        timeout(BUDGET, task).await.unwrap().unwrap();
+    }
+    assert_eq!(s.count(), 0);
+}
+
+#[intent_test_macros::daemon_test]
+async fn optional_output_real_preflight_and_replacement_select_original_or_omit() {
+    let s = ReadServer::new().await;
+    let f = ReadFixture::new(&s, false).await;
+    let good = batch_scope(&f, &s, "group/project");
+    let old = connection_facts(&f.auth.service);
+    assert!(optional_choice(&[&good], Some(&old)).unwrap());
+    *s.fixture.control.pause.lock().unwrap() = Some("pat-second");
+    let service = f.auth.service.clone();
+    let host = s.fixture.host.clone();
+    let writer =
+        tokio::spawn(async move { service.gitlab_connect_pat(host, "pat-second".into()).await });
+    s.fixture.entered().await;
+    assert!(!optional_choice(&[&good], Some(&old)).unwrap());
+    let preflight = connection_facts(&f.auth.service);
+    assert!(preflight.preflight_pending());
+    // This ownership transfer is admitted before the original writer's effect.
+    assert!(optional_choice(&[&good], Some(&preflight)).unwrap());
+    s.fixture.control.release.notify_one();
+    writer.await.unwrap().unwrap();
+    assert_eq!(
+        optional_choice(&[&good], Some(&preflight)),
+        Err(Error::Retired)
+    );
+    let fresh = batch_scope(&f, &s, "group/project");
+    assert!(!optional_choice(&[&fresh], Some(&preflight)).unwrap());
+    assert!(optional_choice(&[&fresh], Some(&connection_facts(&f.auth.service))).unwrap());
+}
+
+#[intent_test_macros::daemon_test]
+async fn optional_output_child_changes_do_not_refuse_native_required_output() {
+    let s = ReadServer::new().await;
+    let f = ReadFixture::new(&s, false).await;
+    let e = batch_scope(&f, &s, "group/project");
+    let old = connection_facts(&f.auth.service);
+    let directory = f.auth.service.repository_connection_directory();
+    let binding = f.auth.request().binding;
+    let checkpoint = directory.child_policy_checkpoint(binding.clone()).unwrap();
+    let ticket = directory.begin_child_policy(&checkpoint).unwrap();
+    assert!(!optional_choice(&[&e], Some(&old)).unwrap());
+    let pending = connection_facts(&f.auth.service);
+    assert!(optional_choice(&[&e], Some(&pending)).unwrap());
+    directory.mark_child_policy_indeterminate(&ticket).unwrap();
+    assert!(!optional_choice(&[&e], Some(&pending)).unwrap());
+    directory.finish_child_policy(&ticket, false).unwrap();
+    let disabled = connection_facts(&f.auth.service);
+    directory.set_child_policy(&binding, false).unwrap();
+    assert!(!optional_choice(&[&e], Some(&disabled)).unwrap());
+    assert!(optional_choice(&[&e], Some(&connection_facts(&f.auth.service))).unwrap());
+    assert_eq!(s.count(), 0);
+}
+
+#[intent_test_macros::daemon_test]
+async fn optional_output_observed_file_mismatch_has_both_admission_orders() {
+    let s = ReadServer::new().await;
+    let f = ReadFixture::new(&s, false).await;
+    let e = batch_scope(&f, &s, "group/project");
+    let old = connection_facts(&f.auth.service);
+    let bytes = std::fs::read(f.auth.service.gitlab_secret_store.path()).unwrap();
+    let reader = f.auth.service.gitlab_repository_secret_reader().unwrap();
+    let expected = f.auth.request();
+    let mut pause = PausedRead::install(&f.auth);
+    f.auth
+        .service
+        .gitlab_secret_store
+        .store(SECRET_ACCOUNT, "external-change")
+        .unwrap();
+    let load = tokio::spawn(async move { reader.load(&expected).await });
+    pause.entered().await;
+    assert!(
+        optional_choice(&[&e], Some(&old)).unwrap(),
+        "external change not yet observed"
+    );
+    pause.resume();
+    assert_eq!(load.await.unwrap().unwrap_err(), Error::SecretMismatch);
+    assert!(!optional_only(Some(&old)));
+    assert_eq!(optional_choice(&[&e], Some(&old)), Err(Error::Unverified));
+    std::fs::write(f.auth.service.gitlab_secret_store.path(), bytes).unwrap();
+    assert!(!optional_only(Some(&old)));
+    let unknown = connection_facts(&f.auth.service);
+    assert_eq!(unknown.lifecycle(), Lifecycle::Ready);
+    assert!(unknown.settled().is_none());
+    assert!(
+        optional_only(Some(&unknown)),
+        "only unknown metadata, no read permission"
+    );
+    assert_eq!(s.count(), 0);
+}
+
+#[intent_test_macros::daemon_test]
+async fn optional_output_refresh_preserves_quota_but_omits_old_secret_revision() {
+    let s = ReadServer::new().await;
+    let f = ReadFixture::new(&s, true).await;
+    let before = connection_facts(&f.auth.service);
+    let (e, op, target) = f.operation(&s, RepositoryResourceKind::Issue);
+    s.status(ISSUE, 429);
+    let (result, quota, receipt) = op.read_issue().await.into_parts();
+    assert!(!optional_choice(&[&e], Some(&before)).unwrap());
+    let backoff = connection_facts(&f.auth.service);
+    tokio::task::yield_now().await;
+    assert!(optional_choice(&[&e], Some(&backoff)).unwrap());
+    f.refresh(&s).await;
+    let refreshed = connection_facts(&f.auth.service);
+    assert_eq!(backoff.backoff_until(), refreshed.backoff_until());
+    assert_eq!(
+        backoff.settled().unwrap().selected().binding,
+        refreshed.settled().unwrap().selected().binding
+    );
+    assert!(!optional_choice(&[&e], Some(&backoff)).unwrap());
+    assert!(optional_choice(&[&e], Some(&refreshed)).unwrap());
+    let (_, blocked, _) = f.operation(&s, RepositoryResourceKind::Issue);
+    assert!(matches!(
+        blocked.read_issue().await.into_parts().0,
+        Err(ScError::AdmissionUnavailable(
+            intent_sourcecontrol::error::AdmissionUnavailable::Backoff
+        ))
+    ));
+    assert!(matches!(result, Err(ScError::RateLimited(_))));
+    assert_eq!(quota.remaining, Some(0));
+    assert_eq!(applied(&e, &receipt, &target).unwrap(), D::NoDenial);
+    assert_eq!(s.count(), 1);
+}
+
+#[intent_test_macros::daemon_test]
+async fn optional_output_refusal_keeps_current_and_obsolete_401_receipts() {
+    for old in [false, true] {
+        let s = ReadServer::new().await;
+        let f = ReadFixture::new(&s, old).await;
+        let facts = connection_facts(&f.auth.service);
+        let (e, op, target) = f.operation(&s, RepositoryResourceKind::MergeRequest);
+        s.status(MR, 401);
+        s.pause(MR);
+        let request = tokio::spawn(op.review_details());
+        s.entered().await;
+        if old {
+            f.refresh(&s).await;
+        }
+        s.resume();
+        let (result, quota, receipt) = request.await.unwrap().into_parts();
+        if old {
+            assert!(!optional_choice(&[&e], Some(&facts)).unwrap());
+        } else {
+            assert_eq!(optional_choice(&[&e], Some(&facts)), Err(Error::Retired));
+        }
+        denial(&result, ProviderFailureKind::CredentialRejected, 401);
+        assert_eq!(quota.remaining, Some(23));
+        assert_eq!(
+            applied(&e, &receipt, &target).unwrap(),
+            if old {
+                D::NotApplied
+            } else {
+                D::AcceptedCredentialRejection
+            }
+        );
+        assert_eq!(s.count(), 1);
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn optional_output_optional_refusal_keeps_project_and_item_denials() {
+    for (path, status, kind, disposition) in [
+        (
+            PROJECT,
+            403,
+            ProviderFailureKind::ProjectDenied,
+            D::CurrentProjectDenial,
+        ),
+        (
+            MR,
+            404,
+            ProviderFailureKind::ResourceDenied,
+            D::CurrentResourceDenial,
+        ),
+    ] {
+        let s = ReadServer::new().await;
+        let f = ReadFixture::new(&s, false).await;
+        let other = ReadFixture::new(&s, false).await;
+        let facts = connection_facts(&other.auth.service);
+        let other_e = batch_scope(&other, &s, "group/project");
+        let (e, op, target) = f.operation(&s, RepositoryResourceKind::MergeRequest);
+        s.status(path, status);
+        let (result, quota, receipt) = op.review_observation().await.into_parts();
+        other_e.owner.evidence.invalidate().unwrap();
+        assert!(!optional_choice(&[&e], Some(&facts)).unwrap());
+        assert_eq!(
+            optional_choice(&[&e, &other_e], Some(&facts)),
+            Err(Error::Unverified)
+        );
+        denial(&result, kind, status);
+        assert_eq!(quota.remaining, Some(23));
+        assert_eq!(applied(&e, &receipt, &target).unwrap(), disposition);
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn optional_output_installed_unavailable_facts_need_no_async_gate_or_io() {
+    let s = Server::new().await;
+    let f = Fixture::unadopted(&s).await;
+    let unknown = connection_facts(&f.service);
+    let gate = f.service.gitlab_credential_gate.lock().await;
+    let owner = gate_owner(&f.service);
+    *owner.evidence.read_probe.lock().unwrap() =
+        Some(Arc::new(|| panic!("metadata must not read a file")));
+    assert!(optional_only(Some(&unknown)));
+    drop(gate);
+    *owner.evidence.read_probe.lock().unwrap() = None;
+    f.service
+        .reconcile_gitlab_repository_binding()
+        .await
+        .unwrap();
+    assert!(!optional_only(Some(&unknown)));
+    let settled = connection_facts(&f.service);
+    f.service.gitlab_revoke_owned(s.host.clone()).await.unwrap();
+    assert!(!optional_only(Some(&settled)));
+    let disconnected = connection_facts(&f.service);
+    assert_eq!(disconnected.lifecycle(), Lifecycle::Disconnected);
+    assert!(disconnected.settled().is_none());
+    assert!(optional_only(Some(&disconnected)));
+}
+fn gate_owner(service: &crate::Services) -> Arc<super::super::RepositoryOwner> {
+    service
+        .gitlab_credential_gate
+        .repository
+        .get()
+        .unwrap()
+        .clone()
+}
+
+#[intent_test_macros::daemon_test]
+async fn optional_output_original_absence_never_recaptures_installed_owner() {
+    let dir = crate::test_support::test_tempdir("optional-absent-owner");
+    let store = intent_store::Store::open(&dir.path().join("store.db"))
+        .await
+        .unwrap();
+    let registry = Arc::new(crate::SettingsRegistry::load(dir.path().join("config.toml")).unwrap());
+    let secrets = FileSecretStore::with_path(dir.path().join("missing.json"));
+    let mut service = crate::Services::new_repository_fixture(store, secrets.clone(), None)
+        .with_settings_registry(registry.clone());
+    service.gitlab_credential_gate = super::super::GitlabCredentialGate::new(); // private absence fixture
+    let unattached = connection_facts(&service);
+    assert!(!optional_only(Some(&unattached)));
+    service
+        .gitlab_credential_gate
+        .attach_repository(service.repository_connection_directory(), None)
+        .unwrap();
+    let boundary_missing = connection_facts(&service);
+    assert!(!optional_only(Some(&boundary_missing)));
+    service
+        .gitlab_credential_gate
+        .install_settings_boundary(&registry, &service.secrets, &secrets, None)
+        .unwrap();
+    assert!(!optional_only(Some(&unattached)));
+    assert!(!optional_only(Some(&boundary_missing)));
+    assert!(optional_only(Some(&connection_facts(&service))));
+    assert!(!secrets.path().exists());
+}
+
+#[intent_test_macros::daemon_test]
+async fn optional_output_transfer_error_and_panic_are_never_retried() {
+    let s = ReadServer::new().await;
+    let f = ReadFixture::new(&s, false).await;
+    let e = Arc::new(batch_scope(&f, &s, "group/project"));
+    let facts = Arc::new(connection_facts(&f.auth.service));
+    let mut calls = 0;
+    let action: Box<dyn FnOnce(bool) -> Result<()> + Send> = Box::new(|include| {
+        assert!(include);
+        calls += 1;
+        Err(Error::TimedOut)
+    });
+    assert_eq!(
+        RepositoryReadEligibility::with_all_current_and_facts(&[&e], Some(&facts), action),
+        Err(Error::TimedOut)
+    );
+    assert_eq!(calls, 1);
+    e.check().unwrap();
+    let count = Arc::new(AtomicUsize::new(0));
+    let counted = count.clone();
+    let original = e.clone();
+    assert!(std::thread::spawn(move || {
+        let _ = RepositoryReadEligibility::with_all_current_and_facts(
+            &[&original],
+            Some(&facts),
+            |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                panic!("private transfer panic");
+            },
+        );
+    })
+    .join()
+    .is_err());
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    assert_eq!(optional_choice(&[&e], None), Err(Error::Indeterminate));
+    assert_eq!(s.count(), 0);
+}
+
+#[intent_test_macros::daemon_test]
+async fn optional_output_settings_and_source_override_do_not_rebind_facts() {
+    use intent_core::WorkspaceApi;
+    let s = ReadServer::new().await;
+    let f = ReadFixture::new(&s, false).await;
+    let e = batch_scope(&f, &s, "group/project");
+    let old = connection_facts(&f.auth.service);
+    f.auth
+        .service
+        .settings_update(json!([
+            {"path":"sourceControl.gitlab.oauthClientId","value":"changed-client"}
+        ]))
+        .await
+        .unwrap();
+    assert!(!optional_only(Some(&old)));
+    assert_eq!(optional_choice(&[&e], Some(&old)), Err(Error::Retired));
+    let current = connection_facts(&f.auth.service);
+    assert!(optional_only(Some(&current)));
+    let source = FileSecretStore::with_path(
+        f.auth
+            .service
+            .gitlab_secret_store
+            .path()
+            .with_file_name("override.json"),
+    );
+    let overridden = (*f.auth.service).clone().with_gitlab_secret_store(source);
+    assert!(!optional_only(Some(&current)));
+    let retired = connection_facts(&overridden);
+    assert_eq!(retired.lifecycle(), Lifecycle::Retired);
+    assert!(retired.settled().is_none());
+    assert!(
+        optional_only(Some(&retired)),
+        "original retired metadata, never an identity grant"
+    );
+    assert_eq!(s.count(), 0);
+}
+
+#[intent_test_macros::daemon_test]
+async fn optional_output_ready_before_proof_cannot_reuse_old_settled_facts() {
+    let s = ReadServer::new().await;
+    let f = ReadFixture::new(&s, true).await;
+    let original = connection_facts(&f.auth.service);
+    let e = batch_scope(&f, &s, "group/project");
+    let pause = SettledWritePause::install(&f.auth.service, 2);
+    f.auth
+        .service
+        .gitlab_secret_store
+        .store(EXPIRES_AT_SECRET_ACCOUNT, "0")
+        .unwrap();
+    let service = f.auth.service.clone();
+    let host = s.fixture.host.clone();
+    let refresh = tokio::spawn(async move {
+        service
+            .stored_proof_token(&crate::source_control_auth_ops::Target::Gitlab { host })
+            .await
+    });
+    pause.entered().await;
+    let (entered, ready) = tokio::sync::oneshot::channel();
+    let (release, wait) = std::sync::mpsc::channel::<()>();
+    let owner = e.owner.clone();
+    let holder = std::thread::spawn(move || {
+        let _guard = owner.descriptor.lock().unwrap();
+        entered.send(()).unwrap();
+        let _ = wait.recv();
+    });
+    timeout(BUDGET, ready).await.unwrap().unwrap();
+    let service = f.auth.service.clone();
+    let observation = tokio::task::spawn_blocking(move || connection_facts(&service));
+    timeout(BUDGET, async {
+        loop {
+            if matches!(
+                e.owner.settings.get().unwrap().config.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    pause.resume();
+    timeout(BUDGET, async {
+        loop {
+            match e.owner.directory.binding() {
+                Ok(_) => break,
+                Err(Error::Mutating) => tokio::task::yield_now().await,
+                other => panic!("unexpected state: {other:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(e.owner.evidence.published.lock().unwrap().is_none());
+    // Optional-only comparison cannot block on the held config/descriptor.
+    assert!(!optional_only(Some(&original)));
+    drop(release);
+    holder.join().unwrap();
+    let gap = timeout(BUDGET, observation).await.unwrap().unwrap();
+    assert_eq!(gap.lifecycle(), Lifecycle::Ready);
+    assert!(gap.settled().is_none());
+    timeout(BUDGET, refresh).await.unwrap().unwrap().unwrap();
+    assert!(!optional_choice(&[&e], Some(&gap)).unwrap());
+    assert!(!optional_choice(&[&e], Some(&original)).unwrap());
+    assert!(optional_choice(&[&e], Some(&connection_facts(&f.auth.service))).unwrap());
+    assert_eq!(s.count(), 0);
+}
+
+#[intent_test_macros::daemon_test]
+async fn optional_output_cancelled_auth_retains_actual_unsettled_owner() {
+    let s = Server::new().await;
+    let f = Fixture::new(&s).await;
+    let old = connection_facts(&f.service);
+    let pause = SettledWritePause::install(&f.service, 1);
+    let service = f.service.clone();
+    let host = s.host.clone();
+    let call =
+        tokio::spawn(async move { service.gitlab_connect_pat(host, "pat-second".into()).await });
+    pause.entered().await;
+    assert!(!optional_only(Some(&old)));
+    let mutating = connection_facts(&f.service);
+    assert_eq!(mutating.lifecycle(), Lifecycle::Mutating);
+    assert!(optional_only(Some(&mutating)));
+    call.abort();
+    assert!(call.await.unwrap_err().is_cancelled());
+    assert!(
+        optional_only(Some(&mutating)),
+        "cancellation is not writer settlement"
+    );
+    pause.resume();
+    let _gate = timeout(BUDGET, f.service.gitlab_credential_gate.lock())
+        .await
+        .unwrap();
+    let unknown = connection_facts(&f.service);
+    assert_eq!(unknown.lifecycle(), Lifecycle::Indeterminate);
+    assert!(!optional_only(Some(&old)));
+    assert!(!optional_only(Some(&mutating)));
+    assert!(optional_only(Some(&unknown)));
+}
+
+#[intent_test_macros::daemon_test]
+async fn optional_output_preflight_boolean_does_not_claim_mutation_history() {
+    let s = ReadServer::new().await;
+    let f = ReadFixture::new(&s, false).await;
+    let e = batch_scope(&f, &s, "group/project");
+    let directory = f.auth.service.repository_connection_directory();
+    let ticket = directory.reserve_mutation(MutationKind::Replace).unwrap();
+    let facts = connection_facts(&f.auth.service);
+    assert!(facts.preflight_pending());
+    directory.cancel_reservation(&ticket).unwrap();
+    assert!(!optional_choice(&[&e], Some(&facts)).unwrap());
+    let next = directory.reserve_mutation(MutationKind::Replace).unwrap();
+    assert!(
+        optional_choice(&[&e], Some(&facts)).unwrap(),
+        "same represented bool, not the same reservation"
+    );
+    directory.cancel_reservation(&next).unwrap();
+    assert_eq!(s.count(), 0);
+}

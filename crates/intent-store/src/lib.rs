@@ -42,6 +42,7 @@ mod pr_monitor_repo;
 mod principal_repo;
 mod repository_authority_repo;
 mod repository_lifecycle;
+mod repository_selection_repo;
 mod sandbox_repo;
 mod script_repo;
 mod settings_repo;
@@ -103,6 +104,11 @@ pub use repository_authority_repo::{
     AuthorityRevision, RepositoryAuthoritySnapshot, RepositoryCredentialAuthority,
     RepositoryPrincipalAuthority, RepositoryWorkspaceAuthority,
     RepositoryWorkspaceAuthoritySnapshot, VersionedAuthority,
+};
+pub use repository_selection_repo::{
+    RepositoryRootIncarnation, RepositorySelectionBinding, RepositorySelectionChange,
+    RepositorySelectionPersistence, RepositorySelectionRevision, RepositorySelectionSnapshot,
+    RepositorySelectionWriteOutcome, RepositorySelectionWriteResult, RepositoryStoredSelection,
 };
 pub use sandbox_repo::{Sandbox, SandboxStatus};
 pub use tracked_changes_repo::{NewTrackedChange, TrackedChangeRow};

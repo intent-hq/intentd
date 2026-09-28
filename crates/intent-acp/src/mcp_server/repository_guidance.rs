@@ -13,16 +13,32 @@ use intent_core::repository_context::{ExecutionScope, RepositoryContextRevision}
 use intent_core::{AgentId, AgentSession, Caller, WorkspaceId};
 use serde_json::{json, Value};
 
+use super::private_results::{McpOptionalEvidence, McpPrivateInvocation};
 use super::request_context::CapturedRequestContext;
 
 const MAX_GUIDANCE_BYTES: usize = 8 * 1024;
 const PREPARE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Immutable source qualification, captured when the endpoint is bound. A
+/// qualified producer requires original optional authority BEFORE preparation.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum GuidancePreparation {
+    CorrelationOnly,
+    Qualified,
+}
 
 /// Trusted service adapter, absent unless explicitly wired for a stamped session.
 /// Implementations must authorize the bound caller and workspace, including
 /// session retirement, before reading context. IDs and transport leases are not
 /// grants. Use the accepted renderer; never derive instructions from raw results.
 pub trait RepositoryGuidanceSource: Send + Sync {
+    /// Existing correlation-only producers retain their old path. A source
+    /// that reads qualified context must explicitly opt in; missing capture
+    /// then suppresses preparation and can never fall back to this default.
+    fn preparation(&self) -> GuidancePreparation {
+        GuidancePreparation::CorrelationOnly
+    }
+
     /// Runs after tool-result shaping within the original caller scope. Share
     /// the supplied fence across calls; only authoritative context transitions
     /// may replace its lease. A late operation result must not replace a lease.
@@ -168,6 +184,7 @@ impl GuidanceLease {
             lease: self.clone(),
             stamp,
             text,
+            evidence: None,
         })
     }
 }
@@ -177,14 +194,27 @@ pub struct GuidanceCandidate {
     lease: GuidanceLease,
     stamp: Option<Stamp>,
     text: String,
+    evidence: Option<McpOptionalEvidence>,
 }
 
 impl GuidanceCandidate {
+    /// Attach opaque original evidence for joint output admission. The producer
+    /// must also opt in BEFORE preparation; this is not a retrospective grant.
+    #[must_use]
+    pub fn with_optional_evidence(mut self, evidence: McpOptionalEvidence) -> Self {
+        self.evidence = Some(evidence);
+        self
+    }
+
     fn belongs_to(&self, fence: &RepositoryGuidanceFence) -> bool {
         Arc::ptr_eq(&self.lease.fence.active, &fence.active)
     }
 
     fn serialize(self, mut response: Value, connection: &ConnectionToken) -> String {
+        if self.evidence.is_some() {
+            // Legacy helpers have no original consuming admission.
+            return format!("{response}\n");
+        }
         // No await between the last check and serialization. This is the
         // writer's enqueue boundary; already-written socket bytes cannot be
         // retracted. Producer transitions serialize with this final check.
@@ -218,6 +248,7 @@ pub(super) struct GuidanceBinding {
     agent_id: AgentId,
     source: Arc<dyn RepositoryGuidanceSource>,
     fence: RepositoryGuidanceFence,
+    preparation: GuidancePreparation,
 }
 
 impl GuidanceBinding {
@@ -233,6 +264,7 @@ impl GuidanceBinding {
             && caller_id == Some(&session.id))
         .then(|| Self {
             agent_id: session.id.clone(),
+            preparation: source.preparation(),
             source,
             fence: RepositoryGuidanceFence::default(),
         })
@@ -258,6 +290,7 @@ impl GuidanceBinding {
             context: CapturedRequestContext::capture(Some(caller.clone()), None),
             caller,
             fence: self.fence.clone(),
+            preparation: self.preparation,
         })
     }
 }
@@ -270,6 +303,7 @@ pub(crate) struct GuidanceRequest {
     caller: Caller,
     fence: RepositoryGuidanceFence,
     context: CapturedRequestContext,
+    preparation: GuidancePreparation,
 }
 
 impl GuidanceRequest {
@@ -284,8 +318,43 @@ impl GuidanceRequest {
             caller,
             fence,
             context,
+            preparation,
         } = self;
         let source_fence = fence.clone();
+        if preparation == GuidancePreparation::Qualified {
+            let invocation = context.private_invocation?;
+            // Synchronous capture precedes even construction of the producer
+            // future. Restore caller/invocation, but never install the required
+            // request's cancellation wrapper around optional preparation.
+            let scope = intent_core::with_caller(
+                caller.clone(),
+                McpPrivateInvocation::scope(Some(invocation.clone()), async {
+                    invocation.capture_optional_context(PREPARE_TIMEOUT)
+                }),
+            )
+            .await?;
+            let mut task = PendingGuidance(tokio::spawn(async move {
+                let mut candidate = None;
+                let body = async {
+                    scope
+                        .scope(Box::pin(async {
+                            candidate = source.prepare(&workspace_id, &caller, &source_fence).await;
+                        }))
+                        .await;
+                };
+                intent_core::with_caller(
+                    caller.clone(),
+                    McpPrivateInvocation::scope(Some(invocation), body),
+                )
+                .await;
+                candidate
+            }));
+            return tokio::time::timeout(PREPARE_TIMEOUT, &mut task.0)
+                .await
+                .ok()?
+                .ok()?
+                .filter(|candidate| candidate.belongs_to(&fence) && candidate.evidence.is_some());
+        }
         // Optional guidance must not turn a completed operation into an error
         // or an unbounded wait. A separate task also contains producer panics;
         // the captured caller is explicitly retained across that task boundary.
@@ -298,7 +367,7 @@ impl GuidanceRequest {
             .await
             .ok()?
             .ok()?
-            .filter(|candidate| candidate.belongs_to(&fence))
+            .filter(|candidate| candidate.belongs_to(&fence) && candidate.evidence.is_none())
     }
 }
 
@@ -317,6 +386,22 @@ pub(crate) struct BridgeResponse {
 }
 
 impl BridgeResponse {
+    pub(super) fn qualified_caller(&self) -> Option<Caller> {
+        self.guidance_request.as_ref().and_then(|request| {
+            (request.preparation == GuidancePreparation::Qualified).then(|| request.caller.clone())
+        })
+    }
+
+    pub(crate) fn requires_qualified_guidance(&self) -> bool {
+        self.guidance_request
+            .as_ref()
+            .is_some_and(|request| request.preparation == GuidancePreparation::Qualified)
+            || self
+                .guidance
+                .as_ref()
+                .is_some_and(|candidate| candidate.evidence.is_some())
+    }
+
     pub(crate) fn plain(value: Value) -> Self {
         Self {
             value,
@@ -343,7 +428,30 @@ impl BridgeResponse {
 
     /// Encode both candidates before mandatory private-payload admission. The
     /// later writer only chooses optional guidance; it cannot authorize data.
-    pub(crate) fn prepare_line(self) -> PreparedBridgeLine {
+    pub(crate) fn prepare_line(mut self) -> PreparedBridgeLine {
+        if self
+            .guidance
+            .as_ref()
+            .is_some_and(|candidate| candidate.evidence.is_some())
+        {
+            self.guidance = None;
+        }
+        self.encode_line()
+    }
+
+    /// Only the mandatory delivery carrier can consume this split. Evidence
+    /// stays outside the prebuilt packet and its synchronous consuming action.
+    pub(super) fn prepare_delivery_line(
+        mut self,
+    ) -> (PreparedBridgeLine, Option<McpOptionalEvidence>) {
+        let evidence = self
+            .guidance
+            .as_mut()
+            .and_then(|candidate| candidate.evidence.take());
+        (self.encode_line(), evidence)
+    }
+
+    fn encode_line(self) -> PreparedBridgeLine {
         let base = format!("{}\n", self.value);
         let enriched = self.guidance.map(|guidance| {
             let mut value = self.value;
@@ -367,6 +475,11 @@ pub(crate) struct PreparedBridgeLine {
 }
 
 impl PreparedBridgeLine {
+    pub(crate) fn without_guidance(mut self) -> Self {
+        self.enriched = None;
+        self
+    }
+
     pub(crate) fn plain(value: Value) -> Self {
         BridgeResponse::plain(value).prepare_line()
     }

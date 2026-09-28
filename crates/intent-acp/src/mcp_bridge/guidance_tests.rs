@@ -531,3 +531,113 @@ async fn pending_guidance_preserves_ping_response_and_cancels_on_peer_disconnect
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn qualified_optional_tcp_admission_orders_keep_results_effects_and_one_whole_line() {
+    use crate::mcp_server::private_results::tests::{optional as o, Api, SECRET};
+    for after in [false, true] {
+        for required in [false, true] {
+            let state = o::State::new();
+            let gate = state.pause_admission(after);
+            let api = Arc::new(Api::new());
+            let candidate = Arc::new(o::server(api.clone(), state.clone(), false));
+            let bridge = serve_workspace_mcp_tcp(candidate).await.unwrap();
+            let (mut reader, mut writer) = connect(&bridge).await;
+            send(
+                &mut writer,
+                &call(
+                    1,
+                    "const r=await ws.git.listRoots(); await ws.workspace.info(); return r;",
+                ),
+            )
+            .await;
+            gate.reached().await;
+            if required {
+                state.required.retire();
+            } else {
+                state.live.store(false, Ordering::SeqCst);
+            }
+            gate.release.add_permits(1);
+            let value = read(&mut reader).await;
+            if required && !after {
+                crate::mcp_server::private_results::tests::refused(&value);
+            } else {
+                assert!(value.to_string().contains(SECRET));
+            }
+            assert_eq!(o::has_guidance(&value), after);
+            assert_eq!(api.acquired.load(Ordering::SeqCst), 1);
+            assert!(api.ordinary.load(Ordering::SeqCst) > 0);
+            send(
+                &mut writer,
+                &json!({"jsonrpc":"2.0","id":2,"method":"ping"}),
+            )
+            .await;
+            assert_eq!(read(&mut reader).await["id"], 2);
+            assert_eq!(state.optional_calls.load(Ordering::SeqCst), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn qualified_optional_writer_can_only_downgrade_an_already_admitted_variant() {
+    use crate::mcp_server::private_results::tests::{optional as o, Api, SECRET};
+    for choice_base in [false, true] {
+        let state = o::State::new();
+        state.live.store(!choice_base, Ordering::SeqCst);
+        let candidate = o::server(Arc::new(Api::new()), state.clone(), false);
+        let response = o::response(&candidate, o::READ).await;
+        let (tx, mut rx) = mpsc::channel(1);
+        let lifetime = ConnectionLifetime::new();
+        response.enqueue(tx, &lifetime.token()).await;
+        assert_eq!(state.optional_calls.load(Ordering::SeqCst), 1);
+        if choice_base {
+            state.live.store(true, Ordering::SeqCst);
+        } else {
+            assert!(state
+                .lease
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .advance(scope(), revision(2)));
+        }
+        let line = rx.recv().await.unwrap().into_line(&lifetime.token());
+        assert!(line.contains(SECRET));
+        assert!(!line.contains(o::TEXT));
+        assert_eq!(
+            state.optional_calls.load(Ordering::SeqCst),
+            1,
+            "writer never re-enters policy"
+        );
+    }
+}
+
+#[tokio::test]
+async fn qualified_optional_pending_preparation_does_not_block_ping_or_lose_completed_result() {
+    use crate::mcp_server::private_results::tests::{optional as o, Api, SECRET};
+    let state = o::State::new();
+    let gate = state.pause_source();
+    let api = Arc::new(Api::new());
+    let candidate = Arc::new(o::server(api.clone(), state.clone(), false));
+    let bridge = serve_mcp_tcp_with_timeout(candidate, Duration::from_millis(500))
+        .await
+        .unwrap();
+    let (mut reader, mut writer) = connect(&bridge).await;
+    send(&mut writer, &call(1, o::READ)).await;
+    gate.reached().await;
+    send(
+        &mut writer,
+        &json!({"jsonrpc":"2.0","id":2,"method":"ping"}),
+    )
+    .await;
+    assert_eq!(read(&mut reader).await["id"], 2);
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(2)).await;
+    tokio::time::resume();
+    let value = read(&mut reader).await;
+    assert_eq!(value["id"], 1);
+    assert!(value.to_string().contains(SECRET));
+    assert!(!o::has_guidance(&value));
+    assert!(state.required.live.load(Ordering::SeqCst));
+    assert_eq!(api.acquired.load(Ordering::SeqCst), 1);
+}

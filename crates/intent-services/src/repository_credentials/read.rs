@@ -48,6 +48,100 @@ impl RepositoryReadBatch<'_> {
     }
 }
 
+/// Separate output planner: only additional, optional-only locks may be skipped.
+/// It neither permits an empty required read nor certifies an ordinary invocation.
+pub(crate) struct RepositoryOutputBatch<'a> {
+    directories: Vec<Arc<RepositoryConnectionDirectory>>,
+    required: Vec<bool>,
+    members: Vec<(&'a RepositoryReadScope, usize)>,
+    optional: Option<usize>,
+}
+
+impl RepositoryOutputBatch<'_> {
+    pub(crate) fn with_current(
+        self,
+        action: impl FnOnce(
+                &[RepositorySecretRequest],
+                Option<RepositoryConnectionMetadata<'_>>,
+            ) -> Result<()>
+            + Send,
+    ) -> Result<()> {
+        let states = self
+            .directories
+            .iter()
+            .zip(&self.required)
+            .map(|(directory, required)| {
+                if *required {
+                    directory.lock().map(Some)
+                } else {
+                    // Neither contention nor poison on an optional-only lock
+                    // may delay or refuse otherwise valid required output.
+                    Ok(directory.state.try_lock().ok())
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let selected = self
+            .members
+            .iter()
+            .map(|(scope, index)| {
+                scope.directory.read_metadata(
+                    states[*index]
+                        .as_deref()
+                        .expect("required directory locked"),
+                    &scope.admission,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let optional = self.optional.and_then(|index| {
+            states[index]
+                .as_deref()
+                .map(|state| self.directories[index].connection_metadata(state))
+        });
+        action(&selected, optional)
+    }
+}
+
+impl RepositoryReadScope {
+    /// Allocation planning only. The two owner-facing entry points separately
+    /// enforce required-nonempty versus a future proven ordinary output branch.
+    pub(crate) fn prepare_output<'a>(
+        originals: &[&'a Self],
+        optional: Option<&Arc<RepositoryConnectionDirectory>>,
+    ) -> RepositoryOutputBatch<'a> {
+        let mut directories = originals
+            .iter()
+            .map(|scope| scope.directory.clone())
+            .chain(optional.cloned())
+            .collect::<Vec<_>>();
+        directories.sort_unstable_by_key(Arc::as_ptr);
+        directories.dedup_by(|a, b| Arc::ptr_eq(a, b));
+        let index = |directory: &Arc<RepositoryConnectionDirectory>| {
+            directories
+                .binary_search_by_key(&Arc::as_ptr(directory), Arc::as_ptr)
+                .expect("original directory retained")
+        };
+        let members = originals
+            .iter()
+            .map(|scope| (*scope, index(&scope.directory)))
+            .collect::<Vec<_>>();
+        let optional = optional.map(index);
+        let required = directories
+            .iter()
+            .map(|directory| {
+                originals
+                    .iter()
+                    .any(|scope| Arc::ptr_eq(directory, &scope.directory))
+            })
+            .collect();
+        RepositoryOutputBatch {
+            directories,
+            required,
+            members,
+            optional,
+        }
+    }
+}
+
 impl RepositoryReadScope {
     /// Gather retained allocations before the owner takes any metadata locks.
     pub(crate) fn prepare_all_current<'a>(
@@ -411,6 +505,61 @@ impl RepositoryReadOperation {
             result,
             quota,
             attribution,
+        }
+    }
+}
+
+/// Borrowed local metadata. The owning projection validates config/proof while
+/// this directory guard is held; these fields cannot authorize a request.
+pub(crate) struct RepositoryConnectionMetadata<'a> {
+    pub(crate) lifecycle: RepositoryConnectionState,
+    pub(crate) mutation: Option<RepositoryMutationKind>,
+    pub(crate) reserved: bool,
+    pub(crate) ready: Result<(&'a GitlabDescriptor, RepositorySecretRequest)>,
+    pub(crate) backoff_until: Option<Instant>,
+    pub(crate) child_enabled: bool,
+    pub(crate) child_revision: u64,
+    pub(crate) child_pending: Option<bool>,
+}
+
+impl RepositoryConnectionDirectory {
+    /// Status projection only. Does not change any admission/state predicate.
+    pub(crate) fn with_connection_metadata<T>(
+        &self,
+        inspect: impl FnOnce(RepositoryConnectionMetadata<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let state = self.lock()?;
+        inspect(self.connection_metadata(&state))
+    }
+
+    fn connection_metadata<'a>(&self, state: &'a State) -> RepositoryConnectionMetadata<'a> {
+        let ready = state.ready().and_then(|published| {
+            if published.binding.daemon_id != self.daemon_id
+                || published.binding.scope.connection_generation != state.generation
+            {
+                return Err(RepositoryCredentialError::Retired);
+            }
+            Ok((
+                &published.verified.descriptor,
+                RepositorySecretRequest {
+                    binding: published.binding.clone(),
+                    secret_revision: state.secret_revision,
+                    source: published.verified.source,
+                },
+            ))
+        });
+        RepositoryConnectionMetadata {
+            lifecycle: state.status,
+            mutation: state.active.as_ref().map(|active| active.kind),
+            reserved: state.reservation.is_some(),
+            ready,
+            backoff_until: state.backoff_until,
+            child_enabled: state.child_enabled,
+            child_revision: state.child_revision,
+            child_pending: state
+                .child_active
+                .as_ref()
+                .map(|active| active.indeterminate),
         }
     }
 }

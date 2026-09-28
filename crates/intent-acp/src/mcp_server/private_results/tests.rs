@@ -1039,3 +1039,724 @@ async fn expired_delivery_budget_is_not_an_operation_timeout() {
     assert_eq!(api.acquired.load(Ordering::SeqCst), 1);
     gate.release.add_permits(1);
 }
+
+/// Explicit neutral policy fixtures. These locks/identities do not implement
+/// the real R shared-parent planner, Store root lifetimes or P comparison.
+pub(crate) mod optional {
+    use super::*;
+    use crate::mcp_server::repository_guidance::{
+        tests::{revision, scope, session},
+        ConnectionLifetime, GuidanceCandidate, GuidanceLease, GuidancePreparation,
+        RepositoryGuidanceFence, RepositoryGuidanceSource,
+    };
+
+    pub(crate) const TEXT: &str = "qualified optional fixture guidance";
+    pub(crate) const READ: &str = "return await ws.git.listRoots();";
+    tokio::task_local! { static OPTIONAL: Arc<()>; }
+
+    pub(crate) struct State {
+        pub(crate) required: Arc<Policy>,
+        original: Arc<()>,
+        pub(crate) capture: AtomicUsize,
+        pub(crate) qualifications: AtomicUsize,
+        pub(crate) qualified: AtomicBool,
+        pub(crate) constructor: AtomicUsize,
+        pub(crate) polls: AtomicUsize,
+        pub(crate) leaves_dropped: AtomicUsize,
+        pub(crate) leaf_dropped: Notify,
+        pub(crate) scope_runs: AtomicUsize,
+        pub(crate) optional_calls: AtomicUsize,
+        pub(crate) final_records: Mutex<Vec<Vec<usize>>>,
+        pub(crate) live: AtomicBool,
+        pub(crate) capture_enabled: AtomicBool,
+        pub(crate) mode: AtomicU8,
+        pub(crate) admission_mode: AtomicU8,
+        pub(crate) gate: Mutex<Option<Arc<Gate>>>,
+        pub(crate) admission_gate: Mutex<Option<(bool, Arc<Gate>)>>,
+        pub(crate) lease: Mutex<Option<GuidanceLease>>,
+        captured_invocation: Mutex<Option<std::sync::Weak<Invocation>>>,
+        stolen: Mutex<Option<McpTransferReceipt>>,
+        drop_count: Arc<AtomicUsize>,
+        in_transfer: Arc<AtomicBool>,
+    }
+
+    impl State {
+        pub(crate) fn new() -> Arc<Self> {
+            Arc::new(Self {
+                required: Policy::new(),
+                original: Arc::new(()),
+                capture: AtomicUsize::new(0),
+                qualifications: AtomicUsize::new(0),
+                qualified: AtomicBool::new(true),
+                constructor: AtomicUsize::new(0),
+                polls: AtomicUsize::new(0),
+                leaves_dropped: AtomicUsize::new(0),
+                leaf_dropped: Notify::new(),
+                scope_runs: AtomicUsize::new(0),
+                optional_calls: AtomicUsize::new(0),
+                final_records: Mutex::new(Vec::new()),
+                live: AtomicBool::new(true),
+                capture_enabled: AtomicBool::new(true),
+                mode: AtomicU8::new(0),
+                admission_mode: AtomicU8::new(0),
+                gate: Mutex::new(None),
+                admission_gate: Mutex::new(None),
+                lease: Mutex::new(None),
+                captured_invocation: Mutex::new(None),
+                stolen: Mutex::new(None),
+                drop_count: Arc::new(AtomicUsize::new(0)),
+                in_transfer: Arc::new(AtomicBool::new(false)),
+            })
+        }
+        pub(crate) fn pause_source(&self) -> Arc<Gate> {
+            let gate = Gate::new();
+            *self.gate.lock().unwrap() = Some(gate.clone());
+            gate
+        }
+        pub(crate) fn pause_admission(&self, after: bool) -> Arc<Gate> {
+            let gate = Gate::new();
+            *self.admission_gate.lock().unwrap() = Some((after, gate.clone()));
+            gate
+        }
+    }
+
+    struct OptionalScope(Arc<State>);
+    impl Drop for OptionalScope {
+        fn drop(&mut self) {
+            self.0.leaves_dropped.fetch_add(1, Ordering::SeqCst);
+            self.0.leaf_dropped.notify_one();
+        }
+    }
+    impl McpOptionalContextScope for OptionalScope {
+        fn scope<'a>(&'a self, body: McpContextFuture<'a>) -> McpContextFuture<'a> {
+            Box::pin(OPTIONAL.scope(self.0.original.clone(), body))
+        }
+    }
+    struct OriginalEvidence {
+        original: Arc<()>,
+        invocation: McpPrivateInvocation,
+        drop_count: Arc<AtomicUsize>,
+        in_transfer: Arc<AtomicBool>,
+    }
+    impl Drop for OriginalEvidence {
+        fn drop(&mut self) {
+            assert!(
+                !self.in_transfer.load(Ordering::SeqCst),
+                "evidence dropped inside action"
+            );
+            self.drop_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    pub(crate) struct Source(pub(crate) Arc<State>);
+    impl RepositoryGuidanceSource for Source {
+        fn preparation(&self) -> GuidancePreparation {
+            self.0.qualifications.fetch_add(1, Ordering::SeqCst);
+            if self.0.qualified.load(Ordering::SeqCst) {
+                GuidancePreparation::Qualified
+            } else {
+                GuidancePreparation::CorrelationOnly
+            }
+        }
+        fn prepare<'a>(
+            &'a self,
+            workspace: &'a WorkspaceId,
+            caller: &'a Caller,
+            fence: &'a RepositoryGuidanceFence,
+        ) -> BoxFuture<'a, Option<GuidanceCandidate>> {
+            self.0.constructor.fetch_add(1, Ordering::SeqCst);
+            assert!(self.0.capture.load(Ordering::SeqCst) > 0);
+            assert_eq!(intent_core::current_caller().as_ref(), Some(caller));
+            assert_eq!(workspace.as_str(), "workspace-1");
+            OPTIONAL.with(|id| assert!(Arc::ptr_eq(id, &self.0.original)));
+            let invocation = McpPrivateInvocation::current().unwrap();
+            assert!(Arc::ptr_eq(
+                &invocation.0,
+                &self
+                    .0
+                    .captured_invocation
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .upgrade()
+                    .unwrap()
+            ));
+            assert_ne!(
+                self.0.mode.load(Ordering::SeqCst),
+                1,
+                "optional constructor panic"
+            );
+            Box::pin(async move {
+                self.0.polls.fetch_add(1, Ordering::SeqCst);
+                assert_ne!(
+                    self.0.mode.load(Ordering::SeqCst),
+                    2,
+                    "optional future panic"
+                );
+                let gate = self.0.gate.lock().unwrap().clone();
+                if let Some(gate) = gate {
+                    gate.wait().await;
+                }
+                let mode = self.0.mode.load(Ordering::SeqCst);
+                if mode == 7 {
+                    let late = McpHostCall {
+                        invocation: invocation.0.clone(),
+                        status: Arc::new(AtomicU8::new(0)),
+                    };
+                    assert!(matches!(late.reserve(), Err(PrivateReadRefusal::Closed)));
+                }
+                if mode == 3 {
+                    return None;
+                }
+                let lease = fence.replace_context(scope(), revision(1)).unwrap();
+                *self.0.lease.lock().unwrap() = Some(lease.clone());
+                let candidate = lease
+                    .current_candidate(scope(), revision(1), TEXT.into())
+                    .unwrap();
+                if mode == 4 {
+                    return Some(candidate);
+                }
+                Some(
+                    candidate.with_optional_evidence(McpOptionalEvidence::new(OriginalEvidence {
+                        original: if mode == 5 {
+                            Arc::new(())
+                        } else {
+                            self.0.original.clone()
+                        },
+                        invocation,
+                        drop_count: self.0.drop_count.clone(),
+                        in_transfer: self.0.in_transfer.clone(),
+                    })),
+                )
+            })
+        }
+    }
+
+    /// `DefaultMode` tests the actual trait default, not a copied implementation.
+    struct DefaultMode(Arc<State>);
+    pub(crate) struct Joint(pub(crate) Arc<State>);
+    fn capture(state: &Arc<State>) -> Option<Box<dyn McpOptionalContextScope>> {
+        assert_eq!(
+            intent_core::current_caller(),
+            Some(Caller::Agent {
+                agent_id: "agent-1".into()
+            })
+        );
+        state.capture.fetch_add(1, Ordering::SeqCst);
+        *state.captured_invocation.lock().unwrap() =
+            Some(Arc::downgrade(&McpPrivateInvocation::current().unwrap().0));
+        assert_ne!(
+            state.mode.load(Ordering::SeqCst),
+            6,
+            "optional capture panic"
+        );
+        state
+            .capture_enabled
+            .load(Ordering::SeqCst)
+            .then(|| Box::new(OptionalScope(state.clone())) as Box<dyn McpOptionalContextScope>)
+    }
+    impl McpPrivatePolicy for DefaultMode {
+        fn capture_host(&self, call: McpHostCall) -> Box<dyn McpPrivateHostScope> {
+            self.0.required.capture_host(call)
+        }
+        fn capture_optional_context(&self) -> Option<Box<dyn McpOptionalContextScope>> {
+            capture(&self.0)
+        }
+        fn admit<'a>(
+            &'a self,
+            boundary: &'a McpPrivateBoundary,
+            originals: &'a [McpReadEvidence],
+            packet: PreparedMcpTransfer<'a>,
+        ) -> BoxFuture<'a, McpPrivateAdmission> {
+            self.0.required.admit(boundary, originals, packet)
+        }
+    }
+    impl McpPrivatePolicy for Joint {
+        fn capture_host(&self, call: McpHostCall) -> Box<dyn McpPrivateHostScope> {
+            self.0.required.capture_host(call)
+        }
+        fn capture_optional_context(&self) -> Option<Box<dyn McpOptionalContextScope>> {
+            capture(&self.0)
+        }
+        fn admit<'a>(
+            &'a self,
+            boundary: &'a McpPrivateBoundary,
+            originals: &'a [McpReadEvidence],
+            packet: PreparedMcpTransfer<'a>,
+        ) -> BoxFuture<'a, McpPrivateAdmission> {
+            self.0.required.admit(boundary, originals, packet)
+        }
+        // Only this neutral fixture inspects ACP's private original anchor.
+        #[expect(clippy::used_underscore_binding)]
+        fn admit_optional<'a>(
+            &'a self,
+            boundary: &'a McpPrivateBoundary,
+            sealed: McpSealedReads<'a>,
+            optional: &'a McpOptionalEvidence,
+            packet: PreparedMcpVariants<'a>,
+        ) -> BoxFuture<'a, McpPrivateAdmission> {
+            Box::pin(async move {
+                assert_eq!(
+                    intent_core::current_caller(),
+                    Some(Caller::Agent {
+                        agent_id: "agent-1".into()
+                    })
+                );
+                assert_eq!(boundary.kind(), McpPrivateBoundaryKind::TcpResponse);
+                self.0.optional_calls.fetch_add(1, Ordering::SeqCst);
+                self.0.final_records.lock().unwrap().push(
+                    sealed
+                        .records()
+                        .iter()
+                        .map(|r| r.downcast_ref::<Evidence>().unwrap().target)
+                        .collect(),
+                );
+                let hold = self.0.admission_gate.lock().unwrap().clone();
+                if let Some((false, gate)) = &hold {
+                    gate.wait().await;
+                }
+                let mode = self.0.admission_mode.load(Ordering::SeqCst);
+                assert_ne!(mode, 1, "combined admission panic before consumption");
+                if mode == 2 {
+                    return McpPrivateAdmission::Refused;
+                }
+                if mode == 3 {
+                    return packet.transfer(
+                        &super::super::boundary(boundary.kind()),
+                        McpGuidanceChoice::WithGuidance,
+                    );
+                }
+                if mode == 4 {
+                    if let Some(receipt) = self.0.stolen.lock().unwrap().take() {
+                        return McpPrivateAdmission::Transferred(receipt);
+                    }
+                }
+                if !sealed.is_empty()
+                    && (!self.0.required.live.load(Ordering::SeqCst)
+                        || sealed.records().iter().any(|r| {
+                            !r.downcast_ref::<Evidence>()
+                                .unwrap()
+                                .live
+                                .load(Ordering::SeqCst)
+                        }))
+                {
+                    return McpPrivateAdmission::Refused;
+                }
+                let original = optional.downcast_ref::<OriginalEvidence>().unwrap();
+                let choice = if self.0.live.load(Ordering::SeqCst)
+                    && self.0.required.live.load(Ordering::SeqCst)
+                    && Arc::ptr_eq(&original.original, &self.0.original)
+                    && std::ptr::eq(sealed._original, original.invocation.0.as_ref())
+                {
+                    McpGuidanceChoice::WithGuidance
+                } else {
+                    McpGuidanceChoice::WithoutGuidance
+                };
+                self.0.in_transfer.store(true, Ordering::SeqCst);
+                let result = packet.transfer(boundary, choice);
+                self.0.in_transfer.store(false, Ordering::SeqCst);
+                assert_ne!(mode, 5, "combined admission panic after consumption");
+                if mode == 4 {
+                    if let McpPrivateAdmission::Transferred(receipt) = result {
+                        *self.0.stolen.lock().unwrap() = Some(receipt);
+                    }
+                    return McpPrivateAdmission::Refused;
+                }
+                if let Some((true, gate)) = &hold {
+                    gate.wait().await;
+                }
+                result
+            })
+        }
+    }
+    struct Factory {
+        state: Arc<State>,
+        policy: Arc<dyn McpPrivatePolicy>,
+    }
+    impl McpRequestContext for Factory {
+        fn capture(&self) -> Arc<dyn McpRequestScope> {
+            Arc::new(RequiredScope {
+                state: self.state.clone(),
+                policy: self.policy.clone(),
+            })
+        }
+    }
+    struct RequiredScope {
+        state: Arc<State>,
+        policy: Arc<dyn McpPrivatePolicy>,
+    }
+    struct CancelRequired {
+        live: Arc<AtomicBool>,
+        completed: bool,
+    }
+    impl Drop for CancelRequired {
+        fn drop(&mut self) {
+            if !self.completed {
+                self.live.store(false, Ordering::SeqCst);
+            }
+        }
+    }
+    impl McpRequestScope for RequiredScope {
+        fn private_result_policy(&self) -> Option<Arc<dyn McpPrivatePolicy>> {
+            Some(self.policy.clone())
+        }
+        fn scope<'a>(&'a self, body: McpContextFuture<'a>) -> McpContextFuture<'a> {
+            Box::pin(async move {
+                self.state.scope_runs.fetch_add(1, Ordering::SeqCst);
+                let mut guard = CancelRequired {
+                    live: self.state.required.live.clone(),
+                    completed: false,
+                };
+                body.await;
+                guard.completed = true;
+            })
+        }
+    }
+    pub(crate) fn server(api: Arc<Api>, state: Arc<State>, default: bool) -> WorkspaceMcpServer {
+        let policy: Arc<dyn McpPrivatePolicy> = if default {
+            Arc::new(DefaultMode(state.clone()))
+        } else {
+            Arc::new(Joint(state.clone()))
+        };
+        WorkspaceMcpServer::new(api, "workspace-1".into())
+            .with_caller_agent_id(Some("agent-1".into()))
+            .with_request_context(Arc::new(Factory {
+                state: state.clone(),
+                policy,
+            }))
+            .with_repository_guidance(&session(Some("3.0")), Arc::new(Source(state)))
+    }
+    pub(crate) async fn response(server: &WorkspaceMcpServer, code: &str) -> DeliveryResponse {
+        server
+            .handle_message_for_delivery(&call(1, code), server.capture_request_context())
+            .await
+            .unwrap()
+    }
+    pub(crate) async fn deliver(response: DeliveryResponse) -> (DeliveryOutcome, Value) {
+        let (tx, mut rx) = mpsc::channel(1);
+        let life = ConnectionLifetime::new();
+        let result = response.enqueue(tx, &life.token()).await;
+        let encoded = rx.recv().await.unwrap().into_line(&life.token());
+        assert!(rx.recv().await.is_none());
+        (result, serde_json::from_str(&encoded).unwrap())
+    }
+    pub(crate) fn has_guidance(value: &Value) -> bool {
+        value.to_string().contains(TEXT)
+    }
+
+    #[tokio::test]
+    async fn optional_default_uses_complete_nonempty_seal_once_and_never_empty_admit() {
+        for empty in [false, true] {
+            let state = State::new();
+            let api = Arc::new(Api::new());
+            let server = server(api, state.clone(), true);
+            let code = if empty {
+                "return 'ordinary';"
+            } else {
+                "await Promise.all([ws.git.listRoots(),ws.git.listRoots()]); return 'constant';"
+            };
+            let (outcome, value) = deliver(response(&server, code).await).await;
+            assert_eq!(outcome, DeliveryOutcome::Admitted);
+            assert!(!has_guidance(&value));
+            assert_eq!(state.capture.load(Ordering::SeqCst), 1);
+            assert_eq!(state.constructor.load(Ordering::SeqCst), 1);
+            assert_eq!(state.leaves_dropped.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                state.scope_runs.load(Ordering::SeqCst),
+                if empty { 1 } else { 2 },
+                "empty ordinary output must not re-enter the required scope"
+            );
+            let events = state.required.events.lock().unwrap();
+            let final_events: Vec<_> = events
+                .iter()
+                .filter(|(kind, _)| *kind == McpPrivateBoundaryKind::TcpResponse)
+                .collect();
+            if empty {
+                assert!(events.is_empty());
+            } else {
+                assert_eq!(final_events.len(), 1);
+                assert_eq!(final_events[0].1, vec![0, 1]);
+            }
+            assert_eq!(state.drop_count.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn optional_current_stale_foreign_and_missing_evidence_preserve_original_result() {
+        for mode in [0, 3, 4, 5] {
+            for stale in [false, true] {
+                let state = State::new();
+                state.mode.store(mode, Ordering::SeqCst);
+                state.live.store(!stale, Ordering::SeqCst);
+                let server = server(Arc::new(Api::new()), state.clone(), false);
+                let (outcome, value) = deliver(response(&server, READ).await).await;
+                assert_eq!(outcome, DeliveryOutcome::Admitted);
+                assert!(value.to_string().contains(SECRET));
+                assert_eq!(has_guidance(&value), mode == 0 && !stale);
+                assert!(state.required.live.load(Ordering::SeqCst));
+                assert_eq!(state.scope_runs.load(Ordering::SeqCst), 2);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn optional_constructor_future_and_capture_panics_do_not_retire_required_parent() {
+        for mode in [1, 2, 6] {
+            let state = State::new();
+            state.mode.store(mode, Ordering::SeqCst);
+            let server = server(Arc::new(Api::new()), state.clone(), false);
+            let (_, value) = deliver(response(&server, READ).await).await;
+            assert!(value.to_string().contains(SECRET));
+            assert!(!has_guidance(&value));
+            assert!(state.required.live.load(Ordering::SeqCst));
+            assert_eq!(state.scope_runs.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                state.constructor.load(Ordering::SeqCst),
+                usize::from(mode != 6)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn optional_timeout_cancels_only_its_leaf_before_required_admission() {
+        let state = State::new();
+        let gate = state.pause_source();
+        let server = server(Arc::new(Api::new()), state.clone(), false);
+        let response = response(&server, READ).await;
+        let task = tokio::spawn(deliver(response));
+        gate.reached().await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let (outcome, value) = task.await.unwrap();
+        tokio::time::resume();
+        assert_eq!(outcome, DeliveryOutcome::Admitted);
+        assert!(value.to_string().contains(SECRET));
+        assert!(!has_guidance(&value));
+        assert!(state.required.live.load(Ordering::SeqCst));
+        assert_eq!(state.leaves_dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(state.scope_runs.load(Ordering::SeqCst), 2);
+        gate.release.add_permits(1);
+        assert_eq!(state.constructor.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn optional_missing_capture_never_invokes_qualified_source_or_falls_back() {
+        for no_policy in [false, true] {
+            let state = State::new();
+            state.capture_enabled.store(false, Ordering::SeqCst);
+            let server = if no_policy {
+                WorkspaceMcpServer::new(Arc::new(Api::new()), "workspace-1".into())
+                    .with_caller_agent_id(Some("agent-1".into()))
+                    .with_repository_guidance(
+                        &session(Some("3.0")),
+                        Arc::new(Source(state.clone())),
+                    )
+            } else {
+                server(Arc::new(Api::new()), state.clone(), false)
+            };
+            let (_, value) = deliver(response(&server, "return 'ordinary';").await).await;
+            assert!(!has_guidance(&value));
+            assert!(value.to_string().contains("ordinary"));
+            assert_eq!(state.constructor.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                state.capture.load(Ordering::SeqCst),
+                usize::from(!no_policy)
+            );
+        }
+        let state = State::new();
+        let server = super::server(Arc::new(Api::new()), state.required.clone())
+            .with_repository_guidance(&session(Some("3.0")), Arc::new(Source(state.clone())));
+        let (_, value) = deliver(response(&server, READ).await).await;
+        assert!(value.to_string().contains(SECRET));
+        assert_eq!(state.capture.load(Ordering::SeqCst), 0);
+        assert_eq!(state.constructor.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn optional_failed_unbound_and_unfinished_seals_never_become_empty() {
+        for unfinished in [false, true] {
+            let state = State::new();
+            let api = Arc::new(Api {
+                unbound: AtomicBool::new(!unfinished),
+                ..Api::new()
+            });
+            let server = server(api, state.clone(), false);
+            let context = server.capture_request_context();
+            let reservation = if unfinished {
+                Some(
+                    McpHostCall {
+                        invocation: context.private_invocation.as_ref().unwrap().0.clone(),
+                        status: Arc::new(AtomicU8::new(0)),
+                    }
+                    .reserve()
+                    .unwrap(),
+                )
+            } else {
+                None
+            };
+            let code = if unfinished {
+                "return 'ordinary';"
+            } else {
+                "try {await ws.git.listRoots();} catch(_){} return 'constant';"
+            };
+            let response = server
+                .handle_message_for_delivery(&call(1, code), context)
+                .await
+                .unwrap();
+            let (_, value) = deliver(response).await;
+            refused(&value);
+            assert_eq!(state.capture.load(Ordering::SeqCst), 0);
+            assert_eq!(state.optional_calls.load(Ordering::SeqCst), 0);
+            drop(reservation);
+        }
+    }
+
+    #[tokio::test]
+    async fn optional_cannot_bypass_required_retirement_or_poisoning_after_caught_reads() {
+        let state = State::new();
+        let gate = state.pause_source();
+        let api = Arc::new(Api {
+            outcome: Mutex::new(Err(SECRET.into())),
+            ..Api::new()
+        });
+        let server = server(api.clone(), state.clone(), false);
+        let response=response(&server,"try {await ws.git.listRoots();} catch(_){} await ws.workspace.setStatusMessage('completed'); return 'constant';").await;
+        let task = tokio::spawn(deliver(response));
+        gate.reached().await;
+        state.required.retire();
+        gate.release.add_permits(1);
+        let (outcome, value) = task.await.unwrap();
+        assert_eq!(outcome, DeliveryOutcome::Refused);
+        refused(&value);
+        assert_eq!(state.final_records.lock().unwrap().as_slice(), &[vec![0]]);
+        assert_eq!(api.acquired.load(Ordering::SeqCst), 1);
+        assert_eq!(*api.mutations.lock().unwrap(), vec!["completed"]);
+    }
+
+    #[tokio::test]
+    async fn optional_joint_failure_preserves_empty_base_but_refuses_required_without_retry() {
+        for empty in [false, true] {
+            for mode in [1, 2, 3, 5] {
+                let state = State::new();
+                state.admission_mode.store(mode, Ordering::SeqCst);
+                let server = server(Arc::new(Api::new()), state.clone(), false);
+                let (outcome, value) = deliver(
+                    response(&server, if empty { "return 'ordinary';" } else { READ }).await,
+                )
+                .await;
+                if empty || mode == 5 {
+                    assert_eq!(outcome, DeliveryOutcome::Admitted);
+                    assert_eq!(has_guidance(&value), mode == 5);
+                    assert!(value
+                        .to_string()
+                        .contains(if empty { "ordinary" } else { SECRET }));
+                } else {
+                    assert_eq!(outcome, DeliveryOutcome::Refused);
+                    refused(&value);
+                }
+                assert_eq!(state.optional_calls.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn optional_foreign_receipt_cannot_authorize_another_original_invocation() {
+        let state = State::new();
+        state.admission_mode.store(4, Ordering::SeqCst);
+        let server = server(Arc::new(Api::new()), state.clone(), false);
+        let (outcome, first) = deliver(response(&server, READ).await).await;
+        assert_eq!(outcome, DeliveryOutcome::Admitted);
+        assert!(has_guidance(&first));
+        let (outcome, second) = deliver(response(&server, READ).await).await;
+        assert_eq!(outcome, DeliveryOutcome::Refused);
+        refused(&second);
+        assert_eq!(state.optional_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn optional_does_not_enter_direct_host_attachment_or_artifact_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::new();
+        let api = Arc::new(Api {
+            checkout: Some(dir.path().to_str().unwrap().into()),
+            max_chars: 20,
+            ..Api::new()
+        });
+        let server = server(api, state.clone(), false);
+        let value = server.handle_message(&call(1, READ)).await.unwrap();
+        assert!(!has_guidance(&value));
+        let kinds: Vec<_> = state
+            .required
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, _)| *k)
+            .collect();
+        assert!(kinds.contains(&McpPrivateBoundaryKind::HostPromise));
+        assert!(kinds.contains(&McpPrivateBoundaryKind::ArtifactStart));
+        assert!(kinds.contains(&McpPrivateBoundaryKind::DirectResponse));
+        assert_eq!(state.capture.load(Ordering::SeqCst), 0);
+        assert_eq!(state.optional_calls.load(Ordering::SeqCst), 0);
+        let registry = Arc::new(TurnAttachmentRegistry::new());
+        let server = self::server(Arc::new(Api::new()), state.clone(), false)
+            .with_turn_attachments(Some(registry.clone()));
+        let result = server.handle_message(&call(2,"await ws.git.listRoots(); return {__mcpContentItems:[{type:'resource',resource:{uri:'fixture://original',mimeType:'application/json',text:'private-fixture-payload'}}]};")).await.unwrap();
+        assert_eq!(result["result"]["isError"], false);
+        assert_eq!(
+            registry.pending_count_by_mime(&"agent-1".into(), "application/json"),
+            1
+        );
+        assert!(state
+            .required
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(kind, _)| *kind == McpPrivateBoundaryKind::Attachments));
+        assert_eq!(state.capture.load(Ordering::SeqCst), 0);
+        assert_eq!(state.optional_calls.load(Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn optional_preparation_drop_retires_only_its_leaf_without_detached_completion() {
+        let state = State::new();
+        let gate = state.pause_source();
+        let server = server(Arc::new(Api::new()), state.clone(), false);
+        let response = response(&server, READ).await;
+        let task = tokio::spawn(response.response.prepare_guidance());
+        gate.reached().await;
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        tokio::time::timeout(WAIT, state.leaf_dropped.notified())
+            .await
+            .unwrap();
+        assert!(state.required.live.load(Ordering::SeqCst));
+        assert_eq!(state.leaves_dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(state.scope_runs.load(Ordering::SeqCst), 1);
+        assert_eq!(state.optional_calls.load(Ordering::SeqCst), 0);
+        gate.release.add_permits(1);
+        assert_eq!(state.polls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn optional_preparation_cannot_add_late_records_to_either_successful_seal() {
+        for empty in [false, true] {
+            let state = State::new();
+            state.mode.store(7, Ordering::SeqCst);
+            let server = server(Arc::new(Api::new()), state.clone(), false);
+            let (outcome, value) =
+                deliver(response(&server, if empty { "return 'ordinary';" } else { READ }).await)
+                    .await;
+            assert_eq!(outcome, DeliveryOutcome::Admitted);
+            assert!(has_guidance(&value));
+            assert_eq!(
+                state.final_records.lock().unwrap().as_slice(),
+                &[if empty { vec![] } else { vec![0] }]
+            );
+            assert_eq!(
+                state.scope_runs.load(Ordering::SeqCst),
+                if empty { 1 } else { 2 }
+            );
+        }
+    }
+}

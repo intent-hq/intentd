@@ -95,6 +95,10 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
 #[cfg(test)]
 pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
     (
+        "repository_selection_state",
+        "daemon-local root/selection continuity and tombstones; imported intent is unverified",
+    ),
+    (
         "_sqlx_migrations",
         "sqlx's own migration bookkeeping; every database maintains its own",
     ),
@@ -559,9 +563,32 @@ impl Store {
                     // triggers. Do not nest per-row or membership tickets here.
                     lifecycle.begin(&[crate::RepositoryLifecycleKey::Database])?;
                 }
+                // Observe the destination before the original INSERT. A source
+                // archive cannot replace its local choice or import continuity.
+                let selection_before = if *table == "workspace" {
+                    let id = map
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            Error::InvalidParams("transfer workspace id must be text".into())
+                        })?;
+                    let id = WorkspaceId::from(id);
+                    let before =
+                        crate::repository_selection_repo::imported_primary_before(&mut tx, &id)
+                            .await?;
+                    Some((id, before))
+                } else {
+                    None
+                };
                 query.execute(&mut *tx).await.map_err(|e| {
                     Error::Internal(format!("transfer import insert into {table} failed: {e}"))
                 })?;
+                if let Some((id, before)) = selection_before {
+                    crate::repository_selection_repo::classify_imported_primary(
+                        &mut tx, &id, before,
+                    )
+                    .await?;
+                }
                 inserted += 1;
             }
         }
@@ -1504,6 +1531,149 @@ attachments: id, workspace_id, file_name, mime_type, size, uploaded_at, stored_p
              make sure the import path tolerates its absence (or defaults it);\n\
              then replace TRANSFERRED_COLUMNS with the actual snapshot \
              below:\n\n{actual}\n"
+        );
+    }
+
+    fn selection_import_rows(path: &str) -> Vec<(String, Vec<serde_json::Value>)> {
+        vec![(
+            "workspace".into(),
+            vec![
+                serde_json::json!({"id":"selection-import","title":"Imported","branch":"main","repository_path":path,"created_at":"same","updated_at":"same"}),
+            ],
+        )]
+    }
+    fn selection_import_root() -> intent_core::RepositoryRootId {
+        intent_core::RepositoryRootId {
+            workspace_id: WorkspaceId::from("selection-import"),
+            kind: intent_core::RepositoryRootKind::Primary,
+        }
+    }
+    #[tokio::test]
+    async fn selection_new_import_is_unresolved_without_invented_provenance() {
+        let db = TempDb::new();
+        let store = Store::open(&db.path).await.unwrap();
+        store
+            .transfer_import_rows(&selection_import_rows("/imported"))
+            .await
+            .unwrap();
+        let snapshot = store
+            .repository_selection_snapshot(&selection_import_root())
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.selection(),
+            Some(&crate::RepositoryStoredSelection::Saved(
+                intent_core::SavedReviewSelection::UnresolvedHistorical {
+                    source: None,
+                    record_id: None
+                }
+            ))
+        );
+        let export = store
+            .transfer_export_rows(&WorkspaceId::from("selection-import"))
+            .await
+            .unwrap();
+        assert!(!export
+            .iter()
+            .any(|(table, _)| table == "repository_selection_state"));
+    }
+    #[tokio::test]
+    async fn selection_source_counter_table_is_rejected_without_any_import_effect() {
+        let db = TempDb::new();
+        let store = Store::open(&db.path).await.unwrap();
+        let mut input = selection_import_rows("/imported");
+        input.push((
+            "repository_selection_state".into(),
+            vec![serde_json::json!({"root_incarnation":99,"selection_revision":99})],
+        ));
+        assert!(store.transfer_import_rows(&input).await.is_err());
+        assert!(store
+            .get_workspace(&WorkspaceId::from("selection-import"))
+            .await
+            .is_err());
+    }
+    #[tokio::test]
+    async fn selection_duplicate_import_retains_original_constraint_and_local_choice() {
+        let db = TempDb::new();
+        let store = Store::open(&db.path).await.unwrap();
+        store
+            .transfer_import_rows(&selection_import_rows("/local"))
+            .await
+            .unwrap();
+        let root = selection_import_root();
+        let before = store.repository_selection_snapshot(&root).await.unwrap();
+        store
+            .write_repository_selection(
+                &before,
+                crate::RepositorySelectionChange::ExplicitRemote {
+                    remote_name: "local".into(),
+                },
+            )
+            .await
+            .result
+            .unwrap();
+        let local = store.repository_selection_snapshot(&root).await.unwrap();
+        assert!(store
+            .transfer_import_rows(&selection_import_rows("/other"))
+            .await
+            .is_err());
+        let after = store.repository_selection_snapshot(&root).await.unwrap();
+        assert_eq!(after.binding(), local.binding());
+        assert_eq!(after.selection(), local.selection());
+        assert_eq!(after.root_incarnation(), local.root_incarnation());
+        assert_eq!(after.selection_revision(), local.selection_revision());
+    }
+    #[tokio::test]
+    async fn selection_original_import_transaction_preserves_equal_binding_and_marks_rebind() {
+        let db = TempDb::new();
+        let store = Store::open(&db.path).await.unwrap();
+        store
+            .transfer_import_rows(&selection_import_rows("/local"))
+            .await
+            .unwrap();
+        // Fixture BEFORE INSERT supplies acknowledged same-row/no-effect and
+        // rebound outcomes to the unchanged generic INSERT algorithm. Production
+        // still uses plain INSERT and retains duplicate-ID constraint errors.
+        sqlx::query("CREATE TRIGGER fixture_import_existing BEFORE INSERT ON workspace WHEN EXISTS(SELECT 1 FROM workspace WHERE id=NEW.id) BEGIN UPDATE workspace SET repository_path=NEW.repository_path WHERE id=NEW.id; SELECT RAISE(IGNORE); END")
+            .execute(store.write_pool()).await.unwrap();
+        let root = selection_import_root();
+        for change in [
+            crate::RepositorySelectionChange::ExplicitRemote {
+                remote_name: "local".into(),
+            },
+            crate::RepositorySelectionChange::Reset,
+        ] {
+            let before = store.repository_selection_snapshot(&root).await.unwrap();
+            store
+                .write_repository_selection(&before, change)
+                .await
+                .result
+                .unwrap();
+            let local = store.repository_selection_snapshot(&root).await.unwrap();
+            for _ in 0..2 {
+                store
+                    .transfer_import_rows(&selection_import_rows("/local"))
+                    .await
+                    .unwrap();
+                let after = store.repository_selection_snapshot(&root).await.unwrap();
+                assert_eq!(after.selection(), local.selection());
+                assert_eq!(after.root_incarnation(), local.root_incarnation());
+                assert_eq!(after.selection_revision(), local.selection_revision());
+            }
+        }
+        store
+            .transfer_import_rows(&selection_import_rows("/rebound"))
+            .await
+            .unwrap();
+        let after = store.repository_selection_snapshot(&root).await.unwrap();
+        assert_eq!(
+            after.selection(),
+            Some(&crate::RepositoryStoredSelection::Saved(
+                intent_core::SavedReviewSelection::UnresolvedHistorical {
+                    source: None,
+                    record_id: None
+                }
+            ))
         );
     }
 }

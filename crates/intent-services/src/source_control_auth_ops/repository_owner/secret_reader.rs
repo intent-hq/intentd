@@ -211,6 +211,288 @@ struct GitlabRepositorySecretReader {
     store: FileSecretStore,
 }
 
+/// Configuration and pairing only; none of these states implies a credential.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RepositoryAttachmentState {
+    Unattached,
+    BoundaryMissing,
+    Unpaired,
+    Paired,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RepositoryDescriptorState {
+    Unavailable,
+    Unapproved,
+    Approved,
+}
+
+/// Scoped to the snapshot's attested connection, independently of native use.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RepositoryChildPolicyState {
+    Disabled,
+    Enabled,
+    Mutating,
+    Indeterminate,
+}
+
+/// Past local metadata, never credential presence, permission or a context revision.
+/// Retain the original allocations; no getter loads secrets or consults a new owner.
+pub(crate) struct RepositoryConnectionFacts {
+    gate: GitlabCredentialGate,
+    owner: Option<Arc<RepositoryOwner>>,
+    directory: Arc<crate::repository_credentials::RepositoryConnectionDirectory>,
+    attachment: RepositoryAttachmentState,
+    approval: RepositoryDescriptorState,
+    descriptor: Option<GitlabDescriptor>,
+    lifecycle: crate::repository_credentials::RepositoryConnectionState,
+    mutation: Option<crate::repository_credentials::RepositoryMutationKind>,
+    preflight_pending: bool,
+    settled: Option<RepositorySettledConnection>,
+    unavailable: Option<Error>,
+    backoff_until: Option<std::time::Instant>,
+    child_policy: Option<(RepositoryChildPolicyState, u64)>,
+}
+
+struct ConnectionFactsView<'a> {
+    config: Option<&'a intent_core::settings_file::GitlabSettings>,
+    descriptor: Option<&'a GitlabDescriptor>,
+    proof: Option<&'a AttestedSource>,
+    metadata: crate::repository_credentials::read::RepositoryConnectionMetadata<'a>,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "live context consumption remains separately owned"
+    )
+)]
+impl RepositoryConnectionFacts {
+    pub(crate) fn attachment(&self) -> super::RepositoryAttachmentState {
+        self.attachment
+    }
+    pub(crate) fn approval(&self) -> super::RepositoryDescriptorState {
+        self.approval
+    }
+    pub(crate) fn descriptor(&self) -> Option<&GitlabDescriptor> {
+        self.descriptor.as_ref()
+    }
+    /// Raw directory lifecycle: Ready without `settled()` is still unattested.
+    pub(crate) fn lifecycle(&self) -> crate::repository_credentials::RepositoryConnectionState {
+        self.lifecycle
+    }
+    pub(crate) fn mutation(&self) -> Option<crate::repository_credentials::RepositoryMutationKind> {
+        self.mutation
+    }
+    /// A reservation has not changed the prior availability or proved an auth phase.
+    pub(crate) fn preflight_pending(&self) -> bool {
+        self.preflight_pending
+    }
+    pub(crate) fn settled(&self) -> Option<&RepositorySettledConnection> {
+        self.settled.as_ref()
+    }
+    pub(crate) fn unavailable_reason(&self) -> Option<Error> {
+        self.unavailable
+    }
+    /// Captured monotonic value, even after expiry. Elapsed time is not a revision.
+    pub(crate) fn backoff_until(&self) -> Option<std::time::Instant> {
+        self.backoff_until
+    }
+    pub(crate) fn child_policy(&self) -> Option<(super::RepositoryChildPolicyState, u64)> {
+        self.child_policy
+    }
+
+    /// Only a future authentic sealed-zero R/ACP branch may call this entry.
+    /// Absence of optional facts does not certify absence of required reads.
+    /// The caller retains its fresh output fence and a single prebuilt packet.
+    pub(crate) fn with_optional_current(
+        optional: Option<&Self>,
+        transfer: impl FnOnce(bool) -> Result<()> + Send,
+    ) -> Result<()> {
+        RepositoryReadEligibility::with_output(&[], optional, transfer)
+    }
+
+    fn retained_owner(&self) -> Option<&Arc<RepositoryOwner>> {
+        if matches!(
+            self.attachment,
+            RepositoryAttachmentState::Unattached | RepositoryAttachmentState::BoundaryMissing
+        ) {
+            // Neither OnceLock installer participates in the ranked lock set.
+            // A later installation can never repair this captured absence.
+            return None;
+        }
+        let owner = self.owner.as_ref()?;
+        if !self
+            .gate
+            .repository
+            .get()
+            .is_some_and(|installed| Arc::ptr_eq(installed, owner))
+            || !Arc::ptr_eq(&owner.directory, &self.directory)
+        {
+            return None;
+        }
+        owner.settings.get()?;
+        Some(owner)
+    }
+
+    fn same_facts(&self, current: &Self) -> bool {
+        let settled = match (&self.settled, &current.settled) {
+            (Some(original), Some(current)) => {
+                original.descriptor == current.descriptor && original.selected == current.selected
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        self.attachment == current.attachment
+            && self.approval == current.approval
+            && self.descriptor == current.descriptor
+            && self.lifecycle == current.lifecycle
+            && self.mutation == current.mutation
+            && self.preflight_pending == current.preflight_pending
+            && settled
+            && self.unavailable == current.unavailable
+            && self.backoff_until == current.backoff_until
+            && self.child_policy == current.child_policy
+    }
+
+    fn observe(
+        gate: &GitlabCredentialGate,
+        directory: &Arc<crate::repository_credentials::RepositoryConnectionDirectory>,
+    ) -> Result<Self> {
+        let owner = gate.repository.get().cloned();
+        let settings = owner.as_ref().and_then(|owner| owner.settings.get());
+        Self::observe_captured(gate, directory, owner.as_ref(), settings)
+    }
+
+    fn observe_captured(
+        gate: &GitlabCredentialGate,
+        directory: &Arc<crate::repository_credentials::RepositoryConnectionDirectory>,
+        owner: Option<&Arc<RepositoryOwner>>,
+        settings: Option<&super::adoption::SettingsAttachment>,
+    ) -> Result<Self> {
+        if owner
+            .as_ref()
+            .is_some_and(|owner| !Arc::ptr_eq(&owner.directory, directory))
+        {
+            return Err(Error::BoundaryMismatch);
+        }
+        let config = settings
+            .map(|s| s.config.lock().map_err(|_| Error::Indeterminate))
+            .transpose()?;
+        let descriptor = owner
+            .as_ref()
+            .map(|o| o.descriptor.lock().map_err(|_| Error::Indeterminate))
+            .transpose()?;
+        directory.with_connection_metadata(|metadata| {
+            let proof = owner
+                .as_ref()
+                .map(|o| {
+                    o.evidence
+                        .published
+                        .lock()
+                        .map_err(|_| Error::Indeterminate)
+                })
+                .transpose()?;
+            // A one-time attachment may have appeared while waiting for these
+            // metadata locks. Never combine a captured absence with its later state.
+            if gate.repository.get().map(Arc::as_ptr) != owner.map(Arc::as_ptr)
+                || owner.and_then(|o| o.settings.get()).map(std::ptr::from_ref)
+                    != settings.map(std::ptr::from_ref)
+            {
+                return Err(Error::Unverified);
+            }
+            Ok(Self::from_held(
+                gate,
+                directory,
+                owner,
+                settings,
+                ConnectionFactsView {
+                    config: config.as_deref(),
+                    descriptor: descriptor.as_deref().and_then(Option::as_ref),
+                    proof: proof.as_deref().and_then(Option::as_deref),
+                    metadata,
+                },
+            ))
+        })
+    }
+
+    fn from_held(
+        gate: &GitlabCredentialGate,
+        directory: &Arc<crate::repository_credentials::RepositoryConnectionDirectory>,
+        owner: Option<&Arc<RepositoryOwner>>,
+        settings: Option<&super::adoption::SettingsAttachment>,
+        view: ConnectionFactsView<'_>,
+    ) -> Self {
+        let attachment = match (owner, settings) {
+            (None, _) => RepositoryAttachmentState::Unattached,
+            (_, None) => RepositoryAttachmentState::BoundaryMissing,
+            (_, Some(s)) if s.source.is_some() && s.store.is_some() => {
+                RepositoryAttachmentState::Paired
+            }
+            _ => RepositoryAttachmentState::Unpaired,
+        };
+        let approved = settings.zip(view.config).and_then(|(s, config)| {
+            super::adoption::approved_descriptor(config, s.fixture.as_ref())
+        });
+        let approved = approved.filter(|approved| view.descriptor == Some(approved));
+        let approval = if settings.is_none() {
+            RepositoryDescriptorState::Unavailable
+        } else if approved.is_some() {
+            RepositoryDescriptorState::Approved
+        } else {
+            RepositoryDescriptorState::Unapproved
+        };
+        let checked = view.metadata.ready.and_then(|(actual, selected)| {
+            if attachment != RepositoryAttachmentState::Paired
+                || selected.source != RepositoryCredentialSource::GitlabSecretSlot
+            {
+                return Err(Error::Unverified);
+            }
+            let proof = view.proof.ok_or(Error::Unverified)?;
+            if proof.request != selected {
+                return Err(Error::SecretMismatch);
+            }
+            if approved.as_ref() != Some(actual) || proof.descriptor != *actual {
+                return Err(Error::BoundaryMismatch);
+            }
+            Ok(RepositorySettledConnection {
+                gate: gate.clone(),
+                owner: owner.ok_or(Error::Unverified)?.clone(),
+                descriptor: actual.clone(),
+                selected,
+            })
+        });
+        let unavailable = checked.as_ref().err().copied();
+        let settled = checked.ok();
+        let backoff_until = settled.as_ref().and(view.metadata.backoff_until);
+        let child_policy = settled.as_ref().map(|_| {
+            let state = match view.metadata.child_pending {
+                Some(true) => RepositoryChildPolicyState::Indeterminate,
+                Some(false) => RepositoryChildPolicyState::Mutating,
+                None if view.metadata.child_enabled => RepositoryChildPolicyState::Enabled,
+                None => RepositoryChildPolicyState::Disabled,
+            };
+            (state, view.metadata.child_revision)
+        });
+        Self {
+            gate: gate.clone(),
+            owner: owner.cloned(),
+            directory: directory.clone(),
+            attachment,
+            approval,
+            descriptor: approved,
+            lifecycle: view.metadata.lifecycle,
+            mutation: view.metadata.mutation,
+            preflight_pending: view.metadata.reserved,
+            settled,
+            unavailable,
+            backoff_until,
+            child_policy,
+        }
+    }
+}
+
 /// A past coherent observation of the original settled connection, not a
 /// permission lease. Reobservation cannot switch its owner or connection.
 pub(crate) struct RepositorySettledConnection {
@@ -303,6 +585,109 @@ pub(crate) struct RepositoryReadEligibility {
 impl RepositoryReadEligibility {
     pub(crate) fn check(&self) -> Result<()> {
         self.with_current(&mut || Ok(()))
+    }
+
+    /// Every required original remains mandatory. The boolean only chooses the
+    /// original prebuilt optional payload; it is not an authority or a snapshot.
+    pub(crate) fn with_all_current_and_facts(
+        required: &[&Self],
+        optional: Option<&RepositoryConnectionFacts>,
+        transfer: impl FnOnce(bool) -> Result<()> + Send,
+    ) -> Result<()> {
+        if required.is_empty() {
+            return Err(Error::Unverified);
+        }
+        Self::with_output(required, optional, transfer)
+    }
+
+    fn with_output(
+        originals: &[&Self],
+        optional: Option<&RepositoryConnectionFacts>,
+        transfer: impl FnOnce(bool) -> Result<()> + Send,
+    ) -> Result<()> {
+        let optional = optional.filter(|facts| facts.retained_owner().is_some());
+        let mut owners = originals
+            .iter()
+            .map(|original| original.owner.clone())
+            .chain(optional.and_then(|facts| facts.owner.clone()))
+            .collect::<Vec<_>>();
+        owners.sort_unstable_by_key(Arc::as_ptr);
+        owners.dedup_by(|a, b| Arc::ptr_eq(a, b));
+        let index = |owner: &Arc<RepositoryOwner>| {
+            owners
+                .binary_search_by_key(&Arc::as_ptr(owner), Arc::as_ptr)
+                .expect("original owner retained")
+        };
+        let indices = originals
+            .iter()
+            .map(|original| index(&original.owner))
+            .collect::<Vec<_>>();
+        let optional_index = optional.and_then(|facts| facts.owner.as_ref()).map(index);
+        let required = owners
+            .iter()
+            .map(|owner| originals.iter().any(|item| Arc::ptr_eq(owner, &item.owner)))
+            .collect::<Vec<_>>();
+        let scopes = originals.iter().map(|item| &item.scope).collect::<Vec<_>>();
+        let batch =
+            RepositoryReadScope::prepare_output(&scopes, optional.map(|facts| &facts.directory));
+        let settings = owners
+            .iter()
+            .map(|owner| owner.settings.get().ok_or(Error::Unverified))
+            .collect::<Result<Vec<_>>>()?;
+        // The original installed attachments are immutable. All unique configs
+        // precede all descriptors, directories and proofs, even across owners.
+        let configs = settings
+            .iter()
+            .zip(&required)
+            .map(|(settings, required)| output_lock(&settings.config, *required))
+            .collect::<Result<Vec<_>>>()?;
+        let descriptors = owners
+            .iter()
+            .zip(&required)
+            .map(|(owner, required)| output_lock(&owner.descriptor, *required))
+            .collect::<Result<Vec<_>>>()?;
+        batch.with_current(|selected, metadata| {
+            let proofs = owners
+                .iter()
+                .zip(&required)
+                .map(|(owner, required)| output_lock(&owner.evidence.published, *required))
+                .collect::<Result<Vec<_>>>()?;
+            for ((original, index), selected) in originals.iter().zip(indices).zip(selected) {
+                original.check_source(
+                    settings[index],
+                    configs[index].as_deref().expect("required config locked"),
+                    descriptors[index].as_deref().and_then(Option::as_ref),
+                    proofs[index].as_deref().and_then(Option::as_deref),
+                    selected,
+                )?;
+            }
+            let include = optional
+                .zip(optional_index)
+                .is_some_and(|(original, index)| {
+                    let (Some(config), Some(descriptor), Some(proof), Some(metadata)) = (
+                        configs[index].as_deref(),
+                        descriptors[index].as_deref(),
+                        proofs[index].as_deref(),
+                        metadata,
+                    ) else {
+                        return false;
+                    };
+                    let current = RepositoryConnectionFacts::from_held(
+                        &original.gate,
+                        &original.directory,
+                        original.owner.as_ref(),
+                        Some(settings[index]),
+                        ConnectionFactsView {
+                            config: Some(config),
+                            descriptor: descriptor.as_ref(),
+                            proof: proof.as_deref(),
+                            metadata,
+                        },
+                    );
+                    original.same_facts(&current)
+                });
+            transfer(include)
+        })
     }
 
     /// Simultaneous eligibility of every captured scope, under the caller's
@@ -462,6 +847,38 @@ impl RepositoryReadEligibility {
             return Err(Error::BoundaryMismatch);
         }
         Ok(())
+    }
+}
+
+/// Required locks retain their existing blocking/error semantics. Additional
+/// optional locks never block and never recover poisoned data.
+fn output_lock<T>(
+    mutex: &Mutex<T>,
+    required: bool,
+) -> Result<Option<std::sync::MutexGuard<'_, T>>> {
+    if required {
+        mutex.lock().map(Some).map_err(|_| Error::Indeterminate)
+    } else {
+        Ok(mutex.try_lock().ok())
+    }
+}
+
+impl crate::Services {
+    /// Metadata only, including non-ready states. No read grant or source I/O.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "live context consumption remains separately owned"
+        )
+    )]
+    pub(crate) fn gitlab_repository_connection_facts(
+        &self,
+    ) -> Result<super::RepositoryConnectionFacts> {
+        RepositoryConnectionFacts::observe(
+            &self.gitlab_credential_gate,
+            &self.repository_connection_directory(),
+        )
     }
 }
 
