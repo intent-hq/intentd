@@ -82,6 +82,9 @@ struct Entry {
     finished: Option<Instant>,
     revision: u64,
     result: Result<Value>,
+    // No HTTP was admitted: this is a background scheduling result, not a
+    // forge response. An overlapping explicit demand must try its own admission.
+    background_deferred: bool,
 }
 
 #[derive(Default)]
@@ -344,6 +347,7 @@ impl Discovery {
                             finished: Some(Instant::now()),
                             revision,
                             result: Ok(value.clone()),
+                            background_deferred: false,
                         });
                         record_reuse(Operation::PrDetail, Reuse::CacheHit);
                         return Ok(value);
@@ -353,6 +357,7 @@ impl Discovery {
         }
         if let Some(cached) = entry.as_ref() {
             if cached.revision == revision
+                && !(force_after.is_some() && cached.background_deferred)
                 && key.scope.is_current()
                 && (merged
                     || (cached.started.elapsed() < WINDOW
@@ -372,7 +377,9 @@ impl Discovery {
             finished: None,
             revision,
             result: Err(unknown("PR refresh interrupted")),
+            background_deferred: false,
         });
+        let mut background_deferred = false;
         let result = async {
             if services.sweeps_rate_limited() {
                 return Err(unknown("PR refresh quota paused"));
@@ -382,7 +389,9 @@ impl Discovery {
             // per-attempt authorization/quota checks for both kinds of read.
             let lease = force_after
                 .is_none()
-                .then(|| Budget::reserve(&self.budget, &key))
+                .then(|| {
+                    Budget::reserve(&self.budget, &key).inspect_err(|_| background_deferred = true)
+                })
                 .transpose()?;
             let _permit = self
                 .concurrent
@@ -466,6 +475,7 @@ impl Discovery {
             finished: Some(Instant::now()),
             revision,
             result: result.clone(),
+            background_deferred,
         });
         result
     }
