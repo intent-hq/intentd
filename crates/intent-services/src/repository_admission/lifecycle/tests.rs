@@ -640,6 +640,16 @@ mod pending_delete {
         );
         assert!(current(&other.callback().capture(), &f.other).await);
         f.registry.install(&f.store).await.unwrap();
+        assert!(f
+            .registry
+            .state
+            .lock()
+            .unwrap()
+            .origins
+            .values()
+            .all(|o| !o.retired));
+        // Managed open performs its existing ordinary Database mutation before
+        // migrations. That retires physical owners, but cannot settle our ticket.
         let reopened = Store::open(&f.dir.path().join("store.db")).await.unwrap();
         let observer: Arc<dyn RepositoryLifecycleObserver> = f.registry.clone();
         assert!(reopened.has_repository_lifecycle_observer(&observer));
@@ -660,6 +670,7 @@ mod pending_delete {
             original_ids
         );
         assert!(!current(&first.callback().capture(), &f.first).await);
+        assert!(!current(&other.callback().capture(), &f.other).await);
         assert!(f
             .registry
             .state
@@ -667,7 +678,7 @@ mod pending_delete {
             .unwrap()
             .origins
             .values()
-            .all(|o| !o.retired));
+            .all(|o| o.retired));
     }
 
     #[tokio::test]
