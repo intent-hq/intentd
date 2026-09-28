@@ -1813,7 +1813,7 @@ async fn shared_discovery_repair_late_open_observation_cannot_erase_merged_confi
                     "MERGED"
                 } else {
                     "CLOSED"
-                })
+                });
             });
             let merged = svc
                 .shared_pr_record(mock.sc.as_ref(), &repo, 10978)

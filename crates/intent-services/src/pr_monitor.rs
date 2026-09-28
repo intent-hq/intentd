@@ -1047,7 +1047,7 @@ pub(crate) async fn read_pr_via_with_fetched(
     monitored: &HashSet<PrKey>,
 ) -> Result<(PrCacheEntry, bool)> {
     let authorization = sc.cache_scope();
-    ensure_current_pr_authorization(&authorization)?;
+    ensure_current_pr_authorization(authorization.as_ref())?;
     let key = pr_key_for(repo_ref, number.cast_signed());
     let max_age = match policy {
         PrReadPolicy::Poll => {
@@ -1068,7 +1068,7 @@ pub(crate) async fn read_pr_via_with_fetched(
     }
     let record_started_at = Instant::now();
     let (pr, snapshot) = fetch_pr_full(sc, repo_ref, number).await?;
-    ensure_current_pr_authorization(&authorization)?;
+    ensure_current_pr_authorization(authorization.as_ref())?;
     Ok((
         store_on_demand(
             cache,
@@ -1098,12 +1098,9 @@ fn cached_pr_within(cache: &PrCache, key: &PrKey, max_age: Duration) -> Option<P
 }
 
 fn ensure_current_pr_authorization(
-    authorization: &Option<intent_sourcecontrol::cache_scope::CacheScope>,
+    authorization: Option<&intent_sourcecontrol::cache_scope::CacheScope>,
 ) -> Result<()> {
-    if authorization
-        .as_ref()
-        .is_some_and(|scope| !scope.is_current())
-    {
+    if authorization.is_some_and(|scope| !scope.is_current()) {
         return Err(Error::Internal(
             "PR authorization changed during read".into(),
         ));
@@ -1121,7 +1118,7 @@ async fn poll_pr(
     monitored: &HashSet<PrKey>,
 ) -> Result<PrCacheEntry> {
     let authorization = sc.cache_scope();
-    ensure_current_pr_authorization(&authorization)?;
+    ensure_current_pr_authorization(authorization.as_ref())?;
     let record_started_at = Instant::now();
     let generation = cache
         .lock()
@@ -1138,7 +1135,7 @@ async fn poll_pr(
         .await
         .map_err(pr_ops::map_sc_err)?,
     };
-    ensure_current_pr_authorization(&authorization)?;
+    ensure_current_pr_authorization(authorization.as_ref())?;
     let fingerprint = PrFingerprint::of(&pr);
     let now = Instant::now();
     let reused = {
@@ -1152,7 +1149,7 @@ async fn poll_pr(
                 entry.cheap_polls += 1;
                 entry.refreshed_at = now;
                 entry.record_started_at = record_started_at;
-                entry.authorization = authorization.clone();
+                entry.authorization.clone_from(&authorization);
                 entry.pr = pr.clone();
                 Some(entry.clone())
             }
@@ -1182,7 +1179,7 @@ async fn poll_pr(
             .await?
         }
     };
-    ensure_current_pr_authorization(&authorization)?;
+    ensure_current_pr_authorization(authorization.as_ref())?;
     let mut entry = PrCacheEntry::new(pr, snapshot, now);
     entry.authorization = authorization;
     entry.record_started_at = record_started_at;
