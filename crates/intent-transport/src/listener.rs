@@ -697,4 +697,173 @@ mod tests {
             buf.len()
         );
     }
+
+    // Deterministic writer failure in the actual local connection loop. The
+    // request owner is the same private fixture used by the real UDS/TLS tests.
+    #[tokio::test]
+    async fn read_carrier_writer_failure_retires_a_held_original_request() {
+        use std::pin::Pin;
+        use std::sync::Arc;
+        use std::task::{Context, Poll};
+
+        use crate::conn::read_delivery_tests::{FixtureApi, Gate};
+        use tokio::io::{AsyncWrite, AsyncWriteExt as _};
+        use tokio::sync::Notify;
+
+        struct BrokenWriter(Arc<Notify>);
+        impl AsyncWrite for BrokenWriter {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                self.0.notify_one();
+                Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
+            }
+
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let dir = tempfile::Builder::new()
+            .prefix("carrier-writer-")
+            .tempdir()
+            .unwrap();
+        let bus = intent_services::EventBus::new(
+            intent_store::Store::open(&dir.path().join("bus.db"))
+                .await
+                .unwrap(),
+        );
+        let handler = Arc::new(Gate::default());
+        let api = Arc::new(FixtureApi::holding_handler(handler.clone()));
+        let failed = Arc::new(Notify::new());
+        let limiter = crate::rpc_limit::RpcLimiter::new(1);
+        let (mut input, reader) = tokio::io::duplex(2048);
+        let task = tokio::spawn(super::handle_connection(
+            reader,
+            BrokenWriter(failed.clone()),
+            api.clone(),
+            bus,
+            None,
+            None,
+            Arc::new(crate::reverse::PrimaryReverseRegistry::new()),
+            limiter.clone(),
+            Arc::new(crate::context::ReadConnectionOwners::default()),
+        ));
+        input.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"settings.get\",\"params\":{\"path\":\"private\"}}\n").await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handler.entered.notified(),
+        )
+        .await
+        .unwrap();
+        let original = api.connections.lock().unwrap()[0].clone();
+        assert!(!original.is_closed());
+        input.write_all(b"invalid-json\n").await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), failed.notified())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !original.is_closed() || !original.captured_are_retired() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !task.is_finished(),
+            "writer failure retired the cohort while the reader still waits"
+        );
+        handler.release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while limiter.try_acquire().is_err() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(input);
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_carrier_late_local_binding_cannot_escape_listener_retirement() {
+        use crate::conn::read_delivery_tests::{FixtureApi, Gate};
+        use std::sync::Arc;
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+        let dir = tempfile::Builder::new()
+            .prefix("carrier-late-bind-")
+            .tempdir()
+            .unwrap();
+        let bus = intent_services::EventBus::new(
+            intent_store::Store::open(&dir.path().join("bus.db"))
+                .await
+                .unwrap(),
+        );
+        let primary = Arc::new(Gate::default());
+        let api = Arc::new(FixtureApi::holding_primary(primary.clone()));
+        let listener = crate::context::ReadListenerGuard::default();
+        let (mut input, reader) = tokio::io::duplex(2048);
+        let (writer, output) = tokio::io::duplex(2048);
+        let task = tokio::spawn(super::handle_connection(
+            reader,
+            writer,
+            api.clone(),
+            bus,
+            None,
+            None,
+            Arc::new(crate::reverse::PrimaryReverseRegistry::new()),
+            crate::rpc_limit::RpcLimiter::unlimited(),
+            listener.0.clone(),
+        ));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            primary.entered.notified(),
+        )
+        .await
+        .unwrap();
+        assert!(api.connections.lock().unwrap().is_empty());
+        drop(listener);
+        primary.release.notify_one();
+        let mut lines = BufReader::new(output).lines();
+        for path in ["private", "ordinary"] {
+            let request = serde_json::json!({"jsonrpc":"2.0","id":7,"method":"settings.get","params":{"path":path}});
+            input
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .unwrap();
+            let line = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let result: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(result.get("result").is_some(), path == "ordinary");
+        }
+        let original = api.connections.lock().unwrap()[0].clone();
+        assert!(original.is_closed());
+        assert!(original.captured_are_retired());
+        drop(input);
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
 }

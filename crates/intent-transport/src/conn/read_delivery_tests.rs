@@ -1,4 +1,4 @@
-//! Disposable carrier fixtures. These are NOT Store/R/NativeRead authority.
+//! Disposable carrier fixtures without Store or repository read authority.
 //! Actual conn/router and socket paths consume this private Core implementation.
 
 use std::sync::{Mutex, Weak};
@@ -46,11 +46,23 @@ struct ScopeState {
     kinds: Vec<RepositoryReadReplyKind>,
 }
 
+#[derive(Clone, Copy, Default)]
+enum DeliveryFault {
+    #[default]
+    None,
+    Construction,
+    BeforeTransfer,
+    AfterTransfer,
+    Repeat,
+    Omit,
+}
+
 pub(crate) struct FixtureScope {
     state: Arc<Mutex<ScopeState>>,
     caller: Option<Caller>,
     credential: Option<WireCredential>,
     delivery: Option<Arc<Gate>>,
+    fault: DeliveryFault,
 }
 
 impl RepositoryReadRequestScope for FixtureScope {
@@ -61,6 +73,7 @@ impl RepositoryReadRequestScope for FixtureScope {
             caller: self.caller.clone(),
             credential: self.credential.clone(),
             delivery: self.delivery.clone(),
+            fault: self.fault,
         });
         Box::pin(FIXTURE_SCOPE.scope(captured, body))
     }
@@ -74,7 +87,18 @@ impl RepositoryReadRequestScope for FixtureScope {
         kind: RepositoryReadReplyKind,
         transfer: &'a mut (dyn FnMut() -> intent_core::Result<()> + Send),
     ) -> BoxFuture<'a, intent_core::Result<()>> {
+        assert!(
+            !matches!(self.fault, DeliveryFault::Construction),
+            "fixture delivery construction panic"
+        );
         Box::pin(async move {
+            assert!(
+                !matches!(self.fault, DeliveryFault::BeforeTransfer),
+                "fixture delivery future panic"
+            );
+            if matches!(self.fault, DeliveryFault::Omit) {
+                return Ok(());
+            }
             if let Some(gate) = &self.delivery {
                 gate.wait().await;
             }
@@ -89,6 +113,14 @@ impl RepositoryReadRequestScope for FixtureScope {
             }
             transfer()?;
             state.sent = true;
+            drop(state);
+            assert!(
+                !matches!(self.fault, DeliveryFault::AfterTransfer),
+                "fixture panic after transfer"
+            );
+            if matches!(self.fault, DeliveryFault::Repeat) {
+                return transfer();
+            }
             Ok(())
         })
     }
@@ -104,6 +136,21 @@ pub(crate) struct FixtureConnection {
     cohort: Mutex<Cohort>,
     scopes: Mutex<Vec<Arc<FixtureScope>>>,
     delivery: Option<Arc<Gate>>,
+    fault: DeliveryFault,
+}
+
+impl FixtureConnection {
+    pub(crate) fn is_closed(&self) -> bool {
+        self.cohort.lock().unwrap().closed
+    }
+
+    pub(crate) fn captured_are_retired(&self) -> bool {
+        let scopes = self.scopes.lock().unwrap();
+        !scopes.is_empty()
+            && scopes
+                .iter()
+                .all(|scope| scope.state.lock().unwrap().retired)
+    }
 }
 
 impl RepositoryReadConnection for FixtureConnection {
@@ -117,6 +164,7 @@ impl RepositoryReadConnection for FixtureConnection {
             caller: intent_core::current_caller(),
             credential: current_wire_credential(),
             delivery: self.delivery.clone(),
+            fault: self.fault,
         });
         cohort.scopes.push(Arc::downgrade(&scope));
         self.scopes.lock().unwrap().push(scope.clone());
@@ -147,6 +195,27 @@ pub(crate) struct FixtureApi {
     pub(crate) handler: Option<Arc<Gate>>,
     pub(crate) delivery: Option<Arc<Gate>>,
     pub(crate) principal: PrincipalId,
+    primary: Option<Arc<Gate>>,
+    member_token_hash: Option<String>,
+    revocations: Option<tokio::sync::broadcast::Sender<intent_core::PrincipalRevocation>>,
+    revoke_reply: Option<Arc<Gate>>,
+    fault: DeliveryFault,
+}
+
+impl FixtureApi {
+    pub(crate) fn holding_handler(gate: Arc<Gate>) -> Self {
+        Self {
+            handler: Some(gate),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn holding_primary(gate: Arc<Gate>) -> Self {
+        Self {
+            primary: Some(gate),
+            ..Self::default()
+        }
+    }
 }
 
 impl WorkspaceApi for FixtureApi {
@@ -158,6 +227,7 @@ impl WorkspaceApi for FixtureApi {
             cohort: Mutex::default(),
             scopes: Mutex::default(),
             delivery: self.delivery.clone(),
+            fault: self.fault,
         });
         self.entries.lock().unwrap().push(entry);
         self.connections.lock().unwrap().push(connection.clone());
@@ -165,7 +235,12 @@ impl WorkspaceApi for FixtureApi {
     }
 
     fn primary_principal_id(&self) -> BoxFuture<'_, intent_core::Result<PrincipalId>> {
-        Box::pin(async { Ok(self.principal.clone()) })
+        Box::pin(async {
+            if let Some(gate) = &self.primary {
+                gate.wait().await;
+            }
+            Ok(self.principal.clone())
+        })
     }
 
     fn principal_host_role(
@@ -178,6 +253,47 @@ impl WorkspaceApi for FixtureApi {
             }
             Ok(HostRole::Member)
         })
+    }
+
+    fn resolve_principal_credential(
+        &self,
+        token_hash: String,
+    ) -> BoxFuture<'_, intent_core::Result<Option<PrincipalId>>> {
+        Box::pin(async move {
+            Ok((self.member_token_hash.as_ref() == Some(&token_hash))
+                .then(|| self.principal.clone()))
+        })
+    }
+
+    fn subscribe_principal_revocations(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<intent_core::PrincipalRevocation>> {
+        self.revocations
+            .as_ref()
+            .map(tokio::sync::broadcast::Sender::subscribe)
+    }
+
+    fn principal_revoke_self(&self) -> BoxFuture<'_, intent_core::Result<Value>> {
+        Box::pin(async {
+            self.revocations
+                .as_ref()
+                .unwrap()
+                .send(self.principal.clone().into())
+                .unwrap();
+            if let Some(gate) = &self.revoke_reply {
+                gate.wait().await;
+            }
+            Ok(json!({"revoked":true}))
+        })
+    }
+
+    fn workspace_members_list(
+        &self,
+        _workspace_id: intent_core::WorkspaceId,
+    ) -> BoxFuture<'_, intent_core::Result<Value>> {
+        // A member-visible transport route carries the same explicit fixture
+        // payload. This does not install a production repository read entry.
+        self.settings_get("private".into())
     }
 
     fn settings_get(&self, path: String) -> BoxFuture<'_, intent_core::Result<Value>> {
@@ -631,6 +747,40 @@ async fn notifications_overload_and_invalid_frames_keep_existing_queue_policy() 
     assert!(h.tx.priority_idle());
 }
 
+#[tokio::test]
+async fn delivery_faults_preserve_one_original_transfer_and_release_every_guard() {
+    for fault in [
+        DeliveryFault::Construction,
+        DeliveryFault::BeforeTransfer,
+        DeliveryFault::AfterTransfer,
+        DeliveryFault::Repeat,
+        DeliveryFault::Omit,
+    ] {
+        let mut h = Harness::new(
+            FixtureApi {
+                fault,
+                ..FixtureApi::default()
+            },
+            HostRole::Owner,
+        )
+        .await;
+        assert!(h.dispatch(&request("private")).await);
+        let reply = h.response().await;
+        let admitted = matches!(fault, DeliveryFault::AfterTransfer | DeliveryFault::Repeat);
+        assert_eq!(reply.get("result").is_some(), admitted);
+        if !admitted {
+            assert_eq!(reply["error"]["code"], -32603);
+        }
+        assert_eq!(reply["id"], 7);
+        let scope = h.original().scopes.lock().unwrap()[0].clone();
+        until(|| scope.state.lock().unwrap().retired).await;
+        assert!(h.rx.priority.try_recv().is_err());
+        assert!(h.tx.priority_idle());
+        assert_eq!(h.limiter.available_permits(), Some(1));
+        assert_eq!(scope.state.lock().unwrap().sent, admitted);
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn actual_uds_binding_and_listener_shutdown_preserve_original_cohorts() {
@@ -932,4 +1082,108 @@ async fn actual_wss_close_rotation_shutdown_and_heartbeat_retire_held_requests()
         }
         server.stop().await;
     }
+}
+
+#[tokio::test]
+async fn actual_wss_principal_revocation_drains_ordinary_reply_but_denies_held_private_data() {
+    use futures::SinkExt as _;
+    use tokio_tungstenite::tungstenite::Message;
+
+    // The TLS upgrade and frame loop are real; credential lookup and the
+    // committed-revocation notification are explicit carrier fixtures.
+    let dir = tempfile::Builder::new()
+        .prefix("carrier-wss-revoke-")
+        .tempdir()
+        .unwrap();
+    let bus = EventBus::new(
+        intent_store::Store::open(&dir.path().join("bus.db"))
+            .await
+            .unwrap(),
+    );
+    let handler = Arc::new(Gate::default());
+    let revoke_reply = Arc::new(Gate::default());
+    let (revocations, _) = tokio::sync::broadcast::channel(8);
+    let token = "e".repeat(64);
+    let token_hash = crate::auth::hash_token(&token);
+    let api = Arc::new(FixtureApi {
+        handler: Some(handler.clone()),
+        member_token_hash: Some(token_hash.clone()),
+        revocations: Some(revocations),
+        revoke_reply: Some(revoke_reply.clone()),
+        ..FixtureApi::default()
+    });
+    let certificate = crate::ensure_tls_certificate(dir.path()).unwrap();
+    let tokens = Arc::new(crate::AsyncTokenStore::new(Arc::new(MemoryToken(
+        Mutex::new("f".repeat(64)),
+    ))));
+    let server = crate::WsApiServer::new(
+        api.clone(),
+        bus,
+        &certificate,
+        &tokens,
+        crate::WsOptions {
+            base_port: 0,
+            ..crate::WsOptions::default()
+        },
+        None,
+    )
+    .unwrap();
+    let mut socket = connect_wss(server.start().await.unwrap(), &certificate, &token).await;
+    socket
+        .send(Message::Text(
+            json!({"jsonrpc":"2.0","id":7,"method":"workspace.members.list","params":{"workspaceId":intent_core::WorkspaceId::new()}})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), handler.entered.notified())
+        .await
+        .unwrap();
+    let original = api.connections.lock().unwrap()[0].clone();
+    let scope = original.scopes.lock().unwrap()[0].clone();
+    assert_eq!(
+        scope.caller,
+        Some(Caller::Wire {
+            principal_id: api.principal.clone(),
+            host_role: HostRole::Member
+        })
+    );
+    let Some(WireCredential::Principal {
+        principal_id,
+        token_hash: actual,
+    }) = &scope.credential
+    else {
+        panic!("actual per-principal WSS bearer missing");
+    };
+    assert_eq!(principal_id, &api.principal);
+    assert_eq!(actual, &token_hash);
+    socket
+        .send(Message::Text(
+            json!({"jsonrpc":"2.0","id":8,"method":"principal.revokeSelf","params":{}})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), revoke_reply.entered.notified())
+        .await
+        .unwrap();
+    until(|| original.is_closed()).await;
+    assert!(scope.state.lock().unwrap().retired);
+    revoke_reply.release.notify_one();
+    handler.release.notify_one();
+    let mut replies = [
+        ws_response(&mut socket).await,
+        ws_response(&mut socket).await,
+    ];
+    replies.sort_by_key(|reply| reply["id"].as_u64());
+    assert_eq!(replies[0]["id"], 7);
+    assert!(replies[0].get("result").is_none());
+    assert!(!replies[0].to_string().contains("original payload"));
+    assert_eq!(replies[1]["id"], 8);
+    assert_eq!(replies[1]["result"]["revoked"], true);
+    assert!(!scope.state.lock().unwrap().sent);
+    until(|| original.captured_are_retired()).await;
+    server.stop().await;
 }

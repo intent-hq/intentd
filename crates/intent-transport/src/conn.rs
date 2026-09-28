@@ -933,7 +933,7 @@ async fn finish_prepared_rpc(
         slot.send(frame);
         Ok(())
     };
-    let result = std::panic::AssertUnwindSafe(scope.deliver(kind, &mut transfer))
+    let result = std::panic::AssertUnwindSafe(async { scope.deliver(kind, &mut transfer).await })
         .catch_unwind()
         .await;
     // A broken owner cannot send twice or undo an already admitted transfer.
