@@ -549,3 +549,42 @@ async fn different_forges_share_no_hub_even_when_cache_slot_is_reused() {
         .validate_receive(&scope, &scope, &[fixture.update(AgentRef::Head)])
         .unwrap();
 }
+
+#[tokio::test]
+async fn failed_git_initialization_is_not_published_and_retry_rebuilds() {
+    let fixture = Fixture::new().await;
+    let root = fixture.hubs.join("failed-initialization");
+    let final_path = root.join(format!("{}.git", fixture.identity.key()));
+    let staging = final_path.with_extension("initializing");
+    let cache = Repository::open(&fixture.cache).unwrap();
+    let broken = cache.path().join("refs/remotes/origin/broken");
+    // Valid ref syntax, but a nonexistent object: real upload-pack/fetch fails
+    // after the staging repo and alternate were created.
+    std::fs::write(&broken, "1111111111111111111111111111111111111111\n").unwrap();
+    assert!(
+        Hub::ensure(&fixture.cache_root, &root, fixture.identity.clone())
+            .await
+            .is_err()
+    );
+    assert!(
+        !final_path.exists(),
+        "failed Git seed must never publish a hub"
+    );
+    assert!(staging.join("objects/info/alternates").exists());
+    std::fs::remove_file(broken).unwrap();
+    let hub = Hub::ensure(&fixture.cache_root, &root, fixture.identity)
+        .await
+        .unwrap();
+    assert!(!staging.exists());
+    assert!(!hub.path().join("objects/info/alternates").exists());
+    assert_eq!(
+        hub.open()
+            .unwrap()
+            .refname_to_id("refs/heads/main")
+            .unwrap(),
+        fixture.tip
+    );
+    std::fs::remove_dir_all(&fixture.cache).unwrap();
+    git(hub.path(), &["gc", "--prune=now"]);
+    git(hub.path(), &["fsck", "--full", "--no-dangling"]);
+}
