@@ -114,7 +114,6 @@ struct Lease {
     budget: Arc<Mutex<Budget>>,
     window: Instant,
     remaining: AtomicUsize,
-    scope: CacheScope,
 }
 
 impl Drop for Lease {
@@ -175,7 +174,6 @@ impl Budget {
             budget: shared.clone(),
             window: state.started,
             remaining: AtomicUsize::new(cost),
-            scope: key.scope.clone(),
         }))
     }
 }
@@ -379,21 +377,32 @@ impl Discovery {
             if services.sweeps_rate_limited() {
                 return Err(unknown("PR refresh quota paused"));
             }
-            let lease = Budget::reserve(&self.budget, &key)?;
+            // An explicit user refresh has its own demand; background
+            // saturation must not defer it. Keep shared concurrency and the
+            // per-attempt authorization/quota checks for both kinds of read.
+            let lease = force_after
+                .is_none()
+                .then(|| Budget::reserve(&self.budget, &key))
+                .transpose()?;
             let _permit = self
                 .concurrent
                 .acquire()
                 .await
                 .map_err(|_| unknown("PR refresh stopped"))?;
             let owner = services.clone();
+            let scope = key.scope.clone();
             let admission = Arc::new(move || {
-                lease.scope.is_current()
-                    && lease.window.elapsed() < WINDOW
+                scope.is_current()
                     && !owner.sweeps_rate_limited()
-                    && lease
-                        .remaining
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                        .is_ok()
+                    && lease.as_ref().is_none_or(|lease| {
+                        lease.window.elapsed() < WINDOW
+                            && lease
+                                .remaining
+                                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                                    n.checked_sub(1)
+                                })
+                                .is_ok()
+                    })
             });
             intent_sourcecontrol::request_budget::with_admission(admission, async {
                 if let Some(number) = key.number {
