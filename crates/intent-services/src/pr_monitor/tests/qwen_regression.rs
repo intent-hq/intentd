@@ -1965,7 +1965,7 @@ async fn shared_rules_forced_service_read_observes_policy_changes() {
     assert_eq!(first.snapshot.requirements.approvals.needed, None);
     mock.edit(|s| {
         s.rules = json!([{"type":"pull_request","parameters":{
-        "required_approving_review_count": 2, "required_review_thread_resolution":true}}])
+        "required_approving_review_count": 2, "required_review_thread_resolution":true}}]);
     });
     let fresh = read_pr_via(
         mock.sc.as_ref(),
