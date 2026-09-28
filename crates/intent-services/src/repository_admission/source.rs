@@ -153,7 +153,11 @@ async fn read_agent_identity(
         || session.status == intent_core::AgentStatus::Deleted
         || services
             .pending_agent_deletes
-            .deadline(agent_id.as_str())
+            .deadline(&crate::delete_grace::PendingDeleteSubject::Agent {
+                workspace_id: session.workspace_id.clone(),
+                agent_id: agent_id.clone(),
+            })
+            .map_err(|error| local_error(&error))?
             .is_some()
     {
         return Err(AdmissionError::Denied);
@@ -267,7 +271,10 @@ impl RepositorySource {
         if self
             .services
             .pending_workspace_deletes
-            .deadline(self.workspace.as_str())
+            .deadline(&crate::delete_grace::PendingDeleteSubject::Workspace(
+                self.workspace.clone(),
+            ))
+            .map_err(|error| local_error(&error))?
             .is_some()
         {
             self.retirement.retire();
@@ -685,11 +692,17 @@ mod captured_scope_tests {
                             let prior = std::fs::read(&config).unwrap();
                             match change {
                                 0 => {
-                                    service.pending_workspace_deletes.schedule(
-                                        f.workspace.id.to_string(),
-                                        "2026-09-27T01:00:00Z".into(),
-                                        |_| tokio::spawn(async {}),
-                                    );
+                                    service
+                                        .pending_workspace_deletes
+                                        .schedule_owned(
+                                            crate::delete_grace::PendingDeleteSubject::Workspace(
+                                                f.workspace.id.clone(),
+                                            ),
+                                            60_000,
+                                            |_| async {},
+                                        )
+                                        .await
+                                        .unwrap();
                                 }
                                 1 => {
                                     f.git(&f.path, &["checkout", "--detach", "main"]);
@@ -703,8 +716,16 @@ mod captured_scope_tests {
                                 0 => {
                                     service
                                         .pending_workspace_deletes
-                                        .cancel(f.workspace.id.as_str());
-                                    assert!(matches!(observed, Err(AdmissionError::Denied)));
+                                        .cancel_owned(
+                                            &crate::delete_grace::PendingDeleteSubject::Workspace(
+                                                f.workspace.id.clone(),
+                                            ),
+                                        )
+                                        .await
+                                        .unwrap();
+                                    // The real pending-delete observer retires the original
+                                    // request before the next source read can observe its marker.
+                                    assert!(matches!(observed, Err(AdmissionError::Retired)));
                                 }
                                 1 => {
                                     f.git(&f.path, &["checkout", "main"]);

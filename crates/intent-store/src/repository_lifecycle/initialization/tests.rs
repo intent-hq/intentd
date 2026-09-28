@@ -93,6 +93,13 @@ impl RepositoryInitializationTicket for InitTicket {
         *self.attempt.phase.lock().unwrap() = Phase::Retired;
         self.settled = true;
     }
+
+    fn settle_committed_without_confirmation(mut self: Box<Self>) -> Result<()> {
+        self.owner.state.lock().unwrap().blocked -= 1;
+        *self.attempt.phase.lock().unwrap() = Phase::Retired;
+        self.settled = true;
+        Ok(())
+    }
 }
 
 struct Mutation(Arc<Mutex<State>>);
@@ -1257,4 +1264,890 @@ async fn outcome_same_id_and_null_expectation_do_not_claim_legacy_effects() {
         .unwrap();
     assert!(rows[0].2.is_none());
     assert_eq!(rows[0].3.as_ref(), Some(&totals));
+}
+
+async fn compatible(
+    f: &Fixture,
+    action: RepositoryAcpInitialization,
+    with_proof: bool,
+) -> RepositoryAcpCompatibilityOutcome {
+    let binding = f.binding(action);
+    let claim = with_proof.then(|| f.claim(&binding));
+    f.store
+        .initialize_repository_acp_session_compatible(claim, binding)
+        .await
+}
+
+#[tokio::test]
+async fn compatible_same_id_folds_once_without_strict_confirmation() {
+    for with_proof in [false, true] {
+        let f = Fixture::new().await;
+        f.store
+            .set_acp_session_id(&f.workspace.id, &f.agent.id, "A")
+            .await
+            .unwrap();
+        let totals = intent_core::TokenUsageTotals {
+            input_tokens: 29,
+            ..Default::default()
+        };
+        f.store
+            .set_agent_session_token_usage(&f.workspace.id, &f.agent.id, &totals)
+            .await
+            .unwrap();
+        let result = compatible(&f, replace(Some("A"), "A"), with_proof).await;
+        assert_eq!(
+            result.result.unwrap(),
+            RepositoryAcpCompatibilityResult::Committed {
+                session_id: "A".into(),
+                effect: RepositoryAcpCompatibilityEffect::AccountingOnly,
+            }
+        );
+        assert_eq!(
+            result.persistence,
+            RepositoryAcpCompatibilityPersistence::Committed {
+                observed: RepositoryInitializationObservation::Present {
+                    session_id: Some("A".into())
+                },
+                affected_rows: 1,
+            }
+        );
+        assert!(result.confirmation.is_err());
+        assert_eq!(f.owner.state.lock().unwrap().blocked, 0);
+        let rows = f
+            .store
+            .get_workspace_agent_usage_data(&f.workspace.id)
+            .await
+            .unwrap();
+        assert!(rows[0].2.is_none());
+        assert_eq!(rows[0].3.as_ref(), Some(&totals));
+    }
+}
+
+#[tokio::test]
+async fn compatible_captured_some_current_null_persists_and_banks_without_proof() {
+    for with_proof in [false, true] {
+        let f = Fixture::new().await;
+        let totals = intent_core::TokenUsageTotals {
+            input_tokens: 31,
+            ..Default::default()
+        };
+        f.store
+            .set_agent_session_token_usage(&f.workspace.id, &f.agent.id, &totals)
+            .await
+            .unwrap();
+        assert!(outcome(&f, replace(Some("old"), "new"))
+            .await
+            .confirmation
+            .is_err());
+        assert_eq!(f.id().await, None);
+        let result = compatible(&f, replace(Some("old"), "new"), with_proof).await;
+        assert_eq!(
+            result.result.unwrap(),
+            RepositoryAcpCompatibilityResult::Committed {
+                session_id: "new".into(),
+                effect: RepositoryAcpCompatibilityEffect::Replace { previous: None },
+            }
+        );
+        assert!(matches!(
+            result.persistence,
+            RepositoryAcpCompatibilityPersistence::Committed {
+                affected_rows: 1,
+                ..
+            }
+        ));
+        assert!(result.confirmation.is_err());
+        assert_eq!(f.id().await.as_deref(), Some("new"));
+        assert_eq!(f.owner.state.lock().unwrap().blocked, 0);
+        let rows = f
+            .store
+            .get_workspace_agent_usage_data(&f.workspace.id)
+            .await
+            .unwrap();
+        assert!(rows[0].2.is_none());
+        assert_eq!(rows[0].3.as_ref(), Some(&totals));
+    }
+}
+
+#[tokio::test]
+async fn compatible_winners_and_loaded_keep_one_use_original_confirmation() {
+    let f = Fixture::new().await;
+    for action in [first("A"), loaded("A"), replace(Some("A"), "B")] {
+        let result = compatible(&f, action, true).await;
+        assert!(result.result.is_ok());
+        assert!(f.consume(result.confirmation.unwrap()));
+    }
+    let g = Fixture::new().await;
+    let result = compatible(&g, first("A"), false).await;
+    assert!(matches!(
+        result.result,
+        Ok(RepositoryAcpCompatibilityResult::Committed { .. })
+    ));
+    assert!(result.confirmation.is_err());
+    assert_eq!(g.id().await.as_deref(), Some("A"));
+}
+
+#[tokio::test]
+async fn compatible_noops_missing_and_original_load_do_not_invent_canonical_ownership() {
+    let f = Fixture::new().await;
+    f.store
+        .set_acp_session_id(&f.workspace.id, &f.agent.id, "A")
+        .await
+        .unwrap();
+    for action in [first("A"), replace(Some("stale"), "fresh")] {
+        let result = compatible(&f, action, true).await;
+        assert_eq!(
+            result.result.unwrap(),
+            RepositoryAcpCompatibilityResult::Observed {
+                session_id: "A".into()
+            }
+        );
+        assert!(matches!(
+            result.persistence,
+            RepositoryAcpCompatibilityPersistence::NoEffect { .. }
+        ));
+        assert!(result.confirmation.is_err());
+    }
+    let conflict = compatible(&f, first("B"), true).await;
+    assert!(
+        matches!(conflict.result, Err(intent_core::Error::Internal(ref message)) if message == "acpSessionId is write-once")
+    );
+    let mut binding = f.binding(first("B"));
+    binding.agent_id = AgentId("missing".into());
+    let missing = f
+        .store
+        .initialize_repository_acp_session_compatible(None, binding)
+        .await;
+    assert!(matches!(
+        missing.result,
+        Err(intent_core::Error::NotFound(_))
+    ));
+    assert_eq!(
+        missing.persistence,
+        RepositoryAcpCompatibilityPersistence::NoEffect {
+            observed: RepositoryInitializationObservation::Missing
+        }
+    );
+    let loaded = compatible(&f, loaded("original-loaded"), false).await;
+    assert_eq!(
+        loaded.result.unwrap(),
+        RepositoryAcpCompatibilityResult::SubmittedFallback {
+            session_id: "original-loaded".into()
+        }
+    );
+    assert!(loaded.confirmation.is_err());
+    assert_eq!(f.id().await.as_deref(), Some("A"));
+}
+
+#[derive(Clone, Copy)]
+enum CompatibilityObserverMode {
+    UnknownBegin,
+    RefuseOrdinary,
+    DefaultSettlement,
+}
+
+struct CompatibilityObserver {
+    inner: Arc<Observer>,
+    mode: CompatibilityObserverMode,
+}
+
+struct DefaultSettlementTicket(Box<dyn RepositoryInitializationTicket>);
+
+impl RepositoryInitializationTicket for DefaultSettlementTicket {
+    fn finish_confirmed(self: Box<Self>) -> Result<Box<dyn Any + Send>> {
+        self.0.finish_confirmed()
+    }
+
+    fn settle_no_effect(self: Box<Self>) {
+        self.0.settle_no_effect();
+    }
+    // Deliberately use the real default: no manufactured proof/settlement.
+}
+
+impl RepositoryLifecycleObserver for CompatibilityObserver {
+    fn begin_mutation(
+        &self,
+        keys: &[RepositoryLifecycleKey],
+    ) -> Result<Box<dyn RepositoryLifecycleMutationTicket>> {
+        if matches!(self.mode, CompatibilityObserverMode::RefuseOrdinary) {
+            return Err(lifecycle_error("fixture ordinary mutation refused"));
+        }
+        self.inner.begin_mutation(keys)
+    }
+
+    fn begin_initialization(
+        &self,
+        proof: Box<dyn Any + Send>,
+        binding: &RepositoryInitializationBinding,
+    ) -> Result<Box<dyn RepositoryInitializationTicket>> {
+        let ticket = self.inner.begin_initialization(proof, binding)?;
+        match self.mode {
+            CompatibilityObserverMode::DefaultSettlement => {
+                Ok(Box::new(DefaultSettlementTicket(ticket)))
+            }
+            CompatibilityObserverMode::UnknownBegin | CompatibilityObserverMode::RefuseOrdinary => {
+                // An actual begun fixture barrier is left unsettled. A generic
+                // error does not prove that the callback created no barrier.
+                drop(ticket);
+                Err(lifecycle_error(
+                    "fixture initialization left unknown barrier",
+                ))
+            }
+        }
+    }
+}
+
+async fn compatibility_observer_fixture(mode: CompatibilityObserverMode) -> Fixture {
+    let original = Fixture::new().await;
+    // Reuse fixture row VALUES, not its Store/domain or installed observer.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("initialization.db"))
+        .await
+        .unwrap();
+    store.insert_workspace(&original.workspace).await.unwrap();
+    store.insert_agent_session(&original.agent).await.unwrap();
+    let owner = Arc::new(Observer::default());
+    let observer: Arc<dyn RepositoryLifecycleObserver> = Arc::new(CompatibilityObserver {
+        inner: owner.clone(),
+        mode,
+    });
+    store
+        .install_repository_lifecycle_observer(observer.clone())
+        .await
+        .unwrap();
+    Fixture {
+        dir,
+        store,
+        workspace: original.workspace,
+        agent: original.agent,
+        owner,
+        observer,
+    }
+}
+
+#[tokio::test]
+async fn compatible_failed_initialization_ordinary_commit_preserves_original_unknown_barrier() {
+    let f = compatibility_observer_fixture(CompatibilityObserverMode::UnknownBegin).await;
+    let old = f.owner.leaf();
+    let result = compatible(&f, first("A"), true).await;
+    assert!(matches!(
+        result.result,
+        Ok(RepositoryAcpCompatibilityResult::Committed { .. })
+    ));
+    assert!(matches!(
+        result.persistence,
+        RepositoryAcpCompatibilityPersistence::Committed { .. }
+    ));
+    assert!(
+        matches!(result.confirmation, Err(ref error) if error.to_string().contains("fixture initialization left unknown barrier"))
+    );
+    assert!(!old.load(Ordering::SeqCst));
+    assert_eq!(f.id().await.as_deref(), Some("A"));
+    assert_eq!(
+        f.owner.state.lock().unwrap().blocked,
+        1,
+        "ordinary commit must not settle the earlier unknown owner"
+    );
+    assert_eq!(f.owner.state.lock().unwrap().starts, 1);
+    // A new no-proof ordinary mutation also owns only its own barrier.
+    let next = compatible(&f, replace(Some("A"), "B"), false).await;
+    assert!(next.result.is_ok());
+    assert!(next.confirmation.is_err());
+    assert_eq!(f.owner.state.lock().unwrap().blocked, 1);
+}
+
+#[tokio::test]
+async fn compatible_ordinary_refusal_prevents_dml_without_erasing_original_error() {
+    let f = compatibility_observer_fixture(CompatibilityObserverMode::RefuseOrdinary).await;
+    let result = compatible(&f, first("A"), true).await;
+    assert!(
+        matches!(result.result, Err(ref error) if error.to_string().contains("fixture ordinary mutation refused"))
+    );
+    assert!(
+        matches!(result.confirmation, Err(ref error) if error.to_string().contains("fixture initialization left unknown barrier"))
+    );
+    assert_eq!(
+        result.persistence,
+        RepositoryAcpCompatibilityPersistence::NoEffect {
+            observed: RepositoryInitializationObservation::Present { session_id: None },
+        }
+    );
+    assert_eq!(f.id().await, None);
+    assert_eq!(f.owner.state.lock().unwrap().blocked, 1);
+}
+
+#[tokio::test]
+async fn compatible_default_settlement_keeps_known_commit_and_unsettled_owner() {
+    let f = compatibility_observer_fixture(CompatibilityObserverMode::DefaultSettlement).await;
+    let result = compatible(&f, replace(Some("old"), "A"), true).await;
+    assert!(matches!(
+        result.result,
+        Ok(RepositoryAcpCompatibilityResult::Committed { .. })
+    ));
+    assert!(matches!(
+        result.persistence,
+        RepositoryAcpCompatibilityPersistence::Committed {
+            affected_rows: 1,
+            ..
+        }
+    ));
+    assert!(
+        matches!(result.confirmation, Err(ref error) if error.to_string().contains("unconfirmed commit settlement is unavailable"))
+    );
+    assert_eq!(f.id().await.as_deref(), Some("A"));
+    assert_eq!(f.owner.state.lock().unwrap().blocked, 1);
+}
+
+#[tokio::test]
+async fn compatible_same_id_or_load_without_usable_proof_preserves_ordinary_invalidation_policy() {
+    for action in [replace(Some("A"), "A"), loaded("A")] {
+        for stale_proof in [false, true] {
+            let f = Fixture::new().await;
+            f.store
+                .set_acp_session_id(&f.workspace.id, &f.agent.id, "A")
+                .await
+                .unwrap();
+            let binding = f.binding(action.clone());
+            let claim = if stale_proof {
+                let proof = f.owner.proof(binding.clone());
+                *proof.attempt.phase.lock().unwrap() = Phase::Retired;
+                Some(
+                    f.store
+                        .bind_repository_initialization_claim(f.observer.clone(), Box::new(proof))
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            let old = f.owner.leaf();
+            let result = f
+                .store
+                .initialize_repository_acp_session_compatible(claim, binding)
+                .await;
+            assert!(result.result.is_ok());
+            assert!(result.confirmation.is_err());
+            assert!(
+                old.load(Ordering::SeqCst),
+                "no effective binding mutation and no successful original begin"
+            );
+            assert_eq!(f.owner.state.lock().unwrap().blocked, 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn compatible_retired_proof_uses_only_ordinary_ticket_and_foreign_claim_never_downgrades() {
+    let f = Fixture::new().await;
+    let binding = f.binding(first("A"));
+    let proof = f.owner.proof(binding.clone());
+    *proof.attempt.phase.lock().unwrap() = Phase::Retired;
+    let claim = f
+        .store
+        .bind_repository_initialization_claim(f.observer.clone(), Box::new(proof))
+        .unwrap();
+    let old = f.owner.leaf();
+    let result = f
+        .store
+        .initialize_repository_acp_session_compatible(Some(claim), binding)
+        .await;
+    assert!(result.result.is_ok());
+    assert!(result.confirmation.is_err());
+    assert_eq!(f.id().await.as_deref(), Some("A"));
+    assert!(!old.load(Ordering::SeqCst));
+    assert_eq!(f.owner.state.lock().unwrap().blocked, 0);
+    let other = Fixture::new().await;
+    let binding = f.binding(first("B"));
+    let claim = f.claim(&binding);
+    let foreign = other
+        .store
+        .initialize_repository_acp_session_compatible(Some(claim), binding)
+        .await;
+    assert_eq!(
+        foreign.persistence,
+        RepositoryAcpCompatibilityPersistence::NotAttempted
+    );
+    assert!(foreign.result.is_err());
+    assert!(foreign.confirmation.is_err());
+    assert_eq!(other.id().await, None);
+}
+
+#[tokio::test]
+async fn compatible_denied_completion_keeps_actual_commit_and_original_error() {
+    let f = Fixture::new().await;
+    f.owner.reject_completion.store(true, Ordering::SeqCst);
+    let result = compatible(&f, first("A"), true).await;
+    assert!(matches!(
+        result.result,
+        Ok(RepositoryAcpCompatibilityResult::Committed { .. })
+    ));
+    assert!(matches!(
+        result.persistence,
+        RepositoryAcpCompatibilityPersistence::Committed { .. }
+    ));
+    assert!(
+        matches!(result.confirmation, Err(ref error) if error.to_string().contains("fixture original owner retired"))
+    );
+    assert_eq!(f.id().await.as_deref(), Some("A"));
+    assert_eq!(f.owner.state.lock().unwrap().blocked, 0);
+}
+
+#[tokio::test]
+async fn compatible_committed_trigger_effects_do_not_claim_an_id_winner() {
+    for trigger in [
+        "CREATE TRIGGER compatible_fault BEFORE UPDATE OF acp_session_id ON agent_session BEGIN UPDATE agent_session SET name='side effect' WHERE id=OLD.id; SELECT RAISE(IGNORE); END",
+        "CREATE TRIGGER compatible_fault AFTER UPDATE OF acp_session_id ON agent_session WHEN NEW.acp_session_id='A' BEGIN UPDATE agent_session SET acp_session_id='different' WHERE id=NEW.id; END",
+    ] {
+        let f = Fixture::new().await;
+        sqlx::query(trigger).execute(f.store.write_pool()).await.unwrap();
+        let result = compatible(&f, first("A"), true).await;
+        assert_eq!(result.result.unwrap(), RepositoryAcpCompatibilityResult::SubmittedFallback { session_id: "A".into() });
+        assert!(matches!(result.persistence, RepositoryAcpCompatibilityPersistence::Committed { .. }));
+        assert!(result.confirmation.is_err());
+        assert_ne!(f.id().await.as_deref(), Some("A"));
+        assert_eq!(f.owner.state.lock().unwrap().blocked, 0);
+    }
+}
+
+#[tokio::test]
+async fn compatible_canceled_commit_worker_preserves_unknown_owner_after_reopen() {
+    for with_proof in [false, true] {
+        let f = Fixture::new().await;
+        let binding = f.binding(replace(Some("old"), "A"));
+        let claim = with_proof.then(|| f.claim(&binding));
+        let pool = f.store.write_pool().clone();
+        let path = f.dir.path().join("initialization.db");
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let signal = entered.clone();
+        let (release, blocked) = std::sync::mpsc::sync_channel(1);
+        let mut blocked = Some(blocked);
+        let mut connection = pool.acquire().await.unwrap();
+        connection
+            .lock_handle()
+            .await
+            .unwrap()
+            .set_commit_hook(move || {
+                if let Some(blocked) = blocked.take() {
+                    signal.notify_one();
+                    blocked
+                        .recv_timeout(std::time::Duration::from_secs(20))
+                        .unwrap();
+                }
+                true
+            });
+        drop(connection);
+        let store = f.store;
+        let task = tokio::spawn(async move {
+            store
+                .initialize_repository_acp_session_compatible(claim, binding)
+                .await
+        });
+        entered.notified().await;
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        assert_eq!(f.owner.state.lock().unwrap().blocked, 1);
+        release.send(()).unwrap();
+        let mut connection = pool.acquire().await.unwrap();
+        connection
+            .lock_handle()
+            .await
+            .unwrap()
+            .set_commit_hook(|| true);
+        let actual: Option<String> =
+            sqlx::query_scalar("SELECT acp_session_id FROM agent_session WHERE id=?")
+                .bind(&f.agent.id.0)
+                .fetch_one(&mut *connection)
+                .await
+                .unwrap();
+        assert_eq!(actual.as_deref(), Some("A"));
+        drop(connection);
+        let reopened = Store::open(&path).await.unwrap();
+        assert!(reopened.has_repository_lifecycle_observer(&f.observer));
+        assert_eq!(f.owner.state.lock().unwrap().blocked, 1);
+        let replacement: Arc<dyn RepositoryLifecycleObserver> = Arc::new(Observer::default());
+        assert!(reopened
+            .install_repository_lifecycle_observer(replacement)
+            .await
+            .is_err());
+    }
+}
+
+// Composition fixtures exercise real Store writers/SQLite, not R request
+// subscriptions, physical-owner policy or a final transport-delivery fence.
+mod mixed_lifecycle {
+    use super::*;
+
+    struct LoggedMutation {
+        token: Arc<()>,
+        keys: Vec<RepositoryLifecycleKey>,
+    }
+
+    struct MixedObserver {
+        inner: Arc<Observer>,
+        mutations: Arc<Mutex<Vec<LoggedMutation>>>,
+    }
+
+    struct LoggedTicket {
+        inner: Box<dyn RepositoryLifecycleMutationTicket>,
+        mutations: Arc<Mutex<Vec<LoggedMutation>>>,
+        token: Arc<()>,
+    }
+
+    impl RepositoryLifecycleMutationTicket for LoggedTicket {
+        fn settle_confirmed(self: Box<Self>) {
+            self.inner.settle_confirmed();
+            self.mutations
+                .lock()
+                .unwrap()
+                .retain(|entry| !Arc::ptr_eq(&entry.token, &self.token));
+        }
+    }
+
+    impl MixedObserver {
+        fn record(
+            &self,
+            keys: &[RepositoryLifecycleKey],
+            inner: Box<dyn RepositoryLifecycleMutationTicket>,
+        ) -> Box<dyn RepositoryLifecycleMutationTicket> {
+            let token = Arc::new(());
+            self.mutations.lock().unwrap().push(LoggedMutation {
+                token: token.clone(),
+                keys: keys.to_vec(),
+            });
+            Box::new(LoggedTicket {
+                inner,
+                mutations: self.mutations.clone(),
+                token,
+            })
+        }
+
+        fn pending(&self, key: &RepositoryLifecycleKey) -> usize {
+            self.mutations
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.keys.contains(key))
+                .count()
+        }
+    }
+
+    impl RepositoryLifecycleObserver for MixedObserver {
+        fn begin_mutation(
+            &self,
+            keys: &[RepositoryLifecycleKey],
+        ) -> Result<Box<dyn RepositoryLifecycleMutationTicket>> {
+            Ok(self.record(keys, self.inner.begin_mutation(keys)?))
+        }
+
+        fn begin_pending_delete(
+            &self,
+            keys: &[RepositoryLifecycleKey],
+        ) -> Result<Box<dyn RepositoryLifecycleMutationTicket>> {
+            // A separate fixture ticket, without an ordinary mutation's
+            // physical-attempt invalidation. This is not the R override.
+            self.inner.state.lock().unwrap().blocked += 1;
+            Ok(self.record(keys, Box::new(Mutation(self.inner.state.clone()))))
+        }
+
+        fn begin_initialization(
+            &self,
+            proof: Box<dyn Any + Send>,
+            binding: &RepositoryInitializationBinding,
+        ) -> Result<Box<dyn RepositoryInitializationTicket>> {
+            self.inner.begin_initialization(proof, binding)
+        }
+    }
+
+    async fn fixture() -> (Fixture, Arc<MixedObserver>, intent_core::Principal) {
+        let rows = Fixture::new().await;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("initialization.db"))
+            .await
+            .unwrap();
+        store.insert_workspace(&rows.workspace).await.unwrap();
+        store.insert_agent_session(&rows.agent).await.unwrap();
+        let principal = intent_core::Principal {
+            id: intent_core::PrincipalId::new(),
+            identity: None,
+            github_user_id: Some(42),
+            login: Some("mixed-lifecycle".into()),
+            display_name: None,
+            avatar_url: None,
+            is_primary: false,
+            created_at: intent_core::now_iso(),
+            updated_at: intent_core::now_iso(),
+        };
+        store.upsert_principal(&principal).await.unwrap();
+        let owner = Arc::new(Observer::default());
+        let probe = Arc::new(MixedObserver {
+            inner: owner.clone(),
+            mutations: Arc::default(),
+        });
+        let observer: Arc<dyn RepositoryLifecycleObserver> = probe.clone();
+        store
+            .install_repository_lifecycle_observer(observer.clone())
+            .await
+            .unwrap();
+        (
+            Fixture {
+                dir,
+                store,
+                workspace: rows.workspace,
+                agent: rows.agent,
+                owner,
+                observer,
+            },
+            probe,
+            principal,
+        )
+    }
+
+    async fn unknown_wire_write(f: &Fixture, principal: &intent_core::Principal) {
+        sqlx::query("CREATE TRIGGER mixed_wire_fault BEFORE INSERT ON principal_credential BEGIN SELECT RAISE(ABORT, 'mixed wire fault'); END")
+            .execute(f.store.write_pool()).await.unwrap();
+        assert!(f
+            .store
+            .insert_principal_credential(&principal.id, "failed-wire")
+            .await
+            .is_err());
+        let absent: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM principal_credential WHERE token_hash='failed-wire'",
+        )
+        .fetch_one(f.store.read_pool())
+        .await
+        .unwrap();
+        assert_eq!(absent, 0);
+        // Removing the disposable fault does not acknowledge the failed owner.
+        sqlx::query("DROP TRIGGER mixed_wire_fault")
+            .execute(f.store.write_pool())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn compatible_commit_cannot_settle_independent_pending_owner() {
+        let (f, probe, _) = fixture().await;
+        let key = RepositoryLifecycleKey::Workspace(f.workspace.id.clone());
+        let pending = f
+            .store
+            .begin_repository_pending_delete(std::slice::from_ref(&key))
+            .await
+            .unwrap();
+        let second = f
+            .store
+            .begin_repository_pending_delete(std::slice::from_ref(&key))
+            .await
+            .unwrap();
+        let result = compatible(&f, first("A"), true).await;
+        assert!(matches!(
+            result.persistence,
+            RepositoryAcpCompatibilityPersistence::Committed {
+                affected_rows: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            result.result,
+            Ok(RepositoryAcpCompatibilityResult::Committed {
+                effect: RepositoryAcpCompatibilityEffect::FirstSet,
+                ..
+            })
+        ));
+        assert!(result.confirmation.is_err());
+        assert_eq!(f.id().await.as_deref(), Some("A"));
+        assert_eq!(probe.pending(&key), 2);
+        assert_eq!(f.owner.state.lock().unwrap().blocked, 2);
+        second.settle_confirmed();
+        assert_eq!(probe.pending(&key), 1);
+        assert!(outcome(&f, loaded("A")).await.confirmation.is_err());
+        pending.settle_confirmed();
+        assert_eq!(probe.pending(&key), 0);
+        assert_eq!(f.owner.state.lock().unwrap().blocked, 0);
+        let fresh = compatible(&f, replace(Some("A"), "B"), true).await;
+        assert!(f.consume(fresh.confirmation.unwrap()));
+    }
+
+    #[tokio::test]
+    async fn wire_unknown_survives_compatible_commit_and_other_known_settlements() {
+        let (f, probe, principal) = fixture().await;
+        unknown_wire_write(&f, &principal).await;
+        let wire = RepositoryLifecycleKey::WireAuthority;
+        assert_eq!(probe.pending(&wire), 1);
+        let pending = f
+            .store
+            .begin_repository_pending_delete(&[RepositoryLifecycleKey::Workspace(
+                f.workspace.id.clone(),
+            )])
+            .await
+            .unwrap();
+        let result = compatible(&f, replace(Some("old"), "A"), true).await;
+        assert!(matches!(
+            result.persistence,
+            RepositoryAcpCompatibilityPersistence::Committed {
+                affected_rows: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            result.result,
+            Ok(RepositoryAcpCompatibilityResult::Committed {
+                effect: RepositoryAcpCompatibilityEffect::Replace { previous: None },
+                ..
+            })
+        ));
+        assert!(result.confirmation.is_err());
+        assert_eq!(f.owner.state.lock().unwrap().blocked, 2);
+        pending.settle_confirmed();
+        f.store
+            .insert_principal_credential(&principal.id, "known-successor")
+            .await
+            .unwrap();
+        let next = compatible(&f, replace(Some("A"), "B"), false).await;
+        assert!(next.result.is_ok());
+        assert!(next.confirmation.is_err());
+        assert_eq!(f.id().await.as_deref(), Some("B"));
+        assert_eq!(
+            probe.pending(&wire),
+            1,
+            "same-coordinate success cannot settle the predecessor"
+        );
+        assert_eq!(
+            probe.pending(&RepositoryLifecycleKey::Agent(f.agent.id.clone())),
+            0
+        );
+        assert_eq!(f.owner.state.lock().unwrap().blocked, 1);
+    }
+
+    #[tokio::test]
+    async fn same_id_accounting_stays_factual_without_settling_pending_ownership() {
+        for with_proof in [false, true] {
+            let (f, probe, _) = fixture().await;
+            f.store
+                .set_acp_session_id(&f.workspace.id, &f.agent.id, "A")
+                .await
+                .unwrap();
+            let totals = intent_core::TokenUsageTotals {
+                input_tokens: 37,
+                ..Default::default()
+            };
+            f.store
+                .set_agent_session_token_usage(&f.workspace.id, &f.agent.id, &totals)
+                .await
+                .unwrap();
+            let key = RepositoryLifecycleKey::Workspace(f.workspace.id.clone());
+            let pending = f
+                .store
+                .begin_repository_pending_delete(std::slice::from_ref(&key))
+                .await
+                .unwrap();
+            for _ in 0..2 {
+                let result = compatible(&f, replace(Some("A"), "A"), with_proof).await;
+                assert_eq!(
+                    result.result.unwrap(),
+                    RepositoryAcpCompatibilityResult::Committed {
+                        session_id: "A".into(),
+                        effect: RepositoryAcpCompatibilityEffect::AccountingOnly
+                    }
+                );
+                assert!(matches!(
+                    result.persistence,
+                    RepositoryAcpCompatibilityPersistence::Committed {
+                        affected_rows: 1,
+                        ..
+                    }
+                ));
+                assert!(result.confirmation.is_err());
+                let rows = f
+                    .store
+                    .get_workspace_agent_usage_data(&f.workspace.id)
+                    .await
+                    .unwrap();
+                assert!(rows[0].2.is_none());
+                assert_eq!(
+                    rows[0].3.as_ref(),
+                    Some(&totals),
+                    "the original snapshot is banked once"
+                );
+                assert_eq!(probe.pending(&key), 1);
+                assert_eq!(f.owner.state.lock().unwrap().blocked, 1);
+            }
+            pending.settle_confirmed();
+            assert_eq!(f.owner.state.lock().unwrap().blocked, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn canceled_compatible_worker_and_wire_predecessor_survive_last_store_reopen() {
+        let (f, probe, principal) = fixture().await;
+        unknown_wire_write(&f, &principal).await;
+        let workspace_key = RepositoryLifecycleKey::Workspace(f.workspace.id.clone());
+        let agent_key = RepositoryLifecycleKey::Agent(f.agent.id.clone());
+        let pending = f
+            .store
+            .begin_repository_pending_delete(std::slice::from_ref(&workspace_key))
+            .await
+            .unwrap();
+        let binding = f.binding(replace(Some("old"), "A"));
+        let claim = f.claim(&binding);
+        let pool = f.store.write_pool().clone();
+        let path = f.dir.path().join("initialization.db");
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let signal = entered.clone();
+        let (release, blocked) = std::sync::mpsc::sync_channel(1);
+        let mut blocked = Some(blocked);
+        let mut connection = pool.acquire().await.unwrap();
+        connection
+            .lock_handle()
+            .await
+            .unwrap()
+            .set_commit_hook(move || {
+                if let Some(blocked) = blocked.take() {
+                    signal.notify_one();
+                    blocked
+                        .recv_timeout(std::time::Duration::from_secs(20))
+                        .unwrap();
+                }
+                true
+            });
+        drop(connection);
+        let store = f.store;
+        let task = tokio::spawn(async move {
+            store
+                .initialize_repository_acp_session_compatible(Some(claim), binding)
+                .await
+        });
+        entered.notified().await;
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        assert_eq!(probe.pending(&agent_key), 1);
+        assert_eq!(probe.pending(&RepositoryLifecycleKey::WireAuthority), 1);
+        pending.settle_confirmed();
+        assert_eq!(probe.pending(&workspace_key), 0);
+        assert_eq!(f.owner.state.lock().unwrap().blocked, 2);
+        release.send(()).unwrap();
+        let mut connection = pool.acquire().await.unwrap();
+        connection
+            .lock_handle()
+            .await
+            .unwrap()
+            .set_commit_hook(|| true);
+        let actual: Option<String> =
+            sqlx::query_scalar("SELECT acp_session_id FROM agent_session WHERE id=?")
+                .bind(&f.agent.id.0)
+                .fetch_one(&mut *connection)
+                .await
+                .unwrap();
+        assert_eq!(actual.as_deref(), Some("A"));
+        drop(connection);
+        // The original task owned the last Store. SQLite's late commit and a
+        // same-observer managed reopen cannot acknowledge that lost owner.
+        let reopened = Store::open(&path).await.unwrap();
+        assert!(reopened.has_repository_lifecycle_observer(&f.observer));
+        assert_eq!(probe.pending(&agent_key), 1);
+        assert_eq!(probe.pending(&RepositoryLifecycleKey::WireAuthority), 1);
+        assert_eq!(f.owner.state.lock().unwrap().blocked, 2);
+        let replacement: Arc<dyn RepositoryLifecycleObserver> = Arc::new(Observer::default());
+        assert!(reopened
+            .install_repository_lifecycle_observer(replacement)
+            .await
+            .is_err());
+    }
 }

@@ -3426,6 +3426,7 @@ impl Store {
             return Ok(AcpSessionWriteOutcome {
                 canonical: stored_id.unwrap_or_else(|| acp_session_id.to_string()),
                 rows_affected: 0,
+                statement_dispatched: false,
             });
         }
         let row_exists = row.is_some();
@@ -3480,6 +3481,7 @@ impl Store {
         Ok(AcpSessionWriteOutcome {
             canonical: acp_session_id.to_string(),
             rows_affected,
+            statement_dispatched: true,
         })
     }
 

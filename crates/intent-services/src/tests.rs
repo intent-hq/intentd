@@ -1974,7 +1974,12 @@ async fn bulk_workspace_list_serialization_matches_per_workspace_shape() {
     let mut expected = store.list_workspaces(true).await.unwrap();
     for row in &mut expected {
         row.activity = svc.workspace_activity(&row.id);
-        row.pending_delete_at = svc.pending_workspace_deletes.deadline(row.id.as_str());
+        row.pending_delete_at = svc
+            .pending_workspace_deletes
+            .deadline(&crate::delete_grace::PendingDeleteSubject::Workspace(
+                row.id.clone(),
+            ))
+            .unwrap();
         svc.enrich_workspace_aggregates_with_unread(
             row,
             Some(unread.contains(row.id.as_str())),
@@ -46099,7 +46104,7 @@ mod bulk_delete_pool_pressure {
         let trash = cleanup_workspace_worktree_locked(&repo, &worktree, "b54b/x", true);
         drop(guard);
 
-        assert!(trash.is_none(), "nothing to detach");
+        assert!(trash.0.is_none(), "nothing to detach");
         let loud = capture.at_or_above(tracing::Level::WARN);
         assert!(
             loud.is_empty(),
@@ -46151,7 +46156,7 @@ mod bulk_delete_pool_pressure {
         let trash = cleanup_workspace_worktree_locked(&repo, &worktree, "b54b/x", true);
         drop(guard);
 
-        assert!(trash.is_none(), "nothing detached");
+        assert!(trash.0.is_none(), "nothing detached");
         let loud = capture.at_or_above(tracing::Level::WARN);
         assert!(
             loud.iter()

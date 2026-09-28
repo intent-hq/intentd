@@ -15,6 +15,8 @@ use crate::{Error, Result, Store};
 
 pub(crate) mod initialization;
 pub use initialization::{
+    RepositoryAcpCompatibilityEffect, RepositoryAcpCompatibilityOutcome,
+    RepositoryAcpCompatibilityPersistence, RepositoryAcpCompatibilityResult,
     RepositoryAcpInitialization, RepositoryInitializationBinding, RepositoryInitializationClaim,
     RepositoryInitializationConfirmation, RepositoryInitializationObservation,
     RepositoryInitializationOutcome, RepositoryInitializationPersistence,

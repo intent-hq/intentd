@@ -671,12 +671,12 @@ async fn agent_retirement_pending_delete_and_replacement_stop_the_original_reque
         with_repository_source(&services,original,"agent-lifetime".into(),vec![NativeReviewStage::Commit],input(&f),RepositoryRetirement::default(), |admission| async move {
             match change {
                 0=>{ f.store.set_agent_session_retired_at(&f.workspace.id,&id,Some("2026-09-27T01:00:00Z"),"2026-09-27T01:00:00Z").await.unwrap(); }
-                1=>{ services_ref.pending_agent_deletes.schedule(id.to_string(),"2026-09-27T01:00:00Z".into(), |_|tokio::spawn(async {})); }
+                1=>{ services_ref.pending_agent_deletes.schedule_owned(crate::delete_grace::PendingDeleteSubject::Agent { workspace_id: f.workspace.id.clone(), agent_id: id.clone() }, 60_000, |_| async {}).await.unwrap(); }
                 2=>{ sqlx::query("UPDATE agent_session SET acp_session_id = 'replacement' WHERE id = ?").bind(id.as_str()).execute(f.store.write_pool()).await.unwrap(); }
                 _=>{ sqlx::query("UPDATE agent_session SET status = 'deleted' WHERE id = ?").bind(id.as_str()).execute(f.store.write_pool()).await.unwrap(); }
             }
             assert!(matches!(revalidate_repository_stage(&admission,NativeReviewStage::Commit).await,Err(AdmissionError::Denied | AdmissionError::Retired)));
-            services_ref.pending_agent_deletes.cancel(id.as_str());
+            services_ref.pending_agent_deletes.cancel_owned(&crate::delete_grace::PendingDeleteSubject::Agent { workspace_id: f.workspace.id.clone(), agent_id: id.clone() }).await.unwrap();
             // A denial already observed by this source is permanent, even if a
             // later restore returns the same row values. Unobserved ABA still
             // requires the explicit owner retirement hook before mutation.
@@ -730,11 +730,17 @@ async fn assert_observed_root_denial_is_permanent(pending_delete: bool) {
                 .await
                 .unwrap();
             if pending_delete {
-                service.pending_workspace_deletes.schedule(
-                    fixture.workspace.id.to_string(),
-                    "2026-09-27T01:00:00Z".into(),
-                    |_| tokio::spawn(async {}),
-                );
+                service
+                    .pending_workspace_deletes
+                    .schedule_owned(
+                        crate::delete_grace::PendingDeleteSubject::Workspace(
+                            fixture.workspace.id.clone(),
+                        ),
+                        60_000,
+                        |_| async {},
+                    )
+                    .await
+                    .unwrap();
             } else {
                 fixture
                     .store
@@ -749,7 +755,11 @@ async fn assert_observed_root_denial_is_permanent(pending_delete: bool) {
             if pending_delete {
                 assert!(service
                     .pending_workspace_deletes
-                    .cancel(fixture.workspace.id.as_str()));
+                    .cancel_owned(&crate::delete_grace::PendingDeleteSubject::Workspace(
+                        fixture.workspace.id.clone()
+                    ))
+                    .await
+                    .unwrap());
             } else {
                 assert!(fixture
                     .store

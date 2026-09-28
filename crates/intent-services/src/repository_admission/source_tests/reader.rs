@@ -482,11 +482,18 @@ async fn actual_observed_denial_then_restore_never_revives_original_reader_autho
                             .unwrap();
                     }
                     1 => {
-                        f.auth.service.pending_workspace_deletes.schedule(
-                            f.git.workspace.id.to_string(),
-                            "2026-09-27T21:00:00Z".into(),
-                            |_| tokio::spawn(async {}),
-                        );
+                        f.auth
+                            .service
+                            .pending_workspace_deletes
+                            .schedule_owned(
+                                crate::delete_grace::PendingDeleteSubject::Workspace(
+                                    f.git.workspace.id.clone(),
+                                ),
+                                60_000,
+                                |_| async {},
+                            )
+                            .await
+                            .unwrap();
                     }
                     _ => {
                         f.git.git(&f.git.path, &["checkout", "--detach", "main"]);
@@ -509,7 +516,11 @@ async fn actual_observed_denial_then_restore_never_revives_original_reader_autho
                         f.auth
                             .service
                             .pending_workspace_deletes
-                            .cancel(f.git.workspace.id.as_str());
+                            .cancel_owned(&crate::delete_grace::PendingDeleteSubject::Workspace(
+                                f.git.workspace.id.clone(),
+                            ))
+                            .await
+                            .unwrap();
                     }
                     _ => {
                         f.git.git(&f.git.path, &["checkout", "main"]);

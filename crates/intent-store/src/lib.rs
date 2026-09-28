@@ -60,6 +60,8 @@ mod workspace_repo;
 mod workspace_ui_context_repo;
 
 pub use repository_lifecycle::{
+    RepositoryAcpCompatibilityEffect, RepositoryAcpCompatibilityOutcome,
+    RepositoryAcpCompatibilityPersistence, RepositoryAcpCompatibilityResult,
     RepositoryAcpInitialization, RepositoryInitializationBinding, RepositoryInitializationClaim,
     RepositoryInitializationConfirmation, RepositoryInitializationObservation,
     RepositoryInitializationOutcome, RepositoryInitializationPersistence,

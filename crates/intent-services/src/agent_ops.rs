@@ -3255,7 +3255,10 @@ impl Services {
         };
         // Delete grace window (§5.5): overlay the pending-deletion deadline
         // from the in-memory registry (O(1) map lookup, never persisted).
-        let pending_delete_at = self.pending_agent_deletes.deadline(session.id.0.as_str());
+        let pending_delete_at = self.pending_agent_deletes.deadline(&crate::delete_grace::PendingDeleteSubject::Agent { workspace_id: session.workspace_id.clone(), agent_id: session.id.clone() }).unwrap_or_else(|error| {
+            tracing::warn!(%error, agent = %session.id, "pending delete display projection unavailable");
+            None
+        });
         let mut lite = project(session);
         lite.is_responding = is_responding;
         lite.is_waiting_on_tool = is_waiting_on_tool;
@@ -4984,6 +4987,20 @@ impl Services {
         agent_id: AgentId,
         workspace_id: Option<WorkspaceId>,
     ) -> Result<Value> {
+        self.agent_delete_with_claim(agent_id, workspace_id, None)
+            .await
+    }
+
+    async fn agent_delete_with_claim(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+        original_claim: Option<crate::delete_grace::PendingDeleteClaim>,
+    ) -> Result<Value> {
+        #[cfg(all(test, unix))]
+        let _completion = self
+            .pending_delete_test_gate
+            .observe_completion(&agent_id.0);
         // Capture the workspace (and name, for the event's `agentName`
         // enrichment — intent-hq/monorepo#2869) before deleting so the
         // post-delete agent:deleted emit can be workspace-scoped. If the
@@ -4991,10 +5008,9 @@ impl Services {
         // failing the idempotent delete. When the caller declares a
         // workspace, reject a cross-workspace bare-id probe by mapping to
         // `NotFound` before touching the store.
-        let session_meta = self
-            .store
-            .get_agent_session(&agent_id)
-            .await
+        let session_observation = self.store.get_agent_session(&agent_id).await;
+        let mut known_completion = matches!(&session_observation, Ok(_) | Err(Error::NotFound(_)));
+        let session_meta = session_observation
             .ok()
             .map(|s| (s.workspace_id, s.name, s.parent_agent_id));
         let session_workspace_id = session_meta.as_ref().map(|(ws, _, _)| ws.clone());
@@ -5004,19 +5020,52 @@ impl Services {
                 return Err(Error::NotFound(format!("agent session {agent_id}")));
             }
         }
-        // Immediate-delete-while-pending (§5.5): an immediate delete
-        // supersedes a running grace window — drop the pending entry and
-        // abort its timer, then commit now. The timer-fired commit path has
-        // already claimed (removed) its entry before calling here, so this
-        // is a no-op for it.
-        self.pending_agent_deletes.cancel(agent_id.0.as_str());
+        let claim = match original_claim {
+            Some(claim) => {
+                match claim.subject() {
+                    crate::delete_grace::PendingDeleteSubject::Agent {
+                        agent_id: original_id,
+                        workspace_id: original_ws,
+                    } if original_id == &agent_id
+                        && workspace_id.as_ref() == Some(original_ws)
+                        && session_workspace_id
+                            .as_ref()
+                            .is_none_or(|ws| ws == original_ws) => {}
+                    _ => {
+                        return Err(Error::InvalidParams(
+                            "different original deletion subject".into(),
+                        ))
+                    }
+                }
+                Some(claim)
+            }
+            None => match session_workspace_id.as_ref() {
+                Some(ws) => Some(
+                    self.pending_agent_deletes
+                        .take_for_immediate_delete(
+                            crate::delete_grace::PendingDeleteSubject::Agent {
+                                workspace_id: ws.clone(),
+                                agent_id: agent_id.clone(),
+                            },
+                        )
+                        .await?,
+                ),
+                None => None,
+            },
+        };
+        #[cfg(all(test, unix))]
+        self.pending_delete_test_gate
+            .pause("agent-sql", &agent_id.0)
+            .await;
         // Route the DELETE through the workspace guard so a stale-caller with the
         // wrong workspace cannot mutate the row even if the pre-check above races
         // with a concurrent workspace move.
         if let Some(session_ws) = session_workspace_id.as_ref() {
-            self.store
+            let deleted = self
+                .store
                 .delete_agent_session(session_ws, &agent_id)
                 .await?;
+            known_completion &= deleted;
             self.invalidate_agent_list_cache(session_ws);
         }
         self.agent_queues
@@ -5091,6 +5140,11 @@ impl Services {
             // the no-op when nothing derived from this session.
             self.maybe_emit_display_status_changed(&workspace_id).await;
         }
+        if known_completion {
+            if let Some(claim) = claim {
+                claim.settle_confirmed();
+            }
+        }
         Ok(json!({ "success": true }))
     }
 
@@ -5121,47 +5175,21 @@ impl Services {
                 return Err(Error::NotFound(format!("agent session {agent_id}")));
             }
         }
-        let delay_ms = crate::delete_grace::clamp_undo_delay_ms(undo_delay_ms);
-        let delete_at = intent_core::iso_ms_from_now(delay_ms);
-        let key = agent_id.0.clone();
         let timer_services = self.clone();
         let timer_id = agent_id.clone();
         let timer_ws = session_ws.clone();
-        // Idempotent re-schedule (§5.5): the registry arms the timer only
-        // when nothing is pending for this key — the check runs under the
-        // registry lock, so concurrent schedules converge on one deadline
-        // and only the arming call emits `agent:delete-scheduled`.
-        if let Some(existing) =
-            self.pending_agent_deletes
-                .schedule(key, delete_at.clone(), move |generation| {
-                    intent_core::spawn_daemon(async move {
-                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                        // Claim-or-abstain: only the timer that still owns the
-                        // entry commits. A cancel or an immediate delete that
-                        // raced ahead removed/superseded the entry — do nothing.
-                        if !timer_services
-                            .pending_agent_deletes
-                            .claim(timer_id.0.as_str(), generation)
-                        {
-                            return;
-                        }
-                        // Commit via the existing immediate-delete cascade (same
-                        // events). Best-effort: the caller is long gone, so a
-                        // failure is logged, not surfaced.
-                        if let Err(e) = timer_services
-                            .agent_delete_op(timer_id.clone(), Some(timer_ws))
-                            .await
-                        {
-                            tracing::warn!(
-                                agent = %timer_id.0,
-                                error = %e,
-                                "scheduled agent delete failed at commit"
-                            );
-                        }
-                    })
-                })
-        {
-            return Ok(existing);
+        let scheduled = self.pending_agent_deletes.schedule_owned(
+            crate::delete_grace::PendingDeleteSubject::Agent { workspace_id: session_ws.clone(), agent_id: agent_id.clone() },
+            undo_delay_ms,
+            move |claim| intent_core::with_caller(intent_core::Caller::Daemon, async move {
+                if let Err(e) = timer_services.agent_delete_with_claim(timer_id.clone(), Some(timer_ws), Some(claim)).await {
+                    tracing::warn!(agent = %timer_id.0, error = %e, "scheduled agent delete failed at commit");
+                }
+            }),
+        ).await?;
+        let delete_at = scheduled.delete_at;
+        if !scheduled.newly_armed {
+            return Ok(delete_at);
         }
         crate::publish_event(
             self.event_bus.as_ref(),
@@ -5196,7 +5224,13 @@ impl Services {
                 return Err(Error::NotFound(format!("agent session {agent_id}")));
             }
         }
-        let cancelled = self.pending_agent_deletes.cancel(agent_id.0.as_str());
+        let cancelled = self
+            .pending_agent_deletes
+            .cancel_owned(&crate::delete_grace::PendingDeleteSubject::Agent {
+                workspace_id: session_ws.clone(),
+                agent_id: agent_id.clone(),
+            })
+            .await?;
         if cancelled {
             crate::publish_event(
                 self.event_bus.as_ref(),
@@ -5212,10 +5246,24 @@ impl Services {
     /// cascade (immediate or committed-from-pending), which supersedes them —
     /// every session is deleted right after, emitting `agent:deleted` per
     /// session (§5.5 cascade interaction).
-    pub(crate) fn abort_pending_agent_deletes(&self, sessions: &[AgentSession]) {
+    pub(crate) async fn take_pending_agent_deletes(
+        &self,
+        sessions: &[AgentSession],
+    ) -> Result<Vec<crate::delete_grace::PendingDeleteClaim>> {
+        let mut claims = Vec::new();
         for session in sessions {
-            self.pending_agent_deletes.cancel(session.id.0.as_str());
+            if let Some(claim) = self
+                .pending_agent_deletes
+                .take_for_cascade(&crate::delete_grace::PendingDeleteSubject::Agent {
+                    workspace_id: session.workspace_id.clone(),
+                    agent_id: session.id.clone(),
+                })
+                .await?
+            {
+                claims.push(claim);
+            }
         }
+        Ok(claims)
     }
 
     /// Soft retire (`ws.agent.retire`): set `retired_at` on the session,
@@ -5531,7 +5579,12 @@ impl Services {
         session.session_corrupted = self.session_poisoned(&session);
         // Delete grace window (§5.5): overlay the pending-deletion deadline
         // from the in-memory registry (O(1) map lookup, never persisted).
-        session.pending_delete_at = self.pending_agent_deletes.deadline(agent_id.0.as_str());
+        session.pending_delete_at = self.pending_agent_deletes.deadline(
+            &crate::delete_grace::PendingDeleteSubject::Agent {
+                workspace_id: session.workspace_id.clone(),
+                agent_id: agent_id.clone(),
+            },
+        )?;
         // Legacy rows (pre-0096): project the current effective agentFeatures
         // on read (never persisted); see `project_lite_with_flags_inner`.
         if session.harness_features.is_none() {

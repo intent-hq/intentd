@@ -223,6 +223,14 @@ pub(crate) struct RepositoryRetirement {
 }
 
 impl RepositoryRetirement {
+    #[cfg(test)]
+    pub(crate) fn with_deletion_test_dispatch<T>(
+        &self,
+        action: impl FnOnce() -> AdmissionResult<T>,
+    ) -> AdmissionResult<T> {
+        self.dispatch(action)
+    }
+
     /// A lock session may end without ending its retained request. Dispatch
     /// still consumes every original ancestor fence before this local leaf.
     pub(super) fn source_child(&self) -> Self {
