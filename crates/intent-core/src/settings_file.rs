@@ -138,6 +138,10 @@ pub struct QuickActionsSettings {
     /// `quickActions.typeOverrides` — per-quick-action model overrides
     /// (`commit`, `pr`, `review`, `fast`).
     pub type_overrides: BTreeMap<String, String>,
+    /// Shared effort for quick actions; blank means provider default.
+    pub default_reasoning_effort: Option<String>,
+    /// Per-action effort, independent of the per-action model override.
+    pub type_reasoning_effort_overrides: BTreeMap<String, String>,
     /// `quickActions.providerSettings` — per-provider quick-action settings
     /// (opaque FE-owned bags; validated structurally as a table only).
     pub provider_settings: toml::Table,
@@ -1660,6 +1664,10 @@ providerDefaults = {}
 # defaultModel = "claude-sonnet-4-5"
 # Quick action type overrides -- per-quick-action model overrides.
 typeOverrides = {}
+# Quick action effort -- provider-defined; blank means provider default.
+# defaultReasoningEffort = "high"
+# Per-action effort overrides; blank or absent inherits the shared effort.
+typeReasoningEffortOverrides = {}
 # Quick action provider settings -- per-provider quick-action settings.
 providerSettings = {}
 

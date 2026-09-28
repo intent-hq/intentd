@@ -2150,6 +2150,11 @@ async fn dispatch(
             }
             let system_prompt = opt_str(params, "systemPrompt");
             let model = opt_str(params, "model");
+            let reasoning_effort = match params.get("reasoningEffort") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(value)) => Some(value.clone()),
+                Some(_) => return Err(invalid_params("reasoningEffort must be a string or null")),
+            };
             // Optional quick-action `type` hint (`commit` / `pr` / `review` /
             // `fast`): keys `quickActions.typeOverrides` in the daemon-side
             // resolution the op applies when no explicit `model` is sent
@@ -2173,6 +2178,7 @@ async fn dispatch(
                     quick_action_type,
                     ws,
                     timeout_ms,
+                    reasoning_effort,
                 )
                 .await
                 .map_err(domain_to_rpc)?;

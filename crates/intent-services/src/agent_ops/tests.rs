@@ -46156,6 +46156,7 @@ async fn wire_agent_complete_once_rejects_compound_model() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect_err("compound model must reject");

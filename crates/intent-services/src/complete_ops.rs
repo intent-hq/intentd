@@ -35,7 +35,7 @@ use crate::enhance_ops::{
     clean_agent_message, run_auggie_print, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS,
 };
 use crate::file_ops;
-use crate::one_shot_acp::{run_one_shot_acp, OneShotCommand, OneShotError};
+use crate::one_shot_acp::{run_one_shot_acp, OneShotCommand, OneShotEffort, OneShotError};
 use crate::Services;
 
 /// Providers served by the ephemeral ACP one-shot runner. Every other
@@ -120,6 +120,33 @@ pub(crate) fn one_shot_session_shape(
         }
     });
     (prompt.to_string(), Some(meta))
+}
+
+/// Effort is independent of model selection, and saved choices belong only
+/// to the active provider. Never filter these against cached capabilities.
+fn resolve_quick_action_effort(
+    settings: &intent_core::settings_file::SettingsFile,
+    quick_action_type: Option<&str>,
+    effective_provider: Option<&str>,
+    run_provider: &str,
+    explicit: Option<&str>,
+) -> OneShotEffort {
+    let nonblank = |s: &str| (!s.trim().is_empty()).then(|| s.trim().to_owned());
+    let explicit = explicit.and_then(nonblank);
+    let mut saved = Vec::new();
+    if effective_provider == Some(run_provider) {
+        let quick = &settings.quick_actions;
+        if let Some(value) = quick_action_type
+            .and_then(|t| quick.type_reasoning_effort_overrides.get(t))
+            .and_then(|v| nonblank(v))
+        {
+            saved.push(value);
+        }
+        if let Some(value) = quick.default_reasoning_effort.as_deref().and_then(nonblank) {
+            saved.push(value);
+        }
+    }
+    OneShotEffort { explicit, saved }
 }
 
 /// Resolve the quick-action model for a one-shot completion the caller sent no
@@ -388,6 +415,7 @@ impl Services {
     /// caller's optional `type` hint keying the override map. The chain
     /// resolves to a `(provider, model)` pair, so a legacy compound value
     /// naming another registered provider routes the one-shot there.
+    #[expect(clippy::too_many_arguments)]
     pub(crate) async fn agent_complete_once_op(
         &self,
         prompt: String,
@@ -396,6 +424,7 @@ impl Services {
         quick_action_type: Option<String>,
         workspace_id: Option<WorkspaceId>,
         timeout_ms: Option<u64>,
+        reasoning_effort: Option<String>,
     ) -> Result<Value> {
         let settings = self.effective_settings();
         let effective_provider = crate::agent_session::derived_default_provider(&settings);
@@ -407,7 +436,7 @@ impl Services {
         // the chain can still resolve when the default provider is unset;
         // the gate closes only when neither yields a provider.
         let (run_provider, model) = match model.filter(|m| !m.trim().is_empty()) {
-            Some(m) => match effective_provider {
+            Some(m) => match effective_provider.clone() {
                 Some(p) => (p, Some(m)),
                 None => {
                     return Ok(unavailable(
@@ -429,6 +458,14 @@ impl Services {
                 }
             },
         };
+
+        let effort = resolve_quick_action_effort(
+            &settings,
+            quick_action_type.as_deref(),
+            effective_provider.as_deref(),
+            &run_provider,
+            reasoning_effort.as_deref(),
+        );
 
         // Optional cwd pin: unknown workspace surfaces as -32602 (NotFound);
         // a workspace without a filesystem root just runs without a cwd
@@ -459,8 +496,17 @@ impl Services {
                     model.as_deref(),
                     cwd,
                     timeout,
+                    &effort,
                 )
                 .await;
+        }
+        if let Some(requested) = effort.explicit.as_deref() {
+            return Err(Error::InvalidParams(format!(
+                "reasoningEffort {requested:?} is not supported by the auggie print path"
+            )));
+        }
+        if !effort.saved.is_empty() {
+            tracing::warn!("saved quick-action effort is unsupported by the auggie print path; using provider default");
         }
         let full_prompt = compose_prompt(&prompt, system_prompt);
 
@@ -516,6 +562,7 @@ impl Services {
     /// return `{ available: false, reason }`; a resolved adapter that then
     /// fails the turn surfaces as an error, matching the auggie route's
     /// spawn/exit failures.
+    #[expect(clippy::too_many_arguments)]
     async fn complete_once_via_acp(
         &self,
         provider_id: &str,
@@ -524,6 +571,7 @@ impl Services {
         model: Option<&str>,
         cwd: Option<PathBuf>,
         timeout_ms: u64,
+        effort: &OneShotEffort,
     ) -> Result<Value> {
         if !ACP_ONE_SHOT_PROVIDERS.contains(&provider_id) {
             return Ok(unavailable(format!(
@@ -587,6 +635,7 @@ impl Services {
             config_option_model(provider, model),
             session_meta,
             Duration::from_millis(timeout_ms),
+            effort,
         )
         .await
         {
@@ -600,6 +649,7 @@ impl Services {
                 waited_ms,
                 limit,
             }),
+            Err(OneShotError::InvalidEffort(message)) => Err(Error::InvalidParams(message)),
             Err(err) => Err(Error::Internal(format!("{provider_id}: {err}"))),
         }
     }
@@ -666,7 +716,7 @@ mod tests {
         let (_tmp, services) =
             services_with_bin(PathBuf::from("/nonexistent/intentd-test/auggie")).await;
         let err = services
-            .agent_complete_once_op("hi".into(), None, None, None, None, None)
+            .agent_complete_once_op("hi".into(), None, None, None, None, None, None)
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Internal(_)), "got {err:?}");
@@ -685,7 +735,7 @@ mod tests {
         let services =
             Services::new(store).with_auggie_bin(PathBuf::from("/nonexistent/intentd-test/auggie"));
         let v = services
-            .agent_complete_once_op("hi".into(), None, None, None, None, None)
+            .agent_complete_once_op("hi".into(), None, None, None, None, None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -778,7 +828,7 @@ rl.on('line', (line) => {{
         .await;
         let v = services
             .with_one_shot_npx(Some(bin))
-            .agent_complete_once_op("make a slug".into(), None, None, None, None, None)
+            .agent_complete_once_op("make a slug".into(), None, None, None, None, None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -860,6 +910,7 @@ rl.on('line', (line) => {
             .agent_complete_once_op(
                 "summarize".into(),
                 system_prompt.map(str::to_string),
+                None,
                 None,
                 None,
                 None,
@@ -963,7 +1014,7 @@ rl.on('line', (line) => {
             services_with_settings(&[("model.defaultProvider", serde_json::json!("opencode"))])
                 .await;
         let v = services
-            .agent_complete_once_op("hi".into(), None, None, None, None, None)
+            .agent_complete_once_op("hi".into(), None, None, None, None, None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -989,7 +1040,7 @@ rl.on('line', (line) => {
                 .await;
         let services = services.with_one_shot_npx(None);
         let v = services
-            .agent_complete_once_op("hi".into(), None, None, None, None, None)
+            .agent_complete_once_op("hi".into(), None, None, None, None, None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -1055,7 +1106,7 @@ rl.on('line', (line) => {
         .await;
         let v = services
             .with_one_shot_npx(Some(bin))
-            .agent_complete_once_op("echo home".into(), None, None, None, None, None)
+            .agent_complete_once_op("echo home".into(), None, None, None, None, None, None)
             .await
             .unwrap();
         let child_env: serde_json::Value =
@@ -1153,6 +1204,7 @@ rl.on('line', (line) => {
                     config_option_model(codex, model),
                     None,
                     Duration::from_secs(5),
+                    &OneShotEffort::default(),
                 )
                 .await
                 .unwrap();
@@ -1191,7 +1243,7 @@ rl.on('line', (line) => {
         .await;
         let result = services
             .with_one_shot_npx(None)
-            .agent_complete_once_op("hello".into(), None, None, None, None, None)
+            .agent_complete_once_op("hello".into(), None, None, None, None, None, None)
             .await
             .unwrap();
         assert_eq!(result["available"], false);
@@ -1344,7 +1396,7 @@ rl.on('line', (line) => {
         let (_bin_dir, bin) = fake_auggie("ok", "printf '🤖\\nslug-goes-here\\n'");
         let (_tmp, services) = services_with_bin(bin).await;
         let v = services
-            .agent_complete_once_op("make a slug".into(), None, None, None, None, None)
+            .agent_complete_once_op("make a slug".into(), None, None, None, None, None, None)
             .await
             .unwrap();
         assert_eq!(v["text"], "slug-goes-here");
@@ -1356,7 +1408,7 @@ rl.on('line', (line) => {
         let (_bin_dir, bin) = fake_auggie("slow", "sleep 30");
         let (_tmp, services) = services_with_bin(bin).await;
         let err = services
-            .agent_complete_once_op("hi".into(), None, None, None, None, Some(200))
+            .agent_complete_once_op("hi".into(), None, None, None, None, Some(200), None)
             .await
             .unwrap_err();
         assert!(
@@ -1378,7 +1430,7 @@ rl.on('line', (line) => {
         let (_bin_dir, bin) = fake_auggie("fail", "exit 3");
         let (_tmp, services) = services_with_bin(bin).await;
         let err = services
-            .agent_complete_once_op("hi".into(), None, None, None, None, None)
+            .agent_complete_once_op("hi".into(), None, None, None, None, None, None)
             .await
             .unwrap_err();
         assert!(
@@ -1415,7 +1467,7 @@ rl.on('line', (line) => {
             .expect("set setting");
         let services = Services::new(store.clone()).with_settings_registry(registry.clone());
         let result = services
-            .agent_complete_once_op("test".into(), None, None, None, None, None)
+            .agent_complete_once_op("test".into(), None, None, None, None, None, None)
             .await
             .unwrap();
         assert_eq!(result["text"], "from-setting");
@@ -1429,7 +1481,7 @@ rl.on('line', (line) => {
             .expect("set setting");
         let services = Services::new(store.clone()).with_settings_registry(registry.clone());
         let err = services
-            .agent_complete_once_op("test".into(), None, None, None, None, None)
+            .agent_complete_once_op("test".into(), None, None, None, None, None, None)
             .await
             .unwrap_err();
         assert!(
@@ -1454,6 +1506,7 @@ rl.on('line', (line) => {
                 None,
                 Some(WorkspaceId::from("ws-missing")),
                 None,
+                None,
             )
             .await
             .unwrap_err();
@@ -1475,6 +1528,7 @@ rl.on('line', (line) => {
             .agent_complete_once_op(
                 "why?".into(),
                 Some("be terse".into()),
+                None,
                 None,
                 None,
                 None,
@@ -1811,7 +1865,15 @@ rl.on('line', (line) => {
         let services = services.with_settings_registry(std::sync::Arc::new(registry));
 
         let v = services
-            .agent_complete_once_op("hi".into(), None, None, Some("commit".into()), None, None)
+            .agent_complete_once_op(
+                "hi".into(),
+                None,
+                None,
+                Some("commit".into()),
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert!(
@@ -1820,7 +1882,7 @@ rl.on('line', (line) => {
         );
 
         let v = services
-            .agent_complete_once_op("hi".into(), None, None, Some("pr".into()), None, None)
+            .agent_complete_once_op("hi".into(), None, None, Some("pr".into()), None, None, None)
             .await
             .unwrap();
         assert!(
@@ -1835,6 +1897,7 @@ rl.on('line', (line) => {
                 None,
                 Some("opus4.7".into()),
                 Some("commit".into()),
+                None,
                 None,
                 None,
             )
@@ -1871,12 +1934,222 @@ rl.on('line', (line) => {
         let services = services.with_settings_registry(std::sync::Arc::new(registry));
 
         let v = services
-            .agent_complete_once_op("hi".into(), None, None, Some("commit".into()), None, None)
+            .agent_complete_once_op(
+                "hi".into(),
+                None,
+                None,
+                Some("commit".into()),
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert!(
             !v["text"].as_str().unwrap().contains("--model"),
             "providerSettings must not resolve a model, got {v:?}"
         );
+    }
+    #[test]
+    fn quick_action_effort_resolution_preserves_candidates_and_provider_isolation() {
+        let mut settings = intent_core::settings_file::SettingsFile::default();
+        settings.model.default_reasoning_effort = Some("ordinary-agent-only".into());
+        assert!(
+            resolve_quick_action_effort(&settings, None, Some("codex"), "codex", None)
+                .saved
+                .is_empty()
+        );
+        settings.quick_actions.default_reasoning_effort = Some(" low ".into());
+        settings
+            .quick_actions
+            .type_reasoning_effort_overrides
+            .insert("commit".into(), " high ".into());
+        for explicit in [None, Some(""), Some(" "), Some("max")] {
+            let resolved = resolve_quick_action_effort(
+                &settings,
+                Some("commit"),
+                Some("codex"),
+                "codex",
+                explicit,
+            );
+            assert_eq!(resolved.saved, ["high", "low"]);
+            assert_eq!(
+                resolved.explicit.as_deref(),
+                explicit.filter(|s| !s.trim().is_empty())
+            );
+        }
+        let other = resolve_quick_action_effort(
+            &settings,
+            Some("commit"),
+            Some("codex"),
+            "claude-code",
+            Some("high"),
+        );
+        assert!(other.saved.is_empty());
+        assert_eq!(other.explicit.as_deref(), Some("high"));
+        assert_eq!(
+            resolve_quick_action_effort(&settings, None, Some("codex"), "codex", None).saved,
+            ["low"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quick_action_effort_reaches_provider_with_explicit_model_and_cold_catalog() {
+        let (_dir, bin, _) = crate::test_support::quick_action_effort_adapter(&json!({}));
+        let (_tmp, svc) = services_with_settings(&[
+            ("model.defaultProvider", json!("claude-code")),
+            ("providers.paths", json!({"claude-code":bin})),
+            ("quickActions.defaultReasoningEffort", json!("low")),
+            (
+                "quickActions.typeReasoningEffortOverrides",
+                json!({"commit":"high", "pr":"stale", "fast":""}),
+            ),
+            ("model.defaultReasoningEffort", json!("ordinary-agent-only")),
+        ])
+        .await;
+        for (kind, explicit, expected) in [
+            (Some("commit"), None, "high"),
+            (Some("pr"), None, "low"),
+            (Some("fast"), None, "low"),
+            (None, None, "low"),
+            (Some("commit"), Some("low"), "low"),
+            (Some("commit"), Some("  "), "high"),
+        ] {
+            let result = svc
+                .agent_complete_once_op(
+                    "hello".into(),
+                    None,
+                    Some("chosen".into()),
+                    kind.map(str::to_owned),
+                    None,
+                    None,
+                    explicit.map(str::to_owned),
+                )
+                .await
+                .unwrap();
+            let reply: Value = serde_json::from_str(result["text"].as_str().unwrap()).unwrap();
+            assert_eq!(reply, json!({"model":"chosen", "effort":expected}));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quick_action_effort_auggie_explicit_rejects_and_saved_does_not_add_flags() {
+        let (_dir, bin) = fake_auggie_echoing_args("effort");
+        let (_tmp, svc) = services_with_bin(bin).await;
+        let error = svc
+            .agent_complete_once_op(
+                "hi".into(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("high".into()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), -32602);
+        svc.settings_registry
+            .as_ref()
+            .unwrap()
+            .apply(&[("quickActions.defaultReasoningEffort".into(), json!("high"))])
+            .unwrap();
+        let reply = svc
+            .agent_complete_once_op("hi".into(), None, None, None, None, None, None)
+            .await
+            .unwrap();
+        assert!(!reply["text"].as_str().unwrap().contains("effort"));
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quick_action_effort_live_selector_overrules_nonempty_cached_levels() {
+        for (cached, live, expected) in [("low", "high", "high"), ("high", "low", "low")] {
+            let (_dir, bin, _) =
+                crate::test_support::quick_action_effort_adapter(&json!({"modelValues":[live]}));
+            let (_tmp, svc) = services_with_settings(&[
+                ("model.defaultProvider", json!("claude-code")),
+                ("providers.paths", json!({"claude-code":bin})),
+                ("quickActions.defaultModel", json!("chosen")),
+                ("quickActions.defaultReasoningEffort", json!("low")),
+                (
+                    "quickActions.typeReasoningEffortOverrides",
+                    json!({"commit":"high"}),
+                ),
+            ])
+            .await;
+            let version = (crate::model_catalog::source_for("claude-code")
+                .unwrap()
+                .version_key)();
+            svc.models_catalog.store_for_test(
+                "claude-code",
+                &version,
+                vec![json!({
+                    "id":"chosen", "provider":"claude-code", "effortLevels":[cached]
+                })],
+            );
+            assert_eq!(
+                svc.cached_models().cached_effort_levels("chosen"),
+                Some(vec![cached.to_owned()])
+            );
+            let reply = svc
+                .agent_complete_once_op(
+                    "hi".into(),
+                    None,
+                    None,
+                    Some("commit".into()),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            let text: Value = serde_json::from_str(reply["text"].as_str().unwrap()).unwrap();
+            assert_eq!(text["effort"], expected);
+            let explicit = svc
+                .agent_complete_once_op(
+                    "hi".into(),
+                    None,
+                    None,
+                    Some("commit".into()),
+                    None,
+                    None,
+                    Some("high".into()),
+                )
+                .await;
+            if live == "high" {
+                assert!(explicit.is_ok());
+            } else {
+                assert_eq!(explicit.unwrap_err().code(), -32602);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quick_action_effort_legacy_compound_model_does_not_leak_provider_defaults() {
+        let (_dir, bin, _) = crate::test_support::quick_action_effort_adapter(&json!({}));
+        let (tmp, svc) =
+            services_with_settings(&[("providers.paths", json!({"claude-code":bin}))]).await;
+        let config = tmp.dir.path().join("legacy.toml");
+        std::fs::write(&config, format!("[model]\ndefaultProvider = \"codex\"\n[quickActions]\ndefaultModel = \"claude-code:chosen\"\ndefaultReasoningEffort = \"low\"\n[quickActions.typeReasoningEffortOverrides]\ncommit = \"high\"\n[providers.paths]\nclaude-code = {bin:?}\n")).unwrap();
+        let svc = svc.with_settings_registry(std::sync::Arc::new(
+            crate::SettingsRegistry::load(config).unwrap(),
+        ));
+        let reply = svc
+            .agent_complete_once_op(
+                "hi".into(),
+                None,
+                None,
+                Some("commit".into()),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let text: Value = serde_json::from_str(reply["text"].as_str().unwrap()).unwrap();
+        assert_eq!(text, json!({"model":"chosen", "effort":"medium"}));
     }
 }

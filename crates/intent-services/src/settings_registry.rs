@@ -54,6 +54,8 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "model.defaultReasoningEffort",
     "quickActions.defaultModel",
     "quickActions.typeOverrides",
+    "quickActions.defaultReasoningEffort",
+    "quickActions.typeReasoningEffortOverrides",
     "quickActions.providerSettings",
     "specialists.default",
     "specialists.dir",
@@ -1205,6 +1207,65 @@ mod tests {
             assert!(err.to_string().contains(invalid_path), "{err}");
             assert_apply_unchanged(&reg, &snapshot, seed, 0, None, &rx);
         }
+    }
+
+    #[test]
+    fn quick_action_effort_round_trips_and_resets_independently() {
+        let (_dir, path) = temp_config(Some("[quickActions]\ndefaultModel = \"existing\"\n"));
+        let reg = SettingsRegistry::load(&path).unwrap();
+        assert_eq!(
+            reg.get("quickActions.defaultReasoningEffort"),
+            Some(Value::Null)
+        );
+        assert_eq!(
+            reg.get("quickActions.typeReasoningEffortOverrides"),
+            Some(json!({}))
+        );
+        let snapshots = json!({"codex": {
+            "defaultReasoningEffort": "high",
+            "typeReasoningEffortOverrides": {"commit": "low"}
+        }, "claude-code": {"defaultModel": "old"}});
+        reg.apply(&[
+            ("quickActions.defaultReasoningEffort".into(), json!("high")),
+            (
+                "quickActions.typeReasoningEffortOverrides".into(),
+                json!({"commit": "low", "fast": ""}),
+            ),
+            ("quickActions.providerSettings".into(), snapshots.clone()),
+        ])
+        .unwrap();
+        let fresh = SettingsRegistry::load(&path).unwrap();
+        assert_eq!(
+            fresh.get("quickActions.defaultReasoningEffort"),
+            Some(json!("high"))
+        );
+        assert_eq!(
+            fresh.get("quickActions.typeReasoningEffortOverrides"),
+            Some(json!({"commit": "low", "fast": ""}))
+        );
+        assert_eq!(fresh.get("quickActions.providerSettings"), Some(snapshots));
+        fresh
+            .apply(&[
+                ("quickActions.defaultReasoningEffort".into(), Value::Null),
+                (
+                    "quickActions.typeReasoningEffortOverrides".into(),
+                    json!({}),
+                ),
+            ])
+            .unwrap();
+        let reset = SettingsRegistry::load(&path).unwrap();
+        assert_eq!(
+            reset.get("quickActions.defaultReasoningEffort"),
+            Some(Value::Null)
+        );
+        assert_eq!(
+            reset.get("quickActions.typeReasoningEffortOverrides"),
+            Some(json!({}))
+        );
+        assert_eq!(
+            reset.get("quickActions.defaultModel"),
+            Some(json!("existing"))
+        );
     }
 
     #[test]

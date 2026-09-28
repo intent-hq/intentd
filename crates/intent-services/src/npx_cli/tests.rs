@@ -141,7 +141,15 @@ async fn services(provider: &str) -> Services {
 
 async fn completion(services: &Services) -> intent_core::Result<Value> {
     services
-        .agent_complete_once("hello".to_string(), None, None, None, None, Some(5_000))
+        .agent_complete_once(
+            "hello".to_string(),
+            None,
+            None,
+            None,
+            None,
+            Some(5_000),
+            None,
+        )
         .await
 }
 

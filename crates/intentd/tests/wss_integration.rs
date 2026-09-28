@@ -22350,3 +22350,126 @@ async fn wss_cross_workspace_siblings_resolve_by_github_identity() {
 
     srv.ws.stop().await;
 }
+
+#[cfg(unix)]
+#[intent_test_macros::daemon_test]
+async fn wss_quick_action_effort_settings_and_execution_contract() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = test_tempdir("wss-quick-action-effort-");
+    let log = dir.path().join("requests.jsonl");
+    let behavior = dir.path().join("behavior.json");
+    std::fs::write(&behavior, "{}").unwrap();
+    let fixture = format!(
+        "{}/tests/fixtures/mock-quick-action-effort.mjs",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let bin = dir.path().join("claude-agent-acp");
+    std::fs::write(&bin, format!("#!/bin/sh\nMOCK_EFFORT_BEHAVIOR=\"$(cat {behavior:?})\" MOCK_EFFORT_LOG={log:?} exec node {fixture:?}\n")).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("model.defaultProvider", serde_json::json!("claude-code"));
+    srv.set_setting("providers.paths", serde_json::json!({"claude-code":bin}));
+    let changes = serde_json::json!([
+        {"path":"quickActions.defaultReasoningEffort","value":"low"},
+        {"path":"quickActions.typeReasoningEffortOverrides","value":{"commit":"high","pr":"stale"}},
+        {"path":"quickActions.providerSettings","value":{"claude-code":{"defaultReasoningEffort":"low","typeReasoningEffortOverrides":{"commit":"high"}}}}
+    ]);
+    let updated = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &serde_json::json!({
+            "jsonrpc":"2.0","id":1,"method":"settings.update","params":{"changes":changes}
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(updated["jsonrpc"], "2.0");
+    assert_eq!(updated["id"], 1);
+    assert!(updated.get("error").is_none(), "{updated}");
+    for change in changes.as_array().unwrap() {
+        let read = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            &serde_json::json!({
+                "jsonrpc":"2.0","id":2,"method":"settings.get","params":{"path":change["path"]}
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(read["result"]["value"], change["value"], "{read}");
+    }
+    // Explicit model does not bypass the independently resolved action effort.
+    for (kind, effort, expected) in [
+        ("commit", Value::Null, "high"),
+        ("commit", serde_json::json!(" "), "high"),
+        ("pr", Value::Null, "low"),
+        ("fast", Value::Null, "low"),
+        ("commit", serde_json::json!("low"), "low"),
+    ] {
+        std::fs::write(&log, "").unwrap();
+        let reply = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            &serde_json::json!({
+                "jsonrpc":"2.0","id":3,"method":"agent.completeOnce",
+                "params":{"prompt":"hi","model":"chosen","type":kind,"reasoningEffort":effort}
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(reply["id"], 3);
+        assert_eq!(reply["jsonrpc"], "2.0");
+        let text: Value =
+            serde_json::from_str(reply["result"]["text"].as_str().expect("completion text"))
+                .unwrap();
+        assert_eq!(
+            text,
+            serde_json::json!({"model":"chosen","effort":expected})
+        );
+        let requests: Vec<Value> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|r| r["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "initialize",
+                "session/new",
+                "session/set_config_option",
+                "session/set_config_option",
+                "session/prompt"
+            ]
+        );
+        assert_eq!(requests[3]["params"]["value"], expected);
+    }
+    for invalid in [
+        serde_json::json!(17),
+        serde_json::json!(true),
+        serde_json::json!([]),
+        serde_json::json!({}),
+        serde_json::json!("unsupported"),
+    ] {
+        std::fs::write(&log, "").unwrap();
+        let reply = wss_call(srv.port, srv.cfg.clone(), &serde_json::json!({
+            "jsonrpc":"2.0","id":4,"method":"agent.completeOnce","params":{"prompt":"hi","reasoningEffort":invalid}
+        }).to_string()).await;
+        assert_eq!(reply["jsonrpc"], "2.0");
+        assert_eq!(reply["id"], 4);
+        assert_eq!(reply["error"]["code"], -32602, "{reply}");
+        assert!(!std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("session/prompt"));
+    }
+    std::fs::write(&behavior, r#"{"rejectEffort":true}"#).unwrap();
+    std::fs::write(&log, "").unwrap();
+    let reply = wss_call(srv.port, srv.cfg.clone(), r#"{"jsonrpc":"2.0","id":5,"method":"agent.completeOnce","params":{"prompt":"hi","reasoningEffort":"high"}}"#).await;
+    assert_eq!(reply["error"]["code"], -32603, "{reply}");
+    assert!(!std::fs::read_to_string(&log)
+        .unwrap()
+        .contains("session/prompt"));
+    srv.ws.stop().await;
+}

@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::one_shot_acp::{run_one_shot_acp, OneShotError};
+use crate::one_shot_acp::{run_one_shot_acp, OneShotEffort, OneShotError};
 
 /// The literal prompt the probe sends. The answer is never surfaced — any
 /// successfully completed turn is a pass.
@@ -69,7 +69,9 @@ fn failure_reason(err: &OneShotError) -> &'static str {
         OneShotError::Rpc(_)
         | OneShotError::Transport(_)
         | OneShotError::Exited(_)
-        | OneShotError::Empty => "error",
+        | OneShotError::Empty
+        | OneShotError::InvalidEffort(_)
+        | OneShotError::ApplyEffort(_) => "error",
     }
 }
 
@@ -199,6 +201,7 @@ pub async fn provider_test_prompt<S: std::hash::BuildHasher>(
         crate::complete_ops::config_option_model(provider, model),
         None,
         TEST_PROMPT_TIMEOUT,
+        &OneShotEffort::default(),
     )
     .await;
     Ok(match outcome {

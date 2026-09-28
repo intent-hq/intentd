@@ -29780,6 +29780,7 @@ impl WorkspaceApi for Services {
         quick_action_type: Option<String>,
         workspace_id: Option<WorkspaceId>,
         timeout_ms: Option<u64>,
+        reasoning_effort: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             if let Some(ws) = workspace_id.as_ref() {
@@ -29795,6 +29796,7 @@ impl WorkspaceApi for Services {
                 quick_action_type,
                 workspace_id,
                 timeout_ms,
+                reasoning_effort,
             )
             .await
         })
