@@ -23671,3 +23671,101 @@ async fn member_removal_preserves_running_turn_and_automation_but_sweeps_human_q
         let _ = mock.await;
     }
 }
+
+/// Characterize the orchestration state that must outlive runtime teardown:
+/// queued delivery and the provider session belong to the agent, not its child.
+#[tokio::test]
+async fn runtime_characterization_stop_preserves_queue_and_resume_identity() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr.with_policy(PermissionPolicy::Interactive));
+    let ws = WorkspaceId::from("ws-runtime-stop");
+    let id = AgentId::from("runtime-stop");
+    seed_agent(&mgr, &ws, &id).await;
+    let agent = track_mock_agent(&mgr, &id, true);
+    let sid = mgr
+        .start_session(&id, PathBuf::from("/tmp/ws"), &test_provider())
+        .await
+        .unwrap();
+    assert!(mgr.try_begin(&id, &ws).await);
+    let queued = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "follow-up survives stop".into(),
+            Some("runtime-queued-message".into()),
+            super::TurnOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(queued["queued"], true);
+    let before = mgr.services.queue_snapshot(&id);
+    assert_eq!(before.len(), 1);
+
+    let mut permission = mgr
+        .permissions
+        .register(prompt("runtime-permission", &id.0));
+    assert!(mgr.respond_permission("runtime-permission", PermissionOutcome::Cancelled));
+    assert_eq!(permission.try_recv().unwrap(), PermissionOutcome::Cancelled);
+    assert!(!mgr.respond_permission("runtime-permission", PermissionOutcome::Cancelled));
+    assert!(mgr.pending_permissions().is_empty());
+
+    assert!(mgr.stop(&id).await);
+    assert!(!mgr.stop(&id).await, "teardown is idempotent");
+    assert!(!mgr.is_busy(&id));
+    assert!(!mgr.registry().is_registered(&id));
+    let after = mgr.services.queue_snapshot(&id);
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0]["id"], before[0]["id"]);
+    assert_eq!(after[0]["content"], before[0]["content"]);
+    assert_eq!(after[0]["turnId"], before[0]["turnId"]);
+    assert_eq!(
+        mgr.services
+            .store
+            .get_agent_session(&id)
+            .await
+            .unwrap()
+            .acp_session_id,
+        Some(sid)
+    );
+    agent.abort();
+}
+
+/// Idle reaping frees runtime capacity without changing the provider session
+/// identity; the next runtime resumes it instead of resending conversation.
+#[tokio::test]
+async fn runtime_characterization_idle_reap_resumes_same_session() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-runtime-reap");
+    let id = AgentId::from("runtime-reap");
+    seed_agent(&mgr, &ws, &id).await;
+    let first = track_mock_agent(&mgr, &id, true);
+    let sid = mgr
+        .start_session(&id, PathBuf::from("/tmp/ws"), &test_provider())
+        .await
+        .unwrap();
+    mgr.registry.set_last_active(&id, 1);
+    assert!(mgr.try_begin(&id, &ws).await);
+    assert_eq!(mgr.reap_idle_older_than(Duration::from_secs(60)).await, 0);
+    mgr.end_turn(&id).await;
+    mgr.registry.set_last_active(&id, 1);
+    assert_eq!(mgr.reap_idle_older_than(Duration::from_secs(60)).await, 1);
+    assert!(!mgr.contains(&id));
+    first.abort();
+
+    let (second, log) = track_mock_agent_with_log(&mgr, &id, true);
+    assert_eq!(
+        mgr.start_session(&id, PathBuf::from("/tmp/ws"), &test_provider())
+            .await
+            .unwrap(),
+        sid
+    );
+    assert!(!mgr.take_recreated(&id));
+    let calls = log.lock().unwrap().clone();
+    assert!(calls
+        .iter()
+        .any(|(method, params)| method == "session/load" && params["sessionId"] == sid));
+    assert!(!calls.iter().any(|(method, _)| method == "session/new"));
+    assert!(mgr.stop(&id).await);
+    second.abort();
+}
