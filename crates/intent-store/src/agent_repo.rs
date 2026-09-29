@@ -6077,7 +6077,7 @@ impl Store {
                 *replacement_counts
                     .entry((
                         role.clone(),
-                        prepared[idx].0.clone(),
+                        prepared[idx].content_json.clone(),
                         metadata_json,
                         created_at.clone(),
                     ))
