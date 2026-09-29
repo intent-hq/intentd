@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.118] - 2026-09-29
+
+### 🐛 Bug Fixes
+
+- Serve RPCs during startup agent recovery ([#2170](https://github.com/intent-hq/intentd/pull/2170))
+
+
 ## [0.9.117] - 2026-09-29
 
 ### 🐛 Bug Fixes
