@@ -1011,8 +1011,42 @@ async fn startup_recovery_failure_can_be_retried_on_the_same_connection() {
     let mut ws = fixture.wss().await;
     let id = &fixture.agents[0];
     wss_rpc(&mut ws, 1, "agent.retire", json!({"agentId": id})).await;
+    assert_eq!(
+        wss_rpc(&mut ws, 10, "agent.listInterrupted", json!({})).await["agents"],
+        json!([])
+    );
+    let workspace = fixture
+        .store
+        .get_agent_session(id)
+        .await
+        .unwrap()
+        .workspace_id;
+    wss_rpc(
+        &mut ws,
+        11,
+        "events.subscribe",
+        json!({"workspaceId": workspace, "eventTypes": ["agent:updated"]}),
+    )
+    .await;
     release.write_u8(1).await.unwrap();
-    wait_for_sweep(fixture.root.path()).await;
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let frame = ws.next().await.unwrap().unwrap();
+            if let Message::Text(text) = frame {
+                let frame: Value = serde_json::from_str(&text).unwrap();
+                let event = &frame["params"]["event"];
+                if event["type"] == "agent:updated"
+                    && event["data"]["startupRecoveryFailed"] == true
+                {
+                    assert_eq!(event["data"]["agentId"], json!(id));
+                    assert_eq!(event["workspaceId"], json!(workspace));
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .expect("failed recovery must notify the already connected client");
     let pending = wss_rpc(&mut ws, 2, "agent.listInterrupted", json!({})).await;
     assert_eq!(pending["agents"].as_array().unwrap().len(), 1);
     assert_eq!(pending["agents"][0]["agentId"], json!(id));

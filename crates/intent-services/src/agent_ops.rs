@@ -16307,6 +16307,41 @@ impl Drop for StartupResumeCandidates {
 }
 
 impl Services {
+    /// Resume one reserved startup candidate, then expose and notify failures.
+    /// The notification invalidates the recovery list; it does not declare a
+    /// terminal agent failure or drive completion watches.
+    ///
+    /// # Errors
+    /// Returns the original resume error after releasing the reservation.
+    pub async fn resume_startup_candidate(
+        &self,
+        candidates: &StartupResumeCandidates,
+        agent_id: &AgentId,
+    ) -> Result<()> {
+        let result = self.resume_interrupted_agent(agent_id).await;
+        candidates.finished(agent_id);
+        if result.is_err() {
+            // Use the durable pending row's workspace, never a caller-supplied
+            // envelope. A concurrent manual winner may already have removed it.
+            match self.store.get_interrupted_agent(agent_id).await {
+                Ok(Some(pending)) => {
+                    self.publish_agent_mutation_event(
+                        &pending.workspace_id,
+                        agent_id,
+                        AGENT_UPDATED,
+                        json!({"agentId": agent_id, "startupRecoveryFailed": true}),
+                    )
+                    .await;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%agent_id, %error, "startup recovery failure notification lookup failed");
+                }
+            }
+        }
+        result
+    }
+
     /// Capture automatic recovery candidates before exposing listeners.
     ///
     /// # Errors
@@ -16766,6 +16801,41 @@ impl Services {
         let workspace_id = interrupted.workspace_id.clone();
         let _mutation = self.workspace_mutations.enter(&workspace_id)?;
 
+        // Claim before transcript/group effects, just like resume. A losing
+        // manual abandon must never settle a child or append a false notice.
+        if !self
+            .store
+            .set_interrupted_resolution(agent_id, "abandoned", &now_iso())
+            .await?
+        {
+            return Err(Error::InvalidParams(format!(
+                "Agent {agent_id} is not in pending interrupted state (already resolved)"
+            )));
+        }
+
+        let text = "This conversation was interrupted because intentd restarted. The agent's in-flight work was terminated.";
+        let content = json!([{
+            "type": "text",
+            "text": text,
+            "meta": { "kind": "interruption" }
+        }]);
+        // Persist the only fallible effect before group settlement. If it fails,
+        // release our claim so a later manual or automatic retry can succeed.
+        let message = match self
+            .store
+            .append_agent_message(agent_id, "system", &content, &now_iso())
+            .await
+        {
+            Ok(message) => message,
+            Err(error) => {
+                if let Err(reset_error) = self.store.reset_interrupted_resolution(agent_id).await {
+                    tracing::warn!(%agent_id, %reset_error, "failed to reset abandoned interruption");
+                }
+                return Err(error);
+            }
+        };
+        self.invalidate_agent_list_cache(&workspace_id);
+
         // Rehydrate delegation groups for this workspace (idempotent, best-effort).
         let _ = self.rehydrate_delegation_groups(&workspace_id).await;
 
@@ -16820,32 +16890,6 @@ impl Services {
                     }
                 }
             }
-        }
-
-        // Build the system interruption message
-        let text = "This conversation was interrupted because intentd restarted. The agent's in-flight work was terminated.";
-        let content = json!([{
-            "type": "text",
-            "text": text,
-            "meta": { "kind": "interruption" }
-        }]);
-
-        // Append the system message
-        let message = self
-            .store
-            .append_agent_message(agent_id, "system", &content, &now_iso())
-            .await?;
-        self.invalidate_agent_list_cache(&workspace_id);
-
-        // Mark the interrupted_agent row as resolved
-        let updated = self
-            .store
-            .set_interrupted_resolution(agent_id, "abandoned", &now_iso())
-            .await?;
-        if !updated {
-            return Err(Error::InvalidParams(format!(
-                "Agent {agent_id} is not in pending interrupted state"
-            )));
         }
 
         // Emit agent:message events so live UIs see the new message

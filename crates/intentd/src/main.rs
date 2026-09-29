@@ -6842,9 +6842,9 @@ async fn run_startup_resume_sweep(
     }
     let candidates = &candidates;
     resume_startup_candidates(ids, &stopping, |agent_id| async move {
-        let result = services.resume_interrupted_agent(&agent_id).await;
-        candidates.finished(&agent_id);
-        result
+        services
+            .resume_startup_candidate(candidates, &agent_id)
+            .await
     })
     .await;
 }

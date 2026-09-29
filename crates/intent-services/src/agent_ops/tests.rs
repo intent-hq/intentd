@@ -46292,3 +46292,82 @@ async fn startup_resume_enumeration_failure_installs_no_reservations() {
     assert!(svc.prepare_startup_resume().await.is_err());
     assert!(svc.startup_resume_candidates.lock().unwrap().is_empty());
 }
+
+#[intent_test_macros::daemon_test]
+async fn startup_resume_and_manual_abandon_have_no_losing_side_effects() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Raced abandoned candidate").await;
+    svc.store
+        .insert_interrupted_agent(&id, &ws, "active", &now_iso())
+        .await
+        .unwrap();
+    let _reservations = svc.prepare_startup_resume().await.unwrap();
+    let (automatic, abandon) = tokio::join!(
+        svc.resume_interrupted_agent(&id),
+        svc.abandon_interrupted_agent(&id)
+    );
+    assert!(automatic.is_ok() ^ abandon.is_ok(), "one resolver wins");
+    let session = svc.store.get_agent_session(&id).await.unwrap();
+    let abandonment_notices = session
+        .messages
+        .iter()
+        .filter(|m| {
+            m.content
+                .to_string()
+                .contains("This conversation was interrupted because intentd restarted")
+        })
+        .count();
+    assert_eq!(
+        abandonment_notices,
+        usize::from(abandon.is_ok()),
+        "a losing abandon must not append a termination notice"
+    );
+    assert_eq!(
+        session.messages.iter().filter(|m| m.role == "user").count(),
+        usize::from(automatic.is_ok())
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn startup_resume_abandon_persist_failure_remains_retryable() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Failed abandonment").await;
+    svc.store
+        .insert_interrupted_agent(&id, &ws, "active", &now_iso())
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER fail_abandon_notice BEFORE INSERT ON agent_message
+         BEGIN SELECT RAISE(FAIL, 'injected abandonment write failure'); END",
+    )
+    .execute(svc.store.write_pool())
+    .await
+    .unwrap();
+    assert!(svc.abandon_interrupted_agent(&id).await.is_err());
+    assert!(svc
+        .store
+        .get_interrupted_agent(&id)
+        .await
+        .unwrap()
+        .is_some());
+    sqlx::query("DROP TRIGGER fail_abandon_notice")
+        .execute(svc.store.write_pool())
+        .await
+        .unwrap();
+    svc.abandon_interrupted_agent(&id).await.unwrap();
+    assert!(svc
+        .store
+        .get_interrupted_agent(&id)
+        .await
+        .unwrap()
+        .is_none());
+    let session = svc.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(
+        session
+            .messages
+            .iter()
+            .filter(|m| m.role == "system")
+            .count(),
+        1
+    );
+}
