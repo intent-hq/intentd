@@ -542,10 +542,22 @@ async fn workspace_create_emits_workspace_created() {
     assert!(e["id"].is_string());
     assert!(e["timestamp"].is_string());
     assert_eq!(e["actor"], primary_actor(&bus).await);
-    // Self-sufficient payload: the event carries the same Workspace the RPC
-    // result returned, so clients render it without a follow-up read.
+    // The shared event carries workspace data, without the creator's
+    // viewer-relative capabilities. Those belong only to the response.
     assert_eq!(e["data"]["workspaceId"], ws_id.as_str());
-    assert_eq!(e["data"]["workspace"], ws["workspace"]);
+    let mut response: intent_core::Workspace =
+        serde_json::from_value(ws["workspace"].clone()).expect("workspace");
+    assert!(
+        response
+            .membership
+            .take()
+            .expect("caller membership")
+            .can_manage
+    );
+    assert_eq!(
+        e["data"]["workspace"],
+        serde_json::to_value(response).expect("shared workspace")
+    );
 
     let _ = shutdown_tx.send(());
     let _ = server.await;

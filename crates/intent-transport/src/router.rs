@@ -5,6 +5,17 @@
 //! Envelope validation, the notification-vs-request distinction, and the
 //! `-32700/-32600/-32601/-32602/-32603` error matrix all live here so every
 //! transport (UDS today, WS/TLS later) shares one code path.
+//!
+//! Discovery/configuration requests may carry optional routing-only `workspaceId`
+//! (docs/protocol/workspace-routing.md). These handlers deliberately consume only
+//! their semantic selectors: catalogs/settings/capabilities/client registry remain
+//! daemon-wide, and specialist project writes still require explicit scope/path.
+//! No workspace lookup or extra service argument is needed for this metadata.
+//!
+//! Selected resource continuations likewise accept optional routing context:
+//! agent/terminal/upload/export/search IDs keep selecting the resource, and the
+//! service authorizes its actual owner. In particular, source export follow-ups
+//! retain their exportId/seq/archiveSource semantics without a workspace lookup.
 
 use intent_core::{
     AgentCreateExtra, AgentDelegateInput, AgentId, AgentWakeCreateOptions, AgentWakeOrCreateInput,
@@ -86,7 +97,30 @@ fn not_found(message: impl Into<String>) -> RpcErr {
 /// surface as `-32603 "Internal error"` carrying the original cause in `data`.
 fn domain_to_rpc(e: Error) -> RpcErr {
     match e {
-        Error::Internal(msg) => RpcErr {
+        Error::ExecutionAuthorization {
+            source,
+            authorization,
+        } => {
+            let code = match source.as_ref() {
+                Error::CloneFailed { .. } | Error::SourceControlUnauthorized { .. } => {
+                    source.code()
+                }
+                _ => -32603,
+            };
+            let data_code = match source.as_ref() {
+                Error::CloneFailed { category, .. } => category.as_str(),
+                Error::SourceControlUnauthorized { .. } => "source-control-unauthorized",
+                _ => "host-execution-authorization",
+            };
+            RpcErr {
+                code,
+                message: authorization.message(),
+                data: Some(json!({
+                    "code": data_code, "executionAuthorization": authorization,
+                })),
+            }
+        }
+        Error::Internal(msg) | Error::GitAuthorization(msg) => RpcErr {
             code: -32603,
             message: "Internal error".to_string(),
             data: Some(Value::String(msg)),
@@ -181,6 +215,18 @@ fn domain_to_rpc(e: Error) -> RpcErr {
                 "provider": provider,
                 "host": host,
             })),
+        },
+        ref e @ Error::HostMembershipRequired => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": "host-membership-required" })),
+        },
+        ref e @ (Error::IdentityMismatch | Error::IdentityInUse) => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(
+                json!({ "code": if matches!(e, Error::IdentityMismatch) { "identity-mismatch" } else { "identity-in-use" } }),
+            ),
         },
         ref e @ Error::SourceControlUnauthorized {
             ref provider,
@@ -721,6 +767,20 @@ async fn dispatch(
         // `workspace.invite.create` is handled on the connection fast-path
         // (it wraps the secret into the `intent://invite` link with the
         // listener's own hosts/port); only list/revoke route here.
+        "host.members.list" => api.host_members_list().await.map_err(domain_to_rpc),
+        "host.members.remove" => api
+            .host_members_remove(intent_core::PrincipalId(require_str_param(
+                params,
+                "principalId",
+            )?))
+            .await
+            .map_err(domain_to_rpc),
+        "host.executionContext" => api.host_execution_context().await.map_err(domain_to_rpc),
+        "host.invite.list" => api.host_invite_list().await.map_err(domain_to_rpc),
+        "host.invite.revoke" => api
+            .host_invite_revoke(require_str_param(params, "inviteId")?)
+            .await
+            .map_err(domain_to_rpc),
         "workspace.invite.list" => {
             let id = require_workspace_id(params)?;
             let r = api.workspace_invite_list(id).await.map_err(workspace_err)?;
@@ -2101,6 +2161,11 @@ async fn dispatch(
             }
             let system_prompt = opt_str(params, "systemPrompt");
             let model = opt_str(params, "model");
+            let reasoning_effort = match params.get("reasoningEffort") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(value)) => Some(value.clone()),
+                Some(_) => return Err(invalid_params("reasoningEffort must be a string or null")),
+            };
             // Optional quick-action `type` hint (`commit` / `pr` / `review` /
             // `fast`): keys `quickActions.typeOverrides` in the daemon-side
             // resolution the op applies when no explicit `model` is sent
@@ -2124,6 +2189,7 @@ async fn dispatch(
                     quick_action_type,
                     ws,
                     timeout_ms,
+                    reasoning_effort,
                 )
                 .await
                 .map_err(domain_to_rpc)?;
@@ -2203,6 +2269,14 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(json!({ "cancelled": cancelled }))
+        }
+        "agent.retire" => {
+            let agent_id = require_agent_id(params)?;
+            let ws = opt_workspace_id(params);
+            let reason = opt_str_strict(params, "reason")?;
+            api.agent_retire(agent_id, ws, reason)
+                .await
+                .map_err(domain_to_rpc)
         }
         "agent.restore" => {
             // Soft retire undo (§5.5): clear `retiredAt`, returning the
@@ -2565,6 +2639,8 @@ async fn dispatch(
                 "removed": r.get("removed").cloned().unwrap_or(Value::Bool(false)),
             }))
         }
+        // Path-based Git calls accept optional routing-only `workspaceId`.
+        // The explicit path still selects the filesystem target on this daemon.
         "git.getBranches" => {
             let repo_path = require_str_param(params, "repoPath")?;
             let include_remote = parse_bool(params, "includeRemote");
@@ -2843,7 +2919,9 @@ async fn dispatch(
         }
         // `github.*` explicit-addressing surface (PROTOCOL §5.27): every data
         // method takes `(owner, repo[, number])` rather than resolving from the
-        // workspace. `limit` falls back to the FE's `perPage` spelling.
+        // workspace. Optional `workspaceId` is routing metadata and must not
+        // change these selectors or leaf credential resolution. `limit` falls back
+        // to the FE's `perPage` spelling.
         "github.pulls.create" => {
             let owner = require_str_param(params, "owner")?;
             let repo = require_str_param(params, "repo")?;
@@ -3162,7 +3240,21 @@ async fn dispatch(
             let nonce = require_str_param(params, "nonce")?;
             let host_label = require_str_param(params, "hostLabel")?;
             let r = api
-                .source_control_identity_proof_create(provider, host, nonce, host_label)
+                .source_control_identity_proof_create(
+                    provider,
+                    host,
+                    nonce,
+                    host_label,
+                    opt_str_strict(params, "purpose")?,
+                    params
+                        .get("expectedIdentity")
+                        .filter(|v| !v.is_null())
+                        .map(|v| {
+                            serde_json::from_value(v.clone())
+                                .map_err(|_| invalid_params("invalid expectedIdentity"))
+                        })
+                        .transpose()?,
+                )
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -3172,7 +3264,12 @@ async fn dispatch(
             let host = opt_str_strict(params, "host")?;
             let proof_id = require_str_param(params, "proofId")?;
             let r = api
-                .source_control_identity_proof_delete(provider, host, proof_id)
+                .source_control_identity_proof_delete(
+                    provider,
+                    host,
+                    proof_id,
+                    opt_str_strict(params, "purpose")?,
+                )
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -3185,6 +3282,54 @@ async fn dispatch(
         // but a present non-string is `-32602` before the service runs — a
         // lax `host` would otherwise route `{"host": 123}` as host-omitted
         // and, on `revoke`, act on the bound credential instead of failing.
+        "identity.authStatus" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            api.identity_auth_status(provider, host)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "identity.connect" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let method = opt_str_strict(params, "method")?;
+            let token = opt_str_strict(params, "token")?;
+            api.identity_connect(provider, host, method, token)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "identity.cancelAuth" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let flow_id = require_str_param(params, "flowId")?;
+            api.identity_cancel_auth(provider, host, flow_id)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "identity.revoke" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            api.identity_revoke(provider, host)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "identity.getUser" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            api.identity_get_user(provider, host)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "identity.select" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let external_user_id = require_str_param(params, "externalUserId")?;
+            api.identity_select(provider, host, external_user_id)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        // `host` names the forge, never an intentd routing destination.
+        // Optional `workspaceId` leaves provider/host credential selection intact.
         "sourceControl.authStatus" => {
             let provider = require_str_param(params, "provider")?;
             let host = opt_str_strict(params, "host")?;
@@ -3238,9 +3383,8 @@ async fn dispatch(
             let r = api.principal_me().await.map_err(domain_to_rpc)?;
             Ok(r)
         }
-        // `principal.list` (direct member add): the host's credentialed
-        // guests for the owner's share dialog; no params. Owner-only in the
-        // service layer (`-32003` for a collaborator).
+        // Credentialed sharing directory for owner/member callers; no params.
+        // The service reads current durable authority; guests are refused.
         "principal.list" => {
             let r = api.principal_list().await.map_err(domain_to_rpc)?;
             Ok(r)
@@ -3261,7 +3405,8 @@ async fn dispatch(
             let r = api.presence_snapshot(id).await.map_err(workspace_err)?;
             Ok(r)
         }
-        // `linear.*` (§5.28) is daemon-owned and global: no `workspaceId`. A key
+        // `linear.*` (§5.28) uses leaf-configured credentials. Optional
+        // `workspaceId` is routing metadata only; it never selects credentials. A key
         // that is absent or fails the `viewer` probe ("not configured") and any
         // other Linear failure surface as `-32603`; an invalid `filter` is
         // `-32602` with the descriptive message verbatim.
@@ -3334,7 +3479,10 @@ async fn dispatch(
             // up front so we never call the engine with a bogus payload.
             let _title = require_non_empty_str(params, "title")?;
             let _team_id = require_non_empty_str(params, "teamId")?;
-            let request = Value::Object(params.clone());
+            let mut request = params.clone();
+            // Routing context belongs to the leaf transport, not the provider body.
+            request.remove("workspaceId");
+            let request = Value::Object(request);
             match api.linear_create_issue(request).await {
                 Ok(v) => Ok(v),
                 Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
@@ -3345,14 +3493,18 @@ async fn dispatch(
             // `issueId` is required; every other field is optional and only
             // forwarded when present.
             let _issue_id = require_non_empty_str(params, "issueId")?;
-            let request = Value::Object(params.clone());
+            let mut request = params.clone();
+            // Routing context belongs to the leaf transport, not the provider body.
+            request.remove("workspaceId");
+            let request = Value::Object(request);
             match api.linear_update_issue(request).await {
                 Ok(v) => Ok(v),
                 Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
-        // `sentry.*` (§5.29) is daemon-owned and global: no `workspaceId`. A
+        // `sentry.*` (§5.29) accepts optional routing-only `workspaceId`;
+        // explicit issue/project selectors and leaf credentials are unchanged. A
         // credential pair that is absent or fails the org probe ("not
         // configured") and any other Sentry failure surface as `-32603`; an
         // invalid `status` is `-32602` with the descriptive message verbatim.
@@ -3511,7 +3663,8 @@ async fn dispatch(
             Ok(r)
         }
         "settings.list" => {
-            // Global namespace (no workspaceId); sensitive values are redacted.
+            // Daemon-wide storage; optional routing context does not scope settings.
+            // Sensitive values are redacted.
             let r = api.settings_list().await.map_err(domain_to_rpc)?;
             Ok(r)
         }
@@ -3543,7 +3696,7 @@ async fn dispatch(
             }
         }
         "system.capabilities" => {
-            // Machine-level capabilities, no workspaceId (PROTOCOL §5.7).
+            // Machine-level capabilities; optional workspaceId is routing-only (§5.7).
             // Router method (unlike the system.* control fast-path): the
             // cowSupported probe lives in the service layer's aggregate cache.
             let r = api.system_capabilities().await.map_err(domain_to_rpc)?;
@@ -4140,7 +4293,7 @@ async fn dispatch(
             }
         }
         "specialist.list" => {
-            // Matches the TS WSS `specialist.list` signature: no params; merges
+            // Optional workspaceId is routing-only. This method merges
             // user > bundled tiers only (the project tier is not part of the live
             // wire contract iOS calls). `specialist.get` still accepts an optional
             // `workspacePath` for the project tier (PROTOCOL §5.11). The optional

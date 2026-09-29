@@ -116,6 +116,27 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
         "daemon-global repository registry; the target daemon discovers repos itself",
     ),
     (
+        "execution_node",
+        "node registrations and pinned identities belong to the source head installation; \
+         workspace transfer cannot enroll hosts or claim their ownership on the target",
+    ),
+    (
+        "node_lease",
+        "source-head lease/incarnation bindings, link generations, acknowledgement watermarks \
+         and release fences are not portable execution authority; the target needs its own enrollment",
+    ),
+    (
+        "node_assignment",
+        "run ownership, capture counters, opaque node paths, merge targets and tombstones bind \
+         agents to source-head leases; imported agent sessions do not inherit those assignments",
+    ),
+    (
+        "node_checkpoint",
+        "checkpoint metadata and replay receipts bind source-head assignments to immutable \
+         hub refs, manifests and blobs not carried by the workspace archive; importing these \
+         rows alone would create dangling recovery pointers and cannot transfer ownership",
+    ),
+    (
         "client",
         "connected FE clients are per-daemon; imported draft rows referencing them \
          are dropped by the import transform layer",
@@ -181,6 +202,14 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
          the owner from the target's primary principal",
     ),
     (
+        "workspace_sharing_summary",
+        "derived sharing counters; the target's grant/invitation triggers rebuild them",
+    ),
+    (
+        "workspace_invite_seat",
+        "derived daemon-local invitation reservations; no invitations transfer",
+    ),
+    (
         "workspace_member",
         "rows FK onto daemon-local `principal` ids; the target's workspace insert \
          trigger recreates the owner membership for its own primary principal",
@@ -193,6 +222,22 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
         "workspace_invite",
         "invite links FK onto daemon-local `principal` ids and hash secrets minted \
          against THIS daemon; an open invite is meaningless on the target",
+    ),
+    (
+        "host_member",
+        "host authority never transfers with a workspace",
+    ),
+    (
+        "host_membership_state",
+        "host-local authority counters and revocation clock",
+    ),
+    (
+        "principal_revocation",
+        "host-local principal revocation generations",
+    ),
+    (
+        "host_invite",
+        "host-local invitations and secrets, unrelated to workspace transfer",
     ),
     (
         "agent_message_fts",
@@ -388,6 +433,19 @@ impl Store {
             }
             out.push(((*table).to_string(), objects));
         }
+        #[cfg(test)]
+        {
+            let barrier = self
+                .export_author_barrier
+                .lock()
+                .map_err(|_| Error::Internal("export test barrier poisoned".into()))?
+                .take();
+            if let Some(barrier) = barrier {
+                barrier.entered.notify_one();
+                barrier.release.notified().await;
+            }
+        }
+        crate::transfer_authorship::capture(&mut tx, &mut out).await?;
         tx.commit()
             .await
             .map_err(|e| Error::Internal(format!("transfer export commit failed: {e}")))?;
@@ -437,6 +495,7 @@ impl Store {
             .begin()
             .await
             .map_err(|e| Error::Internal(format!("transfer import begin failed: {e}")))?;
+        reclaim_imported_metadata(&mut tx, rows).await?;
         let mut inserted = 0usize;
         for (table, _) in TRANSFER_TABLES {
             let Some((_, objects)) = rows.iter().find(|(t, _)| t == table) else {
@@ -481,6 +540,86 @@ impl Store {
             .map_err(|e| Error::Internal(format!("transfer import commit failed: {e}")))?;
         Ok(inserted)
     }
+}
+
+/// Older workspace deletes left these no-workspace-FK registries behind.
+/// Reclaim only IDs present in this archive, owned by an absent workspace
+/// that the same transaction is about to insert. No workspace-wide orphan
+/// sweep, upsert, or provisioning-ownership change is implied by an import.
+/// Cleanup rolls back with every later insert/validation failure.
+async fn reclaim_imported_metadata(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    rows: &[(String, Vec<serde_json::Value>)],
+) -> Result<()> {
+    let workspaces: std::collections::HashSet<&str> = rows
+        .iter()
+        .find(|(table, _)| table == "workspace")
+        .into_iter()
+        .flat_map(|(_, objects)| objects)
+        .filter_map(|row| row.get("id")?.as_str())
+        .collect();
+    for (table, key) in [
+        ("interrupted_agent", "agent_id"),
+        ("script", "id"),
+        ("attachments", "id"),
+    ] {
+        let Some((_, objects)) = rows.iter().find(|(t, _)| t == table) else {
+            continue;
+        };
+        for row in objects {
+            let (Some(id), Some(workspace)) = (
+                row.get(key).and_then(serde_json::Value::as_str),
+                row.get("workspace_id").and_then(serde_json::Value::as_str),
+            ) else {
+                continue; // Ordinary insert validation still rejects bad rows.
+            };
+            if !workspaces.contains(workspace) {
+                continue;
+            }
+            if table == "attachments" {
+                // An attachment can have several retry keys. Bound each
+                // statement while retaining the import's single transaction.
+                loop {
+                    let removed = sqlx::query(
+                        "DELETE FROM attachment_idempotency_keys WHERE rowid IN \
+                         (SELECT k.rowid FROM attachment_idempotency_keys k \
+                          JOIN attachments a ON a.id = k.attachment_id \
+                          WHERE a.id = ?1 AND a.workspace_id = ?2 AND k.workspace_id = ?2 \
+                            AND NOT EXISTS (SELECT 1 FROM workspace WHERE id = ?2) LIMIT ?3)",
+                    )
+                    .bind(id)
+                    .bind(workspace)
+                    .bind(crate::agent_repo::DELETE_CASCADE_BATCH)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|e| {
+                        Error::Internal(format!("reclaim attachment retry keys failed: {e}"))
+                    })?
+                    .rows_affected();
+                    if removed < crate::agent_repo::DELETE_CASCADE_BATCH.unsigned_abs() {
+                        break;
+                    }
+                }
+            }
+            let agent_guard = if table == "interrupted_agent" {
+                " AND NOT EXISTS (SELECT 1 FROM agent_session WHERE id = ?1)"
+            } else {
+                ""
+            };
+            sqlx::query(&format!(
+                "DELETE FROM {table} WHERE {key} = ?1 AND workspace_id = ?2 \
+                 AND NOT EXISTS (SELECT 1 FROM workspace WHERE id = ?2){agent_guard}"
+            ))
+            .bind(id)
+            .bind(workspace)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("reclaim imported {table} metadata failed: {e}"))
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// Serialize one `SQLite` row to a JSON object keyed by column name (see
@@ -623,6 +762,10 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
     }
     Some(out)
 }
+
+#[cfg(test)]
+#[path = "transfer_reimport_tests.rs"]
+mod reimport_tests;
 
 #[cfg(test)]
 mod tests {

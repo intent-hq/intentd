@@ -48,12 +48,15 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "providers.active",
     "providers.enabled",
     "providers.paths",
+    "providers.fastMode",
     "model.default",
     "model.defaultProvider",
     "model.providerDefaults",
     "model.defaultReasoningEffort",
     "quickActions.defaultModel",
     "quickActions.typeOverrides",
+    "quickActions.defaultReasoningEffort",
+    "quickActions.typeReasoningEffortOverrides",
     "quickActions.providerSettings",
     "specialists.default",
     "specialists.dir",
@@ -964,6 +967,58 @@ mod tests {
     }
 
     #[test]
+    fn fast_mode_persistence_atomic_validation_and_reset() {
+        let (_dir, path) = temp_config(Some(""));
+        let reg = SettingsRegistry::load(&path).unwrap();
+        assert_eq!(reg.get("providers.fastMode"), Some(json!({})));
+        let prefs = json!({"claude-code":true,"codex":false});
+        reg.apply(&set("providers.fastMode", prefs.clone()))
+            .unwrap();
+        assert_eq!(
+            SettingsRegistry::load(&path)
+                .unwrap()
+                .get("providers.fastMode"),
+            Some(prefs.clone())
+        );
+        let before = std::fs::read_to_string(&path).unwrap();
+        for invalid in [
+            json!([]),
+            json!(true),
+            json!({"codex":"on"}),
+            json!({"codex":null}),
+            json!({"claude":true}),
+            json!({"auggie":false}),
+            json!({"unknown":true}),
+        ] {
+            assert!(reg
+                .apply(&[
+                    ("git.autoCommit".into(), json!(false)),
+                    ("providers.fastMode".into(), invalid)
+                ])
+                .is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+            assert_eq!(reg.get("providers.fastMode"), Some(prefs.clone()));
+        }
+        assert!(reg
+            .apply(&set("providers.fastMode.codex", json!(true)))
+            .is_err());
+        reg.apply(&set("providers.fastMode", Value::Null)).unwrap();
+        assert_eq!(reg.get("providers.fastMode"), Some(json!({})));
+        assert_eq!(
+            reg.origin("providers.fastMode"),
+            Some(SettingOrigin::Default)
+        );
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("fastMode"));
+        let changed = reg.reload("[providers.fastMode]\ncodex = true\n").unwrap();
+        assert!(changed.changed.contains("providers.fastMode"));
+        assert_eq!(reg.get("providers.fastMode"), Some(json!({"codex":true})));
+        assert!(reg
+            .reload("[providers.fastMode]\ncodex = \"yes\"\n")
+            .is_err());
+        assert_eq!(reg.get("providers.fastMode"), Some(json!({"codex":true})));
+    }
+
+    #[test]
     fn missing_file_inits_template_with_default_effective_values() {
         let (_dir, path) = temp_config(None);
         let reg = SettingsRegistry::load(&path).expect("load inits");
@@ -1205,6 +1260,88 @@ mod tests {
             assert!(err.to_string().contains(invalid_path), "{err}");
             assert_apply_unchanged(&reg, &snapshot, seed, 0, None, &rx);
         }
+    }
+
+    #[test]
+    fn quick_action_effort_blank_normalizes_on_write_and_reload() {
+        let (_dir, path) = temp_config(None);
+        let reg = SettingsRegistry::load(&path).unwrap();
+        for (input, expected) in [
+            ("", Value::Null),
+            ("   ", Value::Null),
+            (" High ", json!(" High ")),
+        ] {
+            reg.apply(&[("quickActions.defaultReasoningEffort".into(), json!(input))])
+                .unwrap();
+            assert_eq!(
+                reg.get("quickActions.defaultReasoningEffort"),
+                Some(expected.clone())
+            );
+            let fresh = SettingsRegistry::load(&path).unwrap();
+            assert_eq!(
+                fresh.get("quickActions.defaultReasoningEffort"),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn quick_action_effort_round_trips_and_resets_independently() {
+        let (_dir, path) = temp_config(Some("[quickActions]\ndefaultModel = \"existing\"\n"));
+        let reg = SettingsRegistry::load(&path).unwrap();
+        assert_eq!(
+            reg.get("quickActions.defaultReasoningEffort"),
+            Some(Value::Null)
+        );
+        assert_eq!(
+            reg.get("quickActions.typeReasoningEffortOverrides"),
+            Some(json!({}))
+        );
+        let snapshots = json!({"codex": {
+            "defaultReasoningEffort": "high",
+            "typeReasoningEffortOverrides": {"commit": "low"}
+        }, "claude-code": {"defaultModel": "old"}});
+        reg.apply(&[
+            ("quickActions.defaultReasoningEffort".into(), json!("high")),
+            (
+                "quickActions.typeReasoningEffortOverrides".into(),
+                json!({"commit": "low", "fast": ""}),
+            ),
+            ("quickActions.providerSettings".into(), snapshots.clone()),
+        ])
+        .unwrap();
+        let fresh = SettingsRegistry::load(&path).unwrap();
+        assert_eq!(
+            fresh.get("quickActions.defaultReasoningEffort"),
+            Some(json!("high"))
+        );
+        assert_eq!(
+            fresh.get("quickActions.typeReasoningEffortOverrides"),
+            Some(json!({"commit": "low", "fast": ""}))
+        );
+        assert_eq!(fresh.get("quickActions.providerSettings"), Some(snapshots));
+        fresh
+            .apply(&[
+                ("quickActions.defaultReasoningEffort".into(), Value::Null),
+                (
+                    "quickActions.typeReasoningEffortOverrides".into(),
+                    json!({}),
+                ),
+            ])
+            .unwrap();
+        let reset = SettingsRegistry::load(&path).unwrap();
+        assert_eq!(
+            reset.get("quickActions.defaultReasoningEffort"),
+            Some(Value::Null)
+        );
+        assert_eq!(
+            reset.get("quickActions.typeReasoningEffortOverrides"),
+            Some(json!({}))
+        );
+        assert_eq!(
+            reset.get("quickActions.defaultModel"),
+            Some(json!("existing"))
+        );
     }
 
     #[test]

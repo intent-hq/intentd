@@ -1,0 +1,17 @@
+[package]
+name = "intent-nodes"
+version = "0.9.117"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "Node provider contracts and static host adapter"
+
+[dependencies]
+intent-core = { path = "../intent-core", version = "0.9.117" }
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true

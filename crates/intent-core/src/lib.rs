@@ -18,6 +18,7 @@ fn disable_node_compile_cache() {
 
 pub mod agent_configs;
 pub(crate) mod agent_logs;
+pub mod agent_runtime;
 pub mod caller;
 pub mod chief_cwd;
 pub mod clock;
@@ -25,9 +26,13 @@ pub mod config;
 pub mod discovery_cache;
 pub mod error;
 pub mod events;
+pub mod execution;
 pub mod git_remote_url;
+pub mod host_membership;
+pub mod human_author;
 pub mod ids;
 pub mod model;
+pub mod nodes;
 pub mod path_utils;
 #[doc(hidden)]
 pub mod queue_visibility_contract;
@@ -65,6 +70,9 @@ pub use discovery_cache::DiscoveryCache;
 pub use error::{CloneErrorCategory, Error, IdentityProofErrorKind, InviteErrorKind, Result};
 pub use events::is_known_event_type;
 pub use git_remote_url::GitRemoteUrl;
+pub use host_membership::{
+    HostInvite, HostMember, HostMembershipState, HostRole, InviteScope, PrincipalRevocation,
+};
 pub use ids::{
     AgentId, ClientId, HookId, NoteId, PrMonitorId, PrincipalId, WorkspaceGitRootId, WorkspaceId,
     CHIEF_WORKSPACE_ID,

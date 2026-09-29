@@ -77,6 +77,7 @@ impl WorkspaceApi for RedeemStub {
         &self,
         invite_id: String,
         secret: String,
+        _scope: InviteScope,
     ) -> intent_core::BoxFuture<'_, intent_core::Result<Value>> {
         self.calls
             .lock()
@@ -94,6 +95,7 @@ impl WorkspaceApi for RedeemStub {
         &self,
         invite_id: String,
         secret: String,
+        _scope: InviteScope,
         credential: String,
     ) -> intent_core::BoxFuture<'_, intent_core::Result<Value>> {
         self.calls
@@ -120,6 +122,7 @@ impl WorkspaceApi for RedeemStub {
         &self,
         invite_id: String,
         secret: String,
+        _scope: InviteScope,
     ) -> intent_core::BoxFuture<'_, intent_core::Result<Value>> {
         self.calls
             .lock()
@@ -142,6 +145,7 @@ impl WorkspaceApi for RedeemStub {
         &self,
         invite_id: String,
         secret: String,
+        _scope: InviteScope,
         nonce: String,
         claim: InviteProofClaim,
     ) -> intent_core::BoxFuture<'_, intent_core::Result<Value>> {
@@ -827,6 +831,13 @@ struct CreateStub {
 }
 
 impl WorkspaceApi for CreateStub {
+    fn host_invite_create(
+        &self,
+        _pin: InvitePin,
+    ) -> intent_core::BoxFuture<'_, intent_core::Result<Value>> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async { Ok(json!({"invite":{"id":"host-inv"},"secret":"s3cret"})) })
+    }
     fn workspace_invite_create(
         &self,
         workspace_id: WorkspaceId,
@@ -1108,5 +1119,26 @@ fn every_invite_method_shares_the_throttle() {
         let refused = admit_redeem(&req, &throttle, t0).expect_err("bucket empty");
         let v: Value = serde_json::from_str(&refused.expect("frame")).unwrap();
         assert_eq!(v["error"]["data"]["code"], json!("invite-flow-busy"), "{v}");
+    }
+}
+
+#[tokio::test]
+async fn host_create_checks_listener_and_tunnel_before_service_mutation() {
+    let stub = Arc::new(CreateStub {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let api: Arc<dyn WorkspaceApi> = stub.clone();
+    for (port, tunnel, code) in [
+        (None, Some("tc-host"), "listener-down"),
+        (Some(7443), None, "tunnel-down"),
+    ] {
+        let (provider, _dir) = stub_provider(port, tunnel);
+        let request=classify(&json!({"jsonrpc":"2.0","id":1,"method":"host.invite.create","params":{"pinLogin":"guest","pinProvider":"github"}})).unwrap();
+        assert!(!request.method.on_invite_endpoint());
+        let frame: Value =
+            serde_json::from_str(&handle_create(request, &api, Some(&provider)).await.unwrap())
+                .unwrap();
+        assert_eq!(frame["error"]["data"], json!({"code":code}));
+        assert_eq!(stub.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }
