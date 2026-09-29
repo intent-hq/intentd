@@ -116,30 +116,117 @@ for asset in "${assets[@]}"; do
     --dir "$assets_dir" --clobber
 done
 
-release_exists=true
-if ! GH_TOKEN="$DEST_GH_TOKEN" gh release view "$TAG" --repo "$DEST_REPO" >/dev/null 2>&1; then
-  release_exists=false
-  prerelease_args=()
-  if [[ "$is_prerelease" == "true" ]]; then
-    prerelease_args=(--prerelease)
-  fi
-  # --latest=false so a backfilled old version never grabs the Latest badge;
-  # consumers discover releases via the channel manifests, not via Latest.
-  if ! GH_TOKEN="$DEST_GH_TOKEN" gh release create "$TAG" \
-    --repo "$DEST_REPO" \
-    --latest=false \
-    "${prerelease_args[@]}" \
-    --title "$RELEASE_TITLE" \
-    --notes-file "$notes_file"
-  then
-    # Tolerate only a lost create race (two mirrors close together): the
-    # release must exist now; otherwise fail loudly.
-    if ! GH_TOKEN="$DEST_GH_TOKEN" gh release view "$TAG" --repo "$DEST_REPO" >/dev/null 2>&1; then
-      echo "error: failed to create release $TAG on $DEST_REPO and it does not exist" >&2
-      exit 1
+# Return 0 for a validated release, 1 for HTTP 404, and 2 for lookup failure.
+# Capture raw output privately: gh errors/debug output can contain credentials.
+# Only allowlisted HTTP status and numeric retry metadata reach the job log.
+lookup_destination_release() {
+  local attempt rc status remaining reset retry_after now delay server_delay
+  local waited=0 max_attempts=3 max_wait=30
+  local response="$tmpdir/lookup-response" headers="$tmpdir/lookup-headers"
+  for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+    rc=0
+    GH_TOKEN="$DEST_GH_TOKEN" GH_DEBUG='' gh api \
+      "repos/$DEST_REPO/releases/tags/$TAG" --include \
+      >"$response" 2>"$tmpdir/lookup-error" || rc=$?
+    status=$(sed -n '1s/^HTTP\/[0-9.]* \([0-9][0-9][0-9]\).*$/\1/p' "$response")
+    awk 'NR == 1 { next } { sub(/\r$/, "") } /^$/ { exit } { print }' "$response" >"$headers"
+    if [[ "$status" == 200 && "$rc" == 0 ]]; then
+      if sed '1,/^\r\{0,1\}$/d' "$response" | jq -es --arg tag "$TAG" \
+        'length == 1 and (.[0] | type == "object" and (.id | type == "number" and . > 0) and .tag_name == $tag)' >/dev/null 2>&1; then
+        return 0
+      fi
+      echo "error: destination release lookup returned invalid release data (HTTP 200)" >&2
+      return 2
     fi
-  fi
-fi
+    if [[ "$status" == 404 ]]; then
+      echo "destination release lookup: HTTP 404 (confirmed not found)" >&2
+      return 1
+    fi
+    echo "destination release lookup attempt $attempt/$max_attempts: HTTP ${status:-unavailable}; gh exit $rc" >&2
+    remaining=$(awk 'tolower($1) == "x-ratelimit-remaining:" { print $2 }' "$headers")
+    reset=$(awk 'tolower($1) == "x-ratelimit-reset:" { print $2 }' "$headers")
+    retry_after=$(sed -n 's/^[Rr][Ee][Tt][Rr][Yy]-[Aa][Ff][Tt][Ee][Rr]:[[:space:]]*//p' "$headers")
+    case "$status" in
+      429|5[0-9][0-9]) ;;
+      403) [[ "$remaining" == 0 || -n "$retry_after" ]] || return 2 ;;
+      '') [[ "$rc" != 0 && ! -s "$response" ]] || return 2 ;;
+      *) return 2 ;;
+    esac
+    if ((attempt == max_attempts)); then
+      echo "error: destination release lookup exhausted $max_attempts attempts" >&2
+      return 2
+    fi
+    if ! now=$(date -u +%s) || [[ ! "$now" =~ ^[0-9]{1,10}$ ]]; then
+      echo "error: destination release lookup cannot determine retry time" >&2
+      return 2
+    fi
+    delay=$attempt
+    # A normal quota window is not a retry deadline while quota remains.
+    if [[ -n "$reset" && ( "$remaining" == 0 || "$status" == 429 ) ]]; then
+      if [[ ! "$reset" =~ ^[0-9]{1,10}$ ]]; then
+        echo "error: destination release lookup has invalid reset metadata; cannot honor retry budget" >&2
+        return 2
+      fi
+      echo "destination release lookup: rate-limit reset epoch $reset" >&2
+      server_delay=$((10#$reset - now))
+      ((server_delay <= delay)) || delay=$server_delay
+    fi
+    if [[ -n "$retry_after" ]]; then
+      if [[ "$retry_after" =~ ^[0-9]{1,10}$ ]]; then
+        server_delay=$((10#$retry_after))
+      elif [[ "$retry_after" =~ ^[A-Za-z]{3},\ [0-9]{2}\ [A-Za-z]{3}\ [0-9]{4}\ [0-9]{2}:[0-9]{2}:[0-9]{2}\ GMT$ ]] \
+        && server_delay=$(date -u -d "$retry_after" +%s 2>/dev/null) \
+        && [[ "$server_delay" =~ ^[0-9]{1,10}$ ]]; then
+        server_delay=$((10#$server_delay - now))
+      else
+        echo "error: destination release lookup has unsupported Retry-After; cannot honor retry budget" >&2
+        return 2
+      fi
+      echo "destination release lookup: Retry-After requires $server_delay seconds" >&2
+      ((server_delay <= delay)) || delay=$server_delay
+    fi
+    if ((waited + delay > max_wait)); then
+      echo "error: destination release lookup requires ${delay}s wait; exceeds ${max_wait}s total retry budget" >&2
+      return 2
+    fi
+    echo "retrying destination release lookup in ${delay}s" >&2
+    sleep "$delay" || return 2
+    waited=$((waited + delay))
+  done
+  return 2
+}
+
+release_exists=true
+lookup_result=0
+lookup_destination_release || lookup_result=$?
+case "$lookup_result" in
+  0) ;;
+  1)
+    release_exists=false
+    prerelease_args=()
+    if [[ "$is_prerelease" == "true" ]]; then
+      prerelease_args=(--prerelease)
+    fi
+    # --latest=false keeps backfills from taking the Latest badge.
+    if ! GH_TOKEN="$DEST_GH_TOKEN" GH_DEBUG='' gh release create "$TAG" \
+      --repo "$DEST_REPO" \
+      --latest=false \
+      "${prerelease_args[@]}" \
+      --title "$RELEASE_TITLE" \
+      --notes-file "$notes_file" >"$tmpdir/create-output" 2>"$tmpdir/create-error"
+    then
+      create_status=$(sed -n 's/.*HTTP \([0-9][0-9][0-9]\).*/\1/p' "$tmpdir/create-error" | sed -n '1p')
+      echo "warning: destination release creation failed (HTTP ${create_status:-unavailable}); checking for a concurrent create" >&2
+      # A failed create is recoverable only with a successful, validated lookup.
+      lookup_result=0
+      lookup_destination_release || lookup_result=$?
+      if [[ "$lookup_result" != 0 ]]; then
+        echo "error: destination release creation failed and follow-up lookup did not confirm the release" >&2
+        exit 1
+      fi
+    fi ;;
+  *) echo "error: destination release lookup failed; refusing destination mutations" >&2; exit 1 ;;
+esac
 
 # Sync mirrored notes onto a pre-existing release so re-runs (mirror-release.yml)
 # backfill notes on releases mirrored before notes were copied. Title stays
