@@ -88,3 +88,12 @@ runs:
         restore-keys: |
           ${{ steps.key.outputs.input-prefix }}
           ${{ steps.key.outputs.prefix }}
+    # Consumers use a lookup sentinel, so cache-hit (exact match) is false even
+    # when an archive was restored by prefix. Compiler hits are separate stats
+    # reported by sccache after the build; restore logs include bytes and time.
+    - name: Report restored archive
+      shell: bash
+      env:
+        CACHE_MATCHED_KEY: ${{ steps.restore.outputs.cache-matched-key }}
+      run: |
+        echo "Restored archive: ${CACHE_MATCHED_KEY:-none} (compiler hits are reported separately)" >> "$GITHUB_STEP_SUMMARY"

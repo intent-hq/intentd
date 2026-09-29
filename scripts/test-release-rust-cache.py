@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline release cache controls and producer contracts (requires PyYAML)."""
+"""Offline release cache controls and producer/consumer contracts (requires PyYAML)."""
 import importlib.util
 import hashlib
 import re
@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import tomllib
 import unittest
 from unittest.mock import patch
 
@@ -190,7 +191,7 @@ class ProducerContract(unittest.TestCase):
             # Read-only lookups must never exactly match an older saved key,
             # which would take precedence over the newest prefix generation.
             self.assertFalse(any(consumer['key'] == r['key'] for r in (old, fresh, retried)))
-            restore_config = action['runs']['steps'][-1]['with']
+            restore_config = next(s['with'] for s in action['runs']['steps'] if s.get('id') == 'restore')
             resolve = lambda expression: consumer[re.fullmatch(r'\$\{\{ steps.key.outputs.([\w-]+) \}\}', expression).group(1)]
             lookup_order = [resolve(restore_config['key']),
                             *(resolve(line) for line in restore_config['restore-keys'].splitlines())]
@@ -267,6 +268,144 @@ class ProducerContract(unittest.TestCase):
         self.assertIn('RUSTC_WRAPPER=sccache', text)
         flavors = [next(s for s in self.workflow['jobs'][j]['steps'] if s.get('uses') == './.github/actions/release-rust-cache')['with']['flavor'] for j in ('daemon', 'sitter')]
         self.assertEqual(flavors, ['daemon-dist', 'sitter-release'])
+
+
+class ConsumerContract(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.action = yaml.safe_load((ROOT / '.github/actions/release-rust-cache/action.yml').read_text())
+        cls.producer = yaml.safe_load((ROOT / '.github/workflows/release-cache.yml').read_text())['jobs']
+        cls.daemon = yaml.safe_load((ROOT / '.github/workflows/v-release.yml').read_text())['jobs']['build-local-artifacts']
+        cls.sitter = yaml.safe_load((ROOT / '.github/workflows/release-sitter.yml').read_text())['jobs']['build']
+        cls.config = tomllib.loads((ROOT / 'dist-workspace.toml').read_text())['dist']
+
+    def restore(self, job):
+        steps = [s for s in job['steps'] if s.get('uses') == './.github/actions/release-rust-cache']
+        self.assertEqual(len(steps), 1, 'each release leg needs exactly one restore')
+        return steps[0]
+
+    def test_all_ten_consumers_match_producer_keys_and_isolate_incompatible_inputs(self):
+        command = self.action['runs']['steps'][0]['run']
+        seen = set()
+        with tempfile.TemporaryDirectory() as temp:
+            def key(inputs, matrix, toolchain='rust1', generation=''):
+                values = {"${{ join(matrix.targets, ' ') }}": matrix['target'],
+                          '${{ matrix.target }}': matrix['target'],
+                          '${{ matrix.runner }}': matrix['runner'], '${{ matrix.os }}': matrix['runner']}
+                output = Path(temp) / 'output'
+                output.write_text('')
+                env = {**os.environ, 'CACHE_FLAVOR': inputs['flavor'],
+                       'CACHE_TARGET': values.get(inputs['target'], inputs['target']),
+                       'CACHE_RUNNER': values.get(inputs['runner'], inputs['runner']),
+                       'TOOLCHAIN': toolchain, 'BUILD_INPUTS': 'inputs', 'CACHE_GENERATION': generation,
+                       'RUNNER_TEMP': temp, 'GITHUB_OUTPUT': str(output), 'GITHUB_ENV': str(Path(temp) / 'env')}
+                subprocess.run(['bash', '-eu', '-c', command], env=env, check=True)
+                return dict(line.split('=', 1) for line in output.read_text().splitlines())
+
+            for name, consumer in [('daemon', self.daemon), ('sitter', self.sitter)]:
+                restored = self.restore(consumer)['with']
+                produced = self.restore(self.producer[name])['with']
+                self.assertEqual(restored.get('generation', ''), '')
+                self.assertEqual({k: restored[k] for k in ('flavor', 'target', 'runner')},
+                                 {k: produced[k] for k in ('flavor', 'target', 'runner')})
+                self.assertEqual(consumer['runs-on'], self.producer[name]['runs-on'])
+                rows = ([{'target': t, 'runner': self.config['github-custom-runners'][t]['runner']}
+                         for t in self.config['targets']] if name == 'daemon' else
+                        [{'target': r['target'], 'runner': r['os']} for r in consumer['strategy']['matrix']['include']])
+                self.assertEqual({r['target'] for r in rows}, set(self.config['targets']))
+                for row in rows:
+                    with self.subTest(flavor=name, **row):
+                        read = key(restored, row)
+                        saved = key(produced, row, generation='100-1')
+                        self.assertNotEqual(read['key'], saved['key'])
+                        self.assertTrue(saved['key'].startswith(read['input-prefix']))
+                        self.assertEqual(read['prefix'], saved['prefix'])
+                        self.assertNotEqual(read['prefix'], key(restored, row, toolchain='rust2')['prefix'])
+                        other_runner = {**row, 'runner': 'windows-2022' if row['runner'] != 'windows-2022' else 'gh-windows-16x'}
+                        self.assertNotEqual(read['prefix'], key(restored, other_runner)['prefix'])
+                        seen.add(read['prefix'])
+            self.assertEqual(len(seen), 10)
+
+    def test_provision_restore_build_order_and_restore_only_tags(self):
+        for name, job in [('daemon', self.daemon), ('sitter', self.sitter)]:
+            with self.subTest(job=name):
+                restore = self.restore(job)
+                steps = job['steps']
+                provision = next(s for s in steps if s.get('name', '').startswith('Provision Rust'))
+                producer_provision = next(s for s in self.producer[name]['steps'] if s.get('name', '').startswith('Provision Rust'))
+                self.assertEqual(provision, producer_provision)
+                self.assertIn('rust-toolchain.toml', provision['run'])
+                self.assertIn('RUSTUP_TOOLCHAIN=$channel', provision['run'])
+                self.assertLess(steps.index(provision), steps.index(restore))
+                self.assertNotIn('if', restore)
+                for build in [s for s in steps if s.get('name') in ('Build artifacts', 'Build (cargo)', 'Build (cargo-zigbuild)')]:
+                    self.assertLess(steps.index(restore), steps.index(build))
+                    self.assertNotIn('cache', build.get('if', ''))
+                for scope in (job, self.action):
+                    text = json.dumps(scope)
+                    self.assertNotIn('actions/cache/save', text)
+                    self.assertNotRegex(text, r'actions/cache@')
+                    self.assertNotIn('--stop-server', text)
+                self.assertEqual(restore['with'].get('disable-annotations', 'false'), 'false')
+        self.assertEqual(self.action['inputs']['generation']['default'], '')
+        archive_restore = next(s for s in self.action['runs']['steps'] if s.get('id') == 'restore')
+        self.assertEqual(archive_restore['with'].get('fail-on-cache-miss', 'false'), 'false')
+
+    def test_generated_daemon_setup_matches_source(self):
+        source = yaml.safe_load((ROOT / '.github/dist-build-setup.yml').read_text())
+        self.restore({'steps': source})
+        steps = self.daemon['steps']
+        start = next(i for i, s in enumerate(steps) if s.get('name') == source[0]['name'])
+        self.assertEqual(steps[start:start + len(source)], source)
+
+    def test_archive_summary_reports_prefix_hits_and_cold_misses(self):
+        reports = [s for s in self.action['runs']['steps'] if 'cache-matched-key' in json.dumps(s.get('env', {}))]
+        self.assertEqual(len(reports), 1)
+        report = reports[0]
+        steps = self.action['runs']['steps']
+        self.assertLess(next(i for i, s in enumerate(steps) if s.get('id') == 'restore'), steps.index(report))
+        self.assertNotIn('cache-hit', json.dumps(report))
+        self.assertNotIn('if', report)
+        with tempfile.TemporaryDirectory() as temp:
+            summary = Path(temp) / 'summary'
+            for matched in ('', 'intentd-release-v1-prefix-generation'):
+                with self.subTest(matched=matched):
+                    summary.write_text('')
+                    env = {**os.environ, 'GITHUB_STEP_SUMMARY': str(summary)}
+                    env.update({k: matched for k in report['env']})
+                    subprocess.run(['bash', '-eu', '-c', report['run']], env=env, check=True)
+                    self.assertIn(matched or 'none', summary.read_text())
+
+    def test_cache_miss_does_not_skip_release_builds(self):
+        # Execute the real build commands with recording tools. The compiler
+        # smoke separately proves a real empty sccache can compile successfully.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            log = root / 'calls'
+            for tool in ('cargo', 'dist'):
+                path = root / tool
+                path.write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "$CALLS"\n')
+                path.chmod(0o755)
+            for name, job in [('daemon', self.daemon), ('sitter', self.sitter)]:
+                self.restore(job)
+                builds = [s for s in job['steps'] if s.get('name') in ('Build artifacts', 'Build (cargo)', 'Build (cargo-zigbuild)')]
+                self.assertEqual(len(builds), 1 if name == 'daemon' else 2)
+                rows = ([{'target': t} for t in self.config['targets']] if name == 'daemon'
+                        else job['strategy']['matrix']['include'])
+                for row in rows:
+                    for step in builds:
+                        self.assertNotIn('cache', step.get('if', ''))
+                        condition = step.get('if', '${{ true }}').removeprefix('${{').removesuffix('}}').strip()
+                        condition = condition.replace('matrix.zigbuild', str(row.get('zigbuild', False))).replace('!', 'not ').replace('true', 'True')
+                        if not eval(condition, {'__builtins__': {}}):
+                            continue
+                        command = step['run'].replace('${{ needs.plan.outputs.tag-flag }}', '--tag=v1.0.0').replace('${{ matrix.dist_args }}', '--artifacts=local --target=' + row['target'])
+                        env = {**os.environ, 'PATH': temp + os.pathsep + os.environ['PATH'],
+                               'TARGET': row['target'], 'CALLS': str(log), 'CACHE_MATCHED_KEY': ''}
+                        subprocess.run(['bash', '-eu', '-c', command], cwd=root, env=env, check=True)
+            calls = log.read_text().splitlines()
+            self.assertEqual(len(calls), 10)
+            self.assertEqual(sum('zigbuild --release -p intentd-sitter' in call for call in calls), 2)
 
 
 if __name__ == '__main__':

@@ -281,6 +281,12 @@ jobs:
           esac
           ls -l "$dest"
         shell: "bash"
+      - name: "Restore release compiler cache"
+        uses: "./.github/actions/release-rust-cache"
+        with:
+          "flavor": "daemon-dist"
+          "runner": "${{ matrix.runner }}"
+          "target": "${{ join(matrix.targets, ' ') }}"
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest
