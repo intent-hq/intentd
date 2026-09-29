@@ -7,6 +7,10 @@ repository.workspace = true
 license.workspace = true
 description = "Shared business-logic surface invoked by every transport and the agent MCP server"
 
+[features]
+# Explicit validation instrumentation; absent from normal daemon builds.
+probe-wait-observer = []
+
 [dependencies]
 intent-core = { path = "../intent-core", version = "0.9.112" }
 intent-store = { path = "../intent-store", version = "0.9.112" }
