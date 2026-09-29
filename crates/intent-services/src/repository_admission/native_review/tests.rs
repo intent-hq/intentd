@@ -8,6 +8,328 @@ use intent_core::repository_request::{
 };
 use intent_core::{HostRole, WorkspaceApi};
 
+// Keep paused time from auto-advancing while the real SQLite/provider workers
+// run. Tests advance only the deadline under examination, without wall sleeps.
+async fn with_review_clock<T>(work: impl Future<Output = T>) -> T {
+    tokio::time::pause();
+    let result = tokio::select! {
+        result = work => result,
+        () = async { loop { tokio::task::yield_now().await; } } => unreachable!(),
+    };
+    tokio::time::resume();
+    result
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_review_queue_deadline_does_not_retire_admitted_commit_or_next_stage() {
+    let f = Fixture::new().await;
+    let s = f.socket().await;
+    f.stage("queue-crossing.txt");
+    let mut query = f.query(Stage::Commit);
+    query.options.create_pr_after_push = true;
+    let p = s.prepare(&f, query).await;
+    let q = command(&f, &p, Stage::Commit);
+    let c = s.concrete(&f).await;
+    let op = c.review.feed.lock().unwrap().records[&q.review.operation_id].clone();
+    with_review_clock(s.entered(async {
+        let frame = s.owner.capture_review(&Frame::Execute(q.clone())).unwrap();
+        let capacity = job(&c).unwrap();
+        op.progress.lock().unwrap().started = true;
+        // A real SQLite writer holds post-commit attribution. Reads, original
+        // admission and the Git primitive still use their unchanged paths.
+        let transaction = f
+            .services
+            .store
+            .read_pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .unwrap();
+        let deadline = Instant::now() + FRAME_TTL;
+        let work = async {
+            let _capacity = capacity;
+            let _finish = Completion(op.clone());
+            run(&c, &op, &q, deadline).await
+        };
+        tokio::pin!(work);
+        tokio::select! {
+            result = &mut work => panic!("work ended before held attribution: {result:?}"),
+            () = wait_until(|| !op.progress.lock().unwrap().effects.is_empty()
+                && f.services.store.write_pool().num_idle() == 0) => {},
+        }
+        tokio::time::advance(FRAME_TTL + Duration::from_secs(1)).await;
+        // Poll the actual sole owner after the deadline while its real worker
+        // is still held. This makes the old queue timeout branch deterministic.
+        std::future::poll_fn(|cx| {
+            assert!(work.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let still_eligible = op.write_current().is_ok();
+        assert_eq!(c.review.workers.available_permits(), WORKERS - 1);
+        assert_eq!(
+            c.services
+                .repository_review_capacity
+                .workers
+                .available_permits(),
+            GLOBAL_WORKERS - 1
+        );
+        assert!(op.progress.lock().unwrap().settled.is_none());
+        assert!(f
+            .services
+            .worktree_locks
+            .try_with_lock(&f.git.path, || async {})
+            .await
+            .is_none());
+        transaction.rollback().await.unwrap();
+        work.await.unwrap();
+        frame.retire();
+        // Join/release the owned work even in the red schedule before reporting
+        // the violated boundary, retaining the actual primitive receipt.
+        assert_eq!(c.review.workers.available_permits(), WORKERS);
+        assert!(
+            still_eligible,
+            "15s queue deadline retired an already admitted commit"
+        );
+    }))
+    .await;
+    let state = s
+        .request(&f.services, Frame::Reconcile(bound(&q)))
+        .await
+        .unwrap();
+    assert_eq!(
+        state["reviewExecution"]["outcome"]["status"], "created",
+        "{state}"
+    );
+    assert_eq!(
+        state["reviewExecution"]["gitReceipts"],
+        json!([{
+            "stage":"commit", "commitHash":f.git.git(&f.git.path, &["rev-parse", "HEAD"]).trim()
+        }])
+    );
+    assert_eq!(f.server.control.posts.load(Ordering::SeqCst), 1);
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_review_queue_expiry_drops_unentered_work_before_capacity_and_lock_release() {
+    let f = Fixture::new().await;
+    let s = f.socket().await;
+    f.stage("expired-queue.txt");
+    let p = s.prepare(&f, f.query(Stage::Commit)).await;
+    let q = command(&f, &p, Stage::Commit);
+    let c = s.concrete(&f).await;
+    let op = c.review.feed.lock().unwrap().records[&q.review.operation_id].clone();
+    let before = f.git.git(&f.git.path, &["rev-parse", "HEAD"]);
+    with_review_clock(s.entered(async {
+        let frame = s.owner.capture_review(&Frame::Execute(q.clone())).unwrap();
+        let capacity = job(&c).unwrap();
+        op.progress.lock().unwrap().started = true;
+        f.services
+            .worktree_locks
+            .with_lock(&f.git.path, || async {
+                let deadline = Instant::now() + FRAME_TTL;
+                let work = async {
+                    let _capacity = capacity;
+                    let _finish = Completion(op.clone());
+                    run(&c, &op, &q, deadline).await
+                };
+                tokio::pin!(work);
+                std::future::poll_fn(|cx| {
+                    assert!(work.as_mut().poll(cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                // Tokio rounds timer deadlines up to a millisecond tick. Cross
+                // that tick while leaving the production deadline unchanged.
+                tokio::time::advance(FRAME_TTL + Duration::from_millis(1)).await;
+                assert!(work.await.is_err());
+                assert_eq!(c.review.workers.available_permits(), WORKERS);
+                assert_eq!(
+                    c.services
+                        .repository_review_capacity
+                        .workers
+                        .available_permits(),
+                    GLOBAL_WORKERS
+                );
+                assert!(op.progress.lock().unwrap().engine.is_none());
+                assert!(op.progress.lock().unwrap().effects.is_empty());
+            })
+            .await;
+        // The original future has been dropped before the held worktree becomes
+        // available; letting the executor run cannot revive late observation.
+        tokio::task::yield_now().await;
+        assert!(op.progress.lock().unwrap().engine.is_none());
+        assert_eq!(f.git.git(&f.git.path, &["rev-parse", "HEAD"]), before);
+        frame.retire();
+    }))
+    .await;
+    assert_eq!(f.server.control.posts.load(Ordering::SeqCst), 0);
+    let state = s
+        .request(&f.services, Frame::Reconcile(bound(&q)))
+        .await
+        .unwrap();
+    assert_eq!(state["reviewExecution"]["gitReceipts"], json!([]));
+    assert_eq!(state["reviewExecution"]["outcome"]["status"], "failed");
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_review_queue_deadline_wins_ready_first_claim_after_observation() {
+    let f = Fixture::new().await;
+    let s = f.socket().await;
+    let p = s.prepare(&f, f.query(Stage::CreatePr)).await;
+    let q = command(&f, &p, Stage::CreatePr);
+    let c = s.concrete(&f).await;
+    let op = c.review.feed.lock().unwrap().records[&q.review.operation_id].clone();
+    with_review_clock(s.entered(async {
+        let frame = s.owner.capture_review(&Frame::Execute(q.clone())).unwrap();
+        let capacity = job(&c).unwrap();
+        op.progress.lock().unwrap().started = true;
+        let create = create_lock(&c, &op).unwrap();
+        let held = create.clone().lock_owned().await;
+        let deadline = Instant::now() + FRAME_TTL;
+        let work = async {
+            let _capacity = capacity;
+            let _finish = Completion(op.clone());
+            run(&c, &op, &q, deadline).await
+        };
+        tokio::pin!(work);
+        tokio::select! {
+            result = &mut work => panic!("work ended before branch-pair wait: {result:?}"),
+            () = wait_until(|| op.progress.lock().unwrap().engine.is_some()
+                && Arc::strong_count(&create) > 2) => {},
+        }
+        assert!(f
+            .services
+            .worktree_locks
+            .try_with_lock(&f.git.path, || async {})
+            .await
+            .is_none());
+        tokio::time::advance(FRAME_TTL).await;
+        // Both expiry and the real blocking worker can now progress. Even if
+        // that worker wins scheduling, its first consuming claim is too late.
+        drop(held);
+        assert!(work.await.is_err());
+        assert!(op.write_current().is_err());
+        assert_eq!(c.review.workers.available_permits(), WORKERS);
+        assert_eq!(
+            c.services
+                .repository_review_capacity
+                .workers
+                .available_permits(),
+            GLOBAL_WORKERS
+        );
+        assert!(op.progress.lock().unwrap().effects.is_empty());
+        assert!(f
+            .services
+            .worktree_locks
+            .try_with_lock(&f.git.path, || async {})
+            .await
+            .is_some());
+        frame.retire();
+    }))
+    .await;
+    assert_eq!(f.server.control.posts.load(Ordering::SeqCst), 0);
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_review_queue_stage_wall_retains_owned_work_receipt_and_stops_next_stage() {
+    let f = Fixture::new().await;
+    let s = f.socket().await;
+    f.stage("stage-wall.txt");
+    let mut query = f.query(Stage::Commit);
+    query.options.create_pr_after_push = true;
+    let p = s.prepare(&f, query).await;
+    let q = command(&f, &p, Stage::Commit);
+    let c = s.concrete(&f).await;
+    let op = c.review.feed.lock().unwrap().records[&q.review.operation_id].clone();
+    with_review_clock(s.entered(async {
+        let frame = s.owner.capture_review(&Frame::Execute(q.clone())).unwrap();
+        let capacity = job(&c).unwrap();
+        op.progress.lock().unwrap().started = true;
+        let transaction = f
+            .services
+            .store
+            .read_pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .unwrap();
+        let deadline = Instant::now() + FRAME_TTL;
+        let work = async {
+            let _capacity = capacity;
+            let _finish = Completion(op.clone());
+            run(&c, &op, &q, deadline).await
+        };
+        tokio::pin!(work);
+        tokio::select! {
+            result = &mut work => panic!("work ended before held attribution: {result:?}"),
+            () = wait_until(|| !op.progress.lock().unwrap().effects.is_empty()
+                && f.services.store.write_pool().num_idle() == 0) => {},
+        }
+        let effects = op.progress.lock().unwrap().effects.clone();
+        tokio::task::yield_now().await;
+        tokio::time::advance(STAGE_TTL.checked_sub(Duration::from_secs(1)).unwrap()).await;
+        std::future::poll_fn(|cx| {
+            assert!(work.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(op.write_current().is_ok());
+        tokio::time::advance(Duration::from_secs(2)).await;
+        wait_until(|| op.write_current().is_err()).await;
+        std::future::poll_fn(|cx| {
+            assert!(work.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(c.review.workers.available_permits(), WORKERS - 1);
+        assert_eq!(
+            c.services
+                .repository_review_capacity
+                .workers
+                .available_permits(),
+            GLOBAL_WORKERS - 1
+        );
+        assert!(op.progress.lock().unwrap().settled.is_none());
+        assert_eq!(op.progress.lock().unwrap().effects, effects);
+        assert!(f
+            .services
+            .worktree_locks
+            .try_with_lock(&f.git.path, || async {})
+            .await
+            .is_none());
+        transaction.rollback().await.unwrap();
+        work.await.unwrap();
+        assert_eq!(c.review.workers.available_permits(), WORKERS);
+        assert_eq!(
+            c.services
+                .repository_review_capacity
+                .workers
+                .available_permits(),
+            GLOBAL_WORKERS
+        );
+        frame.retire();
+    }))
+    .await;
+    let head = f.git.git(&f.git.path, &["rev-parse", "HEAD"]);
+    let state = s
+        .request(&f.services, Frame::Reconcile(bound(&q)))
+        .await
+        .unwrap();
+    assert_eq!(
+        state["reviewExecution"]["gitReceipts"],
+        json!([{"stage":"commit", "commitHash":head.trim()}])
+    );
+    assert_eq!(
+        state["reviewExecution"]["outcome"]["status"], "failed",
+        "{state}"
+    );
+    assert_eq!(f.server.control.posts.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        s.request(&f.services, Frame::Execute(q)).await.unwrap()["reviewExecution"],
+        state["reviewExecution"]
+    );
+    assert_eq!(f.git.git(&f.git.path, &["rev-parse", "HEAD"]), head);
+}
+
 struct Fixture {
     git: Git,
     services: Arc<Services>,

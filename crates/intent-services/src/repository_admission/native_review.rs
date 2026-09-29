@@ -1719,6 +1719,30 @@ pub(crate) fn release(s: &Services, q: Bound) -> BoxFuture<'_, Result<Value>> {
         })
     })
 }
+// Queue admission ends at the first successful synchronous stage claim, not at
+// source observation (which can still wait for a worker or branch-pair lock).
+// Serialize that claim with expiry; release this mutex before any retirement,
+// so expiry never holds it while joining the original R/P admission fences.
+struct StageQueue {
+    deadline: Instant,
+    admitted: Mutex<bool>,
+}
+impl StageQueue {
+    fn claim<T>(&self, claim: impl FnOnce() -> AdmissionResult<T>) -> AdmissionResult<T> {
+        let mut admitted = self.admitted.lock().map_err(|_| AdmissionError::Retired)?;
+        if !*admitted && Instant::now() >= self.deadline {
+            return Err(AdmissionError::Retired);
+        }
+        let result = claim()?;
+        *admitted = true;
+        Ok(result)
+    }
+
+    fn expired_unadmitted(&self) -> bool {
+        self.admitted.lock().map_or(true, |admitted| !*admitted)
+    }
+}
+
 async fn run(
     c: &Arc<Connection>,
     op: &Arc<Operation>,
@@ -1756,6 +1780,10 @@ async fn run(
         #[cfg(test)]
         before_lock: None,
     };
+    let queue = Arc::new(StageQueue {
+        deadline: queue_deadline,
+        admitted: Mutex::new(false),
+    });
     let observation_entered = AtomicBool::new(false);
     let operation = with_repository_lifecycle_source_observed(
         &c.services,
@@ -1768,6 +1796,7 @@ async fn run(
             let op = op.clone();
             let c = c.clone();
             let command = command.clone();
+            let queue = queue.clone();
             async move {
                 op.write_current().map_err(local)?;
                 op.metadata.validate(true).await.map_err(local)?;
@@ -1780,7 +1809,10 @@ async fn run(
                 tokio::task::spawn_blocking(move || {
                     runtime.block_on(with_caller(
                         caller,
-                        with_wire_credential(wire, run_stages(&c, &op, &command, &admission)),
+                        with_wire_credential(
+                            wire,
+                            run_stages(&c, &op, &command, &admission, &queue),
+                        ),
                     ))
                 })
                 .await
@@ -1793,13 +1825,37 @@ async fn run(
     let cancelled = op.write.retirement();
     // This task is the only source poller. No poll can occur between a false
     // observation-entry check and dropping the pinned future on return.
-    tokio::select! {result=&mut operation=>result.map_err(denied),()=cancelled.native_cancelled()=>{if observation_entered.load(Ordering::Acquire){operation.await.map_err(denied)}else{Err(unavailable())}},()=tokio::time::sleep_until(queue_deadline)=>{op.retire();if observation_entered.load(Ordering::Acquire){operation.await.map_err(denied)}else{Err(unavailable())}}}
+    tokio::select! {
+        biased;
+        () = cancelled.native_cancelled() => {
+            if observation_entered.load(Ordering::Acquire) {
+                operation.await.map_err(denied)
+            } else {
+                Err(unavailable())
+            }
+        }
+        () = tokio::time::sleep_until(queue_deadline) => {
+            // An expired unentered queue wins even if source polling is ready.
+            // If a worker is already running, StageQueue::claim also checks the
+            // fixed deadline under the same mutex, before its first claim.
+            if queue.expired_unadmitted() {
+                op.retire();
+            }
+            if observation_entered.load(Ordering::Acquire) {
+                operation.await.map_err(denied)
+            } else {
+                Err(unavailable())
+            }
+        }
+        result = &mut operation => result.map_err(denied),
+    }
 }
 async fn run_stages(
     c: &Connection,
     op: &Arc<Operation>,
     command: &Execute,
     admission: &RepositoryOperationAdmission,
+    queue: &StageQueue,
 ) -> Result<()> {
     if content_fingerprint(op.metadata.root.path(), &op.files)? != op.content_fingerprint {
         return Err(unavailable());
@@ -1879,7 +1935,7 @@ async fn run_stages(
             checked
         };
         let stamp = engine::begin_native_repository_stage(checked, |claim| {
-            op.metadata.with_metadata(claim)
+            op.metadata.with_metadata(|| queue.claim(claim))
         })
         .map_err(denied)?;
         let alarm = op.write.retirement();
