@@ -3410,6 +3410,28 @@ impl Store {
         workspace_id: &WorkspaceId,
         id: &AgentId,
     ) -> Result<bool> {
+        self.delete_agent_session_inner(workspace_id, id, true)
+            .await
+    }
+
+    /// Only for workspace deletion after its bounded recovery sweep has
+    /// completed, with workspace writers stopped. Keep ownership checks and
+    /// all other child sweeps identical to standalone agent deletion.
+    pub(super) async fn delete_workspace_agent_session(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+    ) -> Result<bool> {
+        self.delete_agent_session_inner(workspace_id, id, false)
+            .await
+    }
+
+    async fn delete_agent_session_inner(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        cleanup_recovery: bool,
+    ) -> Result<bool> {
         // Confirm the session exists under THIS workspace before touching any
         // children — the pre-delete statements are keyed by agent id alone, so
         // a mismatched workspace id must remain a no-op exactly like before.
@@ -3442,6 +3464,18 @@ impl Store {
         // referencing either endpoint of a parent/child pair.
         for sql in delete_agent_metadata_batch_statements() {
             delete_in_bounded_batches(self.write_pool(), &sql, &id.0, DELETE_CASCADE_BATCH).await?;
+        }
+        // Recovery history has no FK cascade. There is at most one row per
+        // agent; require both owners so inconsistent metadata is not erased.
+        if cleanup_recovery {
+            sqlx::query("DELETE FROM interrupted_agent WHERE agent_id = ? AND workspace_id = ?")
+                .bind(&id.0)
+                .bind(&workspace_id.0)
+                .execute(self.write_pool())
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("delete agent recovery history failed: {e}"))
+                })?;
         }
         let result = sqlx::query(DELETE_AGENT_SESSION_SQL)
             .bind(&id.0)

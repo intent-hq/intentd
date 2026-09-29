@@ -179,6 +179,12 @@ fn sample_pr() -> PullRequest {
 
 #[async_trait]
 impl SourceControl for StubForge {
+    fn cache_scope(&self) -> Option<intent_sourcecontrol::cache_scope::CacheScope> {
+        // Opt this WSS fixture into the shared repository-discovery contract.
+        intent_sourcecontrol::GitHubSourceControl::new("wss-discovery-fixture", None)
+            .unwrap()
+            .cache_scope()
+    }
     fn provider_id(&self) -> &'static str {
         "stub"
     }
@@ -233,9 +239,19 @@ impl SourceControl for StubForge {
         }
         Ok(sample_pr())
     }
-    async fn list_prs(&self, _: &RepoRef, _: PrQuery) -> ScResult<Page<PullRequest>> {
+    async fn list_prs(&self, _: &RepoRef, query: PrQuery) -> ScResult<Page<PullRequest>> {
+        assert_eq!(
+            query.head, None,
+            "WSS refresh uses the shared repository list"
+        );
+        assert_eq!(query.limit, Some(100));
         let items = match self.open_pr_number {
-            Some(n) => vec![self.open_pr(n)],
+            Some(n) => {
+                let mut sparse = self.open_pr(n);
+                sparse.mergeable = None;
+                sparse.mergeable_state = None;
+                vec![sparse]
+            }
             None => vec![],
         };
         Ok(Page {
@@ -657,7 +673,7 @@ async fn pr_linkage_transition_over_wss() {
     .await;
     assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
 
-    // Drive the same refresh the 60s background sweep runs: discovery links
+    // Drive the same refresh the 180s background sweep runs: discovery links
     // open PR #300 (mergeable, non-draft) → displayStatus flips to pr_ready.
     let refreshed = wss_rpc(
         &mut rpc,

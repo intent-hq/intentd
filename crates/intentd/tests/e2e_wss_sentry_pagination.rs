@@ -166,12 +166,17 @@ type SearchCall = (String, Option<String>, Option<u32>, Option<String>);
 struct RecordingEngine {
     list_calls: Mutex<Vec<FetchIssuesRequest>>,
     search_calls: Mutex<Vec<SearchCall>>,
+    calls: Mutex<Vec<Value>>,
 }
 
 #[async_trait]
 impl SentryEngine for RecordingEngine {
     async fn auth_status(&self) -> SentryResult<SentryAuthState> {
-        unimplemented!()
+        Ok(SentryAuthState {
+            authenticated: true,
+            organization: Some("fixture-org".into()),
+            error: None,
+        })
     }
 
     async fn list_issues(&self, request: FetchIssuesRequest) -> SentryResult<SentryIssuePage> {
@@ -208,20 +213,38 @@ impl SentryEngine for RecordingEngine {
         })
     }
 
-    async fn list_projects(&self, _: Option<u32>) -> SentryResult<Vec<SentryProject>> {
-        unimplemented!()
+    async fn list_projects(&self, limit: Option<u32>) -> SentryResult<Vec<SentryProject>> {
+        self.calls.lock().unwrap().push(json!(["projects", limit]));
+        Ok(vec![serde_json::from_value(
+            json!({"id":"project","slug":"web","name":"Web"}),
+        )
+        .unwrap()])
     }
-    async fn get_issue(&self, _: &str) -> SentryResult<SentryIssueResult> {
-        unimplemented!()
+    async fn get_issue(&self, id: &str) -> SentryResult<SentryIssueResult> {
+        self.calls.lock().unwrap().push(json!(["get_issue", id]));
+        Ok(issue(id))
     }
-    async fn resolve_issue(&self, _: &str) -> SentryResult<SentryIssueResult> {
-        unimplemented!()
+    async fn resolve_issue(&self, id: &str) -> SentryResult<SentryIssueResult> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(json!(["resolve_issue", id]));
+        Ok(issue(id))
     }
-    async fn ignore_issue(&self, _: &str) -> SentryResult<SentryIssueResult> {
-        unimplemented!()
+    async fn ignore_issue(&self, id: &str) -> SentryResult<SentryIssueResult> {
+        self.calls.lock().unwrap().push(json!(["ignore_issue", id]));
+        Ok(issue(id))
     }
-    async fn assign_issue(&self, _: &str, _: Option<&str>) -> SentryResult<SentryIssueResult> {
-        unimplemented!()
+    async fn assign_issue(
+        &self,
+        id: &str,
+        assigned_to: Option<&str>,
+    ) -> SentryResult<SentryIssueResult> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(json!(["assign", id, assigned_to]));
+        Ok(issue(id))
     }
 }
 
@@ -279,7 +302,7 @@ async fn connect(port: u16, cfg: Arc<ClientConfig>) -> TlsWs {
     common::wss_connect_with_retry(port, cfg, &url).await
 }
 
-async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value {
+async fn wss_rpc_envelope(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value {
     let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
     ws.send(Message::Text(req.to_string().into()))
         .await
@@ -290,8 +313,9 @@ async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value 
                 Message::Text(text) => {
                     let v: Value = serde_json::from_str(&text).unwrap();
                     if v.get("id") == Some(&json!(id)) {
-                        assert!(v.get("error").is_none(), "rpc {method} errored: {v}");
-                        return v["result"].clone();
+                        assert_eq!(v["jsonrpc"], "2.0");
+                        assert!(v.get("result").is_some() != v.get("error").is_some());
+                        return v;
                     }
                 }
                 Message::Ping(p) => {
@@ -320,79 +344,194 @@ fn wire_next_token(cursor: &str) -> String {
 /// carries an explicit `nextToken: null`.
 #[intent_test_macros::daemon_test]
 async fn list_issues_next_token_round_trips() {
-    let fx = boot().await;
-    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+    for context in [None, Some("workspace-a")] {
+        let fx = boot().await;
+        let mut ws = connect(fx.port, fx.cfg.clone()).await;
 
-    let r = wss_rpc(
-        &mut ws,
-        1,
-        "sentry.listIssues",
-        json!({ "project": "web", "limit": 5 }),
-    )
-    .await;
-    assert_eq!(r["issues"][0]["shortId"], "PROJ-1");
-    assert_eq!(r["nextToken"], json!(wire_next_token("0:100:0")));
+        let r = context_rpc(
+            context,
+            &mut ws,
+            1,
+            "sentry.listIssues",
+            json!({ "project": "web", "limit": 5 }),
+        )
+        .await;
+        assert_eq!(r["issues"][0]["shortId"], "PROJ-1");
+        assert_eq!(r["nextToken"], json!(wire_next_token("0:100:0")));
 
-    let r = wss_rpc(
-        &mut ws,
-        2,
-        "sentry.listIssues",
-        json!({ "project": "web", "limit": 5, "nextToken": wire_next_token("0:100:0") }),
-    )
-    .await;
-    assert_eq!(r["issues"][0]["shortId"], "PROJ-1");
-    assert_eq!(r["nextToken"], json!(null), "last page is nextToken null");
+        let r = context_rpc(
+            context,
+            &mut ws,
+            2,
+            "sentry.listIssues",
+            json!({ "project": "web", "limit": 5, "nextToken": wire_next_token("0:100:0") }),
+        )
+        .await;
+        assert_eq!(r["issues"][0]["shortId"], "PROJ-1");
+        assert_eq!(r["nextToken"], json!(null), "last page is nextToken null");
 
-    let calls = fx.engine.list_calls.lock().unwrap();
-    assert_eq!(calls.len(), 2);
-    assert_eq!(calls[0].project.as_deref(), Some("web"));
-    assert_eq!(calls[0].limit, Some(5));
-    assert_eq!(calls[0].cursor, None);
-    assert_eq!(calls[1].project.as_deref(), Some("web"));
-    assert_eq!(calls[1].limit, Some(5));
-    assert_eq!(calls[1].cursor.as_deref(), Some("0:100:0"));
+        let calls = fx.engine.list_calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].project.as_deref(), Some("web"));
+        assert_eq!(calls[0].limit, Some(5));
+        assert_eq!(calls[0].cursor, None);
+        assert_eq!(calls[1].project.as_deref(), Some("web"));
+        assert_eq!(calls[1].limit, Some(5));
+        assert_eq!(calls[1].cursor.as_deref(), Some("0:100:0"));
+    }
 }
 
 /// `sentry.searchIssues`: same envelope and cursor semantics, with the wire
 /// `query` + `project` forwarded alongside the token.
 #[intent_test_macros::daemon_test]
 async fn search_issues_next_token_round_trips() {
-    let fx = boot().await;
-    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+    for context in [None, Some("workspace-a")] {
+        let fx = boot().await;
+        let mut ws = connect(fx.port, fx.cfg.clone()).await;
 
-    let r = wss_rpc(
-        &mut ws,
-        1,
-        "sentry.searchIssues",
-        json!({ "query": "login bug", "project": "web" }),
-    )
-    .await;
-    assert_eq!(r["issues"][0]["shortId"], "PROJ-2");
-    assert_eq!(r["nextToken"], json!(wire_next_token("0:100:0")));
+        let r = context_rpc(
+            context,
+            &mut ws,
+            1,
+            "sentry.searchIssues",
+            json!({ "query": "login bug", "project": "web" }),
+        )
+        .await;
+        assert_eq!(r["issues"][0]["shortId"], "PROJ-2");
+        assert_eq!(r["nextToken"], json!(wire_next_token("0:100:0")));
 
-    let r = wss_rpc(
-        &mut ws,
+        let r = context_rpc(
+        context, &mut ws,
         2,
         "sentry.searchIssues",
         json!({ "query": "login bug", "project": "web", "nextToken": wire_next_token("0:100:0") }),
     )
     .await;
-    assert_eq!(r["issues"][0]["shortId"], "PROJ-2");
-    assert_eq!(r["nextToken"], json!(null), "last page is nextToken null");
+        assert_eq!(r["issues"][0]["shortId"], "PROJ-2");
+        assert_eq!(r["nextToken"], json!(null), "last page is nextToken null");
 
-    let calls = fx.engine.search_calls.lock().unwrap();
-    assert_eq!(calls.len(), 2);
-    assert_eq!(
-        calls[0],
-        ("login bug".to_string(), Some("web".to_string()), None, None)
-    );
-    assert_eq!(
-        calls[1],
+        let calls = fx.engine.search_calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0],
+            ("login bug".to_string(), Some("web".to_string()), None, None)
+        );
+        assert_eq!(
+            calls[1],
+            (
+                "login bug".to_string(),
+                Some("web".to_string()),
+                None,
+                Some("0:100:0".to_string())
+            )
+        );
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn integration_context_sentry_preserves_payloads_and_selectors() {
+    let fx = boot().await;
+    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+    for (method, params, expected) in [
+        ("sentry.authStatus", json!({}), None),
         (
-            "login bug".to_string(),
-            Some("web".to_string()),
-            None,
-            Some("0:100:0".to_string())
-        )
-    );
+            "sentry.listProjects",
+            json!({"limit":7}),
+            Some(json!(["projects", 7])),
+        ),
+        (
+            "sentry.getIssue",
+            json!({"id":"PROJ-1","shortId":"ignored"}),
+            Some(json!(["get_issue", "PROJ-1"])),
+        ),
+        (
+            "sentry.getIssue",
+            json!({"shortId":"PROJ-1"}),
+            Some(json!(["get_issue", "PROJ-1"])),
+        ),
+        (
+            "sentry.resolveIssue",
+            json!({"id":"PROJ-1"}),
+            Some(json!(["resolve_issue", "PROJ-1"])),
+        ),
+        (
+            "sentry.ignoreIssue",
+            json!({"id":"PROJ-1"}),
+            Some(json!(["ignore_issue", "PROJ-1"])),
+        ),
+        (
+            "sentry.assignIssue",
+            json!({"id":"PROJ-1","assignedTo":"user"}),
+            Some(json!(["assign", "PROJ-1", "user"])),
+        ),
+        (
+            "sentry.assignIssue",
+            json!({"id":"PROJ-1"}),
+            Some(json!(["assign", "PROJ-1", null])),
+        ),
+    ] {
+        let mut baseline = None;
+        for context in [None, Some("workspace-a"), Some("workspace-b")] {
+            let mut request = params.clone();
+            if let Some(context) = context {
+                request["workspaceId"] = json!(context);
+            }
+            fx.engine.calls.lock().unwrap().clear();
+            let result = wss_rpc(&mut ws, 1, method, request).await;
+            if let Some(baseline) = &baseline {
+                assert_eq!(&result, baseline, "{method}");
+            } else {
+                baseline = Some(result);
+            }
+            assert_eq!(
+                *fx.engine.calls.lock().unwrap(),
+                expected.clone().into_iter().collect::<Vec<_>>(),
+                "{method}: {context:?}"
+            );
+        }
+    }
+}
+
+async fn context_rpc(
+    context: Option<&str>,
+    ws: &mut TlsWs,
+    id: i64,
+    method: &str,
+    mut params: Value,
+) -> Value {
+    if let Some(context) = context {
+        params["workspaceId"] = json!(context);
+    }
+    wss_rpc(ws, id, method, params).await
+}
+
+async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value {
+    let v = wss_rpc_envelope(ws, id, method, params).await;
+    assert!(v.get("error").is_none(), "{method}: {v}");
+    v["result"].clone()
+}
+
+#[intent_test_macros::daemon_test]
+async fn integration_context_sentry_errors_are_unchanged() {
+    let fx = boot().await;
+    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+    for (method, params) in [
+        ("sentry.listIssues", json!({"status":"bogus"})),
+        ("sentry.getIssue", json!({})),
+        ("sentry.resolveIssue", json!({"id":""})),
+        ("sentry.ignoreIssue", json!({})),
+        ("sentry.assignIssue", json!({})),
+    ] {
+        let direct = wss_rpc_envelope(&mut ws, 1, method, params.clone()).await;
+        assert_eq!(direct["error"]["code"], -32602, "{method}: {direct}");
+        let mut routed = params;
+        routed["workspaceId"] = json!("workspace-route");
+        assert_eq!(
+            wss_rpc_envelope(&mut ws, 1, method, routed).await,
+            direct,
+            "{method}"
+        );
+    }
+    assert!(fx.engine.calls.lock().unwrap().is_empty());
+    assert!(fx.engine.list_calls.lock().unwrap().is_empty());
 }

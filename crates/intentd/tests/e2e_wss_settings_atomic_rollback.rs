@@ -38,6 +38,135 @@ use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
+#[tokio::test]
+async fn fast_mode_settings_contract_over_wss() {
+    let dir = temp_data_dir();
+    let data_dir = dir.path().to_path_buf();
+    let env = [("INTENTD_AUTH_TOKEN", TOKEN)];
+    let mut daemon = Daemon {
+        child: spawn_serve(&data_dir, "both", &env),
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    let mut ws = connect_ws(port, cfg.clone()).await;
+    let mut sub = connect_ws(port, cfg).await;
+    let ack = wss_rpc(
+        &mut sub,
+        100,
+        "events.subscribe",
+        json!({"eventTypes":["settings:changed"]}),
+    )
+    .await;
+    assert_success_envelope(&ack, 100);
+    let list = wss_rpc(&mut ws, 1, "settings.list", json!({})).await;
+    assert_success_envelope(&list, 1);
+    let entry = list["result"]["settings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["path"] == "providers.fastMode")
+        .unwrap();
+    assert_eq!(entry["type"], "object");
+    assert_eq!(entry["defaultValue"], json!({}));
+    assert_eq!(entry["value"], json!({}));
+    assert_eq!(entry["origin"], "default");
+    let catalog = wss_rpc(&mut ws, 2, "providers.catalog", json!({})).await;
+    assert_success_envelope(&catalog, 2);
+    for row in catalog["result"]["providers"].as_array().unwrap() {
+        assert_eq!(
+            row["supportsFastMode"],
+            matches!(row["id"].as_str(), Some("claude-code" | "codex"))
+        );
+    }
+    let prefs = json!({"claude-code":true,"codex":false});
+    let response = wss_rpc(
+        &mut ws,
+        3,
+        "settings.update",
+        json!({"changes":[{"path":"providers.fastMode","value":prefs}]}),
+    )
+    .await;
+    assert_success_envelope(&response, 3);
+    let changed = next_settings_changed(&mut sub).await;
+    assert_eq!(
+        changed
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["path"] == "providers.fastMode")
+            .count(),
+        1
+    );
+    assert_eq!(changed[0]["value"], prefs);
+    let before = std::fs::read_to_string(data_dir.join("config.toml")).unwrap();
+    for invalid in [
+        Value::Null,
+        json!([]),
+        json!({"codex":1}),
+        json!({"claude":true}),
+        json!({"auggie":false}),
+        json!({"unknown":true}),
+    ] {
+        let response = wss_rpc(&mut ws, 4, "settings.update", json!({"changes":[{"path":"git.autoCommit","value":false},{"path":"providers.fastMode","value":invalid}]})).await;
+        assert_eq!(response["error"]["code"], -32602, "{response}");
+        assert_eq!(
+            std::fs::read_to_string(data_dir.join("config.toml")).unwrap(),
+            before
+        );
+    }
+    let response = wss_rpc(
+        &mut ws,
+        5,
+        "settings.update",
+        json!({"changes":[{"path":"providers.fastMode.codex","value":true}]}),
+    )
+    .await;
+    assert_eq!(response["error"]["code"], -32602);
+    // A real daemon restart proves both independent values survive process state.
+    daemon.child.kill().unwrap();
+    daemon.child.wait().unwrap();
+    daemon.child = spawn_serve(&data_dir, "both", &env);
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let mut ws = connect_ws(
+        port,
+        client_config(status["result"]["fingerprint"].as_str().unwrap()),
+    )
+    .await;
+    let got = wss_rpc(
+        &mut ws,
+        6,
+        "settings.get",
+        json!({"path":"providers.fastMode"}),
+    )
+    .await;
+    assert_success_envelope(&got, 6);
+    assert_eq!(got["result"]["value"], prefs);
+    assert_eq!(got["result"]["origin"], "file");
+    let reset = wss_rpc(
+        &mut ws,
+        7,
+        "settings.reset",
+        json!({"path":"providers.fastMode"}),
+    )
+    .await;
+    assert_success_envelope(&reset, 7);
+    assert_eq!(reset["result"]["value"], json!({}));
+    let got = wss_rpc(
+        &mut ws,
+        8,
+        "settings.get",
+        json!({"path":"providers.fastMode"}),
+    )
+    .await;
+    assert_eq!(got["result"]["origin"], "default");
+}
+
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
 struct Daemon {

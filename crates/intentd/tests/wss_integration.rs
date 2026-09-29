@@ -8,6 +8,27 @@
 //! plain-`ws://` accept path serves JSON-RPC with no TLS and no bearer token.
 
 mod common;
+#[path = "wss_integration/discovery_context.rs"]
+mod discovery_context;
+#[path = "wss_integration/host_roles.rs"]
+mod host_roles;
+#[path = "wss_integration/human_attribution.rs"]
+mod human_attribution;
+#[path = "wss_integration/imported_queue_authorization.rs"]
+mod imported_queue_authorization;
+#[path = "wss_integration/integration_context.rs"]
+mod integration_context;
+#[path = "wss_integration/resource_context.rs"]
+mod resource_context;
+#[path = "wss_integration/sharing.rs"]
+mod sharing;
+
+#[path = "wss_integration/authenticated_devices.rs"]
+mod authenticated_devices;
+#[path = "wss_integration/member_transport.rs"]
+mod member_transport;
+#[path = "wss_integration/personal_pairing.rs"]
+mod personal_pairing;
 #[path = "wss_integration/workspace_delete.rs"]
 mod workspace_delete;
 
@@ -199,6 +220,11 @@ async fn make_services(
         .with_assets_root(dir.path().join("assets"))
         .with_workspaces_root(workspaces_root)
         .with_settings_registry(registry.clone())
+        .with_secret_store(Arc::new(intent_services::InMemorySecretStore::default()))
+        .with_specialist_dirs(
+            Some(dir.path().join("user-specialists")),
+            Some(dir.path().join("bundled-specialists")),
+        )
         .with_event_bus(bus.clone());
     if let Some(bin) = auggie_bin {
         services = services.with_auggie_bin(bin);
@@ -1241,8 +1267,8 @@ async fn wss_agent_lite_omits_initial_message() {
     srv.ws.stop().await;
 }
 
-/// Soft retire round-trip over the real WSS transport: `agent.retire` (via
-/// the service seam the MCP binding calls) marks the session inert —
+/// Soft retire round-trip over the real WSS transport: `agent.retire`
+/// marks the session inert —
 /// excluded from default `agent.list`, served by `includeRetired: true` with
 /// `retiredAt`, still readable via `agent.get`, rejecting `agent.sendMessage`
 /// — and the wire `agent.restore` method returns it to service. Both
@@ -1332,23 +1358,57 @@ async fn wss_agent_soft_retire_and_restore_round_trip() {
         "subscribe: {sub}"
     );
 
-    // Retire via the WorkspaceApi seam (the MCP `ws.agent.retire` binding
-    // routes here; there is deliberately no wire agent.retire method).
-    let retired = srv
-        .api
-        .agent_retire(
-            intent_core::AgentId::from(agent_id.as_str()),
-            Some(WorkspaceId(ws_id.clone())),
-            Some("handing off".to_string()),
+    for params in [
+        serde_json::json!({}),
+        serde_json::json!({ "agentId": "unknown-agent" }),
+        serde_json::json!({ "agentId": agent_id, "reason": 42 }),
+        serde_json::json!({ "agentId": agent_id, "workspaceId": "wrong-workspace" }),
+    ] {
+        let response = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": 18, "method": "agent.retire", "params": params
+            })
+            .to_string(),
         )
-        .await
-        .expect("retire");
+        .await;
+        assert_eq!(response["error"]["code"], -32602, "{response}");
+        assert!(srv
+            .store
+            .get_agent_session(&intent_core::AgentId::from(agent_id.as_str()))
+            .await
+            .unwrap()
+            .retired_at
+            .is_none());
+    }
+
+    // Direct user retirement works independently of model peer-agent features.
+    srv.set_setting("agentFeatures.peerAgents", serde_json::json!(false));
+    let retire_frame = serde_json::json!({
+        "jsonrpc": "2.0", "id": 17, "method": "agent.retire",
+        "params": { "agentId": agent_id, "workspaceId": ws_id, "reason": "handing off" }
+    })
+    .to_string();
+    let envelope = wss_call(srv.port, srv.cfg.clone(), &retire_frame).await;
+    assert_eq!(envelope["jsonrpc"], "2.0");
+    assert_eq!(envelope["id"], 17);
+    assert!(envelope.get("error").is_none(), "{envelope}");
+    let retired = &envelope["result"];
     assert_eq!(retired["success"], serde_json::json!(true));
     let retired_at = retired["retiredAt"]
         .as_str()
         .expect("retiredAt")
         .to_string();
     let retired_at = retired_at.as_str();
+
+    let repeated = wss_call(srv.port, srv.cfg.clone(), &retire_frame).await;
+    assert_eq!(
+        repeated["result"],
+        serde_json::json!({
+            "success": true, "retiredAt": retired_at, "alreadyRetired": true
+        })
+    );
 
     // agent:retired reaches the subscriber with name + reason.
     let evt = next_event(&mut ws, "agent:retired").await;
@@ -2287,12 +2347,18 @@ async fn wss_agent_retire_cascade_guard_hooks_and_watches() {
 
     // Guard: retire fails while a descendant is running a turn — the error
     // names the child and NOTHING is mutated.
-    let err = srv
-        .api
-        .agent_retire(parent.clone(), Some(workspace_id.clone()), None)
-        .await
-        .expect_err("retire with an active child must be rejected");
-    let msg = err.to_string();
+    let rejected = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 19, "method": "agent.retire",
+            "params": { "agentId": parent_id, "workspaceId": ws_id }
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(rejected["error"]["code"], -32602, "{rejected}");
+    let msg = rejected["error"]["message"].as_str().unwrap();
     assert!(
         msg.contains("active child agent(s) still running a turn") && msg.contains("Junior"),
         "guard error names the active child: {msg}"
@@ -2387,16 +2453,17 @@ async fn wss_agent_retire_cascade_guard_hooks_and_watches() {
     }
 
     // Retire the parent: guard passes now, the cascade retires the child.
-    let retired = srv
-        .api
-        .agent_retire(
-            parent.clone(),
-            Some(workspace_id.clone()),
-            Some("shutting down".to_string()),
-        )
-        .await
-        .expect("retire parent");
-    assert_eq!(retired["success"], serde_json::json!(true), "{retired}");
+    let retired = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 20, "method": "agent.retire",
+            "params": { "agentId": parent_id, "workspaceId": ws_id, "reason": "shutting down" }
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(retired["result"]["success"], true, "{retired}");
 
     // Collect the three lifecycle events (relative order not asserted).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
@@ -3813,6 +3880,7 @@ async fn wss_principal_list_is_owner_only_and_omits_revoked_guests() {
                 "displayName": "older name",
                 "avatarUrl": "https://example.test/older.png",
                 "githubUserId": 11,
+                "hostRole": "guest",
                 "identity": { "provider": "github", "host": "github.com", "externalUserId": "11" },
             },
             {
@@ -3821,6 +3889,7 @@ async fn wss_principal_list_is_owner_only_and_omits_revoked_guests() {
                 "displayName": "newer name",
                 "avatarUrl": "https://example.test/newer.png",
                 "githubUserId": 12,
+                "hostRole": "guest",
                 "identity": { "provider": "github", "host": "github.com", "externalUserId": "12" },
             },
         ] }),
@@ -4323,6 +4392,8 @@ async fn wss_collaborator_capability_matrix_in_service_layer() {
                 "agent.sendMessage",
                 json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "hello from guest" }),
             ),
+            ("agent.retire", json!({ "agentId": agent_id })),
+            ("agent.restore", json!({ "agentId": agent_id })),
             ("git.push", json!({ "workspaceId": ws_id })),
         ]
     };
@@ -4365,6 +4436,11 @@ async fn wss_collaborator_capability_matrix_in_service_layer() {
             "collaborator {method}: {v}"
         );
         match method {
+            "agent.retire" => {
+                assert_eq!(v["result"]["success"], true, "{v}");
+                assert!(v["result"]["retiredAt"].is_string(), "{v}");
+            }
+            "agent.restore" => assert_eq!(v["result"]["restored"], true, "{v}"),
             "workspace.get" => {
                 assert_eq!(v["result"]["workspace"]["myRole"], "collaborator", "{v}");
                 assert_eq!(v["result"]["workspace"]["ownerPrincipalId"], primary.id.0);
@@ -5182,7 +5258,7 @@ async fn wss_collaborator_steered_agent_runs_host_exec_with_owner_capabilities()
     let agent_typed = AgentId::from_string(agent_id.clone());
     let collaborator = Caller::Wire {
         principal_id: guest.principal.id.clone(),
-        is_administrator: false,
+        host_role: intent_core::HostRole::Guest,
     };
     let tool_call = json!({
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -5234,7 +5310,7 @@ async fn wss_collaborator_steered_agent_runs_host_exec_with_owner_capabilities()
         .as_str()
         .unwrap_or_else(|| panic!("tool text: {refused}"));
     assert!(
-        refused_text.contains("forbidden: host.exec requires the daemon administrator"),
+        refused_text.contains("forbidden: host.exec requires host membership"),
         "unbound bridge must surface the gate's refusal: {refused_text}"
     );
 
@@ -6867,7 +6943,7 @@ async fn wss_presence_channel_join_delta_leave_and_gating() {
     assert_eq!(
         ev["data"]["members"],
         json!([{ "principalId": alice.id.0, "login": "alice", "displayName": null,
-                 "avatarUrl": null, "focus": [], "typing": [] }]),
+                 "avatarUrl": null, "hostRole": "guest", "focus": [], "typing": [] }]),
         "{ev}"
     );
 
@@ -6909,7 +6985,7 @@ async fn wss_presence_channel_join_delta_leave_and_gating() {
     assert_eq!(
         p["snapshot"],
         json!({ "viewers": [{ "principalId": alice.id.0, "login": "alice", "displayName": null,
-                              "avatarUrl": null, "cursor": null }] }),
+                              "avatarUrl": null, "hostRole": "guest", "cursor": null }] }),
         "{p}"
     );
     let p = alice_c.push(&sub_a).await;
@@ -6999,7 +7075,7 @@ async fn wss_presence_channel_join_delta_leave_and_gating() {
     assert_eq!(
         p["delta"],
         json!({ "kind": "updated", "viewer": { "principalId": bob.id.0, "login": "bob",
-                "displayName": null, "avatarUrl": null,
+                "displayName": null, "avatarUrl": null, "hostRole": "guest",
                 "cursor": { "rev": 3, "anchor": 10, "head": 12 } } }),
         "{p}"
     );
@@ -7382,7 +7458,7 @@ async fn wss_presence_typing_sources_and_snapshot() {
     assert_eq!(
         alice_row(&json!({ "data": v["result"] })),
         json!({ "principalId": alice.id.0, "login": "alice", "displayName": null,
-                "avatarUrl": null, "focus": [], "typing": [] }),
+                "avatarUrl": null, "hostRole": "guest", "focus": [], "typing": [] }),
         "snapshot rows match the presence:changed member shape: {v}"
     );
 
@@ -13850,8 +13926,8 @@ async fn wss_workspace_update_status_image_asset_id_round_trip() {
         .await
         .expect("insert workspace");
 
-    // One persistent connection: subscribe first so the `workspace:updated`
-    // notification from the mutation below is delivered to this client.
+    // Subscribe before mutating. Use a separate RPC connection so waiting
+    // for the response cannot discard an event delivered ahead of it.
     let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
     let rpc = |id: i64, method: &str, params: Value| {
         serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
@@ -13876,9 +13952,10 @@ async fn wss_workspace_update_status_image_asset_id_round_trip() {
         "subscribe: {sub}"
     );
 
+    let mut rpc_ws = connect_ws(srv.port, srv.cfg.clone()).await;
     // Set: camelCase wire field lands on the row and echoes in the response.
     let resp = send_and_wait(
-        &mut ws,
+        &mut rpc_ws,
         rpc(
             2,
             "workspace.update",
@@ -13927,7 +14004,7 @@ async fn wss_workspace_update_status_image_asset_id_round_trip() {
 
     // Read-back proves persistence through the store.
     let got = send_and_wait(
-        &mut ws,
+        &mut rpc_ws,
         rpc(
             3,
             "workspace.get",
@@ -13944,7 +14021,7 @@ async fn wss_workspace_update_status_image_asset_id_round_trip() {
     // Clear: wire `null` (double-option `Some(None)`) empties the column and
     // the cleared field is omitted from the returned payload.
     let cleared = send_and_wait(
-        &mut ws,
+        &mut rpc_ws,
         rpc(
             4,
             "workspace.update",
@@ -13969,7 +14046,7 @@ async fn wss_workspace_update_status_image_asset_id_round_trip() {
         "cleared asset id must be omitted, not null: {cleared}"
     );
     let got = send_and_wait(
-        &mut ws,
+        &mut rpc_ws,
         rpc(
             5,
             "workspace.get",
@@ -16582,6 +16659,7 @@ async fn wss_tls_capability_gating_and_client_lifecycle_events() {
         ..WsOptions::default()
     })
     .await;
+    let owner = srv.store.get_primary_principal().await.unwrap();
     let mut sub = connect_ws(srv.port, srv.cfg.clone()).await;
     sub.send(Message::Text(
         r#"{"jsonrpc":"2.0","id":"sub","method":"events.subscribe","params":{"eventTypes":["client:connected","client:disconnected"]}}"#
@@ -16617,7 +16695,9 @@ async fn wss_tls_capability_gating_and_client_lifecycle_events() {
     let ev = await_client_event(&mut sub, "client:connected", "tls-aux").await;
     assert_eq!(
         ev["data"],
-        serde_json::json!({ "clientId": "tls-aux", "capabilities": {} })
+        serde_json::json!({ "clientId": "tls-aux", "capabilities": {"browserExec": false},
+            "principalId": owner.id, "hostRole": "owner",
+            "login": null, "displayName": null, "avatarUrl": null })
     );
     assert!(
         !srv.reverse_registry.is_connected(),
@@ -16641,7 +16721,9 @@ async fn wss_tls_capability_gating_and_client_lifecycle_events() {
     assert_eq!(ev["workspaceId"], "");
     assert_eq!(
         ev["data"],
-        serde_json::json!({ "clientId": "tls-desktop", "capabilities": { "browserExec": true } })
+        serde_json::json!({ "clientId": "tls-desktop", "capabilities": { "browserExec": true },
+            "principalId": owner.id, "hostRole": "owner",
+            "login": null, "displayName": null, "avatarUrl": null })
     );
 
     // Leave `desktop` unpolled: no pongs, so the heartbeat reaper aborts its
@@ -16649,7 +16731,9 @@ async fn wss_tls_capability_gating_and_client_lifecycle_events() {
     let ev = await_client_event(&mut sub, "client:disconnected", "tls-desktop").await;
     assert_eq!(
         ev["data"],
-        serde_json::json!({ "clientId": "tls-desktop", "capabilities": { "browserExec": true } })
+        serde_json::json!({ "clientId": "tls-desktop", "capabilities": { "browserExec": true },
+            "principalId": owner.id, "hostRole": "owner",
+            "login": null, "displayName": null, "avatarUrl": null })
     );
     assert!(!srv.reverse_registry.is_connected());
     assert!(srv
@@ -18858,7 +18942,7 @@ async fn wss_workspace_transfer_plan_round_trip() {
     assert_eq!(resp["id"], 2, "envelope: {resp}");
     let plan = &resp["result"]["plan"];
     let manifest = &plan["manifest"];
-    assert_eq!(manifest["formatVersion"], 1, "{resp}");
+    assert_eq!(manifest["formatVersion"], 2, "{resp}");
     assert!(
         manifest["creatingIntentdVersion"].is_string(),
         "manifest records the creating daemon version: {resp}"
@@ -22323,5 +22407,135 @@ async fn wss_cross_workspace_siblings_resolve_by_github_identity() {
         "{resp}"
     );
 
+    srv.ws.stop().await;
+}
+
+#[cfg(unix)]
+#[intent_test_macros::daemon_test]
+async fn wss_quick_action_effort_settings_and_execution_contract() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = test_tempdir("wss-quick-action-effort-");
+    let log = dir.path().join("requests.jsonl");
+    let behavior = dir.path().join("behavior.json");
+    std::fs::write(&behavior, "{}").unwrap();
+    let fixture = format!(
+        "{}/tests/fixtures/mock-quick-action-effort.mjs",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let bin = dir.path().join("claude-agent-acp");
+    std::fs::write(&bin, format!("#!/bin/sh\nMOCK_EFFORT_BEHAVIOR=\"$(cat {behavior:?})\" MOCK_EFFORT_LOG={log:?} exec node {fixture:?}\n")).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("model.defaultProvider", serde_json::json!("claude-code"));
+    srv.set_setting("providers.paths", serde_json::json!({"claude-code":bin}));
+    srv.set_setting(
+        "quickActions.typeOverrides",
+        serde_json::json!({"commit":"action-model"}),
+    );
+    let changes = serde_json::json!([
+        {"path":"quickActions.defaultReasoningEffort","value":"low"},
+        {"path":"quickActions.typeReasoningEffortOverrides","value":{"commit":"high","pr":"stale"}},
+        {"path":"quickActions.providerSettings","value":{"claude-code":{"defaultReasoningEffort":"low","typeReasoningEffortOverrides":{"commit":"high"}}}}
+    ]);
+    let updated = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &serde_json::json!({
+            "jsonrpc":"2.0","id":1,"method":"settings.update","params":{"changes":changes}
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(updated["jsonrpc"], "2.0");
+    assert_eq!(updated["id"], 1);
+    assert!(updated.get("error").is_none(), "{updated}");
+    for change in changes.as_array().unwrap() {
+        let read = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            &serde_json::json!({
+                "jsonrpc":"2.0","id":2,"method":"settings.get","params":{"path":change["path"]}
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(read["result"]["value"], change["value"], "{read}");
+    }
+    // Explicit model does not bypass the independently resolved action effort.
+    for (kind, effort, expected, model) in [
+        ("commit", Value::Null, "high", Some("chosen")),
+        ("commit", serde_json::json!(" "), "high", Some("chosen")),
+        ("pr", Value::Null, "low", Some("chosen")),
+        ("fast", Value::Null, "low", Some("chosen")),
+        ("commit", serde_json::json!("low"), "low", Some("chosen")),
+        (" commit ", Value::Null, "high", Some("chosen")),
+        ("commit", Value::Null, "high", None),
+        (" commit ", Value::Null, "high", None),
+    ] {
+        std::fs::write(&log, "").unwrap();
+        let reply = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            &serde_json::json!({
+                "jsonrpc":"2.0","id":3,"method":"agent.completeOnce",
+                "params":{"prompt":"hi","model":model,"type":kind,"reasoningEffort":effort}
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(reply["id"], 3);
+        assert_eq!(reply["jsonrpc"], "2.0");
+        let text: Value =
+            serde_json::from_str(reply["result"]["text"].as_str().expect("completion text"))
+                .unwrap();
+        assert_eq!(
+            text,
+            serde_json::json!({"model":model.unwrap_or("action-model"),"effort":expected})
+        );
+        let requests: Vec<Value> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|r| r["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "initialize",
+                "session/new",
+                "session/set_config_option",
+                "session/set_config_option",
+                "session/prompt"
+            ]
+        );
+        assert_eq!(requests[3]["params"]["value"], expected);
+    }
+    for invalid in [
+        serde_json::json!(17),
+        serde_json::json!(true),
+        serde_json::json!([]),
+        serde_json::json!({}),
+        serde_json::json!("unsupported"),
+    ] {
+        std::fs::write(&log, "").unwrap();
+        let reply = wss_call(srv.port, srv.cfg.clone(), &serde_json::json!({
+            "jsonrpc":"2.0","id":4,"method":"agent.completeOnce","params":{"prompt":"hi","reasoningEffort":invalid}
+        }).to_string()).await;
+        assert_eq!(reply["jsonrpc"], "2.0");
+        assert_eq!(reply["id"], 4);
+        assert_eq!(reply["error"]["code"], -32602, "{reply}");
+        assert!(!std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("session/prompt"));
+    }
+    std::fs::write(&behavior, r#"{"rejectEffort":true}"#).unwrap();
+    std::fs::write(&log, "").unwrap();
+    let reply = wss_call(srv.port, srv.cfg.clone(), r#"{"jsonrpc":"2.0","id":5,"method":"agent.completeOnce","params":{"prompt":"hi","reasoningEffort":"high"}}"#).await;
+    assert_eq!(reply["error"]["code"], -32603, "{reply}");
+    assert!(!std::fs::read_to_string(&log)
+        .unwrap()
+        .contains("session/prompt"));
     srv.ws.stop().await;
 }

@@ -2,6 +2,58 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.117] - 2026-09-29
+
+### 🐛 Bug Fixes
+
+- *(store)* Prevent deleted workspace metadata from blocking re-import ([#2162](https://github.com/intent-hq/intentd/pull/2162))
+
+
+## [0.9.116] - 2026-09-29
+
+### 🐛 Bug Fixes
+
+- Isolate configuration fixture secrets ([#6097](https://github.com/intent-hq/intentd/pull/6097)) ([#2163](https://github.com/intent-hq/intentd/pull/2163))
+- Bound hook validation and stabilize database and invite fixtures ([#2166](https://github.com/intent-hq/intentd/pull/2166))
+
+
+## [0.9.115] - 2026-09-29
+
+### 🚀 Features
+
+- Add local runtime and remote agent storage foundations ([#2151](https://github.com/intent-hq/intentd/pull/2151))
+- Expose direct agent retirement with runtime cancellation ([#2149](https://github.com/intent-hq/intentd/pull/2149))
+
+### 🐛 Bug Fixes
+
+- Borrow note versions in line attribution ([#2152](https://github.com/intent-hq/intentd/pull/2152))
+- Support ancestry-only attributed merges ([#2141](https://github.com/intent-hq/intentd/pull/2141))
+
+### ⚡ Performance
+
+- Share GitHub PR discovery and rule reads across checkouts ([#2153](https://github.com/intent-hq/intentd/pull/2153))
+
+
+## [0.9.114] - 2026-09-28
+
+### 🚀 Features
+
+- Apply reasoning effort to quick-action completions ([#2146](https://github.com/intent-hq/intentd/pull/2146))
+- Persist provider fast mode and apply it before each turn ([#2147](https://github.com/intent-hq/intentd/pull/2147))
+
+### 🐛 Bug Fixes
+
+- Teach workspace app file links in harness v2.10 ([#2145](https://github.com/intent-hq/intentd/pull/2145))
+- Preserve RPC behavior with workspace routing context ([#2150](https://github.com/intent-hq/intentd/pull/2150))
+
+
+## [0.9.113] - 2026-09-27
+
+### 🚀 Features
+
+- Add shared host membership and portable human attribution ([#2128](https://github.com/intent-hq/intentd/pull/2128))
+
+
 ## [0.9.112] - 2026-09-27
 
 ### 🚀 Features

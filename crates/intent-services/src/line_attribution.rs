@@ -19,14 +19,15 @@ use intent_core::NoteVersion;
 
 /// One line's attribution result. Mirrors the FE `LineAttribution` struct.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct LineAttribution {
+pub(crate) struct LineAttribution<'a> {
     /// 1-based line number in the current note content.
     pub line_number: usize,
     /// The line's current text (no trailing newline).
     pub line_content: String,
     /// Version that last modified this line (`None` when the line is older
-    /// than the retained history).
-    pub version: Option<NoteVersion>,
+    /// than the retained history). Borrow the snapshot so each line does not
+    /// allocate another copy of the full note content.
+    pub version: Option<&'a NoteVersion>,
     /// `true` iff the line differs from the attributed version only in
     /// whitespace (FE `isWhitespaceOnly` flag).
     pub is_whitespace_only: bool,
@@ -120,10 +121,10 @@ fn is_whitespace_only_change(version_line: &str, current_line: &str) -> bool {
 /// See [`LineAttribution`] for the returned per-line record. Empty content
 /// returns an empty vec (FE parity); a note with no versions returns one
 /// unattributed entry per current line.
-pub(crate) fn attribute_lines(
+pub(crate) fn attribute_lines<'a>(
     current_content: &str,
-    versions: &[NoteVersion],
-) -> Vec<LineAttribution> {
+    versions: &'a [NoteVersion],
+) -> Vec<LineAttribution<'a>> {
     let current_lines: Vec<&str> = split_lines_js(current_content);
 
     // Handle empty content up front (FE early return).
@@ -199,12 +200,12 @@ pub(crate) fn attribute_lines(
             }
 
             if was_changed_in_this_version {
-                attributions[i].version = Some(version.clone());
+                attributions[i].version = Some(version);
                 // Preserve any whitespace-only flag already set by a later pass.
             } else if is_whitespace_change && attributions[i].version.is_none() {
                 attributions[i].is_whitespace_only = true;
             } else if prev_version.is_none() && attributions[i].version.is_none() {
-                attributions[i].version = Some(version.clone());
+                attributions[i].version = Some(version);
                 attributions[i].is_whitespace_only =
                     is_whitespace_only_change(version_line, current_line);
             }
@@ -279,6 +280,49 @@ mod tests {
             .as_ref()
             .expect("attribution missing version")
             .v
+    }
+
+    #[test]
+    fn memory_regression_lines_reuse_version_content_buffers() {
+        // Buffer identity catches per-line full-snapshot copies deterministically,
+        // without allocator instrumentation or a process-wide RSS threshold.
+        // Keep even the unfixed case small (under 20 MiB of copied content).
+        for line_count in [32, 256] {
+            let padding = "x".repeat(256);
+            let lines: Vec<String> = (0..line_count)
+                .map(|i| format!("Line {i}: {padding}"))
+                .collect();
+            let versions = vec![
+                v_user(
+                    1,
+                    &lines[..line_count / 2].join("\n"),
+                    "2024-01-01T10:00:00Z",
+                ),
+                v_of(
+                    2,
+                    &lines.join("\n"),
+                    "2024-01-01T10:05:00Z",
+                    AuthorType::Agent,
+                ),
+            ];
+            let attributions = attribute_lines(&versions[1].content, &versions);
+            assert_eq!(attributions.len(), line_count);
+            for (i, attr) in attributions.iter().enumerate() {
+                let source = &versions[usize::from(i >= line_count / 2)];
+                let version = attr.version.as_ref().expect("attributed line");
+                assert_eq!(attr.line_number, i + 1);
+                assert_eq!(attr.line_content, lines[i]);
+                assert_eq!(version.v, source.v);
+                assert_eq!(version.author, source.author);
+                assert_eq!(version.date, source.date);
+                assert!(!attr.is_whitespace_only);
+                assert_eq!(version.content, source.content);
+                assert!(
+                    std::ptr::eq(version.content.as_ptr(), source.content.as_ptr()),
+                    "line {i} must reuse its source snapshot's content buffer"
+                );
+            }
+        }
     }
 
     #[test]

@@ -13,7 +13,9 @@ use tokio::sync::mpsc;
 
 #[cfg(unix)]
 use super::run_one_shot_acp_in;
-use super::{run_one_shot_acp, serve_requests_while, OneShotCommand, OneShotError, Responder};
+use super::{
+    run_one_shot_acp, serve_requests_while, OneShotCommand, OneShotEffort, OneShotError, Responder,
+};
 #[cfg(unix)]
 use crate::acp_adapter::AdapterSlots;
 use crate::test_support::test_tempdir;
@@ -30,6 +32,87 @@ fn mock_adapter(body: &str) -> (OneShotCommand, tempfile::TempDir) {
         vec![script.to_string_lossy().into_owned()],
     );
     (cmd, dir)
+}
+
+#[tokio::test]
+async fn fast_mode_one_shot_samples_after_model_selection_and_preserves_native_state() {
+    const FIXTURE: &str = include_str!("../../tests/fixtures/fast-mode.mjs");
+    for provider in ["claude-code", "codex", "pi"] {
+        for model in ["supported", "unsupported"] {
+            for enabled in [false, true, false] {
+                let log_dir = test_tempdir("fast-mode-one-shot-");
+                let log = log_dir.path().join("calls.jsonl");
+                let (cmd, _dir) = mock_adapter(&format!("const provider = {provider:?}; const failOff = false; const logPath = {};\n{FIXTURE}", json!(log)));
+                let sampled_log = log.clone();
+                let preference = Box::pin(async move {
+                    let calls = std::fs::read_to_string(&sampled_log).unwrap();
+                    assert!(
+                        calls.contains("\"configId\":\"model\""),
+                        "sample only after model selection"
+                    );
+                    enabled
+                });
+                let reply = run_one_shot_acp(
+                    Some((provider, preference)),
+                    cmd,
+                    "inspect",
+                    Some(model),
+                    None,
+                    Duration::from_secs(30),
+                    &OneShotEffort::default(),
+                )
+                .await
+                .unwrap();
+                let state: Value = serde_json::from_str(&reply).unwrap();
+                assert_eq!(state["model"], model);
+                assert_eq!(state["effort"], "medium");
+                if provider == "pi" || (provider == "claude-code" && model == "unsupported") {
+                    assert_eq!(state["controls"], json!([]));
+                } else {
+                    assert_eq!(
+                        state["controls"],
+                        json!([if enabled { "on" } else { "off" }])
+                    );
+                    assert_eq!(
+                        state["serviceTier"],
+                        if enabled && model == "supported" {
+                            json!("fast")
+                        } else {
+                            Value::Null
+                        }
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn fast_mode_one_shot_failed_off_never_prompts_at_inherited_tier() {
+    for provider in ["claude-code", "codex"] {
+        let log_dir = test_tempdir("fast-mode-one-shot-fail-");
+        let log = log_dir.path().join("calls.jsonl");
+        let (cmd, _dir) = mock_adapter(&format!(
+            "const provider = {provider:?}; const failOff = true; const logPath = {};\n{}",
+            json!(log),
+            include_str!("../../tests/fixtures/fast-mode.mjs")
+        ));
+        let error = run_one_shot_acp(
+            Some((provider, Box::pin(async { false }))),
+            cmd,
+            "inspect",
+            Some("supported"),
+            None,
+            Duration::from_secs(30),
+            &OneShotEffort::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("could not apply Fast mode off"));
+        assert!(!std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("session/prompt"));
+    }
 }
 
 /// Shared preamble: an NDJSON JSON-RPC loop that answers `initialize` and
@@ -67,9 +150,17 @@ const onPrompt = (id) => {{
 }};
 "
     ));
-    let text = run_one_shot_acp(cmd, "say hi", None, None, Duration::from_secs(30))
-        .await
-        .expect("one-shot succeeds");
+    let text = run_one_shot_acp(
+        None,
+        cmd,
+        "say hi",
+        None,
+        None,
+        Duration::from_secs(30),
+        &OneShotEffort::default(),
+    )
+    .await
+    .expect("one-shot succeeds");
     assert_eq!(text, "Hello, world!");
 }
 
@@ -96,11 +187,13 @@ async fn session_meta_rides_session_new_verbatim() {
         "claudeCode": { "options": { "tools": [] } },
     });
     let text = run_one_shot_acp(
+        None,
         cmd,
         "hello",
         None,
         Some(meta.clone()),
         Duration::from_secs(30),
+        &OneShotEffort::default(),
     )
     .await
     .expect("one-shot succeeds");
@@ -112,9 +205,17 @@ async fn session_meta_rides_session_new_verbatim() {
 #[tokio::test]
 async fn session_new_omits_meta_when_none_given() {
     let (cmd, _dir) = mock_adapter(&format!("{ADAPTER_PRELUDE}{SESSION_NEW_ECHO_ADAPTER}"));
-    let text = run_one_shot_acp(cmd, "hello", None, None, Duration::from_secs(30))
-        .await
-        .expect("one-shot succeeds");
+    let text = run_one_shot_acp(
+        None,
+        cmd,
+        "hello",
+        None,
+        None,
+        Duration::from_secs(30),
+        &OneShotEffort::default(),
+    )
+    .await
+    .expect("one-shot succeeds");
     let params: serde_json::Value = serde_json::from_str(&text).expect("echoed params parse");
     assert!(
         params.get("_meta").is_none(),
@@ -171,9 +272,18 @@ async fn one_shot_npx_launch_runs_outside_the_catalog_workspace_but_keeps_it_as_
         .env("INTENTD_FAKE_NPX_ADAPTER", adapter.as_os_str());
 
     let slots = AdapterSlots::new(1);
-    let text = run_one_shot_acp_in(&slots, cmd, "where", None, None, Duration::from_secs(30))
-        .await
-        .expect("npx one-shot from a catalog workspace succeeds");
+    let text = run_one_shot_acp_in(
+        None,
+        &slots,
+        cmd,
+        "where",
+        None,
+        None,
+        Duration::from_secs(30),
+        &OneShotEffort::default(),
+    )
+    .await
+    .expect("npx one-shot from a catalog workspace succeeds");
     let reply: Value = serde_json::from_str(&text).expect("echoed reply parses");
     assert_eq!(
         reply["sessionNew"]["cwd"],
@@ -228,9 +338,18 @@ const onPrompt = () => {{}};
     // sibling tests for longer than 500ms, which would turn the asserted
     // PromptTimeout into a QueueTimeout (monorepo#2379).
     let slots = AdapterSlots::new(1);
-    let err = run_one_shot_acp_in(&slots, cmd, "hang", None, None, Duration::from_millis(500))
-        .await
-        .unwrap_err();
+    let err = run_one_shot_acp_in(
+        None,
+        &slots,
+        cmd,
+        "hang",
+        None,
+        None,
+        Duration::from_millis(500),
+        &OneShotEffort::default(),
+    )
+    .await
+    .unwrap_err();
     assert!(
         matches!(err, OneShotError::PromptTimeout),
         "expected PromptTimeout, got {err}"
@@ -300,7 +419,16 @@ const onPrompt = () => {{
     let started = std::time::Instant::now();
     let outcome = tokio::time::timeout(
         Duration::from_secs(15),
-        run_one_shot_acp_in(&slots, cmd, "flood", None, None, budget),
+        run_one_shot_acp_in(
+            None,
+            &slots,
+            cmd,
+            "flood",
+            None,
+            None,
+            budget,
+            &OneShotEffort::default(),
+        ),
     )
     .await;
     let elapsed = started.elapsed();
@@ -569,9 +697,17 @@ const onPrompt = (id) => {{
 }};
 "
     ));
-    let text = run_one_shot_acp(cmd, "touch a file", None, None, Duration::from_secs(30))
-        .await
-        .expect("one-shot succeeds after the auto-deny");
+    let text = run_one_shot_acp(
+        None,
+        cmd,
+        "touch a file",
+        None,
+        None,
+        Duration::from_secs(30),
+        &OneShotEffort::default(),
+    )
+    .await
+    .expect("one-shot succeeds after the auto-deny");
     assert_eq!(text, "denied=\"cancelled\"");
 }
 
@@ -609,9 +745,17 @@ rl.on('line', (line) => {{
 }});
 "
     ));
-    let text = run_one_shot_acp(cmd, "hello", None, None, Duration::from_secs(30))
-        .await
-        .expect("setup-phase permission requests are auto-denied, not hung");
+    let text = run_one_shot_acp(
+        None,
+        cmd,
+        "hello",
+        None,
+        None,
+        Duration::from_secs(30),
+        &OneShotEffort::default(),
+    )
+    .await
+    .expect("setup-phase permission requests are auto-denied, not hung");
     assert_eq!(text, "setup-denials=2");
 }
 
@@ -637,9 +781,17 @@ const onPrompt = (id) => {{
 }};
 "
     ));
-    let text = run_one_shot_acp(cmd, "hello", Some("opus-x"), None, Duration::from_secs(30))
-        .await
-        .expect("one-shot succeeds");
+    let text = run_one_shot_acp(
+        None,
+        cmd,
+        "hello",
+        Some("opus-x"),
+        None,
+        Duration::from_secs(30),
+        &OneShotEffort::default(),
+    )
+    .await
+    .expect("one-shot succeeds");
     assert_eq!(text, "applied=model=opus-x@s1");
 }
 
@@ -664,11 +816,13 @@ const onPrompt = (id) => {{
 "
     ));
     let text = run_one_shot_acp(
+        None,
         cmd,
         "hello",
         Some("bogus-model"),
         None,
         Duration::from_secs(30),
+        &OneShotEffort::default(),
     )
     .await
     .expect("a rejected set_config_option must not fail the one-shot");
@@ -682,9 +836,17 @@ async fn nonzero_exit_surfaces_typed_exited_error() {
         PathBuf::from("/bin/sh"),
         vec!["-c".to_string(), "echo boom >&2; exit 7".to_string()],
     );
-    let err = run_one_shot_acp(cmd, "anything", None, None, Duration::from_secs(30))
-        .await
-        .unwrap_err();
+    let err = run_one_shot_acp(
+        None,
+        cmd,
+        "anything",
+        None,
+        None,
+        Duration::from_secs(30),
+        &OneShotEffort::default(),
+    )
+    .await
+    .unwrap_err();
     let OneShotError::Exited(detail) = err else {
         panic!("expected Exited, got {err}");
     };
@@ -701,9 +863,17 @@ async fn garbage_stdout_surfaces_typed_transport_error() {
         PathBuf::from("/bin/sh"),
         vec!["-c".to_string(), "echo not json; exit 0".to_string()],
     );
-    let err = run_one_shot_acp(cmd, "anything", None, None, Duration::from_secs(30))
-        .await
-        .unwrap_err();
+    let err = run_one_shot_acp(
+        None,
+        cmd,
+        "anything",
+        None,
+        None,
+        Duration::from_secs(30),
+        &OneShotEffort::default(),
+    )
+    .await
+    .unwrap_err();
     assert!(
         matches!(err, OneShotError::Transport(_)),
         "expected Transport, got {err}"
@@ -716,9 +886,17 @@ async fn missing_adapter_binary_surfaces_typed_spawn_error() {
         PathBuf::from("/nonexistent/intentd-one-shot-adapter"),
         Vec::new(),
     );
-    let err = run_one_shot_acp(cmd, "anything", None, None, Duration::from_secs(5))
-        .await
-        .unwrap_err();
+    let err = run_one_shot_acp(
+        None,
+        cmd,
+        "anything",
+        None,
+        None,
+        Duration::from_secs(5),
+        &OneShotEffort::default(),
+    )
+    .await
+    .unwrap_err();
     assert!(
         matches!(err, OneShotError::Spawn(_)),
         "expected Spawn, got {err}"
@@ -803,7 +981,16 @@ const onPrompt = (id) => {{
         .map(|_| {
             let cmd = launch();
             tokio::spawn(async move {
-                run_one_shot_acp(cmd, "go", None, None, Duration::from_secs(30)).await
+                run_one_shot_acp(
+                    None,
+                    cmd,
+                    "go",
+                    None,
+                    None,
+                    Duration::from_secs(30),
+                    &OneShotEffort::default(),
+                )
+                .await
             })
         })
         .collect();
@@ -820,9 +1007,17 @@ const onPrompt = (id) => {{
 
     // A caller arriving into that full queue with a short timeout fails as a
     // queue timeout — and still spawns nothing.
-    let queued_out = run_one_shot_acp(launch(), "go", None, None, Duration::from_millis(300))
-        .await
-        .unwrap_err();
+    let queued_out = run_one_shot_acp(
+        None,
+        launch(),
+        "go",
+        None,
+        None,
+        Duration::from_millis(300),
+        &OneShotEffort::default(),
+    )
+    .await
+    .unwrap_err();
     let OneShotError::QueueTimeout {
         waited_ms,
         limit: reported,
@@ -858,4 +1053,69 @@ const onPrompt = (id) => {{
         burst,
         "every queued caller must eventually run"
     );
+}
+
+#[tokio::test]
+async fn fast_mode_one_shot_applies_after_quick_action_effort() {
+    for provider in ["claude-code", "codex"] {
+        for enabled in [false, true] {
+            let log_dir = test_tempdir("fast-mode-effort-");
+            let log = log_dir.path().join("calls.jsonl");
+            let (cmd, _dir) = mock_adapter(&format!(
+                "const provider = {provider:?}; const failOff = false; const logPath = {};\n{}",
+                json!(log),
+                include_str!("../../tests/fixtures/fast-mode.mjs")
+            ));
+            let sampled_log = log.clone();
+            let preference = Box::pin(async move {
+                let calls = std::fs::read_to_string(sampled_log).unwrap();
+                let last: Value = serde_json::from_str(calls.lines().last().unwrap()).unwrap();
+                assert_eq!(
+                    last["params"]["configId"], "effort",
+                    "sample only after effort selection"
+                );
+                assert_eq!(last["params"]["value"], "high");
+                enabled
+            });
+            let reply = run_one_shot_acp(
+                Some((provider, preference)),
+                cmd,
+                "inspect",
+                Some("supported"),
+                None,
+                Duration::from_secs(30),
+                &OneShotEffort {
+                    explicit: Some("high".into()),
+                    saved: vec![],
+                },
+            )
+            .await
+            .unwrap();
+            let state: Value = serde_json::from_str(&reply).unwrap();
+            assert_eq!(state["model"], "supported");
+            assert_eq!(state["effort"], "high");
+            assert_eq!(state["fastMode"], enabled);
+            let calls: Vec<Value> = std::fs::read_to_string(log)
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            let controls: Vec<&str> = calls
+                .iter()
+                .filter_map(|c| c["params"]["configId"].as_str())
+                .collect();
+            assert_eq!(
+                controls,
+                [
+                    "model",
+                    "effort",
+                    if provider == "claude-code" {
+                        "fast"
+                    } else {
+                        "fast-mode"
+                    }
+                ]
+            );
+        }
+    }
 }

@@ -506,6 +506,7 @@ impl Services {
                 Some("commit".to_string()),
                 Some(session.workspace_id.clone()),
                 Some(timeout_ms),
+                None,
             )
             .await;
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);

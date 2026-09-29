@@ -13376,7 +13376,7 @@ async fn queue_reads_and_queue_updated_carry_resolved_author() {
     let queued = with_caller(
         Caller::Wire {
             principal_id: guest.clone(),
-            is_administrator: false,
+            host_role: intent_core::HostRole::Guest,
         },
         async {
             svc.agent_queue_message(id.clone(), "from guest".into(), None, None, None)
@@ -13494,11 +13494,11 @@ async fn get_queue_is_projected_to_the_calling_principal() {
         .expect("guest membership");
     let as_owner = Caller::Wire {
         principal_id: owner.clone(),
-        is_administrator: true,
+        host_role: intent_core::HostRole::Owner,
     };
     let as_guest = Caller::Wire {
         principal_id: guest.clone(),
-        is_administrator: false,
+        host_role: intent_core::HostRole::Guest,
     };
     let as_agent = Caller::Agent {
         agent_id: AgentId::from("agent-reader"),
@@ -13650,11 +13650,11 @@ async fn queue_mutations_enforce_entry_ownership() {
         .expect("guest membership");
     let as_admin = Caller::Wire {
         principal_id: owner.clone(),
-        is_administrator: true,
+        host_role: intent_core::HostRole::Owner,
     };
     let as_guest = Caller::Wire {
         principal_id: guest.clone(),
-        is_administrator: false,
+        host_role: intent_core::HostRole::Guest,
     };
     let as_agent = Caller::Agent {
         agent_id: AgentId::from("agent-peer"),
@@ -13928,11 +13928,11 @@ pub(super) async fn owner_and_guest_callers(
     (
         Caller::Wire {
             principal_id: owner,
-            is_administrator: true,
+            host_role: intent_core::HostRole::Owner,
         },
         Caller::Wire {
             principal_id: guest,
-            is_administrator: false,
+            host_role: intent_core::HostRole::Guest,
         },
     )
 }
@@ -14951,7 +14951,7 @@ async fn principal_stamp_overwrites_client_value_on_every_user_origin_entry_poin
     }
     let wire = |p: &PrincipalId| Caller::Wire {
         principal_id: p.clone(),
-        is_administrator: false,
+        host_role: intent_core::HostRole::Guest,
     };
     let spoof = || json!({ "fromPrincipalId": "spoof", "kind": "reply" });
     let stamp_of = |md: Option<&serde_json::Value>| {
@@ -15212,7 +15212,7 @@ async fn principal_stamp_overwrites_client_value_on_every_user_origin_entry_poin
     let drained = with_caller(
         Caller::Wire {
             principal_id: bob.clone(),
-            is_administrator: true,
+            host_role: intent_core::HostRole::Owner,
         },
         async {
             svc.agent_send_queued_message_now(ws.clone(), agent.clone(), queued_id.clone())
@@ -15344,7 +15344,7 @@ async fn principal_stamp_overwrites_client_value_on_every_user_origin_entry_poin
     let created_ws = with_caller(
         Caller::Wire {
             principal_id: bob.clone(),
-            is_administrator: true,
+            host_role: intent_core::HostRole::Owner,
         },
         async {
             WorkspaceApi::create_workspace(
@@ -15484,7 +15484,7 @@ async fn collaborator_sender_preamble_on_every_human_authored_entry_point() {
         .expect("guest membership");
     let wire = |p: &PrincipalId| Caller::Wire {
         principal_id: p.clone(),
-        is_administrator: false,
+        host_role: intent_core::HostRole::Guest,
     };
     let preamble = crate::harness::latest().collaborator_sender_preamble(
         Some("octocat"),
@@ -15576,7 +15576,7 @@ async fn collaborator_sender_preamble_on_every_human_authored_entry_point() {
     // agent caller, and a collaborator's non-user-origin send.
     let admin = Caller::Wire {
         principal_id: owner.clone(),
-        is_administrator: true,
+        host_role: intent_core::HostRole::Owner,
     };
     let peer = Caller::Agent {
         agent_id: AgentId::from("agent-peer"),
@@ -15856,7 +15856,7 @@ async fn collaborator_sender_preamble_on_delegate_free_text() {
         .expect("guest membership");
     let wire = |p: &PrincipalId| Caller::Wire {
         principal_id: p.clone(),
-        is_administrator: false,
+        host_role: intent_core::HostRole::Guest,
     };
     let preamble = crate::harness::latest().collaborator_sender_preamble(
         Some("octocat"),
@@ -16060,7 +16060,7 @@ async fn collaborator_sender_preamble_on_delegate_free_text() {
     // absent callers not); every control is served as the owner.
     let admin = Caller::Wire {
         principal_id: owner.clone(),
-        is_administrator: true,
+        host_role: intent_core::HostRole::Owner,
     };
     let peer = Caller::Agent {
         agent_id: AgentId::from("agent-peer"),
@@ -16141,7 +16141,7 @@ async fn collaborator_sender_preamble_on_append_message_user_rows() {
         .expect("guest membership");
     let wire = |p: &PrincipalId| Caller::Wire {
         principal_id: p.clone(),
-        is_administrator: false,
+        host_role: intent_core::HostRole::Guest,
     };
     let preamble = crate::harness::latest().collaborator_sender_preamble(
         Some("octocat"),
@@ -16240,7 +16240,7 @@ async fn collaborator_sender_preamble_on_append_message_user_rows() {
     }
     let admin = Caller::Wire {
         principal_id: owner.clone(),
-        is_administrator: true,
+        host_role: intent_core::HostRole::Owner,
     };
     let peer = Caller::Agent {
         agent_id: AgentId::from("agent-peer"),
@@ -16295,7 +16295,7 @@ async fn non_object_message_metadata_is_rejected_on_every_user_origin_entry_poin
         .expect("membership");
     let caller = Caller::Wire {
         principal_id: strict,
-        is_administrator: false,
+        host_role: intent_core::HostRole::Guest,
     };
     let is_invalid = |label: &str, r: Result<serde_json::Value, Error>| {
         assert!(
@@ -16436,7 +16436,7 @@ async fn edit_queued_message_restamp_rejection_leaves_entry_untouched() {
     let err = with_caller(
         Caller::Wire {
             principal_id: editor,
-            is_administrator: false,
+            host_role: intent_core::HostRole::Guest,
         },
         async {
             svc.agent_edit_queued_message(
@@ -22616,7 +22616,10 @@ async fn wake_or_create_queued_skips_watch_when_caller_deleted() {
     flag_agent_deleted(&svc, &caller).await;
     // Occupy the assignee's in-flight slot so `deliver_wake_message` takes the
     // enqueue branch deterministically.
-    assert!(manager.try_begin_turn(&target, &ws).await, "claim slot");
+    let admission = manager
+        .try_begin_turn(&target, &ws)
+        .await
+        .expect("claim slot");
 
     let input = AgentWakeOrCreateInput {
         caller_agent_id: Some(caller.clone()),
@@ -22635,7 +22638,7 @@ async fn wake_or_create_queued_skips_watch_when_caller_deleted() {
     assert!(svc.list_watches_for_parent(&caller).is_empty());
     assert!(svc.find_watches_for_child(&target).is_empty());
 
-    manager.release_slot(&target).await;
+    manager.release_slot(&target, admission).await;
 }
 
 /// monorepo#994: the #932 pre-gate is ALSO skipped for a Deleted caller —
@@ -22680,7 +22683,10 @@ async fn wake_or_create_queued_registers_watch() {
         .expect("assign");
     // Occupy the assignee's in-flight slot so `deliver_wake_message` takes the
     // enqueue branch deterministically.
-    assert!(manager.try_begin_turn(&target, &ws).await, "claim slot");
+    let admission = manager
+        .try_begin_turn(&target, &ws)
+        .await
+        .expect("claim slot");
 
     let input = AgentWakeOrCreateInput {
         caller_agent_id: Some(caller.clone()),
@@ -22707,7 +22713,7 @@ async fn wake_or_create_queued_registers_watch() {
     assert_eq!(watches[0].id, sub_id);
     assert_eq!(watches[0].child_agent_id, target);
 
-    manager.release_slot(&target).await;
+    manager.release_slot(&target, admission).await;
 }
 
 /// SUB-2 (PR #104 thread `PRRT_kwDOS9Wxuc6QIRcq`), updated for pair
@@ -22742,7 +22748,10 @@ async fn wake_or_create_queued_adopts_existing_watch() {
 
     // Occupy the assignee's in-flight slot so the wakeOrCreate takes the
     // queued branch deterministically.
-    assert!(manager.try_begin_turn(&target, &ws).await, "claim slot");
+    let admission = manager
+        .try_begin_turn(&target, &ws)
+        .await
+        .expect("claim slot");
 
     let queued = svc
         .agent_wake_or_create_op(
@@ -22776,7 +22785,7 @@ async fn wake_or_create_queued_adopts_existing_watch() {
     );
     assert_eq!(watches[0].id, seeded_sub_id);
 
-    manager.release_slot(&target).await;
+    manager.release_slot(&target, admission).await;
 }
 
 /// SUB-2 (Copilot #104 follow-up, thread `PRRT_kwDOS9Wxuc6QKWuU`):
@@ -23890,7 +23899,10 @@ async fn turn_start_opens_new_waiting_period_for_armed_watch() {
 
     // The child starts a REAL turn (e.g. a user message or hook-dispatch
     // wake): the period is over and the marker clears at the claim.
-    assert!(manager.try_begin_turn(&child, &ws).await, "claim slot");
+    let admission = manager
+        .try_begin_turn(&child, &ws)
+        .await
+        .expect("claim slot");
     assert!(
         !svc.store()
             .has_advisory_wake_delivery(&parent, &child)
@@ -23898,7 +23910,7 @@ async fn turn_start_opens_new_waiting_period_for_armed_watch() {
             .expect("marker read"),
         "turn start clears the once-per-period advisory marker"
     );
-    manager.release_slot(&child).await;
+    manager.release_slot(&child, admission).await;
 
     // Period 2: the child stalls monitoring-idle again — the SAME armed
     // watch hears a FRESH advisory instead of waiting in silence (the
@@ -23987,7 +23999,10 @@ async fn turn_start_opens_new_waiting_period_for_grouped_watch() {
     manager.stop(&parent).await;
 
     // Real turn: marker clears, period 2 opens.
-    assert!(manager.try_begin_turn(&child, &ws).await, "claim slot");
+    let admission = manager
+        .try_begin_turn(&child, &ws)
+        .await
+        .expect("claim slot");
     assert!(
         !svc.store()
             .has_advisory_wake_delivery(&parent, &child)
@@ -23995,7 +24010,7 @@ async fn turn_start_opens_new_waiting_period_for_grouped_watch() {
             .expect("marker read"),
         "turn start clears the grouped pair's marker too"
     );
-    manager.release_slot(&child).await;
+    manager.release_slot(&child, admission).await;
 
     // Period 2: the SAME armed watch (same id) delivers a second advisory —
     // the per-period stable id keeps it out of the durable-wake dedup.
@@ -46198,6 +46213,7 @@ async fn wire_agent_complete_once_rejects_compound_model() {
             "p".into(),
             None,
             Some(bad.into()),
+            None,
             None,
             None,
             None,

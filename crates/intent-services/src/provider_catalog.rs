@@ -44,6 +44,10 @@ fn provider_visible(p: &intent_providers::ProviderConfig, env_has: &dyn Fn(&str)
 fn provider_row(p: &intent_providers::ProviderConfig, env_has: &dyn Fn(&str) -> bool) -> Value {
     let mut row = serde_json::Map::new();
     row.insert("id".into(), json!(p.id));
+    row.insert(
+        "supportsFastMode".into(),
+        json!(p.fast_mode_config_id().is_some()),
+    );
     let legacy_aliases = intent_providers::legacy_aliases_for_provider(p.id);
     if !legacy_aliases.is_empty() {
         row.insert("legacyAliases".into(), json!(legacy_aliases));

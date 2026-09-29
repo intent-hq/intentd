@@ -392,34 +392,37 @@ async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value 
 /// preserved.
 #[intent_test_macros::daemon_test]
 async fn repo_config_get_returns_parsed_remote_config() {
-    let fx = boot().await;
-    *fx.forge.file_content.lock().unwrap() = Some(
-        r#"{ "branchPrefix": "feat/", "setupScript": "pnpm install", "customKey": 42 }"#.into(),
-    );
-    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+    for context in [None, Some("workspace-route")] {
+        let fx = boot().await;
+        *fx.forge.file_content.lock().unwrap() = Some(
+            r#"{ "branchPrefix": "feat/", "setupScript": "pnpm install", "customKey": 42 }"#.into(),
+        );
+        let mut ws = connect(fx.port, fx.cfg.clone()).await;
 
-    let r = wss_rpc(
-        &mut ws,
-        1,
-        "github.repoConfig.get",
-        json!({ "owner": "octocat", "repo": "hello", "ref": "main" }),
-    )
-    .await;
-    assert_eq!(r["config"]["branchPrefix"], "feat/");
-    assert_eq!(r["config"]["setupScript"], "pnpm install");
-    // Unknown keys round-trip (RepoConfig `extra` flatten).
-    assert_eq!(r["config"]["customKey"], 42);
-    assert_eq!(r["exists"], true);
+        let r = context_rpc(
+            context,
+            &mut ws,
+            1,
+            "github.repoConfig.get",
+            json!({ "owner": "octocat", "repo": "hello", "ref": "main" }),
+        )
+        .await;
+        assert_eq!(r["config"]["branchPrefix"], "feat/");
+        assert_eq!(r["config"]["setupScript"], "pnpm install");
+        // Unknown keys round-trip (RepoConfig `extra` flatten).
+        assert_eq!(r["config"]["customKey"], 42);
+        assert_eq!(r["exists"], true);
 
-    let calls = fx.forge.content_calls.lock().unwrap();
-    assert_eq!(
-        calls.as_slice(),
-        &[(
-            "octocat/hello".to_string(),
-            ".intent/config.json".to_string(),
-            Some("main".to_string()),
-        )]
-    );
+        let calls = fx.forge.content_calls.lock().unwrap();
+        assert_eq!(
+            calls.as_slice(),
+            &[(
+                "octocat/hello".to_string(),
+                ".intent/config.json".to_string(),
+                Some("main".to_string()),
+            )]
+        );
+    }
 }
 
 /// Tolerant semantics on the wire: a missing file yields
@@ -428,58 +431,72 @@ async fn repo_config_get_returns_parsed_remote_config() {
 /// reaches the engine as `None` (default-branch read).
 #[intent_test_macros::daemon_test]
 async fn repo_config_get_missing_or_invalid_yields_empty_config() {
-    let fx = boot().await;
-    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+    for context in [None, Some("workspace-route")] {
+        let fx = boot().await;
+        let mut ws = connect(fx.port, fx.cfg.clone()).await;
 
-    // Absent file (engine returns None), no ref param.
-    let r = wss_rpc(
-        &mut ws,
-        1,
-        "github.repoConfig.get",
-        json!({ "owner": "octocat", "repo": "hello" }),
-    )
-    .await;
-    assert_eq!(r["config"], Value::Null);
-    assert_eq!(r["exists"], false);
+        // Absent file (engine returns None), no ref param.
+        let r = context_rpc(
+            context,
+            &mut ws,
+            1,
+            "github.repoConfig.get",
+            json!({ "owner": "octocat", "repo": "hello" }),
+        )
+        .await;
+        assert_eq!(r["config"], Value::Null);
+        assert_eq!(r["exists"], false);
 
-    // Invalid JSON in the fetched file.
-    *fx.forge.file_content.lock().unwrap() = Some("{ not json".into());
-    let r2 = wss_rpc(
-        &mut ws,
-        2,
-        "github.repoConfig.get",
-        json!({ "owner": "octocat", "repo": "hello" }),
-    )
-    .await;
-    assert_eq!(r2["config"], json!({}));
-    assert_eq!(r2["exists"], true);
+        // Invalid JSON in the fetched file.
+        *fx.forge.file_content.lock().unwrap() = Some("{ not json".into());
+        let r2 = context_rpc(
+            context,
+            &mut ws,
+            2,
+            "github.repoConfig.get",
+            json!({ "owner": "octocat", "repo": "hello" }),
+        )
+        .await;
+        assert_eq!(r2["config"], json!({}));
+        assert_eq!(r2["exists"], true);
 
-    let calls = fx.forge.content_calls.lock().unwrap();
-    assert_eq!(calls.len(), 2);
-    assert_eq!(calls[0].2, None, "omitted ref reaches the engine as None");
+        let calls = fx.forge.content_calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].2, None, "omitted ref reaches the engine as None");
+    }
 }
 
 /// Missing required params fail with the JSON-RPC `-32602` invalid-params
 /// envelope and never reach the engine.
 #[intent_test_macros::daemon_test]
 async fn repo_config_get_requires_owner_and_repo() {
-    let fx = boot().await;
-    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+    for context in [None, Some("workspace-route")] {
+        let fx = boot().await;
+        let mut ws = connect(fx.port, fx.cfg.clone()).await;
 
-    let env = wss_rpc_envelope(
-        &mut ws,
-        1,
-        "github.repoConfig.get",
-        json!({ "owner": "octocat" }),
-    )
-    .await;
-    assert!(env.get("result").is_none(), "expected error: {env}");
-    assert_eq!(env["error"]["code"], json!(-32602));
+        let env = context_envelope(
+            context,
+            &mut ws,
+            1,
+            "github.repoConfig.get",
+            json!({ "owner": "octocat" }),
+        )
+        .await;
+        assert!(env.get("result").is_none(), "expected error: {env}");
+        assert_eq!(env["error"]["code"], json!(-32602));
 
-    let env2 = wss_rpc_envelope(&mut ws, 2, "github.repoConfig.get", json!({ "repo": "r" })).await;
-    assert_eq!(env2["error"]["code"], json!(-32602));
+        let env2 = context_envelope(
+            context,
+            &mut ws,
+            2,
+            "github.repoConfig.get",
+            json!({ "repo": "r" }),
+        )
+        .await;
+        assert_eq!(env2["error"]["code"], json!(-32602));
 
-    assert!(fx.forge.content_calls.lock().unwrap().is_empty());
+        assert!(fx.forge.content_calls.lock().unwrap().is_empty());
+    }
 }
 
 /// `github.relatedRepos.list` (§5.27) on the wire: the params land on the
@@ -489,9 +506,10 @@ async fn repo_config_get_requires_owner_and_repo() {
 /// skipped.
 #[tokio::test]
 async fn related_repos_list_returns_gitmodules_github_repos() {
-    let fx = boot().await;
-    *fx.forge.file_content.lock().unwrap() = Some(
-        "[submodule \"packages/intentd\"]\n\
+    for context in [None, Some("workspace-route")] {
+        let fx = boot().await;
+        *fx.forge.file_content.lock().unwrap() = Some(
+            "[submodule \"packages/intentd\"]\n\
          \tpath = packages/intentd\n\
          \turl = https://github.com/intent-hq/intentd.git\n\
          [submodule \"packages/fe\"]\n\
@@ -509,36 +527,38 @@ async fn related_repos_list_returns_gitmodules_github_repos() {
          [submodule \"rel\"]\n\
          \tpath = vendor/rel\n\
          \turl = ../sibling.git\n"
-            .into(),
-    );
-    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+                .into(),
+        );
+        let mut ws = connect(fx.port, fx.cfg.clone()).await;
 
-    let r = wss_rpc(
-        &mut ws,
-        1,
-        "github.relatedRepos.list",
-        json!({ "owner": "intent-hq", "repo": "intent", "ref": "main" }),
-    )
-    .await;
-    assert_eq!(
-        r,
-        json!({
-            "repos": [
-                { "owner": "intent-hq", "repo": "intentd", "path": "packages/intentd" },
-                { "owner": "intent-hq", "repo": "cloudlands-fe", "path": "packages/fe" },
-            ]
-        })
-    );
+        let r = context_rpc(
+            context,
+            &mut ws,
+            1,
+            "github.relatedRepos.list",
+            json!({ "owner": "intent-hq", "repo": "intent", "ref": "main" }),
+        )
+        .await;
+        assert_eq!(
+            r,
+            json!({
+                "repos": [
+                    { "owner": "intent-hq", "repo": "intentd", "path": "packages/intentd" },
+                    { "owner": "intent-hq", "repo": "cloudlands-fe", "path": "packages/fe" },
+                ]
+            })
+        );
 
-    let calls = fx.forge.content_calls.lock().unwrap();
-    assert_eq!(
-        calls.as_slice(),
-        &[(
-            "intent-hq/intent".to_string(),
-            ".gitmodules".to_string(),
-            Some("main".to_string()),
-        )]
-    );
+        let calls = fx.forge.content_calls.lock().unwrap();
+        assert_eq!(
+            calls.as_slice(),
+            &[(
+                "intent-hq/intent".to_string(),
+                ".gitmodules".to_string(),
+                Some("main".to_string()),
+            )]
+        );
+    }
 }
 
 /// Graceful semantics on the wire: a missing `.gitmodules` yields
@@ -547,42 +567,76 @@ async fn related_repos_list_returns_gitmodules_github_repos() {
 /// engine call.
 #[tokio::test]
 async fn related_repos_list_missing_file_is_empty_and_requires_owner_and_repo() {
-    let fx = boot().await;
-    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+    for context in [None, Some("workspace-route")] {
+        let fx = boot().await;
+        let mut ws = connect(fx.port, fx.cfg.clone()).await;
 
-    let r = wss_rpc(
-        &mut ws,
-        1,
-        "github.relatedRepos.list",
-        json!({ "owner": "octocat", "repo": "hello" }),
-    )
-    .await;
-    assert_eq!(r, json!({ "repos": [] }));
-    {
-        let calls = fx.forge.content_calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].1, ".gitmodules");
-        assert_eq!(calls[0].2, None, "omitted ref reaches the engine as None");
+        let r = context_rpc(
+            context,
+            &mut ws,
+            1,
+            "github.relatedRepos.list",
+            json!({ "owner": "octocat", "repo": "hello" }),
+        )
+        .await;
+        assert_eq!(r, json!({ "repos": [] }));
+        {
+            let calls = fx.forge.content_calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].1, ".gitmodules");
+            assert_eq!(calls[0].2, None, "omitted ref reaches the engine as None");
+        }
+
+        let env = context_envelope(
+            context,
+            &mut ws,
+            2,
+            "github.relatedRepos.list",
+            json!({ "owner": "octocat" }),
+        )
+        .await;
+        assert!(env.get("result").is_none(), "expected error: {env}");
+        assert_eq!(env["error"]["code"], json!(-32602));
+
+        let env2 = context_envelope(
+            context,
+            &mut ws,
+            3,
+            "github.relatedRepos.list",
+            json!({ "repo": "r" }),
+        )
+        .await;
+        assert_eq!(env2["error"]["code"], json!(-32602));
+
+        assert_eq!(fx.forge.content_calls.lock().unwrap().len(), 1);
     }
+}
 
-    let env = wss_rpc_envelope(
-        &mut ws,
-        2,
-        "github.relatedRepos.list",
-        json!({ "owner": "octocat" }),
-    )
-    .await;
-    assert!(env.get("result").is_none(), "expected error: {env}");
-    assert_eq!(env["error"]["code"], json!(-32602));
+// Each existing fixture runs direct and workspace-originated calls with the same assertions.
+async fn context_rpc(
+    context: Option<&str>,
+    ws: &mut TlsWs,
+    id: i64,
+    method: &str,
+    mut params: Value,
+) -> Value {
+    if method.starts_with("github.") {
+        if let Some(context) = context {
+            params["workspaceId"] = json!(context);
+        }
+    }
+    wss_rpc(ws, id, method, params).await
+}
 
-    let env2 = wss_rpc_envelope(
-        &mut ws,
-        3,
-        "github.relatedRepos.list",
-        json!({ "repo": "r" }),
-    )
-    .await;
-    assert_eq!(env2["error"]["code"], json!(-32602));
-
-    assert_eq!(fx.forge.content_calls.lock().unwrap().len(), 1);
+async fn context_envelope(
+    context: Option<&str>,
+    ws: &mut TlsWs,
+    id: i64,
+    method: &str,
+    mut params: Value,
+) -> Value {
+    if let Some(context) = context {
+        params["workspaceId"] = json!(context);
+    }
+    wss_rpc_envelope(ws, id, method, params).await
 }

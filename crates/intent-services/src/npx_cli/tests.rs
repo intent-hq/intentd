@@ -141,7 +141,15 @@ async fn services(provider: &str) -> Services {
 
 async fn completion(services: &Services) -> intent_core::Result<Value> {
     services
-        .agent_complete_once("hello".to_string(), None, None, None, None, Some(5_000))
+        .agent_complete_once(
+            "hello".to_string(),
+            None,
+            None,
+            None,
+            None,
+            Some(5_000),
+            None,
+        )
         .await
 }
 
@@ -217,10 +225,15 @@ async fn stale_npx_test_prompt_is_not_installed_without_package_launch() {
     ) {
         return;
     }
-    let result =
-        crate::provider_test_prompt::provider_test_prompt("codex", None, &paths("codex"), None)
-            .await
-            .unwrap();
+    let result = crate::provider_test_prompt::provider_test_prompt(
+        None,
+        "codex",
+        None,
+        &paths("codex"),
+        None,
+    )
+    .await
+    .unwrap();
     eprintln!(
         "test prompt={result}; package launches={:?}",
         lines("packages")
@@ -250,9 +263,15 @@ async fn assert_public_launches_succeed() {
         "{models}"
     );
     assert_eq!(
-        crate::provider_test_prompt::provider_test_prompt("codex", None, &paths("codex"), None)
-            .await
-            .unwrap(),
+        crate::provider_test_prompt::provider_test_prompt(
+            None,
+            "codex",
+            None,
+            &paths("codex"),
+            None
+        )
+        .await
+        .unwrap(),
         json!({"ok": true})
     );
     assert_eq!(
@@ -333,6 +352,7 @@ async fn direct_adapter_skips_stale_npx_probe_and_package_launch() {
     );
     assert_eq!(
         crate::provider_test_prompt::provider_test_prompt(
+            None,
             "claude-code",
             None,
             &paths("claude-code"),
