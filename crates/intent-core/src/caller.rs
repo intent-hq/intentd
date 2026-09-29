@@ -27,8 +27,9 @@ pub enum Caller {
     /// A client connection (UDS or WSS) bound to a principal at admission.
     Wire {
         principal_id: PrincipalId,
-        /// Whether the principal administers this daemon (the primary user).
-        is_administrator: bool,
+        /// Role resolved from durable host authority at admission. Services
+        /// revalidate mutable membership; this snapshot is not a grant cache.
+        host_role: crate::HostRole,
     },
     /// An agent session calling back through the `workspace_api` bridge.
     Agent { agent_id: AgentId },
@@ -52,13 +53,25 @@ impl Caller {
     #[must_use]
     pub fn is_administrator(&self) -> bool {
         match self {
-            Caller::Wire {
-                is_administrator, ..
-            } => *is_administrator,
+            Caller::Wire { host_role, .. } => *host_role == crate::HostRole::Owner,
             Caller::Daemon => true,
             Caller::Agent { .. } => false,
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn host_members_are_not_administrators() {
+    let member = Caller::Wire {
+        principal_id: PrincipalId::new(),
+        host_role: crate::HostRole::Member,
+    };
+    assert!(!member.is_administrator());
+    assert!(!queue_attribution_visible_to(
+        &member,
+        &QueueAttribution::UnknownHuman
+    ));
 }
 
 tokio::task_local! {
@@ -85,6 +98,59 @@ where
     F: Future<Output = R>,
 {
     CALLER.scope(caller, f)
+}
+
+/// A short-lived authorization lease. The transport owns its implementation;
+/// services retain it only through an irreversible admission decision, never
+/// through a running agent turn. Neither credentials nor their hashes serialize.
+pub type CredentialLease = Box<dyn Send + Sync>;
+
+/// Revalidate a legacy credential and exclude rotation until the returned lease
+/// drops. Per-principal credentials are checked with durable role in the store.
+pub trait LegacyCredentialAuthority: Send + Sync {
+    fn authorize(&self) -> crate::BoxFuture<'_, crate::Result<CredentialLease>>;
+}
+
+/// Exact wire admission provenance, independent of the caller's role snapshot.
+/// UDS and explicitly unauthenticated local transports have no bearer binding.
+#[derive(Clone)]
+pub enum WireCredential {
+    Legacy {
+        principal_id: PrincipalId,
+        authority: std::sync::Arc<dyn LegacyCredentialAuthority>,
+    },
+    Principal {
+        principal_id: PrincipalId,
+        token_hash: String,
+    },
+}
+
+impl WireCredential {
+    #[must_use]
+    pub fn principal_id(&self) -> &PrincipalId {
+        match self {
+            Self::Legacy { principal_id, .. } | Self::Principal { principal_id, .. } => {
+                principal_id
+            }
+        }
+    }
+}
+
+tokio::task_local! {
+    static WIRE_CREDENTIAL: Option<WireCredential>;
+}
+
+#[must_use]
+pub fn current_wire_credential() -> Option<WireCredential> {
+    WIRE_CREDENTIAL.try_with(Clone::clone).ok().flatten()
+}
+
+/// Transport request spawns must capture and re-establish this alongside Caller.
+pub fn with_wire_credential<F: Future>(
+    credential: Option<WireCredential>,
+    future: F,
+) -> impl Future<Output = F::Output> {
+    WIRE_CREDENTIAL.scope(credential, future)
 }
 
 /// `tokio::spawn` for daemon-internal background work: the spawned task runs
@@ -159,6 +225,9 @@ pub fn queue_attribution_with(
     metadata: Option<&serde_json::Value>,
     fallback: Option<&PrincipalId>,
 ) -> QueueAttribution {
+    if crate::human_author::is_unbound_historical_human(metadata) {
+        return QueueAttribution::UnknownHuman;
+    }
     match crate::lift_from_principal_id(metadata) {
         Some(id) => QueueAttribution::Principal(id),
         None if is_human_authored_metadata(metadata) => fallback
@@ -180,7 +249,7 @@ pub fn queue_attribution_with(
 pub fn queue_attribution_visible_to(caller: &Caller, attribution: &QueueAttribution) -> bool {
     let Caller::Wire {
         principal_id,
-        is_administrator: false,
+        host_role: crate::HostRole::Member | crate::HostRole::Guest,
     } = caller
     else {
         return true;
@@ -276,7 +345,7 @@ pub fn project_queue_for_caller(
     match caller {
         Some(
             caller @ Caller::Wire {
-                is_administrator: false,
+                host_role: crate::HostRole::Member | crate::HostRole::Guest,
                 ..
             },
         ) => queue
@@ -296,7 +365,11 @@ mod tests {
     fn wire(admin: bool) -> Caller {
         Caller::Wire {
             principal_id: PrincipalId("p-1".into()),
-            is_administrator: admin,
+            host_role: if admin {
+                crate::HostRole::Owner
+            } else {
+                crate::HostRole::Guest
+            },
         }
     }
 

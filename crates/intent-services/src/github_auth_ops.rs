@@ -266,6 +266,7 @@ pub(crate) async fn run_poll_loop(
 /// (cache-coherent with `settings.*`, test-injectable).
 pub(crate) async fn delete_stored_token(secrets: &crate::settings::AsyncSecretStore) -> Result<()> {
     secrets.delete(SECRET_ACCOUNT).await?;
+    intent_sourcecontrol::cache_scope::invalidate_authorization();
     secrets
         .delete(crate::source_control_auth_ops::GITHUB_TOKEN_METHOD_ACCOUNT)
         .await

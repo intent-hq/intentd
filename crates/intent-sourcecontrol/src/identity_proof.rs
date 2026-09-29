@@ -206,7 +206,7 @@ pub async fn create_proof_gist(
 ) -> Result<ProofGist> {
     let sc = client(token, api_base_url)?;
     let crab = sc.client();
-    let (login, scopes) = user_and_scopes(crab).await?;
+    let (login, scopes) = user_and_scopes(&crab).await?;
     if !has_gist_scope(scopes.as_deref()) {
         return Err(IdentityProofError::ScopeMissing {
             granted: scopes.unwrap_or_default(),
@@ -283,13 +283,13 @@ pub async fn delete_proof_gist(
 ) -> Result<()> {
     let sc = client(token, api_base_url)?;
     let crab = sc.client();
-    let (_login, scopes) = user_and_scopes(crab).await?;
+    let (_login, scopes) = user_and_scopes(&crab).await?;
     if !has_gist_scope(scopes.as_deref()) {
         return Err(IdentityProofError::ScopeMissing {
             granted: scopes.unwrap_or_default(),
         });
     }
-    let Some(gist) = read_gist(crab, gist_id).await? else {
+    let Some(gist) = read_gist(&crab, gist_id).await? else {
         return Ok(());
     };
     if !is_proof_gist(&gist) {

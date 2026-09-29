@@ -706,6 +706,10 @@ impl PrReadPolicy {
 /// One PR's last full read, remembered between reads.
 #[derive(Debug, Clone)]
 pub struct PrCacheEntry {
+    authorization: Option<intent_sourcecontrol::cache_scope::CacheScope>,
+    /// Start of the request that observed `pr`, before any checklist sub-reads.
+    /// Comparable with discovery reads even when a full fetch finishes late.
+    record_started_at: Instant,
     /// The PR record as of the newest read that confirmed this entry: the
     /// full fetch, or a later cheap poll whose record carried the same
     /// fingerprint.
@@ -730,6 +734,8 @@ pub struct PrCacheEntry {
 impl PrCacheEntry {
     fn new(pr: PullRequest, snapshot: SharedPrSnapshot, now: Instant) -> Self {
         Self {
+            authorization: None,
+            record_started_at: now,
             fingerprint: PrFingerprint::of(&pr),
             pr,
             snapshot,
@@ -775,6 +781,22 @@ pub(crate) struct PrCacheSlot {
 /// daemon restart starts cold. Shared across [`Services`] clones.
 pub(crate) type PrCache = Arc<Mutex<HashMap<PrKey, PrCacheSlot>>>;
 
+/// Background discovery may borrow only a recent record observed in the same
+/// authorization context; it never replaces the full snapshot with list fields.
+pub(crate) fn cached_record_for_discovery(
+    cache: &PrCache,
+    repo: &RepoRef,
+    number: u64,
+    authorization: &intent_sourcecontrol::cache_scope::CacheScope,
+    max_age: Duration,
+) -> Option<(PullRequest, Instant)> {
+    let entry = cached_pr_within(cache, &pr_key_for(repo, number.cast_signed()), max_age)?;
+    (authorization.is_current()
+        && entry.authorization.as_ref() == Some(authorization)
+        && entry.record_started_at.elapsed() < max_age)
+        .then_some((entry.pr, entry.record_started_at))
+}
+
 /// Store an on-demand full read and bump the slot's generation, so a sweep
 /// poll already in flight for the PR does not overwrite it with its
 /// (possibly older) result. `monitored` is the set of PRs under an active
@@ -785,9 +807,13 @@ fn store_on_demand(
     pr: PullRequest,
     snapshot: SharedPrSnapshot,
     monitored: &HashSet<PrKey>,
+    authorization: Option<intent_sourcecontrol::cache_scope::CacheScope>,
+    record_started_at: Instant,
 ) -> PrCacheEntry {
     let now = Instant::now();
-    let entry = PrCacheEntry::new(pr, snapshot, now);
+    let mut entry = PrCacheEntry::new(pr, snapshot, now);
+    entry.authorization = authorization;
+    entry.record_started_at = record_started_at;
     let mut cache = cache.lock().unwrap();
     let slot = cache.entry(key).or_default();
     slot.generation += 1;
@@ -897,18 +923,25 @@ async fn fetch_pr_full(
     if let Some(observation) = observe_pr(sc, repo_ref, number).await? {
         return shared_snapshot_from_observation(sc, repo_ref, number, observation).await;
     }
-    // The load-bearing read: a PR the forge does not know is reported by
-    // number and repo (the message `ws.pr.snapshot` documents), the rest
-    // maps as every other forge error.
-    let pr = sc.get_pr(repo_ref, number).await.map_err(|e| match e {
-        intent_sourcecontrol::Error::NotFound(_) => Error::Internal(format!(
-            "PR #{number} not found in {}/{}",
-            repo_ref.owner, repo_ref.name
-        )),
-        other => pr_ops::map_sc_err(other),
-    })?;
-    let read = pr_ops::merge_requirements_for_pr_detailed(sc, repo_ref, number, &pr).await?;
-    finish_shared_snapshot(sc, repo_ref, number, pr, read).await
+    intent_sourcecontrol::traffic::with_attempt(
+        intent_sourcecontrol::traffic::Attempt::Fallback,
+        async {
+            // The load-bearing read: a PR the forge does not know is reported by
+            // number and repo (the message `ws.pr.snapshot` documents), the rest
+            // maps as every other forge error.
+            let pr = sc.get_pr(repo_ref, number).await.map_err(|e| match e {
+                intent_sourcecontrol::Error::NotFound(_) => Error::Internal(format!(
+                    "PR #{number} not found in {}/{}",
+                    repo_ref.owner, repo_ref.name
+                )),
+                other => pr_ops::map_sc_err(other),
+            })?;
+            let read =
+                pr_ops::merge_requirements_for_pr_detailed(sc, repo_ref, number, &pr).await?;
+            finish_shared_snapshot(sc, repo_ref, number, pr, read).await
+        },
+    )
+    .await
 }
 
 /// The host's folded one-round-trip read
@@ -1013,20 +1046,48 @@ pub(crate) async fn read_pr_via_with_fetched(
     policy: PrReadPolicy,
     monitored: &HashSet<PrKey>,
 ) -> Result<(PrCacheEntry, bool)> {
-    let key = pr_key_for(repo_ref, number.cast_signed());
-    let max_age = match policy {
-        PrReadPolicy::Poll => {
-            let entry = poll_pr(sc, repo_ref, number, cache, key, monitored).await?;
-            return Ok((entry, true));
-        }
+    let rules_max_age = match policy {
+        PrReadPolicy::Poll => intent_sourcecontrol::branch_rules_cache::MAX_AGE,
         PrReadPolicy::Serve { max_age } => max_age,
     };
-    if let Some(entry) = cached_pr_within(cache, &key, max_age) {
-        tracing::trace!(pr_number = number, "pr cache: serving the cached read");
-        return Ok((entry, false));
-    }
-    let (pr, snapshot) = fetch_pr_full(sc, repo_ref, number).await?;
-    Ok((store_on_demand(cache, key, pr, snapshot, monitored), true))
+    intent_sourcecontrol::branch_rules_cache::with_freshness(rules_max_age, async {
+        let authorization = sc.cache_scope();
+        ensure_current_pr_authorization(authorization.as_ref())?;
+        let key = pr_key_for(repo_ref, number.cast_signed());
+        let max_age = match policy {
+            PrReadPolicy::Poll => {
+                let entry = poll_pr(sc, repo_ref, number, cache, key, monitored).await?;
+                return Ok((entry, true));
+            }
+            PrReadPolicy::Serve { max_age } => max_age,
+        };
+        if let Some(entry) = cached_pr_within(cache, &key, max_age)
+            .filter(|entry| entry.authorization == authorization)
+        {
+            intent_sourcecontrol::traffic::record_reuse(
+                intent_sourcecontrol::traffic::Operation::PrDetail,
+                intent_sourcecontrol::traffic::Reuse::CacheHit,
+            );
+            tracing::trace!(pr_number = number, "pr cache: serving the cached read");
+            return Ok((entry, false));
+        }
+        let record_started_at = Instant::now();
+        let (pr, snapshot) = fetch_pr_full(sc, repo_ref, number).await?;
+        ensure_current_pr_authorization(authorization.as_ref())?;
+        Ok((
+            store_on_demand(
+                cache,
+                key,
+                pr,
+                snapshot,
+                monitored,
+                authorization,
+                record_started_at,
+            ),
+            true,
+        ))
+    })
+    .await
 }
 
 /// The cached entry for `key` when a forge read confirmed it current less
@@ -1043,6 +1104,17 @@ fn cached_pr_within(cache: &PrCache, key: &PrKey, max_age: Duration) -> Option<P
         .cloned()
 }
 
+fn ensure_current_pr_authorization(
+    authorization: Option<&intent_sourcecontrol::cache_scope::CacheScope>,
+) -> Result<()> {
+    if authorization.is_some_and(|scope| !scope.is_current()) {
+        return Err(Error::Internal(
+            "PR authorization changed during read".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// [`read_pr_via`] under [`PrReadPolicy::Poll`].
 async fn poll_pr(
     sc: &dyn SourceControl,
@@ -1052,6 +1124,9 @@ async fn poll_pr(
     key: PrKey,
     monitored: &HashSet<PrKey>,
 ) -> Result<PrCacheEntry> {
+    let authorization = sc.cache_scope();
+    ensure_current_pr_authorization(authorization.as_ref())?;
+    let record_started_at = Instant::now();
     let generation = cache
         .lock()
         .unwrap()
@@ -1060,19 +1135,28 @@ async fn poll_pr(
     let observation = observe_pr(sc, repo_ref, number).await?;
     let pr = match &observation {
         Some(observation) => observation.pr.clone(),
-        None => sc
-            .get_pr(repo_ref, number)
-            .await
-            .map_err(pr_ops::map_sc_err)?,
+        None => intent_sourcecontrol::traffic::with_attempt(
+            intent_sourcecontrol::traffic::Attempt::Fallback,
+            sc.get_pr(repo_ref, number),
+        )
+        .await
+        .map_err(pr_ops::map_sc_err)?,
     };
+    ensure_current_pr_authorization(authorization.as_ref())?;
     let fingerprint = PrFingerprint::of(&pr);
     let now = Instant::now();
     let reused = {
         let mut cache = cache.lock().unwrap();
         match cache.get_mut(&key).and_then(|slot| slot.entry.as_mut()) {
-            Some(entry) if entry.reusable(&fingerprint, now) => {
+            Some(entry)
+                if entry.authorization == authorization
+                    && entry.record_started_at <= record_started_at
+                    && entry.reusable(&fingerprint, now) =>
+            {
                 entry.cheap_polls += 1;
                 entry.refreshed_at = now;
+                entry.record_started_at = record_started_at;
+                entry.authorization.clone_from(&authorization);
                 entry.pr = pr.clone();
                 Some(entry.clone())
             }
@@ -1080,6 +1164,10 @@ async fn poll_pr(
         }
     };
     if let Some(entry) = reused {
+        intent_sourcecontrol::traffic::record_reuse(
+            intent_sourcecontrol::traffic::Operation::PrDetail,
+            intent_sourcecontrol::traffic::Reuse::DetailRefresh,
+        );
         tracing::trace!(
             pr_number = number,
             "pr monitor: PR fingerprint unchanged; reusing previous full fetch"
@@ -1090,9 +1178,18 @@ async fn poll_pr(
         Some(observation) => {
             shared_snapshot_from_observation(sc, repo_ref, number, observation).await?
         }
-        None => fetch_shared_snapshot_for(sc, repo_ref, number, pr).await?,
+        None => {
+            intent_sourcecontrol::traffic::with_attempt(
+                intent_sourcecontrol::traffic::Attempt::Fallback,
+                fetch_shared_snapshot_for(sc, repo_ref, number, pr),
+            )
+            .await?
+        }
     };
-    let entry = PrCacheEntry::new(pr, snapshot, now);
+    ensure_current_pr_authorization(authorization.as_ref())?;
+    let mut entry = PrCacheEntry::new(pr, snapshot, now);
+    entry.authorization = authorization;
+    entry.record_started_at = record_started_at;
     let mut cache = cache.lock().unwrap();
     let slot = cache.entry(key).or_default();
     if slot.generation == generation {
@@ -1727,6 +1824,10 @@ impl Services {
         if let PrReadPolicy::Serve { max_age } = policy {
             let key = pr_key_for(repo_ref, number.cast_signed());
             if let Some(entry) = cached_pr_within(&self.pr_cache, &key, max_age) {
+                intent_sourcecontrol::traffic::record_reuse(
+                    intent_sourcecontrol::traffic::Operation::PrDetail,
+                    intent_sourcecontrol::traffic::Reuse::CacheHit,
+                );
                 tracing::trace!(pr_number = number, "pr cache: serving the cached read");
                 return Ok((entry, false));
             }
@@ -3038,6 +3139,14 @@ impl Services {
     /// either way; a full sweep (`skip_fresh == false`) plans no cadence and
     /// spends none.
     async fn sweep_pr_monitors(&self, skip_fresh: bool) {
+        intent_sourcecontrol::traffic::with_caller(
+            intent_sourcecontrol::traffic::Caller::PrMonitor,
+            self.sweep_pr_monitors_accounted(skip_fresh),
+        )
+        .await;
+    }
+
+    async fn sweep_pr_monitors_accounted(&self, skip_fresh: bool) {
         let mut probed = None;
         if self.sweeps_rate_limited() {
             let lifted = match pr_ops::resolve_source_control(self.source_control.clone()).await {
@@ -3081,7 +3190,13 @@ impl Services {
         for monitor in monitors {
             let key = pr_key(&monitor);
             let fetched = match shared.entry(key.clone()) {
-                std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    intent_sourcecontrol::traffic::record_reuse(
+                        intent_sourcecontrol::traffic::Operation::PrDetail,
+                        intent_sourcecontrol::traffic::Reuse::CacheHit,
+                    );
+                    entry.get().clone()
+                }
                 // The gate closed mid-sweep — by this sweep's own fetch or by
                 // a sibling sweep sharing the gate: PRs not fetched yet stay
                 // untouched until the pause window elapses.
@@ -3670,7 +3785,7 @@ impl Services {
     async fn refresh_workspace_pr_after_terminal(&self, workspace_id: &WorkspaceId) {
         match tokio::time::timeout(
             self.pr_refresh_fetch_timeout,
-            self.refresh_workspace_pr(workspace_id),
+            self.refresh_workspace_pr_cached(workspace_id),
         )
         .await
         {
@@ -8151,6 +8266,8 @@ mod tests {
                 pr.clone(),
                 snapshot.clone(),
                 &HashSet::new(),
+                None,
+                Instant::now(),
             );
         })));
         let polled = read_pr_via(&forge, &repo, 42, &cache, PrReadPolicy::Poll, &NONE)

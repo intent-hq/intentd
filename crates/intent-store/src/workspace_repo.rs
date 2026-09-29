@@ -774,6 +774,23 @@ impl Store {
             return Err(Error::NotFound(format!("workspace {id}")));
         }
 
+        // With runtime writers stopped, drain recovery history once BEFORE
+        // deleting sessions. Match this workspace's rows, including orphans,
+        // but protect any live session owned by another workspace. A failed
+        // or cancelled batch leaves the sessions intact; retry drains the
+        // remainder before the internal session path skips recovery cleanup.
+        delete_in_bounded_batches(
+            self.write_pool(),
+            "DELETE FROM interrupted_agent WHERE rowid IN \
+             (SELECT rowid FROM interrupted_agent WHERE workspace_id = ?1 \
+              AND NOT EXISTS (SELECT 1 FROM agent_session \
+                              WHERE id = interrupted_agent.agent_id AND workspace_id != ?1) \
+              LIMIT ?2)",
+            &id.0,
+            DELETE_CASCADE_BATCH,
+        )
+        .await?;
+
         // IDs only: never hydrate sessions or their transcripts. Each session
         // uses the same bounded payload/message cleanup as agent.delete.
         while let Some(agent_id) = sqlx::query_scalar::<_, String>(
@@ -784,8 +801,28 @@ impl Store {
         .await
         .map_err(|e| Error::Internal(format!("list workspace deletion agents failed: {e}")))?
         {
-            self.delete_agent_session(id, &AgentId(agent_id)).await?;
+            self.delete_workspace_agent_session(id, &AgentId(agent_id))
+                .await?;
             tokio::task::yield_now().await;
+        }
+
+        // These registries have no workspace FK. Retry keys must precede
+        // attachments (their FK is NO ACTION). A foreign workspace's
+        // reference must block deletion, never be swept.
+        for (table, predicate) in [
+            ("script", "workspace_id = ?1"),
+            (
+                "attachment_idempotency_keys",
+                "workspace_id = ?1 AND EXISTS (SELECT 1 FROM attachments \
+                 WHERE id = attachment_id AND workspace_id = ?1)",
+            ),
+            ("attachments", "workspace_id = ?1"),
+        ] {
+            let sql = format!(
+                "DELETE FROM {table} WHERE rowid IN \
+                 (SELECT rowid FROM {table} WHERE {predicate} LIMIT ?2)"
+            );
+            delete_in_bounded_batches(self.write_pool(), &sql, &id.0, DELETE_CASCADE_BATCH).await?;
         }
 
         // A note's parent-clear trigger can otherwise update every child in
@@ -1103,6 +1140,20 @@ impl Store {
             .await
             .map_err(|e| Error::Internal(format!("list workspaces failed: {e}")))?;
         rows.iter().map(map_workspace_row).collect()
+    }
+
+    /// Ordinary workspace keys for inherited host access, without hydrating
+    /// rows or issuing a role lookup per workspace. Includes archived rows.
+    ///
+    /// # Errors
+    /// Returns `Internal` on a database failure.
+    pub async fn ordinary_workspace_ids(&self) -> Result<Vec<WorkspaceId>> {
+        let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM workspace WHERE id <> ?")
+            .bind(CHIEF_WORKSPACE_ID)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("workspace keys failed: {e}")))?;
+        Ok(ids.into_iter().map(WorkspaceId).collect())
     }
 
     /// Live (non-archived, non-remote) workspaces referencing a PR by URL —

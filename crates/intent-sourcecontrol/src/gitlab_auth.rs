@@ -282,6 +282,24 @@ pub async fn refresh_access_token(
     client_id: &str,
     store: FileSecretStore,
 ) -> Result<()> {
+    refresh_access_token_with_lease(host, client_id, store, None)
+        .await
+        .map(|_| ())
+}
+
+/// A caller-owned persistence lock retained by blocking writes even on timeout.
+pub type PersistenceLease = std::sync::Arc<dyn std::any::Any + Send + Sync>;
+
+/// Refresh while retaining a caller's persistence lock until all writes finish.
+///
+/// # Errors
+/// As [`refresh_access_token`].
+pub async fn refresh_access_token_with_lease(
+    host: &GitlabHost,
+    client_id: &str,
+    store: FileSecretStore,
+    lease: Option<PersistenceLease>,
+) -> Result<Option<Vec<String>>> {
     let client_id = client_id.trim();
     if client_id.is_empty() {
         return Err(Error::Config(
@@ -358,13 +376,18 @@ pub async fn refresh_access_token(
         } => {
             // Doorkeeper always rotates; keep the old one only if the body
             // somehow omitted a replacement so the next refresh can still try.
-            persist_tokens(
+            persist_tokens_with_lease(
                 store,
                 access_token,
                 Some(rotated.unwrap_or(refresh_token)),
                 expires_in.map(|secs| unix_now().saturating_add(secs)),
+                lease,
             )
-            .await
+            .await?;
+            Ok(body
+                .get("scope")
+                .and_then(Value::as_str)
+                .map(crate::device_flow::parse_scopes))
         }
         other => Err(Error::Decode(format!(
             "unexpected gitlab token refresh response: {other:?}"
@@ -466,6 +489,7 @@ pub struct GitlabGrant {
     access_token: SecretString,
     refresh_token: Option<SecretString>,
     expires_at: Option<u64>,
+    scopes: Option<Vec<String>>,
 }
 
 impl std::fmt::Debug for GitlabGrant {
@@ -485,11 +509,30 @@ impl GitlabGrant {
     ///
     /// Returns an error when the store write fails or times out.
     pub async fn commit(self) -> Result<()> {
-        persist_tokens(
+        self.commit_with_lease(None).await
+    }
+
+    /// Verify this grant's account before writing it.
+    ///
+    /// # Errors
+    /// Returns the provider's auth, scope, transport or decode error.
+    pub async fn verify(&self, host: &GitlabHost) -> Result<(GitlabUser, Option<Vec<String>>)> {
+        let (user, scopes) =
+            validate_pat_with_scopes(host, self.access_token.expose_secret()).await?;
+        Ok((user, scopes.or_else(|| self.scopes.clone())))
+    }
+
+    /// Keep the caller's persistence lock alive through an abandoned blocking write.
+    ///
+    /// # Errors
+    /// Returns the bounded secret-store write error.
+    pub async fn commit_with_lease(self, lease: Option<PersistenceLease>) -> Result<()> {
+        persist_tokens_with_lease(
             self.store,
             self.access_token,
             self.refresh_token,
             self.expires_at,
+            lease,
         )
         .await
     }
@@ -705,6 +748,10 @@ impl GitlabDeviceFlow {
                 access_token,
                 refresh_token,
                 expires_at: expires_in.map(|secs| unix_now().saturating_add(secs)),
+                scopes: body
+                    .get("scope")
+                    .and_then(Value::as_str)
+                    .map(crate::device_flow::parse_scopes),
             })),
             PollResponse::Pending => Ok(GitlabExchange::Pending),
             PollResponse::SlowDown { interval } => {
@@ -819,6 +866,19 @@ pub struct GitlabUser {
 /// Returns [`Error::Auth`] for a 401/403 (rejected token) or a confirmed
 /// missing `api` scope; [`Error::Api`] / [`Error::Decode`] for other failures.
 pub async fn validate_pat(host: &GitlabHost, token: &str) -> Result<GitlabUser> {
+    validate_pat_with_scopes(host, token)
+        .await
+        .map(|(user, _)| user)
+}
+
+/// Validate a token and report only permissions observed from the provider.
+///
+/// # Errors
+/// As [`validate_pat`].
+pub async fn validate_pat_with_scopes(
+    host: &GitlabHost,
+    token: &str,
+) -> Result<(GitlabUser, Option<Vec<String>>)> {
     let token = token.trim();
     if token.is_empty() {
         return Err(Error::Auth("gitlab token is empty".to_string()));
@@ -865,11 +925,12 @@ pub async fn validate_pat(host: &GitlabHost, token: &str) -> Result<GitlabUser> 
         .await
         .ok()
         .filter(|r| r.status().is_success());
-    if let Some(scopes) = scopes {
-        let body: Value = scopes.json().await.unwrap_or(Value::Null);
-        check_api_scope(reported_scopes(&body).as_deref(), host.host())?;
-    }
-    Ok(user)
+    let scopes = match scopes {
+        Some(response) => reported_scopes(&response.json().await.unwrap_or(Value::Null)),
+        None => None,
+    };
+    check_api_scope(scopes.as_deref(), host.host())?;
+    Ok((user, scopes))
 }
 
 /// Resolve the account named `username` on `host` (`GET
@@ -992,8 +1053,31 @@ async fn persist_tokens(
     refresh_token: Option<SecretString>,
     expires_at: Option<u64>,
 ) -> Result<()> {
+    persist_tokens_with_lease(store, token, refresh_token, expires_at, None).await
+}
+
+/// Persist a PAT while holding the caller's persistence lease.
+///
+/// # Errors
+/// As [`persist_gitlab_token`].
+pub async fn persist_gitlab_token_with_lease(
+    store: FileSecretStore,
+    token: SecretString,
+    lease: PersistenceLease,
+) -> Result<()> {
+    persist_tokens_with_lease(store, token, None, None, Some(lease)).await
+}
+
+async fn persist_tokens_with_lease(
+    store: FileSecretStore,
+    token: SecretString,
+    refresh_token: Option<SecretString>,
+    expires_at: Option<u64>,
+    lease: Option<PersistenceLease>,
+) -> Result<()> {
     run_blocking(
         move || {
+            let _lease = lease;
             store.store(SECRET_ACCOUNT, token.expose_secret())?;
             match refresh_token {
                 Some(refresh) => store.store(REFRESH_SECRET_ACCOUNT, refresh.expose_secret())?,
