@@ -1633,6 +1633,7 @@ jobs:
         run: |
           python3 -m pip install PyYAML==6.0.2
           python3 -B scripts/test-prerelease-cleanup-workflow.py
+          python3 -B scripts/test-release-rust-cache.py
       - name: Test publish-channel-manifest.sh
         run: ./scripts/test-publish-channel-manifest.sh
       - name: Test mirror-release-assets.sh
