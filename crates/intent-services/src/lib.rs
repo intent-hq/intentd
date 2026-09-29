@@ -1140,6 +1140,7 @@ pub struct Services {
     repository_connection_directory: Arc<repository_credentials::RepositoryConnectionDirectory>,
     /// Exact ordinary API allocation; clones cannot bind replacement owners.
     repository_wire_owner: Arc<OnceLock<Weak<Services>>>,
+    repository_selection_capacity: Arc<repository_native_wire::selection::Capacity>,
     /// Original invalidation owner for this Services instance. Clones share it;
     /// Store must accept this exact observer before it can be used.
     repository_lifecycle_registry:
@@ -1611,6 +1612,7 @@ impl Services {
             repository_connection_directory,
             repository_lifecycle_registry: Arc::default(),
             repository_wire_owner: Arc::default(),
+            repository_selection_capacity: Arc::default(),
             principal_identity_refreshed_at: Arc::new(tokio::sync::Mutex::new(None)),
             identity_transition: Arc::new(tokio::sync::Mutex::new(())),
             identity_rekey_generation: Arc::new(AtomicU64::new(0)),
@@ -17378,6 +17380,41 @@ impl WorkspaceApi for Services {
         entry: intent_core::repository_request::RepositoryWireEntry,
     ) -> Option<Arc<dyn intent_core::repository_request::RepositoryReadConnection>> {
         repository_native_wire::connection(self, entry)
+    }
+
+    fn repository_selection_capture(
+        &self,
+        query: intent_core::repository_request::RepositorySelectionQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositorySelectionCapture>> {
+        repository_native_wire::selection::capture(self, query)
+    }
+
+    fn repository_selection_save(
+        &self,
+        query: intent_core::repository_request::RepositorySelectionSaveQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositorySelectionAttempt>> {
+        repository_native_wire::selection::save(self, query)
+    }
+
+    fn repository_selection_reset(
+        &self,
+        query: intent_core::repository_request::RepositorySelectionBoundQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositorySelectionAttempt>> {
+        repository_native_wire::selection::reset(self, query)
+    }
+
+    fn repository_selection_reconcile(
+        &self,
+        query: intent_core::repository_request::RepositorySelectionBoundQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositorySelectionAttempt>> {
+        repository_native_wire::selection::reconcile(self, query)
+    }
+
+    fn repository_selection_release(
+        &self,
+        query: intent_core::repository_request::RepositorySelectionBoundQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositorySelectionReleased>> {
+        repository_native_wire::selection::release(self, query)
     }
 
     fn repository_context_capture(

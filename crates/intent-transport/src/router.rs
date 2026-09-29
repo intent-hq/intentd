@@ -595,6 +595,56 @@ async fn dispatch(
     params: &Map<String, Value>,
 ) -> Result<Value, RpcErr> {
     match method {
+        "workspace.repositorySelection.capture" => {
+            let input: intent_core::repository_request::RepositorySelectionQuery =
+                serde_json::from_value(Value::Object(params.clone()))
+                    .map_err(|e| invalid_params(e.to_string()))?;
+            let r = api
+                .repository_selection_capture(input)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(r))
+        }
+        "workspace.repositorySelection.save" => {
+            let input: intent_core::repository_request::RepositorySelectionSaveQuery =
+                serde_json::from_value(Value::Object(params.clone()))
+                    .map_err(|e| invalid_params(e.to_string()))?;
+            let r = api
+                .repository_selection_save(input)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(r))
+        }
+        "workspace.repositorySelection.reset" => {
+            let input: intent_core::repository_request::RepositorySelectionBoundQuery =
+                serde_json::from_value(Value::Object(params.clone()))
+                    .map_err(|e| invalid_params(e.to_string()))?;
+            let r = api
+                .repository_selection_reset(input)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(r))
+        }
+        "workspace.repositorySelection.reconcile" => {
+            let input: intent_core::repository_request::RepositorySelectionBoundQuery =
+                serde_json::from_value(Value::Object(params.clone()))
+                    .map_err(|e| invalid_params(e.to_string()))?;
+            let r = api
+                .repository_selection_reconcile(input)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(r))
+        }
+        "workspace.repositorySelection.release" => {
+            let input: intent_core::repository_request::RepositorySelectionBoundQuery =
+                serde_json::from_value(Value::Object(params.clone()))
+                    .map_err(|e| invalid_params(e.to_string()))?;
+            let r = api
+                .repository_selection_release(input)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(r))
+        }
         "workspace.repositoryContext.capture" => {
             let input = serde_json::from_value(Value::Object(params.clone()))
                 .map_err(|e| invalid_params(format!("invalid params: {e}")))?;

@@ -42,6 +42,9 @@ use crate::source_control_auth_ops::repository_owner::{
 };
 use crate::{Services, SettingsRegistry};
 
+#[path = "native_selection.rs"]
+pub(crate) mod selection;
+
 const LEASE_LIMIT: usize = 64;
 const ROOT_LIMIT: usize = 128;
 const NOTICE_LIMIT: usize = 64;
@@ -112,6 +115,7 @@ pub(crate) fn connection(
         origin,
         weak: weak.clone(),
         parent: RepositoryRetirement::default(),
+        selection: selection::ConnectionState::default(),
         state: Mutex::new(ConnectionState::default()),
         notify: Notify::new(),
         permits: Arc::new(Semaphore::new(LEASE_LIMIT)),
@@ -129,6 +133,7 @@ struct Connection {
     origin: RepositoryWireOrigin,
     weak: Weak<Self>,
     parent: RepositoryRetirement,
+    selection: selection::ConnectionState,
     state: Mutex<ConnectionState>,
     notify: Notify,
     permits: Arc<Semaphore>,
@@ -220,6 +225,7 @@ impl Connection {
         };
         self.notify.notify_waiters();
         self.parent.end_scope();
+        self.selection.close();
         self.origin.retire();
         for lease in leases {
             lease.lifetime.retirement().end_scope();
@@ -342,6 +348,17 @@ impl Connection {
     }
 }
 impl RepositoryReadConnection for Connection {
+    fn capture_selection(
+        &self,
+        frame: &intent_core::repository_request::RepositorySelectionFrame,
+    ) -> Option<Arc<dyn RepositoryReadRequestScope>> {
+        Some(selection::capture_frame(self, frame.clone()))
+    }
+    fn take_selection_retirements(
+        &self,
+    ) -> Option<Box<dyn intent_core::repository_request::RepositorySelectionRetirements>> {
+        selection::take_retirements(self)
+    }
     fn capture(&self) -> Arc<dyn RepositoryReadRequestScope> {
         self.capture_native(None)
     }

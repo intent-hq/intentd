@@ -181,12 +181,12 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// (`sourceControl.identityProof.create` / `delete`, the GitHub gist or
 /// GitLab snippet proof by `provider`); the `github.identityProof.*` pair
 /// stays as byte-identical aliases.
-const EXPECTED_TOTAL_METHODS: usize = 410;
+const EXPECTED_TOTAL_METHODS: usize = 415;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 350;
+const EXPECTED_ROUTER_METHODS: usize = 355;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 58;
@@ -195,7 +195,7 @@ const EXPECTED_FASTPATH_METHODS: usize = 58;
 const EXPECTED_ALIASES: usize = 2;
 
 /// Golden count: server→client notifications.
-const EXPECTED_NOTIFICATIONS: usize = 2;
+const EXPECTED_NOTIFICATIONS: usize = 3;
 
 /// Golden count: client-served reverse RPCs.
 const EXPECTED_REVERSE_METHODS: usize = 5;
@@ -889,6 +889,11 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "workspace.repositoryContext",
     "workspace.repositoryContext.capture",
     "workspace.repositoryContext.release",
+    "workspace.repositorySelection.capture",
+    "workspace.repositorySelection.reconcile",
+    "workspace.repositorySelection.release",
+    "workspace.repositorySelection.reset",
+    "workspace.repositorySelection.save",
     "workspace.restore",
     "workspace.saveSetupScript",
     "workspace.setAutoCommit",

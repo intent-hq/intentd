@@ -371,6 +371,43 @@ fn settled(
     }
 }
 
+struct SelectionAdmission<'a> {
+    authority: &'a crate::RepositoryAuthoritySnapshot,
+    token_hash: Option<&'a str>,
+    admit: Option<Box<dyn FnOnce() -> Result<()> + Send + 'a>>,
+}
+impl SelectionAdmission<'_> {
+    async fn current(
+        &mut self,
+        original: &RepositorySelectionSnapshot,
+        conn: &mut SqliteConnection,
+    ) -> Result<bool> {
+        if original.root.workspace_id != self.authority.workspace_id {
+            return Ok(false);
+        }
+        Ok(crate::repository_authority_repo::read_snapshot(
+            conn,
+            &original.root.workspace_id,
+            &self.authority.principal_id,
+            self.token_hash,
+        )
+        .await?
+            == *self.authority)
+    }
+}
+fn settled_denial(lifecycle: LifecycleWrite, error: Error) -> RepositorySelectionWriteOutcome {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lifecycle.settle()))
+        .map_err(|_| Error::Internal("repository selection settlement failed".into()))
+        .and(Err(error));
+    RepositorySelectionWriteOutcome {
+        result,
+        persistence: RepositorySelectionPersistence::NoEffect,
+    }
+}
+fn admission_denied() -> Error {
+    Error::Forbidden("Repository selection unavailable".into())
+}
+
 impl Store {
     /// Read root membership, binding, continuity and saved intent in one closed
     /// transaction. The result neither grants access nor performs filesystem I/O.
@@ -397,7 +434,39 @@ impl Store {
     ) -> RepositorySelectionWriteOutcome {
         let mut persistence = RepositorySelectionPersistence::NotAttempted;
         match self
-            .write_selection_inner(original, &change, &mut persistence)
+            .write_selection_inner(original, &change, &mut persistence, None)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(e) => RepositorySelectionWriteOutcome {
+                result: Err(e),
+                persistence,
+            },
+        }
+    }
+
+    /// Native selection CAS under the caller's already validated original authority.
+    ///
+    /// The service must own the original Wire/root/credential and manager permission.
+    /// Authority is compared under both serialized snapshots. The one-shot, no-I/O
+    /// callback marks effect admission immediately before the original UPDATE starts.
+    /// No synchronous service fence spans SQL or selection-consumer retirement.
+    pub async fn write_repository_selection_admitted(
+        &self,
+        original: &RepositorySelectionSnapshot,
+        change: RepositorySelectionChange,
+        expected_authority: &crate::RepositoryAuthoritySnapshot,
+        original_token_hash: Option<&str>,
+        admit: impl FnOnce() -> Result<()> + Send,
+    ) -> RepositorySelectionWriteOutcome {
+        let mut persistence = RepositorySelectionPersistence::NotAttempted;
+        let admission = SelectionAdmission {
+            authority: expected_authority,
+            token_hash: original_token_hash,
+            admit: Some(Box::new(admit)),
+        };
+        match self
+            .write_selection_inner(original, &change, &mut persistence, Some(admission))
             .await
         {
             Ok(outcome) => outcome,
@@ -422,6 +491,7 @@ impl Store {
         original: &RepositorySelectionSnapshot,
         change: &RepositorySelectionChange,
         persistence: &mut RepositorySelectionPersistence,
+        mut admission: Option<SelectionAdmission<'_>>,
     ) -> Result<RepositorySelectionWriteOutcome> {
         if !Arc::ptr_eq(&self.repository_lifecycle, &original.domain) {
             return Err(Error::InvalidParams(
@@ -438,7 +508,14 @@ impl Store {
         let mut lifecycle = self.repository_lifecycle_write().await?;
         let mut read = self.read_pool().begin().await.map_err(sql_error)?;
         let current = read_at(self, &original.root, &mut read).await?;
+        let authority_current = match &mut admission {
+            Some(admission) => admission.current(original, &mut read).await?,
+            None => true,
+        };
         read.commit().await.map_err(sql_error)?;
+        if !authority_current {
+            return Ok(settled_denial(lifecycle, admission_denied()));
+        }
         if let SelectionComparison::Finished(result) = classify(current, original, change) {
             return Ok(settled(
                 lifecycle,
@@ -451,6 +528,13 @@ impl Store {
         lifecycle.resume_serialization().await?;
         let mut tx = self.write_pool().begin().await.map_err(sql_error)?;
         let current = read_at(self, &original.root, &mut tx).await?;
+        if let Some(admission) = &mut admission {
+            if !admission.current(original, &mut tx).await? {
+                tx.rollback().await.map_err(sql_error)?;
+                *persistence = RepositorySelectionPersistence::NoEffect;
+                return Ok(settled_denial(lifecycle, admission_denied()));
+            }
+        }
         let current = match classify(current, original, change) {
             SelectionComparison::Write(current) => current,
             SelectionComparison::Finished(result) => {
@@ -470,6 +554,13 @@ impl Store {
             .ok_or_else(error)?;
         let (mode, remote) = desired(change);
         let (kind, id) = key(&original.root);
+        if let Some(admission) = &mut admission {
+            if let Err(denied) = admission.admit.take().ok_or_else(error)?() {
+                tx.rollback().await.map_err(sql_error)?;
+                *persistence = RepositorySelectionPersistence::NoEffect;
+                return Ok(settled_denial(lifecycle, denied));
+            }
+        }
         let changed=sqlx::query("UPDATE repository_selection_state SET selection_revision=?,choice_incarnation=root_incarnation,choice_mode=?,remote_name=?,historical_source=NULL,historical_record_id=NULL WHERE workspace_id=? AND root_kind=? AND root_id=? AND root_incarnation=? AND selection_revision=?")
             .bind(next).bind(mode).bind(remote).bind(original.root.workspace_id.as_str()).bind(kind).bind(id)
             .bind(i64::try_from(state.incarnation).map_err(|_|error())?).bind(i64::try_from(state.revision).map_err(|_|error())?)

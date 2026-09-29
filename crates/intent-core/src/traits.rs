@@ -79,6 +79,46 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async { Err(Error::Forbidden("Repository context unavailable".into())) })
     }
 
+    fn repository_selection_capture(
+        &self,
+        query: crate::repository_request::RepositorySelectionQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_request::RepositorySelectionCapture>> {
+        let _ = query;
+        Box::pin(async { Err(Error::Forbidden("Repository selection unavailable".into())) })
+    }
+
+    fn repository_selection_save(
+        &self,
+        query: crate::repository_request::RepositorySelectionSaveQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_request::RepositorySelectionAttempt>> {
+        let _ = query;
+        Box::pin(async { Err(Error::Forbidden("Repository selection unavailable".into())) })
+    }
+
+    fn repository_selection_reset(
+        &self,
+        query: crate::repository_request::RepositorySelectionBoundQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_request::RepositorySelectionAttempt>> {
+        let _ = query;
+        Box::pin(async { Err(Error::Forbidden("Repository selection unavailable".into())) })
+    }
+
+    fn repository_selection_reconcile(
+        &self,
+        query: crate::repository_request::RepositorySelectionBoundQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_request::RepositorySelectionAttempt>> {
+        let _ = query;
+        Box::pin(async { Err(Error::Forbidden("Repository selection unavailable".into())) })
+    }
+
+    fn repository_selection_release(
+        &self,
+        query: crate::repository_request::RepositorySelectionBoundQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_request::RepositorySelectionReleased>> {
+        let _ = query;
+        Box::pin(async { Err(Error::Forbidden("Repository selection unavailable".into())) })
+    }
+
     /// List workspaces, optionally including archived ones (PROTOCOL §5.1).
     fn list_workspaces(&self, include_archived: bool) -> BoxFuture<'_, Result<Vec<Workspace>>> {
         let _ = include_archived;

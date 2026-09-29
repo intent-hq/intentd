@@ -45,6 +45,20 @@ pub trait RepositoryReadConnection: Send + Sync {
         self.capture()
     }
 
+    /// Capture a distinct native selection frame before queueing. This does not
+    /// widen a context read lease. Unsupported owners cannot supply admission.
+    fn capture_selection(
+        &self,
+        _frame: &RepositorySelectionFrame,
+    ) -> Option<Arc<dyn RepositoryReadRequestScope>> {
+        None
+    }
+
+    /// Independent socket-private selection retirement stream.
+    fn take_selection_retirements(&self) -> Option<Box<dyn RepositorySelectionRetirements>> {
+        None
+    }
+
     /// Retire only this connection's original request cohort. Idempotent.
     /// Concrete owners must join admitted leaves without holding cohort maps.
     fn retire(&self);
@@ -228,6 +242,240 @@ mod native_contract_tests {
         assert_eq!(
             serde_json::to_value(notice).unwrap(),
             json!({"lifetimeIds":[],"sequence":u64::MAX.to_string(),"allRetired":true,"terminal":true})
+        );
+    }
+}
+
+/// Exactly one root: omitted `git_root_id` is Primary, never inventory coverage.
+pub type RepositorySelectionQuery = RepositoryContextQuery;
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RepositorySelectionBoundQuery {
+    pub workspace_id: crate::WorkspaceId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_root_id: Option<crate::WorkspaceGitRootId>,
+    pub selection_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(
+    tag = "mode",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum RepositorySelectionChoice {
+    Automatic {},
+    ExplicitRemote { remote_name: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RepositorySelectionSaveQuery {
+    pub workspace_id: crate::WorkspaceId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_root_id: Option<crate::WorkspaceGitRootId>,
+    pub selection_id: String,
+    pub choice: RepositorySelectionChoice,
+}
+
+/// A transport-captured immutable command. Not a deserializable authority token.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RepositorySelectionFrame {
+    Capture(RepositorySelectionQuery),
+    Save(RepositorySelectionSaveQuery),
+    Reset(RepositorySelectionBoundQuery),
+    Reconcile(RepositorySelectionBoundQuery),
+    Release(RepositorySelectionBoundQuery),
+}
+impl RepositorySelectionFrame {
+    #[must_use]
+    pub fn query(&self) -> RepositorySelectionQuery {
+        match self {
+            Self::Capture(q) => q.clone(),
+            Self::Save(q) => RepositorySelectionQuery {
+                workspace_id: q.workspace_id.clone(),
+                git_root_id: q.git_root_id.clone(),
+            },
+            Self::Reset(q) | Self::Reconcile(q) | Self::Release(q) => RepositorySelectionQuery {
+                workspace_id: q.workspace_id.clone(),
+                git_root_id: q.git_root_id.clone(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum RepositorySelectionState {
+    NeverSaved,
+    Reset,
+    Saved { value: crate::SavedReviewSelection },
+}
+
+/// Public observation only. The actual CAS snapshot remains owned by Store.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositorySelectionSnapshot {
+    pub root: crate::RepositoryRootId,
+    pub root_incarnation: String,
+    pub selection_revision: String,
+    pub selection: RepositorySelectionState,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositorySelectionCapture {
+    pub selection_id: String,
+    pub scope: crate::ExecutionScope,
+    pub root: crate::RepositoryRootId,
+    pub snapshot: RepositorySelectionSnapshot,
+    pub retirement_sequence: String,
+    pub expires_after_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RepositorySelectionFailure {
+    AdmissionRetired,
+    AuthorityUnavailable,
+    StorageFailed,
+    CompletionUnobserved,
+}
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum RepositorySelectionResult {
+    Applied {
+        snapshot: RepositorySelectionSnapshot,
+    },
+    Unchanged {
+        snapshot: RepositorySelectionSnapshot,
+    },
+    Conflict {
+        snapshot: RepositorySelectionSnapshot,
+    },
+    MissingRoot,
+    Failed {
+        code: RepositorySelectionFailure,
+    },
+}
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum RepositorySelectionPersistence {
+    NotAttempted,
+    NoEffect,
+    Committed { selection_revision: String },
+    Unknown,
+}
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositorySelectionReceipt {
+    pub result: RepositorySelectionResult,
+    pub persistence: RepositorySelectionPersistence,
+}
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum RepositorySelectionAttemptState {
+    NotStarted,
+    Pending,
+    Settled {
+        receipt: Box<RepositorySelectionReceipt>,
+    },
+}
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositorySelectionAttempt {
+    pub selection_id: String,
+    pub root: crate::RepositoryRootId,
+    pub attempt: RepositorySelectionAttemptState,
+}
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct RepositorySelectionReleased {
+    pub released: bool,
+}
+
+/// Admission retirement only. No private root, account or receipt payload.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositorySelectionRetired {
+    pub selection_ids: Vec<String>,
+    pub sequence: String,
+    pub all_retired: bool,
+    pub terminal: bool,
+}
+pub trait RepositorySelectionRetirements: Send {
+    fn next(&mut self) -> BoxFuture<'_, Option<RepositorySelectionRetired>>;
+}
+
+#[cfg(test)]
+mod selection_contract_tests {
+    use super::{
+        RepositorySelectionBoundQuery, RepositorySelectionChoice, RepositorySelectionPersistence,
+        RepositorySelectionQuery, RepositorySelectionSaveQuery, RepositorySelectionState,
+    };
+    use serde_json::json;
+    #[test]
+    fn native_selection_strict_command_shape_never_accepts_authority_or_snapshot() {
+        let base = json!({"workspaceId":"workspace", "selectionId":"original", "choice":{"mode":"automatic"}});
+        assert!(serde_json::from_value::<RepositorySelectionSaveQuery>(base.clone()).is_ok());
+        for key in [
+            "scope",
+            "principalId",
+            "snapshot",
+            "repositoryLifetimeId",
+            "revision",
+            "accountId",
+            "hostRole",
+        ] {
+            let mut value = base.clone();
+            value[key] = json!("forged");
+            assert!(serde_json::from_value::<RepositorySelectionSaveQuery>(value).is_err());
+        }
+        for choice in [
+            json!({"mode":"reset"}),
+            json!({"mode":"unresolved-historical"}),
+            json!({"mode":"automatic","remoteName":"extra"}),
+            json!({"mode":"explicit-remote","remoteName":"origin","proof":"forged"}),
+        ] {
+            assert!(serde_json::from_value::<RepositorySelectionChoice>(choice).is_err());
+        }
+        assert!(serde_json::from_value::<RepositorySelectionBoundQuery>(
+            json!({"workspaceId":"w","selectionId":"a","choice":{"mode":"automatic"}})
+        )
+        .is_err());
+        assert!(serde_json::from_value::<RepositorySelectionQuery>(
+            json!({"workspaceId":"w","selectionId":"a"})
+        )
+        .is_err());
+    }
+    #[test]
+    fn native_selection_independent_persistence_and_history_have_stable_tags() {
+        assert_eq!(
+            serde_json::to_value(RepositorySelectionPersistence::Committed {
+                selection_revision: u64::MAX.to_string()
+            })
+            .unwrap(),
+            json!({"kind":"committed","selectionRevision":u64::MAX.to_string()})
+        );
+        assert_eq!(
+            serde_json::to_value(RepositorySelectionState::NeverSaved).unwrap(),
+            json!({"kind":"neverSaved"})
+        );
+        assert_eq!(
+            serde_json::to_value(RepositorySelectionState::Reset).unwrap(),
+            json!({"kind":"reset"})
+        );
+        assert_eq!(
+            serde_json::to_value(RepositorySelectionState::Saved {
+                value: crate::SavedReviewSelection::Automatic
+            })
+            .unwrap(),
+            json!({"kind":"saved","value":{"mode":"automatic"}})
         );
     }
 }

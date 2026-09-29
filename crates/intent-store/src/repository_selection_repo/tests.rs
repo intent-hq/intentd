@@ -574,3 +574,243 @@ async fn legacy_present_registration_record_is_unresolved_without_target_proof()
     replay_selection_migration(&f.store).await;
     unresolved(&f.store.repository_selection_snapshot(&root).await.unwrap());
 }
+
+async fn selection_authority(
+    f: &Fixture,
+    token: Option<&str>,
+) -> crate::RepositoryAuthoritySnapshot {
+    let owner = f.store.get_primary_principal().await.unwrap();
+    f.store
+        .repository_authority_snapshot(&f.root.workspace_id, &owner.id, token)
+        .await
+        .unwrap()
+}
+#[tokio::test]
+async fn admitted_selection_cas_and_original_noop_order_call_admission_once() {
+    let f = Fixture::new().await;
+    let before = f.read().await;
+    let authority = selection_authority(&f, None).await;
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let next = applied(
+        f.store
+            .write_repository_selection_admitted(
+                &before,
+                remote("explicit"),
+                &authority,
+                None,
+                || {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await,
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    for (original, expected_conflict) in [(&before, true), (&next, false)] {
+        let outcome = f
+            .store
+            .write_repository_selection_admitted(
+                original,
+                remote("explicit"),
+                &authority,
+                None,
+                || panic!("no-op must never reach effect admission"),
+            )
+            .await;
+        assert_eq!(
+            outcome.persistence,
+            RepositorySelectionPersistence::NoEffect
+        );
+        assert_eq!(
+            matches!(
+                outcome.result,
+                Ok(RepositorySelectionWriteResult::Conflict(_))
+            ),
+            expected_conflict
+        );
+    }
+    let denied = f
+        .store
+        .write_repository_selection_admitted(&next, remote("denied"), &authority, None, || {
+            Err(admission_denied())
+        })
+        .await;
+    assert_eq!(denied.persistence, RepositorySelectionPersistence::NoEffect);
+    assert!(denied.result.is_err());
+    assert!(next.matches(&f.read().await));
+}
+#[tokio::test]
+async fn admitted_selection_initial_authority_and_foreign_domain_refuse_before_effect() {
+    let f = Fixture::new().await;
+    let owner = f.store.get_primary_principal().await.unwrap();
+    f.store
+        .insert_principal_credential(&owner.id, "admission-fixture")
+        .await
+        .unwrap();
+    let authority = selection_authority(&f, Some("admission-fixture")).await;
+    let before = f.read().await;
+    f.store
+        .revoke_principal_credential("admission-fixture")
+        .await
+        .unwrap();
+    let denied = f
+        .store
+        .write_repository_selection_admitted(
+            &before,
+            remote("denied"),
+            &authority,
+            Some("admission-fixture"),
+            || panic!("stale authority reached update"),
+        )
+        .await;
+    assert_eq!(denied.persistence, RepositorySelectionPersistence::NoEffect);
+    assert!(denied.result.is_err());
+    assert!(before.matches(&f.read().await));
+    let other = Fixture::new().await;
+    let denied = other
+        .store
+        .write_repository_selection_admitted(&before, remote("foreign"), &authority, None, || {
+            panic!("foreign snapshot reached update")
+        })
+        .await;
+    assert_eq!(
+        denied.persistence,
+        RepositorySelectionPersistence::NotAttempted
+    );
+}
+struct SelectionDrain {
+    entered: tokio::sync::Notify,
+    released: (std::sync::Mutex<bool>, std::sync::Condvar),
+    panic_settlement: bool,
+}
+impl crate::RepositoryLifecycleObserver for SelectionDrain {
+    fn begin_mutation(
+        &self,
+        keys: &[crate::RepositoryLifecycleKey],
+    ) -> Result<Box<dyn crate::RepositoryLifecycleMutationTicket>> {
+        let selected = keys
+            .iter()
+            .any(|k| matches!(k, crate::RepositoryLifecycleKey::Selection { .. }));
+        if selected && !self.panic_settlement {
+            self.entered.notify_one();
+            let (ready, signal) = &self.released;
+            let waited = signal
+                .wait_timeout_while(
+                    ready.lock().unwrap(),
+                    std::time::Duration::from_secs(5),
+                    |ready| !*ready,
+                )
+                .unwrap();
+            assert!(*waited.0, "original selection drain never released");
+        }
+        Ok(Box::new(SelectionSettled {
+            panic: selected && self.panic_settlement,
+        }))
+    }
+}
+struct SelectionSettled {
+    panic: bool,
+}
+impl crate::RepositoryLifecycleMutationTicket for SelectionSettled {
+    fn settle_confirmed(self: Box<Self>) {
+        assert!(!self.panic, "fixture settlement failure after commit");
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admitted_selection_final_transaction_rechecks_authority_after_real_drain() {
+    let f = Fixture::new().await;
+    let owner = f.store.get_primary_principal().await.unwrap();
+    f.store
+        .insert_principal_credential(&owner.id, "drain-fixture")
+        .await
+        .unwrap();
+    let authority = selection_authority(&f, Some("drain-fixture")).await;
+    let before = f.read().await;
+    let drain = Arc::new(SelectionDrain {
+        entered: tokio::sync::Notify::new(),
+        released: (std::sync::Mutex::new(false), std::sync::Condvar::new()),
+        panic_settlement: false,
+    });
+    f.store
+        .install_repository_lifecycle_observer(drain.clone())
+        .await
+        .unwrap();
+    let store = f.store.clone();
+    let handle = tokio::runtime::Handle::current();
+    let worker = tokio::task::spawn_blocking(move || {
+        handle.block_on(store.write_repository_selection_admitted(
+            &before,
+            remote("denied"),
+            &authority,
+            Some("drain-fixture"),
+            || panic!("changed authority reached UPDATE"),
+        ))
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), drain.entered.notified())
+        .await
+        .unwrap();
+    f.store
+        .revoke_principal_credential("drain-fixture")
+        .await
+        .unwrap();
+    *drain.released.0.lock().unwrap() = true;
+    drain.released.1.notify_all();
+    let result = worker.await.unwrap();
+    assert_eq!(result.persistence, RepositorySelectionPersistence::NoEffect);
+    assert!(result.result.is_err());
+    assert_eq!(
+        f.read().await.selection(),
+        Some(&RepositoryStoredSelection::NeverSaved)
+    );
+}
+#[tokio::test]
+async fn admitted_selection_commit_survives_settlement_failure_and_abort_stays_unknown() {
+    let f = Fixture::new().await;
+    let before = f.read().await;
+    let authority = selection_authority(&f, None).await;
+    let observer = Arc::new(SelectionDrain {
+        entered: tokio::sync::Notify::new(),
+        released: (std::sync::Mutex::new(false), std::sync::Condvar::new()),
+        panic_settlement: true,
+    });
+    f.store
+        .install_repository_lifecycle_observer(observer)
+        .await
+        .unwrap();
+    let outcome = f
+        .store
+        .write_repository_selection_admitted(&before, remote("committed"), &authority, None, || {
+            Ok(())
+        })
+        .await;
+    assert!(matches!(
+        outcome.persistence,
+        RepositorySelectionPersistence::Committed { .. }
+    ));
+    assert!(outcome.result.is_err());
+    let name: String = sqlx::query_scalar(
+        "SELECT remote_name FROM repository_selection_state WHERE workspace_id=?",
+    )
+    .bind(f.root.workspace_id.as_str())
+    .fetch_one(f.store.read_pool())
+    .await
+    .unwrap();
+    assert_eq!(name, "committed");
+    let f = Fixture::new().await;
+    let before = f.read().await;
+    let authority = selection_authority(&f, None).await;
+    sqlx::query("CREATE TRIGGER native_selection_abort BEFORE UPDATE ON repository_selection_state BEGIN SELECT RAISE(ABORT,'fixture'); END").execute(f.store.write_pool()).await.unwrap();
+    let outcome = f
+        .store
+        .write_repository_selection_admitted(
+            &before,
+            remote("aborted"),
+            &authority,
+            None,
+            || Ok(()),
+        )
+        .await;
+    assert_eq!(outcome.persistence, RepositorySelectionPersistence::Unknown);
+    assert!(outcome.result.is_err());
+    assert!(before.matches(&f.read().await));
+}

@@ -133,6 +133,7 @@ struct Cohort {
 }
 
 pub(crate) struct FixtureConnection {
+    selection_frames: Mutex<Vec<intent_core::repository_request::RepositorySelectionFrame>>,
     cohort: Mutex<Cohort>,
     scopes: Mutex<Vec<Arc<FixtureScope>>>,
     delivery: Option<Arc<Gate>>,
@@ -154,6 +155,14 @@ impl FixtureConnection {
 }
 
 impl RepositoryReadConnection for FixtureConnection {
+    fn capture_selection(
+        &self,
+        frame: &intent_core::repository_request::RepositorySelectionFrame,
+    ) -> Option<Arc<dyn RepositoryReadRequestScope>> {
+        self.selection_frames.lock().unwrap().push(frame.clone());
+        Some(self.capture())
+    }
+
     fn capture(&self) -> Arc<dyn RepositoryReadRequestScope> {
         let mut cohort = self.cohort.lock().unwrap();
         let scope = Arc::new(FixtureScope {
@@ -189,6 +198,7 @@ impl RepositoryReadConnection for FixtureConnection {
 
 #[derive(Default)]
 pub(crate) struct FixtureApi {
+    selection_effects: std::sync::atomic::AtomicUsize,
     pub(crate) connections: Mutex<Vec<Arc<FixtureConnection>>>,
     pub(crate) entries: Mutex<Vec<RepositoryWireEntry>>,
     pub(crate) permission: Option<Arc<Gate>>,
@@ -219,11 +229,77 @@ impl FixtureApi {
 }
 
 impl WorkspaceApi for FixtureApi {
+    fn repository_selection_save(
+        &self,
+        query: intent_core::repository_request::RepositorySelectionSaveQuery,
+    ) -> BoxFuture<
+        '_,
+        intent_core::Result<intent_core::repository_request::RepositorySelectionAttempt>,
+    > {
+        Box::pin(async move {
+            use intent_core::repository_request::{
+                RepositorySelectionAttempt, RepositorySelectionAttemptState,
+                RepositorySelectionPersistence, RepositorySelectionReceipt,
+                RepositorySelectionResult, RepositorySelectionSnapshot, RepositorySelectionState,
+            };
+            let scope = FIXTURE_SCOPE.with(Clone::clone);
+            scope.state.lock().unwrap().qualified = true;
+            assert_eq!(scope.caller, intent_core::current_caller());
+            match (
+                &scope.credential,
+                intent_core::caller::current_wire_credential(),
+            ) {
+                (
+                    Some(WireCredential::Principal {
+                        principal_id: a,
+                        token_hash: x,
+                    }),
+                    Some(WireCredential::Principal {
+                        principal_id: b,
+                        token_hash: y,
+                    }),
+                ) => {
+                    assert_eq!(a, &b);
+                    assert_eq!(x, &y);
+                }
+                _ => panic!("selection fixture lost original credential"),
+            }
+            self.selection_effects
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            let root = intent_core::RepositoryRootId {
+                workspace_id: query.workspace_id,
+                kind: intent_core::RepositoryRootKind::Primary,
+            };
+            Ok(RepositorySelectionAttempt {
+                selection_id: query.selection_id,
+                root: root.clone(),
+                attempt: RepositorySelectionAttemptState::Settled {
+                    receipt: Box::new(RepositorySelectionReceipt {
+                        result: RepositorySelectionResult::Applied {
+                            snapshot: RepositorySelectionSnapshot {
+                                root,
+                                root_incarnation: "1".into(),
+                                selection_revision: "2".into(),
+                                selection: RepositorySelectionState::Saved {
+                                    value: intent_core::SavedReviewSelection::Automatic,
+                                },
+                            },
+                        },
+                        persistence: RepositorySelectionPersistence::Committed {
+                            selection_revision: "2".into(),
+                        },
+                    }),
+                },
+            })
+        })
+    }
+
     fn repository_read_connection(
         &self,
         entry: RepositoryWireEntry,
     ) -> Option<Arc<dyn RepositoryReadConnection>> {
         let connection = Arc::new(FixtureConnection {
+            selection_frames: Mutex::new(Vec::new()),
             cohort: Mutex::default(),
             scopes: Mutex::default(),
             delivery: self.delivery.clone(),
@@ -1186,4 +1262,111 @@ async fn actual_wss_principal_revocation_drains_ordinary_reply_but_denies_held_p
     assert!(!scope.state.lock().unwrap().sent);
     until(|| original.captured_are_retired()).await;
     server.stop().await;
+}
+
+impl Harness {
+    fn dispatch_selection(&self, raw: &str) -> impl Future<Output = bool> + Send + 'static {
+        let mut dispatch = Box::pin(self.dispatch(raw));
+        let raw = raw.to_string();
+        std::future::poll_fn(move |cx| {
+            crate::context::with_repository_frame(&raw, || dispatch.as_mut().poll(cx))
+        })
+    }
+}
+
+fn selection_request() -> String {
+    json!({"jsonrpc":"2.0","id":71,"method":"workspace.repositorySelection.save","params":{"workspaceId":"original-workspace","selectionId":"original-selection","choice":{"mode":"automatic"}}}).to_string()
+}
+#[tokio::test]
+async fn selection_frame_preserves_command_before_original_full_queue() {
+    let h = Harness::new(FixtureApi::default(), HostRole::Owner).await;
+    for _ in 0..PRIORITY_CAPACITY {
+        h.tx.priority.send("occupied".into()).await.unwrap();
+    }
+    let call = h.dispatch_selection(&selection_request());
+    tokio::pin!(call);
+    tokio::select! { biased; result=&mut call => panic!("full queue did not wait: {result}"), ()=tokio::task::yield_now()=>{} }
+    let original = h.original();
+    let frames = original.selection_frames.lock().unwrap().clone();
+    assert_eq!(frames.len(), 1);
+    let intent_core::repository_request::RepositorySelectionFrame::Save(q) = &frames[0] else {
+        panic!("missing typed selection capture")
+    };
+    assert_eq!(q.selection_id, "original-selection");
+    assert_eq!(q.workspace_id.as_str(), "original-workspace");
+    assert_eq!(h.limiter.available_permits(), Some(1));
+    assert_eq!(
+        h.api
+            .selection_effects
+            .load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+    h.connection.retire();
+}
+#[tokio::test]
+async fn selection_original_receipt_has_one_slot_with_both_retirement_orders() {
+    for retire_first in [true, false] {
+        let gate = Arc::new(Gate::default());
+        let mut h = Harness::new(
+            FixtureApi {
+                delivery: Some(gate.clone()),
+                ..FixtureApi::default()
+            },
+            HostRole::Owner,
+        )
+        .await;
+        assert!(h.dispatch_selection(&selection_request()).await);
+        gate.entered.notified().await;
+        assert_eq!(
+            h.api
+                .selection_effects
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+        assert!(h.rx.priority.try_recv().is_err());
+        if retire_first {
+            h.connection.retire();
+        }
+        gate.release.notify_one();
+        until(|| h.limiter.available_permits() == Some(1)).await;
+        if !retire_first {
+            h.connection.retire();
+        }
+        let reply = h.response().await;
+        assert_eq!(reply.get("result").is_some(), !retire_first);
+        assert_eq!(
+            h.api
+                .selection_effects
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+        assert!(h.rx.priority.try_recv().is_err());
+    }
+}
+#[tokio::test]
+async fn selection_post_consumption_faults_never_replay_effect_or_packet() {
+    for fault in [DeliveryFault::AfterTransfer, DeliveryFault::Repeat] {
+        let mut h = Harness::new(
+            FixtureApi {
+                fault,
+                ..FixtureApi::default()
+            },
+            HostRole::Owner,
+        )
+        .await;
+        assert!(h.dispatch_selection(&selection_request()).await);
+        let reply = h.response().await;
+        assert_eq!(
+            reply["result"]["attempt"]["receipt"]["persistence"]["kind"],
+            "committed"
+        );
+        until(|| h.limiter.available_permits() == Some(1)).await;
+        assert_eq!(
+            h.api
+                .selection_effects
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+        assert!(h.rx.priority.try_recv().is_err());
+    }
 }

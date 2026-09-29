@@ -57,6 +57,7 @@ tokio::task_local! {
     /// Queried by `ServerControl::is_tcp_connection()` to enforce safety guards.
     static IS_TCP: RefCell<bool>;
     static READ_CONNECTION: Option<Arc<dyn RepositoryReadConnection>>;
+    static SELECTION_FRAME: Option<intent_core::repository_request::RepositorySelectionFrame>;
     static REPOSITORY_FRAME: Option<intent_core::repository_request::RepositoryContextQuery>;
 }
 
@@ -83,7 +84,32 @@ pub(crate) fn with_repository_frame<T>(raw: &str, construct: impl FnOnce() -> T)
                 _ => None,
             }
         });
-    REPOSITORY_FRAME.sync_scope(query, construct)
+    let selection = serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|value| {
+            use intent_core::repository_request::RepositorySelectionFrame as Frame;
+            let method = value.get("method")?.as_str()?;
+            let params = value.get("params")?.clone();
+            match method {
+                "workspace.repositorySelection.capture" => {
+                    serde_json::from_value(params).ok().map(Frame::Capture)
+                }
+                "workspace.repositorySelection.save" => {
+                    serde_json::from_value(params).ok().map(Frame::Save)
+                }
+                "workspace.repositorySelection.reset" => {
+                    serde_json::from_value(params).ok().map(Frame::Reset)
+                }
+                "workspace.repositorySelection.reconcile" => {
+                    serde_json::from_value(params).ok().map(Frame::Reconcile)
+                }
+                "workspace.repositorySelection.release" => {
+                    serde_json::from_value(params).ok().map(Frame::Release)
+                }
+                _ => None,
+            }
+        });
+    SELECTION_FRAME.sync_scope(selection, || REPOSITORY_FRAME.sync_scope(query, construct))
 }
 
 /// Owned by each actual connection exit path, independently of client ids.
@@ -102,6 +128,7 @@ impl ReadConnectionGuard {
         &self,
         output: tokio::sync::mpsc::Sender<String>,
     ) -> RetirementForwarder {
+        let selection_output = output.clone();
         let task = self.0.as_ref().and_then(|owner| owner.take_retirements()).map(|mut receiver| {
             tokio::spawn(async move {
                 while let Some(notice) = receiver.next().await {
@@ -114,7 +141,16 @@ impl ReadConnectionGuard {
                 }
             })
         });
-        RetirementForwarder(task)
+        let selection = self.0.as_ref().and_then(|owner| owner.take_selection_retirements()).map(|mut receiver| {
+            tokio::spawn(async move {
+                while let Some(notice) = receiver.next().await {
+                    let terminal = notice.terminal;
+                    let frame = serde_json::json!({"jsonrpc":"2.0","method":"workspace.repositorySelection.retired","params":notice}).to_string();
+                    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5), selection_output.send(frame)).await, Ok(Ok(()))) || terminal { break; }
+                }
+            })
+        });
+        RetirementForwarder { task, selection }
     }
 
     pub(crate) fn absent() -> Self {
@@ -132,10 +168,13 @@ impl ReadConnectionGuard {
     }
 }
 
-pub(crate) struct RetirementForwarder(Option<tokio::task::JoinHandle<()>>);
+pub(crate) struct RetirementForwarder {
+    task: Option<tokio::task::JoinHandle<()>>,
+    selection: Option<tokio::task::JoinHandle<()>>,
+}
 impl Drop for RetirementForwarder {
     fn drop(&mut self) {
-        if let Some(task) = &self.0 {
+        for task in [&self.task, &self.selection].into_iter().flatten() {
             task.abort();
         }
     }
@@ -237,12 +276,17 @@ impl CapturedFrame {
             credential: intent_core::caller::current_wire_credential(),
             completion: READ_CONNECTION
                 .try_with(|owner| {
-                    owner.as_ref().map(|owner| {
+                    owner.as_ref().and_then(|owner| {
+                        if let Some(frame) = SELECTION_FRAME.try_with(Clone::clone).ok().flatten() {
+                            return owner
+                                .capture_selection(&frame)
+                                .map(|scope| Arc::new(RequestCompletion(scope)));
+                        }
                         let query = REPOSITORY_FRAME.try_with(Clone::clone).ok().flatten();
-                        Arc::new(RequestCompletion(match query {
+                        Some(Arc::new(RequestCompletion(match query {
                             Some(query) => owner.capture_context(&query),
                             None => owner.capture(),
-                        }))
+                        })))
                     })
                 })
                 .ok()

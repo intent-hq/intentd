@@ -264,7 +264,7 @@ async fn read_workspace_snapshot(
     })
 }
 
-async fn read_snapshot(
+pub(crate) async fn read_snapshot(
     conn: &mut SqliteConnection,
     workspace_id: &WorkspaceId,
     principal_id: &PrincipalId,
