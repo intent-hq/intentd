@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.115] - 2026-09-29
+
+### 🚀 Features
+
+- Add local runtime and remote agent storage foundations ([#2151](https://github.com/intent-hq/intentd/pull/2151))
+- Expose direct agent retirement with runtime cancellation ([#2149](https://github.com/intent-hq/intentd/pull/2149))
+
+### 🐛 Bug Fixes
+
+- Borrow note versions in line attribution ([#2152](https://github.com/intent-hq/intentd/pull/2152))
+- Support ancestry-only attributed merges ([#2141](https://github.com/intent-hq/intentd/pull/2141))
+
+### ⚡ Performance
+
+- Share GitHub PR discovery and rule reads across checkouts ([#2153](https://github.com/intent-hq/intentd/pull/2153))
+
+
 ## [0.9.114] - 2026-09-28
 
 ### 🚀 Features
