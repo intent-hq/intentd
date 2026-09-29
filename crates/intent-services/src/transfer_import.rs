@@ -2827,7 +2827,7 @@ mod tests {
             let ws = WorkspaceId::from("ws-reimport");
             let root = TempDir::new("reimport-root");
             let assets = TempDir::new("reimport-assets");
-            let svc = fresh_services(&root.0, &assets.0).await;
+            let (_db_dir, svc) = fresh_services(&root.0, &assets.0).await;
             let mut rows = fixture_rows(&ws);
             rows.push((
                 "script",
