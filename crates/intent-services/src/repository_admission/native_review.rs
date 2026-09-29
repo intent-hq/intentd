@@ -1850,6 +1850,28 @@ async fn run(
         result = &mut operation => result.map_err(denied),
     }
 }
+// Before a consuming stamp exists, every exit must classify the actual pending
+// stage in the original engine. Its existing contract preserves earlier receipts
+// and refuses to overwrite an active or already terminal stage. After admission,
+// the stamp alone owns completion/uncertainty, including unwinding and cancellation.
+struct UnadmittedStage<'a> {
+    operation: &'a Operation,
+    admission: &'a RepositoryOperationAdmission,
+    stage: Option<Stage>,
+}
+impl Drop for UnadmittedStage<'_> {
+    fn drop(&mut self) {
+        if let Some(stage) = self.stage {
+            if let Ok(execution) = self
+                .admission
+                .fail_before_dispatch(stage, AdmissionError::Retired)
+            {
+                self.operation.retain(execution);
+            }
+        }
+    }
+}
+
 async fn run_stages(
     c: &Connection,
     op: &Arc<Operation>,
@@ -1857,11 +1879,17 @@ async fn run_stages(
     admission: &RepositoryOperationAdmission,
     queue: &StageQueue,
 ) -> Result<()> {
+    let mut pending = UnadmittedStage {
+        operation: op,
+        admission,
+        stage: Some(op.query.action),
+    };
     if content_fingerprint(op.metadata.root.path(), &op.files)? != op.content_fingerprint {
         return Err(unavailable());
     }
     let plan = stages(&op.query)?;
     for stage in plan {
+        pending.stage = Some(stage);
         let preflight = async {
             op.write_current()?;
             op.metadata.validate(true).await?;
@@ -1876,6 +1904,7 @@ async fn run_stages(
                     .fail_before_dispatch(stage, AdmissionError::Retired)
                     .map_err(denied)?,
             );
+            pending.stage = None;
             break;
         };
         // Allocate everything before the consuming comparison. Branch-pair
@@ -1938,6 +1967,7 @@ async fn run_stages(
             op.metadata.with_metadata(|| queue.claim(claim))
         })
         .map_err(denied)?;
+        pending.stage = None;
         let alarm = op.write.retirement();
         let _timer = AbortOnDrop(tokio::spawn(async move {
             tokio::time::sleep(STAGE_TTL).await;

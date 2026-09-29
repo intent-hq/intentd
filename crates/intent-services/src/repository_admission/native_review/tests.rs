@@ -8,6 +8,135 @@ use intent_core::repository_request::{
 };
 use intent_core::{HostRole, WorkspaceApi};
 
+async fn refused_stage_response(after_commit: bool, expire_queue: bool) {
+    let f = Fixture::new().await;
+    let s = f.socket().await;
+    let first = if after_commit {
+        f.stage("before-refused-create.txt");
+        Stage::Commit
+    } else {
+        Stage::CreatePr
+    };
+    let mut query = f.query(first);
+    query.options.create_pr_after_push = after_commit;
+    let p = s.prepare(&f, query).await;
+    let q = command(&f, &p, first);
+    let connection = s.concrete(&f).await;
+    let op = connection.review.feed.lock().unwrap().records[&q.review.operation_id].clone();
+    with_review_clock(s.entered(async {
+        let frame = s.owner.capture_review(&Frame::Execute(q.clone())).unwrap();
+        let capacity = job(&connection).unwrap();
+        op.progress.lock().unwrap().started = true;
+        let create = create_lock(&connection, &op).unwrap();
+        let held = create.clone().lock_owned().await;
+        let deadline = Instant::now() + FRAME_TTL;
+        let work = async {
+            let _capacity = capacity;
+            let _finish = Completion(op.clone());
+            run(&connection, &op, &q, deadline).await
+        };
+        tokio::pin!(work);
+        tokio::select! {
+            result = &mut work => panic!("work ended before branch-pair wait: {result:?}"),
+            () = wait_until(|| op.progress.lock().unwrap().engine.is_some()
+                && Arc::strong_count(&create) > 2) => {},
+        }
+        assert_eq!(
+            op.progress.lock().unwrap().effects.len(),
+            usize::from(after_commit)
+        );
+        let metadata_holder = if expire_queue {
+            tokio::time::advance(FRAME_TTL).await;
+            None
+        } else {
+            // The real worker has passed preflight and is waiting for its
+            // branch pair. Hold the original optional config lock only now;
+            // the later synchronous P comparison must refuse its stage claim.
+            let (entered, waiting) = tokio::sync::oneshot::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            let facts = op.metadata.provider.clone();
+            let holder = std::thread::spawn(move || {
+                facts.hold_native_review_metadata_for_test(entered, released);
+            });
+            waiting.await.unwrap();
+            let mut claimed = false;
+            assert!(op
+                .metadata
+                .with_metadata(|| {
+                    claimed = true;
+                    Ok(())
+                })
+                .is_err());
+            assert!(!claimed);
+            Some((release, holder))
+        };
+        drop(held);
+        assert!(work.await.is_err());
+        // The original run and Completion have joined before final disclosure.
+        // Removing contention cannot renew or retry the consumed command.
+        if let Some((release, holder)) = metadata_holder {
+            release.send(()).unwrap();
+            holder.join().unwrap();
+        }
+        assert!(op.progress.lock().unwrap().settled.is_some());
+        assert_eq!(connection.review.workers.available_permits(), WORKERS);
+        assert_eq!(
+            connection
+                .services
+                .repository_review_capacity
+                .workers
+                .available_permits(),
+            GLOBAL_WORKERS
+        );
+        frame.retire();
+    }))
+    .await;
+    let response = s
+        .request(&f.services, Frame::Execute(q.clone()))
+        .await
+        .unwrap();
+    let reconciled = s
+        .request(&f.services, Frame::Reconcile(bound(&q)))
+        .await
+        .unwrap();
+    assert_eq!(response["reviewExecution"], reconciled["reviewExecution"]);
+    let receipts = if after_commit {
+        json!([{"stage":"commit", "commitHash":f.git.git(&f.git.path, &["rev-parse", "HEAD"]).trim()}])
+    } else {
+        json!([])
+    };
+    assert_eq!(response["reviewExecution"]["gitReceipts"], receipts);
+    assert_eq!(f.server.control.posts.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        response["success"], false,
+        "refused attempt settled successful: {response}"
+    );
+    assert_eq!(
+        response["reviewExecution"]["outcome"]["status"], "failed",
+        "{response}"
+    );
+    assert_eq!(response["reviewExecution"]["outcome"]["stage"], "create-pr");
+    assert_eq!(
+        response["reviewExecution"]["outcome"]["code"],
+        "repository-admission-retired"
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_review_refused_queue_stage_settles_failed_in_original_history() {
+    refused_stage_response(false, true).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_review_refused_consuming_stage_settles_failed_in_original_history() {
+    refused_stage_response(false, false).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_review_refused_later_stage_retains_actual_commit_in_original_history() {
+    refused_stage_response(true, false).await;
+}
+
 // Keep paused time from auto-advancing while the real SQLite/provider workers
 // run. Tests advance only the deadline under examination, without wall sleeps.
 async fn with_review_clock<T>(work: impl Future<Output = T>) -> T {
