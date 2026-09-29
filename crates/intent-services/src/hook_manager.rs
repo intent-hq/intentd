@@ -2707,7 +2707,7 @@ mod tests {
                 &ws,
                 &owner,
                 &json!({
-                    "name": "root", "delayMs": 600000, "code": code
+                    "name": "root", "delayMs": 600_000, "code": code
                 }),
             )
             .await
@@ -2736,7 +2736,7 @@ mod tests {
                     &ws,
                     id,
                     &json!({
-                        "name": "ordinary", "delayMs": 600000, "code": "return {dispatch: false};"
+                        "name": "ordinary", "delayMs": 600_000, "code": "return {dispatch: false};"
                     }),
                 )
                 .await
@@ -2767,7 +2767,7 @@ mod tests {
                 &ws,
                 &owner,
                 &json!({
-                    "name": "original", "delayMs": 600000, "code": code
+                    "name": "original", "delayMs": 600_000, "code": code
                 }),
             )
             .await
@@ -2808,12 +2808,12 @@ mod tests {
         let child_code = "await ws.workspace.setStatusMessage('validation entered'); \
                           await new Promise(() => {});";
         let params = json!({
-            "name": "cancelled-root", "delayMs": 600000,
+            "name": "cancelled-root", "delayMs": 600_000,
             "code": format!("await ws.hook.schedule({{name: 'cancelled-child', delayMs: 600000, code: {}}});", json!(child_code))
         });
         let mut pending = Box::pin(svc.hook_schedule_op(&ws, &owner, &params));
         let ordinary_nested = json!({
-            "name": "healthy-root", "delayMs": 600000,
+            "name": "healthy-root", "delayMs": 600_000,
             "code": "await ws.hook.schedule({name: 'healthy-child', delayMs: 600000, code: 'return {dispatch: false};'});"
         });
         // Poll independent work on the SAME task while the nested evaluation
