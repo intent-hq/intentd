@@ -6819,8 +6819,10 @@ fn should_resume_on_start(
 async fn run_startup_resume_sweep(
     services: &Services,
     candidates: intent_services::StartupResumeCandidates,
-    mut stopping: tokio::sync::watch::Receiver<bool>,
+    stopping: tokio::sync::watch::Receiver<bool>,
 ) {
+    #[cfg(unix)]
+    let mut stopping = stopping;
     let ids = candidates.ids().to_vec();
     tracing::info!(
         count = ids.len(),
