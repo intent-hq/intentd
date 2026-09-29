@@ -495,6 +495,7 @@ impl Store {
             .begin()
             .await
             .map_err(|e| Error::Internal(format!("transfer import begin failed: {e}")))?;
+        reclaim_imported_metadata(&mut tx, rows).await?;
         let mut inserted = 0usize;
         for (table, _) in TRANSFER_TABLES {
             let Some((_, objects)) = rows.iter().find(|(t, _)| t == table) else {
@@ -539,6 +540,86 @@ impl Store {
             .map_err(|e| Error::Internal(format!("transfer import commit failed: {e}")))?;
         Ok(inserted)
     }
+}
+
+/// Older workspace deletes left these no-workspace-FK registries behind.
+/// Reclaim only IDs present in this archive, owned by an absent workspace
+/// that the same transaction is about to insert. No workspace-wide orphan
+/// sweep, upsert, or provisioning-ownership change is implied by an import.
+/// Cleanup rolls back with every later insert/validation failure.
+async fn reclaim_imported_metadata(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    rows: &[(String, Vec<serde_json::Value>)],
+) -> Result<()> {
+    let workspaces: std::collections::HashSet<&str> = rows
+        .iter()
+        .find(|(table, _)| table == "workspace")
+        .into_iter()
+        .flat_map(|(_, objects)| objects)
+        .filter_map(|row| row.get("id")?.as_str())
+        .collect();
+    for (table, key) in [
+        ("interrupted_agent", "agent_id"),
+        ("script", "id"),
+        ("attachments", "id"),
+    ] {
+        let Some((_, objects)) = rows.iter().find(|(t, _)| t == table) else {
+            continue;
+        };
+        for row in objects {
+            let (Some(id), Some(workspace)) = (
+                row.get(key).and_then(serde_json::Value::as_str),
+                row.get("workspace_id").and_then(serde_json::Value::as_str),
+            ) else {
+                continue; // Ordinary insert validation still rejects bad rows.
+            };
+            if !workspaces.contains(workspace) {
+                continue;
+            }
+            if table == "attachments" {
+                // An attachment can have several retry keys. Bound each
+                // statement while retaining the import's single transaction.
+                loop {
+                    let removed = sqlx::query(
+                        "DELETE FROM attachment_idempotency_keys WHERE rowid IN \
+                         (SELECT k.rowid FROM attachment_idempotency_keys k \
+                          JOIN attachments a ON a.id = k.attachment_id \
+                          WHERE a.id = ?1 AND a.workspace_id = ?2 AND k.workspace_id = ?2 \
+                            AND NOT EXISTS (SELECT 1 FROM workspace WHERE id = ?2) LIMIT ?3)",
+                    )
+                    .bind(id)
+                    .bind(workspace)
+                    .bind(crate::agent_repo::DELETE_CASCADE_BATCH)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|e| {
+                        Error::Internal(format!("reclaim attachment retry keys failed: {e}"))
+                    })?
+                    .rows_affected();
+                    if removed < crate::agent_repo::DELETE_CASCADE_BATCH.unsigned_abs() {
+                        break;
+                    }
+                }
+            }
+            let agent_guard = if table == "interrupted_agent" {
+                " AND NOT EXISTS (SELECT 1 FROM agent_session WHERE id = ?1)"
+            } else {
+                ""
+            };
+            sqlx::query(&format!(
+                "DELETE FROM {table} WHERE {key} = ?1 AND workspace_id = ?2 \
+                 AND NOT EXISTS (SELECT 1 FROM workspace WHERE id = ?2){agent_guard}"
+            ))
+            .bind(id)
+            .bind(workspace)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("reclaim imported {table} metadata failed: {e}"))
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// Serialize one `SQLite` row to a JSON object keyed by column name (see
@@ -681,6 +762,10 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
     }
     Some(out)
 }
+
+#[cfg(test)]
+#[path = "transfer_reimport_tests.rs"]
+mod reimport_tests;
 
 #[cfg(test)]
 mod tests {

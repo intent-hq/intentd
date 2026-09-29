@@ -2803,6 +2803,98 @@ mod tests {
         assert_selection(&svc, &session, "codex", Some("gpt-6-astra"), Some("high"));
     }
 
+    #[tokio::test]
+    async fn import_reclaims_orphan_metadata_atomically_with_attachment_files() {
+        for fail_late in [false, true] {
+            let ws = WorkspaceId::from("ws-reimport");
+            let root = TempDir::new("reimport-root");
+            let assets = TempDir::new("reimport-assets");
+            let svc = fresh_services(&root.0, &assets.0).await;
+            let mut rows = fixture_rows(&ws);
+            rows.push((
+                "script",
+                vec![serde_json::json!({
+                    "id":"script-reimport", "workspace_id":ws.0, "name":"Script",
+                    "command":"true", "mode":"command", "source":"user", "created_at":"t0"
+                })],
+            ));
+            let mut stale: Vec<_> = rows
+                .iter()
+                .filter(|(table, _)| matches!(*table, "script" | "attachments"))
+                .map(|(table, rows)| ((*table).to_string(), rows.clone()))
+                .collect();
+            stale.push((
+                "interrupted_agent".into(),
+                vec![serde_json::json!({
+                    "agent_id":"agent-live", "workspace_id":ws.0, "prev_status":"active",
+                    "interrupted_at":"t0", "resolution":"resumed"
+                })],
+            ));
+            svc.store.transfer_import_rows(&stale).await.unwrap();
+            sqlx::query("INSERT INTO attachment_idempotency_keys (workspace_id, key, attachment_id, fingerprint, created_at) VALUES (?, 'retry', 'att-live', 'old', 't0')")
+                .bind(&ws.0).execute(svc.store.write_pool()).await.unwrap();
+            let before = svc.store.transfer_export_rows(&ws).await.unwrap();
+            if fail_late {
+                rows.iter_mut()
+                    .find(|(t, _)| *t == "attachments")
+                    .unwrap()
+                    .1
+                    .push(serde_json::json!({"id":"bad", "workspace_id":ws.0}));
+            }
+            let manifest = manifest(&ws);
+            let archive =
+                build_archive_full(&manifest, &rows, None, &[("att-live", b"attachment-bytes")]);
+            let begun = svc
+                .workspace_import_begin_op(
+                    serde_json::to_value(manifest).unwrap(),
+                    archive.len() as u64,
+                    sha256_hex(&archive),
+                )
+                .await
+                .unwrap();
+            let id = begun["importId"].as_str().unwrap().to_string();
+            svc.workspace_import_chunk_op(id.clone(), 0, b64(&archive))
+                .await
+                .unwrap();
+            let result = svc.workspace_import_commit_op(id.clone()).await;
+            let file = root.0.join(&ws.0).join("repo/.intent/attachments/doc.pdf");
+            if fail_late {
+                let err = result.unwrap_err();
+                assert!(err.to_string().contains("attachments.file_name"), "{err}");
+                assert!(!file.exists(), "failed insert unwinds materialized files");
+                assert_eq!(svc.store.transfer_export_rows(&ws).await.unwrap(), before);
+                svc.workspace_import_abort_op(id).await.unwrap();
+            } else {
+                let result = result.unwrap();
+                assert_eq!(result["workspace"]["id"], ws.0);
+                assert_eq!(tokio::fs::read(file).await.unwrap(), b"attachment-bytes");
+                let resolution: String = sqlx::query_scalar(
+                    "SELECT resolution FROM interrupted_agent WHERE agent_id='agent-live'",
+                )
+                .fetch_one(svc.store.read_pool())
+                .await
+                .unwrap();
+                assert_eq!(
+                    resolution, "pending",
+                    "incoming interruption replaces stale resolved history"
+                );
+            }
+            let retry_keys: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM attachment_idempotency_keys WHERE workspace_id=?",
+            )
+            .bind(&ws.0)
+            .fetch_one(svc.store.read_pool())
+            .await
+            .unwrap();
+            assert_eq!(retry_keys, i64::from(fail_late));
+            assert!(sqlx::query("PRAGMA foreign_key_check")
+                .fetch_all(svc.store.read_pool())
+                .await
+                .unwrap()
+                .is_empty());
+        }
+    }
+
     /// Full lifecycle: begin → two chunks (out of order, one retried) →
     /// commit. The workspace is invisible before commit and live after, with
     /// transforms applied (paths re-rooted, session ids nulled, in-flight
