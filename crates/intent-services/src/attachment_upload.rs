@@ -1135,13 +1135,73 @@ mod tests {
 
     /// One in-process service stack with a seeded workspace whose checkout
     /// root is a real temp dir (so `commit`'s placement path resolves).
-    async fn seeded_services(ws: &WorkspaceId, ws_root: &Path, checkout: &Path) -> Services {
-        let db = std::env::temp_dir().join(format!("attach-up-test-{}.db", uuid::Uuid::new_v4()));
+    // Bind the directory before Services so consumers drop before cleanup.
+    async fn seeded_services(
+        ws: &WorkspaceId,
+        ws_root: &Path,
+        checkout: &Path,
+    ) -> (tempfile::TempDir, Services) {
+        let db_dir = crate::test_support::test_tempdir("attach-up-test-");
+        let db = db_dir.path().join("store.db");
         let store = Store::open(&db).await.expect("open store");
         let mut row = crate::tests::workspace(ws);
         row.worktree_path = Some(checkout.to_string_lossy().into_owned());
         store.insert_workspace(&row).await.expect("seed workspace");
-        Services::new(store).with_workspaces_root(ws_root.to_path_buf())
+        let svc = Services::new(store).with_workspaces_root(ws_root.to_path_buf());
+        (db_dir, svc)
+    }
+
+    /// Run representative fixture consumers in private child TMPDIRs. The parent
+    /// observes residue after test teardown without mutating its own environment.
+    #[cfg(unix)]
+    #[test]
+    fn fixture_databases_are_cleaned_after_consumers_exit() {
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        use intentd_test_support::GuardedChild;
+
+        let root = crate::test_support::test_tempdir("fixture-db-cleanup-");
+        let mut residue = Vec::new();
+        for (index, test) in [
+            "attachment_upload::tests::upload_multi_chunk_out_of_order_with_retry_commits",
+            "transfer_export::tests::export_guards_and_abort",
+            "transfer_export::tests::export_build_failure_cleans_up_and_allows_retry",
+            "transfer_import::tests::import_lifecycle_begin_chunk_commit",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let scratch = root.path().join(index.to_string());
+            std::fs::create_dir(&scratch).unwrap();
+            let log_path = root.path().join(format!("{index}.log"));
+            let log = std::fs::File::create(&log_path).unwrap();
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", test, "--nocapture"])
+                .env("TMPDIR", &scratch)
+                .env("TMP", &scratch)
+                .env("TEMP", &scratch)
+                .env_remove("INTENTD_TEST_KEEP_TMP")
+                .stdin(Stdio::null())
+                .stdout(log.try_clone().unwrap())
+                .stderr(log);
+            let mut child = GuardedChild::spawn(&mut command).unwrap();
+            let status = child.wait_with_timeout(Duration::from_secs(120)).unwrap();
+            let output = std::fs::read_to_string(&log_path).unwrap();
+            assert!(
+                status.is_some_and(|status| status.success()) && output.contains("1 passed"),
+                "fixture consumer {test} failed ({status:?}):\n{output}"
+            );
+            let remaining: Vec<_> = std::fs::read_dir(&scratch)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            if !remaining.is_empty() {
+                residue.push((test, remaining));
+            }
+        }
+        assert!(residue.is_empty(), "fixture residue: {residue:?}");
     }
 
     async fn begin(svc: &Services, ws: &WorkspaceId, payload: &[u8]) -> String {
@@ -1171,7 +1231,7 @@ mod tests {
         let ws = WorkspaceId("ws-up-happy".to_string());
         let ws_root = TempDir::new("attach-up-root");
         let checkout = TempDir::new("attach-up-co");
-        let svc = seeded_services(&ws, &ws_root.0, &checkout.0).await;
+        let (_db_dir, svc) = seeded_services(&ws, &ws_root.0, &checkout.0).await;
 
         let payload: Vec<u8> = (0u32..200_000).flat_map(u32::to_le_bytes).collect();
         let mid = payload.len() / 2;
@@ -1237,7 +1297,7 @@ mod tests {
         let ws_root = TempDir::new("attach-up-root");
         let checkout = TempDir::new("attach-up-co");
         let other_checkout = TempDir::new("attach-up-co-other");
-        let svc = seeded_services(&ws, &ws_root.0, &checkout.0).await;
+        let (_db_dir, svc) = seeded_services(&ws, &ws_root.0, &checkout.0).await;
         let mut other_row = crate::tests::workspace(&other_ws);
         other_row.worktree_path = Some(other_checkout.0.to_string_lossy().into_owned());
         svc.store()
@@ -1395,7 +1455,7 @@ mod tests {
         let ws = WorkspaceId("ws-up-keyed-xsurface".to_string());
         let ws_root = TempDir::new("attach-up-root");
         let checkout = TempDir::new("attach-up-co");
-        let svc = seeded_services(&ws, &ws_root.0, &checkout.0).await;
+        let (_db_dir, svc) = seeded_services(&ws, &ws_root.0, &checkout.0).await;
 
         let payload = b"cross-surface".to_vec();
         let sha = sha256_hex(&payload);
@@ -1501,7 +1561,7 @@ mod tests {
         let ws = WorkspaceId("ws-up-keyed-drift".to_string());
         let ws_root = TempDir::new("attach-up-root");
         let checkout = TempDir::new("attach-up-co");
-        let svc = seeded_services(&ws, &ws_root.0, &checkout.0).await;
+        let (_db_dir, svc) = seeded_services(&ws, &ws_root.0, &checkout.0).await;
 
         let src = "/proc/self/status";
         assert_eq!(std::fs::metadata(src).unwrap().len(), 0, "precondition");
@@ -1552,7 +1612,7 @@ mod tests {
         let ws = WorkspaceId("ws-up-keyed-expired".to_string());
         let ws_root = TempDir::new("attach-up-root");
         let checkout = TempDir::new("attach-up-co");
-        let svc = seeded_services(&ws, &ws_root.0, &checkout.0).await;
+        let (_db_dir, svc) = seeded_services(&ws, &ws_root.0, &checkout.0).await;
 
         let payload = b"boundary".to_vec();
         let sha = sha256_hex(&payload);
@@ -1635,7 +1695,7 @@ mod tests {
         let ws = WorkspaceId("ws-up-keyed-refresh".to_string());
         let ws_root = TempDir::new("attach-up-root");
         let checkout = TempDir::new("attach-up-co");
-        let svc = seeded_services(&ws, &ws_root.0, &checkout.0).await;
+        let (_db_dir, svc) = seeded_services(&ws, &ws_root.0, &checkout.0).await;
 
         let payload = b"refresh-me".to_vec();
         let sha = sha256_hex(&payload);
@@ -1703,7 +1763,7 @@ mod tests {
         let ws = WorkspaceId("ws-up-keyed-dir".to_string());
         let ws_root = TempDir::new("attach-up-root");
         let checkout = TempDir::new("attach-up-co");
-        let svc = seeded_services(&ws, &ws_root.0, &checkout.0).await;
+        let (_db_dir, svc) = seeded_services(&ws, &ws_root.0, &checkout.0).await;
 
         let payload = b"dir-race".to_vec();
         let sha = sha256_hex(&payload);
@@ -1757,7 +1817,7 @@ mod tests {
         let ws = WorkspaceId("ws-up-reject".to_string());
         let ws_root = TempDir::new("attach-up-root");
         let checkout = TempDir::new("attach-up-co");
-        let svc = seeded_services(&ws, &ws_root.0, &checkout.0).await;
+        let (_db_dir, svc) = seeded_services(&ws, &ws_root.0, &checkout.0).await;
         let sha = "a".repeat(64);
 
         let err = svc
@@ -1876,7 +1936,7 @@ mod tests {
         let ws = WorkspaceId("ws-up-chunk".to_string());
         let ws_root = TempDir::new("attach-up-root");
         let checkout = TempDir::new("attach-up-co");
-        let svc = seeded_services(&ws, &ws_root.0, &checkout.0).await;
+        let (_db_dir, svc) = seeded_services(&ws, &ws_root.0, &checkout.0).await;
 
         let err = svc
             .file_attachment_upload_chunk_op("upload-nope".to_string(), 0, b64(b"x"))
@@ -1926,7 +1986,7 @@ mod tests {
         let ws = WorkspaceId("ws-up-cap".to_string());
         let ws_root = TempDir::new("attach-up-root");
         let checkout = TempDir::new("attach-up-co");
-        let svc = seeded_services(&ws, &ws_root.0, &checkout.0).await;
+        let (_db_dir, svc) = seeded_services(&ws, &ws_root.0, &checkout.0).await;
 
         let oversized = vec![0u8; super::ATTACHMENT_UPLOAD_MAX_CHUNK_BYTES + 1];
         let r = svc
@@ -1970,7 +2030,7 @@ mod tests {
         let ws = WorkspaceId("ws-up-commit".to_string());
         let ws_root = TempDir::new("attach-up-root");
         let checkout = TempDir::new("attach-up-co");
-        let svc = seeded_services(&ws, &ws_root.0, &checkout.0).await;
+        let (_db_dir, svc) = seeded_services(&ws, &ws_root.0, &checkout.0).await;
 
         // Incomplete: only half the declared bytes staged.
         let payload = b"half-and-half".to_vec();
@@ -2051,7 +2111,7 @@ mod tests {
         let ws = WorkspaceId("ws-up-restart".to_string());
         let ws_root = TempDir::new("attach-up-root");
         let checkout = TempDir::new("attach-up-co");
-        let svc = seeded_services(&ws, &ws_root.0, &checkout.0).await;
+        let (_db_dir, svc) = seeded_services(&ws, &ws_root.0, &checkout.0).await;
 
         let payload = b"restart-me".to_vec();
         let upload_id = begin(&svc, &ws, &payload).await;
@@ -2065,7 +2125,7 @@ mod tests {
         assert!(orphan_dir.exists());
 
         // "Restart": a fresh Services stack over the same roots.
-        let svc2 = seeded_services(
+        let (_db_dir2, svc2) = seeded_services(
             &WorkspaceId("ws-up-restart-2".to_string()),
             &ws_root.0,
             &checkout.0,
@@ -2091,7 +2151,7 @@ mod tests {
         let ws = WorkspaceId("ws-up-sweep".to_string());
         let ws_root = TempDir::new("attach-up-root");
         let checkout = TempDir::new("attach-up-co");
-        let svc = seeded_services(&ws, &ws_root.0, &checkout.0).await;
+        let (_db_dir, svc) = seeded_services(&ws, &ws_root.0, &checkout.0).await;
 
         let staging_root = ws_root.0.join(".attachment-upload-staging");
         let live_dir = staging_root.join("upload-live");
@@ -2139,7 +2199,7 @@ mod tests {
         let ws = WorkspaceId("ws-up-cap4".to_string());
         let ws_root = TempDir::new("attach-up-root");
         let checkout = TempDir::new("attach-up-co");
-        let svc = seeded_services(&ws, &ws_root.0, &checkout.0).await;
+        let (_db_dir, svc) = seeded_services(&ws, &ws_root.0, &checkout.0).await;
 
         let payload = b"cap-me".to_vec();
         let mut ids = Vec::new();
@@ -2196,7 +2256,7 @@ mod tests {
         let ws = WorkspaceId("ws-up-ttl".to_string());
         let ws_root = TempDir::new("attach-up-root");
         let checkout = TempDir::new("attach-up-co");
-        let svc = seeded_services(&ws, &ws_root.0, &checkout.0).await;
+        let (_db_dir, svc) = seeded_services(&ws, &ws_root.0, &checkout.0).await;
 
         let payload = b"expire-me".to_vec();
         let upload_id = begin(&svc, &ws, &payload).await;
@@ -2250,7 +2310,7 @@ mod tests {
         let ws = WorkspaceId("ws-up-reclaim".to_string());
         let ws_root = TempDir::new("attach-up-root");
         let checkout = TempDir::new("attach-up-co");
-        let svc = seeded_services(&ws, &ws_root.0, &checkout.0).await;
+        let (_db_dir, svc) = seeded_services(&ws, &ws_root.0, &checkout.0).await;
 
         // Fill all 4 slots, then let them all go idle past the TTL.
         let payload = b"reclaim-me".to_vec();
@@ -2298,7 +2358,7 @@ mod tests {
         let ws = WorkspaceId("ws-up-race".to_string());
         let ws_root = TempDir::new("attach-up-root");
         let checkout = TempDir::new("attach-up-co");
-        let svc = seeded_services(&ws, &ws_root.0, &checkout.0).await;
+        let (_db_dir, svc) = seeded_services(&ws, &ws_root.0, &checkout.0).await;
 
         let payload = b"pipelined-final-chunk!".to_vec();
         let mid = payload.len() / 2;
@@ -2374,7 +2434,7 @@ mod tests {
         let ws = WorkspaceId("ws-up-slow-commit".to_string());
         let ws_root = TempDir::new("attach-up-root");
         let checkout = TempDir::new("attach-up-co");
-        let svc = seeded_services(&ws, &ws_root.0, &checkout.0).await;
+        let (_db_dir, svc) = seeded_services(&ws, &ws_root.0, &checkout.0).await;
 
         let payload = b"slow-commit".to_vec();
         let upload_id = begin(&svc, &ws, &payload).await;
@@ -2421,7 +2481,7 @@ mod tests {
         let ws = WorkspaceId("ws-up-flag".to_string());
         let ws_root = TempDir::new("attach-up-root");
         let checkout = TempDir::new("attach-up-co");
-        let svc = seeded_services(&ws, &ws_root.0, &checkout.0).await;
+        let (_db_dir, svc) = seeded_services(&ws, &ws_root.0, &checkout.0).await;
 
         let payload = b"flag-owner".to_vec();
         let upload_id = begin(&svc, &ws, &payload).await;
