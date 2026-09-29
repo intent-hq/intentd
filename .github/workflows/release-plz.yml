@@ -264,13 +264,23 @@ jobs:
       - name: Drop debug info from verify builds
         shell: bash
         run: echo "CARGO_PROFILE_DEV_DEBUG=false" >> "$GITHUB_ENV"
+      # #6163: only a confirmed missing intent-nodes baseline gets initial-release
+      # semantics. The external config retires itself once the shared tag contains
+      # nodes, and is never committed or supplied to the publication job above.
+      - name: Prepare release planning baseline
+        run: python3 -S scripts/release-plz-baseline.py --output "$RUNNER_TEMP/release-plz-planning.toml"
       - name: Run release-plz release-pr
         id: release_pr
         uses: release-plz/action@aec534bbd8631793b9b3b8f1ee6cd886c322e17f # v0.5.133
         with:
           command: release-pr
+          version: 0.3.162 # Keep tag-selection semantics and actual-tool fixtures aligned.
+          config: ${{ runner.temp }}/release-plz-planning.toml
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+      - name: Remove temporary planning configuration
+        if: ${{ always() }}
+        run: rm -f "$RUNNER_TEMP/release-plz-planning.toml"
       - name: Validate release-plz no-op baseline
         id: no_release
         if: ${{ success() && steps.release_pr.outcome == 'success' }}
