@@ -1290,6 +1290,8 @@ pub struct Services {
     workspace_mutations: workspace_mutations::WorkspaceMutations,
     startup_resume_candidates: Arc<Mutex<HashSet<AgentId>>>,
     #[cfg(test)]
+    interrupted_list_park: Option<Arc<script_ops::SupervisePark>>,
+    #[cfg(test)]
     workspace_delete_test_gate: tests::workspace_delete::DeleteGate,
     /// In-memory pending agent-session deletions for the delete grace window
     /// (§5.5): `agent.delete` with `undoDelayMs > 0` registers the timer
@@ -1552,6 +1554,8 @@ impl Services {
             pending_workspace_deletes: delete_grace::PendingDeletes::default(),
             workspace_mutations: workspace_mutations::WorkspaceMutations::default(),
             startup_resume_candidates: Arc::default(),
+            #[cfg(test)]
+            interrupted_list_park: None,
             #[cfg(test)]
             workspace_delete_test_gate: tests::workspace_delete::DeleteGate::default(),
             pending_agent_deletes: delete_grace::PendingDeletes::default(),
@@ -30245,16 +30249,21 @@ impl WorkspaceApi for Services {
 
     fn agent_list_interrupted(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async {
+            // Snapshot reservations BEFORE reading pending rows: recovery may
+            // claim a row and release its reservation during the database await.
+            // Using the later set would expose that stale row as manual work.
+            let reserved = self
+                .startup_resume_candidates
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             let mut rows = self.store.list_interrupted_agents().await?;
-            // Startup reservations hide only the candidates captured before
-            // listeners started. Failed attempts are released individually.
-            {
-                let reserved = self
-                    .startup_resume_candidates
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                rows.retain(|ia| !reserved.contains(&ia.agent_id));
+            #[cfg(test)]
+            if let Some(park) = &self.interrupted_list_park {
+                park.entered.notify_one();
+                park.release.notified().await;
             }
+            rows.retain(|ia| !reserved.contains(&ia.agent_id));
             // Cross-workspace surface: a collaborator sees only member workspaces.
             if let Some(visible) = self.visible_workspace_ids().await? {
                 rows.retain(|ia| visible.contains(&ia.workspace_id));

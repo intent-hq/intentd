@@ -46371,3 +46371,32 @@ async fn startup_resume_abandon_persist_failure_remains_retryable() {
         1
     );
 }
+
+#[intent_test_macros::daemon_test]
+async fn startup_resume_listing_never_exposes_a_stale_successful_candidate() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Candidate resolved during listing").await;
+    svc.store
+        .insert_interrupted_agent(&id, &ws, "active", &now_iso())
+        .await
+        .unwrap();
+    let reservations = svc.prepare_startup_resume().await.unwrap();
+    let park = Arc::new(crate::script_ops::SupervisePark::default());
+    let mut listing = svc.clone();
+    listing.interrupted_list_park = Some(park.clone());
+    let (result, ()) = tokio::join!(listing.agent_list_interrupted(), async {
+        timeout(Duration::from_secs(5), park.entered.notified())
+            .await
+            .unwrap();
+        svc.resume_startup_candidate(&reservations, &id)
+            .await
+            .unwrap();
+        park.release.notify_one();
+    });
+    let result = result.unwrap();
+    assert_eq!(
+        result["agents"],
+        json!([]),
+        "an old pending-row read must not expose a successfully resumed candidate"
+    );
+}
