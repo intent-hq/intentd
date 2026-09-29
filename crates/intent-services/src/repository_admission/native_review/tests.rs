@@ -360,6 +360,280 @@ async fn native_review_queue_deadline_wins_ready_first_claim_after_observation()
 }
 
 #[intent_test_macros::daemon_test]
+async fn native_review_member_boundary_refusal_preserves_failed_history_without_effects() {
+    // Freeze time before preparation creates its monitor. The actual comparison
+    // is refused by the held original config, not by an uncontrolled timer race.
+    with_review_clock(async {
+        let fixture = Fixture::new().await;
+        let (socket, _) = member(&fixture).await;
+        let remote_sha = fixture.server.control.sha.lock().unwrap().clone();
+        let matching = super::credential_tests::review(&remote_sha);
+        *fixture.server.control.reviews.lock().unwrap() = vec![matching.clone()];
+        let head = fixture.git.git(&fixture.git.path, &["rev-parse", "HEAD"]);
+        let status = fixture
+            .git
+            .git(&fixture.git.path, &["status", "--porcelain=v1"]);
+        let fixed_time = Instant::now();
+        let prepared = socket.prepare(&fixture, fixture.query(Stage::CreatePr)).await;
+        let command = command(&fixture, &prepared, Stage::CreatePr);
+        let connection = socket.concrete(&fixture).await;
+        let operation = connection.review.feed.lock().unwrap().records
+            [&command.review.operation_id]
+            .clone();
+        socket
+            .entered(async {
+                let frame = socket
+                    .owner
+                    .capture_review(&Frame::Execute(command.clone()))
+                    .unwrap();
+                let capacity = job(&connection).unwrap();
+                operation.progress.lock().unwrap().started = true;
+                let branch_pair = create_lock(&connection, &operation).unwrap();
+                let held_pair = branch_pair.clone().lock_owned().await;
+                let work = async {
+                    let _capacity = capacity;
+                    let _finish = Completion(operation.clone());
+                    run(&connection, &operation, &command, fixed_time + FRAME_TTL).await
+                };
+                tokio::pin!(work);
+                tokio::select! {
+                    result = &mut work => panic!("run ended before branch-pair barrier: {result:?}"),
+                    () = wait_until(|| operation.progress.lock().unwrap().engine.is_some()
+                        && Arc::strong_count(&branch_pair) > 2) => {},
+                }
+                assert_eq!(connection.review.workers.available_permits(), WORKERS - 1);
+                assert_eq!(
+                    fixture.services.repository_review_capacity.workers.available_permits(),
+                    GLOBAL_WORKERS - 1
+                );
+                assert!(fixture.services.worktree_locks
+                    .try_with_lock(&fixture.git.path, || async {}).await.is_none());
+                let (entered, waiting) = tokio::sync::oneshot::channel();
+                let (release, released) = std::sync::mpsc::channel();
+                let facts = operation.metadata.provider.clone();
+                let holder = std::thread::spawn(move || {
+                    facts.hold_native_review_metadata_for_test(entered, released);
+                });
+                waiting.await.unwrap();
+                let mut claims = 0;
+                assert!(operation.metadata.with_metadata(|| {
+                    claims += 1;
+                    Ok(())
+                }).is_err());
+                assert_eq!(claims, 0);
+                assert_eq!(Instant::now(), fixed_time);
+                drop(held_pair);
+                assert!(work.await.is_err());
+                // Only completed original work can release capacity. Metadata
+                // remains held until the original engine and Completion settle.
+                {
+                    let progress = operation.progress.lock().unwrap();
+                    assert!(progress.settled.is_some());
+                    assert!(progress.effects.is_empty());
+                    assert!(progress.review_effect.is_none());
+                    assert!(matches!(progress.execution.as_ref().unwrap().outcome,
+                        Outcome::Failed { stage: Stage::CreatePr, .. }));
+                }
+                assert_eq!(connection.review.workers.available_permits(), WORKERS);
+                assert_eq!(
+                    fixture.services.repository_review_capacity.workers.available_permits(),
+                    GLOBAL_WORKERS
+                );
+                assert!(fixture.services.worktree_locks
+                    .try_with_lock(&fixture.git.path, || async {}).await.is_some());
+                assert_eq!(fixture.server.control.posts.load(Ordering::SeqCst), 0);
+                release.send(()).unwrap();
+                holder.join().unwrap();
+                frame.retire();
+            })
+            .await;
+        // This observes the already consumed command, with no renewed admission.
+        let response = socket
+            .request(&fixture.services, Frame::Execute(command.clone()))
+            .await
+            .unwrap();
+        let reconciled = socket
+            .request(&fixture.services, Frame::Reconcile(bound(&command)))
+            .await
+            .unwrap();
+        assert_eq!(response["success"], false, "{response}");
+        assert_eq!(response["reviewExecution"], reconciled["reviewExecution"]);
+        assert_eq!(response["reviewExecution"]["outcome"]["status"], "failed");
+        assert_eq!(response["reviewExecution"]["outcome"]["stage"], "create-pr");
+        assert_eq!(response["reviewExecution"]["outcome"]["code"], "repository-admission-retired");
+        assert_eq!(response["reviewExecution"]["gitReceipts"], json!([]));
+        for side in ["source", "target"] {
+            assert!(prepared["reviewPreparation"][side].get("connection").is_none());
+            assert!(response["reviewExecution"]["preparation"][side].get("connection").is_none());
+        }
+        assert_eq!(fixture.server.control.posts.load(Ordering::SeqCst), 0);
+        assert_eq!(*fixture.server.control.reviews.lock().unwrap(), vec![matching]);
+        assert_eq!(*fixture.server.control.sha.lock().unwrap(), remote_sha);
+        assert_eq!(fixture.git.git(&fixture.git.path, &["rev-parse", "HEAD"]), head);
+        assert_eq!(fixture.git.git(&fixture.git.path, &["status", "--porcelain=v1"]), status);
+        assert_eq!(Instant::now(), fixed_time);
+    })
+    .await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_review_member_boundary_admitted_reuse_survives_retirement_and_reply_failure() {
+    // The original monitor cannot contend before admission: its clock is fixed
+    // from before preparation. Real Store/Git/HTTP and every R/P check still run.
+    with_review_clock(async {
+        let fixture = Fixture::new().await;
+        let (socket, _) = member(&fixture).await;
+        let remote_sha = fixture.server.control.sha.lock().unwrap().clone();
+        let matching = super::credential_tests::review(&remote_sha);
+        *fixture.server.control.reviews.lock().unwrap() = vec![matching.clone()];
+        let head = fixture.git.git(&fixture.git.path, &["rev-parse", "HEAD"]);
+        let status = fixture
+            .git
+            .git(&fixture.git.path, &["status", "--porcelain=v1"]);
+        let fixed_time = Instant::now();
+        let prepared = socket
+            .prepare(&fixture, fixture.query(Stage::CreatePr))
+            .await;
+        let command = command(&fixture, &prepared, Stage::CreatePr);
+        let connection = socket.concrete(&fixture).await;
+        let operation =
+            connection.review.feed.lock().unwrap().records[&command.review.operation_id].clone();
+        *fixture.server.control.pause.lock().unwrap() = Some("/merge_requests".into());
+        let response = socket
+            .entered(async {
+                let frame = socket
+                    .owner
+                    .capture_review(&Frame::Execute(command.clone()))
+                    .unwrap();
+                let mut observed = None;
+                {
+                    let call = frame.scope(Box::pin(async {
+                        let reply = fixture
+                            .services
+                            .native_review_execute(command.clone())
+                            .await
+                            .unwrap();
+                        assert_eq!(reply["success"], true, "{reply}");
+                        assert_eq!(reply["reviewExecution"]["outcome"]["status"], "reused");
+                        assert!(matches!(
+                            operation.progress.lock().unwrap().review_effect,
+                            Some(Outcome::Reused { .. })
+                        ));
+                        let mut transfers = 0;
+                        assert!(frame
+                            .deliver(RepositoryReadReplyKind::Result, &mut || {
+                                transfers += 1;
+                                Err(Error::Internal("owned Member reply consumed".into()))
+                            })
+                            .await
+                            .is_err());
+                        assert!(frame
+                            .deliver(RepositoryReadReplyKind::Result, &mut || {
+                                transfers += 1;
+                                Ok(())
+                            })
+                            .await
+                            .is_err());
+                        assert_eq!(transfers, 1);
+                        observed = Some(reply);
+                    }));
+                    tokio::pin!(call);
+                    tokio::select! {
+                        () = &mut call => panic!("response preceded admitted matching GET barrier"),
+                        () = fixture.server.control.entered.notified() => {},
+                    }
+                    {
+                        let requests = fixture.server.control.requests.lock().unwrap();
+                        let (method, path) = requests.last().unwrap();
+                        assert_eq!(method, "GET");
+                        assert!(path.contains("/merge_requests"));
+                    }
+                    assert_eq!(Instant::now(), fixed_time);
+                    assert_eq!(fixture.server.control.posts.load(Ordering::SeqCst), 0);
+                    // Actual arrival at the authenticated HTTP fixture is later than
+                    // the original stage and request claims, not preflight evidence.
+                    operation.retire();
+                    assert!(operation.write_current().is_err());
+                    assert!(operation.disclosure_current().is_ok());
+                    assert!(operation.progress.lock().unwrap().settled.is_none());
+                    assert!(operation.progress.lock().unwrap().review_effect.is_none());
+                    assert_eq!(connection.review.workers.available_permits(), WORKERS - 1);
+                    assert_eq!(
+                        fixture
+                            .services
+                            .repository_review_capacity
+                            .workers
+                            .available_permits(),
+                        GLOBAL_WORKERS - 1
+                    );
+                    assert!(fixture
+                        .services
+                        .worktree_locks
+                        .try_with_lock(&fixture.git.path, || async {})
+                        .await
+                        .is_none());
+                    fixture.server.control.release.notify_one();
+                    call.await;
+                }
+                frame.retire();
+                observed.unwrap()
+            })
+            .await;
+        assert!(operation.progress.lock().unwrap().settled.is_some());
+        assert_eq!(connection.review.workers.available_permits(), WORKERS);
+        assert_eq!(
+            fixture
+                .services
+                .repository_review_capacity
+                .workers
+                .available_permits(),
+            GLOBAL_WORKERS
+        );
+        assert!(fixture
+            .services
+            .worktree_locks
+            .try_with_lock(&fixture.git.path, || async {})
+            .await
+            .is_some());
+        let requests = fixture.server.control.requests.lock().unwrap().clone();
+        let reconciled = socket
+            .request(&fixture.services, Frame::Reconcile(bound(&command)))
+            .await
+            .unwrap();
+        assert_eq!(response["reviewExecution"], reconciled["reviewExecution"]);
+        assert_eq!(reconciled["reviewExecution"]["outcome"]["status"], "reused");
+        assert_eq!(reconciled["reviewExecution"]["gitReceipts"], json!([]));
+        for side in ["source", "target"] {
+            assert!(prepared["reviewPreparation"][side]
+                .get("connection")
+                .is_none());
+            assert!(reconciled["reviewExecution"]["preparation"][side]
+                .get("connection")
+                .is_none());
+        }
+        assert_eq!(*fixture.server.control.requests.lock().unwrap(), requests);
+        assert_eq!(fixture.server.control.posts.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            *fixture.server.control.reviews.lock().unwrap(),
+            vec![matching]
+        );
+        assert_eq!(*fixture.server.control.sha.lock().unwrap(), remote_sha);
+        assert_eq!(
+            fixture.git.git(&fixture.git.path, &["rev-parse", "HEAD"]),
+            head
+        );
+        assert_eq!(
+            fixture
+                .git
+                .git(&fixture.git.path, &["status", "--porcelain=v1"]),
+            status
+        );
+        assert_eq!(Instant::now(), fixed_time);
+    })
+    .await;
+}
+
+#[intent_test_macros::daemon_test]
 async fn native_review_queue_stage_wall_retains_owned_work_receipt_and_stops_next_stage() {
     let f = Fixture::new().await;
     let s = f.socket().await;
