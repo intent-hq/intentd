@@ -171,6 +171,37 @@ class ProducerContract(unittest.TestCase):
                     self.assertNotEqual(before, digest())
                     (root / name).write_text('original')
 
+    def test_daemon_consumers_preserve_seed_and_producers_can_refresh_it(self):
+        action = yaml.safe_load((ROOT / '.github/actions/release-rust-cache/action.yml').read_text())
+        steps = action['runs']['steps']
+        # Export server-level policy before the pinned installer or any compiler
+        # invocation. Restoration must finish before a server can read the seed.
+        self.assertEqual(steps[0]['id'], 'key')
+        install = next(i for i, s in enumerate(steps) if s.get('uses', '').startswith('mozilla-actions/'))
+        restore = next(i for i, s in enumerate(steps) if s.get('id') == 'restore')
+        self.assertLess(0, install)
+        self.assertLess(install, restore)
+        self.assertFalse(any('--start-server' in s.get('run', '') for s in steps[:restore + 1]))
+        command = steps[0]['run']
+        with tempfile.TemporaryDirectory() as temp:
+            for flavor, generation, mode, size in (
+                ('daemon-dist', '', 'READ_ONLY', '256M'),
+                ('daemon-dist', '100-1', 'READ_WRITE', '2G'),
+                ('sitter-release', '', 'READ_WRITE', '256M'),
+                ('sitter-release', '100-1', 'READ_WRITE', '256M'),
+            ):
+                with self.subTest(flavor=flavor, generation=generation):
+                    environment = Path(temp) / 'env'
+                    environment.write_text('')
+                    env = {**os.environ, 'CACHE_FLAVOR': flavor, 'CACHE_GENERATION': generation,
+                           'CACHE_TARGET': 'x86_64-unknown-linux-musl', 'CACHE_RUNNER': 'gh-linux-16x',
+                           'TOOLCHAIN': 'rust1', 'BUILD_INPUTS': 'inputs', 'RUNNER_TEMP': temp,
+                           'GITHUB_OUTPUT': str(Path(temp) / 'output'), 'GITHUB_ENV': str(environment)}
+                    subprocess.run(['bash', '-eu', '-c', command], env=env, check=True)
+                    settings = dict(line.split('=', 1) for line in environment.read_text().splitlines())
+                    self.assertEqual(settings.get('SCCACHE_LOCAL_RW_MODE'), mode)
+                    self.assertEqual(settings['SCCACHE_CACHE_SIZE'], size)
+
     def test_manual_refresh_generations_remain_discoverable(self):
         action = yaml.safe_load((ROOT / '.github/actions/release-rust-cache/action.yml').read_text())
         command = action['runs']['steps'][0]['run']
@@ -264,7 +295,6 @@ class ProducerContract(unittest.TestCase):
         self.assertIn('inputs.target', text)
         self.assertIn('inputs.runner', text)
         self.assertIn('rust-toolchain.toml', text)
-        self.assertIn('SCCACHE_CACHE_SIZE=256M', text)
         self.assertIn('RUSTC_WRAPPER=sccache', text)
         flavors = [next(s for s in self.workflow['jobs'][j]['steps'] if s.get('uses') == './.github/actions/release-rust-cache')['with']['flavor'] for j in ('daemon', 'sitter')]
         self.assertEqual(flavors, ['daemon-dist', 'sitter-release'])
