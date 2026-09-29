@@ -25,9 +25,9 @@ use super::{
     budget_admits, charged_bytes, compute_process_cap, derive_agent_type, derive_is_orchestrator,
     is_cancel_transport_closed, pop_and_wake_waiter, recommended_memory_budget_bytes,
     resolve_npx_only, resolve_spawn, settle_stale_waiter, text_prompt, usage_message_origin,
-    AgentHandle, AgentManager, BusEventSink, KillFn, LocalResources, ProcessRegistry, RegistryInner,
-    ResolvedSpawn, RuntimeHandle, TreeMemoryProbe, TreeSample, DEFAULT_AGENT_TYPE, HOST_MEMORY_RESERVE_BYTES,
-    PROVISIONAL_AGENT_BYTES, REASON_MEMORY_BUDGET, REASON_SLOTS,
+    AgentHandle, AgentManager, BusEventSink, KillFn, LocalResources, ProcessRegistry,
+    RegistryInner, ResolvedSpawn, RuntimeHandle, TreeMemoryProbe, TreeSample, DEFAULT_AGENT_TYPE,
+    HOST_MEMORY_RESERVE_BYTES, PROVISIONAL_AGENT_BYTES, REASON_MEMORY_BUDGET, REASON_SLOTS,
 };
 use crate::agent_ops::user_message_blocks;
 use crate::events::{EventBus, SubscriptionFilter};
