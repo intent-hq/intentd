@@ -42,6 +42,9 @@ use crate::source_control_auth_ops::repository_owner::{
 };
 use crate::{Services, SettingsRegistry};
 
+#[path = "native_review.rs"]
+pub(crate) mod review;
+
 #[path = "native_selection.rs"]
 pub(crate) mod selection;
 
@@ -115,6 +118,7 @@ pub(crate) fn connection(
         origin,
         weak: weak.clone(),
         parent: RepositoryRetirement::default(),
+        review: review::ConnectionState::default(),
         selection: selection::ConnectionState::default(),
         state: Mutex::new(ConnectionState::default()),
         notify: Notify::new(),
@@ -133,6 +137,7 @@ struct Connection {
     origin: RepositoryWireOrigin,
     weak: Weak<Self>,
     parent: RepositoryRetirement,
+    review: review::ConnectionState,
     selection: selection::ConnectionState,
     state: Mutex<ConnectionState>,
     notify: Notify,
@@ -225,6 +230,7 @@ impl Connection {
         };
         self.notify.notify_waiters();
         self.parent.end_scope();
+        self.review.close();
         self.selection.close();
         self.origin.retire();
         for lease in leases {
@@ -348,6 +354,18 @@ impl Connection {
     }
 }
 impl RepositoryReadConnection for Connection {
+    fn capture_review(
+        &self,
+        frame: &intent_core::repository_request::NativeReviewFrame,
+    ) -> Option<Arc<dyn RepositoryReadRequestScope>> {
+        Some(review::capture_frame(self, frame.clone()))
+    }
+    fn take_review_retirements(
+        &self,
+    ) -> Option<Box<dyn intent_core::repository_request::NativeReviewRetirements>> {
+        review::take_retirements(self)
+    }
+
     fn capture_selection(
         &self,
         frame: &intent_core::repository_request::RepositorySelectionFrame,

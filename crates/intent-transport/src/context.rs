@@ -57,6 +57,7 @@ tokio::task_local! {
     /// Queried by `ServerControl::is_tcp_connection()` to enforce safety guards.
     static IS_TCP: RefCell<bool>;
     static READ_CONNECTION: Option<Arc<dyn RepositoryReadConnection>>;
+    static REVIEW_FRAME: Option<intent_core::repository_request::NativeReviewFrame>;
     static SELECTION_FRAME: Option<intent_core::repository_request::RepositorySelectionFrame>;
     static REPOSITORY_FRAME: Option<intent_core::repository_request::RepositoryContextQuery>;
 }
@@ -109,7 +110,29 @@ pub(crate) fn with_repository_frame<T>(raw: &str, construct: impl FnOnce() -> T)
                 _ => None,
             }
         });
-    SELECTION_FRAME.sync_scope(selection, || REPOSITORY_FRAME.sync_scope(query, construct))
+    let review = serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|value| {
+            use intent_core::repository_request::NativeReviewFrame as Frame;
+            let method = value.get("method")?.as_str()?;
+            let params = value.get("params")?.clone();
+            match method {
+                "accept-changes.prepare" if params.get("review").is_some() => {
+                    serde_json::from_value(params).ok().map(Frame::Prepare)
+                }
+                "accept-changes.execute" if params.get("review").is_some() => {
+                    serde_json::from_value(params).ok().map(Frame::Execute)
+                }
+                "accept-changes.reconcile" => {
+                    serde_json::from_value(params).ok().map(Frame::Reconcile)
+                }
+                "accept-changes.release" => serde_json::from_value(params).ok().map(Frame::Release),
+                _ => None,
+            }
+        });
+    REVIEW_FRAME.sync_scope(review, || {
+        SELECTION_FRAME.sync_scope(selection, || REPOSITORY_FRAME.sync_scope(query, construct))
+    })
 }
 
 /// Owned by each actual connection exit path, independently of client ids.
@@ -128,6 +151,7 @@ impl ReadConnectionGuard {
         &self,
         output: tokio::sync::mpsc::Sender<String>,
     ) -> RetirementForwarder {
+        let review_output = output.clone();
         let selection_output = output.clone();
         let task = self.0.as_ref().and_then(|owner| owner.take_retirements()).map(|mut receiver| {
             tokio::spawn(async move {
@@ -150,7 +174,20 @@ impl ReadConnectionGuard {
                 }
             })
         });
-        RetirementForwarder { task, selection }
+        let review = self.0.as_ref().and_then(|owner| owner.take_review_retirements()).map(|mut receiver| {
+            tokio::spawn(async move {
+                while let Some(notice) = receiver.next().await {
+                    let terminal = notice.terminal;
+                    let frame = serde_json::json!({"jsonrpc":"2.0","method":"accept-changes.retired","params":notice}).to_string();
+                    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5), review_output.send(frame)).await, Ok(Ok(()))) || terminal { break; }
+                }
+            })
+        });
+        RetirementForwarder {
+            review,
+            task,
+            selection,
+        }
     }
 
     pub(crate) fn absent() -> Self {
@@ -169,12 +206,16 @@ impl ReadConnectionGuard {
 }
 
 pub(crate) struct RetirementForwarder {
+    review: Option<tokio::task::JoinHandle<()>>,
     task: Option<tokio::task::JoinHandle<()>>,
     selection: Option<tokio::task::JoinHandle<()>>,
 }
 impl Drop for RetirementForwarder {
     fn drop(&mut self) {
-        for task in [&self.task, &self.selection].into_iter().flatten() {
+        for task in [&self.task, &self.selection, &self.review]
+            .into_iter()
+            .flatten()
+        {
             task.abort();
         }
     }
@@ -277,6 +318,11 @@ impl CapturedFrame {
             completion: READ_CONNECTION
                 .try_with(|owner| {
                     owner.as_ref().and_then(|owner| {
+                        if let Some(frame) = REVIEW_FRAME.try_with(Clone::clone).ok().flatten() {
+                            return owner
+                                .capture_review(&frame)
+                                .map(|scope| Arc::new(RequestCompletion(scope)));
+                        }
                         if let Some(frame) = SELECTION_FRAME.try_with(Clone::clone).ok().flatten() {
                             return owner
                                 .capture_selection(&frame)

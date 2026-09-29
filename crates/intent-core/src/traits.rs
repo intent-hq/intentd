@@ -79,6 +79,46 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async { Err(Error::Forbidden("Repository context unavailable".into())) })
     }
 
+    fn native_review_prepare(
+        &self,
+        _query: crate::repository_request::NativeReviewPrepareQuery,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(crate::Error::Forbidden(
+                "Repository review unavailable".into(),
+            ))
+        })
+    }
+    fn native_review_execute(
+        &self,
+        _query: crate::repository_request::NativeReviewExecuteQuery,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(crate::Error::Forbidden(
+                "Repository review unavailable".into(),
+            ))
+        })
+    }
+    fn native_review_reconcile(
+        &self,
+        _query: crate::repository_request::NativeReviewBoundQuery,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(crate::Error::Forbidden(
+                "Repository review unavailable".into(),
+            ))
+        })
+    }
+    fn native_review_release(
+        &self,
+        _query: crate::repository_request::NativeReviewBoundQuery,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(crate::Error::Forbidden(
+                "Repository review unavailable".into(),
+            ))
+        })
+    }
     fn repository_selection_capture(
         &self,
         query: crate::repository_request::RepositorySelectionQuery,

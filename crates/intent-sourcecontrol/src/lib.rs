@@ -51,7 +51,7 @@ pub use model::{
 pub use registry::{GithubSettings, GitlabSettings, SourceControlRegistry, SourceControlSettings};
 /// Re-exported so callers can hand [`gitlab_auth::persist_gitlab_token`] a
 /// redacted token without depending on `secrecy` themselves.
-pub use secrecy::SecretString;
+pub use secrecy::{ExposeSecret, SecretString};
 pub use token::TokenSource;
 
 /// The provider-agnostic forge API (§7.2).

@@ -6,6 +6,7 @@
 //! No entrypoint, mutation writer, context feed or native effect is registered.
 
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use intent_core::caller::{Caller, WireCredential};
@@ -389,6 +390,32 @@ where
     F: FnOnce(RepositoryOperationAdmission) -> Fut,
     Fut: Future<Output = AdmissionResult<T>>,
 {
+    with_repository_source_entry(
+        services,
+        original,
+        request_id,
+        stages,
+        input,
+        (retirement, None),
+        action,
+    )
+    .await
+}
+
+async fn with_repository_source_entry<T, F, Fut>(
+    services: &Services,
+    original: OriginalRepositoryCaller,
+    request_id: String,
+    stages: Vec<NativeReviewStage>,
+    input: RepositorySourceInput,
+    entry: (RepositoryRetirement, Option<&AtomicBool>),
+    action: F,
+) -> AdmissionResult<T>
+where
+    F: FnOnce(RepositoryOperationAdmission) -> Fut,
+    Fut: Future<Output = AdmissionResult<T>>,
+{
+    let (retirement, observation_entry) = entry;
     let _pending = RetireOnDrop(retirement.clone());
     let workspace = &input.facts.preparation.root.workspace_id;
     let initial = {
@@ -408,6 +435,9 @@ where
         record,
         retirement.clone(),
         |git| async move {
+            if let Some(entered) = observation_entry {
+                entered.store(true, Ordering::Release);
+            }
             let facts = input.facts;
             let source = Arc::new(RepositorySource {
                 services: services.clone(),
@@ -472,6 +502,61 @@ where
     F: FnOnce(RepositoryOperationAdmission) -> Fut,
     Fut: Future<Output = AdmissionResult<T>>,
 {
+    with_repository_lifecycle_source_entry(
+        services,
+        original,
+        request_id,
+        stages,
+        input,
+        (lifetime, None),
+        action,
+    )
+    .await
+}
+
+/// Marks entry to Git observation, after the existing locked root validation.
+/// The caller supplies a fresh false flag and exclusively polls the source
+/// future. A false flag permits dropping that future; a true flag requires
+/// joining it and any started blocking work before releasing owned capacity.
+pub(crate) async fn with_repository_lifecycle_source_observed<T, F, Fut>(
+    services: &Services,
+    original: OriginalRepositoryCaller,
+    request_id: String,
+    stages: Vec<NativeReviewStage>,
+    input: RepositorySourceInput,
+    entry: (RepositorySourceLifetime, &AtomicBool),
+    action: F,
+) -> AdmissionResult<T>
+where
+    F: FnOnce(RepositoryOperationAdmission) -> Fut,
+    Fut: Future<Output = AdmissionResult<T>>,
+{
+    with_repository_lifecycle_source_entry(
+        services,
+        original,
+        request_id,
+        stages,
+        input,
+        (entry.0, Some(entry.1)),
+        action,
+    )
+    .await
+}
+
+async fn with_repository_lifecycle_source_entry<T, F, Fut>(
+    services: &Services,
+    original: OriginalRepositoryCaller,
+    request_id: String,
+    stages: Vec<NativeReviewStage>,
+    input: RepositorySourceInput,
+    entry: (RepositorySourceLifetime, Option<&AtomicBool>),
+    action: F,
+) -> AdmissionResult<T>
+where
+    F: FnOnce(RepositoryOperationAdmission) -> Fut,
+    Fut: Future<Output = AdmissionResult<T>>,
+{
+    let (lifetime, observation_entry) = entry;
     let retirement = lifetime.retirement();
     let _pending = RetireOnDrop(retirement.clone());
     // This path is an original producer-qualified input, not canonicalized or
@@ -492,10 +577,23 @@ where
         keys.push(RepositoryLifecycleKey::Agent(agent_id.clone()));
     }
     let _subscription = lifetime.subscribe(&services.store, original.caller(), &keys)?;
-    with_repository_source(
-        services, original, request_id, stages, input, retirement, action,
-    )
-    .await
+    if let Some(entered) = observation_entry {
+        with_repository_source_entry(
+            services,
+            original,
+            request_id,
+            stages,
+            input,
+            (retirement, Some(entered)),
+            action,
+        )
+        .await
+    } else {
+        with_repository_source(
+            services, original, request_id, stages, input, retirement, action,
+        )
+        .await
+    }
 }
 
 #[cfg(test)]

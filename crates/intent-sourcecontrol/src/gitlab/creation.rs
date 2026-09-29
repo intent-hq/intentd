@@ -8,6 +8,15 @@ use super::{provenance::ConfirmedProject, Purpose, RequestProvenance, RequestSco
 use crate::model::{ConfirmedReviewState, ReviewCreateOutcome, ReviewCreateResult};
 
 impl GitLabSourceControl {
+    /// Read the provider-confirmed numeric identity and exact project path using
+    /// this instance's original admitted credentials. These are metadata, not a grant.
+    /// # Errors
+    /// Preserves the existing project decode, identity and upstream failures.
+    pub async fn confirmed_project_identity(&self, repo: &RepoRef) -> Result<(u64, String)> {
+        let confirmed = self.confirmed_project(repo).await?;
+        Ok((confirmed.id(), confirmed.path()))
+    }
+
     async fn confirmed_project<'a>(&self, repo: &'a RepoRef) -> Result<ConfirmedProject<'a>> {
         let value = self.get_project(repo).await?;
         // Preserve the existing decode classification for malformed responses.

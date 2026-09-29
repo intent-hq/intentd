@@ -7,6 +7,10 @@ repository.workspace = true
 license.workspace = true
 description = "Shared business-logic surface invoked by every transport and the agent MCP server"
 
+[features]
+# Explicit disposable repository sources for integration-test composition only.
+repository-test-fixtures = []
+
 [dependencies]
 intent-core = { path = "../intent-core", version = "0.9.112" }
 intent-store = { path = "../intent-store", version = "0.9.112" }

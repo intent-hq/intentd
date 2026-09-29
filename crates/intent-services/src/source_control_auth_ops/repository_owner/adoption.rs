@@ -408,6 +408,29 @@ impl crate::Services {
             .await
     }
 
+    /// Explicit cold test composition on the original paired settings and store.
+    /// This is one-time installation, not a runtime rebind or production grant.
+    ///
+    /// # Errors
+    /// Refuses mismatched descriptors, unavailable sources or repeated installation.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "repository-test-fixtures"))]
+    pub async fn initialize_repository_test_fixture(
+        &self,
+        fixture: GitlabDescriptor,
+    ) -> Result<()> {
+        let guard = self.gitlab_credential_gate.lock().await;
+        let registry = self.settings_registry.as_deref().ok_or_else(unavailable)?;
+        self.gitlab_credential_gate.install_settings_boundary(
+            registry,
+            &self.secrets,
+            &self.gitlab_secret_store,
+            Some(fixture),
+        )?;
+        self.reconcile_gitlab_repository_binding_locked(&guard)
+            .await
+    }
+
     #[cfg(test)]
     pub(crate) async fn reconcile_gitlab_repository_binding(&self) -> Result<()> {
         let guard = self.gitlab_credential_gate.lock().await;

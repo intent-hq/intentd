@@ -329,6 +329,38 @@ impl RepositoryConnectionFacts {
         RepositoryReadEligibility::with_output(&[], optional, transfer)
     }
 
+    /// Requires the original authenticated native Wire operation, its already
+    /// acquired worker and R stage/disclosure fence. The action compares and
+    /// consumes only prebuilt ownership; no I/O, await, refetch or queue inside.
+    /// False must refuse. This metadata comparison supplies no native grant.
+    pub(crate) fn with_native_review_current(
+        facts: &Self,
+        transfer: impl FnOnce(bool) -> Result<()> + Send,
+    ) -> Result<()> {
+        RepositoryReadEligibility::with_output(&[], Some(facts), transfer)
+    }
+
+    /// Observe only the originally captured metadata for background retirement.
+    /// This supplies no authority or consuming admission. Call with no outer
+    /// settings, R, Store, worktree, progress, credential or output lock held.
+    /// Blocking observation keeps the original config/descriptor/directory/proof
+    /// order; a captured missing attachment can never adopt a later installation.
+    pub(crate) fn native_review_metadata_current(&self) -> Result<bool> {
+        let settings = match self.attachment {
+            RepositoryAttachmentState::Unattached | RepositoryAttachmentState::BoundaryMissing => {
+                None
+            }
+            _ => self
+                .retained_owner()
+                .ok_or(Error::Unverified)?
+                .settings
+                .get(),
+        };
+        let current =
+            Self::observe_captured(&self.gate, &self.directory, self.owner.as_ref(), settings)?;
+        Ok(self.same_facts(&current))
+    }
+
     fn retained_owner(&self) -> Option<&Arc<RepositoryOwner>> {
         if matches!(
             self.attachment,

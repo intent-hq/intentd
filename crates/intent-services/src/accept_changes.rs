@@ -486,6 +486,37 @@ pub(crate) fn accept_result(
     Value::Object(obj)
 }
 
+/// Qualified preparation uses its confirmed explicit target/ref, never the
+/// ordinary origin/trunk inference. Existing unqualified preparation is unchanged.
+pub(crate) fn build_native_prepare_value(
+    path: &Path,
+    query: &intent_core::repository_request::NativeReviewPrepareQuery,
+) -> Result<Value> {
+    let mut files = Vec::new();
+    let mut additions = 0;
+    let mut deletions = 0;
+    for (staged, diffs) in [
+        (true, intent_git::diff::diff_head_to_index(path)?),
+        (false, intent_git::diff::diff_index_to_workdir(path)?),
+    ] {
+        for d in diffs {
+            if query
+                .files
+                .as_ref()
+                .is_some_and(|f| !f.is_empty() && !f.contains(&d.path))
+            {
+                continue;
+            }
+            additions += d.additions;
+            deletions += d.deletions;
+            files.push(json!({"path":d.path,"staged":staged,"additions":d.additions,"deletions":d.deletions}));
+        }
+    }
+    Ok(
+        json!({"valid":true,"warnings":[],"errors":[],"files":files,"filesCount":files.len(),"additions":additions,"deletions":deletions,"suggestedCommitMessage":"","suggestedPRTitle":"","suggestedPRBody":""}),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

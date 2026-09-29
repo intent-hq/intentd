@@ -133,6 +133,7 @@ struct Cohort {
 }
 
 pub(crate) struct FixtureConnection {
+    review_frames: Mutex<Vec<intent_core::repository_request::NativeReviewFrame>>,
     selection_frames: Mutex<Vec<intent_core::repository_request::RepositorySelectionFrame>>,
     cohort: Mutex<Cohort>,
     scopes: Mutex<Vec<Arc<FixtureScope>>>,
@@ -155,6 +156,13 @@ impl FixtureConnection {
 }
 
 impl RepositoryReadConnection for FixtureConnection {
+    fn capture_review(
+        &self,
+        frame: &intent_core::repository_request::NativeReviewFrame,
+    ) -> Option<Arc<dyn RepositoryReadRequestScope>> {
+        self.review_frames.lock().unwrap().push(frame.clone());
+        Some(self.capture())
+    }
     fn capture_selection(
         &self,
         frame: &intent_core::repository_request::RepositorySelectionFrame,
@@ -198,6 +206,7 @@ impl RepositoryReadConnection for FixtureConnection {
 
 #[derive(Default)]
 pub(crate) struct FixtureApi {
+    review_effects: std::sync::atomic::AtomicUsize,
     selection_effects: std::sync::atomic::AtomicUsize,
     pub(crate) connections: Mutex<Vec<Arc<FixtureConnection>>>,
     pub(crate) entries: Mutex<Vec<RepositoryWireEntry>>,
@@ -229,6 +238,35 @@ impl FixtureApi {
 }
 
 impl WorkspaceApi for FixtureApi {
+    fn native_review_execute(
+        &self,
+        _q: intent_core::repository_request::NativeReviewExecuteQuery,
+    ) -> BoxFuture<'_, intent_core::Result<Value>> {
+        Box::pin(async move {
+            let scope = FIXTURE_SCOPE.with(Clone::clone);
+            scope.state.lock().unwrap().qualified = true;
+            assert_eq!(scope.caller, intent_core::current_caller());
+            match (&scope.credential, current_wire_credential()) {
+                (
+                    Some(WireCredential::Principal {
+                        principal_id: a,
+                        token_hash: x,
+                    }),
+                    Some(WireCredential::Principal {
+                        principal_id: b,
+                        token_hash: y,
+                    }),
+                ) => {
+                    assert_eq!(a, &b);
+                    assert_eq!(x, &y);
+                }
+                _ => panic!("review fixture lost original credential"),
+            }
+            self.review_effects
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            Ok(json!({"success":true,"reviewExecution":{"outcome":{"status":"created"}}}))
+        })
+    }
     fn repository_selection_save(
         &self,
         query: intent_core::repository_request::RepositorySelectionSaveQuery,
@@ -299,6 +337,7 @@ impl WorkspaceApi for FixtureApi {
         entry: RepositoryWireEntry,
     ) -> Option<Arc<dyn RepositoryReadConnection>> {
         let connection = Arc::new(FixtureConnection {
+            review_frames: Mutex::new(Vec::new()),
             selection_frames: Mutex::new(Vec::new()),
             cohort: Mutex::default(),
             scopes: Mutex::default(),
@@ -1364,6 +1403,102 @@ async fn selection_post_consumption_faults_never_replay_effect_or_packet() {
         assert_eq!(
             h.api
                 .selection_effects
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+        assert!(h.rx.priority.try_recv().is_err());
+    }
+}
+
+fn native_review_request() -> String {
+    json!({"jsonrpc":"2.0","id":71,"method":"accept-changes.execute","params":{"workspaceId":"original-workspace","action":"create-pr","review":{"operationId":"original-review","root":{"workspaceId":"original-workspace","kind":"primary"}},"prTitle":"Original command"}}).to_string()
+}
+#[tokio::test]
+async fn native_review_frame_precedes_actual_full_writer_queue() {
+    let h = Harness::new(FixtureApi::default(), HostRole::Owner).await;
+    for _ in 0..PRIORITY_CAPACITY {
+        h.tx.priority.send("occupied".into()).await.unwrap();
+    }
+    let call = h.dispatch_selection(&native_review_request());
+    tokio::pin!(call);
+    tokio::select! {biased; r=&mut call=>panic!("queue did not wait {r}"),()=tokio::task::yield_now()=>{}}
+    let original = h.original();
+    let frames = original.review_frames.lock().unwrap();
+    let [intent_core::repository_request::NativeReviewFrame::Execute(q)] = frames.as_slice() else {
+        panic!("missing original typed review frame")
+    };
+    assert_eq!(q.review.operation_id, "original-review");
+    assert_eq!(q.pr_title.as_deref(), Some("Original command"));
+    assert_eq!(
+        h.api
+            .review_effects
+            .load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+    assert_eq!(h.limiter.available_permits(), Some(1));
+    h.connection.retire();
+}
+#[tokio::test]
+async fn native_review_actual_slot_both_retirement_orders_retain_effect() {
+    for retire_first in [true, false] {
+        let gate = Arc::new(Gate::default());
+        let mut h = Harness::new(
+            FixtureApi {
+                delivery: Some(gate.clone()),
+                ..FixtureApi::default()
+            },
+            HostRole::Owner,
+        )
+        .await;
+        assert!(h.dispatch_selection(&native_review_request()).await);
+        gate.entered.notified().await;
+        assert_eq!(
+            h.api
+                .review_effects
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+        assert!(h.rx.priority.try_recv().is_err());
+        if retire_first {
+            h.connection.retire();
+        }
+        gate.release.notify_one();
+        until(|| h.limiter.available_permits() == Some(1)).await;
+        if !retire_first {
+            h.connection.retire();
+        }
+        let reply = h.response().await;
+        assert_eq!(reply.get("result").is_some(), !retire_first);
+        assert_eq!(
+            h.api
+                .review_effects
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+        assert!(h.rx.priority.try_recv().is_err());
+    }
+}
+#[tokio::test]
+async fn native_review_consumed_packet_faults_never_replay_primitive_or_reply() {
+    for fault in [DeliveryFault::AfterTransfer, DeliveryFault::Repeat] {
+        let mut h = Harness::new(
+            FixtureApi {
+                fault,
+                ..FixtureApi::default()
+            },
+            HostRole::Owner,
+        )
+        .await;
+        assert!(h.dispatch_selection(&native_review_request()).await);
+        let reply = h.response().await;
+        assert_eq!(
+            reply["result"]["reviewExecution"]["outcome"]["status"],
+            "created"
+        );
+        until(|| h.limiter.available_permits() == Some(1)).await;
+        assert_eq!(
+            h.api
+                .review_effects
                 .load(std::sync::atomic::Ordering::Acquire),
             1
         );

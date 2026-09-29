@@ -3884,6 +3884,15 @@ async fn dispatch(
             Ok(r)
         }
         "accept-changes.prepare" => {
+            if params.contains_key("review") {
+                let input: intent_core::repository_request::NativeReviewPrepareQuery =
+                    serde_json::from_value(Value::Object(params.clone()))
+                        .map_err(|_| invalid_params("Invalid native review parameters"))?;
+                return api
+                    .native_review_prepare(input)
+                    .await
+                    .map_err(domain_to_rpc);
+            }
             let ws = require_ws_note(params)?;
             let action = require_str_param(params, "action")?;
             let files = opt_str_array(params, "files");
@@ -3894,6 +3903,15 @@ async fn dispatch(
             Ok(r)
         }
         "accept-changes.execute" => {
+            if params.contains_key("review") {
+                let input: intent_core::repository_request::NativeReviewExecuteQuery =
+                    serde_json::from_value(Value::Object(params.clone()))
+                        .map_err(|_| invalid_params("Invalid native review parameters"))?;
+                return api
+                    .native_review_execute(input)
+                    .await
+                    .map_err(domain_to_rpc);
+            }
             let ws = require_ws_note(params)?;
             require_str_param(params, "action")?;
             let r = api
@@ -3901,6 +3919,22 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
+        }
+        "accept-changes.reconcile" => {
+            let input: intent_core::repository_request::NativeReviewBoundQuery =
+                serde_json::from_value(Value::Object(params.clone()))
+                    .map_err(|_| invalid_params("Invalid native review parameters"))?;
+            api.native_review_reconcile(input)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "accept-changes.release" => {
+            let input: intent_core::repository_request::NativeReviewBoundQuery =
+                serde_json::from_value(Value::Object(params.clone()))
+                    .map_err(|_| invalid_params("Invalid native review parameters"))?;
+            api.native_review_release(input)
+                .await
+                .map_err(domain_to_rpc)
         }
         "accept-changes.mergePR" => {
             let ws = require_ws_note(params)?;

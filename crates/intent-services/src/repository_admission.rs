@@ -340,6 +340,43 @@ pub(crate) fn begin_repository_stage(
     result
 }
 
+/// Native-only composite comparison, after the actual worker and original
+/// worktree lock are acquired. The comparison is synchronous and may only take
+/// P metadata locks, then invoke the one stage claim. Ordinary entry is unchanged.
+pub(crate) fn begin_native_repository_stage(
+    checked: CheckedRepositoryStage,
+    comparison: impl FnOnce(
+        &mut (dyn FnMut() -> AdmissionResult<RepositoryDispatchStamp> + Send),
+    ) -> AdmissionResult<RepositoryDispatchStamp>,
+) -> AdmissionResult<RepositoryDispatchStamp> {
+    let result = checked.inner.retirement.dispatch(|| {
+        let mut used = false;
+        comparison(&mut || {
+            if std::mem::replace(&mut used, true) {
+                return Err(AdmissionError::StageOrder);
+            }
+            let mut progress = checked
+                .inner
+                .progress
+                .lock()
+                .map_err(|_| AdmissionError::Retired)?;
+            check_stage(&progress, &checked.inner, checked.stage)?;
+            if progress.next != checked.index {
+                return Err(AdmissionError::StageOrder);
+            }
+            progress.active = true;
+            Ok(RepositoryDispatchStamp {
+                inner: checked.inner.clone(),
+                stage: checked.stage,
+                index: checked.index,
+                classified: false,
+            })
+        })
+    });
+    drop(checked);
+    result
+}
+
 impl Drop for RepositoryDispatchStamp {
     fn drop(&mut self) {
         if !self.classified {
@@ -538,6 +575,11 @@ mod tests;
 // Services keeps its native adapter outside this Services-free engine. These
 // crate-private entries preserve the same original retirement implementation.
 impl RepositoryRetirement {
+    /// Link only a child of the same original native operation before queueing.
+    pub(crate) fn native_link(&self, child: &Self) -> AdmissionResult<()> {
+        self.link_optional(child)
+    }
+
     pub(crate) fn native_dispatch<T>(
         &self,
         action: impl FnOnce() -> AdmissionResult<T>,

@@ -59,6 +59,17 @@ pub trait RepositoryReadConnection: Send + Sync {
         None
     }
 
+    /// Original native review frame, captured before any queue or await.
+    fn capture_review(
+        &self,
+        _frame: &NativeReviewFrame,
+    ) -> Option<Arc<dyn RepositoryReadRequestScope>> {
+        None
+    }
+    fn take_review_retirements(&self) -> Option<Box<dyn NativeReviewRetirements>> {
+        None
+    }
+
     /// Retire only this connection's original request cohort. Idempotent.
     /// Concrete owners must join admitted leaves without holding cohort maps.
     fn retire(&self);
@@ -478,4 +489,177 @@ mod selection_contract_tests {
             json!({"kind":"saved","value":{"mode":"automatic"}})
         );
     }
+}
+
+/// Strict, presence-discriminated native review command. Public IDs only correlate
+/// with an original socket-owned operation; they never grant execution authority.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeReviewPrepareQuery {
+    pub workspace_id: crate::WorkspaceId,
+    pub action: crate::NativeReviewStage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<Vec<String>>,
+    #[serde(default)]
+    pub options: NativeReviewOptions,
+    pub review: NativeReviewChoiceQuery,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeReviewOptions {
+    #[serde(default)]
+    pub stage_unstaged: bool,
+    #[serde(default)]
+    pub push_after_commit: bool,
+    #[serde(default, rename = "createPRAfterPush")]
+    pub create_pr_after_push: bool,
+}
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeReviewChoiceQuery {
+    #[serde(deserialize_with = "native_review_root")]
+    pub root: crate::RepositoryRootId,
+    pub choice: NativeReviewChoice,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push_remote: Option<String>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum NativeReviewChoice {
+    Saved,
+    ExplicitTarget {
+        #[serde(deserialize_with = "native_review_target")]
+        target: crate::RepositoryTarget,
+    },
+}
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeReviewOperationRef {
+    pub operation_id: String,
+    #[serde(deserialize_with = "native_review_root")]
+    pub root: crate::RepositoryRootId,
+}
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeReviewExecuteQuery {
+    pub workspace_id: crate::WorkspaceId,
+    pub action: crate::NativeReviewStage,
+    pub review: NativeReviewOperationRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_body: Option<String>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeReviewBoundQuery {
+    pub workspace_id: crate::WorkspaceId,
+    pub operation_id: String,
+    #[serde(deserialize_with = "native_review_root")]
+    pub root: crate::RepositoryRootId,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NativeReviewFrame {
+    Prepare(NativeReviewPrepareQuery),
+    Execute(NativeReviewExecuteQuery),
+    Reconcile(NativeReviewBoundQuery),
+    Release(NativeReviewBoundQuery),
+}
+impl NativeReviewFrame {
+    #[must_use]
+    pub fn root(&self) -> &crate::RepositoryRootId {
+        match self {
+            Self::Prepare(q) => &q.review.root,
+            Self::Execute(q) => &q.review.root,
+            Self::Reconcile(q) | Self::Release(q) => &q.root,
+        }
+    }
+    #[must_use]
+    pub fn workspace(&self) -> &crate::WorkspaceId {
+        match self {
+            Self::Prepare(q) => &q.workspace_id,
+            Self::Execute(q) => &q.workspace_id,
+            Self::Reconcile(q) | Self::Release(q) => &q.workspace_id,
+        }
+    }
+}
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeReviewOperationCapture {
+    pub operation_id: String,
+    pub root: crate::RepositoryRootId,
+    pub retirement_sequence: String,
+    pub expires_after_ms: u64,
+}
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeReviewRetired {
+    pub operation_ids: Vec<String>,
+    pub sequence: String,
+    pub all_retired: bool,
+    pub terminal: bool,
+}
+pub trait NativeReviewRetirements: Send {
+    fn next(&mut self) -> BoxFuture<'_, Option<NativeReviewRetired>>;
+}
+
+fn native_review_root<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<crate::RepositoryRootId, D::Error> {
+    use serde::Deserialize as _;
+    #[derive(serde::Deserialize)]
+    #[serde(
+        tag = "kind",
+        rename_all = "kebab-case",
+        rename_all_fields = "camelCase",
+        deny_unknown_fields
+    )]
+    enum Root {
+        Primary {
+            workspace_id: crate::WorkspaceId,
+        },
+        Registered {
+            workspace_id: crate::WorkspaceId,
+            git_root_id: crate::WorkspaceGitRootId,
+        },
+    }
+    Ok(match Root::deserialize(deserializer)? {
+        Root::Primary { workspace_id } => crate::RepositoryRootId {
+            workspace_id,
+            kind: crate::RepositoryRootKind::Primary,
+        },
+        Root::Registered {
+            workspace_id,
+            git_root_id,
+        } => crate::RepositoryRootId {
+            workspace_id,
+            kind: crate::RepositoryRootKind::Registered { git_root_id },
+        },
+    })
+}
+fn native_review_target<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<crate::RepositoryTarget, D::Error> {
+    use serde::Deserialize as _;
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Target {
+        provider: crate::RepositoryProvider,
+        instance_base_url: String,
+        project_path: String,
+    }
+    let Target {
+        provider,
+        instance_base_url,
+        project_path,
+    } = Target::deserialize(deserializer)?;
+    Ok(crate::RepositoryTarget {
+        provider,
+        instance_base_url,
+        project_path,
+    })
 }

@@ -747,3 +747,129 @@ async fn reader_requires_the_original_installed_source_and_preserves_existing_no
         Some(" stored-pat ")
     );
 }
+
+#[intent_test_macros::daemon_test]
+async fn native_review_facts_wrapper_current_stale_and_error_consume_once() {
+    let server = Server::new().await;
+    let f = Fixture::new(&server).await;
+    let facts = f.service.gitlab_repository_connection_facts().unwrap();
+    let mut count = 0;
+    RepositoryConnectionFacts::with_native_review_current(&facts, |current| {
+        assert!(current);
+        count += 1;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(count, 1);
+    let error = RepositoryConnectionFacts::with_native_review_current(&facts, |current| {
+        assert!(current);
+        count += 1;
+        Err(Error::BoundaryMismatch)
+    })
+    .unwrap_err();
+    assert_eq!(error, Error::BoundaryMismatch);
+    assert_eq!(count, 2);
+    f.service
+        .gitlab_connect_pat(server.host.clone(), "pat-second".into())
+        .await
+        .unwrap();
+    RepositoryConnectionFacts::with_native_review_current(&facts, |current| {
+        assert!(!current);
+        count += 1;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(count, 3);
+    let fresh = f.service.gitlab_repository_connection_facts().unwrap();
+    RepositoryConnectionFacts::with_native_review_current(&fresh, |current| {
+        assert!(current);
+        Ok(())
+    })
+    .unwrap();
+}
+
+impl RepositoryConnectionFacts {
+    // Test-only barrier on the actual ranked optional metadata lock.
+    pub(crate) fn hold_native_review_metadata_for_test(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        let owner = self.retained_owner().unwrap();
+        let _config = owner.settings.get().unwrap().config.lock().unwrap();
+        entered.send(()).unwrap();
+        release.recv().unwrap();
+        drop(release);
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_review_background_observation_waits_for_contention_and_detects_revision() {
+    let server = Server::new().await;
+    let f = Fixture::new(&server).await;
+    let facts = Arc::new(f.service.gitlab_repository_connection_facts().unwrap());
+    let (entered, waiting) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let held = facts.clone();
+    let holder =
+        std::thread::spawn(move || held.hold_native_review_metadata_for_test(entered, released));
+    waiting.await.unwrap();
+    let mut effects = 0;
+    RepositoryConnectionFacts::with_native_review_current(&facts, |current| {
+        assert!(!current);
+        if current {
+            effects += 1;
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(effects, 0);
+    let observed = facts.clone();
+    let (entered, waiting) = tokio::sync::oneshot::channel();
+    let observe = tokio::task::spawn_blocking(move || {
+        entered.send(()).unwrap();
+        observed.native_review_metadata_current()
+    });
+    waiting.await.unwrap();
+    assert!(!observe.is_finished());
+    release.send(()).unwrap();
+    holder.join().unwrap();
+    assert!(observe.await.unwrap().unwrap());
+    f.service
+        .gitlab_connect_pat(server.host.clone(), "pat-second".into())
+        .await
+        .unwrap();
+    assert!(!facts.native_review_metadata_current().unwrap());
+    let fresh = f.service.gitlab_repository_connection_facts().unwrap();
+    assert!(fresh.native_review_metadata_current().unwrap());
+    let owner = fresh.retained_owner().unwrap().clone();
+    let poison = std::thread::spawn(move || {
+        let _guard = owner.descriptor.lock().unwrap();
+        panic!("owned metadata poison");
+    });
+    assert!(poison.join().is_err());
+    assert_eq!(
+        fresh.native_review_metadata_current().unwrap_err(),
+        Error::Indeterminate
+    );
+    RepositoryConnectionFacts::with_native_review_current(&fresh, |current| {
+        assert!(!current);
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_review_background_absence_never_adopts_a_later_attachment() {
+    let gate = GitlabCredentialGate::new();
+    let directory = Arc::new(
+        crate::repository_credentials::RepositoryConnectionDirectory::new("absence-native".into()),
+    );
+    let absent = RepositoryConnectionFacts::observe(&gate, &directory).unwrap();
+    assert!(absent.native_review_metadata_current().unwrap());
+    gate.attach_repository(directory, None).unwrap();
+    assert_eq!(
+        absent.native_review_metadata_current().unwrap_err(),
+        Error::Unverified
+    );
+}

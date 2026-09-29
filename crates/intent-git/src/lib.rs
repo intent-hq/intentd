@@ -28,6 +28,7 @@ pub mod history;
 pub mod identity;
 pub mod local_changes;
 pub mod ls_remote;
+pub mod native_push;
 pub mod pull;
 pub mod push;
 pub mod rebase;

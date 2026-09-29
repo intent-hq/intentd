@@ -181,12 +181,12 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// (`sourceControl.identityProof.create` / `delete`, the GitHub gist or
 /// GitLab snippet proof by `provider`); the `github.identityProof.*` pair
 /// stays as byte-identical aliases.
-const EXPECTED_TOTAL_METHODS: usize = 415;
+const EXPECTED_TOTAL_METHODS: usize = 417;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 355;
+const EXPECTED_ROUTER_METHODS: usize = 357;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 58;
@@ -195,7 +195,7 @@ const EXPECTED_FASTPATH_METHODS: usize = 58;
 const EXPECTED_ALIASES: usize = 2;
 
 /// Golden count: server→client notifications.
-const EXPECTED_NOTIFICATIONS: usize = 3;
+const EXPECTED_NOTIFICATIONS: usize = 4;
 
 /// Golden count: client-served reverse RPCs.
 const EXPECTED_REVERSE_METHODS: usize = 5;
@@ -506,6 +506,8 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "accept-changes.getStatus",
     "accept-changes.mergePR",
     "accept-changes.prepare",
+    "accept-changes.reconcile",
+    "accept-changes.release",
     "agent.cancelDelete",
     "agent.cancelSubscriptions",
     "agent.completeOnce",
@@ -1170,6 +1172,8 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "accept-changes.getStatus",
     "accept-changes.mergePR",
     "accept-changes.prepare",
+    "accept-changes.reconcile",
+    "accept-changes.release",
     "agent.cancelDelete",
     "agent.completeOnce",
     "agent.create",

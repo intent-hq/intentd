@@ -420,3 +420,57 @@ impl From<RepositoryCredentialError> for Error {
         })
     }
 }
+
+impl RepositoryConnectionDirectory {
+    /// Consume a prepared native HTTPS action on the actual owning blocking
+    /// worker. Revalidate the original active R stage AFTER secret acquisition,
+    /// compare P under that fence, then immediately start Git without requeueing.
+    pub(crate) async fn native_push(
+        &self,
+        admission: &RepositoryCredentialAdmission,
+        reader: &dyn RepositorySecretReader,
+        prepared: intent_git::native_push::PreparedNativePush,
+        observed: impl FnMut(&str) + Send,
+    ) -> intent_core::Result<String> {
+        use intent_sourcecontrol::ExposeSecret;
+        let unavailable = |_| intent_core::Error::Forbidden("Repository review unavailable".into());
+        if admission.request.use_kind != RepositoryCredentialUse::NativePush {
+            return Err(unavailable(RepositoryCredentialError::AuthorityDenied));
+        }
+        let ticket = self
+            .acquire_exact(admission, reader, Duration::from_secs(5))
+            .await
+            .map_err(unavailable)?;
+        let fence = admission
+            .authority
+            .revalidate(&admission.request)
+            .await
+            .map_err(unavailable)?;
+        let mut pending = Some((prepared, ticket));
+        let mut admitted = None;
+        fence
+            .dispatch(&mut || {
+                let state = self.lock()?;
+                self.check_locked(&state, admission)?;
+                let (_, ticket) = pending
+                    .as_ref()
+                    .ok_or(RepositoryCredentialError::AuthorityDenied)?;
+                if ticket.stamp.epoch != self.epoch
+                    || ticket.stamp.binding != admission.binding
+                    || ticket.stamp.secret_revision != state.secret_revision
+                    || ticket.stamp.use_kind != RepositoryCredentialUse::NativePush
+                {
+                    return Err(RepositoryCredentialError::Retired);
+                }
+                admitted = pending.take();
+                Ok(())
+            })
+            .map_err(unavailable)?;
+        let (prepared, ticket) =
+            admitted.ok_or_else(|| unavailable(RepositoryCredentialError::AuthorityDenied))?;
+        prepared.execute(
+            || git2::Cred::userpass_plaintext("oauth2", ticket.token.expose_secret()),
+            observed,
+        )
+    }
+}

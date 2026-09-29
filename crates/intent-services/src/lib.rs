@@ -169,7 +169,6 @@ mod repository_credential_writers;
     not(test),
     expect(
         dead_code,
-        unused_imports,
         clippy::wildcard_imports,
         reason = "Native credential consumers remain inactive; unit tests exercise their contracts"
     )
@@ -1140,6 +1139,7 @@ pub struct Services {
     repository_connection_directory: Arc<repository_credentials::RepositoryConnectionDirectory>,
     /// Exact ordinary API allocation; clones cannot bind replacement owners.
     repository_wire_owner: Arc<OnceLock<Weak<Services>>>,
+    repository_review_capacity: Arc<repository_native_wire::review::Capacity>,
     repository_selection_capacity: Arc<repository_native_wire::selection::Capacity>,
     /// Original invalidation owner for this Services instance. Clones share it;
     /// Store must accept this exact observer before it can be used.
@@ -1483,9 +1483,12 @@ impl Services {
         Self::new_with_repository_sources(store, intent_core::FileSecretStore::new(), None)
     }
 
-    /// Select disposable original sources before the fixture's sole attachment.
-    #[cfg(test)]
-    pub(crate) fn new_repository_fixture(
+    /// Hidden test support: select disposable original sources before attachment.
+    /// Production composition must use `Services::new`.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "repository-test-fixtures"))]
+    #[must_use]
+    pub fn new_repository_fixture(
         store: Store,
         secrets: intent_core::FileSecretStore,
         descriptor: Option<intent_sourcecontrol::GitlabDescriptor>,
@@ -1612,6 +1615,7 @@ impl Services {
             repository_connection_directory,
             repository_lifecycle_registry: Arc::default(),
             repository_wire_owner: Arc::default(),
+            repository_review_capacity: Arc::default(),
             repository_selection_capacity: Arc::default(),
             principal_identity_refreshed_at: Arc::new(tokio::sync::Mutex::new(None)),
             identity_transition: Arc::new(tokio::sync::Mutex::new(())),
@@ -17382,6 +17386,30 @@ impl WorkspaceApi for Services {
         repository_native_wire::connection(self, entry)
     }
 
+    fn native_review_prepare(
+        &self,
+        query: intent_core::repository_request::NativeReviewPrepareQuery,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        repository_native_wire::review::prepare(self, query)
+    }
+    fn native_review_execute(
+        &self,
+        query: intent_core::repository_request::NativeReviewExecuteQuery,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        repository_native_wire::review::execute(self, query)
+    }
+    fn native_review_reconcile(
+        &self,
+        query: intent_core::repository_request::NativeReviewBoundQuery,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        repository_native_wire::review::reconcile(self, query)
+    }
+    fn native_review_release(
+        &self,
+        query: intent_core::repository_request::NativeReviewBoundQuery,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        repository_native_wire::review::release(self, query)
+    }
     fn repository_selection_capture(
         &self,
         query: intent_core::repository_request::RepositorySelectionQuery,

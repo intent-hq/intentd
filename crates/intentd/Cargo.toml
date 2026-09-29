@@ -45,7 +45,7 @@ js-engine = ["dep:intent-js"]
 
 [dev-dependencies]
 uuid = { workspace = true }
-intent-services = { path = "../intent-services", version = "0.9.112" }
+intent-services = { path = "../intent-services", version = "0.9.112", features = ["repository-test-fixtures"] }
 intent-acp = { path = "../intent-acp", version = "0.9.112" }
 intent-providers = { path = "../intent-providers", version = "0.9.112" }
 intent-core = { path = "../intent-core", version = "0.9.112" }

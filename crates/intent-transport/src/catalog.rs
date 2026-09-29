@@ -41,6 +41,8 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "accept-changes.getStatus",
     "accept-changes.mergePR",
     "accept-changes.prepare",
+    "accept-changes.reconcile",
+    "accept-changes.release",
     "agent.appendMessage",
     "agent.cancelDelete",
     "agent.cancelSubscriptions",
@@ -489,6 +491,7 @@ pub(crate) const FASTPATH_METHODS: &[&str] = &[
 /// (no request `id`). `events.event` is the sole notification in protocol v2.0.
 #[cfg(test)]
 pub(crate) const NOTIFICATIONS: &[&str] = &[
+    "accept-changes.retired",
     "events.event",
     "workspace.repositoryContext.retired",
     "workspace.repositorySelection.retired",
@@ -761,6 +764,8 @@ pub(crate) const MEMBER_METHODS: &[&str] = &[
     "accept-changes.getStatus",
     "accept-changes.mergePR",
     "accept-changes.prepare",
+    "accept-changes.reconcile",
+    "accept-changes.release",
     "agent.cancelDelete",
     "agent.completeOnce",
     "agent.create",
