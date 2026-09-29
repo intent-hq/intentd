@@ -88,6 +88,17 @@ pub(crate) const MAX_HOOK_NAME_LEN: usize = 50;
 /// [`Services::with_hook_eval_timeout`].
 pub(crate) const HOOK_EVAL_TIMEOUT: Duration = Duration::from_secs(60);
 
+// Validation runs are inline: their ws.hook.schedule calls re-enter the
+// service before any hook is persisted. Bound the evaluation chain, allowing
+// a running hook to validate one replacement, but not another generation.
+const MAX_HOOK_EVAL_DEPTH: usize = 2;
+tokio::task_local! {
+    // Scope follows future polls (including the QuickJS host futures), not a
+    // worker thread or agent. Sibling futures are independent and dropping a
+    // cancelled/timed-out eval restores the enclosing depth automatically.
+    static HOOK_EVAL_DEPTH: usize;
+}
+
 /// Bounded retry budget for a hook run's persistence steps
 /// (intent-hq/intent#5035): a store/pool error (`Error::Internal`) on any
 /// single step is retried up to this many attempts in total, sleeping
@@ -666,9 +677,13 @@ async fn run_hook_script(
     };
     // Hook runs are daemon-internal work: every `ws.*` call the script makes
     // is bound to the `Daemon` caller (multiplayer w1).
-    let eval = intent_core::with_caller(
-        intent_core::Caller::Daemon,
-        intent_js::eval(&full_code, &opts, Some(host)),
+    let depth = HOOK_EVAL_DEPTH.try_with(|depth| *depth).unwrap_or(0);
+    let eval = HOOK_EVAL_DEPTH.scope(
+        depth + 1,
+        intent_core::with_caller(
+            intent_core::Caller::Daemon,
+            intent_js::eval(&full_code, &opts, Some(host)),
+        ),
     );
     match eval.await {
         Ok(v) => {
@@ -884,6 +899,13 @@ impl Services {
         agent_id: &AgentId,
         params: &Value,
     ) -> Result<Value> {
+        if HOOK_EVAL_DEPTH.try_with(|depth| *depth).unwrap_or(0) >= MAX_HOOK_EVAL_DEPTH {
+            return Err(Error::InvalidParams(
+                "hook.schedule: nested hook validation limit reached; a hook may validate \
+                 one replacement, but that validation must not schedule another hook"
+                    .into(),
+            ));
+        }
         let agent_features = self.effective_settings().agent_features;
         if !agent_features.background_hooks {
             return Err(Error::InvalidParams(
@@ -2612,6 +2634,226 @@ mod tests {
                 return types;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Exercise the real service/QuickJS/host-dispatch chain in a disposable
+    /// process. The payload is finite even if the depth guard regresses.
+    #[cfg(unix)]
+    #[test]
+    fn recursive_hook_validation_is_bounded() {
+        const WORKER: &str = "INTENTD_HOOK_RECURSION_WORKER";
+        if let Ok(mode) = std::env::var(WORKER) {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(recursive_hook_worker(&mode));
+            return;
+        }
+        for mode in ["direct", "indirect"] {
+            let root = crate::test_support::test_tempdir("hook-recursion-");
+            let log_path = root.path().join("worker.log");
+            let log = std::fs::File::create(&log_path).unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "hook_manager::tests::recursive_hook_validation_is_bounded",
+                    "--nocapture",
+                ])
+                .env(WORKER, mode)
+                .env("TMPDIR", root.path())
+                .env("INTENT_CONFIG_DIR", root.path())
+                .current_dir(root.path())
+                .stdout(log.try_clone().unwrap())
+                .stderr(log);
+            let mut child = intentd_test_support::GuardedChild::spawn(&mut command).unwrap();
+            let status = child.wait_with_timeout(Duration::from_secs(30)).unwrap();
+            assert!(
+                status.is_some_and(|s| s.success()),
+                "{mode} worker failed ({status:?}): {}",
+                std::fs::read_to_string(log_path).unwrap()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    async fn recursive_hook_worker(mode: &str) {
+        let (_db, _root, svc, ws, owner) = setup().await;
+        // Three finite child validations exceed the two-evaluation boundary.
+        // Repeat a name for direct nesting; alternate names and an async
+        // helper for indirect nesting. Neither payload can reproduce itself.
+        let mut code = "return {dispatch: false};".to_string();
+        for generation in 0..3 {
+            let name = if mode == "direct" || generation % 2 == 0 {
+                "first"
+            } else {
+                "second"
+            };
+            let call = format!(
+                "return await ws.hook.schedule({{name: {name:?}, delayMs: 600000, code: {}}});",
+                json!(code)
+            );
+            code = if mode == "indirect" {
+                format!("async function next() {{ {call} }} return await next();")
+            } else {
+                call
+            };
+        }
+        let err = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "root", "delayMs": 600000, "code": code
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("nested hook validation limit"),
+            "{err}"
+        );
+        assert!(svc
+            .store
+            .list_hooks_by_agent(&owner)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(svc.hook_tasks.lock().unwrap().is_empty());
+
+        // A rejected chain must not poison the owner or unrelated work.
+        let other = AgentId::from("agent-unrelated");
+        svc.store
+            .insert_agent_session(&agent(&ws, &other.0))
+            .await
+            .unwrap();
+        for id in [&owner, &other] {
+            let result = svc
+                .hook_schedule_op(
+                    &ws,
+                    id,
+                    &json!({
+                        "name": "ordinary", "delayMs": 600000, "code": "return {dispatch: false};"
+                    }),
+                )
+                .await
+                .unwrap();
+            let hook: Hook = serde_json::from_value(result["hook"].clone()).unwrap();
+            svc.hook_cancel_op(&ws, &hook.hook_id, Some(id))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn hook_validation_allows_one_level_renewal() {
+        let (_db, _root, svc, ws, owner) = setup().await;
+        // A finite two-generation renewal chain: each replacement only
+        // schedules its successor on a later run, after its validation.
+        let mut code = "return {dispatch: false, state: {armed: true}};".to_string();
+        for _ in 0..2 {
+            code = format!(
+                "if (!hookState) return {{dispatch: false, state: {{armed: true}}}}; \
+                 await ws.hook.schedule({{name: 'replacement', delayMs: 600000, code: {}}}); \
+                 return {{dispatch: true, message: 'renewed'}};",
+                json!(code)
+            );
+        }
+        let result = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "original", "delayMs": 600000, "code": code
+                }),
+            )
+            .await
+            .unwrap();
+        let mut current: Hook = serde_json::from_value(result["hook"].clone()).unwrap();
+        // A spawned replacement starts with a fresh depth on its later run.
+        for _ in 0..2 {
+            svc.hook_run_now_op(&ws, &current.hook_id).await.unwrap();
+            wait_for_hook(&svc, &current.hook_id, |h| h.state == HookState::Dispatched).await;
+            wait_for_task_exit(&svc, &current.hook_id).await;
+            let active: Vec<_> = svc
+                .store
+                .list_hooks_by_agent(&owner)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|h| h.state == HookState::Scheduled)
+                .collect();
+            assert_eq!(active.len(), 1);
+            current = active.into_iter().next().unwrap();
+            assert_eq!(current.name, "replacement");
+            assert_eq!(current.run_count, 1);
+        }
+        svc.hook_cancel_op(&ws, &current.hook_id, Some(&owner))
+            .await
+            .unwrap();
+        wait_for_task_exit(&svc, &current.hook_id).await;
+    }
+
+    #[tokio::test]
+    async fn hook_validation_scope_survives_cancellation_and_parallel_work() {
+        let (_db, _root, svc, ws, owner) = setup().await;
+        let other = AgentId::from("agent-parallel");
+        svc.store
+            .insert_agent_session(&agent(&ws, &other.0))
+            .await
+            .unwrap();
+        let child_code = "await ws.workspace.setStatusMessage('validation entered'); \
+                          await new Promise(() => {});";
+        let params = json!({
+            "name": "cancelled-root", "delayMs": 600000,
+            "code": format!("await ws.hook.schedule({{name: 'cancelled-child', delayMs: 600000, code: {}}});", json!(child_code))
+        });
+        let mut pending = Box::pin(svc.hook_schedule_op(&ws, &owner, &params));
+        let ordinary_nested = json!({
+            "name": "healthy-root", "delayMs": 600000,
+            "code": "await ws.hook.schedule({name: 'healthy-child', delayMs: 600000, code: 'return {dispatch: false};'});"
+        });
+        // Poll independent work on the SAME task while the nested evaluation
+        // is suspended. A process-wide or thread-local depth leaks here.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                result = &mut pending => panic!("pending validation completed: {result:?}"),
+                () = async {
+                    loop {
+                        if svc.store.get_workspace(&ws).await.unwrap().status_message.as_deref()
+                            == Some("validation entered") { break; }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    svc.hook_schedule_op(&ws, &other, &ordinary_nested).await.unwrap();
+                } => {}
+            }
+        })
+        .await
+        .unwrap();
+        drop(pending);
+        assert!(svc
+            .store
+            .list_hooks_by_agent(&owner)
+            .await
+            .unwrap()
+            .is_empty());
+        // Dropping a suspended validation must restore its enclosing scope.
+        svc.hook_schedule_op(&ws, &owner, &ordinary_nested)
+            .await
+            .unwrap();
+        for id in [&owner, &other] {
+            let hooks = svc.store.list_hooks_by_agent(id).await.unwrap();
+            assert_eq!(hooks.len(), 2);
+            for hook in hooks {
+                assert!(hook.name.starts_with("healthy-"));
+                svc.hook_cancel_op(&ws, &hook.hook_id, Some(id))
+                    .await
+                    .unwrap();
+                wait_for_task_exit(&svc, &hook.hook_id).await;
+            }
         }
     }
 
