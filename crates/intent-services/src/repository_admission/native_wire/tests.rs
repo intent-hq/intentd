@@ -1955,3 +1955,569 @@ async fn native_wire_disabled_child_capability_is_metadata_and_never_a_grant() {
     }
     assert_eq!(server.control.requests.lock().unwrap().len(), calls);
 }
+
+// Member target qualification: real original owners, private facts and redacted output.
+use crate::source_control_auth_ops::repository_owner::secret_reader::tests::{
+    Fixture as MemberAuthFixture, Server as MemberServer,
+};
+
+struct MemberTargetFixture {
+    auth: MemberAuthFixture,
+    server: MemberServer,
+    native: Fixture,
+}
+impl MemberTargetFixture {
+    async fn new() -> Self {
+        let server = MemberServer::new().await;
+        let auth = MemberAuthFixture::new(&server).await;
+        let mut git = GitFixture::new().await;
+        auth.service
+            .store
+            .insert_workspace(&git.workspace)
+            .await
+            .unwrap();
+        git.store = auth.service.store.clone();
+        git.git(
+            &git.path,
+            &[
+                "remote",
+                "add",
+                "forge",
+                &format!(
+                    "{}/group/project.git",
+                    server.descriptor.instance().as_str()
+                ),
+            ],
+        );
+        auth.service.initialize_repository_wire().await.unwrap();
+        let principal = auth.service.store.get_primary_principal().await.unwrap();
+        let native = Fixture {
+            git,
+            services: auth.service.clone(),
+            caller: Caller::Wire {
+                principal_id: principal.id,
+                host_role: HostRole::Owner,
+            },
+        };
+        Self {
+            auth,
+            server,
+            native,
+        }
+    }
+}
+
+async fn target_member(f: &Fixture) -> (Socket, Principal) {
+    let person = Principal {
+        id: PrincipalId::new(),
+        identity: None,
+        github_user_id: Some(4306),
+        login: Some("target-member".into()),
+        display_name: None,
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    f.services.store.upsert_principal(&person).await.unwrap();
+    let owner = f.services.store.get_primary_principal().await.unwrap();
+    let invite = intent_core::HostInvite::new(
+        "target-invite".into(),
+        owner.id,
+        person.identity_key().unwrap(),
+        person.login.clone().unwrap(),
+        "target-proof".into(),
+        None,
+    )
+    .unwrap();
+    f.services.store.insert_host_invite(&invite).await.unwrap();
+    let generation = f
+        .services
+        .store
+        .host_membership_state()
+        .await
+        .unwrap()
+        .authorization_generation;
+    f.services
+        .store
+        .join_host_by_invite(
+            &invite.id,
+            &person,
+            intent_store::HostJoinCredential::Proof {
+                token_hash: "target-member-token",
+                authorization_generation: generation,
+            },
+        )
+        .await
+        .unwrap();
+    let socket = f
+        .socket_as(
+            Caller::Wire {
+                principal_id: person.id.clone(),
+                host_role: HostRole::Member,
+            },
+            Some(WireCredential::Principal {
+                principal_id: person.id.clone(),
+                token_hash: "target-member-token".into(),
+            }),
+        )
+        .await;
+    (socket, person)
+}
+
+fn assert_target_redaction(context: &RepositoryContext) {
+    for target in context.roots.iter().flat_map(|r| &r.targets) {
+        assert!(target.connection.is_none());
+        assert!(target.provider_project_id.is_none());
+        assert_eq!(
+            target.availability,
+            intent_core::RepositoryAvailability::Unknown
+        );
+        assert!(target
+            .capabilities
+            .iter()
+            .all(|c| c.state == intent_core::RepositoryCapabilityState::Unknown));
+    }
+    let encoded = serde_json::to_string(context).unwrap();
+    for field in [
+        "connectionId",
+        "connectionGeneration",
+        "accountId",
+        "providerProjectId",
+        "stored-pat",
+        "target-member-token",
+    ] {
+        assert!(!encoded.contains(field), "public context contains {field}");
+    }
+    assert_eq!(
+        serde_json::from_str::<RepositoryContext>(&encoded).unwrap(),
+        *context
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_wire_member_qualification_projection() {
+    let fixture = MemberTargetFixture::new().await;
+    let f = &fixture.native;
+    let registered = f.registered("member-github-root").await;
+    f.git.git(
+        std::path::Path::new(&registered.path),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/team/ordinary.git",
+        ],
+    );
+    let (member, _) = target_member(f).await;
+    let guest = f.guest("target-guest-token", true).await;
+    let owner = f.socket().await;
+    let calls = fixture.server.control.requests.lock().unwrap().len();
+    for (label, socket) in [("owner", &owner), ("member", &member), ("guest", &guest)] {
+        let capture = socket.capture(f).await.unwrap();
+        let value = socket.read(f, &capture).await.unwrap();
+        assert_eq!(value.roots.len(), 2);
+        let primary = value
+            .roots
+            .iter()
+            .find(|r| matches!(r.root.kind, RepositoryRootKind::Primary))
+            .unwrap();
+        let gitlab = primary
+            .targets
+            .iter()
+            .find(|t| t.target.provider == intent_core::RepositoryProvider::Gitlab);
+        if label == "guest" {
+            assert!(gitlab.is_none());
+            assert!(matches!(
+                primary.review_selection.outcome,
+                intent_core::ReviewSelectionOutcome::SelectionRequired { .. }
+            ));
+        } else {
+            let gitlab = gitlab.unwrap_or_else(|| {
+                panic!("{label} must resolve original configured GitLab: {value:?}")
+            });
+            assert_eq!(
+                gitlab.target.instance_base_url,
+                fixture.server.descriptor.instance().as_str()
+            );
+            assert_eq!(gitlab.target.project_path, "group/project");
+            assert!(matches!(
+                primary.review_selection.outcome,
+                intent_core::ReviewSelectionOutcome::Resolved { .. }
+            ));
+            assert_eq!(gitlab.connection.is_some(), label == "owner");
+        }
+        assert!(value
+            .roots
+            .iter()
+            .flat_map(|r| &r.targets)
+            .any(
+                |t| t.target.provider == intent_core::RepositoryProvider::Github
+                    && t.target.project_path == "team/ordinary"
+            ));
+        if label != "owner" {
+            assert_target_redaction(&value);
+        }
+        assert_eq!(
+            fixture.server.control.requests.lock().unwrap().len(),
+            calls,
+            "context performs no provider HTTP"
+        );
+        eprintln!(
+            "member qualification projection {label}: {}",
+            serde_json::to_string(&value).unwrap()
+        );
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_wire_member_qualification_final_transfer() {
+    for mode in [
+        "role",
+        "credential",
+        "workspace",
+        "root",
+        "selection",
+        "provider",
+        "settings",
+    ] {
+        let fixture = MemberTargetFixture::new().await;
+        let f = &fixture.native;
+        let registered = f.registered("member-original-root").await;
+        f.git.git(
+            std::path::Path::new(&registered.path),
+            &[
+                "remote",
+                "add",
+                "forge",
+                &format!(
+                    "{}/group/project.git",
+                    fixture.server.descriptor.instance().as_str()
+                ),
+            ],
+        );
+        let (s, person) = target_member(f).await;
+        let capture = s.capture(f).await.unwrap();
+        s.entered(async {
+            let scope = s.owner.capture_context(&f.query());
+            scope
+                .scope(Box::pin(async {
+                    let body = f
+                        .services
+                        .repository_context(bound(f.query(), &capture.lifetime_id))
+                        .await
+                        .unwrap();
+                    assert_target_redaction(&body);
+                    assert!(body
+                        .roots
+                        .iter()
+                        .flat_map(|r| &r.targets)
+                        .any(|t| t.target.provider == intent_core::RepositoryProvider::Gitlab));
+                    match mode {
+                        "role" => {
+                            f.services
+                                .store
+                                .remove_host_member(&person.id)
+                                .await
+                                .unwrap();
+                        }
+                        "credential" => {
+                            assert!(f
+                                .services
+                                .store
+                                .revoke_principal_credential("target-member-token")
+                                .await
+                                .unwrap());
+                        }
+                        "workspace" => {
+                            f.services
+                                .store
+                                .delete_workspace(&f.git.workspace.id)
+                                .await
+                                .unwrap();
+                        }
+                        "root" => {
+                            f.services
+                                .store
+                                .delete_workspace_git_root(&registered.id)
+                                .await
+                                .unwrap();
+                        }
+                        "selection" => {
+                            let root = RepositoryRootId {
+                                workspace_id: f.git.workspace.id.clone(),
+                                kind: RepositoryRootKind::Primary,
+                            };
+                            let original = f
+                                .services
+                                .store
+                                .repository_selection_snapshot(&root)
+                                .await
+                                .unwrap();
+                            f.services
+                                .store
+                                .write_repository_selection(
+                                    &original,
+                                    intent_store::RepositorySelectionChange::Automatic,
+                                )
+                                .await
+                                .result
+                                .unwrap();
+                        }
+                        "provider" => {
+                            f.services
+                                .gitlab_connect_pat(
+                                    fixture.server.host.clone(),
+                                    "replacement-pat".into(),
+                                )
+                                .await
+                                .unwrap();
+                        }
+                        "settings" => {
+                            fixture
+                                .auth
+                                .registry
+                                .apply(&[("git.autoCommit".into(), json!(true))])
+                                .unwrap();
+                        }
+                        _ => unreachable!(),
+                    }
+                    let calls = fixture.server.control.requests.lock().unwrap().len();
+                    let mut transfers = 0;
+                    let delivered = scope
+                        .deliver(RepositoryReadReplyKind::Result, &mut || {
+                            transfers += 1;
+                            Ok(())
+                        })
+                        .await;
+                    assert!(delivered.is_err(), "{mode}");
+                    assert_eq!(transfers, 0, "{mode}");
+                    assert_eq!(fixture.server.control.requests.lock().unwrap().len(), calls);
+                    eprintln!(
+                        "member original final transfer {mode}: refused; transfers={transfers}"
+                    );
+                }))
+                .await;
+            scope.retire();
+        })
+        .await;
+        match mode {
+            "workspace" => {
+                f.services
+                    .store
+                    .insert_workspace(&f.git.workspace)
+                    .await
+                    .unwrap();
+            }
+            "root" => {
+                f.services
+                    .store
+                    .upsert_workspace_git_root(&registered)
+                    .await
+                    .unwrap();
+            }
+            "provider" => {
+                f.services
+                    .gitlab_connect_pat(fixture.server.host.clone(), "stored-pat".into())
+                    .await
+                    .unwrap();
+            }
+            "settings" => {
+                fixture
+                    .auth
+                    .registry
+                    .apply(&[("git.autoCommit".into(), json!(false))])
+                    .unwrap();
+            }
+            _ => {}
+        }
+        assert!(
+            s.read(f, &capture).await.is_err(),
+            "restoration cannot repair {mode}"
+        );
+    }
+    let fixture = MemberTargetFixture::new().await;
+    let f = &fixture.native;
+    let (s, _) = target_member(f).await;
+    let capture = s.capture(f).await.unwrap();
+    let second = f.socket_as(s.caller.clone(), s.credential.clone()).await;
+    assert!(second.read(f, &capture).await.is_err());
+    let other = Fixture::new().await;
+    other
+        .services
+        .store
+        .insert_workspace(&f.git.workspace)
+        .await
+        .unwrap();
+    s.entered(async {
+        let scope = s.owner.capture_context(&f.query());
+        scope
+            .scope(Box::pin(async {
+                assert!(
+                    other
+                        .services
+                        .repository_context(bound(f.query(), &capture.lifetime_id))
+                        .await
+                        .is_err(),
+                    "equal public workspace ID cannot change original Services host"
+                );
+            }))
+            .await;
+        scope.retire();
+    })
+    .await;
+    assert_target_redaction(&s.read(f, &capture).await.unwrap());
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_wire_member_qualification_unknown_and_busy() {
+    use crate::source_control_auth_ops::repository_owner::RepositoryDescriptorState;
+    // Absent metadata cannot be filled by a later installation, even on this Services.
+    let f = Fixture::new().await;
+    let server = MemberServer::new().await;
+    f.git.git(
+        &f.git.path,
+        &[
+            "remote",
+            "add",
+            "forge",
+            &format!(
+                "{}/group/project.git",
+                server.descriptor.instance().as_str()
+            ),
+        ],
+    );
+    let (s, _) = target_member(&f).await;
+    let absent = s.capture(&f).await.unwrap();
+    let before = s.read(&f, &absent).await.unwrap();
+    assert!(before.roots[0].targets.is_empty());
+    let registry =
+        SettingsRegistry::load(f.git.dir.path().join("member-late-settings.toml")).unwrap();
+    registry
+        .apply(&[
+            ("sourceControl.gitlab.host".into(), json!("gitlab.test")),
+            (
+                "sourceControl.gitlab.instanceBaseUrl".into(),
+                json!(server.descriptor.instance().as_str()),
+            ),
+            (
+                "sourceControl.gitlab.apiBaseUrl".into(),
+                json!(server.host.base_url()),
+            ),
+        ])
+        .unwrap();
+    let guard = f.services.gitlab_credential_gate.lock().await;
+    f.services
+        .gitlab_credential_gate
+        .install_settings_boundary(
+            &registry,
+            &f.services.secrets,
+            &f.services.gitlab_secret_store,
+            None,
+        )
+        .unwrap();
+    drop(guard);
+    assert!(matches!(
+        f.services
+            .gitlab_repository_connection_facts()
+            .unwrap()
+            .approval(),
+        RepositoryDescriptorState::Unapproved
+    ));
+    assert_eq!(s.read(&f, &absent).await.unwrap(), before);
+    let unapproved = s.capture(&f).await.unwrap();
+    let value = s.read(&f, &unapproved).await.unwrap();
+    assert!(value.roots[0].targets.is_empty());
+    assert_target_redaction(&value);
+    assert!(server.control.requests.lock().unwrap().is_empty());
+
+    let fixture = MemberTargetFixture::new().await;
+    let f = &fixture.native;
+    let unknown = f.registered("member-unknown-instance").await;
+    f.git.git(
+        std::path::Path::new(&unknown.path),
+        &[
+            "remote",
+            "add",
+            "forge",
+            "https://unapproved.invalid/group/project.git",
+        ],
+    );
+    let (s, _) = target_member(f).await;
+    let calls = fixture.server.control.requests.lock().unwrap().len();
+    let current = s.capture(f).await.unwrap();
+    let value = s.read(f, &current).await.unwrap();
+    assert_target_redaction(&value);
+    assert_eq!(
+        value.roots.iter().filter(|r| !r.targets.is_empty()).count(),
+        1
+    );
+    f.services
+        .gitlab_revoke_owned(fixture.server.host.clone())
+        .await
+        .unwrap();
+    assert!(s.read(f, &current).await.is_err());
+    let disconnected = s.capture(f).await.unwrap();
+    let value = s.read(f, &disconnected).await.unwrap();
+    assert_eq!(
+        value
+            .roots
+            .iter()
+            .flat_map(|r| &r.targets)
+            .filter(|t| t.target.provider == intent_core::RepositoryProvider::Gitlab)
+            .count(),
+        1
+    );
+    assert_target_redaction(&value);
+    assert_eq!(fixture.server.control.requests.lock().unwrap().len(), calls);
+
+    let fixture = MemberTargetFixture::new().await;
+    let f = &fixture.native;
+    let (s, _) = target_member(f).await;
+    let capture = s.capture(f).await.unwrap();
+    s.entered(async {
+        let scope = s.owner.capture_context(&f.query());
+        scope
+            .scope(Box::pin(async {
+                let value = f
+                    .services
+                    .repository_context(bound(f.query(), &capture.lifetime_id))
+                    .await
+                    .unwrap();
+                assert_target_redaction(&value);
+                let facts = f.services.gitlab_repository_connection_facts().unwrap();
+                let hold = Arc::new(BlockingHold::default());
+                let blocked = hold.clone();
+                let task = tokio::task::spawn_blocking(move || {
+                    RepositoryConnectionFacts::with_native_context_current(
+                        Some(&facts),
+                        |current| {
+                            assert!(current);
+                            blocked.hold();
+                            Ok(())
+                        },
+                    )
+                });
+                hold.entered.notified().await;
+                let calls = fixture.server.control.requests.lock().unwrap().len();
+                let mut transfers = 0;
+                let result = scope
+                    .deliver(RepositoryReadReplyKind::Result, &mut || {
+                        transfers += 1;
+                        Ok(())
+                    })
+                    .await;
+                hold.release();
+                task.await.unwrap().unwrap();
+                assert!(result.is_err());
+                assert_eq!(transfers, 0);
+                assert_eq!(fixture.server.control.requests.lock().unwrap().len(), calls);
+            }))
+            .await;
+        scope.retire();
+    })
+    .await;
+    assert!(s.read(f, &capture).await.is_err());
+    let fresh = s.capture(f).await.unwrap();
+    assert_target_redaction(&s.read(f, &fresh).await.unwrap());
+}

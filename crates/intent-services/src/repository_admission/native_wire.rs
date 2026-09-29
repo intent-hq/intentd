@@ -624,6 +624,8 @@ struct Lease {
     roots: Vec<(RootRecord, SelectionFacts)>,
     settings: Option<(Arc<SettingsRegistry>, Arc<SettingsSnapshot>)>,
     provider: Option<Arc<RepositoryConnectionFacts>>,
+    // Private target qualification never implies administrator disclosure.
+    administrator_projection: bool,
     state: Mutex<Revision>,
     lane: Arc<tokio::sync::Mutex<()>>,
     reads: AtomicUsize,
@@ -888,6 +890,19 @@ async fn capture_inner(
         records.push((record, SelectionFacts::read(&c.services, &root).await?));
     }
     let admin = Services::require_administrator("sourceControl.authStatus").is_ok();
+    let member = matches!(
+        c.caller.caller(),
+        Caller::Wire {
+            host_role: intent_core::HostRole::Member,
+            ..
+        }
+    );
+    if member {
+        c.services
+            .require_host_execution("Repository context")
+            .await
+            .map_err(local)?;
+    }
     let svc = c.services.clone();
     let job_permit = c.workers.clone().try_acquire_owned().map_err(local)?;
     c.active_jobs.fetch_add(1, Ordering::AcqRel);
@@ -901,7 +916,7 @@ async fn capture_inner(
             .settings_registry
             .as_ref()
             .map(|registry| (registry.clone(), registry.snapshot()));
-        let provider = admin
+        let provider = (admin || member)
             .then(|| svc.gitlab_repository_connection_facts().ok())
             .flatten()
             .filter(|f| {
@@ -942,6 +957,7 @@ async fn capture_inner(
         authority: initial,
         roots: records,
         settings,
+        administrator_projection: admin,
         provider,
         state: Mutex::new(Revision::default()),
         lane: Arc::new(tokio::sync::Mutex::new(())),
@@ -1084,8 +1100,15 @@ async fn validate(request: &Request, lease: &Lease) -> AdmissionResult<()> {
     if authority(request, &lease.query.workspace_id).await? != lease.authority {
         return Err(AdmissionError::Retired);
     }
-    if lease.provider.is_some() {
+    if lease.administrator_projection {
         Services::require_administrator("sourceControl.authStatus").map_err(local)?;
+    } else if lease.provider.is_some() {
+        request
+            .connection
+            .services
+            .require_host_execution("Repository context")
+            .await
+            .map_err(local)?;
     }
     for (record, selection) in &lease.roots {
         if RootRecord::read(&request.connection.services.store, record.root()).await? != *record
@@ -1157,6 +1180,7 @@ async fn observe_locked(
                             let path = record.path().to_owned();
                             let saved = selection.saved()?;
                             let facts = lease.provider.clone();
+                            let administrator_projection = lease.administrator_projection;
                             let resolve = resolver(facts.as_deref())?;
                             #[cfg(test)]
                             let probe = c.git_probe.lock().unwrap().clone();
@@ -1172,7 +1196,16 @@ async fn observe_locked(
                                     None,
                                     &resolve,
                                     &GitConfigEnvironment::default(),
-                                    |target| target_context(target, facts.as_deref()),
+                                    |target| {
+                                        target_context(
+                                            target,
+                                            if administrator_projection {
+                                                facts.as_deref()
+                                            } else {
+                                                None
+                                            },
+                                        )
+                                    },
                                 )
                             })
                             .await
