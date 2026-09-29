@@ -493,16 +493,139 @@ mod selection_contract_tests {
 
 /// Strict, presence-discriminated native review command. Public IDs only correlate
 /// with an original socket-owned operation; they never grant execution authority.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeReviewPrepareQuery {
     pub workspace_id: crate::WorkspaceId,
     pub action: crate::NativeReviewStage,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files: Option<Vec<String>>,
-    #[serde(default)]
     pub options: NativeReviewOptions,
     pub review: NativeReviewChoiceQuery,
+}
+// Presence is significant only for the opt-in companion forms. The ordinary
+// form retains its previous defaults, null acceptance and serialized fields.
+#[derive(Default)]
+enum NativeReviewPresence<T> {
+    #[default]
+    Missing,
+    Present(T),
+}
+impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for NativeReviewPresence<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        T::deserialize(d).map(Self::Present)
+    }
+}
+impl<T> NativeReviewPresence<T> {
+    fn present(&self) -> bool {
+        matches!(self, Self::Present(_))
+    }
+    fn value(self) -> Option<T> {
+        match self {
+            Self::Missing => None,
+            Self::Present(v) => Some(v),
+        }
+    }
+}
+impl<'de> serde::Deserialize<'de> for NativeReviewPrepareQuery {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct ChoiceWire {
+            #[serde(deserialize_with = "native_review_root")]
+            root: crate::RepositoryRootId,
+            choice: NativeReviewChoice,
+            #[serde(default)]
+            target_branch: NativeReviewPresence<Option<String>>,
+            #[serde(default)]
+            push_remote: NativeReviewPresence<Option<String>>,
+            #[serde(default)]
+            companion: NativeReviewPresence<NativeReviewCompanion>,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Wire {
+            workspace_id: crate::WorkspaceId,
+            action: crate::NativeReviewStage,
+            #[serde(default)]
+            files: NativeReviewPresence<Option<Vec<String>>>,
+            #[serde(default)]
+            options: NativeReviewPresence<NativeReviewOptions>,
+            review: ChoiceWire,
+        }
+        let wire = Wire::deserialize(d)?;
+        let r = &wire.review;
+        let child = matches!(r.choice, NativeReviewChoice::AfterCommit { .. });
+        let marked = r.companion.present();
+        let invalid = || serde::de::Error::custom("Unsupported native review companion parameters");
+        if child {
+            if wire.action != crate::NativeReviewStage::CreatePr
+                || wire.files.present()
+                || wire.options.present()
+                || r.target_branch.present()
+                || r.push_remote.present()
+                || marked
+            {
+                return Err(invalid());
+            }
+            if let NativeReviewChoice::AfterCommit {
+                operation_id,
+                capture_id,
+            } = &r.choice
+            {
+                if [operation_id, capture_id].iter().any(|id| {
+                    id.len() != 36
+                        || id.bytes().any(|b| b.is_ascii_uppercase())
+                        || uuid::Uuid::parse_str(id).is_err()
+                }) {
+                    return Err(invalid());
+                }
+            }
+        } else if marked
+            && (wire.action != crate::NativeReviewStage::Commit
+                || wire.files.present()
+                || wire.options.present()
+                || r.push_remote.present()
+                || !matches!(&r.target_branch, NativeReviewPresence::Present(Some(v)) if !v.is_empty()))
+        {
+            return Err(invalid());
+        }
+        Ok(Self {
+            workspace_id: wire.workspace_id,
+            action: wire.action,
+            files: wire.files.value().flatten(),
+            options: wire.options.value().unwrap_or_default(),
+            review: NativeReviewChoiceQuery {
+                root: wire.review.root,
+                choice: wire.review.choice,
+                target_branch: wire.review.target_branch.value().flatten(),
+                push_remote: wire.review.push_remote.value().flatten(),
+                companion: wire.review.companion.value(),
+            },
+        })
+    }
+}
+impl serde::Serialize for NativeReviewPrepareQuery {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let companion = self.review.companion.is_some()
+            || matches!(self.review.choice, NativeReviewChoice::AfterCommit { .. });
+        let mut out = serializer.serialize_struct(
+            "NativeReviewPrepareQuery",
+            3 + usize::from(self.files.is_some()) + usize::from(!companion),
+        )?;
+        out.serialize_field("workspaceId", &self.workspace_id)?;
+        out.serialize_field("action", &self.action)?;
+        if let Some(files) = &self.files {
+            out.serialize_field("files", files)?;
+        }
+        if !companion {
+            out.serialize_field("options", &self.options)?;
+        }
+        out.serialize_field("review", &self.review)?;
+        out.end()
+    }
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -524,11 +647,28 @@ pub struct NativeReviewChoiceQuery {
     pub target_branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub push_remote: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub companion: Option<NativeReviewCompanion>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+#[serde(tag = "kind", deny_unknown_fields)]
+pub enum NativeReviewCompanion {
+    #[serde(rename = "create-pr")]
+    CreatePr {},
+}
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
 pub enum NativeReviewChoice {
     Saved,
+    AfterCommit {
+        operation_id: String,
+        capture_id: String,
+    },
     ExplicitTarget {
         #[serde(deserialize_with = "native_review_target")]
         target: crate::RepositoryTarget,

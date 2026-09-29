@@ -105,7 +105,8 @@ pub(crate) fn server_json(
         "osArch": format!("{os}/{arch}"),
         "version": version,
         "protocolVersion": PROTOCOL_VERSION,
-        "capabilities": { "liveState": true, "antigravitySetup": 1, "collaborationIdentity": 1, "hostMembership": 1, "personalPairing": 1, "authenticatedDevices": 1, "repositoryContext": 1, "repositorySelection": 1, "nativeReview": 1 },
+        "capabilities": { "liveState": true, "antigravitySetup": 1, "collaborationIdentity": 1, "hostMembership": 1, "personalPairing": 1, "authenticatedDevices": 1, "repositoryContext": 1, "repositorySelection": 1, "nativeReview": 1,
+                    "nativeReviewCompanion": 1 },
     });
     if let Some(build_commit) = build_commit {
         server

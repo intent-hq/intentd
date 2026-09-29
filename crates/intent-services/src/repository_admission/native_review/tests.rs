@@ -2178,3 +2178,1439 @@ async fn native_review_background_lock_contention_preserves_original_until_real_
         .is_err());
     assert_eq!(f.server.control.posts.load(Ordering::SeqCst), 0);
 }
+
+fn companion_query(f: &Fixture) -> Prepare {
+    let mut value = serde_json::to_value(f.query(Stage::Commit)).unwrap();
+    value.as_object_mut().unwrap().remove("options");
+    value["review"]["companion"] = json!({"kind":"create-pr"});
+    serde_json::from_value(value).unwrap()
+}
+fn companion_child(f: &Fixture, parent: &Execute) -> Prepare {
+    serde_json::from_value(json!({"workspaceId":f.git.workspace.id,"action":"create-pr","review":{"root":parent.review.root,"choice":{"kind":"afterCommit","operationId":parent.review.operation_id,"captureId":uuid::Uuid::new_v4().to_string()}}})).unwrap()
+}
+async fn companion_parent(f: &Fixture, s: &Socket) -> (Execute, Value, Arc<Operation>) {
+    f.stage("companion-staged.txt");
+    let prepared = s.prepare(f, companion_query(f)).await;
+    let command = command(f, &prepared, Stage::Commit);
+    let result = s
+        .request(&f.services, Frame::Execute(command.clone()))
+        .await
+        .unwrap();
+    assert_eq!(result["success"], true, "{result}");
+    let c = s.concrete(f).await;
+    let op = c.review.feed.lock().unwrap().records[&command.review.operation_id].clone();
+    assert!(op.write_current().is_err());
+    assert!(op.companion_normal());
+    assert!(
+        op.companion
+            .as_ref()
+            .unwrap()
+            .state
+            .lock()
+            .unwrap()
+            .delivered
+    );
+    assert_eq!(c.review.workers.available_permits(), WORKERS);
+    (command, result, op)
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_review_companion_actual_owner_member_separate_create_and_reuse() {
+    for member_role in [false, true] {
+        with_review_clock(async {
+            let f = Fixture::new().await;
+            let s = if member_role {
+                member(&f).await.0
+            } else {
+                f.socket().await
+            };
+            std::fs::write(f.git.path.join("not-staged.txt"), "untouched").unwrap();
+            let original_remote = f.server.control.sha.lock().unwrap().clone();
+            if member_role {
+                *f.server.control.reviews.lock().unwrap() =
+                    vec![super::credential_tests::review(&original_remote)];
+            }
+            let (parent, result, op) = companion_parent(&f, &s).await;
+            let head = f
+                .git
+                .git(&f.git.path, &["rev-parse", "HEAD"])
+                .trim()
+                .to_owned();
+            assert_ne!(head, original_remote);
+            assert_eq!(
+                result["reviewExecution"]["gitReceipts"],
+                json!([{"stage":"commit","commitHash":head}])
+            );
+            let before = f.git.git(&f.git.path, &["status", "--porcelain=v1"]);
+            assert!(before.contains("?? not-staged.txt"));
+            let child_query = companion_child(&f, &parent);
+            let child_prepared = s.prepare(&f, child_query.clone()).await;
+            let child = command(&f, &child_prepared, Stage::CreatePr);
+            assert_ne!(child.review.operation_id, parent.review.operation_id);
+            assert_eq!(child_prepared["reviewPreparation"]["localHeadSha"], head);
+            assert_eq!(
+                child_prepared["reviewPreparation"]["target"]["branch"],
+                "trunk"
+            );
+            let c = s.concrete(&f).await;
+            let fresh = c.review.feed.lock().unwrap().records[&child.review.operation_id].clone();
+            assert!(!Arc::ptr_eq(&fresh, &op));
+            assert!(fresh.companion.is_none());
+            assert_ne!(fresh.facts.preparation.scope, op.facts.preparation.scope);
+            assert!(s
+                .request(&f.services, Frame::Prepare(child_query))
+                .await
+                .is_err());
+            let reply = s
+                .request(&f.services, Frame::Execute(child.clone()))
+                .await
+                .unwrap();
+            assert_eq!(reply["success"], true, "{reply}");
+            assert_eq!(
+                reply["reviewExecution"]["outcome"]["status"],
+                if member_role { "reused" } else { "created" }
+            );
+            assert_eq!(reply["reviewExecution"]["gitReceipts"], json!([]));
+            assert_eq!(
+                reply["reviewExecution"]["publication"]["state"],
+                "local-ahead"
+            );
+            assert_eq!(
+                f.server.control.posts.load(Ordering::SeqCst),
+                usize::from(!member_role)
+            );
+            assert_eq!(*f.server.control.sha.lock().unwrap(), original_remote);
+            assert_eq!(f.git.git(&f.git.path, &["rev-parse", "HEAD"]).trim(), head);
+            assert_eq!(
+                f.git.git(&f.git.path, &["status", "--porcelain=v1"]),
+                before
+            );
+            let history = s
+                .request(&f.services, Frame::Reconcile(bound(&parent)))
+                .await
+                .unwrap();
+            assert_eq!(history["reviewExecution"], result["reviewExecution"]);
+            if member_role {
+                for side in ["source", "target"] {
+                    assert!(history["reviewExecution"]["preparation"][side]
+                        .get("connection")
+                        .is_none());
+                    assert!(child_prepared["reviewPreparation"][side]
+                        .get("connection")
+                        .is_none());
+                }
+            }
+            assert!(s
+                .request(&f.services, Frame::Prepare(companion_child(&f, &child)))
+                .await
+                .is_err());
+        })
+        .await;
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_review_companion_delivery_failure_and_undisclosed_receipt_never_grant() {
+    for delivery in [0, 1, 2] {
+        with_review_clock(async {
+            let f = Fixture::new().await;
+            let s = f.socket().await;
+            f.stage("companion-staged.txt");
+            let prepared = s.prepare(&f, companion_query(&f)).await;
+            let command = command(&f, &prepared, Stage::Commit);
+            s.entered(async {
+                let frame = s
+                    .owner
+                    .capture_review(&Frame::Execute(command.clone()))
+                    .unwrap();
+                frame
+                    .scope(Box::pin(async {
+                        let reply = f
+                            .services
+                            .native_review_execute(command.clone())
+                            .await
+                            .unwrap();
+                        assert_eq!(reply["success"], true, "{reply}");
+                        let c = s.concrete(&f).await;
+                        assert_eq!(c.review.workers.available_permits(), WORKERS);
+                        // Nested/callback capture is forbidden independently of receipt data.
+                        let nested = s
+                            .owner
+                            .capture_review(&Frame::Prepare(companion_child(&f, &command)))
+                            .unwrap();
+                        nested.retire();
+                        if delivery != 0 {
+                            let result = frame
+                                .deliver(RepositoryReadReplyKind::Result, &mut || {
+                                    if delivery == 1 {
+                                        Err(Error::Internal("owned failed transfer".into()))
+                                    } else {
+                                        Ok(())
+                                    }
+                                })
+                                .await;
+                            assert_eq!(result.is_ok(), delivery == 2);
+                        }
+                    }))
+                    .await;
+                frame.retire();
+            })
+            .await;
+            let history = s
+                .request(&f.services, Frame::Reconcile(bound(&command)))
+                .await
+                .unwrap();
+            assert_eq!(
+                history["reviewExecution"]["gitReceipts"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            let captured = s
+                .request(&f.services, Frame::Prepare(companion_child(&f, &command)))
+                .await;
+            assert_eq!(captured.is_ok(), delivery == 2);
+            assert_eq!(f.server.control.posts.load(Ordering::SeqCst), 0);
+        })
+        .await;
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_review_companion_original_reply_serializes_immediate_capture() {
+    with_review_clock(async {
+        let f = Fixture::new().await;
+        let s = f.socket().await;
+        f.stage("companion-staged.txt");
+        let prepared = s.prepare(&f, companion_query(&f)).await;
+        let command = command(&f, &prepared, Stage::Commit);
+        let c = s.concrete(&f).await;
+        let child = companion_child(&f, &command);
+        let mut captured = None;
+        s.entered(async {
+            let frame = s
+                .owner
+                .capture_review(&Frame::Execute(command.clone()))
+                .unwrap();
+            frame
+                .scope(Box::pin(async {
+                    let reply = f
+                        .services
+                        .native_review_execute(command.clone())
+                        .await
+                        .unwrap();
+                    assert_eq!(reply["success"], true, "{reply}");
+                    assert_eq!(c.review.workers.available_permits(), WORKERS);
+                    assert_eq!(
+                        c.services
+                            .repository_review_capacity
+                            .workers
+                            .available_permits(),
+                        GLOBAL_WORKERS
+                    );
+                    assert!(c
+                        .services
+                        .worktree_locks
+                        .try_with_lock(&f.git.path, || async {})
+                        .await
+                        .is_some());
+                    let runtime = tokio::runtime::Handle::current();
+                    let original = c.clone();
+                    let early = child.clone();
+                    let refused = std::thread::spawn(move || {
+                        runtime.block_on(with_caller(
+                            original.caller.caller().clone(),
+                            with_wire_credential(
+                                original.caller.wire_credential().cloned(),
+                                async { capture_frame(&original, Frame::Prepare(early)) },
+                            ),
+                        ))
+                    })
+                    .join()
+                    .unwrap();
+                    // Before the original transfer, a receipt alone does not qualify.
+                    refused
+                        .scope(Box::pin(async {
+                            assert!(f
+                                .services
+                                .native_review_prepare(child.clone())
+                                .await
+                                .is_err());
+                        }))
+                        .await;
+                    refused.retire();
+                    let mut thread = None;
+                    let mut received = None;
+                    frame
+                        .deliver(RepositoryReadReplyKind::Result, &mut || {
+                            let runtime = tokio::runtime::Handle::current();
+                            let original = c.clone();
+                            let next = child.clone();
+                            let (started, starting) = std::sync::mpsc::channel();
+                            let (done, result) = std::sync::mpsc::channel();
+                            thread = Some(std::thread::spawn(move || {
+                                runtime.block_on(with_caller(
+                                    original.caller.caller().clone(),
+                                    with_wire_credential(
+                                        original.caller.wire_credential().cloned(),
+                                        async {
+                                            started.send(()).unwrap();
+                                            let scope =
+                                                capture_frame(&original, Frame::Prepare(next));
+                                            done.send(scope).unwrap();
+                                        },
+                                    ),
+                                ));
+                            }));
+                            starting.recv().unwrap();
+                            assert!(result.try_recv().is_err());
+                            received = Some(result);
+                            Ok(())
+                        })
+                        .await
+                        .unwrap();
+                    thread.take().unwrap().join().unwrap();
+                    captured = Some(received.take().unwrap().recv().unwrap());
+                }))
+                .await;
+            // Normal request disposal follows transfer/capture and cannot cancel
+            // the legitimately captured child; the original worker is already done.
+            frame.retire();
+        })
+        .await;
+        let child_frame = captured.unwrap();
+        s.entered(async {
+            child_frame
+                .scope(Box::pin(async {
+                    let response = f
+                        .services
+                        .native_review_prepare(child.clone())
+                        .await
+                        .unwrap();
+                    child_frame
+                        .deliver(RepositoryReadReplyKind::Result, &mut || Ok(()))
+                        .await
+                        .unwrap();
+                    assert_ne!(
+                        response["reviewOperation"]["operationId"],
+                        prepared["reviewOperation"]["operationId"]
+                    );
+                }))
+                .await;
+        })
+        .await;
+        child_frame.retire();
+        assert_eq!(f.server.control.posts.load(Ordering::SeqCst), 0);
+    })
+    .await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_review_companion_release_capture_expiry_and_tombstone_orders() {
+    for order in 0..6 {
+        with_review_clock(async {
+            let f = Fixture::new().await;
+            let s = f.socket().await;
+            let (parent, receipt, op) = companion_parent(&f, &s).await;
+            let child = companion_child(&f, &parent);
+            if order == 0 {
+                s.request(&f.services, Frame::Release(bound(&parent)))
+                    .await
+                    .unwrap();
+            }
+            if order == 1 {
+                tokio::time::advance(LEASE_TTL).await;
+            }
+            let frame = s
+                .entered(async {
+                    s.owner
+                        .capture_review(&Frame::Prepare(child.clone()))
+                        .unwrap()
+                })
+                .await;
+            if order == 2 {
+                s.request(&f.services, Frame::Release(bound(&parent)))
+                    .await
+                    .unwrap();
+            }
+            if order == 3 {
+                tokio::time::advance(LEASE_TTL).await;
+            }
+            let mut prepared = None;
+            s.entered(async {
+                frame
+                    .scope(Box::pin(async {
+                        let response = f.services.native_review_prepare(child.clone()).await;
+                        if order < 4 {
+                            assert!(response.is_err());
+                        } else {
+                            prepared = Some(response.unwrap());
+                            frame
+                                .deliver(RepositoryReadReplyKind::Result, &mut || Ok(()))
+                                .await
+                                .unwrap();
+                        }
+                    }))
+                    .await;
+            })
+            .await;
+            frame.retire();
+            if let Some(p) = prepared {
+                let command = command(&f, &p, Stage::CreatePr);
+                let c = s.concrete(&f).await;
+                let fresh =
+                    c.review.feed.lock().unwrap().records[&command.review.operation_id].clone();
+                if order == 4 {
+                    s.request(&f.services, Frame::Release(bound(&parent)))
+                        .await
+                        .unwrap();
+                    assert!(fresh.write_current().is_err());
+                } else {
+                    // Parent intent expiration is independent of a published
+                    // child's fresh lease; fixed time advanced only after admission.
+                    let remaining =
+                        (op.created + LEASE_TTL).saturating_duration_since(Instant::now());
+                    tokio::time::advance(remaining).await;
+                    // A child published at the same fixed instant also expires here.
+                    assert!(s
+                        .request(&f.services, Frame::Prepare(companion_child(&f, &parent)))
+                        .await
+                        .is_err());
+                }
+            }
+            assert!(s.request(&f.services, Frame::Prepare(child)).await.is_err());
+            let history = s
+                .request(&f.services, Frame::Reconcile(bound(&parent)))
+                .await
+                .unwrap();
+            assert_eq!(history["reviewExecution"], receipt["reviewExecution"]);
+            assert_eq!(f.server.control.posts.load(Ordering::SeqCst), 0);
+        })
+        .await;
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_review_companion_private_git_continuity_at_capture_publication_and_stage() {
+    // Each mutation is applied at a fixed phase to a fresh real operation. No
+    // retry or public SHA/account field is used to restore the original witness.
+    for phase in 0..3 {
+        for mutation in 0..8 {
+            with_review_clock(async {
+                let f = Fixture::new().await;
+                let s = f.socket().await;
+                let (parent, receipt, op) = companion_parent(&f, &s).await;
+                let child = companion_child(&f, &parent);
+                let mutate = || match mutation {
+                    0 => {
+                        f.git.git(
+                            &f.git.path,
+                            &["commit", "--allow-empty", "-m", "unrelated HEAD"],
+                        );
+                    }
+                    1 => {
+                        f.stage("unrelated-index.txt");
+                    }
+                    2 => {
+                        f.git
+                            .git(&f.git.path, &["symbolic-ref", "HEAD", "refs/heads/other"]);
+                    }
+                    3 => {
+                        f.git.git(
+                            &f.git.path,
+                            &[
+                                "config",
+                                "remote.forge.pushurl",
+                                "https://gitlab.test/forge/group/other.git",
+                            ],
+                        );
+                    }
+                    4 => {
+                        f.git.git(
+                            &f.git.path,
+                            &["config", "url.https://unused.invalid/.insteadOf", "unused:"],
+                        );
+                    }
+                    5 => {
+                        f.git.git(
+                            &f.git.path,
+                            &[
+                                "config",
+                                "remote.forge.url",
+                                "https://second.invalid/group/project.git",
+                            ],
+                        );
+                    }
+                    6 => {
+                        let relocated = f.git.dir.path().join("relocated.git");
+                        std::fs::rename(f.git.path.join(".git"), &relocated).unwrap();
+                        std::fs::write(
+                            f.git.path.join(".git"),
+                            format!("gitdir: {}\n", relocated.display()),
+                        )
+                        .unwrap();
+                    }
+                    _ => {
+                        let common = f.git.dir.path().join("common.git");
+                        let local = f.git.path.join(".git");
+                        std::fs::rename(&local, &common).unwrap();
+                        std::fs::create_dir(&local).unwrap();
+                        std::fs::write(local.join("commondir"), format!("{}\n", common.display()))
+                            .unwrap();
+                        std::fs::copy(common.join("HEAD"), local.join("HEAD")).unwrap();
+                        std::fs::copy(common.join("index"), local.join("index")).unwrap();
+                    }
+                };
+                if phase == 0 {
+                    mutate();
+                    assert!(
+                        s.request(&f.services, Frame::Prepare(child)).await.is_err(),
+                        "mutation {mutation}"
+                    );
+                } else if phase == 1 {
+                    s.entered(async {
+                        let frame = s
+                            .owner
+                            .capture_review(&Frame::Prepare(child.clone()))
+                            .unwrap();
+                        frame
+                            .scope(Box::pin(async {
+                                let _ = f.services.native_review_prepare(child).await.unwrap();
+                                mutate();
+                                let mut sent = false;
+                                assert!(frame
+                                    .deliver(RepositoryReadReplyKind::Result, &mut || {
+                                        sent = true;
+                                        Ok(())
+                                    })
+                                    .await
+                                    .is_err());
+                                assert!(!sent);
+                            }))
+                            .await;
+                        frame.retire();
+                    })
+                    .await;
+                } else {
+                    let p = s.prepare(&f, child).await;
+                    let next = command(&f, &p, Stage::CreatePr);
+                    mutate();
+                    let answer = s.request(&f.services, Frame::Execute(next.clone())).await;
+                    if let Ok(value) = answer {
+                        assert_eq!(
+                            value["success"], false,
+                            "phase {phase}, mutation {mutation}: {value}"
+                        );
+                    }
+                }
+                assert_eq!(f.server.control.posts.load(Ordering::SeqCst), 0);
+                let history = s
+                    .request(&f.services, Frame::Reconcile(bound(&parent)))
+                    .await
+                    .unwrap();
+                assert_eq!(history["reviewExecution"], receipt["reviewExecution"]);
+                assert_eq!(op.progress.lock().unwrap().effects.len(), 1);
+            })
+            .await;
+        }
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_review_companion_authority_selection_account_and_root_never_rebind() {
+    for mutation in 0..9 {
+        with_review_clock(async {
+            let f = Fixture::new().await;
+            let (s, member) = member(&f).await;
+            let (parent, receipt, op) = companion_parent(&f, &s).await;
+            let child = companion_child(&f, &parent);
+            match mutation {
+                0 => {
+                    let snapshot = f
+                        .services
+                        .store
+                        .repository_selection_snapshot(&f.git.root())
+                        .await
+                        .unwrap();
+                    f.services
+                        .store
+                        .write_repository_selection(
+                            &snapshot,
+                            intent_store::RepositorySelectionChange::Automatic,
+                        )
+                        .await
+                        .result
+                        .unwrap();
+                }
+                1 => {
+                    f.services
+                        .gitlab_connect_pat(f.server.host.clone(), "stored-pat".into())
+                        .await
+                        .unwrap();
+                }
+                2 => {
+                    with_caller(
+                        Caller::Daemon,
+                        f.services.settings_update(json!([
+                            {"path":"sourceControl.gitlab.oauthClientId","value":"changed"}
+                        ])),
+                    )
+                    .await
+                    .unwrap();
+                }
+                3 => {
+                    f.services
+                        .store
+                        .remove_host_member(&member.id)
+                        .await
+                        .unwrap();
+                }
+                4 => {
+                    use intent_store::RepositoryLifecycleObserver;
+                    let pending = f
+                        .services
+                        .repository_lifecycle_registry
+                        .begin_pending_delete(&[RepositoryLifecycleKey::Workspace(
+                            f.git.workspace.id.clone(),
+                        )])
+                        .unwrap();
+                    assert!(s
+                        .request(&f.services, Frame::Prepare(child.clone()))
+                        .await
+                        .is_err());
+                    pending.settle_confirmed();
+                }
+                5 => {
+                    s.receiver.lock().unwrap().take();
+                }
+                7 => {
+                    let mut workspace = f
+                        .services
+                        .store
+                        .get_workspace(&f.git.workspace.id)
+                        .await
+                        .unwrap();
+                    workspace.repository_path = Some(
+                        f.git
+                            .dir
+                            .path()
+                            .join("changed-root")
+                            .to_string_lossy()
+                            .into(),
+                    );
+                    f.services.store.update_workspace(&workspace).await.unwrap();
+                }
+                8 => {
+                    f.services
+                        .store
+                        .delete_workspace(&f.git.workspace.id)
+                        .await
+                        .unwrap();
+                    f.services
+                        .store
+                        .insert_workspace(&f.git.workspace)
+                        .await
+                        .unwrap();
+                }
+                _ => {
+                    let foreign = f.socket().await;
+                    assert!(foreign
+                        .request(&f.services, Frame::Prepare(child.clone()))
+                        .await
+                        .is_err());
+                    let fresh = companion_child(&f, &parent);
+                    s.prepare(&f, fresh).await;
+                }
+            }
+            assert!(s.request(&f.services, Frame::Prepare(child)).await.is_err());
+            assert_eq!(op.progress.lock().unwrap().effects.len(), 1);
+            if mutation == 0 || mutation == 6 {
+                let history = s
+                    .request(&f.services, Frame::Reconcile(bound(&parent)))
+                    .await
+                    .unwrap();
+                assert_eq!(history["reviewExecution"], receipt["reviewExecution"]);
+            }
+            assert_eq!(f.server.control.posts.load(Ordering::SeqCst), 0);
+        })
+        .await;
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_review_companion_pending_parent_cancel_and_owned_resource_release() {
+    for entered in [false, true] {
+        with_review_clock(async {
+            let f = Fixture::new().await;
+            let s = f.socket().await;
+            f.stage("companion-staged.txt");
+            let p = s.prepare(&f, companion_query(&f)).await;
+            let command = command(&f, &p, Stage::Commit);
+            let c = s.concrete(&f).await;
+            let op = c.review.feed.lock().unwrap().records[&command.review.operation_id].clone();
+            let before = f.git.git(&f.git.path, &["rev-parse", "HEAD"]);
+            let transaction = if entered { Some(f.services.store.read_pool().begin_with("BEGIN IMMEDIATE").await.unwrap()) } else { None };
+            let (held, ready) = tokio::sync::oneshot::channel();
+            let (release, released) = tokio::sync::oneshot::channel();
+            let store = f.services.clone(); let path = f.git.path.clone();
+            let lock_holder = if entered { None } else { Some(tokio::spawn(async move {
+                store.worktree_locks.with_lock(&path, || async { held.send(()).unwrap(); let _ = released.await; }).await;
+            })) };
+            if !entered { ready.await.unwrap(); }
+            s.entered(async {
+                let frame = s.owner.capture_review(&Frame::Execute(command.clone())).unwrap();
+                let call = frame.scope(Box::pin(async { let _ = f.services.native_review_execute(command.clone()).await; }));
+                tokio::pin!(call);
+                tokio::select! {
+                    () = &mut call => panic!("original work did not remain owned"),
+                    () = wait_until(|| if entered { !op.progress.lock().unwrap().effects.is_empty()
+                        && f.services.store.write_pool().num_idle() == 0 } else { c.review.workers.available_permits() == WORKERS - 1 }) => {},
+                }
+                assert!(op.progress.lock().unwrap().settled.is_none());
+                assert!(op.companion_witness("missing").is_err());
+                frame.retire();
+                if entered {
+                    assert_eq!(c.review.workers.available_permits(), WORKERS - 1);
+                    assert!(f.services.worktree_locks.try_with_lock(&f.git.path, || async {}).await.is_none());
+                    transaction.unwrap().rollback().await.unwrap();
+                } else { release.send(()).unwrap(); }
+                call.await;
+                wait_until(|| c.review.workers.available_permits() == WORKERS).await;
+            }).await;
+            if let Some(lock_holder) = lock_holder { lock_holder.await.unwrap(); }
+            assert!(s.request(&f.services, Frame::Prepare(companion_child(&f, &command))).await.is_err());
+            let history = s.request(&f.services, Frame::Reconcile(bound(&command))).await.unwrap();
+            assert_eq!(history["reviewExecution"]["gitReceipts"].as_array().unwrap().len(), usize::from(entered));
+            assert_eq!(f.git.git(&f.git.path, &["rev-parse", "HEAD"]) == before, !entered);
+            assert_eq!(f.server.control.posts.load(Ordering::SeqCst), 0);
+        }).await;
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_review_companion_child_acquisition_cancel_retains_original_http_and_capacity() {
+    for entered in [false, true] {
+        with_review_clock(async {
+            let f = Fixture::new().await;
+            let s = f.socket().await;
+            let (parent, _, _) = companion_parent(&f, &s).await;
+            let c = s.concrete(&f).await;
+            let child = companion_child(&f, &parent);
+            let hold = f.services.worktree_locks.clone();
+            let (ready, waiting) = tokio::sync::oneshot::channel();
+            let (release, released) = tokio::sync::oneshot::channel();
+            let path = f.git.path.clone();
+            let lock = if entered { None } else { Some(tokio::spawn(async move {
+                hold.with_lock(&path, || async { ready.send(()).unwrap(); let _ = released.await; }).await;
+            })) };
+            if entered { *f.server.control.pause.lock().unwrap() = Some("/projects/".into()); }
+            else { waiting.await.unwrap(); }
+            s.entered(async {
+                let frame = s.owner.capture_review(&Frame::Prepare(child.clone())).unwrap();
+                let call = frame.scope(Box::pin(async { assert!(f.services.native_review_prepare(child.clone()).await.is_err()); }));
+                tokio::pin!(call);
+                if entered {
+                    tokio::select! { ()=&mut call => panic!("HTTP did not stay held"), ()=f.server.control.entered.notified()=>{} }
+                } else {
+                    tokio::select! { ()=&mut call=>panic!("lock wait did not stay owned"), ()=wait_until(|| c.review.workers.available_permits()==WORKERS-1)=>{} }
+                }
+                // Cancellation from the original parent also cancels the pending
+                // capture. The already entered provider request remains owned.
+                s.request(&f.services, Frame::Release(bound(&parent))).await.unwrap();
+                call.await;
+                if entered {
+                    assert_eq!(c.review.workers.available_permits(), WORKERS-1);
+                    f.server.control.release.notify_one();
+                } else { release.send(()).unwrap(); }
+                wait_until(|| c.review.workers.available_permits()==WORKERS).await;
+                frame.retire();
+            }).await;
+            if let Some(lock) = lock { lock.await.unwrap(); }
+            assert!(s.request(&f.services, Frame::Prepare(child)).await.is_err());
+            assert_eq!(f.server.control.posts.load(Ordering::SeqCst),0);
+        }).await;
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_review_companion_duplicate_capacity_and_unpolled_capture_do_not_renew() {
+    for scenario in 0..6 {
+        with_review_clock(async {
+            let f = Fixture::new().await;
+            let s = f.socket().await;
+            let (parent, _, _) = companion_parent(&f, &s).await;
+            let c = s.concrete(&f).await;
+            let child = companion_child(&f, &parent);
+            let first = s
+                .entered(async {
+                    s.owner
+                        .capture_review(&Frame::Prepare(child.clone()))
+                        .unwrap()
+                })
+                .await;
+            assert!(s
+                .request(&f.services, Frame::Prepare(child.clone()))
+                .await
+                .is_err());
+            assert!(s
+                .request(&f.services, Frame::Prepare(companion_child(&f, &parent)))
+                .await
+                .is_err());
+            let capacity = if scenario == 0 {
+                Some(
+                    c.review
+                        .workers
+                        .clone()
+                        .try_acquire_many_owned(u32::try_from(WORKERS).unwrap())
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            let record_capacity = match scenario {
+                3 => Some(
+                    c.review
+                        .records
+                        .clone()
+                        .try_acquire_many_owned(u32::try_from(RECORDS - 1).unwrap())
+                        .unwrap(),
+                ),
+                4 => Some(
+                    f.services
+                        .repository_review_capacity
+                        .records
+                        .clone()
+                        .try_acquire_many_owned(u32::try_from(GLOBAL_RECORDS - 1).unwrap())
+                        .unwrap(),
+                ),
+                5 => Some(
+                    f.services
+                        .repository_review_capacity
+                        .workers
+                        .clone()
+                        .try_acquire_many_owned(u32::try_from(GLOBAL_WORKERS).unwrap())
+                        .unwrap(),
+                ),
+                _ => None,
+            };
+            if scenario == 1 {
+                tokio::time::advance(FRAME_TTL).await;
+            }
+            if scenario == 2 {
+                first.retire();
+            }
+            s.entered(async {
+                first
+                    .scope(Box::pin(async {
+                        assert!(f
+                            .services
+                            .native_review_prepare(child.clone())
+                            .await
+                            .is_err());
+                    }))
+                    .await;
+            })
+            .await;
+            drop(capacity);
+            drop(record_capacity);
+            first.retire();
+            assert!(s
+                .request(&f.services, Frame::Prepare(companion_child(&f, &parent)))
+                .await
+                .is_err());
+            assert_eq!(f.server.control.posts.load(Ordering::SeqCst), 0);
+        })
+        .await;
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_review_companion_child_admitted_reuse_and_uncertain_post_survive_release() {
+    for reused in [true, false] {
+        with_review_clock(async {
+            let f=Fixture::new().await; let s=member(&f).await.0;
+            let (parent, receipt, _) = companion_parent(&f,&s).await;
+            let p=s.prepare(&f,companion_child(&f,&parent)).await;
+            let child=command(&f,&p,Stage::CreatePr);
+            let c=s.concrete(&f).await;
+            let op=c.review.feed.lock().unwrap().records[&child.review.operation_id].clone();
+            if reused {
+                let sha=f.server.control.sha.lock().unwrap().clone();
+                *f.server.control.reviews.lock().unwrap()=vec![super::credential_tests::review(&sha)];
+                *f.server.control.pause.lock().unwrap()=Some("/merge_requests".into());
+            } else {
+                f.server.control.pause_post.store(true,Ordering::SeqCst);
+                f.server.control.lost_post.store(true,Ordering::SeqCst);
+            }
+            let mut result=None;
+            s.entered(async {
+                let frame=s.owner.capture_review(&Frame::Execute(child.clone())).unwrap();
+                let call=frame.scope(Box::pin(async {
+                    let response=f.services.native_review_execute(child.clone()).await.unwrap();
+                    assert_eq!(response["reviewExecution"]["outcome"]["status"],if reused {"reused"} else {"uncertain"},"{response}");
+                    let mut sent=0;
+                    assert!(frame.deliver(RepositoryReadReplyKind::Result,&mut || {sent+=1;Err(Error::Internal("owned reply failure".into()))}).await.is_err());
+                    assert_eq!(sent,1);
+                    result=Some(response);
+                }));
+                tokio::pin!(call);
+                if reused {tokio::select! {()=&mut call=>panic!("expected admitted held GET"),()=f.server.control.entered.notified()=>{}}}
+                else {tokio::select! {()=&mut call=>panic!("expected admitted held POST"),()=f.server.control.post_entered.notified()=>{}}}
+                assert!(op.progress.lock().unwrap().settled.is_none());
+                s.request(&f.services,Frame::Release(bound(&parent))).await.unwrap();
+                assert!(op.write_current().is_err());
+                assert_eq!(c.review.workers.available_permits(),WORKERS-1);
+                assert!(f.services.worktree_locks.try_with_lock(&f.git.path,||async{}).await.is_none());
+                if reused { f.server.control.release.notify_one(); } else { f.server.control.post_release.notify_one(); }
+                call.await; frame.retire();
+            }).await;
+            wait_until(|| c.review.workers.available_permits()==WORKERS).await;
+            let history=s.request(&f.services,Frame::Reconcile(bound(&child))).await.unwrap();
+            assert_eq!(history["reviewExecution"],result.unwrap()["reviewExecution"]);
+            assert_eq!(history["reviewExecution"]["gitReceipts"],json!([]));
+            assert_eq!(f.server.control.posts.load(Ordering::SeqCst),usize::from(!reused));
+            let requests=f.server.control.requests.lock().unwrap().clone();
+            s.request(&f.services,Frame::Execute(child)).await.unwrap();
+            assert_eq!(*f.server.control.requests.lock().unwrap(),requests);
+            let parent_history=s.request(&f.services,Frame::Reconcile(bound(&parent))).await.unwrap();
+            assert_eq!(parent_history["reviewExecution"],receipt["reviewExecution"]);
+        }).await;
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_review_companion_actual_primitive_without_valid_success_witness_refuses() {
+    for panic_after_primitive in [true, false] {
+        with_review_clock(async {
+            let f = Fixture::new().await;
+            let s = f.socket().await;
+            f.stage("companion-staged.txt");
+            let p = s.prepare(&f, companion_query(&f)).await;
+            let command = command(&f, &p, Stage::Commit);
+            let c = s.concrete(&f).await;
+            let op = c.review.feed.lock().unwrap().records[&command.review.operation_id].clone();
+            s.entered(async {
+                let frame = s
+                    .owner
+                    .capture_review(&Frame::Execute(command.clone()))
+                    .unwrap();
+                let capacity = job(&c).unwrap();
+                op.progress.lock().unwrap().started = true;
+                let owned = op.clone();
+                let connection = c.clone();
+                let task = tokio::spawn(with_caller(
+                    c.caller.caller().clone(),
+                    with_wire_credential(c.caller.wire_credential().cloned(), async move {
+                        let mut finish = CompanionCompletion {
+                            operation: owned.clone(),
+                            capacity: Some(capacity),
+                            normal: false,
+                        };
+                        let (life, _registration) = connection.new_lifetime().unwrap();
+                        let flag = AtomicBool::new(false);
+                        let result = with_repository_lifecycle_source_observed(
+                            &connection.services,
+                            original(&connection).unwrap(),
+                            owned.id.clone(),
+                            vec![Stage::Commit],
+                            source_input(&owned),
+                            (life, &flag),
+                            |admission| async move {
+                                owned.progress.lock().unwrap().engine = Some(admission.clone());
+                                let checked =
+                                    engine::revalidate_repository_stage(&admission, Stage::Commit)
+                                        .await?;
+                                let stamp =
+                                    engine::begin_native_repository_stage(checked, |claim| {
+                                        owned.metadata.with_metadata(claim)
+                                    })?;
+                                let sink = owned.clone();
+                                let joined = tokio::task::spawn_blocking(move || {
+                                    let outcome = intent_git::commit::commit_observed(
+                                        sink.metadata.root.path(),
+                                        "actual primitive",
+                                        |sha| {
+                                            sink.primitive(GitReceipt::Commit {
+                                                commit_hash: sha.into(),
+                                            });
+                                            assert!(
+                                                !panic_after_primitive,
+                                                "deliberate original observer panic"
+                                            );
+                                        },
+                                    );
+                                    if let Ok(outcome) = outcome {
+                                        // Test-owned filesystem failure AFTER the real helper
+                                        // succeeded: the private post-read cannot certify it.
+                                        let config = sink.metadata.root.path().join(".git/config");
+                                        let original = std::fs::read(&config).unwrap();
+                                        std::fs::write(&config, "[malformed").unwrap();
+                                        let after = fingerprint(sink.metadata.root.path()).ok();
+                                        assert!(after.is_none());
+                                        assert!(commit_witness(
+                                            &sink,
+                                            &outcome.hash,
+                                            after.as_deref()
+                                        )
+                                        .is_err());
+                                        std::fs::write(&config, original).unwrap();
+                                        let execution = engine::classify_repository_completion(
+                                            stamp,
+                                            RepositoryCompletion::Committed {
+                                                hash: outcome.hash,
+                                                staging_after: after,
+                                            },
+                                        )
+                                        .unwrap();
+                                        sink.retain(execution);
+                                    }
+                                })
+                                .await;
+                                assert_eq!(joined.is_err(), panic_after_primitive);
+                                if panic_after_primitive {
+                                    Err(AdmissionError::Unavailable)
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                        )
+                        .await;
+                        assert!(flag.load(Ordering::Acquire));
+                        finish.normal = result.is_ok();
+                    }),
+                ));
+                task.await.unwrap();
+                // A successful history transfer cannot manufacture the missing
+                // helper/post-state witness or repair an uncertain primitive.
+                frame
+                    .scope(Box::pin(async {
+                        frame
+                            .deliver(RepositoryReadReplyKind::Result, &mut || Ok(()))
+                            .await
+                            .unwrap();
+                    }))
+                    .await;
+                frame.retire();
+            })
+            .await;
+            let head = f.git.git(&f.git.path, &["rev-parse", "HEAD"]);
+            let history = s
+                .request(&f.services, Frame::Reconcile(bound(&command)))
+                .await
+                .unwrap();
+            assert_eq!(
+                history["reviewExecution"]["gitReceipts"],
+                json!([{"stage":"commit","commitHash":head.trim()}])
+            );
+            assert_eq!(
+                history["reviewExecution"]["outcome"]["status"],
+                if panic_after_primitive {
+                    "uncertain"
+                } else {
+                    "not-attempted"
+                }
+            );
+            assert!(s
+                .request(&f.services, Frame::Prepare(companion_child(&f, &command)))
+                .await
+                .is_err());
+            assert_eq!(c.review.workers.available_permits(), WORKERS);
+            assert_eq!(f.server.control.posts.load(Ordering::SeqCst), 0);
+        })
+        .await;
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_review_companion_unmarked_commit_and_direct_service_are_not_predecessors() {
+    with_review_clock(async {
+        let f = Fixture::new().await;
+        let s = f.socket().await;
+        f.stage("ordinary.txt");
+        let p = s.prepare(&f, f.query(Stage::Commit)).await;
+        let command = command(&f, &p, Stage::Commit);
+        let reply = s
+            .request(&f.services, Frame::Execute(command.clone()))
+            .await
+            .unwrap();
+        assert_eq!(reply["success"], true);
+        let q = companion_child(&f, &command);
+        assert!(s
+            .request(&f.services, Frame::Prepare(q.clone()))
+            .await
+            .is_err());
+        assert!(f.services.native_review_prepare(q.clone()).await.is_err());
+        assert!(
+            with_caller(Caller::Daemon, f.services.native_review_prepare(q))
+                .await
+                .is_err()
+        );
+        assert_eq!(f.server.control.posts.load(Ordering::SeqCst), 0);
+    })
+    .await;
+}
+
+async fn companion_advance_and_join_monitor(op: &Operation, duration: Duration, observers: usize) {
+    let baseline = Arc::strong_count(&op.metadata);
+    let (entered, waiting) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let facts = op.metadata.provider.clone();
+    let holder =
+        std::thread::spawn(move || facts.hold_native_review_metadata_for_test(entered, released));
+    waiting.await.unwrap();
+    tokio::time::advance(duration).await;
+    wait_until(|| Arc::strong_count(&op.metadata) >= baseline + observers).await;
+    release.send(()).unwrap();
+    holder.join().unwrap();
+    wait_until(|| Arc::strong_count(&op.metadata) == baseline).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_review_companion_published_lease_is_fresh_without_renewing_parent_intent() {
+    with_review_clock(async {
+        let f = Fixture::new().await;
+        let s = f.socket().await;
+        let (parent, _, op) = companion_parent(&f, &s).await;
+        let witness = op
+            .companion
+            .as_ref()
+            .unwrap()
+            .state
+            .lock()
+            .unwrap()
+            .witness
+            .clone()
+            .unwrap();
+        assert_eq!(
+            witness.observed.config_fingerprint,
+            op.observed.config_fingerprint
+        );
+        assert_ne!(
+            witness.observed.change_inputs.fingerprint,
+            op.observed.change_inputs.fingerprint
+        );
+        companion_advance_and_join_monitor(&op, Duration::from_secs(60), 1).await;
+        let p = s.prepare(&f, companion_child(&f, &parent)).await;
+        let child = command(&f, &p, Stage::CreatePr);
+        let c = s.concrete(&f).await;
+        let fresh = c.review.feed.lock().unwrap().records[&child.review.operation_id].clone();
+        wait_until(|| c.review.workers.available_permits() == WORKERS).await;
+        assert_eq!(fresh.lease_start(), Instant::now());
+        companion_advance_and_join_monitor(&op, Duration::from_secs(240), 2).await;
+        assert!(Instant::now() >= op.created + LEASE_TTL);
+        assert!(fresh.write_current().is_ok());
+        assert!(s
+            .request(&f.services, Frame::Prepare(companion_child(&f, &parent)))
+            .await
+            .is_err());
+        let reply = s.request(&f.services, Frame::Execute(child)).await.unwrap();
+        assert_eq!(reply["success"], true, "{reply}");
+        assert_eq!(reply["reviewExecution"]["gitReceipts"], json!([]));
+        assert_eq!(f.server.control.posts.load(Ordering::SeqCst), 1);
+    })
+    .await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_review_companion_concurrent_original_frames_claim_only_one_child() {
+    with_review_clock(async {
+        let f = Fixture::new().await;
+        let s = f.socket().await;
+        let (parent, _, _) = companion_parent(&f, &s).await;
+        let c = s.concrete(&f).await;
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let original = c.clone();
+            let gate = barrier.clone();
+            let q = companion_child(&f, &parent);
+            let runtime = tokio::runtime::Handle::current();
+            threads.push(std::thread::spawn(move || {
+                runtime.block_on(with_caller(
+                    original.caller.caller().clone(),
+                    with_wire_credential(original.caller.wire_credential().cloned(), async {
+                        gate.wait();
+                        let scope = capture_frame(&original, Frame::Prepare(q.clone()));
+                        (scope, q)
+                    }),
+                ))
+            }));
+        }
+        let mut successes = 0;
+        for thread in threads {
+            let (scope, q) = thread.join().unwrap();
+            s.entered(async {
+                scope
+                    .scope(Box::pin(async {
+                        if f.services.native_review_prepare(q).await.is_ok() {
+                            scope
+                                .deliver(RepositoryReadReplyKind::Result, &mut || Ok(()))
+                                .await
+                                .unwrap();
+                            successes += 1;
+                        }
+                    }))
+                    .await;
+            })
+            .await;
+            scope.retire();
+        }
+        assert_eq!(successes, 1);
+        assert_eq!(f.server.control.posts.load(Ordering::SeqCst), 0);
+        assert_eq!(c.review.records.available_permits(), RECORDS - 2);
+    })
+    .await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_review_companion_pending_capture_expires_at_parent_deadline_and_joins() {
+    with_review_clock(async {
+        let f=Fixture::new().await;let s=f.socket().await;
+        let (parent,receipt,op)=companion_parent(&f,&s).await;
+        eprintln!("expiry control: parent complete");
+        companion_advance_and_join_monitor(&op,Duration::from_secs(299),1).await;
+        eprintln!("expiry control: original monitor joined");
+        let c=s.concrete(&f).await;let q=companion_child(&f,&parent);
+        *f.server.control.pause.lock().unwrap()=Some("/projects/".into());
+        s.entered(async {
+            let frame=s.owner.capture_review(&Frame::Prepare(q.clone())).unwrap();
+            let call=frame.scope(Box::pin(async { assert!(f.services.native_review_prepare(q.clone()).await.is_err()); }));
+            tokio::pin!(call);
+            tokio::select! { ()=&mut call=>panic!("expected original held read"), ()=f.server.control.entered.notified()=>{} }
+            eprintln!("expiry control: original provider read held");
+            // Cross the absolute timer's millisecond wake granularity;
+            // synchronous capture/publication still rejects at the exact bound.
+            tokio::time::advance(Duration::from_millis(1001)).await;
+            eprintln!("expiry control: parent deadline elapsed");
+            call.await;
+            eprintln!("expiry control: caller refused");
+            assert_eq!(c.review.workers.available_permits(),WORKERS-1);
+            assert_eq!(c.review.records.available_permits(),RECORDS-2);
+            f.server.control.release.notify_one();
+            wait_until(|| c.review.workers.available_permits()==WORKERS).await;
+            assert_eq!(c.review.records.available_permits(),RECORDS-1);
+            eprintln!("expiry control: actual worker joined");
+            frame.retire();
+        }).await;
+        assert!(s.request(&f.services,Frame::Prepare(q)).await.is_err());
+        // The original operation remains a separate known historical effect.
+        assert_eq!(op.state(true).unwrap()["reviewExecution"],receipt["reviewExecution"]);
+        assert_eq!(f.server.control.posts.load(Ordering::SeqCst),0);
+    }).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_review_companion_intended_target_is_validated_before_plain_commit() {
+    with_review_clock(async {
+        let f = Fixture::new().await;
+        let s = f.socket().await;
+        f.stage("companion-staged.txt");
+        let head = f.git.git(&f.git.path, &["rev-parse", "HEAD"]);
+        for target in ["main", "invalid..ref", "missing"] {
+            let mut query = companion_query(&f);
+            query.review.target_branch = Some(target.into());
+            assert!(s.request(&f.services, Frame::Prepare(query)).await.is_err());
+        }
+        *f.server.control.project.lock().unwrap() =
+            Some((200, json!({"id":0,"path_with_namespace":"group/project"})));
+        assert!(s
+            .request(&f.services, Frame::Prepare(companion_query(&f)))
+            .await
+            .is_err());
+        assert_eq!(f.git.git(&f.git.path, &["rev-parse", "HEAD"]), head);
+        assert_eq!(f.server.control.posts.load(Ordering::SeqCst), 0);
+    })
+    .await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_review_companion_original_pretransfer_refusal_permanently_closes_eligibility() {
+    with_review_clock(async {
+        let f = Fixture::new().await;
+        let s = f.socket().await;
+        f.stage("companion-staged.txt");
+        let prepared = s.prepare(&f, companion_query(&f)).await;
+        let command = command(&f, &prepared, Stage::Commit);
+        let c = s.concrete(&f).await;
+        let op = c.review.feed.lock().unwrap().records[&command.review.operation_id].clone();
+        s.entered(async {
+            let frame = s
+                .owner
+                .capture_review(&Frame::Execute(command.clone()))
+                .unwrap();
+            frame
+                .scope(Box::pin(async {
+                    let reply = f
+                        .services
+                        .native_review_execute(command.clone())
+                        .await
+                        .unwrap();
+                    assert_eq!(reply["success"], true, "{reply}");
+                    let (entered, waiting) = tokio::sync::oneshot::channel();
+                    let (release, released) = std::sync::mpsc::channel();
+                    let facts = op.metadata.provider.clone();
+                    let holder = std::thread::spawn(move || {
+                        facts.hold_native_review_metadata_for_test(entered, released);
+                    });
+                    waiting.await.unwrap();
+                    let mut packets = 0;
+                    assert!(frame
+                        .deliver(RepositoryReadReplyKind::Result, &mut || {
+                            packets += 1;
+                            Ok(())
+                        })
+                        .await
+                        .is_err());
+                    assert_eq!(packets, 0);
+                    release.send(()).unwrap();
+                    holder.join().unwrap();
+                    // Removing real pre-transfer contention must not make this
+                    // failed original delivery eligible on a second call.
+                    assert!(frame
+                        .deliver(RepositoryReadReplyKind::Result, &mut || {
+                            packets += 1;
+                            Ok(())
+                        })
+                        .await
+                        .is_err());
+                    assert_eq!(packets, 0);
+                }))
+                .await;
+            frame.retire();
+        })
+        .await;
+        assert!(s
+            .request(&f.services, Frame::Prepare(companion_child(&f, &command)))
+            .await
+            .is_err());
+        let history = s
+            .request(&f.services, Frame::Reconcile(bound(&command)))
+            .await
+            .unwrap();
+        assert_eq!(
+            history["reviewExecution"]["gitReceipts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(f.server.control.posts.load(Ordering::SeqCst), 0);
+    })
+    .await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_review_companion_failed_attribution_keeps_commit_without_child_grant() {
+    with_review_clock(async {
+        let f = Fixture::new().await;
+        let s = f.socket().await;
+        f.stage("companion-staged.txt");
+        f.services.store.upsert_tracked_change(&intent_store::NewTrackedChange {
+            workspace_id: f.git.workspace.id.clone(), path: "companion-staged.txt".into(),
+            stage: "staged".into(), status: "modified".into(), agent_id: None,
+            session_id: None, turn: None, commit_hash: None, old_blob_sha: None,
+            new_blob_sha: None, additions: 1, deletions: 0,
+        }).await.unwrap();
+        sqlx::query("CREATE TRIGGER companion_attribution_refusal BEFORE UPDATE OF stage ON tracked_changes BEGIN SELECT RAISE(ABORT, 'owned attribution refusal'); END")
+            .execute(f.services.store.write_pool()).await.unwrap();
+        let before = f.git.git(&f.git.path, &["rev-parse", "HEAD"]);
+        let prepared = s.prepare(&f, companion_query(&f)).await;
+        let command = command(&f, &prepared, Stage::Commit);
+        let receipt = s.request(&f.services, Frame::Execute(command.clone())).await.unwrap();
+        let head = f.git.git(&f.git.path, &["rev-parse", "HEAD"]);
+        assert_ne!(before, head);
+        assert_eq!(receipt["reviewExecution"]["gitReceipts"], json!([{"stage":"commit","commitHash":head.trim()}]));
+        let rows = f.services.store.list_tracked_changes(&f.git.workspace.id).await.unwrap();
+        assert_eq!(rows.len(), 1); assert_eq!(rows[0].stage, "staged");
+        assert!(s.request(&f.services, Frame::Prepare(companion_child(&f, &command))).await.is_err());
+        let history = s.request(&f.services, Frame::Reconcile(bound(&command))).await.unwrap();
+        assert_eq!(history["reviewExecution"], receipt["reviewExecution"]);
+        assert_eq!(s.concrete(&f).await.review.workers.available_permits(), WORKERS);
+        assert_eq!(f.server.control.posts.load(Ordering::SeqCst), 0);
+    }).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_review_companion_overlapping_original_delivery_attempts_never_reopen() {
+    for first_polled in [false, true] {
+        with_review_clock(async {
+            let f = Fixture::new().await;
+            let s = f.socket().await;
+            f.stage("companion-staged.txt");
+            let p = s.prepare(&f, companion_query(&f)).await;
+            let command = command(&f, &p, Stage::Commit);
+            let c = s.concrete(&f).await;
+            let op = c.review.feed.lock().unwrap().records[&command.review.operation_id].clone();
+            s.entered(async {
+                let frame = s
+                    .owner
+                    .capture_review(&Frame::Execute(command.clone()))
+                    .unwrap();
+                frame
+                    .scope(Box::pin(async {
+                        let result = f
+                            .services
+                            .native_review_execute(command.clone())
+                            .await
+                            .unwrap();
+                        assert_eq!(result["success"], true);
+                        let (entered, waiting) = tokio::sync::oneshot::channel();
+                        let (release, released) = std::sync::mpsc::channel();
+                        let facts = op.metadata.provider.clone();
+                        let holder = std::thread::spawn(move || {
+                            facts.hold_native_review_metadata_for_test(entered, released);
+                        });
+                        waiting.await.unwrap();
+                        let packets = std::sync::atomic::AtomicUsize::new(0);
+                        let mut one = || {
+                            packets.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        };
+                        let mut two = || {
+                            packets.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        };
+                        // Two original delivery futures coexist. The sole attempt
+                        // must be reserved before either future can await guards.
+                        let first = frame.deliver(RepositoryReadReplyKind::Result, &mut one);
+                        let second = frame.deliver(RepositoryReadReplyKind::Result, &mut two);
+                        if first_polled {
+                            assert!(first.await.is_err());
+                            release.send(()).unwrap();
+                            holder.join().unwrap();
+                            assert!(second.await.is_err());
+                        } else {
+                            // The second future cannot overtake the already
+                            // reserved original attempt when metadata recovers.
+                            release.send(()).unwrap();
+                            holder.join().unwrap();
+                            assert!(second.await.is_err());
+                            assert!(first.await.is_err());
+                        }
+                        assert_eq!(packets.load(Ordering::SeqCst), 0);
+                    }))
+                    .await;
+                frame.retire();
+            })
+            .await;
+            assert!(s
+                .request(&f.services, Frame::Prepare(companion_child(&f, &command)))
+                .await
+                .is_err());
+            let history = s
+                .request(&f.services, Frame::Reconcile(bound(&command)))
+                .await
+                .unwrap();
+            assert_eq!(
+                history["reviewExecution"]["gitReceipts"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(f.server.control.posts.load(Ordering::SeqCst), 0);
+        })
+        .await;
+    }
+}

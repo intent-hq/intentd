@@ -317,6 +317,25 @@ struct Progress {
     effects: Vec<GitReceipt>,
     review_effect: Option<Outcome>,
 }
+// This private intent is independent of historical disclosure and ordinary write
+// retirement. Its original lifecycle still cancels pending/published children.
+struct Companion {
+    lifetime: RepositorySourceLifetime,
+    state: Mutex<CompanionState>,
+}
+#[derive(Default)]
+struct CompanionState {
+    witness: Option<CommitWitness>,
+    normal: bool,
+    delivered: bool,
+    closed: bool,
+    capture: Option<String>,
+}
+#[derive(Clone)]
+struct CommitWitness {
+    observed: RepositoryObservedRoot,
+    staging: String,
+}
 struct Operation {
     id: String,
     query: Prepare,
@@ -336,9 +355,24 @@ struct Operation {
     observations: AtomicUsize,
     progress: Mutex<Progress>,
     changed: Notify,
+    companion: Option<Companion>,
+    companion_publication: Option<std::sync::OnceLock<Instant>>,
 }
 impl Operation {
     fn retire(&self) {
+        if let Some(companion) = &self.companion {
+            // Retirement precedes the state lock: capture/delivery always enter
+            // this lifetime before taking that lock, never in the reverse order.
+            companion.lifetime.retirement().end_scope();
+            companion
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .closed = true;
+        }
+        self.retire_write();
+    }
+    fn retire_write(&self) {
         self.write.retirement().end_scope();
         if !self.noticed.swap(true, Ordering::AcqRel) {
             if let Some(c) = self.metadata.connection.upgrade() {
@@ -347,8 +381,14 @@ impl Operation {
         }
         self.changed.notify_waiters();
     }
+    fn lease_start(&self) -> Instant {
+        self.companion_publication
+            .as_ref()
+            .and_then(|p| p.get().copied())
+            .unwrap_or(self.created)
+    }
     fn write_current(&self) -> Result<()> {
-        if Instant::now() >= self.created + LEASE_TTL {
+        if Instant::now() >= self.lease_start() + LEASE_TTL {
             return Err(unavailable());
         }
         self.write.retirement().check_current().map_err(denied)
@@ -361,7 +401,9 @@ impl Operation {
         let p = self.progress.lock().map_err(denied)?;
         if p.settled
             .is_some_and(|at| Instant::now() >= at + RECEIPT_TTL)
-            || (!p.started && p.settled.is_none() && Instant::now() >= self.created + LEASE_TTL)
+            || (!p.started
+                && p.settled.is_none()
+                && Instant::now() >= self.lease_start() + LEASE_TTL)
         {
             return Err(unavailable());
         }
@@ -404,6 +446,32 @@ impl Operation {
         self.changed.notify_waiters();
     }
     fn complete(&self) {
+        self.complete_owned(false);
+    }
+    fn complete_owned(&self, normal: bool) {
+        let mut companion_normal = false;
+        if normal && self.write_current().is_ok() {
+            if let Some(companion) = &self.companion {
+                let _ = companion.lifetime.retirement().native_dispatch(|| {
+                    let mut state = companion.state.lock().map_err(local)?;
+                    let p = self.progress.lock().map_err(local)?;
+                    let successful = p
+                        .engine
+                        .as_ref()
+                        .and_then(|e| e.execution().ok())
+                        .is_some_and(|e| {
+                            matches!(e.outcome, Outcome::NotAttempted)
+                                && e.git_receipts.len() == 1
+                                && matches!(e.git_receipts[0], GitReceipt::Commit { .. })
+                        });
+                    if !state.closed && state.witness.is_some() && successful {
+                        state.normal = true;
+                        companion_normal = true;
+                    }
+                    Ok(())
+                });
+            }
+        }
         {
             let mut p = self
                 .progress
@@ -425,8 +493,57 @@ impl Operation {
                 p.settled = Some(Instant::now());
             }
         }
-        self.retire();
+        if companion_normal {
+            self.retire_write();
+        } else {
+            self.retire();
+        }
         self.changed.notify_waiters();
+    }
+    fn companion_normal(&self) -> bool {
+        self.companion
+            .as_ref()
+            .is_some_and(|c| c.state.lock().is_ok_and(|s| s.normal && !s.closed))
+    }
+    fn claim_companion(&self, capture: &str) -> Result<()> {
+        let companion = self.companion.as_ref().ok_or_else(unavailable)?;
+        companion
+            .lifetime
+            .retirement()
+            .native_dispatch(|| {
+                let mut state = companion.state.lock().map_err(local)?;
+                if Instant::now() >= self.created + LEASE_TTL
+                    || state.closed
+                    || !state.normal
+                    || !state.delivered
+                    || state.witness.is_none()
+                    || state.capture.is_some()
+                {
+                    return Err(AdmissionError::Retired);
+                }
+                state.capture = Some(capture.to_owned());
+                Ok(())
+            })
+            .map_err(denied)
+    }
+    fn companion_witness(&self, capture: &str) -> Result<CommitWitness> {
+        let companion = self.companion.as_ref().ok_or_else(unavailable)?;
+        companion
+            .lifetime
+            .retirement()
+            .native_dispatch(|| {
+                let state = companion.state.lock().map_err(local)?;
+                if Instant::now() >= self.created + LEASE_TTL
+                    || state.closed
+                    || !state.normal
+                    || !state.delivered
+                    || state.capture.as_deref() != Some(capture)
+                {
+                    return Err(AdmissionError::Retired);
+                }
+                state.witness.clone().ok_or(AdmissionError::Retired)
+            })
+            .map_err(denied)
     }
     fn empty_execution(&self, outcome: Outcome) -> Execution {
         Execution {
@@ -502,6 +619,9 @@ struct Request {
     entry_error: Option<bool>,
     created: Instant,
     admin_projection: AtomicBool,
+    predecessor: Option<Arc<Operation>>,
+    companion_delivered: AtomicBool,
+    companion_reply: bool,
 }
 impl Request {
     fn check(&self) -> Result<()> {
@@ -556,7 +676,11 @@ impl Request {
         }
         if let Ok(o) = self.operation() {
             if self.initiator {
-                o.retire();
+                if self.companion_delivered.load(Ordering::Acquire) {
+                    o.retire_write();
+                } else {
+                    o.retire();
+                }
                 let start = o
                     .progress
                     .lock()
@@ -613,11 +737,15 @@ pub(super) fn capture_frame(c: &Connection, frame: Frame) -> Arc<dyn RepositoryR
     };
     let mut target = None;
     let mut initiator = false;
+    let mut predecessor = None;
     let mut error = lifetime.is_none().then_some(false);
     let id = match &frame {
         Frame::Execute(q) => Some(&q.review.operation_id),
         Frame::Reconcile(q) | Frame::Release(q) => Some(&q.operation_id),
-        Frame::Prepare(_) => None,
+        Frame::Prepare(q) => match &q.review.choice {
+            Choice::AfterCommit { operation_id, .. } => Some(operation_id),
+            _ => None,
+        },
     };
     if error.is_none() {
         if let Some(id) = id {
@@ -649,6 +777,19 @@ pub(super) fn capture_frame(c: &Connection, frame: Frame) -> Arc<dyn RepositoryR
                             p.command = Some(q.clone());
                             initiator = true;
                         }
+                    } else if let Frame::Prepare(q) = &frame {
+                        let Choice::AfterCommit { capture_id, .. } = &q.review.choice else {
+                            return Err(invalid());
+                        };
+                        op.budget()?;
+                        op.claim_companion(capture_id)?;
+                        op.companion
+                            .as_ref()
+                            .ok_or_else(unavailable)?
+                            .lifetime
+                            .retirement()
+                            .native_link(&lifetime.as_ref().ok_or_else(unavailable)?.retirement())
+                            .map_err(denied)?;
                     } else if matches!(frame, Frame::Reconcile(_)) {
                         op.budget()?;
                     }
@@ -657,20 +798,31 @@ pub(super) fn capture_frame(c: &Connection, frame: Frame) -> Arc<dyn RepositoryR
                 if let Err(e) = claim {
                     error = Some(matches!(e, Error::InvalidParams(_)));
                 }
-                target = Some(op);
+                if matches!(frame, Frame::Prepare(_)) {
+                    predecessor = Some(op);
+                } else {
+                    target = Some(op);
+                }
             } else if !matches!(frame, Frame::Release(_)) {
                 error = Some(false);
             }
         }
     }
-    let provider = matches!(frame, Frame::Prepare(_))
-        .then(|| {
-            c.services
-                .gitlab_repository_connection_facts()
-                .ok()
-                .map(Arc::new)
-        })
-        .flatten();
+    let provider = predecessor
+        .as_ref()
+        .map(|p| p.metadata.provider.clone())
+        .or_else(|| {
+            matches!(frame, Frame::Prepare(_))
+                .then(|| {
+                    c.services
+                        .gitlab_repository_connection_facts()
+                        .ok()
+                        .map(Arc::new)
+                })
+                .flatten()
+        });
+    let companion_reply = predecessor.is_some()
+        || (initiator && target.as_ref().is_some_and(|op| op.companion.is_some()));
     let r = Arc::new_cyclic(|weak| Request {
         connection: c.weak.upgrade().expect("owned original connection"),
         weak: weak.clone(),
@@ -687,12 +839,26 @@ pub(super) fn capture_frame(c: &Connection, frame: Frame) -> Arc<dyn RepositoryR
         entry_error: error,
         created: Instant::now(),
         admin_projection: AtomicBool::new(false),
+        predecessor,
+        companion_delivered: AtomicBool::new(false),
+        companion_reply,
     });
     if let Some(life) = &r.lifetime {
         let retirement = life.retirement();
         let weak = Arc::downgrade(&r);
+        let deadline = r
+            .predecessor
+            .as_ref()
+            .map(|parent| (r.created + FRAME_TTL).min(parent.created + LEASE_TTL));
         tokio::spawn(async move {
-            tokio::select! {()=retirement.native_cancelled()=>{},()=tokio::time::sleep(FRAME_TTL)=>{}}
+            let timeout = async {
+                if let Some(deadline) = deadline {
+                    tokio::time::sleep_until(deadline).await;
+                } else {
+                    tokio::time::sleep(FRAME_TTL).await;
+                }
+            };
+            tokio::select! {()=retirement.native_cancelled()=>{},()=timeout=>{}}
             if let Some(r) = weak.upgrade() {
                 if !r.started() {
                     r.finish();
@@ -758,65 +924,164 @@ impl RepositoryReadRequestScope for Request {
         transfer: &'a mut (dyn FnMut() -> Result<()> + Send),
     ) -> BoxFuture<'a, Result<()>> {
         let entered = self.check();
+        // Reserve the opt-in original attempt before its future can await or be
+        // overtaken. A second attempt cannot publish through guard unwinding.
+        let claimed = !self.companion_reply || !self.consumed.swap(true, Ordering::AcqRel);
         Box::pin(async move {
-            if self.public.load(Ordering::Acquire) || self.entry_error.is_some() {
-                if self.consumed.swap(true, Ordering::AcqRel) {
+            let result = async {
+                if !claimed {
                     return Err(unavailable());
                 }
-                return transfer();
-            }
-            entered?;
-            let r = self.weak.upgrade().ok_or_else(unavailable)?;
-            checked(&r, async {
-                let op = self.operation()?;
-                let _legacy = self
-                    .connection
-                    .caller
-                    .legacy_lease()
-                    .await
-                    .map_err(denied)?;
-                op.disclosure_current()?;
-                op.metadata.validate(false).await?;
-                if self.admin_projection.load(Ordering::Acquire) {
-                    Services::require_administrator("sourceControl.authStatus").map_err(denied)?;
+                if self.public.load(Ordering::Acquire) || self.entry_error.is_some() {
+                    if !self.companion_reply && self.consumed.swap(true, Ordering::AcqRel) {
+                        return Err(unavailable());
+                    }
+                    return transfer();
                 }
-                let _locked = if matches!(self.frame, Frame::Prepare(_)) {
-                    op.write_current()?;
-                    op.metadata.validate(true).await?;
-                    Some(final_prepare_lock(self.connection.clone(), op.clone()).await?)
-                } else {
-                    None
-                };
-                self.check()?;
-                self.connection
-                    .parent
-                    .native_dispatch(|| {
-                        self.lifetime
-                            .as_ref()
-                            .ok_or(AdmissionError::Retired)?
-                            .retirement()
-                            .native_dispatch(|| {
-                                op.disclosure.retirement().native_dispatch(|| {
-                                    let action = || {
-                                        if self.completed.load(Ordering::Acquire)
-                                            || self.consumed.swap(true, Ordering::AcqRel)
-                                        {
-                                            return Err(AdmissionError::Retired);
-                                        }
-                                        let result = transfer().map_err(local);
-                                        if result.is_ok() && matches!(self.frame, Frame::Prepare(_))
-                                        {
-                                            op.published.store(true, Ordering::Release);
-                                        }
-                                        result
-                                    };
-                                    op.metadata.with_metadata(action)
+                entered?;
+                let r = self.weak.upgrade().ok_or_else(unavailable)?;
+                checked(&r, async {
+                    let op = self.operation()?;
+                    let _legacy = self
+                        .connection
+                        .caller
+                        .legacy_lease()
+                        .await
+                        .map_err(denied)?;
+                    op.disclosure_current()?;
+                    op.metadata.validate(false).await?;
+                    if self.admin_projection.load(Ordering::Acquire) {
+                        Services::require_administrator("sourceControl.authStatus")
+                            .map_err(denied)?;
+                    }
+                    let _locked = if matches!(self.frame, Frame::Prepare(_)) {
+                        op.write_current()?;
+                        op.metadata.validate(true).await?;
+                        Some(final_prepare_lock(self.connection.clone(), op.clone()).await?)
+                    } else {
+                        None
+                    };
+                    self.check()?;
+                    self.connection
+                        .parent
+                        .native_dispatch(|| {
+                            self.lifetime
+                                .as_ref()
+                                .ok_or(AdmissionError::Retired)?
+                                .retirement()
+                                .native_dispatch(|| {
+                                    op.disclosure.retirement().native_dispatch(|| {
+                                        let action = || {
+                                            if self.completed.load(Ordering::Acquire)
+                                                || (!self.companion_reply
+                                                    && self.consumed.swap(true, Ordering::AcqRel))
+                                            {
+                                                return Err(AdmissionError::Retired);
+                                            }
+                                            let mut transfer = || transfer().map_err(local);
+                                            let result = if matches!(self.frame, Frame::Execute(_))
+                                                && self.initiator
+                                                && op.companion.is_some()
+                                            {
+                                                self.deliver_companion(&op, &mut transfer)
+                                            } else if matches!(self.frame, Frame::Prepare(_))
+                                                && self.predecessor.is_some()
+                                            {
+                                                self.publish_companion(&mut transfer)
+                                            } else {
+                                                transfer()
+                                            };
+                                            if result.is_ok()
+                                                && matches!(self.frame, Frame::Prepare(_))
+                                            {
+                                                if let Some(published) = &op.companion_publication {
+                                                    let _ = published.set(Instant::now());
+                                                }
+                                                op.published.store(true, Ordering::Release);
+                                            }
+                                            result
+                                        };
+                                        op.metadata.with_metadata(action)
+                                    })
                                 })
-                            })
-                    })
-                    .map_err(denied)
-            })
-            .await
+                        })
+                        .map_err(denied)
+                })
+                .await
+            }
+            .await;
+            if result.is_err() && self.companion_reply {
+                // The once-reservation still excludes other deliveries while
+                // all consuming guards unwind before terminal retirement.
+                if let Ok(op) = self.operation() {
+                    op.retire();
+                }
+                self.finish();
+            }
+            result
+        })
+    }
+}
+
+impl Request {
+    fn capture_id(&self) -> Result<&str> {
+        match &self.frame {
+            Frame::Prepare(q) => match &q.review.choice {
+                Choice::AfterCommit { capture_id, .. } => Ok(capture_id),
+                _ => Err(invalid()),
+            },
+            _ => Err(invalid()),
+        }
+    }
+    fn deliver_companion(
+        &self,
+        op: &Operation,
+        transfer: &mut dyn FnMut() -> AdmissionResult<()>,
+    ) -> AdmissionResult<()> {
+        let companion = op.companion.as_ref().ok_or(AdmissionError::Retired)?;
+        let mut called = false;
+        let result = companion.lifetime.retirement().native_dispatch(|| {
+            let mut state = companion.state.lock().map_err(local)?;
+            called = true;
+            let result = transfer();
+            if result.is_ok()
+                && state.normal
+                && state.witness.is_some()
+                && !state.closed
+                && Instant::now() < op.created + LEASE_TTL
+            {
+                state.delivered = true;
+                self.companion_delivered.store(true, Ordering::Release);
+            } else if result.is_err() {
+                state.closed = true;
+            }
+            result
+        });
+        // A retired intent does not erase an otherwise disclosable receipt.
+        if called {
+            result
+        } else {
+            transfer()
+        }
+    }
+    fn publish_companion(
+        &self,
+        transfer: &mut dyn FnMut() -> AdmissionResult<()>,
+    ) -> AdmissionResult<()> {
+        let parent = self.predecessor.as_ref().ok_or(AdmissionError::Retired)?;
+        let companion = parent.companion.as_ref().ok_or(AdmissionError::Retired)?;
+        let capture = self.capture_id().map_err(local)?;
+        companion.lifetime.retirement().native_dispatch(|| {
+            let state = companion.state.lock().map_err(local)?;
+            if state.closed
+                || !state.normal
+                || !state.delivered
+                || Instant::now() >= parent.created + LEASE_TTL
+                || state.capture.as_deref() != Some(capture)
+            {
+                return Err(AdmissionError::Retired);
+            }
+            transfer()
         })
     }
 }
@@ -898,6 +1163,25 @@ async fn authority(c: &Connection, root: &RepositoryRootId) -> Result<Repository
     Ok(before)
 }
 fn stages(q: &Prepare) -> Result<Vec<Stage>> {
+    if q.review.companion.is_some()
+        && (q.action != Stage::Commit
+            || q.files.is_some()
+            || q.options != intent_core::repository_request::NativeReviewOptions::default()
+            || q.review.push_remote.is_some()
+            || q.review.target_branch.as_deref().is_none_or(str::is_empty)
+            || matches!(q.review.choice, Choice::AfterCommit { .. }))
+    {
+        return Err(invalid());
+    }
+    if matches!(q.review.choice, Choice::AfterCommit { .. })
+        && (q.action != Stage::CreatePr
+            || q.files.is_some()
+            || q.options != intent_core::repository_request::NativeReviewOptions::default()
+            || q.review.target_branch.is_some()
+            || q.review.push_remote.is_some())
+    {
+        return Err(invalid());
+    }
     let mut plan = vec![q.action];
     if q.options.push_after_commit {
         if q.action != Stage::Commit {
@@ -930,7 +1214,7 @@ fn saved(snapshot: &RepositorySelectionSnapshot) -> Result<intent_core::SavedRev
 }
 fn explicit(q: &Prepare) -> Option<&RepositoryTarget> {
     match &q.review.choice {
-        Choice::Saved => None,
+        Choice::Saved | Choice::AfterCommit { .. } => None,
         Choice::ExplicitTarget { target } => Some(target),
     }
 }
@@ -1096,6 +1380,16 @@ pub(crate) fn prepare(s: &Services, q: Prepare) -> BoxFuture<'_, Result<Value>> 
     })
 }
 async fn acquire(r: Arc<Request>, q: Prepare) -> Result<Value> {
+    let q = if let Some(parent) = &r.predecessor {
+        parent.companion_witness(r.capture_id()?)?;
+        parent.metadata.validate(true).await?;
+        let mut inherited = parent.query.clone();
+        inherited.action = Stage::CreatePr;
+        inherited.review.companion = None;
+        inherited
+    } else {
+        q
+    };
     let c = &r.connection;
     let permit = c
         .review
@@ -1126,7 +1420,7 @@ async fn acquire(r: Arc<Request>, q: Prepare) -> Result<Value> {
     }
     let provider = r.provider.clone().ok_or_else(unavailable)?;
     provider.settled().ok_or_else(unavailable)?;
-    let metadata = Arc::new(CapturedMetadata {
+    let mut metadata = Arc::new(CapturedMetadata {
         connection: c.weak.clone(),
         root: root.clone(),
         selection,
@@ -1138,6 +1432,21 @@ async fn acquire(r: Arc<Request>, q: Prepare) -> Result<Value> {
             .as_ref()
             .map(|s| (s.clone(), s.snapshot())),
     });
+    if let Some(parent) = &r.predecessor {
+        parent.metadata.validate(true).await?;
+        if metadata.root != parent.metadata.root
+            || metadata.authority != parent.metadata.authority
+            || metadata.selection.binding() != parent.metadata.selection.binding()
+            || metadata.selection.root_incarnation() != parent.metadata.selection.root_incarnation()
+            || metadata.selection.selection_revision()
+                != parent.metadata.selection.selection_revision()
+            || metadata.selection.selection() != parent.metadata.selection.selection()
+            || !Arc::ptr_eq(&metadata.provider, &parent.metadata.provider)
+        {
+            return Err(unavailable());
+        }
+        metadata = parent.metadata.clone();
+    }
     let life = r.lifetime.as_ref().ok_or_else(unavailable)?;
     let extra = life
         .subscribe(
@@ -1209,6 +1518,12 @@ async fn acquire(r: Arc<Request>, q: Prepare) -> Result<Value> {
         result.map_err(denied)?;
     r.check()?;
     metadata.validate(true).await?;
+    if let Some(parent) = &r.predecessor {
+        let witness = parent.companion_witness(r.capture_id()?)?;
+        if observed != witness.observed || staging != witness.staging || !files.is_empty() {
+            return Err(unavailable());
+        }
+    }
     let intent_core::ReviewSelectionOutcome::Resolved { target, .. } =
         &context.review_selection.outcome
     else {
@@ -1239,7 +1554,7 @@ async fn acquire(r: Arc<Request>, q: Prepare) -> Result<Value> {
         .target_branch
         .clone()
         .unwrap_or_else(|| source_branch.clone());
-    if plan.contains(&Stage::CreatePr)
+    if (plan.contains(&Stage::CreatePr) || q.review.companion.is_some())
         && (target_branch == source_branch
             || !git2::Reference::is_valid_name(&format!("refs/heads/{target_branch}")))
     {
@@ -1339,7 +1654,7 @@ async fn acquire(r: Arc<Request>, q: Prepare) -> Result<Value> {
     if path != target.project_path {
         return Err(invalid());
     }
-    if plan.contains(&Stage::CreatePr) {
+    if plan.contains(&Stage::CreatePr) || q.review.companion.is_some() {
         let branch = remote_branch(&provider, &repo, &target_branch).await?;
         if branch.is_none() {
             return Err(invalid());
@@ -1404,6 +1719,22 @@ async fn acquire(r: Arc<Request>, q: Prepare) -> Result<Value> {
         push_destinations: push,
         credential_requests,
     };
+    if let Some(parent) = &r.predecessor {
+        parent.companion_witness(r.capture_id()?)?;
+        let original = &parent.facts;
+        if facts.worktree_path != original.worktree_path
+            || facts.git_dir != original.git_dir
+            || facts.common_dir != original.common_dir
+            || facts.source_ref != original.source_ref
+            || facts.fetch_destinations != original.fetch_destinations
+            || facts.push_destinations != original.push_destinations
+            || facts.preparation.source != original.preparation.source
+            || facts.preparation.target != original.preparation.target
+            || facts.preparation.transport != original.preparation.transport
+        {
+            return Err(unavailable());
+        }
+    }
     metadata.validate(true).await?;
     r.check()?;
     let (write, write_sub) = c.new_lifetime().map_err(denied)?;
@@ -1412,7 +1743,7 @@ async fn acquire(r: Arc<Request>, q: Prepare) -> Result<Value> {
     write_keys.push(root.lifecycle_key());
     let mut disclosure_keys = keys(&q.review.root);
     disclosure_keys.retain(|k| !matches!(k, RepositoryLifecycleKey::Selection { .. }));
-    let subscriptions = vec![
+    let mut subscriptions = vec![
         write_sub,
         disclosure_sub,
         write
@@ -1422,6 +1753,31 @@ async fn acquire(r: Arc<Request>, q: Prepare) -> Result<Value> {
             .subscribe(&c.services.store, c.caller.caller(), &disclosure_keys)
             .map_err(denied)?,
     ];
+    let companion = if q.review.companion.is_some() {
+        let (lifetime, registration) = c.new_lifetime().map_err(denied)?;
+        subscriptions.push(registration);
+        subscriptions.push(
+            lifetime
+                .subscribe(&c.services.store, c.caller.caller(), &write_keys)
+                .map_err(denied)?,
+        );
+        Some(Companion {
+            lifetime,
+            state: Mutex::default(),
+        })
+    } else {
+        None
+    };
+    if let Some(parent) = &r.predecessor {
+        parent
+            .companion
+            .as_ref()
+            .ok_or_else(unavailable)?
+            .lifetime
+            .retirement()
+            .native_link(&write.retirement())
+            .map_err(denied)?;
+    }
     let op = Arc::new(Operation {
         id: id.clone(),
         query: q.clone(),
@@ -1441,6 +1797,8 @@ async fn acquire(r: Arc<Request>, q: Prepare) -> Result<Value> {
         observations: AtomicUsize::new(0),
         progress: Mutex::default(),
         changed: Notify::new(),
+        companion,
+        companion_publication: r.predecessor.as_ref().map(|_| std::sync::OnceLock::new()),
     });
     let admin = Services::require_administrator("sourceControl.authStatus").is_ok();
     r.admin_projection.store(admin, Ordering::Release);
@@ -1519,7 +1877,7 @@ fn monitor(op: &Arc<Operation>) {
             let Some(op) = weak.upgrade() else {
                 return;
             };
-            if op.write_current().is_err() {
+            if op.write_current().is_err() && !op.companion_normal() {
                 op.retire();
             } else {
                 let metadata = op.metadata.clone();
@@ -1592,9 +1950,23 @@ pub(crate) fn execute(s: &Services, q: Execute) -> BoxFuture<'_, Result<Value>> 
                 tokio::spawn(with_caller(
                     c.caller.caller().clone(),
                     with_wire_credential(c.caller.wire_credential().cloned(), async move {
-                        let _capacity = capacity;
-                        let _finish = Completion(owned.clone());
+                        let mut companion_finish =
+                            owned.companion.as_ref().map(|_| CompanionCompletion {
+                                operation: owned.clone(),
+                                capacity: None,
+                                normal: false,
+                            });
+                        let _capacity = if let Some(finish) = &mut companion_finish {
+                            finish.capacity = Some(capacity);
+                            None
+                        } else {
+                            Some(capacity)
+                        };
+                        let _finish = owned.companion.is_none().then(|| Completion(owned.clone()));
                         let result = run(&c, &owned, &q, queue_deadline).await;
+                        if let Some(finish) = &mut companion_finish {
+                            finish.normal = result.is_ok();
+                        }
                         if result.is_err() {
                             if let Ok(p) = owned.progress.lock() {
                                 if let Some(engine) = &p.engine {
@@ -1625,6 +1997,19 @@ pub(crate) fn execute(s: &Services, q: Execute) -> BoxFuture<'_, Result<Value>> 
             Ok(execute_response(state))
         })
     })
+}
+// Declared before the ordinary guard, and releases its own permits before
+// settlement is visible. Unwinding never promotes the private success witness.
+struct CompanionCompletion {
+    operation: Arc<Operation>,
+    capacity: Option<Job>,
+    normal: bool,
+}
+impl Drop for CompanionCompletion {
+    fn drop(&mut self) {
+        drop(self.capacity.take());
+        self.operation.complete_owned(self.normal);
+    }
 }
 struct Completion(Arc<Operation>);
 impl Drop for Completion {
@@ -1872,6 +2257,56 @@ impl Drop for UnadmittedStage<'_> {
     }
 }
 
+fn validate_companion_git(op: &Operation) -> Result<()> {
+    let (_, observed) = read_context_root_with_resolver(
+        &op.query.review.root,
+        op.metadata.root.path(),
+        &saved(&op.metadata.selection)?,
+        explicit(&op.query),
+        &resolver(Some(&op.metadata.provider)).map_err(denied)?,
+        &GitConfigEnvironment::default(),
+        |target| target_context(target, Some(&op.metadata.provider)),
+    )
+    .map_err(denied)?;
+    if observed != op.observed
+        || Some(fingerprint(op.metadata.root.path())?) != op.facts.staging_fingerprint
+    {
+        return Err(unavailable());
+    }
+    Ok(())
+}
+
+fn commit_witness(op: &Operation, sha: &str, staging: Option<&str>) -> Result<CommitWitness> {
+    let staging = staging
+        .filter(|s| Some(*s) == op.facts.staging_fingerprint.as_deref())
+        .ok_or_else(unavailable)?;
+    let (_, observed) = read_context_root_with_resolver(
+        &op.query.review.root,
+        op.metadata.root.path(),
+        &saved(&op.metadata.selection)?,
+        explicit(&op.query),
+        &resolver(Some(&op.metadata.provider)).map_err(denied)?,
+        &GitConfigEnvironment::default(),
+        |target| target_context(target, Some(&op.metadata.provider)),
+    )
+    .map_err(denied)?;
+    let mut expected = op.observed.clone();
+    expected.head_sha = Some(sha.to_owned());
+    // The separate digest fixes the configuration prefix. Only the witnessed
+    // commit's HEAD contribution may change in the existing mixed fingerprint.
+    expected
+        .change_inputs
+        .fingerprint
+        .clone_from(&observed.change_inputs.fingerprint);
+    if expected != observed {
+        return Err(unavailable());
+    }
+    Ok(CommitWitness {
+        observed,
+        staging: staging.to_owned(),
+    })
+}
+
 async fn run_stages(
     c: &Connection,
     op: &Arc<Operation>,
@@ -1963,6 +2398,14 @@ async fn run_stages(
         } else {
             checked
         };
+        if op.companion.is_some() || op.companion_publication.is_some() {
+            // The shared facts projection intentionally does not include every
+            // config/inventory observation. Opt-in continuity compares the full
+            // private snapshot in the original blocking worker/worktree lock,
+            // before entering either synchronous consuming fence. No I/O or
+            // extra queue is introduced into the R/P comparison itself.
+            validate_companion_git(op)?;
+        }
         let stamp = engine::begin_native_repository_stage(checked, |claim| {
             op.metadata.with_metadata(|| queue.claim(claim))
         })
@@ -1994,6 +2437,11 @@ async fn run_stages(
                         commit_hash: outcome.hash.clone(),
                     });
                     let after = fingerprint(op.metadata.root.path()).ok();
+                    let witness = if op.companion.is_some() {
+                        commit_witness(op, &outcome.hash, after.as_deref()).ok()
+                    } else {
+                        None
+                    };
                     let execution = engine::classify_repository_completion(
                         stamp,
                         RepositoryCompletion::Committed {
@@ -2003,10 +2451,13 @@ async fn run_stages(
                     )
                     .map_err(denied)?;
                     op.retain(execution);
+                    if let Some(companion) = &op.companion {
+                        companion.state.lock().map_err(denied)?.witness = witness;
+                    }
                     // Attribution follows the retained primitive receipt.
                     for path in outcome.files {
                         let key = crate::file_tracking::normalize_path(&path);
-                        let _ = c
+                        let staged_failed = c
                             .services
                             .store
                             .set_tracked_change_stage(
@@ -2015,8 +2466,9 @@ async fn run_stages(
                                 "staged",
                                 "committed",
                             )
-                            .await;
-                        let _ = c
+                            .await
+                            .is_err();
+                        let unstaged_failed = c
                             .services
                             .store
                             .set_tracked_change_stage(
@@ -2025,7 +2477,13 @@ async fn run_stages(
                                 "unstaged",
                                 "committed",
                             )
-                            .await;
+                            .await
+                            .is_err();
+                        if staged_failed || unstaged_failed {
+                            if let Some(companion) = &op.companion {
+                                companion.state.lock().map_err(denied)?.witness = None;
+                            }
+                        }
                     }
                     true
                 } else {

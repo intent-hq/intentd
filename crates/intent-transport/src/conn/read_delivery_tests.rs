@@ -1505,3 +1505,59 @@ async fn native_review_consumed_packet_faults_never_replay_primitive_or_reply() 
         assert!(h.rx.priority.try_recv().is_err());
     }
 }
+
+#[test]
+fn native_review_companion_capability_is_explicit_and_versioned() {
+    let server = crate::client::server_json(false, "linux", "fixture", "fixture", None, true);
+    assert_eq!(server["protocolVersion"], "10.13");
+    assert_eq!(server["capabilities"]["nativeReview"], 1);
+    assert_eq!(server["capabilities"]["nativeReviewCompanion"], 1);
+}
+#[tokio::test]
+async fn native_review_companion_typed_capture_precedes_full_writer_queue() {
+    let h = Harness::new(FixtureApi::default(), HostRole::Member).await;
+    for _ in 0..PRIORITY_CAPACITY {
+        h.tx.priority.send("occupied".into()).await.unwrap();
+    }
+    let request = json!({"jsonrpc":"2.0","id":81,"method":"accept-changes.prepare","params":{"workspaceId":"original-workspace","action":"create-pr","review":{"root":{"workspaceId":"original-workspace","kind":"primary"},"choice":{"kind":"afterCommit","operationId":"aaaaaaaa-0000-4000-8000-000000000001","captureId":"aaaaaaaa-0000-4000-8000-000000000002"}}}}).to_string();
+    let call = h.dispatch_selection(&request);
+    tokio::pin!(call);
+    tokio::select! {biased; r=&mut call=>panic!("queue did not wait {r}"),()=tokio::task::yield_now()=>{}}
+    let original = h.original();
+    let frames = original.review_frames.lock().unwrap();
+    let [intent_core::repository_request::NativeReviewFrame::Prepare(q)] = frames.as_slice() else {
+        panic!("missing original companion frame")
+    };
+    assert!(
+        matches!(&q.review.choice, intent_core::repository_request::NativeReviewChoice::AfterCommit { operation_id, capture_id }
+        if operation_id == "aaaaaaaa-0000-4000-8000-000000000001" && capture_id == "aaaaaaaa-0000-4000-8000-000000000002")
+    );
+    assert_eq!(
+        h.api
+            .review_effects
+            .load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+    assert_eq!(h.limiter.available_permits(), Some(1));
+    h.connection.retire();
+}
+#[tokio::test]
+async fn native_review_companion_null_fields_refuse_before_original_capture() {
+    for field in ["targetBranch", "pushRemote", "companion"] {
+        let mut h = Harness::new(FixtureApi::default(), HostRole::Owner).await;
+        let mut request = json!({"jsonrpc":"2.0","id":81,"method":"accept-changes.prepare","params":{"workspaceId":"original-workspace","action":"create-pr","review":{"root":{"workspaceId":"original-workspace","kind":"primary"},"choice":{"kind":"afterCommit","operationId":"aaaaaaaa-0000-4000-8000-000000000001","captureId":"aaaaaaaa-0000-4000-8000-000000000002"}}}});
+        request["params"]["review"][field] = Value::Null;
+        assert!(h.dispatch_selection(&request.to_string()).await);
+        let response = h.response().await;
+        assert_eq!(response["error"]["code"], -32602, "{response}");
+        assert!(h.original().review_frames.lock().unwrap().is_empty());
+        assert_eq!(
+            h.api
+                .review_effects
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        until(|| h.limiter.available_permits() == Some(1)).await;
+        assert!(h.rx.priority.try_recv().is_err());
+    }
+}

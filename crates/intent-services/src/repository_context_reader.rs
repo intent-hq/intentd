@@ -78,6 +78,8 @@ pub(crate) struct RepositoryObservedRoot {
     pub remotes: Vec<RepositoryRemote>,
     pub change_inputs: RepositoryChangeInputs,
     pub private_root: RepositoryPrivateRoot,
+    /// Config prefix of the existing mixed fingerprint; private continuity only.
+    pub config_fingerprint: String,
 }
 
 /// Original effective values from the same consistency-checked Git read.
@@ -608,6 +610,8 @@ fn read_root_with<T>(
         digest.update(value.as_bytes());
         digest.update([0]);
     }
+    let config_fingerprint =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest.clone().finalize());
     digest.update(serde_json::to_vec(&head).map_err(|_| invalid("HEAD encoding failed"))?);
     let fingerprint = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest.finalize());
     let changes = RepositoryChangeInputs {
@@ -625,6 +629,7 @@ fn read_root_with<T>(
     };
     Ok((
         RepositoryObservedRoot {
+            config_fingerprint,
             root: root.clone(),
             branch: head.0,
             head_sha: head.1,

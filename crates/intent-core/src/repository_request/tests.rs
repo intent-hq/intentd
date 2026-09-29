@@ -55,3 +55,92 @@ fn native_review_nested_root_and_target_never_accept_authority_or_extra_ids() {
     }
     assert!(serde_json::from_value::<NativeReviewBoundQuery>(json!({"workspaceId":"w","operationId":"o","root":{"workspaceId":"w","kind":"registered","gitRootId":"r","principalId":"forged"}})).is_err());
 }
+
+#[test]
+fn native_review_companion_strict_presence_roundtrip_and_old_forms() {
+    use serde_json::{json, Value};
+    let root = json!({"workspaceId":"w","kind":"primary"});
+    let parent = json!({"workspaceId":"w","action":"commit","review":{"root":root,"choice":{"kind":"saved"},"targetBranch":"trunk","companion":{"kind":"create-pr"}}});
+    let child = json!({"workspaceId":"w","action":"create-pr","review":{"root":root,"choice":{"kind":"afterCommit","operationId":"aaaaaaaa-0000-4000-8000-000000000001","captureId":"aaaaaaaa-0000-4000-8000-000000000002"}}});
+    for valid in [&parent, &child] {
+        let q: NativeReviewPrepareQuery = serde_json::from_value(valid.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&q).unwrap(), *valid);
+        for key in [
+            "files",
+            "options",
+            "account",
+            "localHeadSha",
+            "prTitle",
+            "commitMessage",
+        ] {
+            for value in [Value::Null, json!({}), json!([])] {
+                let mut bad = valid.clone();
+                bad[key] = value;
+                assert!(
+                    serde_json::from_value::<NativeReviewPrepareQuery>(bad).is_err(),
+                    "{key}"
+                );
+            }
+        }
+        for key in ["pushRemote", "account", "connection", "localHeadSha"] {
+            let mut bad = valid.clone();
+            bad["review"][key] = Value::Null;
+            assert!(
+                serde_json::from_value::<NativeReviewPrepareQuery>(bad).is_err(),
+                "{key}"
+            );
+        }
+    }
+    for key in ["companion", "targetBranch"] {
+        for value in [Value::Null, json!("trunk"), json!({"kind":"create-pr"})] {
+            let mut bad = child.clone();
+            bad["review"][key] = value;
+            assert!(serde_json::from_value::<NativeReviewPrepareQuery>(bad).is_err());
+        }
+    }
+    for key in ["operationId", "captureId"] {
+        for value in [
+            Value::Null,
+            json!(""),
+            json!("not-a-uuid"),
+            json!(1),
+            json!("AAAAAAAA-0000-4000-8000-000000000001"),
+            json!("aaaaaaaa000040008000000000000001"),
+            json!("urn:uuid:aaaaaaaa-0000-4000-8000-000000000001"),
+        ] {
+            let mut bad = child.clone();
+            bad["review"]["choice"][key] = value;
+            assert!(serde_json::from_value::<NativeReviewPrepareQuery>(bad).is_err());
+        }
+    }
+    for action in ["push", "create-pr"] {
+        let mut bad = parent.clone();
+        bad["action"] = json!(action);
+        assert!(serde_json::from_value::<NativeReviewPrepareQuery>(bad).is_err());
+    }
+    for value in [
+        Value::Null,
+        json!({"kind":"push"}),
+        json!({"kind":"create-pr","extra":true}),
+    ] {
+        let mut bad = parent.clone();
+        bad["review"]["companion"] = value;
+        assert!(serde_json::from_value::<NativeReviewPrepareQuery>(bad).is_err());
+    }
+    let mut old = parent.clone();
+    old["review"].as_object_mut().unwrap().remove("companion");
+    old["files"] = Value::Null;
+    old["review"]["pushRemote"] = Value::Null;
+    let decoded: NativeReviewPrepareQuery = serde_json::from_value(old).unwrap();
+    let output = serde_json::to_value(decoded).unwrap();
+    assert_eq!(
+        output["options"],
+        json!({"stageUnstaged":false,"pushAfterCommit":false,"createPRAfterPush":false})
+    );
+    assert!(output["review"].get("companion").is_none());
+    assert!(output.get("files").is_none());
+    assert!(serde_json::from_str::<NativeReviewPrepareQuery>(
+        r#"{"workspaceId":"w","workspaceId":"x","action":"commit","review":{}}"#
+    )
+    .is_err());
+}
