@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.119] - 2026-09-29
+
+### 🐛 Bug Fixes
+
+- Discover user skills in repository-free workspaces ([#5862](https://github.com/intent-hq/intentd/pull/5862)) ([#2172](https://github.com/intent-hq/intentd/pull/2172))
+
+
 ## [0.9.118] - 2026-09-29
 
 ### 🐛 Bug Fixes
