@@ -995,12 +995,18 @@ mod tests {
         }
     }
 
-    async fn fresh_services(workspaces_root: &Path, assets_root: &Path) -> Services {
-        let db = std::env::temp_dir().join(format!("export-test-{}.db", uuid::Uuid::new_v4()));
+    // Bind the directory before Services so consumers drop before cleanup.
+    async fn fresh_services(
+        workspaces_root: &Path,
+        assets_root: &Path,
+    ) -> (tempfile::TempDir, Services) {
+        let db_dir = crate::test_support::test_tempdir("export-test-");
+        let db = db_dir.path().join("store.db");
         let store = Store::open(&db).await.expect("open store");
-        Services::new(store)
+        let svc = Services::new(store)
             .with_workspaces_root(workspaces_root.to_path_buf())
-            .with_assets_root(assets_root.to_path_buf())
+            .with_assets_root(assets_root.to_path_buf());
+        (db_dir, svc)
     }
 
     /// Seed a repo-less workspace with a note, an in-flight agent session,
@@ -1228,7 +1234,7 @@ mod tests {
     async fn export_builds_readable_archive() {
         let ws_root = TempDir::new("export-ws-root");
         let assets_root = TempDir::new("export-assets-root");
-        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+        let (_db_dir, svc) = fresh_services(&ws_root.0, &assets_root.0).await;
         let id = WorkspaceId("ws-export".to_string());
         seed_workspace(&svc, &assets_root.0, &ws_root.0.join("checkout"), &id).await;
 
@@ -1378,7 +1384,7 @@ mod tests {
     async fn export_guards_and_abort() {
         let ws_root = TempDir::new("export-ws-root");
         let assets_root = TempDir::new("export-assets-root");
-        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+        let (_db_dir, svc) = fresh_services(&ws_root.0, &assets_root.0).await;
         let id = WorkspaceId("ws-guards".to_string());
         seed_workspace(&svc, &assets_root.0, &ws_root.0.join("checkout"), &id).await;
 
@@ -1431,7 +1437,7 @@ mod tests {
     async fn export_finalize_without_archive() {
         let ws_root = TempDir::new("export-ws-root");
         let assets_root = TempDir::new("export-assets-root");
-        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+        let (_db_dir, svc) = fresh_services(&ws_root.0, &assets_root.0).await;
         let id = WorkspaceId("ws-fin".to_string());
         seed_workspace(&svc, &assets_root.0, &ws_root.0.join("checkout"), &id).await;
 
@@ -1482,7 +1488,7 @@ mod tests {
     async fn export_bundles_git_and_abort_unwinds_wip() {
         let ws_root = TempDir::new("export-ws-root");
         let assets_root = TempDir::new("export-assets-root");
-        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+        let (_db_dir, svc) = fresh_services(&ws_root.0, &assets_root.0).await;
         let id = WorkspaceId("ws-git".to_string());
 
         // A real repo with one commit and a dirty file.
@@ -1611,7 +1617,7 @@ mod tests {
         };
         let ws_root = TempDir::new("export-ws-root");
         let assets_root = TempDir::new("export-assets-root");
-        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+        let (_db_dir, svc) = fresh_services(&ws_root.0, &assets_root.0).await;
         let id = WorkspaceId("ws-git-sub".to_string());
 
         let fixture_root = ws_root.0.join(&id.0);
@@ -1735,7 +1741,8 @@ mod tests {
 
         let ws_root = TempDir::new("export-ws-root");
         let assets_root = TempDir::new("export-assets-root");
-        let db = std::env::temp_dir().join(format!("export-test-{}.db", uuid::Uuid::new_v4()));
+        let db_dir = crate::test_support::test_tempdir("export-test-");
+        let db = db_dir.path().join("store.db");
         let store = Store::open(&db).await.expect("open store");
         let bus = crate::EventBus::new(store.clone());
         let id = WorkspaceId("ws-fail".to_string());
@@ -1885,7 +1892,7 @@ mod tests {
     async fn export_staging_sweep() {
         let ws_root = TempDir::new("export-ws-root");
         let assets_root = TempDir::new("export-assets-root");
-        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+        let (_db_dir, svc) = fresh_services(&ws_root.0, &assets_root.0).await;
         let root = svc.export_staging_root();
         std::fs::create_dir_all(root.join("export-stale")).expect("stale dir");
         std::fs::create_dir_all(root.join("export-live")).expect("live dir");
