@@ -1644,6 +1644,8 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: release-plz@0.3.162
+      - name: Test new-package release baseline and retirement
+        run: python3 -S scripts/test-release-plz-baseline.py
       - name: Test daemon and sitter changelog separation
         run: python3 -S scripts/test-release-plz-changelog.py
 
