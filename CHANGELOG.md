@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.117] - 2026-09-29
+
+### 🐛 Bug Fixes
+
+- *(store)* Prevent deleted workspace metadata from blocking re-import ([#2162](https://github.com/intent-hq/intentd/pull/2162))
+
+
 ## [0.9.116] - 2026-09-29
 
 ### 🐛 Bug Fixes
