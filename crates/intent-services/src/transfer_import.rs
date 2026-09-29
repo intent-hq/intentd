@@ -531,6 +531,19 @@ impl Services {
         // Rows are committed — the import can no longer be rolled back.
         // Everything below is best-effort enrichment of the now-live
         // workspace; failures are logged, never surfaced as a failed import.
+        // Boot hydration may have cached the reclaimed orphan definitions.
+        // Refresh only imported IDs, after commit so a failed import leaves
+        // both the durable rows and their live definitions untouched.
+        if let Some((_, scripts)) = outcome.rows.iter().find(|(table, _)| table == "script") {
+            let manager = self.script_manager();
+            for script in scripts {
+                if let Some(id) = script.get("id").and_then(serde_json::Value::as_str) {
+                    if let Err(error) = manager.refresh_imported(&workspace_id, id).await {
+                        tracing::warn!(script = %id, %error, "post-import script refresh failed");
+                    }
+                }
+            }
+        }
         self.place_imported_assets(&workspace_id, &extracted_dir.join("assets"))
             .await;
 
@@ -2803,7 +2816,7 @@ mod tests {
         assert_selection(&svc, &session, "codex", Some("gpt-6-astra"), Some("high"));
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn import_reclaims_orphan_metadata_atomically_with_attachment_files() {
         for fail_late in [false, true] {
             let ws = WorkspaceId::from("ws-reimport");
@@ -2815,7 +2828,8 @@ mod tests {
                 "script",
                 vec![serde_json::json!({
                     "id":"script-reimport", "workspace_id":ws.0, "name":"Script",
-                    "command":"true", "mode":"command", "source":"user", "created_at":"t0"
+                    "command":"echo imported > imported-script.txt", "cwd":".intent/attachments",
+                    "mode":"command", "source":"user", "created_at":"t0"
                 })],
             ));
             let mut stale: Vec<_> = rows
@@ -2831,6 +2845,18 @@ mod tests {
                 })],
             ));
             svc.store.transfer_import_rows(&stale).await.unwrap();
+            sqlx::query(
+                "UPDATE script SET command='echo stale', cwd='old-cwd' WHERE id='script-reimport'",
+            )
+            .execute(svc.store.write_pool())
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO script (id, workspace_id, name, command, mode, source, created_at) VALUES ('script-keeper', 'keeper', 'Keep', 'echo keep', 'command', 'user', 't0'), ('script-unlisted', 'ws-reimport', 'Unlisted', 'echo unlisted', 'command', 'user', 't0')")
+                .execute(svc.store.write_pool()).await.unwrap();
+            assert_eq!(svc.hydrate_scripts().await.unwrap(), 3);
+            let manager = svc.script_manager();
+            let cached_before = manager.list(&ws).await.unwrap();
+            let keeper_before = manager.list(&WorkspaceId::from("keeper")).await.unwrap();
             sqlx::query("INSERT INTO attachment_idempotency_keys (workspace_id, key, attachment_id, fingerprint, created_at) VALUES (?, 'retry', 'att-live', 'old', 't0')")
                 .bind(&ws.0).execute(svc.store.write_pool()).await.unwrap();
             let before = svc.store.transfer_export_rows(&ws).await.unwrap();
@@ -2863,11 +2889,46 @@ mod tests {
                 assert!(err.to_string().contains("attachments.file_name"), "{err}");
                 assert!(!file.exists(), "failed insert unwinds materialized files");
                 assert_eq!(svc.store.transfer_export_rows(&ws).await.unwrap(), before);
+                assert_eq!(manager.list(&ws).await.unwrap(), cached_before);
                 svc.workspace_import_abort_op(id).await.unwrap();
             } else {
                 let result = result.unwrap();
                 assert_eq!(result["workspace"]["id"], ws.0);
                 assert_eq!(tokio::fs::read(file).await.unwrap(), b"attachment-bytes");
+                let scripts = manager.list(&ws).await.unwrap();
+                let imported = scripts["scripts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|script| script["id"] == "script-reimport")
+                    .unwrap();
+                assert_eq!(imported["command"], "echo imported > imported-script.txt");
+                assert_eq!(imported["cwd"], ".intent/attachments");
+                let unlisted = scripts["scripts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|script| script["id"] == "script-unlisted")
+                    .unwrap();
+                assert_eq!(unlisted["command"], "echo unlisted");
+                #[cfg(unix)]
+                {
+                    manager
+                        .run(&ws, "script-reimport", None, Some(5))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        tokio::fs::read_to_string(
+                            root.0
+                                .join(&ws.0)
+                                .join("repo/.intent/attachments/imported-script.txt")
+                        )
+                        .await
+                        .unwrap()
+                        .trim(),
+                        "imported"
+                    );
+                }
                 let resolution: String = sqlx::query_scalar(
                     "SELECT resolution FROM interrupted_agent WHERE agent_id='agent-live'",
                 )
@@ -2879,6 +2940,10 @@ mod tests {
                     "incoming interruption replaces stale resolved history"
                 );
             }
+            assert_eq!(
+                manager.list(&WorkspaceId::from("keeper")).await.unwrap(),
+                keeper_before
+            );
             let retry_keys: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM attachment_idempotency_keys WHERE workspace_id=?",
             )

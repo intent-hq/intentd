@@ -136,6 +136,12 @@ async fn deleted_workspace_metadata_can_be_reimported_over_wss() {
         .await;
         assert_eq!(committed["result"]["workspace"]["id"], ws, "{committed}");
         assert_eq!(committed["result"]["importedRows"], 5);
+        let scripts = rpc(&mut client, 4, "script.list", json!({"workspaceId":ws})).await;
+        assert_eq!(
+            scripts["result"]["scripts"][0]["id"], "script-reimport",
+            "{scripts}"
+        );
+        assert_eq!(scripts["result"]["scripts"][0]["command"], "true");
         for table in [
             "interrupted_agent",
             "script",
