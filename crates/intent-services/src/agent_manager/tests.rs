@@ -24344,3 +24344,146 @@ async fn runtime_characterization_idle_reap_resumes_same_session() {
 
 #[path = "runtime_tests.rs"]
 mod runtime_tests;
+
+/// Startup recovery may admit a turn before its lazy provider spawn installs
+/// a handle. Shutdown must still abort that worker and preserve its recovery row.
+#[tokio::test]
+async fn shutdown_captures_startup_turn_before_provider_handle_exists() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-startup-shutdown");
+    let id = AgentId::from("startup-not-spawned");
+    seed_agent(&mgr, &ws, &id).await;
+    assert!(mgr.try_begin(&id, &ws).await);
+    assert!(!mgr.contains(&id));
+    let (gone, receiver) = tokio::sync::oneshot::channel::<()>();
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let (arrived, arrival) = tokio::sync::oneshot::channel::<()>();
+    let pending = mgr.clone();
+    let pending_id = id.clone();
+    let pending_ws = ws.clone();
+    let worker = intent_core::spawn_daemon(async move {
+        let _gone = gone;
+        arrived.send(()).unwrap();
+        if released.await.is_ok() {
+            pending
+                .ensure_started(&pending_id, &pending_ws)
+                .await
+                .unwrap();
+        }
+    });
+    mgr.workers.lock().unwrap().insert(id.clone(), worker);
+    arrival.await.unwrap();
+    mgr.shutdown().await;
+    assert!(
+        mgr.services
+            .store
+            .get_interrupted_agent(&id)
+            .await
+            .unwrap()
+            .is_some(),
+        "an admitted recovery turn must survive shutdown even before its provider starts"
+    );
+    assert!(!mgr.is_busy(&id));
+    assert!(mgr.workers.lock().unwrap().is_empty());
+    assert!(
+        timeout(Duration::from_secs(1), receiver)
+            .await
+            .unwrap()
+            .is_err(),
+        "pending worker was aborted"
+    );
+    assert!(release.send(()).is_err(), "shutdown dropped the held spawn");
+    assert!(
+        matches!(mgr.ensure_started(&id, &ws).await, Err(Error::NotFound(_))),
+        "late provider startup remains fenced"
+    );
+    assert!(!mgr.contains(&id));
+}
+
+/// Holding the first persistence await must not leave later workers alive to
+/// mistake the shutdown spawn fence for a terminal provider failure.
+#[tokio::test]
+async fn shutdown_snapshots_and_aborts_all_workers_before_persistence() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ids = [
+        AgentId::from("startup-first"),
+        AgentId::from("startup-later"),
+    ];
+    let pause = Arc::new(super::TurnStartPause::default());
+    *mgr.shutdown_persist_pause.lock().unwrap() = Some(pause.clone());
+    let mut senders = Vec::new();
+    let mut completions = Vec::new();
+    for id in &ids {
+        let ws = WorkspaceId(format!("ws-{id}"));
+        seed_agent(&mgr, &ws, id).await;
+        assert!(mgr.try_begin(id, &ws).await);
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let (done, completion) = tokio::sync::oneshot::channel::<()>();
+        let (pending, pending_id, pending_ws) = (mgr.clone(), id.clone(), ws.clone());
+        let worker = intent_core::spawn_daemon(async move {
+            released.await.unwrap();
+            let error = super::retry_spawn(&pending, &pending_id, &pending_ws)
+                .await
+                .expect_err("shutdown fence blocks provider startup");
+            super::handle_terminal_spawn_failure(
+                &pending,
+                &pending_id,
+                &pending_ws,
+                "recovery continuation",
+                &super::TurnOptions::default(),
+                true,
+                &error,
+            )
+            .await;
+            pending.release_in_flight_slot(&pending_id);
+            let _ = done.send(());
+        });
+        mgr.workers.lock().unwrap().insert(id.clone(), worker);
+        senders.push(release);
+        completions.push(completion);
+    }
+    let shutdown = {
+        let mgr = mgr.clone();
+        intent_core::spawn_daemon(async move { mgr.shutdown().await })
+    };
+    timeout(Duration::from_secs(5), pause.reached.notified())
+        .await
+        .unwrap();
+    for release in senders {
+        let _ = release.send(());
+    }
+    let mut terminal_failures = 0;
+    for completion in completions {
+        if timeout(Duration::from_secs(5), completion)
+            .await
+            .unwrap()
+            .is_ok()
+        {
+            terminal_failures += 1;
+        }
+    }
+    pause.resume.notify_one();
+    timeout(Duration::from_secs(5), shutdown)
+        .await
+        .unwrap()
+        .unwrap();
+    for id in &ids {
+        assert!(
+            mgr.services
+                .store
+                .get_interrupted_agent(id)
+                .await
+                .unwrap()
+                .is_some(),
+            "every admitted startup turn must remain recoverable: {id}"
+        );
+        assert!(!mgr.contains(id));
+        assert!(!mgr.is_busy(id));
+    }
+    assert_eq!(
+        terminal_failures, 0,
+        "shutdown must abort every worker before persistence"
+    );
+}

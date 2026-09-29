@@ -16268,6 +16268,104 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
     })
 }
 
+/// In-memory visibility reservations for one boot-time recovery sweep. These
+/// never change durable resolution; the normal atomic claim still decides which
+/// automatic or manual resolver wins. Dropping the sweep exposes any unfinished
+/// candidates again, including when startup fails or the worker panics.
+pub struct StartupResumeCandidates {
+    ids: Vec<AgentId>,
+    reserved: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<AgentId>>>,
+}
+
+impl StartupResumeCandidates {
+    /// The fixed candidate set captured before listeners become available.
+    #[must_use]
+    pub fn ids(&self) -> &[AgentId] {
+        &self.ids
+    }
+
+    /// Release one attempted candidate, so a failed resume is immediately
+    /// discoverable even while the remainder of the sweep is still running.
+    pub fn finished(&self, id: &AgentId) {
+        self.reserved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id);
+    }
+}
+
+impl Drop for StartupResumeCandidates {
+    fn drop(&mut self) {
+        let mut reserved = self
+            .reserved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for id in &self.ids {
+            reserved.remove(id);
+        }
+    }
+}
+
+impl Services {
+    /// Resume one reserved startup candidate, then expose and notify failures.
+    /// The notification invalidates the recovery list; it does not declare a
+    /// terminal agent failure or drive completion watches.
+    ///
+    /// # Errors
+    /// Returns the original resume error after releasing the reservation.
+    pub async fn resume_startup_candidate(
+        &self,
+        candidates: &StartupResumeCandidates,
+        agent_id: &AgentId,
+    ) -> Result<()> {
+        let result = self.resume_interrupted_agent(agent_id).await;
+        candidates.finished(agent_id);
+        if result.is_err() {
+            // Use the durable pending row's workspace, never a caller-supplied
+            // envelope. A concurrent manual winner may already have removed it.
+            match self.store.get_interrupted_agent(agent_id).await {
+                Ok(Some(pending)) => {
+                    self.publish_agent_mutation_event(
+                        &pending.workspace_id,
+                        agent_id,
+                        AGENT_UPDATED,
+                        json!({"agentId": agent_id, "startupRecoveryFailed": true}),
+                    )
+                    .await;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%agent_id, %error, "startup recovery failure notification lookup failed");
+                }
+            }
+        }
+        result
+    }
+
+    /// Capture automatic recovery candidates before exposing listeners.
+    ///
+    /// # Errors
+    /// Returns a store error if the candidate query fails; no reservations are
+    /// installed in that case, so manual recovery remains available.
+    pub async fn prepare_startup_resume(&self) -> Result<StartupResumeCandidates> {
+        let ids: Vec<_> = self
+            .store
+            .list_interrupted_agents()
+            .await?
+            .into_iter()
+            .map(|row| row.agent_id)
+            .collect();
+        self.startup_resume_candidates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(ids.iter().cloned());
+        Ok(StartupResumeCandidates {
+            ids,
+            reserved: self.startup_resume_candidates.clone(),
+        })
+    }
+}
+
 impl Services {
     /// Wake-triggered auto-resume sweep (sleep-resume Task D): on a host wake the
     /// daemon's resume orchestrator calls this to resume every turn Task C
@@ -16703,6 +16801,41 @@ impl Services {
         let workspace_id = interrupted.workspace_id.clone();
         let _mutation = self.workspace_mutations.enter(&workspace_id)?;
 
+        // Claim before transcript/group effects, just like resume. A losing
+        // manual abandon must never settle a child or append a false notice.
+        if !self
+            .store
+            .set_interrupted_resolution(agent_id, "abandoned", &now_iso())
+            .await?
+        {
+            return Err(Error::InvalidParams(format!(
+                "Agent {agent_id} is not in pending interrupted state (already resolved)"
+            )));
+        }
+
+        let text = "This conversation was interrupted because intentd restarted. The agent's in-flight work was terminated.";
+        let content = json!([{
+            "type": "text",
+            "text": text,
+            "meta": { "kind": "interruption" }
+        }]);
+        // Persist the only fallible effect before group settlement. If it fails,
+        // release our claim so a later manual or automatic retry can succeed.
+        let message = match self
+            .store
+            .append_agent_message(agent_id, "system", &content, &now_iso())
+            .await
+        {
+            Ok(message) => message,
+            Err(error) => {
+                if let Err(reset_error) = self.store.reset_interrupted_resolution(agent_id).await {
+                    tracing::warn!(%agent_id, %reset_error, "failed to reset abandoned interruption");
+                }
+                return Err(error);
+            }
+        };
+        self.invalidate_agent_list_cache(&workspace_id);
+
         // Rehydrate delegation groups for this workspace (idempotent, best-effort).
         let _ = self.rehydrate_delegation_groups(&workspace_id).await;
 
@@ -16757,32 +16890,6 @@ impl Services {
                     }
                 }
             }
-        }
-
-        // Build the system interruption message
-        let text = "This conversation was interrupted because intentd restarted. The agent's in-flight work was terminated.";
-        let content = json!([{
-            "type": "text",
-            "text": text,
-            "meta": { "kind": "interruption" }
-        }]);
-
-        // Append the system message
-        let message = self
-            .store
-            .append_agent_message(agent_id, "system", &content, &now_iso())
-            .await?;
-        self.invalidate_agent_list_cache(&workspace_id);
-
-        // Mark the interrupted_agent row as resolved
-        let updated = self
-            .store
-            .set_interrupted_resolution(agent_id, "abandoned", &now_iso())
-            .await?;
-        if !updated {
-            return Err(Error::InvalidParams(format!(
-                "Agent {agent_id} is not in pending interrupted state"
-            )));
         }
 
         // Emit agent:message events so live UIs see the new message
