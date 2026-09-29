@@ -32,17 +32,25 @@ def string(dumper, value):
 Dumper.add_representer(str, string)
 
 
-def cache_steps(flavor, target, runner, command):
+def timed_build(step):
+    step = deepcopy(step)
+    if step.get('shell') != 'bash' or 'run' not in step:
+        raise ValueError('cache build timing requires an explicit bash run step')
+    step['run'] = ('start=$SECONDS\n' + step['run'].rstrip() + '\n'
+                   'echo "Build duration: $((SECONDS - start)) seconds" >> "$GITHUB_STEP_SUMMARY"\n')
+    return step
+
+
+def cache_steps(flavor, target, runner, builds):
     return [
         {'name': 'Restore release compiler cache', 'id': 'cache', 'uses': CACHE_ACTION,
-         'with': {'flavor': flavor, 'target': target, 'runner': runner}},
-        {'name': 'Build cache inputs', 'shell': 'bash', 'run': '''start=$SECONDS
-''' + command + '''
-echo "Build duration: $((SECONDS - start)) seconds" >> "$GITHUB_STEP_SUMMARY"
-'''},
+         'with': {'flavor': flavor, 'target': target, 'runner': runner,
+                  'generation': '${{ github.run_id }}-${{ github.run_attempt }}',
+                  'disable-annotations': 'true'}},
+        *[timed_build(step) for step in builds],
         {'name': 'Bound cache and record measurements', 'shell': 'bash',
-         'env': {'CACHE_HIT': '${{ steps.cache.outputs.cache-hit }}'},
-         'run': '''echo "Exact archive hit: $CACHE_HIT (compiler hits are reported separately)" >> "$GITHUB_STEP_SUMMARY"
+         'env': {'CACHE_MATCHED_KEY': '${{ steps.cache.outputs.matched-key }}'},
+         'run': '''echo "Restored archive: ${CACHE_MATCHED_KEY:-none} (compiler hits are reported separately)" >> "$GITHUB_STEP_SUMMARY"
 sccache --show-stats >> "$GITHUB_STEP_SUMMARY"
 sccache --stop-server
 python3 scripts/release-cache-controls.py bound "$SCCACHE_DIR" --limit 268435456
@@ -63,18 +71,19 @@ def generate():
     daemon_setup = [s for s in yaml.safe_load((ROOT / '.github/dist-build-setup.yml').read_text())
                     if s.get('uses') != CACHE_ACTION]
     sitter_source = yaml.safe_load((ROOT / '.github/workflows/release-sitter.yml').read_text())['jobs']['build']
-    sitter_setup = []
-    for step in sitter_source['steps']:
-        if step.get('name') == 'Build (cargo)':
-            break
-        if step.get('uses') != CACHE_ACTION:
-            sitter_setup.append(step)
+    source_steps = sitter_source['steps']
+    build_start = next(i for i, step in enumerate(source_steps) if step.get('name') == 'Build (cargo)')
+    sitter_setup = [step for step in source_steps[:build_start] if step.get('uses') != CACHE_ACTION]
+    sitter_builds = source_steps[build_start:build_start + 2]
+    if [step.get('name') for step in sitter_builds] != ['Build (cargo)', 'Build (cargo-zigbuild)']:
+        raise ValueError('expected adjacent sitter cargo/zigbuild steps; review the producer boundary')
     doc = {
         'name': 'Warm release Rust caches',
         'on': {
             'push': {'branches': ['main'], 'paths': [
                 'Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/config*',
-                'dist-workspace.toml', '**/build.rs', '.github/dist-build-setup.yml',
+                'dist-workspace.toml', '**/build.rs', '**/*.c', '**/*.cc', '**/*.cpp', '**/*.h',
+                '.github/dist-build-setup.yml',
                 '.github/actions/release-rust-cache/**', '.github/workflows/release-cache.yml',
                 '.github/workflows/release-sitter.yml', 'scripts/*release*cache*.py',
             ]},
@@ -104,19 +113,16 @@ echo "matrix=$(jq -c '.ci.github.artifacts_matrix' cache-plan.json)" >> "$GITHUB
                           {'name': 'Install dist (Windows)', 'if': "runner.os == 'Windows'", 'shell': 'pwsh', 'run': '${{ matrix.install_dist.run }}'},
                           {'name': 'Install native build dependencies', 'shell': 'bash', 'run': '${{ matrix.packages_install }}'},
                           *cache_steps('daemon-dist', "${{ join(matrix.targets, ' ') }}", '${{ matrix.runner }}',
-                                       'dist build --output-format=json ${{ matrix.dist_args }} > cache-build-manifest.json')],
+                                       [{'name': 'Build cache inputs', 'shell': 'bash',
+                                         'run': 'dist build --output-format=json ${{ matrix.dist_args }} > cache-build-manifest.json'}])],
             },
             'sitter': {
                 'if': MAIN_ONLY, 'strategy': deepcopy(sitter_source['strategy']),
                 'runs-on': '${{ matrix.os }}', 'timeout-minutes': 30,
-                'env': {'TARGET': '${{ matrix.target }}'},
+                'env': deepcopy(sitter_source.get('env', {})),
                 'steps': [*sitter_setup,
                           *cache_steps('sitter-release', '${{ matrix.target }}', '${{ matrix.os }}',
-                                       '''if [[ "$TARGET" == *-unknown-linux-musl ]]; then
-  cargo zigbuild --release -p intentd-sitter --target "$TARGET"
-else
-  cargo build --release -p intentd-sitter --target "$TARGET"
-fi''')],
+                                       sitter_builds)],
             },
             'retention': {
                 'if': f'always() && ({MAIN_ONLY})', 'needs': ['daemon', 'sitter'],
@@ -130,7 +136,7 @@ fi''')],
     }
     return '''# Generated by scripts/configure-release-cache-producer.py; do not edit.
 # Main-only, build-only: no release/tag/manifest publication or notifications.
-# Bootstrap/refresh: dispatch this workflow on main after merge or LRU eviction.
+# Bootstrap/refresh: dispatch on main; every run/attempt saves a new generation.
 # 256 MiB x 10 slots = 2.5 GiB entry data; up to another generation may coexist
 # during refresh. Retention deletes ONLY older owned main cache generations.
 # Shared 10 GB repository quota still permits eviction; every miss builds cold.
