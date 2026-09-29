@@ -22,6 +22,8 @@ mod integration_context;
 mod resource_context;
 #[path = "wss_integration/sharing.rs"]
 mod sharing;
+#[path = "wss_integration/skills.rs"]
+mod skills;
 
 #[path = "wss_integration/authenticated_devices.rs"]
 mod authenticated_devices;

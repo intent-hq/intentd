@@ -17340,14 +17340,10 @@ impl WorkspaceApi for Services {
     fn skill_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
-            // Resolve workspace path (required for skills discovery)
             let ws = self.store.get_workspace(&workspace_id).await?;
-            let workspace_path = crate::git_ops::worktree_path(&ws).ok_or_else(|| {
-                Error::NotFound(format!(
-                    "workspace {} has no worktree path",
-                    workspace_id.as_str()
-                ))
-            })?;
+            // An empty path selects the loader's user-only discovery mode for
+            // repository-free workspaces, without provisioning a checkout.
+            let workspace_path = crate::git_ops::worktree_path(&ws).unwrap_or_default();
 
             // Check if skills changed and emit event if they did
             let (skills, changed) =
