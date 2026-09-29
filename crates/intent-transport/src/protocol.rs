@@ -684,12 +684,17 @@
 //! identity selection, plus `identity:auth-changed`. The hello capability
 //! `collaborationIdentity: 1` gates purpose-aware proof calls. This does not
 //! advertise the separately implemented host-membership capability.
+//!
+//! Version 10.10 adds user-initiated `agent.retire`, advertised by the hello
+//! capability `agentRetire: 1`. Workspace members can retire a target directly,
+//! stopping its running turn and cancelling wake sources while preserving
+//! conversation history. MCP retirement remains self-only and feature-gated.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "10.9";
+pub const PROTOCOL_VERSION: &str = "10.10";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

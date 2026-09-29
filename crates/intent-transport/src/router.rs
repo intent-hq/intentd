@@ -2270,6 +2270,14 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(json!({ "cancelled": cancelled }))
         }
+        "agent.retire" => {
+            let agent_id = require_agent_id(params)?;
+            let ws = opt_workspace_id(params);
+            let reason = opt_str_strict(params, "reason")?;
+            api.agent_retire(agent_id, ws, reason)
+                .await
+                .map_err(domain_to_rpc)
+        }
         "agent.restore" => {
             // Soft retire undo (§5.5): clear `retiredAt`, returning the
             // session to normal service. User/FE-initiated only — there is

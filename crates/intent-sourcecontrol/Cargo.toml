@@ -1,6 +1,6 @@
 [package]
 name = "intent-sourcecontrol"
-version = "0.9.114"
+version = "0.9.115"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -8,7 +8,7 @@ license.workspace = true
 description = "SourceControl trait + GitHubSourceControl (PR/issue/review/check-run/mergeability)"
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.9.114" }
+intent-core = { path = "../intent-core", version = "0.9.115" }
 octocrab = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
@@ -20,9 +20,15 @@ async-trait = "0.1"
 base64 = { workspace = true }
 secrecy = "0.10"
 http = "1"
+http-body-util = "0.1"
+hyper-timeout = "0.5"
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "ring", "tls12"] }
+tower = { version = "0.5", features = ["util", "retry"] }
+tower-http = { version = "0.6", features = ["follow-redirect"] }
 
 [dev-dependencies]
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 serde_json = { workspace = true }
 tempfile = "3"
 

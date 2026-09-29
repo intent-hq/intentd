@@ -17323,6 +17323,7 @@ mod drafts_events {
 
 pub(crate) mod pr {
     mod accept_member;
+    mod discovery_http;
 
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -23362,6 +23363,111 @@ pub(crate) mod pr {
         assert_eq!(list[0].status, intent_core::PullRequestStatus::Open);
     }
 
+    #[tokio::test]
+    async fn traffic_workspace_error_quota_probe_keeps_background_caller() {
+        use intent_sourcecontrol::traffic::{with_traffic, Caller, Operation, Traffic};
+        let base = spawn_rate_limited_api().await;
+        let sc =
+            Arc::new(intent_sourcecontrol::GitHubSourceControl::new("fake", Some(&base)).unwrap());
+        let (_t, svc, _) = refresh_setup(StubForge::default(), "feature", Some(42), false).await;
+        let svc = svc.with_source_control(sc);
+        let traffic = Traffic::default();
+        with_traffic(traffic.clone(), svc.refresh_all_workspace_prs(0)).await;
+        assert!(svc.sweeps_rate_limited());
+        let snapshot = traffic.snapshot();
+        let probes = snapshot
+            .counts
+            .get(&(Caller::WorkspaceRefresh, Operation::QuotaProbe))
+            .expect("background error probes retain caller");
+        assert_eq!((probes.rest_requests, probes.graphql_requests), (1, 1));
+        assert!(snapshot
+            .counts
+            .keys()
+            .all(|(caller, _)| *caller == Caller::WorkspaceRefresh));
+        with_traffic(traffic.clone(), svc.refresh_all_workspace_prs(0)).await;
+        assert_eq!(
+            traffic.snapshot(),
+            snapshot,
+            "paused sweep reuses the shared probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn traffic_root_error_quota_probe_keeps_background_caller() {
+        use intent_sourcecontrol::traffic::{with_traffic, Caller, Operation, Traffic};
+        let base = spawn_rate_limited_api().await;
+        let sc: Arc<dyn SourceControl> =
+            Arc::new(intent_sourcecontrol::GitHubSourceControl::new("fake", Some(&base)).unwrap());
+        let primary = SweepRepo::init("main", None);
+        let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        let mut root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        root.pr_number = Some(42);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+        let traffic = Traffic::default();
+        with_traffic(
+            traffic.clone(),
+            svc.sweep_workspace_git_roots(&ws, Some(&sc)),
+        )
+        .await;
+        assert!(svc.sweeps_rate_limited());
+        let snapshot = traffic.snapshot();
+        let probes = snapshot
+            .counts
+            .get(&(Caller::GitRootRefresh, Operation::QuotaProbe))
+            .expect("root error probes retain caller");
+        assert_eq!((probes.rest_requests, probes.graphql_requests), (1, 1));
+        assert!(snapshot
+            .counts
+            .keys()
+            .all(|(caller, _)| *caller == Caller::GitRootRefresh));
+        with_traffic(
+            traffic.clone(),
+            svc.sweep_workspace_git_roots(&ws, Some(&sc)),
+        )
+        .await;
+        assert_eq!(
+            traffic.snapshot(),
+            snapshot,
+            "paused root sweep performs no requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn traffic_recovery_quota_probe_keeps_workspace_caller_and_pause() {
+        use intent_sourcecontrol::traffic::{with_traffic, Caller, Operation, Traffic};
+        let base = spawn_rate_limited_api().await;
+        let sc =
+            Arc::new(intent_sourcecontrol::GitHubSourceControl::new("fake", Some(&base)).unwrap());
+        let (_t, svc, _) = refresh_setup(StubForge::default(), "feature", Some(42), false).await;
+        let svc = svc.with_source_control(sc);
+        svc.sweep_rate_limit
+            .pause_for(std::time::Duration::from_secs(300), true);
+        let traffic = Traffic::default();
+        with_traffic(traffic.clone(), svc.refresh_all_workspace_prs(0)).await;
+        assert!(
+            svc.sweeps_rate_limited(),
+            "unknown quota must not lift the pause"
+        );
+        let snapshot = traffic.snapshot();
+        let probes = snapshot
+            .counts
+            .get(&(Caller::WorkspaceRefresh, Operation::QuotaProbe))
+            .expect("recovery probe retains workspace caller");
+        assert_eq!((probes.rest_requests, probes.graphql_requests), (1, 1));
+        assert_eq!(
+            snapshot.counts.len(),
+            1,
+            "paused recovery must not refresh PRs"
+        );
+        with_traffic(traffic.clone(), svc.refresh_all_workspace_prs(0)).await;
+        assert_eq!(
+            traffic.snapshot(),
+            snapshot,
+            "recovery probes stay coalesced"
+        );
+    }
+
     // ---- forge rate-limit backoff (monorepo#2961) -------------------------
 
     /// A rate-limited forge call during the git-root sweep pauses ALL
@@ -23526,7 +23632,9 @@ pub(crate) mod pr {
             ),
         ]);
         let mut fetched_fresh = Vec::new();
+        let (_db, svc) = github_svc().await;
         let (changed, rate_limited) = crate::pr_ops::refresh_stale_pool_entries(
+            &svc,
             &sc,
             &repo,
             &mut list,
@@ -25100,6 +25208,214 @@ mod file_tracking {
             .unwrap();
         let root_id = WorkspaceGitRootId(row["id"].as_str().unwrap().to_string());
         (tmp, svc, ws_id, secondary, root_id)
+    }
+
+    /// Two branches independently made the same change from a common seed.
+    /// Merging them needs a second parent but no change to HEAD's tree.
+    fn ancestry_only_merge(dir: &std::path::Path) -> (git2::Oid, git2::Oid, git2::Oid) {
+        let git = Repository::open(dir).unwrap();
+        let seed = git.head().unwrap().peel_to_commit().unwrap();
+        commit_file(dir, "shared.txt", "same change\n", "ours");
+        let ours = git.head().unwrap().peel_to_commit().unwrap();
+        let tree = ours.tree().unwrap();
+        let sig = Signature::now("Test", "test@example.com").unwrap();
+        let incoming = git
+            .commit(
+                Some("refs/heads/incoming"),
+                &sig,
+                &sig,
+                "theirs",
+                &tree,
+                &[&seed],
+            )
+            .unwrap();
+        assert_eq!(git.merge_base(ours.id(), incoming).unwrap(), seed.id());
+        assert_ne!(ours.id(), incoming);
+        git.merge(&[&git.find_annotated_commit(incoming).unwrap()], None, None)
+            .unwrap();
+        assert_eq!(git.state(), git2::RepositoryState::Merge);
+        assert_eq!(git.index().unwrap().write_tree().unwrap(), tree.id());
+        assert!(intent_git::commit::staged_paths(dir).unwrap().is_empty());
+        (ours.id(), incoming, tree.id())
+    }
+
+    async fn assert_ancestry_only_agent_commit(secondary_target: bool) {
+        let primary = init_git_repo();
+        let (_t, svc, ws, secondary, root_id) = svc_with_registered_root(&primary).await;
+        let (target, other, root_id) = if secondary_target {
+            (&secondary.dir, &primary.dir, Some(root_id))
+        } else {
+            (&primary.dir, &secondary.dir, None)
+        };
+        let other_head = Repository::open(other).unwrap().head().unwrap().target();
+        let (ours, incoming, tree) = ancestry_only_merge(target);
+        let git = Repository::open(target).unwrap();
+        let merge_head = std::fs::read(git.path().join("MERGE_HEAD")).unwrap();
+        let index = std::fs::read(git.path().join("index")).unwrap();
+        std::fs::write(target.join("unstaged.txt"), "leave this alone\n").unwrap();
+
+        // Neither a pending merge nor an empty delta grants permission to
+        // auto-commit or to commit a partial file set.
+        svc.set_workspace_auto_commit(ws.clone(), false)
+            .await
+            .unwrap();
+        for (files, user_requested, expected) in [
+            (None, false, "Auto-commit is disabled"),
+            (
+                Some(vec!["shared.txt".to_string()]),
+                true,
+                "cannot do a partial commit during a merge",
+            ),
+        ] {
+            let err = svc
+                .git_agent_commit(
+                    ws.clone(),
+                    "refused merge".into(),
+                    Some(AgentId::from("agent-merge")),
+                    None,
+                    files,
+                    user_requested,
+                    root_id.clone(),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::Internal(_)), "{err}");
+            assert!(err.to_string().contains(expected), "{err}");
+            assert_eq!(git.head().unwrap().target(), Some(ours));
+            assert_eq!(std::fs::read(git.path().join("index")).unwrap(), index);
+            assert_eq!(
+                std::fs::read(git.path().join("MERGE_HEAD")).unwrap(),
+                merge_head
+            );
+        }
+
+        // Even with auto-commit enabled, an unattributed empty set cannot
+        // complete the merge. Only the explicit staged-only request can.
+        svc.set_workspace_auto_commit(ws.clone(), true)
+            .await
+            .unwrap();
+        let err = svc
+            .git_agent_commit(
+                ws.clone(),
+                "unattributed merge".into(),
+                Some(AgentId::from("agent-merge")),
+                None,
+                None,
+                false,
+                root_id.clone(),
+            )
+            .await
+            .unwrap_err();
+        let expected = if secondary_target {
+            "requires an explicit `files` list"
+        } else {
+            "No uncommitted changes found for this agent"
+        };
+        assert!(err.to_string().contains(expected), "{err}");
+        assert_eq!(git.head().unwrap().target(), Some(ours));
+        assert_eq!(std::fs::read(git.path().join("index")).unwrap(), index);
+        assert_eq!(
+            std::fs::read(git.path().join("MERGE_HEAD")).unwrap(),
+            merge_head
+        );
+        assert!(svc
+            .store()
+            .events_by_type(&ws, "git:commit", 10)
+            .await
+            .unwrap()
+            .is_empty());
+
+        svc.set_workspace_auto_commit(ws.clone(), false)
+            .await
+            .unwrap();
+        let result = svc
+            .git_agent_commit(
+                ws.clone(),
+                "fix: record shared ancestry".into(),
+                Some(AgentId::from("agent-merge")),
+                Some(NoteId::from("note-merge")),
+                secondary_target.then(Vec::new),
+                true,
+                root_id.clone(),
+            )
+            .await
+            .expect("an authorized staged-only ancestry merge must succeed");
+        assert!(result.files.is_empty());
+        assert_eq!(result.file_count, 0);
+        let commit = git
+            .find_commit(git2::Oid::from_str(&result.hash).unwrap())
+            .unwrap();
+        assert_eq!(git.head().unwrap().target(), Some(commit.id()));
+        assert_eq!(
+            commit.parent_ids().collect::<Vec<_>>(),
+            vec![ours, incoming]
+        );
+        assert_eq!(commit.tree_id(), tree);
+        assert_eq!(commit.author().name().unwrap(), "Test");
+        assert_eq!(commit.author().email().unwrap(), "test@example.com");
+        assert_eq!(commit.committer().name().unwrap(), "Test");
+        assert_eq!(commit.committer().email().unwrap(), "test@example.com");
+        let message = commit.message().unwrap();
+        assert!(message.contains("Agent-Id: agent-merge"), "{message}");
+        assert!(message.contains("Linked-Note-Id: note-merge"), "{message}");
+        assert_eq!(git.state(), git2::RepositoryState::Clean);
+        assert!(!git.path().join("MERGE_HEAD").exists());
+        assert_eq!(
+            std::fs::read_to_string(target.join("unstaged.txt")).unwrap(),
+            "leave this alone\n"
+        );
+        assert!(commit.tree().unwrap().get_name("unstaged.txt").is_none());
+        assert_eq!(
+            Repository::open(other).unwrap().head().unwrap().target(),
+            other_head
+        );
+
+        let events = svc
+            .store()
+            .events_by_type(&ws, "git:commit", 10)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data["commit"], result.hash);
+        assert_eq!(events[0].data["files"], serde_json::json!([]));
+        assert_eq!(
+            events[0].data.get("gitRootId"),
+            root_id
+                .as_ref()
+                .map(|id| serde_json::json!(id.as_str()))
+                .as_ref()
+        );
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn agent_commit_ancestry_only_primary() {
+        assert_ancestry_only_agent_commit(false).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn agent_commit_ancestry_only_registered_root() {
+        assert_ancestry_only_agent_commit(true).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn agent_commit_empty_without_merge_is_rejected() {
+        let primary = init_git_repo();
+        let (_t, svc, ws, secondary, root_id) = svc_with_registered_root(&primary).await;
+        for (dir, root_id) in [(&primary.dir, None), (&secondary.dir, Some(root_id))] {
+            let git = Repository::open(dir).unwrap();
+            let before = git.head().unwrap().target();
+            let err = svc
+                .git_agent_commit(ws.clone(), "empty".into(), None, None, None, true, root_id)
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("No staged changes found to commit"),
+                "{err}"
+            );
+            assert_eq!(git.head().unwrap().target(), before);
+            assert_eq!(git.state(), git2::RepositoryState::Clean);
+        }
     }
 
     /// `git.agentCommit` with a `gitRootId` and explicit `files` commits in

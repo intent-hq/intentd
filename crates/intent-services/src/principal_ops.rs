@@ -1098,6 +1098,13 @@ impl Services {
     /// from the write (best-effort — an unreachable forge leaves the row
     /// as is; retry the explicit choice once it becomes reachable).
     pub(crate) fn on_settings_applied(&self, applied: &[Value]) {
+        if applied.iter().any(|c| {
+            c.get("path").and_then(Value::as_str).is_some_and(|p| {
+                p.starts_with("sourceControl.github.") || p == "sourceControl.activeProvider"
+            })
+        }) {
+            intent_sourcecontrol::cache_scope::invalidate_authorization();
+        }
         let changed = applied
             .iter()
             .any(|c| c.get("path").and_then(Value::as_str) == Some(IDENTITY_PROVIDER_SETTING));

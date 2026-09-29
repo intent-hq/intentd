@@ -7,7 +7,7 @@
 
 /// Errors surfaced by [`crate::SourceControl`] implementations and the
 /// [`crate::SourceControlRegistry`].
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum Error {
     /// No usable credential/configuration for the active provider. The daemon
     /// keeps running and source-control features report this (graceful per

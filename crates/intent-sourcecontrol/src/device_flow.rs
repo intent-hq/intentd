@@ -427,7 +427,13 @@ async fn persist_token(
     lease: Option<IdentityLease>,
 ) -> Result<()> {
     persist_with(
-        move || store.store(SECRET_ACCOUNT, token.expose_secret()),
+        move || {
+            let result = store.store(SECRET_ACCOUNT, token.expose_secret());
+            if result.is_ok() {
+                crate::cache_scope::invalidate_authorization();
+            }
+            result
+        },
         lease,
         SECRET_WRITE_TIMEOUT,
     )

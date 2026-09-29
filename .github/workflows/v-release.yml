@@ -46,6 +46,15 @@ on:
     tags:
       - 'v**[0-9]+.[0-9]+.[0-9]+*'
 
+# LOCAL CUSTOMIZATION: hold exclusion from dist planning through alpha/mirror
+# publication. The reusable post-announce workflow MUST NOT acquire this lock.
+# PR plans do not publish and must not block releases. After `dist generate`, run
+# python3 scripts/configure-release-concurrency.py (source of this block).
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('intentd-release-plan-{0}', github.run_id) || 'intentd-release-writers' }}
+  cancel-in-progress: false
+  queue: max
+
 jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:

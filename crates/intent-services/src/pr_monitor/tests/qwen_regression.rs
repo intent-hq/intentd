@@ -38,13 +38,18 @@ async fn full_poll(svc: &Services, mock: &MockQwen) {
     let before = mock.calls("GetPrObservation");
     let rules = mock.calls("/rules/branches/");
     let runs = mock.calls("/check-runs");
-    svc.poll_pr_monitors().await;
+    let traffic = intent_sourcecontrol::traffic::Traffic::default();
+    intent_sourcecontrol::traffic::with_traffic(traffic.clone(), svc.poll_pr_monitors()).await;
     assert!(
         mock.calls("GetPrObservation") > before,
         "must re-read the forge"
     );
     assert!(
-        mock.calls("/rules/branches/") > rules || mock.calls("/check-runs") > runs,
+        mock.calls("/rules/branches/") > rules
+            || mock.calls("/check-runs") > runs
+            || traffic.snapshot().counts.iter().any(|((_, op), counts)| *op
+                == intent_sourcecontrol::traffic::Operation::Rules
+                && counts.cache_hits + counts.in_flight_reuses > 0),
         "must compose a full checklist, not reuse the cached one"
     );
 }
@@ -1538,4 +1543,591 @@ async fn qwen_paginated_legacy_status_and_lone_cancellation_remain_failures() {
     full_poll(&svc, &mock).await;
     assert_eq!(check_map(&row(&svc, &monitor).await), baseline);
     assert_quiet(&svc, &monitor, &owner).await;
+}
+
+#[tokio::test]
+async fn traffic_attributes_real_monitor_http_pages_and_on_demand_cache_reuse() {
+    use intent_sourcecontrol::traffic::{with_traffic, Caller, Operation, Traffic};
+    let (_db, _root, svc, _forge, ws, owner) = setup().await;
+    let mock = MockQwen::start(11506).await;
+    let svc = svc.with_source_control(mock.sc.clone());
+    let traffic = Traffic::default();
+    with_traffic(traffic.clone(), async {
+        svc.pr_monitor_register(&ws, &owner, "QwenLM", "qwen-code", 11506)
+            .await
+            .unwrap();
+        let before = traffic.snapshot();
+        assert_eq!(
+            before.counts[&(Caller::OnDemand, Operation::PrDetail)].graphql_requests,
+            2
+        );
+        assert_eq!(
+            before.counts[&(Caller::OnDemand, Operation::Rules)].rest_requests,
+            1
+        );
+        let repo = RepoRef::new("QwenLM", "qwen-code");
+        svc.read_pr(
+            &repo,
+            11506,
+            PrReadPolicy::Serve {
+                max_age: Duration::from_secs(60),
+            },
+        )
+        .await
+        .unwrap();
+        let hit = traffic.snapshot();
+        assert_eq!(
+            hit.counts[&(Caller::OnDemand, Operation::PrDetail)].graphql_requests,
+            2
+        );
+        assert_eq!(
+            hit.counts[&(Caller::OnDemand, Operation::PrDetail)].cache_hits,
+            1
+        );
+        svc.poll_pr_monitors().await;
+    })
+    .await;
+    let snapshot = traffic.snapshot();
+    let monitor = &snapshot.counts[&(Caller::PrMonitor, Operation::PrDetail)];
+    assert_eq!(
+        monitor.graphql_requests, 2,
+        "real check pagination under the monitor caller"
+    );
+    assert_eq!(monitor.continuation_requests, 1);
+    assert_eq!(
+        monitor.detail_refresh_reuses, 1,
+        "unchanged fingerprint reuses full details"
+    );
+    assert!(!snapshot
+        .counts
+        .contains_key(&(Caller::PrMonitor, Operation::Rules)));
+    assert_eq!(mock.calls("GetPrObservation"), 4);
+    assert_eq!(mock.calls("/rules/branches/"), 1);
+
+    mock.edit(|s| s.mode = ReadMode::Rest);
+    svc.backdate_pr_cache(PR_MONITOR_MAX_CHEAP_AGE + Duration::from_secs(1));
+    let fallback = Traffic::default();
+    let before = mock.calls("");
+    with_traffic(fallback.clone(), svc.poll_pr_monitors()).await;
+    let fallback_snapshot = fallback.snapshot();
+    let c = &fallback_snapshot.counts[&(Caller::PrMonitor, Operation::PrDetail)];
+    assert_eq!(c.graphql_errors, 2, "both folded queries were rejected");
+    assert_eq!(
+        c.continuation_requests, 1,
+        "the REST check fallback paginates"
+    );
+    assert_eq!(
+        c.fallback_requests,
+        c.rest_requests + c.graphql_requests - 1,
+        "all requests after the failed observation belong to its fallback"
+    );
+    assert_eq!(
+        c.rest_requests + c.graphql_requests,
+        (mock.calls("") - before) as u64,
+        "service counts agree with actual server requests"
+    );
+}
+
+#[tokio::test]
+async fn shared_discovery_borrows_newer_monitor_details_without_extra_http() {
+    use intent_sourcecontrol::traffic::{with_caller, with_traffic, Caller, Operation, Traffic};
+    let (_db, _root, svc, _forge, ws, owner) = setup().await;
+    let mock = MockQwen::start(11506).await;
+    let svc = svc.with_source_control(mock.sc.clone());
+    svc.pr_monitor_register(&ws, &owner, "QwenLM", "qwen-code", 11506)
+        .await
+        .unwrap();
+    let repo = RepoRef::new("QwenLM", "qwen-code");
+    let traffic = Traffic::default();
+    let before = mock.calls("");
+    with_traffic(
+        traffic.clone(),
+        with_caller(Caller::GitRootRefresh, async {
+            svc.shared_pr_record(mock.sc.as_ref(), &repo, 11506)
+                .await
+                .unwrap();
+            svc.shared_pr_record(mock.sc.as_ref(), &repo, 11506)
+                .await
+                .unwrap();
+        }),
+    )
+    .await;
+    assert_eq!(mock.calls(""), before);
+    assert_eq!(
+        traffic.snapshot().counts[&(Caller::GitRootRefresh, Operation::PrDetail)].rest_requests,
+        0
+    );
+    mock.edit(|s| s.pr["state"] = json!("CLOSED"));
+    svc.read_pr(&repo, 11506, PrReadPolicy::REFRESH)
+        .await
+        .unwrap();
+    let before = mock.calls("");
+    let current = svc
+        .shared_pr_record(mock.sc.as_ref(), &repo, 11506)
+        .await
+        .unwrap();
+    assert_eq!(current.state, PrState::Closed);
+    assert_eq!(
+        mock.calls(""),
+        before,
+        "newer monitor read supersedes the background hit"
+    );
+}
+
+#[tokio::test]
+async fn shared_discovery_repair_monitor_provenance_across_real_hosts_and_tokens() {
+    for other_host in [false, true] {
+        let (_db, _root, svc, _, _, _) = setup().await;
+        let a = MockQwen::start(10978).await;
+        let b = MockQwen::start(10978).await;
+        let repo = RepoRef::new("QwenLM", "qwen-code");
+        read_pr_via(
+            a.sc.as_ref(),
+            &repo,
+            10978,
+            &svc.pr_cache,
+            PrReadPolicy::REFRESH,
+            &HashSet::new(),
+        )
+        .await
+        .unwrap();
+        let source = if other_host { &b } else { &a };
+        source.edit(|s| s.title = "provider B".into());
+        let provider = intent_sourcecontrol::GitHubSourceControl::new(
+            if other_host {
+                "fixture-token"
+            } else {
+                "provider-B-token"
+            },
+            Some(&source.base),
+        )
+        .unwrap();
+        let rules = source.calls("/rules/branches/");
+        let entry = read_pr_via(
+            &provider,
+            &repo,
+            10978,
+            &svc.pr_cache,
+            PrReadPolicy::Poll,
+            &HashSet::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(entry.pr.title, "provider B");
+        assert!(
+            cached_record_for_discovery(
+                &svc.pr_cache,
+                &repo,
+                10978,
+                &a.sc.cache_scope().unwrap(),
+                Duration::from_secs(180)
+            )
+            .is_none(),
+            "scope A must not borrow B's record"
+        );
+        assert_eq!(
+            cached_record_for_discovery(
+                &svc.pr_cache,
+                &repo,
+                10978,
+                &provider.cache_scope().unwrap(),
+                Duration::from_secs(180)
+            )
+            .unwrap()
+            .0
+            .title,
+            "provider B"
+        );
+        assert_eq!(
+            entry.snapshot.title, "provider B",
+            "a new context must obtain its own rich snapshot"
+        );
+        assert!(source.calls("/rules/branches/") > rules);
+    }
+}
+
+#[tokio::test]
+async fn shared_discovery_repair_authorization_changes_during_monitor_poll() {
+    let (_db, _root, svc, _, _, _) = setup().await;
+    let mock = MockQwen::start(10978).await;
+    let repo = RepoRef::new("QwenLM", "qwen-code");
+    read_pr_via(
+        mock.sc.as_ref(),
+        &repo,
+        10978,
+        &svc.pr_cache,
+        PrReadPolicy::REFRESH,
+        &HashSet::new(),
+    )
+    .await
+    .unwrap();
+    mock.edit(|s| s.title = "obsolete observation".into());
+    let gate = mock.gate("/graphql");
+    let monitored = HashSet::new();
+    let poll = read_pr_via(
+        mock.sc.as_ref(),
+        &repo,
+        10978,
+        &svc.pr_cache,
+        PrReadPolicy::Poll,
+        &monitored,
+    );
+    let change = async {
+        gate.entered.notified().await;
+        intent_sourcecontrol::cache_scope::invalidate_authorization();
+        gate.release.add_permits(100);
+    };
+    let (result, ()) = tokio::join!(poll, change);
+    assert!(
+        result.is_err(),
+        "an obsolete in-flight monitor must not publish"
+    );
+    let cached = svc.pr_cache.lock().unwrap();
+    assert_ne!(
+        cached[&pr_key_for(&repo, 10978)]
+            .entry
+            .as_ref()
+            .unwrap()
+            .pr
+            .title,
+        "obsolete observation"
+    );
+}
+
+#[tokio::test]
+async fn shared_discovery_repair_late_open_observation_cannot_erase_merged_confirmation() {
+    for terminal in [PrState::Merged, PrState::Closed] {
+        let (_db, _root, svc, _, _, _) = setup().await;
+        let mock = MockQwen::start(10978).await;
+        mock.edit(|s| s.pr["state"] = json!("OPEN"));
+        let repo = RepoRef::new("QwenLM", "qwen-code");
+        let gate = mock.gate("/rules/branches/");
+        let monitored = HashSet::new();
+        let old_full = read_pr_via(
+            mock.sc.as_ref(),
+            &repo,
+            10978,
+            &svc.pr_cache,
+            PrReadPolicy::REFRESH,
+            &monitored,
+        );
+        let confirm = async {
+            gate.entered.notified().await;
+            mock.edit(|s| {
+                s.pr["state"] = json!(if terminal == PrState::Merged {
+                    "MERGED"
+                } else {
+                    "CLOSED"
+                });
+            });
+            let merged = svc
+                .shared_pr_record(mock.sc.as_ref(), &repo, 10978)
+                .await
+                .unwrap();
+            assert_eq!(merged.state, terminal);
+            gate.release.add_permits(100);
+        };
+        let (old, ()) = tokio::join!(old_full, confirm);
+        assert_eq!(
+            old.unwrap().pr.state,
+            PrState::Open,
+            "fixture really parked an older Open observation"
+        );
+        let before = mock.calls("");
+        assert_eq!(
+            svc.shared_pr_record(mock.sc.as_ref(), &repo, 10978)
+                .await
+                .unwrap()
+                .state,
+            terminal
+        );
+        assert_eq!(
+            mock.calls(""),
+            before,
+            "confirmed merged state needs no extra read"
+        );
+        // Even a later non-terminal donor cannot undo irreversible merged state.
+        mock.edit(|s| s.pr["state"] = json!("OPEN"));
+        read_pr_via(
+            mock.sc.as_ref(),
+            &repo,
+            10978,
+            &svc.pr_cache,
+            PrReadPolicy::REFRESH,
+            &monitored,
+        )
+        .await
+        .unwrap();
+        let before = mock.calls("");
+        assert_eq!(
+            svc.shared_pr_record(mock.sc.as_ref(), &repo, 10978)
+                .await
+                .unwrap()
+                .state,
+            if terminal == PrState::Merged {
+                PrState::Merged
+            } else {
+                PrState::Open
+            }
+        );
+        assert_eq!(mock.calls(""), before);
+    }
+}
+
+#[tokio::test]
+async fn shared_rules_distinct_prs_http_counts() {
+    use intent_sourcecontrol::traffic::{with_traffic, Caller, Operation, Traffic};
+    for count in [1, 15] {
+        let mock = MockQwen::start(10978).await;
+        let cache = PrCache::default();
+        let monitored = HashSet::new();
+        let traffic = Traffic::default();
+        with_traffic(traffic.clone(), async {
+            for number in 1..=count {
+                mock.edit(|s| s.pr["number"] = json!(number));
+                let entry = read_pr_via(
+                    mock.sc.as_ref(),
+                    &RepoRef::new("QwenLM", "qwen-code"),
+                    number,
+                    &cache,
+                    PrReadPolicy::Poll,
+                    &monitored,
+                )
+                .await
+                .unwrap();
+                assert_eq!(entry.pr.number, number);
+                assert!(entry.snapshot.requirements.rules_known);
+            }
+        })
+        .await;
+        let counts = traffic.snapshot();
+        let rules = &counts.counts[&(Caller::OnDemand, Operation::Rules)];
+        assert_eq!(mock.calls("/rules/branches/"), 1, "distinct PRs={count}");
+        assert_eq!(rules.rest_requests, 1);
+        assert_eq!(rules.cache_hits, count - 1);
+        let detail = &counts.counts[&(Caller::OnDemand, Operation::PrDetail)];
+        assert_eq!(detail.graphql_requests, count);
+        assert_eq!(detail.graphql_cost_observations, 0, "fixture omits cost");
+        assert_eq!(detail.graphql_points, 0, "unknown cost is not inferred");
+    }
+}
+
+#[tokio::test]
+async fn shared_rules_concurrent_http_misses_coalesce() {
+    use intent_sourcecontrol::traffic::{with_traffic, Caller, Operation, Traffic};
+    let mock = MockQwen::start(10978).await;
+    let cache = PrCache::default();
+    let monitored = HashSet::new();
+    let repo = RepoRef::new("QwenLM", "qwen-code");
+    let traffic = Traffic::default();
+    let gate = mock.gate("/rules/branches/");
+    with_traffic(traffic.clone(), async {
+        let first = read_pr_via(mock.sc.as_ref(), &repo, 1, &cache, PrReadPolicy::Poll, &monitored);
+        let second = async {
+            gate.entered.notified().await;
+            let read = read_pr_via(mock.sc.as_ref(), &repo, 2, &cache, PrReadPolicy::Poll, &monitored);
+            tokio::pin!(read);
+            tokio::select! {
+                biased;
+                r = &mut read => panic!("rules response must remain gated: {r:?}"),
+                () = async { while mock.calls("GetPrObservation") < 2 { tokio::task::yield_now().await; } } => {}
+            }
+            gate.release.add_permits(100);
+            read.await.unwrap()
+        };
+        let (a,b) = tokio::join!(first, second);
+        assert!(a.unwrap().snapshot.requirements.rules_known);
+        assert!(b.snapshot.requirements.rules_known);
+    }).await;
+    assert_eq!(mock.calls("/rules/branches/"), 1);
+    assert_eq!(
+        traffic.snapshot().counts[&(Caller::OnDemand, Operation::Rules)].rest_requests,
+        1
+    );
+}
+
+#[tokio::test]
+async fn shared_rules_forced_service_read_observes_policy_changes() {
+    let mock = MockQwen::start(10978).await;
+    let cache = PrCache::default();
+    let monitored = HashSet::new();
+    let repo = RepoRef::new("QwenLM", "qwen-code");
+    let first = read_pr_via(
+        mock.sc.as_ref(),
+        &repo,
+        1,
+        &cache,
+        PrReadPolicy::Poll,
+        &monitored,
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.snapshot.requirements.approvals.needed, None);
+    mock.edit(|s| {
+        s.rules = json!([{"type":"pull_request","parameters":{
+        "required_approving_review_count": 2, "required_review_thread_resolution":true}}]);
+    });
+    let fresh = read_pr_via(
+        mock.sc.as_ref(),
+        &repo,
+        2,
+        &cache,
+        PrReadPolicy::REFRESH,
+        &monitored,
+    )
+    .await
+    .unwrap();
+    assert_eq!(fresh.snapshot.requirements.approvals.needed, Some(2));
+    assert_eq!(
+        fresh.snapshot.requirements.threads.resolution_required,
+        Some(true)
+    );
+    assert_eq!(mock.calls("/rules/branches/"), 2);
+    let next = read_pr_via(
+        mock.sc.as_ref(),
+        &repo,
+        3,
+        &cache,
+        PrReadPolicy::Poll,
+        &monitored,
+    )
+    .await
+    .unwrap();
+    assert_eq!(next.snapshot.requirements.approvals.needed, Some(2));
+    assert_eq!(mock.calls("/rules/branches/"), 2);
+}
+
+#[tokio::test]
+async fn shared_rules_errors_stay_unknown_and_rate_limits_propagate() {
+    for status in [401, 404, 403, 429] {
+        let mock = MockQwen::start(10978).await;
+        let cache = PrCache::default();
+        let monitored = HashSet::new();
+        let repo = RepoRef::new("QwenLM", "qwen-code");
+        mock.edit(|s| {
+            s.rules_status = status;
+            s.rules =
+                json!({"message":if status==429 {"API rate limit exceeded"} else {"unreadable"}});
+        });
+        let result = read_pr_via(
+            mock.sc.as_ref(),
+            &repo,
+            1,
+            &cache,
+            PrReadPolicy::Poll,
+            &monitored,
+        )
+        .await;
+        if status == 429 {
+            assert!(matches!(result, Err(Error::RateLimited(_))));
+        } else {
+            assert!(!result.unwrap().snapshot.requirements.rules_known);
+        }
+        mock.edit(|s| {
+            s.rules_status = 200;
+            s.rules = json!([]);
+        });
+        let recovered = read_pr_via(
+            mock.sc.as_ref(),
+            &repo,
+            2,
+            &cache,
+            PrReadPolicy::Poll,
+            &monitored,
+        )
+        .await
+        .unwrap();
+        assert!(recovered.snapshot.requirements.rules_known);
+        assert_eq!(
+            mock.calls("/rules/branches/"),
+            if status == 429 { 5 } else { 2 }
+        );
+    }
+}
+
+#[tokio::test]
+async fn shared_rules_four_repository_fixture_before_after_http_counts() {
+    use intent_sourcecontrol::traffic::{with_traffic, Caller, Operation, Traffic};
+    for optimized in [false, true] {
+        let mock = MockQwen::start(10978).await;
+        let traffic = Traffic::default();
+        let cache = PrCache::default();
+        let monitored = HashSet::new();
+        with_traffic(traffic.clone(), async {
+            for number in 1..=15 {
+                mock.edit(|s| s.pr["number"] = json!(number));
+                let repo = RepoRef::new("fixture", format!("repo-{}", number % 4));
+                if optimized {
+                    let entry = read_pr_via(
+                        mock.sc.as_ref(),
+                        &repo,
+                        number,
+                        &cache,
+                        PrReadPolicy::Serve {
+                            max_age: Duration::from_secs(60),
+                        },
+                        &monitored,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(entry.pr.number, number);
+                    assert!(entry.snapshot.requirements.rules_known);
+                } else {
+                    // Retained uncached acquisition: one complete observation
+                    // and a fresh effective REST rule read for each PR.
+                    let (pr, snapshot) = fetch_pr_full(mock.sc.as_ref(), &repo, number)
+                        .await
+                        .unwrap();
+                    assert_eq!(pr.number, number);
+                    assert!(snapshot.requirements.rules_known);
+                }
+            }
+        })
+        .await;
+        let snapshot = traffic.snapshot();
+        let rules = &snapshot.counts[&(Caller::OnDemand, Operation::Rules)];
+        assert_eq!(rules.rest_requests, if optimized { 4 } else { 15 });
+        assert_eq!(rules.cache_hits, if optimized { 11 } else { 0 });
+        assert_eq!(
+            mock.calls("/rules/branches/"),
+            if optimized { 4 } else { 15 }
+        );
+        assert_eq!(
+            snapshot.counts[&(Caller::OnDemand, Operation::PrDetail)].graphql_requests,
+            15
+        );
+        assert_eq!(
+            snapshot.counts[&(Caller::OnDemand, Operation::PrDetail)].graphql_cost_observations,
+            0
+        );
+        assert!(!snapshot
+            .counts
+            .contains_key(&(Caller::OnDemand, Operation::Discovery)));
+    }
+}
+
+#[tokio::test]
+async fn shared_rules_standalone_fallback_uses_same_authorized_policy_cache() {
+    let mock = MockQwen::start(10978).await;
+    mock.edit(|s| s.mode = ReadMode::Standalone);
+    let repo = RepoRef::new("QwenLM", "qwen-code");
+    let cache = PrCache::default();
+    let monitored = HashSet::new();
+    for number in 1..=2 {
+        mock.edit(|s| s.pr["number"] = json!(number));
+        let entry = read_pr_via(
+            mock.sc.as_ref(),
+            &repo,
+            number,
+            &cache,
+            PrReadPolicy::Poll,
+            &monitored,
+        )
+        .await
+        .unwrap();
+        assert_eq!(entry.pr.number, number);
+        assert!(entry.snapshot.requirements.rules_known);
+    }
+    assert_eq!(mock.calls("/rules/branches/"), 1);
+    assert_eq!(mock.calls("GetMergeRequirements"), 2);
 }
