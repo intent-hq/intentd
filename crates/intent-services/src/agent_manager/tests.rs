@@ -24413,7 +24413,7 @@ async fn shutdown_snapshots_and_aborts_all_workers_before_persistence() {
     ];
     let pause = Arc::new(super::TurnStartPause::default());
     *mgr.shutdown_persist_pause.lock().unwrap() = Some(pause.clone());
-    let mut releases = Vec::new();
+    let mut senders = Vec::new();
     let mut completions = Vec::new();
     for id in &ids {
         let ws = WorkspaceId(format!("ws-{id}"));
@@ -24441,7 +24441,7 @@ async fn shutdown_snapshots_and_aborts_all_workers_before_persistence() {
             let _ = done.send(());
         });
         mgr.workers.lock().unwrap().insert(id.clone(), worker);
-        releases.push(release);
+        senders.push(release);
         completions.push(completion);
     }
     let shutdown = {
@@ -24451,7 +24451,7 @@ async fn shutdown_snapshots_and_aborts_all_workers_before_persistence() {
     timeout(Duration::from_secs(5), pause.reached.notified())
         .await
         .unwrap();
-    for release in releases {
+    for release in senders {
         let _ = release.send(());
     }
     let mut terminal_failures = 0;
