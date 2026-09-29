@@ -190,6 +190,26 @@ class ProducerContract(unittest.TestCase):
             # Read-only lookups must never exactly match an older saved key,
             # which would take precedence over the newest prefix generation.
             self.assertFalse(any(consumer['key'] == r['key'] for r in (old, fresh, retried)))
+            restore_config = action['runs']['steps'][-1]['with']
+            resolve = lambda expression: consumer[re.fullmatch(r'\$\{\{ steps.key.outputs.([\w-]+) \}\}', expression).group(1)]
+            lookup_order = [resolve(restore_config['key']),
+                            *(resolve(line) for line in restore_config['restore-keys'].splitlines())]
+            legacy = consumer['input-prefix'].removesuffix('-')
+
+            def restored(archives):
+                # Model GitHub lookup order with fixtures oldest-to-newest:
+                # exact match, then newest prefix match for each restore key.
+                for lookup in lookup_order:
+                    if lookup in archives:
+                        return lookup
+                    matches = [archive for archive in archives if archive.startswith(lookup)]
+                    if matches:
+                        return matches[-1]
+                return None
+
+            self.assertEqual(restored([legacy, fresh['key']]), fresh['key'])
+            self.assertEqual(restored([legacy]), legacy)  # refresh save failed
+            self.assertIsNone(restored([]))  # ordinary eviction/cold miss
             for job in ('daemon', 'sitter'):
                 restore = next(s for s in self.workflow['jobs'][job]['steps'] if s.get('uses') == './.github/actions/release-rust-cache')
                 self.assertEqual(restore['with']['generation'], '${{ github.run_id }}-${{ github.run_attempt }}')
