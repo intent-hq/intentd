@@ -25,9 +25,9 @@ use super::{
     budget_admits, charged_bytes, compute_process_cap, derive_agent_type, derive_is_orchestrator,
     is_cancel_transport_closed, pop_and_wake_waiter, recommended_memory_budget_bytes,
     resolve_npx_only, resolve_spawn, settle_stale_waiter, text_prompt, AgentHandle, AgentManager,
-    BusEventSink, KillFn, ProcessRegistry, RegistryInner, ResolvedSpawn, TreeMemoryProbe,
-    TreeSample, DEFAULT_AGENT_TYPE, HOST_MEMORY_RESERVE_BYTES, PROVISIONAL_AGENT_BYTES,
-    REASON_MEMORY_BUDGET, REASON_SLOTS,
+    BusEventSink, KillFn, LocalResources, ProcessRegistry, RegistryInner, ResolvedSpawn,
+    RuntimeHandle, TreeMemoryProbe, TreeSample, DEFAULT_AGENT_TYPE, HOST_MEMORY_RESERVE_BYTES,
+    PROVISIONAL_AGENT_BYTES, REASON_MEMORY_BUDGET, REASON_SLOTS,
 };
 use crate::agent_ops::user_message_blocks;
 use crate::events::{EventBus, SubscriptionFilter};
@@ -2314,21 +2314,24 @@ fn mock_handle() -> AgentHandle {
         },
     ));
     AgentHandle {
-        connection,
-        notifications: Arc::new(TokioMutex::new(note_rx)),
-        serve_task: tokio::spawn(async {}),
-        child: None,
-        child_pid: None,
-        _mcp_bridge: None,
-        _mcp_config: None,
-        _rules_config: None,
-        _pi_extension: None,
-        npx_launch_dir: None,
+        execution: RuntimeHandle::local(LocalResources {
+            connection,
+            notifications: Arc::new(TokioMutex::new(note_rx)),
+            serve_task: tokio::spawn(async {}),
+            child: None,
+            child_pid: None,
+            _mcp_bridge: None,
+            _mcp_config: None,
+            _rules_config: None,
+            _pi_extension: None,
+            npx_launch_dir: None,
+        }),
         antigravity_profile: None,
         session_mcp_servers: Vec::new(),
         spawned_model: None,
         spawned_provider: "auggie".to_string(),
         thought_level: None,
+        config_options: None,
         confirmed_effort: None,
         wake_gate: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         wake_listener: None,
@@ -2984,10 +2987,10 @@ async fn suppressed_reclaim_persists_no_notice() {
         .await
         .expect("archive row");
 
-    assert_eq!(
+    assert!(matches!(
         mgr.try_begin_outcome(&id, &ws, false).await,
-        super::TryBeginOutcome::Started
-    );
+        super::TryBeginOutcome::Started(_)
+    ));
     let after = mgr.services.store.get_workspace(&ws).await.unwrap();
     assert!(
         after.archived,
@@ -3949,9 +3952,25 @@ fn track_with_child(mgr: &AgentManager, id: &AgentId) -> (u32, tokio::task::Join
     cmd.process_group(0);
     let child = cmd.spawn().expect("spawn sleeper child");
     let pid = child.id().expect("live child has a pid");
-    let mut handle = mock_handle();
-    handle.child = Some(child);
-    handle.child_pid = Some(pid);
+    let handle = mock_handle();
+    handle
+        .execution
+        .local
+        .as_ref()
+        .unwrap()
+        .resources
+        .lock()
+        .unwrap()
+        .child = Some(child);
+    handle
+        .execution
+        .local
+        .as_ref()
+        .unwrap()
+        .resources
+        .lock()
+        .unwrap()
+        .child_pid = Some(pid);
     mgr.handles.lock().unwrap().insert(id.clone(), handle);
     mgr.registry.register(id.clone(), mgr.make_kill(id.clone()));
     let watcher = mgr.arm_child_exit_watcher(id.clone(), Some(pid));
@@ -4149,9 +4168,25 @@ async fn stop_many_tears_down_slow_children_in_one_shared_grace_window() {
         cmd.kill_on_drop(true);
         let child = cmd.spawn().expect("spawn slow child");
         let pid = child.id().expect("live child has a pid");
-        let mut handle = mock_handle();
-        handle.child = Some(child);
-        handle.child_pid = Some(pid);
+        let handle = mock_handle();
+        handle
+            .execution
+            .local
+            .as_ref()
+            .unwrap()
+            .resources
+            .lock()
+            .unwrap()
+            .child = Some(child);
+        handle
+            .execution
+            .local
+            .as_ref()
+            .unwrap()
+            .resources
+            .lock()
+            .unwrap()
+            .child_pid = Some(pid);
         mgr.handles.lock().unwrap().insert(id.clone(), handle);
         mgr.registry.register(id.clone(), mgr.make_kill(id.clone()));
         ids.push(id);
@@ -4592,21 +4627,24 @@ fn track_mock_agent_inner(
     mgr.handles.lock().unwrap().insert(
         id.clone(),
         AgentHandle {
-            connection,
-            notifications: Arc::new(TokioMutex::new(note_rx)),
-            serve_task: tokio::spawn(async {}),
-            child: None,
-            child_pid: None,
-            _mcp_bridge: None,
-            _mcp_config: None,
-            _rules_config: None,
-            _pi_extension: None,
-            npx_launch_dir: None,
+            execution: RuntimeHandle::local(LocalResources {
+                connection,
+                notifications: Arc::new(TokioMutex::new(note_rx)),
+                serve_task: tokio::spawn(async {}),
+                child: None,
+                child_pid: None,
+                _mcp_bridge: None,
+                _mcp_config: None,
+                _rules_config: None,
+                _pi_extension: None,
+                npx_launch_dir: None,
+            }),
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
             spawned_provider: "auggie".to_string(),
             thought_level: None,
+            config_options: None,
             confirmed_effort: None,
             wake_gate: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_listener: None,
@@ -4743,21 +4781,24 @@ fn track_mock_agent_prompt_rpc_error_inner(
     mgr.handles.lock().unwrap().insert(
         id.clone(),
         AgentHandle {
-            connection,
-            notifications: Arc::new(TokioMutex::new(note_rx)),
-            serve_task: tokio::spawn(async {}),
-            child: None,
-            child_pid: None,
-            _mcp_bridge: None,
-            _mcp_config: None,
-            _rules_config: None,
-            _pi_extension: None,
-            npx_launch_dir: None,
+            execution: RuntimeHandle::local(LocalResources {
+                connection,
+                notifications: Arc::new(TokioMutex::new(note_rx)),
+                serve_task: tokio::spawn(async {}),
+                child: None,
+                child_pid: None,
+                _mcp_bridge: None,
+                _mcp_config: None,
+                _rules_config: None,
+                _pi_extension: None,
+                npx_launch_dir: None,
+            }),
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
             spawned_provider: spawned_provider.to_string(),
             thought_level: None,
+            config_options: None,
             confirmed_effort: None,
             wake_gate: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_listener: None,
@@ -5463,7 +5504,19 @@ fn track_antigravity_setup(
         }
     });
     track(mgr, id);
-    mgr.handles.lock().unwrap().get_mut(id).unwrap().connection = Arc::new(Connection::new(
+    mgr.handles
+        .lock()
+        .unwrap()
+        .get_mut(id)
+        .unwrap()
+        .execution
+        .local
+        .as_ref()
+        .unwrap()
+        .resources
+        .lock()
+        .unwrap()
+        .connection = Arc::new(Connection::new(
         client_write,
         client_read,
         None,
@@ -7538,6 +7591,7 @@ async fn terminal_failure_events_carry_turn_id() {
         "boom",
         Some("turn-tfe-1"),
         super::FailedProviderSource::CommittedTurn,
+        None,
     )
     .await;
 
@@ -7566,6 +7620,7 @@ async fn terminal_failure_events_carry_turn_id() {
         "boom2",
         None,
         super::FailedProviderSource::CommittedTurn,
+        None,
     )
     .await;
     let mut events = Vec::new();
@@ -7585,6 +7640,51 @@ async fn terminal_failure_events_carry_turn_id() {
     }
 }
 
+#[tokio::test]
+async fn member_async_failure_keeps_safe_authorization_and_workspace_scope() {
+    use intent_core::execution::{
+        ExecutionAuthorizationFailure, ExecutionAuthorizationReason, ExecutionResource,
+    };
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let (ws, id) = (WorkspaceId::from("member-auth-failure"), AgentId::new());
+    seed_agent(&mgr, &ws, &id).await;
+    let auth = ExecutionAuthorizationFailure::new(
+        ExecutionResource::Ai,
+        ExecutionAuthorizationReason::Rejected,
+        Some("mock".into()),
+        None,
+    );
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        workspace_id: Some(ws.0.clone()),
+        ..Default::default()
+    });
+    super::publish_terminal_failure_events(
+        &mgr,
+        &id,
+        &ws,
+        &auth.message(),
+        Some("member-turn"),
+        super::FailedProviderSource::CommittedTurn,
+        Some(&auth),
+    )
+    .await;
+    let events = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let failed = events
+        .iter()
+        .find(|e| e.event_type == "agent:failed")
+        .unwrap();
+    assert_eq!(failed.workspace_id, ws);
+    assert_eq!(failed.data["executionAuthorization"], json!(auth));
+    assert_eq!(failed.data["turnId"], "member-turn");
+    assert!(failed.data["error"]
+        .as_str()
+        .unwrap()
+        .contains("connected host"));
+}
+
 /// Collect the `agent:failed` payload the terminal publisher emits for one
 /// quota-classified failure under the given provider source.
 async fn quota_failed_payload(
@@ -7602,6 +7702,7 @@ async fn quota_failed_payload(
         "session/new failed: rate_limit_error: usage limit reached",
         None,
         source,
+        None,
     )
     .await;
     let mut events = Vec::new();
@@ -7702,6 +7803,7 @@ async fn spawn_attempt_provider_never_outlives_its_attempt() {
         "session/new failed: internal error",
         None,
         super::FailedProviderSource::SpawnAttempt,
+        None,
     )
     .await;
     assert!(
@@ -8490,21 +8592,24 @@ async fn interrupt_on_wedged_transport_still_emits_terminal_events() {
     mgr.handles.lock().unwrap().insert(
         id.clone(),
         AgentHandle {
-            connection: conn,
-            notifications: Arc::new(TokioMutex::new(note_rx)),
-            serve_task: tokio::spawn(async {}),
-            child: None,
-            child_pid: None,
-            _mcp_bridge: None,
-            _mcp_config: None,
-            _rules_config: None,
-            _pi_extension: None,
-            npx_launch_dir: None,
+            execution: RuntimeHandle::local(LocalResources {
+                connection: conn,
+                notifications: Arc::new(TokioMutex::new(note_rx)),
+                serve_task: tokio::spawn(async {}),
+                child: None,
+                child_pid: None,
+                _mcp_bridge: None,
+                _mcp_config: None,
+                _rules_config: None,
+                _pi_extension: None,
+                npx_launch_dir: None,
+            }),
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
             spawned_provider: "auggie".to_string(),
             thought_level: None,
+            config_options: None,
             confirmed_effort: None,
             wake_gate: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_listener: None,
@@ -8561,7 +8666,11 @@ async fn cancel_and_settle_idle_prompt_times_out_on_wedged_transport() {
     let id = AgentId::from("a-wedged-settle");
     let settled = timeout(
         Duration::from_secs(10),
-        super::cancel_and_settle_idle_prompt(&conn, &id, "acp-wedged"),
+        super::cancel_and_settle_idle_prompt(
+            &super::runtime::ConnectionRuntime(&conn),
+            &id,
+            "acp-wedged",
+        ),
     )
     .await
     .expect("settle returns despite the wedged transport (monorepo#3039)");
@@ -9111,6 +9220,482 @@ async fn interrupt_colliding_with_suspend_enrollment_row_keeps_interrupted_end()
         events.iter().any(|e| e.event_type == "agent:idle"),
         "agent:idle still follows the terminal emit"
     );
+}
+
+/// A user retiring a running agent must abort its worker, release the runtime,
+/// and preserve the partial conversation; marking the row alone is insufficient.
+#[tokio::test]
+async fn user_retire_stops_running_target_and_preserves_partial_turn() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-retire"),
+        AgentId::from("retire-running"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    track(&mgr, &id);
+    let admission = mgr.try_begin_turn(&id, &ws).await.unwrap();
+    let worker = tokio::spawn(std::future::pending::<()>());
+    let aborted = worker.abort_handle();
+    mgr.workers.lock().unwrap().insert(id.clone(), worker);
+    let blocks = vec![json!({ "type": "text", "text": "partial retirement turn" })];
+    mgr.services
+        .set_live_turn(&id, "retire-partial", blocks.clone());
+
+    let result = intent_core::with_caller(
+        intent_core::Caller::Wire {
+            principal_id: intent_core::PrincipalId::new(),
+            host_role: intent_core::HostRole::Owner,
+        },
+        mgr.services
+            .agent_retire(id.clone(), Some(ws.clone()), None),
+    )
+    .await
+    .expect("user retirement");
+    assert_eq!(result["success"], true);
+    timeout(Duration::from_secs(2), async {
+        while !aborted.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("retirement must abort the running worker");
+    assert!(!mgr.is_busy(&id));
+    assert!(!mgr.contains(&id));
+    assert!(!mgr.registry().is_registered(&id));
+    assert!(!mgr.workers.lock().unwrap().contains_key(&id));
+    let row = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert!(row.retired_at.is_some());
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].content, Value::Array(blocks));
+    assert_eq!(messages[0].metadata.as_ref().unwrap()["interrupted"], true);
+    let sent = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "late send".into(),
+            None,
+            super::TurnOptions::default(),
+        )
+        .await;
+    assert!(
+        matches!(sent, Err(Error::InvalidParams(ref message)) if message.contains("retired")),
+        "{sent:?}"
+    );
+    mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+    assert!(!mgr.is_busy(&id));
+    assert!(!mgr.contains(&id));
+    // A send may have passed its store check before retirement. Neither
+    // its late claim nor a late worker registration can restart the target.
+    assert!(!mgr.try_begin(&id, &ws).await);
+    mgr.spawn_worker(
+        id.clone(),
+        ws.clone(),
+        "racing send".into(),
+        super::TurnOptions::default(),
+        false,
+        admission,
+    );
+    assert!(!mgr.workers.lock().unwrap().contains_key(&id));
+    mgr.services
+        .agent_restore_op(id.clone(), Some(ws.clone()))
+        .await
+        .unwrap();
+    assert!(
+        mgr.try_begin(&id, &ws).await,
+        "restore clears runtime fence"
+    );
+    mgr.end_turn(&id).await;
+}
+
+#[tokio::test]
+async fn user_retire_waits_for_claimed_turn_start_before_detaching() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let ws = WorkspaceId::from("ws-retire-start");
+    let id = AgentId::from("retire-start");
+    seed_agent(&mgr, &ws, &id).await;
+    let pause = Arc::new(super::TurnStartPause::default());
+    *mgr.turn_start_pause.lock().unwrap() = Some(pause.clone());
+    let starting = tokio::spawn({
+        let (mgr, id, ws) = (mgr.clone(), id.clone(), ws.clone());
+        async move { mgr.try_begin_turn(&id, &ws).await }
+    });
+    timeout(Duration::from_secs(2), pause.reached.notified())
+        .await
+        .expect("turn claimed before side effects");
+    let mut retiring = tokio::spawn({
+        let (mgr, id, ws) = (mgr.clone(), id.clone(), ws.clone());
+        async move {
+            intent_core::with_caller(
+                intent_core::Caller::Wire {
+                    principal_id: intent_core::PrincipalId::new(),
+                    host_role: intent_core::HostRole::Owner,
+                },
+                mgr.services.agent_retire(id, Some(ws), None),
+            )
+            .await
+        }
+    });
+    timeout(Duration::from_secs(2), async {
+        while !mgr.retired.lock().unwrap().contains(&id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("retirement fences the target");
+    // Before the fix this finishes teardown while startup is paused. After
+    // the fix retirement waits for startup, then balances its activity edge.
+    let early_retirement = timeout(Duration::from_millis(100), &mut retiring).await;
+    pause.resume.notify_one();
+    let admission = starting.await.unwrap().unwrap();
+    match early_retirement {
+        Ok(result) => result.unwrap().unwrap(),
+        Err(_) => retiring.await.unwrap().unwrap(),
+    };
+    mgr.spawn_worker(
+        id.clone(),
+        ws.clone(),
+        "late send".into(),
+        super::TurnOptions::default(),
+        false,
+        admission,
+    );
+    assert!(!mgr.is_busy(&id));
+    assert!(!mgr.workers.lock().unwrap().contains_key(&id));
+    assert_eq!(
+        mgr.services
+            .store
+            .get_agent_session(&id)
+            .await
+            .unwrap()
+            .status,
+        AgentStatus::RuntimeIdle,
+        "startup must not persist Active after retirement detached its slot"
+    );
+    assert_eq!(
+        mgr.services
+            .agent_activity
+            .lock()
+            .unwrap()
+            .get(&ws)
+            .copied()
+            .unwrap_or(0),
+        0,
+        "retirement balances even a delayed startup activity increment"
+    );
+    mgr.services
+        .agent_restore_op(id.clone(), Some(ws.clone()))
+        .await
+        .unwrap();
+    let restored = mgr
+        .services
+        .agent_get_op(id.clone(), Some(ws.clone()))
+        .await
+        .unwrap();
+    let restored = serde_json::to_value(restored).unwrap();
+    assert_eq!(restored["status"], "idle");
+    assert_eq!(restored["isActive"], false);
+    assert_eq!(restored["turnInFlight"], false);
+    assert!(
+        mgr.try_begin(&id, &ws).await,
+        "fresh restored turn can start"
+    );
+    mgr.end_turn(&id).await;
+}
+
+#[tokio::test]
+async fn user_retire_invalidates_admitted_send_across_restore() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let ws = WorkspaceId::from("ws-retire-admission");
+    let id = AgentId::from("retire-admission");
+    seed_agent(&mgr, &ws, &id).await;
+    // Pause the sender between admission/persistence and worker registration.
+    let cancelled = mgr.try_begin_turn(&id, &ws).await.unwrap();
+    intent_core::with_caller(
+        intent_core::Caller::Wire {
+            principal_id: intent_core::PrincipalId::new(),
+            host_role: intent_core::HostRole::Owner,
+        },
+        mgr.services
+            .agent_retire(id.clone(), Some(ws.clone()), None),
+    )
+    .await
+    .unwrap();
+    mgr.services
+        .agent_restore_op(id.clone(), Some(ws.clone()))
+        .await
+        .unwrap();
+    assert!(!mgr.retired.lock().unwrap().contains(&id));
+    mgr.spawn_worker(
+        id.clone(),
+        ws.clone(),
+        "cancelled send".into(),
+        super::TurnOptions::default(),
+        true,
+        cancelled,
+    );
+    assert!(
+        !mgr.workers.lock().unwrap().contains_key(&id),
+        "restoring must not revive a cancelled sender's admission"
+    );
+    assert!(!mgr.is_busy(&id));
+
+    let fresh = mgr.try_begin_turn(&id, &ws).await.unwrap();
+    assert_ne!(fresh, cancelled);
+    mgr.spawn_worker(
+        id.clone(),
+        ws.clone(),
+        "cancelled send".into(),
+        super::TurnOptions::default(),
+        true,
+        cancelled,
+    );
+    assert!(
+        !mgr.workers.lock().unwrap().contains_key(&id),
+        "old sender must not register against the fresh restored claim"
+    );
+    assert!(
+        mgr.is_busy(&id),
+        "old sender must not release the fresh slot"
+    );
+    assert_eq!(mgr.turn_admissions.lock().unwrap().get(&id), Some(&fresh));
+    assert_eq!(
+        mgr.services.agent_activity.lock().unwrap().get(&ws),
+        Some(&1)
+    );
+    mgr.end_turn(&id).await;
+    assert_eq!(
+        mgr.services
+            .agent_activity
+            .lock()
+            .unwrap()
+            .get(&ws)
+            .copied()
+            .unwrap_or(0),
+        0
+    );
+}
+
+#[tokio::test]
+async fn user_retire_stale_idle_cleanup_preserves_restored_claim() {
+    assert_retired_cleanup_preserves_fresh_turn(RetiredCleanup::Idle).await;
+}
+
+#[tokio::test]
+async fn user_retire_stale_slot_cleanup_preserves_restored_claim() {
+    assert_retired_cleanup_preserves_fresh_turn(RetiredCleanup::Slot).await;
+}
+
+#[tokio::test]
+async fn user_retire_stale_persist_failure_preserves_restored_claim() {
+    assert_retired_cleanup_preserves_fresh_turn(RetiredCleanup::PersistFailure).await;
+}
+
+#[tokio::test]
+async fn user_retire_stale_flush_preserves_restored_claim() {
+    assert_retired_cleanup_preserves_fresh_turn(RetiredCleanup::Flush).await;
+}
+
+enum RetiredCleanup {
+    Idle,
+    Slot,
+    PersistFailure,
+    Flush,
+}
+
+async fn assert_retired_cleanup_preserves_fresh_turn(cleanup: RetiredCleanup) {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let ws = WorkspaceId::from("ws-retire-cleanup");
+    let id = AgentId::from("retire-cleanup");
+    seed_agent(&mgr, &ws, &id).await;
+    let cancelled = mgr.try_begin_turn(&id, &ws).await.unwrap();
+    let flush = if matches!(cleanup, RetiredCleanup::Flush) {
+        mgr.services.enqueue_message(
+            &id,
+            "old flush".into(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::Automatic,
+        );
+        mgr.services.dequeue_message_draining(&id)
+    } else {
+        None
+    };
+    // The old request is paused after admission while its append/drain awaits.
+    intent_core::with_caller(
+        intent_core::Caller::Wire {
+            principal_id: intent_core::PrincipalId::new(),
+            host_role: intent_core::HostRole::Owner,
+        },
+        mgr.services
+            .agent_retire(id.clone(), Some(ws.clone()), None),
+    )
+    .await
+    .unwrap();
+    mgr.services
+        .agent_restore_op(id.clone(), Some(ws.clone()))
+        .await
+        .unwrap();
+    let fresh = mgr.try_begin_turn(&id, &ws).await.unwrap();
+    assert_ne!(cancelled, fresh);
+    // Resume exactly the old request's error/empty-drain exit after Restore
+    // and a new claim. No scheduler timing or provider process is involved.
+    match cleanup {
+        RetiredCleanup::Idle => mgr.release_slot(&id, cancelled).await,
+        RetiredCleanup::Slot => mgr.finish_admission(&id, cancelled, false).await,
+        RetiredCleanup::PersistFailure => {
+            mgr.fail_admitted_persist(
+                &id,
+                &ws,
+                "old send",
+                &super::TurnOptions::default(),
+                cancelled,
+            )
+            .await;
+        }
+        RetiredCleanup::Flush => {
+            let (entry, draining) = flush.unwrap();
+            let prep = mgr
+                .prepare_admitted_flush_turn(&id, &ws, vec![entry], draining, cancelled)
+                .await;
+            assert!(matches!(prep, super::FlushPrep::Parked));
+            mgr.finish_admission(&id, cancelled, false).await;
+            assert!(
+                mgr.services
+                    .store
+                    .get_agent_messages(&id, None)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "cancelled flush must not persist messages for the new turn"
+            );
+        }
+    }
+    assert!(mgr.is_busy(&id), "stale cleanup must preserve fresh slot");
+    assert_eq!(mgr.turn_admissions.lock().unwrap().get(&id), Some(&fresh));
+    assert_eq!(
+        mgr.services.agent_activity.lock().unwrap().get(&ws),
+        Some(&1)
+    );
+    let row = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(
+        row.status,
+        AgentStatus::Active,
+        "stale failure must not overwrite fresh status"
+    );
+    assert!(row.stop_reason.is_none());
+    assert!(
+        !mgr.services.has_ready_to_send(&id),
+        "cancelled send is not requeued into new turn"
+    );
+    mgr.end_turn(&id).await;
+}
+
+#[tokio::test]
+async fn user_retire_active_descendant_rejection_does_not_stop_target() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let (ws, id, child) = (
+        WorkspaceId::from("ws-retire-guard"),
+        AgentId::from("parent"),
+        AgentId::from("child"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    let mut descendant = mgr.services.store.get_agent_session(&id).await.unwrap();
+    descendant.id = child.clone();
+    descendant.parent_agent_id = Some(id.clone());
+    descendant.status = AgentStatus::Active;
+    mgr.services
+        .store
+        .insert_agent_session(&descendant)
+        .await
+        .unwrap();
+    track(&mgr, &id);
+    assert!(mgr.try_begin(&id, &ws).await);
+    let worker = tokio::spawn(std::future::pending::<()>());
+    let aborted = worker.abort_handle();
+    mgr.workers.lock().unwrap().insert(id.clone(), worker);
+    let result = intent_core::with_caller(
+        intent_core::Caller::Wire {
+            principal_id: intent_core::PrincipalId::new(),
+            host_role: intent_core::HostRole::Owner,
+        },
+        mgr.services
+            .agent_retire(id.clone(), Some(ws.clone()), None),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(Error::InvalidParams(ref message)) if message.contains("active child")),
+        "{result:?}"
+    );
+    assert!(!aborted.is_finished());
+    assert!(mgr.is_busy(&id));
+    assert!(mgr.contains(&id));
+    assert!(!mgr.retired.lock().unwrap().contains(&id));
+    for agent in [&id, &child] {
+        assert!(mgr
+            .services
+            .store
+            .get_agent_session(agent)
+            .await
+            .unwrap()
+            .retired_at
+            .is_none());
+    }
+    mgr.stop(&id).await;
+}
+
+#[tokio::test]
+async fn mcp_retire_leaves_calling_worker_alive_to_finish_response() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-mcp-retire"),
+        AgentId::from("self-retire"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    track(&mgr, &id);
+    assert!(mgr.try_begin(&id, &ws).await);
+    let worker = tokio::spawn(std::future::pending::<()>());
+    let aborted = worker.abort_handle();
+    mgr.workers.lock().unwrap().insert(id.clone(), worker);
+    let result = intent_core::with_caller(
+        intent_core::Caller::Agent {
+            agent_id: id.clone(),
+        },
+        mgr.services.agent_retire(id.clone(), Some(ws), None),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result["success"], true);
+    assert!(!aborted.is_finished(), "MCP response must not abort itself");
+    assert!(mgr
+        .services
+        .store
+        .get_agent_session(&id)
+        .await
+        .unwrap()
+        .retired_at
+        .is_some());
+    mgr.stop(&id).await;
 }
 
 /// Regression companion: the hard `stop()` path (interrupt fallback / kill)
@@ -10038,6 +10623,106 @@ async fn send_queued_message_now_persist_failure_requeues_front() {
     assert_eq!(queue.len(), 1, "entry restored, never lost: {queue:?}");
     assert_eq!(queue[0]["id"], json!(entry_id));
     assert!(!mgr.is_busy(&id), "the slot was released");
+}
+
+#[tokio::test]
+async fn transfer_human_runtime_force_and_handback_keep_original_author() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-historical"),
+        AgentId::from("historical"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    let owner = mgr.services.store.get_primary_principal().await.unwrap();
+    let caller = intent_core::Caller::Wire {
+        principal_id: owner.id,
+        host_role: intent_core::HostRole::Owner,
+    };
+    let entry = crate::human_attribution_tests::imported_pending("historical-input");
+    mgr.services
+        .agent_queues
+        .lock()
+        .unwrap()
+        .insert(id.clone(), vec![entry.clone()]);
+    assert!(intent_core::with_caller(
+        intent_core::Caller::Daemon,
+        mgr.send_queued_message_now(id.clone(), ws.clone(), entry.id.clone())
+    )
+    .await
+    .is_err());
+    assert!(mgr.try_begin(&id, &ws).await);
+    let parked = intent_core::with_caller(
+        caller.clone(),
+        mgr.send_queued_message_now(id.clone(), ws.clone(), entry.id.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(parked["queued"], true);
+    let restored = mgr.services.find_queued_message(&id, &entry.id).unwrap();
+    crate::human_attribution_tests::assert_preserved_queue_metadata(&entry, &restored);
+    assert!(!restored.ready_to_send());
+    mgr.end_turn(&id).await;
+    mgr.redrive_parked_recovery_send(&id, &ws).await;
+    assert!(
+        !mgr.is_busy(&id),
+        "slot release cannot authorize imported input"
+    );
+    assert!(mgr.services.find_queued_message(&id, &entry.id).is_some());
+    sqlx::query("CREATE TRIGGER fail_historical_append BEFORE INSERT ON agent_message BEGIN SELECT RAISE(ABORT,'test append failure'); END").execute(mgr.services.store.write_pool()).await.unwrap();
+    let failed = intent_core::with_caller(
+        caller.clone(),
+        mgr.send_queued_message_now(id.clone(), ws.clone(), entry.id.clone()),
+    )
+    .await;
+    assert!(failed.is_err());
+    assert!(!mgr.is_busy(&id));
+    let restored = mgr.services.find_queued_message(&id, &entry.id).unwrap();
+    crate::human_attribution_tests::assert_preserved_queue_metadata(&entry, &restored);
+    assert!(!restored.ready_to_send());
+    sqlx::query("DROP TRIGGER fail_historical_append")
+        .execute(mgr.services.store.write_pool())
+        .await
+        .unwrap();
+    let script = mock_agent_script();
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+    set_session_provider(&mgr, &ws, &id, "mock").await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+    mgr.handles
+        .lock()
+        .unwrap()
+        .get_mut(&id)
+        .unwrap()
+        .spawned_provider = "node".into();
+    let sent = intent_core::with_caller(
+        caller,
+        mgr.send_queued_message_now(id.clone(), ws, entry.id.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(sent["queued"], false);
+    assert!(mgr.services.find_queued_message(&id, &entry.id).is_none());
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap();
+    let row = messages.iter().find(|m| m.id == entry.id).unwrap();
+    assert_eq!(
+        row.metadata.as_ref().unwrap()["humanAuthor"],
+        entry.message_metadata.as_ref().unwrap()["humanAuthor"]
+    );
+    assert_eq!(
+        row.metadata.as_ref().unwrap()["humanAuthorOriginalMetadata"],
+        entry.message_metadata.as_ref().unwrap()["humanAuthorOriginalMetadata"]
+    );
+    assert!(row
+        .metadata
+        .as_ref()
+        .unwrap()
+        .get("fromPrincipalId")
+        .is_none());
 }
 
 /// monorepo#840 quarantine gate: `send_queued_message_now` on a poisoned
@@ -11051,6 +11736,94 @@ fn prompt(request_id: &str, session_id: &str) -> PermissionRequestData {
         risk_level: RiskLevel::High,
         timestamp: 0,
     }
+}
+
+#[tokio::test]
+async fn member_permission_rpcs_resolve_another_persons_agent_and_recheck_authority() {
+    use intent_core::{with_caller, Caller, HostRole, PrincipalId, WorkspaceRole};
+    let (_tmp, mgr, _bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    let services = mgr.services.clone();
+    services.attach_agent_manager(&mgr);
+    let ws = WorkspaceId::new();
+    let id = AgentId::new();
+    seed_agent(&mgr, &ws, &id).await;
+    let mut member = services.store.get_primary_principal().await.unwrap();
+    member.id = PrincipalId::new();
+    member.is_primary = false;
+    services.store.upsert_principal(&member).await.unwrap();
+    sqlx::query("INSERT INTO host_member (principal_id,added_at) VALUES (?,?)")
+        .bind(member.id.as_str())
+        .bind(now_iso())
+        .execute(services.store.write_pool())
+        .await
+        .unwrap();
+    let caller = Caller::Wire {
+        principal_id: member.id.clone(),
+        host_role: HostRole::Guest,
+    };
+    // A previously admitted guest becomes a member without an explicit row.
+    let mut rx = mgr
+        .permissions
+        .register(prompt("member-prompt", id.as_str()));
+    with_caller(caller.clone(), async {
+        for filter in [None, Some(id.clone())] {
+            let requests = services.agent_pending_permissions(filter).await.unwrap();
+            assert_eq!(requests["requests"][0]["requestId"], "member-prompt");
+        }
+        let answer = services
+            .agent_respond_permission(
+                "member-prompt".into(),
+                json!({"outcome":"selected","optionId":"allow_once"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(answer["resolved"], true);
+    })
+    .await;
+    assert_eq!(
+        rx.try_recv().unwrap(),
+        PermissionOutcome::Selected {
+            option_id: "allow_once".into()
+        }
+    );
+    // A retained guest grant cannot answer or enumerate the next prompt.
+    services
+        .store
+        .add_workspace_member(&ws, &member.id, WorkspaceRole::Collaborator)
+        .await
+        .unwrap();
+    services.store.remove_host_member(&member.id).await.unwrap();
+    let mut rx = mgr
+        .permissions
+        .register(prompt("after-revoke", id.as_str()));
+    with_caller(caller, async {
+        assert_eq!(
+            services.agent_pending_permissions(None).await.unwrap()["requests"],
+            json!([])
+        );
+        assert!(services
+            .agent_pending_permissions(Some(id.clone()))
+            .await
+            .is_err());
+        assert!(services
+            .agent_respond_permission("after-revoke".into(), json!({"outcome":"cancelled"}))
+            .await
+            .is_err());
+    })
+    .await;
+    assert!(rx.try_recv().is_err());
+    // Fabricated callers never gain access through an outstanding request id.
+    let unknown = Caller::Wire {
+        principal_id: PrincipalId::new(),
+        host_role: HostRole::Member,
+    };
+    assert!(with_caller(
+        unknown,
+        services.agent_respond_permission("after-revoke".into(), json!({"outcome":"cancelled"}))
+    )
+    .await
+    .is_err());
 }
 
 #[tokio::test]
@@ -12491,11 +13264,14 @@ async fn prompt_idle_event_precedes_end_turn_status_persistence() {
     let (connection, notifications) = {
         let handles = mgr.handles.lock().unwrap();
         let handle = handles.get(&id).unwrap();
-        (handle.connection.clone(), handle.notifications.clone())
+        (
+            handle.execution.connection().unwrap(),
+            handle.execution.runtime.notifications(),
+        )
     };
     let mut sub = bus.subscribe(SubscriptionFilter::default());
     mgr.services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &connection,
             &mut *notifications.lock().await,
             &id,
@@ -14044,7 +14820,7 @@ async fn wake_to_busy_vanished_session_fails_closed() {
     );
     seed_agent(&mgr, &ws, &id).await;
     assert!(
-        mgr.try_begin_turn(&id, &ws).await,
+        mgr.try_begin_turn(&id, &ws).await.is_some(),
         "claim the in-flight slot so the wake takes the busy enqueue branch"
     );
     mgr.services
@@ -14220,6 +14996,13 @@ async fn probe_bridge_workspace_api(mgr: &AgentManager, id: &AgentId, code: &str
         .unwrap()
         .get(id)
         .expect("the woken agent keeps a live handle")
+        .execution
+        .local
+        .as_ref()
+        .unwrap()
+        .resources
+        .lock()
+        .unwrap()
         ._mcp_bridge
         .as_ref()
         .expect("the live handle serves a workspace_api bridge")
@@ -19662,21 +20445,24 @@ mod harness_wake_tests {
             ConnectionHooks::default(),
         ));
         let handle = AgentHandle {
-            connection,
-            notifications: Arc::new(TokioMutex::new(note_rx)),
-            serve_task: tokio::spawn(async {}),
-            child: None,
-            child_pid: None,
-            _mcp_bridge: None,
-            _mcp_config: None,
-            _rules_config: None,
-            _pi_extension: None,
-            npx_launch_dir: None,
+            execution: RuntimeHandle::local(LocalResources {
+                connection,
+                notifications: Arc::new(TokioMutex::new(note_rx)),
+                serve_task: tokio::spawn(async {}),
+                child: None,
+                child_pid: None,
+                _mcp_bridge: None,
+                _mcp_config: None,
+                _rules_config: None,
+                _pi_extension: None,
+                npx_launch_dir: None,
+            }),
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
             spawned_provider: "auggie".to_string(),
             thought_level: None,
+            config_options: None,
             confirmed_effort: None,
             wake_gate: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_listener: None,
@@ -20203,7 +20989,7 @@ mod harness_wake_tests {
         // The replay drain (resume path) still sees the buffered burst.
         let notes = {
             let map = mgr.handles.lock().unwrap();
-            map.get(&id).unwrap().notifications.clone()
+            map.get(&id).unwrap().execution.runtime.notifications()
         };
         {
             let mut guard = notes.lock().await;
@@ -20242,7 +21028,7 @@ mod harness_wake_tests {
         {
             let notes = {
                 let map = mgr.handles.lock().unwrap();
-                map.get(&id).unwrap().notifications.clone()
+                map.get(&id).unwrap().execution.runtime.notifications()
             };
             let mut guard = notes.try_lock().expect("receiver not held");
             let buffered = guard.try_recv();
@@ -20462,7 +21248,7 @@ mod harness_wake_tests {
         note_tx.send(chunk_note("later burst")).unwrap();
         let notes = {
             let map = mgr.handles.lock().unwrap();
-            map.get(&id).unwrap().notifications.clone()
+            map.get(&id).unwrap().execution.runtime.notifications()
         };
         let persisted_id = {
             let mut guard = notes.lock().await;
@@ -22830,7 +23616,19 @@ mod session_model_tests {
             ConnectionHooks::default(),
         ));
         track(mgr, id);
-        mgr.handles.lock().unwrap().get_mut(id).unwrap().connection = conn.clone();
+        mgr.handles
+            .lock()
+            .unwrap()
+            .get_mut(id)
+            .unwrap()
+            .execution
+            .local
+            .as_ref()
+            .unwrap()
+            .resources
+            .lock()
+            .unwrap()
+            .connection = conn.clone();
         (conn, server, request)
     }
 
@@ -23238,4 +24036,454 @@ mod enqueue_origin_table {
             );
         }
     }
+}
+
+#[intent_test_macros::daemon_test]
+async fn member_removal_preserves_running_turn_and_automation_but_sweeps_human_queue() {
+    use intent_core::{with_caller, Caller, HostRole, PrincipalId};
+    for drain_first in [false, true] {
+        let (_tmp, mgr, _bus) = manager_with_bus().await;
+        let mgr = Arc::new(mgr);
+        mgr.services.attach_agent_manager(&mgr);
+        let ws = WorkspaceId::new();
+        let id = AgentId::new();
+        seed_agent(&mgr, &ws, &id).await;
+        let person = PrincipalId::new();
+        sqlx::query(
+            "INSERT INTO principal (id,is_primary,created_at,updated_at) VALUES (?,0,'t0','t0')",
+        )
+        .bind(&person.0)
+        .execute(mgr.services.store.write_pool())
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO host_member (principal_id,added_at) VALUES (?,'t0')")
+            .bind(&person.0)
+            .execute(mgr.services.store.write_pool())
+            .await
+            .unwrap();
+        mgr.services
+            .store
+            .insert_principal_credential(&person, "worker-removal-credential")
+            .await
+            .unwrap();
+        let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
+        let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
+        let (prompt_tx, mut prompts) = mpsc::unbounded_channel();
+        let (finish_first, mut finish) = mpsc::unbounded_channel::<()>();
+        let mock = tokio::spawn(async move {
+            let mut lines = BufReader::new(c2a_agent).lines();
+            let mut write = a2c_agent;
+            while let Ok(Some(line)) = lines.next_line().await {
+                let value: Value = serde_json::from_str(&line).unwrap();
+                let (Some(rpc_id), Some(method)) =
+                    (value.get("id"), value.get("method").and_then(Value::as_str))
+                else {
+                    continue;
+                };
+                let result = match method {
+                    "initialize" => {
+                        json!({"protocolVersion":1,"agentCapabilities":{"loadSession":false}})
+                    }
+                    "session/new" => {
+                        json!({"sessionId":MGR_ACP_SID,"modes":MockModes::with_bypass().to_json()})
+                    }
+                    "session/prompt" => {
+                        prompt_tx.send(value["params"].clone()).unwrap();
+                        finish.recv().await.unwrap();
+                        json!({"stopReason":"end_turn"})
+                    }
+                    _ => json!({}),
+                };
+                let response = json!({"jsonrpc":"2.0","id":rpc_id,"result":result});
+                write
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+                write.flush().await.unwrap();
+            }
+        });
+        let (note_tx, note_rx) = mpsc::unbounded_channel();
+        let connection = Arc::new(Connection::new(
+            c2a_client,
+            a2c_client,
+            None,
+            ConnectionHooks {
+                notifications: Some(note_tx),
+                ..ConnectionHooks::default()
+            },
+        ));
+        let handle = mock_handle();
+        handle
+            .execution
+            .local
+            .as_ref()
+            .unwrap()
+            .resources
+            .lock()
+            .unwrap()
+            .connection = connection;
+        handle
+            .execution
+            .local
+            .as_ref()
+            .unwrap()
+            .resources
+            .lock()
+            .unwrap()
+            .notifications = Arc::new(TokioMutex::new(note_rx));
+        mgr.handles.lock().unwrap().insert(id.clone(), handle);
+        mgr.registry.register(id.clone(), mgr.make_kill(id.clone()));
+        let caller = Caller::Wire {
+            principal_id: person.clone(),
+            host_role: HostRole::Member,
+        };
+        let sent = with_caller(
+            caller.clone(),
+            mgr.services.agent_send_message(
+                ws.clone(),
+                id.clone(),
+                "running human".into(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                MessageOrigin::User,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sent["queued"], false);
+        let first = timeout(Duration::from_secs(10), prompts.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(first.to_string().contains("running human"));
+        with_caller(
+            caller,
+            mgr.services.agent_queue_message(
+                id.clone(),
+                "pending human".into(),
+                None,
+                None,
+                Some(json!({"source":"system"})),
+            ),
+        )
+        .await
+        .unwrap();
+        if !drain_first {
+            mgr.services
+                .agent_queue_message(
+                    id.clone(),
+                    "automatic continuation".into(),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        if drain_first {
+            // Stop the actual worker inside admission, after its first turn.
+            let (reached, release) = mgr.services.queue_drain_commit_pause.arm();
+            finish_first.send(()).unwrap();
+            reached.await.unwrap();
+            let mut remove = mgr.services.host_members_remove(person.clone());
+            let pending =
+                std::future::poll_fn(|cx| std::task::Poll::Ready(remove.as_mut().poll(cx))).await;
+            assert!(
+                pending.is_pending(),
+                "removal must serialize with selected instructions"
+            );
+            release.send(()).unwrap();
+            remove.await.unwrap();
+            let second = timeout(Duration::from_secs(10), prompts.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(second.to_string().contains("pending human"));
+            mgr.services
+                .agent_queue_message(
+                    id.clone(),
+                    "automatic continuation".into(),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            // This turn was admitted before revocation, so it may finish.
+            finish_first.send(()).unwrap();
+        } else {
+            // Removal completes while the real provider prompt is still blocked.
+            mgr.services
+                .host_members_remove(person.clone())
+                .await
+                .unwrap();
+            assert!(mgr.contains(&id));
+            assert!(mgr.is_busy(&id));
+            finish_first.send(()).unwrap();
+        }
+        let automatic = timeout(Duration::from_secs(10), prompts.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(automatic.to_string().contains("automatic continuation"));
+        // History may contain the admitted first turn; no removed queued user
+        // row may appear when removal linearized first.
+        if !drain_first {
+            assert!(!automatic.to_string().contains("pending human"));
+        }
+        finish_first.send(()).unwrap();
+        mgr.stop(&id).await;
+        mock.abort();
+        let _ = mock.await;
+    }
+}
+
+/// Characterize the orchestration state that must outlive runtime teardown:
+/// queued delivery and the provider session belong to the agent, not its child.
+#[tokio::test]
+async fn runtime_characterization_stop_preserves_queue_and_resume_identity() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr.with_policy(PermissionPolicy::Interactive));
+    let ws = WorkspaceId::from("ws-runtime-stop");
+    let id = AgentId::from("runtime-stop");
+    seed_agent(&mgr, &ws, &id).await;
+    let agent = track_mock_agent(&mgr, &id, true);
+    let sid = mgr
+        .start_session(&id, PathBuf::from("/tmp/ws"), &test_provider())
+        .await
+        .unwrap();
+    assert!(mgr.try_begin(&id, &ws).await);
+    let queued = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "follow-up survives stop".into(),
+            Some("runtime-queued-message".into()),
+            super::TurnOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(queued["queued"], true);
+    let before = mgr.services.queue_snapshot(&id);
+    assert_eq!(before.len(), 1);
+
+    let mut permission = mgr
+        .permissions
+        .register(prompt("runtime-permission", &id.0));
+    assert!(mgr.respond_permission("runtime-permission", PermissionOutcome::Cancelled));
+    assert_eq!(permission.try_recv().unwrap(), PermissionOutcome::Cancelled);
+    assert!(!mgr.respond_permission("runtime-permission", PermissionOutcome::Cancelled));
+    assert!(mgr.pending_permissions().is_empty());
+
+    assert!(mgr.stop(&id).await);
+    assert!(!mgr.stop(&id).await, "teardown is idempotent");
+    assert!(!mgr.is_busy(&id));
+    assert!(!mgr.registry().is_registered(&id));
+    let after = mgr.services.queue_snapshot(&id);
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0]["id"], before[0]["id"]);
+    assert_eq!(after[0]["content"], before[0]["content"]);
+    assert_eq!(after[0]["turnId"], before[0]["turnId"]);
+    assert_eq!(
+        mgr.services
+            .store
+            .get_agent_session(&id)
+            .await
+            .unwrap()
+            .acp_session_id,
+        Some(sid)
+    );
+    agent.abort();
+}
+
+/// Idle reaping frees runtime capacity without changing the provider session
+/// identity; the next runtime resumes it instead of resending conversation.
+#[tokio::test]
+async fn runtime_characterization_idle_reap_resumes_same_session() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-runtime-reap");
+    let id = AgentId::from("runtime-reap");
+    seed_agent(&mgr, &ws, &id).await;
+    let first = track_mock_agent(&mgr, &id, true);
+    let sid = mgr
+        .start_session(&id, PathBuf::from("/tmp/ws"), &test_provider())
+        .await
+        .unwrap();
+    mgr.registry.set_last_active(&id, 1);
+    assert!(mgr.try_begin(&id, &ws).await);
+    assert_eq!(mgr.reap_idle_older_than(Duration::from_secs(60)).await, 0);
+    mgr.end_turn(&id).await;
+    mgr.registry.set_last_active(&id, 1);
+    assert_eq!(mgr.reap_idle_older_than(Duration::from_secs(60)).await, 1);
+    assert!(!mgr.contains(&id));
+    first.abort();
+
+    let (second, log) = track_mock_agent_with_log(&mgr, &id, true);
+    assert_eq!(
+        mgr.start_session(&id, PathBuf::from("/tmp/ws"), &test_provider())
+            .await
+            .unwrap(),
+        sid
+    );
+    assert!(!mgr.take_recreated(&id));
+    let calls = log.lock().unwrap().clone();
+    assert!(calls
+        .iter()
+        .any(|(method, params)| method == "session/load" && params["sessionId"] == sid));
+    assert!(!calls.iter().any(|(method, _)| method == "session/new"));
+    assert!(mgr.stop(&id).await);
+    second.abort();
+}
+
+#[path = "runtime_tests.rs"]
+mod runtime_tests;
+
+/// Startup recovery may admit a turn before its lazy provider spawn installs
+/// a handle. Shutdown must still abort that worker and preserve its recovery row.
+#[tokio::test]
+async fn shutdown_captures_startup_turn_before_provider_handle_exists() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-startup-shutdown");
+    let id = AgentId::from("startup-not-spawned");
+    seed_agent(&mgr, &ws, &id).await;
+    assert!(mgr.try_begin(&id, &ws).await);
+    assert!(!mgr.contains(&id));
+    let (gone, receiver) = tokio::sync::oneshot::channel::<()>();
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let (arrived, arrival) = tokio::sync::oneshot::channel::<()>();
+    let pending = mgr.clone();
+    let pending_id = id.clone();
+    let pending_ws = ws.clone();
+    let worker = intent_core::spawn_daemon(async move {
+        let _gone = gone;
+        arrived.send(()).unwrap();
+        if released.await.is_ok() {
+            pending
+                .ensure_started(&pending_id, &pending_ws)
+                .await
+                .unwrap();
+        }
+    });
+    mgr.workers.lock().unwrap().insert(id.clone(), worker);
+    arrival.await.unwrap();
+    mgr.shutdown().await;
+    assert!(
+        mgr.services
+            .store
+            .get_interrupted_agent(&id)
+            .await
+            .unwrap()
+            .is_some(),
+        "an admitted recovery turn must survive shutdown even before its provider starts"
+    );
+    assert!(!mgr.is_busy(&id));
+    assert!(mgr.workers.lock().unwrap().is_empty());
+    assert!(
+        timeout(Duration::from_secs(1), receiver)
+            .await
+            .unwrap()
+            .is_err(),
+        "pending worker was aborted"
+    );
+    assert!(release.send(()).is_err(), "shutdown dropped the held spawn");
+    assert!(
+        matches!(mgr.ensure_started(&id, &ws).await, Err(Error::NotFound(_))),
+        "late provider startup remains fenced"
+    );
+    assert!(!mgr.contains(&id));
+}
+
+/// Holding the first persistence await must not leave later workers alive to
+/// mistake the shutdown spawn fence for a terminal provider failure.
+#[tokio::test]
+async fn shutdown_snapshots_and_aborts_all_workers_before_persistence() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ids = [
+        AgentId::from("startup-first"),
+        AgentId::from("startup-later"),
+    ];
+    let pause = Arc::new(super::TurnStartPause::default());
+    *mgr.shutdown_persist_pause.lock().unwrap() = Some(pause.clone());
+    let mut senders = Vec::new();
+    let mut completions = Vec::new();
+    for id in &ids {
+        let ws = WorkspaceId(format!("ws-{id}"));
+        seed_agent(&mgr, &ws, id).await;
+        assert!(mgr.try_begin(id, &ws).await);
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let (done, completion) = tokio::sync::oneshot::channel::<()>();
+        let (pending, pending_id, pending_ws) = (mgr.clone(), id.clone(), ws.clone());
+        let worker = intent_core::spawn_daemon(async move {
+            released.await.unwrap();
+            let error = super::retry_spawn(&pending, &pending_id, &pending_ws)
+                .await
+                .expect_err("shutdown fence blocks provider startup");
+            super::handle_terminal_spawn_failure(
+                &pending,
+                &pending_id,
+                &pending_ws,
+                "recovery continuation",
+                &super::TurnOptions::default(),
+                true,
+                &error,
+            )
+            .await;
+            pending.release_in_flight_slot(&pending_id);
+            let _ = done.send(());
+        });
+        mgr.workers.lock().unwrap().insert(id.clone(), worker);
+        senders.push(release);
+        completions.push(completion);
+    }
+    let shutdown = {
+        let mgr = mgr.clone();
+        intent_core::spawn_daemon(async move { mgr.shutdown().await })
+    };
+    timeout(Duration::from_secs(5), pause.reached.notified())
+        .await
+        .unwrap();
+    for release in senders {
+        let _ = release.send(());
+    }
+    let mut terminal_failures = 0;
+    for completion in completions {
+        if timeout(Duration::from_secs(5), completion)
+            .await
+            .unwrap()
+            .is_ok()
+        {
+            terminal_failures += 1;
+        }
+    }
+    pause.resume.notify_one();
+    timeout(Duration::from_secs(5), shutdown)
+        .await
+        .unwrap()
+        .unwrap();
+    for id in &ids {
+        assert!(
+            mgr.services
+                .store
+                .get_interrupted_agent(id)
+                .await
+                .unwrap()
+                .is_some(),
+            "every admitted startup turn must remain recoverable: {id}"
+        );
+        assert!(!mgr.contains(id));
+        assert!(!mgr.is_busy(id));
+    }
+    assert_eq!(
+        terminal_failures, 0,
+        "shutdown must abort every worker before persistence"
+    );
 }

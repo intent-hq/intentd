@@ -10,16 +10,21 @@
 //! No `pr.*` wire methods or routing live here — those map onto this trait in a
 //! later milestone (§7.5).
 
+pub mod branch_rules_cache;
+pub mod cache_scope;
 pub mod device_flow;
 pub mod error;
 pub mod gh_sync;
 pub mod github;
+mod github_transport;
 pub mod gitlab_auth;
 pub mod gitlab_token;
 pub mod identity_proof;
 pub mod model;
 pub mod registry;
+pub mod request_budget;
 pub mod token;
+pub mod traffic;
 
 use async_trait::async_trait;
 
@@ -56,6 +61,12 @@ pub use token::TokenSource;
 pub trait SourceControl: Send + Sync {
     /// Stable id of the provider, e.g. `"github"`.
     fn provider_id(&self) -> &'static str;
+
+    /// Authorization-scoped identity for shared reads. Providers without this
+    /// contract keep the legacy uncached path.
+    fn cache_scope(&self) -> Option<cache_scope::CacheScope> {
+        None
+    }
 
     /// Capabilities the active host supports (FE can gate UI on these).
     fn capabilities(&self) -> ScCapabilities;

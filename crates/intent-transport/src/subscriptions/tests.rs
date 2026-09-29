@@ -242,6 +242,13 @@ fn channel_event_types_are_all_collaborator_visible() {
         assert!(!types.is_empty(), "{channel:?} tails no types");
         let hidden: Vec<&String> = types
             .iter()
+            // A workspace channel consumes the global role invalidation
+            // internally and re-reads caller-scoped rows; it never forwards
+            // the event payload (including the unrelated principal id).
+            .filter(|t| {
+                !(channel == Channel::Workspace
+                    && t.as_str() == intent_core::events::HOST_MEMBERS_CHANGED)
+            })
             .filter(|t| !intent_core::events::is_collaborator_event_type(t))
             .collect();
         assert!(
@@ -820,10 +827,11 @@ fn channel_event_types_full_matrix() {
         "pr:linked",
         "pr:updated",
         "pr:unlinked",
+        "host:members-changed",
     ] {
         assert!(ws.iter().any(|s| s == t), "workspace missing {t}");
     }
-    assert_eq!(ws.len(), 10);
+    assert_eq!(ws.len(), 11);
     // Comment channel — single type.
     assert_eq!(
         channel_event_types(Channel::Comment),
@@ -2866,6 +2874,7 @@ mod agent_delta_list_projection {
             "lastSeenMessageId": "msg-seen",
             "isInitialAgent": true,
             "sponsorAgentId": "agent-sponsor",
+            "chiefPromptVersion": u32::MAX,
         });
         serde_json::from_value(json!({
             "id": "agent-1",
@@ -5141,7 +5150,7 @@ mod channel_membership {
         let principal_id = PrincipalId::new();
         let caller = Caller::Wire {
             principal_id: principal_id.clone(),
-            is_administrator: false,
+            host_role: intent_core::HostRole::Guest,
         };
         (principal_id, caller)
     }
@@ -5203,7 +5212,7 @@ mod channel_membership {
 
         let owner = Caller::Wire {
             principal_id: PrincipalId::new(),
-            is_administrator: true,
+            host_role: intent_core::HostRole::Owner,
         };
         let admin = subscribe(owner, &[STORE_DOWN], chat_subscribe("agent-1")).await;
         assert_eq!(
@@ -5308,7 +5317,7 @@ mod channel_membership {
         let principal_id = PrincipalId::new();
         let owner = Caller::Wire {
             principal_id: principal_id.clone(),
-            is_administrator: true,
+            host_role: intent_core::HostRole::Owner,
         };
         let mut h = subscribe(owner, &[], chat_subscribe("agent-2")).await;
         h.bus
@@ -5556,7 +5565,7 @@ mod channel_membership {
     async fn workspace_administrator_receives_every_tombstone() {
         let owner = Caller::Wire {
             principal_id: PrincipalId::new(),
-            is_administrator: true,
+            host_role: intent_core::HostRole::Owner,
         };
         let mut h = subscribe(owner, &["ws-1"], workspace_subscribe()).await;
         h.bus
@@ -5574,4 +5583,53 @@ mod channel_membership {
         );
         drop(h.subs);
     }
+}
+
+#[test]
+fn resource_context_keeps_unsubscribe_dispatch_and_chat_selectors() {
+    use serde_json::json;
+    for method in [
+        "events.unsubscribe",
+        "note.unsubscribe",
+        "task.unsubscribe",
+        "comment.unsubscribe",
+        "chat.unsubscribe",
+        "note.presence.unsubscribe",
+    ] {
+        for workspace in [None, Some("routing-context")] {
+            let mut params = json!({"subscriptionId":"owned-subscription"});
+            if let Some(ws) = workspace {
+                params["workspaceId"] = json!(ws);
+            }
+            let frame = json!({"jsonrpc":"2.0","id":7,"method":method,"params":params});
+            if method == "events.unsubscribe" {
+                assert!(matches!(
+                    crate::events::classify(&frame),
+                    Some(crate::events::FastPath::Unsubscribe { .. })
+                ));
+            } else {
+                assert!(matches!(
+                    classify(&frame),
+                    Some(SubFastPath::Unsubscribe { .. })
+                ));
+            }
+            assert_eq!(
+                crate::events::parse_unsubscribe_id(params.as_object().unwrap()).unwrap(),
+                "owned-subscription"
+            );
+        }
+    }
+    let legacy = json!({"jsonrpc":"2.0","id":1,"method":"agent.unsubscribe","params":{"subscriptionId":"s","workspaceId":"w"}});
+    assert!(classify(&legacy).is_none());
+    assert!(crate::events::classify(&legacy).is_none());
+    let params = json!({"agentId":"a","sinceMessageId":"cursor","deltaEncoding":"incremental","projection":"slim","replaceGroup":"chat"});
+    let plain = parse_chat_subscribe_params(params.as_object().unwrap()).unwrap();
+    let mut routed = params;
+    routed["workspaceId"] = json!("routing-context");
+    let routed = parse_chat_subscribe_params(routed.as_object().unwrap()).unwrap();
+    assert_eq!(plain.agent_id, routed.agent_id);
+    assert_eq!(plain.since_message_id, routed.since_message_id);
+    assert_eq!(plain.delta_encoding, routed.delta_encoding);
+    assert_eq!(plain.projection, routed.projection);
+    assert_eq!(plain.replace_group, routed.replace_group);
 }

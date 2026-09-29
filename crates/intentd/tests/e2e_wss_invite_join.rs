@@ -8,7 +8,7 @@
 //! GitHub identity and `workspace.get` the collaborator role → the same
 //! guest previews a second workspace's link with `invite.inspect` and joins
 //! it with `invite.accept` on that credential (no GitHub call; the presented
-//! credential is rotated out) → a third workspace is joined by gist proof
+//! credential is reused) → a third workspace is joined by gist proof
 //! again, exercising every proof refusal → the owner's `github.connect`
 //! authorised as a different account is refused (`identity-locked`) while
 //! the guest depends on the primary identity → the owner removes the member →
@@ -46,6 +46,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixStream};
+use tokio::sync::Notify;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::Message;
@@ -122,6 +123,9 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
     cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
+        // Keep heartbeat-reaper evidence in retained failure logs: a provider
+        // error and a later socket EOF do not establish the same cause.
+        .env("RUST_LOG", "info,intent_transport::ws=debug")
         .env_remove("GH_TOKEN")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
@@ -259,6 +263,28 @@ async fn wss_rpc(ws: &mut Ws, id: i64, method: &str, params: Value) -> Value {
     }
 }
 
+/// Listener readiness does not imply that the detached startup identity refresh
+/// has committed. Wait for the fixture owner before exercising invite minting.
+async fn await_owner_identity(owner: &mut Ws) {
+    let expected_owner_id = OWNER_ID.to_string();
+    let mut last = Value::Null;
+    timeout(common::daemon_startup_timeout(), async {
+        loop {
+            last = wss_rpc(owner, 199, "principal.me", json!({})).await;
+            assert!(last.get("error").is_none(), "principal.me: {last}");
+            if last["result"]["identity"]["externalUserId"].as_str()
+                == Some(expected_owner_id.as_str())
+            {
+                return;
+            }
+            // timing-guard: poll the observable startup identity, never retry minting
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("owner startup identity was not ready; last principal.me: {last}"));
+}
+
 /// One `/invite` round-trip that waits out the listener-wide start throttle
 /// (§ step 9): a request refused `invite-flow-busy` is retried until it is
 /// admitted — the bucket restores one token per 5 s — bounded by a deadline.
@@ -318,6 +344,7 @@ async fn prove(
 /// Pump a subscriber until a `workspace:updated` event whose `changes`
 /// satisfy `pred` arrives (bounded).
 async fn await_workspace_updated(ws: &mut Ws, what: &str, pred: impl Fn(&Value) -> bool) -> Value {
+    eprintln!("await workspace:updated ({what})");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let remaining = deadline
@@ -340,7 +367,7 @@ async fn await_workspace_updated(ws: &mut Ws, what: &str, pred: impl Fn(&Value) 
                 let _ = ws.send(Message::Pong(p)).await;
             }
             Some(Ok(_)) => {}
-            other => panic!("expected text frame, got {other:?}"),
+            other => panic!("workspace:updated ({what}): expected text frame, got {other:?}"),
         }
     }
 }
@@ -420,8 +447,18 @@ async fn upgrade_status_line(port: u16, cfg: Arc<ClientConfig>, token: &str) -> 
 /// The mock's scripted gists, keyed by gist id.
 type Gists = Arc<Mutex<HashMap<String, Value>>>;
 
+/// Hold one HTTP response until the test observes the competing operation.
+#[derive(Default)]
+struct ResponseGate {
+    entered: Notify,
+    release: Notify,
+}
+
+type ResponseGates = Arc<Mutex<HashMap<String, Arc<ResponseGate>>>>;
+
 struct MockGithub {
     base_uri: String,
+    response_gates: ResponseGates,
     flows: Arc<AtomicUsize>,
     grants: Arc<Mutex<Vec<Option<&'static str>>>>,
     gists: Gists,
@@ -430,6 +467,15 @@ struct MockGithub {
 }
 
 impl MockGithub {
+    fn hold_response(&self, path: &str) -> Arc<ResponseGate> {
+        let gate = Arc::new(ResponseGate::default());
+        self.response_gates
+            .lock()
+            .unwrap()
+            .insert(path.into(), gate.clone());
+        gate
+    }
+
     /// Script `GET /gists/{id}`: a gist owned by `owner`, created `created_at`,
     /// whose `intent-join-proof.txt` (when `proof` is given) starts with
     /// `proof` — the shape the daemon reads back to verify an identity proof.
@@ -509,6 +555,8 @@ async fn spawn_mock_github() -> MockGithub {
     let grants: Arc<Mutex<Vec<Option<&'static str>>>> = Arc::new(Mutex::new(Vec::new()));
     let gists: Gists = Arc::new(Mutex::new(HashMap::new()));
     let gist_reads: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let response_gates = ResponseGates::default();
+    let gates = response_gates.clone();
     let (f, g, gi, gr) = (
         flows.clone(),
         grants.clone(),
@@ -521,13 +569,15 @@ async fn spawn_mock_github() -> MockGithub {
                 return;
             };
             let (f, g, gi, gr) = (f.clone(), g.clone(), gi.clone(), gr.clone());
+            let gates = gates.clone();
             tokio::spawn(async move {
-                let _ = serve_conn(stream, f, g, gi, gr).await;
+                let _ = serve_conn(stream, f, g, gi, gr, gates).await;
             });
         }
     });
     MockGithub {
         base_uri: format!("http://127.0.0.1:{port}"),
+        response_gates,
         flows,
         grants,
         gists,
@@ -543,6 +593,7 @@ async fn serve_conn(
     grants: Arc<Mutex<Vec<Option<&'static str>>>>,
     gists: Gists,
     gist_reads: Arc<Mutex<Vec<String>>>,
+    response_gates: ResponseGates,
 ) -> std::io::Result<()> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 1024];
@@ -586,6 +637,11 @@ async fn serve_conn(
         .unwrap_or_default()
         .to_string();
     let path_only = path.split('?').next().unwrap_or_default();
+    let gate = response_gates.lock().unwrap().remove(path_only);
+    if let Some(gate) = gate {
+        gate.entered.notify_one();
+        gate.release.notified().await;
+    }
     let (status, payload) = if path_only == "/login/device/code" {
         let n = flows.fetch_add(1, Ordering::SeqCst);
         (
@@ -686,6 +742,7 @@ async fn invite_link_identity_join_and_removal_over_wss() {
 
     // OWNER: a workspace, plus a subscriber connection on workspace:updated.
     let mut owner = connect_ws(port, cfg.clone(), TOKEN).await;
+    await_owner_identity(&mut owner).await;
     let v = wss_rpc(
         &mut owner,
         1,
@@ -950,9 +1007,8 @@ async fn invite_link_identity_join_and_removal_over_wss() {
     //     `invite.accept` on the credential minted in 5 — no GitHub call at
     //     all: the mock's flow counter stays where step 5 left it. A bogus
     //     credential is `credential-invalid`. The result is the phase-2
-    //     shape with a fresh credential for the same principal; the
-    //     presented credential is rotated out (it no longer upgrades, while
-    //     the connection it already opened stays bound), and the owner's
+    //     shape with the same credential and principal; the bearer still
+    //     upgrades and the connection it already opened stays bound. The owner's
     //     subscriber sees the membership change on the second workspace.
     let flows_before = mock.flows.load(Ordering::SeqCst);
     let v = wss_rpc(
@@ -1034,7 +1090,7 @@ async fn invite_link_identity_join_and_removal_over_wss() {
     assert_eq!(r["workspaceId"], json!(second_ws));
     let guest_token_2 = r["token"].as_str().expect("credential").to_string();
     assert_eq!(guest_token_2.len(), 64);
-    assert_ne!(guest_token_2, guest_token);
+    assert_eq!(guest_token_2, guest_token);
     assert!(r.get("hostname").is_none(), "{r}");
     assert_eq!(
         mock.flows.load(Ordering::SeqCst),
@@ -1049,12 +1105,11 @@ async fn invite_link_identity_join_and_removal_over_wss() {
     assert_eq!(ev["data"]["workspaceId"], json!(second_ws));
     assert_eq!(ev["data"]["changes"]["members"], json!(true));
 
-    // The fresh credential connects; the rotated-out one no longer upgrades,
-    // but the connection it already opened is still bound.
+    // The reused credential connects and its existing connection stays bound.
     let line = upgrade_status_line(port, cfg.clone(), &guest_token).await;
     assert!(
-        line.starts_with("HTTP/1.1 401"),
-        "rotated-out credential upgrade: {line}"
+        line.starts_with("HTTP/1.1 101"),
+        "reused credential upgrade: {line}"
     );
     let mut guest2 = connect_ws(port, cfg.clone(), &guest_token_2).await;
     let v = wss_rpc(&mut guest2, 70, "principal.me", json!({})).await;
@@ -1383,14 +1438,14 @@ async fn invite_link_identity_join_and_removal_over_wss() {
     assert_eq!(remaining, expected, "the second and third remain: {v}");
 
     // 8. principal.revokeSelf: both live credentials (the one `invite.accept`
-    //    rotated in and the one `invite.prove` minted in 6c — the one minted
-    //    in 5 was rotated out in 6a) are revoked, the remaining memberships (the
+    //    reused from 5 and the one `invite.prove` minted in 6c) are revoked,
+    //    the remaining memberships (the
     //    second and third workspaces) are left, the connection is closed by
     //    the daemon (policy close), and no token authenticates an upgrade.
     let v = wss_rpc(&mut guest, 35, "principal.revokeSelf", json!({})).await;
     assert_eq!(
         v["result"],
-        json!({ "revoked": true, "credentials": 2, "workspaces": 2 }),
+        json!({ "revoked": true, "credentials": 2, "workspaces": 2, "hostMembershipRemoved": false }),
         "{v}"
     );
     let closed = timeout(Duration::from_secs(15), async {
@@ -1477,6 +1532,113 @@ async fn invite_link_identity_join_and_removal_over_wss() {
     );
 }
 
+/// Reproduce the startup interleaving from #6120 deterministically. A pinned
+/// recipient lookup parks minting after it snapshots the unlinked creator;
+/// startup then attaches the identity before minting revalidates that snapshot.
+#[tokio::test]
+async fn invite_mint_during_startup_identity_refresh_over_wss() {
+    let mock = spawn_mock_github().await;
+    let profile = mock.hold_response("/user");
+    let recipient = mock.hold_response("/users/guest");
+
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let secrets_s = data_dir.join("secrets.json").to_string_lossy().to_string();
+    let tailcat = write_fake_tailcat(&data_dir).to_string_lossy().to_string();
+    let env: [(&str, &str); 7] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("INTENTD_SECRETS_FILE", &secrets_s),
+        ("INTENTD_GITHUB_LOGIN_BASE_URI", &mock.base_uri),
+        ("INTENTD_GITHUB_API_BASE_URI", &mock.base_uri),
+        ("INTENTD_TAILCAT_BIN", &tailcat),
+        ("GITHUB_TOKEN", OWNER_TOKEN),
+    ];
+    let child = spawn_serve(&data_dir, &env);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut owner = connect_ws(port, cfg.clone(), TOKEN).await;
+    let v = wss_rpc(
+        &mut owner,
+        1,
+        "workspace.create",
+        json!({ "title": "Startup identity race" }),
+    )
+    .await;
+    assert!(v.get("error").is_none(), "workspace.create: {v}");
+    let ws_id = v["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    timeout(common::daemon_startup_timeout(), profile.entered.notified())
+        .await
+        .expect("startup GET /user did not arrive");
+    let mut observer = connect_ws(port, cfg.clone(), TOKEN).await;
+    let me = wss_rpc(&mut observer, 190, "principal.me", json!({})).await;
+    assert!(me.get("error").is_none(), "principal.me: {me}");
+    assert!(
+        me["result"]["identity"].is_null(),
+        "profile response is held: {me}"
+    );
+
+    let mint = wss_rpc(
+        &mut owner,
+        2,
+        "workspace.invite.create",
+        json!({ "workspaceId": ws_id, "pinProvider": "github", "pinLogin": "guest" }),
+    );
+    let transition = async {
+        timeout(
+            common::daemon_startup_timeout(),
+            recipient.entered.notified(),
+        )
+        .await
+        .expect("invite recipient lookup did not arrive");
+        profile.release.notify_one();
+        await_owner_identity(&mut observer).await;
+        recipient.release.notify_one();
+    };
+    let (v, ()) = tokio::join!(mint, transition);
+    assert_eq!(v["error"]["code"], json!(-32603), "invite.create: {v}");
+    assert_eq!(
+        v["error"]["message"],
+        json!("internal error: the inviting identity changed while minting; retry"),
+        "invite.create: {v}"
+    );
+    let listed = wss_rpc(
+        &mut owner,
+        3,
+        "workspace.invite.list",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(listed["result"]["invites"], json!([]), "{listed}");
+
+    // Once the observable owner identity is ready, a fresh unpinned mint
+    // succeeds. Do not hide the rejected operation behind an invite retry.
+    await_owner_identity(&mut owner).await;
+    let ready = wss_rpc(
+        &mut owner,
+        4,
+        "workspace.invite.create",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(ready.get("error").is_none(), "ready invite.create: {ready}");
+    assert_eq!(ready["result"]["invite"]["reusable"], json!(true));
+}
+
 /// An UNPINNED link is reusable over the wire: `workspace.invite.create`
 /// answers `reusable: true` / `redemptionCount: 0`; two distinct accounts
 /// (guest, intruder) prove on the same link and both join; the row stays
@@ -1515,6 +1677,7 @@ async fn unpinned_invite_link_is_reusable_until_revoked_over_wss() {
     let cfg = client_config(&fingerprint);
 
     let mut owner = connect_ws(port, cfg.clone(), TOKEN).await;
+    await_owner_identity(&mut owner).await;
     let v = wss_rpc(
         &mut owner,
         1,

@@ -25,6 +25,10 @@ const COMMENT_COLUMNS: &str = "id, thread_id, note_id, kind, content, author, au
 #[serde(rename_all = "camelCase")]
 struct ExtraFields {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    author_principal_id: Option<intent_core::PrincipalId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    author_identity: Option<intent_core::PrincipalIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     anchor_before: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     anchor_after: Option<String>,
@@ -60,7 +64,9 @@ impl ExtraFields {
     /// The camelCase keys this struct owns inside `extra_json`. Anything else
     /// in the blob is a preserved legacy/unknown key (see
     /// [`Store::insert_comment_with_extras`]) that updates must not drop.
-    const KNOWN_KEYS: [&'static str; 6] = [
+    const KNOWN_KEYS: [&'static str; 8] = [
+        "authorPrincipalId",
+        "authorIdentity",
         "anchorBefore",
         "anchorAfter",
         "suggestionOriginal",
@@ -100,6 +106,8 @@ fn encode_comment_json(
     let anchor_json = serde_json::to_string(&c.anchor)
         .map_err(|e| Error::Internal(format!("encode anchor failed: {e}")))?;
     let extra = ExtraFields {
+        author_principal_id: c.author_principal_id.clone(),
+        author_identity: c.author_identity.clone(),
         anchor_before: c.anchor_before.clone(),
         anchor_after: c.anchor_after.clone(),
         suggestion_original: c.suggestion_original.clone(),
@@ -109,6 +117,12 @@ fn encode_comment_json(
     };
     let mut merged = extra.to_map()?;
     for (k, v) in legacy_extra {
+        if matches!(
+            k.as_str(),
+            "authorPrincipalId" | "authorIdentity" | "sourceAuthorPrincipalId"
+        ) {
+            continue;
+        }
         merged.entry(k.clone()).or_insert_with(|| v.clone());
     }
     let extra_json = extra_map_to_json(merged)?;
@@ -321,6 +335,10 @@ impl Store {
         let anchor_json = serde_json::to_string(&c.anchor)
             .map_err(|e| Error::Internal(format!("encode anchor failed: {e}")))?;
         let extra = ExtraFields {
+            // Creation attribution is immutable. Carry these from the stored
+            // row below, including absence on legacy comments.
+            author_principal_id: None,
+            author_identity: None,
             anchor_before: c.anchor_before.clone(),
             anchor_after: c.anchor_after.clone(),
             suggestion_original: c.suggestion_original.clone(),
@@ -345,7 +363,10 @@ impl Store {
                     // importer preserved verbatim (the store itself only ever
                     // encodes booleans here) — carry it over too.
                     let legacy_orphaned = k == "isOrphaned" && !matches!(v, Value::Bool(_));
-                    if !ExtraFields::KNOWN_KEYS.contains(&k.as_str()) || legacy_orphaned {
+                    if matches!(k.as_str(), "authorPrincipalId" | "authorIdentity")
+                        || !ExtraFields::KNOWN_KEYS.contains(&k.as_str())
+                        || legacy_orphaned
+                    {
                         merged.entry(k).or_insert(v);
                     }
                 }
@@ -530,6 +551,8 @@ fn map_comment_row(row: &SqliteRow) -> Result<Comment> {
         content: col(row, "content")?,
         author: col(row, "author")?,
         author_type: enum_from_db(&col::<String>(row, "author_type")?)?,
+        author_principal_id: extra.author_principal_id,
+        author_identity: extra.author_identity,
         status: enum_from_db::<CommentStatus>(&col::<String>(row, "status")?)?,
         parent_id: col(row, "parent_id")?,
         anchor,

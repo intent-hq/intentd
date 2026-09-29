@@ -1133,3 +1133,53 @@ async fn generated_message_preserves_trailers() {
         "got: {message}"
     );
 }
+
+#[cfg(unix)]
+#[intent_test_macros::daemon_test]
+async fn generation_applies_commit_quick_action_effort_before_prompt() {
+    let repo = init_git_repo();
+    let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
+    let (_dir, bin, log) = crate::test_support::quick_action_effort_adapter(&json!({
+        "response": "{\"subject\":\"feat: configured effort\"}"
+    }));
+    let (_config_dir, registry) = auggie_active_registry();
+    registry
+        .apply(&[
+            ("model.defaultProvider".into(), json!("claude-code")),
+            ("providers.paths".into(), json!({"claude-code":bin})),
+            ("quickActions.defaultReasoningEffort".into(), json!("low")),
+            (
+                "quickActions.typeReasoningEffortOverrides".into(),
+                json!({"commit":"high"}),
+            ),
+        ])
+        .unwrap();
+    let svc = svc.with_settings_registry(registry);
+    let agent = session("effort-agent", &ws_id, None, false, "Builder", true);
+    svc.store().insert_agent_session(&agent).await.unwrap();
+    attribute_dirty_change(&svc, &ws_id, "effort-agent").await;
+    svc.handle_agent_idle_auto_commit(&idle_event(&ws_id, "effort-agent", "end_turn"))
+        .await;
+    assert!(last_commit_trailers(&repo.dir)
+        .2
+        .starts_with("feat: configured effort"));
+    let calls: Vec<serde_json::Value> = std::fs::read_to_string(log)
+        .unwrap()
+        .lines()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+    assert_eq!(
+        calls
+            .iter()
+            .map(|c| c["method"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "initialize",
+            "session/new",
+            "session/set_config_option",
+            "session/prompt"
+        ]
+    );
+    assert_eq!(calls[2]["params"]["configId"], "adapter-thinking");
+    assert_eq!(calls[2]["params"]["value"], "high");
+}

@@ -594,7 +594,13 @@ async fn agent_features_gate_new_sessions_only() {
             "full prompt missing {guidance}"
         );
     }
-    assert_eq!(session_a["result"]["session"]["harnessVersion"], "2.8");
+    assert_eq!(
+        session_a["result"]["session"]["harnessVersion"],
+        intent_core::CURRENT_HARNESS_VERSION
+    );
+    assert!(prompt_a.contains(
+        "[Open the report](intent://local/file/.intent/artifacts/Quarterly%20report%20%231.pdf)"
+    ));
     let prompts = received_prompts(&prompt_log);
     assert_eq!(prompts.len(), 1);
     assert!(
@@ -752,6 +758,10 @@ async fn agent_features_gate_new_sessions_only() {
     assert!(!prompt_b.contains("ws.agent.requestDiscussion"));
     assert!(!prompt_b.contains("ws.agent.reportBlocker"));
     assert!(!prompt_b.contains("concrete assigned work"));
+    assert!(
+        prompt_b.contains("[Open the report](intent://local/file/.intent/artifacts/Quarterly%20report%20%231.pdf)"),
+        "ordinary Markdown app file links must survive richChatBlocks being disabled"
+    );
     let prompts = received_prompts(&prompt_log);
     assert_eq!(prompts.len(), 2);
     assert!(

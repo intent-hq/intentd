@@ -2,9 +2,9 @@
 //! concurrency [`ProcessRegistry`] and a concrete [`EventSink`] over the M2
 //! event bus (§6.8).
 //!
-//! [`AgentManager`] owns one [`AgentHandle`] per [`AgentId`] (the spawned child,
-//! its ACP [`Connection`], the streaming-notification receiver, and the
-//! client-served request loop). Each connection carries its own JSON-RPC id
+//! [`AgentManager`] owns one [`AgentHandle`] per [`AgentId`], with execution
+//! resources behind [`intent_core::agent_runtime::AgentRuntime`]. The local
+//! adapter owns ACP, process and bridge resources. Each connection has its own JSON-RPC id
 //! space + pending-request map (`intent-acp`), so response correlation is
 //! per-connection and the manager keys everything by `AgentId` — the stable
 //! analog of the TS registry's `pid`. The [`ProcessRegistry`] ports
@@ -74,6 +74,11 @@ use crate::Services;
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+pub(crate) mod runtime;
+#[cfg(all(test, unix))]
+use runtime::DetachedChild;
+use runtime::{ChildState, LocalResources, RuntimeHandle, RuntimeTeardown};
 
 /// Deterministic system note appended to a STALE queued-message redrive (#576)
 /// so a delegated child that already delivered its completion report does not
@@ -412,16 +417,11 @@ const SESSION_CANCEL_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// caller the child is likely not settleable and a respawn path is more
 /// appropriate than a warn-and-continue turn.
 async fn cancel_and_settle_idle_prompt(
-    conn: &Connection,
+    conn: &runtime::Runtime<'_>,
     agent_id: &AgentId,
     acp_session_id: &str,
 ) -> bool {
-    match tokio::time::timeout(
-        SESSION_CANCEL_WRITE_TIMEOUT,
-        intent_acp::session::cancel(conn, acp_session_id),
-    )
-    .await
-    {
+    match tokio::time::timeout(SESSION_CANCEL_WRITE_TIMEOUT, conn.cancel(acp_session_id)).await {
         Ok(Ok(())) => true,
         Ok(Err(e)) if is_cancel_transport_closed(&e) => {
             tracing::debug!(
@@ -2327,45 +2327,17 @@ struct AppliedEffort {
     default_value: String,
 }
 
-/// One live agent: its ACP [`Connection`] (own id space + pending map), the
-/// streaming-notification receiver consumed during a turn, the client-served
-/// request loop, the owned child (its process group is killed on teardown via
-/// [`kill_child_tree`], with `kill_on_drop` as a direct-child safety net), and
-/// the per-agent MCP bridge + generated config that back the agent→BE tool loop.
-///
-/// Ownership invariant: a handle never drops while still owning its child.
-/// Every teardown path moves the child out first ([`DetachedChild::take`])
-/// and awaits its owned cleanup; a handle dropped any other way — the fresh
-/// local handle `create_agent` holds across the stale reap when that await
-/// is cancelled, or a map dropped wholesale — hands the child to the same
-/// owned cleanup from [`Drop`], so the tree is still swept before its npx
-/// launch dir goes away.
+/// Orchestration metadata for one live agent, backed by an execution runtime.
+/// The runtime owns the provider connection, child, request handler and bridge.
+/// Removing this handle starts cancellation-safe resource cleanup even while
+/// an in-flight prompt retains a runtime reference. Local teardown preserves
+/// the process-tree sweep and launch-directory lifetime guarantees.
 ///
 /// `spawned_model` and `spawned_provider` track the model/provider the child was
 /// spawned with, enabling `ensure_started` to detect model changes (via `agent.setModel`)
 /// and respawn the child with the new model before the next turn.
 struct AgentHandle {
-    connection: Arc<Connection>,
-    notifications: Arc<TokioMutex<mpsc::UnboundedReceiver<IncomingNotification>>>,
-    serve_task: JoinHandle<()>,
-    child: Option<Child>,
-    /// The child's pid captured at spawn: `Child::id()` reads `None` once a
-    /// `try_wait` liveness probe reaps the exit status, and the pgid-based
-    /// teardown (`kill_child_tree`) still needs it to sweep same-group
-    /// descendants that outlive the leader (monorepo#764).
-    child_pid: Option<u32>,
-    _mcp_bridge: Option<McpBridge>,
-    _mcp_config: Option<TempConfigFile>,
-    _rules_config: Option<TempConfigFile>,
-    /// Bundled pi-extension MCP delivery files (extension + wrapper script),
-    /// removed when the handle drops (pi only).
-    _pi_extension: Option<PiExtensionDelivery>,
-    /// The neutral directory an npx launch started in (intent-hq/intent#5738;
-    /// `None` for other launch tiers). It is the live tree's cwd, so it
-    /// always leaves the handle together with the child
-    /// ([`DetachedChild::take`], explicitly or from [`Drop`]) and only the
-    /// detached child's owned cleanup may release it.
-    npx_launch_dir: Option<NpxLaunchDir>,
+    execution: RuntimeHandle,
     antigravity_profile: Option<crate::antigravity::SessionProfile>,
     /// MCP servers (workspace bridge + user servers) delivered via the ACP
     /// `session/new` / `session/load` `mcpServers` field for providers that
@@ -2383,6 +2355,7 @@ struct AgentHandle {
     /// `ensure_started` re-apply a mid-session `reasoningEffort` change on the
     /// LIVE child, so it lands before the next prompt without a respawn.
     thought_level: Option<ThoughtLevelOption>,
+    config_options: Option<Value>,
     /// Set only after the latest turn-boundary application was acknowledged
     /// (or already current). A rejection/unsupported option leaves it empty.
     confirmed_effort: Option<AppliedEffort>,
@@ -2398,14 +2371,10 @@ struct AgentHandle {
 
 impl Drop for AgentHandle {
     fn drop(&mut self) {
-        self.serve_task.abort();
         if let Some(listener) = &self.wake_listener {
             listener.abort();
         }
-        // Cancellation-safe fallback for a handle that still owns its child:
-        // the detached child's own `Drop` starts the owned tree kill (no-op
-        // once a teardown path has already taken the child).
-        drop(DetachedChild::take(self));
+        // RuntimeHandle::drop starts owned execution cleanup.
     }
 }
 
@@ -2465,10 +2434,15 @@ impl Drop for TeardownFence {
 /// the slot, the handle is being torn down, so no work may be handed to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TryBeginOutcome {
-    Started,
+    Started(TurnAdmission),
     Busy,
     ReapClaimed,
 }
+
+/// Identity of a claimed slot. Teardown invalidates it, so an admitted send
+/// cannot register a worker against a later claim after retirement/restore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TurnAdmission(usize);
 
 /// Why [`AgentManager::claim_slot_sync`] did not claim: the two
 /// [`TryBeginOutcome`] losses, or the caller's own claim precondition
@@ -2488,6 +2462,14 @@ enum SlotClaimLoss<E> {
 #[derive(Default)]
 struct HandbackGate {
     reached: std::sync::atomic::AtomicBool,
+    resume: tokio::sync::Notify,
+}
+
+/// Pause a claimed turn before startup side effects for retirement race tests.
+#[cfg(test)]
+#[derive(Default)]
+struct TurnStartPause {
+    reached: tokio::sync::Notify,
     resume: tokio::sync::Notify,
 }
 
@@ -2535,6 +2517,10 @@ pub struct AgentManager {
     /// `agent.sendMessage` consults this to flip a message to the queue while a
     /// turn is mid-stream (the TS "queue while streaming" semantics).
     busy: Arc<Mutex<HashSet<AgentId>>>,
+    turn_admissions: Mutex<HashMap<AgentId, TurnAdmission>>,
+    next_admission: AtomicUsize,
+    /// Claimed startup side effects must finish before retirement detaches.
+    turn_start_gates: crate::agent_ops::AgentRetirementGates,
     /// Start of the current stretch with no turn in flight: `Some(boot)`
     /// initially, cleared on the `busy` empty → non-empty edge and re-armed
     /// on the non-empty → empty edge. Every access — the two writers AND the
@@ -2657,6 +2643,9 @@ pub struct AgentManager {
     /// the caller's store cascade, at which point the session row is gone and
     /// the spawn path fails `NotFound` on its own).
     stopping: Arc<Mutex<HashSet<AgentId>>>,
+    /// User-retired sessions remain fenced until explicit restore. This lock
+    /// orders retirement with slot claims, worker spawns and handle installs.
+    retired: Arc<Mutex<HashSet<AgentId>>>,
     /// Daemon-owned singleton Unsloth server (spec "Proposed design" §4,
     /// monorepo#878): started on demand when an `unsloth`-provider agent
     /// spawns, reused while the served model matches, restarted on model
@@ -2682,6 +2671,10 @@ pub struct AgentManager {
     /// [`HandbackGate`].
     #[cfg(test)]
     send_now_handback_gate: Mutex<Option<Arc<HandbackGate>>>,
+    #[cfg(test)]
+    turn_start_pause: Mutex<Option<Arc<TurnStartPause>>>,
+    #[cfg(test)]
+    shutdown_persist_pause: Mutex<Option<Arc<TurnStartPause>>>,
 }
 
 impl AgentManager {
@@ -2742,6 +2735,9 @@ impl AgentManager {
             antigravity_state_root: None,
             chief_cwd_root: None,
             busy: Arc::new(Mutex::new(HashSet::new())),
+            turn_admissions: Mutex::new(HashMap::new()),
+            next_admission: AtomicUsize::new(0),
+            turn_start_gates: crate::agent_ops::AgentRetirementGates::default(),
             idle_since: Arc::new(Mutex::new(Some(Instant::now()))),
             reap_claims: Arc::new(Mutex::new(HashSet::new())),
             agent_ws: Arc::new(Mutex::new(HashMap::new())),
@@ -2754,11 +2750,16 @@ impl AgentManager {
             force_recreate: Arc::new(Mutex::new(HashSet::new())),
             spawn_attempt_provider: Arc::new(Mutex::new(HashMap::new())),
             stopping: Arc::new(Mutex::new(HashSet::new())),
+            retired: Arc::new(Mutex::new(HashSet::new())),
             unsloth: Arc::new(crate::unsloth_server::UnslothServerManager::default()),
             tree_probe: std::sync::OnceLock::new(),
             auto_unarchived: Arc::new(Mutex::new(HashSet::new())),
             #[cfg(test)]
             send_now_handback_gate: Mutex::new(None),
+            #[cfg(test)]
+            turn_start_pause: Mutex::new(None),
+            #[cfg(test)]
+            shutdown_persist_pause: Mutex::new(None),
         }
     }
 
@@ -2922,7 +2923,7 @@ impl AgentManager {
                     AgentSpawnDetails {
                         provider: handle.spawned_provider.clone(),
                         model: handle.spawned_model.clone(),
-                        root_pid: handle.child_pid,
+                        root_pid: handle.execution.runtime.spawned_pid(),
                     },
                 )
             })
@@ -2955,13 +2956,11 @@ impl AgentManager {
             .unwrap()
             .iter_mut()
             .filter_map(|(agent_id, handle)| {
-                let pid = handle.child_pid?;
-                if let Some(child) = handle.child.as_mut() {
-                    if !matches!(child.try_wait(), Ok(None)) {
-                        return None;
-                    }
-                }
-                Some((pid, agent_id.clone()))
+                handle
+                    .execution
+                    .runtime
+                    .root_pid()
+                    .map(|pid| (pid, agent_id.clone()))
             })
             .collect()
     }
@@ -3390,21 +3389,24 @@ impl AgentManager {
         self.registry
             .register(agent_id.clone(), self.make_kill(agent_id.clone()));
         let handle = AgentHandle {
-            connection,
-            notifications: Arc::new(TokioMutex::new(note_rx)),
-            serve_task,
-            child: Some(child),
-            child_pid,
-            _mcp_bridge: Some(bridge),
-            _mcp_config: mcp_config,
-            _rules_config: rules_config,
-            _pi_extension: pi_extension,
-            npx_launch_dir,
+            execution: RuntimeHandle::local(LocalResources {
+                connection,
+                notifications: Arc::new(TokioMutex::new(note_rx)),
+                serve_task,
+                child: Some(child),
+                child_pid,
+                _mcp_bridge: Some(bridge),
+                _mcp_config: mcp_config,
+                _rules_config: rules_config,
+                _pi_extension: pi_extension,
+                npx_launch_dir,
+            }),
             antigravity_profile,
             session_mcp_servers,
             spawned_model: opts.model.map(std::string::ToString::to_string),
             spawned_provider: opts.provider.command.to_string(),
             thought_level: None,
+            config_options: None,
             confirmed_effort: None,
             wake_gate: Arc::new(AtomicUsize::new(0)),
             wake_listener: None,
@@ -3422,7 +3424,7 @@ impl AgentManager {
         // orphaned and neither launch dir is removed early.
         let stale = self.handles.lock().unwrap().remove(&agent_id);
         if let Some(mut stale) = stale {
-            if let Some(child) = DetachedChild::take(&mut stale) {
+            if let Some(child) = RuntimeTeardown::take(&mut stale) {
                 child.kill_tree().await;
             }
         }
@@ -3436,8 +3438,9 @@ impl AgentManager {
         // installed first → `stop_many`'s detach finds it and kills it with
         // the batch. Either interleaving leaves no orphaned process.
         let fenced = {
+            let retired = self.retired.lock().unwrap();
             let stopping = self.stopping.lock().unwrap();
-            if stopping.contains(&agent_id) {
+            if retired.contains(&agent_id) || stopping.contains(&agent_id) {
                 Some(handle)
             } else {
                 self.handles
@@ -3449,7 +3452,7 @@ impl AgentManager {
         };
         if let Some(mut handle) = fenced {
             self.registry.deregister(&agent_id);
-            if let Some(child) = DetachedChild::take(&mut handle) {
+            if let Some(child) = RuntimeTeardown::take(&mut handle) {
                 child.kill_tree().await;
             }
             return Err(Error::NotFound(format!(
@@ -3688,7 +3691,9 @@ impl AgentManager {
                 .get(agent_id)
                 .ok_or_else(|| Error::NotFound(format!("agent {agent_id}")))?;
             (
-                handle.connection.clone(),
+                handle.execution.connection().ok_or_else(|| {
+                    Error::Internal("session initialization requires a local runtime".into())
+                })?,
                 handle.session_mcp_servers.clone(),
                 handle.wake_gate.clone(),
                 handle.antigravity_profile.clone(),
@@ -3812,7 +3817,7 @@ impl AgentManager {
                     .lock()
                     .unwrap()
                     .get(agent_id)
-                    .map(|h| h.notifications.clone());
+                    .map(|h| h.execution.runtime.notifications());
                 if let Some(notes) = notes {
                     let mut guard = notes.lock().await;
                     Services::drain_replay_notifications(&mut guard).await;
@@ -4075,6 +4080,10 @@ impl AgentManager {
         stored_effort: Option<&str>,
         default_override: Option<&str>,
     ) {
+        if let Some(handle) = self.handles.lock().unwrap().get_mut(&session_record.id) {
+            handle.config_options.clone_from(&opened.config_options);
+            crate::fast_mode::refresh_options(&mut handle.config_options, model_response.as_ref());
+        }
         let mut thought_level = opened.thought_level.clone();
         if let Some(options) = model_response
             .and_then(|mut response| response.get_mut("configOptions").map(Value::take))
@@ -4112,6 +4121,37 @@ impl AgentManager {
         }
         self.apply_thought_level(conn, &session_record.id, &opened.session_id, stored_effort)
             .await;
+    }
+
+    /// Apply the latest preference after model/effort selection and before a
+    /// new turn. Always send explicit off, even if the advertised value is
+    /// already off: native or resumed tier inheritance must be cleared.
+    async fn apply_fast_mode(
+        &self,
+        agent_id: &AgentId,
+        session_id: &str,
+        provider: &str,
+    ) -> Result<()> {
+        let Some((conn, mut options)) = self.handles.lock().unwrap().get(agent_id).and_then(|h| {
+            h.execution
+                .connection()
+                .map(|conn| (conn, h.config_options.clone()))
+        }) else {
+            return Ok(());
+        };
+        let enabled = self
+            .services
+            .effective_settings()
+            .providers
+            .fast_mode
+            .get(provider)
+            .copied()
+            .unwrap_or(false);
+        crate::fast_mode::apply(&conn, session_id, provider, enabled, &mut options).await?;
+        if let Some(handle) = self.handles.lock().unwrap().get_mut(agent_id) {
+            handle.config_options = options;
+        }
+        Ok(())
     }
 
     /// Send the session's `reasoningEffort` to the provider through the
@@ -4174,6 +4214,12 @@ impl AgentManager {
             .await
             {
                 Ok(response) => {
+                    if let Some(handle) = self.handles.lock().unwrap().get_mut(agent_id) {
+                        crate::fast_mode::refresh_options(
+                            &mut handle.config_options,
+                            Some(&response),
+                        );
+                    }
                     // Older adapters acknowledge with {}. When a value is
                     // echoed, it must actually confirm the requested setting.
                     if let Some(actual) = response
@@ -4898,7 +4944,10 @@ impl AgentManager {
             let handle = map
                 .get(agent_id)
                 .ok_or_else(|| Error::NotFound(format!("agent {agent_id}")))?;
-            (handle.connection.clone(), handle.notifications.clone())
+            (
+                handle.execution.runtime.clone(),
+                handle.execution.runtime.notifications(),
+            )
         };
         self.registry.mark_active(agent_id);
         let mut guard = notes.lock().await;
@@ -4929,6 +4978,21 @@ impl AgentManager {
             child.kill_tree().await;
         }
         removed
+    }
+
+    /// Fence a user-retired session before aborting its worker and child.
+    /// The service has already committed `retired_at` and checked descendants.
+    pub(crate) async fn retire(&self, agent_id: &AgentId) {
+        self.retired.lock().unwrap().insert(agent_id.clone());
+        // Fence first so no new claim or worker can start while we wait for
+        // an already-claimed turn to finish activity/status bookkeeping.
+        let gate = self.turn_start_gates.for_agent(agent_id);
+        let _starting = gate.lock().await;
+        self.stop(agent_id).await;
+    }
+
+    pub(crate) fn restore_retired(&self, agent_id: &AgentId) {
+        self.retired.lock().unwrap().remove(agent_id);
     }
 
     /// Stop MANY agents under ONE shared grace window: detach each agent with
@@ -4985,7 +5049,7 @@ impl AgentManager {
             tracing::warn!(error = %e, "stop-redelivery persistence sync failed for batch stop");
         }
         if !children.is_empty() {
-            DetachedChild::kill_trees(children).await;
+            RuntimeTeardown::kill_trees(children).await;
         }
         fence
     }
@@ -4996,7 +5060,7 @@ impl AgentManager {
     /// `stop()` kills the single tree inline (SIGTERM→grace→SIGKILL);
     /// `shutdown()` collects every detached child and kills all process groups
     /// concurrently under ONE shared grace window.
-    async fn detach(&self, agent_id: &AgentId) -> (bool, Option<DetachedChild>) {
+    async fn detach(&self, agent_id: &AgentId) -> (bool, Option<RuntimeTeardown>) {
         self.detach_with_redelivery(agent_id, None, true).await
     }
 
@@ -5021,7 +5085,7 @@ impl AgentManager {
         agent_id: &AgentId,
         redelivery: Option<crate::agent_ops::QueuedPrepend>,
         sync_store: bool,
-    ) -> (bool, Option<DetachedChild>) {
+    ) -> (bool, Option<RuntimeTeardown>) {
         // Pin the live-turn slot BEFORE aborting the worker (the abort drops
         // LiveTurnGuard; the pin keeps the slot published until the flush
         // below persists the row — monorepo#2056), then flush the partial
@@ -5089,7 +5153,7 @@ impl AgentManager {
         self.end_turn(agent_id).await;
         let handle = self.handles.lock().unwrap().remove(agent_id);
         let removed = handle.is_some();
-        let child = handle.and_then(|mut h| DetachedChild::take(&mut h));
+        let child = handle.and_then(|mut h| RuntimeTeardown::take(&mut h));
         self.registry.deregister(agent_id);
         (removed, child)
     }
@@ -5148,14 +5212,14 @@ impl AgentManager {
         interrupted_by: Option<InterruptedBy>,
     ) -> InterruptOutcome {
         let suppress_idle_emit = reason == InterruptReason::PreemptedByMessage;
-        // The live connection is the interrupt capability; grab it WITHOUT
-        // removing the handle so the child stays alive for resume.
+        // The runtime is the interrupt capability; grab it WITHOUT removing
+        // the handle so execution stays available for resume.
         let conn = self
             .handles
             .lock()
             .unwrap()
             .get(agent_id)
-            .map(|h| h.connection.clone());
+            .map(|h| h.execution.runtime.clone());
         let Some(conn) = conn else {
             // No live session to interrupt → keep-alive is a no-op; fall back to
             // the hard kill path (itself a no-op when the agent is already gone).
@@ -5293,11 +5357,7 @@ impl AgentManager {
         // `mark_idle` below no-op (handle removed, registry deregistered) —
         // fine, a killed child leaves no stragglers to drain and nothing for
         // the idle sweep to hold.
-        match tokio::time::timeout(
-            SESSION_CANCEL_WRITE_TIMEOUT,
-            intent_acp::session::cancel(&conn, &acp_session_id),
-        )
-        .await
+        match tokio::time::timeout(SESSION_CANCEL_WRITE_TIMEOUT, conn.cancel(&acp_session_id)).await
         {
             Ok(Ok(())) => {}
             Ok(Err(e)) if is_cancel_transport_closed(&e) => {
@@ -5366,7 +5426,7 @@ impl AgentManager {
             .lock()
             .unwrap()
             .get(agent_id)
-            .map(|h| h.notifications.clone());
+            .map(|h| h.execution.runtime.notifications());
         if let Some(notes) = notes {
             let mut guard = notes.lock().await;
             Services::drain_replay_notifications(&mut guard).await;
@@ -5771,11 +5831,12 @@ impl AgentManager {
     /// any persisted `stop_reason`) and emits `agent:status-changed` (PROTOCOL
     /// §6.5/§6.7) so a hydrated chat reflects the live runtime rather than the
     /// stored `Pending` placeholder.
+    #[cfg(test)]
     async fn try_begin(&self, agent_id: &AgentId, workspace_id: &WorkspaceId) -> bool {
-        self.try_begin_outcome(agent_id, workspace_id, true).await == TryBeginOutcome::Started
+        self.try_begin_turn(agent_id, workspace_id).await.is_some()
     }
 
-    /// [`AgentManager::try_begin`] with the loss reason: callers that behave
+    /// [`AgentManager::try_begin_turn`] with the loss reason: callers that behave
     /// differently on "a prompt worker owns the slot" (safe to hand work to)
     /// versus "the idle-reap sweep holds the agent mid-kill" (nobody owns the
     /// slot; the handle is being torn down) need the distinction decided under
@@ -5796,13 +5857,15 @@ impl AgentManager {
         workspace_id: &WorkspaceId,
         auto_unarchive: bool,
     ) -> TryBeginOutcome {
+        let gate = self.turn_start_gates.for_agent(agent_id);
+        let _starting = gate.lock().await;
         match self.claim_slot_sync(agent_id, workspace_id, || {
             Ok::<(), std::convert::Infallible>(())
         }) {
-            Ok(()) => {
+            Ok(((), admission)) => {
                 self.begin_turn_side_effects(agent_id, workspace_id, auto_unarchive)
                     .await;
-                TryBeginOutcome::Started
+                TryBeginOutcome::Started(admission)
             }
             Err(SlotClaimLoss::Busy) => TryBeginOutcome::Busy,
             Err(SlotClaimLoss::ReapClaimed) => TryBeginOutcome::ReapClaimed,
@@ -5827,7 +5890,9 @@ impl AgentManager {
         &self,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
-    ) -> Option<(QueuedMessage, DrainingGuard)> {
+    ) -> Option<((QueuedMessage, DrainingGuard), TurnAdmission)> {
+        let gate = self.turn_start_gates.for_agent(agent_id);
+        let _starting = gate.lock().await;
         let claimed = self.claim_slot_sync(agent_id, workspace_id, || {
             match self.services.claim_parked_recovery_send(agent_id) {
                 RecoverySendClaim::Drained(popped) => Ok(*popped),
@@ -5869,10 +5934,16 @@ impl AgentManager {
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
         precondition: impl FnOnce() -> std::result::Result<T, E>,
-    ) -> std::result::Result<T, SlotClaimLoss<E>> {
+    ) -> std::result::Result<(T, TurnAdmission), SlotClaimLoss<E>> {
         // Insert into `agent_ws` while still holding the `busy` lock
         // (busy → agent_ws order, matching `list_busy`) so a concurrent
         // `list_busy` never observes a busy agent without its workspace.
+        let retired = self.retired.lock().unwrap();
+        if retired.contains(agent_id) {
+            // Like an idle-reap claim, retirement permits no implicit wake
+            // turn. Any delivery that already passed its store check parks.
+            return Err(SlotClaimLoss::ReapClaimed);
+        }
         let mut busy = self.busy.lock().unwrap();
         // An agent claimed by the idle-reap sweep (monorepo#2118) counts
         // as busy: the sweep is about to (or is mid-way through) killing
@@ -5916,6 +5987,11 @@ impl AgentManager {
         self.services
             .clear_live_turn_unless_flush_in_flight(agent_id);
         busy.insert(agent_id.clone());
+        let admission = TurnAdmission(self.next_admission.fetch_add(1, AtomicOrdering::Relaxed));
+        self.turn_admissions
+            .lock()
+            .unwrap()
+            .insert(agent_id.clone(), admission);
         if busy.len() == 1 {
             *self.idle_since.lock().unwrap() = None;
         }
@@ -5923,7 +5999,7 @@ impl AgentManager {
             .lock()
             .unwrap()
             .insert(agent_id.clone(), workspace_id.clone());
-        Ok(claimed)
+        Ok((claimed, admission))
     }
 
     /// Start of the current continuous stretch with no turn in flight, or
@@ -5963,6 +6039,14 @@ impl AgentManager {
         workspace_id: &WorkspaceId,
         auto_unarchive: bool,
     ) {
+        #[cfg(test)]
+        {
+            let pause = self.turn_start_pause.lock().unwrap().take();
+            if let Some(pause) = pause {
+                pause.reached.notify_one();
+                pause.resume.notified().await;
+            }
+        }
         {
             // A real turn is starting: if the workspace is Archived, flip it
             // back to Active and emit the stamped §6.5 delta (auto-unarchive
@@ -6051,6 +6135,66 @@ impl AgentManager {
         }
     }
 
+    fn owns_admission(&self, agent_id: &AgentId, admission: TurnAdmission) -> bool {
+        self.turn_admissions.lock().unwrap().get(agent_id) == Some(&admission)
+    }
+
+    /// Pre-spawn exits belong to the admitted request, not whichever turn
+    /// happens to own this agent now. Keep status persistence ordered with
+    /// retirement and new claims as well as checking the slot identity.
+    async fn finish_admission(
+        &self,
+        agent_id: &AgentId,
+        admission: TurnAdmission,
+        persist_idle: bool,
+    ) {
+        let gate = self.turn_start_gates.for_agent(agent_id);
+        let _starting = gate.lock().await;
+        if !self.owns_admission(agent_id, admission) {
+            return;
+        }
+        if persist_idle {
+            self.end_turn(agent_id).await;
+        } else {
+            self.release_in_flight_slot(agent_id);
+        }
+    }
+
+    async fn fail_admitted_persist(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        content: &str,
+        options: &TurnOptions,
+        admission: TurnAdmission,
+    ) {
+        let gate = self.turn_start_gates.for_agent(agent_id);
+        let _starting = gate.lock().await;
+        if !self.owns_admission(agent_id, admission) {
+            return;
+        }
+        handle_drain_persist_failure(self, agent_id, workspace_id, content, options).await;
+        self.release_in_flight_slot(agent_id);
+    }
+
+    async fn prepare_admitted_flush_turn(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        entries: Vec<QueuedMessage>,
+        draining: DrainingGuard,
+        admission: TurnAdmission,
+    ) -> FlushPrep {
+        let gate = self.turn_start_gates.for_agent(agent_id);
+        let _starting = gate.lock().await;
+        if !self.owns_admission(agent_id, admission) {
+            return FlushPrep::Parked;
+        }
+        // Flush preparation can requeue entries and persist Error on append
+        // failure. Order all of those effects before retirement detaches.
+        prepare_flush_turn(self, agent_id, workspace_id, entries, draining).await
+    }
+
     /// Remove `agent_id` from `busy` and `agent_ws` atomically with respect to
     /// `list_busy` (both maps mutated under the `busy` lock, busy → `agent_ws`
     /// order). Returns `None` when the agent was not busy, otherwise the
@@ -6069,6 +6213,7 @@ impl AgentManager {
             if !busy.remove(agent_id) {
                 return None;
             }
+            self.turn_admissions.lock().unwrap().remove(agent_id);
             if busy.is_empty() {
                 *self.idle_since.lock().unwrap() = Some(Instant::now());
             }
@@ -6688,7 +6833,7 @@ impl AgentManager {
                 .await;
             return Ok(result);
         }
-        if !self.try_begin(&agent_id, &workspace_id).await {
+        let Some(admission) = self.try_begin_turn(&agent_id, &workspace_id).await else {
             // A send INTO an `Error` session is recorded as the parked
             // recovery send, atomically with its enqueue
             // (intent-hq/intent#4962): the slot holder may be a
@@ -6739,7 +6884,7 @@ impl AgentManager {
             self.redrive_parked_recovery_send(&agent_id, &workspace_id)
                 .await;
             return Ok(result);
-        }
+        };
         // Delivery-time unblocked hints (monorepo#2044), direct-send arm: an
         // idle target delivers the wake immediately, so delivery time is NOW
         // — compute the section here so an unqueued completion wake carries
@@ -6808,7 +6953,7 @@ impl AgentManager {
                 // `agent.sendMessage` fallback (PROTOCOL §5.5). Self-drain:
                 // the slot we just released will be reclaimed below if the
                 // queue is ready and the agent is otherwise free.
-                self.end_turn(&agent_id).await;
+                self.finish_admission(&agent_id, admission, true).await;
                 // Check-then-act race guard (monorepo#564): if the session
                 // vanished between the up-front validation and the append
                 // (concurrent delete), fail closed like the guard rather than
@@ -6891,7 +7036,7 @@ impl AgentManager {
         self.services
             .maybe_emit_display_status_changed(&workspace_id)
             .await;
-        self.spawn_worker(agent_id, workspace_id, content, options, true);
+        self.spawn_worker(agent_id, workspace_id, content, options, true, admission);
         Ok(json!({
             "success": true,
             "queued": false,
@@ -6960,12 +7105,38 @@ impl AgentManager {
     /// exactly the marked entry, bypassing the batch flush and the head pop;
     /// every other gate — busy, ready-to-send, archived, quarantine, retired
     /// — still applies.
-    async fn try_drain_queue_inner(
+    fn try_drain_queue_inner(
+        self: Arc<Self>,
+        agent_id: AgentId,
+        workspace_id: WorkspaceId,
+        redrive_error_park: bool,
+    ) -> intent_core::BoxFuture<'static, ()> {
+        Box::pin(async move {
+            let services = self.services.clone();
+            services
+                .instruction_admission(self.try_drain_queue_authorized(
+                    agent_id,
+                    workspace_id,
+                    redrive_error_park,
+                ))
+                .await;
+        })
+    }
+
+    async fn try_drain_queue_authorized(
         self: Arc<Self>,
         agent_id: AgentId,
         workspace_id: WorkspaceId,
         redrive_error_park: bool,
     ) {
+        if self
+            .services
+            .discard_revoked_instructions(&agent_id)
+            .await
+            .is_err()
+        {
+            return;
+        }
         let Ok(_mutation) = self.services.workspace_mutations.enter(&workspace_id) else {
             return;
         };
@@ -7131,13 +7302,15 @@ impl AgentManager {
         // STAB-52 gate holds for `agent.retry`. Under the archived-workspace
         // exemption only a user-origin entry may drain; the normal path
         // claims first, then pops the queue head (or a flush batch).
+        let admission;
         let dequeued = if redrive_error_park {
-            let Some(popped) = self
+            let Some((popped, claimed)) = self
                 .try_begin_recovery_redrive(&agent_id, &workspace_id)
                 .await
             else {
                 return;
             };
+            admission = claimed;
             // Same `failed → in_progress` displayStatus recompute the direct
             // Error-redrive arm of `send_message` performs: the claim's own
             // recompute still read `status = Error` and was a no-op.
@@ -7146,9 +7319,10 @@ impl AgentManager {
                 .await;
             Some(popped)
         } else {
-            if !self.try_begin(&agent_id, &workspace_id).await {
+            let Some(claimed) = self.try_begin_turn(&agent_id, &workspace_id).await else {
                 return;
-            }
+            };
+            admission = claimed;
             // Batch flush (`agents.flushQueuedMessages`, default `all`): with
             // a batching mode and MORE THAN ONE eligible entry waiting, drain
             // them all into ONE combined provider turn while persisting each
@@ -7163,15 +7337,31 @@ impl AgentManager {
                 self.services
                     .dequeue_flush_batch_draining(&agent_id, mode, archived_drain, 2)
             {
-                match prepare_flush_turn(&self, &agent_id, &workspace_id, batch, draining).await {
+                match self
+                    .prepare_admitted_flush_turn(
+                        &agent_id,
+                        &workspace_id,
+                        batch,
+                        draining,
+                        admission,
+                    )
+                    .await
+                {
                     FlushPrep::Turn { content, options } => {
-                        self.spawn_worker(agent_id, workspace_id, content, *options, true);
+                        self.spawn_worker(
+                            agent_id,
+                            workspace_id,
+                            content,
+                            *options,
+                            true,
+                            admission,
+                        );
                     }
                     FlushPrep::Parked => {
                         // Release the slot without overwriting the Error
                         // status just persisted, so `agent.retry` (or a
                         // future message) can redrive.
-                        self.release_in_flight_slot(&agent_id);
+                        self.finish_admission(&agent_id, admission, false).await;
                     }
                 }
                 return;
@@ -7186,7 +7376,7 @@ impl AgentManager {
         let Some((mut next, draining)) = dequeued else {
             // Raced with another mutation (e.g. remove) that emptied the
             // ready-to-send queue between the check above and the dequeue.
-            self.end_turn(&agent_id).await;
+            self.finish_admission(&agent_id, admission, true).await;
             // monorepo#1280: the racing retraction saw this drain's
             // in-flight slot (`agent_is_busy` true) and skipped its own
             // redelivery, expecting a turn to end with a terminal
@@ -7269,11 +7459,14 @@ impl AgentManager {
             ..TurnOptions::default()
         };
         if !user_persisted {
-            handle_drain_persist_failure(&self, &agent_id, &workspace_id, &next.content, &options)
-                .await;
-            // Release the slot without overwriting the Error status just
-            // persisted, so `agent.retry` (or a future message) can redrive.
-            self.release_in_flight_slot(&agent_id);
+            self.fail_admitted_persist(
+                &agent_id,
+                &workspace_id,
+                &next.content,
+                &options,
+                admission,
+            )
+            .await;
             return;
         }
         drop(draining);
@@ -7286,6 +7479,7 @@ impl AgentManager {
             next.content,
             options,
             user_persisted,
+            admission,
         );
     }
 
@@ -7321,6 +7515,9 @@ impl AgentManager {
     ) -> Result<Value> {
         // monorepo#564: fail closed on a nonexistent target BEFORE touching
         // the queue.
+        self.services
+            .discard_revoked_instructions(&agent_id)
+            .await?;
         let session = self.services.require_agent_session(&agent_id).await?;
         // Bind the activation to the target's OWN session workspace
         // (intent-hq/intent#5017): the router forwards the CALLER's
@@ -7368,15 +7565,25 @@ impl AgentManager {
                 "queuedMessage": entry,
             }));
         }
+        let destination_owner = self
+            .services
+            .destination_owner_queue_authorization(&agent_id, &message_id)
+            .await?;
         // Atomic dequeue under the queue lock: no concurrent drain can
         // deliver the same entry twice. The entry stays listed in queue
         // snapshots (§6.5 drain ordering) until `draining` is dropped.
         let (mut entry, draining) = self
             .services
-            .take_queued_message_draining_gated(&agent_id, &message_id, gate.as_ref())?
+            .take_queued_message_draining_gated(
+                &agent_id,
+                &message_id,
+                gate.as_ref(),
+                destination_owner.as_ref(),
+            )?
             .ok_or_else(|| {
                 Error::InvalidParams(format!("queued message not found: {message_id}"))
             })?;
+        drop(destination_owner);
         // Stale-redrive parity with the drain paths (#576): a delegated
         // agent's entry that predates the delivered completion report is
         // annotated and keeps the report queryable.
@@ -7416,7 +7623,7 @@ impl AgentManager {
         // Preempt a cancellable in-flight turn keep-alive (no-op when idle
         // or during turn startup, where preemption would kill the child).
         self.preempt_busy_turn(&agent_id, &mut options).await;
-        if !self.try_begin(&agent_id, &workspace_id).await {
+        let Some(admission) = self.try_begin_turn(&agent_id, &workspace_id).await else {
             // The slot is still held (turn startup, or a concurrent send won
             // the race): restore the entry at the FRONT so it is the next
             // message delivered, and report the queued outcome honestly.
@@ -7444,7 +7651,7 @@ impl AgentManager {
                 "queued": true,
                 "queuedMessage": restored,
             }));
-        }
+        };
         // The pop above was provisional (it preceded the claim, and the
         // lost-claim arm hands the entry back undelivered); the delivery is
         // committed now (intent-hq/intent#4962).
@@ -7483,7 +7690,7 @@ impl AgentManager {
                     // Transactional guarantee: release the slot and restore
                     // the entry at the FRONT (`persisted: false`, so a retry
                     // re-attempts the append), then surface the failure.
-                    self.end_turn(&agent_id).await;
+                    self.finish_admission(&agent_id, admission, true).await;
                     self.services.requeue_front(&agent_id, entry);
                     drop(draining);
                     self.services.publish_queue_updated(&agent_id).await;
@@ -7525,7 +7732,14 @@ impl AgentManager {
             .await;
         let entry_id = entry.id.clone();
         let turn_id = entry.turn_id.clone();
-        self.spawn_worker(agent_id, workspace_id, entry.content, options, true);
+        self.spawn_worker(
+            agent_id,
+            workspace_id,
+            entry.content,
+            options,
+            true,
+            admission,
+        );
         Ok(json!({
             "success": true,
             "queued": false,
@@ -7928,7 +8142,16 @@ impl AgentManager {
         content: String,
         mut options: TurnOptions,
         user_persisted: bool,
+        admission: TurnAdmission,
     ) {
+        // Hold through spawn + registration: retirement either sees this
+        // worker in its abort sweep or prevents it from starting at all.
+        let retired = self.retired.lock().unwrap();
+        if retired.contains(&agent_id) || !self.owns_admission(&agent_id, admission) {
+            // Teardown owns the cancelled slot. Never release a newer claim
+            // installed by restore while this old send was persisting.
+            return;
+        }
         // Every worker spawn flows through here, so this is the single mint
         // point for the turn correlation id (monorepo#1022): direct sends get
         // a fresh id; callers that already carry one (a drained queue entry's
@@ -7982,18 +8205,24 @@ impl AgentManager {
         }
         let mgr = self.clone();
         let id = agent_id.clone();
-        let handle = intent_core::spawn_daemon(async move {
-            // Clear the durable stop-redelivery mirror before the turn runs
-            // (intent-hq/monorepo#1899): the payload was consumed into this
-            // turn's prompt above, so a restart after this point must not
-            // rehydrate — and redeliver — it a second time. The sync re-reads
-            // the map, so a repeat stop that re-armed in the gap upserts the
-            // new payload instead of deleting.
-            if consumed_redelivery {
-                mgr.sync_stop_redelivery(&id).await;
-            }
-            run_message_worker(mgr, id, workspace_id, content, options, user_persisted).await;
-        });
+        let execution = mgr.services.clone();
+        let principal = intent_core::lift_from_principal_id(options.message_metadata.as_ref());
+        let handle = intent_core::spawn_daemon(crate::host_execution::background_execution(
+            execution,
+            principal,
+            async move {
+                // Clear the durable stop-redelivery mirror before the turn runs
+                // (intent-hq/monorepo#1899): the payload was consumed into this
+                // turn's prompt above, so a restart after this point must not
+                // rehydrate — and redeliver — it a second time. The sync re-reads
+                // the map, so a repeat stop that re-armed in the gap upserts the
+                // new payload instead of deleting.
+                if consumed_redelivery {
+                    mgr.sync_stop_redelivery(&id).await;
+                }
+                run_message_worker(mgr, id, workspace_id, content, options, user_persisted).await;
+            },
+        ));
         self.workers.lock().unwrap().insert(agent_id, handle);
     }
 
@@ -8005,14 +8234,17 @@ impl AgentManager {
     /// having launched a worker that could produce assistant output for a
     /// row that isn't in the transcript.
     ///
-    /// Returns `true` when the slot was claimed, `false` when a turn was
+    /// Returns the admission when the slot was claimed, `None` when a turn was
     /// already in flight (the caller must enqueue instead).
     pub(crate) async fn try_begin_turn(
         &self,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
-    ) -> bool {
-        self.try_begin(agent_id, workspace_id).await
+    ) -> Option<TurnAdmission> {
+        match self.try_begin_outcome(agent_id, workspace_id, true).await {
+            TryBeginOutcome::Started(admission) => Some(admission),
+            TryBeginOutcome::Busy | TryBeginOutcome::ReapClaimed => None,
+        }
     }
 
     /// Arm the per-agent idle-notification listener (monorepo#855): a
@@ -8058,7 +8290,10 @@ impl AgentManager {
             let Some(handle) = map.get(agent_id) else {
                 return false;
             };
-            (handle.notifications.clone(), handle.wake_gate.clone())
+            (
+                handle.execution.runtime.notifications(),
+                handle.wake_gate.clone(),
+            )
         };
         if gate.load(AtomicOrdering::SeqCst) > 0 {
             return true;
@@ -8160,8 +8395,8 @@ impl AgentManager {
         // to the prompt turn that won the slot: marking idle here would flag
         // the process eviction-eligible (and pop a spawn waiter)
         // mid-prompt-turn.
-        match self.try_begin_outcome(agent_id, workspace_id, true).await {
-            TryBeginOutcome::Started => {}
+        let admission = match self.try_begin_outcome(agent_id, workspace_id, true).await {
+            TryBeginOutcome::Started(admission) => admission,
             TryBeginOutcome::Busy => {
                 // Outcome deliberately ignored: the prompt turn that won the
                 // slot is itself the recovery — an empty zero-settle drive
@@ -8186,8 +8421,7 @@ impl AgentManager {
             // output and would have died with the handle's buffer had the
             // kill won the race to it.
             TryBeginOutcome::ReapClaimed => return true,
-        }
-        self.registry.mark_active(agent_id);
+        };
         // Drive the turn in its own task registered in `workers`, so
         // `interrupt` / `interrupt_send_message` / `stop` abort an open wake
         // turn with the same snapshot→abort→flush semantics as a prompt turn
@@ -8198,6 +8432,11 @@ impl AgentManager {
         // turn is open.
         let mgr = self.clone();
         let (id, ws) = (agent_id.clone(), workspace_id.clone());
+        let retired = self.retired.lock().unwrap();
+        if retired.contains(agent_id) || !self.owns_admission(agent_id, admission) {
+            return true;
+        }
+        self.registry.mark_active(agent_id);
         let drive = intent_core::spawn_daemon(async move {
             let outcome = mgr
                 .services
@@ -8423,8 +8662,9 @@ impl AgentManager {
         workspace_id: WorkspaceId,
         content: String,
         options: TurnOptions,
+        admission: TurnAdmission,
     ) {
-        self.spawn_worker(agent_id, workspace_id, content, options, true);
+        self.spawn_worker(agent_id, workspace_id, content, options, true, admission);
     }
 
     /// Release an in-flight slot claimed via [`AgentManager::try_begin_turn`]
@@ -8432,8 +8672,8 @@ impl AgentManager {
     /// [`AgentManager::finish_prepersisted_turn_spawn`]). Public-in-crate seam
     /// so `Services::deliver_wake_message` can hand control back to the drain
     /// loop after a store error, mirroring the `send_message` self-drain path.
-    pub(crate) async fn release_slot(&self, agent_id: &AgentId) {
-        self.end_turn(agent_id).await;
+    pub(crate) async fn release_slot(&self, agent_id: &AgentId, admission: TurnAdmission) {
+        self.finish_admission(agent_id, admission, true).await;
     }
 
     /// Whether the cached handle's child process + transport still look live
@@ -8449,13 +8689,7 @@ impl AgentManager {
         let Some(handle) = handles.get_mut(agent_id) else {
             return false;
         };
-        if !handle.connection.is_alive() {
-            return false;
-        }
-        match handle.child.as_mut() {
-            Some(child) => !matches!(child.try_wait(), Ok(Some(_))),
-            None => true,
-        }
+        handle.execution.runtime.is_alive()
     }
 
     /// Persist the informational `model_changed` transcript row when this
@@ -8994,7 +9228,7 @@ impl AgentManager {
         // settled sandbox fields. No-op when no provisioning is in flight —
         // the common case for every turn after the first.
         self.services.await_sandbox_provisioning(agent_id).await;
-        let mut session = self.services.store.get_agent_session(agent_id).await?;
+        let mut session = self.services.require_agent_session(agent_id).await?;
         // Lazy legacy feature freeze (intent-hq/monorepo#2459): a pre-0096
         // row still carrying harness_features = NULL gets its snapshot
         // materialized at this activation choke point — every turn (first
@@ -9077,7 +9311,7 @@ impl AgentManager {
                         .lock()
                         .unwrap()
                         .get(agent_id)
-                        .map(|h| h.connection.clone());
+                        .and_then(|h| h.execution.connection());
                     if let Some(conn) = conn {
                         let effort = Self::session_model_effort(
                             &resolved.provider,
@@ -9089,6 +9323,8 @@ impl AgentManager {
                     }
                     self.maybe_persist_effort_change_notice(agent_id, workspace_id, &resolved)
                         .await;
+                    self.apply_fast_mode(agent_id, &acp, resolved.provider.id)
+                        .await?;
                     return Ok(acp);
                 }
                 // The child/transport died while the agent sat idle
@@ -9315,6 +9551,8 @@ impl AgentManager {
             .await;
         self.maybe_persist_effort_change_notice(agent_id, workspace_id, &resolved)
             .await;
+        self.apply_fast_mode(agent_id, &acp_session_id, resolved.provider.id)
+            .await?;
         self.spawn_attempt_provider.lock().unwrap().remove(agent_id);
         Ok(acp_session_id)
     }
@@ -9328,35 +9566,44 @@ impl AgentManager {
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn shutdown(&self) {
-        let ids: Vec<AgentId> = self.handles.lock().unwrap().keys().cloned().collect();
-        let now = intent_core::now_iso();
-
-        // Capture in-flight agents before stop() settles them to RuntimeIdle.
-        for id in &ids {
-            // Only agents currently in-flight (in the busy set) need interruption rows.
-            if !self.busy.lock().unwrap().contains(id) {
-                continue;
-            }
-            // Read the workspace from agent_ws (stop() will clear it via end_turn).
-            let Some(workspace_id) = self.agent_ws.lock().unwrap().get(id).cloned() else {
-                // Stale busy entry (should not happen).
-                continue;
-            };
-            // Pin the live-turn slot BEFORE aborting the worker: the abort
-            // drops the worker future and with it the LiveTurnGuard, so an
-            // UNPINNED slot read after the abort would race that drop and
-            // frequently lose the partial content. The pin both keeps the slot
-            // published to `chat.subscribe` until the flush below persists the
-            // row (monorepo#2056) and lets that flush re-read the slot as it
-            // stands (monorepo#2110).
+        // A recovered turn can be admitted while its provider is still waiting
+        // to spawn. Include those workers, not only installed handles, or their
+        // resolved interruption row would be lost at this shutdown.
+        let in_flight = self.list_busy();
+        let mut ids: HashSet<AgentId> = self.handles.lock().unwrap().keys().cloned().collect();
+        ids.extend(in_flight.iter().map(|(id, _)| id.clone()));
+        ids.extend(self.workers.lock().unwrap().keys().cloned());
+        // Pin every live slot before aborting any worker: dropping its future
+        // drops the LiveTurnGuard, which would otherwise erase partial output.
+        for (id, _) in &in_flight {
             self.services.pin_live_turn(id);
-            // Abort the turn worker BEFORE flushing so it cannot race the
-            // partial flush by persisting the full turn under the same minted
-            // message id (which would leave the transcript stuck on the partial
-            // snapshot while the worker's own append errors on the UNIQUE id).
-            // stop() below removes the (already-gone) worker entry harmlessly.
-            if let Some(worker) = self.workers.lock().unwrap().remove(id) {
-                worker.abort();
+        }
+        // Fence and abort the WHOLE snapshot before the first persistence await.
+        // Otherwise a later worker can hit the fence during an earlier flush,
+        // publish a terminal spawn failure, and release its busy/workspace slot.
+        // Keep the fence locked through abort so a worker cannot observe it as
+        // a provider error before its cancellation is armed.
+        {
+            let mut stopping = self.stopping.lock().unwrap();
+            stopping.extend(ids.iter().cloned());
+            let mut workers = self.workers.lock().unwrap();
+            for id in &ids {
+                if let Some(worker) = workers.remove(id) {
+                    worker.abort();
+                }
+            }
+        }
+        // The lazy-spawn fence remains for this manager's lifetime. Persist the
+        // captured identities, never a post-await re-read of the mutable maps.
+        let now = intent_core::now_iso();
+        for (id, workspace_id) in &in_flight {
+            #[cfg(test)]
+            {
+                let pause = self.shutdown_persist_pause.lock().unwrap().take();
+                if let Some(pause) = pause {
+                    pause.reached.notify_one();
+                    pause.resume.notified().await;
+                }
             }
             // Best-effort: persist any partial in-flight assistant content from
             // the pinned slot so the transcript keeps the streamed-so-far
@@ -9414,7 +9661,7 @@ impl AgentManager {
             if let Err(e) = self
                 .services
                 .store
-                .insert_interrupted_agent(id, &workspace_id, &prev_str, &now)
+                .insert_interrupted_agent(id, workspace_id, &prev_str, &now)
                 .await
             {
                 tracing::warn!(agent_id = %id, workspace_id = %workspace_id, error = %e, "graceful shutdown: failed to insert interrupted_agent row");
@@ -9439,7 +9686,7 @@ impl AgentManager {
                 children.push(child);
             }
         }
-        DetachedChild::kill_trees(children).await;
+        RuntimeTeardown::kill_trees(children).await;
         // The daemon-managed Unsloth server is not an agent child — tear it
         // down explicitly so a clean shutdown never orphans it.
         self.unsloth.shutdown().await;
@@ -9605,7 +9852,7 @@ impl AgentManager {
     async fn kill_child_only(&self, agent_id: &AgentId) {
         let handle = self.handles.lock().unwrap().remove(agent_id);
         if let Some(mut handle) = handle {
-            if let Some(child) = DetachedChild::take(&mut handle) {
+            if let Some(child) = RuntimeTeardown::take(&mut handle) {
                 child.kill_tree().await;
             }
         }
@@ -9625,7 +9872,7 @@ impl AgentManager {
                     .upgrade()
                     .and_then(|h| h.lock().unwrap().remove(&id));
                 if let Some(mut handle) = removed {
-                    if let Some(child) = DetachedChild::take(&mut handle) {
+                    if let Some(child) = RuntimeTeardown::take(&mut handle) {
                         child.kill_tree().await;
                     }
                 }
@@ -9684,23 +9931,9 @@ impl AgentManager {
                     let Some(handle) = map.get_mut(&agent_id) else {
                         return false;
                     };
-                    let Some(child) = handle.child.as_mut() else {
-                        return false;
-                    };
-                    // A respawn installed a NEWER child under this agent id
-                    // (which armed its own watcher) — stand down. A child
-                    // already reaped by a prior `try_wait` reports
-                    // `id() == None` and falls through: `try_wait` then
-                    // returns its cached exit status.
-                    if let Some(current) = child.id() {
-                        if Some(current) != child_pid {
-                            return false;
-                        }
-                    }
-                    match child.try_wait() {
-                        // Alive — keep polling. A transient probe error is
-                        // treated as alive so it never forces a teardown.
-                        Ok(None) | Err(_) => None,
+                    match handle.execution.child_exit(child_pid) {
+                        ChildState::Absent => return false,
+                        ChildState::Alive => None,
                         // Exited. Mid-turn (busy) the in-flight turn's
                         // terminal-failure path owns the teardown: keep
                         // polling until it removes the handle (or the agent
@@ -9714,7 +9947,7 @@ impl AgentManager {
                         // handle (which requires this lock), so a deregister
                         // outside the lock could land AFTER that fresh
                         // `register` and clobber the new child's slot.
-                        Ok(Some(status)) => {
+                        ChildState::Exited(status) => {
                             if is_busy {
                                 None
                             } else {
@@ -9723,7 +9956,7 @@ impl AgentManager {
                                 Some((
                                     status,
                                     dead.map(|mut h| {
-                                        (DetachedChild::take(&mut h), Arc::clone(&h.connection))
+                                        (RuntimeTeardown::take(&mut h), h.execution.connection())
                                     }),
                                 ))
                             }
@@ -9731,8 +9964,7 @@ impl AgentManager {
                     }
                 };
                 if let Some((status, dead)) = exited {
-                    let (dead_child, dead_conn) =
-                        dead.map_or((None, None), |(child, conn)| (child, Some(conn)));
+                    let (dead_child, dead_conn) = dead.unwrap_or((None, None));
                     // The direct child is already reaped (`try_wait` above),
                     // but same-group descendants can survive it: sweep the
                     // process group via the spawn-time pid. Swept BEFORE the
@@ -9798,103 +10030,6 @@ const PROCESS_GROUP_TERM_GRACE: Duration = Duration::from_secs(2);
 /// before returning (`SIGKILLed` children reap almost instantly).
 #[cfg(unix)]
 const KILL_SWEEP_REAP_GRACE: Duration = Duration::from_millis(500);
-
-/// A provider child handed out of its [`AgentHandle`] for a bounded
-/// process-tree kill, together with its spawn-time pid (the process-group
-/// id, still valid once the leader has been `try_wait`ed) and the npx launch
-/// dir it runs in (intent-hq/intent#5738): that dir is the live tree's cwd,
-/// so it must outlive [`kill_child_tree`] / [`kill_child_trees`] rather than
-/// drop with the handle before the tree has been signalled.
-///
-/// Cleanup ownership is persistent, not the awaiting caller's: [`Self::kill_tree`]
-/// and [`Self::kill_trees`] move the child, its pgid and the launch dir into
-/// ONE owned task on the current runtime and await that task. Cancelling the
-/// caller — `stop()` aborting a worker inside `kill_child_only` after the
-/// handle left the map, an RPC deadline dropping a `stop` / `stop_many`
-/// future — leaves the task, and the descendant snapshot it already took,
-/// running to completion (a second kill could not rediscover escaped
-/// descendants once the leader is dead). [`Drop`] starts the same task for a
-/// detached child that was never killed explicitly. When no runtime can run
-/// the task, or it shuts down before the task finishes, the launch dir is
-/// retained on disk rather than removed from under a possibly live tree, and
-/// the child falls back to `kill_on_drop` — the same boundary as the
-/// ephemeral adapter's `AdapterChild`.
-struct DetachedChild {
-    /// `None` once moved into the owned cleanup task.
-    child: Option<Child>,
-    spawn_pid: Option<u32>,
-    /// `None` once moved into the owned cleanup task.
-    npx_launch_dir: Option<NpxLaunchDir>,
-}
-
-impl DetachedChild {
-    /// Move the child (and its launch dir) out of `handle`; `None` when the
-    /// handle owns no child.
-    fn take(handle: &mut AgentHandle) -> Option<Self> {
-        let child = handle.child.take()?;
-        Some(Self {
-            child: Some(child),
-            spawn_pid: handle.child_pid,
-            npx_launch_dir: handle.npx_launch_dir.take(),
-        })
-    }
-
-    /// [`kill_child_tree`] on an owned task, releasing the launch dir only
-    /// afterwards; awaits the task, but the task outlives a cancelled await.
-    async fn kill_tree(mut self) {
-        if let Some(cleanup) = self.start_cleanup() {
-            let _ = cleanup.await;
-        }
-    }
-
-    /// Move the child and the launch dir into the owned cleanup task. `None`
-    /// when there is nothing left to clean up or no runtime to run it on
-    /// (then the dir is retained and the child left to `kill_on_drop`).
-    fn start_cleanup(&mut self) -> Option<JoinHandle<()>> {
-        let child = self.child.take()?;
-        let spawn_pid = self.spawn_pid;
-        let launch_dir = RetainUnlessSwept(self.npx_launch_dir.take());
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            drop(launch_dir);
-            drop(child);
-            return None;
-        };
-        Some(spawn_owned_cleanup(&runtime, async move {
-            kill_child_tree(child, spawn_pid).await;
-            launch_dir.remove();
-        }))
-    }
-
-    /// [`kill_child_trees`] over the batch on ONE owned task, releasing every
-    /// launch dir only after the shared sweep completes; a cancelled await
-    /// leaves the batch sweep running.
-    async fn kill_trees(children: Vec<Self>) {
-        let mut trees = Vec::with_capacity(children.len());
-        let mut launch_dirs = Vec::with_capacity(children.len());
-        for mut detached in children {
-            if let Some(child) = detached.child.take() {
-                trees.push((child, detached.spawn_pid));
-            }
-            launch_dirs.push(RetainUnlessSwept(detached.npx_launch_dir.take()));
-        }
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        let _ = spawn_owned_cleanup(&runtime, async move {
-            kill_child_trees(trees).await;
-            for dir in launch_dirs {
-                dir.remove();
-            }
-        })
-        .await;
-    }
-}
-
-impl Drop for DetachedChild {
-    fn drop(&mut self) {
-        drop(self.start_cleanup());
-    }
-}
 
 /// Spawn `cleanup` on `runtime` as a task no caller owns: it runs with
 /// [`intent_core::Caller::Daemon`] bound (like [`intent_core::spawn_daemon`])
@@ -9972,7 +10107,6 @@ async fn kill_child_tree(mut child: Child, spawn_pid: Option<u32>) {
 /// Non-unix fallback: no process groups, so fall back to killing the direct
 /// child (`kill_on_drop` remains the safety net on drop).
 #[cfg(not(unix))]
-#[expect(clippy::unused_async)] // signature mirrors the unix variant so call sites stay identical
 async fn kill_child_tree(mut child: Child, _spawn_pid: Option<u32>) {
     let _ = child.start_kill();
 }
@@ -11176,7 +11310,7 @@ async fn run_message_worker(
                                     .lock()
                                     .unwrap()
                                     .get(&agent_id)
-                                    .map(|h| h.connection.clone());
+                                    .map(|h| h.execution.runtime.clone());
                                 // Response watermark BEFORE `session/cancel`:
                                 // the idle timeout dropped `req_fut`, so the
                                 // hung prompt's pending-map entry is already
@@ -11241,7 +11375,7 @@ async fn run_message_worker(
                                         .lock()
                                         .unwrap()
                                         .get(&agent_id)
-                                        .map(|h| h.notifications.clone());
+                                        .map(|h| h.execution.runtime.notifications());
                                     if let Some(notes) = notes {
                                         let mut guard = notes.lock().await;
                                         Services::drain_replay_notifications(&mut guard).await;
@@ -11558,6 +11692,22 @@ async fn run_message_worker(
                 }
             }
         }
+        // This is a separate drain from the explicit send/kick paths. Hold
+        // admission through selection and turn preparation, never through the
+        // already-running provider turn above. Removal either sweeps first or
+        // waits for this instruction to become admitted work.
+        let instruction_authority = mgr.services.human_instruction_authority.read().await;
+        if mgr
+            .services
+            .discard_revoked_instructions(&agent_id)
+            .await
+            .is_err()
+        {
+            mgr.release_in_flight_slot(&agent_id);
+            break 'outer;
+        }
+        #[cfg(test)]
+        mgr.services.queue_drain_commit_pause.pause().await;
         // Batch flush (`agents.flushQueuedMessages`): same contract as the
         // `try_drain_queue` flush arm — ≥2 ready entries drain into one
         // combined provider turn; otherwise the single-entry arm below runs
@@ -11687,6 +11837,7 @@ async fn run_message_worker(
                 None => (Vec::new(), None),
             };
         if raced.is_empty() {
+            drop(instruction_authority);
             // monorepo#1297: heal a busy-misclassified terminal idle. The
             // turn's `agent:idle` is published while this worker still holds
             // the busy slot (`end_turn` above runs after `run_prompt_turn`
@@ -11704,8 +11855,10 @@ async fn run_message_worker(
                 .await;
             break 'outer;
         }
-        if mgr.try_begin_outcome(&agent_id, &workspace_id, false).await == TryBeginOutcome::Started
-        {
+        if matches!(
+            mgr.try_begin_outcome(&agent_id, &workspace_id, false).await,
+            TryBeginOutcome::Started(_)
+        ) {
             // Archived re-check on the raced pop (intent-hq/monorepo#2513):
             // the popped entry can be a wake parked by the archived gates
             // AFTER the gate at the top of this drain ran — e.g. the
@@ -11743,6 +11896,7 @@ async fn run_message_worker(
                         // pre-release archived arm above.
                         mgr.clear_worker(&agent_id);
                         mgr.end_turn(&agent_id).await;
+                        drop(instruction_authority);
                         mgr.clone()
                             .try_drain_queue(agent_id.clone(), workspace_id.clone())
                             .await;
@@ -12450,9 +12604,13 @@ fn antigravity_setup_error(method: &str, error: &intent_acp::AcpError, rejection
                 "Antigravity {method}: agent stdout closed; no prompt was sent"
             ))
         }
-        AcpError::Auth(_) => Error::InvalidParams(crate::provider_auth::not_authenticated_message(
+        AcpError::Auth(_) => crate::host_execution::ai_authorization_error(
+            Error::InvalidParams(crate::provider_auth::not_authenticated_message(
+                "antigravity",
+            )),
             "antigravity",
-        )),
+            intent_core::execution::ExecutionAuthorizationReason::Rejected,
+        ),
         _ => Error::InvalidParams(rejection),
     }
 }
@@ -12719,6 +12877,7 @@ async fn publish_terminal_failure_events(
     error_msg: &str,
     turn_id: Option<&str>,
     provider_source: FailedProviderSource,
+    authorization: Option<&intent_core::execution::ExecutionAuthorizationFailure>,
 ) {
     use intent_core::events::{AGENT_FAILED, AGENT_STREAM_END};
 
@@ -12731,6 +12890,9 @@ async fn publish_terminal_failure_events(
         "failed",
     );
     let mut failed_data = json!({ "agentId": agent_id.0, "error": error_msg });
+    if let Some(auth) = authorization {
+        failed_data["executionAuthorization"] = json!(auth);
+    }
     let mut end_data = json!({ "agentId": agent_id.0 });
     if let Some(tid) = turn_id {
         failed_data["turnId"] = json!(tid);
@@ -13251,6 +13413,7 @@ async fn handle_terminal_spawn_failure(
         &error_text,
         options.turn_id.as_deref(),
         FailedProviderSource::SpawnAttempt,
+        error.execution_authorization(),
     )
     .await;
     publish_error_status_and_requeue(
@@ -13297,6 +13460,7 @@ async fn handle_drain_persist_failure(
         &error_text,
         options.turn_id.as_deref(),
         FailedProviderSource::CommittedTurn,
+        None,
     )
     .await;
     publish_error_status_and_requeue(
@@ -13417,7 +13581,7 @@ async fn stderr_capture_hint(
         .lock()
         .unwrap()
         .get(agent_id)
-        .map(|h| Arc::clone(&h.connection));
+        .and_then(|h| h.execution.connection());
     let connection = connection?;
     // Sweep the child's process group BEFORE awaiting settle (same ordering
     // as the idle-exit watcher): a same-group descendant holding the stderr
@@ -13829,6 +13993,7 @@ async fn handle_terminal_turn_failure(
             &error_text,
             options.turn_id.as_deref(),
             FailedProviderSource::CommittedTurn,
+            error.execution_authorization(),
         )
         .await;
     }
@@ -16179,21 +16344,24 @@ mod dead_child_respawn_tests {
         let (_note_tx, note_rx) = mpsc::unbounded_channel::<IncomingNotification>();
         let child_pid = child.as_ref().and_then(tokio::process::Child::id);
         AgentHandle {
-            connection,
-            notifications: Arc::new(TokioMutex::new(note_rx)),
-            serve_task: tokio::spawn(async {}),
-            child,
-            child_pid,
-            _mcp_bridge: None,
-            _mcp_config: None,
-            _rules_config: None,
-            _pi_extension: None,
-            npx_launch_dir,
+            execution: RuntimeHandle::local(LocalResources {
+                connection,
+                notifications: Arc::new(TokioMutex::new(note_rx)),
+                serve_task: tokio::spawn(async {}),
+                child,
+                child_pid,
+                _mcp_bridge: None,
+                _mcp_config: None,
+                _rules_config: None,
+                _pi_extension: None,
+                npx_launch_dir,
+            }),
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
             spawned_provider: "node".to_string(),
             thought_level: None,
+            config_options: None,
             confirmed_effort: None,
             wake_gate: Arc::new(AtomicUsize::new(0)),
             wake_listener: None,
@@ -16219,7 +16387,18 @@ mod dead_child_respawn_tests {
         assert_eq!(acp, "acp-cached", "live child reuses the cached session");
         // No respawn happened: the fake handle (no owned child) is untouched.
         let handles = mgr.handles.lock().unwrap();
-        assert!(handles.get(&agent_id).unwrap().child.is_none());
+        assert!(handles
+            .get(&agent_id)
+            .unwrap()
+            .execution
+            .local
+            .as_ref()
+            .unwrap()
+            .resources
+            .lock()
+            .unwrap()
+            .child
+            .is_none());
     }
 
     /// Handle present but the child already exited → `ensure_started` must
@@ -16255,7 +16434,18 @@ mod dead_child_respawn_tests {
         {
             let handles = mgr.handles.lock().unwrap();
             assert!(
-                handles.get(&agent_id).unwrap().child.is_some(),
+                handles
+                    .get(&agent_id)
+                    .unwrap()
+                    .execution
+                    .local
+                    .as_ref()
+                    .unwrap()
+                    .resources
+                    .lock()
+                    .unwrap()
+                    .child
+                    .is_some(),
                 "respawn installed a real child-owning handle"
             );
         }
@@ -16736,7 +16926,18 @@ mod disabled_provider_rehome_tests {
         {
             let handles = mgr.handles.lock().unwrap();
             assert!(
-                handles.get(&agent_id).unwrap().child.is_some(),
+                handles
+                    .get(&agent_id)
+                    .unwrap()
+                    .execution
+                    .local
+                    .as_ref()
+                    .unwrap()
+                    .resources
+                    .lock()
+                    .unwrap()
+                    .child
+                    .is_some(),
                 "re-home replaced the fake handle with a real child"
             );
         }
@@ -17642,7 +17843,7 @@ mod thought_level_tests {
             let mut handles = mgr.handles.lock().unwrap();
             let handle = handles.get_mut(&agent_id).unwrap();
             handle.thought_level = thought_level;
-            handle.connection.clone()
+            handle.execution.connection().unwrap()
         };
         (mgr, agent_id, conn, calls, db, task)
     }
@@ -17675,6 +17876,7 @@ mod thought_level_tests {
                 session_id: "sid-1".into(),
                 modes: None,
                 thought_level: Some(option("medium")),
+                config_options: None,
             };
             mgr.services
                 .persist_session_effort_levels(
@@ -17723,6 +17925,7 @@ mod thought_level_tests {
                 session_id: "sid-1".into(),
                 modes: None,
                 thought_level: Some(option("medium")),
+                config_options: None,
             };
             mgr.services
                 .persist_session_effort_levels(
@@ -18864,7 +19067,10 @@ mod cancel_and_settle_tests {
         let conn = Connection::new(c2a_client, a2c_client, None, ConnectionHooks::default());
         let agent_id = AgentId::from("agent-idle-settle");
 
-        assert!(cancel_and_settle_idle_prompt(&conn, &agent_id, "acp-1").await);
+        assert!(
+            cancel_and_settle_idle_prompt(&runtime::ConnectionRuntime(&conn), &agent_id, "acp-1")
+                .await
+        );
 
         // The cancel frame reached the agent side of the pipe.
         let mut lines = BufReader::new(c2a_agent).lines();
@@ -18900,7 +19106,10 @@ mod cancel_and_settle_tests {
         }
         assert!(!conn.is_alive(), "writer task exited on broken pipe");
 
-        assert!(!cancel_and_settle_idle_prompt(&conn, &agent_id, "acp-1").await);
+        assert!(
+            !cancel_and_settle_idle_prompt(&runtime::ConnectionRuntime(&conn), &agent_id, "acp-1")
+                .await
+        );
     }
 }
 
@@ -20142,3 +20351,7 @@ mod agent_retry_tests {
 #[cfg(all(test, unix))]
 #[path = "agent_manager/effort_notice_tests.rs"]
 mod effort_notice_tests;
+
+#[cfg(all(test, unix))]
+#[path = "agent_manager/fast_mode_tests.rs"]
+mod fast_mode_tests;

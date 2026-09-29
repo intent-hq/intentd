@@ -409,6 +409,10 @@ pub struct Workspace {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceMembership {
+    /// Effective management authority for the current caller. Host members
+    /// inherit this on ordinary workspaces without becoming their owner.
+    #[serde(default)]
+    pub can_manage: bool,
     /// The workspace's owner; `None` only for a row whose principal columns
     /// were nulled by transfer import and not yet re-derived.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -488,9 +492,9 @@ pub const WORKSPACE_LIST_PR_CAP: usize = 5;
 /// `diskUsage`) are deliberately absent; `pullRequestsTotal` is the one
 /// list-only key (set by the [`WORKSPACE_LIST_PR_CAP`] truncation, never on
 /// `workspace.get`). The flattened [`WorkspaceMembership`] keys
-/// (`ownerPrincipalId`, `myRole`, `memberCount`, `openInviteCount`) are
-/// list-relevant (role badge / member count in the sidebar), small, and
-/// rung 1: one bulk membership query per list, persisted counts. Adding a
+/// (`ownerPrincipalId`, `myRole`, `canManage`, `memberCount`, `openInviteCount`)
+/// are list-relevant (role badge, management actions and member count), small,
+/// and rung 1: persisted authority projected in one bulk membership query. Adding a
 /// key here is a
 /// wire-contract change — update `docs/protocol/methods/workspace.md` in
 /// the same commit and state which rung of the derived-field ladder the
@@ -538,6 +542,7 @@ pub const WORKSPACE_LIST_ROW_KEYS: &[&str] = &[
     "pendingDeleteAt",
     "ownerPrincipalId",
     "myRole",
+    "canManage",
     "memberCount",
     "openInviteCount",
 ];
@@ -738,7 +743,7 @@ pub const CHIEF_WORKSPACE_TIMESTAMP: &str = "2026-01-01T00:00:00.000Z";
 pub fn chief_workspace() -> Workspace {
     Workspace {
         id: WorkspaceId::chief(),
-        title: "Chief of Staff".to_string(),
+        title: "Assistant".to_string(),
         branch: String::new(),
         base_ref: None,
         base_commit_sha: None,
@@ -1673,6 +1678,10 @@ pub struct Comment {
     pub content: String,
     pub author: String,
     pub author_type: AuthorType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_principal_id: Option<PrincipalId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_identity: Option<PrincipalIdentity>,
     pub status: CommentStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
@@ -2380,6 +2389,10 @@ pub struct CommentWire {
     pub content: String,
     pub author: String,
     pub author_type: AuthorType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_principal_id: Option<PrincipalId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_identity: Option<PrincipalIdentity>,
     pub status: CommentStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
@@ -2428,6 +2441,8 @@ impl CommentWire {
             content: c.content.clone(),
             author: c.author.clone(),
             author_type: c.author_type,
+            author_principal_id: c.author_principal_id.clone(),
+            author_identity: c.author_identity.clone(),
             status: c.status,
             parent_id: c.parent_id.clone(),
             anchor: c.anchor.clone(),
@@ -2479,6 +2494,10 @@ pub struct CommentThreadSummary {
     pub last_activity: String,
     pub latest_comment_author: String,
     pub latest_comment_author_type: AuthorType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_comment_author_principal_id: Option<PrincipalId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_comment_author_identity: Option<PrincipalIdentity>,
     pub latest_comment_at: String,
     pub comment_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3476,6 +3495,7 @@ pub const AGENT_LIST_ROW_METADATA_KEYS: &[&str] = &[
     "lastSeenMessageId",
     "isInitialAgent",
     "sponsorAgentId",
+    "chiefPromptVersion",
 ];
 
 /// Serialized-size attribution of one JSON object for list-row budget
@@ -3607,7 +3627,7 @@ pub fn lift_from_principal_id(metadata: Option<&serde_json::Value>) -> Option<Pr
 /// defaults change materially; existing sessions keep their stamped version
 /// for life (no upgrade/migration path). Pre-feature rows backfill to "1.0"
 /// (migration 0096).
-pub const CURRENT_HARNESS_VERSION: &str = "2.8";
+pub const CURRENT_HARNESS_VERSION: &str = "2.10";
 
 /// Serde default for [`AgentSession::harness_version`]: payloads persisted or
 /// exported before harness versioning existed deserialize as "1.0", matching
@@ -3701,6 +3721,19 @@ pub(crate) const IS_INITIAL_AGENT_KEY: &str = "isInitialAgent";
 /// (no schema migration), like [`IS_INITIAL_AGENT_KEY`]. Read back by
 /// [`AgentSession::sponsor_agent_id`].
 pub(crate) const SPONSOR_AGENT_ID_KEY: &str = "sponsorAgentId";
+
+/// Client-supplied version of the Assistant prompt frozen at creation.
+/// Never inferred from specialist identity or creation time.
+pub const CHIEF_PROMPT_VERSION_KEY: &str = "chiefPromptVersion";
+
+/// Read a positive JSON integer version; malformed legacy values fail closed.
+pub fn chief_prompt_version(metadata: &serde_json::Value) -> Option<u32> {
+    metadata
+        .get(CHIEF_PROMPT_VERSION_KEY)
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|n| *n > 0)
+}
 
 /// Who originated an `agent.sendMessage`-shaped delivery (PROTOCOL §5.5).
 /// `User` marks the explicit user-action front doors — the FE
@@ -4207,6 +4240,10 @@ pub struct AgentMetadata {
     /// [`IS_INITIAL_AGENT_KEY`]); omitted for non-peer agents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sponsor_agent_id: Option<String>,
+    /// Explicit creation-time Assistant prompt version. Missing/invalid legacy
+    /// markers are omitted; prompt or specialist changes invalidate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chief_prompt_version: Option<u32>,
 }
 
 /// Lightweight `agent.list` / `agent.get` projection (PROTOCOL §5.5). Mirrors
@@ -4446,6 +4483,7 @@ impl AgentLite {
         let last_seen_message_id = session.last_seen_message_id().map(str::to_string);
         let is_initial_agent = session.is_initial_agent().then_some(true);
         let sponsor_agent_id = session.sponsor_agent_id().map(str::to_string);
+        let chief_prompt_version = session.metadata.as_ref().and_then(chief_prompt_version);
         let metadata = AgentMetadata {
             is_background: session.is_background,
             specialist: session.specialist,
@@ -4467,6 +4505,7 @@ impl AgentLite {
             last_seen_message_id,
             is_initial_agent,
             sponsor_agent_id,
+            chief_prompt_version,
         };
         Self {
             id: session.id,
@@ -6888,6 +6927,8 @@ mod tests {
             content: "hello".to_string(),
             author: "Agent".to_string(),
             author_type: AuthorType::Agent,
+            author_principal_id: None,
+            author_identity: None,
             status: CommentStatus::Open,
             parent_id: None,
             anchor: Some(CommentAnchor {
@@ -6941,6 +6982,8 @@ mod tests {
             content: "try this".to_string(),
             author: "Agent".to_string(),
             author_type: AuthorType::Agent,
+            author_principal_id: None,
+            author_identity: None,
             status: CommentStatus::Open,
             parent_id: Some("c1".to_string()),
             anchor: None,
@@ -8348,6 +8391,27 @@ mod tests {
         // Only the JSON boolean `true` surfaces the flag.
         let v = project(Some(json!({ IS_INITIAL_AGENT_KEY: true })));
         assert_eq!(v["metadata"]["isInitialAgent"], true);
+
+        for version in [json!(1), json!(3), json!(u32::MAX)] {
+            let v = project(Some(json!({ CHIEF_PROMPT_VERSION_KEY: version })));
+            assert_eq!(v["metadata"][CHIEF_PROMPT_VERSION_KEY], version);
+        }
+        for version in [
+            json!(null),
+            json!(0),
+            json!(-1),
+            json!(3.0),
+            json!(1.5),
+            json!("3"),
+            json!(true),
+            json!({}),
+            json!([]),
+            json!(u64::MAX),
+        ] {
+            let v = project(Some(json!({ CHIEF_PROMPT_VERSION_KEY: version })));
+            assert!(v["metadata"].get(CHIEF_PROMPT_VERSION_KEY).is_none());
+        }
+        assert!(legacy["metadata"].get(CHIEF_PROMPT_VERSION_KEY).is_none());
     }
 
     /// `AgentSession` serializes to the camelCase `agent-session.ts` wire shape:

@@ -42,7 +42,7 @@ pub(crate) async fn dispatch(
     // Chief-workspace gating: all ws.app.* methods require the caller to be
     // in the Chief workspace.
     if !workspace_id.is_chief() {
-        return Err("ws.app.* is only available in the Chief of Staff workspace".to_string());
+        return Err("ws.app.* is only available in the Assistant workspace".to_string());
     }
 
     match method {
@@ -433,7 +433,7 @@ fn assert_mutable_workspace_id(id: &str) -> Result<(), String> {
         return Err("workspace id is required".to_string());
     }
     if id == "__chief__" {
-        return Err("The Chief virtual workspace cannot be modified".to_string());
+        return Err("The Assistant virtual workspace cannot be modified".to_string());
     }
     Ok(())
 }
@@ -1314,7 +1314,7 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err(),
-            "ws.app.* is only available in the Chief of Staff workspace"
+            "ws.app.* is only available in the Assistant workspace"
         );
     }
 
@@ -1330,7 +1330,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(denied.contains("only available in the Chief"));
+        assert!(denied.contains("only available in the Assistant"));
         for args in [
             json!(null),
             json!({}),
@@ -2585,7 +2585,7 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err(),
-            "The Chief virtual workspace cannot be modified"
+            "The Assistant virtual workspace cannot be modified"
         );
     }
 
@@ -2641,7 +2641,7 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err(),
-            "The Chief virtual workspace cannot be modified"
+            "The Assistant virtual workspace cannot be modified"
         );
     }
 
@@ -2710,7 +2710,7 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err(),
-            "The Chief virtual workspace cannot be modified"
+            "The Assistant virtual workspace cannot be modified"
         );
     }
 
@@ -2856,7 +2856,7 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err(),
-            "The Chief virtual workspace cannot be modified"
+            "The Assistant virtual workspace cannot be modified"
         );
     }
 

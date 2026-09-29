@@ -79,10 +79,21 @@ impl Services {
         method: &str,
         tab_id: &str,
     ) -> Result<BrowserTab> {
-        self.store
-            .get_browser_tab(tab_id)
-            .await?
-            .ok_or_else(|| Error::InvalidParams(format!("{method}: tab not found: {tab_id}")))
+        let tab =
+            self.store.get_browser_tab(tab_id).await?.ok_or_else(|| {
+                Error::InvalidParams(format!("{method}: tab not found: {tab_id}"))
+            })?;
+        self.require_browser_workspace(&tab.workspace_id).await?;
+        Ok(tab)
+    }
+
+    /// Browser transport used to be administrator-only. Retain internal callers
+    /// while checking the actual resource for every non-administrator wire call.
+    async fn require_browser_workspace(&self, workspace: &WorkspaceId) -> Result<()> {
+        if crate::event_ops::is_collaborator_caller() {
+            self.require_workspace_manager(workspace, "browser").await?;
+        }
+        Ok(())
     }
 
     /// Dispatch one `browser.exec` action about `tab` to its routing target
@@ -371,8 +382,13 @@ impl Services {
         host: ClientId,
         tab: BrowserTabInput,
     ) -> Result<BrowserTab> {
+        self.require_browser_workspace(&tab.workspace_id).await?;
         let _mutation = self.workspace_mutations.enter(&tab.workspace_id)?;
         let _gate = self.browser_tab_gate.lock().await;
+        if let Some(existing) = self.store.get_browser_tab(&tab.tab_id).await? {
+            self.require_browser_workspace(&existing.workspace_id)
+                .await?;
+        }
         let outcome = self.store.upsert_browser_tab(&host, tab).await?;
         match &outcome {
             BrowserTabUpsertOutcome::Opened(tab) => {
@@ -397,6 +413,9 @@ impl Services {
     /// `browser.removeTab`: host-reported close. Emits `browser:tab-closed`
     /// when an open row was deleted; unknown ids are a silent no-op.
     pub(crate) async fn browser_tab_remove(&self, host: ClientId, tab_id: String) -> Result<()> {
+        if let Some(tab) = self.store.get_browser_tab(&tab_id).await? {
+            self.require_browser_workspace(&tab.workspace_id).await?;
+        }
         let _gate = self.browser_tab_gate.lock().await;
         if let Some(tab) = self.store.remove_browser_tab(&host, &tab_id).await? {
             publish_event(
@@ -417,11 +436,20 @@ impl Services {
         host: ClientId,
         tabs: Vec<BrowserTabInput>,
     ) -> Result<Vec<String>> {
+        for tab in &tabs {
+            self.require_browser_workspace(&tab.workspace_id).await?;
+        }
         let _mutations = tabs
             .iter()
             .map(|tab| self.workspace_mutations.enter(&tab.workspace_id))
             .collect::<Result<Vec<_>>>()?;
         let _gate = self.browser_tab_gate.lock().await;
+        for tab in &tabs {
+            if let Some(existing) = self.store.get_browser_tab(&tab.tab_id).await? {
+                self.require_browser_workspace(&existing.workspace_id)
+                    .await?;
+            }
+        }
         let result = self.store.sync_browser_tabs(&host, tabs).await?;
         let bus = self.event_bus.as_ref();
         for tab in &result.opened {

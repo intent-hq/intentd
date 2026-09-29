@@ -4771,7 +4771,7 @@ async fn app_agents_send_persists_chief_attribution_and_source_link() {
         Some(json!({
             "type": "chief_message",
             "fromAgentId": chief.0,
-            "fromAgentName": "Chief of Staff",
+            "fromAgentName": "Assistant",
             "fromWorkspaceId": chief_ws.0,
             "sourceMessageId": source_id,
             "sourceUrl": source_url,
@@ -4834,7 +4834,7 @@ async fn app_agents_send_delivers_despite_target_pending_questions() {
     let expected_metadata = json!({
         "type": "chief_message",
         "fromAgentId": chief.0,
-        "fromAgentName": "Chief of Staff",
+        "fromAgentName": "Assistant",
         "fromWorkspaceId": chief_ws.0,
         "sourceMessageId": source_id,
         "sourceUrl": source_url,
@@ -9784,7 +9784,24 @@ async fn worst_case_agent_list_row(
     };
     let parent = create_agent(svc, ws, "Parent").await;
     let child = create_agent(svc, ws, "Child").await;
-    let id = create_agent(svc, ws, "Worst-case row").await;
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Worst-case row".into()),
+            Some("sonnet4.5".into()),
+            None,
+            None,
+            None,
+            false,
+            intent_core::AgentCreateExtra {
+                provider: Some("auggie".into()),
+                metadata: Some(json!({"chiefPromptVersion": u32::MAX})),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create versioned budget row");
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
 
     let user = json!([{ "type": "text", "text": format!("ask {}", "u".repeat(BUDGET * 3)) }]);
     svc.store()
@@ -9862,6 +9879,7 @@ async fn worst_case_agent_list_row(
         },
         "isInitialAgent": true,
         "sponsorAgentId": parent.0,
+        "chiefPromptVersion": u32::MAX,
     }));
     svc.store()
         .update_agent_session(ws, &s)
@@ -13376,7 +13394,7 @@ async fn queue_reads_and_queue_updated_carry_resolved_author() {
     let queued = with_caller(
         Caller::Wire {
             principal_id: guest.clone(),
-            is_administrator: false,
+            host_role: intent_core::HostRole::Guest,
         },
         async {
             svc.agent_queue_message(id.clone(), "from guest".into(), None, None, None)
@@ -13494,11 +13512,11 @@ async fn get_queue_is_projected_to_the_calling_principal() {
         .expect("guest membership");
     let as_owner = Caller::Wire {
         principal_id: owner.clone(),
-        is_administrator: true,
+        host_role: intent_core::HostRole::Owner,
     };
     let as_guest = Caller::Wire {
         principal_id: guest.clone(),
-        is_administrator: false,
+        host_role: intent_core::HostRole::Guest,
     };
     let as_agent = Caller::Agent {
         agent_id: AgentId::from("agent-reader"),
@@ -13650,11 +13668,11 @@ async fn queue_mutations_enforce_entry_ownership() {
         .expect("guest membership");
     let as_admin = Caller::Wire {
         principal_id: owner.clone(),
-        is_administrator: true,
+        host_role: intent_core::HostRole::Owner,
     };
     let as_guest = Caller::Wire {
         principal_id: guest.clone(),
-        is_administrator: false,
+        host_role: intent_core::HostRole::Guest,
     };
     let as_agent = Caller::Agent {
         agent_id: AgentId::from("agent-peer"),
@@ -13928,11 +13946,11 @@ pub(super) async fn owner_and_guest_callers(
     (
         Caller::Wire {
             principal_id: owner,
-            is_administrator: true,
+            host_role: intent_core::HostRole::Owner,
         },
         Caller::Wire {
             principal_id: guest,
-            is_administrator: false,
+            host_role: intent_core::HostRole::Guest,
         },
     )
 }
@@ -14951,7 +14969,7 @@ async fn principal_stamp_overwrites_client_value_on_every_user_origin_entry_poin
     }
     let wire = |p: &PrincipalId| Caller::Wire {
         principal_id: p.clone(),
-        is_administrator: false,
+        host_role: intent_core::HostRole::Guest,
     };
     let spoof = || json!({ "fromPrincipalId": "spoof", "kind": "reply" });
     let stamp_of = |md: Option<&serde_json::Value>| {
@@ -15212,7 +15230,7 @@ async fn principal_stamp_overwrites_client_value_on_every_user_origin_entry_poin
     let drained = with_caller(
         Caller::Wire {
             principal_id: bob.clone(),
-            is_administrator: true,
+            host_role: intent_core::HostRole::Owner,
         },
         async {
             svc.agent_send_queued_message_now(ws.clone(), agent.clone(), queued_id.clone())
@@ -15344,7 +15362,7 @@ async fn principal_stamp_overwrites_client_value_on_every_user_origin_entry_poin
     let created_ws = with_caller(
         Caller::Wire {
             principal_id: bob.clone(),
-            is_administrator: true,
+            host_role: intent_core::HostRole::Owner,
         },
         async {
             WorkspaceApi::create_workspace(
@@ -15484,7 +15502,7 @@ async fn collaborator_sender_preamble_on_every_human_authored_entry_point() {
         .expect("guest membership");
     let wire = |p: &PrincipalId| Caller::Wire {
         principal_id: p.clone(),
-        is_administrator: false,
+        host_role: intent_core::HostRole::Guest,
     };
     let preamble = crate::harness::latest().collaborator_sender_preamble(
         Some("octocat"),
@@ -15576,7 +15594,7 @@ async fn collaborator_sender_preamble_on_every_human_authored_entry_point() {
     // agent caller, and a collaborator's non-user-origin send.
     let admin = Caller::Wire {
         principal_id: owner.clone(),
-        is_administrator: true,
+        host_role: intent_core::HostRole::Owner,
     };
     let peer = Caller::Agent {
         agent_id: AgentId::from("agent-peer"),
@@ -15856,7 +15874,7 @@ async fn collaborator_sender_preamble_on_delegate_free_text() {
         .expect("guest membership");
     let wire = |p: &PrincipalId| Caller::Wire {
         principal_id: p.clone(),
-        is_administrator: false,
+        host_role: intent_core::HostRole::Guest,
     };
     let preamble = crate::harness::latest().collaborator_sender_preamble(
         Some("octocat"),
@@ -16060,7 +16078,7 @@ async fn collaborator_sender_preamble_on_delegate_free_text() {
     // absent callers not); every control is served as the owner.
     let admin = Caller::Wire {
         principal_id: owner.clone(),
-        is_administrator: true,
+        host_role: intent_core::HostRole::Owner,
     };
     let peer = Caller::Agent {
         agent_id: AgentId::from("agent-peer"),
@@ -16141,7 +16159,7 @@ async fn collaborator_sender_preamble_on_append_message_user_rows() {
         .expect("guest membership");
     let wire = |p: &PrincipalId| Caller::Wire {
         principal_id: p.clone(),
-        is_administrator: false,
+        host_role: intent_core::HostRole::Guest,
     };
     let preamble = crate::harness::latest().collaborator_sender_preamble(
         Some("octocat"),
@@ -16240,7 +16258,7 @@ async fn collaborator_sender_preamble_on_append_message_user_rows() {
     }
     let admin = Caller::Wire {
         principal_id: owner.clone(),
-        is_administrator: true,
+        host_role: intent_core::HostRole::Owner,
     };
     let peer = Caller::Agent {
         agent_id: AgentId::from("agent-peer"),
@@ -16295,7 +16313,7 @@ async fn non_object_message_metadata_is_rejected_on_every_user_origin_entry_poin
         .expect("membership");
     let caller = Caller::Wire {
         principal_id: strict,
-        is_administrator: false,
+        host_role: intent_core::HostRole::Guest,
     };
     let is_invalid = |label: &str, r: Result<serde_json::Value, Error>| {
         assert!(
@@ -16436,7 +16454,7 @@ async fn edit_queued_message_restamp_rejection_leaves_entry_untouched() {
     let err = with_caller(
         Caller::Wire {
             principal_id: editor,
-            is_administrator: false,
+            host_role: intent_core::HostRole::Guest,
         },
         async {
             svc.agent_edit_queued_message(
@@ -22616,7 +22634,10 @@ async fn wake_or_create_queued_skips_watch_when_caller_deleted() {
     flag_agent_deleted(&svc, &caller).await;
     // Occupy the assignee's in-flight slot so `deliver_wake_message` takes the
     // enqueue branch deterministically.
-    assert!(manager.try_begin_turn(&target, &ws).await, "claim slot");
+    let admission = manager
+        .try_begin_turn(&target, &ws)
+        .await
+        .expect("claim slot");
 
     let input = AgentWakeOrCreateInput {
         caller_agent_id: Some(caller.clone()),
@@ -22635,7 +22656,7 @@ async fn wake_or_create_queued_skips_watch_when_caller_deleted() {
     assert!(svc.list_watches_for_parent(&caller).is_empty());
     assert!(svc.find_watches_for_child(&target).is_empty());
 
-    manager.release_slot(&target).await;
+    manager.release_slot(&target, admission).await;
 }
 
 /// monorepo#994: the #932 pre-gate is ALSO skipped for a Deleted caller —
@@ -22680,7 +22701,10 @@ async fn wake_or_create_queued_registers_watch() {
         .expect("assign");
     // Occupy the assignee's in-flight slot so `deliver_wake_message` takes the
     // enqueue branch deterministically.
-    assert!(manager.try_begin_turn(&target, &ws).await, "claim slot");
+    let admission = manager
+        .try_begin_turn(&target, &ws)
+        .await
+        .expect("claim slot");
 
     let input = AgentWakeOrCreateInput {
         caller_agent_id: Some(caller.clone()),
@@ -22707,7 +22731,7 @@ async fn wake_or_create_queued_registers_watch() {
     assert_eq!(watches[0].id, sub_id);
     assert_eq!(watches[0].child_agent_id, target);
 
-    manager.release_slot(&target).await;
+    manager.release_slot(&target, admission).await;
 }
 
 /// SUB-2 (PR #104 thread `PRRT_kwDOS9Wxuc6QIRcq`), updated for pair
@@ -22742,7 +22766,10 @@ async fn wake_or_create_queued_adopts_existing_watch() {
 
     // Occupy the assignee's in-flight slot so the wakeOrCreate takes the
     // queued branch deterministically.
-    assert!(manager.try_begin_turn(&target, &ws).await, "claim slot");
+    let admission = manager
+        .try_begin_turn(&target, &ws)
+        .await
+        .expect("claim slot");
 
     let queued = svc
         .agent_wake_or_create_op(
@@ -22776,7 +22803,7 @@ async fn wake_or_create_queued_adopts_existing_watch() {
     );
     assert_eq!(watches[0].id, seeded_sub_id);
 
-    manager.release_slot(&target).await;
+    manager.release_slot(&target, admission).await;
 }
 
 /// SUB-2 (Copilot #104 follow-up, thread `PRRT_kwDOS9Wxuc6QKWuU`):
@@ -23890,7 +23917,10 @@ async fn turn_start_opens_new_waiting_period_for_armed_watch() {
 
     // The child starts a REAL turn (e.g. a user message or hook-dispatch
     // wake): the period is over and the marker clears at the claim.
-    assert!(manager.try_begin_turn(&child, &ws).await, "claim slot");
+    let admission = manager
+        .try_begin_turn(&child, &ws)
+        .await
+        .expect("claim slot");
     assert!(
         !svc.store()
             .has_advisory_wake_delivery(&parent, &child)
@@ -23898,7 +23928,7 @@ async fn turn_start_opens_new_waiting_period_for_armed_watch() {
             .expect("marker read"),
         "turn start clears the once-per-period advisory marker"
     );
-    manager.release_slot(&child).await;
+    manager.release_slot(&child, admission).await;
 
     // Period 2: the child stalls monitoring-idle again — the SAME armed
     // watch hears a FRESH advisory instead of waiting in silence (the
@@ -23987,7 +24017,10 @@ async fn turn_start_opens_new_waiting_period_for_grouped_watch() {
     manager.stop(&parent).await;
 
     // Real turn: marker clears, period 2 opens.
-    assert!(manager.try_begin_turn(&child, &ws).await, "claim slot");
+    let admission = manager
+        .try_begin_turn(&child, &ws)
+        .await
+        .expect("claim slot");
     assert!(
         !svc.store()
             .has_advisory_wake_delivery(&parent, &child)
@@ -23995,7 +24028,7 @@ async fn turn_start_opens_new_waiting_period_for_grouped_watch() {
             .expect("marker read"),
         "turn start clears the grouped pair's marker too"
     );
-    manager.release_slot(&child).await;
+    manager.release_slot(&child, admission).await;
 
     // Period 2: the SAME armed watch (same id) delivers a second advisory —
     // the per-period stable id keeps it out of the durable-wake dedup.
@@ -46156,9 +46189,232 @@ async fn wire_agent_complete_once_rejects_compound_model() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect_err("compound model must reject");
         assert_compound_model_rejection(err, "model");
     }
+}
+
+#[intent_test_macros::daemon_test]
+async fn startup_resume_reservations_hide_only_candidates_and_release_on_drop() {
+    let (_t, svc, ws) = setup().await;
+    let first = create_agent(&svc, &ws, "Startup candidate").await;
+    svc.store
+        .insert_interrupted_agent(&first, &ws, "active", &now_iso())
+        .await
+        .unwrap();
+    let reservations = svc.prepare_startup_resume().await.unwrap();
+    assert_eq!(
+        svc.clone().agent_list_interrupted().await.unwrap()["agents"],
+        json!([])
+    );
+    assert!(
+        svc.store
+            .get_interrupted_agent(&first)
+            .await
+            .unwrap()
+            .is_some(),
+        "reservation must not resolve durable work"
+    );
+    let later = create_agent(&svc, &ws, "Later interruption").await;
+    svc.store
+        .insert_interrupted_agent(&later, &ws, "active", &now_iso())
+        .await
+        .unwrap();
+    let listed = svc.agent_list_interrupted().await.unwrap();
+    assert_eq!(listed["agents"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["agents"][0]["agentId"], json!(later));
+    drop(reservations);
+    assert_eq!(
+        svc.agent_list_interrupted().await.unwrap()["agents"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn startup_resume_failure_is_visible_and_retryable_while_other_candidates_are_reserved() {
+    let (_t, svc, ws) = setup().await;
+    let failed = create_agent(&svc, &ws, "Retired candidate").await;
+    let waiting = create_agent(&svc, &ws, "Waiting candidate").await;
+    for id in [&failed, &waiting] {
+        svc.store
+            .insert_interrupted_agent(id, &ws, "active", &now_iso())
+            .await
+            .unwrap();
+    }
+    svc.agent_retire_op(failed.clone(), Some(ws.clone()), None)
+        .await
+        .unwrap();
+    let reservations = svc.prepare_startup_resume().await.unwrap();
+    assert!(svc.resume_interrupted_agent(&failed).await.is_err());
+    reservations.finished(&failed);
+    let listed = svc.agent_list_interrupted().await.unwrap();
+    assert_eq!(listed["agents"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["agents"][0]["agentId"], json!(failed));
+    svc.agent_restore_op(failed.clone(), Some(ws.clone()))
+        .await
+        .unwrap();
+    svc.resume_interrupted_agent(&failed).await.unwrap();
+    assert_eq!(
+        svc.agent_list_interrupted().await.unwrap()["agents"],
+        json!([])
+    );
+    drop(reservations);
+    assert_eq!(
+        svc.agent_list_interrupted().await.unwrap()["agents"][0]["agentId"],
+        json!(waiting)
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn startup_resume_and_manual_resolution_have_one_winner() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Raced startup candidate").await;
+    svc.store
+        .insert_interrupted_agent(&id, &ws, "active", &now_iso())
+        .await
+        .unwrap();
+    let _reservations = svc.prepare_startup_resume().await.unwrap();
+    let (automatic, manual) = tokio::join!(
+        svc.resume_interrupted_agent(&id),
+        svc.agent_resolve_interrupted(Some(vec![id.0.clone()]), None)
+    );
+    let manual = manual.unwrap();
+    let manual_won = !manual["resumed"].as_array().unwrap().is_empty();
+    assert!(
+        automatic.is_ok() ^ manual_won,
+        "exactly one resume must win"
+    );
+    let session = svc.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(
+        session.messages.iter().filter(|m| m.role == "user").count(),
+        1
+    );
+    assert!(svc
+        .store
+        .get_interrupted_agent(&id)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[intent_test_macros::daemon_test]
+async fn startup_resume_enumeration_failure_installs_no_reservations() {
+    let (_t, svc, _ws) = setup().await;
+    svc.store.close().await;
+    assert!(svc.prepare_startup_resume().await.is_err());
+    assert!(svc.startup_resume_candidates.lock().unwrap().is_empty());
+}
+
+#[intent_test_macros::daemon_test]
+async fn startup_resume_and_manual_abandon_have_no_losing_side_effects() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Raced abandoned candidate").await;
+    svc.store
+        .insert_interrupted_agent(&id, &ws, "active", &now_iso())
+        .await
+        .unwrap();
+    let _reservations = svc.prepare_startup_resume().await.unwrap();
+    let (automatic, abandon) = tokio::join!(
+        svc.resume_interrupted_agent(&id),
+        svc.abandon_interrupted_agent(&id)
+    );
+    assert!(automatic.is_ok() ^ abandon.is_ok(), "one resolver wins");
+    let session = svc.store.get_agent_session(&id).await.unwrap();
+    let abandonment_notices = session
+        .messages
+        .iter()
+        .filter(|m| {
+            m.content
+                .to_string()
+                .contains("This conversation was interrupted because intentd restarted")
+        })
+        .count();
+    assert_eq!(
+        abandonment_notices,
+        usize::from(abandon.is_ok()),
+        "a losing abandon must not append a termination notice"
+    );
+    assert_eq!(
+        session.messages.iter().filter(|m| m.role == "user").count(),
+        usize::from(automatic.is_ok())
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn startup_resume_abandon_persist_failure_remains_retryable() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Failed abandonment").await;
+    svc.store
+        .insert_interrupted_agent(&id, &ws, "active", &now_iso())
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER fail_abandon_notice BEFORE INSERT ON agent_message
+         BEGIN SELECT RAISE(FAIL, 'injected abandonment write failure'); END",
+    )
+    .execute(svc.store.write_pool())
+    .await
+    .unwrap();
+    assert!(svc.abandon_interrupted_agent(&id).await.is_err());
+    assert!(svc
+        .store
+        .get_interrupted_agent(&id)
+        .await
+        .unwrap()
+        .is_some());
+    sqlx::query("DROP TRIGGER fail_abandon_notice")
+        .execute(svc.store.write_pool())
+        .await
+        .unwrap();
+    svc.abandon_interrupted_agent(&id).await.unwrap();
+    assert!(svc
+        .store
+        .get_interrupted_agent(&id)
+        .await
+        .unwrap()
+        .is_none());
+    let session = svc.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(
+        session
+            .messages
+            .iter()
+            .filter(|m| m.role == "system")
+            .count(),
+        1
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn startup_resume_listing_never_exposes_a_stale_successful_candidate() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Candidate resolved during listing").await;
+    svc.store
+        .insert_interrupted_agent(&id, &ws, "active", &now_iso())
+        .await
+        .unwrap();
+    let reservations = svc.prepare_startup_resume().await.unwrap();
+    let park = Arc::new(crate::script_ops::SupervisePark::default());
+    let mut listing = svc.clone();
+    listing.interrupted_list_park = Some(park.clone());
+    let (result, ()) = tokio::join!(listing.agent_list_interrupted(), async {
+        timeout(Duration::from_secs(5), park.entered.notified())
+            .await
+            .unwrap();
+        svc.resume_startup_candidate(&reservations, &id)
+            .await
+            .unwrap();
+        park.release.notify_one();
+    });
+    let result = result.unwrap();
+    assert_eq!(
+        result["agents"],
+        json!([]),
+        "an old pending-row read must not expose a successfully resumed candidate"
+    );
 }

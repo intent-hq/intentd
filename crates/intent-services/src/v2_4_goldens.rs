@@ -146,6 +146,7 @@ const COMPARED_SURFACES: &[&str] = &[
     "dequeue_wait_note",
     "a2a_sender_note",
     "collaborator_sender_preamble",
+    "host_member_sender_preamble",
     "wait_duration",
     "idle_timeout_warning",
     "truncation_redrive_nudge",
@@ -244,7 +245,7 @@ fn harness_surface_list_is_exhaustive() {
 #[test]
 fn v2_4_matches_v2_3_on_every_other_surface() {
     use crate::agent_ops::ready_delta::{UnblockedReason, UnblockedTask};
-    use crate::harness::{ChildSettlementParams, TurnEnvelopeParams};
+    use crate::harness::{ChildSettlementParams, HostMemberSender, TurnEnvelopeParams};
 
     let v1 = crate::harness::resolve_entry("1.0").harness;
     let v2_3 = crate::harness::resolve_entry("2.3").harness;
@@ -330,6 +331,12 @@ fn v2_4_matches_v2_3_on_every_other_surface() {
         "principal-1"
     ));
     same!(collaborator_sender_preamble(None, None, "principal-1"));
+    same!(host_member_sender_preamble(HostMemberSender {
+        login: Some("octocat"),
+        display_name: Some("The Octocat"),
+        principal_id: "principal-1",
+        identity: None,
+    }));
     for secs in [0, 59, 60, 3599, 3600, 90_000] {
         same!(wait_duration(secs));
     }

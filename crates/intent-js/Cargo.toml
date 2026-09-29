@@ -1,6 +1,6 @@
 [package]
 name = "intent-js"
-version = "0.9.111"
+version = "0.9.118"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true

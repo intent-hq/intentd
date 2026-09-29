@@ -8695,6 +8695,8 @@ mod wsapi3_bindings_tests {
                         content: "root".to_string(),
                         author: "Agent".to_string(),
                         author_type: intent_core::AuthorType::default(),
+                        author_principal_id: None,
+                        author_identity: None,
                         status: intent_core::CommentStatus::default(),
                         parent_id: None,
                         anchor: Option::default(),
@@ -8744,6 +8746,8 @@ mod wsapi3_bindings_tests {
                         content: comment,
                         author: "Agent".to_string(),
                         author_type: intent_core::AuthorType::default(),
+                        author_principal_id: None,
+                        author_identity: None,
                         status: intent_core::CommentStatus::default(),
                         parent_id: None,
                         anchor: Option::default(),
@@ -10362,6 +10366,7 @@ mod wsapi4_bindings_tests {
                 last_seen_message_id: None,
                 is_initial_agent: None,
                 sponsor_agent_id: None,
+                chief_prompt_version: None,
             },
         }
     }
@@ -13694,6 +13699,7 @@ mod workspace_apply_proposal_tests {
                 last_seen_message_id: None,
                 is_initial_agent: None,
                 sponsor_agent_id: None,
+                chief_prompt_version: None,
             },
         }
     }

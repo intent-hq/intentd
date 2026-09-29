@@ -39,7 +39,7 @@ use crate::pairing::encode_query_value;
 use crate::server::ServerPairingInfo;
 use intent_core::{
     Error, InviteErrorKind, InviteLinkBuilder, InviteLinkEnvelope, InvitePin, InviteProofClaim,
-    ResolvedInviteLinkEnvelope, Result, WorkspaceApi, WorkspaceId,
+    InviteScope, ResolvedInviteLinkEnvelope, Result, WorkspaceApi, WorkspaceId,
 };
 
 /// Version of the `intent://invite` payload format (`v` query parameter and
@@ -75,6 +75,7 @@ pub(crate) fn build_invite_uri(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InviteMethod {
     Create,
+    HostCreate,
     Inspect,
     Accept,
     Challenge,
@@ -85,7 +86,7 @@ impl InviteMethod {
     /// Served on the unauthenticated `/invite` endpoint (everything but
     /// `workspace.invite.create`, which needs an authenticated owner).
     pub(crate) fn on_invite_endpoint(self) -> bool {
-        !matches!(self, InviteMethod::Create)
+        !matches!(self, InviteMethod::Create | InviteMethod::HostCreate)
     }
 }
 
@@ -113,6 +114,7 @@ pub(crate) fn classify(value: &Value) -> Option<InviteRequest> {
     }
     let method = match method {
         "workspace.invite.create" => InviteMethod::Create,
+        "host.invite.create" => InviteMethod::HostCreate,
         "invite.inspect" => InviteMethod::Inspect,
         "invite.accept" => InviteMethod::Accept,
         "invite.challenge" => InviteMethod::Challenge,
@@ -161,6 +163,12 @@ fn respond(req: &InviteRequest, result: Result<Value>) -> Option<String> {
             e.code(),
             &e.to_string(),
             &json!({ "code": "identity-unverifiable", "host": host }),
+        ),
+        Err(e @ Error::InvalidParams(_)) => error_frame_with_data(
+            &req.id_echo,
+            e.code(),
+            &e.to_string(),
+            &json!({"code":"invalid-params"}),
         ),
         Err(e) => error_frame(&req.id_echo, e.code(), &e.to_string()),
     })
@@ -243,7 +251,7 @@ pub(crate) fn hashes_secret(req: &InviteRequest) -> bool {
         | InviteMethod::Accept
         | InviteMethod::Challenge
         | InviteMethod::Prove => true,
-        InviteMethod::Create => false,
+        InviteMethod::Create | InviteMethod::HostCreate => false,
     }
 }
 
@@ -387,37 +395,61 @@ pub(crate) async fn handle_create(
     api: &Arc<dyn WorkspaceApi>,
     provider: Option<&Arc<dyn ServerPairingInfo>>,
 ) -> Option<String> {
-    let result = create_json(&req.params, api, provider).await;
+    let result = create_scoped_json(
+        &req.params,
+        api,
+        provider,
+        if req.method == InviteMethod::HostCreate {
+            InviteScope::Host
+        } else {
+            InviteScope::Workspace
+        },
+    )
+    .await;
     respond(&req, result)
 }
 
-async fn create_json(
+async fn create_scoped_json(
     params: &Value,
     api: &Arc<dyn WorkspaceApi>,
     provider: Option<&Arc<dyn ServerPairingInfo>>,
+    scope: InviteScope,
 ) -> Result<Value> {
-    let workspace_id = WorkspaceId::from(str_param(params, "workspaceId")?.as_str());
-    let pin = if let Some(login) = opt_str_param(params, "pinLogin")? {
-        Some(InvitePin {
-            login,
-            provider: opt_str_param(params, "pinProvider")?,
-            host: opt_str_param(params, "pinHost")?,
-        })
-    } else {
-        if params.get("pinProvider").is_some_and(|v| !v.is_null())
-            || params.get("pinHost").is_some_and(|v| !v.is_null())
-        {
+    let (workspace_id, pin, expires_in_secs) = if scope == InviteScope::Host {
+        if params.get("workspaceId").is_some() || params.get("expiresInSecs").is_some() {
             return Err(Error::InvalidParams(
-                "`pinProvider` / `pinHost` require `pinLogin`".to_string(),
+                "host invitations do not accept workspaceId or expiresInSecs".into(),
             ));
         }
-        None
+        (
+            None,
+            Some(InvitePin {
+                login: str_param(params, "pinLogin")?,
+                provider: Some(str_param(params, "pinProvider")?),
+                host: opt_str_param(params, "pinHost")?,
+            }),
+            None,
+        )
+    } else {
+        (
+            Some(WorkspaceId::from(
+                str_param(params, "workspaceId")?.as_str(),
+            )),
+            workspace_pin(params)?,
+            opt_u64_param(params, "expiresInSecs")?,
+        )
     };
-    let expires_in_secs = opt_u64_param(params, "expiresInSecs")?;
     let envelope = link_envelope(provider).await?;
-    let mut result = api
-        .workspace_invite_create(workspace_id, pin, expires_in_secs)
-        .await?;
+    let mut result = match workspace_id {
+        Some(workspace_id) => {
+            api.workspace_invite_create(workspace_id, pin, expires_in_secs)
+                .await?
+        }
+        None => {
+            api.host_invite_create(pin.expect("host pin was validated"))
+                .await?
+        }
+    };
     let invite_id = result
         .pointer("/invite/id")
         .and_then(Value::as_str)
@@ -428,7 +460,7 @@ async fn create_json(
         .and_then(Value::as_str)
         .ok_or_else(|| Error::Internal("invite result carries no secret".to_string()))?
         .to_string();
-    let url = envelope.invite_url(&invite_id, &secret);
+    let url = envelope.scoped_invite_url(&invite_id, &secret, scope);
     result
         .pointer_mut("/invite")
         .and_then(Value::as_object_mut)
@@ -492,6 +524,34 @@ pub(crate) async fn handle_inspect(
     respond(&req, result)
 }
 
+fn workspace_pin(params: &Value) -> Result<Option<InvitePin>> {
+    let pin = if let Some(login) = opt_str_param(params, "pinLogin")? {
+        Some(InvitePin {
+            login,
+            provider: opt_str_param(params, "pinProvider")?,
+            host: opt_str_param(params, "pinHost")?,
+        })
+    } else {
+        if params.get("pinProvider").is_some_and(|v| !v.is_null())
+            || params.get("pinHost").is_some_and(|v| !v.is_null())
+        {
+            return Err(Error::InvalidParams(
+                "`pinProvider` / `pinHost` require `pinLogin`".to_string(),
+            ));
+        }
+        None
+    };
+    Ok(pin)
+}
+
+fn invite_scope(params: &Value) -> Result<InviteScope> {
+    match params.get("scope") {
+        None => Ok(InviteScope::Workspace),
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|_| Error::InvalidParams("scope must be workspace or host".into())),
+    }
+}
+
 async fn inspect_json(
     params: &Value,
     api: &Arc<dyn WorkspaceApi>,
@@ -499,7 +559,9 @@ async fn inspect_json(
 ) -> Result<Value> {
     let invite_id = str_param(params, "inviteId")?;
     let secret = str_param(params, "secret")?;
-    let result = api.invite_inspect(invite_id, secret).await?;
+    let result = api
+        .invite_inspect(invite_id, secret, invite_scope(params)?)
+        .await?;
     with_host_identity(result, "invite.inspect", host)
 }
 
@@ -519,7 +581,8 @@ async fn accept_json(params: &Value, api: &Arc<dyn WorkspaceApi>) -> Result<Valu
     let invite_id = str_param(params, "inviteId")?;
     let secret = str_param(params, "secret")?;
     let credential = str_param(params, "credential")?;
-    api.invite_accept(invite_id, secret, credential).await
+    api.invite_accept(invite_id, secret, invite_scope(params)?, credential)
+        .await
 }
 
 /// Handle a classified `invite.challenge` on the `/invite` endpoint: params
@@ -542,7 +605,9 @@ async fn challenge_json(
 ) -> Result<Value> {
     let invite_id = str_param(params, "inviteId")?;
     let secret = str_param(params, "secret")?;
-    let result = api.invite_challenge(invite_id, secret).await?;
+    let result = api
+        .invite_challenge(invite_id, secret, invite_scope(params)?)
+        .await?;
     with_host_identity(result, "invite.challenge", host)
 }
 
@@ -590,7 +655,8 @@ async fn prove_json(params: &Value, api: &Arc<dyn WorkspaceApi>) -> Result<Value
         provider: opt_str_param(params, "provider")?,
         host: opt_str_param(params, "host")?,
     };
-    api.invite_prove(invite_id, secret, nonce, claim).await
+    api.invite_prove(invite_id, secret, invite_scope(params)?, nonce, claim)
+        .await
 }
 
 /// Handle any classified `/invite` request
@@ -606,7 +672,7 @@ pub(crate) async fn handle_invite_endpoint(
         InviteMethod::Accept => handle_accept(req, api).await,
         InviteMethod::Challenge => handle_challenge(req, api, host).await,
         InviteMethod::Prove => handle_prove(req, api).await,
-        InviteMethod::Create => req
+        InviteMethod::Create | InviteMethod::HostCreate => req
             .id_present
             .then(|| error_frame(&req.id_echo, -32001, INVITE_ENDPOINT_ONLY_MESSAGE)),
     }
