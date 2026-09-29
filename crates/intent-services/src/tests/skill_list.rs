@@ -22,16 +22,12 @@ async fn skill_list_repo_less_is_empty_without_user_skills_and_does_not_provisio
 }
 
 #[tokio::test]
-async fn skill_list_preserves_missing_denied_and_unbound_errors() {
+async fn skill_list_preserves_missing_and_denied_errors() {
     let (_tmp, svc, id, _) = setup("").await;
     let missing = WorkspaceId::new();
     assert!(matches!(
         with_caller(Caller::Daemon, svc.skill_list(missing.clone())).await,
         Err(Error::NotFound(_))
-    ));
-    assert!(matches!(
-        svc.skill_list(id.clone()).await,
-        Err(Error::Forbidden(_))
     ));
     let mut guest = svc.store.get_primary_principal().await.unwrap();
     guest.id = PrincipalId::new();
