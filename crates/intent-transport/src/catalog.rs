@@ -374,6 +374,9 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "workspace.members.leave",
     "workspace.members.list",
     "workspace.members.remove",
+    "workspace.repositoryContext",
+    "workspace.repositoryContext.capture",
+    "workspace.repositoryContext.release",
     "workspace.restore",
     "workspace.saveSetupScript",
     "workspace.setAutoCommit",
@@ -480,7 +483,7 @@ pub(crate) const FASTPATH_METHODS: &[&str] = &[
 /// These are unsolicited notifications sent from the daemon to connected clients
 /// (no request `id`). `events.event` is the sole notification in protocol v2.0.
 #[cfg(test)]
-pub(crate) const NOTIFICATIONS: &[&str] = &["events.event"];
+pub(crate) const NOTIFICATIONS: &[&str] = &["events.event", "workspace.repositoryContext.retired"];
 
 /// Client-served reverse RPCs (dispatched with `id: "rev-<n>"`).
 ///
@@ -713,6 +716,9 @@ pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("workspace.markSeen", "Steer: clears the workspace unseen marker."),
     ("workspace.members.leave", "Guest lifecycle: the caller drops its OWN collaborator membership of a workspace; owners cannot leave. Self-directed only, no target parameter; removal of others stays owner-only."),
     ("workspace.members.list", "Read: the membership roster (principal fields + role) of a member workspace. Removal stays owner-only."),
+    ("workspace.repositoryContext", "Read: original socket/root lease; durable repository membership is rechecked. Host account metadata remains administrator-only."),
+    ("workspace.repositoryContext.capture", "Read acquisition: original socket and workspace/root only; require_member decides durable local inventory permission, never write permission."),
+    ("workspace.repositoryContext.release", "Release: only an original socket-owned repository lease; no cross-socket lookup or new authority."),
     ("workspace.subscribe", "Client boot: the workspace channel fast path; rows membership-filtered, removals delivered on unshare."),
     ("workspace.unsubscribe", "Client boot: drops the workspace channel subscription."),
     ("workspace.update", "Steer: title / tags / status message / status image of a member workspace. No path or repository fields."),
@@ -870,6 +876,9 @@ pub(crate) const MEMBER_METHODS: &[&str] = &[
     "workspace.invite.revoke",
     "workspace.members.add",
     "workspace.members.remove",
+    "workspace.repositoryContext",
+    "workspace.repositoryContext.capture",
+    "workspace.repositoryContext.release",
     "workspace.restore",
     "workspace.saveSetupScript",
     "workspace.setAutoCommit",

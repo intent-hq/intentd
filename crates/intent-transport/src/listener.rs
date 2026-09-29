@@ -268,6 +268,7 @@ where
     // saturated link) and responses and pushed notifications never interleave
     // mid-frame on the socket.
     let (out_tx, mut out_rx) = outbound_channel();
+    let _retirements = read_connection.forward_retirements(out_tx.priority_sender());
     let writer_read_connection = read_connection.clone();
     let writer = tokio::spawn(async move {
         let _retire_on_writer_exit = writer_read_connection;
@@ -351,21 +352,23 @@ where
             caller.clone(),
             None,
             read_connection.run(async {
-                process_frame(
-                    trimmed,
-                    &api,
-                    &bus,
-                    &out_tx,
-                    &mut subs,
-                    &mut forwards,
-                    &reverse,
-                    &reverse_guard,
-                    control.as_ref(),
-                    server_pairing_info.as_ref(),
-                    &mut client_id,
-                    true,
-                    &limiter,
-                )
+                crate::context::with_repository_frame(trimmed, || {
+                    process_frame(
+                        trimmed,
+                        &api,
+                        &bus,
+                        &out_tx,
+                        &mut subs,
+                        &mut forwards,
+                        &reverse,
+                        &reverse_guard,
+                        control.as_ref(),
+                        server_pairing_info.as_ref(),
+                        &mut client_id,
+                        true,
+                        &limiter,
+                    )
+                })
                 .await
             }),
         )

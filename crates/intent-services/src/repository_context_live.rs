@@ -657,7 +657,9 @@ pub(crate) async fn context_member(
     Ok(ContextMember { workspace, agent })
 }
 
-fn resolver(facts: Option<&RepositoryConnectionFacts>) -> AdmissionResult<CanonicalRemoteResolver> {
+pub(crate) fn resolver(
+    facts: Option<&RepositoryConnectionFacts>,
+) -> AdmissionResult<CanonicalRemoteResolver> {
     let mut instances = vec![RemoteInstance::github_com()];
     if let Some(facts) =
         facts.filter(|facts| facts.approval() == RepositoryDescriptorState::Approved)
@@ -669,7 +671,7 @@ fn resolver(facts: Option<&RepositoryConnectionFacts>) -> AdmissionResult<Canoni
     CanonicalRemoteResolver::new(instances, Vec::new()).map_err(|_| AdmissionError::Unavailable)
 }
 
-fn target_context(
+pub(crate) fn target_context(
     target: &RepositoryTarget,
     facts: Option<&RepositoryConnectionFacts>,
 ) -> RepositoryTargetContext {

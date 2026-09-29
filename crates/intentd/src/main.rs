@@ -2177,7 +2177,11 @@ async fn cmd_serve(
 
     // Build api Arc early so it can be cloned for runtime control (§5.12).
     // ServerControl is attached after DaemonControl is built via the OnceLock seam.
-    let api: Arc<dyn WorkspaceApi> = Arc::new(services.clone());
+    let api_services = Arc::new(services.clone());
+    if let Err(error) = api_services.initialize_repository_wire().await {
+        tracing::debug!(%error, "native repository context remains unavailable at startup");
+    }
+    let api: Arc<dyn WorkspaceApi> = api_services;
     // Bridge `file:*` → debounced `changes:git-status` (monorepo#1397): external
     // file edits refresh the FE Changes panel without any in-app git action.
     // Arc'd so the watcher registry's `.git` metadata watches feed the same

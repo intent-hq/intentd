@@ -3719,3 +3719,121 @@ async fn prompt_facts_callback_preserves_original_error_and_owned_effect_once() 
     assert_eq!(output.as_deref(), Some(&42));
     assert_eq!(s.count(), 0);
 }
+
+// Actual owner wrapper controls; only Services/transport tests establish original Wire provenance.
+#[intent_test_macros::daemon_test]
+async fn native_facts_current_and_refreshed_revision_select_original_payload() {
+    let s = ReadServer::new().await;
+    let f = ReadFixture::new(&s, true).await;
+    let original = connection_facts(&f.auth.service);
+    let mut choices = Vec::new();
+    let gate = f.auth.service.gitlab_credential_gate.lock().await;
+    RepositoryConnectionFacts::with_native_context_current(Some(&original), |include| {
+        choices.push(include);
+        Ok(())
+    })
+    .unwrap();
+    drop(gate);
+    f.refresh(&s).await;
+    let refreshed = connection_facts(&f.auth.service);
+    assert_eq!(
+        original.settled().unwrap().selected().binding,
+        refreshed.settled().unwrap().selected().binding
+    );
+    assert_ne!(
+        original.settled().unwrap().selected().secret_revision,
+        refreshed.settled().unwrap().selected().secret_revision
+    );
+    for facts in [&original, &refreshed] {
+        RepositoryConnectionFacts::with_native_context_current(Some(facts), |include| {
+            choices.push(include);
+            Ok(())
+        })
+        .unwrap();
+    }
+    assert_eq!(choices, [true, false, true]);
+    assert_eq!(s.count(), 0);
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_facts_busy_optional_lock_omits_before_release() {
+    let s = ReadServer::new().await;
+    let f = ReadFixture::new(&s, false).await;
+    let eligibility = Arc::new(batch_scope(&f, &s, "group/project"));
+    let facts = Arc::new(connection_facts(&f.auth.service));
+    let held = hold_output_rank(eligibility, 1).await;
+    let original = facts.clone();
+    let admission = tokio::task::spawn_blocking(move || {
+        let mut selected = None;
+        RepositoryConnectionFacts::with_native_context_current(Some(&original), |include| {
+            assert!(selected.replace(include).is_none());
+            Ok(())
+        })
+        .unwrap();
+        selected.unwrap()
+    });
+    let result = timeout(BUDGET, admission).await;
+    drop(held);
+    assert!(!result.unwrap().unwrap());
+    RepositoryConnectionFacts::with_native_context_current(Some(&facts), |include| {
+        assert!(include);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(s.count(), 0);
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_facts_original_missing_boundary_stays_omitted_after_install() {
+    let dir = crate::test_support::test_tempdir("native-facts-missing-boundary");
+    let store = intent_store::Store::open(&dir.path().join("store.db"))
+        .await
+        .unwrap();
+    let registry = Arc::new(crate::SettingsRegistry::load(dir.path().join("config.toml")).unwrap());
+    let secrets = FileSecretStore::with_path(dir.path().join("missing.json"));
+    let service = crate::Services::new_repository_fixture(store, secrets.clone(), None)
+        .with_settings_registry(registry.clone());
+    let missing = connection_facts(&service);
+    assert!(missing.attachment() == RepositoryAttachmentState::BoundaryMissing);
+    let mut choices = Vec::new();
+    RepositoryConnectionFacts::with_native_context_current(Some(&missing), |include| {
+        choices.push(include);
+        Ok(())
+    })
+    .unwrap();
+    service
+        .gitlab_credential_gate
+        .install_settings_boundary(&registry, &service.secrets, &secrets, None)
+        .unwrap();
+    for facts in [Some(&missing), None] {
+        RepositoryConnectionFacts::with_native_context_current(facts, |include| {
+            choices.push(include);
+            Ok(())
+        })
+        .unwrap();
+    }
+    assert_eq!(choices, [false, false, false]);
+    assert!(!secrets.path().exists());
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_facts_callback_preserves_original_error_and_owned_effect_once() {
+    let s = ReadServer::new().await;
+    let f = ReadFixture::new(&s, false).await;
+    let facts = connection_facts(&f.auth.service);
+    let packet = Box::new(42_u8);
+    let mut output = None;
+    let mut calls = 0;
+    assert_eq!(
+        RepositoryConnectionFacts::with_native_context_current(Some(&facts), |include| {
+            assert!(include);
+            calls += 1;
+            assert!(output.replace(packet).is_none());
+            Err(Error::TimedOut)
+        }),
+        Err(Error::TimedOut)
+    );
+    assert_eq!(calls, 1);
+    assert_eq!(output.as_deref(), Some(&42));
+    assert_eq!(s.count(), 0);
+}

@@ -595,6 +595,30 @@ async fn dispatch(
     params: &Map<String, Value>,
 ) -> Result<Value, RpcErr> {
     match method {
+        "workspace.repositoryContext.capture" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_context_capture(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "workspace.repositoryContext" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_context(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "workspace.repositoryContext.release" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_context_release(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
         "workspace.list" => {
             let include_archived = params
                 .get("includeArchived")

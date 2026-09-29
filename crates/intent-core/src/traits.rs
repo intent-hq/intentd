@@ -54,6 +54,31 @@ pub trait WorkspaceApi: Send + Sync {
         None
     }
 
+    /// Acquire read-only repository context under the original native connection.
+    fn repository_context_capture(
+        &self,
+        query: crate::repository_request::RepositoryContextQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_request::RepositoryContextCapture>> {
+        let _ = query;
+        Box::pin(async { Err(Error::Forbidden("Repository context unavailable".into())) })
+    }
+
+    fn repository_context(
+        &self,
+        query: crate::repository_request::RepositoryContextBoundQuery,
+    ) -> BoxFuture<'_, Result<crate::RepositoryContext>> {
+        let _ = query;
+        Box::pin(async { Err(Error::Forbidden("Repository context unavailable".into())) })
+    }
+
+    fn repository_context_release(
+        &self,
+        query: crate::repository_request::RepositoryContextBoundQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_request::RepositoryContextReleased>> {
+        let _ = query;
+        Box::pin(async { Err(Error::Forbidden("Repository context unavailable".into())) })
+    }
+
     /// List workspaces, optionally including archived ones (PROTOCOL §5.1).
     fn list_workspaces(&self, include_archived: bool) -> BoxFuture<'_, Result<Vec<Workspace>>> {
         let _ = include_archived;

@@ -108,7 +108,6 @@ mod source_control_auth_ops;
     not(test),
     expect(
         dead_code,
-        unused_imports,
         clippy::wildcard_imports,
         reason = "Physical producer and repository dispatch integration remain pending"
     )
@@ -176,6 +175,8 @@ mod repository_credential_writers;
     )
 )]
 mod repository_credentials;
+#[path = "repository_admission/native_wire.rs"]
+mod repository_native_wire;
 #[path = "repository_admission/read_policy.rs"]
 mod repository_read_policy;
 #[path = "repository_admission/read_source.rs"]
@@ -1137,6 +1138,8 @@ pub struct Services {
     /// The one repository credential directory for this server incarnation.
     /// Clones share it; construction alone leaves the connection unverified.
     repository_connection_directory: Arc<repository_credentials::RepositoryConnectionDirectory>,
+    /// Exact ordinary API allocation; clones cannot bind replacement owners.
+    repository_wire_owner: Arc<OnceLock<Weak<Services>>>,
     /// Original invalidation owner for this Services instance. Clones share it;
     /// Store must accept this exact observer before it can be used.
     repository_lifecycle_registry:
@@ -1607,6 +1610,7 @@ impl Services {
             gitlab_credential_gate: source_control_auth_ops::new_gitlab_credential_gate(),
             repository_connection_directory,
             repository_lifecycle_registry: Arc::default(),
+            repository_wire_owner: Arc::default(),
             principal_identity_refreshed_at: Arc::new(tokio::sync::Mutex::new(None)),
             identity_transition: Arc::new(tokio::sync::Mutex::new(())),
             identity_rekey_generation: Arc::new(AtomicU64::new(0)),
@@ -17369,6 +17373,34 @@ impl Services {
 }
 
 impl WorkspaceApi for Services {
+    fn repository_read_connection(
+        &self,
+        entry: intent_core::repository_request::RepositoryWireEntry,
+    ) -> Option<Arc<dyn intent_core::repository_request::RepositoryReadConnection>> {
+        repository_native_wire::connection(self, entry)
+    }
+
+    fn repository_context_capture(
+        &self,
+        query: intent_core::repository_request::RepositoryContextQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositoryContextCapture>> {
+        repository_native_wire::capture(self, query)
+    }
+
+    fn repository_context(
+        &self,
+        query: intent_core::repository_request::RepositoryContextBoundQuery,
+    ) -> BoxFuture<'_, Result<intent_core::RepositoryContext>> {
+        repository_native_wire::read(self, query)
+    }
+
+    fn repository_context_release(
+        &self,
+        query: intent_core::repository_request::RepositoryContextBoundQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositoryContextReleased>> {
+        repository_native_wire::release(self, query)
+    }
+
     fn settings_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             // Daemon settings are host state: administrator-only in the matrix.

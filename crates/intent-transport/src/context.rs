@@ -57,6 +57,33 @@ tokio::task_local! {
     /// Queried by `ServerControl::is_tcp_connection()` to enforce safety guards.
     static IS_TCP: RefCell<bool>;
     static READ_CONNECTION: Option<Arc<dyn RepositoryReadConnection>>;
+    static REPOSITORY_FRAME: Option<intent_core::repository_request::RepositoryContextQuery>;
+}
+
+/// Bind only the new method's declared root while constructing the ORIGINAL
+/// frame future. The synchronous carrier captures it before any slot wait.
+pub(crate) fn with_repository_frame<T>(raw: &str, construct: impl FnOnce() -> T) -> T {
+    use intent_core::repository_request::{RepositoryContextBoundQuery, RepositoryContextQuery};
+    let query = serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|value| {
+            let params = value.get("params")?.clone();
+            match value.get("method")?.as_str()? {
+                "workspace.repositoryContext.capture" => {
+                    serde_json::from_value::<RepositoryContextQuery>(params).ok()
+                }
+                "workspace.repositoryContext" | "workspace.repositoryContext.release" => {
+                    serde_json::from_value::<RepositoryContextBoundQuery>(params)
+                        .ok()
+                        .map(|query| RepositoryContextQuery {
+                            workspace_id: query.workspace_id,
+                            git_root_id: query.git_root_id,
+                        })
+                }
+                _ => None,
+            }
+        });
+    REPOSITORY_FRAME.sync_scope(query, construct)
 }
 
 /// Owned by each actual connection exit path, independently of client ids.
@@ -68,6 +95,26 @@ pub(crate) struct ReadConnectionGuard(Option<Arc<dyn RepositoryReadConnection>>)
 impl ReadConnectionGuard {
     pub(crate) fn bind(api: &dyn intent_core::WorkspaceApi, entry: RepositoryWireEntry) -> Self {
         Self(api.repository_read_connection(entry))
+    }
+
+    /// Consume the original owner's bounded control feed on this socket only.
+    pub(crate) fn forward_retirements(
+        &self,
+        output: tokio::sync::mpsc::Sender<String>,
+    ) -> RetirementForwarder {
+        let task = self.0.as_ref().and_then(|owner| owner.take_retirements()).map(|mut receiver| {
+            tokio::spawn(async move {
+                while let Some(notice) = receiver.next().await {
+                    let terminal = notice.terminal;
+                    let frame = serde_json::json!({
+                        "jsonrpc": "2.0", "method": "workspace.repositoryContext.retired", "params": notice,
+                    }).to_string();
+                    // Receiver loss closes this original feed and all its leases.
+                    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5), output.send(frame)).await, Ok(Ok(()))) || terminal { break; }
+                }
+            })
+        });
+        RetirementForwarder(task)
     }
 
     pub(crate) fn absent() -> Self {
@@ -82,6 +129,15 @@ impl ReadConnectionGuard {
 
     pub(crate) fn run<F: Future>(&self, body: F) -> impl Future<Output = F::Output> {
         READ_CONNECTION.scope(self.0.clone(), body)
+    }
+}
+
+pub(crate) struct RetirementForwarder(Option<tokio::task::JoinHandle<()>>);
+impl Drop for RetirementForwarder {
+    fn drop(&mut self) {
+        if let Some(task) = &self.0 {
+            task.abort();
+        }
     }
 }
 
@@ -181,9 +237,13 @@ impl CapturedFrame {
             credential: intent_core::caller::current_wire_credential(),
             completion: READ_CONNECTION
                 .try_with(|owner| {
-                    owner
-                        .as_ref()
-                        .map(|owner| Arc::new(RequestCompletion(owner.capture())))
+                    owner.as_ref().map(|owner| {
+                        let query = REPOSITORY_FRAME.try_with(Clone::clone).ok().flatten();
+                        Arc::new(RequestCompletion(match query {
+                            Some(query) => owner.capture_context(&query),
+                            None => owner.capture(),
+                        }))
+                    })
                 })
                 .ok()
                 .flatten(),

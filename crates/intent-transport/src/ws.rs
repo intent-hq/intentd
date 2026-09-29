@@ -1289,6 +1289,7 @@ impl WsInner {
         let mut forwards = ForwardRegistry::default();
         // Bind reverse authority independently of hello metadata. Members may
         // serve ordinary workspace browsers, while guests remain ineligible.
+        let _retirements = read_connection.forward_retirements(app_tx.priority_sender());
         let reverse = ReverseChannel::new(app_tx.priority_sender())
             .with_administrator(caller.as_ref().is_none_or(Caller::is_administrator))
             .with_member_authority(self.api.clone(), caller.as_ref());
@@ -1472,21 +1473,23 @@ impl WsInner {
                                 true,
                                 caller.clone(),
                                 read_connection.run(async {
-                                    conn::process_frame(
-                                        &text,
-                                        &self.api,
-                                        &self.bus,
-                                        &app_tx,
-                                        &mut subs,
-                                        &mut forwards,
-                                        &reverse,
-                                        &reverse_guard,
-                                        self.control.as_ref(),
-                                        self.server_pairing_info.as_ref(),
-                                        &mut client_id,
-                                        self.locality_is_local,
-                                        &self.rpc_limiter,
-                                    )
+                                    crate::context::with_repository_frame(&text, || {
+                                        conn::process_frame(
+                                            &text,
+                                            &self.api,
+                                            &self.bus,
+                                            &app_tx,
+                                            &mut subs,
+                                            &mut forwards,
+                                            &reverse,
+                                            &reverse_guard,
+                                            self.control.as_ref(),
+                                            self.server_pairing_info.as_ref(),
+                                            &mut client_id,
+                                            self.locality_is_local,
+                                            &self.rpc_limiter,
+                                        )
+                                    })
                                     .await
                                 }),
                             ),

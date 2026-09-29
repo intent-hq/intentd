@@ -318,6 +318,17 @@ impl RepositoryConnectionFacts {
         RepositoryReadEligibility::with_output(&[], optional, transfer)
     }
 
+    /// Requires the original authenticated Wire/context owner and the original
+    /// prepared response slot. This supplies no native caller provenance or grant.
+    /// The caller must refuse a payload containing facts when this returns false;
+    /// its consuming action never refetches, rebuilds or retries the packet.
+    pub(crate) fn with_native_context_current(
+        optional: Option<&Self>,
+        transfer: impl FnOnce(bool) -> Result<()> + Send,
+    ) -> Result<()> {
+        RepositoryReadEligibility::with_output(&[], optional, transfer)
+    }
+
     fn retained_owner(&self) -> Option<&Arc<RepositoryOwner>> {
         if matches!(
             self.attachment,

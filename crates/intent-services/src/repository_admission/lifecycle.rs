@@ -137,7 +137,7 @@ impl RepositorySourceLifetime {
         }
     }
 
-    pub(super) fn for_optional_request(
+    pub(crate) fn for_optional_request(
         registry: Arc<RepositoryLifecycleRegistry>,
         origin: RepositoryPhysicalOrigin,
         parent: &RepositoryRetirement,
@@ -403,6 +403,74 @@ impl RepositoryLifecycleObserver for RepositoryLifecycleRegistry {
             state: self.state.clone(),
             id,
         }))
+    }
+}
+
+/// Original native transport registration. Only an authentically captured Wire
+/// entry can construct this owner; no caller ID or fixture origin is accepted.
+pub(crate) struct RepositoryWireOrigin {
+    registry: Arc<RepositoryLifecycleRegistry>,
+    id: u64,
+    token: Arc<()>,
+}
+
+impl RepositoryWireOrigin {
+    pub(crate) fn capture(
+        registry: &Arc<RepositoryLifecycleRegistry>,
+        original: &super::OriginalRepositoryCaller,
+    ) -> AdmissionResult<Self> {
+        if !matches!(original.caller(), Caller::Wire { .. }) {
+            return Err(AdmissionError::Denied);
+        }
+        let keys = HashSet::from([RepositoryLifecycleKey::Database]);
+        let token = Arc::new(());
+        let mut state = registry.state.lock().map_err(|_| AdmissionError::Retired)?;
+        if state.blocked(&keys) {
+            return Err(AdmissionError::Unavailable);
+        }
+        let id = state.next()?;
+        state.origins.insert(
+            id,
+            Origin {
+                token: Arc::downgrade(&token),
+                caller: original.caller().clone(),
+                keys,
+                retired: false,
+            },
+        );
+        Ok(Self {
+            registry: registry.clone(),
+            id,
+            token,
+        })
+    }
+
+    pub(crate) fn origin(&self) -> RepositoryPhysicalOrigin {
+        RepositoryPhysicalOrigin {
+            registry: Arc::downgrade(&self.registry),
+            id: self.id,
+            token: Arc::downgrade(&self.token),
+        }
+    }
+
+    pub(crate) fn retire(&self) {
+        let leaves = {
+            let mut state = self
+                .registry
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.origins.remove(&self.id);
+            state.detach(|entry| entry.origin == self.id);
+            state.pending_leaves(|entry| entry.origin == self.id)
+        };
+        finish_retirement(&self.registry.state, &leaves);
+    }
+}
+
+impl Drop for RepositoryWireOrigin {
+    fn drop(&mut self) {
+        self.retire();
     }
 }
 

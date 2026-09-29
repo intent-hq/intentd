@@ -534,3 +534,17 @@ impl RepositoryOperationAdmission {
 #[cfg(test)]
 #[path = "repository_admission/tests.rs"]
 mod tests;
+
+// Services keeps its native adapter outside this Services-free engine. These
+// crate-private entries preserve the same original retirement implementation.
+impl RepositoryRetirement {
+    pub(crate) fn native_dispatch<T>(
+        &self,
+        action: impl FnOnce() -> AdmissionResult<T>,
+    ) -> AdmissionResult<T> {
+        self.dispatch(action)
+    }
+    pub(crate) async fn native_cancelled(&self) {
+        self.cancelled().await;
+    }
+}
