@@ -1631,3 +1631,115 @@ async fn hook_lifecycle_over_wss() {
     );
     await_conversation_contains(&mut rpc, 940, &ws_id, &agent_id, "fired and is now retired").await;
 }
+
+/// Recursive validation must fail only the offending MCP call, leaving the
+/// disposable daemon, another agent, and ordinary background hooks usable.
+#[intent_test_macros::daemon_test]
+async fn recursive_hook_validation_leaves_daemon_usable() {
+    let Some(script) = gate("recursive hook validation E2E") else {
+        return;
+    };
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let (ws_id, _) = seed_workspace_and_note(&data_dir).await;
+    // Finite even without the guard: exceed the validation boundary without
+    // an unbounded reproduction in the daemon process.
+    let mut recursive_code = "return {dispatch: false};".to_string();
+    for _ in 0..3 {
+        recursive_code = format!(
+            "return await ws.hook.schedule({{name: 'nested', delayMs: 600000, code: {}}});",
+            json!(recursive_code)
+        );
+    }
+    let recursive_js = format!(
+        "try {{ await ws.hook.schedule({{name: 'recursive-root', delayMs: 600000, code: {}}}); \
+         throw new Error('unexpected acceptance'); }} catch (error) {{ return String(error); }}",
+        json!(recursive_code)
+    );
+    let behavior = json!({
+        "response": "ok",
+        "rules": [
+            {
+                "ifPromptContains": "RECURSIVE_HOOK",
+                "toolCall": {"name": "workspace_api", "arguments": {
+                    "code": recursive_js, "summary": "test bounded hook validation"
+                }},
+                "emitToolBlocks": true,
+                "response": "recursion checked"
+            },
+            {
+                "ifPromptContains": "ORDINARY_HOOK",
+                "toolCall": {"name": "workspace_api", "arguments": {
+                    "code": "await ws.hook.schedule({name: 'healthy', delayMs: 600000, code: 'return {dispatch: false};'}); return 'ordinary hook scheduled';",
+                    "summary": "schedule an ordinary hook"
+                }},
+                "emitToolBlocks": true,
+                "response": "ordinary work completed"
+            }
+        ]
+    }).to_string();
+    let child = spawn_serve(
+        &data_dir,
+        &[
+            ("INTENTD_AUTH_TOKEN", TOKEN),
+            ("MOCK_AGENT_SCRIPT_PATH", &script),
+            ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ],
+    );
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status_logged(&socket, &data_dir.join("daemon.log")).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let mut rpc = connect_ws(
+        port,
+        client_config(status["result"]["fingerprint"].as_str().unwrap()),
+    )
+    .await;
+    for (index, (prompt, expected)) in [
+        ("RECURSIVE_HOOK", "nested hook validation limit"),
+        ("ORDINARY_HOOK", "ordinary hook scheduled"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let base = i64::try_from(index).unwrap() * 1000;
+        let created = wss_rpc(
+            &mut rpc,
+            base + 1,
+            "agent.create",
+            json!({
+                "workspaceId": ws_id, "name": prompt, "model": "default", "provider": "mock"
+            }),
+        )
+        .await;
+        let id = created["agent"]["id"].as_str().unwrap();
+        wss_rpc(
+            &mut rpc,
+            base + 2,
+            "agent.sendMessage",
+            json!({
+                "workspaceId": ws_id, "agentId": id, "content": prompt
+            }),
+        )
+        .await;
+        await_conversation_contains(&mut rpc, base + 10, &ws_id, id, expected).await;
+        let hooks = wss_rpc(
+            &mut rpc,
+            base + 900,
+            "hook.list",
+            json!({
+                "workspaceId": ws_id, "agentId": id, "includeRetired": true
+            }),
+        )
+        .await;
+        let hooks = hooks["hooks"].as_array().unwrap();
+        assert_eq!(hooks.len(), index, "only the ordinary hook may persist");
+        if index == 1 {
+            assert_eq!(hooks[0]["name"], "healthy");
+        }
+    }
+}

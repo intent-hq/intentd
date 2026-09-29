@@ -2005,12 +2005,18 @@ mod tests {
         );
     }
 
-    async fn fresh_services(workspaces_root: &Path, assets_root: &Path) -> Services {
-        let db = std::env::temp_dir().join(format!("import-test-{}.db", uuid::Uuid::new_v4()));
+    // Bind the directory before Services so consumers drop before cleanup.
+    async fn fresh_services(
+        workspaces_root: &Path,
+        assets_root: &Path,
+    ) -> (tempfile::TempDir, Services) {
+        let db_dir = crate::test_support::test_tempdir("import-test-");
+        let db = db_dir.path().join("store.db");
         let store = Store::open(&db).await.expect("open store");
-        Services::new(store)
+        let svc = Services::new(store)
             .with_workspaces_root(workspaces_root.to_path_buf())
-            .with_assets_root(assets_root.to_path_buf())
+            .with_assets_root(assets_root.to_path_buf());
+        (db_dir, svc)
     }
 
     fn manifest(ws: &WorkspaceId) -> TransferManifest {
@@ -2186,7 +2192,7 @@ mod tests {
         ]
     }
 
-    async fn selection_fixture() -> (Services, TempDir, TempDir) {
+    async fn selection_fixture() -> (TempDir, TempDir, tempfile::TempDir, Services) {
         let root = TempDir::new("import-selection");
         let assets = TempDir::new("import-selection-assets");
         let registry =
@@ -2214,9 +2220,8 @@ mod tests {
                 ),
             ])
             .unwrap();
-        let svc = fresh_services(&root.0, &assets.0)
-            .await
-            .with_settings_registry(registry);
+        let (db_dir, svc) = fresh_services(&root.0, &assets.0).await;
+        let svc = svc.with_settings_registry(registry);
         for (provider, model) in [("codex", "gpt-6-astra"), ("auggie", "gpt6-astra")] {
             seed_selection_catalog(
                 &svc,
@@ -2225,7 +2230,7 @@ mod tests {
                 crate::model_catalog::ModelCatalogCache::now_ms(),
             );
         }
-        (svc, root, assets)
+        (root, assets, db_dir, svc)
     }
 
     fn seed_selection_catalog(svc: &Services, provider: &str, model: &str, now: u64) {
@@ -2338,7 +2343,7 @@ mod tests {
 
     #[tokio::test]
     async fn import_selection_disabled_auggie_uses_destination_defaults() {
-        let (svc, _root, _assets) = selection_fixture().await;
+        let (_root, _assets, _db_dir, svc) = selection_fixture().await;
         svc.settings_registry()
             .unwrap()
             .apply(&[(
@@ -2352,14 +2357,14 @@ mod tests {
 
     #[tokio::test]
     async fn import_selection_missing_model_uses_destination_defaults() {
-        let (svc, _root, _assets) = selection_fixture().await;
+        let (_root, _assets, _db_dir, svc) = selection_fixture().await;
         let session = import_selection(&svc, serde_json::json!({"provider":"auggie", "model":"removed-model", "reasoning_effort":"low"})).await;
         assert_selection(&svc, &session, "codex", Some("gpt-6-astra"), Some("high"));
     }
 
     #[tokio::test]
     async fn import_selection_unsupported_effort_replaces_entire_selection() {
-        let (svc, _root, _assets) = selection_fixture().await;
+        let (_root, _assets, _db_dir, svc) = selection_fixture().await;
         let session = import_selection(&svc, serde_json::json!({"provider":"auggie", "model":"gpt6-astra", "reasoning_effort":"source-only-effort"})).await;
         assert_selection(&svc, &session, "codex", Some("gpt-6-astra"), Some("high"));
     }
@@ -2370,7 +2375,7 @@ mod tests {
             serde_json::json!({"provider":"auggie", "model":"gpt6-astra", "reasoning_effort":"HIGH"}),
             serde_json::json!({"provider":"auggie", "model":null, "reasoning_effort":null}),
         ] {
-            let (svc, _root, _assets) = selection_fixture().await;
+            let (_root, _assets, _db_dir, svc) = selection_fixture().await;
             let session = import_selection(&svc, selection.clone()).await;
             assert_selection(
                 &svc,
@@ -2385,7 +2390,7 @@ mod tests {
     #[tokio::test]
     async fn import_selection_supported_legacy_compound_survives() {
         for provider in [Some("auggie"), Some("codex"), None] {
-            let (svc, _root, _assets) = selection_fixture().await;
+            let (_root, _assets, _db_dir, svc) = selection_fixture().await;
             let session = import_selection(&svc, serde_json::json!({"provider":provider, "model":"auggie:gpt6-astra", "reasoning_effort":"high"})).await;
             // The store's legacy read backstop splits compound ids. Verify the
             // unchanged persisted selection independently of normalized reads.
@@ -2444,7 +2449,7 @@ mod tests {
         explicit_effort: Option<&str>,
         effective_effort: &str,
     ) {
-        let (svc, _root, _assets) = selection_fixture().await;
+        let (_root, _assets, _db_dir, svc) = selection_fixture().await;
         let session = import_selection(
             &svc,
             serde_json::json!({
@@ -2486,7 +2491,7 @@ mod tests {
     #[tokio::test]
     async fn import_selection_codex_legacy_unsupported_embedded_effort_falls_back() {
         for model in ["gpt-6-astra/medium", "gpt-6-astra[medium]"] {
-            let (svc, _root, _assets) = selection_fixture().await;
+            let (_root, _assets, _db_dir, svc) = selection_fixture().await;
             let session = import_selection(
                 &svc,
                 serde_json::json!({
@@ -2500,7 +2505,7 @@ mod tests {
 
     #[tokio::test]
     async fn import_selection_non_codex_slash_model_is_not_effort() {
-        let (svc, _root, _assets) = selection_fixture().await;
+        let (_root, _assets, _db_dir, svc) = selection_fixture().await;
         let model = "gpt-6-astra/low";
         seed_selection_catalog(
             &svc,
@@ -2520,7 +2525,7 @@ mod tests {
 
     #[tokio::test]
     async fn import_selection_disabled_legacy_prefix_replaces_conflicting_provider() {
-        let (svc, _root, _assets) = selection_fixture().await;
+        let (_root, _assets, _db_dir, svc) = selection_fixture().await;
         svc.settings_registry()
             .unwrap()
             .apply(&[(
@@ -2576,7 +2581,7 @@ mod tests {
     }
 
     async fn assert_imported_legacy_alias(alias: &str, mode: &str, disabled: bool) {
-        let (svc, _root, _assets) = selection_fixture().await;
+        let (_root, _assets, _db_dir, svc) = selection_fixture().await;
         svc.settings_registry()
             .unwrap()
             .apply(&[(
@@ -2654,7 +2659,7 @@ mod tests {
             serde_json::json!({"provider":null, "model":null, "reasoning_effort":null}),
             serde_json::json!({"provider":"foreign-provider", "model":"foreign-model", "reasoning_effort":"low"}),
         ] {
-            let (svc, _root, _assets) = selection_fixture().await;
+            let (_root, _assets, _db_dir, svc) = selection_fixture().await;
             let session = import_selection(&svc, selection).await;
             assert_selection(&svc, &session, "codex", Some("gpt-6-astra"), Some("high"));
         }
@@ -2670,7 +2675,7 @@ mod tests {
                 serde_json::json!({"codex":"missing-default-model"}),
             ),
         ] {
-            let (svc, _root, _assets) = selection_fixture().await;
+            let (_root, _assets, _db_dir, svc) = selection_fixture().await;
             svc.settings_registry()
                 .unwrap()
                 .apply(&[(setting.0.into(), setting.1)])
@@ -2693,7 +2698,7 @@ mod tests {
     #[tokio::test]
     async fn import_selection_temporary_catalog_uncertainty_preserves_source() {
         for uncertainty in ["cold", "stale", "version", "failed-refresh"] {
-            let (mut svc, _root, _assets) = selection_fixture().await;
+            let (_root, _assets, _db_dir, mut svc) = selection_fixture().await;
             let source = crate::model_catalog::source_for("auggie").unwrap();
             let version = (source.version_key)();
             match uncertainty {
@@ -2741,7 +2746,7 @@ mod tests {
 
     #[tokio::test]
     async fn import_selection_fallback_uses_auto_when_default_effort_is_unset() {
-        let (svc, _root, _assets) = selection_fixture().await;
+        let (_root, _assets, _db_dir, svc) = selection_fixture().await;
         svc.settings_registry()
             .unwrap()
             .apply(&[(
@@ -2756,7 +2761,7 @@ mod tests {
     #[tokio::test]
     async fn import_selection_fallback_uses_global_default_then_catalog_then_cli() {
         for tier in ["global", "catalog", "cli"] {
-            let (mut svc, _root, _assets) = selection_fixture().await;
+            let (_root, _assets, _db_dir, mut svc) = selection_fixture().await;
             let mut settings = vec![("model.providerDefaults".into(), serde_json::json!({}))];
             settings.push((
                 "model.default".into(),
@@ -2784,7 +2789,7 @@ mod tests {
 
     #[tokio::test]
     async fn import_selection_effort_evidence_is_scoped_to_source_provider() {
-        let (svc, _root, _assets) = selection_fixture().await;
+        let (_root, _assets, _db_dir, svc) = selection_fixture().await;
         // The same bare id can have different effort vocabularies. Auggie
         // precedes Codex in the catalog registry but cannot reject its effort.
         seed_selection_catalog(
@@ -2807,7 +2812,7 @@ mod tests {
 
     #[tokio::test]
     async fn import_selection_auto_with_unsupported_explicit_effort_falls_back() {
-        let (svc, _root, _assets) = selection_fixture().await;
+        let (_root, _assets, _db_dir, svc) = selection_fixture().await;
         let session = import_selection(
             &svc,
             serde_json::json!({"provider":"auggie", "model":null, "reasoning_effort":"xhigh"}),
@@ -2970,7 +2975,7 @@ mod tests {
         let ws = WorkspaceId("ws-imported".to_string());
         let ws_root = TempDir::new("import-ws-root");
         let assets_root = TempDir::new("import-assets-root");
-        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+        let (_db_dir, svc) = fresh_services(&ws_root.0, &assets_root.0).await;
 
         let m = manifest(&ws);
         let archive = build_archive_full(
@@ -3105,7 +3110,8 @@ mod tests {
     async fn transfer_human_legacy_archive_import_is_unknown_even_with_colliding_ids() {
         use intent_core::WorkspaceApi;
         let root = TempDir::new("legacy-authors");
-        let svc = fresh_services(&root.0.join("workspaces"), &root.0.join("assets")).await;
+        let (_db_dir, svc) =
+            fresh_services(&root.0.join("workspaces"), &root.0.join("assets")).await;
         let owner = svc.store.get_primary_principal().await.unwrap();
         let ws = WorkspaceId::new();
         let mut m = manifest(&ws);
@@ -3246,7 +3252,8 @@ mod tests {
     #[intent_test_macros::daemon_test]
     async fn transfer_human_invalid_v2_author_rejects_before_workspace_visibility() {
         let root = TempDir::new("invalid-authors");
-        let svc = fresh_services(&root.0.join("workspaces"), &root.0.join("assets")).await;
+        let (_db_dir, svc) =
+            fresh_services(&root.0.join("workspaces"), &root.0.join("assets")).await;
         let ws = WorkspaceId::new();
         let m = manifest(&ws);
         let mut rows = fixture_rows(&ws);
@@ -3334,7 +3341,7 @@ mod tests {
         let ws = WorkspaceId("ws-git-imported".to_string());
         let ws_root = TempDir::new("import-git-ws-root");
         let assets_root = TempDir::new("import-git-assets-root");
-        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+        let (_db_dir, svc) = fresh_services(&ws_root.0, &assets_root.0).await;
 
         // Source workspace repo on branch `feature` with committed work and
         // dirty state (staged + untracked).
@@ -3530,7 +3537,7 @@ mod tests {
         let ws = WorkspaceId("ws-git-norefs".to_string());
         let ws_root = TempDir::new("import-git-ws-root");
         let assets_root = TempDir::new("import-git-assets-root");
-        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+        let (_db_dir, svc) = fresh_services(&ws_root.0, &assets_root.0).await;
 
         // Archive with a git/repo.bundle but no git/refs.json.
         let m = manifest(&ws);
@@ -3594,7 +3601,7 @@ mod tests {
         let ws = WorkspaceId("ws-git-rollback".to_string());
         let ws_root = TempDir::new("import-git-rb-ws-root");
         let assets_root = TempDir::new("import-git-rb-assets-root");
-        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+        let (_db_dir, svc) = fresh_services(&ws_root.0, &assets_root.0).await;
 
         let src = TempDir::new("import-git-rb-src");
         let repo = src.0.join("source-repo");
@@ -3700,7 +3707,7 @@ mod tests {
         let ws = WorkspaceId("ws-att-rollback".to_string());
         let ws_root = TempDir::new("import-att-rb-ws-root");
         let assets_root = TempDir::new("import-att-rb-assets-root");
-        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+        let (_db_dir, svc) = fresh_services(&ws_root.0, &assets_root.0).await;
 
         let t = "2026-08-11T00:00:00Z";
         let ws_row = serde_json::json!({
@@ -3841,7 +3848,7 @@ mod tests {
         let ws_root = TempDir::new("import-att-sym-ws-root");
         let assets_root = TempDir::new("import-att-sym-assets-root");
         let outside = TempDir::new("import-att-sym-outside");
-        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+        let (_db_dir, svc) = fresh_services(&ws_root.0, &assets_root.0).await;
 
         // Simulate what a hostile bundle materializes: the checkout exists
         // and `.intent` is a symlink pointing outside the workspace.
@@ -3909,7 +3916,7 @@ mod tests {
         let ws = WorkspaceId("ws-reject".to_string());
         let ws_root = TempDir::new("import-ws-root");
         let assets_root = TempDir::new("import-assets-root");
-        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+        let (_db_dir, svc) = fresh_services(&ws_root.0, &assets_root.0).await;
         let sha = "a".repeat(64);
 
         let mut bad_format = manifest(&ws);
@@ -3963,7 +3970,7 @@ mod tests {
         let ws = WorkspaceId("ws-verify".to_string());
         let ws_root = TempDir::new("import-ws-root");
         let assets_root = TempDir::new("import-assets-root");
-        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+        let (_db_dir, svc) = fresh_services(&ws_root.0, &assets_root.0).await;
 
         let m = manifest(&ws);
         let archive = build_archive(&m, &fixture_rows(&ws));
@@ -4026,7 +4033,7 @@ mod tests {
         let ws = WorkspaceId("ws-chunk".to_string());
         let ws_root = TempDir::new("import-ws-root");
         let assets_root = TempDir::new("import-assets-root");
-        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+        let (_db_dir, svc) = fresh_services(&ws_root.0, &assets_root.0).await;
 
         let m = manifest(&ws);
         let begin = svc
@@ -4078,7 +4085,7 @@ mod tests {
         let ws = WorkspaceId("ws-commit-flag".to_string());
         let ws_root = TempDir::new("import-ws-root");
         let assets_root = TempDir::new("import-assets-root");
-        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+        let (_db_dir, svc) = fresh_services(&ws_root.0, &assets_root.0).await;
 
         let m = manifest(&ws);
         let archive = build_archive(&m, &fixture_rows(&ws));
@@ -4152,7 +4159,7 @@ mod tests {
         let ws = WorkspaceId("ws-sweep-race".to_string());
         let ws_root = TempDir::new("import-ws-root");
         let assets_root = TempDir::new("import-assets-root");
-        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+        let (_db_dir, svc) = fresh_services(&ws_root.0, &assets_root.0).await;
 
         let staging_root = svc.import_staging_root();
         let live_dir = staging_root.join("import-live");
