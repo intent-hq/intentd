@@ -3,8 +3,8 @@
 # (up to GitHub's 100-entry limit). Never add the same lock to a nested workflow.
 # Queue semantics: https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency
 #
-# Activation: first land the shared command and replace its reviewed validation
-# SHA below with the final merged monorepo SHA. Drain ALL older release, mirror,
+# Shared command: intent-hq/intent#6171, merged at the immutable SHA below.
+# Activation: Drain ALL older release, mirror,
 # promotion and cleanup workflow runs (including queued runs and old-tag reruns)
 # before setting PRERELEASE_CLEANUP_ENABLED=true. Until then schedules preview;
 # manual apply is refused. Reverting/clearing the variable stops future apply.
@@ -84,7 +84,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: intent-hq/intent
-          ref: e039b4dca2ad7fa59139a0b1d2ca2aecca558448
+          ref: 3cd2e23e904051f8a0c047717fe7a8e843a5c4ea
           token: ${{ secrets.PRERELEASE_CLEANUP_TOKEN }}
           persist-credentials: false
           path: monorepo

@@ -60,6 +60,7 @@ class WorkflowContract(unittest.TestCase):
         checkout = next(s for s in steps if s.get("uses", "").startswith("actions/checkout@"))
         self.assertEqual(checkout["with"]["repository"], "intent-hq/intent")
         self.assertRegex(checkout["with"]["ref"], r"^[0-9a-f]{40}$")
+        self.assertEqual(checkout["with"]["ref"], "3cd2e23e904051f8a0c047717fe7a8e843a5c4ea")
         self.assertEqual(checkout["with"]["token"], "${{ secrets.PRERELEASE_CLEANUP_TOKEN }}")
         self.assertIs(checkout["with"]["persist-credentials"], False)
         self.assertLess(next(i for i, s in enumerate(steps) if s.get("id") == "controls"), steps.index(checkout))
@@ -84,7 +85,7 @@ class WorkflowContract(unittest.TestCase):
             "Contents read on intent-hq/intent", "intent-hq/cloudlands-fe",
             "intent-hq/cloudlands-releases", "Contents write",
             "intent-hq/intentd and intent-hq/intentd-releases", "Drain ALL older",
-            "queued runs and old-tag reruns", "final merged monorepo SHA",
+            "queued runs and old-tag reruns", "intent-hq/intent#6171",
             "PRERELEASE_CLEANUP_ENABLED=true", "100-entry limit",
         ):
             self.assertIn(requirement, text)
