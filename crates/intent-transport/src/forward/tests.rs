@@ -5,6 +5,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use super::*;
+struct StubApi;
+impl intent_core::WorkspaceApi for StubApi {}
 
 /// Bind a loopback echo server and return its port. Each accepted connection is
 /// echoed byte-for-byte, standing in for a detected remote dev server.
@@ -43,7 +45,7 @@ async fn create_lists_forwards_and_round_trips_bytes() {
         "params": { "remotePort": echo_port }
     }))
     .unwrap();
-    let result = parsed(handle(create, &mut reg, false).await);
+    let result = parsed(handle(create, &mut reg, false, &StubApi).await);
     assert_eq!(result["id"], 1);
     let forward_id = result["result"]["forwardId"].as_str().unwrap().to_string();
     let local_port =
@@ -63,7 +65,7 @@ async fn create_lists_forwards_and_round_trips_bytes() {
 
     // `forward.list` reflects the active forward.
     let list = classify(&json!({ "jsonrpc": "2.0", "id": 2, "method": "forward.list" })).unwrap();
-    let listed = parsed(handle(list, &mut reg, false).await);
+    let listed = parsed(handle(list, &mut reg, false, &StubApi).await);
     let forwards = listed["result"]["forwards"].as_array().unwrap();
     assert_eq!(forwards.len(), 1);
     assert_eq!(forwards[0]["forwardId"], forward_id);
@@ -78,10 +80,10 @@ async fn create_lists_forwards_and_round_trips_bytes() {
         "params": { "forwardId": forward_id }
     }))
     .unwrap();
-    let closed = parsed(handle(close, &mut reg, false).await);
+    let closed = parsed(handle(close, &mut reg, false, &StubApi).await);
     assert_eq!(closed["result"]["ok"], true);
     let list = classify(&json!({ "jsonrpc": "2.0", "id": 4, "method": "forward.list" })).unwrap();
-    let listed = parsed(handle(list, &mut reg, false).await);
+    let listed = parsed(handle(list, &mut reg, false, &StubApi).await);
     assert!(listed["result"]["forwards"].as_array().unwrap().is_empty());
 }
 
@@ -95,7 +97,7 @@ async fn local_create_is_a_metadata_only_no_op() {
         "params": { "remotePort": 3000 }
     }))
     .unwrap();
-    let result = parsed(handle(create, &mut reg, true).await);
+    let result = parsed(handle(create, &mut reg, true, &StubApi).await);
     assert_eq!(result["result"]["localPort"].as_u64().unwrap(), 3000);
     assert_eq!(result["result"]["remotePort"].as_u64().unwrap(), 3000);
 }
@@ -105,12 +107,12 @@ async fn create_requires_remote_port_and_close_requires_id() {
     let mut reg = ForwardRegistry::default();
     let create =
         classify(&json!({ "jsonrpc": "2.0", "id": 1, "method": "forward.create" })).unwrap();
-    let err = parsed(handle(create, &mut reg, false).await);
+    let err = parsed(handle(create, &mut reg, false, &StubApi).await);
     assert_eq!(err["error"]["code"], -32602);
     assert_eq!(err["error"]["data"]["code"], "invalid-params");
 
     let close = classify(&json!({ "jsonrpc": "2.0", "id": 2, "method": "forward.close" })).unwrap();
-    let err = parsed(handle(close, &mut reg, false).await);
+    let err = parsed(handle(close, &mut reg, false, &StubApi).await);
     assert_eq!(err["error"]["code"], -32602);
     assert_eq!(err["error"]["data"]["code"], "invalid-params");
 }
@@ -132,5 +134,5 @@ async fn notification_create_gets_no_response() {
         "jsonrpc": "2.0", "method": "forward.create", "params": { "remotePort": 3000 }
     }))
     .unwrap();
-    assert!(handle(req, &mut reg, true).await.is_none());
+    assert!(handle(req, &mut reg, true, &StubApi).await.is_none());
 }

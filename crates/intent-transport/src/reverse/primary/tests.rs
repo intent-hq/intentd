@@ -592,7 +592,7 @@ fn transitions_queued_before_the_claim_are_retained() {
     );
     assert!(transitions
         .iter()
-        .all(|t| t.identity() == &identity("x", true)));
+        .all(|t| t.identity() == Some(&identity("x", true))));
 }
 
 #[test]

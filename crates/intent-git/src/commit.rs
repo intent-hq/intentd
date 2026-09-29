@@ -48,6 +48,17 @@ fn pending_merge_heads(repo: &mut Repository) -> Result<Vec<git2::Oid>> {
     Ok(heads)
 }
 
+/// Whether `MERGE_HEAD` names an incoming parent for a pending merge.
+/// Used by staged-only callers because a merge can have no changed paths.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the repository or its merge heads cannot be read.
+pub fn has_pending_merge(worktree_path: &Path) -> Result<bool> {
+    let mut repo = Repository::open(worktree_path).map_err(map_git_err)?;
+    Ok(!pending_merge_heads(&mut repo)?.is_empty())
+}
+
 /// The outcome of creating a commit: the new commit SHA and the files it changed.
 #[derive(Debug, Clone)]
 pub struct CommitOutcome {

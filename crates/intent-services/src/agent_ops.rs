@@ -98,6 +98,26 @@ pub(crate) fn is_terminal_status(status: AgentStatus) -> bool {
     )
 }
 
+/// Serialize each retirement transition with restore without blocking other
+/// targets. Weak entries keep completed transitions out of the lock registry.
+#[derive(Clone, Default)]
+pub(crate) struct AgentRetirementGates {
+    gates: Arc<Mutex<HashMap<AgentId, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
+}
+
+impl AgentRetirementGates {
+    pub(crate) fn for_agent(&self, agent_id: &AgentId) -> Arc<tokio::sync::Mutex<()>> {
+        let mut gates = self.gates.lock().expect("retirement gate map poisoned");
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        if let Some(gate) = gates.get(agent_id).and_then(std::sync::Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        gates.insert(agent_id.clone(), Arc::downgrade(&gate));
+        gate
+    }
+}
+
 /// Per-agent ordering gate for pending-question marker writes and their
 /// matching `agent:updated` events. Different agents never contend.
 #[derive(Clone, Default)]
@@ -970,9 +990,15 @@ pub(crate) fn provider_is_disabled(
     provider_id: &str,
     enabled: Option<&std::collections::BTreeMap<String, bool>>,
 ) -> bool {
-    let disableable =
-        intent_providers::find_provider(provider_id).is_some_and(|p| p.can_be_disabled);
-    disableable && enabled.is_some_and(|m| m.get(provider_id) == Some(&false))
+    intent_providers::find_provider(provider_id)
+        .is_some_and(|provider| provider_config_is_disabled(provider, enabled))
+}
+
+fn provider_config_is_disabled(
+    provider: &intent_providers::ProviderConfig,
+    enabled: Option<&std::collections::BTreeMap<String, bool>>,
+) -> bool {
+    provider.can_be_disabled && enabled.is_some_and(|m| m.get(provider.id) == Some(&false))
 }
 
 /// Where a turn-start re-home lands (intent-hq/intent#5737): the target
@@ -1090,10 +1116,14 @@ pub(crate) fn ensure_provider_authenticated(
     if auth_verdict != Some(false) {
         return Ok(());
     }
-    Err(Error::InvalidParams(format!(
-        "{method}: {}",
-        crate::provider_auth::not_authenticated_message(provider_id)
-    )))
+    Err(crate::host_execution::ai_authorization_error(
+        Error::InvalidParams(format!(
+            "{method}: {}",
+            crate::provider_auth::not_authenticated_message(provider_id)
+        )),
+        provider_id,
+        intent_core::execution::ExecutionAuthorizationReason::Missing,
+    ))
 }
 
 /// The runnability half of [`ensure_provider_available`], with the npx probe
@@ -1177,7 +1207,7 @@ enum PopCommit {
 #[derive(Debug, Clone)]
 pub(crate) struct QueueEntryGate {
     principal_id: PrincipalId,
-    is_administrator: bool,
+    host_role: intent_core::HostRole,
     author_only: bool,
     fallback: Option<PrincipalId>,
 }
@@ -1192,7 +1222,7 @@ impl QueueEntryGate {
         );
         let caller = intent_core::Caller::Wire {
             principal_id: self.principal_id.clone(),
-            is_administrator: self.is_administrator,
+            host_role: self.host_role,
         };
         if !intent_core::queue_attribution_visible_to(&caller, &attribution) {
             return Err(Error::InvalidParams(format!(
@@ -1405,9 +1435,14 @@ impl QueuedMessage {
     }
 
     /// The ready-to-send predicate shared by every drain path and idle gate
-    /// (PROTOCOL §5.5/§6.5): not under edit and not held.
+    /// (PROTOCOL §5.5/§6.5): not under edit, held, or awaiting a destination
+    /// owner's explicit authorization for an imported human instruction.
     pub(crate) fn ready_to_send(&self) -> bool {
-        !self.editing && !self.is_held()
+        !self.editing
+            && !self.is_held()
+            && !intent_core::human_author::is_unbound_historical_human(
+                self.message_metadata.as_ref(),
+            )
     }
 }
 
@@ -5223,7 +5258,12 @@ impl Services {
         workspace_id: Option<WorkspaceId>,
         reason: Option<String>,
     ) -> Result<Value> {
-        let session = self.store.get_agent_session_summary(&agent_id).await?;
+        let session = {
+            // An idempotent retry also waits for the winning retire's cleanup.
+            let gate = self.agent_retirement_gates.for_agent(&agent_id);
+            let _retirement = gate.lock().await;
+            self.store.get_agent_session_summary(&agent_id).await?
+        };
         if let Some(ws) = workspace_id.as_ref() {
             if session.workspace_id != *ws {
                 return Err(Error::NotFound(format!("agent session {agent_id}")));
@@ -5338,6 +5378,8 @@ impl Services {
         session: &AgentSession,
         reason: Option<&str>,
     ) -> Result<Option<String>> {
+        let gate = self.agent_retirement_gates.for_agent(&session.id);
+        let _retirement = gate.lock().await;
         let now = now_iso();
         // Unread state observed BEFORE the retire write (derived + stored
         // flag): a retired session drops out of the unread derivation, so
@@ -5354,6 +5396,19 @@ impl Services {
             .await?;
         if !transitioned {
             return Ok(None);
+        }
+        // The persisted mark closes new requests before teardown. A wire
+        // caller retires another agent, whose current worker must be aborted;
+        // MCP self-retirement instead lets its own response unwind normally.
+        // The runtime fence also rejects send/wake work that passed a store
+        // check before this transition and reaches worker installation later.
+        if matches!(
+            intent_core::current_caller(),
+            Some(intent_core::Caller::Wire { .. })
+        ) {
+            if let Some(manager) = self.agent_manager() {
+                manager.retire(&session.id).await;
+            }
         }
         self.invalidate_agent_list_cache(&session.workspace_id);
         // Drop the retired agent's event subscriptions: the wake target is
@@ -5443,6 +5498,8 @@ impl Services {
         agent_id: AgentId,
         workspace_id: Option<WorkspaceId>,
     ) -> Result<Value> {
+        let gate = self.agent_retirement_gates.for_agent(&agent_id);
+        let _retirement = gate.lock().await;
         let session = self.store.get_agent_session_summary(&agent_id).await?;
         if let Some(ws) = workspace_id.as_ref() {
             if session.workspace_id != *ws {
@@ -5462,6 +5519,9 @@ impl Services {
             .await?;
         if !transitioned {
             return Ok(json!({ "success": true, "restored": false }));
+        }
+        if let Some(manager) = self.agent_manager() {
+            manager.restore_retired(&agent_id);
         }
         self.invalidate_agent_list_cache(&session.workspace_id);
         crate::publish_event(
@@ -6026,7 +6086,11 @@ impl Services {
                 })?;
             let metadata = match obj.get("metadata") {
                 Some(Value::Null) | None => None,
-                Some(v) => Some(v.clone()),
+                Some(v) => {
+                    let mut metadata = v.clone();
+                    intent_core::human_author::strip_historical_human_author(&mut metadata);
+                    Some(metadata)
+                }
             };
             let created_at = match obj.get("timestamp").or_else(|| obj.get("createdAt")) {
                 Some(Value::String(s)) => s.clone(),
@@ -6488,12 +6552,12 @@ impl Services {
     ) -> Result<Option<QueueEntryGate>> {
         let Some(intent_core::Caller::Wire {
             principal_id,
-            is_administrator,
+            host_role,
         }) = intent_core::current_caller()
         else {
             return Ok(None);
         };
-        if is_administrator && !author_only {
+        if host_role == intent_core::HostRole::Owner && !author_only {
             return Ok(None);
         }
         let workspace_id = self.agent_workspace(agent_id).await?;
@@ -6502,10 +6566,60 @@ impl Services {
             .await;
         Ok(Some(QueueEntryGate {
             principal_id,
-            is_administrator,
+            host_role,
             author_only,
             fallback,
         }))
+    }
+
+    /// Resolve current owner/credential authority and retain both guards through
+    /// the imported entry's synchronous pop. Normal local/nonhuman entries keep
+    /// their existing path. An entry that appears later fails closed at pop.
+    pub(crate) async fn destination_owner_queue_authorization(
+        &self,
+        agent_id: &AgentId,
+        message_id: &str,
+    ) -> Result<Option<DestinationOwnerQueueAuthorization>> {
+        use intent_core::caller::{current_wire_credential, WireCredential};
+        if !self
+            .find_queued_message(agent_id, message_id)
+            .is_some_and(|entry| {
+                intent_core::human_author::is_unbound_historical_human(
+                    entry.message_metadata.as_ref(),
+                )
+            })
+        {
+            return Ok(None);
+        }
+        let Some(intent_core::Caller::Wire { principal_id, .. }) = intent_core::current_caller()
+        else {
+            return Ok(None);
+        };
+        let credential = current_wire_credential();
+        if credential
+            .as_ref()
+            .is_some_and(|c| c.principal_id() != &principal_id)
+        {
+            return Err(Error::Forbidden(
+                "admitted credential principal mismatch".into(),
+            ));
+        }
+        let lease = match credential.as_ref() {
+            Some(WireCredential::Legacy { authority, .. }) => Some(authority.authorize().await?),
+            _ => None,
+        };
+        let token_hash = match credential.as_ref() {
+            Some(WireCredential::Principal { token_hash, .. }) => Some(token_hash.as_str()),
+            _ => None,
+        };
+        Ok(self
+            .store
+            .owner_queue_permit(&principal_id, token_hash)
+            .await?
+            .map(|owner| DestinationOwnerQueueAuthorization {
+                _owner: owner,
+                _credential: lease,
+            }))
     }
 
     /// Test seam (intentd#2068): park a GATED per-id queue mutation between
@@ -7078,19 +7192,29 @@ impl Services {
     ) -> Result<Value> {
         // Fail closed on a nonexistent target BEFORE touching the queue
         // (monorepo#564).
+        self.discard_revoked_instructions(&agent_id).await?;
         let session = self.require_agent_session(&agent_id).await?;
         let _mutation = self.workspace_mutations.enter(&session.workspace_id)?;
         let workspace_id = session.workspace_id.clone();
         let gate = self.queue_entry_gate(&agent_id, false).await?;
         self.park_queue_mutation_gate(gate.as_ref()).await;
+        let destination_owner = self
+            .destination_owner_queue_authorization(&agent_id, &message_id)
+            .await?;
         // Atomic dequeue; the entry stays listed in queue snapshots (§6.5
         // drain ordering) until `draining` is dropped right before the shrunk
         // publish below.
         let (mut entry, draining) = self
-            .take_queued_message_draining_gated(&agent_id, &message_id, gate.as_ref())?
+            .take_queued_message_draining_gated(
+                &agent_id,
+                &message_id,
+                gate.as_ref(),
+                destination_owner.as_ref(),
+            )?
             .ok_or_else(|| {
                 Error::InvalidParams(format!("queued message not found: {message_id}"))
             })?;
+        drop(destination_owner);
         // Identity link: parity with the runtime path.
         crate::agent_manager::stamp_queued_message_id(&mut entry);
         // Durable shrink now; the shrunk `agent:queue:updated` is published
@@ -13664,7 +13788,7 @@ impl Services {
         //   3. Spawn the worker with the same content in-memory (the worker
         //      path does not re-persist).
         let content_owned = content.to_string();
-        if !manager.try_begin_turn(agent_id, workspace_id).await {
+        let Some(admission) = manager.try_begin_turn(agent_id, workspace_id).await else {
             // Fast enqueue branch: the manager is already draining a turn. The
             // metadata rides along on the queue entry so the drain re-persist
             // keeps the wake tag.
@@ -13684,7 +13808,7 @@ impl Services {
                 "queued": true,
                 "queuedMessage": queued.to_value(position),
             }));
-        }
+        };
         let blocks = json!([build_block()]);
         let created_at = now_iso();
         // Row-level metadata rides along with the in-block fold (monorepo#1217)
@@ -13706,7 +13830,7 @@ impl Services {
                 msg
             }
             Err(append_err) => {
-                manager.release_slot(agent_id).await;
+                manager.release_slot(agent_id, admission).await;
                 // Fail closed on a vanished session (intent-hq/monorepo#2762):
                 // the only FK on `agent_message` is `agent_id →
                 // agent_session(id)`, so an append failure against a gone row
@@ -13778,6 +13902,7 @@ impl Services {
                 message_metadata: message_metadata.cloned(),
                 ..Default::default()
             },
+            admission,
         );
         Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
     }
@@ -15094,7 +15219,7 @@ impl Services {
         agent_id: &AgentId,
         message_id: &str,
     ) -> Option<(QueuedMessage, DrainingGuard)> {
-        self.take_queued_message_draining_gated(agent_id, message_id, None)
+        self.take_queued_message_draining_gated(agent_id, message_id, None, None)
             .ok()
             .flatten()
     }
@@ -15110,12 +15235,14 @@ impl Services {
     /// against the entry INSIDE the pop's critical section (draining overlay
     /// lock → `agent_queues` lock): a refused entry is left in place untouched
     /// and the refusal surfaces as `Err`; `Ok(None)` is the ordinary absent
-    /// id. `None` for `gate` pops unconditionally.
+    /// id. Historical unbound humans additionally require an affirmative
+    /// current destination owner; an absent gate never grants that authority.
     pub(crate) fn take_queued_message_draining_gated(
         &self,
         agent_id: &AgentId,
         message_id: &str,
         gate: Option<&QueueEntryGate>,
+        destination_owner: Option<&DestinationOwnerQueueAuthorization>,
     ) -> Result<Option<(QueuedMessage, DrainingGuard)>> {
         let mut refused = None;
         let popped = self.pop_draining(
@@ -15132,6 +15259,15 @@ impl Services {
                         refused = Some(e);
                         return None;
                     }
+                }
+                if intent_core::human_author::is_unbound_historical_human(
+                    queue[idx].message_metadata.as_ref(),
+                ) && destination_owner.is_none()
+                {
+                    refused = Some(Error::Forbidden(
+                        "imported human instruction requires the destination owner".into(),
+                    ));
+                    return None;
                 }
                 Some(queue.remove(idx))
             },
@@ -16655,4 +16791,11 @@ impl Services {
 
         Ok(())
     }
+}
+
+/// Opaque positive authorization; only the durable role/credential validator can
+/// construct one, and its guards remain held while the queue lock is acquired.
+pub(crate) struct DestinationOwnerQueueAuthorization {
+    _owner: intent_store::OwnerQueuePermit,
+    _credential: Option<intent_core::caller::CredentialLease>,
 }

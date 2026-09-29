@@ -34,13 +34,7 @@ pub(crate) const NO_ACTIVE_PR: &str = "No active PR";
 /// code) so the background sweeps can detect quota exhaustion and pause
 /// instead of misreporting it as an auth/internal error (monorepo#2961).
 pub(crate) fn map_sc_err(e: intent_sourcecontrol::Error) -> Error {
-    match e {
-        intent_sourcecontrol::Error::Unsupported(msg) => {
-            Error::Internal(format!("unsupported by provider: {msg}"))
-        }
-        intent_sourcecontrol::Error::RateLimited(msg) => Error::RateLimited(msg),
-        other => Error::Internal(other.to_string()),
-    }
+    crate::host_execution::forge_error(e)
 }
 
 /// Resolve the active [`SourceControl`]: the injected handle (tests / explicit
@@ -581,6 +575,7 @@ pub(crate) const MAX_STALE_POOL_REFETCHES: usize = 5;
 /// exhausted quota for the same answer) and the caller pauses the sweeps
 /// instead of this loop WARN-ing per entry.
 pub(crate) async fn refresh_stale_pool_entries(
+    services: &crate::Services,
     sc: &dyn SourceControl,
     repo_ref: &RepoRef,
     list: &mut Option<Vec<PullRequestInfo>>,
@@ -595,11 +590,25 @@ pub(crate) async fn refresh_stale_pool_entries(
         .filter(|p| p.status != PullRequestStatus::Merged && !fetched_fresh.contains(&p.number))
         .map(|p| (parse_iso(&p.updated_at), p.number))
         .collect();
-    candidates.sort();
+    // Unread/least-recently-attempted records first. Forge updatedAt alone
+    // never moves for a quiet open PR, so it could pin the same five entries
+    // ahead of the rest of a long history forever.
+    candidates.sort_by_key(|(updated, number)| {
+        (
+            services.pr_discovery.last_attempt(sc, repo_ref, *number),
+            *updated,
+            *number,
+        )
+    });
     candidates.truncate(MAX_STALE_POOL_REFETCHES);
     let mut changed = false;
     for (_, number) in candidates {
-        match tokio::time::timeout(per_entry_timeout, sc.get_pr(repo_ref, number)).await {
+        match tokio::time::timeout(
+            per_entry_timeout,
+            services.shared_pr_record(sc, repo_ref, number),
+        )
+        .await
+        {
             Ok(Ok(pr)) => {
                 fetched_fresh.push(number);
                 changed |= upsert_pr_info(list, &mut build_pr_info(&pr));
@@ -1657,7 +1666,13 @@ async fn fallback_check_runs(
         .or_else(|| Some(pr.source_branch.clone()).filter(|s| !s.is_empty()));
     match head_ref {
         Some(git_ref) if !rollup_known && sc.capabilities().check_runs => {
-            let runs = degrade_unless_rate_limited(sc.check_runs(repo_ref, &git_ref).await)?;
+            let runs = degrade_unless_rate_limited(
+                intent_sourcecontrol::traffic::with_attempt(
+                    intent_sourcecontrol::traffic::Attempt::Fallback,
+                    sc.check_runs(repo_ref, &git_ref),
+                )
+                .await,
+            )?;
             let complete = runs.is_some();
             Ok((runs.unwrap_or_default(), complete))
         }
@@ -1689,7 +1704,12 @@ async fn read_review_thread_tally(
                 pr_number = number,
                 "merge requirements: review threads unavailable, falling back to REST comments (thread resolution state unavailable, unresolved count reported as unknown)"
             );
-            match fetch_all_pages(|p| sc.list_review_comments(repo_ref, number, p)).await {
+            match intent_sourcecontrol::traffic::with_attempt(
+                intent_sourcecontrol::traffic::Attempt::Fallback,
+                fetch_all_pages(|p| sc.list_review_comments(repo_ref, number, p)),
+            )
+            .await
+            {
                 Ok((comments, _, _)) => Ok((
                     count_thread_comments(&fallback_threads(comments)).0,
                     None,

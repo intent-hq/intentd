@@ -75,11 +75,11 @@ impl CallerClass {
         match self {
             CallerClass::Administrator => Some(Caller::Wire {
                 principal_id: PrincipalId(CALLER_PRINCIPAL.into()),
-                is_administrator: true,
+                host_role: crate::HostRole::Owner,
             }),
             CallerClass::AuthorGuest | CallerClass::ForeignGuest => Some(Caller::Wire {
                 principal_id: PrincipalId(CALLER_PRINCIPAL.into()),
-                is_administrator: false,
+                host_role: crate::HostRole::Guest,
             }),
             CallerClass::Agent => Some(Caller::Agent {
                 agent_id: AgentId(AGENT_CALLER.into()),

@@ -355,7 +355,7 @@ mod collaborator_fan_out {
         let principal_id = PrincipalId::new();
         let guest = Caller::Wire {
             principal_id: principal_id.clone(),
-            is_administrator: false,
+            host_role: intent_core::HostRole::Guest,
         };
         let mut h = subscribe(guest, &["ws-1"], json!({"eventTypes":["note:*"]})).await;
         h.bus.publish(&event(NOTE_UPDATED, "ws-2")).await.unwrap();
@@ -397,7 +397,7 @@ mod collaborator_fan_out {
         let principal_id = PrincipalId::new();
         let guest = Caller::Wire {
             principal_id: principal_id.clone(),
-            is_administrator: false,
+            host_role: intent_core::HostRole::Guest,
         };
         let mut scoped = subscribe(
             guest.clone(),
@@ -478,7 +478,7 @@ mod collaborator_fan_out {
         let principal_id = PrincipalId::new();
         let guest = Caller::Wire {
             principal_id: principal_id.clone(),
-            is_administrator: false,
+            host_role: intent_core::HostRole::Guest,
         };
         let mut h = subscribe(
             guest,
@@ -518,7 +518,7 @@ mod collaborator_fan_out {
     async fn non_administrator_receives_only_allowlisted_types() {
         let guest = Caller::Wire {
             principal_id: PrincipalId::new(),
-            is_administrator: false,
+            host_role: intent_core::HostRole::Guest,
         };
         assert_eq!(
             subscribe_and_publish(guest).await,
@@ -530,7 +530,7 @@ mod collaborator_fan_out {
     async fn administrator_receives_everything_named() {
         let owner = Caller::Wire {
             principal_id: PrincipalId::new(),
-            is_administrator: true,
+            host_role: intent_core::HostRole::Owner,
         };
         assert_eq!(
             subscribe_and_publish(owner).await,
@@ -606,7 +606,7 @@ mod collaborator_fan_out {
         let principal_id = PrincipalId::new();
         let guest = Caller::Wire {
             principal_id: principal_id.clone(),
-            is_administrator: false,
+            host_role: intent_core::HostRole::Guest,
         };
         let frames = queue_frames_for(guest, &principal_id).await;
         assert_eq!(frames.len(), 1, "{frames:?}");
@@ -622,7 +622,7 @@ mod collaborator_fan_out {
         let principal_id = PrincipalId::new();
         let owner = Caller::Wire {
             principal_id: principal_id.clone(),
-            is_administrator: true,
+            host_role: intent_core::HostRole::Owner,
         };
         let agent = Caller::Agent {
             agent_id: AgentId::from("agent-9"),
@@ -697,7 +697,7 @@ mod collaborator_fan_out {
         let principal_id = PrincipalId::new();
         let guest = Caller::Wire {
             principal_id: principal_id.clone(),
-            is_administrator: false,
+            host_role: intent_core::HostRole::Guest,
         };
         let frames = processing_frames_for(guest, &principal_id).await;
         assert_eq!(frames.len(), 4, "{frames:?}");
@@ -722,7 +722,7 @@ mod collaborator_fan_out {
         let principal_id = PrincipalId::new();
         let owner = Caller::Wire {
             principal_id: principal_id.clone(),
-            is_administrator: true,
+            host_role: intent_core::HostRole::Owner,
         };
         let agent = Caller::Agent {
             agent_id: AgentId::from("agent-9"),
@@ -737,10 +737,10 @@ mod collaborator_fan_out {
     }
 
     /// The reverse registry's transition → event-type mapping resolves to
-    /// taxonomy members that the allowlist refuses, so the exhaustive golden
-    /// in `intent-core/tests/events.rs` covers the transport's own emits.
+    /// taxonomy members that support caller-filtered device delivery. The
+    /// membership gate applies each guest's self-only audience separately.
     #[test]
-    fn client_transitions_publish_taxonomy_types_outside_the_allowlist() {
+    fn client_transitions_publish_taxonomy_types_with_scoped_audience() {
         use crate::reverse::{ClientTransition, ReverseClientIdentity};
         use intent_core::{ClientHostInfo, ClientId};
 
@@ -760,7 +760,7 @@ mod collaborator_fan_out {
         ] {
             let ty = transition.event_type();
             assert!(intent_core::events::is_known_event_type(ty), "{ty}");
-            assert!(!intent_core::events::is_collaborator_event_type(ty), "{ty}");
+            assert!(intent_core::events::is_collaborator_event_type(ty), "{ty}");
         }
     }
 }

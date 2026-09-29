@@ -41,6 +41,9 @@ pub struct NewEvent {
 /// fields are ignored. Results are ordered newest-first (`timestamp` DESC).
 #[derive(Debug, Clone, Default)]
 pub struct EventQuery {
+    /// Guests may read only their own device events, including legacy/durable
+    /// rows. Applied in SQL before limits and paging, not after fetching.
+    pub client_principal_id: Option<intent_core::PrincipalId>,
     pub workspace_id: Option<WorkspaceId>,
     pub event_types: Vec<String>,
     /// Prefix match over `event_type` (e.g. `"note:"` for the note category),
@@ -213,6 +216,16 @@ impl Store {
     pub async fn query_events(&self, q: &EventQuery) -> Result<Vec<Event>> {
         let mut qb: QueryBuilder<Sqlite> =
             QueryBuilder::new(format!("SELECT {EVENT_COLUMNS} FROM event WHERE 1=1"));
+        if let Some(principal) = &q.client_principal_id {
+            qb.push(" AND (event_type NOT IN (");
+            let mut sep = qb.separated(", ");
+            for kind in intent_core::events::CLIENT_EVENT_TYPES {
+                sep.push_bind(*kind);
+            }
+            qb.push(") OR json_extract(data_json, '$.principalId') = ")
+                .push_bind(principal.as_str())
+                .push(")");
+        }
         if let Some(ws) = &q.workspace_id {
             qb.push(" AND workspace_id = ").push_bind(ws.0.clone());
         }

@@ -7,7 +7,7 @@
 
 /// Errors surfaced by [`crate::SourceControl`] implementations and the
 /// [`crate::SourceControlRegistry`].
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum Error {
     /// No usable credential/configuration for the active provider. The daemon
     /// keeps running and source-control features report this (graceful per
@@ -55,6 +55,15 @@ pub enum Error {
     /// the caller can offer the PAT path for that instance instead.
     #[error("device authorization grant unsupported on {0}; use a personal access token")]
     DeviceGrantUnsupported(String),
+}
+
+impl Error {
+    /// A scope rejection already classified as a forge authorization error.
+    /// Preserve the legacy Auth variant for existing account/proof consumers.
+    #[must_use]
+    pub fn is_insufficient_scope(&self) -> bool {
+        matches!(self, Self::Auth(message) if message.contains("insufficient_scope") || message.contains("requires a token with"))
+    }
 }
 
 /// Result alias used throughout the crate.

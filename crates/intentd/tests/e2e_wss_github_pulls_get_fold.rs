@@ -583,136 +583,143 @@ async fn assert_no_events(ws: &mut TlsWs) {
 /// snapshot. A fetch for a PR nobody references writes nothing.
 #[tokio::test]
 async fn github_pulls_get_folds_fetched_pr_into_workspace_pr_state_over_wss() {
-    let fx = boot().await;
-    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    for context in [None, Some("workspace-route")] {
+        let fx = boot().await;
+        let mut rpc = connect(fx.port, fx.cfg.clone()).await;
 
-    // Baseline read: the stale Open snapshot reads `pr_ready`, and this
-    // first observation seeds the displayStatus transition baseline.
-    let before = wss_rpc(
-        &mut rpc,
-        1,
-        "workspace.get",
-        json!({ "workspaceId": fx.ws_id.as_str() }),
-    )
-    .await;
-    assert_eq!(before["workspace"]["prStatus"], "Open");
-    assert_eq!(before["workspace"]["displayStatus"], "pr_ready");
+        // Baseline read: the stale Open snapshot reads `pr_ready`, and this
+        // first observation seeds the displayStatus transition baseline.
+        let before = context_rpc(
+            context,
+            &mut rpc,
+            1,
+            "workspace.get",
+            json!({ "workspaceId": fx.ws_id.as_str() }),
+        )
+        .await;
+        assert_eq!(before["workspace"]["prStatus"], "Open");
+        assert_eq!(before["workspace"]["displayStatus"], "pr_ready");
 
-    // Subscribe on a separate connection before driving the fetch.
-    let mut sub = connect(fx.port, fx.cfg.clone()).await;
-    let sub_res = wss_rpc(
-        &mut sub,
-        10,
-        "events.subscribe",
-        json!({
-            "eventTypes": ["pr:updated", "gitRoot:updated", "workspace:displayStatus-changed"],
-            "workspaceId": fx.ws_id.as_str(),
-        }),
-    )
-    .await;
-    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+        // Subscribe on a separate connection before driving the fetch.
+        let mut sub = connect(fx.port, fx.cfg.clone()).await;
+        let sub_res = context_rpc(
+            context,
+            &mut sub,
+            10,
+            "events.subscribe",
+            json!({
+                "eventTypes": ["pr:updated", "gitRoot:updated", "workspace:displayStatus-changed"],
+                "workspaceId": fx.ws_id.as_str(),
+            }),
+        )
+        .await;
+        assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
 
-    // The hover card's on-demand fetch: response envelope per §5.27.
-    let envelope = wss_call(
-        &mut rpc,
-        2,
-        "github.pulls.get",
-        json!({ "owner": "o", "repo": "r", "number": 42 }),
-    )
-    .await;
-    assert_eq!(envelope["jsonrpc"], "2.0");
-    assert_eq!(envelope["id"], 2);
-    assert!(envelope.get("error").is_none(), "errored: {envelope}");
-    let pull = &envelope["result"]["pull"];
-    assert_eq!(pull["number"], 42);
-    assert_eq!(pull["htmlUrl"], PR_URL);
-    assert_eq!(pull["state"], "closed");
-    assert_eq!(pull["merged"], true);
-    assert_eq!(pull["draft"], false);
-    assert_eq!(pull["headRef"], "feature");
-    // The additive, presence-detected merge-queue flag rides the shared PR
-    // cache's checklist onto the hover card (§5.27).
-    assert_eq!(pull["isInMergeQueue"], true, "pull: {pull}");
-    assert_eq!(fx.forge.fetches(), 1, "a cache miss is one forge PR read");
-    let first_pull = pull.clone();
+        // The hover card's on-demand fetch: response envelope per §5.27.
+        let envelope = wss_call(
+            &mut rpc,
+            2,
+            "github.pulls.get",
+            json!({ "owner": "o", "repo": "r", "number": 42 }),
+        )
+        .await;
+        assert_eq!(envelope["jsonrpc"], "2.0");
+        assert_eq!(envelope["id"], 2);
+        assert!(envelope.get("error").is_none(), "errored: {envelope}");
+        let pull = &envelope["result"]["pull"];
+        assert_eq!(pull["number"], 42);
+        assert_eq!(pull["htmlUrl"], PR_URL);
+        assert_eq!(pull["state"], "closed");
+        assert_eq!(pull["merged"], true);
+        assert_eq!(pull["draft"], false);
+        assert_eq!(pull["headRef"], "feature");
+        // The additive, presence-detected merge-queue flag rides the shared PR
+        // cache's checklist onto the hover card (§5.27).
+        assert_eq!(pull["isInMergeQueue"], true, "pull: {pull}");
+        assert_eq!(fx.forge.fetches(), 1, "a cache miss is one forge PR read");
+        let first_pull = pull.clone();
 
-    // The fold's events: the workspace delta first (pool + linked columns,
-    // then the derived rollup), the git root's pool delta after.
-    let events = next_events(&mut sub, 3).await;
-    assert_eq!(events[0]["type"], "pr:updated", "events: {events:?}");
-    assert_eq!(events[0]["workspaceId"], fx.ws_id.as_str());
-    assert_eq!(events[0]["data"]["prNumber"], 42);
-    assert_eq!(events[0]["data"]["prStatus"], "Merged");
-    assert_eq!(events[0]["data"]["activePullRequest"]["status"], "Merged");
-    assert_eq!(events[0]["data"]["activePullRequest"]["url"], PR_URL);
-    let pooled = events[0]["data"]["pullRequests"]
-        .as_array()
-        .expect("pullRequests array");
-    assert_eq!(pooled.len(), 1, "pool upserted in place: {pooled:?}");
-    assert_eq!(pooled[0]["status"], "Merged");
+        // The fold's events: the workspace delta first (pool + linked columns,
+        // then the derived rollup), the git root's pool delta after.
+        let events = next_events(&mut sub, 3).await;
+        assert_eq!(events[0]["type"], "pr:updated", "events: {events:?}");
+        assert_eq!(events[0]["workspaceId"], fx.ws_id.as_str());
+        assert_eq!(events[0]["data"]["prNumber"], 42);
+        assert_eq!(events[0]["data"]["prStatus"], "Merged");
+        assert_eq!(events[0]["data"]["activePullRequest"]["status"], "Merged");
+        assert_eq!(events[0]["data"]["activePullRequest"]["url"], PR_URL);
+        let pooled = events[0]["data"]["pullRequests"]
+            .as_array()
+            .expect("pullRequests array");
+        assert_eq!(pooled.len(), 1, "pool upserted in place: {pooled:?}");
+        assert_eq!(pooled[0]["status"], "Merged");
 
-    assert_eq!(
-        events[1]["type"], "workspace:displayStatus-changed",
-        "events: {events:?}"
-    );
-    assert_eq!(
-        events[1]["data"],
-        json!({ "workspaceId": fx.ws_id.as_str(), "displayStatus": "pr_merged" })
-    );
+        assert_eq!(
+            events[1]["type"], "workspace:displayStatus-changed",
+            "events: {events:?}"
+        );
+        assert_eq!(
+            events[1]["data"],
+            json!({ "workspaceId": fx.ws_id.as_str(), "displayStatus": "pr_merged" })
+        );
 
-    assert_eq!(events[2]["type"], "gitRoot:updated", "events: {events:?}");
-    assert_eq!(events[2]["data"]["gitRoot"]["id"], fx.root_id.as_str());
-    let root_pool = events[2]["data"]["gitRoot"]["pullRequests"]
-        .as_array()
-        .expect("root pullRequests array");
-    assert_eq!(root_pool.len(), 1, "root pool upserted: {root_pool:?}");
-    assert_eq!(root_pool[0]["status"], "Merged");
-    assert_eq!(root_pool[0]["url"], PR_URL);
+        assert_eq!(events[2]["type"], "gitRoot:updated", "events: {events:?}");
+        assert_eq!(events[2]["data"]["gitRoot"]["id"], fx.root_id.as_str());
+        let root_pool = events[2]["data"]["gitRoot"]["pullRequests"]
+            .as_array()
+            .expect("root pullRequests array");
+        assert_eq!(root_pool.len(), 1, "root pool upserted: {root_pool:?}");
+        assert_eq!(root_pool[0]["status"], "Merged");
+        assert_eq!(root_pool[0]["url"], PR_URL);
 
-    // The persisted state the sidebar reads back.
-    let after = wss_rpc(
-        &mut rpc,
-        3,
-        "workspace.get",
-        json!({ "workspaceId": fx.ws_id.as_str() }),
-    )
-    .await;
-    assert_eq!(after["workspace"]["prStatus"], "Merged");
-    assert_eq!(after["workspace"]["prUrl"], PR_URL);
-    assert_eq!(after["workspace"]["activePullRequest"]["status"], "Merged");
-    assert_eq!(after["workspace"]["pullRequests"][0]["status"], "Merged");
-    assert_eq!(after["workspace"]["displayStatus"], "pr_merged");
+        // The persisted state the sidebar reads back.
+        let after = context_rpc(
+            context,
+            &mut rpc,
+            3,
+            "workspace.get",
+            json!({ "workspaceId": fx.ws_id.as_str() }),
+        )
+        .await;
+        assert_eq!(after["workspace"]["prStatus"], "Merged");
+        assert_eq!(after["workspace"]["prUrl"], PR_URL);
+        assert_eq!(after["workspace"]["activePullRequest"]["status"], "Merged");
+        assert_eq!(after["workspace"]["pullRequests"][0]["status"], "Merged");
+        assert_eq!(after["workspace"]["displayStatus"], "pr_merged");
 
-    // A PR nobody references: the hover card still gets its `{ pull }`, and
-    // the fold writes nothing (no events).
-    let other = wss_rpc(
-        &mut rpc,
-        4,
-        "github.pulls.get",
-        json!({ "owner": "o", "repo": "r", "number": 99 }),
-    )
-    .await;
-    assert_eq!(other["pull"]["number"], 99);
-    assert_eq!(fx.forge.fetches(), 2, "another PR is another miss");
-    assert_no_events(&mut sub).await;
+        // A PR nobody references: the hover card still gets its `{ pull }`, and
+        // the fold writes nothing (no events).
+        let other = context_rpc(
+            context,
+            &mut rpc,
+            4,
+            "github.pulls.get",
+            json!({ "owner": "o", "repo": "r", "number": 99 }),
+        )
+        .await;
+        assert_eq!(other["pull"]["number"], 99);
+        assert_eq!(fx.forge.fetches(), 2, "another PR is another miss");
+        assert_no_events(&mut sub).await;
 
-    // A repeat hover within `prCache.maxAgeSeconds` is served from the
-    // shared cache: the same `{ pull }`, no forge request, and — the served
-    // snapshot agreeing with the pool — nothing to fold (no events).
-    let again = wss_rpc(
-        &mut rpc,
-        5,
-        "github.pulls.get",
-        json!({ "owner": "o", "repo": "r", "number": 42 }),
-    )
-    .await;
-    assert_eq!(again["pull"], first_pull, "a hit answers the cached object");
-    assert_eq!(
-        fx.forge.fetches(),
-        2,
-        "a hit within max_age costs no forge request"
-    );
-    assert_no_events(&mut sub).await;
+        // A repeat hover within `prCache.maxAgeSeconds` is served from the
+        // shared cache: the same `{ pull }`, no forge request, and — the served
+        // snapshot agreeing with the pool — nothing to fold (no events).
+        let again = context_rpc(
+            context,
+            &mut rpc,
+            5,
+            "github.pulls.get",
+            json!({ "owner": "o", "repo": "r", "number": 42 }),
+        )
+        .await;
+        assert_eq!(again["pull"], first_pull, "a hit answers the cached object");
+        assert_eq!(
+            fx.forge.fetches(),
+            2,
+            "a hit within max_age costs no forge request"
+        );
+        assert_no_events(&mut sub).await;
+    }
 }
 
 /// The pool path of intent-hq/intent#5654, with NO PR monitor: hovering a
@@ -725,119 +732,143 @@ async fn github_pulls_get_folds_fetched_pr_into_workspace_pr_state_over_wss() {
 /// signal, so the sidebar does not flap back to `pr_ready`.
 #[tokio::test]
 async fn github_pulls_get_folds_is_in_merge_queue_and_reads_pr_queued_over_wss() {
-    let fx = boot().await;
-    fx.forge.serve_open.store(true, Ordering::SeqCst);
-    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    for context in [None, Some("workspace-route")] {
+        let fx = boot().await;
+        fx.forge.serve_open.store(true, Ordering::SeqCst);
+        let mut rpc = connect(fx.port, fx.cfg.clone()).await;
 
-    // Baseline: the persisted REST-only snapshot reads `pr_ready` and carries
-    // no `isInMergeQueue` key at all (presence-detected).
-    let before = wss_rpc(
-        &mut rpc,
-        1,
-        "workspace.get",
-        json!({ "workspaceId": fx.ws_id.as_str() }),
-    )
-    .await;
-    assert_eq!(before["workspace"]["displayStatus"], "pr_ready");
-    assert!(
-        before["workspace"]["pullRequests"][0]
-            .get("isInMergeQueue")
-            .is_none(),
-        "seeded pool: {}",
-        before["workspace"]["pullRequests"]
-    );
+        // Baseline: the persisted REST-only snapshot reads `pr_ready` and carries
+        // no `isInMergeQueue` key at all (presence-detected).
+        let before = context_rpc(
+            context,
+            &mut rpc,
+            1,
+            "workspace.get",
+            json!({ "workspaceId": fx.ws_id.as_str() }),
+        )
+        .await;
+        assert_eq!(before["workspace"]["displayStatus"], "pr_ready");
+        assert!(
+            before["workspace"]["pullRequests"][0]
+                .get("isInMergeQueue")
+                .is_none(),
+            "seeded pool: {}",
+            before["workspace"]["pullRequests"]
+        );
 
-    let mut sub = connect(fx.port, fx.cfg.clone()).await;
-    let sub_res = wss_rpc(
-        &mut sub,
-        10,
-        "events.subscribe",
-        json!({
-            "eventTypes": ["pr:updated", "gitRoot:updated", "workspace:displayStatus-changed"],
-            "workspaceId": fx.ws_id.as_str(),
-        }),
-    )
-    .await;
-    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+        let mut sub = connect(fx.port, fx.cfg.clone()).await;
+        let sub_res = context_rpc(
+            context,
+            &mut sub,
+            10,
+            "events.subscribe",
+            json!({
+                "eventTypes": ["pr:updated", "gitRoot:updated", "workspace:displayStatus-changed"],
+                "workspaceId": fx.ws_id.as_str(),
+            }),
+        )
+        .await;
+        assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
 
-    let hover = wss_rpc(
-        &mut rpc,
-        2,
-        "github.pulls.get",
-        json!({ "owner": "o", "repo": "r", "number": 42 }),
-    )
-    .await;
-    assert_eq!(hover["pull"]["state"], "open");
-    assert_eq!(hover["pull"]["mergeableState"], "clean");
-    assert_eq!(hover["pull"]["isInMergeQueue"], true, "pull: {hover}");
-    assert_eq!(fx.forge.fetches(), 1);
+        let hover = context_rpc(
+            context,
+            &mut rpc,
+            2,
+            "github.pulls.get",
+            json!({ "owner": "o", "repo": "r", "number": 42 }),
+        )
+        .await;
+        assert_eq!(hover["pull"]["state"], "open");
+        assert_eq!(hover["pull"]["mergeableState"], "clean");
+        assert_eq!(hover["pull"]["isInMergeQueue"], true, "pull: {hover}");
+        assert_eq!(fx.forge.fetches(), 1);
 
-    // The fold: the signal lands on the linked copy and the pool entry, the
-    // rollup moves to `pr_queued`, and the git root's pool copy follows.
-    let events = next_events(&mut sub, 3).await;
-    assert_eq!(events[0]["type"], "pr:updated", "events: {events:?}");
-    assert_eq!(events[0]["data"]["prStatus"], "Open");
-    assert_eq!(
-        events[0]["data"]["activePullRequest"]["isInMergeQueue"], true,
-        "events: {events:?}"
-    );
-    let pooled = events[0]["data"]["pullRequests"]
-        .as_array()
-        .expect("pullRequests array");
-    assert_eq!(pooled.len(), 1, "pool upserted in place: {pooled:?}");
-    assert_eq!(pooled[0]["status"], "Open");
-    assert_eq!(pooled[0]["mergeableState"], "clean");
-    assert_eq!(pooled[0]["isInMergeQueue"], true);
-    assert_eq!(
-        events[1]["type"], "workspace:displayStatus-changed",
-        "events: {events:?}"
-    );
-    assert_eq!(
-        events[1]["data"],
-        json!({ "workspaceId": fx.ws_id.as_str(), "displayStatus": "pr_queued" })
-    );
-    assert_eq!(events[2]["type"], "gitRoot:updated", "events: {events:?}");
-    assert_eq!(
-        events[2]["data"]["gitRoot"]["pullRequests"][0]["isInMergeQueue"], true,
-        "events: {events:?}"
-    );
+        // The fold: the signal lands on the linked copy and the pool entry, the
+        // rollup moves to `pr_queued`, and the git root's pool copy follows.
+        let events = next_events(&mut sub, 3).await;
+        assert_eq!(events[0]["type"], "pr:updated", "events: {events:?}");
+        assert_eq!(events[0]["data"]["prStatus"], "Open");
+        assert_eq!(
+            events[0]["data"]["activePullRequest"]["isInMergeQueue"], true,
+            "events: {events:?}"
+        );
+        let pooled = events[0]["data"]["pullRequests"]
+            .as_array()
+            .expect("pullRequests array");
+        assert_eq!(pooled.len(), 1, "pool upserted in place: {pooled:?}");
+        assert_eq!(pooled[0]["status"], "Open");
+        assert_eq!(pooled[0]["mergeableState"], "clean");
+        assert_eq!(pooled[0]["isInMergeQueue"], true);
+        assert_eq!(
+            events[1]["type"], "workspace:displayStatus-changed",
+            "events: {events:?}"
+        );
+        assert_eq!(
+            events[1]["data"],
+            json!({ "workspaceId": fx.ws_id.as_str(), "displayStatus": "pr_queued" })
+        );
+        assert_eq!(events[2]["type"], "gitRoot:updated", "events: {events:?}");
+        assert_eq!(
+            events[2]["data"]["gitRoot"]["pullRequests"][0]["isInMergeQueue"], true,
+            "events: {events:?}"
+        );
 
-    let after = wss_rpc(
-        &mut rpc,
-        3,
-        "workspace.get",
-        json!({ "workspaceId": fx.ws_id.as_str() }),
-    )
-    .await;
-    assert_eq!(after["workspace"]["displayStatus"], "pr_queued");
-    assert_eq!(
-        after["workspace"]["activePullRequest"]["isInMergeQueue"],
-        true
-    );
-    assert_eq!(
-        after["workspace"]["pullRequests"][0]["isInMergeQueue"],
-        true
-    );
+        let after = context_rpc(
+            context,
+            &mut rpc,
+            3,
+            "workspace.get",
+            json!({ "workspaceId": fx.ws_id.as_str() }),
+        )
+        .await;
+        assert_eq!(after["workspace"]["displayStatus"], "pr_queued");
+        assert_eq!(
+            after["workspace"]["activePullRequest"]["isInMergeQueue"],
+            true
+        );
+        assert_eq!(
+            after["workspace"]["pullRequests"][0]["isInMergeQueue"],
+            true
+        );
 
-    // A REST-only refresh on the same open head cannot see the queue; the
-    // persisted signal is carried, so nothing changes and no event fires.
-    let refreshed = wss_rpc(
-        &mut rpc,
-        4,
-        "pr.refresh",
-        json!({ "workspaceId": fx.ws_id.as_str() }),
-    )
-    .await;
-    assert_eq!(refreshed["outcome"], "unchanged", "refresh: {refreshed}");
-    assert_eq!(refreshed["pullRequests"][0]["isInMergeQueue"], true);
-    assert_eq!(fx.forge.fetches(), 2, "pr.refresh is one REST read");
-    assert_no_events(&mut sub).await;
-    let still = wss_rpc(
-        &mut rpc,
-        5,
-        "workspace.get",
-        json!({ "workspaceId": fx.ws_id.as_str() }),
-    )
-    .await;
-    assert_eq!(still["workspace"]["displayStatus"], "pr_queued");
+        // A REST-only refresh on the same open head cannot see the queue; the
+        // persisted signal is carried, so nothing changes and no event fires.
+        let refreshed = context_rpc(
+            context,
+            &mut rpc,
+            4,
+            "pr.refresh",
+            json!({ "workspaceId": fx.ws_id.as_str() }),
+        )
+        .await;
+        assert_eq!(refreshed["outcome"], "unchanged", "refresh: {refreshed}");
+        assert_eq!(refreshed["pullRequests"][0]["isInMergeQueue"], true);
+        assert_eq!(fx.forge.fetches(), 2, "pr.refresh is one REST read");
+        assert_no_events(&mut sub).await;
+        let still = context_rpc(
+            context,
+            &mut rpc,
+            5,
+            "workspace.get",
+            json!({ "workspaceId": fx.ws_id.as_str() }),
+        )
+        .await;
+        assert_eq!(still["workspace"]["displayStatus"], "pr_queued");
+    }
+}
+
+// Each existing fixture runs direct and workspace-originated calls with the same assertions.
+async fn context_rpc(
+    context: Option<&str>,
+    ws: &mut TlsWs,
+    id: i64,
+    method: &str,
+    mut params: Value,
+) -> Value {
+    if method.starts_with("github.") {
+        if let Some(context) = context {
+            params["workspaceId"] = json!(context);
+        }
+    }
+    wss_rpc(ws, id, method, params).await
 }

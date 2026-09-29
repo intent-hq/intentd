@@ -1078,3 +1078,320 @@ async fn pr_observation_counts_match_the_per_signal_reads_past_their_ceilings() 
     );
     assert_eq!(tally.unresolved, paged_unresolved);
 }
+
+#[tokio::test]
+async fn traffic_counts_actual_pages_retries_errors_and_caller_without_payloads() {
+    use intent_sourcecontrol::traffic::{
+        with_caller, with_traffic, Caller, Operation, Resource, Traffic,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let calls = Arc::new(AtomicUsize::new(0));
+    let server_calls = calls.clone();
+    let mock = spawn_mock_with_headers(Arc::new(move |request| {
+        let n = server_calls.fetch_add(1, Ordering::SeqCst);
+        assert!(request.contains("authorization: Bearer secret-fixture-token"));
+        let target = request_target(request);
+        let (status, body) = if n == 0 {
+            (500, json!({"message":"temporary"}))
+        } else if target.contains("/rules/branches/") {
+            (403, json!({"message":"forbidden private-body"}))
+        } else if target.contains("/pulls/17") {
+            (404, json!({"message":"missing"}))
+        } else {
+            (200, json!([]))
+        };
+        (status, "x-ratelimit-resource: core\r\nx-ratelimit-remaining: 12\r\nx-ratelimit-limit: 5000\r\nx-ratelimit-used: 4988\r\nx-ratelimit-reset: 1234\r\n".into(), body.to_string())
+    })).await;
+    let sc = GitHubSourceControl::new("secret-fixture-token", Some(&mock.base_uri)).unwrap();
+    let traffic = Traffic::default();
+    let repo = RepoRef::new("private-owner", "private-repo");
+    with_traffic(
+        traffic.clone(),
+        with_caller(Caller::GitRootRefresh, async {
+            for cursor in [None, Some("2".into())] {
+                sc.list_prs(
+                    &repo,
+                    PrQuery {
+                        cursor,
+                        ..PrQuery::default()
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            assert!(sc.get_pr(&repo, 17).await.is_err());
+            assert!(sc.branch_rules(&repo, "private-branch").await.is_err());
+        }),
+    )
+    .await;
+    let snapshot = traffic.snapshot();
+    let discovery = &snapshot.counts[&(Caller::GitRootRefresh, Operation::Discovery)];
+    assert_eq!(
+        discovery.rest_requests, 3,
+        "first page retried once, then page two"
+    );
+    assert_eq!(discovery.page_requests, 3);
+    assert_eq!(discovery.continuation_requests, 1);
+    assert_eq!(discovery.http_errors, 1);
+    assert_eq!(
+        snapshot.counts[&(Caller::GitRootRefresh, Operation::PrDetail)].http_errors,
+        1
+    );
+    assert_eq!(
+        snapshot.counts[&(Caller::GitRootRefresh, Operation::Rules)].rest_requests,
+        1
+    );
+    let quota = &snapshot.quotas[&(Caller::GitRootRefresh, Operation::Discovery, Resource::Core)];
+    assert_eq!(
+        (quota.remaining, quota.used, quota.reset),
+        (Some(12), Some(4988), Some(1234))
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        5,
+        "the collector must not probe GitHub"
+    );
+    let diagnostic = format!("{snapshot:?}");
+    for private in [
+        "secret-fixture-token",
+        "private-owner",
+        "private-repo",
+        "private-branch",
+        "private-body",
+        &mock.base_uri,
+    ] {
+        assert!(!diagnostic.contains(private));
+    }
+}
+
+#[tokio::test]
+async fn traffic_separates_graphql_points_schema_fallback_and_unknown_cost() {
+    use intent_sourcecontrol::traffic::{with_traffic, Caller, Operation, Traffic};
+    let mock = spawn_mock_graphql_with(Arc::new(|request| {
+        assert!(request.contains("rateLimit { cost }"));
+        if request.contains("isInMergeQueue") {
+            json!({"errors":[{"message":"Field 'isInMergeQueue' doesn't exist on type 'PullRequest'"}]}).to_string()
+        } else {
+            json!({"data":{"rateLimit":{"cost":7},"repository":{"pullRequest":{"mergeStateStatus":"CLEAN"}}}}).to_string()
+        }
+    })).await;
+    let sc = GitHubSourceControl::new("fake", Some(&mock.base_uri)).unwrap();
+    let traffic = Traffic::default();
+    with_traffic(
+        traffic.clone(),
+        sc.merge_requirements(&RepoRef::new("o", "r"), 17),
+    )
+    .await
+    .unwrap();
+    let c = traffic.snapshot().counts[&(Caller::OnDemand, Operation::PrDetail)].clone();
+    assert_eq!(c.graphql_requests, 2);
+    assert_eq!(c.graphql_points, 7);
+    assert_eq!(
+        c.graphql_cost_observations, 1,
+        "rejected query's cost remains unknown"
+    );
+    assert_eq!(c.graphql_errors, 1);
+    assert_eq!(c.fallback_requests, 1);
+    assert_eq!(c.rest_requests, 0);
+}
+
+#[tokio::test]
+async fn traffic_counts_redirects_and_retains_task_attribution_across_octocrab_buffer() {
+    use intent_sourcecontrol::traffic::{with_caller, with_traffic, Caller, Operation, Traffic};
+    let mock = spawn_mock_with_headers(Arc::new(|request| {
+        if request_target(request).contains("/pulls?") {
+            (
+                307,
+                "location: /repos/o/r/pulls-redirected\r\n".into(),
+                "{}".into(),
+            )
+        } else {
+            (200, String::new(), "[]".into())
+        }
+    }))
+    .await;
+    let sc = GitHubSourceControl::new("fake", Some(&mock.base_uri)).unwrap();
+    let traffic = Traffic::default();
+    let repo = RepoRef::new("o", "r");
+    with_traffic(traffic.clone(), async {
+        let (a, b) = tokio::join!(
+            with_caller(
+                Caller::WorkspaceRefresh,
+                sc.list_prs(&repo, PrQuery::default())
+            ),
+            with_caller(
+                Caller::GitRootRefresh,
+                sc.list_prs(&repo, PrQuery::default())
+            )
+        );
+        a.unwrap();
+        b.unwrap();
+    })
+    .await;
+    let snapshot = traffic.snapshot();
+    for caller in [Caller::WorkspaceRefresh, Caller::GitRootRefresh] {
+        assert_eq!(
+            snapshot.counts[&(caller, Operation::Discovery)].rest_requests,
+            1
+        );
+        assert_eq!(
+            snapshot.counts[&(caller, Operation::Other)].rest_requests,
+            1
+        );
+    }
+    assert!(!snapshot.counts.keys().any(|(c, _)| *c == Caller::OnDemand));
+}
+
+#[tokio::test]
+async fn traffic_records_transport_failures_without_inventing_quota_or_success() {
+    use intent_sourcecontrol::traffic::{with_traffic, Caller, Operation, Traffic};
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    // A bound, non-listening socket is not portable; close each accepted stream
+    // instead so every attempt fails without reserving a supposedly unused port.
+    let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = accepts.clone();
+    let server = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            drop(stream);
+        }
+    });
+    let sc = GitHubSourceControl::new("fake", Some(&format!("http://{address}"))).unwrap();
+    let traffic = Traffic::default();
+    let result = with_traffic(traffic.clone(), sc.get_pr(&RepoRef::new("o", "r"), 1)).await;
+    server.abort();
+    assert!(result.is_err());
+    let s = traffic.snapshot();
+    let c = &s.counts[&(Caller::OnDemand, Operation::PrDetail)];
+    assert_eq!(
+        c.rest_requests, 4,
+        "original attempt and three configured retries"
+    );
+    assert_eq!(c.transport_errors, 4);
+    assert_eq!(c.http_errors, 0);
+    assert!(s.quotas.is_empty());
+    assert_eq!(accepts.load(std::sync::atomic::Ordering::SeqCst), 4);
+}
+
+#[tokio::test]
+async fn traffic_quota_probes_are_separate_and_enterprise_paths_are_classified() {
+    use intent_sourcecontrol::traffic::{with_traffic, Caller, Operation, Resource, Traffic};
+    let mock = spawn_mock_with_headers(Arc::new(|request| {
+        let target = request_target(request);
+        assert!(target.starts_with("/api/v3/"));
+        let resource = if target.ends_with("/graphql") { "graphql" } else { "core" };
+        (200, format!("x-ratelimit-resource: {resource}\r\nx-ratelimit-limit: 5000\r\nx-ratelimit-remaining: 4999\r\n"), "[]".into())
+    })).await;
+    let sc = GitHubSourceControl::new("fake", Some(&format!("{}/api/v3", mock.base_uri))).unwrap();
+    let traffic = Traffic::default();
+    with_traffic(traffic.clone(), async {
+        sc.rate_limit_status().await.unwrap();
+        sc.list_prs(&RepoRef::new("o", "r"), PrQuery::default())
+            .await
+            .unwrap();
+    })
+    .await;
+    let s = traffic.snapshot();
+    let probes = &s.counts[&(Caller::OnDemand, Operation::QuotaProbe)];
+    assert_eq!((probes.rest_requests, probes.graphql_requests), (1, 1));
+    assert_eq!(
+        s.counts[&(Caller::OnDemand, Operation::Discovery)].rest_requests,
+        1
+    );
+    assert_eq!(
+        s.quotas[&(Caller::OnDemand, Operation::QuotaProbe, Resource::Core)].responses,
+        1
+    );
+    assert_eq!(
+        s.quotas[&(Caller::OnDemand, Operation::QuotaProbe, Resource::Graphql)].responses,
+        1
+    );
+}
+
+#[tokio::test]
+async fn traffic_transport_strips_authentication_on_cross_origin_redirects() {
+    let destination = spawn_mock_with(Arc::new(|request| {
+        assert!(
+            !request.to_ascii_lowercase().contains("authorization:"),
+            "redirect must not disclose credentials"
+        );
+        (200, "[]".into())
+    }))
+    .await;
+    let location = format!("location: {}/repos/o/r/pulls\r\n", destination.base_uri);
+    let origin = spawn_mock_with_headers(Arc::new(move |request| {
+        assert!(request.contains("authorization: Bearer private-token"));
+        (307, location.clone(), "{}".into())
+    }))
+    .await;
+    let sc = GitHubSourceControl::new("private-token", Some(&origin.base_uri)).unwrap();
+    sc.list_prs(&RepoRef::new("o", "r"), PrQuery::default())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn traffic_rest_branch_named_graphql_remains_rules_with_enterprise_prefix() {
+    use intent_sourcecontrol::traffic::{with_traffic, Caller, Operation, Traffic};
+    for prefix in ["", "/api/v3"] {
+        let expected = format!("{prefix}/repos/o/r/rules/branches/graphql");
+        let mock = spawn_mock_with(Arc::new(move |request| {
+            assert_eq!(request_target(request), expected);
+            (200, "[]".into())
+        }))
+        .await;
+        let sc =
+            GitHubSourceControl::new("fake", Some(&format!("{}{prefix}", mock.base_uri))).unwrap();
+        let traffic = Traffic::default();
+        with_traffic(
+            traffic.clone(),
+            sc.branch_rules(&RepoRef::new("o", "r"), "graphql"),
+        )
+        .await
+        .unwrap();
+        let snapshot = traffic.snapshot();
+        let counts = snapshot
+            .counts
+            .get(&(Caller::OnDemand, Operation::Rules))
+            .expect("REST rules attribution");
+        assert_eq!(
+            (
+                counts.rest_requests,
+                counts.graphql_requests,
+                counts.page_requests
+            ),
+            (1, 0, 0)
+        );
+        assert_eq!(snapshot.counts.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn traffic_comments_count_the_single_first_page() {
+    use intent_sourcecontrol::traffic::{with_traffic, Caller, Operation, Traffic};
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let recorded = calls.clone();
+    let mock = spawn_mock_with(Arc::new(move |request| {
+        recorded.lock().unwrap().push(request_target(request));
+        (200, "[]".into())
+    }))
+    .await;
+    let sc = GitHubSourceControl::new("fake", Some(&mock.base_uri)).unwrap();
+    let traffic = Traffic::default();
+    with_traffic(
+        traffic.clone(),
+        sc.list_comments(&RepoRef::new("o", "r"), 1),
+    )
+    .await
+    .unwrap();
+    let snapshot = traffic.snapshot();
+    let counts = &snapshot.counts[&(Caller::OnDemand, Operation::PrDetail)];
+    assert_eq!(counts.rest_requests, 1);
+    assert_eq!(counts.page_requests, 1);
+    assert_eq!(counts.continuation_requests, 0);
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].contains("per_page=100"));
+    assert!(calls[0].contains("sort=created&direction=desc"));
+}

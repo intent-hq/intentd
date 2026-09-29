@@ -126,6 +126,17 @@ struct OneCredential {
 }
 
 impl WorkspaceApi for OneCredential {
+    fn principal_host_role(
+        &self,
+        principal_id: intent_core::PrincipalId,
+    ) -> intent_core::BoxFuture<'_, Result<intent_core::HostRole>> {
+        let role = if principal_id.0 == "primary" {
+            intent_core::HostRole::Owner
+        } else {
+            intent_core::HostRole::Guest
+        };
+        Box::pin(async move { Ok(role) })
+    }
     fn primary_principal_id(&self) -> intent_core::BoxFuture<'_, Result<intent_core::PrincipalId>> {
         Box::pin(async { Ok(intent_core::PrincipalId("primary".into())) })
     }
@@ -225,7 +236,7 @@ async fn resolved_credential_binds_caller() {
         ResolvedCredential::Legacy.into_caller(&api).await,
         Some(Caller::Wire {
             principal_id: intent_core::PrincipalId("primary".into()),
-            is_administrator: true,
+            host_role: intent_core::HostRole::Owner,
         })
     );
     assert_eq!(
@@ -234,12 +245,20 @@ async fn resolved_credential_binds_caller() {
             .await,
         Some(Caller::Wire {
             principal_id: intent_core::PrincipalId("p-collab".into()),
-            is_administrator: false,
+            host_role: intent_core::HostRole::Guest,
         })
     );
     // No principal store: the legacy token is admitted with no caller bound.
     assert_eq!(
         ResolvedCredential::Legacy.into_caller(&NoPrincipals).await,
+        None
+    );
+    // Even a previously resolved credential is not a caller when durable
+    // authority is now unavailable. The upgrade path rejects this case.
+    assert_eq!(
+        ResolvedCredential::Principal(intent_core::PrincipalId("vanished".into()))
+            .into_caller(&NoPrincipals)
+            .await,
         None
     );
 }
@@ -576,4 +595,331 @@ async fn intervening_store_token_wins_over_slow_load() {
         Some("new-token".to_string()),
         "intervening store_token must win against a delayed load result"
     );
+}
+
+#[tokio::test]
+async fn imported_owner_credential_lease_orders_rotation_at_pop() {
+    use futures::FutureExt;
+    use intent_core::caller::LegacyCredentialAuthority;
+    let original = "ab".repeat(32);
+    let replacement = "cd".repeat(32);
+    let backing = Arc::new(MemoryStore::with(&original));
+    let store = async_of(backing.clone());
+    let authority = LegacyAdmission {
+        store: store.clone(),
+        token: original.clone(),
+    };
+    let lease = authority.authorize().await.unwrap();
+    let mut rotation = Box::pin(store.store_token(&replacement));
+    assert!((&mut rotation).now_or_never().is_none());
+    assert_eq!(
+        backing.load_token(),
+        Some(original.clone()),
+        "durable rotation cannot pass the authorized pop"
+    );
+    drop(lease);
+    rotation.await.unwrap();
+    assert!(authority.authorize().await.is_err());
+    let fresh = LegacyAdmission {
+        store: store.clone(),
+        token: replacement.clone(),
+    };
+    drop(fresh.authorize().await.unwrap());
+    store.store_token(&replacement).await.unwrap();
+    drop(fresh.authorize().await.unwrap());
+    store.store_token("").await.unwrap();
+    assert!(fresh.authorize().await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn imported_owner_credential_late_write_keeps_fence_after_timeout_or_cancellation() {
+    use futures::FutureExt;
+    use intent_core::caller::LegacyCredentialAuthority;
+    struct PausedWrite {
+        token: Mutex<Option<String>>,
+        entered: tokio::sync::Notify,
+        release: (Mutex<bool>, std::sync::Condvar),
+    }
+    impl TokenStore for PausedWrite {
+        fn load_token(&self) -> Option<String> {
+            self.token.lock().unwrap().clone()
+        }
+        fn store_token(&self, token: &str) -> Result<()> {
+            self.entered.notify_one();
+            let (lock, cv) = &self.release;
+            let (_released, timeout) = cv
+                .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(10), |v| !*v)
+                .unwrap();
+            assert!(!timeout.timed_out());
+            *self.token.lock().unwrap() = Some(token.to_owned());
+            Ok(())
+        }
+    }
+    for cancel in [false, true] {
+        let old = "ab".repeat(32);
+        let new = "cd".repeat(32);
+        let backing = Arc::new(PausedWrite {
+            token: Mutex::new(Some(old.clone())),
+            entered: tokio::sync::Notify::new(),
+            release: (Mutex::new(false), std::sync::Condvar::new()),
+        });
+        let store = AsyncTokenStore::with_timings(
+            backing.clone(),
+            Duration::from_secs(1),
+            if cancel {
+                Duration::from_secs(10)
+            } else {
+                Duration::from_millis(20)
+            },
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        assert_eq!(store.load_token().await, Some(old.clone()));
+        let writer = tokio::spawn({
+            let store = store.clone();
+            let new = new.clone();
+            async move { store.store_token(&new).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), backing.entered.notified())
+            .await
+            .unwrap();
+        if cancel {
+            writer.abort();
+            assert!(writer.await.unwrap_err().is_cancelled());
+        } else {
+            assert!(writer.await.unwrap().is_err());
+        }
+        let authority = LegacyAdmission {
+            store: store.clone(),
+            token: old,
+        };
+        let mut admission = Box::pin(authority.authorize());
+        assert!(
+            (&mut admission).now_or_never().is_none(),
+            "unfinished durable write retains exclusion after caller exits"
+        );
+        {
+            let (lock, cv) = &backing.release;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+        }
+        assert!(
+            admission.await.is_err(),
+            "late write publishes the new credential before releasing the fence"
+        );
+        assert_eq!(store.load_token().await, Some(new.clone()));
+        assert_eq!(
+            store.changes.borrow().as_deref(),
+            Some(hash_token(&new).as_str())
+        );
+        drop(
+            LegacyAdmission { store, token: new }
+                .authorize()
+                .await
+                .unwrap(),
+        );
+    }
+}
+
+#[tokio::test]
+async fn imported_owner_credential_wait_is_bounded_by_load_timeout() {
+    use intent_core::caller::LegacyCredentialAuthority;
+    let token = "ab".repeat(32);
+    let store = AsyncTokenStore::with_timings(
+        Arc::new(MemoryStore::with(&token)),
+        Duration::from_millis(10),
+        Duration::from_millis(10),
+        Duration::from_secs(60),
+        Duration::from_secs(60),
+    );
+    let authority = LegacyAdmission {
+        store: store.clone(),
+        token,
+    };
+    let writer = store.admission.write().await;
+    let result = tokio::time::timeout(Duration::from_millis(500), authority.authorize()).await;
+    drop(writer);
+    assert!(
+        matches!(result, Ok(Err(_))),
+        "authorization must refuse within its own bound while durable rotation is outstanding"
+    );
+    drop(authority.authorize().await.unwrap());
+}
+
+#[tokio::test]
+async fn imported_owner_credential_write_wait_is_bounded_by_write_timeout() {
+    use intent_core::caller::LegacyCredentialAuthority;
+    let token = "ab".repeat(32);
+    let backing = Arc::new(MemoryStore::with(&token));
+    let store = AsyncTokenStore::with_timings(
+        backing.clone(),
+        Duration::from_millis(10),
+        Duration::from_millis(10),
+        Duration::from_secs(60),
+        Duration::from_secs(60),
+    );
+    let authority = LegacyAdmission {
+        store: store.clone(),
+        token: token.clone(),
+    };
+    let lease = authority.authorize().await.unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_millis(500),
+        store.store_token(&"cd".repeat(32)),
+    )
+    .await;
+    drop(lease);
+    assert!(
+        matches!(result, Ok(Err(_))),
+        "waiting for an admitted pop must share the token write deadline"
+    );
+    assert_eq!(backing.load_token(), Some(token));
+    drop(authority.authorize().await.unwrap());
+}
+
+async fn exercise_writer_ready_after_wait(elapsed: Duration, expired: bool) {
+    use futures::FutureExt;
+
+    struct CountedWrites {
+        memory: MemoryStore,
+        writes: AtomicUsize,
+    }
+    impl TokenStore for CountedWrites {
+        fn load_token(&self) -> Option<String> {
+            self.memory.load_token()
+        }
+        fn store_token(&self, token: &str) -> Result<()> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            self.memory.store_token(token)
+        }
+    }
+
+    let original = "ab".repeat(32);
+    let replacement = "cd".repeat(32);
+    let backing = Arc::new(CountedWrites {
+        memory: MemoryStore::with(&original),
+        writes: AtomicUsize::new(0),
+    });
+    let store = AsyncTokenStore::with_timings(
+        backing.clone(),
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+        Duration::from_secs(60),
+        Duration::from_secs(60),
+    );
+    assert_eq!(store.load_token().await, Some(original.clone()));
+    let hash_before = store.changes.borrow().clone();
+    let lease = store.admission.read().await;
+    tokio::time::pause();
+    let mut writer = Box::pin(store.store_token(&replacement));
+    assert!((&mut writer).now_or_never().is_none());
+    // This future is not spawned: advance the clock without polling it again,
+    // then make its inner lock future ready before its timeout is repolled.
+    tokio::time::advance(elapsed).await;
+    drop(lease);
+    let polled = (&mut writer).now_or_never();
+    tokio::time::resume();
+    let result = match polled {
+        Some(result) => result,
+        None => writer.await,
+    };
+    // A wrongly admitted blocking write owns the lock until publication. Wait
+    // for that precise boundary before inspecting its effects, without sleeps.
+    let idle = timeout(Duration::from_secs(5), store.admission.write())
+        .await
+        .unwrap();
+    assert_eq!(
+        backing.writes.load(Ordering::SeqCst),
+        usize::from(!expired),
+        "an expired admission must not start a backing write: {result:?}"
+    );
+    let expected = if expired { &original } else { &replacement };
+    assert_eq!(backing.load_token().as_ref(), Some(expected));
+    let expected_hash = if expired {
+        hash_before
+    } else {
+        Some(hash_token(&replacement))
+    };
+    assert_eq!(*store.changes.borrow(), expected_hash);
+    drop(idle);
+    if expired {
+        assert!(matches!(result, Err(Error::Internal(_))));
+        // An expired request does not consume the next request's admission.
+        store.store_token(&replacement).await.unwrap();
+        assert_eq!(backing.writes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store.load_token().await.as_deref(),
+            Some(replacement.as_str())
+        );
+    } else {
+        result.unwrap();
+    }
+}
+
+async fn exercise_authorizer_ready_after_wait(elapsed: Duration, expired: bool) {
+    use futures::FutureExt;
+    use intent_core::caller::LegacyCredentialAuthority;
+
+    let token = "ab".repeat(32);
+    let backing = Arc::new(MemoryStore::with(&token));
+    let store = AsyncTokenStore::with_timings(
+        backing.clone(),
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+        Duration::from_secs(60),
+        Duration::from_secs(60),
+    );
+    assert_eq!(store.load_token().await, Some(token.clone()));
+    let hash_before = store.changes.borrow().clone();
+    let authority = LegacyAdmission {
+        store: store.clone(),
+        token: token.clone(),
+    };
+    let writer = store.admission.write().await;
+    tokio::time::pause();
+    let mut admission = authority.authorize();
+    assert!((&mut admission).now_or_never().is_none());
+    tokio::time::advance(elapsed).await;
+    drop(writer);
+    let polled = (&mut admission).now_or_never();
+    tokio::time::resume();
+    let result = match polled {
+        Some(result) => result,
+        None => admission.await,
+    };
+    if expired {
+        assert!(
+            matches!(result, Err(Error::Forbidden(_))),
+            "a ready lease must not return queue authority at an expired deadline"
+        );
+    } else {
+        drop(result.unwrap());
+    }
+    assert_eq!(backing.load_token(), Some(token.clone()));
+    assert_eq!(*store.changes.borrow(), hash_before);
+    drop(authority.authorize().await.unwrap());
+}
+
+#[tokio::test]
+async fn imported_owner_credential_write_rejects_ready_lease_at_expired_deadline() {
+    for elapsed in [Duration::from_secs(5), Duration::from_millis(5001)] {
+        exercise_writer_ready_after_wait(elapsed, true).await;
+    }
+}
+
+#[tokio::test]
+async fn imported_owner_credential_authorize_rejects_ready_lease_at_expired_deadline() {
+    for elapsed in [Duration::from_secs(5), Duration::from_millis(5001)] {
+        exercise_authorizer_ready_after_wait(elapsed, true).await;
+    }
+}
+
+#[tokio::test]
+async fn imported_owner_credential_write_accepts_ready_lease_before_deadline() {
+    exercise_writer_ready_after_wait(Duration::from_secs(1), false).await;
+}
+
+#[tokio::test]
+async fn imported_owner_credential_authorize_accepts_ready_lease_before_deadline() {
+    exercise_authorizer_ready_after_wait(Duration::from_secs(1), false).await;
 }

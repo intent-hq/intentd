@@ -43,6 +43,7 @@ pub(crate) const IMPORT_MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 /// One in-flight staged import: everything `chunk`/`commit`/`abort` need
 /// between calls. Lives in [`Services::transfer_imports`]; in-memory only.
 pub(crate) struct ImportSession {
+    pub initiator: Option<intent_core::PrincipalId>,
     pub manifest: TransferManifest,
     pub workspace_id: WorkspaceId,
     /// `<workspaces_root>/.import-staging/<importId>/`.
@@ -98,7 +99,7 @@ impl Services {
     ) -> Result<serde_json::Value> {
         let manifest: TransferManifest = serde_json::from_value(manifest)
             .map_err(|e| Error::InvalidParams(format!("invalid transfer manifest: {e}")))?;
-        if manifest.format_version != TRANSFER_FORMAT_VERSION {
+        if !matches!(manifest.format_version, 1 | TRANSFER_FORMAT_VERSION) {
             return Err(Error::InvalidParams(format!(
                 "unsupported transfer format version {} (this daemon supports {})",
                 manifest.format_version, TRANSFER_FORMAT_VERSION
@@ -152,6 +153,7 @@ impl Services {
                 )));
             }
             let session = ImportSession {
+                initiator: intent_core::current_caller().and_then(|c| c.principal_id().cloned()),
                 workspace_id: manifest.workspace_id.clone(),
                 manifest,
                 staging_dir: staging_dir.clone(),
@@ -452,11 +454,12 @@ impl Services {
 
         // Load rows/<table>.jsonl (unknown files — including event.jsonl —
         // are skipped defensively; the store layer would reject them anyway).
-        let rows = load_row_files(&extracted_dir.join("rows")).await?;
+        let mut rows = load_row_files(&extracted_dir.join("rows")).await?;
         // Every row must be scoped to the manifest's workspace — collision
         // validation only ran for that id, so smuggled rows for other
         // workspaces (or agents outside the archive) fail the commit.
         validate_row_scope(&rows, &workspace_id)?;
+        crate::transfer_authorship::prepare_import(&mut rows, manifest.format_version)?;
 
         // Transform: path rewrites against OUR workspaces root, session-id
         // clearing, in-flight → interrupted, drafts dropped.
@@ -528,6 +531,19 @@ impl Services {
         // Rows are committed — the import can no longer be rolled back.
         // Everything below is best-effort enrichment of the now-live
         // workspace; failures are logged, never surfaced as a failed import.
+        // Boot hydration may have cached the reclaimed orphan definitions.
+        // Refresh only imported IDs, after commit so a failed import leaves
+        // both the durable rows and their live definitions untouched.
+        if let Some((_, scripts)) = outcome.rows.iter().find(|(table, _)| table == "script") {
+            let manager = self.script_manager();
+            for script in scripts {
+                if let Some(id) = script.get("id").and_then(serde_json::Value::as_str) {
+                    if let Err(error) = manager.refresh_imported(&workspace_id, id).await {
+                        tracing::warn!(script = %id, %error, "post-import script refresh failed");
+                    }
+                }
+            }
+        }
         self.place_imported_assets(&workspace_id, &extracted_dir.join("assets"))
             .await;
 
@@ -1989,12 +2005,18 @@ mod tests {
         );
     }
 
-    async fn fresh_services(workspaces_root: &Path, assets_root: &Path) -> Services {
-        let db = std::env::temp_dir().join(format!("import-test-{}.db", uuid::Uuid::new_v4()));
+    // Bind the directory before Services so consumers drop before cleanup.
+    async fn fresh_services(
+        workspaces_root: &Path,
+        assets_root: &Path,
+    ) -> (tempfile::TempDir, Services) {
+        let db_dir = crate::test_support::test_tempdir("import-test-");
+        let db = db_dir.path().join("store.db");
         let store = Store::open(&db).await.expect("open store");
-        Services::new(store)
+        let svc = Services::new(store)
             .with_workspaces_root(workspaces_root.to_path_buf())
-            .with_assets_root(assets_root.to_path_buf())
+            .with_assets_root(assets_root.to_path_buf());
+        (db_dir, svc)
     }
 
     fn manifest(ws: &WorkspaceId) -> TransferManifest {
@@ -2170,7 +2192,7 @@ mod tests {
         ]
     }
 
-    async fn selection_fixture() -> (Services, TempDir, TempDir) {
+    async fn selection_fixture() -> (TempDir, TempDir, tempfile::TempDir, Services) {
         let root = TempDir::new("import-selection");
         let assets = TempDir::new("import-selection-assets");
         let registry =
@@ -2198,9 +2220,8 @@ mod tests {
                 ),
             ])
             .unwrap();
-        let svc = fresh_services(&root.0, &assets.0)
-            .await
-            .with_settings_registry(registry);
+        let (db_dir, svc) = fresh_services(&root.0, &assets.0).await;
+        let svc = svc.with_settings_registry(registry);
         for (provider, model) in [("codex", "gpt-6-astra"), ("auggie", "gpt6-astra")] {
             seed_selection_catalog(
                 &svc,
@@ -2209,7 +2230,7 @@ mod tests {
                 crate::model_catalog::ModelCatalogCache::now_ms(),
             );
         }
-        (svc, root, assets)
+        (root, assets, db_dir, svc)
     }
 
     fn seed_selection_catalog(svc: &Services, provider: &str, model: &str, now: u64) {
@@ -2322,7 +2343,7 @@ mod tests {
 
     #[tokio::test]
     async fn import_selection_disabled_auggie_uses_destination_defaults() {
-        let (svc, _root, _assets) = selection_fixture().await;
+        let (_root, _assets, _db_dir, svc) = selection_fixture().await;
         svc.settings_registry()
             .unwrap()
             .apply(&[(
@@ -2336,14 +2357,14 @@ mod tests {
 
     #[tokio::test]
     async fn import_selection_missing_model_uses_destination_defaults() {
-        let (svc, _root, _assets) = selection_fixture().await;
+        let (_root, _assets, _db_dir, svc) = selection_fixture().await;
         let session = import_selection(&svc, serde_json::json!({"provider":"auggie", "model":"removed-model", "reasoning_effort":"low"})).await;
         assert_selection(&svc, &session, "codex", Some("gpt-6-astra"), Some("high"));
     }
 
     #[tokio::test]
     async fn import_selection_unsupported_effort_replaces_entire_selection() {
-        let (svc, _root, _assets) = selection_fixture().await;
+        let (_root, _assets, _db_dir, svc) = selection_fixture().await;
         let session = import_selection(&svc, serde_json::json!({"provider":"auggie", "model":"gpt6-astra", "reasoning_effort":"source-only-effort"})).await;
         assert_selection(&svc, &session, "codex", Some("gpt-6-astra"), Some("high"));
     }
@@ -2354,7 +2375,7 @@ mod tests {
             serde_json::json!({"provider":"auggie", "model":"gpt6-astra", "reasoning_effort":"HIGH"}),
             serde_json::json!({"provider":"auggie", "model":null, "reasoning_effort":null}),
         ] {
-            let (svc, _root, _assets) = selection_fixture().await;
+            let (_root, _assets, _db_dir, svc) = selection_fixture().await;
             let session = import_selection(&svc, selection.clone()).await;
             assert_selection(
                 &svc,
@@ -2369,7 +2390,7 @@ mod tests {
     #[tokio::test]
     async fn import_selection_supported_legacy_compound_survives() {
         for provider in [Some("auggie"), Some("codex"), None] {
-            let (svc, _root, _assets) = selection_fixture().await;
+            let (_root, _assets, _db_dir, svc) = selection_fixture().await;
             let session = import_selection(&svc, serde_json::json!({"provider":provider, "model":"auggie:gpt6-astra", "reasoning_effort":"high"})).await;
             // The store's legacy read backstop splits compound ids. Verify the
             // unchanged persisted selection independently of normalized reads.
@@ -2428,7 +2449,7 @@ mod tests {
         explicit_effort: Option<&str>,
         effective_effort: &str,
     ) {
-        let (svc, _root, _assets) = selection_fixture().await;
+        let (_root, _assets, _db_dir, svc) = selection_fixture().await;
         let session = import_selection(
             &svc,
             serde_json::json!({
@@ -2470,7 +2491,7 @@ mod tests {
     #[tokio::test]
     async fn import_selection_codex_legacy_unsupported_embedded_effort_falls_back() {
         for model in ["gpt-6-astra/medium", "gpt-6-astra[medium]"] {
-            let (svc, _root, _assets) = selection_fixture().await;
+            let (_root, _assets, _db_dir, svc) = selection_fixture().await;
             let session = import_selection(
                 &svc,
                 serde_json::json!({
@@ -2484,7 +2505,7 @@ mod tests {
 
     #[tokio::test]
     async fn import_selection_non_codex_slash_model_is_not_effort() {
-        let (svc, _root, _assets) = selection_fixture().await;
+        let (_root, _assets, _db_dir, svc) = selection_fixture().await;
         let model = "gpt-6-astra/low";
         seed_selection_catalog(
             &svc,
@@ -2504,7 +2525,7 @@ mod tests {
 
     #[tokio::test]
     async fn import_selection_disabled_legacy_prefix_replaces_conflicting_provider() {
-        let (svc, _root, _assets) = selection_fixture().await;
+        let (_root, _assets, _db_dir, svc) = selection_fixture().await;
         svc.settings_registry()
             .unwrap()
             .apply(&[(
@@ -2560,7 +2581,7 @@ mod tests {
     }
 
     async fn assert_imported_legacy_alias(alias: &str, mode: &str, disabled: bool) {
-        let (svc, _root, _assets) = selection_fixture().await;
+        let (_root, _assets, _db_dir, svc) = selection_fixture().await;
         svc.settings_registry()
             .unwrap()
             .apply(&[(
@@ -2638,7 +2659,7 @@ mod tests {
             serde_json::json!({"provider":null, "model":null, "reasoning_effort":null}),
             serde_json::json!({"provider":"foreign-provider", "model":"foreign-model", "reasoning_effort":"low"}),
         ] {
-            let (svc, _root, _assets) = selection_fixture().await;
+            let (_root, _assets, _db_dir, svc) = selection_fixture().await;
             let session = import_selection(&svc, selection).await;
             assert_selection(&svc, &session, "codex", Some("gpt-6-astra"), Some("high"));
         }
@@ -2654,7 +2675,7 @@ mod tests {
                 serde_json::json!({"codex":"missing-default-model"}),
             ),
         ] {
-            let (svc, _root, _assets) = selection_fixture().await;
+            let (_root, _assets, _db_dir, svc) = selection_fixture().await;
             svc.settings_registry()
                 .unwrap()
                 .apply(&[(setting.0.into(), setting.1)])
@@ -2677,7 +2698,7 @@ mod tests {
     #[tokio::test]
     async fn import_selection_temporary_catalog_uncertainty_preserves_source() {
         for uncertainty in ["cold", "stale", "version", "failed-refresh"] {
-            let (mut svc, _root, _assets) = selection_fixture().await;
+            let (_root, _assets, _db_dir, mut svc) = selection_fixture().await;
             let source = crate::model_catalog::source_for("auggie").unwrap();
             let version = (source.version_key)();
             match uncertainty {
@@ -2725,7 +2746,7 @@ mod tests {
 
     #[tokio::test]
     async fn import_selection_fallback_uses_auto_when_default_effort_is_unset() {
-        let (svc, _root, _assets) = selection_fixture().await;
+        let (_root, _assets, _db_dir, svc) = selection_fixture().await;
         svc.settings_registry()
             .unwrap()
             .apply(&[(
@@ -2740,7 +2761,7 @@ mod tests {
     #[tokio::test]
     async fn import_selection_fallback_uses_global_default_then_catalog_then_cli() {
         for tier in ["global", "catalog", "cli"] {
-            let (mut svc, _root, _assets) = selection_fixture().await;
+            let (_root, _assets, _db_dir, mut svc) = selection_fixture().await;
             let mut settings = vec![("model.providerDefaults".into(), serde_json::json!({}))];
             settings.push((
                 "model.default".into(),
@@ -2768,7 +2789,7 @@ mod tests {
 
     #[tokio::test]
     async fn import_selection_effort_evidence_is_scoped_to_source_provider() {
-        let (svc, _root, _assets) = selection_fixture().await;
+        let (_root, _assets, _db_dir, svc) = selection_fixture().await;
         // The same bare id can have different effort vocabularies. Auggie
         // precedes Codex in the catalog registry but cannot reject its effort.
         seed_selection_catalog(
@@ -2791,13 +2812,157 @@ mod tests {
 
     #[tokio::test]
     async fn import_selection_auto_with_unsupported_explicit_effort_falls_back() {
-        let (svc, _root, _assets) = selection_fixture().await;
+        let (_root, _assets, _db_dir, svc) = selection_fixture().await;
         let session = import_selection(
             &svc,
             serde_json::json!({"provider":"auggie", "model":null, "reasoning_effort":"xhigh"}),
         )
         .await;
         assert_selection(&svc, &session, "codex", Some("gpt-6-astra"), Some("high"));
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn import_reclaims_orphan_metadata_atomically_with_attachment_files() {
+        for fail_late in [false, true] {
+            let ws = WorkspaceId::from("ws-reimport");
+            let root = TempDir::new("reimport-root");
+            let assets = TempDir::new("reimport-assets");
+            let (_db_dir, svc) = fresh_services(&root.0, &assets.0).await;
+            let mut rows = fixture_rows(&ws);
+            rows.push((
+                "script",
+                vec![serde_json::json!({
+                    "id":"script-reimport", "workspace_id":ws.0, "name":"Script",
+                    "command":"echo imported > imported-script.txt", "cwd":".intent/attachments",
+                    "mode":"command", "source":"user", "created_at":"t0"
+                })],
+            ));
+            let mut stale: Vec<_> = rows
+                .iter()
+                .filter(|(table, _)| matches!(*table, "script" | "attachments"))
+                .map(|(table, rows)| ((*table).to_string(), rows.clone()))
+                .collect();
+            stale.push((
+                "interrupted_agent".into(),
+                vec![serde_json::json!({
+                    "agent_id":"agent-live", "workspace_id":ws.0, "prev_status":"active",
+                    "interrupted_at":"t0", "resolution":"resumed"
+                })],
+            ));
+            svc.store.transfer_import_rows(&stale).await.unwrap();
+            sqlx::query(
+                "UPDATE script SET command='echo stale', cwd='old-cwd' WHERE id='script-reimport'",
+            )
+            .execute(svc.store.write_pool())
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO script (id, workspace_id, name, command, mode, source, created_at) VALUES ('script-keeper', 'keeper', 'Keep', 'echo keep', 'command', 'user', 't0'), ('script-unlisted', 'ws-reimport', 'Unlisted', 'echo unlisted', 'command', 'user', 't0')")
+                .execute(svc.store.write_pool()).await.unwrap();
+            assert_eq!(svc.hydrate_scripts().await.unwrap(), 3);
+            let manager = svc.script_manager();
+            let cached_before = manager.list(&ws).await.unwrap();
+            let keeper_before = manager.list(&WorkspaceId::from("keeper")).await.unwrap();
+            sqlx::query("INSERT INTO attachment_idempotency_keys (workspace_id, key, attachment_id, fingerprint, created_at) VALUES (?, 'retry', 'att-live', 'old', 't0')")
+                .bind(&ws.0).execute(svc.store.write_pool()).await.unwrap();
+            let before = svc.store.transfer_export_rows(&ws).await.unwrap();
+            if fail_late {
+                rows.iter_mut()
+                    .find(|(t, _)| *t == "attachments")
+                    .unwrap()
+                    .1
+                    .push(serde_json::json!({"id":"bad", "workspace_id":ws.0}));
+            }
+            let manifest = manifest(&ws);
+            let archive =
+                build_archive_full(&manifest, &rows, None, &[("att-live", b"attachment-bytes")]);
+            let begun = svc
+                .workspace_import_begin_op(
+                    serde_json::to_value(manifest).unwrap(),
+                    archive.len() as u64,
+                    sha256_hex(&archive),
+                )
+                .await
+                .unwrap();
+            let id = begun["importId"].as_str().unwrap().to_string();
+            svc.workspace_import_chunk_op(id.clone(), 0, b64(&archive))
+                .await
+                .unwrap();
+            let result = svc.workspace_import_commit_op(id.clone()).await;
+            let file = root.0.join(&ws.0).join("repo/.intent/attachments/doc.pdf");
+            if fail_late {
+                let err = result.unwrap_err();
+                assert!(err.to_string().contains("attachments.file_name"), "{err}");
+                assert!(!file.exists(), "failed insert unwinds materialized files");
+                assert_eq!(svc.store.transfer_export_rows(&ws).await.unwrap(), before);
+                assert_eq!(manager.list(&ws).await.unwrap(), cached_before);
+                svc.workspace_import_abort_op(id).await.unwrap();
+            } else {
+                let result = result.unwrap();
+                assert_eq!(result["workspace"]["id"], ws.0);
+                assert_eq!(tokio::fs::read(file).await.unwrap(), b"attachment-bytes");
+                let scripts = manager.list(&ws).await.unwrap();
+                let imported = scripts["scripts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|script| script["id"] == "script-reimport")
+                    .unwrap();
+                assert_eq!(imported["command"], "echo imported > imported-script.txt");
+                assert_eq!(imported["cwd"], ".intent/attachments");
+                let unlisted = scripts["scripts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|script| script["id"] == "script-unlisted")
+                    .unwrap();
+                assert_eq!(unlisted["command"], "echo unlisted");
+                #[cfg(unix)]
+                {
+                    manager
+                        .run(&ws, "script-reimport", None, Some(5))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        tokio::fs::read_to_string(
+                            root.0
+                                .join(&ws.0)
+                                .join("repo/.intent/attachments/imported-script.txt")
+                        )
+                        .await
+                        .unwrap()
+                        .trim(),
+                        "imported"
+                    );
+                }
+                let resolution: String = sqlx::query_scalar(
+                    "SELECT resolution FROM interrupted_agent WHERE agent_id='agent-live'",
+                )
+                .fetch_one(svc.store.read_pool())
+                .await
+                .unwrap();
+                assert_eq!(
+                    resolution, "pending",
+                    "incoming interruption replaces stale resolved history"
+                );
+            }
+            assert_eq!(
+                manager.list(&WorkspaceId::from("keeper")).await.unwrap(),
+                keeper_before
+            );
+            let retry_keys: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM attachment_idempotency_keys WHERE workspace_id=?",
+            )
+            .bind(&ws.0)
+            .fetch_one(svc.store.read_pool())
+            .await
+            .unwrap();
+            assert_eq!(retry_keys, i64::from(fail_late));
+            assert!(sqlx::query("PRAGMA foreign_key_check")
+                .fetch_all(svc.store.read_pool())
+                .await
+                .unwrap()
+                .is_empty());
+        }
     }
 
     /// Full lifecycle: begin → two chunks (out of order, one retried) →
@@ -2810,7 +2975,7 @@ mod tests {
         let ws = WorkspaceId("ws-imported".to_string());
         let ws_root = TempDir::new("import-ws-root");
         let assets_root = TempDir::new("import-assets-root");
-        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+        let (_db_dir, svc) = fresh_services(&ws_root.0, &assets_root.0).await;
 
         let m = manifest(&ws);
         let archive = build_archive_full(
@@ -2941,6 +3106,181 @@ mod tests {
         ));
     }
 
+    #[intent_test_macros::daemon_test]
+    async fn transfer_human_legacy_archive_import_is_unknown_even_with_colliding_ids() {
+        use intent_core::WorkspaceApi;
+        let root = TempDir::new("legacy-authors");
+        let (_db_dir, svc) =
+            fresh_services(&root.0.join("workspaces"), &root.0.join("assets")).await;
+        let owner = svc.store.get_primary_principal().await.unwrap();
+        let ws = WorkspaceId::new();
+        let mut m = manifest(&ws);
+        m.format_version = 1;
+        let mut rows = fixture_rows(&ws);
+        rows.retain(|(t, _)| matches!(*t, "workspace" | "agent_session" | "agent_message"));
+        let messages = &mut rows
+            .iter_mut()
+            .find(|(t, _)| *t == "agent_message")
+            .unwrap()
+            .1;
+        messages[0]["metadata"]=serde_json::json!({"fromPrincipalId":owner.id,"humanAuthor":{"login":"planted","displayName":null,"avatarUrl":null},"keep":42}).to_string().into();
+        let originals = crate::human_attribution_tests::legacy_metadata_values();
+        let prototype = messages[0].clone();
+        let mut queue = Vec::new();
+        for (i, metadata) in originals.iter().enumerate() {
+            let mut row = prototype.clone();
+            row["id"] = serde_json::json!(format!("old-human-{i}"));
+            row["seq"] = serde_json::json!(i + 3);
+            row["metadata"] = metadata.as_ref().map_or(serde_json::Value::Null, |v| {
+                serde_json::json!(v.to_string())
+            });
+            messages.push(row);
+            let id = format!("old-pending-{i}");
+            let mut payload = serde_json::json!({"id":id,"content":"old input","queuedAt":"2020-01-01T00:00:00Z"});
+            if let Some(value) = metadata {
+                payload["messageMetadata"] = value.clone();
+            }
+            queue.push(serde_json::json!({"id":id,"agent_id":"agent-live","position":i,"payload":payload.to_string(),"created_at":"2020-01-01T00:00:00Z","turn_id":id}));
+        }
+        rows.push(("agent_queue", queue));
+        let archive = build_archive(&m, &rows);
+        let begin = svc
+            .workspace_import_begin_op(
+                serde_json::to_value(&m).unwrap(),
+                archive.len() as u64,
+                sha256_hex(&archive),
+            )
+            .await
+            .unwrap();
+        let import = begin["importId"].as_str().unwrap().to_string();
+        svc.workspace_import_chunk_op(import.clone(), 0, b64(&archive))
+            .await
+            .unwrap();
+        svc.workspace_import_commit_op(import).await.unwrap();
+        let view = svc
+            .agent_get_conversation(
+                AgentId::from("agent-live"),
+                None,
+                Some(ws.clone()),
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let human = &view["messages"][0];
+        assert_eq!(
+            human["author"],
+            serde_json::json!({"principalId":null,"login":null,"displayName":null,"avatarUrl":null})
+        );
+        assert_eq!(human["metadata"]["keep"], 42);
+        assert!(human["metadata"].get("fromPrincipalId").is_none());
+        assert!(view["messages"][1].get("author").is_none());
+        for (i, original) in originals.iter().enumerate() {
+            let human = view["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["id"] == format!("old-human-{i}"))
+                .unwrap();
+            assert_eq!(
+                human["author"],
+                serde_json::json!({"principalId":null,"login":null,"displayName":null,"avatarUrl":null})
+            );
+            match original {
+                Some(serde_json::Value::Object(object)) => {
+                    for (key, value) in object {
+                        assert_eq!(&human["metadata"][key], value);
+                    }
+                }
+                Some(value) => assert_eq!(
+                    human["metadata"].get("humanAuthorOriginalMetadata"),
+                    Some(value)
+                ),
+                None => assert!(human["metadata"]
+                    .get("humanAuthorOriginalMetadata")
+                    .is_none()),
+            }
+            let pending = svc
+                .find_queued_message(&AgentId::from("agent-live"), &format!("old-pending-{i}"))
+                .unwrap();
+            assert_eq!(pending.message_metadata.as_ref(), Some(&human["metadata"]));
+            assert!(!pending.ready_to_send());
+        }
+        let exported = svc.store.transfer_export_rows(&ws).await.unwrap();
+        let row = exported
+            .iter()
+            .find(|(t, _)| t == "agent_message")
+            .unwrap()
+            .1
+            .iter()
+            .find(|r| r["id"] == "m-1")
+            .unwrap();
+        let md: serde_json::Value =
+            serde_json::from_str(row["metadata"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            md["humanAuthor"],
+            serde_json::json!({"login":null,"displayName":null,"avatarUrl":null})
+        );
+        for (i, _) in originals.iter().enumerate() {
+            let id = format!("old-human-{i}");
+            let row = exported
+                .iter()
+                .find(|(t, _)| t == "agent_message")
+                .unwrap()
+                .1
+                .iter()
+                .find(|r| r["id"] == id)
+                .unwrap();
+            let metadata: serde_json::Value =
+                serde_json::from_str(row["metadata"].as_str().unwrap()).unwrap();
+            let projected = view["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"] == id)
+                .unwrap();
+            assert_eq!(
+                metadata, projected["metadata"],
+                "unknown and original payload survive re-export"
+            );
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn transfer_human_invalid_v2_author_rejects_before_workspace_visibility() {
+        let root = TempDir::new("invalid-authors");
+        let (_db_dir, svc) =
+            fresh_services(&root.0.join("workspaces"), &root.0.join("assets")).await;
+        let ws = WorkspaceId::new();
+        let m = manifest(&ws);
+        let mut rows = fixture_rows(&ws);
+        rows.retain(|(t, _)| matches!(*t, "workspace" | "agent_session" | "agent_message"));
+        rows.iter_mut().find(|(t,_)|*t=="agent_message").unwrap().1[0]["metadata"]=serde_json::json!({"humanAuthor":{"login":"bad","displayName":null,"avatarUrl":null,"identity":{"provider":"gitlab","host":"https://gitlab.com/","externalUserId":"42"}}}).to_string().into();
+        let archive = build_archive(&m, &rows);
+        let begin = svc
+            .workspace_import_begin_op(
+                serde_json::to_value(&m).unwrap(),
+                archive.len() as u64,
+                sha256_hex(&archive),
+            )
+            .await
+            .unwrap();
+        let import = begin["importId"].as_str().unwrap().to_string();
+        svc.workspace_import_chunk_op(import.clone(), 0, b64(&archive))
+            .await
+            .unwrap();
+        assert!(svc.workspace_import_commit_op(import).await.is_err());
+        assert!(svc.store.get_workspace(&ws).await.is_err());
+        assert!(svc
+            .store
+            .get_agent_session(&AgentId::from("agent-live"))
+            .await
+            .is_err());
+    }
+
     // ---- git materialization e2e ----------------------------------------
 
     fn init_repo(repo_path: &Path) {
@@ -3001,7 +3341,7 @@ mod tests {
         let ws = WorkspaceId("ws-git-imported".to_string());
         let ws_root = TempDir::new("import-git-ws-root");
         let assets_root = TempDir::new("import-git-assets-root");
-        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+        let (_db_dir, svc) = fresh_services(&ws_root.0, &assets_root.0).await;
 
         // Source workspace repo on branch `feature` with committed work and
         // dirty state (staged + untracked).
@@ -3197,7 +3537,7 @@ mod tests {
         let ws = WorkspaceId("ws-git-norefs".to_string());
         let ws_root = TempDir::new("import-git-ws-root");
         let assets_root = TempDir::new("import-git-assets-root");
-        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+        let (_db_dir, svc) = fresh_services(&ws_root.0, &assets_root.0).await;
 
         // Archive with a git/repo.bundle but no git/refs.json.
         let m = manifest(&ws);
@@ -3261,7 +3601,7 @@ mod tests {
         let ws = WorkspaceId("ws-git-rollback".to_string());
         let ws_root = TempDir::new("import-git-rb-ws-root");
         let assets_root = TempDir::new("import-git-rb-assets-root");
-        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+        let (_db_dir, svc) = fresh_services(&ws_root.0, &assets_root.0).await;
 
         let src = TempDir::new("import-git-rb-src");
         let repo = src.0.join("source-repo");
@@ -3367,7 +3707,7 @@ mod tests {
         let ws = WorkspaceId("ws-att-rollback".to_string());
         let ws_root = TempDir::new("import-att-rb-ws-root");
         let assets_root = TempDir::new("import-att-rb-assets-root");
-        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+        let (_db_dir, svc) = fresh_services(&ws_root.0, &assets_root.0).await;
 
         let t = "2026-08-11T00:00:00Z";
         let ws_row = serde_json::json!({
@@ -3508,7 +3848,7 @@ mod tests {
         let ws_root = TempDir::new("import-att-sym-ws-root");
         let assets_root = TempDir::new("import-att-sym-assets-root");
         let outside = TempDir::new("import-att-sym-outside");
-        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+        let (_db_dir, svc) = fresh_services(&ws_root.0, &assets_root.0).await;
 
         // Simulate what a hostile bundle materializes: the checkout exists
         // and `.intent` is a symlink pointing outside the workspace.
@@ -3576,7 +3916,7 @@ mod tests {
         let ws = WorkspaceId("ws-reject".to_string());
         let ws_root = TempDir::new("import-ws-root");
         let assets_root = TempDir::new("import-assets-root");
-        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+        let (_db_dir, svc) = fresh_services(&ws_root.0, &assets_root.0).await;
         let sha = "a".repeat(64);
 
         let mut bad_format = manifest(&ws);
@@ -3630,7 +3970,7 @@ mod tests {
         let ws = WorkspaceId("ws-verify".to_string());
         let ws_root = TempDir::new("import-ws-root");
         let assets_root = TempDir::new("import-assets-root");
-        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+        let (_db_dir, svc) = fresh_services(&ws_root.0, &assets_root.0).await;
 
         let m = manifest(&ws);
         let archive = build_archive(&m, &fixture_rows(&ws));
@@ -3693,7 +4033,7 @@ mod tests {
         let ws = WorkspaceId("ws-chunk".to_string());
         let ws_root = TempDir::new("import-ws-root");
         let assets_root = TempDir::new("import-assets-root");
-        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+        let (_db_dir, svc) = fresh_services(&ws_root.0, &assets_root.0).await;
 
         let m = manifest(&ws);
         let begin = svc
@@ -3745,7 +4085,7 @@ mod tests {
         let ws = WorkspaceId("ws-commit-flag".to_string());
         let ws_root = TempDir::new("import-ws-root");
         let assets_root = TempDir::new("import-assets-root");
-        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+        let (_db_dir, svc) = fresh_services(&ws_root.0, &assets_root.0).await;
 
         let m = manifest(&ws);
         let archive = build_archive(&m, &fixture_rows(&ws));
@@ -3819,7 +4159,7 @@ mod tests {
         let ws = WorkspaceId("ws-sweep-race".to_string());
         let ws_root = TempDir::new("import-ws-root");
         let assets_root = TempDir::new("import-assets-root");
-        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+        let (_db_dir, svc) = fresh_services(&ws_root.0, &assets_root.0).await;
 
         let staging_root = svc.import_staging_root();
         let live_dir = staging_root.join("import-live");
@@ -3832,6 +4172,7 @@ mod tests {
         svc.transfer_imports.lock().unwrap().insert(
             "import-live".to_string(),
             super::ImportSession {
+                initiator: None,
                 manifest: manifest(&ws),
                 workspace_id: ws.clone(),
                 staging_dir: live_dir.clone(),

@@ -125,10 +125,15 @@ impl ForwardRegistry {
 /// Accept connections on the loopback listener and splice each to the remote
 /// port on the daemon host until the listener is dropped/aborted.
 async fn accept_loop(listener: TcpListener, remote_port: u16) {
+    // The accept loop owns every accepted relay. Aborting the forward must
+    // stop existing streams as well as close the listener (credential revocation).
+    let mut relays = tokio::task::JoinSet::new();
     loop {
-        match listener.accept().await {
+        tokio::select! {
+        _ = relays.join_next(), if !relays.is_empty() => {},
+        accepted = listener.accept() => match accepted {
             Ok((mut inbound, _)) => {
-                tokio::spawn(async move {
+                relays.spawn(async move {
                     match TcpStream::connect(("127.0.0.1", remote_port)).await {
                         Ok(mut outbound) => {
                             let _ =
@@ -144,6 +149,7 @@ async fn accept_loop(listener: TcpListener, remote_port: u16) {
                 tracing::debug!(error = %e, "forward accept failed");
                 break;
             }
+        }
         }
     }
 }
@@ -230,8 +236,9 @@ pub(crate) async fn handle(
     req: ForwardRequest,
     registry: &mut ForwardRegistry,
     is_local: bool,
+    api: &dyn intent_core::WorkspaceApi,
 ) -> Option<String> {
-    if crate::context::is_non_administrator_caller() {
+    if !crate::context::may_manage_workspaces(api).await {
         return frame(
             req.id_present,
             &req.id_echo,
