@@ -9562,7 +9562,14 @@ impl AgentManager {
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn shutdown(&self) {
-        let ids: Vec<AgentId> = self.handles.lock().unwrap().keys().cloned().collect();
+        // A recovered turn can be admitted while its provider is still waiting
+        // to spawn. Include those workers, not only installed handles, or their
+        // resolved interruption row would be lost at this shutdown.
+        let mut ids: HashSet<AgentId> = self.handles.lock().unwrap().keys().cloned().collect();
+        ids.extend(self.busy.lock().unwrap().iter().cloned());
+        ids.extend(self.workers.lock().unwrap().keys().cloned());
+        // Keep the lazy-spawn fence for the rest of this manager's lifetime.
+        self.stopping.lock().unwrap().extend(ids.iter().cloned());
         let now = intent_core::now_iso();
 
         // Capture in-flight agents before stop() settles them to RuntimeIdle.

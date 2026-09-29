@@ -223,6 +223,7 @@ pub use agent_manager::{
 // Re-export the suspend-overlap query trait (Task C) so the composition root
 // can implement it on the daemon's `SuspendTracker` and wire it via
 // [`Services::with_suspend_tracker`].
+pub use agent_ops::StartupResumeCandidates;
 pub use agent_session::SuspendOverlapQuery;
 // Re-export the permission types the composition root (`INTENTD_PERMISSION_POLICY`)
 // and the transport router (`agent.respondPermission` outcome parsing) need.
@@ -1287,6 +1288,7 @@ pub struct Services {
     /// front door observes one set.
     pending_workspace_deletes: delete_grace::PendingDeletes,
     workspace_mutations: workspace_mutations::WorkspaceMutations,
+    startup_resume_candidates: Arc<Mutex<HashSet<AgentId>>>,
     #[cfg(test)]
     workspace_delete_test_gate: tests::workspace_delete::DeleteGate,
     /// In-memory pending agent-session deletions for the delete grace window
@@ -1549,6 +1551,7 @@ impl Services {
             sweep_rate_limit: Arc::new(rate_limit::RateLimitGate::default()),
             pending_workspace_deletes: delete_grace::PendingDeletes::default(),
             workspace_mutations: workspace_mutations::WorkspaceMutations::default(),
+            startup_resume_candidates: Arc::default(),
             #[cfg(test)]
             workspace_delete_test_gate: tests::workspace_delete::DeleteGate::default(),
             pending_agent_deletes: delete_grace::PendingDeletes::default(),
@@ -30243,6 +30246,15 @@ impl WorkspaceApi for Services {
     fn agent_list_interrupted(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async {
             let mut rows = self.store.list_interrupted_agents().await?;
+            // Startup reservations hide only the candidates captured before
+            // listeners started. Failed attempts are released individually.
+            {
+                let reserved = self
+                    .startup_resume_candidates
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                rows.retain(|ia| !reserved.contains(&ia.agent_id));
+            }
             // Cross-workspace surface: a collaborator sees only member workspaces.
             if let Some(visible) = self.visible_workspace_ids().await? {
                 rows.retain(|ia| visible.contains(&ia.workspace_id));

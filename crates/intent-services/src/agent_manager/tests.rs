@@ -24344,3 +24344,59 @@ async fn runtime_characterization_idle_reap_resumes_same_session() {
 
 #[path = "runtime_tests.rs"]
 mod runtime_tests;
+
+/// Startup recovery may admit a turn before its lazy provider spawn installs
+/// a handle. Shutdown must still abort that worker and preserve its recovery row.
+#[tokio::test]
+async fn shutdown_captures_startup_turn_before_provider_handle_exists() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-startup-shutdown");
+    let id = AgentId::from("startup-not-spawned");
+    seed_agent(&mgr, &ws, &id).await;
+    assert!(mgr.try_begin(&id, &ws).await);
+    assert!(!mgr.contains(&id));
+    let (gone, receiver) = tokio::sync::oneshot::channel::<()>();
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let (arrived, arrival) = tokio::sync::oneshot::channel::<()>();
+    let pending = mgr.clone();
+    let pending_id = id.clone();
+    let pending_ws = ws.clone();
+    let worker = intent_core::spawn_daemon(async move {
+        let _gone = gone;
+        arrived.send(()).unwrap();
+        if released.await.is_ok() {
+            pending
+                .ensure_started(&pending_id, &pending_ws)
+                .await
+                .unwrap();
+        }
+    });
+    mgr.workers.lock().unwrap().insert(id.clone(), worker);
+    arrival.await.unwrap();
+    mgr.shutdown().await;
+    assert!(
+        mgr.services
+            .store
+            .get_interrupted_agent(&id)
+            .await
+            .unwrap()
+            .is_some(),
+        "an admitted recovery turn must survive shutdown even before its provider starts"
+    );
+    assert!(!mgr.is_busy(&id));
+    assert!(mgr.workers.lock().unwrap().is_empty());
+    assert!(
+        timeout(Duration::from_secs(1), receiver)
+            .await
+            .unwrap()
+            .is_err(),
+        "pending worker was aborted"
+    );
+    assert!(release.send(()).is_err(), "shutdown dropped the held spawn");
+    assert!(
+        matches!(mgr.ensure_started(&id, &ws).await, Err(Error::NotFound(_))),
+        "late provider startup remains fenced"
+    );
+    assert!(!mgr.contains(&id));
+}
