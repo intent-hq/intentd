@@ -3838,3 +3838,435 @@ async fn native_review_sidebar_preview_explicit_stage_all_and_other_actions() {
     assert_eq!(f.git.git(&f.git.path, &["write-tree"]), tree);
     assert_eq!(f.server.control.posts.load(Ordering::SeqCst), 0);
 }
+
+// companion-observation: begin qualification
+fn diagnostic_checkpoint(observer: &companion_observation::Collector, label: &str, value: Value) {
+    let mut record = json!({"checkpoint":label,"frames":observer.lines()});
+    record["actual"] = value;
+    println!("COMPANION6328 {record}");
+}
+
+fn diagnostic_reply(value: &Result<Value>) -> Value {
+    match value {
+        Ok(value) => json!({"result":value}),
+        Err(error) => json!({"error":error.to_string()}),
+    }
+}
+async fn diagnostic_request(
+    f: &Fixture,
+    s: &Socket,
+    query: Frame,
+    observer: &companion_observation::Collector,
+) -> Result<Value> {
+    s.entered(async {
+        let frame=s.owner.capture_review(&query).unwrap();
+        let mut result=None;
+        frame.scope(Box::pin(async {
+            let reply=match query {
+                Frame::Prepare(q)=>f.services.native_review_prepare(q).await,
+                Frame::Execute(q)=>f.services.native_review_execute(q).await,
+                Frame::Reconcile(q)=>f.services.native_review_reconcile(q).await,
+                Frame::Release(q)=>f.services.native_review_release(q).await,
+            };
+            let mut transfers=0;
+            let delivered=frame.deliver(if reply.is_ok(){RepositoryReadReplyKind::Result}else{RepositoryReadReplyKind::ServiceError},&mut||{transfers+=1;Ok(())}).await;
+            diagnostic_checkpoint(observer,"original-response",json!({"body":diagnostic_reply(&reply),"deliveryOk":delivered.is_ok(),"transfers":transfers,"posts":f.server.control.posts.load(Ordering::SeqCst)}));
+            assert!(transfers<=1);
+            result=Some(delivered.and(reply));
+        })).await;
+        frame.retire();
+        result.unwrap()
+    }).await
+}
+async fn diagnostic_parent(
+    f: &Fixture,
+    s: &Socket,
+    observer: &companion_observation::Collector,
+) -> (Execute, Value, Arc<Operation>) {
+    f.stage("companion-staged.txt");
+    let index = f.git.git(&f.git.path, &["write-tree"]);
+    let prepared = diagnostic_request(f, s, Frame::Prepare(companion_query(f)), observer)
+        .await
+        .unwrap();
+    let q = command(f, &prepared, Stage::Commit);
+    let receipt = diagnostic_request(f, s, Frame::Execute(q.clone()), observer)
+        .await
+        .unwrap();
+    let c = s.concrete(f).await;
+    let op = c.review.feed.lock().unwrap().records[&q.review.operation_id].clone();
+    let tree = f.git.git(&f.git.path, &["rev-parse", "HEAD^{tree}"]);
+    diagnostic_checkpoint(
+        observer,
+        "parent-owned-completion",
+        json!({"receipt":receipt,"index":index.trim(),"tree":tree.trim(),"workers":c.review.workers.available_permits(),"globalWorkers":f.services.repository_review_capacity.workers.available_permits()}),
+    );
+    assert_eq!(receipt["success"], true);
+    assert_eq!(
+        receipt["reviewExecution"]["gitReceipts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(index, tree);
+    assert_eq!(c.review.workers.available_permits(), WORKERS);
+    assert_eq!(
+        f.services
+            .repository_review_capacity
+            .workers
+            .available_permits(),
+        GLOBAL_WORKERS
+    );
+    (q, receipt, op)
+}
+struct DiagnosticPanicEvidence {
+    observer: companion_observation::Collector,
+    label: String,
+}
+impl Drop for DiagnosticPanicEvidence {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            println!(
+                "COMPANION6328-PARTIAL {}",
+                json!({"case":self.label,"frames":self.observer.lines(),"terminal":false})
+            );
+        }
+    }
+}
+async fn diagnostic_case<F: Future<Output = ()>>(
+    label: &str,
+    work: impl FnOnce(companion_observation::Collector) -> F,
+) {
+    use tracing::instrument::WithSubscriber;
+    let (dispatch, observer) = companion_observation::Collector::new(None);
+    let process = observer.process();
+    let _partial = DiagnosticPanicEvidence {
+        observer: observer.clone(),
+        label: label.into(),
+    };
+    work(observer.clone()).with_subscriber(dispatch).await;
+    drop(process);
+    // Original Request cancellation owners may still be unwinding their own task.
+    // This wait observes diagnostics only; worker/lock assertions are separate.
+    let finished = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if companion_observation::read(&observer.lines())
+                .incomplete
+                .is_empty()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let report = observer.finish();
+    diagnostic_checkpoint(
+        &observer,
+        label,
+        json!({"joinedObservationOwners":finished.is_ok(),"report":report}),
+    );
+    assert!(finished.is_ok());
+    assert_eq!(report["complete"], true, "{report}");
+}
+#[intent_test_macros::daemon_test]
+async fn companion_diagnostic_group1_owner_member_completion() {
+    for member_role in [false, true] {
+        diagnostic_case(if member_role{"g1-member"}else{"g1-owner"},|observer|async move {
+            with_review_clock(async {
+                let f=Fixture::new().await;
+                let s=if member_role{member(&f).await.0}else{f.socket().await};
+                std::fs::write(f.git.path.join("unstaged-proof.txt"),"untouched").unwrap();
+                let (parent,receipt,op)=diagnostic_parent(&f,&s,&observer).await;
+                let before=f.git.git(&f.git.path,&["status","--porcelain=v1"]);
+                let child=diagnostic_request(&f,&s,Frame::Prepare(companion_child(&f,&parent)),&observer).await.unwrap();
+                diagnostic_checkpoint(&observer,"child-prepared",json!({"child":child,"parent":receipt,"postCount":f.server.control.posts.load(Ordering::SeqCst),"status":f.git.git(&f.git.path,&["status","--porcelain=v1"])}));
+                assert_ne!(child["reviewOperation"]["operationId"],parent.review.operation_id);
+                assert_eq!(before,f.git.git(&f.git.path,&["status","--porcelain=v1"]));
+                assert_eq!(op.progress.lock().unwrap().effects.len(),1);
+                assert_eq!(f.server.control.posts.load(Ordering::SeqCst),0);
+                let c=s.concrete(&f).await;
+                wait_until(||c.review.workers.available_permits()==WORKERS).await;
+            }).await;
+        }).await;
+    }
+}
+#[intent_test_macros::daemon_test]
+async fn companion_diagnostic_group2_once_cancel_expiry_capacity() {
+    for scenario in 0..6 {
+        diagnostic_case(&format!("g2-{scenario}"),|observer|async move {
+            with_review_clock(async {
+                let f=Fixture::new().await;let s=f.socket().await;
+                let (parent,receipt,op)=diagnostic_parent(&f,&s,&observer).await;
+                let c=s.concrete(&f).await;let child=companion_child(&f,&parent);
+                if scenario<2 {
+                    let first=s.entered(async{s.owner.capture_review(&Frame::Prepare(child.clone())).unwrap()}).await;
+                    let repeated=if scenario==0{child.clone()}else{companion_child(&f,&parent)};
+                    let refused=diagnostic_request(&f,&s,Frame::Prepare(repeated),&observer).await;
+                    first.retire();drop(first);assert!(refused.is_err());
+                } else if scenario<4 {
+                    let (ready,waiting)=tokio::sync::oneshot::channel();
+                    let (release,released)=tokio::sync::oneshot::channel();
+                    let path=f.git.path.clone();let locks=f.services.worktree_locks.clone();
+                    let holder=if scenario==2{Some(tokio::spawn(async move{locks.with_lock(&path,||async {ready.send(()).unwrap();let _=released.await;}).await;}))}else{None};
+                    if scenario==2{waiting.await.unwrap();}else{*f.server.control.pause.lock().unwrap()=Some("/projects/".into());}
+                    let call=diagnostic_request(&f,&s,Frame::Prepare(child.clone()),&observer);tokio::pin!(call);
+                    if scenario==2 {tokio::select!{result=&mut call=>panic!("unexpected early result:{result:?}"),()=wait_until(||c.review.workers.available_permits()==WORKERS-1)=>{}}}
+                    else {tokio::select!{result=&mut call=>panic!("unexpected early result:{result:?}"),()=f.server.control.entered.notified()=>{}}}
+                    let released_parent=diagnostic_request(&f,&s,Frame::Release(bound(&parent)),&observer).await;
+                    let reply=call.await;
+                    diagnostic_checkpoint(&observer,"cancel-before-owned-join",json!({"body":diagnostic_reply(&reply),"parentRelease":diagnostic_reply(&released_parent),"workers":c.review.workers.available_permits()}));
+                    if scenario==2{release.send(()).unwrap();}else{f.server.control.release.notify_one();}
+                    if let Some(holder)=holder{holder.await.unwrap();}
+                    wait_until(||c.review.workers.available_permits()==WORKERS).await;
+                    assert!(released_parent.is_ok());assert!(reply.is_err());
+                } else {
+                    let hold=if scenario==5{Some(c.review.workers.clone().try_acquire_many_owned(u32::try_from(WORKERS).unwrap()).unwrap())}else{None};
+                    if scenario==4{tokio::time::advance(LEASE_TTL).await;}
+                    let refused=diagnostic_request(&f,&s,Frame::Prepare(child),&observer).await;
+                    drop(hold);assert!(refused.is_err());
+                }
+                diagnostic_checkpoint(&observer,"once-only-retained-parent",json!({"receipt":receipt,"effectCount":op.progress.lock().unwrap().effects.len(),"workers":c.review.workers.available_permits(),"posts":f.server.control.posts.load(Ordering::SeqCst)}));
+                assert_eq!(op.progress.lock().unwrap().effects.len(),1);
+                assert_eq!(c.review.workers.available_permits(),WORKERS);assert_eq!(f.services.repository_review_capacity.workers.available_permits(),GLOBAL_WORKERS);
+                assert_eq!(f.server.control.posts.load(Ordering::SeqCst),0);
+                assert!(diagnostic_request(&f,&s,Frame::Prepare(companion_child(&f,&parent)),&observer).await.is_err());
+            }).await;
+        }).await;
+    }
+}
+#[intent_test_macros::daemon_test]
+async fn companion_diagnostic_group3_continuity_authority_disclosure() {
+    for scenario in 0..6 {
+        diagnostic_case(&format!("g3-{scenario}"),|observer|async move {
+            with_review_clock(async {
+                let f=Fixture::new().await;let(s,person)=member(&f).await;
+                let(parent,receipt,op)=diagnostic_parent(&f,&s,&observer).await;
+                let child=companion_child(&f,&parent);
+                if scenario==5 {
+                    s.entered(async {
+                        let frame=s.owner.capture_review(&Frame::Prepare(child.clone())).unwrap();
+                        frame.scope(Box::pin(async {
+                            let body=f.services.native_review_prepare(child).await;
+                            diagnostic_checkpoint(&observer,"protected-child-before-revocation",diagnostic_reply(&body));
+                            assert!(body.is_ok());
+                            f.services.store.remove_host_member(&person.id).await.unwrap();
+                            let mut transfers=0;
+                            let delivered=frame.deliver(RepositoryReadReplyKind::Result,&mut||{transfers+=1;Ok(())}).await;
+                            diagnostic_checkpoint(&observer,"refused-first-protected-transfer",json!({"deliveryOk":delivered.is_ok(),"protectedTransfers":transfers}));
+                            assert!(delivered.is_err());assert_eq!(transfers,0);
+                        })).await;
+                        frame.retire();
+                    }).await;
+                    assert!(diagnostic_request(&f,&s,Frame::Reconcile(bound(&parent)),&observer).await.is_err());
+                } else {
+                    match scenario {
+                        0=>{f.git.git(&f.git.path,&["commit","--allow-empty","-m","unrelated"]);},
+                        1=>{f.stage("unrelated-index.txt");},
+                        2=>{f.services.store.remove_host_member(&person.id).await.unwrap();},
+                        3=>{f.services.store.revoke_principal_credential("review-member-credential").await.unwrap();},
+                        4=>{let selection=f.services.store.repository_selection_snapshot(&f.git.root()).await.unwrap();f.services.store.write_repository_selection(&selection,intent_store::RepositorySelectionChange::Automatic).await.result.unwrap();},
+                        _=>unreachable!(),
+                    }
+                    assert!(diagnostic_request(&f,&s,Frame::Prepare(child),&observer).await.is_err());
+                }
+                diagnostic_checkpoint(&observer,"private-receipt-after-refusal",json!({"original":receipt,"effects":op.progress.lock().unwrap().effects,"posts":f.server.control.posts.load(Ordering::SeqCst)}));
+                assert_eq!(op.progress.lock().unwrap().effects.len(),1);
+                assert_eq!(f.server.control.posts.load(Ordering::SeqCst),0);
+            }).await;
+        }).await;
+    }
+}
+#[intent_test_macros::daemon_test]
+async fn companion_diagnostic_group4_project_metadata_deadline() {
+    for deadline in [false, true] {
+        diagnostic_case(if deadline{"g4-acquisition-deadline"}else{"g4-project-then-unavailable"},|observer|async move {
+            with_review_clock(async {
+                let f=Fixture::new().await;let s=f.socket().await;
+                let(parent,receipt,op)=diagnostic_parent(&f,&s,&observer).await;
+                let c=s.concrete(&f).await;
+                let before=f.server.control.requests.lock().unwrap().iter().filter(|(_,path)|path.contains("/repository/branches")).count();
+                *f.server.control.pause.lock().unwrap()=Some("/projects/".into());
+                let call=diagnostic_request(&f,&s,Frame::Prepare(companion_child(&f,&parent)),&observer);tokio::pin!(call);
+                tokio::select!{result=&mut call=>panic!("original project GET not held:{result:?}"),()=f.server.control.entered.notified()=>{}}
+                let holder=if deadline {None} else {
+                    let (entered,waiting)=tokio::sync::oneshot::channel();let (release,released)=std::sync::mpsc::channel();let facts=op.metadata.provider.clone();
+                    let task=std::thread::spawn(move||facts.hold_native_review_metadata_for_test(entered,released));waiting.await.unwrap();Some((release,task))
+                };
+                if deadline{tokio::time::advance(ACQUIRE).await;}else{f.server.control.release.notify_one();}
+                let reply=call.await;
+                diagnostic_checkpoint(&observer,"held-project-original-return",json!({"body":diagnostic_reply(&reply),"receipt":receipt,"workers":c.review.workers.available_permits(),"requests":f.server.control.requests.lock().unwrap().clone()}));
+                if let Some((release,task))=holder{release.send(()).unwrap();task.join().unwrap();}
+                if deadline{f.server.control.release.notify_one();}
+                wait_until(||c.review.workers.available_permits()==WORKERS).await;
+                let after=f.server.control.requests.lock().unwrap().iter().filter(|(_,path)|path.contains("/repository/branches")).count();
+                assert!(reply.is_err());assert_eq!(before,after);assert_eq!(f.server.control.posts.load(Ordering::SeqCst),0);
+                let frames=observer.lines().into_iter().filter_map(|raw|serde_json::from_str::<companion_observation::FrameRecord>(&raw).ok()).collect::<Vec<_>>();
+                assert!(frames.iter().any(|f|f.phase==companion_observation::Phase::Project));
+                if !deadline {assert!(frames.iter().any(|f|f.phase==companion_observation::Phase::Branch&&f.outcome==companion_observation::Outcome::Error));}
+                assert_eq!(op.progress.lock().unwrap().effects.len(),1);
+            }).await;
+        }).await;
+    }
+}
+#[test]
+fn companion_diagnostic_group5_reader_bounds_privacy() {
+    use companion_observation::{Collector, FrameRecord, Outcome, Phase};
+    use std::os::unix::fs::PermissionsExt;
+    let (_dispatch, collector) = Collector::new(None);
+    let probe = collector.process();
+    let ok = companion_observe!(probe, Project, Ok::<_, ()>(37));
+    assert_eq!(ok, Ok(37));
+    let err = companion_observe!(probe, Branch, Err::<(), _>(41));
+    assert_eq!(err, Err(41));
+    probe.link(Phase::SourceEntered);
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _scope = probe.span(Phase::Acquire);
+        panic!("controlled unwind");
+    }));
+    assert!(panic.is_err());
+    drop(probe);
+    let valid = collector.lines();
+    println!(
+        "COMPANION6328-READER {}",
+        json!({"valid":valid,"report":collector.finish()})
+    );
+    assert_eq!(collector.finish()["complete"], true);
+    let parse = |lines: &[String]| companion_observation::read(lines);
+    for scenario in 0..14 {
+        let mut lines = valid.clone();
+        match scenario {
+            0 => {
+                lines.pop();
+            }
+            1 => {
+                lines.remove(0);
+            }
+            2 => {
+                lines.insert(1, lines[1].clone());
+            }
+            3 => {
+                lines.swap(1, 2);
+            }
+            4 => {
+                lines[1] = "{".into();
+            }
+            5 => {
+                let mut value: Value = serde_json::from_str(&lines[1]).unwrap();
+                value["token"] = json!("private");
+                lines[1] = value.to_string();
+            }
+            6 => {
+                let mut value: Value = serde_json::from_str(&lines[1]).unwrap();
+                value["operation"] = json!("https://forbidden.invalid");
+                lines[1] = value.to_string();
+            }
+            7 => {
+                let mut f: FrameRecord = serde_json::from_str(lines.last().unwrap()).unwrap();
+                f.sequence = 1;
+                f.observed = 1;
+                f.span = None;
+                lines = vec![serde_json::to_string(&f).unwrap()];
+            }
+            8 => {
+                let mut f: FrameRecord = serde_json::from_str(lines.last().unwrap()).unwrap();
+                f.sequence = 1;
+                f.observed = 1;
+                f.span = None;
+                f.outcome = Outcome::Unwind;
+                lines = vec![serde_json::to_string(&f).unwrap()];
+            }
+            9 => {
+                let mut f: FrameRecord = serde_json::from_str(lines.last().unwrap()).unwrap();
+                f.span = Some(99);
+                *lines.last_mut().unwrap() = serde_json::to_string(&f).unwrap();
+            }
+            10 => {
+                let mut f: FrameRecord = serde_json::from_str(&lines[1]).unwrap();
+                f.domain = "foreign-clock".into();
+                lines[1] = serde_json::to_string(&f).unwrap();
+            }
+            11 => {
+                lines.clear();
+            }
+            12 => {
+                let mut f: FrameRecord = serde_json::from_str(lines.last().unwrap()).unwrap();
+                f.sequence = 1;
+                f.observed = 1;
+                f.span = Some(1);
+                lines = vec![serde_json::to_string(&f).unwrap()];
+            }
+            _ => {
+                let mut f: FrameRecord = serde_json::from_str(lines.last().unwrap()).unwrap();
+                f.phase = Phase::Branch;
+                *lines.last_mut().unwrap() = serde_json::to_string(&f).unwrap();
+            }
+        }
+        let report = parse(&lines);
+        println!(
+            "COMPANION6328-READER {}",
+            json!({"subcase":scenario,"report":report})
+        );
+        assert!(!report.errors.is_empty() || !report.incomplete.is_empty());
+    }
+    let (_dispatch, limited) = Collector::new(None);
+    let probe = limited.process();
+    for _ in 0..300 {
+        probe.link(Phase::SourceEntered);
+    }
+    drop(probe);
+    let report = limited.finish();
+    println!("COMPANION6328-READER {report}");
+    assert_eq!(report["complete"], false);
+    let (_dispatch, multi) = Collector::new(None);
+    for _ in 0..2 {
+        let p = multi.process();
+        p.link(Phase::SourceEntered);
+        drop(p);
+    }
+    assert_eq!(multi.finish()["complete"], true);
+    let (_dispatch, capped) = Collector::new(None);
+    for _ in 0..9 {
+        let p = capped.process();
+        for _ in 0..250 {
+            p.link(Phase::SourceEntered);
+        }
+        drop(p);
+    }
+    let full = capped.finish();
+    println!("COMPANION6328-READER {full}");
+    assert_eq!(full["complete"], false);
+    assert!(full["accounting"]["overflow"].as_u64().unwrap() > 0);
+    let mut oversized = valid.clone();
+    oversized[1] = "x".repeat(companion_observation::FRAME_BYTES + 1);
+    assert!(!parse(&oversized).errors.is_empty());
+    let directory = crate::test_support::test_tempdir("companion-observer-io");
+    let disk_path = directory.path().join("actual-private-output.jsonl");
+    let (_dispatch, disk) = Collector::new(Some(&disk_path));
+    let p = disk.process();
+    p.link(Phase::SourceEntered);
+    drop(p);
+    let report = disk.finish();
+    assert_eq!(report["complete"], true);
+    assert_eq!(
+        std::fs::read_to_string(&disk_path)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        disk.lines().iter().map(String::as_str).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        std::fs::metadata(disk_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let (_dispatch, io) = Collector::new(Some(&directory.path().join("absent/output")));
+    let probe = io.process();
+    let result = companion_observe!(probe, Project, Ok::<_, ()>(43));
+    drop(probe);
+    assert_eq!(result, Ok(43));
+    assert_eq!(io.finish()["accounting"]["io"], 1);
+    assert!(!valid.iter().any(|line| line.contains("stored-pat")
+        || line.contains("group/project")
+        || line.contains("account")));
+}
+// companion-observation: end qualification

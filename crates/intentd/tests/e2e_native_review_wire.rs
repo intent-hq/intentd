@@ -2748,6 +2748,9 @@ mod driver_ownership {
             std::fs::set_permissions(&tls, std::fs::Permissions::from_mode(0o700))?;
             make_fixture_certificate(&tls);
             let descriptor = driver_descriptor(&path, true)?;
+            // companion-observation: begin worker collector
+            let _companion_observer = CompanionFixtureObservation::install(&descriptor.directory);
+            // companion-observation: end worker collector
             return tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?
@@ -3493,3 +3496,33 @@ async fn native_review_target_prerequisite_member_wss() {
     drop(client);
     h.shutdown().await;
 }
+
+// companion-observation: begin fixture collector
+struct CompanionFixtureObservation(Option<Box<dyn FnOnce()>>);
+impl CompanionFixtureObservation {
+    fn install(directory: &std::path::Path) -> Self {
+        let (dispatch, collector) = intent_services::Services::native_companion_observer(Some(
+            &directory.join("companion-preparation-v1.jsonl"),
+        ));
+        let process = collector.process();
+        // Only this explicitly selected, isolated fixture worker installs it.
+        let installed = tracing::dispatcher::set_global_default(dispatch).is_ok();
+        let summary = directory.join("companion-preparation-v1-final.json");
+        Self(Some(Box::new(move || {
+            drop(process);
+            let report = collector.finish();
+            let value = json!({"collectorInstalled":installed,"observation":report});
+            if private_json(&summary, &value).is_err() {
+                eprintln!("companion-preparation-v1: finalization output failed");
+            }
+        })))
+    }
+}
+impl Drop for CompanionFixtureObservation {
+    fn drop(&mut self) {
+        if let Some(finish) = self.0.take() {
+            finish();
+        }
+    }
+}
+// companion-observation: end fixture collector

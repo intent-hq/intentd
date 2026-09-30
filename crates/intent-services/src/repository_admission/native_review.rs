@@ -55,6 +55,762 @@ use std::time::Duration;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
+// companion-observation: begin module
+#[cfg(any(test, feature = "repository-test-fixtures"))]
+mod companion_observation {
+    use super::{json, Arc, Choice, Connection, Frame, HashMap, Instant, Mutex, Ordering, Value};
+    use serde::{Deserialize, Serialize};
+    use std::io::Write;
+    use std::sync::atomic::AtomicU64;
+    pub const TARGET: &str = "intent_companion_preparation_v1";
+    pub const PER_STREAM: u64 = 256;
+    pub const PER_FIXTURE: usize = 2048;
+    pub const FRAME_BYTES: usize = 1024;
+    #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum Phase {
+        Process,
+        Request,
+        Operation,
+        Capture,
+        Claim,
+        Witness,
+        Capacity,
+        RecordCapacity,
+        GlobalRecordCapacity,
+        Acquire,
+        AcquireWait,
+        Authority,
+        Metadata,
+        Source,
+        SourceEntered,
+        SourceCancelled,
+        SourceDeadline,
+        GitContinuity,
+        Project,
+        Branch,
+        ReadAuthority,
+        ReadFence,
+        ReadFenceAbandoned,
+        Facts,
+        FinalFacts,
+        Install,
+        Body,
+        Delivery,
+        PublicError,
+        ProtectedResult,
+        Worker,
+        FrameDeadline,
+        RequestFinish,
+        Complete,
+        CompleteNormal,
+        CompleteAbandoned,
+        WriteRetire,
+        FullRetire,
+        CommitWitness,
+        ResourceRelease,
+    }
+    #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum Outcome {
+        Enter,
+        Ok,
+        Error,
+        Exit,
+        Unwind,
+        Link,
+    }
+    #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum Method {
+        Prepare,
+        Execute,
+        Reconcile,
+        Release,
+    }
+    #[derive(Clone, Debug, Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct FrameRecord {
+        pub version: u8,
+        pub pid: u32,
+        pub stream: u64,
+        pub domain: String,
+        pub anchor_ms: u64,
+        pub elapsed_ns: u64,
+        pub sequence: u64,
+        pub observed: u64,
+        pub dropped: u64,
+        pub span: Option<u64>,
+        pub phase: Phase,
+        pub outcome: Outcome,
+        pub finalized: bool,
+        pub origin_stream: Option<u64>,
+        pub method: Option<Method>,
+        pub daemon: Option<String>,
+        pub operation: Option<String>,
+        pub capture: Option<String>,
+    }
+    fn opaque(value: &str) -> Option<String> {
+        (value.len() == 36
+            && value.bytes().enumerate().all(|(i, c)| {
+                if [8, 13, 18, 23].contains(&i) {
+                    c == b'-'
+                } else {
+                    c.is_ascii_hexdigit()
+                }
+            }))
+        .then(|| value.to_owned())
+    }
+    #[derive(Default)]
+    struct State {
+        sequence: u64,
+        observed: u64,
+        dropped: u64,
+        next_span: u64,
+    }
+    struct Trace {
+        dispatch: tracing::Dispatch,
+        start: Instant,
+        anchor_ms: u64,
+        id: u64,
+        root: Phase,
+        origin_stream: Option<u64>,
+        method: Option<Method>,
+        daemon: Option<String>,
+        operation: Option<String>,
+        capture: Option<String>,
+        state: Mutex<State>,
+    }
+    #[derive(Clone)]
+    pub struct Probe(Arc<Trace>);
+    impl Probe {
+        fn new(
+            dispatch: tracing::Dispatch,
+            root: Phase,
+            origin_stream: Option<u64>,
+            method: Option<Method>,
+            daemon: Option<String>,
+            operation: Option<String>,
+            capture: Option<String>,
+        ) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(1);
+            let trace = Arc::new(Trace {
+                dispatch,
+                start: Instant::now(),
+                anchor_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0)),
+                id: NEXT.fetch_add(1, Ordering::Relaxed),
+                root,
+                origin_stream,
+                method,
+                daemon,
+                operation,
+                capture,
+                state: Mutex::new(State {
+                    next_span: 1,
+                    ..State::default()
+                }),
+            });
+            trace.emit(root, Outcome::Enter, Some(1), false);
+            Self(trace)
+        }
+        pub(super) fn request(c: &Connection, frame: &Frame) -> Self {
+            let (operation, capture) = match frame {
+                Frame::Prepare(q) => match &q.review.choice {
+                    Choice::AfterCommit {
+                        operation_id,
+                        capture_id,
+                    } => (opaque(operation_id), opaque(capture_id)),
+                    _ => (None, None),
+                },
+                Frame::Execute(q) => (opaque(&q.review.operation_id), None),
+                Frame::Reconcile(q) | Frame::Release(q) => (opaque(&q.operation_id), None),
+            };
+            Self::new(
+                tracing::dispatcher::get_default(Clone::clone),
+                Phase::Request,
+                None,
+                Some(match frame {
+                    Frame::Prepare(_) => Method::Prepare,
+                    Frame::Execute(_) => Method::Execute,
+                    Frame::Reconcile(_) => Method::Reconcile,
+                    Frame::Release(_) => Method::Release,
+                }),
+                opaque(&c.services.daemon_boot_id),
+                operation,
+                capture,
+            )
+        }
+        pub fn operation(&self, id: &str) -> Self {
+            Self::new(
+                self.0.dispatch.clone(),
+                Phase::Operation,
+                Some(self.0.id),
+                None,
+                self.0.daemon.clone(),
+                opaque(id),
+                self.0.capture.clone(),
+            )
+        }
+        pub fn span(&self, phase: Phase) -> Span {
+            let id = {
+                let mut s = self
+                    .0
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                s.next_span += 1;
+                s.next_span
+            };
+            self.0.emit(phase, Outcome::Enter, Some(id), false);
+            Span {
+                probe: self.clone(),
+                phase,
+                id,
+                ended: false,
+            }
+        }
+        pub fn link(&self, phase: Phase) {
+            self.0.emit(phase, Outcome::Link, None, false);
+        }
+    }
+    impl Trace {
+        fn emit(&self, phase: Phase, outcome: Outcome, span: Option<u64>, finalized: bool) {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.observed = state.observed.saturating_add(1);
+            if state.sequence >= PER_STREAM - u64::from(!finalized) {
+                state.dropped = state.dropped.saturating_add(1);
+                return;
+            }
+            state.sequence += 1;
+            let frame = FrameRecord {
+                version: 1,
+                pid: std::process::id(),
+                stream: self.id,
+                domain: format!("tokio-instant:{}:{}", std::process::id(), self.id),
+                anchor_ms: self.anchor_ms,
+                elapsed_ns: u64::try_from(self.start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                sequence: state.sequence,
+                observed: state.observed,
+                dropped: state.dropped,
+                span,
+                phase,
+                outcome,
+                finalized,
+                origin_stream: self.origin_stream,
+                method: self.method,
+                daemon: self.daemon.clone(),
+                operation: self.operation.clone(),
+                capture: self.capture.clone(),
+            };
+            if let Ok(raw) = serde_json::to_string(&frame) {
+                if raw.len() <= FRAME_BYTES {
+                    tracing::dispatcher::with_default(
+                        &self.dispatch,
+                        || tracing::event!(target:TARGET,tracing::Level::INFO,frame=raw.as_str()),
+                    );
+                } else {
+                    state.dropped = state.dropped.saturating_add(1);
+                }
+            } else {
+                state.dropped = state.dropped.saturating_add(1);
+            }
+        }
+    }
+    impl Drop for Trace {
+        fn drop(&mut self) {
+            self.emit(
+                self.root,
+                if std::thread::panicking() {
+                    Outcome::Unwind
+                } else {
+                    Outcome::Exit
+                },
+                Some(1),
+                true,
+            );
+        }
+    }
+    pub struct Span {
+        probe: Probe,
+        phase: Phase,
+        id: u64,
+        ended: bool,
+    }
+    impl Span {
+        pub fn result<T, E>(&mut self, result: &std::result::Result<T, E>) {
+            self.probe.0.emit(
+                self.phase,
+                if result.is_ok() {
+                    Outcome::Ok
+                } else {
+                    Outcome::Error
+                },
+                Some(self.id),
+                false,
+            );
+            self.ended = true;
+        }
+    }
+    impl Drop for Span {
+        fn drop(&mut self) {
+            if !self.ended {
+                self.probe.0.emit(
+                    self.phase,
+                    if std::thread::panicking() {
+                        Outcome::Unwind
+                    } else {
+                        Outcome::Exit
+                    },
+                    Some(self.id),
+                    false,
+                );
+            }
+        }
+    }
+    // Declared after the original legacy lease in PreparationFence. Its only
+    // output happens after that field and the original consuming guards drop.
+    pub(super) struct DeferredFence {
+        probe: Probe,
+        outcome: std::sync::atomic::AtomicU8,
+    }
+    impl DeferredFence {
+        pub(super) fn new(probe: Probe) -> Self {
+            Self {
+                probe,
+                outcome: std::sync::atomic::AtomicU8::new(0),
+            }
+        }
+        pub(super) fn outer<T, E>(&self, result: &std::result::Result<T, E>) {
+            if result.is_err() {
+                self.outcome.store(1, Ordering::Relaxed);
+            }
+        }
+        pub(super) fn inner<T, E>(
+            &self,
+            result: &std::result::Result<std::result::Result<T, E>, E>,
+        ) {
+            self.outcome.store(
+                if result.as_ref().is_ok_and(std::result::Result::is_ok) {
+                    2
+                } else {
+                    1
+                },
+                Ordering::Relaxed,
+            );
+        }
+    }
+    impl Drop for DeferredFence {
+        fn drop(&mut self) {
+            let outcome = self.outcome.load(Ordering::Relaxed);
+            if outcome == 0 && !std::thread::panicking() {
+                self.probe.link(Phase::ReadFenceAbandoned);
+                return;
+            }
+            let mut span = self.probe.span(Phase::ReadFence);
+            if !std::thread::panicking() {
+                span.result(&if outcome == 2 { Ok(()) } else { Err(()) });
+            }
+        }
+    }
+    #[derive(Default, Debug, Serialize)]
+    pub struct Report {
+        pub records: usize,
+        pub errors: Vec<String>,
+        pub incomplete: Vec<String>,
+        pub producer_observed: u64,
+        pub producer_dropped: u64,
+    }
+    #[derive(Clone, PartialEq, Eq)]
+    struct Context {
+        method: Option<Method>,
+        daemon: Option<String>,
+        operation: Option<String>,
+        capture: Option<String>,
+        origin: Option<u64>,
+    }
+    #[derive(Default)]
+    struct ReadState {
+        sequence: u64,
+        elapsed: u64,
+        anchor: u64,
+        observed: u64,
+        dropped: u64,
+        context: Option<Context>,
+        domain: String,
+        active: HashMap<u64, Phase>,
+        root: Option<Phase>,
+        finalized: bool,
+        invalid: bool,
+    }
+    pub fn read(lines: &[String]) -> Report {
+        let mut report = Report::default();
+        if lines.is_empty() {
+            report.incomplete.push("no-records".into());
+        }
+        let mut streams: HashMap<(u32, u64), ReadState> = HashMap::new();
+        if lines.len() > PER_FIXTURE {
+            report.errors.push("fixture-cap".into());
+        }
+        for raw in lines.iter().take(PER_FIXTURE) {
+            if raw.len() > FRAME_BYTES {
+                report.errors.push("frame-cap".into());
+                continue;
+            }
+            let Ok(f) = serde_json::from_str::<FrameRecord>(raw) else {
+                report.errors.push("malformed".into());
+                continue;
+            };
+            report.records += 1;
+            let s = streams.entry((f.pid, f.stream)).or_default();
+            let valid_ids = [&f.daemon, &f.operation, &f.capture]
+                .into_iter()
+                .all(|v| v.as_ref().is_none_or(|v| opaque(v).is_some()));
+            let context = Context {
+                method: f.method,
+                daemon: f.daemon.clone(),
+                operation: f.operation.clone(),
+                capture: f.capture.clone(),
+                origin: f.origin_stream,
+            };
+            let valid_base = f.version == 1
+                && f.pid != 0
+                && f.stream != 0
+                && f.anchor_ms != 0
+                && valid_ids
+                && f.domain == format!("tokio-instant:{}:{}", f.pid, f.stream)
+                && f.sequence == s.sequence + 1
+                && f.sequence <= PER_STREAM
+                && f.observed == f.sequence
+                && f.dropped == 0
+                && !s.finalized
+                && f.elapsed_ns >= s.elapsed;
+            if s.sequence == 0 {
+                s.context = Some(context.clone());
+                s.anchor = f.anchor_ms;
+                s.domain.clone_from(&f.domain);
+            }
+            let mut valid = valid_base
+                && s.anchor == f.anchor_ms
+                && s.domain == f.domain
+                && s.context.as_ref() == Some(&context);
+            match f.outcome {
+                Outcome::Enter => {
+                    if let Some(id) = f.span {
+                        valid &= !f.finalized && !s.active.contains_key(&id);
+                        if f.sequence == 1 {
+                            valid &= id == 1
+                                && matches!(
+                                    f.phase,
+                                    Phase::Process | Phase::Request | Phase::Operation
+                                );
+                            valid &= match f.phase {
+                                Phase::Process => {
+                                    f.method.is_none()
+                                        && f.origin_stream.is_none()
+                                        && f.daemon.is_none()
+                                        && f.operation.is_none()
+                                        && f.capture.is_none()
+                                }
+                                Phase::Request => f.method.is_some() && f.origin_stream.is_none(),
+                                Phase::Operation => {
+                                    f.method.is_none()
+                                        && f.origin_stream.is_some()
+                                        && f.operation.is_some()
+                                }
+                                _ => false,
+                            };
+                            s.root = Some(f.phase);
+                        } else {
+                            valid &= id != 1
+                                && !matches!(
+                                    f.phase,
+                                    Phase::Process | Phase::Request | Phase::Operation
+                                );
+                        }
+                        if valid {
+                            s.active.insert(id, f.phase);
+                        }
+                    } else {
+                        valid = false;
+                    }
+                }
+                Outcome::Link => {
+                    valid &= f.span.is_none() && !f.finalized && s.active.contains_key(&1);
+                }
+                _ => {
+                    let paired = f.span.is_some_and(|id| s.active.get(&id) == Some(&f.phase));
+                    valid &= paired;
+                    if f.finalized {
+                        valid &= f.span == Some(1)
+                            && s.root == Some(f.phase)
+                            && s.active.len() == 1
+                            && matches!(f.outcome, Outcome::Exit | Outcome::Unwind);
+                    } else {
+                        valid &= f.span != Some(1);
+                    }
+                    if valid {
+                        s.active.remove(&f.span.unwrap());
+                        if f.finalized && !s.invalid {
+                            s.finalized = true;
+                        }
+                    }
+                }
+            }
+            if !valid {
+                s.invalid = true;
+                report
+                    .errors
+                    .push(format!("invalid:{}:{}:{}", f.pid, f.stream, f.sequence));
+            }
+            s.observed = f.observed;
+            s.dropped = f.dropped;
+            s.sequence = f.sequence;
+            s.elapsed = f.elapsed_ns;
+        }
+        if !streams.values().any(|s| s.root == Some(Phase::Process)) {
+            report.incomplete.push("process-unobserved".into());
+        }
+        for ((pid, id), s) in streams {
+            report.producer_observed += s.observed;
+            report.producer_dropped += s.dropped;
+            if s.invalid || !s.finalized || !s.active.is_empty() {
+                report.incomplete.push(format!("{pid}:{id}"));
+            }
+        }
+        report
+    }
+    #[derive(Default, Debug, Serialize)]
+    pub struct Accounting {
+        pub observed: u64,
+        pub written: u64,
+        pub dropped: u64,
+        pub overflow: u64,
+        pub io: u64,
+        pub malformed: u64,
+        pub unmatched: u64,
+        pub finalized: bool,
+    }
+    struct Sink {
+        lines: Vec<String>,
+        file: Option<std::fs::File>,
+        file_expected: bool,
+        counts: Accounting,
+    }
+    #[derive(Clone)]
+    pub struct Collector {
+        inner: Arc<Mutex<Sink>>,
+    }
+    impl Collector {
+        pub fn new(output: Option<&std::path::Path>) -> (tracing::Dispatch, Self) {
+            let mut counts = Accounting::default();
+            let file = output.and_then(|path| {
+                use std::os::unix::fs::OpenOptionsExt;
+                if let Ok(file) = std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .mode(0o600)
+                    .open(path)
+                {
+                    Some(file)
+                } else {
+                    counts.io += 1;
+                    None
+                }
+            });
+            let c = Self {
+                inner: Arc::new(Mutex::new(Sink {
+                    lines: vec![],
+                    file,
+                    file_expected: output.is_some(),
+                    counts,
+                })),
+            };
+            (tracing::Dispatch::new(c.clone()), c)
+        }
+        pub fn process(&self) -> Probe {
+            Probe::new(
+                tracing::Dispatch::new(self.clone()),
+                Phase::Process,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+
+        pub fn lines(&self) -> Vec<String> {
+            self.inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .lines
+                .clone()
+        }
+        pub fn finish(&self) -> Value {
+            let mut sink = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(file) = &mut sink.file {
+                if file.sync_all().is_err() {
+                    sink.counts.io += 1;
+                }
+            }
+            let report = read(&sink.lines);
+            sink.counts.unmatched = report.incomplete.len() as u64;
+            sink.counts.finalized = true;
+            json!({"version":1,"accounting":sink.counts,"report":report,"complete":report.errors.is_empty()&&report.incomplete.is_empty()&&sink.counts.dropped==0&&sink.counts.io==0&&sink.counts.malformed==0})
+        }
+        fn accept(&self, raw: String) {
+            let mut sink = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            sink.counts.observed += 1;
+            if sink.lines.len() >= PER_FIXTURE {
+                sink.counts.dropped += 1;
+                sink.counts.overflow += 1;
+                return;
+            }
+            if raw.len() > FRAME_BYTES || serde_json::from_str::<FrameRecord>(&raw).is_err() {
+                sink.counts.malformed += 1;
+                sink.counts.dropped += 1;
+                return;
+            }
+            if sink.file_expected && sink.file.is_none() {
+                sink.counts.dropped += 1;
+                return;
+            }
+            if let Some(file) = &mut sink.file {
+                if writeln!(file, "{raw}").is_err() {
+                    sink.counts.io += 1;
+                    sink.counts.dropped += 1;
+                    return;
+                }
+            }
+            sink.lines.push(raw);
+            sink.counts.written += 1;
+        }
+    }
+    impl tracing::Subscriber for Collector {
+        fn enabled(&self, m: &tracing::Metadata<'_>) -> bool {
+            m.target() == TARGET
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Visitor(Option<String>);
+            impl tracing::field::Visit for Visitor {
+                fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                    if f.name() == "frame" {
+                        self.0 = Some(v.to_owned());
+                    }
+                }
+                fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+            }
+            if !self.enabled(event.metadata()) {
+                return;
+            }
+            let mut visitor = Visitor(None);
+            event.record(&mut visitor);
+            if let Some(raw) = visitor.0 {
+                self.accept(raw);
+            } else {
+                self.inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .counts
+                    .malformed += 1;
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+}
+#[cfg(any(test, feature = "repository-test-fixtures"))]
+impl Services {
+    /// Passive bounded collector for the separately owned disposable fixture.
+    #[must_use]
+    pub fn native_companion_observer(
+        output: Option<&std::path::Path>,
+    ) -> (tracing::Dispatch, companion_observation::Collector) {
+        companion_observation::Collector::new(output)
+    }
+}
+macro_rules! companion_observe {
+    ($probe:expr, $phase:ident, $expression:expr) => {{
+        #[cfg(any(test, feature = "repository-test-fixtures"))]
+        {
+            let mut observation = $probe.span(companion_observation::Phase::$phase);
+            let result = $expression;
+            observation.result(&result);
+            result
+        }
+        #[cfg(not(any(test, feature = "repository-test-fixtures")))]
+        {
+            $expression
+        }
+    }};
+}
+macro_rules! companion_link {
+    ($probe:expr, $phase:ident) => {
+        #[cfg(any(test, feature = "repository-test-fixtures"))]
+        $probe.link(companion_observation::Phase::$phase);
+    };
+}
+macro_rules! companion_condition {
+    ($probe:expr, $phase:ident, $expression:expr) => {{
+        #[cfg(any(test, feature = "repository-test-fixtures"))]
+        {
+            let mut observation = $probe.span(companion_observation::Phase::$phase);
+            let result = $expression;
+            observation.result(&if result { Err(()) } else { Ok(()) });
+            result
+        }
+        #[cfg(not(any(test, feature = "repository-test-fixtures")))]
+        {
+            $expression
+        }
+    }};
+}
+macro_rules! companion_fence_outer {
+    ($observation:expr,$expression:expr) => {{
+        #[cfg(any(test, feature = "repository-test-fixtures"))]
+        {
+            let result = $expression;
+            $observation.outer(&result);
+            result
+        }
+        #[cfg(not(any(test, feature = "repository-test-fixtures")))]
+        {
+            $expression
+        }
+    }};
+}
+macro_rules! companion_fence_inner {
+    ($observation:expr,$expression:expr) => {{
+        #[cfg(any(test, feature = "repository-test-fixtures"))]
+        {
+            let result = $expression;
+            $observation.inner(&result);
+            result
+        }
+        #[cfg(not(any(test, feature = "repository-test-fixtures")))]
+        {
+            $expression
+        }
+    }};
+}
+// companion-observation: end module
+
 const RECORDS: usize = 32;
 const GLOBAL_RECORDS: usize = 256;
 const WORKERS: usize = 2;
@@ -337,6 +1093,8 @@ struct CommitWitness {
     staging: String,
 }
 struct Operation {
+    #[cfg(any(test, feature = "repository-test-fixtures"))]
+    probe: companion_observation::Probe,
     id: String,
     query: Prepare,
     metadata: Arc<CapturedMetadata>,
@@ -371,6 +1129,7 @@ impl Operation {
                 .closed = true;
         }
         self.retire_write();
+        companion_link!(self.probe, FullRetire);
     }
     fn retire_write(&self) {
         self.write.retirement().end_scope();
@@ -380,6 +1139,7 @@ impl Operation {
             }
         }
         self.changed.notify_waiters();
+        companion_link!(self.probe, WriteRetire);
     }
     fn lease_start(&self) -> Instant {
         self.companion_publication
@@ -499,6 +1259,13 @@ impl Operation {
             self.retire();
         }
         self.changed.notify_waiters();
+        companion_link!(self.probe, Complete);
+        #[cfg(any(test, feature = "repository-test-fixtures"))]
+        self.probe.link(if companion_normal {
+            companion_observation::Phase::CompleteNormal
+        } else {
+            companion_observation::Phase::CompleteAbandoned
+        });
     }
     fn companion_normal(&self) -> bool {
         self.companion
@@ -604,6 +1371,8 @@ fn keys(root: &RepositoryRootId) -> Vec<RepositoryLifecycleKey> {
 
 tokio::task_local! {static REVIEW_REQUEST:Arc<Request>;}
 struct Request {
+    #[cfg(any(test, feature = "repository-test-fixtures"))]
+    probe: companion_observation::Probe,
     connection: Arc<Connection>,
     weak: Weak<Self>,
     frame: Frame,
@@ -668,6 +1437,7 @@ impl Request {
             .ok_or_else(unavailable)
     }
     fn finish(&self) {
+        companion_link!(self.probe, RequestFinish);
         if self.completed.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -703,34 +1473,40 @@ impl Drop for Request {
     }
 }
 pub(super) fn capture_frame(c: &Connection, frame: Frame) -> Arc<dyn RepositoryReadRequestScope> {
-    let capture = (|| {
-        c.entered().map_err(denied)?;
-        c.review.check()?;
-        if REVIEW_REQUEST.try_with(|_| ()).is_ok()
-            || super::NATIVE_REQUEST.try_with(|_| ()).is_ok()
-            || frame.root().workspace_id != *frame.workspace()
-        {
-            return Err(unavailable());
-        }
-        if match &frame {
-            Frame::Prepare(q) => serde_json::to_vec(q),
-            Frame::Execute(q) => serde_json::to_vec(q),
-            Frame::Reconcile(q) | Frame::Release(q) => serde_json::to_vec(q),
-        }
-        .map_err(denied)?
-        .len()
-            > COMMAND_BYTES
-        {
-            return Err(invalid());
-        }
-        let (life, registration) = c.new_lifetime().map_err(denied)?;
-        let subs = vec![
-            registration,
-            life.subscribe(&c.services.store, c.caller.caller(), &keys(frame.root()))
-                .map_err(denied)?,
-        ];
-        Ok((life, subs))
-    })();
+    #[cfg(any(test, feature = "repository-test-fixtures"))]
+    let probe = companion_observation::Probe::request(c, &frame);
+    let capture = companion_observe!(
+        probe,
+        Capture,
+        (|| {
+            c.entered().map_err(denied)?;
+            c.review.check()?;
+            if REVIEW_REQUEST.try_with(|_| ()).is_ok()
+                || super::NATIVE_REQUEST.try_with(|_| ()).is_ok()
+                || frame.root().workspace_id != *frame.workspace()
+            {
+                return Err(unavailable());
+            }
+            if match &frame {
+                Frame::Prepare(q) => serde_json::to_vec(q),
+                Frame::Execute(q) => serde_json::to_vec(q),
+                Frame::Reconcile(q) | Frame::Release(q) => serde_json::to_vec(q),
+            }
+            .map_err(denied)?
+            .len()
+                > COMMAND_BYTES
+            {
+                return Err(invalid());
+            }
+            let (life, registration) = c.new_lifetime().map_err(denied)?;
+            let subs = vec![
+                registration,
+                life.subscribe(&c.services.store, c.caller.caller(), &keys(frame.root()))
+                    .map_err(denied)?,
+            ];
+            Ok((life, subs))
+        })()
+    );
     let (lifetime, subscriptions) = match capture {
         Ok((l, s)) => (Some(l), s),
         Err(_) => (None, vec![]),
@@ -758,43 +1534,49 @@ pub(super) fn capture_frame(c: &Connection, frame: Frame) -> Arc<dyn RepositoryR
             if let Some(op) = op.filter(|op| {
                 op.query.review.root == *frame.root() && op.published.load(Ordering::Acquire)
             }) {
-                let claim = (|| {
-                    op.disclosure_current()?;
-                    if let Frame::Execute(q) = &frame {
-                        if q.action != op.query.action
-                            || serde_json::to_vec(q).map_err(denied)?.len() > COMMAND_BYTES
-                        {
-                            return Err(invalid());
-                        }
-                        let mut p = op.progress.lock().map_err(denied)?;
-                        if let Some(previous) = &p.command {
-                            if previous != q {
+                let claim = companion_observe!(
+                    probe,
+                    Claim,
+                    (|| {
+                        op.disclosure_current()?;
+                        if let Frame::Execute(q) = &frame {
+                            if q.action != op.query.action
+                                || serde_json::to_vec(q).map_err(denied)?.len() > COMMAND_BYTES
+                            {
                                 return Err(invalid());
                             }
+                            let mut p = op.progress.lock().map_err(denied)?;
+                            if let Some(previous) = &p.command {
+                                if previous != q {
+                                    return Err(invalid());
+                                }
+                                op.budget()?;
+                            } else {
+                                op.write_current()?;
+                                p.command = Some(q.clone());
+                                initiator = true;
+                            }
+                        } else if let Frame::Prepare(q) = &frame {
+                            let Choice::AfterCommit { capture_id, .. } = &q.review.choice else {
+                                return Err(invalid());
+                            };
                             op.budget()?;
-                        } else {
-                            op.write_current()?;
-                            p.command = Some(q.clone());
-                            initiator = true;
+                            op.claim_companion(capture_id)?;
+                            op.companion
+                                .as_ref()
+                                .ok_or_else(unavailable)?
+                                .lifetime
+                                .retirement()
+                                .native_link(
+                                    &lifetime.as_ref().ok_or_else(unavailable)?.retirement(),
+                                )
+                                .map_err(denied)?;
+                        } else if matches!(frame, Frame::Reconcile(_)) {
+                            op.budget()?;
                         }
-                    } else if let Frame::Prepare(q) = &frame {
-                        let Choice::AfterCommit { capture_id, .. } = &q.review.choice else {
-                            return Err(invalid());
-                        };
-                        op.budget()?;
-                        op.claim_companion(capture_id)?;
-                        op.companion
-                            .as_ref()
-                            .ok_or_else(unavailable)?
-                            .lifetime
-                            .retirement()
-                            .native_link(&lifetime.as_ref().ok_or_else(unavailable)?.retirement())
-                            .map_err(denied)?;
-                    } else if matches!(frame, Frame::Reconcile(_)) {
-                        op.budget()?;
-                    }
-                    Ok(())
-                })();
+                        Ok(())
+                    })()
+                );
                 if let Err(e) = claim {
                     error = Some(matches!(e, Error::InvalidParams(_)));
                 }
@@ -824,6 +1606,8 @@ pub(super) fn capture_frame(c: &Connection, frame: Frame) -> Arc<dyn RepositoryR
     let companion_reply = predecessor.is_some()
         || (initiator && target.as_ref().is_some_and(|op| op.companion.is_some()));
     let r = Arc::new_cyclic(|weak| Request {
+        #[cfg(any(test, feature = "repository-test-fixtures"))]
+        probe,
         connection: c.weak.upgrade().expect("owned original connection"),
         weak: weak.clone(),
         frame,
@@ -850,6 +1634,8 @@ pub(super) fn capture_frame(c: &Connection, frame: Frame) -> Arc<dyn RepositoryR
             .predecessor
             .as_ref()
             .map(|parent| (r.created + FRAME_TTL).min(parent.created + LEASE_TTL));
+        #[cfg(any(test, feature = "repository-test-fixtures"))]
+        let observation = r.probe.clone();
         tokio::spawn(async move {
             let timeout = async {
                 if let Some(deadline) = deadline {
@@ -858,7 +1644,7 @@ pub(super) fn capture_frame(c: &Connection, frame: Frame) -> Arc<dyn RepositoryR
                     tokio::time::sleep(FRAME_TTL).await;
                 }
             };
-            tokio::select! {()=retirement.native_cancelled()=>{},()=timeout=>{}}
+            tokio::select! {()=retirement.native_cancelled()=>{},()=timeout=>{companion_link!(observation, FrameDeadline);}}
             if let Some(r) = weak.upgrade() {
                 if !r.started() {
                     r.finish();
@@ -891,7 +1677,7 @@ fn entry<'a>(
     let r = Request::current(s, f);
     Box::pin(async move {
         let r = r?;
-        let result = checked(&r, body(r.clone())).await;
+        let result = companion_observe!(r.probe, Body, checked(&r, body(r.clone())).await);
         if result.is_err() {
             r.public.store(true, Ordering::Release);
             if r.initiator {
@@ -928,6 +1714,8 @@ impl RepositoryReadRequestScope for Request {
         // overtaken. A second attempt cannot publish through guard unwinding.
         let claimed = !self.companion_reply || !self.consumed.swap(true, Ordering::AcqRel);
         Box::pin(async move {
+            #[cfg(any(test, feature = "repository-test-fixtures"))]
+            let mut observation = self.probe.span(companion_observation::Phase::Delivery);
             let result = async {
                 if !claimed {
                     return Err(unavailable());
@@ -936,9 +1724,11 @@ impl RepositoryReadRequestScope for Request {
                     if !self.companion_reply && self.consumed.swap(true, Ordering::AcqRel) {
                         return Err(unavailable());
                     }
+                    companion_link!(self.probe, PublicError);
                     return transfer();
                 }
                 entered?;
+                companion_link!(self.probe, ProtectedResult);
                 let r = self.weak.upgrade().ok_or_else(unavailable)?;
                 checked(&r, async {
                     let op = self.operation()?;
@@ -1010,6 +1800,8 @@ impl RepositoryReadRequestScope for Request {
                 .await
             }
             .await;
+            #[cfg(any(test, feature = "repository-test-fixtures"))]
+            observation.result(&result);
             if result.is_err() && self.companion_reply {
                 // The once-reservation still excludes other deliveries while
                 // all consuming guards unwind before terminal retirement.
@@ -1279,6 +2071,8 @@ fn content_fingerprint(path: &std::path::Path, files: &[String]) -> Result<Strin
 }
 
 struct PreparationAuthority {
+    #[cfg(any(test, feature = "repository-test-fixtures"))]
+    probe: companion_observation::Probe,
     metadata: Arc<CapturedMetadata>,
     retirement: RepositoryRetirement,
     request: RepositoryAuthorityRequest,
@@ -1288,6 +2082,8 @@ struct PreparationFence {
     retirement: RepositoryRetirement,
     parent: RepositoryRetirement,
     _legacy: Option<intent_core::caller::CredentialLease>,
+    #[cfg(any(test, feature = "repository-test-fixtures"))]
+    observation: companion_observation::DeferredFence,
 }
 impl RepositoryAuthority for PreparationAuthority {
     fn revalidate<'a>(
@@ -1298,11 +2094,9 @@ impl RepositoryAuthority for PreparationAuthority {
             if request != &self.request || request.use_kind != Use::NativeRead {
                 return Err(CredentialError::AuthorityDenied);
             }
-            self.retirement.check_current().map_err(credential_error)?;
-            let c = self
-                .metadata
-                .validate(true)
-                .await
+            companion_observe!(self.probe, ReadAuthority, self.retirement.check_current())
+                .map_err(credential_error)?;
+            let c = companion_observe!(self.probe, Metadata, self.metadata.validate(true).await)
                 .map_err(credential_error)?;
             let legacy = c.caller.legacy_lease().await.map_err(credential_error)?;
             Ok(Box::new(PreparationFence {
@@ -1310,6 +2104,8 @@ impl RepositoryAuthority for PreparationAuthority {
                 retirement: self.retirement.clone(),
                 parent: c.parent.clone(),
                 _legacy: legacy,
+                #[cfg(any(test, feature = "repository-test-fixtures"))]
+                observation: companion_observation::DeferredFence::new(self.probe.clone()),
             }) as Box<dyn RepositoryAuthorityFence>)
         })
     }
@@ -1320,8 +2116,9 @@ impl RepositoryAuthorityFence for PreparationFence {
         action: &mut (dyn FnMut() -> std::result::Result<(), CredentialError> + Send),
     ) -> std::result::Result<(), CredentialError> {
         let mut result = None;
-        self.parent
-            .native_dispatch(|| {
+        companion_fence_outer!(
+            self.observation,
+            self.parent.native_dispatch(|| {
                 self.retirement.native_dispatch(|| {
                     self.metadata.with_settings(|| {
                         result = Some(action());
@@ -1329,8 +2126,12 @@ impl RepositoryAuthorityFence for PreparationFence {
                     })
                 })
             })
-            .map_err(credential_error)?;
-        result.ok_or(CredentialError::AuthorityDenied)?
+        )
+        .map_err(credential_error)?;
+        companion_fence_inner!(
+            self.observation,
+            result.ok_or(CredentialError::AuthorityDenied)
+        )?
     }
 }
 struct Job {
@@ -1359,30 +2160,39 @@ pub(crate) fn prepare(s: &Services, q: Prepare) -> BoxFuture<'_, Result<Value>> 
     entry(s, &Frame::Prepare(q.clone()), move |r| {
         Box::pin(async move {
             stages(&q)?;
-            let capacity = job(&r.connection)?;
+            let capacity = companion_observe!(r.probe, Capacity, job(&r.connection))?;
             let c = r.connection.clone();
             let (tx, rx) = tokio::sync::oneshot::channel();
             let caller = c.caller.caller().clone();
             let wire = c.caller.wire_credential().cloned();
+            #[cfg(any(test, feature = "repository-test-fixtures"))]
+            let observation = r.probe.clone();
             tokio::spawn(with_caller(
                 caller,
                 with_wire_credential(wire, async move {
+                    #[cfg(any(test, feature = "repository-test-fixtures"))]
+                    let _observation = r.probe.span(companion_observation::Phase::Worker);
                     let _capacity = capacity;
-                    let result = acquire(r, q).await;
+                    #[cfg(any(test, feature = "repository-test-fixtures"))]
+                    let observation = r.probe.clone();
+                    let result = companion_observe!(observation, Acquire, acquire(r, q).await);
                     let _ = tx.send(result);
                 }),
             ));
-            tokio::time::timeout(ACQUIRE, rx)
-                .await
-                .map_err(denied)?
-                .map_err(denied)?
+            companion_observe!(
+                observation,
+                AcquireWait,
+                tokio::time::timeout(ACQUIRE, rx).await
+            )
+            .map_err(denied)?
+            .map_err(denied)?
         })
     })
 }
 async fn acquire(r: Arc<Request>, q: Prepare) -> Result<Value> {
     let q = if let Some(parent) = &r.predecessor {
-        parent.companion_witness(r.capture_id()?)?;
-        parent.metadata.validate(true).await?;
+        companion_observe!(r.probe, Witness, parent.companion_witness(r.capture_id()?))?;
+        companion_observe!(r.probe, Metadata, parent.metadata.validate(true).await)?;
         let mut inherited = parent.query.clone();
         inherited.action = Stage::CreatePr;
         inherited.review.companion = None;
@@ -1391,21 +2201,25 @@ async fn acquire(r: Arc<Request>, q: Prepare) -> Result<Value> {
         q
     };
     let c = &r.connection;
-    let permit = c
-        .review
-        .records
-        .clone()
-        .try_acquire_owned()
-        .map_err(denied)?;
-    let global = c
-        .services
-        .repository_review_capacity
-        .records
-        .clone()
-        .try_acquire_owned()
-        .map_err(denied)?;
+    let permit = companion_observe!(
+        r.probe,
+        RecordCapacity,
+        c.review.records.clone().try_acquire_owned()
+    )
+    .map_err(denied)?;
+    let global = companion_observe!(
+        r.probe,
+        GlobalRecordCapacity,
+        c.services
+            .repository_review_capacity
+            .records
+            .clone()
+            .try_acquire_owned()
+    )
+    .map_err(denied)?;
     r.check()?;
-    let initial_authority = authority(c, &q.review.root).await?;
+    let initial_authority =
+        companion_observe!(r.probe, Authority, authority(c, &q.review.root).await)?;
     let root = RootRecord::read(&c.services.store, &q.review.root)
         .await
         .map_err(denied)?;
@@ -1433,16 +2247,20 @@ async fn acquire(r: Arc<Request>, q: Prepare) -> Result<Value> {
             .map(|s| (s.clone(), s.snapshot())),
     });
     if let Some(parent) = &r.predecessor {
-        parent.metadata.validate(true).await?;
-        if metadata.root != parent.metadata.root
-            || metadata.authority != parent.metadata.authority
-            || metadata.selection.binding() != parent.metadata.selection.binding()
-            || metadata.selection.root_incarnation() != parent.metadata.selection.root_incarnation()
-            || metadata.selection.selection_revision()
-                != parent.metadata.selection.selection_revision()
-            || metadata.selection.selection() != parent.metadata.selection.selection()
-            || !Arc::ptr_eq(&metadata.provider, &parent.metadata.provider)
-        {
+        companion_observe!(r.probe, Metadata, parent.metadata.validate(true).await)?;
+        if companion_condition!(
+            r.probe,
+            Facts,
+            metadata.root != parent.metadata.root
+                || metadata.authority != parent.metadata.authority
+                || metadata.selection.binding() != parent.metadata.selection.binding()
+                || metadata.selection.root_incarnation()
+                    != parent.metadata.selection.root_incarnation()
+                || metadata.selection.selection_revision()
+                    != parent.metadata.selection.selection_revision()
+                || metadata.selection.selection() != parent.metadata.selection.selection()
+                || !Arc::ptr_eq(&metadata.provider, &parent.metadata.provider)
+        ) {
             return Err(unavailable());
         }
         metadata = parent.metadata.clone();
@@ -1504,23 +2322,39 @@ async fn acquire(r: Arc<Request>, q: Prepare) -> Result<Value> {
         },
     );
     tokio::pin!(read);
+    #[cfg(any(test, feature = "repository-test-fixtures"))]
+    let mut source_observation = r.probe.span(companion_observation::Phase::Source);
     let result = tokio::select! {
         result = &mut read => result,
         () = retirement.native_cancelled() => {
+            companion_link!(r.probe, SourceCancelled);
             if acquired.load(Ordering::Acquire) { read.await } else { Err(AdmissionError::Retired) }
         },
         () = tokio::time::sleep(ACQUIRE) => {
+            companion_link!(r.probe, SourceDeadline);
             retirement.end_scope();
             if acquired.load(Ordering::Acquire) { read.await } else { Err(AdmissionError::Retired) }
         }
     };
+    #[cfg(any(test, feature = "repository-test-fixtures"))]
+    {
+        source_observation.result(&result);
+        if acquired.load(Ordering::Acquire) {
+            r.probe.link(companion_observation::Phase::SourceEntered);
+        }
+    }
     let (context, observed, staging, files, worktree_digest, mut response) =
         result.map_err(denied)?;
     r.check()?;
-    metadata.validate(true).await?;
+    companion_observe!(r.probe, Metadata, metadata.validate(true).await)?;
     if let Some(parent) = &r.predecessor {
-        let witness = parent.companion_witness(r.capture_id()?)?;
-        if observed != witness.observed || staging != witness.staging || !files.is_empty() {
+        let witness =
+            companion_observe!(r.probe, Witness, parent.companion_witness(r.capture_id()?))?;
+        if companion_condition!(
+            r.probe,
+            GitContinuity,
+            observed != witness.observed || staging != witness.staging || !files.is_empty()
+        ) {
             return Err(unavailable());
         }
     }
@@ -1627,6 +2461,8 @@ async fn acquire(r: Arc<Request>, q: Prepare) -> Result<Value> {
         allowed_transport: RepositoryCredentialTransport::GitlabApi(descriptor.clone()),
     };
     let read_authority = Arc::new(PreparationAuthority {
+        #[cfg(any(test, feature = "repository-test-fixtures"))]
+        probe: r.probe.clone(),
         metadata: metadata.clone(),
         retirement: life.retirement(),
         request: read_request.clone(),
@@ -1647,15 +2483,21 @@ async fn acquire(r: Arc<Request>, q: Prepare) -> Result<Value> {
     .into_provider()
     .map_err(denied)?;
     let repo = repo_ref(target)?;
-    let (project_id, path) = provider
-        .confirmed_project_identity(&repo)
-        .await
-        .map_err(denied)?;
+    let (project_id, path) = companion_observe!(
+        r.probe,
+        Project,
+        provider.confirmed_project_identity(&repo).await
+    )
+    .map_err(denied)?;
     if path != target.project_path {
         return Err(invalid());
     }
     if plan.contains(&Stage::CreatePr) || q.review.companion.is_some() {
-        let branch = remote_branch(&provider, &repo, &target_branch).await?;
+        let branch = companion_observe!(
+            r.probe,
+            Branch,
+            remote_branch(&provider, &repo, &target_branch).await
+        )?;
         if branch.is_none() {
             return Err(invalid());
         }
@@ -1699,6 +2541,8 @@ async fn acquire(r: Arc<Request>, q: Prepare) -> Result<Value> {
         };
         // P validates all approved destinations; no secret or stage authority is released here.
         let check = Arc::new(PreparationAuthority {
+            #[cfg(any(test, feature = "repository-test-fixtures"))]
+            probe: r.probe.clone(),
             metadata: metadata.clone(),
             retirement: life.retirement(),
             request: request.clone(),
@@ -1720,22 +2564,25 @@ async fn acquire(r: Arc<Request>, q: Prepare) -> Result<Value> {
         credential_requests,
     };
     if let Some(parent) = &r.predecessor {
-        parent.companion_witness(r.capture_id()?)?;
+        companion_observe!(r.probe, Witness, parent.companion_witness(r.capture_id()?))?;
         let original = &parent.facts;
-        if facts.worktree_path != original.worktree_path
-            || facts.git_dir != original.git_dir
-            || facts.common_dir != original.common_dir
-            || facts.source_ref != original.source_ref
-            || facts.fetch_destinations != original.fetch_destinations
-            || facts.push_destinations != original.push_destinations
-            || facts.preparation.source != original.preparation.source
-            || facts.preparation.target != original.preparation.target
-            || facts.preparation.transport != original.preparation.transport
-        {
+        if companion_condition!(
+            r.probe,
+            FinalFacts,
+            facts.worktree_path != original.worktree_path
+                || facts.git_dir != original.git_dir
+                || facts.common_dir != original.common_dir
+                || facts.source_ref != original.source_ref
+                || facts.fetch_destinations != original.fetch_destinations
+                || facts.push_destinations != original.push_destinations
+                || facts.preparation.source != original.preparation.source
+                || facts.preparation.target != original.preparation.target
+                || facts.preparation.transport != original.preparation.transport
+        ) {
             return Err(unavailable());
         }
     }
-    metadata.validate(true).await?;
+    companion_observe!(r.probe, Metadata, metadata.validate(true).await)?;
     r.check()?;
     let (write, write_sub) = c.new_lifetime().map_err(denied)?;
     let (disclosure, disclosure_sub) = c.new_lifetime().map_err(denied)?;
@@ -1779,6 +2626,8 @@ async fn acquire(r: Arc<Request>, q: Prepare) -> Result<Value> {
             .map_err(denied)?;
     }
     let op = Arc::new(Operation {
+        #[cfg(any(test, feature = "repository-test-fixtures"))]
+        probe: r.probe.operation(&id),
         id: id.clone(),
         query: q.clone(),
         metadata: metadata.clone(),
@@ -1825,6 +2674,7 @@ async fn acquire(r: Arc<Request>, q: Prepare) -> Result<Value> {
             Ok(())
         })
         .map_err(denied)?;
+    companion_link!(r.probe, Install);
     monitor(&op);
     Ok(response)
 }
@@ -2008,6 +2858,7 @@ struct CompanionCompletion {
 impl Drop for CompanionCompletion {
     fn drop(&mut self) {
         drop(self.capacity.take());
+        companion_link!(self.operation.probe, ResourceRelease);
         self.operation.complete_owned(self.normal);
     }
 }
@@ -2438,7 +3289,12 @@ async fn run_stages(
                     });
                     let after = fingerprint(op.metadata.root.path()).ok();
                     let witness = if op.companion.is_some() {
-                        commit_witness(op, &outcome.hash, after.as_deref()).ok()
+                        companion_observe!(
+                            op.probe,
+                            CommitWitness,
+                            commit_witness(op, &outcome.hash, after.as_deref())
+                        )
+                        .ok()
                     } else {
                         None
                     };
