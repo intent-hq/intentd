@@ -87,11 +87,20 @@ async fn wss_linked_skills_external_edits_additions_deletions_and_root_retarget_
     for step in 0..8 {
         match step {
             0 => {}
-            1 => write_skill(
-                &target.join("one/SKILL.md"),
-                "watched-linked",
-                "external metadata edit",
-            ),
+            1 => {
+                let file = target.join("one/SKILL.md");
+                let before = std::fs::metadata(&file).unwrap();
+                write_skill(&file, "watched-linked", "changed");
+                std::fs::File::options()
+                    .write(true)
+                    .open(&file)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(before.modified().unwrap()))
+                    .unwrap();
+                let after = std::fs::metadata(&file).unwrap();
+                assert_eq!(after.len(), before.len());
+                assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+            }
             2 => write_skill(&target.join("two/SKILL.md"), "watched-added", "addition"),
             3 => {
                 std::fs::remove_file(target.join("two/SKILL.md")).unwrap();
@@ -148,7 +157,7 @@ async fn wss_linked_skills_external_edits_additions_deletions_and_root_retarget_
         let skills = list(&srv, &id).await;
         let description = match step {
             0 => "initial",
-            1..=3 => "external metadata edit",
+            1..=3 => "changed",
             _ => "new root",
         };
         assert_eq!(
@@ -274,4 +283,295 @@ async fn wss_linked_skills_roots_children_files_cycles_precedence_and_retarget()
         srv.dir.path().join("linked-skills-evidence.json").display()
     );
     srv.ws.stop().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn wss_linked_skills_companion_base_and_shallower_alias() {
+    let srv = start(WsOptions::default()).await;
+    let project = srv.dir.path().join("resource-project");
+    let kit = project.join("shared-kit");
+    let alias = project.join(".claude/skills/file-only/SKILL.md");
+    write_skill(
+        &kit.join("guide.md"),
+        "resource-fixture",
+        "shared resources",
+    );
+    std::fs::create_dir_all(kit.join("scripts")).unwrap();
+    std::fs::write(kit.join("scripts/check.sh"), "echo companion-found\n").unwrap();
+    std::fs::create_dir_all(alias.parent().unwrap()).unwrap();
+    symlink(kit.join("guide.md"), &alias).unwrap();
+    write_skill(
+        &project.join(".intent/skills/plain/SKILL.md"),
+        "plain-fixture",
+        "ordinary",
+    );
+    let tree = project.join("tree");
+    write_skill(
+        &tree.join("child/SKILL.md"),
+        "depth-fixture",
+        "reachable via shallow alias",
+    );
+    let deep = project.join(".intent/skills/a/b/c/linked");
+    std::fs::create_dir_all(deep.parent().unwrap()).unwrap();
+    symlink(&tree, &deep).unwrap();
+    let shallow = project.join(".claude/skills/shallow");
+    symlink(&tree, &shallow).unwrap();
+    symlink(&tree, tree.join("loop")).unwrap();
+    let id = WorkspaceId::new();
+    let mut row = fixture_workspace(&id);
+    row.worktree_path = Some(project.to_string_lossy().into_owned());
+    srv.store.insert_workspace(&row).await.unwrap();
+    let skills = list(&srv, &id).await;
+    let linked = named(&skills, "resource-fixture");
+    assert_eq!(linked["location"], alias.to_string_lossy().as_ref());
+    assert_eq!(
+        linked["resourceDirectory"],
+        kit.canonicalize().unwrap().to_string_lossy().as_ref()
+    );
+    assert!(named(&skills, "plain-fixture")
+        .get("resourceDirectory")
+        .is_none());
+    assert_eq!(
+        named(&skills, "depth-fixture")["location"],
+        shallow.join("child/SKILL.md").to_string_lossy().as_ref()
+    );
+    let resource =
+        Path::new(linked["resourceDirectory"].as_str().unwrap()).join("scripts/check.sh");
+    let read = wss_call(srv.port, srv.cfg.clone(), &json!({"jsonrpc":"2.0","id":73,"method":"file.read","params":{"workspaceId":id,"path":resource}}).to_string()).await;
+    assert_eq!(read["jsonrpc"], "2.0");
+    assert_eq!(read["id"], 73);
+    assert_eq!(read["result"], "echo companion-found\n", "{read}");
+    let before = std::fs::metadata(kit.join("guide.md")).unwrap();
+    write_skill(
+        &kit.join("guide.md"),
+        "resource-fixture",
+        "edited resources",
+    );
+    std::fs::File::options()
+        .write(true)
+        .open(kit.join("guide.md"))
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(before.modified().unwrap()))
+        .unwrap();
+    assert_eq!(
+        std::fs::metadata(kit.join("guide.md")).unwrap().len(),
+        before.len()
+    );
+    let updated = list(&srv, &id).await;
+    assert_eq!(
+        named(&updated, "resource-fixture")["description"],
+        "edited resources"
+    );
+    let evidence = srv.dir.path().join("linked-skills-resources.json");
+    std::fs::write(
+        &evidence,
+        serde_json::to_vec_pretty(&json!({"skills":skills,"companionRead":read,"updated":updated}))
+            .unwrap(),
+    )
+    .unwrap();
+    eprintln!("linked skills resource evidence: {}", evidence.display());
+    srv.ws.stop().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn wss_linked_skills_byte_budget_counts_invalid_utf8_and_recovers() {
+    let srv = start(WsOptions::default()).await;
+    let project = srv.dir.path().join("bounded-project");
+    let root = project.join(".claude/skills");
+    let target = srv.dir.path().join("bounded-target");
+    let payloads = target.join("payloads");
+    std::fs::create_dir_all(root.parent().unwrap()).unwrap();
+    symlink(&target, &root).unwrap();
+    let oversized = target.join("oversized/SKILL.md");
+    write_skill(&oversized, "too-large", "Exceeds the per-file limit");
+    std::fs::File::options()
+        .write(true)
+        .open(&oversized)
+        .unwrap()
+        .set_len(1_048_577)
+        .unwrap();
+    let invalid_bytes = vec![0xff; 1_048_576];
+    for index in 0..32 {
+        let file = payloads.join(format!("{index:02}/SKILL.md"));
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, &invalid_bytes).unwrap();
+    }
+    write_skill(
+        &target.join("z-valid/SKILL.md"),
+        "after-budget",
+        "Available after repair",
+    );
+    let id = WorkspaceId::new();
+    let mut row = fixture_workspace(&id);
+    row.worktree_path = Some(project.to_string_lossy().into_owned());
+    srv.store.insert_workspace(&row).await.unwrap();
+    let exhausted = list(&srv, &id).await;
+    assert!(
+        !exhausted
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| matches!(s["name"].as_str(), Some("after-budget" | "too-large"))),
+        "{exhausted}"
+    );
+    std::fs::remove_dir_all(&payloads).unwrap();
+    let restored = list(&srv, &id).await;
+    assert_eq!(
+        named(&restored, "after-budget")["description"],
+        "Available after repair"
+    );
+    assert!(!restored
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["name"] == "too-large"));
+    let evidence = srv.dir.path().join("linked-skills-limits.json");
+    std::fs::write(
+        &evidence,
+        serde_json::to_vec_pretty(&json!({"exhausted":exhausted,"restored":restored})).unwrap(),
+    )
+    .unwrap();
+    eprintln!("linked skills byte-limit evidence: {}", evidence.display());
+    srv.ws.stop().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn wss_linked_skills_custom_config_directory_and_empty_fallback() {
+    use std::process::Stdio;
+    let temp = common::test_tempdir("linked-skills-config-");
+    let mut evidence = Vec::new();
+    for mode in ["linked", "missing", "empty"] {
+        let data = temp.path().join(mode);
+        let home = data.join("home");
+        let config = data.join("config");
+        let target = data.join("config-target");
+        let project = data.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        write_skill(
+            &home.join(".claude/skills/default/SKILL.md"),
+            "default-config-fixture",
+            "default root",
+        );
+        write_skill(
+            &project.join(".claude/skills/project/SKILL.md"),
+            "project-config-fixture",
+            "project unchanged",
+        );
+        if mode == "linked" {
+            write_skill(
+                &target.join("skills/custom/SKILL.md"),
+                "custom-config-fixture",
+                "custom root",
+            );
+            symlink(&target, &config).unwrap();
+        }
+        common::enable_ws_api(&data);
+        let log_path = data.join("daemon.log");
+        let log = std::fs::File::create(&log_path).unwrap();
+        let mut command = common::serve_command();
+        common::hermetic_github_identity(&mut command, &data);
+        command
+            .env("HOME", &home)
+            .env(
+                "CLAUDE_CONFIG_DIR",
+                if mode == "empty" {
+                    Path::new("")
+                } else {
+                    &config
+                },
+            )
+            .env("INTENTD_DATA_DIR", &data)
+            .env("INTENTD_WORKSPACES_DIR", data.join("workspaces"))
+            .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
+            .env("INTENTD_AUTH_TOKEN", TOKEN)
+            .env("INTENTD_SECRETS_FILE", data.join("secrets.json"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log));
+        std::fs::create_dir_all(data.join("workspaces")).unwrap();
+        let mut daemon = common::DaemonGuard::process_only(command.spawn().unwrap());
+        let socket = data.join("intentd.sock");
+        common::await_daemon_listening(daemon.child_mut(), &socket, &log_path).await;
+        let status = common::await_wss_status_logged(&socket, &log_path).await;
+        let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+        let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+        let created = wss_call(port, cfg.clone(), &json!({"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Config skills","skipWorktree":true,"path":project}}).to_string()).await;
+        let id = created["result"]["workspace"]["id"].as_str().unwrap();
+        let listed = wss_call(
+            port,
+            cfg.clone(),
+            &json!({"jsonrpc":"2.0","id":2,"method":"skill.list","params":{"workspaceId":id}})
+                .to_string(),
+        )
+        .await;
+        assert_eq!(listed["jsonrpc"], "2.0");
+        assert_eq!(listed["id"], 2);
+        let skills = listed["result"].as_array().unwrap();
+        assert_eq!(
+            skills.iter().any(|s| s["name"] == "default-config-fixture"),
+            mode == "empty"
+        );
+        assert_eq!(
+            skills.iter().any(|s| s["name"] == "custom-config-fixture"),
+            mode == "linked"
+        );
+        assert_eq!(
+            named(&listed["result"], "project-config-fixture")["scope"],
+            "project"
+        );
+        let mut changed = Value::Null;
+        if mode != "empty" {
+            let mut events = connect_ws(port, cfg.clone()).await;
+            events.send(Message::text(json!({"jsonrpc":"2.0","id":3,"method":"events.subscribe","params":{"workspaceId":id,"eventTypes":["skills:changed"]}}).to_string())).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    match events.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let reply: Value = serde_json::from_str(&text).unwrap();
+                            if reply["id"] == 3 {
+                                assert!(reply["result"]["subscriptionId"].is_string(), "{reply}");
+                                break;
+                            }
+                        }
+                        Some(Ok(Message::Ping(p))) => events.send(Message::Pong(p)).await.unwrap(),
+                        Some(Ok(_)) => {}
+                        other => panic!("config subscription closed: {other:?}"),
+                    }
+                }
+            })
+            .await
+            .expect("config skills subscription");
+            write_skill(
+                &config.join("skills/custom/SKILL.md"),
+                "custom-config-fixture",
+                "live update",
+            );
+            changed = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match events.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let event: Value = serde_json::from_str(&text).unwrap();
+                            if event["method"] == "events.event" && event["params"]["event"]["type"] == "skills:changed" {
+                                let reply = wss_call(port, cfg.clone(), &json!({"jsonrpc":"2.0","id":4,"method":"skill.list","params":{"workspaceId":id}}).to_string()).await;
+                                if reply["result"].as_array().unwrap().iter().any(|s| s["name"] == "custom-config-fixture" && s["description"] == "live update") {
+                                    break json!({"event":event,"listed":reply});
+                                }
+                            }
+                        }
+                        Some(Ok(Message::Ping(p))) => events.send(Message::Pong(p)).await.unwrap(),
+                        Some(Ok(_)) => {},
+                        other => panic!("config event stream closed: {other:?}"),
+                    }
+                }
+            }).await.expect("live custom config skills update");
+        }
+        evidence.push(json!({"mode":mode,"listed":listed,"changed":changed}));
+        drop(daemon);
+    }
+    let artifact = temp.path().join("config-directory-evidence.json");
+    std::fs::write(&artifact, serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
+    eprintln!(
+        "linked skills configuration evidence: {}",
+        artifact.display()
+    );
 }

@@ -277,9 +277,13 @@ fn get_user_skill_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Some(home) = home_dir() {
         roots.push(home.join(".agents").join("skills"));
-        roots.push(home.join(".claude").join("skills"));
+        roots.push(crate::skills::claude_config_dir(&home).join("skills"));
         roots.push(home.join(".intent").join("skills"));
         roots.push(home.join(".augment").join("skills"));
+    } else if let Some(config) =
+        std::env::var_os("CLAUDE_CONFIG_DIR").filter(|path| !path.is_empty())
+    {
+        roots.push(PathBuf::from(config).join("skills"));
     }
     roots
 }
@@ -333,13 +337,17 @@ async fn debounce_loop(
                     match workspace_id {
                         // User-tier change: affects all workspaces
                         None => {
-                            for ws_id in workspace_paths.keys() {
+                            for (ws_id, path) in &workspace_paths {
+                                crate::skills::invalidate_skills_cache(path);
                                 pending.entry(ws_id.clone()).or_insert(deadline);
                             }
                         }
                         // Project-tier change: affects specific workspace
                         Some(ws_id) => {
-                            pending.entry(ws_id).or_insert(deadline);
+                            if let Some(path) = workspace_paths.get(&ws_id) {
+                                crate::skills::invalidate_skills_cache(path);
+                                pending.entry(ws_id).or_insert(deadline);
+                            }
                         }
                     }
                 }

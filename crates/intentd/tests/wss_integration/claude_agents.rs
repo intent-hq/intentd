@@ -57,6 +57,18 @@ async fn claude_agents_discovery_follows_links_and_preserves_precedence() {
     std::fs::write(squad.join("invalid.md"), "---\nname: [\n---\nInvalid").unwrap();
     symlink(&squad, home.join(".claude/agents")).unwrap();
 
+    let nested = squad.join("a-depth/a/b/c/d/e/f");
+    std::fs::create_dir_all(&nested).unwrap();
+    let shared = dir.path().join("shared-depth");
+    write_agent(
+        &shared.join("nested/reachable.md"),
+        "shallow-reachable",
+        "",
+        "Reached through the shallow alias.",
+    );
+    symlink(&shared, nested.join("deep")).unwrap();
+    symlink(&shared, squad.join("z-shallow")).unwrap();
+
     let project = dir.path().join("project");
     write_agent(
         &project.join(".claude/agents/review-helper.md"),
@@ -81,6 +93,10 @@ async fn claude_agents_discovery_follows_links_and_preserves_precedence() {
         .contains("Review the patch."));
     assert!(imported.get("unsupportedFields").is_none());
     assert!(definition(&list, "inherited").get("model").is_none());
+    assert_eq!(
+        definition(&list, "shallow-reachable")["prompt"],
+        "Reached through the shallow alias."
+    );
     assert_eq!(
         definition(&list, "file-linked")["model"],
         "claude-custom-model"
@@ -286,6 +302,398 @@ async fn claude_agents_external_target_edits_and_link_retargets_emit_changes() {
     std::fs::write(
         dir.path().join("claude-watch-result.json"),
         serde_json::to_vec_pretty(&evidence).unwrap(),
+    )
+    .unwrap();
+    stop(daemon, &dir.path().join("intentd.sock")).await;
+}
+
+#[tokio::test]
+async fn claude_agents_report_exclusions_and_clear_repaired_diagnostics() {
+    let dir = scratch_dir("claude-diagnostics");
+    let home = dir.path().join("home");
+    let root = home.join(".claude/agents");
+    write_agent(&root.join("a.md"), "collision", "", "Winner.");
+    write_agent(&root.join("b.md"), "collision", "", "Shadowed.");
+    write_agent(
+        &root.join("developer.md"),
+        "developer",
+        "",
+        "Shadowed built-in.",
+    );
+    std::fs::write(root.join("invalid.md"), "---\nname: [\n---\n").unwrap();
+    std::fs::write(root.join("binary.md"), [0xff, 0xfe]).unwrap();
+    std::fs::File::create(root.join("large.md"))
+        .unwrap()
+        .set_len(1_048_577)
+        .unwrap();
+    symlink(root.join("missing-target.md"), root.join("broken.md")).unwrap();
+    let (daemon, port, cfg) = boot(dir.path(), &home).await;
+    let mut client = connect_ws(port, cfg.clone()).await;
+    let before = wss_rpc(&mut client, 1, "specialist.list", json!({})).await;
+    assert_eq!(definition(&before, "collision")["prompt"], "Winner.");
+    let diagnostics = before["importDiagnostics"].as_array().unwrap();
+    for (file, code) in [
+        ("b.md", "shadowed"),
+        ("developer.md", "shadowed"),
+        ("invalid.md", "invalid"),
+        ("binary.md", "unreadable"),
+        ("large.md", "too-large"),
+        ("broken.md", "broken-link"),
+    ] {
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d["path"] == root.join(file).to_string_lossy().as_ref()
+                    && d["code"] == code
+                    && d["source"] == "user"),
+            "{file}: {before}"
+        );
+    }
+    let duplicate = diagnostics
+        .iter()
+        .find(|d| d["path"] == root.join("b.md").to_string_lossy().as_ref())
+        .unwrap();
+    assert_eq!(duplicate["specialistId"], "collision");
+    assert_eq!(
+        duplicate["winnerPath"],
+        root.join("a.md").to_string_lossy().as_ref()
+    );
+    let workspace = wss_rpc(
+        &mut client,
+        3,
+        "workspace.create",
+        json!({"title":"Import diagnostic repair"}),
+    )
+    .await;
+    let mut subscription = connect_ws(port, cfg).await;
+    wss_rpc(
+        &mut subscription,
+        1,
+        "events.subscribe",
+        json!({"eventTypes":["specialists:changed"],"workspaceId":workspace["workspace"]["id"]}),
+    )
+    .await;
+    write_agent(&root.join("invalid.md"), "repaired", "", "Repaired.");
+    let event = next_event(&mut subscription, &["specialists:changed"], 20).await;
+    let after = wss_rpc(&mut client, 2, "specialist.list", json!({})).await;
+    assert_eq!(definition(&after, "repaired")["prompt"], "Repaired.");
+    assert!(!after["importDiagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|d| d["path"] == root.join("invalid.md").to_string_lossy().as_ref()));
+    std::fs::write(
+        dir.path().join("claude-diagnostics-evidence.json"),
+        serde_json::to_vec_pretty(&json!({"before":before,"event":event,"after":after})).unwrap(),
+    )
+    .unwrap();
+    stop(daemon, &dir.path().join("intentd.sock")).await;
+}
+
+#[tokio::test]
+async fn claude_agents_missing_skills_block_creation_and_recover_in_project_scope() {
+    let dir = scratch_dir("claude-dependencies");
+    let home = dir.path().join("home");
+    write_agent(
+        &home.join(".claude/agents/reviewer.md"),
+        "reviewer",
+        "skills: [code-review, missing-kit]\n",
+        "Review.",
+    );
+    let installed = home.join(".claude/skills/review/SKILL.md");
+    std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+    std::fs::write(
+        &installed,
+        "---\nname: code-review\ndescription: Reviews code\n---\nUse the kit.",
+    )
+    .unwrap();
+    let checkout = dir.path().join("checkout");
+    std::fs::create_dir_all(&checkout).unwrap();
+    let (daemon, port, cfg) = boot(dir.path(), &home).await;
+    let mut client = connect_ws(port, cfg).await;
+    let before = wss_rpc(&mut client, 1, "specialist.list", json!({})).await;
+    assert_eq!(
+        definition(&before, "reviewer")["requiredSkills"],
+        json!(["code-review", "missing-kit"])
+    );
+    assert_eq!(
+        definition(&before, "reviewer")["missingSkills"],
+        json!(["missing-kit"])
+    );
+    let workspace = wss_rpc(
+        &mut client,
+        2,
+        "workspace.create",
+        json!({"title":"Required skill repair", "skipWorktree":true,"path":checkout}),
+    )
+    .await;
+    let workspace_id = workspace["workspace"]["id"].clone();
+    let denied = wss_reply(
+        &mut client,
+        3,
+        "agent.create",
+        json!({"workspaceId":workspace_id,"specialistId":"reviewer","provider":"mock"}),
+    )
+    .await;
+    assert_eq!(denied["error"]["code"], -32602, "{denied}");
+    assert!(
+        denied["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("missing-kit"),
+        "{denied}"
+    );
+    let sessions = wss_rpc(
+        &mut client,
+        4,
+        "agent.list",
+        json!({"workspaceId":workspace_id}),
+    )
+    .await;
+    assert!(sessions["agents"].as_array().unwrap().is_empty());
+    let repaired = checkout.join(".intent/skills/kit/SKILL.md");
+    std::fs::create_dir_all(repaired.parent().unwrap()).unwrap();
+    std::fs::write(
+        &repaired,
+        "---\nname: missing-kit\ndescription: Installed project kit\n---\nFollow this kit.",
+    )
+    .unwrap();
+    let after = wss_rpc(
+        &mut client,
+        5,
+        "specialist.get",
+        json!({"id":"reviewer","workspacePath":checkout}),
+    )
+    .await;
+    assert!(
+        after["specialist"].get("missingSkills").is_none(),
+        "{after}"
+    );
+    let global = wss_rpc(&mut client, 6, "specialist.list", json!({})).await;
+    assert_eq!(
+        definition(&global, "reviewer")["missingSkills"],
+        json!(["missing-kit"])
+    );
+    wss_rpc(
+        &mut client,
+        7,
+        "settings.update",
+        json!({"changes":[{"path":"providers.paths", "value":{"auggie":"/bin/sh"}}]}),
+    )
+    .await;
+    let created = wss_rpc(
+        &mut client,
+        8,
+        "agent.create",
+        json!({"workspaceId":workspace_id,"specialistId":"reviewer","provider":"auggie"}),
+    )
+    .await;
+    assert_eq!(created["agent"]["metadata"]["specialist"], "reviewer");
+    std::fs::remove_file(&installed).unwrap();
+    let removed = wss_rpc(
+        &mut client,
+        9,
+        "specialist.get",
+        json!({"id":"reviewer","workspacePath":checkout}),
+    )
+    .await;
+    assert_eq!(
+        removed["specialist"]["missingSkills"],
+        json!(["code-review"])
+    );
+    std::fs::write(
+        dir.path().join("claude-dependency-evidence.json"),
+        serde_json::to_vec_pretty(
+            &json!({"before":before,"denied":denied,"after":after,"removed":removed}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    stop(daemon, &dir.path().join("intentd.sock")).await;
+}
+
+#[tokio::test]
+async fn claude_agents_limits_are_explicit_and_deterministic() {
+    let dir = scratch_dir("claude-limits");
+    let home = dir.path().join("home");
+    let root = home.join(".claude/agents");
+    write_agent(&root.join("a.md"), "kept", "", "Keep the valid prefix.");
+    let crowded = root.join("crowded");
+    std::fs::create_dir_all(&crowded).unwrap();
+    for index in 0..4097 {
+        std::fs::write(crowded.join(format!("{index}.txt")), "").unwrap();
+    }
+    let (daemon, port, cfg) = boot(dir.path(), &home).await;
+    let mut client = connect_ws(port, cfg).await;
+    let first = wss_rpc(&mut client, 1, "specialist.list", json!({})).await;
+    let second = wss_rpc(&mut client, 2, "specialist.list", json!({})).await;
+    assert_eq!(first, second);
+    assert_eq!(
+        definition(&first, "kept")["prompt"],
+        "Keep the valid prefix."
+    );
+    assert!(
+        first["importDiagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"] == "scan-limit"
+                && d["path"] == crowded.to_string_lossy().as_ref()
+                && d["isDirectory"] == true),
+        "{first}"
+    );
+    std::fs::remove_dir_all(&crowded).unwrap();
+    for index in 0..130 {
+        std::fs::write(
+            root.join(format!("invalid-{index}.md")),
+            "Invalid frontmatter",
+        )
+        .unwrap();
+    }
+    let capped = wss_rpc(&mut client, 3, "specialist.list", json!({})).await;
+    assert_eq!(capped["importDiagnostics"].as_array().unwrap().len(), 128);
+    assert_eq!(capped["importDiagnostics"][127]["code"], "scan-limit");
+    std::fs::remove_dir_all(&root).unwrap();
+    let payloads = dir.path().join("linked-payloads");
+    std::fs::create_dir_all(&payloads).unwrap();
+    let invalid_bytes = vec![0xff; 1_048_576];
+    for index in 0..32 {
+        std::fs::write(payloads.join(format!("{index:02}.md")), &invalid_bytes).unwrap();
+    }
+    write_agent(
+        &root.join("z-valid.md"),
+        "after-budget",
+        "",
+        "Available after repair.",
+    );
+    symlink(&payloads, root.join("payloads")).unwrap();
+    let exhausted = wss_rpc(&mut client, 4, "specialist.list", json!({})).await;
+    assert!(!exhausted["specialists"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|d| d["id"] == "after-budget"));
+    assert!(
+        exhausted["importDiagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"] == "scan-limit"
+                && d["path"] == root.join("z-valid.md").to_string_lossy().as_ref()
+                && d["isDirectory"] == false),
+        "{exhausted}"
+    );
+    std::fs::remove_file(root.join("payloads")).unwrap();
+    std::fs::remove_dir_all(&payloads).unwrap();
+    let restored = wss_rpc(&mut client, 5, "specialist.list", json!({})).await;
+    assert_eq!(
+        definition(&restored, "after-budget")["prompt"],
+        "Available after repair."
+    );
+    std::fs::write(
+        dir.path().join("claude-limit-evidence.json"),
+        serde_json::to_vec_pretty(
+            &json!({"entries":first,"diagnostics":capped,"bytes":exhausted,"restored":restored}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    stop(daemon, &dir.path().join("intentd.sock")).await;
+}
+
+#[tokio::test]
+async fn claude_agents_custom_config_root_discovers_and_watches_agents_and_skills() {
+    let dir = scratch_dir("claude-config");
+    let home = dir.path().join("home");
+    let config = dir.path().join("custom-config");
+    let target = dir.path().join("shared-config");
+    write_agent(
+        &home.join(".claude/agents/default.md"),
+        "not-from-config",
+        "",
+        "Default root.",
+    );
+    write_agent(
+        &target.join("agents/custom.md"),
+        "configured",
+        "skills: [config-kit]\n",
+        "Custom root.",
+    );
+    std::fs::create_dir_all(target.join("skills/kit")).unwrap();
+    std::fs::write(
+        target.join("skills/kit/SKILL.md"),
+        "---\nname: config-kit\ndescription: Configuration kit\n---\nFollow.",
+    )
+    .unwrap();
+    symlink(&target, &config).unwrap();
+    let child = common::DaemonGuard::process_only(spawn_serve_with_claude_config(
+        dir.path(),
+        &home,
+        Some(&config),
+    ));
+    let (daemon, port, cfg) = await_boot(dir.path(), child).await;
+    let mut client = connect_ws(port, cfg.clone()).await;
+    let first = wss_rpc(&mut client, 1, "specialist.list", json!({})).await;
+    assert!(
+        definition(&first, "configured")
+            .get("missingSkills")
+            .is_none(),
+        "{first}"
+    );
+    assert!(!first["specialists"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|d| d["id"] == "not-from-config"));
+    let workspace = wss_rpc(
+        &mut client,
+        2,
+        "workspace.create",
+        json!({"title":"Custom config"}),
+    )
+    .await;
+    let workspace_id = workspace["workspace"]["id"].clone();
+    let skills = wss_rpc(
+        &mut client,
+        3,
+        "skill.list",
+        json!({"workspaceId":workspace_id}),
+    )
+    .await;
+    assert!(
+        skills
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["name"] == "config-kit"),
+        "{skills}"
+    );
+    let mut subscription = connect_ws(port, cfg).await;
+    wss_rpc(
+        &mut subscription,
+        1,
+        "events.subscribe",
+        json!({"eventTypes":["specialists:changed"],"workspaceId":workspace_id}),
+    )
+    .await;
+    write_agent(
+        &target.join("agents/custom.md"),
+        "configured",
+        "skills: [config-kit]\n",
+        "Updated custom root.",
+    );
+    let event = next_event(&mut subscription, &["specialists:changed"], 20).await;
+    let after = wss_rpc(&mut client, 4, "specialist.get", json!({"id":"configured"})).await;
+    assert!(after["specialist"]["prompt"]
+        .as_str()
+        .unwrap()
+        .contains("Updated custom root."));
+    std::fs::write(
+        dir.path().join("claude-config-evidence.json"),
+        serde_json::to_vec_pretty(
+            &json!({"before":first,"skills":skills,"event":event,"after":after}),
+        )
+        .unwrap(),
     )
     .unwrap();
     stop(daemon, &dir.path().join("intentd.sock")).await;

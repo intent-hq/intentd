@@ -386,7 +386,7 @@ async fn refresh_claude_watches(
     linked: &mut HashMap<WorkspaceId, LinkedWatches>,
 ) {
     let mut roots = vec![workspace_path.join(".claude/agents")];
-    if let Some(root) = user_dir.and_then(claude_agents::user_root) {
+    if let Some(root) = claude_agents::user_root(user_dir) {
         roots.push(root);
     }
     let Ok(directories) = tokio::task::spawn_blocking(move || {

@@ -1324,6 +1324,16 @@ impl SpecialistsService {
                         "Claude agent {canonical} uses settings Intent cannot apply: {fields}. Edit the original agent file or create an Intent specialist with the required behavior."
                     )));
                 }
+                if let Some(skills) = definition.get("missingSkills").and_then(Value::as_array) {
+                    let skills = skills
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(Error::InvalidParams(format!(
+                        "Claude agent {canonical} requires skills that are unavailable: {skills}. Restore the required skills or update the original agent file."
+                    )));
+                }
                 return Ok(canonical);
             }
         }
@@ -1603,6 +1613,14 @@ impl SpecialistsService {
         &self,
         workspace_path: Option<&Path>,
     ) -> std::collections::BTreeMap<String, Value> {
+        self.collect_catalog_with_diagnostics(workspace_path)
+            .definitions
+    }
+
+    fn collect_catalog_with_diagnostics(
+        &self,
+        workspace_path: Option<&Path>,
+    ) -> claude_agents::Catalog {
         let mut acc = std::collections::BTreeMap::new();
         for (id, content) in self.embedded {
             acc.insert(
@@ -1619,29 +1637,82 @@ impl SpecialistsService {
         if let Some(wp) = workspace_path {
             Self::collect_dir(&project_dir(wp), "project", &mut acc);
         }
-        for (id, definition) in self.claude_catalog(workspace_path) {
-            acc.entry(id).or_insert(definition);
+        let mut imports = self.claude_catalog_with_diagnostics(workspace_path);
+        for (id, definition) in imports.definitions {
+            if let Some(winner) = acc.get(&id) {
+                claude_agents::add_diagnostic(
+                    &mut imports.diagnostics,
+                    claude_agents::shadowed(&definition, winner),
+                );
+            } else {
+                acc.insert(id, definition);
+            }
         }
-        acc
+        claude_agents::Catalog {
+            definitions: acc,
+            diagnostics: imports.diagnostics,
+        }
     }
 
     fn claude_catalog(
         &self,
         workspace_path: Option<&Path>,
     ) -> std::collections::BTreeMap<String, Value> {
-        let mut definitions = self
-            .user_dir
-            .as_deref()
-            .and_then(claude_agents::user_root)
+        self.claude_catalog_with_diagnostics(workspace_path)
+            .definitions
+    }
+
+    fn claude_catalog_with_diagnostics(
+        &self,
+        workspace_path: Option<&Path>,
+    ) -> claude_agents::Catalog {
+        let mut catalog = claude_agents::user_root(self.user_dir.as_deref())
             .map(|root| claude_agents::collect(&root, "user"))
             .unwrap_or_default();
         if let Some(workspace) = workspace_path {
-            definitions.extend(claude_agents::collect(
-                &workspace.join(".claude/agents"),
-                "project",
-            ));
+            let project = claude_agents::collect(&workspace.join(".claude/agents"), "project");
+            for diagnostic in project.diagnostics {
+                claude_agents::add_diagnostic(&mut catalog.diagnostics, diagnostic);
+            }
+            for (id, definition) in project.definitions {
+                if let Some(previous) = catalog.definitions.insert(id, definition.clone()) {
+                    claude_agents::add_diagnostic(
+                        &mut catalog.diagnostics,
+                        claude_agents::shadowed(&previous, &definition),
+                    );
+                }
+            }
         }
-        definitions
+        if catalog
+            .definitions
+            .values()
+            .any(|definition| definition.get("requiredSkills").is_some())
+        {
+            let home = self.user_dir.as_deref().and_then(|path| {
+                let intent = path.parent()?;
+                (intent.file_name()? == ".intent")
+                    .then(|| intent.parent().map(Path::to_path_buf))
+                    .flatten()
+            });
+            let available = crate::skills::discover_skills_sync(workspace_path, home)
+                .into_iter()
+                .map(|skill| skill.name)
+                .collect::<std::collections::BTreeSet<_>>();
+            for definition in catalog.definitions.values_mut() {
+                if let Some(required) = definition.get("requiredSkills").and_then(Value::as_array) {
+                    let missing = required
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .filter(|name| !available.contains(*name))
+                        .map(str::to_string)
+                        .collect::<Vec<_>>();
+                    if !missing.is_empty() {
+                        definition["missingSkills"] = json!(missing);
+                    }
+                }
+            }
+        }
+        catalog
     }
 
     fn reject_imported_mutation(&self, id: &str, workspace_path: Option<&Path>) -> Result<()> {
@@ -1661,12 +1732,16 @@ impl SpecialistsService {
     /// tier.
     #[expect(clippy::unnecessary_wraps)] // WorkspaceApi surface; keeps the uniform Result shape
     pub(crate) fn list(&self, workspace_path: Option<&Path>) -> Result<Value> {
-        let mut acc = self.collect_catalog(workspace_path);
+        let mut catalog = self.collect_catalog_with_diagnostics(workspace_path);
         // Ralph remains in the pinned v1 doctrine for existing sessions, but
         // is retired from new-session catalogs (including Settings).
-        acc.remove("ralph");
-        let specialists: Vec<Value> = acc.into_values().collect();
-        Ok(json!({ "specialists": specialists }))
+        catalog.definitions.remove("ralph");
+        let specialists: Vec<Value> = catalog.definitions.into_values().collect();
+        let mut result = json!({ "specialists": specialists });
+        if !catalog.diagnostics.is_empty() {
+            result["importDiagnostics"] = json!(catalog.diagnostics);
+        }
+        Ok(result)
     }
 
     /// `specialist.get` → `{ specialist: SpecialistDef }`, the resolved view;
