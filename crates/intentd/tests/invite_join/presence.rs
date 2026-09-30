@@ -5,7 +5,7 @@ use super::*;
 use intent_core::{Principal, PrincipalId, PrincipalIdentity, WorkspaceId, WorkspaceRole};
 use std::collections::VecDeque;
 
-/// Keep channel frames received before the subscribe reply. Unlike wss_rpc,
+/// Keep channel frames received before the subscribe reply. Unlike `wss_rpc`,
 /// this observer must retain every proof frame, including the seq-0 snapshot.
 struct NoteObserver {
     socket: Ws,
@@ -204,7 +204,7 @@ async fn offline_addition_notifies_guest(cached: bool) {
         // This separate connection never says hello: the authorized note
         // lease retains its profile while the workspace roster stays offline.
         let mut lease = connect_ws(host.port, host.cfg.clone(), &token).await;
-        let subscribed = result(
+        let lease_reply = result(
             &wss_rpc(
                 &mut lease,
                 896,
@@ -214,7 +214,7 @@ async fn offline_addition_notifies_guest(cached: bool) {
             .await,
             896,
         );
-        let subscription = subscribed["subscriptionId"].as_str().unwrap().to_owned();
+        let subscription = lease_reply["subscriptionId"].as_str().unwrap().to_owned();
         let mut promoted = connect_ws(host.port, host.cfg.clone(), &token).await;
         result(
             &wss_rpc(
