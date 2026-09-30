@@ -509,6 +509,59 @@ starts the listener immediately — no restart needed. Interactively this is a `
 prompt; unattended runs (non-TTY stdin) must pass `--yes`/`-y` to opt in, otherwise the
 command fails with guidance.
 
+### Durable evidence for long saved commands (Unix)
+
+Use the opt-in wrapper for noninteractive validation that must retain its actual
+OS exit across daemon loss. Give every invocation a fresh ID and an explicit
+execution bound (1–86400 seconds). The same command can be a saved command's body:
+
+```bash
+intentd command-run --record-dir "$HOME/command-evidence" \
+  --invocation validation-20260930-001 --timeout-seconds 3600 -- make check
+intentd command-result --record-dir "$HOME/command-evidence" \
+  --invocation validation-20260930-001
+```
+
+An independent session owns the child and its wait status. Stopping the saved
+script or daemon stops the caller, **but this opted-in worker continues until the
+command exits, its timeout expires, or `command-stop` requests termination**. stdin is closed; stdout and stderr go to
+`stdout.log` and `stderr.log` inside the invocation directory. Each stream retains at most 8 MiB by default
+(`--max-output-bytes`, maximum 64 MiB per stream). Excess output is drained and
+discarded; `stdoutTruncated`/`stderrTruncated` report the loss. `invocation.json`
+records the exact argv, cwd, start time and timeout. The worker atomically writes
+`result.json` only after observing the direct child's OS status (or a spawn
+failure). Existing invocation directories are refused; retain them until their
+evidence is no longer needed. Arguments are recorded, so use environment variables
+or files for secrets.
+
+Both commands print JSON and return 0 for an observed successful exit, 1 for a
+known failure, or 2 when evidence is unavailable. `outcome` distinguishes `exited`,
+`timedOut`, `stopped`, `spawnFailed`, and `unknown`; actual exit code and terminating signal
+are separate fields. After a daemon restart, `script.status` remains honestly
+lost: use `command-result` with the original directory and invocation ID. Missing,
+partial or mismatched records stay unknown, including a still-running command or
+a killed worker. Passing test reports and missing PIDs never establish success.
+
+Use `intentd command-stop --record-dir <dir> --invocation <id>` to request a stop
+from the owning worker. It kills and reaps the direct child and its process group,
+then records `stopped` with the observed status. The stop client waits up to five
+seconds; if the worker is lost or cannot settle, evidence remains unknown. It
+never signals a PID recovered from disk.
+
+After exporting needed evidence, run `intentd command-clean --record-dir <dir>
+--invocation <id>` to delete that settled run's logs and records. Cleanup refuses
+active or unknown runs, and leaves an empty tombstone directory to prevent ID
+reuse. Call this at the end of validation to bound retention; no background timer
+deletes evidence while a user is reviewing it. A lost worker's files require
+manual inspection/cleanup because absence cannot prove settlement.
+
+This boundary covers the direct child, not completion of all descendants. Timeout
+kills its process group and direct child; descendants that deliberately escape
+that group are outside this guarantee. Machine loss or killing the worker can
+still prevent a receipt. Files are local evidence, not protection against another
+process running as the same user. These CLI helpers do not open the daemon store
+or apply migrations.
+
 ## Current status
 
 The backend port is well past a vertical slice: Milestones 1–10 are implemented, plus the
