@@ -1634,6 +1634,19 @@ jobs:
           python3 -m pip install PyYAML==6.0.2
           python3 -B scripts/test-prerelease-cleanup-workflow.py
           python3 -B scripts/test-release-rust-cache.py
+      - name: Install release cache regression compiler
+        shell: bash
+        run: |
+          channel=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          rustup toolchain install "$channel" --profile minimal --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
+      - name: Install release cache regression wrapper
+        uses: mozilla-actions/sccache-action@d651010b8da762cde178750d8eda7b5febfe147a # v0.0.9
+        with:
+          version: v0.17.0
+          disable_annotations: 'true'
+      - name: Test compiler reuse under cache pressure
+        run: python3 -B scripts/test-release-cache-smoke.py
       - name: Test publish-channel-manifest.sh
         run: ./scripts/test-publish-channel-manifest.sh
       - name: Test mirror-release-assets.sh

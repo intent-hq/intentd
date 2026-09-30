@@ -3131,6 +3131,51 @@ async fn wait_for_persisted_groups(svc: &Services, ws: &WorkspaceId, expected: u
     }
 }
 
+/// A delegation group is not a useful restart-recovery record until its first
+/// expected child is enrolled. Persisting the empty creation snapshot first
+/// can leave a sealed, permanently incomplete group after a crash and lose the
+/// aggregated parent wake.
+#[tokio::test]
+async fn delegation_group_first_persisted_snapshot_contains_enrolled_child() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    let gid = svc.get_or_create_delegation_group(&ws, &parent);
+    let before_enrollment = svc.enqueue_group_persist_acked(GroupPersistOp::Delete(format!(
+        "barrier-{}",
+        uuid::Uuid::new_v4()
+    )));
+    Services::await_group_persist(before_enrollment)
+        .await
+        .expect("creation lane barrier");
+    assert!(
+        svc.store()
+            .list_undelivered_groups(&ws)
+            .await
+            .expect("groups before enrollment")
+            .is_empty(),
+        "empty group creation snapshot must not become a recovery record"
+    );
+
+    svc.enroll_child_in_group(&gid, &child);
+    let after_enrollment = svc.enqueue_group_persist_acked(GroupPersistOp::Delete(format!(
+        "barrier-{}",
+        uuid::Uuid::new_v4()
+    )));
+    Services::await_group_persist(after_enrollment)
+        .await
+        .expect("enrollment lane barrier");
+    let groups = svc
+        .store()
+        .list_undelivered_groups(&ws)
+        .await
+        .expect("groups after enrollment");
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].group_id, gid);
+    assert_eq!(groups[0].expected_agent_ids, vec![child]);
+}
+
 /// intent#4460 product-side probe: a scoped group cancel issued right after
 /// the group is created (its create/enroll upserts spawned but not yet
 /// landed) must not leave a resurrected `delegation_group` row behind — a
@@ -4771,7 +4816,7 @@ async fn app_agents_send_persists_chief_attribution_and_source_link() {
         Some(json!({
             "type": "chief_message",
             "fromAgentId": chief.0,
-            "fromAgentName": "Chief of Staff",
+            "fromAgentName": "Assistant",
             "fromWorkspaceId": chief_ws.0,
             "sourceMessageId": source_id,
             "sourceUrl": source_url,
@@ -4834,7 +4879,7 @@ async fn app_agents_send_delivers_despite_target_pending_questions() {
     let expected_metadata = json!({
         "type": "chief_message",
         "fromAgentId": chief.0,
-        "fromAgentName": "Chief of Staff",
+        "fromAgentName": "Assistant",
         "fromWorkspaceId": chief_ws.0,
         "sourceMessageId": source_id,
         "sourceUrl": source_url,
@@ -9784,7 +9829,24 @@ async fn worst_case_agent_list_row(
     };
     let parent = create_agent(svc, ws, "Parent").await;
     let child = create_agent(svc, ws, "Child").await;
-    let id = create_agent(svc, ws, "Worst-case row").await;
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Worst-case row".into()),
+            Some("sonnet4.5".into()),
+            None,
+            None,
+            None,
+            false,
+            intent_core::AgentCreateExtra {
+                provider: Some("auggie".into()),
+                metadata: Some(json!({"chiefPromptVersion": u32::MAX})),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create versioned budget row");
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
 
     let user = json!([{ "type": "text", "text": format!("ask {}", "u".repeat(BUDGET * 3)) }]);
     svc.store()
@@ -9862,6 +9924,7 @@ async fn worst_case_agent_list_row(
         },
         "isInitialAgent": true,
         "sponsorAgentId": parent.0,
+        "chiefPromptVersion": u32::MAX,
     }));
     svc.store()
         .update_agent_session(ws, &s)
@@ -46222,4 +46285,226 @@ async fn wire_agent_complete_once_rejects_compound_model() {
         .expect_err("compound model must reject");
         assert_compound_model_rejection(err, "model");
     }
+}
+
+#[intent_test_macros::daemon_test]
+async fn startup_resume_reservations_hide_only_candidates_and_release_on_drop() {
+    let (_t, svc, ws) = setup().await;
+    let first = create_agent(&svc, &ws, "Startup candidate").await;
+    svc.store
+        .insert_interrupted_agent(&first, &ws, "active", &now_iso())
+        .await
+        .unwrap();
+    let reservations = svc.prepare_startup_resume().await.unwrap();
+    assert_eq!(
+        svc.clone().agent_list_interrupted().await.unwrap()["agents"],
+        json!([])
+    );
+    assert!(
+        svc.store
+            .get_interrupted_agent(&first)
+            .await
+            .unwrap()
+            .is_some(),
+        "reservation must not resolve durable work"
+    );
+    let later = create_agent(&svc, &ws, "Later interruption").await;
+    svc.store
+        .insert_interrupted_agent(&later, &ws, "active", &now_iso())
+        .await
+        .unwrap();
+    let listed = svc.agent_list_interrupted().await.unwrap();
+    assert_eq!(listed["agents"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["agents"][0]["agentId"], json!(later));
+    drop(reservations);
+    assert_eq!(
+        svc.agent_list_interrupted().await.unwrap()["agents"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn startup_resume_failure_is_visible_and_retryable_while_other_candidates_are_reserved() {
+    let (_t, svc, ws) = setup().await;
+    let failed = create_agent(&svc, &ws, "Retired candidate").await;
+    let waiting = create_agent(&svc, &ws, "Waiting candidate").await;
+    for id in [&failed, &waiting] {
+        svc.store
+            .insert_interrupted_agent(id, &ws, "active", &now_iso())
+            .await
+            .unwrap();
+    }
+    svc.agent_retire_op(failed.clone(), Some(ws.clone()), None)
+        .await
+        .unwrap();
+    let reservations = svc.prepare_startup_resume().await.unwrap();
+    assert!(svc.resume_interrupted_agent(&failed).await.is_err());
+    reservations.finished(&failed);
+    let listed = svc.agent_list_interrupted().await.unwrap();
+    assert_eq!(listed["agents"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["agents"][0]["agentId"], json!(failed));
+    svc.agent_restore_op(failed.clone(), Some(ws.clone()))
+        .await
+        .unwrap();
+    svc.resume_interrupted_agent(&failed).await.unwrap();
+    assert_eq!(
+        svc.agent_list_interrupted().await.unwrap()["agents"],
+        json!([])
+    );
+    drop(reservations);
+    assert_eq!(
+        svc.agent_list_interrupted().await.unwrap()["agents"][0]["agentId"],
+        json!(waiting)
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn startup_resume_and_manual_resolution_have_one_winner() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Raced startup candidate").await;
+    svc.store
+        .insert_interrupted_agent(&id, &ws, "active", &now_iso())
+        .await
+        .unwrap();
+    let _reservations = svc.prepare_startup_resume().await.unwrap();
+    let (automatic, manual) = tokio::join!(
+        svc.resume_interrupted_agent(&id),
+        svc.agent_resolve_interrupted(Some(vec![id.0.clone()]), None)
+    );
+    let manual = manual.unwrap();
+    let manual_won = !manual["resumed"].as_array().unwrap().is_empty();
+    assert!(
+        automatic.is_ok() ^ manual_won,
+        "exactly one resume must win"
+    );
+    let session = svc.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(
+        session.messages.iter().filter(|m| m.role == "user").count(),
+        1
+    );
+    assert!(svc
+        .store
+        .get_interrupted_agent(&id)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[intent_test_macros::daemon_test]
+async fn startup_resume_enumeration_failure_installs_no_reservations() {
+    let (_t, svc, _ws) = setup().await;
+    svc.store.close().await;
+    assert!(svc.prepare_startup_resume().await.is_err());
+    assert!(svc.startup_resume_candidates.lock().unwrap().is_empty());
+}
+
+#[intent_test_macros::daemon_test]
+async fn startup_resume_and_manual_abandon_have_no_losing_side_effects() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Raced abandoned candidate").await;
+    svc.store
+        .insert_interrupted_agent(&id, &ws, "active", &now_iso())
+        .await
+        .unwrap();
+    let _reservations = svc.prepare_startup_resume().await.unwrap();
+    let (automatic, abandon) = tokio::join!(
+        svc.resume_interrupted_agent(&id),
+        svc.abandon_interrupted_agent(&id)
+    );
+    assert!(automatic.is_ok() ^ abandon.is_ok(), "one resolver wins");
+    let session = svc.store.get_agent_session(&id).await.unwrap();
+    let abandonment_notices = session
+        .messages
+        .iter()
+        .filter(|m| {
+            m.content
+                .to_string()
+                .contains("This conversation was interrupted because intentd restarted")
+        })
+        .count();
+    assert_eq!(
+        abandonment_notices,
+        usize::from(abandon.is_ok()),
+        "a losing abandon must not append a termination notice"
+    );
+    assert_eq!(
+        session.messages.iter().filter(|m| m.role == "user").count(),
+        usize::from(automatic.is_ok())
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn startup_resume_abandon_persist_failure_remains_retryable() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Failed abandonment").await;
+    svc.store
+        .insert_interrupted_agent(&id, &ws, "active", &now_iso())
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER fail_abandon_notice BEFORE INSERT ON agent_message
+         BEGIN SELECT RAISE(FAIL, 'injected abandonment write failure'); END",
+    )
+    .execute(svc.store.write_pool())
+    .await
+    .unwrap();
+    assert!(svc.abandon_interrupted_agent(&id).await.is_err());
+    assert!(svc
+        .store
+        .get_interrupted_agent(&id)
+        .await
+        .unwrap()
+        .is_some());
+    sqlx::query("DROP TRIGGER fail_abandon_notice")
+        .execute(svc.store.write_pool())
+        .await
+        .unwrap();
+    svc.abandon_interrupted_agent(&id).await.unwrap();
+    assert!(svc
+        .store
+        .get_interrupted_agent(&id)
+        .await
+        .unwrap()
+        .is_none());
+    let session = svc.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(
+        session
+            .messages
+            .iter()
+            .filter(|m| m.role == "system")
+            .count(),
+        1
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn startup_resume_listing_never_exposes_a_stale_successful_candidate() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Candidate resolved during listing").await;
+    svc.store
+        .insert_interrupted_agent(&id, &ws, "active", &now_iso())
+        .await
+        .unwrap();
+    let reservations = svc.prepare_startup_resume().await.unwrap();
+    let park = Arc::new(crate::script_ops::SupervisePark::default());
+    let mut listing = svc.clone();
+    listing.interrupted_list_park = Some(park.clone());
+    let (result, ()) = tokio::join!(listing.agent_list_interrupted(), async {
+        timeout(Duration::from_secs(5), park.entered.notified())
+            .await
+            .unwrap();
+        svc.resume_startup_candidate(&reservations, &id)
+            .await
+            .unwrap();
+        park.release.notify_one();
+    });
+    let result = result.unwrap();
+    assert_eq!(
+        result["agents"],
+        json!([]),
+        "an old pending-row read must not expose a successfully resumed candidate"
+    );
 }

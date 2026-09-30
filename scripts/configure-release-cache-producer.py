@@ -139,6 +139,7 @@ echo "matrix=$(jq -c '.ci.github.artifacts_matrix' cache-plan.json)" >> "$GITHUB
 # Bootstrap/refresh: dispatch on main; every run/attempt saves a new generation.
 # 256 MiB x 10 slots = 2.5 GiB entry data; up to another generation may coexist
 # during refresh. Retention deletes ONLY older owned main cache generations.
+# Daemon producers use a 2 GiB temporary working cache, trimmed before upload.
 # Shared 10 GB repository quota still permits eviction; every miss builds cold.
 # Run logs record archive transfer time; summaries record hits, size and build time.
 # Compare cold/warm main runs before claiming a platform speedup.
