@@ -979,3 +979,106 @@ async fn retirement_shutdown_does_not_attach_predecessor_result_to_restart_admis
     );
     assert!(def.archived_at.is_some());
 }
+
+async fn cancelled_observed_failure_retires(bad_cwd: bool) {
+    let h = harness_with_worktree(true).await;
+    let id = create(
+        &h,
+        ScriptCreateParams {
+            name: "cancelled observed failure".into(),
+            command: "true".into(),
+            cwd: bad_cwd.then(|| "../../escape".into()),
+            mode: ScriptMode::Command,
+            purpose: Some(intent_core::ScriptPurpose::OneOff),
+            ..Default::default()
+        },
+    )
+    .await;
+    let park = Arc::new(SupervisePark::default());
+    let mut mgr = h.services.script_manager();
+    mgr.parks.terminal_persist = Some(park.clone());
+    if !bad_cwd {
+        mgr.pty.kill_all().await;
+    }
+    let mut sub = subscribe(&h);
+    let run = {
+        let mgr = mgr.clone();
+        let ws = h.ws.clone();
+        let id = id.clone();
+        intent_core::spawn_daemon(async move { mgr.run(&ws, &id, None, None).await })
+    };
+    tokio::time::timeout(LIVENESS, park.entered.notified())
+        .await
+        .unwrap();
+    let observed = mgr
+        .scripts
+        .lock()
+        .unwrap()
+        .get(&(h.ws.clone(), id.clone()))
+        .unwrap()
+        .pending_result
+        .clone()
+        .expect("failure already observed before cancellation");
+    assert_eq!(observed.outcome, intent_core::ScriptRunOutcome::Failed);
+    assert_eq!(observed.exit_code, Some(-1));
+    assert!(observed.started_at.is_none());
+    assert!(observed.error.is_some());
+    assert_eq!(
+        h.services.store.pending_script_runs().await.unwrap().len(),
+        1
+    );
+    run.abort();
+    assert!(run.await.unwrap_err().is_cancelled());
+    park.release.notify_one();
+    // No later stop, shutdown or rerun may be needed to flush this failure.
+    let settled = retired(&h, &id).await;
+    assert_eq!(settled.last_run, Some(observed));
+    assert!(h
+        .services
+        .store
+        .pending_script_runs()
+        .await
+        .unwrap()
+        .is_empty());
+    tokio::time::timeout(LIVENESS, async {
+        let mut terminal_seen = false;
+        loop {
+            for event in sub.recv().await.unwrap() {
+                let event = serde_json::to_value(event).unwrap();
+                if event["type"] == "script:state" && event["data"]["status"] == "exited" {
+                    assert_eq!(
+                        event["data"]["error"],
+                        settled
+                            .last_run
+                            .as_ref()
+                            .unwrap()
+                            .error
+                            .as_ref()
+                            .unwrap()
+                            .as_str()
+                    );
+                    terminal_seen = true;
+                }
+                if event["type"] == "script:changed" {
+                    assert!(
+                        terminal_seen,
+                        "failure publication must precede automatic archive"
+                    );
+                    return;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[intent_test_macros::daemon_test]
+async fn retirement_cancelled_run_waiter_after_cwd_failure_still_retires() {
+    cancelled_observed_failure_retires(true).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn retirement_cancelled_run_waiter_after_spawn_failure_still_retires() {
+    cancelled_observed_failure_retires(false).await;
+}
