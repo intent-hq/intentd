@@ -1177,7 +1177,7 @@ fn finalization_expiry_and_incomplete_cleanup_cannot_pass() {
             start,
             deadline,
             || {
-                // Real explicit directory close; only the clock advancement and the
+                // Real explicit directory disposition; only the clock advancement and the
                 // incomplete semantic classification are synthetic contract inputs.
                 let directory = directory.finalize(false);
                 clock.set(if case == "late-finalization" {
@@ -1194,8 +1194,23 @@ fn finalization_expiry_and_incomplete_cleanup_cannot_pass() {
             &json!({"case":case,"resources":resources,"completion":completed}),
         )
         .unwrap();
-        assert_eq!(resources["directory"]["closeOk"], true);
-        assert!(!path.exists());
+        let directory = &resources["directory"];
+        assert!(directory_complete(directory));
+        if directory["retentionRequested"] == true {
+            assert_eq!(directory["closeAttempted"], false);
+            assert_eq!(directory["closeOk"], false);
+            assert_eq!(directory["removed"], false);
+            assert_eq!(directory["retained"], json!(path));
+            let metadata = std::fs::symlink_metadata(&path).unwrap();
+            assert!(metadata.is_dir());
+            assert_eq!(directory["identity"], json!([metadata.dev(), metadata.ino()]));
+        } else {
+            assert_eq!(directory["closeAttempted"], true);
+            assert_eq!(directory["closeOk"], true);
+            assert_eq!(directory["removed"], true);
+            assert!(directory["retained"].is_null());
+            assert!(!path.exists());
+        }
         assert_eq!(completed["normalCompletion"], case == "on-time");
         assert_eq!(completed["withinDeadline"], case != "late-finalization");
         assert_eq!(
