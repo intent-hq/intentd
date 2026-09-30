@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.124] - 2026-09-30
+
+### 🐛 Bug Fixes
+
+- Retry transient proposal metadata writes ([#5886](https://github.com/intent-hq/intentd/pull/5886)) ([#2179](https://github.com/intent-hq/intentd/pull/2179))
+- Honor keep-temp mode in suppression retention tests ([#2181](https://github.com/intent-hq/intentd/pull/2181))
+- Isolate wake fixture identity and teardown ([#6014](https://github.com/intent-hq/intentd/pull/6014)) ([#2184](https://github.com/intent-hq/intentd/pull/2184))
+
+
 ## [0.9.123] - 2026-09-30
 
 ### 🐛 Bug Fixes
