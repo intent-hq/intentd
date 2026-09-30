@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.127] - 2026-09-30
+
+### 🚀 Features
+
+- *(terminal)* Add exact output replay cursors ([#2193](https://github.com/intent-hq/intentd/pull/2193))
+- Archive one-off scripts with durable run history ([#2195](https://github.com/intent-hq/intentd/pull/2195))
+
+### 🐛 Bug Fixes
+
+- *(settings)* Release revision gate during secret-store mutations ([#2112](https://github.com/intent-hq/intentd/pull/2112))
+
+
 ## [0.9.126] - 2026-09-30
 
 ### 🚀 Features
