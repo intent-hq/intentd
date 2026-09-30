@@ -2885,10 +2885,11 @@ impl Store {
 
     /// Set the session's `notifications_muted` flag (0123) — the store side
     /// of `agent.update { notificationsMuted }`. Returns `true` when the
-    /// stored value actually changed; an already-matching flag is a no-op
-    /// (no write, no `updated_at` bump). The ONLY post-insert mutator of the
-    /// column: the full-row [`Store::update_agent_session`] deliberately
-    /// excludes it so a concurrent `agent.update` on unrelated fields, or a
+    /// stored value actually changed; an already-matching flag is a no-op.
+    /// Notification preferences never advance the activity timestamp. The ONLY
+    /// post-insert mutator of the column: the full-row
+    /// [`Store::update_agent_session`] deliberately excludes it so a concurrent
+    /// `agent.update` on unrelated fields, or a
     /// long-lived in-memory session persisted at turn end, can never revert
     /// the user's toggle. Scoped to `workspace_id` (defense-in-depth).
     /// `NotFound` if the session is absent or the workspace does not match.
@@ -2901,14 +2902,12 @@ impl Store {
         workspace_id: &WorkspaceId,
         id: &AgentId,
         muted: bool,
-        updated_at: &str,
     ) -> Result<bool> {
         let rows = sqlx::query(
-            "UPDATE agent_session SET notifications_muted=?, updated_at=? \
+            "UPDATE agent_session SET notifications_muted=? \
              WHERE id=? AND workspace_id=? AND notifications_muted != ?",
         )
         .bind(i64::from(muted))
-        .bind(updated_at)
         .bind(&id.0)
         .bind(&workspace_id.0)
         .bind(i64::from(muted))
@@ -3212,31 +3211,38 @@ impl Store {
         value: &str,
         updated_at: &str,
     ) -> Result<()> {
-        let rows = sqlx::query(
-            "UPDATE agent_session SET \
-             metadata = json_set(\
-                 CASE \
-                     WHEN metadata IS NULL THEN '{}' \
-                     WHEN json_type(metadata) = 'object' THEN metadata \
-                     ELSE json_object('priorNonObjectMetadata', json(metadata)) \
-                 END, \
-                 '$.' || ?, json(?)), \
-             updated_at = ? \
-             WHERE id = ? AND workspace_id = ?",
-        )
-        .bind(key)
-        .bind(value)
-        .bind(updated_at)
-        .bind(&id.0)
-        .bind(&workspace_id.0)
-        .execute(self.write_pool())
+        // The scoped single-key update is idempotent. Retry only this write;
+        // proposal notices and events remain outside the retry boundary.
+        crate::with_write_txn_retry(|| async {
+            let rows = sqlx::query(
+                "UPDATE agent_session SET \
+                 metadata = json_set(\
+                     CASE \
+                         WHEN metadata IS NULL THEN '{}' \
+                         WHEN json_type(metadata) = 'object' THEN metadata \
+                         ELSE json_object('priorNonObjectMetadata', json(metadata)) \
+                     END, \
+                     '$.' || ?, json(?)), \
+                 updated_at = ? \
+                 WHERE id = ? AND workspace_id = ?",
+            )
+            .bind(key)
+            .bind(value)
+            .bind(updated_at)
+            .bind(&id.0)
+            .bind(&workspace_id.0)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("set agent session metadata key json failed: {e}"))
+            })?
+            .rows_affected();
+            if rows == 0 {
+                return Err(Error::NotFound(format!("agent session {id}")));
+            }
+            Ok(())
+        })
         .await
-        .map_err(|e| Error::Internal(format!("set agent session metadata key json failed: {e}")))?
-        .rows_affected();
-        if rows == 0 {
-            return Err(Error::NotFound(format!("agent session {id}")));
-        }
-        Ok(())
     }
 
     /// CAS-set one session metadata key unless a later user row already
@@ -5563,6 +5569,28 @@ impl Store {
         }
     }
 
+    /// Queue IDs whose user transcript rows already committed. Shutdown
+    /// recovery uses this narrow metadata projection to avoid replaying an
+    /// append whose acknowledgement was lost to cancellation.
+    ///
+    /// # Errors
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn persisted_queue_message_ids(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<std::collections::HashSet<String>> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT json_extract(metadata, '$.queueInfo.queuedMessageId') FROM agent_message \
+             WHERE agent_id = ? AND role = 'user' \
+             AND json_type(metadata, '$.queueInfo.queuedMessageId') = 'text'",
+        )
+        .bind(&agent_id.0)
+        .fetch_all(self.read_pool())
+        .await
+        .map(|ids| ids.into_iter().collect())
+        .map_err(|e| Error::Internal(format!("read persisted queue message IDs failed: {e}")))
+    }
+
     /// One message of an agent's log by row id, hydrated as a single row —
     /// the pending-questions marker resolver (PROTOCOL §5.5). One statement
     /// over the primary key, at most ONE decoded message regardless of
@@ -7556,9 +7584,49 @@ mod tests {
         muted: bool,
     ) {
         store
-            .set_agent_notifications_muted(ws, agent, muted, &intent_core::now_iso())
+            .set_agent_notifications_muted(ws, agent, muted)
             .await
             .expect("persist notifications_muted");
+    }
+
+    #[tokio::test]
+    async fn notifications_muted_preserves_activity_timestamp() {
+        let tmp = TempDb::new("test-agent-mute-timestamp");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ws = WorkspaceId("ws-mute-timestamp".to_string());
+        insert_test_workspace(&store, &ws).await;
+        let agent = AgentId("agent-mute-timestamp".to_string());
+        let old = "2020-01-01T00:00:00.000Z";
+        seed_unread_top_level_session(&store, &ws, &agent, old).await;
+
+        for (muted, changed) in [(true, true), (true, false), (false, true), (false, false)] {
+            assert_eq!(
+                store
+                    .set_agent_notifications_muted(&ws, &agent, muted)
+                    .await
+                    .expect("set mute"),
+                changed
+            );
+            let stored = store.get_agent_session(&agent).await.expect("reload");
+            assert_eq!(stored.notifications_muted, muted);
+            assert_eq!(
+                stored.updated_at, old,
+                "mute preference is not agent activity"
+            );
+        }
+        assert!(matches!(
+            store
+                .set_agent_notifications_muted(
+                    &WorkspaceId("wrong-workspace".to_string()),
+                    &agent,
+                    true,
+                )
+                .await,
+            Err(Error::NotFound(_))
+        ));
+        let stored = store.get_agent_session(&agent).await.expect("reload");
+        assert!(!stored.notifications_muted);
+        assert_eq!(stored.updated_at, old);
     }
 
     /// `set_agent_notifications_muted` is the only writer of the column: it
@@ -7581,12 +7649,12 @@ mod tests {
         assert!(!stale.notifications_muted);
 
         assert!(store
-            .set_agent_notifications_muted(&ws, &agent, true, &ts)
+            .set_agent_notifications_muted(&ws, &agent, true)
             .await
             .expect("mute"));
         assert!(
             !store
-                .set_agent_notifications_muted(&ws, &agent, true, &ts)
+                .set_agent_notifications_muted(&ws, &agent, true)
                 .await
                 .expect("mute again"),
             "same-value write is a no-op"
@@ -7605,7 +7673,7 @@ mod tests {
         );
 
         assert!(store
-            .set_agent_notifications_muted(&ws, &agent, false, &ts)
+            .set_agent_notifications_muted(&ws, &agent, false)
             .await
             .expect("unmute"));
         assert!(
@@ -7617,12 +7685,7 @@ mod tests {
         );
         assert!(matches!(
             store
-                .set_agent_notifications_muted(
-                    &ws,
-                    &AgentId("agent-missing".to_string()),
-                    true,
-                    &ts
-                )
+                .set_agent_notifications_muted(&ws, &AgentId("agent-missing".to_string()), true)
                 .await,
             Err(Error::NotFound(_))
         ));

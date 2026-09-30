@@ -457,6 +457,9 @@ async fn cancel_and_settle_idle_prompt(
 /// since a `QueuedMessage` has no per-turn hints of its own.
 #[derive(Debug, Default, Clone)]
 pub struct TurnOptions {
+    /// Resume recovery must retain its pending interruption when shutdown
+    /// refuses admission, rather than hiding it behind an ordinary queue.
+    pub reject_on_shutdown: bool,
     pub stdin_context: Option<String>,
     pub note_ids: Option<serde_json::Value>,
     pub context_references: Option<serde_json::Value>,
@@ -2534,6 +2537,9 @@ pub struct AgentManager {
     /// `agent.sendMessage` consults this to flip a message to the queue while a
     /// turn is mid-stream (the TS "queue while streaming" semantics).
     busy: Arc<Mutex<HashSet<AgentId>>>,
+    // Lock order: admission_closed → retired/busy/stopping/workers. Never
+    // held across awaits; claims, worker registration, and closure serialize.
+    admission_closed: Mutex<bool>,
     turn_admissions: Mutex<HashMap<AgentId, TurnAdmission>>,
     next_admission: AtomicUsize,
     /// Claimed startup side effects must finish before retirement detaches.
@@ -2692,6 +2698,8 @@ pub struct AgentManager {
     turn_start_pause: Mutex<Option<Arc<TurnStartPause>>>,
     #[cfg(test)]
     shutdown_persist_pause: Mutex<Option<Arc<TurnStartPause>>>,
+    #[cfg(test)]
+    user_persist_pause: Mutex<Option<Arc<TurnStartPause>>>,
 }
 
 impl AgentManager {
@@ -2752,6 +2760,7 @@ impl AgentManager {
             antigravity_state_root: None,
             chief_cwd_root: None,
             busy: Arc::new(Mutex::new(HashSet::new())),
+            admission_closed: Mutex::new(false),
             turn_admissions: Mutex::new(HashMap::new()),
             next_admission: AtomicUsize::new(0),
             turn_start_gates: crate::agent_ops::AgentRetirementGates::default(),
@@ -2777,6 +2786,8 @@ impl AgentManager {
             turn_start_pause: Mutex::new(None),
             #[cfg(test)]
             shutdown_persist_pause: Mutex::new(None),
+            #[cfg(test)]
+            user_persist_pause: Mutex::new(None),
         }
     }
 
@@ -3058,6 +3069,9 @@ impl AgentManager {
         cwd: PathBuf,
         opts: &SpawnOptions<'_>,
     ) -> Result<()> {
+        if self.is_shutting_down() {
+            return Err(Error::NotFound("daemon is shutting down".into()));
+        }
         // Claim-before-kill (monorepo#2247): the slot-cap/budget eviction
         // inside `acquire` claims its victim against `try_begin` exactly like
         // the reap sweeps, so a turn cannot start on the victim mid-kill. The
@@ -3455,9 +3469,10 @@ impl AgentManager {
         // installed first → `stop_many`'s detach finds it and kills it with
         // the batch. Either interleaving leaves no orphaned process.
         let fenced = {
+            let closed = self.admission_closed.lock().unwrap();
             let retired = self.retired.lock().unwrap();
             let stopping = self.stopping.lock().unwrap();
-            if retired.contains(&agent_id) || stopping.contains(&agent_id) {
+            if *closed || retired.contains(&agent_id) || stopping.contains(&agent_id) {
                 Some(handle)
             } else {
                 self.handles
@@ -5955,6 +5970,10 @@ impl AgentManager {
         // Insert into `agent_ws` while still holding the `busy` lock
         // (busy → agent_ws order, matching `list_busy`) so a concurrent
         // `list_busy` never observes a busy agent without its workspace.
+        let closed = self.admission_closed.lock().unwrap();
+        if *closed {
+            return Err(SlotClaimLoss::ReapClaimed);
+        }
         let retired = self.retired.lock().unwrap();
         if retired.contains(agent_id) {
             // Like an idle-reap claim, retirement permits no implicit wake
@@ -6167,7 +6186,7 @@ impl AgentManager {
     ) {
         let gate = self.turn_start_gates.for_agent(agent_id);
         let _starting = gate.lock().await;
-        if !self.owns_admission(agent_id, admission) {
+        if self.is_shutting_down() || !self.owns_admission(agent_id, admission) {
             return;
         }
         if persist_idle {
@@ -6187,7 +6206,7 @@ impl AgentManager {
     ) {
         let gate = self.turn_start_gates.for_agent(agent_id);
         let _starting = gate.lock().await;
-        if !self.owns_admission(agent_id, admission) {
+        if self.is_shutting_down() || !self.owns_admission(agent_id, admission) {
             return;
         }
         handle_drain_persist_failure(self, agent_id, workspace_id, content, options).await;
@@ -6204,6 +6223,14 @@ impl AgentManager {
     ) -> FlushPrep {
         let gate = self.turn_start_gates.for_agent(agent_id);
         let _starting = gate.lock().await;
+        if self.is_shutting_down() {
+            // These entries were popped before closure. Keep them available
+            // for restart even if another queued send persists a new snapshot.
+            self.services.requeue_front_batch(agent_id, entries);
+            drop(draining);
+            self.services.persist_queue_snapshot(agent_id).await;
+            return FlushPrep::Parked;
+        }
         if !self.owns_admission(agent_id, admission) {
             return FlushPrep::Parked;
         }
@@ -6645,6 +6672,9 @@ impl AgentManager {
         message_id: Option<String>,
         mut options: TurnOptions,
     ) -> Result<Value> {
+        if options.reject_on_shutdown && self.is_shutting_down() {
+            return Err(Error::Internal("daemon is shutting down".into()));
+        }
         // Validate the caller-supplied id length BEFORE any state change
         // (mirrors `agent_send_message_op`'s unconditional guard — the row id
         // is now the client id). Hoisted above `try_begin` so a doomed
@@ -6850,7 +6880,22 @@ impl AgentManager {
                 .await;
             return Ok(result);
         }
+        #[cfg(test)]
+        if options.reject_on_shutdown {
+            if let Some(park) = &self.services.interrupted_resume_park {
+                park.entered.notify_one();
+                park.release.notified().await;
+            }
+        }
         let Some(admission) = self.try_begin_turn(&agent_id, &workspace_id).await else {
+            // A resume may have claimed its durable interruption before closure
+            // and awaited store work since the entry check. Refuse here too:
+            // shutdown is monotonic and the failed claim created no busy slot
+            // for the checkpoint to recover. Never enqueue this continuation.
+            if options.reject_on_shutdown && self.is_shutting_down() {
+                return Err(Error::Internal("daemon is shutting down".into()));
+            }
+
             // A send INTO an `Error` session is recorded as the parked
             // recovery send, atomically with its enqueue
             // (intent-hq/intent#4962): the slot holder may be a
@@ -8165,8 +8210,9 @@ impl AgentManager {
     ) {
         // Hold through spawn + registration: retirement either sees this
         // worker in its abort sweep or prevents it from starting at all.
+        let closed = self.admission_closed.lock().unwrap();
         let retired = self.retired.lock().unwrap();
-        if retired.contains(&agent_id) || !self.owns_admission(&agent_id, admission) {
+        if *closed || retired.contains(&agent_id) || !self.owns_admission(&agent_id, admission) {
             // Teardown owns the cancelled slot. Never release a newer claim
             // installed by restore while this old send was persisting.
             return;
@@ -8451,8 +8497,9 @@ impl AgentManager {
         // turn is open.
         let mgr = self.clone();
         let (id, ws) = (agent_id.clone(), workspace_id.clone());
+        let closed = self.admission_closed.lock().unwrap();
         let retired = self.retired.lock().unwrap();
-        if retired.contains(agent_id) || !self.owns_admission(agent_id, admission) {
+        if *closed || retired.contains(agent_id) || !self.owns_admission(agent_id, admission) {
             return true;
         }
         self.registry.mark_active(agent_id);
@@ -9248,6 +9295,9 @@ impl AgentManager {
         // burning spawn attempts against a fence that will not lift. The
         // install-time fence in `create_agent` closes the interleaving where
         // this check passes just before the fence arms.
+        if self.is_shutting_down() {
+            return Err(Error::NotFound("daemon is shutting down".into()));
+        }
         if self.stopping.lock().unwrap().contains(agent_id) {
             return Err(Error::NotFound(format!(
                 "agent session {agent_id} is being deleted"
@@ -9593,7 +9643,41 @@ impl AgentManager {
         Ok(acp_session_id)
     }
 
-    /// Tear down every tracked agent (clean daemon shutdown kills all children).
+    /// Close admission before the composition root performs any teardown await.
+    /// Workers are pinned before cancellation so interrupted output survives.
+    /// Registration and claims use the same lock: even a previously admitted
+    /// send cannot register a worker after this sweep.
+    ///
+    /// # Panics
+    /// Panics if an internal mutex is poisoned.
+    pub fn begin_shutdown(&self) {
+        let mut closed = self.admission_closed.lock().unwrap();
+        if *closed {
+            return;
+        }
+        *closed = true;
+        self.services.freeze_shutdown_drains();
+        let in_flight = self.list_busy();
+        for (id, _) in &in_flight {
+            self.services.pin_live_turn(id);
+        }
+        let mut stopping = self.stopping.lock().unwrap();
+        stopping.extend(in_flight.into_iter().map(|(id, _)| id));
+        stopping.extend(self.handles.lock().unwrap().keys().cloned());
+        let workers = self.workers.lock().unwrap();
+        stopping.extend(workers.keys().cloned());
+        for worker in workers.values() {
+            worker.abort();
+        }
+        self.services.delivery_tasks.close();
+    }
+
+    fn is_shutting_down(&self) -> bool {
+        *self.admission_closed.lock().unwrap()
+    }
+
+    /// Checkpoint frozen queues and interrupted turns before potentially slow
+    /// external-service teardown. This may be repeated by final shutdown.
     /// Before stopping each in-flight agent, capture it as an interrupted session
     /// so the FE modal offers resumption on next launch — same as a crash (INT-41
     /// graceful-shutdown gap).
@@ -9601,38 +9685,32 @@ impl AgentManager {
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
-    pub async fn shutdown(&self) {
+    pub async fn checkpoint_shutdown(&self) {
+        self.begin_shutdown();
         // A recovered turn can be admitted while its provider is still waiting
         // to spawn. Include those workers, not only installed handles, or their
         // resolved interruption row would be lost at this shutdown.
         let in_flight = self.list_busy();
-        let mut ids: HashSet<AgentId> = self.handles.lock().unwrap().keys().cloned().collect();
-        ids.extend(in_flight.iter().map(|(id, _)| id.clone()));
-        ids.extend(self.workers.lock().unwrap().keys().cloned());
         // Pin every live slot before aborting any worker: dropping its future
         // drops the LiveTurnGuard, which would otherwise erase partial output.
         for (id, _) in &in_flight {
             self.services.pin_live_turn(id);
         }
-        // Fence and abort the WHOLE snapshot before the first persistence await.
-        // Otherwise a later worker can hit the fence during an earlier flush,
-        // publish a terminal spawn failure, and release its busy/workspace slot.
-        // Keep the fence locked through abort so a worker cannot observe it as
-        // a provider error before its cancellation is armed.
-        {
-            let mut stopping = self.stopping.lock().unwrap();
-            stopping.extend(ids.iter().cloned());
-            let mut workers = self.workers.lock().unwrap();
-            for id in &ids {
-                if let Some(worker) = workers.remove(id) {
-                    worker.abort();
-                }
-            }
+        // begin_shutdown closed registration and armed every cancellation.
+        // Await actual drops before flushing pinned content or closing the store.
+        let workers = std::mem::take(&mut *self.workers.lock().unwrap());
+        for (_, worker) in workers {
+            let _ = worker.await;
         }
+        self.services.persist_shutdown_drains().await;
         // The lazy-spawn fence remains for this manager's lifetime. Persist the
         // captured identities, never a post-await re-read of the mutable maps.
         let now = intent_core::now_iso();
         for (id, workspace_id) in &in_flight {
+            // A claimed request may still be finishing its startup status writes.
+            // Order those before shutdown persistence, without the global lock.
+            let gate = self.turn_start_gates.for_agent(id);
+            let _starting = gate.lock().await;
             #[cfg(test)]
             {
                 let pause = self.shutdown_persist_pause.lock().unwrap().take();
@@ -9703,7 +9781,20 @@ impl AgentManager {
                 tracing::warn!(agent_id = %id, workspace_id = %workspace_id, error = %e, "graceful shutdown: failed to insert interrupted_agent row");
             }
         }
+    }
 
+    /// Persist recovery before waiting for committed delivery tails, then
+    /// tear down every tracked provider. Admission remains permanently closed.
+    ///
+    /// # Panics
+    /// Panics if an internal mutex is poisoned.
+    pub async fn shutdown(&self) {
+        self.begin_shutdown();
+        let mut ids: HashSet<AgentId> = self.handles.lock().unwrap().keys().cloned().collect();
+        ids.extend(self.list_busy().into_iter().map(|(id, _)| id));
+        ids.extend(self.workers.lock().unwrap().keys().cloned());
+        self.checkpoint_shutdown().await;
+        self.services.shutdown_agent_deliveries().await;
         // Now tear down every agent's bookkeeping (settles to RuntimeIdle) and
         // collect the detached children, then kill all process groups in
         // parallel under ONE shared grace window — total teardown stays ~one
@@ -11652,6 +11743,11 @@ async fn run_message_worker(
                 }
             }
             Err(e) => {
+                if mgr.is_shutting_down() {
+                    // Cancellation is not provider failure. Leave the admitted
+                    // slot for shutdown's interrupted-turn capture.
+                    return;
+                }
                 match stderr_capture_hint(&mgr, &agent_id, &e).await {
                     Some(log) => tracing::warn!(
                         agent = %agent_id,
@@ -12285,6 +12381,11 @@ async fn prepare_flush_turn(
             entries[i].persisted = true;
             continue;
         }
+        if mgr.is_shutting_down() {
+            mgr.services.requeue_front_batch(agent_id, entries);
+            mgr.services.persist_queue_snapshot(agent_id).await;
+            return FlushPrep::Parked;
+        }
         // Fail closed: restore the queue in original order — tail first,
         // then the failed entry (the handler's own front requeue), then the
         // already-persisted head entries ahead of it.
@@ -12400,6 +12501,14 @@ async fn persist_user(
     turn_id: Option<&str>,
     user_origin: bool,
 ) -> bool {
+    #[cfg(test)]
+    {
+        let pause = mgr.user_persist_pause.lock().unwrap().take();
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.resume.notified().await;
+        }
+    }
     let created_at = now_iso();
     let mut blocks = user_message_blocks(content, image_blocks, file_blocks);
     let block_md = message_metadata.and_then(|md| match md {
@@ -13458,6 +13567,9 @@ async fn handle_terminal_spawn_failure(
     persisted: bool,
     error: &Error,
 ) {
+    if mgr.is_shutting_down() {
+        return;
+    }
     let error_text = error.to_string();
     if discard_failure_for_vanished_session(mgr, agent_id, &error_text).await {
         return;
@@ -13505,6 +13617,11 @@ async fn handle_drain_persist_failure(
     content: &str,
     options: &TurnOptions,
 ) -> bool {
+    // Shutdown freezes the original draining payload before cancellation.
+    // Leave that copy for recovery rather than inventing a terminal failure.
+    if mgr.is_shutting_down() {
+        return false;
+    }
     let error_text = "failed to persist user message to transcript; turn not started".to_string();
     if discard_failure_for_vanished_session(mgr, agent_id, &error_text).await {
         return true;

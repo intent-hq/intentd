@@ -77,6 +77,7 @@ mod conditional_write_precedence_tests;
 mod config_watcher;
 mod create_progress;
 mod delete_grace;
+mod delivery_tasks;
 mod device_ops;
 mod discovery_cache;
 mod disk_usage;
@@ -103,6 +104,7 @@ mod github_browse_ops;
 mod source_control_auth_ops;
 
 mod agent_list_cache;
+pub mod checkpoint;
 mod fast_mode;
 mod harness;
 mod history_xml;
@@ -225,6 +227,7 @@ pub use agent_manager::{
 // [`Services::with_suspend_tracker`].
 pub use agent_ops::StartupResumeCandidates;
 pub use agent_session::SuspendOverlapQuery;
+pub use agent_subscriptions::StartupCompletionRecovery;
 // Re-export the permission types the composition root (`INTENTD_PERMISSION_POLICY`)
 // and the transport router (`agent.respondPermission` outcome parsing) need.
 // The individual watcher families are constructed only by `WatcherRegistry`,
@@ -266,6 +269,20 @@ pub(crate) struct CompletionClassifyPark {
     pub(crate) entered: tokio::sync::Notify,
     /// Held by the parked delivery inside the window until the test releases it.
     pub(crate) release: tokio::sync::Notify,
+}
+
+/// Retry ownership and watch scope for one child's completion delivery.
+/// Live events cover every watch; deferred startup events cover only restored IDs.
+#[derive(Debug, Default, Clone)]
+struct CompletionDeliveryRetry {
+    generation: u64,
+    attempts: Vec<CompletionRetryAttempt>,
+}
+
+#[derive(Debug, Clone)]
+struct CompletionRetryAttempt {
+    event: Event,
+    watch_ids: Option<HashSet<String>>,
 }
 
 /// Live state of the completion delivery passes over one child
@@ -415,9 +432,12 @@ pub struct Services {
     /// snapshots ([`agent_ops::Services::queue_snapshot`]) keep listing them
     /// ahead of the live queue until the owning [`agent_ops::DrainingGuard`]
     /// is dropped, so an unrelated concurrent mutation's `agent:queue:updated`
-    /// never shows the entry gone before its row exists. Never persisted.
+    /// never shows the entry gone before its row exists. Shutdown freezes and
+    /// persists this overlay before dropping cancelled owners.
     /// Lock order: this mutex is taken BEFORE `agent_queues`, never after.
     draining_queue_entries: Arc<Mutex<HashMap<AgentId, Vec<agent_ops::QueuedMessage>>>>,
+    /// Freeze popped payloads before cancelling their owners at shutdown.
+    draining_shutdown: Arc<std::sync::atomic::AtomicBool>,
     /// Queue-entry id of an `agent.sendMessage` into an `Error` session that
     /// lost the in-flight slot to a worker still holding it
     /// (intent-hq/intent#4962). The documented recovery for an `Error`
@@ -560,8 +580,10 @@ pub struct Services {
     /// Serializes strict completion-only ask registration so a watch is
     /// durably persisted before it becomes visible to completion delivery.
     completion_watch_registration_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Cancellation and drain ownership for automatic agent delivery tasks.
+    delivery_tasks: Arc<delivery_tasks::DeliveryTasks>,
     /// Child agent ids with an active terminal-delivery retry task, mapped
-    /// to a schedule generation. Ownership is coalesced per CHILD, not per
+    /// to pending attempts and a schedule generation. Ownership is coalesced per CHILD, not per
     /// watch (intent-hq/intent#3728): one delivery pass processes ALL of the
     /// child's watches, so per-watch tasks would each repeat the same full
     /// pass (quadratic attempts, synchronized bursts). A transient wake or
@@ -569,7 +591,7 @@ pub struct Services {
     /// its stable message id without waiting for another event; scheduling
     /// while a task is live bumps the generation, which the task re-checks
     /// before exiting so a racing failure never loses its retry owner.
-    completion_delivery_retries: Arc<Mutex<HashMap<String, u64>>>,
+    completion_delivery_retries: Arc<Mutex<HashMap<String, CompletionDeliveryRetry>>>,
     /// Delegation-group ids with an active aggregated-wake retry task.
     completion_group_delivery_retries: Arc<Mutex<HashSet<String>>>,
     /// Per-agent consecutive-identical-terminal-failure streak (monorepo#840):
@@ -777,6 +799,10 @@ pub struct Services {
     /// deterministic. `None` in production wiring; tests inject via the
     /// `#[cfg(test)]`-only `with_completion_classify_park`.
     completion_classify_park: Option<Arc<CompletionClassifyPark>>,
+    #[cfg(test)]
+    hook_wake_park: Option<Arc<CompletionClassifyPark>>,
+    #[cfg(test)]
+    hook_eval_park: Option<Arc<CompletionClassifyPark>>,
     /// Test park seam (intent-hq/intent#4367) for the completion-delivery
     /// claim→send window: parks the ungrouped terminal delivery right after
     /// it claims the watch and before the durable send, so a concurrent
@@ -1296,6 +1322,8 @@ pub struct Services {
     #[cfg(test)]
     interrupted_list_park: Option<Arc<script_ops::SupervisePark>>,
     #[cfg(test)]
+    interrupted_resume_park: Option<Arc<CompletionClassifyPark>>,
+    #[cfg(test)]
     workspace_delete_test_gate: tests::workspace_delete::DeleteGate,
     /// In-memory pending agent-session deletions for the delete grace window
     /// (§5.5): `agent.delete` with `undoDelayMs > 0` registers the timer
@@ -1399,6 +1427,7 @@ impl Services {
             event_bus: None,
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
             draining_queue_entries: Arc::new(Mutex::new(HashMap::new())),
+            draining_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             parked_recovery_sends: Arc::new(Mutex::new(HashMap::new())),
             agent_queue_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
             agent_queue_publish_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -1424,6 +1453,7 @@ impl Services {
             )),
             group_persist_lane: Arc::new(OnceLock::new()),
             completion_watch_registration_gate: Arc::new(tokio::sync::Mutex::new(())),
+            delivery_tasks: Arc::new(delivery_tasks::DeliveryTasks::default()),
             completion_delivery_retries: Arc::new(Mutex::new(HashMap::new())),
             completion_group_delivery_retries: Arc::new(Mutex::new(HashSet::new())),
             agent_failure_streaks: Arc::new(Mutex::new(HashMap::new())),
@@ -1453,6 +1483,10 @@ impl Services {
             script_too_fast_ms: script_ops::TOO_FAST_MS,
             script_parks: script_ops::ScriptParks::default(),
             completion_classify_park: None,
+            #[cfg(test)]
+            hook_wake_park: None,
+            #[cfg(test)]
+            hook_eval_park: None,
             completion_claim_park: None,
             completion_flip_take_park: None,
             attention_write_park: None,
@@ -1562,6 +1596,8 @@ impl Services {
             startup_resume_candidates: Arc::default(),
             #[cfg(test)]
             interrupted_list_park: None,
+            #[cfg(test)]
+            interrupted_resume_park: None,
             #[cfg(test)]
             workspace_delete_test_gate: tests::workspace_delete::DeleteGate::default(),
             pending_agent_deletes: delete_grace::PendingDeletes::default(),
@@ -6239,25 +6275,44 @@ impl Services {
             return intent_core::spawn_daemon(async {});
         };
         let services = self.clone();
-        intent_core::spawn_daemon(async move {
-            // Span every workspace (workspace_id = None) and deliver each matched
-            // event immediately (batch_window = None) so wakes are never coalesced.
-            let filter = SubscriptionFilter {
-                event_types: vec![
-                    AGENT_IDLE.to_string(),
-                    AGENT_FAILED.to_string(),
-                    AGENT_DELETED.to_string(),
-                    AGENT_RETIRED.to_string(),
-                ],
-                ..Default::default()
-            };
-            let mut sub = bus.subscribe(filter);
-            while let Some(events) = sub.recv().await {
-                for event in events {
-                    services.handle_completion_event(&event).await;
+        self.delivery_tasks
+            .spawn(async move {
+                // Span every workspace (workspace_id = None) and deliver each matched
+                // event immediately (batch_window = None) so wakes are never coalesced.
+                let filter = SubscriptionFilter {
+                    event_types: vec![
+                        AGENT_IDLE.to_string(),
+                        AGENT_FAILED.to_string(),
+                        AGENT_DELETED.to_string(),
+                        AGENT_RETIRED.to_string(),
+                    ],
+                    ..Default::default()
+                };
+                let mut sub = bus.subscribe(filter);
+                while let Some(events) = sub.recv().await {
+                    for event in events {
+                        services.handle_completion_event(&event).await;
+                    }
                 }
-            }
-        })
+            })
+            .unwrap_or_else(|| intent_core::spawn_daemon(async {}))
+    }
+
+    /// Stop and drain automatic delivery work without retiring its durable
+    /// watches, hooks, subscriptions, or queued messages. New registrations
+    /// are refused atomically with this close.
+    ///
+    /// # Panics
+    /// Panics if an internal mutex is poisoned.
+    pub async fn shutdown_agent_deliveries(&self) {
+        self.delivery_tasks.shutdown().await;
+        self.completion_delivery_retries.lock().unwrap().clear();
+        self.completion_group_delivery_retries
+            .lock()
+            .unwrap()
+            .clear();
+        self.hook_tasks.lock().unwrap().clear();
+        self.event_subscriptions.lock().unwrap().clear();
     }
 
     /// Resolve the completed child + workspace from a completion event and fan
@@ -6622,6 +6677,15 @@ impl Services {
             .lock()
             .expect("advisory-pending interim skip registry poisoned")
             .remove(child_id);
+    }
+
+    /// Historical scoped recovery can add a deferral, but must not erase the
+    /// provenance a new watcher recorded after readiness.
+    fn mark_interim_skipped_idle_preserving_provenance(&self, child_id: &AgentId) {
+        self.interim_skipped_idles
+            .lock()
+            .expect("interim skipped idle registry poisoned")
+            .insert(child_id.clone());
     }
 
     /// [`Self::mark_interim_skipped_idle`] variant for a LIVE monitoring
@@ -7273,9 +7337,8 @@ impl Services {
     /// Retry failed durable terminal wakes for `child_id` until its
     /// ungrouped watches retire or a pass completes without a delivery
     /// failure. Retry ownership is coalesced per child
-    /// (intent-hq/intent#3728): each delivery pass processes ALL of the
-    /// child's watches, so one task owns the child and a second failure
-    /// while it runs only bumps the registry generation — the task
+    /// (intent-hq/intent#3728): one task owns the child; a second failure
+    /// coalesces its event/scope and bumps the registry generation — the task
     /// re-checks the generation before exiting, so a failure racing its
     /// clean pass keeps the task alive for another pass instead of being
     /// stranded without an owner. A pass that reports no ungrouped
@@ -7283,21 +7346,46 @@ impl Services {
     /// armed on purpose (interim deferral, dedup suppression) and the
     /// normal event paths own their settlement. The delivery path's
     /// stable message ids make every attempt idempotent.
-    fn schedule_completion_delivery_retry(&self, child_id: AgentId, event: Event) {
+    fn schedule_completion_delivery_retry(
+        &self,
+        child_id: AgentId,
+        event: Event,
+        watch_ids: Option<&HashSet<String>>,
+    ) {
+        if self.delivery_tasks.is_closed() {
+            return;
+        }
         {
             let mut retries = self
                 .completion_delivery_retries
                 .lock()
                 .expect("completion delivery retries poisoned");
-            if let Some(generation) = retries.get_mut(&child_id.0) {
-                *generation = generation.wrapping_add(1);
+            let already_owned = retries.contains_key(&child_id.0);
+            let retry = retries.entry(child_id.0.clone()).or_default();
+            retry.generation = retry.generation.wrapping_add(1);
+            // Coalesce duplicate attempts, never widen a historical boot
+            // event to live watches. A concurrent live event keeps its own
+            // payload and advisory policy under the same per-child worker.
+            if let Some(attempt) = retry.attempts.iter_mut().find(|attempt| {
+                attempt.event.id == event.id && attempt.watch_ids.is_some() == watch_ids.is_some()
+            }) {
+                if let (Some(current), Some(incoming)) = (&mut attempt.watch_ids, watch_ids) {
+                    current.extend(incoming.iter().cloned());
+                }
+            } else {
+                retry.attempts.push(CompletionRetryAttempt {
+                    event,
+                    watch_ids: watch_ids.cloned(),
+                });
+            }
+            if already_owned {
                 return;
             }
-            retries.insert(child_id.0.clone(), 0);
         }
 
         let services = self.clone();
-        intent_core::spawn_daemon(async move {
+        let retry_key = child_id.0.clone();
+        let task = self.delivery_tasks.spawn(async move {
             // 500ms initial (monorepo#4183): the old 100ms start burst three
             // attempts inside the first second on every transient failure;
             // wakes are not latency-critical enough to justify that.
@@ -7305,24 +7393,38 @@ impl Services {
             let max_backoff = std::time::Duration::from_secs(5);
             loop {
                 tokio::time::sleep(backoff).await;
-                let seen_generation = services
+                let retry = services
                     .completion_delivery_retries
                     .lock()
                     .expect("completion delivery retries poisoned")
                     .get(&child_id.0)
-                    .copied()
-                    .unwrap_or(0);
-                let ungrouped_armed = services
-                    .find_watches_for_child(&child_id)
-                    .iter()
-                    .any(|watch| watch.group_id.is_none());
-                let clean = if ungrouped_armed {
-                    !Box::pin(services.deliver_completion_to_watches(&child_id, &event))
+                    .cloned()
+                    .unwrap_or_default();
+                let mut clean = true;
+                for attempt in &retry.attempts {
+                    let ungrouped_armed =
+                        services
+                            .find_watches_for_child(&child_id)
+                            .iter()
+                            .any(|watch| {
+                                watch.group_id.is_none()
+                                    && attempt
+                                        .watch_ids
+                                        .as_ref()
+                                        .is_none_or(|ids| ids.contains(&watch.id))
+                            });
+                    if ungrouped_armed {
+                        clean &= !Box::pin(services.deliver_completion_to_watches_inner(
+                            &child_id,
+                            &attempt.event,
+                            attempt.watch_ids.is_none(),
+                            true,
+                            attempt.watch_ids.as_ref(),
+                        ))
                         .await
-                        .ungrouped_delivery_failed
-                } else {
-                    true
-                };
+                        .ungrouped_delivery_failed;
+                    }
+                }
                 if !clean {
                     backoff = backoff.saturating_mul(2).min(max_backoff);
                     continue;
@@ -7331,7 +7433,11 @@ impl Services {
                     .completion_delivery_retries
                     .lock()
                     .expect("completion delivery retries poisoned");
-                if retries.get(&child_id.0).copied().unwrap_or(seen_generation) == seen_generation {
+                if retries
+                    .get(&child_id.0)
+                    .map_or(retry.generation, |state| state.generation)
+                    == retry.generation
+                {
                     retries.remove(&child_id.0);
                     break;
                 }
@@ -7339,11 +7445,20 @@ impl Services {
                 // another pass so it keeps a retry owner.
             }
         });
+        if task.is_none() {
+            self.completion_delivery_retries
+                .lock()
+                .unwrap()
+                .remove(&retry_key);
+        }
     }
 
     /// Retry one failed durable aggregated wake until its group settles or is
     /// removed. The stable group message id makes every attempt idempotent.
     fn schedule_completion_group_delivery_retry(&self, group_id: String) {
+        if self.delivery_tasks.is_closed() {
+            return;
+        }
         if !self
             .completion_group_delivery_retries
             .lock()
@@ -7354,7 +7469,8 @@ impl Services {
         }
 
         let services = self.clone();
-        intent_core::spawn_daemon(async move {
+        let retry_key = group_id.clone();
+        let task = self.delivery_tasks.spawn(async move {
             // 500ms initial backoff, aligned with the per-child retry task
             // (monorepo#4183): wakes are not latency-critical enough to
             // justify bursting attempts inside the first second.
@@ -7377,6 +7493,12 @@ impl Services {
                 .expect("completion group delivery retries poisoned")
                 .remove(&group_id);
         });
+        if task.is_none() {
+            self.completion_group_delivery_retries
+                .lock()
+                .unwrap()
+                .remove(&retry_key);
+        }
     }
 
     /// Wake every parent whose watch matches `child_id`, then drop that watch:
@@ -7479,7 +7601,7 @@ impl Services {
         child_id: &AgentId,
         event: &Event,
     ) -> CompletionIdleClassification {
-        self.deliver_completion_to_watches_inner(child_id, event, true, true)
+        self.deliver_completion_to_watches_inner(child_id, event, true, true, None)
             .await
     }
 
@@ -7495,7 +7617,7 @@ impl Services {
         child_id: &AgentId,
         event: &Event,
     ) -> CompletionIdleClassification {
-        self.deliver_completion_to_watches_inner(child_id, event, true, false)
+        self.deliver_completion_to_watches_inner(child_id, event, true, false, None)
             .await
     }
 
@@ -7512,7 +7634,7 @@ impl Services {
         child_id: &AgentId,
         event: &Event,
     ) -> CompletionIdleClassification {
-        self.deliver_completion_to_watches_inner(child_id, event, false, true)
+        self.deliver_completion_to_watches_inner(child_id, event, false, true, None)
             .await
     }
 
@@ -7522,6 +7644,7 @@ impl Services {
         event: &Event,
         advisory_allowed: bool,
         clear_advisory_markers: bool,
+        watch_ids: Option<&HashSet<String>>,
     ) -> CompletionIdleClassification {
         // Queue- and busy-aware completion: an `agent:idle` for a child whose
         // pending message queue still holds ready-to-send entries, OR whose
@@ -7644,7 +7767,9 @@ impl Services {
             // OWED, not cancelled — record the advisory-pending provenance so
             // the worker-exit heal (`redeliver_completion_after_queue_mutation`)
             // runs the advisory-ALLOWED variant and delivers it.
-            if advisory_allowed
+            if watch_ids.is_some() {
+                self.mark_interim_skipped_idle_preserving_provenance(child_id);
+            } else if advisory_allowed
                 && busy_interim
                 && (hook_waiting || pr_monitor_waiting)
                 && !agent_waiting
@@ -7658,14 +7783,15 @@ impl Services {
         // completion, so it must not clear failure-dedup state (a poisoned
         // child's replayed identical failure could otherwise slip a
         // duplicate wake through).
-        if event.event_type != AGENT_FAILED && !interim_idle {
+        if watch_ids.is_none() && event.event_type != AGENT_FAILED && !interim_idle {
             self.clear_failure_wake_dedup(child_id);
         }
         // monorepo#1280: any non-interim completion supersedes a recorded
         // interim skip — the delivery below settles the watches, so the
         // retraction-redelivery marker must not linger and produce a stale
-        // synthetic wake later.
-        if !interim_idle {
+        // synthetic wake later. Scoped historical recovery must leave this
+        // child-wide state intact: a new watch may have deferred after boot.
+        if watch_ids.is_none() && !interim_idle {
             self.take_interim_skipped_idle(child_id);
             // PR #1578 review: the child's genuine settlement
             // (completion/failure/deletion/retirement) ends its
@@ -7704,7 +7830,14 @@ impl Services {
                 .unwrap_or("")
                 .to_string()
         });
-        let watches = self.find_watches_for_child(child_id);
+        // Deferred boot reconciliation belongs only to the restored watches.
+        // A new explicit watch registered since readiness retains registration
+        // semantics (including waiting for the next completion of an idle child).
+        let watches: Vec<_> = self
+            .find_watches_for_child(child_id)
+            .into_iter()
+            .filter(|watch| watch_ids.is_none_or(|ids| ids.contains(&watch.id)))
+            .collect();
         // intent-hq/monorepo#3906: the wake label must reflect the genuine
         // delegation relationship, not the watch itself — a watch on a
         // non-child (top-level peer, SUB-1 send target) renders "Watched
@@ -7806,7 +7939,7 @@ impl Services {
             Option<String>,
             Option<String>,
         ) = if !watches.is_empty() && event.event_type == AGENT_IDLE && !interim_idle {
-            match self.store.get_agent_session(child_id).await {
+            match self.store.get_agent_session_summary(child_id).await {
                 Ok(s) => {
                     let identity = if event_report_raw.is_some()
                         && event_report_raw == s.completion_report.as_deref()
@@ -7853,7 +7986,7 @@ impl Services {
             if !watches.is_empty() && event.event_type == AGENT_FAILED {
                 match failure_error_text.as_deref() {
                     Some(err) if !err.is_empty() => {
-                        match self.store.get_agent_session(child_id).await {
+                        match self.store.get_agent_session_summary(child_id).await {
                             Ok(s) => {
                                 let wrapped = Error::Internal(format!(
                                     "{} {err}",
@@ -7983,7 +8116,7 @@ impl Services {
                 // attention request (whose immediate wake already fired at
                 // raise time — the alert) is folded into the child's line +
                 // event data the same way (the record).
-                let child_session = self.store.get_agent_session(child_id).await.ok();
+                let child_session = self.store.get_agent_session_summary(child_id).await.ok();
                 let attention = child_session.as_ref().and_then(|s| {
                     s.attention_request_kind
                         .clone()
@@ -8399,7 +8532,11 @@ impl Services {
                         .await;
                 }
                 ungrouped_delivery_failed = true;
-                self.schedule_completion_delivery_retry(child_id.clone(), retry_event.clone());
+                self.schedule_completion_delivery_retry(
+                    child_id.clone(),
+                    retry_event.clone(),
+                    watch_ids,
+                );
                 continue;
             }
             let delivered_at = now_iso();
@@ -8421,7 +8558,7 @@ impl Services {
                     "terminal wake is durable but watch retirement failed; stable-id retry remains armed"
                 );
                 ungrouped_delivery_failed = true;
-                self.schedule_completion_delivery_retry(child_id.clone(), retry_event);
+                self.schedule_completion_delivery_retry(child_id.clone(), retry_event, watch_ids);
                 continue;
             }
             self.remove_watch_after_delivery_commit(&watch.id);
@@ -8653,7 +8790,7 @@ impl Services {
             );
             if !grouped {
                 *ungrouped_delivery_failed = true;
-                self.schedule_completion_delivery_retry(child_id.clone(), event.clone());
+                self.schedule_completion_delivery_retry(child_id.clone(), event.clone(), None);
             }
             return false;
         }
@@ -8720,7 +8857,11 @@ impl Services {
             let Some(child) = completion_event_child_id(event) else {
                 continue;
             };
-            if let Ok(s) = self.store.get_agent_session(&AgentId::from(child)).await {
+            if let Ok(s) = self
+                .store
+                .get_agent_session_summary(&AgentId::from(child))
+                .await
+            {
                 if let Some(n) = s.task_note_id {
                     trigger_tasks.push((s.workspace_id.0, n.0));
                 }
@@ -9566,6 +9707,11 @@ impl Services {
         message_metadata: Option<serde_json::Value>,
         message_id: Option<String>,
     ) -> Result<serde_json::Value> {
+        if self.delivery_tasks.is_closed() {
+            // A transient refusal keeps completion watches armed for restart;
+            // it must not be mistaken for a deleted parent.
+            return Err(Error::Internal("daemon is shutting down".into()));
+        }
         if let Some(id) = message_id.as_deref() {
             // queue-egress: allow — id-only idempotency probe; no entry leaves the daemon
             let queued = self
@@ -15381,7 +15527,7 @@ impl Services {
         if event_type != AGENT_IDLE {
             return None;
         }
-        let session = self.store.get_agent_session(child_id).await.ok()?;
+        let session = self.store.get_agent_session_summary(child_id).await.ok()?;
         self.stall_suspicion_for_session(&session).await
     }
 

@@ -27,9 +27,13 @@
 #![cfg(unix)]
 
 mod common;
+#[path = "e2e_wss_wake_or_create/daemon_exit.rs"]
+mod daemon_exit;
+#[path = "e2e_wss_wake_or_create/fixture_identity.rs"]
+mod fixture_identity;
 
 use std::path::Path;
-use std::process::{Child, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -49,13 +53,141 @@ const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefe
 struct Daemon {
     child: Child,
     /// Kept alive for the daemon's lifetime; the store lives under it.
-    data_dir: tempfile::TempDir,
+    data_dir: daemon_exit::FixtureDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        let was_panicking = std::thread::panicking();
+        let started = std::time::Instant::now();
+        let deadline = started + daemon_exit::BOUND;
+        let pid = self.child.id();
+        let mut events = vec![json!({"event": "TeardownEntered", "pid": pid})];
+        let mut wait_attempted = false;
+        let attempt = catch_unwind(AssertUnwindSafe(|| -> std::io::Result<()> {
+            let mut wait = daemon_exit::ExitWait::new(&mut self.child)?;
+            daemon_exit::shutdown(
+                &self.data_dir.path().join("intentd.sock"),
+                pid,
+                deadline,
+                &mut events,
+            )?;
+            wait.until_exit(deadline, || {
+                events.push(json!({"event": "DaemonExitWaitPending", "pid": pid,
+                    "scope": "fixture direct-child exit readiness; not production admission"}));
+
+                Ok(())
+            })?;
+            events.push(json!({"event": "DaemonExitReadyUnreaped", "pid": pid}));
+
+            daemon_exit::remaining(deadline)?;
+            wait_attempted = true;
+            let waited = wait.reap();
+            events.push(daemon_exit::wait_record(&waited));
+
+            let status = waited?;
+            if !daemon_exit::normal(status) {
+                return Err(daemon_exit::invalid("unexpected daemon termination status"));
+            }
+
+            daemon_exit::remaining(deadline)?;
+            Ok(())
+        }));
+        let mut failure = match &attempt {
+            _ if was_panicking => Some("test was already panicking before teardown".to_owned()),
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error.to_string()),
+            Err(_) => Some("panic during fixture teardown".to_owned()),
+        };
+        if let Some(error) = &failure {
+            // Latch before cleanup. The original error/panic remains primary;
+            // cleanup cannot turn a forced termination or unknown owner into success.
+            events.push(json!({"event": "TeardownFailed", "error": error}));
+
+            if !wait_attempted {
+                let cleanup = catch_unwind(AssertUnwindSafe(|| -> std::io::Result<()> {
+                    events.push(json!({"event": "FailureCleanupKillAttempt", "pid": pid}));
+
+                    let killed = self.child.kill();
+
+                    events.push(
+                        json!({"event": "FailureCleanupKillResult", "ok": killed.is_ok(),
+                        "error": killed.as_ref().err().map(ToString::to_string)}),
+                    );
+                    killed?;
+                    let mut wait = daemon_exit::ExitWait::new(&mut self.child)?;
+                    wait.until_exit(deadline, || Ok(()))?;
+                    let waited = wait.reap();
+                    events.push(daemon_exit::wait_record(&waited));
+
+                    waited.map(|_| ())
+                }));
+                events.push(json!({"event": "FailureCleanupResult", "result": match cleanup {
+                    Ok(Ok(())) => "direct daemon reaped after failure".to_owned(),
+                    Ok(Err(error)) => error.to_string(), Err(_) => "cleanup panicked".to_owned(),
+                }}));
+            }
+        }
+        let finalizing = catch_unwind(AssertUnwindSafe(|| {
+            daemon_exit::finalize_and_measure(
+                started,
+                deadline,
+                || {
+                    let failed = failure.is_some() || daemon_exit::remaining(deadline).is_err();
+                    let directory = self.data_dir.finalize(failed);
+                    json!({"complete": !failed && daemon_exit::directory_complete(&directory),
+                    "daemonDirectory": directory})
+                },
+                std::time::Instant::now,
+            )
+        }));
+        let (resources, completion) = match &finalizing {
+            Ok((resources, completion)) => (resources.clone(), completion.clone()),
+            Err(_) => (
+                json!({"complete":false,"error":"resource finalization panicked"}),
+                daemon_exit::completion(started, deadline, std::time::Instant::now(), false),
+            ),
+        };
+        if completion["normalCompletion"] != true {
+            failure
+                .get_or_insert_with(|| "incomplete, failed or late semantic finalization".into());
+        }
+        let receipt = json!({"pid":pid,"events":events,"failure":failure,"completion":completion,
+            "resources":resources,
+            "platform":std::env::consts::OS,"normalCompletion":failure.is_none() && completion["normalCompletion"] == true,
+            "timingScope":"semantic finalization before serialization; synchronous syscalls are not hard-preemptible"});
+        if failure.is_some() {
+            if let Some(path) = receipt["resources"]["daemonDirectory"]["retained"].as_str() {
+                // Already failed; retain the write result without hiding the
+                // original panic/error. No additional success grace is granted.
+                let retained = serde_json::to_vec_pretty(&receipt)
+                    .map_err(std::io::Error::other)
+                    .and_then(|bytes| {
+                        std::fs::write(Path::new(path).join("teardown-failure.json"), bytes)
+                    });
+                events.push(json!({"event":"FailureEvidenceWrite","ok":retained.is_ok(),
+                    "error":retained.err().map(|e|e.to_string())}));
+            }
+        }
+        let mut receipt = receipt;
+        receipt["events"] = json!(events);
+        let reporting = catch_unwind(AssertUnwindSafe(|| {
+            daemon_exit::report("fixture-graceful-teardown", &receipt)
+        }));
+        daemon_exit::propagate_teardown_outcome(
+            was_panicking,
+            attempt,
+            finalizing,
+            failure,
+            reporting,
+            |outcomes| {
+                std::io::Write::write_fmt(
+                    &mut std::io::stderr(),
+                    format_args!("fixture-teardown-outcomes {outcomes}\n"),
+                )
+            },
+        );
     }
 }
 
@@ -64,6 +196,12 @@ fn temp_data_dir() -> tempfile::TempDir {
 }
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
+    serve_command(data_dir, listen, env)
+        .spawn()
+        .expect("spawn intentd serve")
+}
+
+fn serve_command(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Command {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     if listen != "uds" {
         common::enable_ws_api(data_dir);
@@ -77,7 +215,20 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     for (k, v) in env {
         cmd.env(k, v);
     }
-    cmd.spawn().expect("spawn intentd serve")
+    // This suite expects an anonymous primary author. Apply isolation last so
+    // caller-provided fixture inputs cannot restore a host credential or root.
+    let workspaces_dir = data_dir.join("workspaces");
+    std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
+    common::hermetic_github_identity(&mut cmd, data_dir);
+    cmd.env_remove("GH_HOST")
+        .env_remove("GH_ENTERPRISE_TOKEN")
+        .env_remove("GITHUB_ENTERPRISE_TOKEN")
+        .env("INTENTD_DATA_DIR", data_dir)
+        .env("INTENTD_CONFIG", data_dir.join("config.toml"))
+        .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
+        .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
+        .env("INTENTD_ASSERT_HERMETIC_ROOT", "1");
+    cmd
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -331,7 +482,7 @@ async fn boot_daemon_with_task_env(
     title: &str,
     extra_env: &[(&str, &str)],
 ) -> (Daemon, String, String, u16, String) {
-    let data_dir_guard = temp_data_dir();
+    let data_dir_guard: daemon_exit::FixtureDir = temp_data_dir().into();
     let data_dir = data_dir_guard.path().to_path_buf();
     let (ws_id, note_id) = seed_workspace_and_task(&data_dir, title).await;
     let mut env: Vec<(&str, &str)> = vec![("INTENTD_AUTH_TOKEN", TOKEN)];

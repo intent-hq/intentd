@@ -19,6 +19,9 @@ use intent_core::{Error, Result};
 
 use crate::scrollback::{LineSnapshot, Scrollback, DEFAULT_SCROLLBACK_BYTES};
 
+#[cfg(unix)]
+mod unix_io;
+
 /// Broadcast backlog of output chunks buffered per subscriber before lagging.
 const FANOUT_CAPACITY: usize = 2048;
 /// Read chunk size for the PTY reader loop.
@@ -242,6 +245,9 @@ struct PtySession {
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     fanout: Arc<Mutex<Fanout>>,
     reader: Mutex<Option<JoinHandle<()>>>,
+    /// Ask the Unix reader to drain queued output and stop without waiting for EOF.
+    #[cfg(unix)]
+    stop_reader: Arc<AtomicBool>,
     /// Exit watcher thread: reaps the child, then releases `slave` once the
     /// reader has drained the queue (see `exit_watch_loop`).
     watcher: Mutex<Option<JoinHandle<()>>>,
@@ -358,6 +364,20 @@ impl PtyHost {
             cmd.env_remove(k);
         }
 
+        // Prepare I/O before spawning: an fd/configuration failure must not
+        // leave a child behind without a session to own its cleanup.
+        #[cfg(unix)]
+        let stop_reader = Arc::new(AtomicBool::new(false));
+        #[cfg(unix)]
+        let (reader, writer) =
+            unix_io::open(pair.master.as_ref(), &stop_reader).map_err(internal)?;
+        #[cfg(unix)]
+        let (reader, writer): (Box<dyn Read + Send>, Box<dyn Write + Send>) =
+            (Box::new(reader), Box::new(writer));
+        #[cfg(not(unix))]
+        let writer = pair.master.take_writer().map_err(internal)?;
+        #[cfg(not(unix))]
+        let reader = pair.master.try_clone_reader().map_err(internal)?;
         let child = pair.slave.spawn_command(cmd).map_err(internal)?;
         // Keep the parent-side slave open (monorepo#587): if we dropped it
         // here, a fast-exiting child would close the *last* slave fd before
@@ -369,8 +389,6 @@ impl PtyHost {
 
         let pid = child.process_id();
         let killer = child.clone_killer();
-        let writer = pair.master.take_writer().map_err(internal)?;
-        let reader = pair.master.try_clone_reader().map_err(internal)?;
 
         let (tx, _rx) = broadcast::channel(FANOUT_CAPACITY);
         let fanout = Arc::new(Mutex::new(Fanout {
@@ -404,6 +422,8 @@ impl PtyHost {
             killer: Mutex::new(killer),
             fanout,
             reader: Mutex::new(Some(handle)),
+            #[cfg(unix)]
+            stop_reader,
             watcher: Mutex::new(None),
             exit: Mutex::new(None),
         });
@@ -912,7 +932,10 @@ fn exit_watch_loop(session: &PtySession) {
     // against a wedged reader; a grandchild that inherited the slave keeps
     // the stream open regardless of when we release ours.
     let deadline = std::time::Instant::now() + DRAIN_GRACE;
-    while master_pending(session) && std::time::Instant::now() < deadline {
+    while session.slave.lock().unwrap().is_some()
+        && master_pending(session)
+        && std::time::Instant::now() < deadline
+    {
         std::thread::sleep(DRAIN_POLL);
     }
     session.slave.lock().unwrap().take();
@@ -937,17 +960,10 @@ fn read_loop(mut reader: Box<dyn Read + Send>, fanout: &Arc<Mutex<Fanout>>) {
     }
 }
 
-/// Terminate a session's whole process group (SIGTERM→grace→SIGKILL), then drop
-/// the master and join the reader thread. The PTY child is a `setsid` session
-/// leader so `killpg` reaps grandchildren too (no orphans, mirroring M5).
-#[cfg_attr(
-    not(unix),
-    expect(
-        clippy::unused_async,
-        reason = "async on every platform; the group escalation awaits only on unix"
-    )
-)]
-async fn teardown(session: &PtySession) {
+/// Terminate a session's whole process group (SIGTERM→grace→SIGKILL), then
+/// cancel and join its I/O threads. The PTY child is a setsid session leader,
+/// so killpg also reaches descendants that remain in its process group.
+async fn teardown(session: &Arc<PtySession>) {
     #[cfg(unix)]
     {
         if let Some(pid) = session.pid {
@@ -960,16 +976,11 @@ async fn teardown(session: &PtySession) {
     {
         let _ = session.killer.lock().unwrap().kill();
     }
-    // Release the held slave and the master fd so the reader observes EOF,
-    // then join the reader and exit-watcher threads (the watcher exits on its
-    // own once it sees the slave released).
-    session.slave.lock().unwrap().take();
-    session.master.lock().unwrap().take();
-    if let Some(handle) = session.reader.lock().unwrap().take() {
-        let _ = handle.join();
-    }
-    if let Some(handle) = session.watcher.lock().unwrap().take() {
-        let _ = handle.join();
+    // Joining may wait for a bounded output drain; do not stall a runtime
+    // worker (and other sessions' concurrent teardown) while that happens.
+    let session = Arc::clone(session);
+    if let Err(e) = tokio::task::spawn_blocking(move || finish_io(&session)).await {
+        tracing::warn!(error = %e, "pty I/O cleanup task failed");
     }
 }
 
@@ -994,11 +1005,24 @@ fn reap_refused_spawn(session: &PtySession) {
     // Blocking reap is fine: the child was just SIGKILLed, so `wait` returns
     // promptly, and this path only runs during daemon shutdown.
     let _ = session.child.lock().unwrap().wait();
-    session.slave.lock().unwrap().take();
-    session.master.lock().unwrap().take();
+    finish_io(session);
+}
+
+/// Join owned I/O threads without relying on every slave holder exiting. Keep
+/// our slave open until queued output has drained (macOS discards it on close).
+fn finish_io(session: &PtySession) {
+    #[cfg(unix)]
+    session.stop_reader.store(true, Ordering::Release);
+    #[cfg(not(unix))]
+    {
+        session.slave.lock().unwrap().take();
+        session.master.lock().unwrap().take();
+    }
     if let Some(handle) = session.reader.lock().unwrap().take() {
         let _ = handle.join();
     }
+    session.slave.lock().unwrap().take();
+    session.master.lock().unwrap().take();
     if let Some(handle) = session.watcher.lock().unwrap().take() {
         let _ = handle.join();
     }
@@ -1624,6 +1648,131 @@ mod tests {
             dead,
             "SIGKILL escalation must reap the TERM-trapping descendant"
         );
+    }
+
+    /// A slave retained outside the child's process group has the same EOF
+    /// behavior as a descendant that escaped with `setsid()`. The watchdog owns
+    /// that fd and releases it on failure, so even the unfixed blocking join
+    /// cannot strand the test process. The outer test runner is bounded too.
+    struct RetainedSlave {
+        release: Option<std::sync::mpsc::Sender<()>>,
+        holder: Option<JoinHandle<bool>>,
+    }
+
+    impl RetainedSlave {
+        fn new(session: &PtySession) -> Self {
+            use std::os::unix::fs::OpenOptionsExt;
+            let path = session
+                .master
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .tty_name()
+                .unwrap();
+            let slave = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(nix::libc::O_NOCTTY)
+                .open(path)
+                .unwrap();
+            let (release, rx) = std::sync::mpsc::channel();
+            let holder = std::thread::spawn(move || {
+                let completed = rx
+                    .recv_timeout(Duration::from_secs(10).mul_f64(timeout_multiplier()))
+                    .is_ok();
+                drop(slave);
+                completed
+            });
+            Self {
+                release: Some(release),
+                holder: Some(holder),
+            }
+        }
+
+        fn release(&mut self) -> bool {
+            let _ = self.release.take().unwrap().send(());
+            self.holder.take().unwrap().join().unwrap()
+        }
+    }
+
+    impl Drop for RetainedSlave {
+        fn drop(&mut self) {
+            if self.holder.is_some() {
+                let _ = self.release();
+            }
+        }
+    }
+
+    async fn teardown_with_retained_slave(mode: &str) {
+        struct Cleanup(Arc<PtySession>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                reap_refused_spawn(&self.0);
+            }
+        }
+        let host = PtyHost::new();
+        let id = host.spawn(cat_spec("retained-slave")).unwrap();
+        let session = host.get(id).unwrap();
+        // Declared before the holder so panic unwinding releases the external
+        // slave before cleanup joins threads, including on unfixed code.
+        let _cleanup = Cleanup(Arc::clone(&session));
+        let mut holder = RetainedSlave::new(&session);
+        let mut rx = host.attach(id).unwrap().live;
+        host.write(id, b"reader-ready\n").unwrap();
+        let output = collect_until(&mut rx, b"reader-ready", Duration::from_secs(5)).await;
+        assert!(
+            contains(&output, b"reader-ready"),
+            "reader is running before teardown"
+        );
+
+        match mode {
+            "all" => assert_eq!(host.kill_all().await, 1),
+            "single" => assert!(host.kill(id).await),
+            "refused" => {
+                host.sessions.lock().unwrap().remove(&id);
+                reap_refused_spawn(&session);
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            Arc::strong_count(&session.fanout),
+            1,
+            "reader released its fanout owner"
+        );
+        assert_eq!(
+            Arc::strong_count(&session),
+            2,
+            "only the test and cleanup guard retain the joined session"
+        );
+        assert!(session.reader.lock().unwrap().is_none(), "reader joined");
+        assert!(session.watcher.lock().unwrap().is_none(), "watcher joined");
+        assert!(session.slave.lock().unwrap().is_none());
+        assert!(session.master.lock().unwrap().is_none());
+        assert!(observe_exit(&session).is_some(), "direct child reaped");
+        assert_eq!(host.count(), 0);
+        // Assert thread ownership above while the external slave is still
+        // held: dropping a blocked JoinHandle is not a successful teardown.
+        let completed_while_held = holder.release();
+        assert!(
+            completed_while_held,
+            "{mode} teardown waited for the external slave holder to release its fd"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_all_finishes_with_retained_slave() {
+        teardown_with_retained_slave("all").await;
+    }
+
+    #[tokio::test]
+    async fn kill_finishes_with_retained_slave() {
+        teardown_with_retained_slave("single").await;
+    }
+
+    #[tokio::test]
+    async fn refused_spawn_cleanup_finishes_with_retained_slave() {
+        teardown_with_retained_slave("refused").await;
     }
 
     /// Clean daemon shutdown (monorepo#1526): `kill_all` reaps every tracked

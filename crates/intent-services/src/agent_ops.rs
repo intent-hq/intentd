@@ -1479,10 +1479,12 @@ impl QueuedMessage {
 /// Dropping the guard retires the entries from the overlay — on the settled
 /// path right before the shrunk `agent:queue:updated` is published, on every
 /// hand-back / failure path at scope exit, and when an aborted worker's
-/// future is dropped mid-drain, so no ghost entry ever outlives its arm.
+/// future is dropped mid-drain. Shutdown freezes this overlay first so
+/// cancelled owners leave their payloads available for durable recovery.
 #[must_use = "drop the guard only once the drained rows are persisted"]
 pub(crate) struct DrainingGuard {
     overlay: Arc<Mutex<HashMap<AgentId, Vec<QueuedMessage>>>>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
     agent_id: AgentId,
     ids: Vec<String>,
 }
@@ -1502,6 +1504,9 @@ impl Drop for DrainingGuard {
             .overlay
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         if let Some(entries) = overlay.get_mut(&self.agent_id) {
             entries.retain(|m| !self.ids.contains(&m.id));
             if entries.is_empty() {
@@ -5872,7 +5877,7 @@ impl Services {
                 metadata.remove(intent_core::CHIEF_PROMPT_VERSION_KEY);
             }
         }
-        session.updated_at = now_iso();
+        let mute_only = obj.len() == 1 && obj.contains_key("notificationsMuted");
         let workspace_id = session.workspace_id.clone();
         // Muting drops the session out of the workspace unread derivation
         // (§5.1), so snapshot the unread state BEFORE the write — the
@@ -5884,9 +5889,14 @@ impl Services {
         } else {
             None
         };
-        self.store
-            .update_agent_session(&workspace_id, &session)
-            .await?;
+        // A preference-only request is not agent activity. Skip the full-row
+        // write entirely so it cannot overwrite concurrent session progress.
+        if !mute_only {
+            session.updated_at = now_iso();
+            self.store
+                .update_agent_session(&workspace_id, &session)
+                .await?;
+        }
         // `notifications_muted` is excluded from the full-row write above
         // (its only post-insert mutator is this scoped UPDATE), so a
         // concurrent `agent.update` on unrelated fields — or a long-lived
@@ -5898,9 +5908,13 @@ impl Services {
                     &workspace_id,
                     &agent_id,
                     session.notifications_muted,
-                    &session.updated_at,
                 )
                 .await?;
+        }
+        if mute_only {
+            // Return current activity and preference state, including any
+            // genuine session update that raced the scoped preference write.
+            session = self.store.get_agent_session(&agent_id).await?;
         }
         // The stored model changed, so any persisted display resolution now
         // names the wrong model — clear it, same anti-staleness contract as
@@ -15401,6 +15415,12 @@ impl Services {
             .draining_queue_entries
             .lock()
             .expect("draining queue registry poisoned");
+        if self
+            .draining_shutdown
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return None;
+        }
         let popped = pop(self)?;
         let entries = entries(&popped);
         if commit == PopCommit::Delivery {
@@ -15422,6 +15442,7 @@ impl Services {
             .extend(entries.iter().cloned());
         DrainingGuard {
             overlay: Arc::clone(&self.draining_queue_entries),
+            shutdown: Arc::clone(&self.draining_shutdown),
             agent_id: agent_id.clone(),
             ids: entries.iter().map(|m| m.id.clone()).collect(),
         }
@@ -15485,26 +15506,81 @@ impl Services {
     /// dropped on return). Callers that persist the result must hold
     /// `agent_queue_persist_gate` across snapshot + store write.
     fn queue_rows(&self, agent_id: &AgentId) -> Vec<intent_store::AgentQueueRow> {
-        let guard = self
-            .agent_queues
-            .lock()
-            .expect("agent queue registry poisoned");
-        guard
+        let draining = self.draining_queue_entries.lock().unwrap();
+        let live = self.agent_queues.lock().unwrap();
+        let live = live.get(agent_id).map(Vec::as_slice).unwrap_or_default();
+        let frozen = self
+            .draining_shutdown
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let retained: Vec<_> = draining
             .get(agent_id)
-            .map(|q| {
-                q.iter()
-                    .enumerate()
-                    .map(|(i, m)| intent_store::AgentQueueRow {
-                        id: m.id.clone(),
-                        agent_id: agent_id.clone(),
-                        position: i64::try_from(i).expect("value fits in i64"),
-                        payload: serde_json::to_value(m).unwrap_or(Value::Null),
-                        created_at: m.queued_at.clone(),
-                        turn_id: m.turn_id.clone(),
-                    })
-                    .collect()
+            .into_iter()
+            .flatten()
+            .filter(|_| frozen)
+            .collect();
+        let mut seen_ids = HashSet::new();
+        // Frozen order is authoritative even when a partially persisted batch
+        // explicitly hands back just its head/tail. Prefer updated live flags
+        // without moving the missing middle entry ahead of its original head.
+        retained
+            .iter()
+            .map(|d| {
+                live.iter()
+                    .find(|m| m.id == d.id || m.turn_id == d.turn_id)
+                    .unwrap_or(d)
             })
-            .unwrap_or_default()
+            .chain(live.iter().filter(|m| {
+                !retained
+                    .iter()
+                    .any(|d| d.id == m.id || d.turn_id == m.turn_id)
+            }))
+            .filter(|m| seen_ids.insert(m.id.clone()))
+            .enumerate()
+            .map(|(i, m)| intent_store::AgentQueueRow {
+                id: m.id.clone(),
+                agent_id: agent_id.clone(),
+                position: i64::try_from(i).expect("value fits in i64"),
+                payload: {
+                    let mut payload = serde_json::to_value(m).unwrap_or(Value::Null);
+                    if frozen
+                        && draining.get(agent_id).is_some_and(|entries| {
+                            entries
+                                .iter()
+                                .any(|d| d.id == m.id || d.turn_id == m.turn_id)
+                        })
+                    {
+                        payload["shutdownRecovery"] = Value::Bool(true);
+                    }
+                    payload
+                },
+                created_at: m.queued_at.clone(),
+                turn_id: m.turn_id.clone(),
+            })
+            .collect()
+    }
+
+    /// Keep the last copy of a popped payload alive when its owner is aborted.
+    /// This lock also orders closure against new pops and guard drops.
+    pub(crate) fn freeze_shutdown_drains(&self) {
+        let _draining = self.draining_queue_entries.lock().unwrap();
+        self.draining_shutdown
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Called after delivery/worker joins. Keep the overlay frozen for any
+    /// previously admitted request still unwinding; subsequent queue writes
+    /// must not overwrite its payloads either.
+    pub(crate) async fn persist_shutdown_drains(&self) {
+        let ids: Vec<_> = self
+            .draining_queue_entries
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        for id in ids {
+            self.persist_queue_snapshot(&id).await;
+        }
     }
 
     /// Rehydrate every persisted agent queue into the in-memory map at daemon
@@ -15534,7 +15610,11 @@ impl Services {
     pub async fn rehydrate_agent_queues(&self) -> Result<usize> {
         let rows = self.store.load_all_agent_queues().await?;
         let mut map: HashMap<AgentId, Vec<QueuedMessage>> = HashMap::new();
+        let mut recover = HashSet::new();
         for row in rows {
+            if row.payload.get("shutdownRecovery").and_then(Value::as_bool) == Some(true) {
+                recover.insert((row.agent_id.clone(), row.id.clone()));
+            }
             match serde_json::from_value::<QueuedMessage>(row.payload) {
                 Ok(mut message) => {
                     message.editing = false;
@@ -15550,6 +15630,22 @@ impl Services {
                         error = %e,
                         "skipping undecodable persisted queue entry"
                     );
+                }
+            }
+        }
+        // A cancelled append may have committed before its future observed the
+        // result. Recover the payload, but never append that user row twice.
+        for (agent_id, queue) in &mut map {
+            if !queue
+                .iter()
+                .any(|m| recover.contains(&(agent_id.clone(), m.id.clone())))
+            {
+                continue;
+            }
+            let persisted = self.store.persisted_queue_message_ids(agent_id).await?;
+            for message in queue {
+                if recover.contains(&(agent_id.clone(), message.id.clone())) {
+                    message.persisted |= persisted.contains(&message.id);
                 }
             }
         }
@@ -16815,10 +16911,16 @@ impl Services {
         // `TurnOptions::prepend_content`; the store-only fallback (no manager
         // attached) keeps the plain trait call — it drives no outbound
         // prompt, so there is no context to repair.
+        #[cfg(test)]
+        if let Some(park) = &self.interrupted_resume_park {
+            park.entered.notify_one();
+            park.release.notified().await;
+        }
         let send_result = match self.agent_manager() {
             Some(manager) => {
                 let options = match recap {
                     Some(recap) => crate::agent_manager::TurnOptions {
+                        reject_on_shutdown: true,
                         prepend_content: Some(recap.text),
                         prepend_image_blocks: recap.image_blocks,
                         prepend_file_blocks: recap.file_blocks,
@@ -16827,6 +16929,7 @@ impl Services {
                         ..crate::agent_manager::TurnOptions::default()
                     },
                     None => crate::agent_manager::TurnOptions {
+                        reject_on_shutdown: true,
                         message_metadata: Some(continuation_metadata.clone()),
                         origin: intent_core::MessageOrigin::Automatic,
                         ..crate::agent_manager::TurnOptions::default()

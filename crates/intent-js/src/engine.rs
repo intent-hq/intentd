@@ -1,3 +1,7 @@
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 
 use rquickjs::{function::Async, AsyncContext, AsyncRuntime, CatchResultExt, Function, Promise};
@@ -59,6 +63,29 @@ pub async fn eval(
     opts: &EvalOptions,
     host: Option<HostFn>,
 ) -> Result<serde_json::Value, JsError> {
+    eval_inner(code, opts, host, None).await
+}
+
+/// Evaluate with an interrupt flag for synchronous JavaScript execution.
+/// Callers should also cancel the evaluation future to stop pending host calls.
+///
+/// # Errors
+/// Returns the same errors as [`eval`], or a runtime cancellation error.
+pub async fn eval_with_cancellation(
+    code: &str,
+    opts: &EvalOptions,
+    host: Option<HostFn>,
+    cancelled: Arc<AtomicBool>,
+) -> Result<serde_json::Value, JsError> {
+    eval_inner(code, opts, host, Some(cancelled)).await
+}
+
+async fn eval_inner(
+    code: &str,
+    opts: &EvalOptions,
+    host: Option<HostFn>,
+    cancelled: Option<Arc<AtomicBool>>,
+) -> Result<serde_json::Value, JsError> {
     let rt = AsyncRuntime::new().map_err(|e| JsError::Engine(e.to_string()))?;
 
     // Guard against pathological timeouts (e.g. CLI users passing an
@@ -66,8 +93,14 @@ pub async fn eval(
     let deadline = Instant::now()
         .checked_add(opts.timeout)
         .ok_or_else(|| JsError::Engine("timeout is too large: Instant overflow".into()))?;
-    rt.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)))
-        .await;
+    let interrupt = cancelled.clone();
+    rt.set_interrupt_handler(Some(Box::new(move || {
+        Instant::now() >= deadline
+            || interrupt
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    })))
+    .await;
 
     if let Some(limit) = opts.memory_limit_bytes {
         rt.set_memory_limit(limit).await;
@@ -96,6 +129,12 @@ pub async fn eval(
         .await
         .map_err(|_| ());
 
+    if cancelled
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    {
+        return Err(JsError::Runtime("execution cancelled".into()));
+    }
     match inner {
         Ok(Ok(v)) => Ok(v),
         Ok(Err(RunErr::Runtime(msg))) => {

@@ -7,9 +7,10 @@
 
 mod common;
 
+use intentd_test_support::GuardedChild;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,7 +39,7 @@ fn free_port() -> u16 {
 }
 
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
     data_dir: PathBuf,
     /// If false, skip `data_dir` cleanup in Drop (for tests that reuse the same `data_dir`)
     cleanup_data_dir: bool,
@@ -46,8 +47,6 @@ struct Daemon {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
         if self.cleanup_data_dir {
             let log_path = self.data_dir.join("daemon.log");
             if let Ok(log) = std::fs::read_to_string(&log_path) {
@@ -87,19 +86,19 @@ fn configure_serve(cmd: &mut Command, data_dir: &Path, listen: &str, env: &[(&st
     }
 }
 
-fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
+fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> GuardedChild {
     let mut cmd = common::serve_command();
     configure_serve(&mut cmd, data_dir, listen, env);
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 /// [`spawn_serve`] without the `INTENTD_TCP_PORT=0` seam: the listener binds
 /// the seeded/settings `server.wsApi.port`, for tests whose assertion IS that
 /// port (a same-port listener restart, a batch's explicit port).
-fn spawn_serve_fixed_port(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
+fn spawn_serve_fixed_port(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> GuardedChild {
     let mut cmd = common::serve_command_fixed_port();
     configure_serve(&mut cmd, data_dir, listen, env);
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 /// Spawn `intentd serve` as the CHILD of a stand-in sitter: `sitter_bin` (a
@@ -116,7 +115,7 @@ fn spawn_serve_under_stand_in_sitter(
     env: &[(&str, &str)],
     sitter_bin: &Path,
     daemon_pid_path: &Path,
-) -> Child {
+) -> GuardedChild {
     let mut cmd = Command::new(sitter_bin);
     cmd.arg("-c")
         .arg(r#""$1" serve & echo "$!" > "$2"; wait"#)
@@ -183,9 +182,9 @@ fn serve_command_builders_own_the_tcp_port_seam() {
 /// closed only at that child's own exec), making exec of the fresh copy
 /// fail with "Text file busy". Only needed for the COPIED sitter/decoy
 /// binaries (intent-hq/monorepo#4220).
-fn spawn_retrying_etxtbsy(cmd: &mut Command, what: &str) -> Child {
+fn spawn_retrying_etxtbsy(cmd: &mut Command, what: &str) -> GuardedChild {
     for _ in 0..400 {
-        match cmd.spawn() {
+        match GuardedChild::spawn(cmd) {
             Ok(child) => return child,
             Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
                 std::thread::sleep(Duration::from_millis(5));
@@ -1683,7 +1682,7 @@ case "$1" in
     ;;
   serve)
     printf '{"listenAddr":"tc-%s"}\n' "$(cat "$key")"
-    sleep 600
+    exec sleep 600
     ;;
 esac
 "#;

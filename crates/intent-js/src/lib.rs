@@ -88,4 +88,4 @@ impl Default for EvalOptions {
 }
 
 mod engine;
-pub use engine::eval;
+pub use engine::{eval, eval_with_cancellation};
