@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.123] - 2026-09-30
+
+### 🐛 Bug Fixes
+
+- Preserve agent activity timestamps when muting notifications ([#2180](https://github.com/intent-hq/intentd/pull/2180))
+- Stop owned fixture descendants before teardown completes ([#2182](https://github.com/intent-hq/intentd/pull/2182))
+
+
 ## [0.9.122] - 2026-09-30
 
 ### 🐛 Bug Fixes
