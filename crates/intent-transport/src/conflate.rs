@@ -15,7 +15,9 @@
 //!   carrying the newest live preview.
 //! - `terminal:data` — byte-concat per terminal: chunks are decoded, merged
 //!   in arrival order, and re-encoded as one frame (size-capped; an oversized
-//!   merge seals the entry and starts a new one).
+//!   merge seals the entry and starts a new one). Positioned output merges only
+//!   across valid adjacent ranges in the same boot; legacy cursorless chunks
+//!   retain byte-concat semantics.
 //! - `file:*` — latest-wins per (workspace, path): refetch triggers, not
 //!   content carriers; burst summaries carry `path` = directory, so
 //!   per-directory conflation falls out of the same key.
@@ -250,6 +252,44 @@ pub(crate) enum EventItem {
     },
 }
 
+/// Cursorless producers keep the legacy concat behavior. Partial or invalid
+/// cursor metadata must never be silently converted into a different range.
+enum TerminalCursor<'a> {
+    Legacy,
+    Positioned { boot: &'a str, start: u64, end: u64 },
+    Invalid,
+}
+
+fn terminal_cursor(data: &Value, byte_len: usize) -> TerminalCursor<'_> {
+    if !["daemonBootId", "startOffset", "endOffset"]
+        .iter()
+        .any(|key| data.get(*key).is_some())
+    {
+        return TerminalCursor::Legacy;
+    }
+    let Some(boot) = data
+        .get("daemonBootId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    else {
+        return TerminalCursor::Invalid;
+    };
+    let offset = |key: &str| {
+        let text = data.get(key)?.as_str()?;
+        if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        text.parse::<u64>().ok()
+    };
+    let (Some(start), Some(end)) = (offset("startOffset"), offset("endOffset")) else {
+        return TerminalCursor::Invalid;
+    };
+    if end.checked_sub(start) != u64::try_from(byte_len).ok() {
+        return TerminalCursor::Invalid;
+    }
+    TerminalCursor::Positioned { boot, start, end }
+}
+
 impl EventItem {
     /// Wrap a conflatable bus event for buffering, per its key kind.
     pub(crate) fn new(key: &Key, event: Event) -> Self {
@@ -319,11 +359,34 @@ impl Conflate for EventItem {
                         bytes: Some(add),
                     });
                 }
+                let start = match (
+                    terminal_cursor(&event.data, acc.len()),
+                    terminal_cursor(&new_event.data, add.len()),
+                ) {
+                    (TerminalCursor::Legacy, TerminalCursor::Legacy) => None,
+                    (
+                        TerminalCursor::Positioned { boot, start, end },
+                        TerminalCursor::Positioned {
+                            boot: next_boot,
+                            start: next_start,
+                            ..
+                        },
+                    ) if boot == next_boot && end == next_start => Some(start),
+                    _ => {
+                        return Some(EventItem::Terminal {
+                            event: new_event,
+                            bytes: Some(add),
+                        })
+                    }
+                };
                 acc.extend_from_slice(&add);
                 // The merged frame rides the newest event's envelope
                 // (id/timestamp), carrying all bytes in arrival order.
                 let merged = std::mem::take(bytes);
                 *event = new_event;
+                if let Some(start) = start {
+                    event.data["startOffset"] = Value::String(start.to_string());
+                }
                 *bytes = merged;
                 None
             }
