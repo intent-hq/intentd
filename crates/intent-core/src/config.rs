@@ -144,6 +144,14 @@ pub const DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS: u32 = 10;
 /// ≥1s wall/monotonic divergence.
 pub const MIN_WAKE_RESUME_THRESHOLD_SECONDS: u32 = 1;
 
+/// Default active PR monitors per agent (`prMonitor.maxPerAgent`). The
+/// centralized scheduler shares reads and stretches polling as inventory grows.
+pub const DEFAULT_PR_MONITORS_MAX_PER_AGENT: u32 = 5;
+
+/// Hard ceiling for the configurable per-agent monitor quota. There is no
+/// unlimited value; the shared scheduler independently bounds forge polling.
+pub const MAX_PR_MONITORS_PER_AGENT: u32 = 100;
+
 /// Default poll cadence for the centralized PR-monitor loop
 /// (`prMonitor.pollSeconds`).
 pub const DEFAULT_PR_MONITOR_POLL_SECONDS: u64 = 30;

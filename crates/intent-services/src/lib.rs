@@ -1281,9 +1281,12 @@ pub struct Services {
     /// wiring — reads `prMonitor.debounceSeconds` live from the settings
     /// registry; values below the floor are clamped at read time.
     pr_monitor_debounce_seconds: Option<u64>,
-    /// Cap on concurrently active PR monitors per agent (mirrors
-    /// `[hooks] maxPerAgent`).
-    pr_monitors_max_per_agent: u32,
+    /// Test override for active PR monitors per agent. Production reads
+    /// `prMonitor.maxPerAgent` live from the settings registry.
+    pr_monitors_max_per_agent: Option<u32>,
+    /// Serialize quota admission through persistence per owner, including
+    /// adoption; unrelated owners never wait on each other's forge reads.
+    pr_monitor_registration: Arc<KeyedInflight<AgentId>>,
     /// Upper bound on one shared forge fetch within a PR-monitor sweep (60 s
     /// in production) — defense in depth above the client-level network
     /// timeouts, so a hung connection can never wedge the sweep loop. Tests
@@ -1581,7 +1584,8 @@ impl Services {
             pr_monitor_quota_share_percent: None,
             pr_monitor_logged_interval: Arc::new(Mutex::new(None)),
             pr_monitor_debounce_seconds: None,
-            pr_monitors_max_per_agent: pr_monitor::DEFAULT_PR_MONITORS_MAX_PER_AGENT,
+            pr_monitors_max_per_agent: None,
+            pr_monitor_registration: Arc::default(),
             pr_monitor_fetch_timeout: pr_monitor::PR_MONITOR_FETCH_TIMEOUT,
             pr_refresh_fetch_timeout: PR_REFRESH_FETCH_TIMEOUT,
             sweep_rate_limit: Arc::new(rate_limit::RateLimitGate::default()),
@@ -1663,7 +1667,7 @@ impl Services {
     /// Override the per-agent active-monitor cap.
     #[cfg(test)]
     pub(crate) fn with_pr_monitors_max_per_agent(mut self, cap: u32) -> Self {
-        self.pr_monitors_max_per_agent = cap;
+        self.pr_monitors_max_per_agent = Some(cap);
         self
     }
 

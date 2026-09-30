@@ -2036,6 +2036,15 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         )
         .with_token_impact("~170 tokens/session"),
         number(
+            "prMonitor.maxPerAgent",
+            "PR monitors per agent",
+            "Maximum active PR monitors per agent across repositories (1–100). Raise for review orchestrators; the shared scheduler slows polling as inventory grows. Applies immediately to registration and adoption; lowering it preserves existing monitors and same-owner re-registration.",
+            "prMonitor",
+            Some(1.0),
+            Some(100.0),
+            5.0,
+        ),
+        number(
             "prMonitor.debounceSeconds",
             "PR monitor debounce seconds",
             "Quiet window (in seconds) a changed PR must observe before its consolidated wake is delivered (minimum 10)",
@@ -5532,7 +5541,8 @@ mod tests {
         );
     }
 
-    /// `[prMonitor]` exposes four TOML-backed numbers: `debounceSeconds`
+    /// `[prMonitor]` exposes five TOML-backed numbers: `maxPerAgent`
+    /// (default 5, floor 1, max 100), `debounceSeconds`
     /// (default 60, floor 10), `pollSeconds` (default 30, floor 10),
     /// `hourlyRequestBudget` (default 1500, floor 60, max 5000) and
     /// `quotaSharePercent` (default 50, floor 1, max 100) — the latter
@@ -5542,6 +5552,7 @@ mod tests {
     #[tokio::test]
     async fn pr_monitor_intervals_round_trip_via_registry() {
         for (path, default, floor) in [
+            ("prMonitor.maxPerAgent", 5.0, 1.0),
             ("prMonitor.debounceSeconds", 60.0, 10.0),
             ("prMonitor.pollSeconds", 30.0, 10.0),
             ("prMonitor.hourlyRequestBudget", 1500.0, 60.0),
@@ -5581,6 +5592,13 @@ mod tests {
             ),
             "quotaSharePercent caps at 100"
         );
+        assert!(matches!(
+            find_definition("prMonitor.maxPerAgent").unwrap().ty,
+            SettingType::Number {
+                max: Some(100.0),
+                ..
+            }
+        ));
         // The catalog range and the read-time clamp constants must agree.
         assert_eq!(
             intent_core::config::MIN_PR_MONITOR_HOURLY_REQUEST_BUDGET,
@@ -5611,7 +5629,19 @@ mod tests {
         let secrets = AsyncSecretStore::new(secrets);
         let svc = SettingsService::new(&store, &secrets, Some(&registry));
 
+        for invalid in [json!(0), json!(101), json!(1.5), json!(-1), json!("55")] {
+            assert!(svc
+                .update(&json!([{ "path": "prMonitor.maxPerAgent", "value": invalid }]))
+                .await
+                .is_err());
+            assert_eq!(
+                svc.get("prMonitor.maxPerAgent").await.unwrap()["value"],
+                json!(5.0)
+            );
+        }
+
         for (path, default, updated, rejected) in [
+            ("prMonitor.maxPerAgent", 5.0, 55, 0),
             ("prMonitor.debounceSeconds", 60.0, 120, 5),
             ("prMonitor.pollSeconds", 30.0, 120, 5),
             ("prMonitor.hourlyRequestBudget", 1500.0, 120, 5),

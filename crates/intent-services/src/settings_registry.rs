@@ -133,6 +133,7 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "agentFeatures.peerAgents",
     "agentFeatures.mcpTools",
     "prMonitor.debounceSeconds",
+    "prMonitor.maxPerAgent",
     "prMonitor.pollSeconds",
     "prMonitor.hourlyRequestBudget",
     "prMonitor.quotaSharePercent",
