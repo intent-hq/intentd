@@ -126,11 +126,11 @@ fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
 }
 
 struct Fixture {
-    _ws: WsApiServer,
+    ws: WsApiServer,
     port: u16,
     cfg: Arc<ClientConfig>,
     root: PathBuf,
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
 }
 
 async fn boot() -> Fixture {
@@ -157,11 +157,11 @@ async fn boot() -> Fixture {
     let cfg = client_config(&tls.fingerprint256);
     let port = ws.start().await.expect("start");
     Fixture {
-        _ws: ws,
+        ws,
         port,
         cfg,
         root: workspaces_root,
-        _dir: dir_guard,
+        dir: dir_guard,
     }
 }
 
@@ -266,11 +266,16 @@ async fn wait_for_warm_completion(root: &std::path::Path, owner: &str, repo: &st
 /// Retention remains an explicit supported mode, using the common guard's rule.
 async fn finish(fx: Fixture, rpc: TlsWs) {
     drop(rpc);
-    fx._ws.stop().await;
-    let dir = fx._dir.path().to_path_buf();
+    fx.ws.stop().await;
+    let dir = fx.dir.path().to_path_buf();
     drop(fx);
     let keep = std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty());
-    assert_eq!(dir.exists(), keep, "fixture directory retention: {dir:?}");
+    assert_eq!(
+        dir.exists(),
+        keep,
+        "fixture directory retention: {}",
+        dir.display()
+    );
 }
 
 /// `.git` may already exist while the original warm still owns a writer.
