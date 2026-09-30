@@ -24,5 +24,11 @@ serde_json = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+intentd-test-support = { path = "../intentd-test-support" }
+rcgen = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+
 [lints]
 workspace = true
