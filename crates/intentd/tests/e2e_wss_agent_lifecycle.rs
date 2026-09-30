@@ -2487,9 +2487,11 @@ async fn agent_notifications_muted_round_trip_and_idle_stamp_over_wss() {
         json!(false),
         "{unmuted}"
     );
-    assert_eq!(
-        unmuted["agent"]["updatedAt"],
-        after_turn["agent"]["updatedAt"]
+    // Turn cleanup can still persist genuine activity after agent:idle. The
+    // exact mute-only timestamp invariant is exercised above before any turn.
+    assert!(
+        unmuted["agent"]["updatedAt"].as_str().unwrap()
+            >= after_turn["agent"]["updatedAt"].as_str().unwrap()
     );
     let cleared = wss_rpc(
         &mut rpc,
