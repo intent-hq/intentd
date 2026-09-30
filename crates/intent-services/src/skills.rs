@@ -7,10 +7,11 @@
 //! 3. `~/.augment/skills` (p3, auggie convention for back-compat)
 //! 4. `~/.intent/skills` (p4, app-owned)
 //! 5. `<workspace>/.agents/skills` (p5)
-//! 6. `<workspace>/.augment/skills` (p6, auggie convention for back-compat)
-//! 7. `<workspace>/.intent/skills` (p7, app-owned)
+//! 6. `<workspace>/.claude/skills` (p6)
+//! 7. `<workspace>/.augment/skills` (p7, auggie convention for back-compat)
+//! 8. `<workspace>/.intent/skills` (p8, app-owned)
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -18,6 +19,7 @@ use std::time::SystemTime;
 const SKILL_FILENAME: &str = "SKILL.md";
 const MAX_SCAN_DEPTH: usize = 4;
 const MAX_SCANNED_DIRECTORIES: usize = 2000;
+const MAX_SCANNED_ENTRIES: usize = 20_000;
 const NO_WORKSPACE_CACHE_KEY: &str = "__no_workspace__";
 
 static NOISE_DIRECTORIES: &[&str] = &[
@@ -41,7 +43,7 @@ fn home_dir() -> Option<PathBuf> {
         .filter(|p| !p.as_os_str().is_empty())
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SkillMetadata {
     pub name: String,
@@ -76,7 +78,9 @@ struct ScanTarget {
 struct PathFingerprint {
     path: PathBuf,
     exists: bool,
-    mtime_ms: u128,
+    mtime_ns: u128,
+    length: u64,
+    canonical: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +88,7 @@ struct CachePayload {
     skills: Vec<SkillMetadata>,
     catalog: String,
     fingerprints: Vec<PathFingerprint>,
+    watch_directories: Vec<PathBuf>,
 }
 
 struct CacheEntry {
@@ -126,20 +131,8 @@ pub(crate) async fn check_skills_changed(workspace_path: &str) -> (Vec<SkillMeta
     let payload = load_skills_payload(workspace_path).await;
     let new_skills = payload.skills.clone();
 
-    // Compare: changed if cache was empty or skill names/count differ
-    let changed = match old_skills {
-        None => !new_skills.is_empty(), // Changed if we now have skills
-        Some(old) => {
-            if old.len() == new_skills.len() {
-                // Compare sorted skill names
-                let old_names: Vec<_> = old.iter().map(|s| &s.name).collect();
-                let new_names: Vec<_> = new_skills.iter().map(|s| &s.name).collect();
-                old_names != new_names
-            } else {
-                true
-            }
-        }
-    };
+    // Metadata and alias locations are observable catalog changes too.
+    let changed = old_skills.map_or(!new_skills.is_empty(), |old| old != new_skills);
 
     (new_skills, changed)
 }
@@ -202,13 +195,18 @@ fn get_scan_targets(
             scope: "project".to_string(),
         });
         targets.push(ScanTarget {
-            root: ws_path.join(".augment").join("skills"),
+            root: ws_path.join(".claude").join("skills"),
             precedence: 6,
             scope: "project".to_string(),
         });
         targets.push(ScanTarget {
-            root: ws_path.join(".intent").join("skills"),
+            root: ws_path.join(".augment").join("skills"),
             precedence: 7,
+            scope: "project".to_string(),
+        });
+        targets.push(ScanTarget {
+            root: ws_path.join(".intent").join("skills"),
+            precedence: 8,
             scope: "project".to_string(),
         });
     }
@@ -276,6 +274,7 @@ async fn load_skills_payload_with_home(
                         skills: Vec::new(),
                         catalog: String::new(),
                         fingerprints: Vec::new(),
+                        watch_directories: Vec::new(),
                     }),
                     load_promise: Some(load_lock.clone()),
                 },
@@ -307,11 +306,13 @@ async fn scan_skills_with_home(
 ) -> CachePayload {
     let mut observed_paths = std::collections::HashSet::new();
     let mut discovered_by_name = BTreeMap::new();
-    let mut scan_state = ScanState {
-        scanned_directories: 0,
-    };
+    let mut scan_state = ScanState::default();
 
-    for target in get_scan_targets(workspace_path, home_override) {
+    // Visit the winning tier first so canonical deduplication cannot erase it.
+    for target in get_scan_targets(workspace_path, home_override)
+        .into_iter()
+        .rev()
+    {
         observed_paths.insert(target.root.clone());
         let skill_files =
             find_skill_files(&target.root, &mut observed_paths, &mut scan_state).await;
@@ -354,6 +355,7 @@ async fn scan_skills_with_home(
         .collect();
     skills.sort_by(|a, b| a.name.cmp(&b.name));
 
+    observed_paths.extend(scan_state.watch_directories.iter().cloned());
     let mut fingerprint_paths: Vec<_> = observed_paths.into_iter().collect();
     fingerprint_paths.sort();
     let mut fingerprints = Vec::new();
@@ -361,17 +363,90 @@ async fn scan_skills_with_home(
         fingerprints.push(get_path_fingerprint(&path).await);
     }
 
+    let mut watch_directories: Vec<_> = scan_state.watch_directories.into_iter().collect();
+    watch_directories.sort();
     let catalog = build_skills_catalog(&skills);
 
     CachePayload {
         skills,
         catalog,
         fingerprints,
+        watch_directories,
     }
 }
 
+/// Canonical directories outside the ordinary tier streams, including link
+/// parents. Every subscription is non-recursive; the scan bounds its coverage.
+pub(crate) async fn linked_skill_watch_directories(workspace_path: &str) -> Vec<PathBuf> {
+    load_skills_payload(workspace_path).await.watch_directories
+}
+
+#[derive(Default)]
 struct ScanState {
     scanned_directories: usize,
+    scanned_entries: usize,
+    directories: HashSet<PathBuf>,
+    files: HashSet<PathBuf>,
+    watch_directories: HashSet<PathBuf>,
+}
+
+impl ScanState {
+    fn watch_directory(&mut self, path: PathBuf) {
+        if self.watch_directories.len() < MAX_SCANNED_DIRECTORIES {
+            self.watch_directories.insert(path);
+        }
+    }
+}
+
+/// Observe both ends of a link. Parent watches detect replacement of the alias
+/// and atomic replacement of a file target with an arbitrary filename. A broken
+/// target watches only its nearest existing ancestor until it can be resolved.
+async fn observe_link(path: &Path, state: &mut ScanState) {
+    let canonical = tokio::fs::canonicalize(path).await.ok();
+    if canonical.as_deref() == Some(path)
+        || (canonical.is_none()
+            && !tokio::fs::symlink_metadata(path)
+                .await
+                .is_ok_and(|m| m.is_symlink()))
+    {
+        return;
+    }
+    let mut link = path.to_path_buf();
+    // Match the OS symlink-resolution bound and cover intermediary links too.
+    for _ in 0..40 {
+        let mut alias = link.as_path();
+        while let Some(parent) = alias.parent() {
+            if let Ok(canonical_parent) = tokio::fs::canonicalize(parent).await {
+                let unchanged = canonical_parent == parent;
+                state.watch_directory(canonical_parent);
+                if unchanged {
+                    break;
+                }
+            }
+            alias = parent;
+        }
+        let Ok(target) = tokio::fs::read_link(&link).await else {
+            break;
+        };
+        link = link.parent().unwrap_or(&link).join(target);
+    }
+    if let Some(target) = canonical {
+        if tokio::fs::metadata(&target).await.is_ok_and(|m| m.is_dir()) {
+            state.watch_directory(target);
+        } else if let Some(parent) = target.parent() {
+            state.watch_directory(parent.to_path_buf());
+        }
+    } else if let Ok(target) = tokio::fs::read_link(path).await {
+        let target = path.parent().unwrap_or(path).join(target);
+        let mut ancestor = target.as_path();
+        while let Some(parent) = ancestor.parent() {
+            if let Ok(canonical) = tokio::fs::canonicalize(parent).await {
+                state.watch_directory(canonical);
+                break;
+            }
+            ancestor = parent;
+        }
+    }
 }
 
 /// Find all SKILL.md files under `root_path`
@@ -380,6 +455,7 @@ async fn find_skill_files(
     observed_paths: &mut std::collections::HashSet<PathBuf>,
     scan_state: &mut ScanState,
 ) -> Vec<PathBuf> {
+    observe_link(root_path, scan_state).await;
     if !tokio::fs::try_exists(root_path).await.unwrap_or(false) {
         return Vec::new();
     }
@@ -398,12 +474,18 @@ async fn walk_directory(
     scan_state: &mut ScanState,
     skill_files: &mut Vec<PathBuf>,
 ) {
+    observed_paths.insert(current_path.to_path_buf());
+    observe_link(current_path, scan_state).await;
     if scan_state.scanned_directories >= MAX_SCANNED_DIRECTORIES {
         return;
     }
-
+    let Ok(canonical) = tokio::fs::canonicalize(current_path).await else {
+        return;
+    };
+    if !scan_state.directories.insert(canonical) {
+        return;
+    }
     scan_state.scanned_directories += 1;
-    observed_paths.insert(current_path.to_path_buf());
 
     let mut entries = match tokio::fs::read_dir(current_path).await {
         Ok(entries) => entries,
@@ -418,7 +500,11 @@ async fn walk_directory(
     };
 
     let mut dir_entries = Vec::new();
-    while let Ok(Some(entry)) = entries.next_entry().await {
+    while scan_state.scanned_entries < MAX_SCANNED_ENTRIES {
+        let Ok(Some(entry)) = entries.next_entry().await else {
+            break;
+        };
+        scan_state.scanned_entries += 1;
         dir_entries.push(entry);
     }
     dir_entries.sort_by_key(tokio::fs::DirEntry::file_name);
@@ -431,8 +517,17 @@ async fn walk_directory(
     if has_skill_file {
         let skill_path = current_path.join(SKILL_FILENAME);
         observed_paths.insert(skill_path.clone());
-        skill_files.push(skill_path);
-        return; // Stop descending once SKILL.md is found
+        observe_link(&skill_path, scan_state).await;
+        if let Ok(canonical) = tokio::fs::canonicalize(&skill_path).await {
+            if tokio::fs::metadata(&skill_path)
+                .await
+                .is_ok_and(|m| m.is_file())
+                && scan_state.files.insert(canonical)
+            {
+                skill_files.push(skill_path);
+            }
+            return; // Stop descending once a real SKILL.md is found.
+        }
     }
 
     if depth >= MAX_SCAN_DEPTH {
@@ -444,11 +539,15 @@ async fn walk_directory(
         let file_name = entry.file_name();
         let file_name_str = file_name.to_string_lossy();
 
-        if let Ok(metadata) = entry.metadata().await {
-            if metadata.is_dir()
-                && !metadata.is_symlink()
-                && !NOISE_DIRECTORIES.contains(&file_name_str.as_ref())
-            {
+        if NOISE_DIRECTORIES.contains(&file_name_str.as_ref()) {
+            continue;
+        }
+        if entry.file_type().await.is_ok_and(|kind| kind.is_symlink()) {
+            observed_paths.insert(entry.path());
+            observe_link(&entry.path(), scan_state).await;
+        }
+        if let Ok(metadata) = tokio::fs::metadata(entry.path()).await {
+            if metadata.is_dir() {
                 walk_directory(
                     &entry.path(),
                     depth + 1,
@@ -692,21 +791,25 @@ fn escape_xml(text: &str) -> String {
 async fn get_path_fingerprint(path: &Path) -> PathFingerprint {
     match tokio::fs::metadata(path).await {
         Ok(metadata) => {
-            let mtime_ms = metadata
+            let mtime_ns = metadata
                 .modified()
                 .ok()
                 .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-                .map_or(0, |d| d.as_millis());
+                .map_or(0, |d| d.as_nanos());
             PathFingerprint {
                 path: path.to_path_buf(),
                 exists: true,
-                mtime_ms,
+                mtime_ns,
+                length: metadata.len(),
+                canonical: tokio::fs::canonicalize(path).await.ok(),
             }
         }
         Err(_) => PathFingerprint {
             path: path.to_path_buf(),
             exists: false,
-            mtime_ms: 0,
+            mtime_ns: 0,
+            length: 0,
+            canonical: None,
         },
     }
 }
@@ -715,7 +818,11 @@ async fn get_path_fingerprint(path: &Path) -> PathFingerprint {
 async fn are_fingerprints_current(fingerprints: &[PathFingerprint]) -> bool {
     for fingerprint in fingerprints {
         let current = get_path_fingerprint(&fingerprint.path).await;
-        if current.exists != fingerprint.exists || current.mtime_ms != fingerprint.mtime_ms {
+        if current.exists != fingerprint.exists
+            || current.mtime_ns != fingerprint.mtime_ns
+            || current.length != fingerprint.length
+            || current.canonical != fingerprint.canonical
+        {
             return false;
         }
     }

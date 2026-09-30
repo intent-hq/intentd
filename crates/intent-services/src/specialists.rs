@@ -8,11 +8,15 @@
 //! [`REPLACEMENT_DIR_ENV`] (startup-pinned) wholesale-replaces the base tier
 //! with an operator-supplied directory, excluding the embedded bundle and the
 //! bundled directory entirely.
+//! Claude user/project agent files are read-only fallbacks below Intent's
+//! definitions; unsupported execution settings block creation explicitly.
 
 use std::path::{Path, PathBuf};
 
 use intent_core::{Error, Result};
 use serde_json::{json, Map, Value};
+
+pub(crate) mod claude_agents;
 
 /// Folder name under `.intent/` (and the bundled `resources/`) holding files.
 const SPECIALISTS_FOLDER: &str = "specialists";
@@ -1251,7 +1255,7 @@ impl SpecialistsService {
                 resolved = Some(def);
             }
         }
-        resolved
+        resolved.or_else(|| self.claude_catalog(workspace_path).remove(id))
     }
 
     /// Map an alias to the canonical id of the specialist claiming it via
@@ -1306,7 +1310,20 @@ impl SpecialistsService {
         let mut catalog = self.collect_catalog(workspace_path);
         catalog.remove("ralph");
         if let Some(canonical) = self.canonical_id(id, workspace_path) {
-            if catalog.contains_key(&canonical) {
+            if let Some(definition) = catalog.get(&canonical) {
+                if let Some(fields) = definition
+                    .get("unsupportedFields")
+                    .and_then(Value::as_array)
+                {
+                    let fields = fields
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(Error::InvalidParams(format!(
+                        "Claude agent {canonical} uses settings Intent cannot apply: {fields}. Edit the original agent file or create an Intent specialist with the required behavior."
+                    )));
+                }
                 return Ok(canonical);
             }
         }
@@ -1399,6 +1416,12 @@ impl SpecialistsService {
         let Some(canonical) = self.canonical_id(id, workspace_path) else {
             return RoleResolution::Unknown;
         };
+        if self
+            .resolve_direct(&canonical, workspace_path)
+            .is_some_and(|def| def.get("importedFrom").is_some())
+        {
+            return RoleResolution::Cleared;
+        }
         let mut state = RoleResolution::Absent;
         if let Some((_, content)) = self.embedded.iter().find(|(k, _)| *k == canonical) {
             fold_role_directive(&mut state, content);
@@ -1596,7 +1619,41 @@ impl SpecialistsService {
         if let Some(wp) = workspace_path {
             Self::collect_dir(&project_dir(wp), "project", &mut acc);
         }
+        for (id, definition) in self.claude_catalog(workspace_path) {
+            acc.entry(id).or_insert(definition);
+        }
         acc
+    }
+
+    fn claude_catalog(
+        &self,
+        workspace_path: Option<&Path>,
+    ) -> std::collections::BTreeMap<String, Value> {
+        let mut definitions = self
+            .user_dir
+            .as_deref()
+            .and_then(claude_agents::user_root)
+            .map(|root| claude_agents::collect(&root, "user"))
+            .unwrap_or_default();
+        if let Some(workspace) = workspace_path {
+            definitions.extend(claude_agents::collect(
+                &workspace.join(".claude/agents"),
+                "project",
+            ));
+        }
+        definitions
+    }
+
+    fn reject_imported_mutation(&self, id: &str, workspace_path: Option<&Path>) -> Result<()> {
+        if self
+            .resolve_direct(id, workspace_path)
+            .is_some_and(|def| def.get("importedFrom").is_some())
+        {
+            return Err(Error::InvalidParams(format!(
+                "Imported Claude agent {id} is read-only. Edit its original Claude file or create an Intent specialist override."
+            )));
+        }
+        Ok(())
     }
 
     /// `specialist.list` → `{ specialists: SpecialistDef[] }`, the resolved
@@ -1770,6 +1827,7 @@ impl SpecialistsService {
     ) -> Result<Value> {
         validate_id(id)?;
         let scope = parse_scope(scope)?;
+        self.reject_imported_mutation(id, workspace_path)?;
         if !spec.is_object() {
             return Err(Error::InvalidParams("spec must be an object".to_string()));
         }
@@ -1808,6 +1866,7 @@ impl SpecialistsService {
     ) -> Result<Value> {
         validate_id(id)?;
         let scope = parse_scope(scope)?;
+        self.reject_imported_mutation(id, workspace_path)?;
         let dir = match scope {
             "project" => {
                 let wp = workspace_path.ok_or_else(|| {

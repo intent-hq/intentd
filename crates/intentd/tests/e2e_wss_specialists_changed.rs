@@ -8,6 +8,8 @@
 
 #![cfg(unix)]
 
+#[path = "wss_integration/claude_agents.rs"]
+mod claude_agents;
 mod common;
 
 use std::io::Write;
@@ -197,6 +199,18 @@ async fn wss_rpc<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: 
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    let reply = wss_reply(ws, id, method, params).await;
+    assert!(
+        reply.get("error").is_none(),
+        "rpc {method} errored: {reply}"
+    );
+    reply["result"].clone()
+}
+
+async fn wss_reply<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: Value) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
     ws.send(Message::Text(frame.to_string().into()))
         .await
@@ -209,8 +223,7 @@ where
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
                 if v["id"] == json!(id) {
-                    assert!(v.get("error").is_none(), "rpc {method} errored: {v}");
-                    return v["result"].clone();
+                    return v;
                 }
             }
             Some(Ok(Message::Ping(p))) => {
