@@ -102,7 +102,6 @@ const BASELINE: &[&str] = &[
     "crates/intentd/tests/e2e_wss_delegation_group_persist.rs",
     "crates/intentd/tests/e2e_wss_display_status_hooks.rs",
     "crates/intentd/tests/e2e_wss_display_status_needs_attention.rs",
-    "crates/intentd/tests/e2e_wss_flush_queued_messages.rs",
     "crates/intentd/tests/e2e_wss_git_clone.rs",
     "crates/intentd/tests/e2e_wss_git_discard.rs",
     "crates/intentd/tests/e2e_wss_git_reads.rs",
