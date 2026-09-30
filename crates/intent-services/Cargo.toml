@@ -1,6 +1,6 @@
 [package]
 name = "intent-services"
-version = "0.9.121"
+version = "0.9.122"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -8,19 +8,19 @@ license.workspace = true
 description = "Shared business-logic surface invoked by every transport and the agent MCP server"
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.9.121" }
-intent-store = { path = "../intent-store", version = "0.9.121" }
-intent-git = { path = "../intent-git", version = "0.9.121" }
-intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.9.121" }
-intent-linear = { path = "../intent-linear", version = "0.9.121" }
-intent-sentry = { path = "../intent-sentry", version = "0.9.121" }
+intent-core = { path = "../intent-core", version = "0.9.122" }
+intent-store = { path = "../intent-store", version = "0.9.122" }
+intent-git = { path = "../intent-git", version = "0.9.122" }
+intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.9.122" }
+intent-linear = { path = "../intent-linear", version = "0.9.122" }
+intent-sentry = { path = "../intent-sentry", version = "0.9.122" }
 intent-voice = { path = "../intent-voice", version = "0.4.1" }
-intent-acp = { path = "../intent-acp", version = "0.9.121" }
-intent-js = { path = "../intent-js", version = "0.9.121" }
-intent-context = { path = "../intent-context", version = "0.9.121" }
-intent-providers = { path = "../intent-providers", version = "0.9.121" }
-intent-pty = { path = "../intent-pty", version = "0.9.121" }
-intent-search = { path = "../intent-search", version = "0.9.121" }
+intent-acp = { path = "../intent-acp", version = "0.9.122" }
+intent-js = { path = "../intent-js", version = "0.9.122" }
+intent-context = { path = "../intent-context", version = "0.9.122" }
+intent-providers = { path = "../intent-providers", version = "0.9.122" }
+intent-pty = { path = "../intent-pty", version = "0.9.122" }
+intent-search = { path = "../intent-search", version = "0.9.122" }
 base64 = { workspace = true }
 git2 = { workspace = true }
 ignore = { workspace = true }
