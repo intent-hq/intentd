@@ -259,7 +259,7 @@ async fn boot(data_dir: &Path) -> (u16, String) {
 async fn server_pairing_info_over_uds() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
-    let mut daemon = Daemon {
+    let daemon = Daemon {
         child: spawn_serve(&data_dir),
     };
     let (port, fp) = boot(&data_dir).await;
@@ -317,7 +317,7 @@ async fn server_pairing_info_over_uds() {
 async fn server_rotate_token_env_fixed_rejects() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
-    let mut daemon = Daemon {
+    let daemon = Daemon {
         child: spawn_serve(&data_dir),
     };
     let (_port, _fp) = boot(&data_dir).await;
@@ -343,7 +343,7 @@ async fn server_rotate_token_env_fixed_rejects() {
 async fn server_pairing_info_over_wss_rejects() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
-    let mut daemon = Daemon {
+    let daemon = Daemon {
         child: spawn_serve(&data_dir),
     };
     let (port, fp) = boot(&data_dir).await;
@@ -368,7 +368,7 @@ async fn server_pairing_info_over_wss_rejects() {
 async fn pairing_get_info_loopback_default_errors_without_tunnel() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
-    let mut daemon = Daemon {
+    let daemon = Daemon {
         child: spawn_serve(&data_dir),
     };
     boot(&data_dir).await;
@@ -416,7 +416,7 @@ async fn pairing_surfaces_report_tc_address_when_tunnel_up() {
     )
     .expect("seed config.toml with server.tunnel.enabled");
     let tailcat_bin = write_fake_tailcat(&data_dir);
-    let mut daemon = Daemon {
+    let daemon = Daemon {
         child: spawn_serve_with_tailcat(&data_dir, &tailcat_bin),
     };
     let (port, fp) = boot(&data_dir).await;
@@ -470,7 +470,7 @@ async fn pairing_get_info_explicit_wide_bind_honored() {
         "[server]\nbindAddress = \"0.0.0.0\"\n",
     )
     .expect("seed config.toml with wide bindAddress");
-    let mut daemon = Daemon {
+    let daemon = Daemon {
         child: spawn_serve(&data_dir),
     };
     let (port, fp) = boot(&data_dir).await;
@@ -516,7 +516,7 @@ async fn pairing_get_info_explicit_wide_bind_honored() {
 async fn pairing_get_info_listener_down_over_uds() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
-    let mut daemon = Daemon {
+    let daemon = Daemon {
         child: spawn_serve_wss_disabled(&data_dir),
     };
     let socket = data_dir.join("intentd.sock");
@@ -546,7 +546,7 @@ async fn pairing_get_info_listener_down_over_uds() {
 async fn pairing_get_info_over_wss_rejects() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
-    let mut daemon = Daemon {
+    let daemon = Daemon {
         child: spawn_serve(&data_dir),
     };
     let (port, fp) = boot(&data_dir).await;
@@ -572,7 +572,7 @@ async fn pairing_get_info_over_wss_rejects() {
 async fn server_rotate_token_over_wss_rejects() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
-    let mut daemon = Daemon {
+    let daemon = Daemon {
         child: spawn_serve(&data_dir),
     };
     let (port, fp) = boot(&data_dir).await;
@@ -597,7 +597,7 @@ async fn server_rotate_token_over_wss_rejects() {
 async fn system_import_legacy_over_wss_rejects() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
-    let mut daemon = Daemon {
+    let daemon = Daemon {
         child: spawn_serve(&data_dir),
     };
     let (port, fp) = boot(&data_dir).await;
@@ -625,7 +625,7 @@ async fn system_import_legacy_over_wss_rejects() {
 async fn system_git_credential_over_wss_rejects() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
-    let mut daemon = Daemon {
+    let daemon = Daemon {
         child: spawn_serve(&data_dir),
     };
     let (port, fp) = boot(&data_dir).await;
@@ -655,7 +655,7 @@ async fn system_git_credential_over_wss_rejects() {
 async fn system_shutdown_over_wss_rejects_and_daemon_survives() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
-    let mut daemon = Daemon {
+    let daemon = Daemon {
         child: spawn_serve(&data_dir),
     };
     let (port, fp) = boot(&data_dir).await;
