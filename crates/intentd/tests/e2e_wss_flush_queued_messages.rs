@@ -83,9 +83,10 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         // Providers own separate process groups. Let normal daemon shutdown
         // stop them before reaping the daemon; the guard remains the fallback.
-        let stopped = self.child.try_wait().and_then(|status| match status {
-            Some(status) => Ok(Some(status)),
-            None => {
+        let stopped = self.child.try_wait().and_then(|status| {
+            if let Some(status) = status {
+                Ok(Some(status))
+            } else {
                 self.child
                     .signal(nix::sys::signal::Signal::SIGTERM)
                     .map_err(std::io::Error::other)?;
