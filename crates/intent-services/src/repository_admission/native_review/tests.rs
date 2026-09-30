@@ -4077,37 +4077,323 @@ async fn companion_diagnostic_group3_continuity_authority_disclosure() {
         }).await;
     }
 }
-#[intent_test_macros::daemon_test]
-async fn companion_diagnostic_group4_project_metadata_deadline() {
-    for deadline in [false, true] {
-        diagnostic_case(if deadline{"g4-acquisition-deadline"}else{"g4-project-then-unavailable"},|observer|async move {
-            with_review_clock(async {
-                let f=Fixture::new().await;let s=f.socket().await;
-                let(parent,receipt,op)=diagnostic_parent(&f,&s,&observer).await;
-                let c=s.concrete(&f).await;
-                let before=f.server.control.requests.lock().unwrap().iter().filter(|(_,path)|path.contains("/repository/branches")).count();
-                *f.server.control.pause.lock().unwrap()=Some("/projects/".into());
-                let call=diagnostic_request(&f,&s,Frame::Prepare(companion_child(&f,&parent)),&observer);tokio::pin!(call);
-                tokio::select!{result=&mut call=>panic!("original project GET not held:{result:?}"),()=f.server.control.entered.notified()=>{}}
-                let holder=if deadline {None} else {
-                    let (entered,waiting)=tokio::sync::oneshot::channel();let (release,released)=std::sync::mpsc::channel();let facts=op.metadata.provider.clone();
-                    let task=std::thread::spawn(move||facts.hold_native_review_metadata_for_test(entered,released));waiting.await.unwrap();Some((release,task))
-                };
-                if deadline{tokio::time::advance(ACQUIRE).await;}else{f.server.control.release.notify_one();}
-                let reply=call.await;
-                diagnostic_checkpoint(&observer,"held-project-original-return",json!({"body":diagnostic_reply(&reply),"receipt":receipt,"workers":c.review.workers.available_permits(),"requests":f.server.control.requests.lock().unwrap().clone()}));
-                if let Some((release,task))=holder{release.send(()).unwrap();task.join().unwrap();}
-                if deadline{f.server.control.release.notify_one();}
-                wait_until(||c.review.workers.available_permits()==WORKERS).await;
-                let after=f.server.control.requests.lock().unwrap().iter().filter(|(_,path)|path.contains("/repository/branches")).count();
-                assert!(reply.is_err());assert_eq!(before,after);assert_eq!(f.server.control.posts.load(Ordering::SeqCst),0);
-                let frames=observer.lines().into_iter().filter_map(|raw|serde_json::from_str::<companion_observation::FrameRecord>(&raw).ok()).collect::<Vec<_>>();
-                assert!(frames.iter().any(|f|f.phase==companion_observation::Phase::Project));
-                if !deadline {assert!(frames.iter().any(|f|f.phase==companion_observation::Phase::Branch&&f.outcome==companion_observation::Outcome::Error));}
-                assert_eq!(op.progress.lock().unwrap().effects.len(),1);
-            }).await;
-        }).await;
+// Group4 owns only its test resources; none of these guards participates in
+// the original Request's admission, result, retirement or consuming fences.
+struct Group4MetadataHolder {
+    request_release: Option<std::sync::mpsc::Sender<()>>,
+    watchdog: Option<std::thread::JoinHandle<(&'static str, bool)>>,
+    holder: Option<std::thread::JoinHandle<()>>,
+    observer: companion_observation::Collector,
+}
+impl Group4MetadataHolder {
+    fn start(
+        facts: Arc<RepositoryConnectionFacts>,
+        observer: &companion_observation::Collector,
+    ) -> (Self, tokio::sync::oneshot::Receiver<()>) {
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let (request_release, requested) = std::sync::mpsc::channel();
+        // This independent real-time watchdog remains runnable when the test's
+        // Tokio clock is fixed or the original caller needs the held mutex.
+        let watchdog = std::thread::spawn(move || {
+            let reason = match requested.recv_timeout(ACQUIRE) {
+                Ok(()) => "requested",
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => "watchdog",
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => "disconnected",
+            };
+            (reason, release.send(()).is_ok())
+        });
+        let holder = std::thread::spawn(move || {
+            facts.hold_native_review_metadata_for_test(entered, released);
+        });
+        (
+            Self {
+                request_release: Some(request_release),
+                watchdog: Some(watchdog),
+                holder: Some(holder),
+                observer: observer.clone(),
+            },
+            waiting,
+        )
     }
+    fn finish(&mut self) -> Value {
+        let requested = self
+            .request_release
+            .take()
+            .is_some_and(|release| release.send(()).is_ok());
+        let watchdog = self.watchdog.take().map(std::thread::JoinHandle::join);
+        let (watchdog_joined, reason, released) = match watchdog {
+            Some(Ok((reason, released))) => (true, reason, released),
+            _ => (false, "unobserved", false),
+        };
+        let joined = self
+            .holder
+            .take()
+            .is_some_and(|holder| holder.join().is_ok());
+        let result = json!({"requested":requested,"releaseReason":reason,"releaseSent":released,"watchdogJoined":watchdog_joined,"holderJoined":joined});
+        diagnostic_checkpoint(&self.observer, "g4-holder-release-join", result.clone());
+        result
+    }
+}
+impl Drop for Group4MetadataHolder {
+    fn drop(&mut self) {
+        if self.holder.is_some() || self.watchdog.is_some() {
+            let _ = self.finish();
+        }
+    }
+}
+struct Group4ProviderRelease {
+    control: Arc<super::credential_tests::Control>,
+    observer: companion_observation::Collector,
+    signalled: bool,
+}
+impl Group4ProviderRelease {
+    fn release(&mut self) {
+        if !self.signalled {
+            self.control.release.notify_one();
+            self.signalled = true;
+            diagnostic_checkpoint(
+                &self.observer,
+                "g4-provider-release-signalled",
+                json!({"signalled":true,"unwinding":std::thread::panicking(),"workerCompletionClaim":false}),
+            );
+        }
+    }
+}
+impl Drop for Group4ProviderRelease {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+fn group4_frames(
+    observer: &companion_observation::Collector,
+    capture: &str,
+) -> Vec<companion_observation::FrameRecord> {
+    observer
+        .lines()
+        .iter()
+        .map(|raw| serde_json::from_str::<companion_observation::FrameRecord>(raw).unwrap())
+        .filter(|frame| frame.capture.as_deref() == Some(capture))
+        .collect()
+}
+fn group4_has(
+    frames: &[companion_observation::FrameRecord],
+    phase: companion_observation::Phase,
+    outcome: companion_observation::Outcome,
+) -> bool {
+    frames
+        .iter()
+        .any(|frame| frame.phase == phase && frame.outcome == outcome && frame.span.is_some())
+}
+fn group4_git(f: &Fixture) -> Value {
+    json!({
+        "head":f.git.git(&f.git.path,&["rev-parse","HEAD"]).trim(),
+        "index":f.git.git(&f.git.path,&["ls-files","--stage"]),
+        "status":f.git.git(&f.git.path,&["status","--porcelain=v1"]),
+        "worktreeDiff":f.git.git(&f.git.path,&["diff","--no-ext-diff"]),
+        "unstaged":std::fs::read_to_string(f.git.path.join("group4-unstaged.txt")).unwrap(),
+    })
+}
+struct Group4Original {
+    fixture: Fixture,
+    socket: Socket,
+    connection: Arc<Connection>,
+    parent: Execute,
+    receipt: Value,
+    operation: Arc<Operation>,
+    before: Value,
+    requests_before: usize,
+    records_before: (usize, usize),
+    child: Prepare,
+    capture: String,
+}
+impl Group4Original {
+    async fn new(observer: &companion_observation::Collector) -> Self {
+        let fixture = Fixture::new().await;
+        let socket = fixture.socket().await;
+        let (parent, receipt, operation) = diagnostic_parent(&fixture, &socket, observer).await;
+        std::fs::write(fixture.git.path.join("group4-unstaged.txt"), "unchanged").unwrap();
+        let connection = socket.concrete(&fixture).await;
+        let child = companion_child(&fixture, &parent);
+        let Choice::AfterCommit { capture_id, .. } = &child.review.choice else {
+            unreachable!()
+        };
+        let capture = capture_id.clone();
+        let before = group4_git(&fixture);
+        let requests_before = fixture.server.control.requests.lock().unwrap().len();
+        let records_before = (
+            connection.review.records.available_permits(),
+            fixture
+                .services
+                .repository_review_capacity
+                .records
+                .available_permits(),
+        );
+        diagnostic_checkpoint(
+            observer,
+            "g4-original-baseline",
+            json!({"parent":receipt,"capture":capture,"git":before,"requests":requests_before,"recordCapacity":records_before,"effects":operation.progress.lock().unwrap().effects}),
+        );
+        Self {
+            fixture,
+            socket,
+            connection,
+            parent,
+            receipt,
+            operation,
+            before,
+            requests_before,
+            records_before,
+            child,
+            capture,
+        }
+    }
+    async fn completed(&self, observer: &companion_observation::Collector, project_reads: usize) {
+        use companion_observation::{Outcome, Phase};
+        // Called after the fixed-clock schedule has returned. The existing
+        // five-second observation bound now runs normally. A Worker scope end
+        // follows original acquire return and capacity drop in the frozen owner;
+        // neither receiver failure nor a permit snapshot substitutes for it.
+        wait_until(|| {
+            let frames = group4_frames(observer, &self.capture);
+            group4_has(&frames, Phase::Acquire, Outcome::Error)
+                && group4_has(&frames, Phase::Worker, Outcome::Exit)
+        })
+        .await;
+        let f = &self.fixture;
+        let frames = group4_frames(observer, &self.capture);
+        let after = group4_git(f);
+        let requests = f.server.control.requests.lock().unwrap().clone();
+        let added = &requests[self.requests_before..];
+        let effects = json!(self.operation.progress.lock().unwrap().effects);
+        let records_after = (
+            self.connection.review.records.available_permits(),
+            f.services
+                .repository_review_capacity
+                .records
+                .available_permits(),
+        );
+        let retained = self
+            .connection
+            .review
+            .feed
+            .lock()
+            .unwrap()
+            .records
+            .get(&self.parent.review.operation_id)
+            .is_some_and(|op| Arc::ptr_eq(op, &self.operation));
+        diagnostic_checkpoint(
+            observer,
+            "g4-owned-worker-completion",
+            json!({"frames":frames,"git":after,"receipt":self.receipt,"effects":effects,"receiptRetained":retained,"recordCapacity":records_after,"workers":self.connection.review.workers.available_permits(),"globalWorkers":f.services.repository_review_capacity.workers.available_permits(),"childHttpCount":added.len(),"branchRequests":added.iter().filter(|(_,p)|p.contains("/repository/branches")).count(),"posts":f.server.control.posts.load(Ordering::SeqCst)}),
+        );
+        assert!(retained);
+        assert_eq!(records_after, self.records_before);
+        assert_eq!(effects, self.receipt["reviewExecution"]["gitReceipts"]);
+        assert_eq!(after, self.before);
+        assert_eq!(added.len(), project_reads);
+        assert!(added.iter().all(|(method, path)| method == "GET"
+            && path.starts_with("/api/v4/projects/")
+            && !path.contains("/repository/branches")));
+        assert_eq!(f.server.control.posts.load(Ordering::SeqCst), 0);
+        assert_eq!(self.connection.review.workers.available_permits(), WORKERS);
+        assert_eq!(
+            f.services
+                .repository_review_capacity
+                .workers
+                .available_permits(),
+            GLOBAL_WORKERS
+        );
+        assert!(frames.iter().all(|frame| frame.operation.as_deref()
+            == Some(self.parent.review.operation_id.as_str())
+            && frame.daemon.as_deref() == Some(f.services.daemon_boot_id.as_str())));
+    }
+}
+#[intent_test_macros::daemon_test]
+async fn companion_diagnostic_group4_initial_metadata_unavailable() {
+    diagnostic_case("g4-initial-metadata-unavailable", |observer| async move {
+        use companion_observation::{Outcome, Phase};
+        let (original, checks) = with_review_clock(async {
+            let original = Group4Original::new(&observer).await;
+            let mut checks = None;
+            original.socket.entered(async {
+                let frame=original.socket.owner.capture_review(&Frame::Prepare(original.child.clone())).unwrap();
+                diagnostic_checkpoint(&observer,"g4-child-captured-before-holder",json!({"capture":original.capture,"parent":original.parent.review.operation_id,"bodyPolled":false}));
+                let (mut holder,waiting)=Group4MetadataHolder::start(original.operation.metadata.provider.clone(),&observer);
+                let entered=waiting.await;
+                diagnostic_checkpoint(&observer,"g4-holder-entered-before-body",json!({"entered":entered.is_ok(),"bodyPolled":false,"capture":original.capture}));
+                assert!(entered.is_ok());
+                frame.scope(Box::pin(async {
+                    let body=original.fixture.services.native_review_prepare(original.child.clone()).await;
+                    diagnostic_checkpoint(&observer,"g4-initial-original-body",json!({"body":diagnostic_reply(&body),"capture":original.capture}));
+                    let released=holder.finish();
+                    let mut transfers=0;
+                    let delivered=frame.deliver(if body.is_ok(){RepositoryReadReplyKind::Result}else{RepositoryReadReplyKind::ServiceError},&mut||{transfers+=1;Ok(())}).await;
+                    diagnostic_checkpoint(&observer,"g4-initial-original-delivery",json!({"body":diagnostic_reply(&body),"deliveryOk":delivered.is_ok(),"publicErrorTransfers":if body.is_err(){transfers}else{0},"protectedResultTransfers":if body.is_ok(){transfers}else{0},"release":released}));
+                    checks=Some((body.is_err(),delivered.is_ok(),transfers,released));
+                })).await;
+                frame.retire();
+            }).await;
+            (original, checks.unwrap())
+        }).await;
+        original.completed(&observer,0).await;
+        let frames=group4_frames(&observer,&original.capture);
+        let metadata=frames.iter().filter(|f|f.phase==Phase::Metadata&&f.outcome!=Outcome::Enter).collect::<Vec<_>>();
+        assert!(checks.0);assert!(checks.1);assert_eq!(checks.2,1);
+        assert_eq!(checks.3["releaseReason"],"requested");assert_eq!(checks.3["releaseSent"],true);assert_eq!(checks.3["watchdogJoined"],true);assert_eq!(checks.3["holderJoined"],true);
+        assert!(group4_has(&frames,Phase::Witness,Outcome::Ok));
+        assert_eq!(metadata.len(),1);assert_eq!(metadata[0].outcome,Outcome::Error);
+        assert!(!frames.iter().any(|f|matches!(f.phase,Phase::Source|Phase::Project|Phase::Branch|Phase::ReadAuthority|Phase::ProtectedResult)));
+        assert!(frames.iter().any(|f|f.phase==Phase::PublicError&&f.outcome==Outcome::Link));
+        assert!(group4_has(&frames,Phase::AcquireWait,Outcome::Ok));
+    }).await;
+}
+#[intent_test_macros::daemon_test]
+async fn companion_diagnostic_group4_acquisition_deadline() {
+    diagnostic_case("g4-acquisition-deadline", |observer| async move {
+        use companion_observation::{Outcome, Phase};
+        let (original,checks)=with_review_clock(async {
+            let original=Group4Original::new(&observer).await;
+            let mut provider=Group4ProviderRelease{control:original.fixture.server.control.clone(),observer:observer.clone(),signalled:false};
+            *provider.control.pause.lock().unwrap()=Some("/projects/".into());
+            let mut checks=None;
+            original.socket.entered(async {
+                let frame=original.socket.owner.capture_review(&Frame::Prepare(original.child.clone())).unwrap();
+                diagnostic_checkpoint(&observer,"g4-deadline-original-capture",json!({"capture":original.capture,"parent":original.parent.review.operation_id}));
+                frame.scope(Box::pin(async {
+                    let call=original.fixture.services.native_review_prepare(original.child.clone());tokio::pin!(call);
+                    let mut early=None;
+                    let held=tokio::select!{result=&mut call=>{early=Some(result);false},()=provider.control.entered.notified()=>true};
+                    diagnostic_checkpoint(&observer,"g4-original-project-hold",json!({"entered":held,"capture":original.capture,"earlyBody":early.as_ref().map(diagnostic_reply),"workers":original.connection.review.workers.available_permits()}));
+                    let before=Instant::now();
+                    if held{tokio::time::advance(ACQUIRE).await;}
+                    let advanced=before.elapsed();
+                    diagnostic_checkpoint(&observer,"g4-original-deadline-advanced",json!({"capture":original.capture,"advancedNanos":advanced.as_nanos().to_string(),"boundNanos":ACQUIRE.as_nanos().to_string(),"clock":"original fixed Tokio Instant; compare only this request stream"}));
+                    let body=if let Some(body)=early{body}else{call.await};
+                    diagnostic_checkpoint(&observer,"g4-deadline-original-body-before-release",json!({"body":diagnostic_reply(&body),"capture":original.capture,"providerReleased":provider.signalled,"workers":original.connection.review.workers.available_permits()}));
+                    let mut transfers=0;
+                    let delivered=frame.deliver(if body.is_ok(){RepositoryReadReplyKind::Result}else{RepositoryReadReplyKind::ServiceError},&mut||{transfers+=1;Ok(())}).await;
+                    diagnostic_checkpoint(&observer,"g4-deadline-original-delivery",json!({"body":diagnostic_reply(&body),"deliveryOk":delivered.is_ok(),"publicErrorTransfers":if body.is_err(){transfers}else{0},"protectedResultTransfers":if body.is_ok(){transfers}else{0}}));
+                    checks=Some((held,advanced,body.is_err(),delivered.is_ok(),transfers));
+                })).await;
+                frame.retire();
+                diagnostic_checkpoint(&observer,"g4-deadline-original-request-retired",json!({"capture":original.capture,"providerReleased":provider.signalled}));
+            }).await;
+            provider.release();
+            (original,checks.unwrap())
+        }).await;
+        original.completed(&observer,1).await;
+        let frames=group4_frames(&observer,&original.capture);
+        assert!(checks.0);assert_eq!(checks.1,ACQUIRE);assert!(checks.2);assert!(checks.3);assert_eq!(checks.4,1);
+        let wait=frames.iter().find(|f|f.phase==Phase::AcquireWait&&f.outcome==Outcome::Enter).unwrap();
+        let elapsed=frames.iter().find(|f|f.phase==Phase::AcquireWait&&f.outcome==Outcome::Error).unwrap();
+        assert_eq!(wait.domain,elapsed.domain);assert_eq!(wait.span,elapsed.span);
+        assert_eq!(u128::from(elapsed.elapsed_ns-wait.elapsed_ns),ACQUIRE.as_nanos());
+        assert!(group4_has(&frames,Phase::Project,Outcome::Ok));
+        assert!(group4_has(&frames,Phase::Branch,Outcome::Error));
+        assert!(!frames.iter().any(|f|matches!(f.phase,Phase::SourceDeadline|Phase::FrameDeadline|Phase::ProtectedResult)));
+        assert!(frames.iter().any(|f|f.phase==Phase::RequestFinish&&f.outcome==Outcome::Link));
+    }).await;
 }
 #[test]
 fn companion_diagnostic_group5_reader_bounds_privacy() {
