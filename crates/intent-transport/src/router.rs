@@ -4153,12 +4153,38 @@ async fn dispatch(
         }
         "script.list" => {
             let ws = require_ws_note(params)?;
-            api.script_list(ws).await.map_err(domain_to_rpc)
+            let archive = params
+                .get("archive")
+                .map(|value| {
+                    serde_json::from_value::<intent_core::ScriptArchiveFilter>(value.clone())
+                })
+                .transpose()
+                .map_err(|e| invalid_params(e.to_string()))?
+                .unwrap_or_default();
+            api.script_list_filtered(ws, archive)
+                .await
+                .map_err(domain_to_rpc)
         }
         "script.create" => {
             let ws = require_ws_note(params)?;
             let create = parse_script_create(params)?;
             api.script_create(ws, create).await.map_err(domain_to_rpc)
+        }
+        "script.archive" | "script.restore" => {
+            let ws = require_workspace_id(params)?;
+            let ids = params
+                .get("scriptIds")
+                .ok_or_else(|| invalid_params("scriptIds is required"))?;
+            let ids: Vec<String> =
+                serde_json::from_value(ids.clone()).map_err(|e| invalid_params(e.to_string()))?;
+            if ids.is_empty() || ids.len() > 1000 || ids.iter().any(|id| id.trim().is_empty()) {
+                return Err(invalid_params("scriptIds must contain 1–1000 nonempty IDs"));
+            }
+            if method == "script.archive" {
+                api.script_archive(ws, ids).await.map_err(domain_to_rpc)
+            } else {
+                api.script_restore(ws, ids).await.map_err(domain_to_rpc)
+            }
         }
         "script.remove" => {
             let ws = require_ws_note(params)?;
@@ -4865,6 +4891,11 @@ fn parse_script_create(params: &Map<String, Value>) -> Result<ScriptCreateParams
         }
     };
     Ok(ScriptCreateParams {
+        purpose: params
+            .get("purpose")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+            .map_err(|e| invalid_params(format!("Invalid purpose: {e}")))?,
         name,
         command,
         mode,

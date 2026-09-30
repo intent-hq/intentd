@@ -1959,3 +1959,80 @@ async fn member_pr_status_rejection_publishes_durable_safe_context() {
         .iter()
         .any(|e| e.id == batch[0].id && e.data == batch[0].data));
 }
+
+#[tokio::test]
+async fn script_archive_restore_enforce_workspace_scope_and_guest_authority() {
+    use intent_core::{ScriptCreateParams, ScriptMode};
+    let tmp = TempDb::new();
+    let (svc, _, member) = fixture(&tmp).await;
+    let a = WorkspaceId::new();
+    let b = WorkspaceId::new();
+    for ws in [&a, &b] {
+        svc.store.insert_workspace(&workspace(ws)).await.unwrap();
+    }
+    let def = with_caller(
+        Caller::Daemon,
+        svc.script_create(
+            a.clone(),
+            ScriptCreateParams {
+                name: "kept".into(),
+                command: "true".into(),
+                mode: ScriptMode::Command,
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    let id = def["id"].as_str().unwrap().to_owned();
+    with_caller(caller(&member), async {
+        assert_eq!(
+            svc.script_archive(b.clone(), vec![id.clone()])
+                .await
+                .unwrap(),
+            serde_json::json!({"archived":[],"skipped":[{"scriptId":id,"reason":"notFound"}]})
+        );
+        svc.script_archive(a.clone(), vec![id.clone()])
+            .await
+            .unwrap();
+        svc.script_restore(a.clone(), vec![id.clone()])
+            .await
+            .unwrap();
+    })
+    .await;
+    sqlx::query("DELETE FROM host_member WHERE principal_id=?")
+        .bind(member.as_str())
+        .execute(svc.store.write_pool())
+        .await
+        .unwrap();
+    let guest = Caller::Wire {
+        principal_id: member.clone(),
+        host_role: HostRole::Guest,
+    };
+    with_caller(guest.clone(), async {
+        assert!(matches!(
+            svc.script_archive(a.clone(), vec![id.clone()]).await,
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            svc.script_restore(a.clone(), vec![id.clone()]).await,
+            Err(Error::NotFound(_))
+        ));
+    })
+    .await;
+    svc.store
+        .add_workspace_member(&a, &member, WorkspaceRole::Collaborator)
+        .await
+        .unwrap();
+    with_caller(guest, async {
+        assert!(matches!(
+            svc.script_archive(a.clone(), vec![id.clone()]).await,
+            Err(Error::Forbidden(_))
+        ));
+        assert!(matches!(
+            svc.script_restore(a.clone(), vec![id.clone()]).await,
+            Err(Error::Forbidden(_))
+        ));
+    })
+    .await;
+}

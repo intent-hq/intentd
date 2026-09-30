@@ -6115,6 +6115,9 @@ async fn script_upsert_list_remove_round_trip() {
     let mut env = std::collections::BTreeMap::new();
     env.insert("PORT".to_string(), "3000".to_string());
     let script = intent_core::Script {
+        purpose: intent_core::ScriptPurpose::Saved,
+        archived_at: None,
+        last_run: None,
         id: "s-1".to_string(),
         workspace_id: "ws-1".to_string(),
         name: "dev server".to_string(),
@@ -6144,6 +6147,9 @@ async fn script_upsert_list_remove_round_trip() {
 
     // Sparse optionals persist as NULL and read back as None.
     let sparse = intent_core::Script {
+        purpose: intent_core::ScriptPurpose::Saved,
+        archived_at: None,
+        last_run: None,
         id: "s-2".to_string(),
         workspace_id: "ws-2".to_string(),
         name: "build".to_string(),
@@ -6185,6 +6191,9 @@ async fn script_bulk_upsert_round_trip_replace_and_chunking() {
     env.insert("PORT".to_string(), "3000".to_string());
     let scripts: Vec<intent_core::Script> = (0..2100)
         .map(|i| intent_core::Script {
+            purpose: intent_core::ScriptPurpose::Saved,
+            archived_at: None,
+            last_run: None,
             id: format!("s-{i}"),
             workspace_id: "ws-1".to_string(),
             name: format!("script {i}"),
@@ -6225,6 +6234,9 @@ async fn script_was_running_marker_set_clear_and_reset_semantics() {
     let store = Store::open(&tmp.path).await.expect("open store");
 
     let script = |ws: &str, id: &str| intent_core::Script {
+        purpose: intent_core::ScriptPurpose::Saved,
+        archived_at: None,
+        last_run: None,
         id: id.to_string(),
         workspace_id: ws.to_string(),
         name: "dev".to_string(),
@@ -10727,4 +10739,84 @@ async fn join_workspace_by_invite_concurrent_accepts_keep_the_shared_bearer() {
     let rows = store.list_principal_credentials(&person.id).await.unwrap();
     assert_eq!(rows.len(), 1);
     assert!(rows[0].is_active());
+}
+
+#[tokio::test]
+async fn script_lifecycle_legacy_defaults_and_durable_scope() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    sqlx::query("INSERT INTO script (id,workspace_id,name,command,mode,source,created_at) VALUES ('legacy','ws','Legacy','true','command','user','t0')")
+        .execute(store.write_pool()).await.unwrap();
+    let mut def = store.list_all_scripts().await.unwrap().remove(0);
+    assert_eq!(def.purpose, intent_core::ScriptPurpose::Saved);
+    assert!(def.archived_at.is_none() && def.last_run.is_none());
+    let ws = WorkspaceId::from("ws");
+    assert!(matches!(
+        store
+            .set_script_archived_at(&WorkspaceId::from("foreign"), "legacy", Some("t1"))
+            .await,
+        Err(intent_core::Error::NotFound(_))
+    ));
+    def.purpose = intent_core::ScriptPurpose::OneOff;
+    def.last_run = Some(intent_core::ScriptLastRun {
+        outcome: intent_core::ScriptRunOutcome::Failed,
+        exit_code: Some(2),
+        started_at: Some("t1".into()),
+        stopped_at: "t2".into(),
+        error: Some("failed".into()),
+    });
+    store.upsert_script(&def).await.unwrap();
+    store
+        .set_script_archived_at(&ws, "legacy", Some("t3"))
+        .await
+        .unwrap();
+    def.archived_at = Some("t3".into());
+    let reopened = Store::open(&tmp.path).await.unwrap();
+    assert_eq!(
+        reopened
+            .get_script_in_workspace(&ws, "legacy")
+            .await
+            .unwrap(),
+        Some(def.clone())
+    );
+    reopened
+        .set_script_archived_at(&ws, "legacy", None)
+        .await
+        .unwrap();
+    def.archived_at = None;
+    assert_eq!(
+        reopened
+            .get_script_in_workspace(&ws, "legacy")
+            .await
+            .unwrap(),
+        Some(def)
+    );
+}
+
+#[tokio::test]
+async fn script_lifecycle_migration_preserves_legacy_definitions() {
+    use sqlx::Row as _;
+    let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+    sqlx::raw_sql(include_str!("../migrations/0025_scripts.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!("../migrations/0079_script_was_running.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO script (id,workspace_id,name,command,mode,source,created_at,was_running) VALUES ('old','ws','Test','true','command','user','t0',1)").execute(&pool).await.unwrap();
+    sqlx::raw_sql(include_str!("../migrations/0139_script_lifecycle.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let row = sqlx::query("SELECT * FROM script WHERE id='old'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row.get::<String, _>("purpose"), "saved");
+    assert!(row.get::<Option<String>, _>("archived_at").is_none());
+    assert!(row.get::<Option<String>, _>("last_run").is_none());
+    assert_eq!(row.get::<i64, _>("was_running"), 1);
+    assert_eq!(row.get::<String, _>("command"), "true");
 }

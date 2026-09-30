@@ -39,7 +39,9 @@ fn run_timeout_ceiling_secs(budget: Duration) -> i64 {
 pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.script = {
-        list: () => host({ method: 'script.list' }),
+        list: (options) => host({ method: 'script.list', args: options || {} }),
+        archive: (scriptIds) => host({ method: 'script.archive', args: { scriptIds } }),
+        restore: (scriptIds) => host({ method: 'script.restore', args: { scriptIds } }),
         create: (name, command, mode, options) =>
             host({ method: 'script.create', args: { name, command, mode, ...(options || {}) } }),
         remove: (scriptId) => host({ method: 'script.remove', args: { scriptId } }),
@@ -64,7 +66,9 @@ pub(crate) async fn dispatch(
     args: &Value,
 ) -> Result<Value, String> {
     match method {
-        "list" => list(api, ws).await,
+        "list" => list(api, ws, args).await,
+        "archive" => archive(api, ws, args, true).await,
+        "restore" => archive(api, ws, args, false).await,
         "create" => create(api, ws, args).await,
         "remove" => remove(api, ws, args).await,
         "start" => start(api, ws, args).await,
@@ -77,7 +81,27 @@ pub(crate) async fn dispatch(
     }
 }
 
-async fn list(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value, String> {
+async fn archive(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    args: &Value,
+    archive: bool,
+) -> Result<Value, String> {
+    let ids: Vec<String> =
+        serde_json::from_value(args.get("scriptIds").cloned().unwrap_or(Value::Null))
+            .map_err(|e| format!("Invalid scriptIds: {e}"))?;
+    if archive {
+        api.script_archive(ws.clone(), ids).await.map_err(map_err)
+    } else {
+        api.script_restore(ws.clone(), ids).await.map_err(map_err)
+    }
+}
+
+async fn list(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    args: &Value,
+) -> Result<Value, String> {
     // The reference `ws.script.list()` (see `ws-script-api.ts`) returns a
     // bare array of scripts, but the production `WorkspaceApi::script_list`
     // (via `intent-services::ScriptManager::list`) wraps them as
@@ -85,7 +109,16 @@ async fn list(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value, St
     // JS callers get the documented shape; fall back to the raw value for
     // forward-compatibility with any daemon that already returns a bare
     // array.
-    let raw = api.script_list(ws.clone()).await.map_err(map_err)?;
+    let archive = args
+        .get("archive")
+        .map(|value| serde_json::from_value(value.clone()))
+        .transpose()
+        .map_err(|e| format!("Invalid archive: {e}"))?
+        .unwrap_or(intent_core::ScriptArchiveFilter::Active);
+    let raw = api
+        .script_list_filtered(ws.clone(), archive)
+        .await
+        .map_err(map_err)?;
     if let Some(inner) = raw.get("scripts") {
         return Ok(inner.clone());
     }
@@ -132,6 +165,11 @@ async fn create(
         }
     };
     let params = ScriptCreateParams {
+        purpose: args
+            .get("purpose")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+            .map_err(|e| format!("Invalid purpose: {e}"))?,
         name,
         command,
         mode,

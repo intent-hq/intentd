@@ -1,7 +1,8 @@
 //! Script-definition registry (`script.*`, PROTOCOL §5.8). Parity with the
 //! FE's `.workspace/scripts.json` persistence: definitions survive a daemon
-//! restart and are hydrated into the runtime registry on boot. Runtime state
-//! is transient and never persisted — except the `was_running` marker
+//! restart and are hydrated into the runtime registry on boot. Archive state
+//! and the compact latest result are durable; PTY runtime/output remain transient.
+//! Recovery uses the `was_running` marker
 //! (stored-on-write), which records that a service-mode script was running
 //! when the daemon died so hydration can surface `previouslyRunning`.
 
@@ -14,7 +15,7 @@ use sqlx::Row;
 use crate::{enum_from_db, enum_to_db, Store};
 
 const SCRIPT_COLUMNS: &str = "id, workspace_id, name, command, cwd, env, mode, category, \
-    source, auto_start, created_at, updated_at";
+    source, auto_start, created_at, updated_at, purpose, archived_at, last_run";
 
 impl Store {
     /// Resolve a script's durable scope without reading its command or environment.
@@ -57,7 +58,7 @@ impl Store {
 
     async fn upsert_script_with_scope(&self, s: &Script, scoped: bool) -> Result<()> {
         let sql = format!(
-            "INSERT OR REPLACE INTO script ({SCRIPT_COLUMNS}) SELECT ?,?,?,?,?,?,?,?,?,?,?,? \
+            "INSERT OR REPLACE INTO script ({SCRIPT_COLUMNS}) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,? \
              WHERE ? = 0 OR NOT EXISTS (SELECT 1 FROM script WHERE id = ? AND workspace_id != ?)"
         );
         let result = sqlx::query(&sql)
@@ -73,6 +74,15 @@ impl Store {
             .bind(s.auto_start.map(i64::from))
             .bind(&s.created_at)
             .bind(&s.updated_at)
+            .bind(enum_to_db(&s.purpose)?)
+            .bind(&s.archived_at)
+            .bind(
+                s.last_run
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|e| Error::Internal(format!("encode script result failed: {e}")))?,
+            )
             .bind(scoped)
             .bind(&s.id)
             .bind(&s.workspace_id)
@@ -127,7 +137,18 @@ impl Store {
                     .bind(&s.source)
                     .bind(s.auto_start.map(i64::from))
                     .bind(&s.created_at)
-                    .bind(&s.updated_at);
+                    .bind(&s.updated_at)
+                    .bind(enum_to_db(&s.purpose)?)
+                    .bind(&s.archived_at)
+                    .bind(
+                        s.last_run
+                            .as_ref()
+                            .map(serde_json::to_string)
+                            .transpose()
+                            .map_err(|e| {
+                                Error::Internal(format!("encode script result failed: {e}"))
+                            })?,
+                    );
             }
             query
                 .execute(&mut *tx)
@@ -187,7 +208,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_all_scripts(&self) -> Result<Vec<Script>> {
-        let sql = format!("SELECT {SCRIPT_COLUMNS} FROM script ORDER BY created_at");
+        let sql = format!("SELECT {SCRIPT_COLUMNS} FROM script ORDER BY created_at, id");
         let rows = sqlx::query(&sql)
             .fetch_all(self.read_pool())
             .await
@@ -212,6 +233,29 @@ impl Store {
             .await
             .map_err(|e| Error::Internal(format!("get script failed: {e}")))?;
         row.as_ref().map(map_script_row).transpose()
+    }
+
+    /// Commit archive state without replacing the definition, result or recovery marker.
+    /// # Errors
+    /// Returns a database error or `NotFound` for a foreign/missing definition.
+    pub async fn set_script_archived_at(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &str,
+        archived_at: Option<&str>,
+    ) -> Result<()> {
+        let result =
+            sqlx::query("UPDATE script SET archived_at = ? WHERE workspace_id = ? AND id = ?")
+                .bind(archived_at)
+                .bind(workspace_id.as_str())
+                .bind(id)
+                .execute(self.write_pool())
+                .await
+                .map_err(|e| Error::Internal(format!("archive script failed: {e}")))?;
+        if result.rows_affected() == 0 {
+            return Err(Error::NotFound(format!("script {id}")));
+        }
+        Ok(())
     }
 
     /// Set or clear the service was-running marker (stored-on-write): set on a
@@ -286,6 +330,12 @@ fn map_script_row(r: &SqliteRow) -> Result<Script> {
             .map_err(|e| Error::Internal(format!("column {name}: {e}")))
     };
     Ok(Script {
+        purpose: enum_from_db(&r.get::<String, _>("purpose"))?,
+        archived_at: col("archived_at")?,
+        last_run: col("last_run")?
+            .map(|value| serde_json::from_str(&value))
+            .transpose()
+            .map_err(|e| Error::Internal(format!("decode script result failed: {e}")))?,
         id: r.get("id"),
         workspace_id: r.get("workspace_id"),
         name: r.get("name"),

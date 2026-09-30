@@ -5107,6 +5107,49 @@ pub enum ScriptMode {
     Command,
 }
 
+/// Explicit retention choice; legacy definitions remain saved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ScriptPurpose {
+    #[default]
+    Saved,
+    OneOff,
+}
+
+/// Archive selection. Omitted wire filters preserve legacy lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScriptArchiveFilter {
+    Active,
+    Archived,
+    #[default]
+    All,
+}
+
+/// Latest settled command outcome, independent of transient runtime state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScriptRunOutcome {
+    Succeeded,
+    Failed,
+    Cancelled,
+    Interrupted,
+}
+
+/// Compact durable result; full PTY output remains transient.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScriptLastRun {
+    pub outcome: ScriptRunOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    pub stopped_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// Runtime status of a script process (ported from the TS `ScriptStatus`,
 /// plus `restarting` — new in intentd, monorepo#1318 — and `starting` —
 /// intent-hq/intent#4858). `restarting` covers the restart-in-flight window
@@ -5178,6 +5221,12 @@ impl Default for ScriptRuntimeState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Script {
+    #[serde(default)]
+    pub purpose: ScriptPurpose,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run: Option<ScriptLastRun>,
     pub id: String,
     pub workspace_id: String,
     pub name: String,
@@ -5201,6 +5250,7 @@ pub struct Script {
 /// request params. `workspaceId` is passed separately.
 #[derive(Debug, Clone, Default)]
 pub struct ScriptCreateParams {
+    pub purpose: Option<ScriptPurpose>,
     pub name: String,
     pub command: String,
     pub mode: ScriptMode,

@@ -20,6 +20,8 @@ mod imported_queue_authorization;
 mod integration_context;
 #[path = "wss_integration/resource_context.rs"]
 mod resource_context;
+#[path = "wss_integration/script_lifecycle.rs"]
+mod script_lifecycle;
 #[path = "wss_integration/sharing.rs"]
 mod sharing;
 #[path = "wss_integration/skills.rs"]

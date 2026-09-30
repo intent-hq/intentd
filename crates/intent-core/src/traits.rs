@@ -6667,6 +6667,56 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Select active, archived or all retained definitions, preserving the list envelope.
+    fn script_list_filtered(
+        &self,
+        workspace_id: WorkspaceId,
+        archive: crate::ScriptArchiveFilter,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let mut result = self.script_list(workspace_id).await?;
+            if let Some(scripts) = result
+                .get_mut("scripts")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                scripts.retain(|script| match archive {
+                    crate::ScriptArchiveFilter::All => true,
+                    crate::ScriptArchiveFilter::Active => script.get("archivedAt").is_none(),
+                    crate::ScriptArchiveFilter::Archived => script.get("archivedAt").is_some(),
+                });
+            }
+            Ok(result)
+        })
+    }
+
+    /// Archive an explicit workspace-scoped selection without stopping processes.
+    fn script_archive(
+        &self,
+        workspace_id: WorkspaceId,
+        script_ids: Vec<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, script_ids);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::script_archive not implemented".into(),
+            ))
+        })
+    }
+
+    /// Restore retained definitions without starting processes.
+    fn script_restore(
+        &self,
+        workspace_id: WorkspaceId,
+        script_ids: Vec<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, script_ids);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::script_restore not implemented".into(),
+            ))
+        })
+    }
+
     /// `script.create`: register a script definition; returns the created
     /// [`Script`](crate::model::Script) (PROTOCOL §5.8).
     fn script_create(
