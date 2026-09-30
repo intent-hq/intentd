@@ -144,3 +144,109 @@ async fn script_archive_restore_contract_over_wss() {
     assert_eq!(status["result"]["status"], "idle");
     srv.ws.stop().await;
 }
+
+#[intent_test_macros::daemon_test]
+async fn script_one_off_settlement_and_output_over_wss() {
+    let srv = start(WsOptions::default()).await;
+    let mut client = connect_ws(srv.port, srv.cfg.clone()).await;
+    let hello = rpc(
+        &mut client,
+        0,
+        "client.hello",
+        json!({"clientId":"script-lifecycle-e2e","clientType":"web"}),
+    )
+    .await;
+    assert_eq!(
+        hello["result"]["server"]["capabilities"]["scriptLifecycle"], 1,
+        "{hello}"
+    );
+    let created = rpc(
+        &mut client,
+        1,
+        "workspace.create",
+        json!({"title":"One-off results"}),
+    )
+    .await;
+    let ws = created["result"]["workspace"]["id"].as_str().unwrap();
+    let mut watching = connect_ws(srv.port, srv.cfg.clone()).await;
+    rpc(
+        &mut watching,
+        2,
+        "events.subscribe",
+        json!({"workspaceId":ws,"eventTypes":["script:state","script:changed","script:output"]}),
+    )
+    .await;
+    for (sid, command, outcome, code) in [
+        ("success", "printf retained", "succeeded", 0),
+        ("failure", "exit 9", "failed", 9),
+    ] {
+        let def = rpc(&mut client,3,"script.create",json!({"workspaceId":ws,"scriptId":sid,"name":"check","mode":"command","purpose":"oneOff","command":command})).await;
+        assert_eq!(def["result"]["purpose"], "oneOff");
+        let run = rpc(
+            &mut client,
+            4,
+            "script.run",
+            json!({"workspaceId":ws,"scriptId":sid,"timeoutSeconds":5}),
+        )
+        .await;
+        assert_eq!(run["result"]["exitCode"], code, "{run}");
+        assert_eq!(run["result"]["timedOut"], false);
+        let mut exited = false;
+        loop {
+            let event = frame(&mut watching).await;
+            let event = &event["params"]["event"];
+            if event["data"]["scriptId"] != sid {
+                continue;
+            }
+            if event["type"] == "script:state" && event["data"]["status"] == "exited" {
+                assert_eq!(event["data"]["exitCode"], code);
+                exited = true;
+            }
+            if event["type"] == "script:changed" && event["data"]["action"] == "updated" {
+                assert!(exited, "archive invalidation follows final state");
+                break;
+            }
+        }
+        let active = rpc(
+            &mut client,
+            5,
+            "script.list",
+            json!({"workspaceId":ws,"archive":"active"}),
+        )
+        .await;
+        assert_eq!(active["result"], json!({"scripts":[]}));
+        let all = rpc(&mut client, 6, "script.list", json!({"workspaceId":ws})).await;
+        let row = all["result"]["scripts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == sid)
+            .unwrap();
+        assert!(row["archivedAt"].is_string());
+        assert_eq!(row["lastRun"]["outcome"], outcome);
+        assert_eq!(row["lastRun"]["exitCode"], code);
+        assert!(row["lastRun"]["startedAt"].is_string() && row["lastRun"]["stoppedAt"].is_string());
+        assert_eq!(
+            rpc(
+                &mut client,
+                7,
+                "script.status",
+                json!({"workspaceId":ws,"scriptId":sid})
+            )
+            .await["result"]["status"],
+            "exited"
+        );
+        let output = rpc(
+            &mut client,
+            8,
+            "script.output",
+            json!({"workspaceId":ws,"scriptId":sid}),
+        )
+        .await;
+        assert!(output["result"].is_string());
+        if code == 0 {
+            assert!(output["result"].as_str().unwrap().contains("retained"));
+        }
+    }
+    srv.ws.stop().await;
+}

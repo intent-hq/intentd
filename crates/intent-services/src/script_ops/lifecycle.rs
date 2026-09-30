@@ -33,9 +33,14 @@ impl ScriptManager {
             .get(&(ws.clone(), id.to_owned()))
             .is_some_and(|m| m.def.mode == ScriptMode::Command);
         if command {
-            self.store
-                .set_script_was_running(ws.as_str(), id, true)
-                .await?;
+            let token = uuid::Uuid::new_v4().to_string();
+            self.store.admit_script_run(ws, id, &token).await?;
+            self.scripts
+                .lock()
+                .unwrap()
+                .get_mut(&(ws.clone(), id.to_owned()))
+                .unwrap()
+                .run_id = Some(token);
         }
         Ok(())
     }

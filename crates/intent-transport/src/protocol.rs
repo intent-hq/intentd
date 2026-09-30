@@ -692,9 +692,9 @@
 //!
 //! Version 10.11 adds script purpose and durable, workspace-scoped
 //! `script.archive` / `script.restore`, plus the `script.list` archive filter.
-//! An omitted filter preserves the legacy all-definitions list. Full automatic
-//! retirement and recovery require the separate `scriptLifecycle` capability;
-//! this additive storage surface does not advertise that capability.
+//! An omitted filter preserves the legacy all-definitions list. The
+//! `scriptLifecycle: 1` capability includes atomic command results, one-off
+//! retirement for every settled outcome, and durable admission recovery.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};

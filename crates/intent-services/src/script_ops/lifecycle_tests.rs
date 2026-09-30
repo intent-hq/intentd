@@ -51,7 +51,7 @@ async fn archive_round_trip_preserves_output_scope_and_hydrates() {
         .unwrap();
     assert_eq!(history["scripts"].as_array().unwrap().len(), 1);
     assert_eq!(history["scripts"][0]["purpose"], "saved");
-    assert!(history["scripts"][0].get("lastRun").is_none());
+    assert_eq!(history["scripts"][0]["lastRun"]["outcome"], "succeeded");
     h.services
         .script_archive(h.ws.clone(), vec![id.clone()])
         .await
@@ -438,7 +438,7 @@ async fn archive_cannot_hide_run_reservation_and_run_restores_history() {
 #[intent_test_macros::daemon_test]
 async fn archive_run_cancelled_after_restore_commit_keeps_registry_consistent() {
     let h = harness().await;
-    let id = create_simple(&h, "cancel restore", "cat", ScriptMode::Command).await;
+    let id = one_off(&h, "cat").await;
     h.services
         .script_archive(h.ws.clone(), vec![id.clone()])
         .await
@@ -495,6 +495,11 @@ async fn archive_run_cancelled_after_restore_commit_keeps_registry_consistent() 
     );
     assert_eq!(entry.state.status, ScriptStatus::Idle);
     assert!(entry.run_reserved.is_none());
+    assert!(
+        entry.run_id.is_none(),
+        "cancelled pre-spawn waiter cannot leave a run for a later stop to settle"
+    );
+    assert!(entry.def.last_run.is_none());
     assert_eq!(mgr.pty.count(), 0, "cancelled admission spawned nothing");
 }
 
@@ -545,4 +550,69 @@ async fn archive_empty_active_view_never_rebootstraps_repository_scripts() {
     assert_eq!(history["scripts"].as_array().unwrap().len(), 1);
     assert_eq!(history["scripts"][0]["id"], id);
     assert_eq!(h.services.store.list_all_scripts().await.unwrap().len(), 1);
+}
+
+#[intent_test_macros::daemon_test]
+async fn retirement_run_records_success_failure_and_saved_summary() {
+    for (purpose, command, outcome, code) in [
+        (
+            intent_core::ScriptPurpose::OneOff,
+            "printf retained",
+            "succeeded",
+            0,
+        ),
+        (intent_core::ScriptPurpose::OneOff, "exit 7", "failed", 7),
+        (intent_core::ScriptPurpose::Saved, "true", "succeeded", 0),
+    ] {
+        let h = harness().await;
+        let id = create(
+            &h,
+            ScriptCreateParams {
+                name: "retirement".into(),
+                command: command.into(),
+                mode: ScriptMode::Command,
+                purpose: Some(purpose),
+                ..Default::default()
+            },
+        )
+        .await;
+        let result = h
+            .services
+            .script_run(h.ws.clone(), id.clone(), None, Some(5))
+            .await
+            .unwrap();
+        assert_eq!(result["exitCode"], code);
+        let def = h
+            .services
+            .store
+            .get_script_in_workspace(&h.ws, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&def).unwrap()["lastRun"]["outcome"],
+            outcome
+        );
+        assert_eq!(
+            def.archived_at.is_some(),
+            purpose == intent_core::ScriptPurpose::OneOff
+        );
+        assert_eq!(
+            h.services
+                .script_status(h.ws.clone(), id.clone())
+                .await
+                .unwrap()["status"],
+            "exited"
+        );
+        if code == 0 && purpose == intent_core::ScriptPurpose::OneOff {
+            assert!(h
+                .services
+                .script_output(h.ws.clone(), id, None, None, None)
+                .await
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .contains("retained"));
+        }
+    }
 }

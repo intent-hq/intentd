@@ -10820,3 +10820,41 @@ async fn script_lifecycle_migration_preserves_legacy_definitions() {
     assert_eq!(row.get::<i64, _>("was_running"), 1);
     assert_eq!(row.get::<String, _>("command"), "true");
 }
+
+#[tokio::test]
+async fn script_lifecycle_run_identity_migration_marks_only_unfinished_commands() {
+    use sqlx::Row as _;
+    let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+    for migration in [
+        include_str!("../migrations/0025_scripts.sql"),
+        include_str!("../migrations/0079_script_was_running.sql"),
+        include_str!("../migrations/0139_script_lifecycle.sql"),
+    ] {
+        sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+    }
+    for (id, mode, running) in [
+        ("live-command", "command", 1),
+        ("idle-command", "command", 0),
+        ("live-service", "service", 1),
+    ] {
+        sqlx::query("INSERT INTO script (id,workspace_id,name,command,mode,source,created_at,was_running) VALUES (?, 'ws', 'legacy', 'true', ?, 'user', 't0', ?)").bind(id).bind(mode).bind(running).execute(&pool).await.unwrap();
+    }
+    sqlx::raw_sql(include_str!("../migrations/0140_script_run_identity.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    for row in sqlx::query("SELECT * FROM script")
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+    {
+        let id: String = row.get("id");
+        assert_eq!(
+            row.get::<Option<String>, _>("pending_run_id").is_some(),
+            id == "live-command"
+        );
+        assert!(row.get::<Option<String>, _>("pending_started_at").is_none());
+        assert!(row.get::<Option<String>, _>("last_run").is_none());
+        assert_eq!(row.get::<String, _>("purpose"), "saved");
+    }
+}
