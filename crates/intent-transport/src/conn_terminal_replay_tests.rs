@@ -63,7 +63,7 @@ async fn congested_terminal_forwarder_preserves_cursor_ranges_and_exit_order() {
         }
         frames
     };
-    let (_, frames) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let ((), frames) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         tokio::join!(forwarder, reader)
     })
     .await
