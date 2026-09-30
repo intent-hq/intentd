@@ -92,15 +92,11 @@ use crate::workspace_status::MonitorPrSignals;
 use crate::{publish_event, system_actor, Services};
 
 use intent_core::config::{
-    MAX_PR_CACHE_MAX_AGE_SECONDS, MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET,
+    MAX_PR_CACHE_MAX_AGE_SECONDS, MAX_PR_MONITORS_PER_AGENT, MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET,
     MAX_PR_MONITOR_QUOTA_SHARE_PERCENT, MIN_PR_CACHE_MAX_AGE_SECONDS,
     MIN_PR_MONITOR_DEBOUNCE_SECONDS, MIN_PR_MONITOR_HOURLY_REQUEST_BUDGET,
     MIN_PR_MONITOR_POLL_SECONDS, MIN_PR_MONITOR_QUOTA_SHARE_PERCENT,
 };
-
-/// Cap on concurrently ACTIVE monitors per agent (mirrors the background-hook
-/// `maxPerAgent` convention).
-pub(crate) const DEFAULT_PR_MONITORS_MAX_PER_AGENT: u32 = 5;
 
 /// Forge REST calls one distinct-PR poll is COSTED at on the steady-state
 /// GitHub path: the PR read, the reviews list, and the conversation-comment
@@ -1926,6 +1922,14 @@ impl Services {
         Duration::from_secs(secs)
     }
 
+    /// Active monitors allowed per owner. Read live on registration/adoption;
+    /// existing watches and same-owner refreshes survive a lowered limit.
+    fn pr_monitor_max_per_agent(&self) -> u32 {
+        self.pr_monitors_max_per_agent
+            .unwrap_or_else(|| self.effective_settings().pr_monitor.max_per_agent)
+            .clamp(1, MAX_PR_MONITORS_PER_AGENT)
+    }
+
     /// The tick cadence of the centralized monitor loop and the per-PR poll
     /// interval floor (`prMonitor.pollSeconds`), clamped to
     /// [`MIN_PR_MONITOR_POLL_SECONDS`]. Read live from the settings registry
@@ -2164,6 +2168,8 @@ impl Services {
         repo_name: &str,
         pr_number: u64,
     ) -> Result<PrMonitorRegistration> {
+        let registration = self.pr_monitor_registration.enter(agent_id.clone());
+        let _admission = registration.acquire().await;
         let _mutation = self.workspace_mutations.enter(workspace_id)?;
         let existing = self
             .store
@@ -2189,7 +2195,7 @@ impl Services {
                 }
                 None => {}
             }
-            let cap = self.pr_monitors_max_per_agent as usize;
+            let cap = self.pr_monitor_max_per_agent() as usize;
             let active = self
                 .store
                 .list_pr_monitors_by_agent(agent_id)
@@ -2199,7 +2205,7 @@ impl Services {
                 .count();
             if active >= cap {
                 return Err(Error::InvalidParams(format!(
-                    "pr.monitor: agent already monitors {active} PRs (max {cap})"
+                    "pr.monitor: agent already monitors {active} PRs (max {cap}); configure prMonitor.maxPerAgent (1–100) for a larger inventory"
                 )));
             }
         }
@@ -4314,6 +4320,7 @@ impl Services {
 
 #[cfg(test)]
 mod tests {
+    mod quota_regression;
     mod qwen_regression;
     use std::path::PathBuf;
 

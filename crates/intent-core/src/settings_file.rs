@@ -38,19 +38,20 @@ use crate::config::{
     ACP_NODE_MAX_OLD_SPACE_MB_MAX, ACP_NODE_MAX_OLD_SPACE_MB_MIN,
     DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS, DEFAULT_HOOKS_MAX_PER_AGENT,
     DEFAULT_IDLE_REAP_MINUTES, DEFAULT_MAX_CONCURRENT_ADAPTERS, DEFAULT_MAX_TOP_LEVEL_AGENTS,
-    DEFAULT_PR_CACHE_MAX_AGE_SECONDS, DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS,
-    DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET, DEFAULT_PR_MONITOR_POLL_SECONDS,
-    DEFAULT_PR_MONITOR_QUOTA_SHARE_PERCENT, DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS,
-    DEFAULT_SERVER_MAX_OUTSTANDING_RPCS, DEFAULT_SHARING_MAX_CONNECTIONS_PER_GUEST,
-    DEFAULT_SHARING_MAX_GUESTS_PER_WORKSPACE, DEFAULT_SHARING_MAX_GUEST_CONNECTIONS,
-    DEFAULT_STREAM_RETENTION_HOURS, DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS,
-    DEFAULT_UPDATES_CHECK_ON_IDLE, DEFAULT_UPDATES_IDLE_CHECK_INTERVAL_MINUTES,
-    DEFAULT_UPDATES_IDLE_GRACE_SECONDS, DEFAULT_WAKE_RESUME_ENABLED,
-    DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS, DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS,
-    DEFAULT_WORKSPACE_API_TOON_OUTPUT, HISTORY_REPLAY_TOOL_CONTENT_CHARS_MAX,
-    HISTORY_REPLAY_TOOL_CONTENT_CHARS_MIN, MAX_CONCURRENT_ADAPTERS_LIMIT,
-    MAX_SHARING_MAX_GUESTS_PER_WORKSPACE, MIN_UPDATES_IDLE_CHECK_INTERVAL_MINUTES,
-    MIN_UPDATES_IDLE_GRACE_SECONDS, TOOL_PAYLOAD_RETENTION_DAYS_MAX,
+    DEFAULT_PR_CACHE_MAX_AGE_SECONDS, DEFAULT_PR_MONITORS_MAX_PER_AGENT,
+    DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS, DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET,
+    DEFAULT_PR_MONITOR_POLL_SECONDS, DEFAULT_PR_MONITOR_QUOTA_SHARE_PERCENT,
+    DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS, DEFAULT_SERVER_MAX_OUTSTANDING_RPCS,
+    DEFAULT_SHARING_MAX_CONNECTIONS_PER_GUEST, DEFAULT_SHARING_MAX_GUESTS_PER_WORKSPACE,
+    DEFAULT_SHARING_MAX_GUEST_CONNECTIONS, DEFAULT_STREAM_RETENTION_HOURS,
+    DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS, DEFAULT_UPDATES_CHECK_ON_IDLE,
+    DEFAULT_UPDATES_IDLE_CHECK_INTERVAL_MINUTES, DEFAULT_UPDATES_IDLE_GRACE_SECONDS,
+    DEFAULT_WAKE_RESUME_ENABLED, DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS,
+    DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS, DEFAULT_WORKSPACE_API_TOON_OUTPUT,
+    HISTORY_REPLAY_TOOL_CONTENT_CHARS_MAX, HISTORY_REPLAY_TOOL_CONTENT_CHARS_MIN,
+    MAX_CONCURRENT_ADAPTERS_LIMIT, MAX_SHARING_MAX_GUESTS_PER_WORKSPACE,
+    MIN_UPDATES_IDLE_CHECK_INTERVAL_MINUTES, MIN_UPDATES_IDLE_GRACE_SECONDS,
+    TOOL_PAYLOAD_RETENTION_DAYS_MAX,
 };
 use crate::error::{Error, Result};
 
@@ -1104,6 +1105,10 @@ impl Default for WakeResumeSettings {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct PrMonitorSettings {
+    /// `prMonitor.maxPerAgent` — active monitors per owner, across repositories
+    /// and workspaces. Read live on registration/adoption; lowering the limit
+    /// preserves existing monitors. Supported range 1–100, clamped at read time.
+    pub max_per_agent: u32,
     /// `prMonitor.debounceSeconds` — quiet window a changed PR must observe
     /// before its consolidated wake is delivered.
     pub debounce_seconds: u64,
@@ -1130,6 +1135,7 @@ pub struct PrMonitorSettings {
 impl Default for PrMonitorSettings {
     fn default() -> Self {
         Self {
+            max_per_agent: DEFAULT_PR_MONITORS_MAX_PER_AGENT,
             debounce_seconds: DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS,
             poll_seconds: DEFAULT_PR_MONITOR_POLL_SECONDS,
             hourly_request_budget: DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET,
@@ -2023,6 +2029,10 @@ enabled = true
 thresholdSeconds = 10
 
 [prMonitor]
+# Active PR monitors per agent across repositories (minimum 1, maximum 100).
+# Raise for review orchestrators; shared polling slows as inventory grows.
+# Lowering the limit preserves existing monitors; applies without restart.
+maxPerAgent = 5
 # PR monitor debounce seconds -- quiet window (in seconds) a changed PR must
 # observe before its consolidated wake is delivered (minimum 10).
 debounceSeconds = 60
@@ -2217,6 +2227,10 @@ mod tests {
         assert!(parsed.agent_features.attention_requests);
         assert!(parsed.agent_features.state_snapshot);
         assert!(parsed.agent_features.pr_monitor);
+        assert_eq!(
+            parsed.pr_monitor.max_per_agent,
+            DEFAULT_PR_MONITORS_MAX_PER_AGENT
+        );
         assert!(parsed.agent_features.task_graph);
         assert!(parsed.agent_features.peer_agents);
     }
@@ -2966,6 +2980,10 @@ mod tests {
         // and `agentFeatures.prMonitor` defaults on.
         let parsed = SettingsFile::parse_str("").expect("empty file parses");
         assert!(parsed.agent_features.pr_monitor);
+        assert_eq!(
+            parsed.pr_monitor.max_per_agent,
+            DEFAULT_PR_MONITORS_MAX_PER_AGENT
+        );
         assert_eq!(
             parsed.pr_monitor.debounce_seconds,
             DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS
