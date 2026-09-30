@@ -2628,3 +2628,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "conn_terminal_replay_tests.rs"]
+mod terminal_replay_tests;
