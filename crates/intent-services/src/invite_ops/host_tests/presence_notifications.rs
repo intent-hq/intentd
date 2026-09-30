@@ -1,6 +1,6 @@
 use super::*;
 use crate::events::{EventBus, Subscription, SubscriptionFilter};
-use intent_core::events::{PRESENCE_CHANGED, WORKSPACE_UPDATED};
+use intent_core::events::{NOTE_PRESENCE, PRESENCE_CHANGED, WORKSPACE_UPDATED};
 
 /// The marker shares the subscription's FIFO with presence. Once observed,
 /// absence assertions cover every emission completed by the preceding action.
@@ -49,6 +49,23 @@ async fn membership_addition_presence(cached: bool, online: bool, self_removal: 
     )
     .await
     .unwrap();
+    let note = intent_core::NoteId::from("spec");
+    if cached && !online {
+        // A non-hello note lease keeps the profile cached without making
+        // its principal online, including after the hello connection closes.
+        let viewers = with_caller(
+            wire(&person),
+            f.services.note_presence_join_op(
+                "cached-note".into(),
+                "cache-lease".into(),
+                f.ws.clone(),
+                note.clone(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(viewers["viewers"][0]["principalId"], person.0);
+    }
     if cached {
         with_caller(
             wire(&person),
@@ -77,12 +94,53 @@ async fn membership_addition_presence(cached: bool, online: bool, self_removal: 
     let retained = f.store.list_workspace_members(&f.ws).await.unwrap();
     let count = f.services.member_count(&f.ws).await.unwrap();
     let mut events = bus.subscribe(SubscriptionFilter {
-        event_types: vec![PRESENCE_CHANGED.into(), WORKSPACE_UPDATED.into()],
+        event_types: vec![
+            PRESENCE_CHANGED.into(),
+            WORKSPACE_UPDATED.into(),
+            NOTE_PRESENCE.into(),
+        ],
         batch_window: None,
         ..Default::default()
     });
 
     let link = create(&f, "guest").await;
+    if cached && !online {
+        with_caller(
+            wire(&person),
+            f.services.note_presence_update_op(
+                "cached-note",
+                f.ws.clone(),
+                note,
+                &json!({"rev":1,"anchor":0,"head":0}),
+            ),
+        )
+        .await
+        .unwrap();
+        let proof = through_marker(&bus, &mut events, &f.ws).await;
+        let update = proof
+            .iter()
+            .find(|event| event.event_type == NOTE_PRESENCE && event.data["kind"] == "updated")
+            .expect("live note lease publishes its cached profile before acceptance");
+        assert_eq!(update.data["viewer"]["principalId"], person.0);
+        assert_eq!(update.data["viewer"]["login"], "guest");
+        assert_eq!(update.data["viewer"]["hostRole"], "guest");
+    }
+    let immediately_before = with_caller(
+        wire(&f.collaborator),
+        f.services.presence_snapshot_op(f.ws.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(immediately_before, before_presence);
+    assert_eq!(
+        immediately_before["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["principalId"] == person.0),
+        online,
+        "retaining a note lease must not mark its principal online"
+    );
     let joined = f
         .services
         .invite_accept_op(
@@ -179,6 +237,16 @@ async fn membership_addition_presence(cached: bool, online: bool, self_removal: 
         revision
     );
 
+    if cached && !online {
+        f.services
+            .note_presence_leave_op("cached-note", "cache-lease");
+        let left = through_marker(&bus, &mut events, &f.ws).await;
+        assert!(left.iter().any(|event| {
+            event.event_type == NOTE_PRESENCE
+                && event.data["kind"] == "left"
+                && event.data["viewer"]["principalId"] == person.0
+        }));
+    }
     if self_removal {
         with_caller(
             Caller::Wire {

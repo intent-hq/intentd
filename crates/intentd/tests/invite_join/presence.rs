@@ -119,11 +119,25 @@ async fn offline_addition_notifies_guest(cached: bool) {
     let mut subscriber = connect_ws(host.port, host.cfg.clone(), &remaining_token).await;
     result(
         &wss_rpc(&mut subscriber, 884, "events.subscribe", json!({
-            "eventTypes":["presence:changed","workspace:updated","host:members-changed","host:invites-changed"]
+            "eventTypes":["presence:changed","note:presence","workspace:updated","host:members-changed","host:invites-changed"]
         })).await,
         884,
     );
-    if cached {
+    let mut cached_lease = if cached {
+        // This separate connection never says hello: the authorized note
+        // lease retains its profile while the workspace roster stays offline.
+        let mut lease = connect_ws(host.port, host.cfg.clone(), &token).await;
+        let subscribed = result(
+            &wss_rpc(
+                &mut lease,
+                896,
+                "note.presence.subscribe",
+                json!({"workspaceId":workspace,"noteId":"spec"}),
+            )
+            .await,
+            896,
+        );
+        let subscription = subscribed["subscriptionId"].as_str().unwrap().to_owned();
         let mut promoted = connect_ws(host.port, host.cfg.clone(), &token).await;
         result(
             &wss_rpc(
@@ -152,7 +166,10 @@ async fn offline_addition_notifies_guest(cached: bool) {
         })
         .await
         .expect("promoted guest is now offline");
-    }
+        Some((lease, subscription))
+    } else {
+        None
+    };
     events_through_marker(&mut owner, &mut subscriber, &workspace, "Ready").await;
     let before = result(
         &wss_rpc(
@@ -203,6 +220,41 @@ async fn offline_addition_notifies_guest(cached: bool) {
     );
     let link = host_invite(&mut owner, "github").await;
     let mut join = connect_invite(host.port, host.cfg.clone()).await;
+    if let Some((lease, _)) = &mut cached_lease {
+        result(
+            &wss_rpc(
+                lease,
+                897,
+                "note.presence.update",
+                json!({"workspaceId":workspace,"noteId":"spec","rev":1,"anchor":0,"head":0}),
+            )
+            .await,
+            897,
+        );
+        let proof = events_through_marker(&mut owner, &mut subscriber, &workspace, "Cached").await;
+        assert_scoped(&proof, &workspace);
+        let update = proof
+            .iter()
+            .find(|event| event["type"] == "note:presence" && event["data"]["kind"] == "updated")
+            .expect("live note lease publishes its cached profile before acceptance");
+        assert_eq!(update["data"]["viewer"]["principalId"], person.id.0);
+        assert_eq!(update["data"]["viewer"]["login"], "gh-guest");
+        assert_eq!(update["data"]["viewer"]["hostRole"], "guest");
+    }
+    assert_eq!(
+        result(
+            &wss_rpc(
+                &mut guest_rpc,
+                898,
+                "presence.snapshot",
+                json!({"workspaceId":workspace}),
+            )
+            .await,
+            898,
+        ),
+        before,
+        "the retained note lease must not make the promoted guest online"
+    );
     let joined = result(
         &admitted_rpc(&mut join, 888, "invite.accept", json!({
             "inviteId":link["invite"]["id"],"secret":link["secret"],"scope":"host","credential":token
@@ -290,6 +342,27 @@ async fn offline_addition_notifies_guest(cached: bool) {
     assert_scoped(&noop, &workspace);
     assert!(noop.iter().all(|event| event["type"] != "presence:changed"));
 
+    if let Some((mut lease, subscription)) = cached_lease {
+        result(
+            &wss_rpc(
+                &mut lease,
+                899,
+                "note.presence.unsubscribe",
+                json!({"subscriptionId":subscription}),
+            )
+            .await,
+            899,
+        );
+        let left =
+            events_through_marker(&mut owner, &mut subscriber, &workspace, "Lease released").await;
+        assert_scoped(&left, &workspace);
+        assert!(left.iter().any(|event| {
+            event["type"] == "note:presence"
+                && event["data"]["kind"] == "left"
+                && event["data"]["viewer"]["principalId"] == person.id.0
+        }));
+        lease.close(None).await.unwrap();
+    }
     result(
         &wss_rpc(
             &mut owner,
