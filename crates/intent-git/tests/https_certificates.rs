@@ -2,7 +2,7 @@
 //!
 //! Linux's bundled libgit2 uses OpenSSL; also check the actual backend so a
 //! system library cannot silently substitute a different trust mechanism.
-//! Apple Secure Transport and Windows WinHTTP need separate trust fixtures.
+//! Apple Secure Transport and Windows `WinHTTP` need separate trust fixtures.
 //! Each connection runs in a child before libgit2 initializes its global trust
 //! store. Neither the parent environment nor host trust/config is changed.
 
