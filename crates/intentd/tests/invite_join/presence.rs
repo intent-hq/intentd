@@ -237,9 +237,9 @@ async fn offline_addition_notifies_guest(cached: bool) {
             .iter()
             .find(|event| event["type"] == "note:presence" && event["data"]["kind"] == "updated")
             .expect("live note lease publishes its cached profile before acceptance");
-        assert_eq!(update["data"]["viewer"]["principalId"], person.id.0);
-        assert_eq!(update["data"]["viewer"]["login"], "gh-guest");
-        assert_eq!(update["data"]["viewer"]["hostRole"], "guest");
+        assert_eq!(update["data"]["principalId"], person.id.0);
+        assert_eq!(update["data"]["login"], "gh-guest");
+        assert_eq!(update["data"]["hostRole"], "guest");
     }
     assert_eq!(
         result(
@@ -359,7 +359,7 @@ async fn offline_addition_notifies_guest(cached: bool) {
         assert!(left.iter().any(|event| {
             event["type"] == "note:presence"
                 && event["data"]["kind"] == "left"
-                && event["data"]["viewer"]["principalId"] == person.id.0
+                && event["data"]["principalId"] == person.id.0
         }));
         lease.close(None).await.unwrap();
     }

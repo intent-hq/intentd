@@ -121,9 +121,9 @@ async fn membership_addition_presence(cached: bool, online: bool, self_removal: 
             .iter()
             .find(|event| event.event_type == NOTE_PRESENCE && event.data["kind"] == "updated")
             .expect("live note lease publishes its cached profile before acceptance");
-        assert_eq!(update.data["viewer"]["principalId"], person.0);
-        assert_eq!(update.data["viewer"]["login"], "guest");
-        assert_eq!(update.data["viewer"]["hostRole"], "guest");
+        assert_eq!(update.data["principalId"], person.0);
+        assert_eq!(update.data["login"], "guest");
+        assert_eq!(update.data["hostRole"], "guest");
     }
     let immediately_before = with_caller(
         wire(&f.collaborator),
@@ -244,7 +244,7 @@ async fn membership_addition_presence(cached: bool, online: bool, self_removal: 
         assert!(left.iter().any(|event| {
             event.event_type == NOTE_PRESENCE
                 && event.data["kind"] == "left"
-                && event.data["viewer"]["principalId"] == person.0
+                && event.data["principalId"] == person.0
         }));
     }
     if self_removal {
