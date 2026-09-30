@@ -38,7 +38,7 @@ use crate::repository_context_reader::{
 };
 use crate::settings_registry::SettingsSnapshot;
 use crate::source_control_auth_ops::repository_owner::{
-    RepositoryAttachmentState, RepositoryConnectionFacts,
+    RepositoryAttachmentState, RepositoryConnectionFacts, RepositoryDescriptorState,
 };
 use crate::{Services, SettingsRegistry};
 
@@ -1135,6 +1135,35 @@ impl Drop for JobGuard {
 struct Locks {
     _release: oneshot::Sender<()>,
 }
+fn project_target_context(
+    target: &intent_core::RepositoryTarget,
+    facts: Option<&RepositoryConnectionFacts>,
+    administrator_projection: bool,
+    member_projection: bool,
+) -> intent_core::RepositoryTargetContext {
+    if administrator_projection {
+        return target_context(target, facts);
+    }
+    let mut context = target_context(target, None);
+    // An original host Member may observe this exact settled connection without
+    // its administrator identities. This is neither provider reachability nor
+    // permission, capability, execution admission, or a reservation. Capabilities
+    // stay Unknown; the original lease and consuming transfer still compare P/R.
+    if member_projection
+        && target.provider == intent_core::RepositoryProvider::Gitlab
+        && facts.is_some_and(|facts| {
+            facts.attachment() == RepositoryAttachmentState::Paired
+                && facts.approval() == RepositoryDescriptorState::Approved
+                && facts.settled().is_some_and(|settled| {
+                    settled.descriptor().instance().as_str() == target.instance_base_url
+                })
+        })
+    {
+        context.availability = intent_core::RepositoryAvailability::Connected;
+    }
+    context
+}
+
 async fn observe_locked(
     request: Arc<Request>,
     lease: Arc<Lease>,
@@ -1181,6 +1210,13 @@ async fn observe_locked(
                             let saved = selection.saved()?;
                             let facts = lease.provider.clone();
                             let administrator_projection = lease.administrator_projection;
+                            let member_projection = matches!(
+                                c.caller.caller(),
+                                Caller::Wire {
+                                    host_role: intent_core::HostRole::Member,
+                                    ..
+                                }
+                            );
                             let resolve = resolver(facts.as_deref())?;
                             #[cfg(test)]
                             let probe = c.git_probe.lock().unwrap().clone();
@@ -1197,13 +1233,11 @@ async fn observe_locked(
                                     &resolve,
                                     &GitConfigEnvironment::default(),
                                     |target| {
-                                        target_context(
+                                        project_target_context(
                                             target,
-                                            if administrator_projection {
-                                                facts.as_deref()
-                                            } else {
-                                                None
-                                            },
+                                            facts.as_deref(),
+                                            administrator_projection,
+                                            member_projection,
                                         )
                                     },
                                 )

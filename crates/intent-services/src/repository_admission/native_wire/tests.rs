@@ -2069,10 +2069,6 @@ fn assert_target_redaction(context: &RepositoryContext) {
     for target in context.roots.iter().flat_map(|r| &r.targets) {
         assert!(target.connection.is_none());
         assert!(target.provider_project_id.is_none());
-        assert_eq!(
-            target.availability,
-            intent_core::RepositoryAvailability::Unknown
-        );
         assert!(target
             .capabilities
             .iter()
@@ -2093,6 +2089,22 @@ fn assert_target_redaction(context: &RepositoryContext) {
         serde_json::from_str::<RepositoryContext>(&encoded).unwrap(),
         *context
     );
+}
+
+fn assert_target_availability(context: &RepositoryContext, connected_instance: Option<&str>) {
+    for target in context.roots.iter().flat_map(|r| &r.targets) {
+        let qualified = target.target.provider == intent_core::RepositoryProvider::Gitlab
+            && connected_instance == Some(target.target.instance_base_url.as_str());
+        assert_eq!(
+            target.availability,
+            if qualified {
+                intent_core::RepositoryAvailability::Connected
+            } else {
+                intent_core::RepositoryAvailability::Unknown
+            },
+            "original role/facts determine availability, independently of redaction"
+        );
+    }
 }
 
 #[intent_test_macros::daemon_test]
@@ -2157,6 +2169,14 @@ async fn native_wire_member_qualification_projection() {
             ));
         if label != "owner" {
             assert_target_redaction(&value);
+            assert_target_availability(
+                &value,
+                if label == "member" {
+                    Some(fixture.server.descriptor.instance().as_str())
+                } else {
+                    None
+                },
+            );
         }
         assert_eq!(
             fixture.server.control.requests.lock().unwrap().len(),
@@ -2208,6 +2228,10 @@ async fn native_wire_member_qualification_final_transfer() {
                         .await
                         .unwrap();
                     assert_target_redaction(&body);
+                    assert_target_availability(
+                        &body,
+                        Some(fixture.server.descriptor.instance().as_str()),
+                    );
                     assert!(body
                         .roots
                         .iter()
@@ -2366,7 +2390,12 @@ async fn native_wire_member_qualification_final_transfer() {
         scope.retire();
     })
     .await;
-    assert_target_redaction(&s.read(f, &capture).await.unwrap());
+    let current = s.read(f, &capture).await.unwrap();
+    assert_target_redaction(&current);
+    assert_target_availability(
+        &current,
+        Some(fixture.server.descriptor.instance().as_str()),
+    );
 }
 
 #[intent_test_macros::daemon_test]
@@ -2429,6 +2458,7 @@ async fn native_wire_member_qualification_unknown_and_busy() {
     let value = s.read(&f, &unapproved).await.unwrap();
     assert!(value.roots[0].targets.is_empty());
     assert_target_redaction(&value);
+    assert_target_availability(&value, None);
     assert!(server.control.requests.lock().unwrap().is_empty());
 
     let fixture = MemberTargetFixture::new().await;
@@ -2448,6 +2478,7 @@ async fn native_wire_member_qualification_unknown_and_busy() {
     let current = s.capture(f).await.unwrap();
     let value = s.read(f, &current).await.unwrap();
     assert_target_redaction(&value);
+    assert_target_availability(&value, Some(fixture.server.descriptor.instance().as_str()));
     assert_eq!(
         value.roots.iter().filter(|r| !r.targets.is_empty()).count(),
         1
@@ -2469,6 +2500,7 @@ async fn native_wire_member_qualification_unknown_and_busy() {
         1
     );
     assert_target_redaction(&value);
+    assert_target_availability(&value, None);
     assert_eq!(fixture.server.control.requests.lock().unwrap().len(), calls);
 
     let fixture = MemberTargetFixture::new().await;
@@ -2485,6 +2517,10 @@ async fn native_wire_member_qualification_unknown_and_busy() {
                     .await
                     .unwrap();
                 assert_target_redaction(&value);
+                assert_target_availability(
+                    &value,
+                    Some(fixture.server.descriptor.instance().as_str()),
+                );
                 let facts = f.services.gitlab_repository_connection_facts().unwrap();
                 let hold = Arc::new(BlockingHold::default());
                 let blocked = hold.clone();
@@ -2519,5 +2555,226 @@ async fn native_wire_member_qualification_unknown_and_busy() {
     .await;
     assert!(s.read(f, &capture).await.is_err());
     let fresh = s.capture(f).await.unwrap();
-    assert_target_redaction(&s.read(f, &fresh).await.unwrap());
+    let current = s.read(f, &fresh).await.unwrap();
+    assert_target_redaction(&current);
+    assert_target_availability(
+        &current,
+        Some(fixture.server.descriptor.instance().as_str()),
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_wire_sidebar_member_connected_original_transfer() {
+    let fixture = MemberTargetFixture::new().await;
+    let f = &fixture.native;
+    let (s, _) = target_member(f).await;
+    let calls = fixture.server.control.requests.lock().unwrap().len();
+    let capture = s.capture(f).await.unwrap();
+    let mut saved = None;
+    s.entered(async {
+        let scope = s.owner.capture_context(&f.query());
+        scope
+            .scope(Box::pin(async {
+                let body = f
+                    .services
+                    .repository_context(bound(f.query(), &capture.lifetime_id))
+                    .await;
+                let mut transfers = 0;
+                let delivered = scope
+                    .deliver(
+                        if body.is_ok() {
+                            RepositoryReadReplyKind::Result
+                        } else {
+                            RepositoryReadReplyKind::ServiceError
+                        },
+                        &mut || {
+                            transfers += 1;
+                            Ok(())
+                        },
+                    )
+                    .await;
+                saved = Some((body, delivered, transfers));
+            }))
+            .await;
+        scope.retire();
+    })
+    .await;
+    let (body, delivered, transfers) = saved.unwrap();
+    let after = fixture.server.control.requests.lock().unwrap().len();
+    eprintln!("sidebar B1 capture={capture:?} original body={body:?} delivery={delivered:?} transfers={transfers} providerCallsBefore={calls} providerCallsAfter={after}");
+    let body = body.unwrap();
+    delivered.unwrap();
+    assert_eq!(transfers, 1);
+    assert_eq!(after, calls);
+    let target = body.roots[0]
+        .targets
+        .iter()
+        .find(|t| t.target.provider == intent_core::RepositoryProvider::Gitlab)
+        .unwrap();
+    assert_eq!(
+        target.target.instance_base_url,
+        fixture.server.descriptor.instance().as_str()
+    );
+    assert_eq!(target.target.project_path, "group/project");
+    assert_eq!(
+        target.availability,
+        intent_core::RepositoryAvailability::Connected
+    );
+    assert!(target.connection.is_none());
+    assert!(target.provider_project_id.is_none());
+    assert!(target
+        .capabilities
+        .iter()
+        .all(|c| c.state == intent_core::RepositoryCapabilityState::Unknown));
+    let encoded = serde_json::to_string(&body).unwrap();
+    for forbidden in [
+        "connectionId",
+        "connectionGeneration",
+        "accountId",
+        "providerProjectId",
+        "stored-pat",
+        "target-member-token",
+    ] {
+        assert!(!encoded.contains(forbidden), "{forbidden}");
+    }
+    assert_eq!(
+        serde_json::from_str::<RepositoryContext>(&encoded).unwrap(),
+        body
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_wire_sidebar_member_exact_projection_and_unattested_facts() {
+    let fixture = MemberTargetFixture::new().await;
+    let f = &fixture.native;
+    let target = intent_core::RepositoryTarget {
+        provider: intent_core::RepositoryProvider::Gitlab,
+        instance_base_url: fixture.server.descriptor.instance().as_str().into(),
+        project_path: "group/project".into(),
+    };
+    let facts = f.services.gitlab_repository_connection_facts().unwrap();
+    assert!(facts.settled().is_some());
+    for kind in [
+        "member",
+        "guest",
+        "absent",
+        "wrong-instance",
+        "github",
+        "administrator",
+    ] {
+        let mut selected = target.clone();
+        if kind == "wrong-instance" {
+            selected.instance_base_url = "https://unapproved.invalid".into();
+        }
+        if kind == "github" {
+            selected.provider = intent_core::RepositoryProvider::Github;
+        }
+        let original = if kind == "absent" { None } else { Some(&facts) };
+        let projected = project_target_context(
+            &selected,
+            original,
+            kind == "administrator",
+            kind != "guest",
+        );
+        eprintln!(
+            "sidebar B3 pure projection {kind}: {}",
+            serde_json::to_string(&projected).unwrap()
+        );
+        if kind == "administrator" {
+            assert_eq!(projected, target_context(&selected, original));
+        } else {
+            assert_eq!(
+                projected.availability,
+                if kind == "member" {
+                    intent_core::RepositoryAvailability::Connected
+                } else {
+                    intent_core::RepositoryAvailability::Unknown
+                }
+            );
+            assert!(projected.connection.is_none());
+            assert!(projected.provider_project_id.is_none());
+            assert!(projected
+                .capabilities
+                .iter()
+                .all(|c| c.state == intent_core::RepositoryCapabilityState::Unknown));
+        }
+    }
+    let (s, _) = target_member(f).await;
+    let binding = fixture.auth.request().binding;
+    f.services
+        .repository_connection_directory
+        .set_child_policy(&binding, false)
+        .unwrap();
+    let calls = fixture.server.control.requests.lock().unwrap().len();
+    let capture = s.capture(f).await.unwrap();
+    let connected = s.read(f, &capture).await.unwrap();
+    eprintln!(
+        "sidebar B3 Member with private disabled child policy: {}",
+        serde_json::to_string(&connected).unwrap()
+    );
+    assert_target_redaction(&connected);
+    assert_target_availability(
+        &connected,
+        Some(fixture.server.descriptor.instance().as_str()),
+    );
+    assert_eq!(fixture.server.control.requests.lock().unwrap().len(), calls);
+
+    // The setup invokes the existing real secret reader to retire its attestation.
+    // Context itself still reads only the retained metadata, without provider HTTP.
+    let expected = fixture.auth.request();
+    let reader = f.services.gitlab_repository_secret_reader().unwrap();
+    f.services
+        .gitlab_secret_store
+        .store(
+            intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT,
+            "changed-owned-secret",
+        )
+        .unwrap();
+    let invalidated = reader.load(&expected).await;
+    eprintln!(
+        "sidebar B3 setup attestation read failed={}",
+        invalidated.is_err()
+    );
+    assert!(invalidated.is_err());
+    f.services
+        .gitlab_secret_store
+        .store(
+            intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT,
+            "stored-pat",
+        )
+        .unwrap();
+    let unverified = f.services.gitlab_repository_connection_facts().unwrap();
+    assert_eq!(
+        unverified.lifecycle(),
+        crate::repository_credentials::RepositoryConnectionState::Ready
+    );
+    assert!(unverified.settled().is_none());
+    let old_result = s.read(f, &capture).await;
+    let fresh = s.capture(f).await.unwrap();
+    let unknown = s.read(f, &fresh).await;
+    let after = fixture.server.control.requests.lock().unwrap().len();
+    eprintln!("sidebar B3 original after attestation retirement={old_result:?}; fresh={unknown:?}; providerCallsBefore={calls}; after={after}");
+    assert!(old_result.is_err());
+    let unknown = unknown.unwrap();
+    assert_eq!(unknown.roots[0].targets.len(), 1);
+    assert_target_redaction(&unknown);
+    assert_target_availability(&unknown, None);
+    assert_eq!(after, calls);
+    f.services
+        .gitlab_connect_pat(fixture.server.host.clone(), "stored-pat".into())
+        .await
+        .unwrap();
+    let calls = fixture.server.control.requests.lock().unwrap().len();
+    let old_result = s.read(f, &fresh).await;
+    let current = s.capture(f).await.unwrap();
+    let current = s.read(f, &current).await;
+    eprintln!("sidebar B3 reattested old={old_result:?}; current={current:?}");
+    assert!(old_result.is_err());
+    let current = current.unwrap();
+    assert_target_redaction(&current);
+    assert_target_availability(
+        &current,
+        Some(fixture.server.descriptor.instance().as_str()),
+    );
+    assert_eq!(fixture.server.control.requests.lock().unwrap().len(), calls);
 }
