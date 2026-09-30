@@ -2301,6 +2301,79 @@ async fn agent_notifications_muted_round_trip_and_idle_stamp_over_wss() {
         "agent.getSession serves notificationsMuted=false explicitly: {fresh_session}"
     );
 
+    // Seed an old activity timestamp so this regression cannot pass just
+    // because the preference write happens in the same clock tick as creation.
+    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
+        .await
+        .unwrap();
+    let id = intent_core::AgentId(agent_id.clone());
+    let mut seeded = store.get_agent_session(&id).await.unwrap();
+    let old = "2020-01-01T00:00:00.000Z";
+    seeded.updated_at = old.to_string();
+    store
+        .update_agent_session(&seeded.workspace_id, &seeded)
+        .await
+        .unwrap();
+    for (index, changes) in [
+        json!({ "notificationsMuted": true }),
+        json!({ "notificationsMuted": true }),
+        json!({ "notificationsMuted": false }),
+        json!({ "notificationsMuted": false }),
+        json!({ "notificationsMuted": false, "name": "WSS-Renamed" }),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let response = wss_rpc_envelope(
+            &mut rpc,
+            30,
+            "agent.update",
+            json!({ "workspaceId": ws_id, "agentId": agent_id, "changes": changes }),
+        )
+        .await;
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], 30);
+        assert_eq!(response["result"]["success"], true, "{response}");
+        let agent = &response["result"]["agent"];
+        if index < 4 {
+            assert_eq!(agent["updatedAt"], old, "{changes}");
+        } else {
+            assert!(
+                agent["updatedAt"].as_str().unwrap() > old,
+                "mixed edit is activity"
+            );
+            assert_eq!(agent["name"], "WSS-Renamed");
+        }
+        assert_eq!(agent["notificationsMuted"], changes["notificationsMuted"]);
+        let mut received = false;
+        for _ in 0..40 {
+            let frame = wss_event(&mut sub, 30).await;
+            let ev = &frame["params"]["event"];
+            if ev["type"] == "agent:updated" && ev["data"]["agentId"] == agent_id {
+                assert_eq!(
+                    ev["data"]["notificationsMuted"],
+                    changes["notificationsMuted"]
+                );
+                assert!(ev["data"].get("updatedAt").is_none());
+                received = true;
+                break;
+            }
+        }
+        assert!(received, "preference mutation emits invalidation");
+        let refreshed = wss_rpc(
+            &mut rpc,
+            31,
+            "agent.get",
+            json!({ "workspaceId": ws_id, "agentId": agent_id }),
+        )
+        .await;
+        assert_eq!(refreshed["agent"]["updatedAt"], agent["updatedAt"]);
+        assert_eq!(
+            refreshed["agent"]["notificationsMuted"],
+            agent["notificationsMuted"]
+        );
+    }
+
     // Mute: persisted, returned on the AgentLite, and `agent:updated` carries
     // the change so subscribed clients invalidate their projection.
     let muted = wss_rpc(
@@ -2388,6 +2461,18 @@ async fn agent_notifications_muted_round_trip_and_idle_stamp_over_wss() {
         "agent:idle carries notificationsMuted=true for a muted agent: {idle}"
     );
     assert_eq!(idle["isBackground"], json!(false), "{idle}");
+    let after_turn = wss_rpc(
+        &mut rpc,
+        32,
+        "agent.get",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert!(
+        after_turn["agent"]["updatedAt"].as_str().unwrap()
+            > muted["agent"]["updatedAt"].as_str().unwrap(),
+        "genuine activity advances the timestamp while muted"
+    );
 
     // `false` clears the flag.
     let unmuted = wss_rpc(
@@ -2401,6 +2486,10 @@ async fn agent_notifications_muted_round_trip_and_idle_stamp_over_wss() {
         unmuted["agent"]["notificationsMuted"],
         json!(false),
         "{unmuted}"
+    );
+    assert_eq!(
+        unmuted["agent"]["updatedAt"],
+        after_turn["agent"]["updatedAt"]
     );
     let cleared = wss_rpc(
         &mut rpc,

@@ -3884,9 +3884,8 @@ mod workspace_needs_attention {
             (&questions, |s| s.needs_attention),
         ];
         for (session, expect) in cases {
-            let ts = intent_core::now_iso();
             svc.store
-                .set_agent_notifications_muted(&ws, &session.id, false, &ts)
+                .set_agent_notifications_muted(&ws, &session.id, false)
                 .await
                 .unwrap();
             assert!(
@@ -3895,7 +3894,7 @@ mod workspace_needs_attention {
                 session.id.0
             );
             svc.store
-                .set_agent_notifications_muted(&ws, &session.id, true, &ts)
+                .set_agent_notifications_muted(&ws, &session.id, true)
                 .await
                 .unwrap();
         }

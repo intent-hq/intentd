@@ -5861,7 +5861,7 @@ impl Services {
                 metadata.remove(intent_core::CHIEF_PROMPT_VERSION_KEY);
             }
         }
-        session.updated_at = now_iso();
+        let mute_only = obj.len() == 1 && obj.contains_key("notificationsMuted");
         let workspace_id = session.workspace_id.clone();
         // Muting drops the session out of the workspace unread derivation
         // (§5.1), so snapshot the unread state BEFORE the write — the
@@ -5873,9 +5873,14 @@ impl Services {
         } else {
             None
         };
-        self.store
-            .update_agent_session(&workspace_id, &session)
-            .await?;
+        // A preference-only request is not agent activity. Skip the full-row
+        // write entirely so it cannot overwrite concurrent session progress.
+        if !mute_only {
+            session.updated_at = now_iso();
+            self.store
+                .update_agent_session(&workspace_id, &session)
+                .await?;
+        }
         // `notifications_muted` is excluded from the full-row write above
         // (its only post-insert mutator is this scoped UPDATE), so a
         // concurrent `agent.update` on unrelated fields — or a long-lived
@@ -5887,9 +5892,13 @@ impl Services {
                     &workspace_id,
                     &agent_id,
                     session.notifications_muted,
-                    &session.updated_at,
                 )
                 .await?;
+        }
+        if mute_only {
+            // Return current activity and preference state, including any
+            // genuine session update that raced the scoped preference write.
+            session = self.store.get_agent_session(&agent_id).await?;
         }
         // The stored model changed, so any persisted display resolution now
         // names the wrong model — clear it, same anti-staleness contract as

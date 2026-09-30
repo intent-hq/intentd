@@ -2885,10 +2885,11 @@ impl Store {
 
     /// Set the session's `notifications_muted` flag (0123) — the store side
     /// of `agent.update { notificationsMuted }`. Returns `true` when the
-    /// stored value actually changed; an already-matching flag is a no-op
-    /// (no write, no `updated_at` bump). The ONLY post-insert mutator of the
-    /// column: the full-row [`Store::update_agent_session`] deliberately
-    /// excludes it so a concurrent `agent.update` on unrelated fields, or a
+    /// stored value actually changed; an already-matching flag is a no-op.
+    /// Notification preferences never advance the activity timestamp. The ONLY
+    /// post-insert mutator of the column: the full-row
+    /// [`Store::update_agent_session`] deliberately excludes it so a concurrent
+    /// `agent.update` on unrelated fields, or a
     /// long-lived in-memory session persisted at turn end, can never revert
     /// the user's toggle. Scoped to `workspace_id` (defense-in-depth).
     /// `NotFound` if the session is absent or the workspace does not match.
@@ -2901,14 +2902,12 @@ impl Store {
         workspace_id: &WorkspaceId,
         id: &AgentId,
         muted: bool,
-        updated_at: &str,
     ) -> Result<bool> {
         let rows = sqlx::query(
-            "UPDATE agent_session SET notifications_muted=?, updated_at=? \
+            "UPDATE agent_session SET notifications_muted=? \
              WHERE id=? AND workspace_id=? AND notifications_muted != ?",
         )
         .bind(i64::from(muted))
-        .bind(updated_at)
         .bind(&id.0)
         .bind(&workspace_id.0)
         .bind(i64::from(muted))
@@ -7556,9 +7555,49 @@ mod tests {
         muted: bool,
     ) {
         store
-            .set_agent_notifications_muted(ws, agent, muted, &intent_core::now_iso())
+            .set_agent_notifications_muted(ws, agent, muted)
             .await
             .expect("persist notifications_muted");
+    }
+
+    #[tokio::test]
+    async fn notifications_muted_preserves_activity_timestamp() {
+        let tmp = TempDb::new("test-agent-mute-timestamp");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ws = WorkspaceId("ws-mute-timestamp".to_string());
+        insert_test_workspace(&store, &ws).await;
+        let agent = AgentId("agent-mute-timestamp".to_string());
+        let old = "2020-01-01T00:00:00.000Z";
+        seed_unread_top_level_session(&store, &ws, &agent, old).await;
+
+        for (muted, changed) in [(true, true), (true, false), (false, true), (false, false)] {
+            assert_eq!(
+                store
+                    .set_agent_notifications_muted(&ws, &agent, muted)
+                    .await
+                    .expect("set mute"),
+                changed
+            );
+            let stored = store.get_agent_session(&agent).await.expect("reload");
+            assert_eq!(stored.notifications_muted, muted);
+            assert_eq!(
+                stored.updated_at, old,
+                "mute preference is not agent activity"
+            );
+        }
+        assert!(matches!(
+            store
+                .set_agent_notifications_muted(
+                    &WorkspaceId("wrong-workspace".to_string()),
+                    &agent,
+                    true,
+                )
+                .await,
+            Err(Error::NotFound(_))
+        ));
+        let stored = store.get_agent_session(&agent).await.expect("reload");
+        assert!(!stored.notifications_muted);
+        assert_eq!(stored.updated_at, old);
     }
 
     /// `set_agent_notifications_muted` is the only writer of the column: it
@@ -7581,12 +7620,12 @@ mod tests {
         assert!(!stale.notifications_muted);
 
         assert!(store
-            .set_agent_notifications_muted(&ws, &agent, true, &ts)
+            .set_agent_notifications_muted(&ws, &agent, true)
             .await
             .expect("mute"));
         assert!(
             !store
-                .set_agent_notifications_muted(&ws, &agent, true, &ts)
+                .set_agent_notifications_muted(&ws, &agent, true)
                 .await
                 .expect("mute again"),
             "same-value write is a no-op"
@@ -7605,7 +7644,7 @@ mod tests {
         );
 
         assert!(store
-            .set_agent_notifications_muted(&ws, &agent, false, &ts)
+            .set_agent_notifications_muted(&ws, &agent, false)
             .await
             .expect("unmute"));
         assert!(
@@ -7617,12 +7656,7 @@ mod tests {
         );
         assert!(matches!(
             store
-                .set_agent_notifications_muted(
-                    &ws,
-                    &AgentId("agent-missing".to_string()),
-                    true,
-                    &ts
-                )
+                .set_agent_notifications_muted(&ws, &AgentId("agent-missing".to_string()), true)
                 .await,
             Err(Error::NotFound(_))
         ));
