@@ -27,6 +27,8 @@
 #![cfg(unix)]
 
 mod common;
+#[path = "common/invitation_fixture_lifecycle.rs"]
+mod fixture_lifecycle;
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -66,14 +68,10 @@ const INTRUDER_ID: u64 = 300;
 const USER_CODE: &str = "JOIN-0001";
 
 struct Daemon {
+    // Let GuardedChild stop the whole group before it reaps the daemon.
+    // A parent-only kill/wait here would disable that owned-group teardown.
+    #[expect(dead_code, reason = "GuardedChild owns fixture teardown on drop")]
     child: GuardedChild,
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 fn temp_data_dir() -> tempfile::TempDir {
@@ -99,7 +97,7 @@ case "$1" in
     ;;
   serve)
     printf '{"listenAddr":"tc-%s"}\n' "$(cat "$key")"
-    sleep 600
+    exec sleep 600
     ;;
 esac
 "#;
