@@ -787,3 +787,107 @@ async fn retirement_recovery_fences_a_pending_finalizer() {
     assert_eq!(after.last_run, recovered.last_run);
     assert_eq!(after.archived_at, recovered.archived_at);
 }
+
+#[intent_test_macros::daemon_test]
+async fn retirement_shutdown_preserves_terminal_result_before_marker_persistence() {
+    use intent_core::ScriptRunOutcome::{Cancelled, Failed, Succeeded};
+    for (command, use_run, bad_cwd, expected) in [
+        ("printf observed", false, false, Succeeded),
+        ("exit 7", false, false, Failed),
+        ("true", false, true, Failed),
+        ("printf observed", true, false, Succeeded),
+        ("sleep 30", true, false, Cancelled),
+    ] {
+        let h = harness_with_worktree(true).await;
+        let id = create(
+            &h,
+            ScriptCreateParams {
+                name: "early terminal".into(),
+                command: command.into(),
+                cwd: bad_cwd.then(|| "../../escape".into()),
+                mode: ScriptMode::Command,
+                purpose: Some(intent_core::ScriptPurpose::OneOff),
+                ..Default::default()
+            },
+        )
+        .await;
+        let park = Arc::new(SupervisePark::default());
+        let mut mgr = h.services.script_manager();
+        mgr.parks.terminal_persist = Some(park.clone());
+        let run = if use_run {
+            let mgr = mgr.clone();
+            let ws = h.ws.clone();
+            let id = id.clone();
+            Some(intent_core::spawn_daemon(async move {
+                mgr.run(&ws, &id, None, Some(1)).await
+            }))
+        } else {
+            mgr.start(&h.ws, &id).await.unwrap();
+            None
+        };
+        tokio::time::timeout(LIVENESS, park.entered.notified())
+            .await
+            .unwrap();
+        let shutdown = {
+            let mgr = mgr.clone();
+            intent_core::spawn_daemon(async move { mgr.stop_all().await })
+        };
+        tokio::time::timeout(LIVENESS, async {
+            loop {
+                if mgr
+                    .scripts
+                    .lock()
+                    .unwrap()
+                    .get(&(h.ws.clone(), id.clone()))
+                    .unwrap()
+                    .stopped_by_user
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let captured = {
+            let entries = mgr.scripts.lock().unwrap();
+            let m = entries.get(&(h.ws.clone(), id.clone())).unwrap();
+            (m.pending_result.clone(), m.running_at_shutdown)
+        };
+        park.release.notify_one();
+        tokio::time::timeout(LIVENESS, shutdown)
+            .await
+            .unwrap()
+            .unwrap();
+        if let Some(run) = run {
+            run.await.unwrap().unwrap();
+        }
+        assert!(
+            !captured.1,
+            "already observed terminal outcome must survive shutdown: {command}"
+        );
+        assert_eq!(captured.0.unwrap().outcome, expected);
+        let before = h
+            .services
+            .store
+            .get_script_in_workspace(&h.ws, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            before.archived_at.is_some(),
+            "shutdown drains terminal owner before returning"
+        );
+        assert_eq!(before.last_run.as_ref().unwrap().outcome, expected);
+        let fresh = Services::new(Store::open(&h.tmp.path).await.unwrap());
+        fresh.hydrate_scripts().await.unwrap();
+        let after = fresh
+            .store
+            .get_script_in_workspace(&h.ws, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.last_run, before.last_run);
+        assert_eq!(after.archived_at, before.archived_at);
+    }
+}

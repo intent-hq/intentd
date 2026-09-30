@@ -231,6 +231,8 @@ pub(crate) struct ScriptParks {
     pub(crate) settlement_committed: Option<Arc<SupervisePark>>,
     /// Parks settled process ownership before the outcome persistence decision.
     pub(crate) settlement_ready: Option<Arc<SupervisePark>>,
+    /// Parks a terminal runtime transition before marker persistence/events.
+    pub(crate) terminal_persist: Option<Arc<SupervisePark>>,
 }
 
 /// Cancellation guard for the `script.run` reservation window (reserve →
@@ -1873,6 +1875,10 @@ impl ScriptManager {
                 m.running_at_shutdown,
             )
         };
+        if let Some(park) = &self.parks.terminal_persist {
+            park.entered.notify_one();
+            park.release.notified().await;
+        }
         if !keep_marker {
             self.persist_was_running(ws, script_id, false).await;
         }
@@ -1952,6 +1958,10 @@ impl ScriptManager {
                 std::mem::take(&mut m.lost_at_daemon_stop) || m.def.mode == ScriptMode::Command,
             )
         };
+        if let Some(park) = &self.parks.terminal_persist {
+            park.entered.notify_one();
+            park.release.notified().await;
+        }
         if lost_superseded {
             self.persist_was_running(ws, script_id, false).await;
         }
