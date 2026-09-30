@@ -473,7 +473,7 @@ case "$1" in
     ;;
   serve)
     printf '{"listenAddr":"tc-%s"}\n' "$(cat "$key")"
-    sleep 600
+    exec sleep 600
     ;;
 esac
 "#;
@@ -532,7 +532,7 @@ case "$1" in
       while [ ! -f "$dir/exit-now" ]; do sleep 0.1; done
       exit 1
     fi
-    sleep 600
+    exec sleep 600
     ;;
 esac
 "#;

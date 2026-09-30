@@ -5,38 +5,31 @@
 
 mod common;
 
+use intentd_test_support::GuardedChild;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
     data_dir: PathBuf,
 }
 
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-fn spawn_daemon(data_dir: &PathBuf) -> Child {
+fn spawn_daemon(data_dir: &PathBuf) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     let secrets_file = data_dir.join("secrets.json");
-    common::serve_command()
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", &secrets_file)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env_remove("INTENTD_AUTH_TOKEN")
         .stdout(Stdio::null())
-        .stderr(Stdio::from(log))
-        .spawn()
-        .expect("spawn intentd serve")
+        .stderr(Stdio::from(log));
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 /// Wait for the daemon UDS to accept, failing fast (with the daemon log) if
@@ -153,7 +146,7 @@ async fn stop_succeeds_when_daemon_not_running() {
 /// enabled via `server.wsApi.enabled` in config.toml. `token` fixes the bearer
 /// token via `INTENTD_AUTH_TOKEN`; `None` uses the file-backed secrets store
 /// (required by rotation tests — an env-fixed token cannot rotate).
-fn spawn_daemon_both(data_dir: &PathBuf, token: Option<&str>) -> Child {
+fn spawn_daemon_both(data_dir: &PathBuf, token: Option<&str>) -> GuardedChild {
     spawn_daemon_both_inner(data_dir, token, None)
 }
 
@@ -161,7 +154,7 @@ fn spawn_daemon_both(data_dir: &PathBuf, token: Option<&str>) -> Child {
 /// at least one dialable route, and these hermetic tests keep the loopback
 /// default bind (never advertised), so the deterministic tc address is what
 /// makes `intentd pair` succeed without real networking.
-fn spawn_daemon_both_tunneled(data_dir: &PathBuf, token: Option<&str>) -> Child {
+fn spawn_daemon_both_tunneled(data_dir: &PathBuf, token: Option<&str>) -> GuardedChild {
     let config = data_dir.join("config.toml");
     let mut text = std::fs::read_to_string(&config).unwrap_or_default();
     text.push_str("[server.tunnel]\nenabled = true\n");
@@ -174,7 +167,7 @@ fn spawn_daemon_both_inner(
     data_dir: &PathBuf,
     token: Option<&str>,
     tailcat_bin: Option<&Path>,
-) -> Child {
+) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -194,7 +187,7 @@ fn spawn_daemon_both_inner(
     if let Some(bin) = tailcat_bin {
         cmd.env("INTENTD_TAILCAT_BIN", bin);
     }
-    cmd.spawn().expect("spawn intentd serve (ws api enabled)")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve (ws api enabled)")
 }
 
 /// Write an executable fake-tailcat script into `dir`: `genkey` creates the
@@ -216,7 +209,7 @@ case "$1" in
     ;;
   serve)
     printf '{"listenAddr":"tc-%s"}\n' "$(cat "$key")"
-    sleep 600
+    exec sleep 600
     ;;
 esac
 "#;

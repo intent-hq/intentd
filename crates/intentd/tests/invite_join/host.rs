@@ -34,7 +34,10 @@ fn script_proof(mock: &MockForge, provider: &str, nonce: &str) -> Value {
 }
 
 async fn restart(host: &mut Host, mock: &MockForge, credentials: &[(&str, &str)]) {
-    host.daemon.child.kill().unwrap();
+    host.daemon
+        .child
+        .signal_group(nix::sys::signal::Signal::SIGKILL)
+        .unwrap();
     host.daemon.child.wait().unwrap();
     let data_dir = host.dir.path();
     let secrets = data_dir.join("secrets.json").to_string_lossy().to_string();

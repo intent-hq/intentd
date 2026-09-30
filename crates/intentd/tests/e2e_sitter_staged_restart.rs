@@ -173,7 +173,7 @@ case "$1" in
     ;;
   serve)
     printf '{{"listenAddr":"tc-%s"}}\n' "$(cat "$key")"
-    sleep 600
+    exec sleep 600
     ;;
 esac
 "#

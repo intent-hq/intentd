@@ -42,8 +42,9 @@
 
 mod common;
 
+use intentd_test_support::GuardedChild;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -74,14 +75,34 @@ const FLUSH_HEADER: &str = "2 queued messages while you were working";
 const WAIT_NOTE_PREFIX: &str = "[SYSTEM NOTE] This message was queued at";
 
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
     data_dir: PathBuf,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // Providers own separate process groups. Let normal daemon shutdown
+        // stop them before reaping the daemon; the guard remains the fallback.
+        let stopped = self.child.try_wait().and_then(|status| {
+            if let Some(status) = status {
+                Ok(Some(status))
+            } else {
+                self.child
+                    .signal(nix::sys::signal::Signal::SIGTERM)
+                    .map_err(std::io::Error::other)?;
+                self.child
+                    .wait_with_timeout(common::test_timeout(Duration::from_secs(5)))
+            }
+        });
+        eprintln!("queue fixture daemon {} wait: {stopped:?}", self.child.id());
+        let normal = matches!(stopped, Ok(Some(status)) if status.success());
+        if !normal {
+            if std::thread::panicking() {
+                eprintln!("queue fixture shutdown failed while preserving the original panic");
+            } else {
+                panic!("queue fixture daemon did not stop normally: {stopped:?}");
+            }
+        }
         let log_path = self.data_dir.join("daemon.log");
         if let Ok(log) = std::fs::read_to_string(&log_path) {
             eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
@@ -93,7 +114,7 @@ fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-wss-flush-")
 }
 
-fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
+fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -107,7 +128,7 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     for (k, v) in env {
         cmd.env(k, v);
     }
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -1767,11 +1788,49 @@ fn diagnostics_entry_ids(queue_row: &Value) -> Vec<String> {
 ///    `summary.queuedAgents` 1.
 #[tokio::test]
 async fn diagnostics_projects_queues_per_caller_over_wss() {
+    diagnostics_queue_projection(drop, true).await;
+}
+
+#[tokio::test]
+async fn diagnostics_fixture_preserves_error_after_teardown() {
+    diagnostics_queue_projection(
+        |daemon| {
+            fn fail(daemon: Daemon) -> Result<(), &'static str> {
+                let _daemon = daemon;
+                Err("deliberate diagnostic fixture error")
+            }
+            assert_eq!(fail(daemon), Err("deliberate diagnostic fixture error"));
+        },
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn diagnostics_fixture_preserves_panic_after_teardown() {
+    diagnostics_queue_projection(
+        |daemon| {
+            let outcome = std::panic::catch_unwind(|| {
+                let _daemon = daemon;
+                panic!("deliberate diagnostic fixture panic");
+            });
+            assert_eq!(
+                outcome.unwrap_err().downcast_ref::<&str>(),
+                Some(&"deliberate diagnostic fixture panic")
+            );
+        },
+        false,
+    )
+    .await;
+}
+
+async fn diagnostics_queue_projection(teardown: impl FnOnce(Daemon), release_kickoff: bool) {
     let Some(script) = gate("WSS agent.diagnostics queue projection E2E") else {
         return;
     };
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
+    let _retention = common::suppress_failure_retention();
     let (ws_id, guest) = seed_workspace_with_guest(&data_dir).await;
     // The target's kick-off turn is a barrier (released at the end) so all
     // three enqueues and both diagnostics reads land inside the busy window.
@@ -1790,7 +1849,7 @@ async fn diagnostics_projects_queues_per_caller_over_wss() {
         "response": "relay dispatched"
     });
     let Booted {
-        daemon: _daemon,
+        daemon,
         port,
         cfg,
         prompt_log: _,
@@ -1964,5 +2023,9 @@ async fn diagnostics_projects_queues_per_caller_over_wss() {
         "agent-sent entry keeps its agent stamp: {owner_row}"
     );
 
-    std::fs::write(&kickoff_release, b"go").expect("write kick-off release file");
+    // Error and panic controls unwind while the provider is still parked.
+    if release_kickoff {
+        std::fs::write(&kickoff_release, b"go").expect("write kick-off release file");
+    }
+    teardown(daemon);
 }
