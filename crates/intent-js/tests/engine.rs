@@ -292,6 +292,7 @@ async fn cancellation_interrupts_non_yielding_javascript() {
     let cancelled = Arc::new(AtomicBool::new(false));
     let signal = cancelled.clone();
     let cancel = std::thread::spawn(move || {
+        // timing-guard: cancel from outside the runtime while synchronous JS spins, before its 500ms deadline
         std::thread::sleep(Duration::from_millis(50));
         signal.store(true, Ordering::Relaxed);
     });
