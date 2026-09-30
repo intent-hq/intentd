@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.126] - 2026-09-30
+
+### 🚀 Features
+
+- Configure bounded PR monitoring capacity ([#5887](https://github.com/intent-hq/intentd/pull/5887)) ([#2192](https://github.com/intent-hq/intentd/pull/2192))
+- Retain invocation-bound command exit evidence ([#5938](https://github.com/intent-hq/intentd/pull/5938)) ([#2191](https://github.com/intent-hq/intentd/pull/2191))
+
+
 ## [0.9.125] - 2026-09-30
 
 ### 🚀 Features
