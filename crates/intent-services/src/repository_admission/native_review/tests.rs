@@ -4145,24 +4145,63 @@ impl Drop for Group4MetadataHolder {
 struct Group4ProviderRelease {
     control: Arc<super::credential_tests::Control>,
     observer: companion_observation::Collector,
-    signalled: bool,
+    signalled: Arc<AtomicBool>,
+    request_release: Option<std::sync::mpsc::Sender<()>>,
+    watcher: Option<std::thread::JoinHandle<(&'static str, Duration)>>,
 }
 impl Group4ProviderRelease {
-    fn release(&mut self) {
-        if !self.signalled {
-            self.control.release.notify_one();
-            self.signalled = true;
-            diagnostic_checkpoint(
-                &self.observer,
-                "g4-provider-release-signalled",
-                json!({"signalled":true,"unwinding":std::thread::panicking(),"workerCompletionClaim":false}),
-            );
+    fn start(
+        control: Arc<super::credential_tests::Control>,
+        observer: &companion_observation::Collector,
+    ) -> Self {
+        let (request_release, requested) = std::sync::mpsc::channel();
+        let signalled = Arc::new(AtomicBool::new(false));
+        let signal = signalled.clone();
+        let held_provider = control.clone();
+        let started = std::time::Instant::now();
+        // This wall-clock containment bound is independent of the paused test
+        // clock and the original body. A watchdog release fails qualification.
+        let deadline = started + ACQUIRE;
+        let watcher = std::thread::spawn(move || {
+            let reason = match requested
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            {
+                Ok(()) => "requested",
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => "watchdog",
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => "disconnected",
+            };
+            held_provider.release.notify_one();
+            signal.store(true, Ordering::Release);
+            (reason, started.elapsed())
+        });
+        Self {
+            control,
+            observer: observer.clone(),
+            signalled,
+            request_release: Some(request_release),
+            watcher: Some(watcher),
         }
+    }
+    fn release_and_join(&mut self) -> Value {
+        let requested = self
+            .request_release
+            .take()
+            .is_some_and(|sender| sender.send(()).is_ok());
+        let joined = self.watcher.take().map(std::thread::JoinHandle::join);
+        let (watcher_joined, reason, elapsed) = match joined {
+            Some(Ok((reason, elapsed))) => (true, reason, Some(elapsed.as_nanos().to_string())),
+            _ => (false, "unobserved", None),
+        };
+        let result = json!({"requested":requested,"releaseReason":reason,"watcherJoined":watcher_joined,"signalled":self.signalled.load(Ordering::Acquire),"wallElapsedNanos":elapsed,"wallBoundNanos":ACQUIRE.as_nanos().to_string(),"unwinding":std::thread::panicking(),"workerCompletionClaim":false});
+        diagnostic_checkpoint(&self.observer, "g4-provider-release-join", result.clone());
+        result
     }
 }
 impl Drop for Group4ProviderRelease {
     fn drop(&mut self) {
-        self.release();
+        if self.watcher.is_some() {
+            let _ = self.release_and_join();
+        }
     }
 }
 fn group4_frames(
@@ -4352,9 +4391,9 @@ async fn companion_diagnostic_group4_initial_metadata_unavailable() {
 async fn companion_diagnostic_group4_acquisition_deadline() {
     diagnostic_case("g4-acquisition-deadline", |observer| async move {
         use companion_observation::{Outcome, Phase};
-        let (original,checks)=with_review_clock(async {
+        let (original,checks,release)=with_review_clock(async {
             let original=Group4Original::new(&observer).await;
-            let mut provider=Group4ProviderRelease{control:original.fixture.server.control.clone(),observer:observer.clone(),signalled:false};
+            let mut provider=Group4ProviderRelease::start(original.fixture.server.control.clone(),&observer);
             *provider.control.pause.lock().unwrap()=Some("/projects/".into());
             let mut checks=None;
             original.socket.entered(async {
@@ -4367,28 +4406,52 @@ async fn companion_diagnostic_group4_acquisition_deadline() {
                     diagnostic_checkpoint(&observer,"g4-original-project-hold",json!({"entered":held,"capture":original.capture,"earlyBody":early.as_ref().map(diagnostic_reply),"workers":original.connection.review.workers.available_permits()}));
                     let before=Instant::now();
                     if held{tokio::time::advance(ACQUIRE).await;}
-                    let advanced=before.elapsed();
-                    diagnostic_checkpoint(&observer,"g4-original-deadline-advanced",json!({"capture":original.capture,"advancedNanos":advanced.as_nanos().to_string(),"boundNanos":ACQUIRE.as_nanos().to_string(),"clock":"original fixed Tokio Instant; compare only this request stream"}));
+                    let nominal=before.elapsed();
+                    diagnostic_checkpoint(&observer,"g4-original-deadline-advanced",json!({"capture":original.capture,"advancedNanos":nominal.as_nanos().to_string(),"boundNanos":ACQUIRE.as_nanos().to_string(),"clock":"original fixed Tokio Instant; compare only this request stream"}));
+                    let mut crossing=Duration::ZERO;
+                    let mut polled_pending=None;
+                    if early.is_none() {
+                        let polled=std::future::poll_fn(|cx|std::task::Poll::Ready(call.as_mut().poll(cx))).await;
+                        polled_pending=Some(polled.is_pending());
+                        diagnostic_checkpoint(&observer,"g4-original-body-poll-at-nominal",json!({"capture":original.capture,"state":if polled.is_pending(){"pending"}else{"ready"},"elapsedNanos":before.elapsed().as_nanos().to_string(),"body":match &polled{std::task::Poll::Ready(body)=>Some(diagnostic_reply(body)),std::task::Poll::Pending=>None},"privateTimerStateObserved":false}));
+                        match polled {
+                            std::task::Poll::Ready(body)=>early=Some(body),
+                            std::task::Poll::Pending=>{
+                                // Pinned Tokio1.53.1 rounds the deadline upward
+                                // to a millisecond tick. Cross at most one tick;
+                                // the original ACQUIRE and future stay unchanged.
+                                crossing=Duration::from_millis(1);
+                                tokio::time::advance(crossing).await;
+                                diagnostic_checkpoint(&observer,"g4-original-one-tick-crossing",json!({"capture":original.capture,"crossingNanos":crossing.as_nanos().to_string(),"elapsedNanos":before.elapsed().as_nanos().to_string(),"providerReleased":provider.signalled.load(Ordering::Acquire)}));
+                            }
+                        }
+                    }
                     let body=if let Some(body)=early{body}else{call.await};
-                    diagnostic_checkpoint(&observer,"g4-deadline-original-body-before-release",json!({"body":diagnostic_reply(&body),"capture":original.capture,"providerReleased":provider.signalled,"workers":original.connection.review.workers.available_permits()}));
+                    let elapsed=before.elapsed();
+                    diagnostic_checkpoint(&observer,"g4-deadline-original-body-before-release",json!({"body":diagnostic_reply(&body),"capture":original.capture,"nominalNanos":nominal.as_nanos().to_string(),"crossingNanos":crossing.as_nanos().to_string(),"elapsedNanos":elapsed.as_nanos().to_string(),"providerReleased":provider.signalled.load(Ordering::Acquire),"workers":original.connection.review.workers.available_permits()}));
                     let mut transfers=0;
                     let delivered=frame.deliver(if body.is_ok(){RepositoryReadReplyKind::Result}else{RepositoryReadReplyKind::ServiceError},&mut||{transfers+=1;Ok(())}).await;
                     diagnostic_checkpoint(&observer,"g4-deadline-original-delivery",json!({"body":diagnostic_reply(&body),"deliveryOk":delivered.is_ok(),"publicErrorTransfers":if body.is_err(){transfers}else{0},"protectedResultTransfers":if body.is_ok(){transfers}else{0}}));
-                    checks=Some((held,advanced,body.is_err(),delivered.is_ok(),transfers));
+                    checks=Some((held,nominal,crossing,elapsed,polled_pending,body.is_err(),delivered.is_ok(),transfers));
                 })).await;
                 frame.retire();
-                diagnostic_checkpoint(&observer,"g4-deadline-original-request-retired",json!({"capture":original.capture,"providerReleased":provider.signalled}));
+                diagnostic_checkpoint(&observer,"g4-deadline-original-request-retired",json!({"capture":original.capture,"providerReleased":provider.signalled.load(Ordering::Acquire)}));
             }).await;
-            provider.release();
-            (original,checks.unwrap())
+            let release=provider.release_and_join();
+            (original,checks.unwrap(),release)
         }).await;
         original.completed(&observer,1).await;
         let frames=group4_frames(&observer,&original.capture);
-        assert!(checks.0);assert_eq!(checks.1,ACQUIRE);assert!(checks.2);assert!(checks.3);assert_eq!(checks.4,1);
+        assert!(checks.0);assert_eq!(checks.1,ACQUIRE);
+        assert_eq!(checks.2,if checks.4==Some(true){Duration::from_millis(1)}else{Duration::ZERO});
+        assert!(checks.4.is_some());assert_eq!(checks.3,ACQUIRE+checks.2);
+        assert!(checks.5);assert!(checks.6);assert_eq!(checks.7,1);
+        assert_eq!(release["requested"],true);assert_eq!(release["releaseReason"],"requested");assert_eq!(release["watcherJoined"],true);assert_eq!(release["signalled"],true);
         let wait=frames.iter().find(|f|f.phase==Phase::AcquireWait&&f.outcome==Outcome::Enter).unwrap();
         let elapsed=frames.iter().find(|f|f.phase==Phase::AcquireWait&&f.outcome==Outcome::Error).unwrap();
         assert_eq!(wait.domain,elapsed.domain);assert_eq!(wait.span,elapsed.span);
-        assert_eq!(u128::from(elapsed.elapsed_ns-wait.elapsed_ns),ACQUIRE.as_nanos());
+        let duration=u128::from(elapsed.elapsed_ns-wait.elapsed_ns);
+        assert!((ACQUIRE.as_nanos()..=(ACQUIRE+Duration::from_millis(1)).as_nanos()).contains(&duration));
         assert!(group4_has(&frames,Phase::Project,Outcome::Ok));
         assert!(group4_has(&frames,Phase::Branch,Outcome::Error));
         assert!(!frames.iter().any(|f|matches!(f.phase,Phase::SourceDeadline|Phase::FrameDeadline|Phase::ProtectedResult)));
