@@ -18,6 +18,7 @@ async fn assert_fixture_teardown(teardown: impl FnOnce(Daemon)) {
     let mut command = Command::new("sh");
     command
         .arg("-c")
+        // timing-guard: parked child must outlive the EOF deadline unless fixture teardown stops it
         .arg("sh -c 'printf ready; exec sleep 600' & wait")
         .stdin(Stdio::null())
         .stdout(Stdio::from(OwnedFd::from(writer)))
@@ -51,10 +52,11 @@ async fn fixture_drop_stops_descendant_on_return() {
 #[tokio::test]
 async fn fixture_drop_stops_descendant_on_error() {
     assert_fixture_teardown(|daemon| {
-        let result: Result<(), &str> = (|| {
+        fn fail(daemon: Daemon) -> Result<(), &'static str> {
             let _daemon = daemon;
             Err("deliberate fixture failure")
-        })();
+        }
+        let result = fail(daemon);
         assert_eq!(result, Err("deliberate fixture failure"));
     })
     .await;
