@@ -13,6 +13,7 @@ nix.workspace = true
 portable-pty.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true

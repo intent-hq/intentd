@@ -22,7 +22,7 @@ use intent_acp::{
 };
 use intent_core::events::{TERMINAL_DATA, TERMINAL_EXIT};
 use intent_core::{now_iso, BoxFuture, Error, Result, WorkspaceId};
-use intent_pty::{LineSnapshot, PtyExit, PtyHost, PtyId, PtySize, SpawnSpec};
+use intent_pty::{LineSnapshot, OutputChunk, PtyExit, PtyHost, PtyId, PtySize, SpawnSpec};
 use intent_store::{NewEvent, Store};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -303,13 +303,17 @@ pub(crate) fn get_buffer(
     let id = resolve(terminal_id)?;
     // Omitted (and legacy negative) bounds retain full-history semantics. A
     // usable bound takes the ring tail directly, without cloning its prefix.
-    let bytes = if let Some(max) = max_bytes.and_then(|n| usize::try_from(n).ok()) {
-        pty.scrollback_tail(id, max)?
-    } else {
-        pty.scrollback(id)?
-    };
-    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    Ok(json!({ "terminalId": terminal_id, "data": data }))
+    let max = max_bytes
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(usize::MAX);
+    let snapshot = pty.positioned_scrollback(id, max)?;
+    let data = base64::engine::general_purpose::STANDARD.encode(&snapshot.bytes);
+    Ok(json!({
+        "terminalId": terminal_id, "data": data,
+        "daemonBootId": pty.daemon_boot_id(),
+        "startOffset": snapshot.start_offset.to_string(),
+        "endOffset": snapshot.end_offset.to_string(),
+    }))
 }
 
 /// The workspace's live terminals wrapped in the per-boot envelope
@@ -531,13 +535,14 @@ pub(crate) fn spawn_output_stream(
                 bus.as_ref(),
                 &workspace_id,
                 &terminal_id,
+                pty.daemon_boot_id(),
                 &attachment.backlog,
             );
         }
         loop {
             tokio::select! {
                 recv = live.recv() => match recv {
-                    Ok(chunk) => emit_data(bus.as_ref(), &workspace_id, &terminal_id, &chunk),
+                    Ok(chunk) => emit_data(bus.as_ref(), &workspace_id, &terminal_id, pty.daemon_boot_id(), &chunk),
                     Err(RecvError::Lagged(_)) => {},
                     // A `terminal.kill` tore down the session and dropped the
                     // sender; the process is gone.
@@ -547,7 +552,7 @@ pub(crate) fn spawn_output_stream(
                     if matches!(pty.try_exit(pty_id), Ok(Some(_))) {
                         // Reaped: drain any output the reader flushed just before
                         // EOF, then stop tailing.
-                        drain_pending(&mut live, bus.as_ref(), &workspace_id, &terminal_id);
+                        drain_pending(&mut live, bus.as_ref(), &workspace_id, &terminal_id, pty.daemon_boot_id());
                         break;
                     }
                 }
@@ -561,14 +566,15 @@ pub(crate) fn spawn_output_stream(
 /// Flush any output buffered on the live channel without blocking (used once the
 /// child has exited so trailing output still streams before `terminal:exit`).
 fn drain_pending(
-    live: &mut tokio::sync::broadcast::Receiver<Arc<Vec<u8>>>,
+    live: &mut tokio::sync::broadcast::Receiver<Arc<OutputChunk>>,
     bus: Option<&EventBus>,
     workspace_id: &WorkspaceId,
     terminal_id: &str,
+    daemon_boot_id: &str,
 ) {
     loop {
         match live.try_recv() {
-            Ok(chunk) => emit_data(bus, workspace_id, terminal_id, &chunk),
+            Ok(chunk) => emit_data(bus, workspace_id, terminal_id, daemon_boot_id, &chunk),
             Err(TryRecvError::Lagged(_)) => {}
             Err(TryRecvError::Empty | TryRecvError::Closed) => break,
         }
@@ -585,14 +591,20 @@ fn drain_pending(
 /// `terminal:data` rows. Ordering vs `terminal:exit` is preserved: the stream
 /// task broadcasts every chunk synchronously before it awaits the durable
 /// `emit_exit`, so exit can never overtake data.
-fn emit_data(bus: Option<&EventBus>, ws: &WorkspaceId, terminal_id: &str, bytes: &[u8]) {
-    let chunk = base64::engine::general_purpose::STANDARD.encode(bytes);
+fn emit_data(
+    bus: Option<&EventBus>,
+    ws: &WorkspaceId,
+    terminal_id: &str,
+    daemon_boot_id: &str,
+    output: &OutputChunk,
+) {
+    let chunk = base64::engine::general_purpose::STANDARD.encode(&output.bytes);
     publish_event_transient(
         bus,
         &terminal_event(
             ws,
             TERMINAL_DATA,
-            json!({ "terminalId": terminal_id, "chunk": chunk }),
+            json!({ "terminalId": terminal_id, "chunk": chunk, "daemonBootId": daemon_boot_id, "startOffset": output.start_offset.to_string(), "endOffset": output.end_offset.to_string() }),
         ),
     );
 }

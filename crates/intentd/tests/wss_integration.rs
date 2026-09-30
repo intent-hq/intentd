@@ -24,6 +24,7 @@ mod resource_context;
 mod sharing;
 #[path = "wss_integration/skills.rs"]
 mod skills;
+mod terminal_replay;
 
 #[path = "wss_integration/authenticated_devices.rs"]
 mod authenticated_devices;
