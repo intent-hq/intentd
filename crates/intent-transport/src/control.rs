@@ -217,12 +217,37 @@ pub struct FileWatchStatus {
 /// A `(username, password)` pair resolved for `system.gitCredential`.
 pub type GitCredential = (String, String);
 
+/// Services explicitly registered by a trusted composition root. This is not
+/// caller permission: authentication, roles and transport checks still apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemServices {
+    /// Existing daemon control providers expose the complete control surface.
+    Full,
+    /// Only the status read is installed; commands keep absent-provider routing.
+    StatusOnly,
+}
+
+impl SystemServices {
+    pub(crate) fn admits(self, method: &SystemMethod) -> bool {
+        self == Self::Full || matches!(method, SystemMethod::Status)
+    }
+}
+
 /// Live daemon control surface implemented by the composition root (`intentd`).
 /// Lets a listener answer `system.status` from real state and trigger a
 /// graceful shutdown for `system.shutdown` without reaching into domain code.
 pub trait SystemControl: Send + Sync {
+    /// Select the installed services. Existing providers retain their full surface.
+    fn services(&self) -> SystemServices {
+        SystemServices::Full
+    }
     /// Snapshot the current daemon state.
     fn status(&self) -> SystemStatus;
+    /// Metadata-only compositions may await their original listener snapshot.
+    /// Full providers keep the existing synchronous status dispatch below.
+    fn metadata_status(&self) -> Pin<Box<dyn Future<Output = SystemStatus> + Send + '_>> {
+        Box::pin(async { self.status() })
+    }
     /// Cached host identity, refreshed by the composition root off the RPC path.
     fn host_environment(&self) -> crate::host_env::HostEnvironment;
     /// Request a graceful shutdown (idempotent). Returns immediately; the daemon
@@ -551,6 +576,17 @@ pub(crate) async fn handle(
     is_administrator: bool,
 ) -> Option<String> {
     let result: Result<Value, (i32, String)> = match req.method {
+        SystemMethod::Status if control.services() == SystemServices::StatusOnly => {
+            let snapshot = control.metadata_status().await;
+            if is_administrator {
+                let mut status = status_json(&snapshot, is_local);
+                // No updater is registered on a metadata-only composition.
+                status["exactUpdateSupported"] = json!(false);
+                Ok(status)
+            } else {
+                Ok(collaborator_status_json(&snapshot, is_local))
+            }
+        }
         SystemMethod::Status if !is_administrator => {
             Ok(collaborator_status_json(&control.status(), is_local))
         }
@@ -644,3 +680,32 @@ pub(crate) async fn handle(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod registration_tests {
+    use super::*;
+    #[test]
+    fn typed_system_registration_preserves_classification() {
+        for method in [
+            "system.status",
+            "system.shutdown",
+            "system.requestUpdate",
+            "system.importLegacy",
+            "system.gitCredential",
+        ] {
+            for id in [Some(json!(7)), None] {
+                let mut frame = json!({"jsonrpc":"2.0","method":method,"params":{}});
+                if let Some(id) = id {
+                    frame["id"] = id;
+                }
+                let req = classify(&frame).unwrap();
+                assert!(SystemServices::Full.admits(&req.method));
+                assert_eq!(
+                    SystemServices::StatusOnly.admits(&req.method),
+                    method == "system.status"
+                );
+            }
+        }
+        assert!(classify(&json!({"method":"system.status"})).is_none());
+    }
+}

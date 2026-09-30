@@ -488,7 +488,9 @@ async fn process_captured_frame(
             }
         }
         if let Some(control) = control {
-            if let Some(req) = control::classify(value) {
+            if let Some(req) =
+                control::classify(value).filter(|req| control.services().admits(&req.method))
+            {
                 let is_uds = !crate::context::is_tcp_connection();
                 // A collaborator only ever reaches `system.status` here (the
                 // allowlist above refused the rest) and gets its guest-safe
@@ -507,7 +509,9 @@ async fn process_captured_frame(
             }
         }
         if let Some(server_info) = server_pairing_info {
-            if let Some(req) = crate::pairing::classify_self(value) {
+            if let Some(req) = crate::pairing::classify_self(value)
+                .filter(|_| server_info.services() == crate::server::PairingServices::Full)
+            {
                 let frame = panic_guard::guard_frame(
                     &method,
                     rpc_id.clone(),
@@ -519,7 +523,9 @@ async fn process_captured_frame(
                     None => true,
                 };
             }
-            if let Some(req) = crate::server::classify(value) {
+            if let Some(req) = crate::server::classify(value)
+                .filter(|req| server_info.services().admits(&req.method))
+            {
                 // server.* RPCs are local-only; gate on real connection origin (UDS vs TCP)
                 // not the locality flag. Task-local context set by transport (§5.2).
                 let is_local = !crate::context::is_tcp_connection();
@@ -534,7 +540,9 @@ async fn process_captured_frame(
                     None => true,
                 };
             }
-            if let Some(req) = crate::pairing::classify(value) {
+            if let Some(req) = crate::pairing::classify(value)
+                .filter(|_| server_info.services() == crate::server::PairingServices::Full)
+            {
                 // pairing.getInfo shares the server.* provider and local-only gating:
                 // the payload embeds the bearer token, so it never crosses TCP.
                 let is_local = !crate::context::is_tcp_connection();
@@ -565,7 +573,12 @@ async fn process_captured_frame(
                 let frame = panic_guard::guard_frame(
                     &method,
                     rpc_id.clone(),
-                    crate::invite::handle_create(req, api, server_pairing_info),
+                    crate::invite::handle_create(
+                        req,
+                        api,
+                        server_pairing_info
+                            .filter(|info| info.services() == crate::server::PairingServices::Full),
+                    ),
                 )
                 .await;
                 return match frame {
@@ -587,9 +600,16 @@ async fn process_captured_frame(
             };
         }
         if let Some(req) = host::classify(value) {
+            // Metadata registration does not install a provider for unrelated
+            // host dispatch or invite/alias consumers. Keep their absent path.
             let host_environment = control
+                .filter(|control| control.services() == control::SystemServices::Full)
                 .map(|control| control.host_environment())
-                .or_else(|| server_pairing_info.map(|info| info.host_environment()));
+                .or_else(|| {
+                    server_pairing_info
+                        .filter(|info| info.services() == crate::server::PairingServices::Full)
+                        .map(|info| info.host_environment())
+                });
             // Slow path: spawn so `host.exec` and friends can't block the read
             // loop (UDS HOL fix). `openInEditor` in particular awaits an
             // FE-served reverse RPC on this same connection (§5.14) — running

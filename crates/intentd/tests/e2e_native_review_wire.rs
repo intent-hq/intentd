@@ -118,7 +118,215 @@ impl TokenStore for FixtureToken {
     }
 }
 
+// Metadata composition owns no command or shutdown capability. The legacy
+// SystemControl callbacks below are tripwires: typed dispatch must never invoke
+// them. In particular its void shutdown callback is not a refusal mechanism.
+struct FixtureMetadata {
+    ws: std::sync::OnceLock<std::sync::Weak<WsApiServer>>,
+    uds: std::sync::atomic::AtomicBool,
+    host: intent_transport::HostEnvironment,
+    has_display: bool,
+    started: std::time::Instant,
+    process: std::sync::Mutex<sysinfo::System>,
+    pid: sysinfo::Pid,
+    dir: PathBuf,
+    token: Arc<AsyncTokenStore>,
+    unsupported_calls: std::sync::atomic::AtomicUsize,
+}
+struct MetadataToken {
+    writes: std::sync::atomic::AtomicUsize,
+}
+impl TokenStore for MetadataToken {
+    fn load_token(&self) -> Option<String> {
+        FixtureToken.load_token()
+    }
+    fn store_token(&self, _: &str) -> intent_core::Result<()> {
+        self.writes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(intent_core::Error::Forbidden(
+            "immutable fixture token".into(),
+        ))
+    }
+}
+impl FixtureMetadata {
+    fn new(dir: PathBuf, token: Arc<AsyncTokenStore>) -> Self {
+        Self {
+            ws: std::sync::OnceLock::new(),
+            uds: std::sync::atomic::AtomicBool::new(false),
+            host: intent_transport::host_env::detect_host_environment(),
+            has_display: intent_transport::host_env::detect_has_display(),
+            started: std::time::Instant::now(),
+            process: std::sync::Mutex::new(sysinfo::System::new()),
+            pid: sysinfo::get_current_pid().unwrap(),
+            dir,
+            token,
+            unsupported_calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+    fn server(&self) -> Option<Arc<WsApiServer>> {
+        self.ws.get().and_then(std::sync::Weak::upgrade)
+    }
+    fn snapshot(
+        &self,
+        server: Option<&WsApiServer>,
+        port: Option<u16>,
+    ) -> intent_transport::SystemStatus {
+        let mut system = self.process.lock().unwrap();
+        system.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&[self.pid]),
+            true,
+            sysinfo::ProcessRefreshKind::nothing()
+                .with_cpu()
+                .with_memory(),
+        );
+        let process = system
+            .process(self.pid)
+            .expect("original fixture process sample");
+        intent_transport::SystemStatus {
+            listen_mode: if port.is_some() { "both" } else { "uds" }.into(),
+            uds: self.uds.load(std::sync::atomic::Ordering::SeqCst),
+            tcp: port.is_some(),
+            port,
+            clients: server.as_ref().map_or(0, |s| s.client_count()),
+            // This fixture does not attach an AgentManager or launch agents.
+            agents: 0,
+            max_agents: 0,
+            busy_agents: 0,
+            fingerprint: server
+                .as_ref()
+                .and_then(|s| s.fingerprint().map(str::to_owned)),
+            os: std::env::consts::OS.into(),
+            arch: std::env::consts::ARCH.into(),
+            has_display: self.has_display,
+            version: env!("CARGO_PKG_VERSION").into(),
+            build_commit: intent_transport::BUILD_COMMIT.map(str::to_owned),
+            uptime_seconds: self.started.elapsed().as_secs(),
+            local_ips: intent_transport::server::collect_local_ips(),
+            tc_address: None,
+            hostname: self.host.hostname.clone(),
+            pretty_hostname: self.host.pretty_hostname.clone(),
+            device_kind: self.host.device_kind.clone(),
+            hardware_model: self.host.hardware_model.clone(),
+            cpu_percent: process.cpu_usage(),
+            memory_bytes: process.memory(),
+            child_processes: None,
+            child_memory_bytes: None,
+            child_memory_peak_bytes: None,
+            agent_memory_bytes: None,
+            agent_process_count: None,
+            agent_memory_budget_bytes: None,
+            agent_memory_charged_bytes: None,
+            queued_spawns: None,
+            workspaces_disk_available_bytes: None,
+            workspaces_disk_total_bytes: None,
+            file_watch: None,
+            fd_count: None,
+            fd_limit: None,
+            update_supported: false,
+            idle_update_check: intent_transport::IdleUpdateCheckStatus::default(),
+        }
+    }
+    fn unsupported(&self) {
+        self.unsupported_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+impl intent_transport::SystemControl for FixtureMetadata {
+    fn services(&self) -> intent_transport::control::SystemServices {
+        intent_transport::control::SystemServices::StatusOnly
+    }
+    fn status(&self) -> intent_transport::SystemStatus {
+        // Legacy synchronous trait access is not the installed metadata route.
+        // The original live await is selected by StatusOnly dispatch.
+        use futures_util::FutureExt;
+        let server = self.server();
+        let port = server
+            .as_ref()
+            .and_then(|s| s.bound_port().now_or_never().flatten());
+        self.snapshot(server.as_deref(), port)
+    }
+    fn metadata_status(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = intent_transport::SystemStatus> + Send + '_>,
+    > {
+        Box::pin(async {
+            let server = self.server();
+            let port = match &server {
+                Some(server) => server.bound_port().await,
+                None => None,
+            };
+            self.snapshot(server.as_deref(), port)
+        })
+    }
+    fn host_environment(&self) -> intent_transport::HostEnvironment {
+        self.host.clone()
+    }
+    fn request_shutdown(&self) {
+        self.unsupported();
+    }
+    fn request_update(&self) -> Result<(), String> {
+        self.unsupported();
+        Err("metadata fixture has no updater".into())
+    }
+    fn import_legacy(
+        &self,
+        _: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + '_>>
+    {
+        self.unsupported();
+        Box::pin(async { Err("metadata fixture has no importer".into()) })
+    }
+    fn git_credential(
+        &self,
+        _: Option<u64>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Option<intent_transport::control::GitCredential>>
+                + Send
+                + '_,
+        >,
+    > {
+        self.unsupported();
+        Box::pin(async { None })
+    }
+}
+impl intent_transport::ServerPairingInfo for FixtureMetadata {
+    fn services(&self) -> intent_transport::server::PairingServices {
+        intent_transport::server::PairingServices::LocalInfoOnly
+    }
+    fn pairing_snapshot(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = intent_transport::PairingSnapshot> + Send + '_>,
+    > {
+        Box::pin(async {
+            let port = match self.server() {
+                Some(s) => s.bound_port().await,
+                None => None,
+            };
+            intent_transport::PairingSnapshot {
+                port,
+                bind_addresses: port.map(|_| vec![std::net::Ipv4Addr::LOCALHOST.into()]),
+                tc_address: None,
+            }
+        })
+    }
+    fn host_environment(&self) -> intent_transport::HostEnvironment {
+        self.host.clone()
+    }
+    fn data_dir(&self) -> &std::path::Path {
+        &self.dir
+    }
+    fn token_store(&self) -> &AsyncTokenStore {
+        &self.token
+    }
+}
+
 struct Harness {
+    metadata: Arc<FixtureMetadata>,
+    metadata_token: Arc<MetadataToken>,
+    api: Arc<dyn WorkspaceApi>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     listener: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     ws: Arc<WsApiServer>,
@@ -341,25 +549,55 @@ impl Harness {
         let api: Arc<dyn WorkspaceApi> = services.clone();
         let tls = ensure_tls_certificate(dir.path()).unwrap();
         let cfg = client_config(&tls.fingerprint256);
-        let token_store = Arc::new(AsyncTokenStore::new(Arc::new(FixtureToken)));
+        let metadata_token = Arc::new(MetadataToken {
+            writes: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let token_store = Arc::new(AsyncTokenStore::new(metadata_token.clone()));
+        let metadata = Arc::new(FixtureMetadata::new(
+            dir.path().to_owned(),
+            token_store.clone(),
+        ));
         let options = WsOptions {
             base_port: 0,
             bind_addresses: vec![std::net::Ipv4Addr::LOCALHOST.into()],
             ..Default::default()
         };
-        let ws_server = Arc::new(
-            WsApiServer::new(api.clone(), bus.clone(), &tls, &token_store, options, None).unwrap(),
-        );
+        let mut ws_server = WsApiServer::new(
+            api.clone(),
+            bus.clone(),
+            &tls,
+            &token_store,
+            options,
+            Some(metadata.clone()),
+        )
+        .unwrap();
+        ws_server.install_pairing_info(metadata.clone());
+        let ws_server = Arc::new(ws_server);
+        metadata.ws.set(Arc::downgrade(&ws_server)).unwrap();
         let port = ws_server.start().await.unwrap();
         let (shutdown, receive) = tokio::sync::oneshot::channel();
         let socket = dir.path().join("intentd.sock");
         let socket_task = socket.clone();
         let ws_task = ws_server.clone();
+        let api_task = api.clone();
+        let metadata_task = metadata.clone();
         let listener = tokio::spawn(async move {
-            let result = serve_uds(api, bus, &socket_task, None, async move {
-                let _ = receive.await;
-            })
+            let result = intent_transport::serve_uds_with_reverse(
+                api_task,
+                bus,
+                &socket_task,
+                Some(metadata_task.clone()),
+                Some(metadata_task.clone()),
+                Arc::new(intent_transport::PrimaryReverseRegistry::new()),
+                intent_transport::RpcLimiter::unlimited(),
+                async move {
+                    let _ = receive.await;
+                },
+            )
             .await;
+            metadata_task
+                .uds
+                .store(false, std::sync::atomic::Ordering::SeqCst);
             ws_task.stop().await;
             result
         });
@@ -374,7 +612,13 @@ impl Harness {
         })
         .await
         .unwrap();
+        metadata
+            .uds
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         Self {
+            metadata,
+            metadata_token,
+            api,
             shutdown: Some(shutdown),
             listener: Some(listener),
             ws: ws_server,
@@ -3526,3 +3770,333 @@ impl Drop for CompanionFixtureObservation {
     }
 }
 // companion-observation: end fixture collector
+
+// Metadata qualification uses original listeners and admission, never the
+// standalone driver entry point. Private pairing replies stay in memory.
+async fn metadata_effects(h: &Harness) -> Value {
+    json!({"head":git(&h.root,&["rev-parse","HEAD"]),
+        "index":git(&h.root,&["ls-files","--stage"]),
+        "worktree":git(&h.root,&["diff","--binary"]),
+        "provider":h.counts(),
+        "workspaceInvites":h.store.count_open_workspace_invites().await.unwrap(),
+        "hostInvites":h.store.list_open_host_invites().await.unwrap().len(),
+        "unsupportedCalls":h.metadata.unsupported_calls.load(std::sync::atomic::Ordering::SeqCst),
+        "tokenWrites":h.metadata_token.writes.load(std::sync::atomic::Ordering::SeqCst)})
+}
+fn metadata_public(frame: &Value) {
+    let text = frame.to_string();
+    for token in [TOKEN, MEMBER, GUEST] {
+        assert!(
+            !text.contains(token),
+            "public response contained fixture credential"
+        );
+    }
+    assert!(!text.contains("BEGIN CERTIFICATE"));
+    assert!(frame.get("result").and_then(|r| r.get("token")).is_none());
+}
+async fn metadata_close(h: Harness) {
+    let metadata = h.metadata.clone();
+    let ws = Arc::downgrade(&h.ws);
+    h.shutdown().await;
+    eprintln!(
+        "metadata cleanup: {}",
+        json!({"originalHarnessShutdownJoined":true,"wsOwnerReleased":ws.upgrade().is_none(),"metadataStrongCount":Arc::strong_count(&metadata),"uds":metadata.uds.load(std::sync::atomic::Ordering::SeqCst)})
+    );
+    assert!(ws.upgrade().is_none());
+    assert_eq!(Arc::strong_count(&metadata), 1);
+    assert!(!metadata.uds.load(std::sync::atomic::Ordering::SeqCst));
+}
+#[intent_test_macros::daemon_test]
+async fn native_fixture_metadata_status_pairing_roles() {
+    if run_in_tls_process("native_fixture_metadata_status_pairing_roles").await {
+        return;
+    }
+    use futures_util::FutureExt;
+    eprintln!(
+        "metadata worker: {}",
+        json!({"test":"native_fixture_metadata_status_pairing_roles","pid":std::process::id()})
+    );
+    let a = Harness::boot().await;
+    let b = Harness::boot().await;
+    let result=std::panic::AssertUnwindSafe(async {
+        let before_a=metadata_effects(&a).await;
+        let before_b=metadata_effects(&b).await;
+        for h in [&a,&b] {
+            let mut uds=h.uds().await;
+            let status=uds.rpc("system.status",json!({})).await;
+            metadata_public(&status);
+            eprintln!("metadata UDS status: {status}");
+            let value=success(&status);
+            assert_eq!(value["port"],h.port);
+            assert_eq!(value["transports"],json!(["uds","tcp"]));
+            assert_eq!(value["fingerprint"],h.ws.fingerprint().unwrap());
+            assert_eq!(value["host"]["locality"],"local");
+            assert_eq!(value["agents"],0);
+            assert_eq!(value["maxAgents"],0);
+            assert_eq!(value["updateSupported"],false);
+            assert_eq!(value["exactUpdateSupported"],false);
+            assert_eq!(value["idleUpdateCheck"]["supported"],false);
+            assert!(value["memoryBytes"].as_u64().unwrap()>0);
+            assert!(value["cpuPercent"].as_f64().unwrap().is_finite());
+            assert!(value["childProcesses"].is_null());
+            assert!(value.get("fileWatch").is_none());
+            let pairing=uds.rpc("server.pairingInfo",json!({})).await;
+            // Do not print a private reply, including on an assertion failure.
+            assert!(pairing.get("error").is_none(),"local pairing refused");
+            let p=&pairing["result"];
+            let token_matches=p["token"].as_str()==Some(TOKEN);
+            let certificate_matches=p["certFingerprint"].as_str()==h.ws.fingerprint();
+            let port_matches=p["port"]==h.port;
+            eprintln!("metadata local pairing checks: {}",json!({"tokenMatches":token_matches,"certificateMatches":certificate_matches,"portMatches":port_matches,"pathMatches":p["path"]=="/ws"}));
+            assert!(token_matches && certificate_matches && port_matches);
+            assert_eq!(p["path"],"/ws");
+            for (role,token) in [("owner",TOKEN),("member",MEMBER),("guest",GUEST)] {
+                let mut remote=h.wss(token).await;
+                let status=remote.rpc("system.status",json!({})).await;
+                metadata_public(&status);
+                eprintln!("metadata {role} WSS status: {status}");
+                let v=success(&status);
+                assert_eq!(v["port"],h.port);
+                assert_eq!(v["host"]["locality"],"remote");
+                if role=="owner" {
+                    assert_eq!(v["clients"],h.ws.client_count());
+                    assert_eq!(v["updateSupported"],false);
+                } else {
+                    for key in ["clients","agents","maxAgents","cpuPercent","memoryBytes","updateSupported","exactUpdateSupported","idleUpdateCheck","busyAgents"] { assert!(v.get(key).is_none(),"collaborator received {key}"); }
+                }
+                let denied=remote.rpc("server.pairingInfo",json!({})).await;
+                metadata_public(&denied);
+                eprintln!("metadata {role} remote pairing refusal: {denied}");
+                assert!(denied.get("result").is_none());
+                assert_eq!(denied["error"]["code"],if role=="owner" {-32001} else {-32003});
+            }
+            let url=format!("wss://127.0.0.1:{}/ws?token=invalid-metadata-token",h.port);
+            let status=timeout(common::rpc_read_timeout(),async {
+            let tcp=tokio::net::TcpStream::connect(("127.0.0.1",h.port)).await.unwrap();
+            let tls=tokio_rustls::TlsConnector::from(h.cfg.clone()).connect(ServerName::try_from("localhost").unwrap().to_owned(),tcp).await.unwrap();
+            let rejected=tokio_tungstenite::client_async(&url,tls).await;
+            match rejected {Err(tokio_tungstenite::tungstenite::Error::Http(reply))=>Some(reply.status().as_u16()),_=>None}
+            }).await.expect("original invalid bearer upgrade bounded");
+            eprintln!("metadata invalid bearer actual HTTP status: {status:?}");
+            assert_eq!(status,Some(401));
+        }
+        assert_ne!(a.port,b.port);
+        assert_ne!(a.workspace,b.workspace);
+        assert_ne!(a.dir.path(),b.dir.path());
+        // The original TLS helper caches one WSS certificate per process. Use
+        // the separately owned provider CA as the genuinely different pin.
+        let foreign=std::process::Command::new("openssl")
+            .args(["x509","-in"]).arg(a.dir.path().join("ca.pem"))
+            .args(["-outform","DER"]).output().unwrap();
+        assert!(foreign.status.success(),"owned provider certificate read failed");
+        let foreign_pin=Sha256::digest(&foreign.stdout).iter()
+            .map(|byte| format!("{byte:02X}")).collect::<Vec<_>>().join(":");
+        assert_ne!(Some(foreign_pin.as_str()),b.ws.fingerprint());
+        let cross=timeout(common::rpc_read_timeout(),async {
+        let tcp=tokio::net::TcpStream::connect(("127.0.0.1",b.port)).await.unwrap();
+        tokio_rustls::TlsConnector::from(client_config(&foreign_pin)).connect(ServerName::try_from("localhost").unwrap().to_owned(),tcp).await
+        }).await.expect("original foreign certificate rejection bounded");
+        eprintln!("metadata foreign certificate TLS rejected: {}",cross.is_err());
+        assert!(cross.is_err(),"foreign pinned certificate upgraded");
+        let after_a=metadata_effects(&a).await;let after_b=metadata_effects(&b).await;
+        eprintln!("metadata original effects: {}",json!({"beforeA":before_a,"afterA":after_a,"beforeB":before_b,"afterB":after_b}));
+        assert_eq!(before_a,after_a);assert_eq!(before_b,after_b);
+    }).catch_unwind().await;
+    metadata_close(a).await;
+    metadata_close(b).await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+impl Client {
+    async fn metadata_notification(&mut self, method: &str, params: &Value) {
+        let frame = json!({"jsonrpc":"2.0","method":method,"params":params}).to_string();
+        match &mut self.socket {
+            Socket::Uds(stream) => stream
+                .get_mut()
+                .write_all(format!("{frame}\n").as_bytes())
+                .await
+                .unwrap(),
+            Socket::Ws(ws) => ws.send(Message::Text(frame.into())).await.unwrap(),
+        }
+    }
+}
+#[intent_test_macros::daemon_test]
+async fn native_fixture_metadata_unsupported_matches_absent() {
+    if run_in_tls_process("native_fixture_metadata_unsupported_matches_absent").await {
+        return;
+    }
+    use futures_util::FutureExt;
+    eprintln!(
+        "metadata worker: {}",
+        json!({"test":"native_fixture_metadata_unsupported_matches_absent","pid":std::process::id()})
+    );
+    let h = Harness::boot().await;
+    let socket = h.dir.path().join("absent.sock");
+    let (stop, receive) = tokio::sync::oneshot::channel();
+    let api = h.api.clone();
+    let task_socket = socket.clone();
+    let absent_bus = EventBus::new(h.store.clone());
+    let listener = tokio::spawn(async move {
+        serve_uds(api, absent_bus, &task_socket, None, async {
+            let _ = receive.await;
+        })
+        .await
+    });
+    let tls = ensure_tls_certificate(h.dir.path()).unwrap();
+    let absent = WsApiServer::new(
+        h.api.clone(),
+        EventBus::new(h.store.clone()),
+        &tls,
+        &h.metadata.token,
+        WsOptions {
+            base_port: 0,
+            bind_addresses: vec![std::net::Ipv4Addr::LOCALHOST.into()],
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap();
+    let port = absent.start().await.unwrap();
+    let result = std::panic::AssertUnwindSafe(async {
+        let before = metadata_effects(&h).await;
+        let stream = timeout(common::daemon_startup_timeout(), async {
+            loop {
+                if let Ok(s) = UnixStream::connect(&socket).await {
+                    break s;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut baseline = Client {
+            socket: Socket::Uds(BufReader::new(stream)),
+            id: 0,
+            notices: Vec::new(),
+        };
+        let mut metadata = h.uds().await;
+        let url = format!("wss://localhost:{port}/ws?token={TOKEN}");
+        let ws = common::wss_connect_with_retry(port, h.cfg.clone(), &url).await;
+        let mut baseline_remote = Client {
+            socket: Socket::Ws(Box::new(ws)),
+            id: 0,
+            notices: Vec::new(),
+        };
+        let mut metadata_remote = h.wss(TOKEN).await;
+        for (method, params) in [
+            ("system.shutdown", json!({})),
+            ("system.requestUpdate", json!({})),
+            ("system.requestUpdate", json!({"targetVersion":"1.2.3"})),
+            ("system.requestUpdate", json!({"targetVersion":42})),
+            ("system.importLegacy", json!({"force":true})),
+            (
+                "system.gitCredential",
+                json!({"protocol":"https","host":"github.com"}),
+            ),
+            (
+                "system.gitCredential",
+                json!({"protocol":"ssh","host":"other.invalid"}),
+            ),
+            ("server.rotateToken", json!({})),
+            ("pairing.getInfo", json!({})),
+            ("pairing.getSelfInfo", json!({})),
+            (
+                "workspace.invite.create",
+                json!({"workspaceId":h.workspace}),
+            ),
+            (
+                "host.invite.create",
+                json!({"pinLogin":"fixture","pinProvider":"github"}),
+            ),
+        ] {
+            for (transport, a, b) in [
+                ("uds", &mut metadata, &mut baseline),
+                ("wss", &mut metadata_remote, &mut baseline_remote),
+            ] {
+                a.metadata_notification(method, &params).await;
+                b.metadata_notification(method, &params).await;
+                let mut actual = a.rpc(method, params.clone()).await;
+                let mut absent = b.rpc(method, params.clone()).await;
+                metadata_public(&actual);
+                metadata_public(&absent);
+                actual.as_object_mut().unwrap().remove("id");
+                absent.as_object_mut().unwrap().remove("id");
+                eprintln!(
+                    "metadata unsupported {transport} {method}: {}",
+                    json!({"actual":actual,"absent":absent})
+                );
+                assert!(actual.get("result").is_none());
+                assert_eq!(actual, absent);
+            }
+        }
+        success(&metadata.rpc("system.status", json!({})).await);
+        success(&metadata_remote.rpc("system.status", json!({})).await);
+        let notification_frames=[metadata.notices.len(),baseline.notices.len(),metadata_remote.notices.len(),baseline_remote.notices.len()];
+        eprintln!("metadata unsolicited frames after notification/request routing: {notification_frames:?}");
+        assert_eq!(notification_frames,[0,0,0,0]);
+        let after = metadata_effects(&h).await;
+        eprintln!(
+            "metadata unsupported effects: {}",
+            json!({"before":before,"after":after})
+        );
+        assert_eq!(before, after);
+        assert_eq!(after["unsupportedCalls"], 0);
+        assert_eq!(after["tokenWrites"], 0);
+    })
+    .catch_unwind()
+    .await;
+    stop.send(()).unwrap();
+    timeout(Duration::from_secs(5), listener)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    absent.stop().await;
+    assert!(absent.bound_port().await.is_none());
+    assert!(UnixStream::connect(&socket).await.is_err());
+    assert!(tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .is_err());
+    eprintln!("metadata absent listener original close and join completed");
+    metadata_close(h).await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_fixture_metadata_failed_bind_releases_original_owners() {
+    if run_in_tls_process("native_fixture_metadata_failed_bind_releases_original_owners").await {
+        return;
+    }
+    eprintln!(
+        "metadata worker: {}",
+        json!({"test":"native_fixture_metadata_failed_bind_releases_original_owners","pid":std::process::id()})
+    );
+    let h = Harness::boot().await;
+    let before = metadata_effects(&h).await;
+    let path = h.dir.path().join("occupied-socket");
+    std::fs::create_dir(&path).unwrap();
+    let result = intent_transport::serve_uds_with_reverse(
+        h.api.clone(),
+        EventBus::new(h.store.clone()),
+        &path,
+        Some(h.metadata.clone()),
+        Some(h.metadata.clone()),
+        Arc::new(intent_transport::PrimaryReverseRegistry::new()),
+        intent_transport::RpcLimiter::unlimited(),
+        std::future::pending::<()>(),
+    )
+    .await;
+    eprintln!(
+        "metadata original failed bind: {}",
+        json!({"errorKind":result.as_ref().err().map(|e|format!("{:?}",e.kind())),"effects":metadata_effects(&h).await})
+    );
+    let failed = result.is_err();
+    let after = metadata_effects(&h).await;
+    metadata_close(h).await;
+    assert!(failed);
+    assert_eq!(before, after);
+}
