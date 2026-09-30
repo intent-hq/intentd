@@ -32,6 +32,8 @@ use serde_json::{json, Value};
 use sqlx::Row;
 
 mod client;
+#[cfg(unix)]
+mod command_evidence;
 mod doctor_codex;
 mod exact_update;
 mod git_credential;
@@ -57,6 +59,34 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Run a bounded noninteractive command with durable OS exit evidence (Unix).
+    /// An independent waiter survives this caller or daemon stopping; script.stop
+    /// does not cancel it. Output goes to record-dir/invocation/*.log. The receipt
+    /// covers the direct child, not escaped descendants. Query command-result
+    /// after daemon loss; script.status remains lost. Never reuse an invocation ID.
+    #[cfg(unix)]
+    #[command(name = "command-run")]
+    EvidenceRun(command_evidence::RunArgs),
+    /// Read invocation-bound exit evidence; exit 0 = success, 1 = known failure,
+    /// 2 = unknown (missing, incomplete or mismatched evidence). Does not use PIDs
+    /// or test reports to infer success. Works without a running daemon (Unix).
+    #[cfg(unix)]
+    #[command(name = "command-result")]
+    EvidenceResult(command_evidence::ResultArgs),
+    /// Request stop from the invocation's waiter and wait up to five seconds for
+    /// observed exit evidence. Missing evidence stays unknown; never signals a PID.
+    #[cfg(unix)]
+    #[command(name = "command-stop")]
+    EvidenceStop(command_evidence::ResultArgs),
+    /// Remove settled invocation evidence and logs; retain a tombstone preventing
+    /// ID reuse. Refuses active/unknown invocations; export needed evidence first.
+    #[cfg(unix)]
+    #[command(name = "command-clean")]
+    EvidenceClean(command_evidence::ResultArgs),
+    #[cfg(unix)]
+    #[command(hide = true)]
+    #[command(name = "command-worker")]
+    EvidenceWorker { directory: PathBuf },
     /// Provider authentication and internal ACP launch helpers.
     Provider {
         #[command(subcommand)]
@@ -281,6 +311,15 @@ fn main() -> ExitCode {
     // value). The env var is the single seam `apply_startup_pins` and the
     // specialists service read.
     let cli = Cli::parse();
+    #[cfg(unix)]
+    let cli = match cli.command {
+        Command::EvidenceRun(args) => return command_evidence::run(args),
+        Command::EvidenceResult(args) => return command_evidence::result(&args),
+        Command::EvidenceStop(args) => return command_evidence::stop(&args),
+        Command::EvidenceClean(args) => return command_evidence::clean(&args),
+        Command::EvidenceWorker { directory } => return command_evidence::worker(&directory),
+        command => Cli { command },
+    };
     if let Command::Serve {
         specialists_dir: Some(dir),
         ..
@@ -340,6 +379,14 @@ async fn async_main(cli: Cli) -> ExitCode {
     // the capability gates never see an unbound request (fail-closed).
     intent_core::with_caller(intent_core::Caller::Daemon, async move {
         match command {
+            #[cfg(unix)]
+            Command::EvidenceRun(_)
+            | Command::EvidenceResult(_)
+            | Command::EvidenceStop(_)
+            | Command::EvidenceClean(_)
+            | Command::EvidenceWorker { .. } => {
+                unreachable!("command evidence helpers run before the async runtime")
+            }
             Command::Provider { command } => provider::run(command).await,
             Command::Serve {
                 mode,
