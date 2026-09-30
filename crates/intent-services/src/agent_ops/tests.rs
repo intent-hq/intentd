@@ -38695,11 +38695,11 @@ async fn resolve_proposal_dismissed_delivers_dismissed_notice() {
 
 /// Idempotency: re-resolving an already-resolved id succeeds echoing the
 /// persisted outcome — even with a DIFFERENT requested outcome — without a
-/// duplicate notice. Restart equivalence comes free: the check reads the
-/// persisted resolutions map.
+/// duplicate notice or resolution event. Restart equivalence comes free:
+/// the check reads the persisted resolutions map.
 #[tokio::test]
 async fn resolve_proposal_repeat_resolution_is_idempotent() {
-    let (_t, svc, ws) = setup().await;
+    let (_t, svc, ws, bus) = setup_with_bus().await;
     let id = create_agent(&svc, &ws, "Proposer").await;
     let msg = svc
         .store()
@@ -38711,6 +38711,10 @@ async fn resolve_proposal_repeat_resolution_is_idempotent() {
             .await
     );
 
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_UPDATED.to_string()],
+        ..Default::default()
+    });
     svc.agent_resolve_proposal_op(
         ws.clone(),
         id.clone(),
@@ -38746,16 +38750,57 @@ async fn resolve_proposal_repeat_resolution_is_idempotent() {
         session.proposal_resolutions().get("tc-1"),
         Some(&json!("applied"))
     );
-    let count_after_second = svc
+    let messages_after_second = svc
         .store()
         .get_agent_messages(&id, None)
         .await
-        .expect("messages")
-        .len();
+        .expect("messages");
     assert_eq!(
-        count_after_first, count_after_second,
+        count_after_first,
+        messages_after_second.len(),
         "re-resolution must not deliver a duplicate notice"
     );
+    assert_eq!(
+        messages_after_second
+            .iter()
+            .filter(|message| message.metadata.as_ref().is_some_and(|metadata| {
+                metadata["type"] == "proposal_resolved" && metadata["proposalId"] == "tc-1"
+            }))
+            .count(),
+        1,
+        "exactly one proposal notice must be persisted"
+    );
+
+    // Publication is awaited by resolveProposal. Count its durable events
+    // after both calls, then match the live delivery by id, without a sleep
+    // that could miss a queued duplicate.
+    let events = svc
+        .store()
+        .query_events(&intent_store::EventQuery {
+            workspace_id: Some(ws.clone()),
+            event_types: vec![AGENT_UPDATED.to_string()],
+            ..Default::default()
+        })
+        .await
+        .expect("resolution events");
+    let resolution_events: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event.data["agentId"] == id.0 && event.data.get("proposalResolutions").is_some()
+        })
+        .collect();
+    assert_eq!(resolution_events.len(), 1, "exactly one resolution event");
+    assert_eq!(resolution_events[0].data["pendingProposals"], json!([]));
+    assert_eq!(
+        resolution_events[0].data["proposalResolutions"],
+        json!({"tc-1": "applied"})
+    );
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("live resolution event timed out")
+        .expect("subscription closed");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch[0].id, resolution_events[0].id);
 }
 
 /// Error paths: unknown `proposalId` (never pending, never resolved) →

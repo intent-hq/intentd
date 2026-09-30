@@ -22,6 +22,8 @@ mod human_attribution;
 mod sharing;
 mod workspace_delete;
 
+mod metadata_key_json;
+
 /// A unique temp DB path inside an RAII temp dir: the dir (and with it the
 /// `.db`/`-wal`/`-shm` files) is removed on drop, including on panic; set
 /// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
