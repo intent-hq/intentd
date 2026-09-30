@@ -663,8 +663,8 @@ impl Services {
     }
 
     /// Publish `presence:changed` to every workspace `principal` belongs to
-    /// (its online / offline transition).
-    async fn emit_presence_for_memberships(&self, principal: &PrincipalId) {
+    /// after an online/offline transition or an effective membership addition.
+    pub(super) async fn emit_presence_for_memberships(&self, principal: &PrincipalId) {
         let memberships = match self
             .store
             .effective_principal_workspace_ids(principal)
