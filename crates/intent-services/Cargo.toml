@@ -1,6 +1,6 @@
 [package]
 name = "intent-services"
-version = "0.9.117"
+version = "0.9.120"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -12,19 +12,19 @@ description = "Shared business-logic surface invoked by every transport and the 
 probe-wait-observer = []
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.9.117" }
-intent-store = { path = "../intent-store", version = "0.9.117" }
-intent-git = { path = "../intent-git", version = "0.9.117" }
-intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.9.117" }
-intent-linear = { path = "../intent-linear", version = "0.9.117" }
-intent-sentry = { path = "../intent-sentry", version = "0.9.117" }
+intent-core = { path = "../intent-core", version = "0.9.120" }
+intent-store = { path = "../intent-store", version = "0.9.120" }
+intent-git = { path = "../intent-git", version = "0.9.120" }
+intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.9.120" }
+intent-linear = { path = "../intent-linear", version = "0.9.120" }
+intent-sentry = { path = "../intent-sentry", version = "0.9.120" }
 intent-voice = { path = "../intent-voice", version = "0.4.1" }
-intent-acp = { path = "../intent-acp", version = "0.9.117" }
-intent-js = { path = "../intent-js", version = "0.9.117" }
-intent-context = { path = "../intent-context", version = "0.9.117" }
-intent-providers = { path = "../intent-providers", version = "0.9.117" }
-intent-pty = { path = "../intent-pty", version = "0.9.117" }
-intent-search = { path = "../intent-search", version = "0.9.117" }
+intent-acp = { path = "../intent-acp", version = "0.9.120" }
+intent-js = { path = "../intent-js", version = "0.9.120" }
+intent-context = { path = "../intent-context", version = "0.9.120" }
+intent-providers = { path = "../intent-providers", version = "0.9.120" }
+intent-pty = { path = "../intent-pty", version = "0.9.120" }
+intent-search = { path = "../intent-search", version = "0.9.120" }
 base64 = { workspace = true }
 git2 = { workspace = true }
 ignore = { workspace = true }

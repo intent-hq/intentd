@@ -1,5 +1,5 @@
 name: Restore release Rust cache
-description: Read-only bounded sccache contract shared by main producers and tag consumers.
+description: Bounded sccache archives shared by main producers and tag consumers.
 inputs:
   flavor:
     description: daemon-dist or sitter-release (never shared across profiles)
@@ -67,9 +67,23 @@ runs:
           # newest committed generation instead of pinning an old exact key.
           echo "key=$prefix$BUILD_INPUTS-${generation:-lookup}"
         } >> "$GITHUB_OUTPUT"
+        # The daemon graph exceeds the archive cap. Writing early misses into
+        # that small cache evicts restored late dependencies before their turn.
+        # Tags preserve the seed; main producers need bounded working room to
+        # refresh it. The producer still trims to 256 MiB BEFORE every upload.
+        size=256M
+        mode=READ_WRITE
+        if [[ "$CACHE_FLAVOR" == daemon-dist ]]; then
+          if [[ -n "$generation" ]]; then
+            size=2G
+          else
+            mode=READ_ONLY
+          fi
+        fi
         {
           echo "SCCACHE_DIR=$directory"
-          echo 'SCCACHE_CACHE_SIZE=256M'
+          echo "SCCACHE_CACHE_SIZE=$size"
+          echo "SCCACHE_LOCAL_RW_MODE=$mode"
           echo 'SCCACHE_GHA_ENABLED=false'
           echo 'CARGO_INCREMENTAL=0'
           echo 'RUSTC_WRAPPER=sccache'
@@ -97,3 +111,7 @@ runs:
         CACHE_MATCHED_KEY: ${{ steps.restore.outputs.cache-matched-key }}
       run: |
         echo "Restored archive: ${CACHE_MATCHED_KEY:-none} (compiler hits are reported separately)" >> "$GITHUB_STEP_SUMMARY"
+        echo "Compiler cache mode: ${SCCACHE_LOCAL_RW_MODE:-READ_WRITE}; working limit: ${SCCACHE_CACHE_SIZE:-256M}; saved entry limit: 256 MiB." >> "$GITHUB_STEP_SUMMARY"
+        if [[ "${SCCACHE_LOCAL_RW_MODE:-}" == READ_ONLY ]]; then
+          echo 'Daemon seed is read-only to prevent eviction before reuse. sccache 0.17 reports intentionally rejected miss writes as cache-write errors; raw statistics are preserved.' >> "$GITHUB_STEP_SUMMARY"
+        fi

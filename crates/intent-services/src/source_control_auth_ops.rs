@@ -34,6 +34,9 @@ use crate::events::EventBus;
 use crate::github_auth_ops::{self, FlowPhase, FlowSlot, MAX_CONSECUTIVE_POLL_ERRORS};
 use crate::{publish_event, system_actor};
 
+#[cfg(test)]
+mod startup_tests;
+
 /// Env override for the origin GitLab API / OAuth calls go to — the
 /// spawned-daemon test seam (consulted only when
 /// `sourceControl.gitlab.apiBaseUrl` is unset; same loopback-only cleartext
@@ -162,12 +165,20 @@ pub(crate) struct GitlabFlowSlot {
     pub(crate) slot: FlowSlot,
 }
 
+/// Ownership reserved before awaiting the upstream startup response. A late
+/// response may install a flow only while this intent is still current.
+pub(crate) struct GitlabStartupIntent {
+    pub(crate) host: String,
+    id: u64,
+}
+
 /// Shared GitLab auth state: the flow slot plus the hosts that reported the
 /// device grant unsupported (404 / `unauthorized_client`), which flips
 /// `deviceGrantSupported` to `false` until the daemon restarts.
 #[derive(Default)]
 pub(crate) struct GitlabAuthState {
     pub(crate) flow: Option<GitlabFlowSlot>,
+    pub(crate) starting: Option<GitlabStartupIntent>,
     pub(crate) unsupported_hosts: HashSet<String>,
 }
 
@@ -927,7 +938,11 @@ impl crate::Services {
         )
         .await
         .map_err(crate::pr_ops::map_sc_err)?;
-        self.gitlab_auth.lock().await.flow = None;
+        {
+            let mut guard = self.gitlab_auth.lock().await;
+            guard.flow = None;
+            guard.starting = None;
+        }
         bind_gitlab_host(self.settings_registry.as_deref(), host.host());
         tracing::info!(host = host.host(), "gitlab personal access token connected");
         publish_auth_changed(
@@ -949,7 +964,7 @@ impl crate::Services {
             provider: Provider::Gitlab.as_wire().to_string(),
             host: host.host().to_string(),
         };
-        {
+        let (flow_id, client_id) = {
             let mut guard = self.gitlab_auth.lock().await;
             if let Some(f) = guard.flow.as_ref() {
                 if f.host == host.host() && f.slot.is_live() {
@@ -957,12 +972,19 @@ impl crate::Services {
                 }
             }
             guard.flow = None;
+            guard.starting = None;
             if guard.unsupported_hosts.contains(host.host()) {
                 return Err(unsupported());
             }
-        }
-        let Some(client_id) = self.gitlab_client_id(&host) else {
-            return Err(unsupported());
+            let Some(client_id) = self.gitlab_client_id(&host) else {
+                return Err(unsupported());
+            };
+            let flow_id = github_auth_ops::next_flow_id();
+            guard.starting = Some(GitlabStartupIntent {
+                host: host.host().to_string(),
+                id: flow_id,
+            });
+            (flow_id, client_id)
         };
         let started = intent_sourcecontrol::gitlab_auth::start_device_grant_with_store(
             &host,
@@ -970,6 +992,20 @@ impl crate::Services {
             self.gitlab_secret_store.clone(),
         )
         .await;
+        let mut guard = self.gitlab_auth.lock().await;
+        if !matches!(guard.starting.as_ref(), Some(s) if s.id == flow_id) {
+            // Keep same-host reuse when a concurrent request already installed
+            // its live flow, but never resurrect a superseded startup.
+            if let Some(f) = guard.flow.as_ref() {
+                if f.host == host.host() && f.slot.is_live() {
+                    return Ok(github_auth_ops::connect_response(&f.slot));
+                }
+            }
+            return Err(Error::Internal(
+                "GitLab device authorization was cancelled or superseded".to_string(),
+            ));
+        }
+        guard.starting = None;
         let (auth, flow) = match started {
             Ok(pair) => pair,
             Err(intent_sourcecontrol::Error::DeviceGrantUnsupported(reason)) => {
@@ -978,22 +1014,11 @@ impl crate::Services {
                     reason,
                     "gitlab device grant unsupported"
                 );
-                self.gitlab_auth
-                    .lock()
-                    .await
-                    .unsupported_hosts
-                    .insert(host.host().to_string());
+                guard.unsupported_hosts.insert(host.host().to_string());
                 return Err(unsupported());
             }
             Err(e) => return Err(crate::pr_ops::map_sc_err(e)),
         };
-        let mut guard = self.gitlab_auth.lock().await;
-        if let Some(f) = guard.flow.as_ref() {
-            if f.host == host.host() && f.slot.is_live() {
-                return Ok(github_auth_ops::connect_response(&f.slot));
-            }
-        }
-        let flow_id = github_auth_ops::next_flow_id();
         let deadline = Instant::now() + std::time::Duration::from_secs(auth.expires_in);
         intent_core::spawn_daemon(run_gitlab_poll_loop(
             self.gitlab_auth.clone(),
