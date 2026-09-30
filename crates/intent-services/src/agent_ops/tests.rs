@@ -9953,7 +9953,7 @@ async fn worst_case_agent_list_row(
         .await
         .expect("effort levels");
     svc.store()
-        .set_agent_notifications_muted(ws, &id, true, &ts)
+        .set_agent_notifications_muted(ws, &id, true)
         .await
         .expect("mute");
 
@@ -31242,6 +31242,96 @@ async fn agent_update_patches_listed_fields_and_emits_updated() {
     assert!(batch.iter().any(
         |e| e.event_type == AGENT_UPDATED && e.data["agentId"].as_str() == Some(id.0.as_str())
     ));
+}
+
+/// Preference-only updates preserve activity time in persistence, the response,
+/// and the projection a client reads after receiving the invalidation event.
+#[tokio::test]
+async fn agent_update_notifications_muted_preserves_activity_timestamp() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Mute timestamp").await;
+    let old = "2020-01-01T00:00:00.000Z";
+    let mut session = svc.store.get_agent_session(&id).await.unwrap();
+    session.updated_at = old.to_string();
+    svc.store.update_agent_session(&ws, &session).await.unwrap();
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_UPDATED.to_string()],
+        ..Default::default()
+    });
+
+    for muted in [true, true, false, false] {
+        let response = svc
+            .agent_update_op(id.clone(), json!({ "notificationsMuted": muted }))
+            .await
+            .expect("toggle notifications");
+        assert_eq!(response["agent"]["notificationsMuted"], muted);
+        assert_eq!(response["agent"]["updatedAt"], old);
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("event arrives")
+            .expect("subscription open");
+        let event = batch
+            .iter()
+            .find(|e| e.event_type == AGENT_UPDATED)
+            .unwrap();
+        assert_eq!(
+            event.data,
+            json!({ "agentId": id.0, "notificationsMuted": muted })
+        );
+        let stored = svc.agent_get_session_op(id.clone()).await.unwrap();
+        assert_eq!(stored.updated_at, old);
+        assert_eq!(stored.notifications_muted, muted);
+        assert_eq!(stored.name, "Mute timestamp");
+        assert_eq!(stored.status, session.status);
+    }
+}
+
+/// A mute flag accompanying substantive edits must not suppress their activity
+/// timestamp; the event remains an invalidation of the updated stored projection.
+#[tokio::test]
+async fn agent_update_notifications_muted_mixed_edits_advance_activity_timestamp() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Before").await;
+    let old = "2020-01-01T00:00:00.000Z";
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_UPDATED.to_string(), AGENT_RENAMED.to_string()],
+        ..Default::default()
+    });
+    for changes in [
+        json!({ "notificationsMuted": true, "name": "After" }),
+        json!({ "notificationsMuted": true, "status": "idle" }),
+        json!({ "notificationsMuted": false, "systemPrompt": "New prompt" }),
+        json!({ "notificationsMuted": false, "isBackground": true }),
+        json!({ "name": "Real edit" }),
+    ] {
+        let mut session = svc.store.get_agent_session(&id).await.unwrap();
+        session.updated_at = old.to_string();
+        svc.store.update_agent_session(&ws, &session).await.unwrap();
+        let response = svc
+            .agent_update_op(id.clone(), changes.clone())
+            .await
+            .unwrap();
+        let stored = svc.agent_get_session_op(id.clone()).await.unwrap();
+        assert!(stored.updated_at.as_str() > old, "{changes}");
+        assert_eq!(response["agent"]["updatedAt"], stored.updated_at);
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let event = batch.iter().find(|e| e.data["agentId"] == id.0).unwrap();
+        for (key, value) in changes.as_object().unwrap() {
+            assert_eq!(&event.data[key], value);
+        }
+        assert!(
+            event.data.get("updatedAt").is_none(),
+            "invalidation does not invent activity time"
+        );
+    }
+    let stored = svc.agent_get_session_op(id).await.unwrap();
+    assert_eq!(stored.name, "Real edit");
+    assert_eq!(stored.system_prompt.as_deref(), Some("New prompt"));
+    assert!(stored.is_background);
+    assert!(!stored.notifications_muted);
 }
 
 /// Name-only updates fold into `agent:renamed` (not `agent:updated`), matching
