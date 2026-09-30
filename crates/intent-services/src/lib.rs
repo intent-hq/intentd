@@ -19077,6 +19077,47 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn script_list_filtered(
+        &self,
+        workspace_id: WorkspaceId,
+        archive: intent_core::ScriptArchiveFilter,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let mgr = self.script_manager();
+        Box::pin(async move {
+            self.require_workspace_manager(&workspace_id, "script.list")
+                .await?;
+            mgr.list_filtered(&workspace_id, archive).await
+        })
+    }
+
+    fn script_archive(
+        &self,
+        workspace_id: WorkspaceId,
+        script_ids: Vec<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let mgr = self.script_manager();
+        Box::pin(async move {
+            self.require_workspace_manager(&workspace_id, "script.archive")
+                .await?;
+            self.require_member(&workspace_id).await?;
+            mgr.archive(&workspace_id, script_ids, true).await
+        })
+    }
+
+    fn script_restore(
+        &self,
+        workspace_id: WorkspaceId,
+        script_ids: Vec<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let mgr = self.script_manager();
+        Box::pin(async move {
+            self.require_workspace_manager(&workspace_id, "script.restore")
+                .await?;
+            self.require_member(&workspace_id).await?;
+            mgr.archive(&workspace_id, script_ids, false).await
+        })
+    }
+
     fn script_create(
         &self,
         workspace_id: WorkspaceId,
@@ -19132,7 +19173,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_workspace_manager(&workspace_id, "script.start")
                 .await?;
-            mgr.start(&workspace_id, &script_id)
+            mgr.start(&workspace_id, &script_id).await
         })
     }
 

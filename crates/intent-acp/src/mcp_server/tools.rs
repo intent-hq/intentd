@@ -268,10 +268,13 @@ API:
     Prefer explicit categories over bare `*`; `excludeSelf` defaults to true and `batchWindow` defaults to 500ms. `agent:*` events are not subscribable — use `ws.agent.watch(agentId)` to be woken when another agent completes, fails, or raises a blocker/discussion.
   ws.event.unsubscribe(subscriptionId) → { ok, subscriptionId }  // Removes one event subscription.
 
-  ws.script.list() → [scripts]  // Lists saved scripts with runtime status when available.
-  ws.script.create(name, command, mode, { cwd?, env?, category?, autoStart?, scriptId? }) → { id }  // Create or update a saved script. `mode="service"` is for long-running auto-restart processes; `mode="command"` runs once to completion.
+  ws.script.list({ archive? }?) → [scripts]  // Lists active scripts. Archive is active, archived or all. Retained IDs remain available to status/output.
+  ws.script.create(name, command, mode, { cwd?, env?, category?, autoStart?, scriptId?, purpose? }) → { id }  // Creates or replaces a script. Purpose is saved (default) or oneOff (command only, no autoStart). Use oneOff for ad hoc validation: all settled outcomes retire to history with lastRun; saved commands/services stay active. `mode="service"` is for long-running auto-restart processes; `mode="command"` runs once to completion.
+  ws.script.archive(scriptIds) → { archived, skipped }  // Archives inactive commands. Select 1–1000 IDs; never stops a process.
+  ws.script.restore(scriptIds) → { restored, skipped }  // Restores scripts. Does not start processes.
+    Example: `const { id } = await ws.script.create("Check", "make check", "command", { purpose: "oneOff" }); await ws.script.start(id);` Then follow the completion guidance under `ws.script.status(id)` and read `ws.script.output(id)`. Inspect outcomes with `ws.script.list({ archive: "archived" })`; output remains transient across daemon restart.
   ws.script.remove(scriptId) → { ok, scriptId }  // Stops and removes a saved script definition.
-  ws.script.start(scriptId) → { ok, scriptId }  // Starts an existing script and returns at once: `ok: true` means the launch was accepted, not that the process is up. The status flips to `starting` synchronously (a call that lands inside a `restarting` gap keeps `restarting`; one on an already `starting` / `running` script is a no-op) and the spawn's outcome — `running`, or `exited` + `error` on a startup failure — lands on `ws.script.status` and the `script:state` event afterwards; watch it with the completion recipe under `ws.script.status`.
+  ws.script.start(scriptId) → { ok, scriptId }  // Starts a script. Returns after launch acceptance; `ok: true` does not mean the process is up. The status flips to `starting` synchronously (a call that lands inside a `restarting` gap keeps `restarting`; one on an already `starting` / `running` script is a no-op) and the spawn's outcome — `running`, or `exited` + `error` on a startup failure — lands on `ws.script.status` and the `script:state` event afterwards; watch it with the completion recipe under `ws.script.status`.
   ws.script.stop(scriptId) → { ok, scriptId }  // Stops a running script.
   ws.script.restart(scriptId) → { ok, scriptId }  // Stops then restarts a script.
   ws.script.output(scriptId, maxLines?) → string  // Returns recent output buffer text.
@@ -525,10 +528,13 @@ API:
     Prefer explicit categories over bare `*`; `excludeSelf` defaults to true and `batchWindow` defaults to 500ms. `agent:*` events are not subscribable — use `ws.agent.watch(agentId)` to be woken when another agent completes, fails, or raises a blocker/discussion.
   ws.event.unsubscribe(subscriptionId) → { ok, subscriptionId }  // Removes one event subscription.
 
-  ws.script.list() → [scripts]  // Lists saved scripts with runtime status when available.
-  ws.script.create(name, command, mode, { cwd?, env?, category?, autoStart?, scriptId? }) → { id }  // Create or update a saved script. `mode="service"` is for long-running auto-restart processes; `mode="command"` runs once to completion.
+  ws.script.list({ archive? }?) → [scripts]  // Lists active scripts. Archive is active, archived or all. Retained IDs remain available to status/output.
+  ws.script.create(name, command, mode, { cwd?, env?, category?, autoStart?, scriptId?, purpose? }) → { id }  // Creates or replaces a script. Purpose is saved (default) or oneOff (command only, no autoStart). Use oneOff for ad hoc validation: all settled outcomes retire to history with lastRun; saved commands/services stay active. `mode="service"` is for long-running auto-restart processes; `mode="command"` runs once to completion.
+  ws.script.archive(scriptIds) → { archived, skipped }  // Archives inactive commands. Select 1–1000 IDs; never stops a process.
+  ws.script.restore(scriptIds) → { restored, skipped }  // Restores scripts. Does not start processes.
+    Example: `const { id } = await ws.script.create("Check", "make check", "command", { purpose: "oneOff" }); await ws.script.start(id);` Then follow the completion guidance under `ws.script.status(id)` and read `ws.script.output(id)`. Inspect outcomes with `ws.script.list({ archive: "archived" })`; output remains transient across daemon restart.
   ws.script.remove(scriptId) → { ok, scriptId }  // Stops and removes a saved script definition.
-  ws.script.start(scriptId) → { ok, scriptId }  // Starts an existing script and returns at once: `ok: true` means the launch was accepted, not that the process is up. The status flips to `starting` synchronously (a call that lands inside a `restarting` gap keeps `restarting`; one on an already `starting` / `running` script is a no-op) and the spawn's outcome — `running`, or `exited` + `error` on a startup failure — lands on `ws.script.status` and the `script:state` event afterwards; watch it with the completion recipe under `ws.script.status`.
+  ws.script.start(scriptId) → { ok, scriptId }  // Starts a script. Returns after launch acceptance; `ok: true` does not mean the process is up. The status flips to `starting` synchronously (a call that lands inside a `restarting` gap keeps `restarting`; one on an already `starting` / `running` script is a no-op) and the spawn's outcome — `running`, or `exited` + `error` on a startup failure — lands on `ws.script.status` and the `script:state` event afterwards; watch it with the completion recipe under `ws.script.status`.
   ws.script.stop(scriptId) → { ok, scriptId }  // Stops a running script.
   ws.script.restart(scriptId) → { ok, scriptId }  // Stops then restarts a script.
   ws.script.output(scriptId, maxLines?) → string  // Returns recent output buffer text.

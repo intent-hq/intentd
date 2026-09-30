@@ -765,6 +765,9 @@ async fn seed_source(
         .expect("pr monitor");
     svc.store
         .upsert_script(&Script {
+            purpose: intent_core::ScriptPurpose::Saved,
+            archived_at: None,
+            last_run: None,
             id: "script-rt".to_string(),
             workspace_id: id.0.clone(),
             name: "build".to_string(),

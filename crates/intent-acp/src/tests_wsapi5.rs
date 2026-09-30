@@ -354,7 +354,11 @@ impl WorkspaceApi for FakeApi {
         // reshaping it to the reference bare-array contract before it
         // reaches JS callers — returning the wrapped shape here keeps the
         // test exercising that reshape.
-        Box::pin(async { Ok(json!({ "scripts": [{ "id": "s-1", "name": "dev" }] })) })
+        Box::pin(async {
+            Ok(
+                json!({ "scripts": [{ "id": "s-1", "name": "dev" }, {"id":"archived", "archivedAt":"2026-09-30T00:00:00Z"}] }),
+            )
+        })
     }
 
     fn script_create(
@@ -1496,4 +1500,44 @@ async fn file_rename_forwards_pair() {
         api.file_rename_calls.lock().unwrap()[0],
         ("a.txt".to_string(), "b.txt".to_string())
     );
+}
+
+#[tokio::test]
+async fn script_list_archive_filters_are_explicit_and_strict() {
+    let (srv, _) = server();
+    for (options, expected) in [
+        ("{}", 1),
+        ("{archive:'all'}", 2),
+        ("{archive:'archived'}", 1),
+    ] {
+        let resp = call(&srv, &format!("return await ws.script.list({options});")).await;
+        assert_eq!(resp["result"]["isError"], false);
+        assert_eq!(body(&resp).as_array().unwrap().len(), expected);
+    }
+    for options in ["{archive:null}", "{archive:'unknown'}"] {
+        let resp = call(&srv, &format!("return await ws.script.list({options});")).await;
+        assert_eq!(resp["result"]["isError"], true);
+    }
+}
+
+#[tokio::test]
+async fn script_create_purpose_is_forwarded_and_null_refused() {
+    let (srv, api) = server();
+    let resp = call(
+        &srv,
+        "return await ws.script.create('check','true','command',{purpose:'oneOff'});",
+    )
+    .await;
+    assert_eq!(resp["result"]["isError"], false);
+    assert_eq!(
+        api.script_create_calls.lock().unwrap()[0].purpose,
+        Some(intent_core::ScriptPurpose::OneOff)
+    );
+    let resp = call(
+        &srv,
+        "return await ws.script.create('check','true','command',{purpose:null});",
+    )
+    .await;
+    assert_eq!(resp["result"]["isError"], true);
+    assert_eq!(api.script_create_calls.lock().unwrap().len(), 1);
 }
