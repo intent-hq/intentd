@@ -2,6 +2,44 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.120] - 2026-09-30
+
+### 🐛 Bug Fixes
+
+- Preserve newer GitLab device authorization ([#5899](https://github.com/intent-hq/intentd/pull/5899)) ([#2140](https://github.com/intent-hq/intentd/pull/2140))
+- Preserve buffered WSS presence test frames ([#5827](https://github.com/intent-hq/intentd/pull/5827)) ([#2143](https://github.com/intent-hq/intentd/pull/2143))
+
+
+## [0.9.119] - 2026-09-29
+
+### 🐛 Bug Fixes
+
+- Discover user skills in repository-free workspaces ([#5862](https://github.com/intent-hq/intentd/pull/5862)) ([#2172](https://github.com/intent-hq/intentd/pull/2172))
+- Rename Assistant and persist prompt identity ([#2106](https://github.com/intent-hq/intentd/pull/2106))
+
+
+## [0.9.118] - 2026-09-29
+
+### 🐛 Bug Fixes
+
+- Serve RPCs during startup agent recovery ([#2170](https://github.com/intent-hq/intentd/pull/2170))
+
+
+## [0.9.117] - 2026-09-29
+
+### 🐛 Bug Fixes
+
+- *(store)* Prevent deleted workspace metadata from blocking re-import ([#2162](https://github.com/intent-hq/intentd/pull/2162))
+
+
+## [0.9.116] - 2026-09-29
+
+### 🐛 Bug Fixes
+
+- Isolate configuration fixture secrets ([#6097](https://github.com/intent-hq/intentd/pull/6097)) ([#2163](https://github.com/intent-hq/intentd/pull/2163))
+- Bound hook validation and stabilize database and invite fixtures ([#2166](https://github.com/intent-hq/intentd/pull/2166))
+
+
 ## [0.9.115] - 2026-09-29
 
 ### 🚀 Features

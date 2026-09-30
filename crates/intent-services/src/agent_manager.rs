@@ -571,6 +571,23 @@ fn origin_from_user_flag(user_origin: bool) -> intent_core::MessageOrigin {
     }
 }
 
+fn usage_message_origin(
+    origin: intent_core::MessageOrigin,
+    metadata: Option<&serde_json::Value>,
+) -> intent_store::UsageMessageOrigin {
+    if origin.is_user() {
+        intent_store::UsageMessageOrigin::Human
+    } else if metadata
+        .and_then(|m| m.get("fromAgentId"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|id| !id.is_empty())
+    {
+        intent_store::UsageMessageOrigin::Agent
+    } else {
+        intent_store::UsageMessageOrigin::Excluded
+    }
+}
+
 /// Rebuild the single-entry drain [`TurnOptions`] for one queue entry — the
 /// exact shape the non-flush drain arms construct inline. Used by the
 /// batch-flush persist-failure path so the failed entry is parked/requeued
@@ -2673,6 +2690,8 @@ pub struct AgentManager {
     send_now_handback_gate: Mutex<Option<Arc<HandbackGate>>>,
     #[cfg(test)]
     turn_start_pause: Mutex<Option<Arc<TurnStartPause>>>,
+    #[cfg(test)]
+    shutdown_persist_pause: Mutex<Option<Arc<TurnStartPause>>>,
 }
 
 impl AgentManager {
@@ -2756,6 +2775,8 @@ impl AgentManager {
             send_now_handback_gate: Mutex::new(None),
             #[cfg(test)]
             turn_start_pause: Mutex::new(None),
+            #[cfg(test)]
+            shutdown_persist_pause: Mutex::new(None),
         }
     }
 
@@ -6929,13 +6950,14 @@ impl AgentManager {
         let message = match self
             .services
             .store
-            .append_agent_message_with_id(
+            .append_agent_message_with_provenance(
                 &agent_id,
                 &message_id,
                 "user",
                 &blocks,
                 options.message_metadata.as_ref(),
                 &now_iso(),
+                usage_message_origin(options.origin, options.message_metadata.as_ref()),
             )
             .await
         {
@@ -7668,13 +7690,14 @@ impl AgentManager {
             let message = match self
                 .services
                 .store
-                .append_agent_message_with_id(
+                .append_agent_message_with_provenance(
                     &agent_id,
                     &entry.id,
                     "user",
                     &blocks,
                     entry.message_metadata.as_ref(),
                     &now_iso(),
+                    usage_message_origin(options.origin, options.message_metadata.as_ref()),
                 )
                 .await
             {
@@ -9579,35 +9602,44 @@ impl AgentManager {
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn shutdown(&self) {
-        let ids: Vec<AgentId> = self.handles.lock().unwrap().keys().cloned().collect();
-        let now = intent_core::now_iso();
-
-        // Capture in-flight agents before stop() settles them to RuntimeIdle.
-        for id in &ids {
-            // Only agents currently in-flight (in the busy set) need interruption rows.
-            if !self.busy.lock().unwrap().contains(id) {
-                continue;
-            }
-            // Read the workspace from agent_ws (stop() will clear it via end_turn).
-            let Some(workspace_id) = self.agent_ws.lock().unwrap().get(id).cloned() else {
-                // Stale busy entry (should not happen).
-                continue;
-            };
-            // Pin the live-turn slot BEFORE aborting the worker: the abort
-            // drops the worker future and with it the LiveTurnGuard, so an
-            // UNPINNED slot read after the abort would race that drop and
-            // frequently lose the partial content. The pin both keeps the slot
-            // published to `chat.subscribe` until the flush below persists the
-            // row (monorepo#2056) and lets that flush re-read the slot as it
-            // stands (monorepo#2110).
+        // A recovered turn can be admitted while its provider is still waiting
+        // to spawn. Include those workers, not only installed handles, or their
+        // resolved interruption row would be lost at this shutdown.
+        let in_flight = self.list_busy();
+        let mut ids: HashSet<AgentId> = self.handles.lock().unwrap().keys().cloned().collect();
+        ids.extend(in_flight.iter().map(|(id, _)| id.clone()));
+        ids.extend(self.workers.lock().unwrap().keys().cloned());
+        // Pin every live slot before aborting any worker: dropping its future
+        // drops the LiveTurnGuard, which would otherwise erase partial output.
+        for (id, _) in &in_flight {
             self.services.pin_live_turn(id);
-            // Abort the turn worker BEFORE flushing so it cannot race the
-            // partial flush by persisting the full turn under the same minted
-            // message id (which would leave the transcript stuck on the partial
-            // snapshot while the worker's own append errors on the UNIQUE id).
-            // stop() below removes the (already-gone) worker entry harmlessly.
-            if let Some(worker) = self.workers.lock().unwrap().remove(id) {
-                worker.abort();
+        }
+        // Fence and abort the WHOLE snapshot before the first persistence await.
+        // Otherwise a later worker can hit the fence during an earlier flush,
+        // publish a terminal spawn failure, and release its busy/workspace slot.
+        // Keep the fence locked through abort so a worker cannot observe it as
+        // a provider error before its cancellation is armed.
+        {
+            let mut stopping = self.stopping.lock().unwrap();
+            stopping.extend(ids.iter().cloned());
+            let mut workers = self.workers.lock().unwrap();
+            for id in &ids {
+                if let Some(worker) = workers.remove(id) {
+                    worker.abort();
+                }
+            }
+        }
+        // The lazy-spawn fence remains for this manager's lifetime. Persist the
+        // captured identities, never a post-await re-read of the mutable maps.
+        let now = intent_core::now_iso();
+        for (id, workspace_id) in &in_flight {
+            #[cfg(test)]
+            {
+                let pause = self.shutdown_persist_pause.lock().unwrap().take();
+                if let Some(pause) = pause {
+                    pause.reached.notify_one();
+                    pause.resume.notified().await;
+                }
             }
             // Best-effort: persist any partial in-flight assistant content from
             // the pinned slot so the transcript keeps the streamed-so-far
@@ -9665,7 +9697,7 @@ impl AgentManager {
             if let Err(e) = self
                 .services
                 .store
-                .insert_interrupted_agent(id, &workspace_id, &prev_str, &now)
+                .insert_interrupted_agent(id, workspace_id, &prev_str, &now)
                 .await
             {
                 tracing::warn!(agent_id = %id, workspace_id = %workspace_id, error = %e, "graceful shutdown: failed to insert interrupted_agent row");
@@ -12384,19 +12416,23 @@ async fn persist_user(
             text_block.insert("messageMetadata".into(), md);
         }
     }
+    let usage_origin = usage_message_origin(origin_from_user_flag(user_origin), message_metadata);
     // Bounded retry (#547): initial attempt + one retry per backoff delay.
     let backoff = persist_retry_backoff_ms();
     let mut attempt = 0usize;
+    let message_id = new_message_id();
     let message = loop {
         match mgr
             .services
             .store
-            .append_agent_message_with_metadata(
+            .append_agent_message_with_provenance(
                 agent_id,
+                &message_id,
                 "user",
                 &blocks,
                 message_metadata,
                 &created_at,
+                usage_origin,
             )
             .await
         {

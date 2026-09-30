@@ -1350,7 +1350,7 @@ async fn non_chief_agent_ws_app_gating_error() {
         .as_str()
         .expect("error should be a string");
     assert!(
-        error_msg.contains("ws.app.* is only available in the Chief of Staff workspace"),
+        error_msg.contains("ws.app.* is only available in the Assistant workspace"),
         "Expected gating error message in tool output, got: {error_msg}"
     );
 

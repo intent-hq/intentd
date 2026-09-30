@@ -838,7 +838,7 @@ async fn set_agent_name(
 fn chief_guard(ws: &WorkspaceId, method: &str) -> Result<(), String> {
     if ws.is_chief() {
         return Err(format!(
-            "ws.workspace.{method} is not available in the chief-of-staff workspace"
+            "ws.workspace.{method} is not available in the Assistant workspace"
         ));
     }
     Ok(())

@@ -243,17 +243,18 @@ async fn transfer_human_trust_migration_cleans_legacy_keys_once_and_fences_downg
     let (_ws, agent) = seed(&store).await;
     let old =
         json!({"humanAuthor":{"login":"planted"},"fromPrincipalId":"real-source","keep":{"x":7}});
-    store
-        .append_agent_message_with_id(
-            &agent,
-            "old-message",
-            "user",
-            &json!([{"type":"text","text":"unchanged"}]),
-            Some(&old),
-            "2020-01-01T00:00:00Z",
-        )
-        .await
-        .unwrap();
+    // Seed the historical schema directly: current append APIs also write
+    // provenance columns that did not exist before migration 0138.
+    sqlx::query(
+        "INSERT INTO agent_message (id,agent_id,seq,role,content,metadata,created_at) \
+         VALUES ('old-message',?,0,'user',?,?,'2020-01-01T00:00:00Z')",
+    )
+    .bind(agent.as_str())
+    .bind(json!([{"type":"text","text":"unchanged"}]).to_string())
+    .bind(old.to_string())
+    .execute(store.write_pool())
+    .await
+    .unwrap();
     store.replace_agent_queue(&agent,&[AgentQueueRow{id:"old-queue".into(),agent_id:agent.clone(),position:0,payload:json!({"id":"old-queue","content":"pending","messageMetadata":old,"other":42}),created_at:"2020-01-01T00:00:00Z".into(),turn_id:"turn-original".into()}]).await.unwrap();
     // No comment schema changed; seed arbitrary pre-reservation extras.
     sqlx::query("INSERT INTO comment (id,thread_id,workspace_id,kind,content,author,author_type,status,anchor_json,created_at,updated_at,extra_json) VALUES ('old-comment','old-comment',?,'comment','text','label','user','active','{}','2020-01-01','2020-01-01',?)")

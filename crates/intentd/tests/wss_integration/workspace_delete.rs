@@ -7,6 +7,169 @@ use std::sync::atomic::{AtomicBool, Ordering};
 type Ws = tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
 const ROWS: i64 = 2_001;
 
+#[intent_test_macros::daemon_test]
+async fn deleted_workspace_metadata_can_be_reimported_over_wss() {
+    use base64::Engine as _;
+    use std::io::Write as _;
+    let srv = start(WsOptions::default()).await;
+    let mut client = connect(&srv).await;
+    let ws = "ws-reimport";
+    let fixture = vec![
+        (
+            "workspace".to_string(),
+            vec![
+                json!({"id":ws, "title":"Reimport", "branch":"main", "status":"Active", "created_at":"t0", "updated_at":"t0"}),
+            ],
+        ),
+        (
+            "agent_session".into(),
+            vec![
+                json!({"id":"agent-reimport", "workspace_id":ws, "name":"Agent", "status":"idle", "created_at":"t0", "updated_at":"t0"}),
+            ],
+        ),
+        (
+            "interrupted_agent".into(),
+            vec![
+                json!({"agent_id":"agent-reimport", "workspace_id":ws, "prev_status":"active", "resolution":"resumed", "interrupted_at":"t0"}),
+            ],
+        ),
+        (
+            "script".into(),
+            vec![
+                json!({"id":"script-reimport", "workspace_id":ws, "name":"Script", "command":"true", "mode":"command", "source":"user", "created_at":"t0"}),
+            ],
+        ),
+        (
+            "attachments".into(),
+            vec![
+                json!({"id":"attachment-reimport", "workspace_id":ws, "file_name":"gone.txt", "size":1, "uploaded_at":"t0", "stored_path":".intent/attachments/gone.txt"}),
+            ],
+        ),
+    ];
+    srv.store.transfer_import_rows(&fixture).await.unwrap();
+    // Historical deletion leaves exactly these metadata rows. Exercise the
+    // real RPC import first, then the fixed public delete/import round trip.
+    sqlx::query("DELETE FROM workspace WHERE id=?")
+        .bind(ws)
+        .execute(srv.store.write_pool())
+        .await
+        .unwrap();
+    let manifest = json!({
+        "formatVersion": intent_core::transfer::TRANSFER_FORMAT_VERSION,
+        "creatingIntentdVersion": env!("CARGO_PKG_VERSION"), "workspaceId":ws,
+        "createdAt":"2026-09-25T00:00:00Z", "tables":[], "assets":[],
+        "git":{"hasRepository":false, "dirtyFiles":[], "sandboxBranches":[]}
+    });
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default();
+    zip.start_file("manifest.json", options).unwrap();
+    zip.write_all(manifest.to_string().as_bytes()).unwrap();
+    for (table, rows) in &fixture {
+        zip.start_file(format!("rows/{table}.jsonl"), options)
+            .unwrap();
+        for row in rows {
+            writeln!(zip, "{row}").unwrap();
+        }
+    }
+    let archive = zip.finish().unwrap().into_inner();
+    let begin_params = json!({"manifest":manifest, "archiveSizeBytes":archive.len(), "archiveSha256":sha256_hex(&archive)});
+    for round in 0..2 {
+        sqlx::query("INSERT INTO attachment_idempotency_keys (workspace_id, key, attachment_id, fingerprint, created_at) VALUES (?, 'retry', 'attachment-reimport', 'fp', 't0')")
+            .bind(ws).execute(srv.store.write_pool()).await.unwrap();
+        if round == 1 {
+            let rejected = rpc(
+                &mut client,
+                10,
+                "workspace.import.begin",
+                begin_params.clone(),
+            )
+            .await;
+            assert_eq!(
+                rejected["error"]["code"], -32602,
+                "live workspace collision: {rejected}"
+            );
+            let deleted = rpc(
+                &mut client,
+                11,
+                "workspace.delete",
+                json!({"workspaceId":ws}),
+            )
+            .await;
+            assert_eq!(
+                deleted,
+                json!({"jsonrpc":"2.0", "id":11, "result":{"success":true}})
+            );
+            for table in [
+                "interrupted_agent",
+                "script",
+                "attachments",
+                "attachment_idempotency_keys",
+            ] {
+                let count: i64 = sqlx::query_scalar(&format!(
+                    "SELECT COUNT(*) FROM {table} WHERE workspace_id=?"
+                ))
+                .bind(ws)
+                .fetch_one(srv.store.read_pool())
+                .await
+                .unwrap();
+                assert_eq!(count, 0, "workspace.delete left {table}");
+            }
+        }
+        let begun = rpc(
+            &mut client,
+            1,
+            "workspace.import.begin",
+            begin_params.clone(),
+        )
+        .await;
+        let import_id = begun["result"]["importId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{begun}"));
+        let chunk = rpc(&mut client, 2, "workspace.import.chunk", json!({"importId":import_id, "seq":0, "data":base64::engine::general_purpose::STANDARD.encode(&archive)})).await;
+        assert_eq!(chunk["result"]["receivedBytes"], archive.len());
+        let committed = rpc(
+            &mut client,
+            3,
+            "workspace.import.commit",
+            json!({"importId":import_id}),
+        )
+        .await;
+        assert_eq!(committed["result"]["workspace"]["id"], ws, "{committed}");
+        assert_eq!(committed["result"]["importedRows"], 5);
+        let scripts = rpc(&mut client, 4, "script.list", json!({"workspaceId":ws})).await;
+        assert_eq!(
+            scripts["result"]["scripts"][0]["id"], "script-reimport",
+            "{scripts}"
+        );
+        assert_eq!(scripts["result"]["scripts"][0]["command"], "true");
+        for table in [
+            "interrupted_agent",
+            "script",
+            "attachments",
+            "attachment_idempotency_keys",
+        ] {
+            let count: i64 = sqlx::query_scalar(&format!(
+                "SELECT COUNT(*) FROM {table} WHERE workspace_id=?"
+            ))
+            .bind(ws)
+            .fetch_one(srv.store.read_pool())
+            .await
+            .unwrap();
+            assert_eq!(
+                count,
+                i64::from(table != "attachment_idempotency_keys"),
+                "{table}"
+            );
+        }
+    }
+    assert!(sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(srv.store.read_pool())
+        .await
+        .unwrap()
+        .is_empty());
+    srv.ws.stop().await;
+}
+
 async fn connect(srv: &Server) -> Ws {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     let tls = common::tls_connect_with_retry(srv.port, srv.cfg.clone()).await;

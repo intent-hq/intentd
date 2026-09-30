@@ -2443,20 +2443,10 @@ async fn cmd_serve(
         idle_update_state.clone(),
     );
 
-    // Auto-resume interrupted agents at startup. `--resume-all` forces the
-    // sweep, as does an update-triggered restart (the sitter sets
-    // `INTENTD_UPDATE_RESTART=1` when it respawns a different version than
-    // the one that just ran; captured into [`UPDATE_RESTART`] and scrubbed
-    // from the environment in `main()` so it never leaks to subprocesses);
-    // otherwise the `agents.resumeInterruptedOnStart`
-    // setting decides (`auto` = headless hosts only, `on` = always, `off` =
-    // never). Awaited to
-    // completion BEFORE any listener starts (WS/WSS below, UDS further down)
-    // so the first `agent.listInterrupted` a client issues on connect never
-    // sees rows the sweep is about to claim (no interrupted-agents modal
-    // blip). "Complete" means every resume was initiated/claimed — the resumed
-    // agent turns still run in the background — and every failure inside the
-    // sweep only logs, so a bad sweep never wedges startup.
+    // Reserve the boot-time candidates before exposing any listener. Only the
+    // bounded candidate read gates startup; per-agent service work runs below
+    // in an owned background sweep. Reservations prevent a manual-dialog flash.
+    // --resume-all and update-triggered restarts still override the setting.
     let resume_setting = boot_settings.effective.agents.resume_interrupted_on_start;
     let has_display = detect_has_display();
     // Captured in `main()` before the env var was scrubbed from the
@@ -2472,8 +2462,46 @@ async fn cmd_serve(
         resume = resume_on_start,
         "startup interrupted-agent resume decision"
     );
-    if resume_on_start {
-        run_startup_resume_sweep(&services).await;
+    let startup_candidates = if resume_on_start {
+        match services.prepare_startup_resume().await {
+            Ok(candidates) => Some(candidates),
+            Err(error) => {
+                tracing::error!(%error, "resume-on-start: failed to list interrupted agents");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Wire ServerControl to Services for settings-driven runtime control (§5.12).
+    // The control is attached after the api Arc is built via the `OnceLock` seam.
+    let server_control: Arc<dyn intent_core::ServerControl> = control.clone();
+    services.attach_server_control(server_control);
+
+    // Build pairing info provider for `server.pairingInfo` / `server.rotateToken` (§5.2).
+    // Only built when there's a token store (secure mode); `None` in insecure mode.
+    // Available to UDS clients even when TCP is disabled (they can still call the RPCs).
+    let pairing_info: Option<Arc<dyn intent_transport::ServerPairingInfo>> =
+        if let Some(ref ts) = token_store {
+            // Share the same AsyncTokenStore instance as the WSS listener
+            // so rotations propagate to the live auth layer.
+            Some(Arc::new(DaemonPairingInfo {
+                data_dir: config.data_dir.clone(),
+                token_store: ts.clone(),
+                ws_runtime: runtime.clone(),
+                tunnel: tunnel_supervisor.clone(),
+                route_info: route_info.clone(),
+            }))
+        } else {
+            None
+        };
+    // Let `workspace.invite.list` stamp each open invite with its `url`
+    // (multiplayer w4): the same envelope the create fast path resolves.
+    if let Some(provider) = pairing_info.clone() {
+        services.attach_invite_link_builder(Arc::new(intent_transport::InviteLinkResolver::new(
+            provider,
+        )));
     }
 
     // Resolve the boot-time TCP listener decision once: `--insecure` always
@@ -2506,11 +2534,6 @@ async fn cmd_serve(
             state.bind_addresses = Some(ws_options.bind_addresses.clone());
         }
     }
-
-    // Wire ServerControl to Services for settings-driven runtime control (§5.12).
-    // The control is attached after the api Arc is built via the `OnceLock` seam.
-    let server_control: Arc<dyn intent_core::ServerControl> = control.clone();
-    services.attach_server_control(server_control);
 
     // Live-reload of config.toml (§9.8): watch the file's parent directory
     // (survives editor rename/atomic-save), debounce, and strictly re-parse.
@@ -2567,32 +2590,9 @@ async fn cmd_serve(
         }
     }
 
-    // Build pairing info provider for `server.pairingInfo` / `server.rotateToken` (§5.2).
-    // Only built when there's a token store (secure mode); `None` in insecure mode.
-    // Available to UDS clients even when TCP is disabled (they can still call the RPCs).
-    let pairing_info: Option<Arc<dyn intent_transport::ServerPairingInfo>> =
-        if let Some(ref ts) = token_store {
-            // Share the same AsyncTokenStore instance as the WSS listener
-            // so rotations propagate to the live auth layer.
-            Some(Arc::new(DaemonPairingInfo {
-                data_dir: config.data_dir.clone(),
-                token_store: ts.clone(),
-                ws_runtime: runtime.clone(),
-                tunnel: tunnel_supervisor.clone(),
-                route_info: route_info.clone(),
-            }))
-        } else {
-            None
-        };
-    // Let `workspace.invite.list` stamp each open invite with its `url`
-    // (multiplayer w4): the same envelope the create fast path resolves.
-    if let Some(provider) = pairing_info.clone() {
-        services.attach_invite_link_builder(Arc::new(intent_transport::InviteLinkResolver::new(
-            provider,
-        )));
-    }
-
+    let (startup_stop, startup_stopping) = tokio::sync::watch::channel(false);
     let shutdown = {
+        let startup_stop = startup_stop.clone();
         let notify = shutdown_notify.clone();
         #[cfg(unix)]
         let idle_update_state = idle_update_state.clone();
@@ -2601,6 +2601,7 @@ async fn cmd_serve(
                 () = shutdown_signal() => {}
                 () = notify.notified() => tracing::info!("shutdown requested via system.shutdown"),
             }
+            let _ = startup_stop.send(true);
             // Latch the cause at the decision point, before any teardown
             // await: a staged restart that fires later must not overwrite a
             // requested stop. The compare-and-set loses (correctly) when the
@@ -2684,6 +2685,12 @@ async fn cmd_serve(
             services.prewarm_repository_metadata().await;
         })
     };
+    let startup_resume = startup_candidates.map(|candidates| {
+        let services = services.clone();
+        intent_core::spawn_daemon(async move {
+            run_startup_resume_sweep(&services, candidates, startup_stopping).await;
+        })
+    });
     let serve_result = serve_uds_with_reverse(
         api,
         bus,
@@ -2706,6 +2713,15 @@ async fn cmd_serve(
     {
         idle_update_requester.abort();
         staged_restart_watcher.abort();
+    }
+    // Also stop on a UDS bind error. Never detach or abort a claimed resume:
+    // let the current service operation commit/reset its claim, skip later
+    // candidates, then let manager.shutdown capture any admitted turns.
+    let _ = startup_stop.send(true);
+    if let Some(task) = startup_resume {
+        if let Err(error) = task.await {
+            tracing::error!(%error, "resume-on-start: recovery worker failed");
+        }
     }
     serve_result?;
 
@@ -6797,58 +6813,75 @@ fn should_resume_on_start(
     }
 }
 
-/// Run the startup interrupted-agent resume sweep to completion: list the
-/// pending interrupted agents and resume each via the same service operation
-/// as `agent.resolveInterrupted`. Awaited in `serve` BEFORE any listener
-/// starts, so a client's first `agent.listInterrupted` never sees rows the
-/// sweep is about to claim. Never fails startup: a store error listing agents
-/// logs and returns (the daemon still serves), and per-agent resume failures
-/// are logged and skipped.
-async fn run_startup_resume_sweep(services: &Services) {
-    tracing::info!("resume-on-start: enumerating interrupted agents");
-    // List all pending interrupted agents
-    let rows = match services.store().list_interrupted_agents().await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!(error = %e, "resume-on-start: failed to list interrupted agents");
-            return;
-        }
-    };
-    if rows.is_empty() {
-        tracing::info!("resume-on-start: no interrupted agents to resume");
-        return;
-    }
+/// Run recovery off the listener path. Shutdown stops between operations;
+/// an admitted operation drains so its durable claim cannot be stranded by
+/// cancellation. Provider turns themselves remain owned by `AgentManager`.
+async fn run_startup_resume_sweep(
+    services: &Services,
+    candidates: intent_services::StartupResumeCandidates,
+    stopping: tokio::sync::watch::Receiver<bool>,
+) {
+    #[cfg(unix)]
+    let mut stopping = stopping;
+    let ids = candidates.ids().to_vec();
     tracing::info!(
-        count = rows.len(),
+        count = ids.len(),
         "resume-on-start: resuming interrupted agents"
     );
-    let mut resumed = Vec::new();
-    let mut failed = Vec::new();
-    // Resume each agent using the same service operation as agent.resolveInterrupted
-    for interrupted in rows {
-        let agent_id = interrupted.agent_id.clone();
-        match services.resume_interrupted_agent(&agent_id).await {
+    // Deterministic e2e seam, including release-mode tests. Holding a provider
+    // handshake would not hold the sweep, since provider turns are background.
+    #[cfg(unix)]
+    if let Some(path) = std::env::var_os("INTENTD_TEST_STARTUP_RESUME_GATE") {
+        use tokio::io::AsyncReadExt;
+        tokio::select! {
+            biased;
+            _ = stopping.wait_for(|stop| *stop) => return,
+            () = async {
+                let mut gate = tokio::net::UnixStream::connect(path).await.expect("resume test gate");
+                let _ = gate.read_u8().await;
+            } => {},
+        }
+    }
+    let candidates = &candidates;
+    resume_startup_candidates(ids, &stopping, |agent_id| async move {
+        services
+            .resume_startup_candidate(candidates, &agent_id)
+            .await
+    })
+    .await;
+}
+
+/// Never cancel the callback after admitting a candidate: it may already have
+/// claimed the interruption or persisted its continuation. A stop skips every
+/// later candidate, while the caller joins this loop before manager teardown.
+async fn resume_startup_candidates<F, Fut>(
+    ids: Vec<intent_core::AgentId>,
+    stopping: &tokio::sync::watch::Receiver<bool>,
+    mut resume: F,
+) where
+    F: FnMut(intent_core::AgentId) -> Fut,
+    Fut: std::future::Future<Output = intent_core::Result<()>>,
+{
+    let mut resumed = 0;
+    let mut failed = 0;
+    for agent_id in ids {
+        if *stopping.borrow() {
+            break;
+        }
+        match resume(agent_id.clone()).await {
             Ok(()) => {
-                tracing::info!(
-                    agent_id = %agent_id,
-                    workspace = %interrupted.workspace_id,
-                    "resume-on-start: resumed agent"
-                );
-                resumed.push(agent_id.0);
+                tracing::info!(%agent_id, "resume-on-start: resumed agent");
+                resumed += 1;
             }
-            Err(e) => {
-                tracing::warn!(
-                    agent_id = %agent_id,
-                    error = %e,
-                    "resume-on-start: failed to resume agent"
-                );
-                failed.push((agent_id.0, e.to_string()));
+            Err(error) => {
+                tracing::warn!(%agent_id, %error, "resume-on-start: failed to resume agent");
+                failed += 1;
             }
         }
     }
     tracing::info!(
-        resumed = resumed.len(),
-        failed = failed.len(),
+        resumed,
+        failed,
         "resume-on-start: auto-resume sweep complete"
     );
 }
@@ -8849,6 +8882,49 @@ mod tests {
         assert!(!is_listener_down_error(&other));
         let no_message = json!({ "code": -32603 });
         assert!(!is_listener_down_error(&no_message));
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_shutdown_drains_admitted_operation_and_skips_next() {
+        let (stop, stopping) = tokio::sync::watch::channel(false);
+        let (arrived, arrival) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let sweep = tokio::spawn(async move {
+            let mut barriers = Some((arrived, released));
+            resume_startup_candidates(
+                vec![
+                    intent_core::AgentId::from("first"),
+                    intent_core::AgentId::from("second"),
+                ],
+                &stopping,
+                move |_| {
+                    let (arrived, released) =
+                        barriers.take().expect("no second admission after stop");
+                    let calls = calls.clone();
+                    async move {
+                        arrived.send(()).unwrap();
+                        released.await.unwrap();
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(())
+                    }
+                },
+            )
+            .await;
+        });
+        arrival.await.unwrap();
+        stop.send(true).unwrap();
+        assert!(
+            !sweep.is_finished(),
+            "the admitted operation is still owned and draining"
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), sweep)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
