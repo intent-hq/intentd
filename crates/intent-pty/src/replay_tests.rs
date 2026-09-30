@@ -156,3 +156,28 @@ fn binary_chunk_larger_than_ring_keeps_its_full_event_range() {
     assert_eq!(snapshot.bytes, b"0m");
     assert_eq!((snapshot.start_offset, snapshot.end_offset), (6, 8));
 }
+
+#[test]
+fn capped_snapshot_gap_requires_uncapped_recovery_before_declaring_eviction() {
+    for capacity in [100, 10] {
+        let fanout = fanout(capacity);
+        let output_bytes: Vec<u8> = (0..100).collect();
+        output(&fanout, &output_bytes);
+        let guard = fanout.lock().unwrap();
+        let capped = guard.scrollback.positioned_snapshot(10);
+        assert_eq!((capped.start_offset, capped.end_offset), (90, 100));
+        let recovery = guard.scrollback.positioned_snapshot(usize::MAX);
+        let mut rendered = output_bytes[..20].to_vec();
+        let mut next = 20;
+        if recovery.start_offset > next {
+            assert_eq!(capacity, 10, "only actual eviction loses output");
+            rendered = recovery.bytes;
+            next = recovery.end_offset;
+            assert_eq!(rendered, output_bytes[90..]);
+        } else {
+            replay(&mut rendered, &mut next, &recovery);
+            assert_eq!(rendered, output_bytes);
+        }
+        assert_eq!(next, 100);
+    }
+}
