@@ -16891,10 +16891,16 @@ impl Services {
         // `TurnOptions::prepend_content`; the store-only fallback (no manager
         // attached) keeps the plain trait call — it drives no outbound
         // prompt, so there is no context to repair.
+        #[cfg(test)]
+        if let Some(park) = &self.interrupted_resume_park {
+            park.entered.notify_one();
+            park.release.notified().await;
+        }
         let send_result = match self.agent_manager() {
             Some(manager) => {
                 let options = match recap {
                     Some(recap) => crate::agent_manager::TurnOptions {
+                        reject_on_shutdown: true,
                         prepend_content: Some(recap.text),
                         prepend_image_blocks: recap.image_blocks,
                         prepend_file_blocks: recap.file_blocks,
@@ -16903,6 +16909,7 @@ impl Services {
                         ..crate::agent_manager::TurnOptions::default()
                     },
                     None => crate::agent_manager::TurnOptions {
+                        reject_on_shutdown: true,
                         message_metadata: Some(continuation_metadata.clone()),
                         origin: intent_core::MessageOrigin::Automatic,
                         ..crate::agent_manager::TurnOptions::default()

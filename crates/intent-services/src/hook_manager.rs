@@ -1044,6 +1044,37 @@ impl Services {
                 .then(|| self.delivery_tasks.cancellation_flag()),
         )
         .await;
+        // A failed validation has no durable outcome or notification to own.
+        // Preserve its original error, including pre-closed JS cancellation.
+        if matches!(outcome, RunOutcome::Failed { .. }) {
+            return self.commit_hook_validation(hook, kind, outcome).await;
+        }
+        // Inline validation may be running inside a parent's cancellable JS
+        // evaluation. Transfer the outcome before the first durable write so
+        // cancelling that parent cannot discard a committed child notification.
+        let services = self.clone();
+        let (finished, result) = tokio::sync::oneshot::channel();
+        self.delivery_tasks
+            .spawn_draining(async move {
+                let outcome = crate::workspace_mutations::boxed(
+                    services.commit_hook_validation(hook, kind, outcome),
+                )
+                .await;
+                let _ = finished.send(outcome);
+            })
+            .ok_or_else(|| Error::Internal("daemon is shutting down".into()))?;
+        result
+            .await
+            .map_err(|_| Error::Internal("hook validation commit task failed".into()))?
+    }
+
+    async fn commit_hook_validation(
+        &self,
+        hook: Hook,
+        kind: ScheduleKind,
+        outcome: RunOutcome,
+    ) -> Result<Value> {
+        let workspace_id = &hook.workspace_id.clone();
         let _mutation = self.workspace_mutations.enter(workspace_id)?;
         self.store.get_workspace(workspace_id).await?;
         match outcome {
@@ -4026,6 +4057,127 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "task not removed");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_nested_committed_hook_dispatch_keeps_one_durable_wake() {
+        shutdown_nested_committed_validation(false).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_nested_expired_perpetual_validation_preserves_wakes() {
+        shutdown_nested_committed_validation(true).await;
+    }
+
+    async fn shutdown_nested_committed_validation(expired_perpetual: bool) {
+        use crate::agent_manager::{AgentManager, BusEventSink};
+        let (_tmp, _root, mut svc, ws, owner) = setup().await;
+        if expired_perpetual {
+            // Child TTL is ten seconds; the parent's default TTL is a day.
+            svc = svc.with_hook_clock_skew(Arc::new(std::sync::atomic::AtomicI64::new(20_000)));
+        }
+        let park = Arc::new(crate::CompletionClassifyPark::default());
+        svc.hook_wake_park = Some(park.clone());
+        let mgr = Arc::new(AgentManager::new(
+            svc.clone(),
+            Arc::new(BusEventSink::new(svc.event_bus.clone().unwrap())),
+            8,
+        ));
+        svc.attach_agent_manager(&mgr);
+        let mut probe = note(&ws, "nested-shutdown-probe", "wait");
+        svc.store.insert_note(&probe).await.unwrap();
+        let code = r#"
+            const n = await ws.note.read('nested-shutdown-probe');
+            if (!n.content.includes('go')) return {dispatch:false};
+            await ws.hook.schedule({name:'nested committed child',delayMs:600000,ttlMs:10000,perpetual:EXPIRED_PERPETUAL,
+                code:"console.log('child evaluated once'); return {dispatch:true,message:'preserve nested committed wake'};"});
+            return {dispatch:false};
+        "#;
+        let code = code.replace(
+            "EXPIRED_PERPETUAL",
+            if expired_perpetual { "true" } else { "false" },
+        );
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name":"nested shutdown parent", "delayMs":600_000, "code":code
+                }),
+            )
+            .await
+            .unwrap();
+        let parent: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        probe.content = "go".into();
+        svc.store.update_note(&probe).await.unwrap();
+        svc.hook_run_now_op(&ws, &parent.hook_id).await.unwrap();
+        tokio::time::timeout(POLL_DEADLINE, park.entered.notified())
+            .await
+            .unwrap();
+        let child = svc
+            .store
+            .list_hooks_by_agent(&owner)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|h| h.name == "nested committed child")
+            .unwrap();
+        let terminal = if expired_perpetual {
+            HookState::Expired
+        } else {
+            HookState::Dispatched
+        };
+        assert_eq!(child.state, terminal);
+        assert_eq!(child.run_count, 1);
+        mgr.begin_shutdown();
+        mgr.checkpoint_shutdown().await;
+        let draining = svc.clone();
+        let shutdown = tokio::spawn(async move {
+            draining.shutdown_agent_deliveries().await;
+        });
+        park.release.notify_one();
+        if expired_perpetual {
+            // Expired perpetual validation sends a dispatch and an expiry notice.
+            tokio::time::timeout(POLL_DEADLINE, park.entered.notified())
+                .await
+                .unwrap();
+            park.release.notify_one();
+        }
+        tokio::time::timeout(POLL_DEADLINE, shutdown)
+            .await
+            .unwrap()
+            .unwrap();
+        mgr.shutdown().await;
+        let restarted = Services::new(svc.store.clone());
+        restarted.rehydrate_agent_queues().await.unwrap();
+        let queue = restarted.queue_snapshot(&owner);
+        assert_eq!(
+            queue.len(),
+            if expired_perpetual { 2 } else { 1 },
+            "cancelling the parent evaluator must not discard its child's committed wake"
+        );
+        assert!(queue[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("preserve nested committed wake"));
+        restarted.rehydrate_agent_queues().await.unwrap();
+        assert_eq!(restarted.queue_snapshot(&owner).len(), queue.len());
+        assert_eq!(
+            queue
+                .iter()
+                .filter(|entry| entry["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("preserve nested committed wake"))
+                .count(),
+            1
+        );
+        let recovered = restarted.store.get_hook(&child.hook_id).await.unwrap();
+        assert_eq!(recovered.state, terminal);
+        assert_eq!(
+            recovered.run_count, 1,
+            "recovery must not rerun the committed child script"
+        );
     }
 
     #[tokio::test]

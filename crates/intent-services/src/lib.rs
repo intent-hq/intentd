@@ -1318,6 +1318,8 @@ pub struct Services {
     #[cfg(test)]
     interrupted_list_park: Option<Arc<script_ops::SupervisePark>>,
     #[cfg(test)]
+    interrupted_resume_park: Option<Arc<CompletionClassifyPark>>,
+    #[cfg(test)]
     workspace_delete_test_gate: tests::workspace_delete::DeleteGate,
     /// In-memory pending agent-session deletions for the delete grace window
     /// (§5.5): `agent.delete` with `undoDelayMs > 0` registers the timer
@@ -1588,6 +1590,8 @@ impl Services {
             startup_resume_candidates: Arc::default(),
             #[cfg(test)]
             interrupted_list_park: None,
+            #[cfg(test)]
+            interrupted_resume_park: None,
             #[cfg(test)]
             workspace_delete_test_gate: tests::workspace_delete::DeleteGate::default(),
             pending_agent_deletes: delete_grace::PendingDeletes::default(),

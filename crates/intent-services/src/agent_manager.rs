@@ -457,6 +457,9 @@ async fn cancel_and_settle_idle_prompt(
 /// since a `QueuedMessage` has no per-turn hints of its own.
 #[derive(Debug, Default, Clone)]
 pub struct TurnOptions {
+    /// Resume recovery must retain its pending interruption when shutdown
+    /// refuses admission, rather than hiding it behind an ordinary queue.
+    pub reject_on_shutdown: bool,
     pub stdin_context: Option<String>,
     pub note_ids: Option<serde_json::Value>,
     pub context_references: Option<serde_json::Value>,
@@ -6669,6 +6672,9 @@ impl AgentManager {
         message_id: Option<String>,
         mut options: TurnOptions,
     ) -> Result<Value> {
+        if options.reject_on_shutdown && self.is_shutting_down() {
+            return Err(Error::Internal("daemon is shutting down".into()));
+        }
         // Validate the caller-supplied id length BEFORE any state change
         // (mirrors `agent_send_message_op`'s unconditional guard — the row id
         // is now the client id). Hoisted above `try_begin` so a doomed
@@ -6874,7 +6880,22 @@ impl AgentManager {
                 .await;
             return Ok(result);
         }
+        #[cfg(test)]
+        if options.reject_on_shutdown {
+            if let Some(park) = &self.services.interrupted_resume_park {
+                park.entered.notify_one();
+                park.release.notified().await;
+            }
+        }
         let Some(admission) = self.try_begin_turn(&agent_id, &workspace_id).await else {
+            // A resume may have claimed its durable interruption before closure
+            // and awaited store work since the entry check. Refuse here too:
+            // shutdown is monotonic and the failed claim created no busy slot
+            // for the checkpoint to recover. Never enqueue this continuation.
+            if options.reject_on_shutdown && self.is_shutting_down() {
+                return Err(Error::Internal("daemon is shutting down".into()));
+            }
+
             // A send INTO an `Error` session is recorded as the parked
             // recovery send, atomically with its enqueue
             // (intent-hq/intent#4962): the slot holder may be a
