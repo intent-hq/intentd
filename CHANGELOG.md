@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.125] - 2026-09-30
+
+### 🚀 Features
+
+- Extract reusable agent checkpoint capture and restore ([#2157](https://github.com/intent-hq/intentd/pull/2157))
+
+### 🐛 Bug Fixes
+
+- *(git)* Correct HTTPS IP certificate verification ([#2185](https://github.com/intent-hq/intentd/pull/2185))
+- Bound PTY teardown and preserve agent work during shutdown ([#2187](https://github.com/intent-hq/intentd/pull/2187))
+- Settle warm-cache fixtures before teardown ([#6356](https://github.com/intent-hq/intentd/pull/6356)) ([#2183](https://github.com/intent-hq/intentd/pull/2183))
+
+
 ## [0.9.124] - 2026-09-30
 
 ### 🐛 Bug Fixes
