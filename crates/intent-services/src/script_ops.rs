@@ -1405,20 +1405,14 @@ impl ScriptManager {
         let cwd = match self.resolve_cwd(&ws, &def).await {
             Ok(cwd) => cwd,
             Err(e) => {
-                self.fail(&ws, script_id, generation, &e.to_string(), false)
-                    .await;
-                drop(reservation);
-                let _ = self.queue_settlement(&ws, script_id, generation).await;
+                let _ = self.fail_run(reservation, e.to_string()).await;
                 return Err(e);
             }
         };
         let pty_id = match self.pty.spawn(self.build_spec(&ws, &def, cwd.as_ref())) {
             Ok(id) => id,
             Err(e) => {
-                self.fail(&ws, script_id, generation, &e.to_string(), false)
-                    .await;
-                drop(reservation);
-                let _ = self.queue_settlement(&ws, script_id, generation).await;
+                let _ = self.fail_run(reservation, e.to_string()).await;
                 return Err(e);
             }
         };
@@ -1490,6 +1484,20 @@ impl ScriptManager {
             "output": output,
             "timedOut": timed_out,
         }))
+    }
+
+    /// Once a launch error is observed, its publication and settlement must
+    /// outlive the RPC waiter. Keep its reservation until the terminal event
+    /// is published, then release it before joining the owned finalizer.
+    fn fail_run(&self, reservation: RunReservation, error: String) -> tokio::task::JoinHandle<()> {
+        let mgr = self.clone();
+        intent_core::spawn_daemon(async move {
+            let (ws, id) = reservation.key.clone();
+            let generation = reservation.generation;
+            mgr.fail(&ws, &id, generation, &error, false).await;
+            drop(reservation);
+            let _ = mgr.queue_settlement(&ws, &id, generation).await;
+        })
     }
 
     /// The per-script supervisor: spawn → stream → (service) auto-restart per the
