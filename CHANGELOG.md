@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.122] - 2026-09-30
+
+### 🐛 Bug Fixes
+
+- Defer completion reconciliation until listeners are ready ([#2177](https://github.com/intent-hq/intentd/pull/2177))
+
+
 ## [0.9.121] - 2026-09-30
 
 ### 🚀 Features

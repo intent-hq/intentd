@@ -1065,3 +1065,232 @@ async fn startup_recovery_failure_can_be_retried_on_the_same_connection() {
     );
     fixture.store.close().await;
 }
+
+/// Persisted watch/group bookkeeping is visible while completion delivery is
+/// held. The real authenticated WSS transport must answer before release.
+#[tokio::test]
+async fn startup_completion_recovery_serves_wss_before_waking_parents() {
+    for (grouped, stop_while_held) in [(false, false), (true, false), (true, true)] {
+        let fixture = RecoveryFixture::new().await;
+        let parent = &fixture.agents[0];
+        let child = &fixture.agents[1];
+        let mut session = fixture
+            .store
+            .get_agent_session_summary(child)
+            .await
+            .unwrap();
+        let workspace = session.workspace_id.clone();
+        session.status = intent_core::AgentStatus::Completed;
+        session.completion_report = Some("finished during downtime".into());
+        session.completion_report_timestamp = Some(intent_core::now_iso());
+        fixture
+            .store
+            .update_agent_session(&workspace, &session)
+            .await
+            .unwrap();
+        fixture
+            .store
+            .set_interrupted_resolution(child, "abandoned", &intent_core::now_iso())
+            .await
+            .unwrap();
+        let group_id = grouped.then(|| "startup-group".to_string());
+        if let Some(id) = &group_id {
+            fixture
+                .store
+                .upsert_delegation_group(&intent_store::PersistedDelegationGroup {
+                    group_id: id.clone(),
+                    workspace_id: workspace.clone(),
+                    parent_agent_id: parent.clone(),
+                    await_mode: "after_all".into(),
+                    expected_agent_ids: vec![child.clone()],
+                    completed_agent_ids: vec![],
+                    deleted_agent_ids: vec![],
+                    sealed: true,
+                    delivered: false,
+                    event_summaries: vec![],
+                    raw_events_json: vec![],
+                    created_at: intent_core::now_iso(),
+                    updated_at: intent_core::now_iso(),
+                })
+                .await
+                .unwrap();
+        }
+        fixture
+            .store
+            .upsert_completion_watch(&intent_store::PersistedCompletionWatch {
+                id: "startup-watch".into(),
+                parent_workspace_id: workspace.clone(),
+                child_workspace_id: workspace.clone(),
+                parent_agent_id: parent.clone(),
+                parent_agent_name: "First".into(),
+                child_agent_id: child.clone(),
+                group_id,
+                report_delivered: false,
+                wake_on_attention: false,
+                completion_only: false,
+                created_at: intent_core::now_iso(),
+            })
+            .await
+            .unwrap();
+        let gate_path = fixture.root.path().join("completion-gate.sock");
+        let gate = tokio::net::UnixListener::bind(&gate_path).unwrap();
+        let provider_log = fixture.root.path().join("provider-sessions.jsonl");
+        let env = [
+            ("INTENTD_AUTH_TOKEN", TOKEN),
+            ("MOCK_AGENT_SCRIPT_PATH", fixture.script.as_str()),
+            ("MOCK_AGENT_SESSION_LOG", provider_log.to_str().unwrap()),
+            (
+                "INTENTD_TEST_STARTUP_COMPLETION_GATE",
+                gate_path.to_str().unwrap(),
+            ),
+        ];
+        let mut daemon = Daemon {
+            child: spawn_serve(fixture.root.path(), "both", &env, true),
+            data_dir: fixture.root.path().to_owned(),
+        };
+        let (mut release, _) = timeout(common::daemon_startup_timeout(), gate.accept())
+            .await
+            .expect("completion recovery reached gate")
+            .unwrap();
+        let mut ws = fixture.wss().await;
+        let status = wss_rpc(&mut ws, 10, "system.status", json!({})).await;
+        assert!(status.is_object(), "{status}");
+        let pending = wss_rpc(&mut ws, 11, "agent.listInterrupted", json!({})).await;
+        assert_eq!(
+            pending["agents"],
+            json!([]),
+            "reservations precede early completion wakes"
+        );
+        let subscriptions = wss_rpc(
+            &mut ws,
+            12,
+            "agent.getSubscriptions",
+            json!({"workspaceId": workspace, "agentId": parent}),
+        )
+        .await;
+        assert_eq!(
+            subscriptions["subscriptions"].as_array().unwrap().len(),
+            1,
+            "watch registry ready before reconciliation"
+        );
+        assert_eq!(
+            subscriptions["delegationGroups"].as_array().unwrap().len(),
+            usize::from(grouped),
+            "group registry ready before reconciliation"
+        );
+        assert!(
+            !provider_log.exists(),
+            "no recovery provider may start before release"
+        );
+        assert_eq!(
+            fixture.store.list_completion_watches().await.unwrap().len(),
+            1
+        );
+        if stop_while_held {
+            let stopped = uds_rpc(
+                &fixture.root.path().join("intentd.sock"),
+                13,
+                "system.shutdown",
+                json!({}),
+            )
+            .await;
+            assert!(stopped["error"].is_null(), "{stopped}");
+            timeout(common::daemon_startup_timeout(), async {
+                loop {
+                    if let Some(status) = daemon.child.try_wait().unwrap() {
+                        assert!(status.success(), "{status}");
+                        break;
+                    }
+                    // timing-guard: observe graceful shutdown while completion recovery is held
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("shutdown cancels unadmitted completion recovery");
+            assert_eq!(
+                fixture.store.list_completion_watches().await.unwrap().len(),
+                1
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .list_undelivered_groups(&workspace)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                fixture.store.list_interrupted_agents().await.unwrap().len(),
+                1
+            );
+            assert!(!provider_log.exists());
+            // Exercise the composition root again: shutdown must leave both
+            // watch/group state and the interrupted parent recoverable, and
+            // the next startup must deliver exactly one completion wake.
+            drop(ws);
+            daemon = Daemon {
+                child: spawn_serve(
+                    fixture.root.path(),
+                    "both",
+                    &[
+                        ("INTENTD_AUTH_TOKEN", TOKEN),
+                        ("MOCK_AGENT_SCRIPT_PATH", fixture.script.as_str()),
+                        ("MOCK_AGENT_SESSION_LOG", provider_log.to_str().unwrap()),
+                    ],
+                    true,
+                ),
+                data_dir: fixture.root.path().to_owned(),
+            };
+            let mut restarted_ws = fixture.wss().await;
+            assert!(wss_rpc(&mut restarted_ws, 14, "system.status", json!({}))
+                .await
+                .is_object());
+            assert!(daemon.child.try_wait().unwrap().is_none());
+        } else {
+            release.write_u8(1).await.unwrap();
+        }
+        wait_for_sweep(fixture.root.path()).await;
+        timeout(common::rpc_read_timeout(), async {
+            loop {
+                if fixture
+                    .store
+                    .list_completion_watches()
+                    .await
+                    .unwrap()
+                    .is_empty()
+                {
+                    break;
+                }
+                // timing-guard: wait for durable completion-watch retirement
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("completion delivered after release");
+        let messages = fixture
+            .store
+            .get_agent_session(parent)
+            .await
+            .unwrap()
+            .messages;
+        let wakes = messages
+            .iter()
+            .filter(|m| {
+                m.metadata
+                    .as_ref()
+                    .is_some_and(|v| v["type"] == "event_notification")
+            })
+            .count();
+        assert_eq!(
+            wakes, 1,
+            "exactly one recovery wake, grouped={grouped}: {messages:?}"
+        );
+        assert!(fixture
+            .store
+            .list_undelivered_groups(&workspace)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+}
