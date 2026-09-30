@@ -17,6 +17,7 @@ pub use local_changes::{local_changes, LocalChanges, MAX_UNPUSHED_COUNT};
 
 pub mod auth;
 pub mod branches;
+pub mod checkpoint;
 pub mod commit;
 pub mod conflicts;
 pub mod cow;
@@ -25,6 +26,7 @@ pub mod diff;
 pub mod fetch;
 pub mod fs_remove;
 pub mod history;
+pub mod hub;
 pub mod identity;
 pub mod local_changes;
 pub mod ls_remote;

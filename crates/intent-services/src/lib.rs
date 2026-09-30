@@ -77,6 +77,7 @@ mod conditional_write_precedence_tests;
 mod config_watcher;
 mod create_progress;
 mod delete_grace;
+mod delivery_tasks;
 mod device_ops;
 mod discovery_cache;
 mod disk_usage;
@@ -103,6 +104,7 @@ mod github_browse_ops;
 mod source_control_auth_ops;
 
 mod agent_list_cache;
+pub mod checkpoint;
 mod codex_home;
 mod fast_mode;
 mod harness;
@@ -124,6 +126,7 @@ mod npx_cli;
 mod one_shot_acp;
 pub mod pagination;
 pub mod pi_cli;
+mod pr_discovery;
 mod pr_monitor;
 mod pr_ops;
 pub mod presence;
@@ -223,7 +226,9 @@ pub use agent_manager::{
 // Re-export the suspend-overlap query trait (Task C) so the composition root
 // can implement it on the daemon's `SuspendTracker` and wire it via
 // [`Services::with_suspend_tracker`].
+pub use agent_ops::StartupResumeCandidates;
 pub use agent_session::SuspendOverlapQuery;
+pub use agent_subscriptions::StartupCompletionRecovery;
 // Re-export the permission types the composition root (`INTENTD_PERMISSION_POLICY`)
 // and the transport router (`agent.respondPermission` outcome parsing) need.
 // The individual watcher families are constructed only by `WatcherRegistry`,
@@ -265,6 +270,20 @@ pub(crate) struct CompletionClassifyPark {
     pub(crate) entered: tokio::sync::Notify,
     /// Held by the parked delivery inside the window until the test releases it.
     pub(crate) release: tokio::sync::Notify,
+}
+
+/// Retry ownership and watch scope for one child's completion delivery.
+/// Live events cover every watch; deferred startup events cover only restored IDs.
+#[derive(Debug, Default, Clone)]
+struct CompletionDeliveryRetry {
+    generation: u64,
+    attempts: Vec<CompletionRetryAttempt>,
+}
+
+#[derive(Debug, Clone)]
+struct CompletionRetryAttempt {
+    event: Event,
+    watch_ids: Option<HashSet<String>>,
 }
 
 /// Live state of the completion delivery passes over one child
@@ -414,9 +433,12 @@ pub struct Services {
     /// snapshots ([`agent_ops::Services::queue_snapshot`]) keep listing them
     /// ahead of the live queue until the owning [`agent_ops::DrainingGuard`]
     /// is dropped, so an unrelated concurrent mutation's `agent:queue:updated`
-    /// never shows the entry gone before its row exists. Never persisted.
+    /// never shows the entry gone before its row exists. Shutdown freezes and
+    /// persists this overlay before dropping cancelled owners.
     /// Lock order: this mutex is taken BEFORE `agent_queues`, never after.
     draining_queue_entries: Arc<Mutex<HashMap<AgentId, Vec<agent_ops::QueuedMessage>>>>,
+    /// Freeze popped payloads before cancelling their owners at shutdown.
+    draining_shutdown: Arc<std::sync::atomic::AtomicBool>,
     /// Queue-entry id of an `agent.sendMessage` into an `Error` session that
     /// lost the in-flight slot to a worker still holding it
     /// (intent-hq/intent#4962). The documented recovery for an `Error`
@@ -465,6 +487,8 @@ pub struct Services {
     /// between a `syncTabs` commit and that sync's per-row `tab-opened`,
     /// leaving subscribers with a ghost tab the database no longer has.
     browser_tab_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Per-target ordering of retirement cleanup and restore.
+    agent_retirement_gates: agent_ops::AgentRetirementGates,
     /// Per-entry debounce-hold release timers, keyed by queue-entry id: each
     /// held [`agent_ops::QueuedMessage`] gets a spawned sleeper that flushes
     /// the hold marker at `holdUntil` and kicks delivery. Release/retract
@@ -554,8 +578,10 @@ pub struct Services {
     /// Serializes strict completion-only ask registration so a watch is
     /// durably persisted before it becomes visible to completion delivery.
     completion_watch_registration_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Cancellation and drain ownership for automatic agent delivery tasks.
+    delivery_tasks: Arc<delivery_tasks::DeliveryTasks>,
     /// Child agent ids with an active terminal-delivery retry task, mapped
-    /// to a schedule generation. Ownership is coalesced per CHILD, not per
+    /// to pending attempts and a schedule generation. Ownership is coalesced per CHILD, not per
     /// watch (intent-hq/intent#3728): one delivery pass processes ALL of the
     /// child's watches, so per-watch tasks would each repeat the same full
     /// pass (quadratic attempts, synchronized bursts). A transient wake or
@@ -563,7 +589,7 @@ pub struct Services {
     /// its stable message id without waiting for another event; scheduling
     /// while a task is live bumps the generation, which the task re-checks
     /// before exiting so a racing failure never loses its retry owner.
-    completion_delivery_retries: Arc<Mutex<HashMap<String, u64>>>,
+    completion_delivery_retries: Arc<Mutex<HashMap<String, CompletionDeliveryRetry>>>,
     /// Delegation-group ids with an active aggregated-wake retry task.
     completion_group_delivery_retries: Arc<Mutex<HashSet<String>>>,
     /// Per-agent consecutive-identical-terminal-failure streak (monorepo#840):
@@ -771,6 +797,10 @@ pub struct Services {
     /// deterministic. `None` in production wiring; tests inject via the
     /// `#[cfg(test)]`-only `with_completion_classify_park`.
     completion_classify_park: Option<Arc<CompletionClassifyPark>>,
+    #[cfg(test)]
+    hook_wake_park: Option<Arc<CompletionClassifyPark>>,
+    #[cfg(test)]
+    hook_eval_park: Option<Arc<CompletionClassifyPark>>,
     /// Test park seam (intent-hq/intent#4367) for the completion-delivery
     /// claim→send window: parks the ungrouped terminal delivery right after
     /// it claims the watch and before the durable send, so a concurrent
@@ -1018,10 +1048,11 @@ pub struct Services {
     /// envelope); unset means no `url` is stamped. Shared across clones.
     invite_links: Arc<OnceLock<Arc<dyn intent_core::InviteLinkBuilder>>>,
     /// In-memory watermark cache for incremental token-usage scanning (finding F2).
-    /// Maps `workspace_id` → `agent_message` count. When the watermark is unchanged
+    /// Maps `workspace_id` → (`agent_message` count, transcript mutation epoch).
+    /// When both are unchanged
     /// since the last scan, the workspace is skipped. A restart rescans once.
     /// Shared across clones so every scan tick observes the same watermark state.
-    token_usage_watermarks: Arc<Mutex<HashMap<WorkspaceId, u64>>>,
+    token_usage_watermarks: Arc<Mutex<HashMap<WorkspaceId, (u64, u64)>>>,
     /// The single in-flight (or last-terminal) GitHub device-flow slot backing
     /// `github.connect` / `github.cancelAuth` / `github.authStatus` (§5.27).
     /// At most one flow exists at a time; a `connect` while one is pending
@@ -1209,6 +1240,7 @@ pub struct Services {
     /// read within `prCache.maxAgeSeconds` (see [`pr_monitor::PrCache`]).
     /// In-memory only; shared across clones.
     pr_cache: pr_monitor::PrCache,
+    pr_discovery: pr_discovery::Discovery,
     /// The issue cache behind `github.issues.get`: each issue's last forge
     /// read, served within `prCache.maxAgeSeconds` like the PR cache and
     /// retained under the same unmonitored policy (see
@@ -1284,6 +1316,11 @@ pub struct Services {
     /// front door observes one set.
     pending_workspace_deletes: delete_grace::PendingDeletes,
     workspace_mutations: workspace_mutations::WorkspaceMutations,
+    startup_resume_candidates: Arc<Mutex<HashSet<AgentId>>>,
+    #[cfg(test)]
+    interrupted_list_park: Option<Arc<script_ops::SupervisePark>>,
+    #[cfg(test)]
+    interrupted_resume_park: Option<Arc<CompletionClassifyPark>>,
     #[cfg(test)]
     workspace_delete_test_gate: tests::workspace_delete::DeleteGate,
     /// In-memory pending agent-session deletions for the delete grace window
@@ -1388,11 +1425,13 @@ impl Services {
             event_bus: None,
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
             draining_queue_entries: Arc::new(Mutex::new(HashMap::new())),
+            draining_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             parked_recovery_sends: Arc::new(Mutex::new(HashMap::new())),
             agent_queue_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
             agent_queue_publish_gate: Arc::new(tokio::sync::Mutex::new(())),
             browser_client_pin_gate: Arc::new(tokio::sync::Mutex::new(())),
             browser_tab_gate: Arc::new(tokio::sync::Mutex::new(())),
+            agent_retirement_gates: agent_ops::AgentRetirementGates::default(),
             hold_release_timers: Arc::new(Mutex::new(HashMap::new())),
             pending_question_mutation_locks: agent_ops::PendingQuestionMutationLocks::default(),
             pending_marker_mutation_park: None,
@@ -1410,6 +1449,7 @@ impl Services {
             )),
             group_persist_lane: Arc::new(OnceLock::new()),
             completion_watch_registration_gate: Arc::new(tokio::sync::Mutex::new(())),
+            delivery_tasks: Arc::new(delivery_tasks::DeliveryTasks::default()),
             completion_delivery_retries: Arc::new(Mutex::new(HashMap::new())),
             completion_group_delivery_retries: Arc::new(Mutex::new(HashSet::new())),
             agent_failure_streaks: Arc::new(Mutex::new(HashMap::new())),
@@ -1439,6 +1479,10 @@ impl Services {
             script_too_fast_ms: script_ops::TOO_FAST_MS,
             script_parks: script_ops::ScriptParks::default(),
             completion_classify_park: None,
+            #[cfg(test)]
+            hook_wake_park: None,
+            #[cfg(test)]
+            hook_eval_park: None,
             completion_claim_park: None,
             completion_flip_take_park: None,
             attention_write_park: None,
@@ -1530,6 +1574,7 @@ impl Services {
             suspend_tracker: None,
             pr_monitor_catch_up: Arc::new(Mutex::new(HashMap::new())),
             pr_cache: Arc::new(Mutex::new(HashMap::new())),
+            pr_discovery: pr_discovery::Discovery::default(),
             issue_cache: Arc::new(Mutex::new(HashMap::new())),
             pr_cache_max_age_seconds: None,
             pr_read_park: None,
@@ -1544,6 +1589,11 @@ impl Services {
             sweep_rate_limit: Arc::new(rate_limit::RateLimitGate::default()),
             pending_workspace_deletes: delete_grace::PendingDeletes::default(),
             workspace_mutations: workspace_mutations::WorkspaceMutations::default(),
+            startup_resume_candidates: Arc::default(),
+            #[cfg(test)]
+            interrupted_list_park: None,
+            #[cfg(test)]
+            interrupted_resume_park: None,
             #[cfg(test)]
             workspace_delete_test_gate: tests::workspace_delete::DeleteGate::default(),
             pending_agent_deletes: delete_grace::PendingDeletes::default(),
@@ -4851,7 +4901,11 @@ impl Services {
             };
             match refreshed {
                 Err(Error::RateLimited(detail)) => {
-                    self.pause_sweeps_for_rate_limit(sc, &detail).await;
+                    intent_sourcecontrol::traffic::with_caller(
+                        intent_sourcecontrol::traffic::Caller::GitRootRefresh,
+                        self.pause_sweeps_for_rate_limit(sc, &detail),
+                    )
+                    .await;
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -5103,6 +5157,18 @@ impl Services {
     /// the next `workspace.list`.
     async fn refresh_git_root_pr(
         &self,
+        root: intent_core::WorkspaceGitRoot,
+        sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
+    ) -> Result<pr_ops::PrRefreshOutcome> {
+        intent_sourcecontrol::traffic::with_caller(
+            intent_sourcecontrol::traffic::Caller::GitRootRefresh,
+            self.refresh_git_root_pr_accounted(root, sc),
+        )
+        .await
+    }
+
+    async fn refresh_git_root_pr_accounted(
+        &self,
         mut root: intent_core::WorkspaceGitRoot,
         sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
     ) -> Result<pr_ops::PrRefreshOutcome> {
@@ -5132,8 +5198,8 @@ impl Services {
         // delta persist below and the sweep pauses globally (monorepo#2961).
         let mut discovery_rate_limited: Option<String> = None;
         let mut outcome = if let Some(number) = root.pr_number {
-            let pr = sc
-                .get_pr(&repo_ref, number)
+            let pr = self
+                .linked_pr_record(sc.as_ref(), &repo_ref, number)
                 .await
                 .map_err(pr_ops::map_sc_err)?;
             fetched_fresh.push(number);
@@ -5174,14 +5240,15 @@ impl Services {
                     intent_core::PullRequestStatus::Merged | intent_core::PullRequestStatus::Closed
                 ) && !branch.is_empty()
                 {
-                    let discovered = match pr_ops::discover_matching_open_pr(
-                        sc.as_ref(),
-                        &repo_ref,
-                        &branch,
-                        None,
-                        Some(number),
-                    )
-                    .await
+                    let discovered = match self
+                        .discover_shared_pr(
+                            sc.as_ref(),
+                            &repo_ref,
+                            &branch,
+                            None,
+                            (pr.state == intent_sourcecontrol::PrState::Merged).then_some(number),
+                        )
+                        .await
                     {
                         Ok(found) => found,
                         // A rate-limited discovery still degrades to the
@@ -5229,10 +5296,10 @@ impl Services {
         } else if branch.is_empty() {
             PrRefreshOutcome::Skipped
         } else {
-            let found =
-                pr_ops::discover_matching_open_pr(sc.as_ref(), &repo_ref, &branch, None, None)
-                    .await
-                    .map_err(pr_ops::map_sc_err)?;
+            let found = self
+                .discover_shared_pr(sc.as_ref(), &repo_ref, &branch, None, None)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
             match found {
                 Some(pr) => {
                     fetched_fresh.push(pr.number);
@@ -5256,6 +5323,7 @@ impl Services {
         let mut rate_limited = discovery_rate_limited;
         if rate_limited.is_none() {
             let (heal_changed, heal_rate_limited) = pr_ops::refresh_stale_pool_entries(
+                self,
                 sc.as_ref(),
                 &repo_ref,
                 &mut root.pull_requests,
@@ -5330,6 +5398,16 @@ impl Services {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<pr_ops::PrRefreshOutcome> {
+        // Start the refresh generation before store/provider awaits so
+        // simultaneous callers can share a fill even if their reads finish
+        // at different times.
+        pr_discovery::explicitly_refresh(self.refresh_workspace_pr_cached(workspace_id)).await
+    }
+
+    async fn refresh_workspace_pr_cached(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<pr_ops::PrRefreshOutcome> {
         // Check eligibility before resolving provider (PRRT_kwDOS9Wxuc6QZ0zr):
         // avoids errors/warnings for remote/archived/ineligible workspaces when
         // source control is unconfigured.
@@ -5365,6 +5443,18 @@ impl Services {
     /// resurrected.
     async fn refresh_workspace_pr_with_sc(
         &self,
+        ws: Workspace,
+        sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
+    ) -> Result<pr_ops::PrRefreshOutcome> {
+        intent_sourcecontrol::traffic::with_caller(
+            intent_sourcecontrol::traffic::Caller::WorkspaceRefresh,
+            self.refresh_workspace_pr_with_sc_accounted(ws, sc),
+        )
+        .await
+    }
+
+    async fn refresh_workspace_pr_with_sc_accounted(
+        &self,
         mut ws: Workspace,
         sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
     ) -> Result<pr_ops::PrRefreshOutcome> {
@@ -5378,8 +5468,8 @@ impl Services {
         };
 
         if let Some(number) = ws.pr_number {
-            let pr = sc
-                .get_pr(&repo_ref, number)
+            let pr = self
+                .linked_pr_record(sc.as_ref(), &repo_ref, number)
                 .await
                 .map_err(pr_ops::map_sc_err)?;
             // Clear a stale link only on a positive mismatch against BOTH
@@ -5431,14 +5521,15 @@ impl Services {
                 intent_core::PullRequestStatus::Merged | intent_core::PullRequestStatus::Closed
             ) && (!ws.branch.is_empty() || ws.base_ref.is_some())
             {
-                let discovered = match pr_ops::discover_matching_open_pr(
-                    sc.as_ref(),
-                    &repo_ref,
-                    &ws.branch,
-                    ws.base_ref.as_deref(),
-                    Some(number),
-                )
-                .await
+                let discovered = match self
+                    .discover_shared_pr(
+                        sc.as_ref(),
+                        &repo_ref,
+                        &ws.branch,
+                        ws.base_ref.as_deref(),
+                        (pr.state == intent_sourcecontrol::PrState::Merged).then_some(number),
+                    )
+                    .await
                 {
                     Ok(found) => found,
                     // A rate-limited discovery still degrades to the plain
@@ -5512,15 +5603,16 @@ impl Services {
             if ws.branch.is_empty() && ws.base_ref.is_none() {
                 return Ok(PrRefreshOutcome::Skipped);
             }
-            let found = pr_ops::discover_matching_open_pr(
-                sc.as_ref(),
-                &repo_ref,
-                &ws.branch,
-                ws.base_ref.as_deref(),
-                None,
-            )
-            .await
-            .map_err(pr_ops::map_sc_err)?;
+            let found = self
+                .discover_shared_pr(
+                    sc.as_ref(),
+                    &repo_ref,
+                    &ws.branch,
+                    ws.base_ref.as_deref(),
+                    None,
+                )
+                .await
+                .map_err(pr_ops::map_sc_err)?;
             match found {
                 Some(pr) => {
                     let mut info = pr_ops::build_pr_info(&pr);
@@ -5786,7 +5878,11 @@ impl Services {
         // A paused tick consults the shared quota probe here: the pause
         // lifts early once the quota has recovered (monorepo#2961).
         if let Some(sc) = sc.as_ref() {
-            self.maybe_lift_rate_limit_pause(sc).await;
+            intent_sourcecontrol::traffic::with_caller(
+                intent_sourcecontrol::traffic::Caller::WorkspaceRefresh,
+                self.maybe_lift_rate_limit_pause(sc),
+            )
+            .await;
         }
         for ws in workspaces {
             // STAB-3 fix: refresh all workspaces (discovery + update), not just
@@ -5817,7 +5913,11 @@ impl Services {
                 };
                 match refreshed {
                     Err(Error::RateLimited(detail)) => {
-                        self.pause_sweeps_for_rate_limit(sc, &detail).await;
+                        intent_sourcecontrol::traffic::with_caller(
+                            intent_sourcecontrol::traffic::Caller::WorkspaceRefresh,
+                            self.pause_sweeps_for_rate_limit(sc, &detail),
+                        )
+                        .await;
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -5891,11 +5991,16 @@ impl Services {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<bool> {
-        // Cheap change detection: skip when the watermark is unchanged (finding F2).
-        let current_watermark = self
+        // Reuse the existing per-workspace mutation revision: replacement or
+        // delete+append can change provenance without changing COUNT(*).
+        // Capture BEFORE awaiting reads/recompute. A concurrent invalidation
+        // must remain visible to the next scan, not be consumed by this one.
+        let epoch = self.agent_list_cache.current_epoch(&workspace_id.0);
+        let message_count = self
             .store
             .get_workspace_message_watermark(workspace_id)
             .await?;
+        let current_watermark = (message_count, epoch);
         let last_watermark = self
             .token_usage_watermarks
             .lock()
@@ -5904,7 +6009,7 @@ impl Services {
             .copied();
         if let Some(last) = last_watermark {
             if last == current_watermark {
-                // No messages added/removed since last scan — skip tallying.
+                // No count change or service transcript mutation — skip tallying.
                 return Ok(false);
             }
         }
@@ -5960,49 +6065,124 @@ impl Services {
         workspace_id: &WorkspaceId,
         guard_zero_regression: bool,
     ) -> Result<bool> {
-        let written = self
-            .store
-            .update_workspace_token_usage(workspace_id, |usage_data, current| {
-                // Tally usage without hydrating full message logs (finding F2;
-                // snapshot/baseline-backed sessions arrive with empty contents).
-                let tallies: Vec<token_usage::AgentTokenTally> = usage_data
-                    .iter()
-                    .map(|(agent_id, model, snapshot, baseline, contents)| {
-                        token_usage::agent_token_tally(
+        let written =
+            self.store
+                .update_workspace_token_usage(workspace_id, |usage_data, current| {
+                    // Tally usage without hydrating full message logs (finding F2;
+                    // snapshot/baseline-backed sessions arrive with empty contents).
+                    let mut tallies = Vec::new();
+                    let mut cross_rows = Vec::new();
+                    for (agent_id, model, snapshot, baseline, contents, cells) in usage_data {
+                        let reported =
+                            intent_core::token_usage_reported(baseline.as_ref(), snapshot.as_ref());
+                        let mut contributed = false;
+                        let has_materialized_totals = cells.iter().any(|cell| {
+                            cell.reported_totals != intent_core::TokenUsageTotals::default()
+                        });
+                        for cell in cells {
+                            let totals = if reported {
+                                cell.reported_totals.clone()
+                            } else {
+                                let mut totals = token_usage::agent_token_tally(
+                                    agent_id,
+                                    Some(&cell.model),
+                                    None,
+                                    None,
+                                    &cell.message_usage,
+                                )
+                                .totals;
+                                totals.cost.clone_from(&cell.reported_totals.cost);
+                                totals
+                            };
+                            if totals != intent_core::TokenUsageTotals::default()
+                                || cell.human_messages != 0
+                                || cell.agent_messages != 0
+                            {
+                                contributed = true;
+                                let model = if cell.model.is_empty() {
+                                    token_usage::UNKNOWN_MODEL.to_string()
+                                } else {
+                                    cell.model.clone()
+                                };
+                                tallies.push(token_usage::AgentTokenTally {
+                                    agent_id: agent_id.clone(),
+                                    model: model.clone(),
+                                    totals: totals.clone(),
+                                });
+                                cross_rows.push(intent_core::TokenUsageCrossFilterRow {
+                                    agent_id: agent_id.clone(),
+                                    model,
+                                    totals,
+                                    human_messages: cell.human_messages,
+                                    agent_messages: cell.agent_messages,
+                                });
+                            }
+                        }
+                        let fallback = token_usage::agent_token_tally(
                             agent_id,
                             model.as_deref(),
                             baseline.as_ref(),
                             snapshot.as_ref(),
                             contents,
-                        )
-                    })
-                    .collect();
-                let mut usage = token_usage::aggregate_token_usage(&tallies);
-                usage.last_scan_at = Some(now_iso());
-
-                if guard_zero_regression
-                    && !usage_data.is_empty()
-                    && usage.totals == intent_core::TokenUsageTotals::default()
-                    && current
-                        .is_some_and(|prev| prev.totals != intent_core::TokenUsageTotals::default())
-                {
-                    // Reconciliation guard: never clobber a fresher live snapshot
-                    // with an all-zero tally while session rows exist (the racing-
-                    // sweep case). An empty workspace (all sessions deleted) has no
-                    // turn to race, so the zero recount above writes through.
-                    return None;
-                }
-                let changed = match current {
-                    Some(prev) => {
-                        prev.by_agent_id != usage.by_agent_id
-                            || prev.by_model != usage.by_model
-                            || prev.totals != usage.totals
+                        );
+                        if reported
+                            && !has_materialized_totals
+                            && fallback.totals != intent_core::TokenUsageTotals::default()
+                        {
+                            if let Some(row) = cross_rows.iter_mut().rev().find(|row| {
+                                row.agent_id == *agent_id && row.model == fallback.model
+                            }) {
+                                row.totals = fallback.totals.clone();
+                            } else {
+                                cross_rows.push(intent_core::TokenUsageCrossFilterRow {
+                                    agent_id: agent_id.clone(),
+                                    model: fallback.model.clone(),
+                                    totals: fallback.totals.clone(),
+                                    human_messages: 0,
+                                    agent_messages: 0,
+                                });
+                            }
+                            tallies.push(fallback.clone());
+                            contributed = true;
+                        }
+                        if !contributed {
+                            tallies.push(fallback);
+                        }
                     }
-                    None => true,
-                };
-                changed.then_some(usage)
-            })
-            .await?;
+                    cross_rows.sort_by(|a, b| {
+                        a.agent_id
+                            .cmp(&b.agent_id)
+                            .then_with(|| a.model.cmp(&b.model))
+                    });
+                    let mut usage = token_usage::aggregate_token_usage(&tallies);
+                    usage.by_agent_model = Some(cross_rows);
+                    usage.last_scan_at = Some(now_iso());
+
+                    if guard_zero_regression
+                        && !usage_data.is_empty()
+                        && usage.totals == intent_core::TokenUsageTotals::default()
+                        && current.is_some_and(|prev| {
+                            prev.totals != intent_core::TokenUsageTotals::default()
+                        })
+                    {
+                        // Reconciliation guard: never clobber a fresher live snapshot
+                        // with an all-zero tally while session rows exist (the racing-
+                        // sweep case). An empty workspace (all sessions deleted) has no
+                        // turn to race, so the zero recount above writes through.
+                        return None;
+                    }
+                    let changed = match current {
+                        Some(prev) => {
+                            prev.by_agent_id != usage.by_agent_id
+                                || prev.by_model != usage.by_model
+                                || prev.by_agent_model != usage.by_agent_model
+                                || prev.totals != usage.totals
+                        }
+                        None => true,
+                    };
+                    changed.then_some(usage)
+                })
+                .await?;
         let Some(usage) = written else {
             return Ok(false);
         };
@@ -6091,25 +6271,44 @@ impl Services {
             return intent_core::spawn_daemon(async {});
         };
         let services = self.clone();
-        intent_core::spawn_daemon(async move {
-            // Span every workspace (workspace_id = None) and deliver each matched
-            // event immediately (batch_window = None) so wakes are never coalesced.
-            let filter = SubscriptionFilter {
-                event_types: vec![
-                    AGENT_IDLE.to_string(),
-                    AGENT_FAILED.to_string(),
-                    AGENT_DELETED.to_string(),
-                    AGENT_RETIRED.to_string(),
-                ],
-                ..Default::default()
-            };
-            let mut sub = bus.subscribe(filter);
-            while let Some(events) = sub.recv().await {
-                for event in events {
-                    services.handle_completion_event(&event).await;
+        self.delivery_tasks
+            .spawn(async move {
+                // Span every workspace (workspace_id = None) and deliver each matched
+                // event immediately (batch_window = None) so wakes are never coalesced.
+                let filter = SubscriptionFilter {
+                    event_types: vec![
+                        AGENT_IDLE.to_string(),
+                        AGENT_FAILED.to_string(),
+                        AGENT_DELETED.to_string(),
+                        AGENT_RETIRED.to_string(),
+                    ],
+                    ..Default::default()
+                };
+                let mut sub = bus.subscribe(filter);
+                while let Some(events) = sub.recv().await {
+                    for event in events {
+                        services.handle_completion_event(&event).await;
+                    }
                 }
-            }
-        })
+            })
+            .unwrap_or_else(|| intent_core::spawn_daemon(async {}))
+    }
+
+    /// Stop and drain automatic delivery work without retiring its durable
+    /// watches, hooks, subscriptions, or queued messages. New registrations
+    /// are refused atomically with this close.
+    ///
+    /// # Panics
+    /// Panics if an internal mutex is poisoned.
+    pub async fn shutdown_agent_deliveries(&self) {
+        self.delivery_tasks.shutdown().await;
+        self.completion_delivery_retries.lock().unwrap().clear();
+        self.completion_group_delivery_retries
+            .lock()
+            .unwrap()
+            .clear();
+        self.hook_tasks.lock().unwrap().clear();
+        self.event_subscriptions.lock().unwrap().clear();
     }
 
     /// Resolve the completed child + workspace from a completion event and fan
@@ -6474,6 +6673,15 @@ impl Services {
             .lock()
             .expect("advisory-pending interim skip registry poisoned")
             .remove(child_id);
+    }
+
+    /// Historical scoped recovery can add a deferral, but must not erase the
+    /// provenance a new watcher recorded after readiness.
+    fn mark_interim_skipped_idle_preserving_provenance(&self, child_id: &AgentId) {
+        self.interim_skipped_idles
+            .lock()
+            .expect("interim skipped idle registry poisoned")
+            .insert(child_id.clone());
     }
 
     /// [`Self::mark_interim_skipped_idle`] variant for a LIVE monitoring
@@ -7125,9 +7333,8 @@ impl Services {
     /// Retry failed durable terminal wakes for `child_id` until its
     /// ungrouped watches retire or a pass completes without a delivery
     /// failure. Retry ownership is coalesced per child
-    /// (intent-hq/intent#3728): each delivery pass processes ALL of the
-    /// child's watches, so one task owns the child and a second failure
-    /// while it runs only bumps the registry generation — the task
+    /// (intent-hq/intent#3728): one task owns the child; a second failure
+    /// coalesces its event/scope and bumps the registry generation — the task
     /// re-checks the generation before exiting, so a failure racing its
     /// clean pass keeps the task alive for another pass instead of being
     /// stranded without an owner. A pass that reports no ungrouped
@@ -7135,21 +7342,46 @@ impl Services {
     /// armed on purpose (interim deferral, dedup suppression) and the
     /// normal event paths own their settlement. The delivery path's
     /// stable message ids make every attempt idempotent.
-    fn schedule_completion_delivery_retry(&self, child_id: AgentId, event: Event) {
+    fn schedule_completion_delivery_retry(
+        &self,
+        child_id: AgentId,
+        event: Event,
+        watch_ids: Option<&HashSet<String>>,
+    ) {
+        if self.delivery_tasks.is_closed() {
+            return;
+        }
         {
             let mut retries = self
                 .completion_delivery_retries
                 .lock()
                 .expect("completion delivery retries poisoned");
-            if let Some(generation) = retries.get_mut(&child_id.0) {
-                *generation = generation.wrapping_add(1);
+            let already_owned = retries.contains_key(&child_id.0);
+            let retry = retries.entry(child_id.0.clone()).or_default();
+            retry.generation = retry.generation.wrapping_add(1);
+            // Coalesce duplicate attempts, never widen a historical boot
+            // event to live watches. A concurrent live event keeps its own
+            // payload and advisory policy under the same per-child worker.
+            if let Some(attempt) = retry.attempts.iter_mut().find(|attempt| {
+                attempt.event.id == event.id && attempt.watch_ids.is_some() == watch_ids.is_some()
+            }) {
+                if let (Some(current), Some(incoming)) = (&mut attempt.watch_ids, watch_ids) {
+                    current.extend(incoming.iter().cloned());
+                }
+            } else {
+                retry.attempts.push(CompletionRetryAttempt {
+                    event,
+                    watch_ids: watch_ids.cloned(),
+                });
+            }
+            if already_owned {
                 return;
             }
-            retries.insert(child_id.0.clone(), 0);
         }
 
         let services = self.clone();
-        intent_core::spawn_daemon(async move {
+        let retry_key = child_id.0.clone();
+        let task = self.delivery_tasks.spawn(async move {
             // 500ms initial (monorepo#4183): the old 100ms start burst three
             // attempts inside the first second on every transient failure;
             // wakes are not latency-critical enough to justify that.
@@ -7157,24 +7389,38 @@ impl Services {
             let max_backoff = std::time::Duration::from_secs(5);
             loop {
                 tokio::time::sleep(backoff).await;
-                let seen_generation = services
+                let retry = services
                     .completion_delivery_retries
                     .lock()
                     .expect("completion delivery retries poisoned")
                     .get(&child_id.0)
-                    .copied()
-                    .unwrap_or(0);
-                let ungrouped_armed = services
-                    .find_watches_for_child(&child_id)
-                    .iter()
-                    .any(|watch| watch.group_id.is_none());
-                let clean = if ungrouped_armed {
-                    !Box::pin(services.deliver_completion_to_watches(&child_id, &event))
+                    .cloned()
+                    .unwrap_or_default();
+                let mut clean = true;
+                for attempt in &retry.attempts {
+                    let ungrouped_armed =
+                        services
+                            .find_watches_for_child(&child_id)
+                            .iter()
+                            .any(|watch| {
+                                watch.group_id.is_none()
+                                    && attempt
+                                        .watch_ids
+                                        .as_ref()
+                                        .is_none_or(|ids| ids.contains(&watch.id))
+                            });
+                    if ungrouped_armed {
+                        clean &= !Box::pin(services.deliver_completion_to_watches_inner(
+                            &child_id,
+                            &attempt.event,
+                            attempt.watch_ids.is_none(),
+                            true,
+                            attempt.watch_ids.as_ref(),
+                        ))
                         .await
-                        .ungrouped_delivery_failed
-                } else {
-                    true
-                };
+                        .ungrouped_delivery_failed;
+                    }
+                }
                 if !clean {
                     backoff = backoff.saturating_mul(2).min(max_backoff);
                     continue;
@@ -7183,7 +7429,11 @@ impl Services {
                     .completion_delivery_retries
                     .lock()
                     .expect("completion delivery retries poisoned");
-                if retries.get(&child_id.0).copied().unwrap_or(seen_generation) == seen_generation {
+                if retries
+                    .get(&child_id.0)
+                    .map_or(retry.generation, |state| state.generation)
+                    == retry.generation
+                {
                     retries.remove(&child_id.0);
                     break;
                 }
@@ -7191,11 +7441,20 @@ impl Services {
                 // another pass so it keeps a retry owner.
             }
         });
+        if task.is_none() {
+            self.completion_delivery_retries
+                .lock()
+                .unwrap()
+                .remove(&retry_key);
+        }
     }
 
     /// Retry one failed durable aggregated wake until its group settles or is
     /// removed. The stable group message id makes every attempt idempotent.
     fn schedule_completion_group_delivery_retry(&self, group_id: String) {
+        if self.delivery_tasks.is_closed() {
+            return;
+        }
         if !self
             .completion_group_delivery_retries
             .lock()
@@ -7206,7 +7465,8 @@ impl Services {
         }
 
         let services = self.clone();
-        intent_core::spawn_daemon(async move {
+        let retry_key = group_id.clone();
+        let task = self.delivery_tasks.spawn(async move {
             // 500ms initial backoff, aligned with the per-child retry task
             // (monorepo#4183): wakes are not latency-critical enough to
             // justify bursting attempts inside the first second.
@@ -7229,6 +7489,12 @@ impl Services {
                 .expect("completion group delivery retries poisoned")
                 .remove(&group_id);
         });
+        if task.is_none() {
+            self.completion_group_delivery_retries
+                .lock()
+                .unwrap()
+                .remove(&retry_key);
+        }
     }
 
     /// Wake every parent whose watch matches `child_id`, then drop that watch:
@@ -7331,7 +7597,7 @@ impl Services {
         child_id: &AgentId,
         event: &Event,
     ) -> CompletionIdleClassification {
-        self.deliver_completion_to_watches_inner(child_id, event, true, true)
+        self.deliver_completion_to_watches_inner(child_id, event, true, true, None)
             .await
     }
 
@@ -7347,7 +7613,7 @@ impl Services {
         child_id: &AgentId,
         event: &Event,
     ) -> CompletionIdleClassification {
-        self.deliver_completion_to_watches_inner(child_id, event, true, false)
+        self.deliver_completion_to_watches_inner(child_id, event, true, false, None)
             .await
     }
 
@@ -7364,7 +7630,7 @@ impl Services {
         child_id: &AgentId,
         event: &Event,
     ) -> CompletionIdleClassification {
-        self.deliver_completion_to_watches_inner(child_id, event, false, true)
+        self.deliver_completion_to_watches_inner(child_id, event, false, true, None)
             .await
     }
 
@@ -7374,6 +7640,7 @@ impl Services {
         event: &Event,
         advisory_allowed: bool,
         clear_advisory_markers: bool,
+        watch_ids: Option<&HashSet<String>>,
     ) -> CompletionIdleClassification {
         // Queue- and busy-aware completion: an `agent:idle` for a child whose
         // pending message queue still holds ready-to-send entries, OR whose
@@ -7496,7 +7763,9 @@ impl Services {
             // OWED, not cancelled — record the advisory-pending provenance so
             // the worker-exit heal (`redeliver_completion_after_queue_mutation`)
             // runs the advisory-ALLOWED variant and delivers it.
-            if advisory_allowed
+            if watch_ids.is_some() {
+                self.mark_interim_skipped_idle_preserving_provenance(child_id);
+            } else if advisory_allowed
                 && busy_interim
                 && (hook_waiting || pr_monitor_waiting)
                 && !agent_waiting
@@ -7510,14 +7779,15 @@ impl Services {
         // completion, so it must not clear failure-dedup state (a poisoned
         // child's replayed identical failure could otherwise slip a
         // duplicate wake through).
-        if event.event_type != AGENT_FAILED && !interim_idle {
+        if watch_ids.is_none() && event.event_type != AGENT_FAILED && !interim_idle {
             self.clear_failure_wake_dedup(child_id);
         }
         // monorepo#1280: any non-interim completion supersedes a recorded
         // interim skip — the delivery below settles the watches, so the
         // retraction-redelivery marker must not linger and produce a stale
-        // synthetic wake later.
-        if !interim_idle {
+        // synthetic wake later. Scoped historical recovery must leave this
+        // child-wide state intact: a new watch may have deferred after boot.
+        if watch_ids.is_none() && !interim_idle {
             self.take_interim_skipped_idle(child_id);
             // PR #1578 review: the child's genuine settlement
             // (completion/failure/deletion/retirement) ends its
@@ -7556,7 +7826,14 @@ impl Services {
                 .unwrap_or("")
                 .to_string()
         });
-        let watches = self.find_watches_for_child(child_id);
+        // Deferred boot reconciliation belongs only to the restored watches.
+        // A new explicit watch registered since readiness retains registration
+        // semantics (including waiting for the next completion of an idle child).
+        let watches: Vec<_> = self
+            .find_watches_for_child(child_id)
+            .into_iter()
+            .filter(|watch| watch_ids.is_none_or(|ids| ids.contains(&watch.id)))
+            .collect();
         // intent-hq/monorepo#3906: the wake label must reflect the genuine
         // delegation relationship, not the watch itself — a watch on a
         // non-child (top-level peer, SUB-1 send target) renders "Watched
@@ -7658,7 +7935,7 @@ impl Services {
             Option<String>,
             Option<String>,
         ) = if !watches.is_empty() && event.event_type == AGENT_IDLE && !interim_idle {
-            match self.store.get_agent_session(child_id).await {
+            match self.store.get_agent_session_summary(child_id).await {
                 Ok(s) => {
                     let identity = if event_report_raw.is_some()
                         && event_report_raw == s.completion_report.as_deref()
@@ -7705,7 +7982,7 @@ impl Services {
             if !watches.is_empty() && event.event_type == AGENT_FAILED {
                 match failure_error_text.as_deref() {
                     Some(err) if !err.is_empty() => {
-                        match self.store.get_agent_session(child_id).await {
+                        match self.store.get_agent_session_summary(child_id).await {
                             Ok(s) => {
                                 let wrapped = Error::Internal(format!(
                                     "{} {err}",
@@ -7835,7 +8112,7 @@ impl Services {
                 // attention request (whose immediate wake already fired at
                 // raise time — the alert) is folded into the child's line +
                 // event data the same way (the record).
-                let child_session = self.store.get_agent_session(child_id).await.ok();
+                let child_session = self.store.get_agent_session_summary(child_id).await.ok();
                 let attention = child_session.as_ref().and_then(|s| {
                     s.attention_request_kind
                         .clone()
@@ -8251,7 +8528,11 @@ impl Services {
                         .await;
                 }
                 ungrouped_delivery_failed = true;
-                self.schedule_completion_delivery_retry(child_id.clone(), retry_event.clone());
+                self.schedule_completion_delivery_retry(
+                    child_id.clone(),
+                    retry_event.clone(),
+                    watch_ids,
+                );
                 continue;
             }
             let delivered_at = now_iso();
@@ -8273,7 +8554,7 @@ impl Services {
                     "terminal wake is durable but watch retirement failed; stable-id retry remains armed"
                 );
                 ungrouped_delivery_failed = true;
-                self.schedule_completion_delivery_retry(child_id.clone(), retry_event);
+                self.schedule_completion_delivery_retry(child_id.clone(), retry_event, watch_ids);
                 continue;
             }
             self.remove_watch_after_delivery_commit(&watch.id);
@@ -8505,7 +8786,7 @@ impl Services {
             );
             if !grouped {
                 *ungrouped_delivery_failed = true;
-                self.schedule_completion_delivery_retry(child_id.clone(), event.clone());
+                self.schedule_completion_delivery_retry(child_id.clone(), event.clone(), None);
             }
             return false;
         }
@@ -8572,7 +8853,11 @@ impl Services {
             let Some(child) = completion_event_child_id(event) else {
                 continue;
             };
-            if let Ok(s) = self.store.get_agent_session(&AgentId::from(child)).await {
+            if let Ok(s) = self
+                .store
+                .get_agent_session_summary(&AgentId::from(child))
+                .await
+            {
                 if let Some(n) = s.task_note_id {
                     trigger_tasks.push((s.workspace_id.0, n.0));
                 }
@@ -9418,6 +9703,11 @@ impl Services {
         message_metadata: Option<serde_json::Value>,
         message_id: Option<String>,
     ) -> Result<serde_json::Value> {
+        if self.delivery_tasks.is_closed() {
+            // A transient refusal keeps completion watches armed for restart;
+            // it must not be mistaken for a deleted parent.
+            return Err(Error::Internal("daemon is shutting down".into()));
+        }
         if let Some(id) = message_id.as_deref() {
             // queue-egress: allow — id-only idempotency probe; no entry leaves the daemon
             let queued = self
@@ -9490,28 +9780,28 @@ impl Services {
                 content
             };
             let blocks = serde_json::json!([{ "type": "text", "text": content }]);
-            if let Some(id) = message_id.as_deref() {
-                self.store
-                    .append_agent_message_with_id(
-                        &parent_agent_id,
-                        id,
-                        "user",
-                        &blocks,
-                        message_metadata.as_ref(),
-                        &now_iso(),
-                    )
-                    .await?;
+            let origin = if message_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("fromAgentId"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| !id.is_empty())
+            {
+                intent_store::UsageMessageOrigin::Agent
             } else {
-                self.store
-                    .append_agent_message_with_metadata(
-                        &parent_agent_id,
-                        "user",
-                        &blocks,
-                        message_metadata.as_ref(),
-                        &now_iso(),
-                    )
-                    .await?;
-            }
+                intent_store::UsageMessageOrigin::Excluded
+            };
+            let message_id = message_id.unwrap_or_else(crate::agent_ops::new_message_id);
+            self.store
+                .append_agent_message_with_provenance(
+                    &parent_agent_id,
+                    &message_id,
+                    "user",
+                    &blocks,
+                    message_metadata.as_ref(),
+                    &now_iso(),
+                    origin,
+                )
+                .await?;
             self.invalidate_agent_list_cache(workspace_id);
             Ok(serde_json::json!({ "success": true, "queued": false }))
         }
@@ -15233,7 +15523,7 @@ impl Services {
         if event_type != AGENT_IDLE {
             return None;
         }
-        let session = self.store.get_agent_session(child_id).await.ok()?;
+        let session = self.store.get_agent_session_summary(child_id).await.ok()?;
         self.stall_suspicion_for_session(&session).await
     }
 
@@ -17278,14 +17568,10 @@ impl WorkspaceApi for Services {
     fn skill_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
-            // Resolve workspace path (required for skills discovery)
             let ws = self.store.get_workspace(&workspace_id).await?;
-            let workspace_path = crate::git_ops::worktree_path(&ws).ok_or_else(|| {
-                Error::NotFound(format!(
-                    "workspace {} has no worktree path",
-                    workspace_id.as_str()
-                ))
-            })?;
+            // An empty path selects the loader's user-only discovery mode for
+            // repository-free workspaces, without provisioning a checkout.
+            let workspace_path = crate::git_ops::worktree_path(&ws).unwrap_or_default();
 
             // Check if skills changed and emit event if they did
             let (skills, changed) =
@@ -28330,7 +28616,15 @@ impl WorkspaceApi for Services {
                     (filtered, true, true)
                 }
             };
-            if to_commit.is_empty() {
+            // An explicitly requested staged-only merge can record ancestry
+            // without changing HEAD's tree. Let the full-index commit path
+            // preserve its parents and attribution; empty automatic commits
+            // and ordinary empty checkpoints remain rejected.
+            if to_commit.is_empty()
+                && !(user_requested
+                    && !needs_stage
+                    && intent_git::commit::has_pending_merge(&worktree)?)
+            {
                 return Err(Error::Internal(if user_requested {
                     "No staged changes found to commit".to_string()
                 } else {
@@ -30179,7 +30473,21 @@ impl WorkspaceApi for Services {
 
     fn agent_list_interrupted(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async {
+            // Snapshot reservations BEFORE reading pending rows: recovery may
+            // claim a row and release its reservation during the database await.
+            // Using the later set would expose that stale row as manual work.
+            let reserved = self
+                .startup_resume_candidates
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             let mut rows = self.store.list_interrupted_agents().await?;
+            #[cfg(test)]
+            if let Some(park) = &self.interrupted_list_park {
+                park.entered.notify_one();
+                park.release.notified().await;
+            }
+            rows.retain(|ia| !reserved.contains(&ia.agent_id));
             // Cross-workspace surface: a collaborator sees only member workspaces.
             if let Some(visible) = self.visible_workspace_ids().await? {
                 rows.retain(|ia| visible.contains(&ia.workspace_id));
@@ -30733,6 +31041,7 @@ impl WorkspaceApi for Services {
                 )
                 .await
                 .map_err(pr_ops::map_sc_err)?;
+            self.pr_discovery.invalidate(sc.as_ref(), &repo_ref);
             Ok(serde_json::json!({ "pull": github_ops::pull_to_json(&pr) }))
         })
     }
@@ -32012,6 +32321,10 @@ impl WorkspaceApi for Services {
                     // is cancelled; a terminal slot stays until the next
                     // connect replaces it (same rule as `github.cancelAuth`).
                     let mut guard = self.gitlab_auth.lock().await;
+                    let starting = guard
+                        .starting
+                        .as_ref()
+                        .is_some_and(|s| s.host == host.host());
                     let cancelled = matches!(
                         guard.flow.as_ref(),
                         Some(f) if f.host == host.host()
@@ -32020,7 +32333,10 @@ impl WorkspaceApi for Services {
                     if cancelled {
                         guard.flow = None;
                     }
-                    Ok(serde_json::json!({ "ok": true, "cancelled": cancelled }))
+                    if starting {
+                        guard.starting = None;
+                    }
+                    Ok(serde_json::json!({ "ok": true, "cancelled": cancelled || starting }))
                 }
             }
         })
@@ -32049,6 +32365,13 @@ impl WorkspaceApi for Services {
                         let mut guard = self.gitlab_auth.lock().await;
                         if guard.flow.as_ref().is_some_and(|f| f.host == host.host()) {
                             guard.flow = None;
+                        }
+                        if guard
+                            .starting
+                            .as_ref()
+                            .is_some_and(|s| s.host == host.host())
+                        {
+                            guard.starting = None;
                         }
                     }
                     // Only the bound instance owns the stored token — read
@@ -34597,6 +34920,7 @@ impl Services {
             .create_pr(&repo_ref, input)
             .await
             .map_err(pr_ops::map_sc_err)?;
+        self.pr_discovery.invalidate(sc.as_ref(), &repo_ref);
 
         let mut info = pr_ops::build_pr_info(&pr);
         pr_ops::upsert_pr_info(&mut ws.pull_requests, &mut info);

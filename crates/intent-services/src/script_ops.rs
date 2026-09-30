@@ -472,6 +472,53 @@ impl ScriptManager {
         Ok(loaded)
     }
 
+    /// Reconcile one committed import without rewriting its persisted definition
+    /// or touching scripts absent from the archive. Imported scripts stay idle.
+    pub(crate) async fn refresh_imported(
+        &self,
+        workspace_id: &WorkspaceId,
+        script_id: &str,
+    ) -> Result<()> {
+        let lock = self.locks.definition_lock(script_id);
+        let _guard = lock.lock().await;
+        let Some(def) = self
+            .store
+            .get_script_in_workspace(workspace_id, script_id)
+            .await?
+        else {
+            return Ok(());
+        };
+        let key = (workspace_id.clone(), script_id.to_string());
+        let old = self.scripts.lock().unwrap().remove(&key);
+        if let Some(mut old) = old {
+            // As with upsert, removal fences the supervisor's generation.
+            // Await it so a PTY still being registered is also reaped.
+            let handle = old.supervisor.take();
+            if let Some(pty_id) = old.pty_id {
+                self.pty.kill(pty_id).await;
+            }
+            if let Some(handle) = handle {
+                if let Err(error) = handle.await {
+                    tracing::warn!(script = %script_id, %error, "script supervisor join failed during import teardown");
+                }
+            }
+        }
+        self.scripts.lock().unwrap().insert(
+            key,
+            ManagedScript {
+                def,
+                state: ScriptRuntimeState::default(),
+                pty_id: None,
+                stopped_by_user: false,
+                supervisor: None,
+                generation: next_generation(),
+                lost_at_daemon_stop: false,
+                running_at_shutdown: false,
+            },
+        );
+        Ok(())
+    }
+
     /// `script.list`: the workspace's scripts with merged runtime state.
     /// When empty, bootstrap from repo config `scripts[]` (FE parity:
     /// scripts.ipc.ts L291-320).

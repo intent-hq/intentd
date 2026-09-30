@@ -54,10 +54,11 @@ on:
 permissions:
   contents: write
 
-# Never cancel a promotion in progress
+# Serialize source/mirror promotion with publication and cleanup; preserve queued runs.
 concurrency:
-  group: intentd-stable-promotion
+  group: intentd-release-writers
   cancel-in-progress: false
+  queue: max
 
 jobs:
   promote-to-stable:

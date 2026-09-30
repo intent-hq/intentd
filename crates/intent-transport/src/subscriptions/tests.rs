@@ -2796,6 +2796,7 @@ mod agent_delta_list_projection {
             "lastSeenMessageId": "msg-seen",
             "isInitialAgent": true,
             "sponsorAgentId": "agent-sponsor",
+            "chiefPromptVersion": u32::MAX,
         });
         serde_json::from_value(json!({
             "id": "agent-1",
@@ -5504,4 +5505,53 @@ mod channel_membership {
         );
         drop(h.subs);
     }
+}
+
+#[test]
+fn resource_context_keeps_unsubscribe_dispatch_and_chat_selectors() {
+    use serde_json::json;
+    for method in [
+        "events.unsubscribe",
+        "note.unsubscribe",
+        "task.unsubscribe",
+        "comment.unsubscribe",
+        "chat.unsubscribe",
+        "note.presence.unsubscribe",
+    ] {
+        for workspace in [None, Some("routing-context")] {
+            let mut params = json!({"subscriptionId":"owned-subscription"});
+            if let Some(ws) = workspace {
+                params["workspaceId"] = json!(ws);
+            }
+            let frame = json!({"jsonrpc":"2.0","id":7,"method":method,"params":params});
+            if method == "events.unsubscribe" {
+                assert!(matches!(
+                    crate::events::classify(&frame),
+                    Some(crate::events::FastPath::Unsubscribe { .. })
+                ));
+            } else {
+                assert!(matches!(
+                    classify(&frame),
+                    Some(SubFastPath::Unsubscribe { .. })
+                ));
+            }
+            assert_eq!(
+                crate::events::parse_unsubscribe_id(params.as_object().unwrap()).unwrap(),
+                "owned-subscription"
+            );
+        }
+    }
+    let legacy = json!({"jsonrpc":"2.0","id":1,"method":"agent.unsubscribe","params":{"subscriptionId":"s","workspaceId":"w"}});
+    assert!(classify(&legacy).is_none());
+    assert!(crate::events::classify(&legacy).is_none());
+    let params = json!({"agentId":"a","sinceMessageId":"cursor","deltaEncoding":"incremental","projection":"slim","replaceGroup":"chat"});
+    let plain = parse_chat_subscribe_params(params.as_object().unwrap()).unwrap();
+    let mut routed = params;
+    routed["workspaceId"] = json!("routing-context");
+    let routed = parse_chat_subscribe_params(routed.as_object().unwrap()).unwrap();
+    assert_eq!(plain.agent_id, routed.agent_id);
+    assert_eq!(plain.since_message_id, routed.since_message_id);
+    assert_eq!(plain.delta_encoding, routed.delta_encoding);
+    assert_eq!(plain.projection, routed.projection);
+    assert_eq!(plain.replace_group, routed.replace_group);
 }

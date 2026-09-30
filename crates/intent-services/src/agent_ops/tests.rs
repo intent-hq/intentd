@@ -3131,6 +3131,51 @@ async fn wait_for_persisted_groups(svc: &Services, ws: &WorkspaceId, expected: u
     }
 }
 
+/// A delegation group is not a useful restart-recovery record until its first
+/// expected child is enrolled. Persisting the empty creation snapshot first
+/// can leave a sealed, permanently incomplete group after a crash and lose the
+/// aggregated parent wake.
+#[tokio::test]
+async fn delegation_group_first_persisted_snapshot_contains_enrolled_child() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    let gid = svc.get_or_create_delegation_group(&ws, &parent);
+    let before_enrollment = svc.enqueue_group_persist_acked(GroupPersistOp::Delete(format!(
+        "barrier-{}",
+        uuid::Uuid::new_v4()
+    )));
+    Services::await_group_persist(before_enrollment)
+        .await
+        .expect("creation lane barrier");
+    assert!(
+        svc.store()
+            .list_undelivered_groups(&ws)
+            .await
+            .expect("groups before enrollment")
+            .is_empty(),
+        "empty group creation snapshot must not become a recovery record"
+    );
+
+    svc.enroll_child_in_group(&gid, &child);
+    let after_enrollment = svc.enqueue_group_persist_acked(GroupPersistOp::Delete(format!(
+        "barrier-{}",
+        uuid::Uuid::new_v4()
+    )));
+    Services::await_group_persist(after_enrollment)
+        .await
+        .expect("enrollment lane barrier");
+    let groups = svc
+        .store()
+        .list_undelivered_groups(&ws)
+        .await
+        .expect("groups after enrollment");
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].group_id, gid);
+    assert_eq!(groups[0].expected_agent_ids, vec![child]);
+}
+
 /// intent#4460 product-side probe: a scoped group cancel issued right after
 /// the group is created (its create/enroll upserts spawned but not yet
 /// landed) must not leave a resurrected `delegation_group` row behind — a
@@ -4771,7 +4816,7 @@ async fn app_agents_send_persists_chief_attribution_and_source_link() {
         Some(json!({
             "type": "chief_message",
             "fromAgentId": chief.0,
-            "fromAgentName": "Chief of Staff",
+            "fromAgentName": "Assistant",
             "fromWorkspaceId": chief_ws.0,
             "sourceMessageId": source_id,
             "sourceUrl": source_url,
@@ -4834,7 +4879,7 @@ async fn app_agents_send_delivers_despite_target_pending_questions() {
     let expected_metadata = json!({
         "type": "chief_message",
         "fromAgentId": chief.0,
-        "fromAgentName": "Chief of Staff",
+        "fromAgentName": "Assistant",
         "fromWorkspaceId": chief_ws.0,
         "sourceMessageId": source_id,
         "sourceUrl": source_url,
@@ -9784,7 +9829,24 @@ async fn worst_case_agent_list_row(
     };
     let parent = create_agent(svc, ws, "Parent").await;
     let child = create_agent(svc, ws, "Child").await;
-    let id = create_agent(svc, ws, "Worst-case row").await;
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Worst-case row".into()),
+            Some("sonnet4.5".into()),
+            None,
+            None,
+            None,
+            false,
+            intent_core::AgentCreateExtra {
+                provider: Some("auggie".into()),
+                metadata: Some(json!({"chiefPromptVersion": u32::MAX})),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create versioned budget row");
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
 
     let user = json!([{ "type": "text", "text": format!("ask {}", "u".repeat(BUDGET * 3)) }]);
     svc.store()
@@ -9862,6 +9924,7 @@ async fn worst_case_agent_list_row(
         },
         "isInitialAgent": true,
         "sponsorAgentId": parent.0,
+        "chiefPromptVersion": u32::MAX,
     }));
     svc.store()
         .update_agent_session(ws, &s)
@@ -9890,7 +9953,7 @@ async fn worst_case_agent_list_row(
         .await
         .expect("effort levels");
     svc.store()
-        .set_agent_notifications_muted(ws, &id, true, &ts)
+        .set_agent_notifications_muted(ws, &id, true)
         .await
         .expect("mute");
 
@@ -22616,7 +22679,10 @@ async fn wake_or_create_queued_skips_watch_when_caller_deleted() {
     flag_agent_deleted(&svc, &caller).await;
     // Occupy the assignee's in-flight slot so `deliver_wake_message` takes the
     // enqueue branch deterministically.
-    assert!(manager.try_begin_turn(&target, &ws).await, "claim slot");
+    let admission = manager
+        .try_begin_turn(&target, &ws)
+        .await
+        .expect("claim slot");
 
     let input = AgentWakeOrCreateInput {
         caller_agent_id: Some(caller.clone()),
@@ -22635,7 +22701,7 @@ async fn wake_or_create_queued_skips_watch_when_caller_deleted() {
     assert!(svc.list_watches_for_parent(&caller).is_empty());
     assert!(svc.find_watches_for_child(&target).is_empty());
 
-    manager.release_slot(&target).await;
+    manager.release_slot(&target, admission).await;
 }
 
 /// monorepo#994: the #932 pre-gate is ALSO skipped for a Deleted caller —
@@ -22680,7 +22746,10 @@ async fn wake_or_create_queued_registers_watch() {
         .expect("assign");
     // Occupy the assignee's in-flight slot so `deliver_wake_message` takes the
     // enqueue branch deterministically.
-    assert!(manager.try_begin_turn(&target, &ws).await, "claim slot");
+    let admission = manager
+        .try_begin_turn(&target, &ws)
+        .await
+        .expect("claim slot");
 
     let input = AgentWakeOrCreateInput {
         caller_agent_id: Some(caller.clone()),
@@ -22707,7 +22776,7 @@ async fn wake_or_create_queued_registers_watch() {
     assert_eq!(watches[0].id, sub_id);
     assert_eq!(watches[0].child_agent_id, target);
 
-    manager.release_slot(&target).await;
+    manager.release_slot(&target, admission).await;
 }
 
 /// SUB-2 (PR #104 thread `PRRT_kwDOS9Wxuc6QIRcq`), updated for pair
@@ -22742,7 +22811,10 @@ async fn wake_or_create_queued_adopts_existing_watch() {
 
     // Occupy the assignee's in-flight slot so the wakeOrCreate takes the
     // queued branch deterministically.
-    assert!(manager.try_begin_turn(&target, &ws).await, "claim slot");
+    let admission = manager
+        .try_begin_turn(&target, &ws)
+        .await
+        .expect("claim slot");
 
     let queued = svc
         .agent_wake_or_create_op(
@@ -22776,7 +22848,7 @@ async fn wake_or_create_queued_adopts_existing_watch() {
     );
     assert_eq!(watches[0].id, seeded_sub_id);
 
-    manager.release_slot(&target).await;
+    manager.release_slot(&target, admission).await;
 }
 
 /// SUB-2 (Copilot #104 follow-up, thread `PRRT_kwDOS9Wxuc6QKWuU`):
@@ -23890,7 +23962,10 @@ async fn turn_start_opens_new_waiting_period_for_armed_watch() {
 
     // The child starts a REAL turn (e.g. a user message or hook-dispatch
     // wake): the period is over and the marker clears at the claim.
-    assert!(manager.try_begin_turn(&child, &ws).await, "claim slot");
+    let admission = manager
+        .try_begin_turn(&child, &ws)
+        .await
+        .expect("claim slot");
     assert!(
         !svc.store()
             .has_advisory_wake_delivery(&parent, &child)
@@ -23898,7 +23973,7 @@ async fn turn_start_opens_new_waiting_period_for_armed_watch() {
             .expect("marker read"),
         "turn start clears the once-per-period advisory marker"
     );
-    manager.release_slot(&child).await;
+    manager.release_slot(&child, admission).await;
 
     // Period 2: the child stalls monitoring-idle again — the SAME armed
     // watch hears a FRESH advisory instead of waiting in silence (the
@@ -23987,7 +24062,10 @@ async fn turn_start_opens_new_waiting_period_for_grouped_watch() {
     manager.stop(&parent).await;
 
     // Real turn: marker clears, period 2 opens.
-    assert!(manager.try_begin_turn(&child, &ws).await, "claim slot");
+    let admission = manager
+        .try_begin_turn(&child, &ws)
+        .await
+        .expect("claim slot");
     assert!(
         !svc.store()
             .has_advisory_wake_delivery(&parent, &child)
@@ -23995,7 +24073,7 @@ async fn turn_start_opens_new_waiting_period_for_grouped_watch() {
             .expect("marker read"),
         "turn start clears the grouped pair's marker too"
     );
-    manager.release_slot(&child).await;
+    manager.release_slot(&child, admission).await;
 
     // Period 2: the SAME armed watch (same id) delivers a second advisory —
     // the per-period stable id keeps it out of the durable-wake dedup.
@@ -31164,6 +31242,96 @@ async fn agent_update_patches_listed_fields_and_emits_updated() {
     assert!(batch.iter().any(
         |e| e.event_type == AGENT_UPDATED && e.data["agentId"].as_str() == Some(id.0.as_str())
     ));
+}
+
+/// Preference-only updates preserve activity time in persistence, the response,
+/// and the projection a client reads after receiving the invalidation event.
+#[tokio::test]
+async fn agent_update_notifications_muted_preserves_activity_timestamp() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Mute timestamp").await;
+    let old = "2020-01-01T00:00:00.000Z";
+    let mut session = svc.store.get_agent_session(&id).await.unwrap();
+    session.updated_at = old.to_string();
+    svc.store.update_agent_session(&ws, &session).await.unwrap();
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_UPDATED.to_string()],
+        ..Default::default()
+    });
+
+    for muted in [true, true, false, false] {
+        let response = svc
+            .agent_update_op(id.clone(), json!({ "notificationsMuted": muted }))
+            .await
+            .expect("toggle notifications");
+        assert_eq!(response["agent"]["notificationsMuted"], muted);
+        assert_eq!(response["agent"]["updatedAt"], old);
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("event arrives")
+            .expect("subscription open");
+        let event = batch
+            .iter()
+            .find(|e| e.event_type == AGENT_UPDATED)
+            .unwrap();
+        assert_eq!(
+            event.data,
+            json!({ "agentId": id.0, "notificationsMuted": muted })
+        );
+        let stored = svc.agent_get_session_op(id.clone()).await.unwrap();
+        assert_eq!(stored.updated_at, old);
+        assert_eq!(stored.notifications_muted, muted);
+        assert_eq!(stored.name, "Mute timestamp");
+        assert_eq!(stored.status, session.status);
+    }
+}
+
+/// A mute flag accompanying substantive edits must not suppress their activity
+/// timestamp; the event remains an invalidation of the updated stored projection.
+#[tokio::test]
+async fn agent_update_notifications_muted_mixed_edits_advance_activity_timestamp() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Before").await;
+    let old = "2020-01-01T00:00:00.000Z";
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_UPDATED.to_string(), AGENT_RENAMED.to_string()],
+        ..Default::default()
+    });
+    for changes in [
+        json!({ "notificationsMuted": true, "name": "After" }),
+        json!({ "notificationsMuted": true, "status": "idle" }),
+        json!({ "notificationsMuted": false, "systemPrompt": "New prompt" }),
+        json!({ "notificationsMuted": false, "isBackground": true }),
+        json!({ "name": "Real edit" }),
+    ] {
+        let mut session = svc.store.get_agent_session(&id).await.unwrap();
+        session.updated_at = old.to_string();
+        svc.store.update_agent_session(&ws, &session).await.unwrap();
+        let response = svc
+            .agent_update_op(id.clone(), changes.clone())
+            .await
+            .unwrap();
+        let stored = svc.agent_get_session_op(id.clone()).await.unwrap();
+        assert!(stored.updated_at.as_str() > old, "{changes}");
+        assert_eq!(response["agent"]["updatedAt"], stored.updated_at);
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let event = batch.iter().find(|e| e.data["agentId"] == id.0).unwrap();
+        for (key, value) in changes.as_object().unwrap() {
+            assert_eq!(&event.data[key], value);
+        }
+        assert!(
+            event.data.get("updatedAt").is_none(),
+            "invalidation does not invent activity time"
+        );
+    }
+    let stored = svc.agent_get_session_op(id).await.unwrap();
+    assert_eq!(stored.name, "Real edit");
+    assert_eq!(stored.system_prompt.as_deref(), Some("New prompt"));
+    assert!(stored.is_background);
+    assert!(!stored.notifications_muted);
 }
 
 /// Name-only updates fold into `agent:renamed` (not `agent:updated`), matching
@@ -38527,11 +38695,11 @@ async fn resolve_proposal_dismissed_delivers_dismissed_notice() {
 
 /// Idempotency: re-resolving an already-resolved id succeeds echoing the
 /// persisted outcome — even with a DIFFERENT requested outcome — without a
-/// duplicate notice. Restart equivalence comes free: the check reads the
-/// persisted resolutions map.
+/// duplicate notice or resolution event. Restart equivalence comes free:
+/// the check reads the persisted resolutions map.
 #[tokio::test]
 async fn resolve_proposal_repeat_resolution_is_idempotent() {
-    let (_t, svc, ws) = setup().await;
+    let (_t, svc, ws, bus) = setup_with_bus().await;
     let id = create_agent(&svc, &ws, "Proposer").await;
     let msg = svc
         .store()
@@ -38543,6 +38711,10 @@ async fn resolve_proposal_repeat_resolution_is_idempotent() {
             .await
     );
 
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_UPDATED.to_string()],
+        ..Default::default()
+    });
     svc.agent_resolve_proposal_op(
         ws.clone(),
         id.clone(),
@@ -38578,16 +38750,57 @@ async fn resolve_proposal_repeat_resolution_is_idempotent() {
         session.proposal_resolutions().get("tc-1"),
         Some(&json!("applied"))
     );
-    let count_after_second = svc
+    let messages_after_second = svc
         .store()
         .get_agent_messages(&id, None)
         .await
-        .expect("messages")
-        .len();
+        .expect("messages");
     assert_eq!(
-        count_after_first, count_after_second,
+        count_after_first,
+        messages_after_second.len(),
         "re-resolution must not deliver a duplicate notice"
     );
+    assert_eq!(
+        messages_after_second
+            .iter()
+            .filter(|message| message.metadata.as_ref().is_some_and(|metadata| {
+                metadata["type"] == "proposal_resolved" && metadata["proposalId"] == "tc-1"
+            }))
+            .count(),
+        1,
+        "exactly one proposal notice must be persisted"
+    );
+
+    // Publication is awaited by resolveProposal. Count its durable events
+    // after both calls, then match the live delivery by id, without a sleep
+    // that could miss a queued duplicate.
+    let events = svc
+        .store()
+        .query_events(&intent_store::EventQuery {
+            workspace_id: Some(ws.clone()),
+            event_types: vec![AGENT_UPDATED.to_string()],
+            ..Default::default()
+        })
+        .await
+        .expect("resolution events");
+    let resolution_events: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event.data["agentId"] == id.0 && event.data.get("proposalResolutions").is_some()
+        })
+        .collect();
+    assert_eq!(resolution_events.len(), 1, "exactly one resolution event");
+    assert_eq!(resolution_events[0].data["pendingProposals"], json!([]));
+    assert_eq!(
+        resolution_events[0].data["proposalResolutions"],
+        json!({"tc-1": "applied"})
+    );
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("live resolution event timed out")
+        .expect("subscription closed");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch[0].id, resolution_events[0].id);
 }
 
 /// Error paths: unknown `proposalId` (never pending, never resolved) →
@@ -46162,4 +46375,917 @@ async fn wire_agent_complete_once_rejects_compound_model() {
         .expect_err("compound model must reject");
         assert_compound_model_rejection(err, "model");
     }
+}
+
+#[intent_test_macros::daemon_test]
+async fn startup_resume_reservations_hide_only_candidates_and_release_on_drop() {
+    let (_t, svc, ws) = setup().await;
+    let first = create_agent(&svc, &ws, "Startup candidate").await;
+    svc.store
+        .insert_interrupted_agent(&first, &ws, "active", &now_iso())
+        .await
+        .unwrap();
+    let reservations = svc.prepare_startup_resume().await.unwrap();
+    assert_eq!(
+        svc.clone().agent_list_interrupted().await.unwrap()["agents"],
+        json!([])
+    );
+    assert!(
+        svc.store
+            .get_interrupted_agent(&first)
+            .await
+            .unwrap()
+            .is_some(),
+        "reservation must not resolve durable work"
+    );
+    let later = create_agent(&svc, &ws, "Later interruption").await;
+    svc.store
+        .insert_interrupted_agent(&later, &ws, "active", &now_iso())
+        .await
+        .unwrap();
+    let listed = svc.agent_list_interrupted().await.unwrap();
+    assert_eq!(listed["agents"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["agents"][0]["agentId"], json!(later));
+    drop(reservations);
+    assert_eq!(
+        svc.agent_list_interrupted().await.unwrap()["agents"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn startup_resume_failure_is_visible_and_retryable_while_other_candidates_are_reserved() {
+    let (_t, svc, ws) = setup().await;
+    let failed = create_agent(&svc, &ws, "Retired candidate").await;
+    let waiting = create_agent(&svc, &ws, "Waiting candidate").await;
+    for id in [&failed, &waiting] {
+        svc.store
+            .insert_interrupted_agent(id, &ws, "active", &now_iso())
+            .await
+            .unwrap();
+    }
+    svc.agent_retire_op(failed.clone(), Some(ws.clone()), None)
+        .await
+        .unwrap();
+    let reservations = svc.prepare_startup_resume().await.unwrap();
+    assert!(svc.resume_interrupted_agent(&failed).await.is_err());
+    reservations.finished(&failed);
+    let listed = svc.agent_list_interrupted().await.unwrap();
+    assert_eq!(listed["agents"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["agents"][0]["agentId"], json!(failed));
+    svc.agent_restore_op(failed.clone(), Some(ws.clone()))
+        .await
+        .unwrap();
+    svc.resume_interrupted_agent(&failed).await.unwrap();
+    assert_eq!(
+        svc.agent_list_interrupted().await.unwrap()["agents"],
+        json!([])
+    );
+    drop(reservations);
+    assert_eq!(
+        svc.agent_list_interrupted().await.unwrap()["agents"][0]["agentId"],
+        json!(waiting)
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn startup_resume_and_manual_resolution_have_one_winner() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Raced startup candidate").await;
+    svc.store
+        .insert_interrupted_agent(&id, &ws, "active", &now_iso())
+        .await
+        .unwrap();
+    let _reservations = svc.prepare_startup_resume().await.unwrap();
+    let (automatic, manual) = tokio::join!(
+        svc.resume_interrupted_agent(&id),
+        svc.agent_resolve_interrupted(Some(vec![id.0.clone()]), None)
+    );
+    let manual = manual.unwrap();
+    let manual_won = !manual["resumed"].as_array().unwrap().is_empty();
+    assert!(
+        automatic.is_ok() ^ manual_won,
+        "exactly one resume must win"
+    );
+    let session = svc.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(
+        session.messages.iter().filter(|m| m.role == "user").count(),
+        1
+    );
+    assert!(svc
+        .store
+        .get_interrupted_agent(&id)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[intent_test_macros::daemon_test]
+async fn startup_resume_enumeration_failure_installs_no_reservations() {
+    let (_t, svc, _ws) = setup().await;
+    svc.store.close().await;
+    assert!(svc.prepare_startup_resume().await.is_err());
+    assert!(svc.startup_resume_candidates.lock().unwrap().is_empty());
+}
+
+#[intent_test_macros::daemon_test]
+async fn startup_resume_and_manual_abandon_have_no_losing_side_effects() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Raced abandoned candidate").await;
+    svc.store
+        .insert_interrupted_agent(&id, &ws, "active", &now_iso())
+        .await
+        .unwrap();
+    let _reservations = svc.prepare_startup_resume().await.unwrap();
+    let (automatic, abandon) = tokio::join!(
+        svc.resume_interrupted_agent(&id),
+        svc.abandon_interrupted_agent(&id)
+    );
+    assert!(automatic.is_ok() ^ abandon.is_ok(), "one resolver wins");
+    let session = svc.store.get_agent_session(&id).await.unwrap();
+    let abandonment_notices = session
+        .messages
+        .iter()
+        .filter(|m| {
+            m.content
+                .to_string()
+                .contains("This conversation was interrupted because intentd restarted")
+        })
+        .count();
+    assert_eq!(
+        abandonment_notices,
+        usize::from(abandon.is_ok()),
+        "a losing abandon must not append a termination notice"
+    );
+    assert_eq!(
+        session.messages.iter().filter(|m| m.role == "user").count(),
+        usize::from(automatic.is_ok())
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn startup_resume_abandon_persist_failure_remains_retryable() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Failed abandonment").await;
+    svc.store
+        .insert_interrupted_agent(&id, &ws, "active", &now_iso())
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER fail_abandon_notice BEFORE INSERT ON agent_message
+         BEGIN SELECT RAISE(FAIL, 'injected abandonment write failure'); END",
+    )
+    .execute(svc.store.write_pool())
+    .await
+    .unwrap();
+    assert!(svc.abandon_interrupted_agent(&id).await.is_err());
+    assert!(svc
+        .store
+        .get_interrupted_agent(&id)
+        .await
+        .unwrap()
+        .is_some());
+    sqlx::query("DROP TRIGGER fail_abandon_notice")
+        .execute(svc.store.write_pool())
+        .await
+        .unwrap();
+    svc.abandon_interrupted_agent(&id).await.unwrap();
+    assert!(svc
+        .store
+        .get_interrupted_agent(&id)
+        .await
+        .unwrap()
+        .is_none());
+    let session = svc.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(
+        session
+            .messages
+            .iter()
+            .filter(|m| m.role == "system")
+            .count(),
+        1
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn startup_resume_listing_never_exposes_a_stale_successful_candidate() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Candidate resolved during listing").await;
+    svc.store
+        .insert_interrupted_agent(&id, &ws, "active", &now_iso())
+        .await
+        .unwrap();
+    let reservations = svc.prepare_startup_resume().await.unwrap();
+    let park = Arc::new(crate::script_ops::SupervisePark::default());
+    let mut listing = svc.clone();
+    listing.interrupted_list_park = Some(park.clone());
+    let (result, ()) = tokio::join!(listing.agent_list_interrupted(), async {
+        timeout(Duration::from_secs(5), park.entered.notified())
+            .await
+            .unwrap();
+        svc.resume_startup_candidate(&reservations, &id)
+            .await
+            .unwrap();
+        park.release.notify_one();
+    });
+    let result = result.unwrap();
+    assert_eq!(
+        result["agents"],
+        json!([]),
+        "an old pending-row read must not expose a successfully resumed candidate"
+    );
+}
+
+/// A transcript decode failure must not affect metadata-only startup checks.
+/// Poisoning the payload makes this a deterministic cost regression, not a timer.
+#[tokio::test]
+async fn completion_startup_checks_do_not_read_transcripts() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.unwrap();
+    let svc = Services::new(store);
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .unwrap();
+    wait_for_persisted_watches(&svc, 1).await;
+    sqlx::query("UPDATE agent_session SET status = 'Completed', completion_report = 'finished' WHERE id = ?")
+        .bind(&child.0).execute(svc.store().write_pool()).await.unwrap();
+    sqlx::query("INSERT INTO agent_message (id, agent_id, seq, role, content, created_at) VALUES ('poison', ?, 0, 'assistant', 'invalid JSON', '2026-09-30T00:00:00Z')")
+        .bind(&child.0).execute(svc.store().write_pool()).await.unwrap();
+    assert!(svc.store().get_agent_session(&child).await.is_err());
+    assert_eq!(
+        svc.store()
+            .get_agent_session_summary(&child)
+            .await
+            .unwrap()
+            .status,
+        intent_core::AgentStatus::Completed
+    );
+    svc.reconcile_watch_child_on_rehydration(
+        &child,
+        &ws,
+        crate::agent_subscriptions::WatchReconcileCallSite::Rehydration,
+    )
+    .await;
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "completion must not read the poisoned transcript"
+    );
+    assert_eq!(
+        svc.store()
+            .get_agent_session(&parent)
+            .await
+            .unwrap()
+            .messages
+            .len(),
+        1
+    );
+    sqlx::query("UPDATE agent_session SET status = 'deleted' WHERE id = ?")
+        .bind(&child.0)
+        .execute(svc.store().write_pool())
+        .await
+        .unwrap();
+    assert!(
+        !svc.agent_is_live(&child).await,
+        "deleted liveness must not fail open due to an unrelated transcript"
+    );
+}
+
+#[tokio::test]
+async fn completion_startup_restores_repeated_parent_without_delivery_and_survives_stop() {
+    for grouped in [false, true] {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.unwrap();
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.unwrap();
+        let svc = Services::new(store);
+        let parent = create_agent(&svc, &ws, "Parent").await;
+        let children = vec![
+            create_agent(&svc, &ws, "One").await,
+            create_agent(&svc, &ws, "Two").await,
+        ];
+        let group_id = grouped.then(|| "restored-group".to_string());
+        if let Some(id) = &group_id {
+            svc.store()
+                .upsert_delegation_group(&intent_store::PersistedDelegationGroup {
+                    group_id: id.clone(),
+                    workspace_id: ws.clone(),
+                    parent_agent_id: parent.clone(),
+                    await_mode: "after_all".into(),
+                    expected_agent_ids: children.clone(),
+                    completed_agent_ids: vec![],
+                    deleted_agent_ids: vec![],
+                    sealed: true,
+                    delivered: false,
+                    event_summaries: vec![],
+                    raw_events_json: vec![],
+                    created_at: now_iso(),
+                    updated_at: now_iso(),
+                })
+                .await
+                .unwrap();
+        }
+        // A large, deliberately undecodable parent history proves restoration
+        // depends on metadata only, regardless of watch count/history size.
+        sqlx::query("INSERT INTO agent_message (id, agent_id, seq, role, content, created_at) VALUES ('history', ?, 0, 'assistant', ?, ?)")
+            .bind(&parent.0).bind("x".repeat(1024 * 1024)).bind(now_iso()).execute(svc.store().write_pool()).await.unwrap();
+        for child in &children {
+            let mut session = svc.store().get_agent_session_summary(child).await.unwrap();
+            session.status = intent_core::AgentStatus::Completed;
+            session.completion_report = Some("done".into());
+            svc.store()
+                .update_agent_session(&ws, &session)
+                .await
+                .unwrap();
+            svc.store()
+                .upsert_completion_watch(&intent_store::PersistedCompletionWatch {
+                    id: child.0.clone(),
+                    parent_workspace_id: ws.clone(),
+                    child_workspace_id: ws.clone(),
+                    parent_agent_id: parent.clone(),
+                    parent_agent_name: "Parent".into(),
+                    child_agent_id: child.clone(),
+                    group_id: group_id.clone(),
+                    report_delivered: false,
+                    wake_on_attention: false,
+                    completion_only: false,
+                    created_at: now_iso(),
+                })
+                .await
+                .unwrap();
+        }
+        let recovery = svc.prepare_startup_completion_recovery().await;
+        for child in &children {
+            assert_eq!(svc.find_watches_for_child(child).len(), 1);
+        }
+        // Stopping before admission leaves durable rows available to next boot.
+        let (_stop, stopping) = tokio::sync::watch::channel(true);
+        svc.reconcile_startup_completions(recovery, &stopping).await;
+        assert_eq!(
+            svc.store().list_completion_watches().await.unwrap().len(),
+            2
+        );
+        sqlx::query("DELETE FROM agent_message WHERE id = 'history'")
+            .execute(svc.store().write_pool())
+            .await
+            .unwrap();
+        let restarted = Services::new(Store::open(&tmp.path).await.unwrap());
+        let recovery = restarted.prepare_startup_completion_recovery().await;
+        assert!(restarted
+            .store()
+            .get_agent_session(&parent)
+            .await
+            .unwrap()
+            .messages
+            .is_empty());
+        let (_stop, stopping) = tokio::sync::watch::channel(false);
+        restarted
+            .reconcile_startup_completions(recovery, &stopping)
+            .await;
+        assert_eq!(
+            restarted
+                .store()
+                .get_agent_session(&parent)
+                .await
+                .unwrap()
+                .messages
+                .len(),
+            if grouped { 1 } else { 2 }
+        );
+        wait_for_persisted_watches(&restarted, 0).await;
+    }
+}
+
+#[tokio::test]
+async fn completion_startup_reconciliation_does_not_consume_new_watches() {
+    for failure in ["none", "append", "retirement"] {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.unwrap();
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.unwrap();
+        let svc = Services::new(store);
+        let original = create_agent(&svc, &ws, "Original").await;
+        let newcomer = create_agent(&svc, &ws, "Newcomer").await;
+        let child = create_agent(&svc, &ws, "Child").await;
+        svc.register_completion_watch(
+            &ws,
+            &ws,
+            original.clone(),
+            "Original".into(),
+            child.clone(),
+            None,
+        )
+        .unwrap();
+        wait_for_persisted_watches(&svc, 1).await;
+        let hook_a = seed_active_hook(&svc, &ws, &child, "first hook").await;
+        let hook_b = seed_active_hook(&svc, &ws, &child, "last hook").await;
+        let mut session = svc.store().get_agent_session_summary(&child).await.unwrap();
+        session.status = intent_core::AgentStatus::RuntimeIdle;
+        session.completion_report = Some("historical completion".into());
+        session.completion_report_timestamp = Some(now_iso());
+        svc.store()
+            .update_agent_session(&ws, &session)
+            .await
+            .unwrap();
+        let restarted = Services::new(Store::open(&tmp.path).await.unwrap());
+        let recovery = restarted.prepare_startup_completion_recovery().await;
+        restarted
+            .agent_watch_op(ws.clone(), newcomer.clone(), child.clone())
+            .await
+            .unwrap();
+        assert!(restarted.has_stale_report_interim_skip(&child));
+        match failure {
+            "append" => {
+                sqlx::query("CREATE TRIGGER fail_startup_wake BEFORE INSERT ON agent_message BEGIN SELECT RAISE(FAIL, 'injected startup wake failure'); END").execute(restarted.store().write_pool()).await.unwrap();
+            }
+            "retirement" => {
+                sqlx::query("CREATE TRIGGER fail_startup_wake BEFORE DELETE ON completion_watch BEGIN SELECT RAISE(FAIL, 'injected startup retirement failure'); END").execute(restarted.store().write_pool()).await.unwrap();
+            }
+            _ => {}
+        }
+        let (_stop, stopping) = tokio::sync::watch::channel(false);
+        restarted
+            .reconcile_startup_completions(recovery, &stopping)
+            .await;
+        if failure != "none" {
+            assert!(!restarted
+                .completion_delivery_retries
+                .lock()
+                .unwrap()
+                .is_empty());
+            sqlx::query("DROP TRIGGER fail_startup_wake")
+                .execute(restarted.store().write_pool())
+                .await
+                .unwrap();
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    if restarted
+                        .completion_delivery_retries
+                        .lock()
+                        .unwrap()
+                        .is_empty()
+                    {
+                        break;
+                    }
+                    // timing-guard: observe completion of scoped startup retries
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("startup retry settles");
+        }
+        assert_eq!(
+            parent_message_count(&restarted, &original).await,
+            1,
+            "{failure}"
+        );
+        assert_eq!(
+            parent_message_count(&restarted, &newcomer).await,
+            0,
+            "no historical wake or advisory for the new watch: {failure}"
+        );
+        assert!(
+            restarted.has_stale_report_interim_skip(&child),
+            "scoped recovery must preserve registration provenance: {failure}"
+        );
+        restarted
+            .store()
+            .update_hook_state(&hook_a.hook_id, intent_core::HookState::Dispatched)
+            .await
+            .unwrap();
+        restarted
+            .redeliver_completion_after_queue_mutation(&child)
+            .await;
+        assert_eq!(parent_message_count(&restarted, &newcomer).await, 0);
+        restarted
+            .store()
+            .update_hook_state(&hook_b.hook_id, intent_core::HookState::Dispatched)
+            .await
+            .unwrap();
+        restarted
+            .redeliver_completion_after_queue_mutation(&child)
+            .await;
+        assert_eq!(parent_message_count(&restarted, &newcomer).await, 1);
+        assert!(!parent_messages_text(&restarted, &newcomer)
+            .await
+            .contains("historical completion"));
+        assert!(restarted.find_watches_for_child(&child).is_empty());
+        restarted
+            .redeliver_completion_after_queue_mutation(&child)
+            .await;
+        assert_eq!(parent_message_count(&restarted, &newcomer).await, 1);
+    }
+}
+
+#[tokio::test]
+async fn completion_startup_stop_drains_claimed_wake_and_skips_next_child() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.unwrap();
+    let svc = Services::new(store);
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let mut children = vec![
+        create_agent(&svc, &ws, "One").await,
+        create_agent(&svc, &ws, "Two").await,
+    ];
+    children.sort_by(|a, b| a.0.cmp(&b.0));
+    for child in &children {
+        svc.register_completion_watch(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child.clone(),
+            None,
+        )
+        .unwrap();
+        let mut session = svc.store().get_agent_session_summary(child).await.unwrap();
+        session.status = intent_core::AgentStatus::Completed;
+        session.completion_report = Some("done".into());
+        svc.store()
+            .update_agent_session(&ws, &session)
+            .await
+            .unwrap();
+    }
+    wait_for_persisted_watches(&svc, 2).await;
+    let park = Arc::new(crate::CompletionClassifyPark::default());
+    let restarted = Services::new(Store::open(&tmp.path).await.unwrap())
+        .with_completion_claim_park(park.clone());
+    let recovery = restarted.prepare_startup_completion_recovery().await;
+    let (stop, stopping) = tokio::sync::watch::channel(false);
+    let worker = tokio::spawn({
+        let restarted = restarted.clone();
+        async move {
+            restarted
+                .reconcile_startup_completions(recovery, &stopping)
+                .await;
+        }
+    });
+    timeout(Duration::from_secs(5), park.entered.notified())
+        .await
+        .expect("recovery claimed first wake");
+    // Live completion racing deferred boot delivery yields to its existing claim.
+    restarted
+        .handle_completion_event(&completion_event(
+            &ws,
+            AGENT_IDLE,
+            &children[0],
+            json!({"agentId": children[0].0}),
+        ))
+        .await;
+    stop.send(true).unwrap();
+    assert!(!worker.is_finished(), "an admitted wake must drain");
+    park.release.notify_one();
+    timeout(Duration::from_secs(5), worker)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(parent_message_count(&restarted, &parent).await, 1);
+    assert!(restarted.find_watches_for_child(&children[0]).is_empty());
+    assert_eq!(restarted.find_watches_for_child(&children[1]).len(), 1);
+    wait_for_persisted_watches(&restarted, 1).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn completion_startup_unreported_child_keeps_stall_annotation_without_history() {
+    for report in [None, Some(String::new())] {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.unwrap();
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.unwrap();
+        let svc = Services::new(store);
+        let parent = create_agent(&svc, &ws, "Parent").await;
+        let child = create_agent(&svc, &ws, "Child").await;
+        link_task_note(&svc, &ws, &child, "Unfinished task", "in_progress").await;
+        let mut session = svc.store().get_agent_session_summary(&child).await.unwrap();
+        session.status = intent_core::AgentStatus::Completed;
+        session.completion_report = report;
+        svc.store()
+            .update_agent_session(&ws, &session)
+            .await
+            .unwrap();
+        svc.register_completion_watch(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child.clone(),
+            None,
+        )
+        .unwrap();
+        wait_for_persisted_watches(&svc, 1).await;
+        sqlx::query("INSERT INTO agent_message (id, agent_id, seq, role, content, created_at) VALUES ('poison', ?, 0, 'assistant', 'invalid JSON', ?)")
+            .bind(&child.0).bind(now_iso()).execute(svc.store().write_pool()).await.unwrap();
+        assert!(svc.store().get_agent_session(&child).await.is_err());
+        assert_eq!(
+            svc.store()
+                .get_agent_session_summary(&child)
+                .await
+                .unwrap()
+                .status,
+            intent_core::AgentStatus::Completed
+        );
+        let restarted = Services::new(Store::open(&tmp.path).await.unwrap());
+        let recovery = restarted.prepare_startup_completion_recovery().await;
+        let (_stop, stopping) = tokio::sync::watch::channel(false);
+        restarted
+            .reconcile_startup_completions(recovery, &stopping)
+            .await;
+        let messages = restarted
+            .store()
+            .get_agent_session(&parent)
+            .await
+            .unwrap()
+            .messages;
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].content.to_string().contains(STALL_MARKER));
+        let metadata = messages[0].metadata.as_ref().unwrap();
+        assert_eq!(metadata["stallSuspected"], json!(true));
+        assert_eq!(metadata["taskStatus"], json!("in_progress"));
+        assert_eq!(metadata["events"][0]["data"]["stallSuspected"], json!(true));
+    }
+}
+
+#[tokio::test]
+async fn completion_startup_and_live_retries_keep_distinct_payloads_and_scopes() {
+    for boot_first in [true, false] {
+        let (_t, svc, ws) = setup().await;
+        let original = create_agent(&svc, &ws, "Original").await;
+        let newcomer = create_agent(&svc, &ws, "Newcomer").await;
+        let child = create_agent(&svc, &ws, "Child").await;
+        let original_watch = svc
+            .register_completion_watch(
+                &ws,
+                &ws,
+                original.clone(),
+                "Original".into(),
+                child.clone(),
+                None,
+            )
+            .unwrap();
+        svc.register_completion_watch(
+            &ws,
+            &ws,
+            newcomer.clone(),
+            "Newcomer".into(),
+            child.clone(),
+            None,
+        )
+        .unwrap();
+        let boot = completion_event(
+            &ws,
+            AGENT_IDLE,
+            &child,
+            json!({"agentId": child.0, "completionReport": "historical completion"}),
+        );
+        let live = completion_event(
+            &ws,
+            AGENT_FAILED,
+            &child,
+            json!({"agentId": child.0, "error": "fresh failure"}),
+        );
+        let scope = std::collections::HashSet::from([original_watch]);
+        // Both failures share one retry owner, but the live failure must not
+        // widen the earlier boot payload to watches created after restoration.
+        if boot_first {
+            svc.schedule_completion_delivery_retry(child.clone(), boot, Some(&scope));
+            svc.schedule_completion_delivery_retry(child.clone(), live, None);
+        } else {
+            svc.schedule_completion_delivery_retry(child.clone(), live, None);
+            svc.schedule_completion_delivery_retry(child.clone(), boot, Some(&scope));
+        }
+        assert_eq!(svc.completion_delivery_retries.lock().unwrap().len(), 1);
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if svc.completion_delivery_retries.lock().unwrap().is_empty() {
+                    break;
+                }
+                // timing-guard: observe both coalesced retry attempts settling
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("coalesced retry worker completes");
+        assert_eq!(parent_message_count(&svc, &original).await, 1);
+        assert!(parent_messages_text(&svc, &original)
+            .await
+            .contains(if boot_first {
+                "historical completion"
+            } else {
+                "fresh failure"
+            }));
+        assert_eq!(parent_message_count(&svc, &newcomer).await, 1);
+        let text = parent_messages_text(&svc, &newcomer).await;
+        assert!(text.contains("fresh failure"), "{text}");
+        assert!(!text.contains("historical completion"), "{text}");
+    }
+}
+
+#[tokio::test]
+async fn shutdown_admission_stops_retry_and_preserves_durable_watch() {
+    let (_t, svc, manager, _bus, ws) = setup_with_manager().await;
+    let parent = create_agent(&svc, &ws, "Shutdown parent").await;
+    let child = create_agent(&svc, &ws, "Shutdown child").await;
+    svc.register_completion_watch_durable(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .await
+    .unwrap();
+    let event = completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "lastResponseSummary": "done" }),
+    );
+    // Arm the same retry used after a transient delivery failure. Freeze time
+    // after fixture I/O so no backoff pass can race the shutdown assertion.
+    tokio::time::pause();
+    svc.schedule_completion_delivery_retry(child.clone(), event.clone(), None);
+    assert_eq!(svc.completion_delivery_retries.lock().unwrap().len(), 1);
+    manager.shutdown().await;
+    assert!(
+        svc.completion_delivery_retries.lock().unwrap().is_empty(),
+        "shutdown must drain completion retry ownership"
+    );
+    // A delivery already in progress may request a retry after shutdown closed.
+    svc.schedule_completion_delivery_retry(child.clone(), event.clone(), None);
+    assert!(svc.completion_delivery_retries.lock().unwrap().is_empty());
+    tokio::time::resume();
+    assert_eq!(
+        svc.store().list_completion_watches().await.unwrap().len(),
+        1
+    );
+    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+
+    // Restart wiring can still recover the watch and deliver its stable wake.
+    let restarted = Services::new(svc.store().clone());
+    restarted
+        .heal_completion_watches_on_startup()
+        .await
+        .unwrap();
+    restarted.handle_completion_event(&event).await;
+    assert_eq!(parent_message_count(&restarted, &parent).await, 1);
+    assert!(restarted
+        .store()
+        .list_completion_watches()
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[intent_test_macros::daemon_test]
+async fn shutdown_claimed_startup_resume_remains_recoverable() {
+    shutdown_claimed_resume_at_barrier(false).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn shutdown_claimed_startup_resume_rechecks_actual_admission() {
+    shutdown_claimed_resume_at_barrier(true).await;
+}
+
+async fn shutdown_claimed_resume_at_barrier(inside_send: bool) {
+    let (_tmp, svc, ws) = setup().await;
+    let bus = EventBus::new(svc.store.clone());
+    let mut svc = svc.with_event_bus(bus.clone());
+    let park = Arc::new(crate::CompletionClassifyPark::default());
+    if inside_send {
+        svc.interrupted_resume_park = Some(park.clone());
+    }
+    let manager = Arc::new(crate::agent_manager::AgentManager::new(
+        svc.clone(),
+        Arc::new(crate::agent_manager::BusEventSink::new(bus)),
+        4,
+    ));
+    svc.attach_agent_manager(&manager);
+    // Only one layer pauses: either resume before send, or the manager after
+    // its entry check. Attach once, as the real composition root does.
+    svc.interrupted_resume_park = if inside_send {
+        None
+    } else {
+        Some(park.clone())
+    };
+    let agent = create_agent(&svc, &ws, "claimed resume").await;
+    svc.store
+        .set_agent_session_status(
+            &ws,
+            &agent,
+            AgentStatus::RuntimeIdle,
+            false,
+            &now_iso(),
+            None,
+        )
+        .await
+        .unwrap();
+    svc.store
+        .insert_interrupted_agent(&agent, &ws, "active", &now_iso())
+        .await
+        .unwrap();
+    assert_eq!(
+        svc.store
+            .get_agent_session_summary(&agent)
+            .await
+            .unwrap()
+            .status,
+        AgentStatus::RuntimeIdle
+    );
+    let candidates = svc.prepare_startup_resume().await.unwrap();
+    let resuming = svc.clone();
+    let id = agent.clone();
+    let resume = intent_core::spawn_daemon(async move {
+        resuming.resume_startup_candidate(&candidates, &id).await
+    });
+    timeout(Duration::from_secs(5), park.entered.notified())
+        .await
+        .unwrap();
+    assert!(
+        svc.store
+            .get_interrupted_agent(&agent)
+            .await
+            .unwrap()
+            .is_none(),
+        "resume has claimed the interruption"
+    );
+    assert!(
+        manager.list_busy().is_empty(),
+        "claim precedes turn admission"
+    );
+    manager.begin_shutdown();
+    manager.checkpoint_shutdown().await;
+    svc.shutdown_agent_deliveries().await;
+    park.release.notify_one();
+    let outcome = timeout(Duration::from_secs(5), resume)
+        .await
+        .unwrap()
+        .unwrap();
+    manager.shutdown().await;
+    assert!(
+        outcome.is_err(),
+        "a shutdown-parked continuation must not resolve recovery as resumed"
+    );
+    assert!(
+        svc.store
+            .get_interrupted_agent(&agent)
+            .await
+            .unwrap()
+            .is_some(),
+        "unadmitted recovery stays pending for the next boot"
+    );
+    let restarted = Services::new(svc.store.clone());
+    restarted.rehydrate_agent_queues().await.unwrap();
+    assert!(
+        restarted.queue_snapshot(&agent).is_empty(),
+        "no duplicate continuation may be stranded in an ordinary queue"
+    );
+    let candidates = restarted.prepare_startup_resume().await.unwrap();
+    assert_eq!(candidates.ids(), std::slice::from_ref(&agent));
+    restarted
+        .resume_startup_candidate(&candidates, &agent)
+        .await
+        .unwrap();
+    assert!(restarted
+        .store
+        .get_interrupted_agent(&agent)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(restarted.resume_interrupted_agent(&agent).await.is_err());
+    let messages = restarted
+        .store
+        .get_agent_session(&agent)
+        .await
+        .unwrap()
+        .messages;
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|m| m
+                .metadata
+                .as_ref()
+                .is_some_and(|v| v["type"] == super::RESUME_CONTINUATION_METADATA_TYPE))
+            .count(),
+        1
+    );
+    assert_eq!(
+        messages.iter().filter(|m| m.role == "system").count(),
+        1,
+        "retry does not duplicate the interruption marker"
+    );
 }

@@ -313,6 +313,11 @@ fn read_secrets(path: &Path) -> Value {
 #[derive(Default)]
 struct MockFlags {
     requests: Mutex<Vec<Value>>,
+    start_requests: AtomicUsize,
+    poll_requests: AtomicUsize,
+    hold_start: AtomicBool,
+    start_held: Notify,
+    release_start: Notify,
     authorize: AtomicBool,
     unsupported: AtomicBool,
     short_lived: AtomicBool,
@@ -448,6 +453,20 @@ async fn serve_conn(mut stream: TcpStream, flags: Arc<MockFlags>) -> std::io::Re
         "method": method, "route": route, "bearer": bearer,
         "clientId": form_field("client_id"), "grantType": form_field("grant_type")
     }));
+    if method == "POST" && route == "/oauth/authorize_device" {
+        assert!(
+            bearer.is_empty(),
+            "startup must not send stored credentials"
+        );
+        flags.start_requests.fetch_add(1, Ordering::SeqCst);
+        if flags.hold_start.swap(false, Ordering::SeqCst) {
+            flags.start_held.notify_one();
+            flags.release_start.notified().await;
+        }
+    }
+    if method == "POST" && route == "/oauth/token" && !is_refresh {
+        flags.poll_requests.fetch_add(1, Ordering::SeqCst);
+    }
     if method == "GET" && route == "/api/v4/user" {
         flags.user_requests.fetch_add(1, Ordering::SeqCst);
         flags.user_hit.notify_one();
@@ -1571,44 +1590,50 @@ async fn gitlab_revoke_is_host_scoped_and_idempotent_over_wss() {
 /// never an error carrying the bound instance's secret off-host.
 #[tokio::test]
 async fn gitlab_env_token_is_bound_to_the_configured_host_over_wss() {
-    const OTHER_HOST: &str = "gitlab.acme.internal";
-    let mock = spawn_mock_gitlab().await;
-    let h = boot_with_env(&mock, &[("GITLAB_TOKEN", PAT_TOKEN)]).await;
-    let mut rpc = connect_ws(h.port, h.cfg.clone()).await;
-    let gitlab = json!({ "provider": "gitlab" });
-    let other = json!({ "provider": "gitlab", "host": OTHER_HOST });
+    for context in [None, Some("workspace-route")] {
+        const OTHER_HOST: &str = "gitlab.acme.internal";
+        let mock = spawn_mock_gitlab().await;
+        let h = boot_with_env(&mock, &[("GITLAB_TOKEN", PAT_TOKEN)]).await;
+        let mut rpc = connect_ws(h.port, h.cfg.clone()).await;
+        let mut gitlab = json!({ "provider": "gitlab" });
+        let mut other = json!({ "provider": "gitlab", "host": OTHER_HOST });
 
-    // The bound instance resolves the env credential (provenance "env").
-    let v = wss_rpc(&mut rpc, 10, "sourceControl.authStatus", gitlab.clone()).await;
-    let r = &v["result"];
-    assert_eq!(r["isConfigured"], json!(true), "{r}");
-    assert_eq!(r["method"], json!("env"));
-    assert_eq!(r["host"], json!(HOST));
-    assert_eq!(r["user"]["login"], json!("glab-octocat"));
-    let probes = mock.flags.user_requests.load(Ordering::SeqCst);
-    assert!(probes >= 1, "the bound probe reached the instance");
+        if let Some(context) = context {
+            gitlab["workspaceId"] = json!(context);
+            other["workspaceId"] = json!(context);
+        }
+        // The bound instance resolves the env credential (provenance "env").
+        let v = wss_rpc(&mut rpc, 10, "sourceControl.authStatus", gitlab.clone()).await;
+        let r = &v["result"];
+        assert_eq!(r["isConfigured"], json!(true), "{r}");
+        assert_eq!(r["method"], json!("env"));
+        assert_eq!(r["host"], json!(HOST));
+        assert_eq!(r["user"]["login"], json!("glab-octocat"));
+        let probes = mock.flags.user_requests.load(Ordering::SeqCst);
+        assert!(probes >= 1, "the bound probe reached the instance");
 
-    // Another host: not configured, no error, and nothing leaves the daemon
-    // (the bound instance's API override is not applied to another host, so
-    // the only observable request path is the one that must stay silent).
-    let v = wss_rpc(&mut rpc, 11, "sourceControl.authStatus", other.clone()).await;
-    let r = &v["result"];
-    assert!(v.get("error").is_none(), "{v}");
-    assert_eq!(r["isConfigured"], json!(false), "{r}");
-    assert_eq!(r["method"], Value::Null);
-    assert!(r.get("user").is_none(), "{r}");
-    assert_eq!(r["host"], json!(OTHER_HOST));
-    let v = wss_rpc(&mut rpc, 12, "sourceControl.getUser", other).await;
-    assert_eq!(v["result"], json!({ "user": null }), "{v}");
-    assert_eq!(
-        mock.flags.user_requests.load(Ordering::SeqCst),
-        probes,
-        "an unbound host's probe never reaches an instance"
-    );
+        // Another host: not configured, no error, and nothing leaves the daemon
+        // (the bound instance's API override is not applied to another host, so
+        // the only observable request path is the one that must stay silent).
+        let v = wss_rpc(&mut rpc, 11, "sourceControl.authStatus", other.clone()).await;
+        let r = &v["result"];
+        assert!(v.get("error").is_none(), "{v}");
+        assert_eq!(r["isConfigured"], json!(false), "{r}");
+        assert_eq!(r["method"], Value::Null);
+        assert!(r.get("user").is_none(), "{r}");
+        assert_eq!(r["host"], json!(OTHER_HOST));
+        let v = wss_rpc(&mut rpc, 12, "sourceControl.getUser", other).await;
+        assert_eq!(v["result"], json!({ "user": null }), "{v}");
+        assert_eq!(
+            mock.flags.user_requests.load(Ordering::SeqCst),
+            probes,
+            "an unbound host's probe never reaches an instance"
+        );
 
-    // The bound instance is untouched by the other host's probes.
-    let v = wss_rpc(&mut rpc, 13, "sourceControl.getUser", gitlab).await;
-    assert_eq!(v["result"]["user"]["login"], json!("glab-octocat"), "{v}");
+        // The bound instance is untouched by the other host's probes.
+        let v = wss_rpc(&mut rpc, 13, "sourceControl.getUser", gitlab).await;
+        assert_eq!(v["result"]["user"]["login"], json!("glab-octocat"), "{v}");
+    }
 }
 
 /// Two probes that overlap on the same near-expiry device credential must
@@ -1743,6 +1768,213 @@ async fn await_latch(latch: &Notify, what: &str) {
     timeout(Duration::from_secs(15), latch.notified())
         .await
         .unwrap_or_else(|_| panic!("timed out waiting for the mock to {what}"));
+}
+
+async fn bind_startup_host(rpc: &mut Ws, mock: &MockGitlab, host: &str) {
+    let result = wss_rpc(
+        rpc,
+        80,
+        "settings.update",
+        json!({ "changes": [
+            {"path": "sourceControl.gitlab.host", "value": host},
+            {"path": "sourceControl.gitlab.apiBaseUrl", "value": mock.base_uri},
+            {"path": "sourceControl.gitlab.oauthClientId", "value": "private-startup-client"}
+        ] }),
+    )
+    .await;
+    assert!(
+        result.get("error").is_none(),
+        "bind private upstream: {result}"
+    );
+}
+
+async fn held_startup(
+    h: &Harness,
+    mock: &MockGitlab,
+    host: &str,
+) -> tokio::task::JoinHandle<Value> {
+    mock.flags.hold_start.store(true, Ordering::SeqCst);
+    let mut rpc = connect_ws(h.port, h.cfg.clone()).await;
+    let params = json!({"provider": "gitlab", "host": host});
+    let task =
+        tokio::spawn(async move { wss_rpc(&mut rpc, 81, "sourceControl.connect", params).await });
+    await_latch(&mock.flags.start_held, "hold the startup response").await;
+    task
+}
+
+async fn finish_startup(mock: &MockGitlab, task: tokio::task::JoinHandle<Value>) -> Value {
+    mock.flags.release_start.notify_one();
+    timeout(Duration::from_secs(15), task)
+        .await
+        .expect("startup settled")
+        .unwrap()
+}
+
+fn expect_superseded_startup(v: &Value) {
+    assert_eq!(
+        v["error"]["code"], -32603,
+        "cancelled/superseded startup: {v}"
+    );
+    assert!(v.get("result").is_none(), "no abandoned codes: {v}");
+}
+
+/// The request order owns the slot, including when the older response lands
+/// before the newer response. The winning poll still completes over WSS.
+#[tokio::test]
+async fn gitlab_startup_newer_host_wins_both_response_orders_over_wss() {
+    for newer_finishes_first in [true, false] {
+        let a = spawn_mock_gitlab().await;
+        let b = spawn_mock_gitlab().await;
+        let h = boot(&a).await;
+        let mut rpc = connect_ws(h.port, h.cfg.clone()).await;
+        let mut sub = subscriber(&h).await;
+        let old = held_startup(&h, &a, HOST).await;
+        bind_startup_host(&mut rpc, &b, OTHER).await;
+        let new = held_startup(&h, &b, OTHER).await;
+        let (old_result, new_result) = if newer_finishes_first {
+            let new_result = finish_startup(&b, new).await;
+            (finish_startup(&a, old).await, new_result)
+        } else {
+            let old_result = finish_startup(&a, old).await;
+            // The old host cannot become resident even temporarily.
+            let status = wss_rpc(
+                &mut rpc,
+                82,
+                "sourceControl.authStatus",
+                json!({"provider":"gitlab", "host":HOST}),
+            )
+            .await;
+            assert_eq!(status["result"]["deviceFlow"], Value::Null, "{status}");
+            (old_result, finish_startup(&b, new).await)
+        };
+        expect_superseded_startup(&old_result);
+        assert_eq!(new_result["result"]["userCode"], USER_CODE, "{new_result}");
+        let unmatched = wss_rpc(
+            &mut rpc,
+            83,
+            "sourceControl.cancelAuth",
+            json!({"provider":"gitlab", "host":HOST}),
+        )
+        .await;
+        assert_eq!(unmatched["result"], json!({"ok":true,"cancelled":false}));
+        let reused = wss_rpc(
+            &mut rpc,
+            84,
+            "sourceControl.connect",
+            json!({"provider":"gitlab", "host":OTHER}),
+        )
+        .await;
+        assert_eq!(reused["result"]["flowId"], new_result["result"]["flowId"]);
+        assert_eq!(b.flags.start_requests.load(Ordering::SeqCst), 1);
+        b.flags.authorize.store(true, Ordering::SeqCst);
+        let event = await_auth_changed_matching(&mut sub, None, 15).await;
+        assert_eq!(
+            event,
+            json!({"provider":"gitlab","host":OTHER,"status":"authorized"})
+        );
+        assert_eq!(
+            a.flags.poll_requests.load(Ordering::SeqCst),
+            0,
+            "the abandoned startup never polls"
+        );
+        assert!(b.flags.poll_requests.load(Ordering::SeqCst) > 0);
+        let status = wss_rpc(
+            &mut rpc,
+            85,
+            "sourceControl.authStatus",
+            json!({"provider":"gitlab", "host":OTHER}),
+        )
+        .await;
+        assert_eq!(status["result"]["method"], "device", "{status}");
+        assert_eq!(status["result"]["deviceFlow"], Value::Null);
+        assert_eq!(
+            read_secrets(&h.secrets_file)["sourceControl.gitlab.token"],
+            ACCESS_TOKEN
+        );
+    }
+}
+
+#[tokio::test]
+async fn gitlab_startup_cancel_before_settlement_preserves_pat_over_wss() {
+    let mock = spawn_mock_gitlab().await;
+    let h = boot(&mock).await;
+    let mut rpc = connect_ws(h.port, h.cfg.clone()).await;
+    let params = json!({"provider":"gitlab", "host":HOST});
+    let pat = wss_rpc(
+        &mut rpc,
+        86,
+        "sourceControl.connect",
+        json!({"provider":"gitlab","method":"pat","token":PAT_TOKEN}),
+    )
+    .await;
+    assert_eq!(pat["result"], json!({"ok":true,"method":"pat"}));
+    let saved = read_secrets(&h.secrets_file);
+    let task = held_startup(&h, &mock, HOST).await;
+    let unmatched = wss_rpc(
+        &mut rpc,
+        87,
+        "sourceControl.cancelAuth",
+        json!({"provider":"gitlab", "host":OTHER}),
+    )
+    .await;
+    assert_eq!(unmatched["result"], json!({"ok":true,"cancelled":false}));
+    let cancelled = wss_rpc(&mut rpc, 88, "sourceControl.cancelAuth", params.clone()).await;
+    let result = finish_startup(&mock, task).await;
+    assert_eq!(cancelled["result"], json!({"ok":true,"cancelled":true}));
+    expect_superseded_startup(&result);
+    let again = wss_rpc(&mut rpc, 89, "sourceControl.cancelAuth", params.clone()).await;
+    assert_eq!(again["result"], json!({"ok":true,"cancelled":false}));
+    let status = wss_rpc(&mut rpc, 90, "sourceControl.authStatus", params).await;
+    assert_eq!(status["result"]["deviceFlow"], Value::Null, "{status}");
+    assert_eq!(status["result"]["method"], "pat");
+    assert_eq!(read_secrets(&h.secrets_file), saved);
+    assert_eq!(mock.flags.poll_requests.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn gitlab_startup_pat_and_revoke_supersede_before_settlement_over_wss() {
+    for revoke in [false, true] {
+        let mock = spawn_mock_gitlab().await;
+        let h = boot(&mock).await;
+        let mut rpc = connect_ws(h.port, h.cfg.clone()).await;
+        let task = held_startup(&h, &mock, HOST).await;
+        let result = if revoke {
+            wss_rpc(
+                &mut rpc,
+                91,
+                "sourceControl.revoke",
+                json!({"provider":"gitlab"}),
+            )
+            .await
+        } else {
+            wss_rpc(
+                &mut rpc,
+                91,
+                "sourceControl.connect",
+                json!({"provider":"gitlab","method":"pat","token":PAT_TOKEN}),
+            )
+            .await
+        };
+        assert_eq!(result["result"]["ok"], true, "{result}");
+        expect_superseded_startup(&finish_startup(&mock, task).await);
+        let status = wss_rpc(
+            &mut rpc,
+            92,
+            "sourceControl.authStatus",
+            json!({"provider":"gitlab"}),
+        )
+        .await;
+        assert_eq!(status["result"]["deviceFlow"], Value::Null, "{status}");
+        assert_eq!(status["result"]["isConfigured"], !revoke);
+        if !revoke {
+            assert_eq!(status["result"]["method"], "pat");
+            assert_eq!(
+                read_secrets(&h.secrets_file)["sourceControl.gitlab.token"],
+                PAT_TOKEN
+            );
+        }
+        assert_eq!(mock.flags.poll_requests.load(Ordering::SeqCst), 0);
+    }
 }
 
 /// A PAT connect that lands while the device grant's authorize exchange is

@@ -18,6 +18,7 @@ fn disable_node_compile_cache() {
 
 pub mod agent_configs;
 pub(crate) mod agent_logs;
+pub mod agent_runtime;
 pub mod caller;
 pub mod chief_cwd;
 pub mod clock;
@@ -31,6 +32,7 @@ pub mod host_membership;
 pub mod human_author;
 pub mod ids;
 pub mod model;
+pub mod nodes;
 pub mod path_utils;
 #[doc(hidden)]
 pub mod queue_visibility_contract;
@@ -99,6 +101,7 @@ pub use model::{
     AGENT_LIST_ROW_KEYS, AGENT_LIST_ROW_METADATA_KEYS, NOTE_LIST_PREVIEW_CHARS,
     SLIM_PAGE_BUDGET_BYTES, SLIM_PROJECTION_BUDGET_BYTES,
 };
+pub use model::{chief_prompt_version, CHIEF_PROMPT_VERSION_KEY};
 pub use model::{chief_workspace, CHIEF_WORKSPACE_TIMESTAMP};
 pub use model::{lift_app_message_id, USER_APP_MESSAGE_ID_KEY};
 pub use model::{lift_from_principal_id, FROM_PRINCIPAL_ID_KEY};
@@ -126,12 +129,12 @@ pub use model::{
     TaskConvertBlocksResult, TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult,
     TaskMarkAsTaskResult, TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult,
     TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
-    TokenUsage, TokenUsageTotals, TopChangedFile, UsageCost, Workspace, WorkspaceActivity,
-    WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention, WorkspaceCreate,
-    WorkspaceCreateInitialAgent, WorkspaceCreateResult, WorkspaceDiskUsage, WorkspaceDisplayStatus,
-    WorkspaceEventSummary, WorkspaceGitRoot, WorkspaceGitRootSource, WorkspaceSetupState,
-    WorkspaceSetupStatus, WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
-    SUPPORTED_ASSET_MIME_TYPES,
+    TokenUsage, TokenUsageCrossFilterRow, TokenUsageTotals, TopChangedFile, UsageCost, Workspace,
+    WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
+    WorkspaceCreate, WorkspaceCreateInitialAgent, WorkspaceCreateResult, WorkspaceDiskUsage,
+    WorkspaceDisplayStatus, WorkspaceEventSummary, WorkspaceGitRoot, WorkspaceGitRootSource,
+    WorkspaceSetupState, WorkspaceSetupStatus, WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats,
+    WorkspaceUpdate, SUPPORTED_ASSET_MIME_TYPES,
 };
 pub use model::{AnchorContext, SuggestionDiff, WorkspaceDiffSummary, WorkspaceDiffSummaryFile};
 pub use model::{

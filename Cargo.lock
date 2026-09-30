@@ -2161,7 +2161,7 @@ dependencies = [
 
 [[package]]
 name = "intent-acp"
-version = "0.9.113"
+version = "0.9.124"
 dependencies = [
  "agent-client-protocol",
  "ctor",
@@ -2187,7 +2187,7 @@ dependencies = [
 
 [[package]]
 name = "intent-context"
-version = "0.9.113"
+version = "0.9.124"
 dependencies = [
  "async-trait",
  "ctor",
@@ -2200,7 +2200,7 @@ dependencies = [
 
 [[package]]
 name = "intent-core"
-version = "0.9.113"
+version = "0.9.124"
 dependencies = [
  "async-trait",
  "ctor",
@@ -2222,21 +2222,26 @@ dependencies = [
 
 [[package]]
 name = "intent-git"
-version = "0.9.113"
+version = "0.9.124"
 dependencies = [
  "git2",
  "intent-core",
+ "intentd-test-support",
  "libc",
+ "rcgen",
+ "rustls",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "tracing",
 ]
 
 [[package]]
 name = "intent-js"
-version = "0.9.113"
+version = "0.9.124"
 dependencies = [
  "rquickjs",
  "serde_json",
@@ -2246,7 +2251,7 @@ dependencies = [
 
 [[package]]
 name = "intent-linear"
-version = "0.9.113"
+version = "0.9.124"
 dependencies = [
  "async-trait",
  "intent-core",
@@ -2259,8 +2264,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "intent-nodes"
+version = "0.9.124"
+dependencies = [
+ "intent-core",
+ "tokio",
+]
+
+[[package]]
 name = "intent-providers"
-version = "0.9.113"
+version = "0.9.124"
 dependencies = [
  "ctor",
  "intent-core",
@@ -2271,7 +2284,7 @@ dependencies = [
 
 [[package]]
 name = "intent-pty"
-version = "0.9.113"
+version = "0.9.124"
 dependencies = [
  "intent-core",
  "nix 0.31.3",
@@ -2282,7 +2295,7 @@ dependencies = [
 
 [[package]]
 name = "intent-search"
-version = "0.9.113"
+version = "0.9.124"
 dependencies = [
  "globset",
  "grep",
@@ -2295,7 +2308,7 @@ dependencies = [
 
 [[package]]
 name = "intent-sentry"
-version = "0.9.113"
+version = "0.9.124"
 dependencies = [
  "async-trait",
  "intent-core",
@@ -2309,7 +2322,7 @@ dependencies = [
 
 [[package]]
 name = "intent-services"
-version = "0.9.113"
+version = "0.9.124"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -2360,11 +2373,15 @@ dependencies = [
 
 [[package]]
 name = "intent-sourcecontrol"
-version = "0.9.113"
+version = "0.9.124"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
  "http",
+ "http-body-util",
+ "hyper-rustls",
+ "hyper-timeout",
+ "hyper-util",
  "intent-core",
  "octocrab",
  "reqwest",
@@ -2374,12 +2391,14 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tower",
+ "tower-http",
  "tracing",
 ]
 
 [[package]]
 name = "intent-store"
-version = "0.9.113"
+version = "0.9.124"
 dependencies = [
  "base64 0.23.1",
  "flate2",
@@ -2405,7 +2424,7 @@ dependencies = [
 
 [[package]]
 name = "intent-transport"
-version = "0.9.113"
+version = "0.9.124"
 dependencies = [
  "base64 0.23.1",
  "ctor",
@@ -2455,7 +2474,7 @@ dependencies = [
 
 [[package]]
 name = "intentd"
-version = "0.9.113"
+version = "0.9.124"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2508,7 +2527,7 @@ dependencies = [
 
 [[package]]
 name = "intentd-sitter"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "directories",
  "flate2",
@@ -2638,9 +2657,9 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libgit2-sys"
-version = "0.18.5+1.9.4"
+version = "0.18.8+1.9.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "005d6ae6eac1912906073e069f7db60b1fa98e052a68227824afe3e3a1c59ca2"
+checksum = "7f7c568b25d7489bc3fb2988ed69ab111d2944d2f5fec3d5c987fe545ea97b50"
 dependencies = [
  "cc",
  "libc",

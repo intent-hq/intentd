@@ -8,14 +8,22 @@
 //! plain-`ws://` accept path serves JSON-RPC with no TLS and no bearer token.
 
 mod common;
+#[path = "wss_integration/discovery_context.rs"]
+mod discovery_context;
 #[path = "wss_integration/host_roles.rs"]
 mod host_roles;
 #[path = "wss_integration/human_attribution.rs"]
 mod human_attribution;
 #[path = "wss_integration/imported_queue_authorization.rs"]
 mod imported_queue_authorization;
+#[path = "wss_integration/integration_context.rs"]
+mod integration_context;
+#[path = "wss_integration/resource_context.rs"]
+mod resource_context;
 #[path = "wss_integration/sharing.rs"]
 mod sharing;
+#[path = "wss_integration/skills.rs"]
+mod skills;
 
 #[path = "wss_integration/authenticated_devices.rs"]
 mod authenticated_devices;
@@ -214,6 +222,11 @@ async fn make_services(
         .with_assets_root(dir.path().join("assets"))
         .with_workspaces_root(workspaces_root)
         .with_settings_registry(registry.clone())
+        .with_secret_store(Arc::new(intent_services::InMemorySecretStore::default()))
+        .with_specialist_dirs(
+            Some(dir.path().join("user-specialists")),
+            Some(dir.path().join("bundled-specialists")),
+        )
         .with_event_bus(bus.clone());
     if let Some(bin) = auggie_bin {
         services = services.with_auggie_bin(bin);
@@ -1256,8 +1269,8 @@ async fn wss_agent_lite_omits_initial_message() {
     srv.ws.stop().await;
 }
 
-/// Soft retire round-trip over the real WSS transport: `agent.retire` (via
-/// the service seam the MCP binding calls) marks the session inert —
+/// Soft retire round-trip over the real WSS transport: `agent.retire`
+/// marks the session inert —
 /// excluded from default `agent.list`, served by `includeRetired: true` with
 /// `retiredAt`, still readable via `agent.get`, rejecting `agent.sendMessage`
 /// — and the wire `agent.restore` method returns it to service. Both
@@ -1347,23 +1360,57 @@ async fn wss_agent_soft_retire_and_restore_round_trip() {
         "subscribe: {sub}"
     );
 
-    // Retire via the WorkspaceApi seam (the MCP `ws.agent.retire` binding
-    // routes here; there is deliberately no wire agent.retire method).
-    let retired = srv
-        .api
-        .agent_retire(
-            intent_core::AgentId::from(agent_id.as_str()),
-            Some(WorkspaceId(ws_id.clone())),
-            Some("handing off".to_string()),
+    for params in [
+        serde_json::json!({}),
+        serde_json::json!({ "agentId": "unknown-agent" }),
+        serde_json::json!({ "agentId": agent_id, "reason": 42 }),
+        serde_json::json!({ "agentId": agent_id, "workspaceId": "wrong-workspace" }),
+    ] {
+        let response = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": 18, "method": "agent.retire", "params": params
+            })
+            .to_string(),
         )
-        .await
-        .expect("retire");
+        .await;
+        assert_eq!(response["error"]["code"], -32602, "{response}");
+        assert!(srv
+            .store
+            .get_agent_session(&intent_core::AgentId::from(agent_id.as_str()))
+            .await
+            .unwrap()
+            .retired_at
+            .is_none());
+    }
+
+    // Direct user retirement works independently of model peer-agent features.
+    srv.set_setting("agentFeatures.peerAgents", serde_json::json!(false));
+    let retire_frame = serde_json::json!({
+        "jsonrpc": "2.0", "id": 17, "method": "agent.retire",
+        "params": { "agentId": agent_id, "workspaceId": ws_id, "reason": "handing off" }
+    })
+    .to_string();
+    let envelope = wss_call(srv.port, srv.cfg.clone(), &retire_frame).await;
+    assert_eq!(envelope["jsonrpc"], "2.0");
+    assert_eq!(envelope["id"], 17);
+    assert!(envelope.get("error").is_none(), "{envelope}");
+    let retired = &envelope["result"];
     assert_eq!(retired["success"], serde_json::json!(true));
     let retired_at = retired["retiredAt"]
         .as_str()
         .expect("retiredAt")
         .to_string();
     let retired_at = retired_at.as_str();
+
+    let repeated = wss_call(srv.port, srv.cfg.clone(), &retire_frame).await;
+    assert_eq!(
+        repeated["result"],
+        serde_json::json!({
+            "success": true, "retiredAt": retired_at, "alreadyRetired": true
+        })
+    );
 
     // agent:retired reaches the subscriber with name + reason.
     let evt = next_event(&mut ws, "agent:retired").await;
@@ -2302,12 +2349,18 @@ async fn wss_agent_retire_cascade_guard_hooks_and_watches() {
 
     // Guard: retire fails while a descendant is running a turn — the error
     // names the child and NOTHING is mutated.
-    let err = srv
-        .api
-        .agent_retire(parent.clone(), Some(workspace_id.clone()), None)
-        .await
-        .expect_err("retire with an active child must be rejected");
-    let msg = err.to_string();
+    let rejected = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 19, "method": "agent.retire",
+            "params": { "agentId": parent_id, "workspaceId": ws_id }
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(rejected["error"]["code"], -32602, "{rejected}");
+    let msg = rejected["error"]["message"].as_str().unwrap();
     assert!(
         msg.contains("active child agent(s) still running a turn") && msg.contains("Junior"),
         "guard error names the active child: {msg}"
@@ -2402,16 +2455,17 @@ async fn wss_agent_retire_cascade_guard_hooks_and_watches() {
     }
 
     // Retire the parent: guard passes now, the cascade retires the child.
-    let retired = srv
-        .api
-        .agent_retire(
-            parent.clone(),
-            Some(workspace_id.clone()),
-            Some("shutting down".to_string()),
-        )
-        .await
-        .expect("retire parent");
-    assert_eq!(retired["success"], serde_json::json!(true), "{retired}");
+    let retired = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 20, "method": "agent.retire",
+            "params": { "agentId": parent_id, "workspaceId": ws_id, "reason": "shutting down" }
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(retired["result"]["success"], true, "{retired}");
 
     // Collect the three lifecycle events (relative order not asserted).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
@@ -3200,6 +3254,7 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
             cost: None,
         },
         by_model: BTreeMap::new(),
+        by_agent_model: None,
         last_scan_at: Some(now_iso()),
     };
     let ws_active = WorkspaceId::new();
@@ -4340,6 +4395,8 @@ async fn wss_collaborator_capability_matrix_in_service_layer() {
                 "agent.sendMessage",
                 json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "hello from guest" }),
             ),
+            ("agent.retire", json!({ "agentId": agent_id })),
+            ("agent.restore", json!({ "agentId": agent_id })),
             ("git.push", json!({ "workspaceId": ws_id })),
         ]
     };
@@ -4382,6 +4439,11 @@ async fn wss_collaborator_capability_matrix_in_service_layer() {
             "collaborator {method}: {v}"
         );
         match method {
+            "agent.retire" => {
+                assert_eq!(v["result"]["success"], true, "{v}");
+                assert!(v["result"]["retiredAt"].is_string(), "{v}");
+            }
+            "agent.restore" => assert_eq!(v["result"]["restored"], true, "{v}"),
             "workspace.get" => {
                 assert_eq!(v["result"]["workspace"]["myRole"], "collaborator", "{v}");
                 assert_eq!(v["result"]["workspace"]["ownerPrincipalId"], primary.id.0);
@@ -6698,19 +6760,15 @@ impl PresenceClient {
             .expect("send");
     }
 
-    /// The reply to request `id`; pushes and events arriving first are
-    /// skipped.
+    /// The reply to request `id`; retain unmatched pushes and events.
     async fn reply(&mut self, id: u64, method: &str) -> Value {
-        loop {
-            let v = self
-                .next_within(Duration::from_secs(10))
-                .await
-                .unwrap_or_else(|| panic!("no reply to {method} #{id} within 10s"));
-            if v["id"] == id {
-                return v;
-            }
-            self.skipped.push(v);
-        }
+        presence_matching_frame(
+            &mut self.rx,
+            &mut self.skipped,
+            |v| v["id"] == id,
+            &format!("reply to {method} #{id}"),
+        )
+        .await
     }
 
     /// Round-trip one request; pushes and events arriving first are skipped.
@@ -6719,33 +6777,28 @@ impl PresenceClient {
         self.reply(id, method).await
     }
 
-    /// The params of the next `subscription.push` on `sub` (other frames are
-    /// skipped).
+    /// The params of the next `subscription.push` on `sub`; retain other frames.
     async fn push(&mut self, sub: &str) -> Value {
-        loop {
-            let v = self
-                .next_within(Duration::from_secs(10))
-                .await
-                .unwrap_or_else(|| panic!("no push on {sub} within 10s"));
-            if v["method"] == "subscription.push" && v["params"]["subscriptionId"] == sub {
-                return v["params"].clone();
-            }
-            self.skipped.push(v);
-        }
+        presence_matching_frame(
+            &mut self.rx,
+            &mut self.skipped,
+            |v| v["method"] == "subscription.push" && v["params"]["subscriptionId"] == sub,
+            &format!("push on {sub}"),
+        )
+        .await["params"]
+            .clone()
     }
 
-    /// The next `events.event` of `event_type` (other frames are skipped).
+    /// The next `events.event` of `event_type`; retain other frames.
     async fn event(&mut self, event_type: &str) -> Value {
-        loop {
-            let v = self
-                .next_within(Duration::from_secs(10))
-                .await
-                .unwrap_or_else(|| panic!("no {event_type} event within 10s"));
-            if v["method"] == "events.event" && v["params"]["event"]["type"] == event_type {
-                return v["params"]["event"].clone();
-            }
-            self.skipped.push(v);
-        }
+        presence_matching_frame(
+            &mut self.rx,
+            &mut self.skipped,
+            |v| v["method"] == "events.event" && v["params"]["event"]["type"] == event_type,
+            &format!("{event_type} event"),
+        )
+        .await["params"]["event"]
+            .clone()
     }
 
     /// Every frame already delivered plus whatever arrives in a short grace
@@ -6780,6 +6833,140 @@ impl PresenceClient {
     /// so only the daemon's heartbeat reaper can end the connection.
     fn go_silent(&mut self) {
         self.reader.abort();
+    }
+}
+
+/// Match the reader's frames without losing messages for another waiter.
+async fn presence_matching_frame(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<Value>,
+    skipped: &mut Vec<Value>,
+    matches: impl Fn(&Value) -> bool,
+    description: &str,
+) -> Value {
+    if let Some(index) = skipped.iter().position(&matches) {
+        return skipped.remove(index);
+    }
+    loop {
+        let v = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| panic!("no {description} within 10s"));
+        if matches(&v) {
+            return v;
+        }
+        skipped.push(v);
+    }
+}
+
+#[cfg(test)]
+mod presence_dispatcher {
+    use super::*;
+    use serde_json::json;
+
+    fn event(sequence: u64) -> Value {
+        json!({ "method": "events.event", "params": {
+            "event": { "type": "presence:changed", "sequence": sequence }
+        } })
+    }
+
+    fn push() -> Value {
+        json!({ "method": "subscription.push", "params": {
+            "subscriptionId": "note", "delta": { "kind": "left" }
+        } })
+    }
+
+    fn frames(values: Vec<Value>) -> tokio::sync::mpsc::UnboundedReceiver<Value> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        for value in values {
+            tx.send(value).expect("queue frame");
+        }
+        // Closing the sender makes a missed buffered frame fail immediately.
+        rx
+    }
+
+    async fn next(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<Value>,
+        skipped: &mut Vec<Value>,
+        method: &str,
+    ) -> Value {
+        presence_matching_frame(rx, skipped, |v| v["method"] == method, method).await
+    }
+
+    #[tokio::test]
+    async fn event_before_push_is_still_available_after_push() {
+        let event = event(1);
+        let push = push();
+        let unrelated = json!({ "id": 9, "result": { "ok": true } });
+        let mut rx = frames(vec![unrelated.clone(), event.clone(), push.clone()]);
+        let mut skipped = Vec::new();
+        assert_eq!(next(&mut rx, &mut skipped, "subscription.push").await, push);
+        assert_eq!(skipped, vec![unrelated.clone(), event.clone()]);
+        assert_eq!(next(&mut rx, &mut skipped, "events.event").await, event);
+        assert_eq!(skipped, vec![unrelated]);
+    }
+
+    #[tokio::test]
+    async fn push_before_event_is_still_available_after_event() {
+        let event = event(1);
+        let push = push();
+        let unrelated = json!({ "method": "other.notification" });
+        let mut rx = frames(vec![unrelated.clone(), push.clone(), event.clone()]);
+        let mut skipped = Vec::new();
+        assert_eq!(next(&mut rx, &mut skipped, "events.event").await, event);
+        assert_eq!(skipped, vec![unrelated.clone(), push.clone()]);
+        assert_eq!(next(&mut rx, &mut skipped, "subscription.push").await, push);
+        assert_eq!(skipped, vec![unrelated]);
+    }
+
+    #[tokio::test]
+    async fn reply_wait_preserves_events_and_other_replies() {
+        let event = event(1);
+        let first_reply = json!({ "id": 1, "result": { "ok": true } });
+        let second_reply = json!({ "id": 2, "result": { "ok": true } });
+        let mut rx = frames(vec![
+            event.clone(),
+            first_reply.clone(),
+            second_reply.clone(),
+        ]);
+        let mut skipped = Vec::new();
+        assert_eq!(
+            presence_matching_frame(&mut rx, &mut skipped, |v| v["id"] == 2, "reply #2").await,
+            second_reply
+        );
+        assert_eq!(next(&mut rx, &mut skipped, "events.event").await, event);
+        assert_eq!(
+            presence_matching_frame(&mut rx, &mut skipped, |v| v["id"] == 1, "reply #1").await,
+            first_reply
+        );
+        assert!(skipped.is_empty());
+    }
+
+    #[tokio::test]
+    async fn buffered_matches_keep_arrival_order_and_are_consumed_once() {
+        let mut rx = frames(vec![event(3)]);
+        let unrelated = json!({ "method": "other.notification" });
+        let mut skipped = vec![event(1), unrelated.clone(), event(2)];
+        for sequence in 1..=3 {
+            assert_eq!(
+                next(&mut rx, &mut skipped, "events.event").await,
+                event(sequence)
+            );
+        }
+        assert_eq!(skipped, vec![unrelated]);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn matching_frames_in_wait_order_leave_unrelated_frames_for_negative_checks() {
+        let event = event(1);
+        let push = push();
+        let unrelated = json!({ "method": "other.notification" });
+        let mut rx = frames(vec![unrelated.clone(), push.clone(), event.clone()]);
+        let mut skipped = Vec::new();
+        assert_eq!(next(&mut rx, &mut skipped, "subscription.push").await, push);
+        assert_eq!(next(&mut rx, &mut skipped, "events.event").await, event);
+        assert_eq!(skipped, vec![unrelated]);
     }
 }
 

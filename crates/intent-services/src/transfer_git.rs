@@ -22,12 +22,12 @@ use crate::transfer_submodules::{find_unpublished_submodules, UnpublishedSubmodu
 /// First line of every transfer WIP snapshot commit message. The import side
 /// identifies snapshot commits by this sentinel and unwinds them via
 /// [`unwind_wip`]; keep it stable across versions.
-pub(crate) const TRANSFER_WIP_SENTINEL: &str = "intent-transfer: WIP snapshot";
+pub(crate) use intent_git::checkpoint::WIP_SENTINEL as TRANSFER_WIP_SENTINEL;
 
 /// Commit-message trailer carrying the pre-snapshot index tree OID, so
 /// [`unwind_wip`] can restore the exact staged/unstaged split (a plain soft
 /// reset would leave everything staged).
-const INDEX_TREE_TRAILER: &str = "Intent-Index-Tree:";
+use intent_git::checkpoint::parse_index_tree_trailer;
 
 /// Namespace for the temporary refs anchoring non-branch bundle entries in
 /// the worktree repo. Created for the duration of `git bundle create` and
@@ -288,43 +288,20 @@ pub(crate) fn snapshot_wip(repo_path: &Path) -> Result<Option<String>> {
         let tree_oid = index
             .write_tree()
             .map_err(|e| Error::Internal(format!("write tree failed: {e}")))?;
-        let tree = repo
-            .find_tree(tree_oid)
-            .map_err(|e| Error::Internal(format!("find tree failed: {e}")))?;
-        let sig = resolve_signature(&repo)?;
-        // Auxiliary anchor commit (no ref update): its only job is to make
-        // the pre-snapshot index tree REACHABLE from the WIP commit, so the
-        // tree travels inside a transfer bundle and `unwind_wip` on the
-        // import side can restore the exact staged/unstaged split. Without
-        // it the trailer OID would dangle in a bundle clone (bundles carry
-        // only objects reachable from their refs) and the unwind would
-        // degrade to everything-staged.
-        let index_tree = repo
-            .find_tree(orig_index_tree)
-            .map_err(|e| Error::Internal(format!("find pre-snapshot index tree failed: {e}")))?;
-        let anchor_oid = repo
-            .commit(
-                None,
-                &sig,
-                &sig,
-                "intent-transfer: index state anchor",
-                &index_tree,
-                &[&head_commit],
-            )
-            .map_err(|e| Error::Internal(format!("create index anchor commit failed: {e}")))?;
-        let anchor = repo
-            .find_commit(anchor_oid)
-            .map_err(|e| Error::Internal(format!("find index anchor commit failed: {e}")))?;
-        let message = format!("{TRANSFER_WIP_SENTINEL}\n\n{INDEX_TREE_TRAILER} {orig_index_tree}");
-        repo.commit(
-            Some("HEAD"),
-            &sig,
-            &sig,
-            &message,
-            &tree,
-            &[&head_commit, &anchor],
+        let (_, wip) =
+            intent_git::checkpoint::write_wip(&repo, head_commit.id(), orig_index_tree, tree_oid)?;
+        let reference = repo.head().map_err(|e| Error::Internal(e.to_string()))?;
+        repo.reference_matching(
+            reference
+                .name()
+                .map_err(|e| Error::Internal(e.to_string()))?,
+            wip,
+            true,
+            head_commit.id(),
+            "commit: intent-transfer: WIP snapshot",
         )
-        .map_err(|e| Error::Internal(format!("create WIP snapshot commit failed: {e}")))
+        .map_err(|e| Error::Internal(format!("attach WIP snapshot failed: {e}")))?;
+        Ok(wip)
     })();
     match commit_result {
         Ok(oid) => Ok(Some(oid.to_string())),
@@ -346,7 +323,7 @@ pub(crate) fn snapshot_wip(repo_path: &Path) -> Result<Option<String>> {
 
 /// Inverse of [`snapshot_wip`]: when HEAD is a transfer WIP snapshot commit,
 /// soft-reset it away and restore the pre-snapshot index from the
-/// [`INDEX_TREE_TRAILER`], leaving the worktree exactly as found (staged
+/// [`intent_git::checkpoint::INDEX_TREE_TRAILER`], leaving the worktree exactly as found (staged
 /// stays staged, unstaged stays unstaged, untracked stays untracked).
 /// Returns `false` (no-op) when HEAD is not a transfer WIP commit.
 pub(crate) fn unwind_wip(repo_path: &Path) -> Result<bool> {
@@ -839,30 +816,6 @@ fn cleanup_temp_refs(worktree: &Path, refs: &[String]) {
         if let Ok(mut r) = repo.find_reference(name) {
             let _ = r.delete();
         }
-    }
-}
-
-/// Extract the pre-snapshot index tree OID from a WIP commit message.
-fn parse_index_tree_trailer(message: &str) -> Option<git2::Oid> {
-    message
-        .lines()
-        .find_map(|line| line.strip_prefix(INDEX_TREE_TRAILER))
-        .and_then(|v| git2::Oid::from_str(v.trim()).ok())
-}
-
-/// Resolve a commit signature, falling back to a stable default identity when
-/// the user has no `user.name`/`user.email` configured (parity with the
-/// `sandbox_ops` helper of the same name).
-fn resolve_signature(repo: &git2::Repository) -> Result<git2::Signature<'static>> {
-    match repo.signature() {
-        Ok(sig) => Ok(sig),
-        Err(e) if e.code() == git2::ErrorCode::NotFound => {
-            git2::Signature::now("Intent", "intent@localhost")
-                .map_err(|e| Error::Internal(format!("construct fallback signature failed: {e}")))
-        }
-        Err(e) => Err(Error::Internal(format!(
-            "resolve git signature failed: {e}"
-        ))),
     }
 }
 

@@ -33,6 +33,8 @@
 
 use std::sync::Arc;
 
+use std::collections::{HashMap, HashSet};
+
 use intent_store::{PersistedCompletionWatch, PersistedDelegationGroup, Store};
 
 use intent_core::{now_iso, AgentId, Error, Event, Result, WorkspaceId};
@@ -240,6 +242,15 @@ pub(crate) fn check_watch_scope(
         )));
     }
     Ok(())
+}
+
+/// Restored startup bookkeeping awaiting reconciliation after listener readiness.
+/// Contains identifiers only; durable rows remain the recovery record on shutdown.
+#[derive(Default)]
+pub struct StartupCompletionRecovery {
+    groups: Vec<String>,
+    children: Vec<(AgentId, WorkspaceId)>,
+    watch_ids: HashSet<String>,
 }
 
 impl Services {
@@ -961,10 +972,12 @@ impl Services {
             event_summaries: Vec::new(),
             raw_events: Vec::new(),
         };
-        guard.delegation_groups.push(group.clone());
-        // Write-through persist (best-effort), enqueued under the lock so the
-        // lane order matches the registry order.
-        self.persist_delegation_group(group);
+        // Do not persist an empty recovery record. If it lands before the
+        // first enrollment snapshot and the daemon stops between the writes,
+        // rehydration seals a group with no expected children and loses the
+        // eventual parent wake. Enrollment persists the first meaningful
+        // snapshot through the same ordered lane.
+        guard.delegation_groups.push(group);
         drop(guard);
         group_id
     }
@@ -1553,13 +1566,25 @@ impl Services {
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn heal_completion_watches_on_startup(&self) -> Result<usize> {
+        let recovery = self.restore_completion_watches(&mut HashMap::new()).await?;
+        let loaded = recovery.watch_ids.len();
+        let (_stop, stopping) = tokio::sync::watch::channel(false);
+        self.reconcile_startup_completions(recovery, &stopping)
+            .await;
+        Ok(loaded)
+    }
+
+    async fn restore_completion_watches(
+        &self,
+        parents: &mut HashMap<AgentId, bool>,
+    ) -> Result<StartupCompletionRecovery> {
         let mut persisted = self.store.list_completion_watches().await?;
         // Strongest-first: grouped (0) < ungrouped (1), with the store's
         // created_at ASC ordering as the tiebreaker (stable sort).
         let rank =
             |p: &intent_store::PersistedCompletionWatch| -> u8 { u8::from(p.group_id.is_none()) };
         persisted.sort_by_key(rank);
-        let mut loaded = 0usize;
+        let mut watch_ids = HashSet::new();
         let mut to_reconcile: Vec<(AgentId, WorkspaceId)> = Vec::new();
         for p in persisted {
             enum LoadOutcome {
@@ -1574,13 +1599,9 @@ impl Services {
             // soft-retire inertness gate rejects every wake, so rehydrating
             // its watch only feeds the delivery-retry loop; `agent.restore`
             // does not resurrect watches, matching the retire sweep.
-            let parent_alive = self.agent_is_live(&p.parent_agent_id).await
-                && !matches!(
-                    self.store
-                        .get_agent_session_retired_at(&p.parent_agent_id)
-                        .await,
-                    Ok(Some(_))
-                );
+            let parent_alive = self
+                .completion_parent_is_live(&p.parent_agent_id, parents)
+                .await;
             if !parent_alive {
                 tracing::info!(
                     watch = %p.id,
@@ -1650,7 +1671,7 @@ impl Services {
                     continue;
                 }
             };
-            loaded += 1;
+            watch_ids.insert(p.id);
             to_reconcile.push((child_agent, child_ws));
         }
         // Reconcile: a child that completed (or was deleted) while the daemon
@@ -1658,23 +1679,109 @@ impl Services {
         // event covers every watch on the same child.
         to_reconcile.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
         to_reconcile.dedup_by(|a, b| a.0 == b.0);
-        for (child_id, child_ws) in to_reconcile {
-            self.reconcile_watch_child_on_rehydration(
-                &child_id,
-                &child_ws,
+        Ok(StartupCompletionRecovery {
+            groups: Vec::new(),
+            children: to_reconcile,
+            watch_ids,
+        })
+    }
+
+    /// Restore startup groups and watches without delivering any completion.
+    /// Call before listeners open; reconciliation belongs to an owned worker
+    /// after readiness. Parent metadata is read once across the entire pass.
+    pub async fn prepare_startup_completion_recovery(&self) -> StartupCompletionRecovery {
+        let mut recovery = StartupCompletionRecovery::default();
+        let mut parents = HashMap::new();
+        match self.store.list_workspaces_with_undelivered_groups().await {
+            Ok(workspaces) => {
+                for workspace in workspaces {
+                    match self
+                        .restore_delegation_groups(&workspace, &mut parents)
+                        .await
+                    {
+                        Ok(groups) => recovery.groups.extend(groups),
+                        Err(error) => {
+                            tracing::warn!(%error, %workspace, "delegation group startup restoration failed");
+                        }
+                    }
+                }
+            }
+            Err(error) => tracing::warn!(%error, "delegation group startup listing failed"),
+        }
+        match self.restore_completion_watches(&mut parents).await {
+            Ok(watches) => {
+                recovery.children = watches.children;
+                recovery.watch_ids = watches.watch_ids;
+            }
+            Err(error) => tracing::warn!(%error, "completion watch startup restoration failed"),
+        }
+        tracing::info!(
+            groups = recovery.groups.len(),
+            watches = recovery.watch_ids.len(),
+            "restored startup completion bookkeeping"
+        );
+        recovery
+    }
+
+    /// Reconcile restored groups first, then individual watched children.
+    /// Stop between operations, draining an admitted wake so its durable
+    /// delivery claim is never stranded. The caller must join this worker
+    /// before shutting down the agent manager or store.
+    pub async fn reconcile_startup_completions(
+        &self,
+        recovery: StartupCompletionRecovery,
+        stopping: &tokio::sync::watch::Receiver<bool>,
+    ) {
+        for group in recovery.groups {
+            if *stopping.borrow() {
+                return;
+            }
+            self.reconcile_group_on_rehydration(&group).await;
+            self.try_fire_group(&group).await;
+        }
+        for (child, workspace) in recovery.children {
+            if *stopping.borrow() {
+                return;
+            }
+            self.reconcile_watch_child_for_watches(
+                &child,
+                &workspace,
                 WatchReconcileCallSite::Rehydration,
+                Some(&recovery.watch_ids),
             )
             .await;
         }
-        Ok(loaded)
+        tracing::info!("startup completion reconciliation complete");
+    }
+
+    async fn completion_parent_is_live(
+        &self,
+        parent: &AgentId,
+        parents: &mut HashMap<AgentId, bool>,
+    ) -> bool {
+        if let Some(live) = parents.get(parent) {
+            return *live;
+        }
+        let live = match self.store.get_agent_session_summary(parent).await {
+            Ok(session) => {
+                session.status != intent_core::AgentStatus::Deleted && session.retired_at.is_none()
+            }
+            Err(intent_store::Error::NotFound(_)) => false,
+            Err(error) => {
+                tracing::warn!(%parent, %error, "completion parent lookup failed; retaining bookkeeping");
+                true
+            }
+        };
+        parents.insert(parent.clone(), live);
+        live
     }
 
     /// Whether an agent session row exists and is not `Deleted`. Store errors
     /// other than `NotFound` are treated as live (conservative: never prune a
     /// watch on a transient store error).
     pub(crate) async fn agent_is_live(&self, agent_id: &AgentId) -> bool {
-        match self.store.get_agent_session(agent_id).await {
-            Ok(session) => !matches!(session.status, intent_core::AgentStatus::Deleted),
+        match self.store.get_agent_session_status(agent_id).await {
+            Ok(status) => !matches!(status, intent_core::AgentStatus::Deleted),
             Err(intent_store::Error::NotFound(_)) => false,
             Err(e) => {
                 tracing::warn!(
@@ -1703,9 +1810,31 @@ impl Services {
         fallback_ws: &WorkspaceId,
         call_site: WatchReconcileCallSite,
     ) {
+        self.reconcile_watch_child_for_watches(child_id, fallback_ws, call_site, None)
+            .await;
+    }
+
+    async fn reconcile_watch_child_for_watches(
+        &self,
+        child_id: &AgentId,
+        fallback_ws: &WorkspaceId,
+        call_site: WatchReconcileCallSite,
+        watch_ids: Option<&HashSet<String>>,
+    ) {
         use intent_core::AgentStatus;
+
+        // A live request or earlier group settlement may have retired every
+        // restored watch for this child while the worker was deferred.
+        if watch_ids.is_some_and(|ids| {
+            !self
+                .find_watches_for_child(child_id)
+                .iter()
+                .any(|watch| ids.contains(&watch.id))
+        }) {
+            return;
+        }
         let (event_type, event_ws, status_value, completion_report, stop_reason, agent_name) =
-            match self.store.get_agent_session(child_id).await {
+            match self.store.get_agent_session_summary(child_id).await {
                 Ok(session) => {
                     let is_deleted = matches!(session.status, AgentStatus::Deleted);
                     // A retired session (`retired_at` set) is inert — no
@@ -1748,7 +1877,11 @@ impl Services {
                         // completion if the last outgoing watch disappears
                         // without a wake, then leave the watch armed.
                         if settled && self.agent_is_waiting_on_agents(child_id) {
-                            self.mark_interim_skipped_idle(child_id);
+                            if watch_ids.is_some() {
+                                self.mark_interim_skipped_idle_preserving_provenance(child_id);
+                            } else {
+                                self.mark_interim_skipped_idle(child_id);
+                            }
                             return;
                         }
                         // Registration-time hook/PR-monitor/event-subscription
@@ -1889,7 +2022,7 @@ impl Services {
         // No-advisory variant: registration-time / boot reconciliation must
         // never fire the monitoring-idle advisory — a deferred idle here
         // leaves the watch armed, exactly as before the advisory existed.
-        self.deliver_completion_to_watches_no_advisory(child_id, &event)
+        self.deliver_completion_to_watches_inner(child_id, &event, false, true, watch_ids)
             .await;
     }
 
@@ -1917,6 +2050,22 @@ impl Services {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<usize> {
+        let groups = self
+            .restore_delegation_groups(workspace_id, &mut HashMap::new())
+            .await?;
+        let loaded = groups.len();
+        for group in groups {
+            self.reconcile_group_on_rehydration(&group).await;
+            self.try_fire_group(&group).await;
+        }
+        Ok(loaded)
+    }
+
+    async fn restore_delegation_groups(
+        &self,
+        workspace_id: &WorkspaceId,
+        parents: &mut HashMap<AgentId, bool>,
+    ) -> Result<Vec<String>> {
         let persisted = self.store.list_undelivered_groups(workspace_id).await?;
         // Prune groups whose parent is permanently gone (deleted/missing or
         // retired) BEFORE loading them (monorepo#4183): an aggregated wake
@@ -1929,13 +2078,9 @@ impl Services {
         // group (the delivery-path backstop catches it later).
         let mut survivors = Vec::with_capacity(persisted.len());
         for p in persisted {
-            let parent_gone = !self.agent_is_live(&p.parent_agent_id).await
-                || matches!(
-                    self.store
-                        .get_agent_session_retired_at(&p.parent_agent_id)
-                        .await,
-                    Ok(Some(_)) | Err(intent_store::Error::NotFound(_))
-                );
+            let parent_gone = !self
+                .completion_parent_is_live(&p.parent_agent_id, parents)
+                .await;
             if parent_gone {
                 tracing::info!(
                     group = %p.group_id,
@@ -1950,12 +2095,11 @@ impl Services {
             survivors.push(p);
         }
         let persisted = survivors;
-        let (loaded, groups_to_reconcile) = {
+        let groups_to_reconcile = {
             let mut guard = self
                 .agent_subscriptions
                 .lock()
                 .expect("agent subscription registry poisoned");
-            let mut loaded = 0;
             let mut groups_to_reconcile = Vec::new();
             for p in persisted {
                 // Skip if this group is already in memory (idempotent rehydration).
@@ -1971,18 +2115,11 @@ impl Services {
                 group.sealed = true;
                 groups_to_reconcile.push(group.group_id.clone());
                 guard.delegation_groups.push(group);
-                loaded += 1;
             }
-            (loaded, groups_to_reconcile)
+            groups_to_reconcile
         }; // guard dropped here
 
-        // STAB-108 reconciliation: check each rehydrated group for already-completed children
-        for group_id in groups_to_reconcile {
-            self.reconcile_group_on_rehydration(&group_id).await;
-            // Fire the group if it's now ready (all children completed/deleted)
-            self.try_fire_group(&group_id).await;
-        }
-        Ok(loaded)
+        Ok(groups_to_reconcile)
     }
 
     /// STAB-108: Reconcile a delegation group against current agent state after rehydration.
@@ -2021,7 +2158,7 @@ impl Services {
         // For each unrecorded child, check its status and record if complete/deleted
         for child_id in agents_to_check {
             // Check agent status
-            let agent_result = self.store.get_agent_session(&child_id).await;
+            let agent_result = self.store.get_agent_session_summary(&child_id).await;
 
             match agent_result {
                 Ok(session) => {
@@ -2171,7 +2308,7 @@ impl Services {
                         if event_type == intent_core::events::AGENT_IDLE
                             && self.agent_is_waiting_on_agents_durable(&child_id).await
                         {
-                            self.mark_interim_skipped_idle(&child_id);
+                            self.mark_interim_skipped_idle_preserving_provenance(&child_id);
                             continue;
                         }
                         // Same emit-time `isWaitingForOtherAgents` stamp as

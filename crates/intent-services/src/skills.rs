@@ -773,6 +773,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_repo_less_scan_uses_only_user_skills_with_existing_precedence() {
+        let root = crate::test_support::test_tempdir("repo-less-skills-");
+        let home = root.path().join("home");
+        let empty = scan_skills_with_home(None, Some(home.clone())).await;
+        assert!(empty.skills.is_empty());
+        assert!(
+            !home.exists(),
+            "discovery must not create missing directories"
+        );
+        for (tier, description) in [(".agents", "base"), (".intent", "override")] {
+            write_skill(
+                &home.join(tier).join("skills"),
+                "shared",
+                &build_skill_content(&format!("name: shared\ndescription: {description}"), "Body"),
+            )
+            .await;
+        }
+        let user = scan_skills_with_home(None, Some(home.clone())).await;
+        assert_eq!(user.skills.len(), 1);
+        assert_eq!(user.skills[0].scope, "user");
+        assert_eq!(user.skills[0].description, "override");
+        let project = root.path().join("project");
+        write_skill(
+            &project.join(".agents/skills"),
+            "shared",
+            &build_skill_content("name: shared\ndescription: project", "Body"),
+        )
+        .await;
+        let configured = scan_skills_with_home(Some(&project.to_string_lossy()), Some(home)).await;
+        assert_eq!(configured.skills.len(), 1);
+        assert_eq!(configured.skills[0].scope, "project");
+        assert_eq!(configured.skills[0].description, "project");
+    }
+
+    #[tokio::test]
     async fn test_discover_and_parse_valid_skill() {
         clear_cache();
         let temp_dir = tempfile::tempdir().unwrap();

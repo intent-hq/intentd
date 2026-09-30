@@ -856,7 +856,7 @@ async fn prompt_turn_streams_events_and_accumulates() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     let stop = services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -1094,7 +1094,7 @@ async fn abnormal_stop_reason_persists_finish_reason_on_row_and_stream_end() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     let stop = services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -1164,7 +1164,7 @@ async fn zero_output_abnormal_stop_reason_persists_empty_marker_row() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     let stop = services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -1243,7 +1243,7 @@ async fn prompt_turn_activity_preview_clips_partial_line_and_digest() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     let stop = services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -1348,7 +1348,7 @@ async fn agent_idle_payload_carries_agent_name_and_completion_report() {
     });
 
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -1449,7 +1449,7 @@ async fn resume_replay_burst_is_dropped_then_real_turn_streams() {
     // A subsequent real turn still streams + accumulates normally.
     let (conn, mut note_rx, _agent) = connect();
     let stop = services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -1517,7 +1517,7 @@ async fn tool_call_then_update_persists_use_and_result_blocks() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -1622,7 +1622,7 @@ async fn heavy_tool_output_prestages_mid_turn_and_final_append_adopts() {
         let workspace_id = workspace_id.clone();
         tokio::spawn(async move {
             services
-                .run_prompt_turn(
+                .run_connection_prompt_turn(
                     &conn,
                     &mut note_rx,
                     &agent_id,
@@ -1790,7 +1790,7 @@ async fn repatched_tool_output_invalidates_prestaged_placeholder() {
     let (conn, mut note_rx, _agent) = connect_with(updates);
 
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -1878,7 +1878,7 @@ async fn title_only_update_leaves_prestaged_placeholder_untouched() {
     let (conn, mut note_rx, _agent) = connect_with(vec![tool_call, completed, title_only]);
 
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -1999,7 +1999,7 @@ async fn status_only_update_keeps_title_name_and_input_on_event() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -2061,7 +2061,7 @@ async fn richer_title_update_is_merged_into_block_and_event() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -2137,7 +2137,7 @@ async fn tool_output_with_proposal_resource_appends_standalone_block() {
     let (conn, mut note_rx, _agent) = connect_with(prompt_updates_with_proposal_resource());
 
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -2193,7 +2193,7 @@ async fn tool_output_with_collapsed_proposal_appends_standalone_block() {
     let (conn, mut note_rx, _agent) = connect_with(prompt_updates_with_collapsed_proposal());
 
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -2296,7 +2296,7 @@ async fn registered_attachment_survives_garbled_tool_echo() {
     );
 
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -2380,7 +2380,7 @@ async fn auggie_shaped_workspace_api_call_claims_registered_attachment() {
     );
 
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -2586,7 +2586,7 @@ async fn turn_end_attachments_append_trailing_blocks_and_leftovers_drop() {
     );
 
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -2680,7 +2680,7 @@ async fn question_tail_at_turn_end_raises_then_retires_needs_attention() {
     );
     let (conn, mut note_rx, _agent) = connect_with(prompt_updates());
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -2728,7 +2728,7 @@ async fn question_tail_at_turn_end_raises_then_retires_needs_attention() {
         .expect("append answer");
     let (conn, mut note_rx, _agent) = connect_with(prompt_updates());
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -2770,7 +2770,7 @@ async fn turn_end_writes_pending_marker_and_question_free_turn_keeps_it() {
     );
     let (conn, mut note_rx, _agent) = connect_with(prompt_updates());
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -2806,7 +2806,7 @@ async fn turn_end_writes_pending_marker_and_question_free_turn_keeps_it() {
     // A question-free turn must NOT clear the marker.
     let (conn, mut note_rx, _agent) = connect_with(prompt_updates());
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -2860,7 +2860,7 @@ async fn turn_end_records_pending_proposals_and_proposal_free_turn_keeps_them() 
     );
     let (conn, mut note_rx, _agent) = connect_with(prompt_updates());
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -2894,7 +2894,7 @@ async fn turn_end_records_pending_proposals_and_proposal_free_turn_keeps_them() 
     // A proposal-free turn must NOT touch the list.
     let (conn, mut note_rx, _agent) = connect_with(prompt_updates());
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -3371,7 +3371,7 @@ async fn stale_anonymous_tool_update_is_dropped_not_persisted() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -3905,7 +3905,7 @@ async fn pre_output_transport_death_marks_error_and_suppresses_terminal_events()
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     let err = services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -3971,7 +3971,7 @@ async fn post_output_transport_death_keeps_terminal_events() {
     let _capture_guard = capture.set_as_default();
 
     let err = services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -4101,7 +4101,7 @@ async fn truncation_cap_exhaustion_logs_terminal_outcome_and_idles() {
     let capture = LifecycleCapture::default();
     let _capture_guard = capture.set_as_default();
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -4414,7 +4414,7 @@ async fn streaming_terminal_failure_persists_error_before_publishing_events() {
         tokio::spawn(async move {
             let mut note_rx = note_rx;
             services
-                .run_prompt_turn(
+                .run_connection_prompt_turn(
                     &conn,
                     &mut note_rx,
                     &agent_id,
@@ -4482,7 +4482,7 @@ async fn streaming_benign_cancel_does_not_persist_error() {
         connect_with_prompt_rpc_error_code(-32800, "request cancelled");
 
     let err = services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -4634,7 +4634,7 @@ async fn transient_provider_fetch_failure_retries_and_turn_completes() {
 
     let stop = timeout(
         Duration::from_secs(10),
-        services.run_prompt_turn(
+        services.run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -4690,7 +4690,7 @@ async fn transient_provider_fetch_failure_exhausts_bounded_retries() {
 
     let err = timeout(
         Duration::from_secs(10),
-        services.run_prompt_turn(
+        services.run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -4739,7 +4739,7 @@ async fn terminal_provider_error_fails_fast_without_retry() {
 
     let err = timeout(
         Duration::from_secs(10),
-        services.run_prompt_turn(
+        services.run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -4780,7 +4780,7 @@ async fn transient_fetch_failure_after_streamed_output_is_not_retried() {
 
     let err = timeout(
         Duration::from_secs(10),
-        services.run_prompt_turn(
+        services.run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -4850,7 +4850,7 @@ async fn post_output_transient_fetch_failure_raises_blocker_attention() {
 
     let err = timeout(
         Duration::from_secs(10),
-        services.run_prompt_turn(
+        services.run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -4984,7 +4984,7 @@ async fn post_output_non_transient_error_raises_no_attention() {
 
     let err = timeout(
         Duration::from_secs(10),
-        services.run_prompt_turn(
+        services.run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -5074,7 +5074,7 @@ async fn backoff_late_output_blocker_reason_reports_dispatched_attempt() {
 
     let err = timeout(
         Duration::from_secs(10),
-        services.run_prompt_turn(
+        services.run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -5213,7 +5213,7 @@ async fn transient_fetch_failure_after_client_request_is_not_retried() {
 
     let err = timeout(
         Duration::from_secs(10),
-        services.run_prompt_turn(
+        services.run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -5345,7 +5345,7 @@ async fn suspend_interrupt_enrolls_transient_failure_and_suppresses_terminal_fai
     let _capture_guard = capture.set_as_default();
 
     let err = services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -5446,7 +5446,7 @@ async fn suspend_interrupt_awake_transient_failure_surfaces_terminally() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     let err = services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -5497,7 +5497,7 @@ async fn suspend_interrupt_ignores_non_transient_error_during_suspend() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     let err = services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -5547,7 +5547,7 @@ async fn wake_resume_resumes_turn_enrolled_by_suspend_classifier() {
     let (conn, mut note_rx, _agent) =
         connect_with_prompt_rpc_error(vec![suspend_chunk("partial ")], "Connection reset by peer");
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -5616,7 +5616,7 @@ async fn suspend_enrollment_self_heals_resume_without_wake_broadcast() {
     let (conn, mut note_rx, _agent) =
         connect_with_prompt_rpc_error(vec![suspend_chunk("partial ")], "Connection reset by peer");
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -5673,7 +5673,7 @@ async fn idle_timeout_silent_turn_suppresses_agent_failed() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     let err = services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -5748,7 +5748,7 @@ async fn idle_timeout_after_output_flushes_partial_and_marks_streamed() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     let err = services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -5827,7 +5827,7 @@ async fn idle_timeout_after_unmapped_update_marks_streamed() {
     let _sub = bus.subscribe(SubscriptionFilter::default());
 
     let err = services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -6034,7 +6034,7 @@ async fn mid_turn_stall_emits_stalled_then_resumed_and_rearms() {
         let workspace_id = workspace_id.clone();
         tokio::spawn(async move {
             services
-                .run_prompt_turn(
+                .run_connection_prompt_turn(
                     &conn,
                     &mut note_rx,
                     &agent_id,
@@ -6229,7 +6229,7 @@ async fn buffered_update_drained_after_stall_still_emits_resumed() {
         let workspace_id = workspace_id.clone();
         tokio::spawn(async move {
             services
-                .run_prompt_turn(
+                .run_connection_prompt_turn(
                     &conn,
                     &mut note_rx,
                     &agent_id,
@@ -6282,7 +6282,7 @@ async fn sub_threshold_turn_emits_no_stall_status() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -6452,7 +6452,7 @@ async fn tool_call_in_flight_suppresses_stall_until_closed() {
         let workspace_id = workspace_id.clone();
         tokio::spawn(async move {
             services
-                .run_prompt_turn(
+                .run_connection_prompt_turn(
                     &conn,
                     &mut note_rx,
                     &agent_id,
@@ -6520,7 +6520,7 @@ async fn unclosed_tool_call_below_ceiling_emits_no_stalled() {
         let workspace_id = workspace_id.clone();
         tokio::spawn(async move {
             services
-                .run_prompt_turn(
+                .run_connection_prompt_turn(
                     &conn,
                     &mut note_rx,
                     &agent_id,
@@ -6588,7 +6588,7 @@ async fn unclosed_tool_call_past_ceiling_emits_stalled() {
         let workspace_id = workspace_id.clone();
         tokio::spawn(async move {
             services
-                .run_prompt_turn(
+                .run_connection_prompt_turn(
                     &conn,
                     &mut note_rx,
                     &agent_id,
@@ -6689,7 +6689,7 @@ async fn open_tool_call_silence_past_terminal_threshold_fails_turn_and_raises_at
     let started = std::time::Instant::now();
     let err = timeout(
         Duration::from_secs(5),
-        services.run_prompt_turn(
+        services.run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -6828,7 +6828,7 @@ async fn open_tool_call_stall_with_cancelled_in_label_stays_terminal() {
 
     let err = timeout(
         Duration::from_secs(5),
-        services.run_prompt_turn(
+        services.run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -7009,7 +7009,7 @@ async fn streaming_tool_call_past_open_tool_terminal_threshold_is_not_terminated
         let workspace_id = workspace_id.clone();
         tokio::spawn(async move {
             services
-                .run_prompt_turn(
+                .run_connection_prompt_turn(
                     &conn,
                     &mut note_rx,
                     &agent_id,
@@ -7111,7 +7111,7 @@ async fn tool_free_provider_stall_past_terminal_threshold_fails_turn_and_raises_
 
     let err = timeout(
         Duration::from_secs(5),
-        services.run_prompt_turn(
+        services.run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -7351,7 +7351,7 @@ async fn dropped_anonymous_tool_update_does_not_suppress_stall() {
         let workspace_id = workspace_id.clone();
         tokio::spawn(async move {
             services
-                .run_prompt_turn(
+                .run_connection_prompt_turn(
                     &conn,
                     &mut note_rx,
                     &agent_id,
@@ -7398,7 +7398,7 @@ async fn prompt_turn_failure_stamps_turn_id_on_agent_failed() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -7445,7 +7445,7 @@ async fn prompt_turn_failure_omits_turn_id_when_absent() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -7501,7 +7501,7 @@ async fn detached_turn_end_usage_bookkeeping_still_lands() {
     });
 
     let stop = services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -7601,7 +7601,7 @@ async fn detached_bookkeeping_chains_per_agent_across_turns() {
         .insert(agent_id.clone(), prev);
 
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -8641,7 +8641,7 @@ async fn normal_zero_output_turn_end_leaves_the_pinned_slot_to_the_teardown_flus
         let workspace_id = workspace_id.clone();
         tokio::spawn(async move {
             services
-                .run_prompt_turn(
+                .run_connection_prompt_turn(
                     &conn,
                     &mut note_rx,
                     &agent_id,
@@ -8938,7 +8938,7 @@ async fn tool_only_turn_emits_throttled_activity_with_last_tool_use() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     let stop = services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,

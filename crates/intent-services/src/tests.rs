@@ -15,6 +15,7 @@ use intent_store::Store;
 
 use crate::{repository_backfill_probe_count, BackfillCandidate, Services};
 
+mod skill_list;
 pub(crate) mod workspace_delete;
 
 /// Runs before `main()` — and therefore before any test threads exist, making
@@ -645,6 +646,7 @@ async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
             cost: None,
         },
         by_model: BTreeMap::new(),
+        by_agent_model: None,
         last_scan_at: Some(now_iso()),
     };
 
@@ -925,6 +927,7 @@ async fn worst_case_workspace_list_row() -> Workspace {
             .collect(),
         totals: totals(9),
         by_model: BTreeMap::from([("claude-opus-4-1".to_string(), totals(1))]),
+        by_agent_model: None,
         last_scan_at: Some(now_iso()),
     });
     row.cow_supported = Some(true);
@@ -1485,6 +1488,7 @@ async fn workspace_list_of_130_realistic_rows_stays_under_1mib() {
                 ("claude-opus-4-1".to_string(), totals(2)),
                 ("gpt-5".to_string(), totals(3)),
             ]),
+            by_agent_model: None,
             last_scan_at: Some(now_iso()),
         });
         if i >= ACTIVE {
@@ -17323,6 +17327,7 @@ mod drafts_events {
 
 pub(crate) mod pr {
     mod accept_member;
+    mod discovery_http;
 
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -23362,6 +23367,111 @@ pub(crate) mod pr {
         assert_eq!(list[0].status, intent_core::PullRequestStatus::Open);
     }
 
+    #[tokio::test]
+    async fn traffic_workspace_error_quota_probe_keeps_background_caller() {
+        use intent_sourcecontrol::traffic::{with_traffic, Caller, Operation, Traffic};
+        let base = spawn_rate_limited_api().await;
+        let sc =
+            Arc::new(intent_sourcecontrol::GitHubSourceControl::new("fake", Some(&base)).unwrap());
+        let (_t, svc, _) = refresh_setup(StubForge::default(), "feature", Some(42), false).await;
+        let svc = svc.with_source_control(sc);
+        let traffic = Traffic::default();
+        with_traffic(traffic.clone(), svc.refresh_all_workspace_prs(0)).await;
+        assert!(svc.sweeps_rate_limited());
+        let snapshot = traffic.snapshot();
+        let probes = snapshot
+            .counts
+            .get(&(Caller::WorkspaceRefresh, Operation::QuotaProbe))
+            .expect("background error probes retain caller");
+        assert_eq!((probes.rest_requests, probes.graphql_requests), (1, 1));
+        assert!(snapshot
+            .counts
+            .keys()
+            .all(|(caller, _)| *caller == Caller::WorkspaceRefresh));
+        with_traffic(traffic.clone(), svc.refresh_all_workspace_prs(0)).await;
+        assert_eq!(
+            traffic.snapshot(),
+            snapshot,
+            "paused sweep reuses the shared probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn traffic_root_error_quota_probe_keeps_background_caller() {
+        use intent_sourcecontrol::traffic::{with_traffic, Caller, Operation, Traffic};
+        let base = spawn_rate_limited_api().await;
+        let sc: Arc<dyn SourceControl> =
+            Arc::new(intent_sourcecontrol::GitHubSourceControl::new("fake", Some(&base)).unwrap());
+        let primary = SweepRepo::init("main", None);
+        let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        let mut root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        root.pr_number = Some(42);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+        let traffic = Traffic::default();
+        with_traffic(
+            traffic.clone(),
+            svc.sweep_workspace_git_roots(&ws, Some(&sc)),
+        )
+        .await;
+        assert!(svc.sweeps_rate_limited());
+        let snapshot = traffic.snapshot();
+        let probes = snapshot
+            .counts
+            .get(&(Caller::GitRootRefresh, Operation::QuotaProbe))
+            .expect("root error probes retain caller");
+        assert_eq!((probes.rest_requests, probes.graphql_requests), (1, 1));
+        assert!(snapshot
+            .counts
+            .keys()
+            .all(|(caller, _)| *caller == Caller::GitRootRefresh));
+        with_traffic(
+            traffic.clone(),
+            svc.sweep_workspace_git_roots(&ws, Some(&sc)),
+        )
+        .await;
+        assert_eq!(
+            traffic.snapshot(),
+            snapshot,
+            "paused root sweep performs no requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn traffic_recovery_quota_probe_keeps_workspace_caller_and_pause() {
+        use intent_sourcecontrol::traffic::{with_traffic, Caller, Operation, Traffic};
+        let base = spawn_rate_limited_api().await;
+        let sc =
+            Arc::new(intent_sourcecontrol::GitHubSourceControl::new("fake", Some(&base)).unwrap());
+        let (_t, svc, _) = refresh_setup(StubForge::default(), "feature", Some(42), false).await;
+        let svc = svc.with_source_control(sc);
+        svc.sweep_rate_limit
+            .pause_for(std::time::Duration::from_secs(300), true);
+        let traffic = Traffic::default();
+        with_traffic(traffic.clone(), svc.refresh_all_workspace_prs(0)).await;
+        assert!(
+            svc.sweeps_rate_limited(),
+            "unknown quota must not lift the pause"
+        );
+        let snapshot = traffic.snapshot();
+        let probes = snapshot
+            .counts
+            .get(&(Caller::WorkspaceRefresh, Operation::QuotaProbe))
+            .expect("recovery probe retains workspace caller");
+        assert_eq!((probes.rest_requests, probes.graphql_requests), (1, 1));
+        assert_eq!(
+            snapshot.counts.len(),
+            1,
+            "paused recovery must not refresh PRs"
+        );
+        with_traffic(traffic.clone(), svc.refresh_all_workspace_prs(0)).await;
+        assert_eq!(
+            traffic.snapshot(),
+            snapshot,
+            "recovery probes stay coalesced"
+        );
+    }
+
     // ---- forge rate-limit backoff (monorepo#2961) -------------------------
 
     /// A rate-limited forge call during the git-root sweep pauses ALL
@@ -23526,7 +23636,9 @@ pub(crate) mod pr {
             ),
         ]);
         let mut fetched_fresh = Vec::new();
+        let (_db, svc) = github_svc().await;
         let (changed, rate_limited) = crate::pr_ops::refresh_stale_pool_entries(
+            &svc,
             &sc,
             &repo,
             &mut list,
@@ -25100,6 +25212,214 @@ mod file_tracking {
             .unwrap();
         let root_id = WorkspaceGitRootId(row["id"].as_str().unwrap().to_string());
         (tmp, svc, ws_id, secondary, root_id)
+    }
+
+    /// Two branches independently made the same change from a common seed.
+    /// Merging them needs a second parent but no change to HEAD's tree.
+    fn ancestry_only_merge(dir: &std::path::Path) -> (git2::Oid, git2::Oid, git2::Oid) {
+        let git = Repository::open(dir).unwrap();
+        let seed = git.head().unwrap().peel_to_commit().unwrap();
+        commit_file(dir, "shared.txt", "same change\n", "ours");
+        let ours = git.head().unwrap().peel_to_commit().unwrap();
+        let tree = ours.tree().unwrap();
+        let sig = Signature::now("Test", "test@example.com").unwrap();
+        let incoming = git
+            .commit(
+                Some("refs/heads/incoming"),
+                &sig,
+                &sig,
+                "theirs",
+                &tree,
+                &[&seed],
+            )
+            .unwrap();
+        assert_eq!(git.merge_base(ours.id(), incoming).unwrap(), seed.id());
+        assert_ne!(ours.id(), incoming);
+        git.merge(&[&git.find_annotated_commit(incoming).unwrap()], None, None)
+            .unwrap();
+        assert_eq!(git.state(), git2::RepositoryState::Merge);
+        assert_eq!(git.index().unwrap().write_tree().unwrap(), tree.id());
+        assert!(intent_git::commit::staged_paths(dir).unwrap().is_empty());
+        (ours.id(), incoming, tree.id())
+    }
+
+    async fn assert_ancestry_only_agent_commit(secondary_target: bool) {
+        let primary = init_git_repo();
+        let (_t, svc, ws, secondary, root_id) = svc_with_registered_root(&primary).await;
+        let (target, other, root_id) = if secondary_target {
+            (&secondary.dir, &primary.dir, Some(root_id))
+        } else {
+            (&primary.dir, &secondary.dir, None)
+        };
+        let other_head = Repository::open(other).unwrap().head().unwrap().target();
+        let (ours, incoming, tree) = ancestry_only_merge(target);
+        let git = Repository::open(target).unwrap();
+        let merge_head = std::fs::read(git.path().join("MERGE_HEAD")).unwrap();
+        let index = std::fs::read(git.path().join("index")).unwrap();
+        std::fs::write(target.join("unstaged.txt"), "leave this alone\n").unwrap();
+
+        // Neither a pending merge nor an empty delta grants permission to
+        // auto-commit or to commit a partial file set.
+        svc.set_workspace_auto_commit(ws.clone(), false)
+            .await
+            .unwrap();
+        for (files, user_requested, expected) in [
+            (None, false, "Auto-commit is disabled"),
+            (
+                Some(vec!["shared.txt".to_string()]),
+                true,
+                "cannot do a partial commit during a merge",
+            ),
+        ] {
+            let err = svc
+                .git_agent_commit(
+                    ws.clone(),
+                    "refused merge".into(),
+                    Some(AgentId::from("agent-merge")),
+                    None,
+                    files,
+                    user_requested,
+                    root_id.clone(),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::Internal(_)), "{err}");
+            assert!(err.to_string().contains(expected), "{err}");
+            assert_eq!(git.head().unwrap().target(), Some(ours));
+            assert_eq!(std::fs::read(git.path().join("index")).unwrap(), index);
+            assert_eq!(
+                std::fs::read(git.path().join("MERGE_HEAD")).unwrap(),
+                merge_head
+            );
+        }
+
+        // Even with auto-commit enabled, an unattributed empty set cannot
+        // complete the merge. Only the explicit staged-only request can.
+        svc.set_workspace_auto_commit(ws.clone(), true)
+            .await
+            .unwrap();
+        let err = svc
+            .git_agent_commit(
+                ws.clone(),
+                "unattributed merge".into(),
+                Some(AgentId::from("agent-merge")),
+                None,
+                None,
+                false,
+                root_id.clone(),
+            )
+            .await
+            .unwrap_err();
+        let expected = if secondary_target {
+            "requires an explicit `files` list"
+        } else {
+            "No uncommitted changes found for this agent"
+        };
+        assert!(err.to_string().contains(expected), "{err}");
+        assert_eq!(git.head().unwrap().target(), Some(ours));
+        assert_eq!(std::fs::read(git.path().join("index")).unwrap(), index);
+        assert_eq!(
+            std::fs::read(git.path().join("MERGE_HEAD")).unwrap(),
+            merge_head
+        );
+        assert!(svc
+            .store()
+            .events_by_type(&ws, "git:commit", 10)
+            .await
+            .unwrap()
+            .is_empty());
+
+        svc.set_workspace_auto_commit(ws.clone(), false)
+            .await
+            .unwrap();
+        let result = svc
+            .git_agent_commit(
+                ws.clone(),
+                "fix: record shared ancestry".into(),
+                Some(AgentId::from("agent-merge")),
+                Some(NoteId::from("note-merge")),
+                secondary_target.then(Vec::new),
+                true,
+                root_id.clone(),
+            )
+            .await
+            .expect("an authorized staged-only ancestry merge must succeed");
+        assert!(result.files.is_empty());
+        assert_eq!(result.file_count, 0);
+        let commit = git
+            .find_commit(git2::Oid::from_str(&result.hash).unwrap())
+            .unwrap();
+        assert_eq!(git.head().unwrap().target(), Some(commit.id()));
+        assert_eq!(
+            commit.parent_ids().collect::<Vec<_>>(),
+            vec![ours, incoming]
+        );
+        assert_eq!(commit.tree_id(), tree);
+        assert_eq!(commit.author().name().unwrap(), "Test");
+        assert_eq!(commit.author().email().unwrap(), "test@example.com");
+        assert_eq!(commit.committer().name().unwrap(), "Test");
+        assert_eq!(commit.committer().email().unwrap(), "test@example.com");
+        let message = commit.message().unwrap();
+        assert!(message.contains("Agent-Id: agent-merge"), "{message}");
+        assert!(message.contains("Linked-Note-Id: note-merge"), "{message}");
+        assert_eq!(git.state(), git2::RepositoryState::Clean);
+        assert!(!git.path().join("MERGE_HEAD").exists());
+        assert_eq!(
+            std::fs::read_to_string(target.join("unstaged.txt")).unwrap(),
+            "leave this alone\n"
+        );
+        assert!(commit.tree().unwrap().get_name("unstaged.txt").is_none());
+        assert_eq!(
+            Repository::open(other).unwrap().head().unwrap().target(),
+            other_head
+        );
+
+        let events = svc
+            .store()
+            .events_by_type(&ws, "git:commit", 10)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data["commit"], result.hash);
+        assert_eq!(events[0].data["files"], serde_json::json!([]));
+        assert_eq!(
+            events[0].data.get("gitRootId"),
+            root_id
+                .as_ref()
+                .map(|id| serde_json::json!(id.as_str()))
+                .as_ref()
+        );
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn agent_commit_ancestry_only_primary() {
+        assert_ancestry_only_agent_commit(false).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn agent_commit_ancestry_only_registered_root() {
+        assert_ancestry_only_agent_commit(true).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn agent_commit_empty_without_merge_is_rejected() {
+        let primary = init_git_repo();
+        let (_t, svc, ws, secondary, root_id) = svc_with_registered_root(&primary).await;
+        for (dir, root_id) in [(&primary.dir, None), (&secondary.dir, Some(root_id))] {
+            let git = Repository::open(dir).unwrap();
+            let before = git.head().unwrap().target();
+            let err = svc
+                .git_agent_commit(ws.clone(), "empty".into(), None, None, None, true, root_id)
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("No staged changes found to commit"),
+                "{err}"
+            );
+            assert_eq!(git.head().unwrap().target(), before);
+            assert_eq!(git.state(), git2::RepositoryState::Clean);
+        }
     }
 
     /// `git.agentCommit` with a `gitRootId` and explicit `files` commits in
@@ -42090,7 +42410,7 @@ mod last_activity_events {
             .get(&h.ws)
             .copied()
             .expect("watermark set after first scan");
-        assert_eq!(watermark1, 1, "watermark should be 1 after one message");
+        assert_eq!(watermark1.0, 1, "watermark should be 1 after one message");
 
         let changed2 = h
             .services
@@ -42131,7 +42451,7 @@ mod last_activity_events {
             .get(&h.ws)
             .copied()
             .expect("watermark 1");
-        assert_eq!(watermark1, 1, "one message");
+        assert_eq!(watermark1.0, 1, "one message");
 
         let usage2 = serde_json::json!({ "usage": { "inputTokens": 20, "outputTokens": 10 } });
         h.store
@@ -42154,7 +42474,7 @@ mod last_activity_events {
             .get(&h.ws)
             .copied()
             .expect("watermark 2");
-        assert_eq!(watermark2, 2, "two messages");
+        assert_eq!(watermark2.0, 2, "two messages");
 
         let ws = h.store.get_workspace(&h.ws).await.unwrap();
         let usage = ws.token_usage.expect("usage persisted");
@@ -42730,7 +43050,7 @@ mod turn_end_unread_gate {
             "a muted agent must not raise the turn-end blue dot"
         );
         h.store
-            .set_agent_notifications_muted(&h.ws, &agent_id, false, &now_iso())
+            .set_agent_notifications_muted(&h.ws, &agent_id, false)
             .await
             .expect("unmute session");
         assert!(
@@ -42975,12 +43295,12 @@ mod turn_token_usage {
     use crate::{EventBus, Subscription, SubscriptionFilter};
     use intent_acp::session::Usage;
     use intent_core::events::WORKSPACE_TOKEN_USAGE_CHANGED;
-    use serde_json::Value;
+    use serde_json::{json, Value};
     use std::time::Duration;
     use tokio::time::timeout;
 
     struct Harness {
-        _tmp: TempDb,
+        tmp: TempDb,
         store: Store,
         services: Services,
         bus: EventBus,
@@ -42998,7 +43318,7 @@ mod turn_token_usage {
         let bus = EventBus::new(store.clone());
         let services = Services::new(store.clone()).with_event_bus(bus.clone());
         Harness {
-            _tmp: tmp,
+            tmp,
             store,
             services,
             bus,
@@ -43086,6 +43406,205 @@ mod turn_token_usage {
         }
     }
 
+    #[tokio::test]
+    async fn token_scan_observes_same_length_role_and_model_replacements() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent, &h.ws, "model-a"))
+            .await
+            .unwrap();
+        h.services
+            .agent_append_message_op(agent.clone(), "user".into(), json!([]), None)
+            .await
+            .unwrap();
+        assert!(h.services.scan_workspace_token_usage(&h.ws).await.unwrap());
+        let original_watermark = h.services.token_usage_watermarks.lock().unwrap()[&h.ws];
+        let initial = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .unwrap()
+            .token_usage
+            .unwrap();
+        let initial_cells = initial.by_agent_model.unwrap();
+        assert_eq!(
+            (
+                initial_cells[0].human_messages,
+                initial_cells[0].agent_messages
+            ),
+            (1, 0)
+        );
+
+        // The role changes first; then only the model changes. Both mutations
+        // retain COUNT(*) = 1, and neither waits for another ACP turn.
+        for model in ["model-a", "model-b"] {
+            h.store
+                .set_agent_session_model(&h.ws, &agent, model, None, &now_iso())
+                .await
+                .unwrap();
+            h.services
+                .agent_replace_messages_op(
+                    agent.clone(),
+                    json!([{
+                        "role":"assistant", "contentBlocks":[{"type":"text","text":model}]
+                    }]),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                h.store
+                    .get_workspace_message_watermark(&h.ws)
+                    .await
+                    .unwrap(),
+                1
+            );
+            let mut sub = subscribe_usage(&h);
+            assert!(h.services.scan_workspace_token_usage(&h.ws).await.unwrap());
+            let event = recv_usage_event(&mut sub).await;
+            assert_eq!(
+                event["data"]["tokenUsage"]["byAgentModel"][0]["model"],
+                model
+            );
+            let usage = h
+                .store
+                .get_workspace(&h.ws)
+                .await
+                .unwrap()
+                .token_usage
+                .unwrap();
+            let cells = usage.by_agent_model.unwrap();
+            assert_eq!(cells.len(), 1);
+            assert_eq!(cells[0].model, model);
+            assert_eq!((cells[0].human_messages, cells[0].agent_messages), (0, 1));
+            assert_eq!(usage.totals, intent_core::TokenUsageTotals::default());
+            let watermark = h.services.token_usage_watermarks.lock().unwrap()[&h.ws];
+            assert_eq!(watermark.0, original_watermark.0);
+            assert_ne!(watermark.1, original_watermark.1);
+            assert!(
+                !h.services.scan_workspace_token_usage(&h.ws).await.unwrap(),
+                "unchanged scan still skips"
+            );
+        }
+
+        // A committed mutation just before shutdown must be caught by the
+        // first rehydrated scan even though process-local epochs start empty.
+        h.services
+            .agent_replace_messages_op(
+                agent.clone(),
+                json!([{
+                    "role":"user", "contentBlocks":[]
+                }]),
+            )
+            .await
+            .unwrap();
+        h.store.close().await;
+        let reopened = Store::open(&h.tmp.path).await.unwrap();
+        let services = Services::new(reopened.clone());
+        assert!(services.scan_workspace_token_usage(&h.ws).await.unwrap());
+        let usage = reopened
+            .get_workspace(&h.ws)
+            .await
+            .unwrap()
+            .token_usage
+            .unwrap();
+        let cells = usage.by_agent_model.unwrap();
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].model, "model-b");
+        assert_eq!((cells[0].human_messages, cells[0].agent_messages), (1, 0));
+        assert!(!services.scan_workspace_token_usage(&h.ws).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn token_scan_observes_edit_truncate_then_append_at_unchanged_count() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent, &h.ws, "model-a"))
+            .await
+            .unwrap();
+        for role in ["user", "assistant", "user", "assistant"] {
+            h.services
+                .agent_append_message_op(agent.clone(), role.into(), json!([]), None)
+                .await
+                .unwrap();
+        }
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(100, 20, 0, 0)), None)
+            .await;
+        h.services.scan_workspace_token_usage(&h.ws).await.unwrap();
+        let before = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .unwrap()
+            .token_usage
+            .unwrap();
+        let old_watermark = h.services.token_usage_watermarks.lock().unwrap()[&h.ws];
+        let messages = h.store.get_agent_messages(&agent, None).await.unwrap();
+        assert_eq!(
+            h.services
+                .agent_edit_truncate_op(&agent, &messages[2].id)
+                .await
+                .unwrap(),
+            2
+        );
+        h.store
+            .set_agent_session_model(&h.ws, &agent, "model-b", None, &now_iso())
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            h.services
+                .agent_append_message_op(agent.clone(), "assistant".into(), json!([]), None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            h.store
+                .get_workspace_message_watermark(&h.ws)
+                .await
+                .unwrap(),
+            old_watermark.0
+        );
+        let mut sub = subscribe_usage(&h);
+        assert!(h.services.scan_workspace_token_usage(&h.ws).await.unwrap());
+        recv_usage_event(&mut sub).await;
+        let usage = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .unwrap()
+            .token_usage
+            .unwrap();
+        assert_eq!(
+            usage.totals, before.totals,
+            "edit never reduces historical spend"
+        );
+        let cells = usage.by_agent_model.unwrap();
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells[0].model, "model-a");
+        assert_eq!((cells[0].human_messages, cells[0].agent_messages), (1, 1));
+        assert_eq!(cells[1].model, "model-b");
+        assert_eq!((cells[1].human_messages, cells[1].agent_messages), (0, 2));
+        assert_eq!(cells[1].totals, intent_core::TokenUsageTotals::default());
+        assert!(!h.services.scan_workspace_token_usage(&h.ws).await.unwrap());
+        h.store.close().await;
+        let reopened = Store::open(&h.tmp.path).await.unwrap();
+        let services = Services::new(reopened.clone());
+        assert!(!services.scan_workspace_token_usage(&h.ws).await.unwrap());
+        assert_eq!(
+            reopened
+                .get_workspace(&h.ws)
+                .await
+                .unwrap()
+                .token_usage
+                .unwrap()
+                .by_agent_model
+                .unwrap(),
+            cells
+        );
+    }
+
     /// Two turns on the same session: the workspace tally equals the LATEST
     /// cumulative snapshot, never the sum, and each change emits one
     /// `workspace:tokenUsage-changed` carrying the new tally.
@@ -43129,7 +43648,110 @@ mod turn_token_usage {
         assert_eq!(usage.totals.cache_creation_tokens, 6);
         assert_eq!(usage.by_agent_id[&agent.0].input_tokens, 100);
         assert_eq!(usage.by_model["opus-4.8"].input_tokens, 100);
+        let cells = usage
+            .by_agent_model
+            .expect("new snapshots carry cross-filter cells");
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].agent_id, agent.0);
+        assert_eq!(cells[0].model, "opus-4.8");
+        assert_eq!(cells[0].totals.input_tokens, 100);
+        assert_eq!((cells[0].human_messages, cells[0].agent_messages), (0, 0));
         assert!(usage.last_scan_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn model_switch_assigns_only_the_new_snapshot_delta_to_the_new_cell() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent, &h.ws, "model-a"))
+            .await
+            .expect("insert session");
+
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(100, 0, 0, 0)), None)
+            .await;
+        h.store
+            .set_agent_session_model(&h.ws, &agent, "model-b", None, &now_iso())
+            .await
+            .expect("switch model");
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(150, 0, 0, 0)), None)
+            .await;
+
+        let usage = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("workspace")
+            .token_usage
+            .expect("usage");
+        assert_eq!(usage.totals.input_tokens, 150);
+        assert_eq!(usage.by_agent_id[&agent.0].input_tokens, 150);
+        assert_eq!(usage.by_model["model-a"].input_tokens, 100);
+        assert_eq!(usage.by_model["model-b"].input_tokens, 50);
+        let cells = usage.by_agent_model.expect("cross-filter cells");
+        assert_eq!(cells[0].model, "model-a");
+        assert_eq!(cells[0].totals.input_tokens, 100);
+        assert_eq!(cells[1].model, "model-b");
+        assert_eq!(cells[1].totals.input_tokens, 50);
+    }
+
+    #[tokio::test]
+    async fn legacy_snapshot_fallback_merges_with_new_materialized_message_counts() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent, &h.ws, "model-a"))
+            .await
+            .expect("insert session");
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(70, 0, 0, 0)), None)
+            .await;
+        sqlx::query("DELETE FROM agent_usage_cell WHERE agent_id=?")
+            .bind(&agent.0)
+            .execute(h.store.write_pool())
+            .await
+            .expect("simulate archive without cells");
+        h.store
+            .append_agent_message(&agent, "user", &serde_json::json!([]), &now_iso())
+            .await
+            .expect("append message");
+
+        h.services
+            .recompute_workspace_token_usage(&h.ws, false)
+            .await
+            .expect("recompute");
+        let usage = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("workspace")
+            .token_usage
+            .expect("usage");
+        assert_eq!(usage.totals.input_tokens, 70);
+        let cells = usage.by_agent_model.expect("cross-filter cells");
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].totals.input_tokens, 70);
+        assert_eq!(cells[0].human_messages, 1);
+
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(100, 0, 0, 0)), None)
+            .await;
+        let usage = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("workspace after continued report")
+            .token_usage
+            .expect("usage after continued report");
+        assert_eq!(usage.totals.input_tokens, 100);
+        assert_eq!(usage.by_agent_id[&agent.0].input_tokens, 100);
+        assert_eq!(usage.by_model["model-a"].input_tokens, 100);
+        let cells = usage.by_agent_model.expect("cross-filter cells");
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].totals.input_tokens, 100);
+        assert_eq!(cells[0].human_messages, 1);
     }
 
     /// An identical snapshot re-report leaves the tally unchanged and emits no

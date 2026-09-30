@@ -33,6 +33,7 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     let mut cmd = common::serve_command();
     cmd.env("INTENTD_DATA_DIR", data_dir)
+        .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -74,6 +75,43 @@ async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
         .expect("uds rpc timed out")
         .expect("read uds response");
     serde_json::from_str(buf.trim_end()).expect("invalid JSON frame")
+}
+
+/// Exercise the real fixture with an inherited secrets path without mutating
+/// this test process's environment (other tests may run concurrently).
+#[test]
+fn fixture_startup_preserves_inherited_secrets_file() {
+    let outer_dir = temp_data_dir();
+    let secrets_file = outer_dir.path().join("outer-secrets.json");
+    let canary = b"{\n  \"fixture.canary\": \"unchanged\"\n}\n";
+    std::fs::write(&secrets_file, canary).expect("seed outer secrets canary");
+
+    let out = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            "env_pins_beat_file_and_reject_wire_mutation",
+            "--nocapture",
+        ])
+        .env("INTENTD_SECRETS_FILE", &secrets_file)
+        .env_remove("INTENTD_AUTH_TOKEN")
+        .env_remove("INTENTD_INSECURE")
+        .output()
+        .expect("run config fixture in an isolated test process");
+    assert!(
+        out.status.success(),
+        "config fixture failed: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("1 passed"),
+        "the subprocess must run the config fixture test"
+    );
+    // Do not include secrets-file contents in assertion diagnostics.
+    assert!(
+        std::fs::read(&secrets_file).expect("read outer secrets canary") == canary,
+        "fixture startup changed the inherited secrets file"
+    );
 }
 
 /// Env pins beat config.toml; unpinned keys follow the file; a pinned key
@@ -361,6 +399,7 @@ fn invalid_config_refuses_startup_with_key_in_error() {
         std::fs::write(data_dir.path().join("config.toml"), body).expect("seed config.toml");
         let out = common::serve_command()
             .env("INTENTD_DATA_DIR", data_dir.path())
+            .env("INTENTD_SECRETS_FILE", data_dir.path().join("secrets.json"))
             .output()
             .expect("run intentd serve");
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -388,6 +427,7 @@ fn out_of_range_env_pin_refuses_startup() {
     // The explicit pin overrides the builder's ephemeral seam.
     let out = common::serve_command()
         .env("INTENTD_DATA_DIR", data_dir.path())
+        .env("INTENTD_SECRETS_FILE", data_dir.path().join("secrets.json"))
         .env("INTENTD_TCP_PORT", "80")
         .output()
         .expect("run intentd serve");

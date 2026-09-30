@@ -8,8 +8,8 @@
 //! Coverage:
 //! - `--resume-all` auto-resumes all pending interrupted agents at startup
 //! - Resumed agents complete their work (observable via WSS events)
-//! - The sweep completes BEFORE the listeners start: `agent.listInterrupted`
-//!   is already empty on the first RPC after connect (no client-visible blip)
+//! - Listeners serve while recovery runs: reserved automatic candidates stay
+//!   hidden from `agent.listInterrupted` (no client-visible dialog blip)
 //! - No `agent.resolveInterrupted` RPC required
 //! - `agents.resumeInterruptedOnStart=on` (written over WSS via
 //!   `settings.update`) runs the same sweep WITHOUT `--resume-all`, even when
@@ -209,6 +209,9 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)], resume_all: 
         .stderr(Stdio::from(log));
     if resume_all {
         cmd.arg("--resume-all");
+    }
+    if listen == "insecure" {
+        cmd.arg("--insecure");
     }
     for (k, v) in env {
         cmd.env(k, v);
@@ -443,9 +446,8 @@ async fn serve_resume_all_auto_resumes_interrupted_agents() {
         .expect("fingerprint")
         .to_string();
 
-    // Phase 3: The startup sweep completes BEFORE the listeners start, so the
-    // very first RPC on a fresh connection must already see zero pending rows
-    // — this is the client-visible contract (no interrupted-agents modal blip).
+    // Automatic candidates are reserved before listeners start, so the first
+    // RPC sees no manual-recovery candidates even if the sweep is unfinished.
     eprintln!("Phase 3: Assert listInterrupted is empty on first connect");
     let cfg = client_config(&fingerprint);
     let mut ws = connect_ws(actual_port, cfg).await;
@@ -457,6 +459,8 @@ async fn serve_resume_all_auto_resumes_interrupted_agents() {
          resuming start, got {agents:?}"
     );
     eprintln!("✓ Interrupted agents list is empty on first connect");
+
+    wait_for_sweep(&data_dir).await;
 
     // Phase 4: Poll agent status to confirm turn completion (agent reached idle)
     eprintln!("Phase 4: Poll agent status to confirm turn completion");
@@ -654,9 +658,8 @@ async fn setting_on_resumes_without_resume_all_flag() {
         .expect("fingerprint")
         .to_string();
 
-    // Phase 3: The startup sweep completes BEFORE the listeners start, so the
-    // very first RPC on a fresh connection must already see zero pending rows
-    // — this is the client-visible contract (no interrupted-agents modal blip).
+    // Automatic candidates are reserved before listeners start, so the first
+    // RPC sees no manual-recovery candidates even if the sweep is unfinished.
     eprintln!("Phase 3: Assert listInterrupted is empty on first connect");
     let cfg = client_config(&fingerprint);
     let mut ws = connect_ws(actual_port, cfg).await;
@@ -669,21 +672,7 @@ async fn setting_on_resumes_without_resume_all_flag() {
     );
     eprintln!("✓ Interrupted agents list is empty on first connect");
 
-    // The startup ordering is also visible in daemon2's log: the sweep summary
-    // line must precede the UDS "starting intentd" socket line (the log file
-    // is truncated per spawn, so it only contains daemon2's output).
-    let log = std::fs::read_to_string(data_dir.join("daemon.log")).expect("read daemon2 log");
-    let sweep_idx = log
-        .find("resume-on-start: auto-resume sweep complete")
-        .expect("sweep-complete line missing from daemon2 log");
-    let socket_idx = log
-        .find("starting intentd")
-        .expect("'starting intentd' line missing from daemon2 log");
-    assert!(
-        sweep_idx < socket_idx,
-        "sweep-complete log line must precede the 'starting intentd' socket line"
-    );
-    eprintln!("✓ Sweep-complete log line precedes the socket line");
+    wait_for_sweep(&data_dir).await;
 
     // Phase 4: Poll agent status to confirm turn completion (agent reached idle)
     eprintln!("Phase 4: Poll agent status to confirm turn completion");
@@ -718,4 +707,590 @@ async fn setting_on_resumes_without_resume_all_flag() {
     );
 
     eprintln!("SUCCESS: setting=on auto-resumed agent without --resume-all");
+}
+
+struct RecoveryFixture {
+    root: tempfile::TempDir,
+    store: intent_store::Store,
+    agents: Vec<intent_core::AgentId>,
+    script: String,
+}
+
+impl RecoveryFixture {
+    async fn new() -> Self {
+        let script = gate("startup recovery").unwrap();
+        let root = temp_data_dir();
+        let data_dir = root.path();
+        let socket = data_dir.join("intentd.sock");
+        let env = [
+            ("INTENTD_AUTH_TOKEN", TOKEN),
+            ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+        ];
+        let daemon = Daemon {
+            child: spawn_serve(data_dir, "both", &env, false),
+            data_dir: data_dir.to_owned(),
+        };
+        assert!(await_uds(&socket).await);
+        let store = intent_store::Store::open(&data_dir.join("intentd.db"))
+            .await
+            .unwrap();
+        let workspace = intent_core::WorkspaceId::new();
+        store
+            .insert_workspace(&workspace_seed(&workspace))
+            .await
+            .unwrap();
+        let mut agents = Vec::new();
+        for name in ["First", "Second"] {
+            let created = uds_rpc(&socket, 1, "agent.create", json!({"workspaceId": workspace, "name": name, "provider": "mock", "model": "default"})).await;
+            agents.push(intent_core::AgentId::from(
+                created["result"]["agent"]["id"].as_str().unwrap(),
+            ));
+        }
+        let setting = uds_rpc(
+            &socket,
+            2,
+            "settings.update",
+            json!({"changes": [{"path": "agents.resumeInterruptedOnStart", "value": "off"}]}),
+        )
+        .await;
+        assert!(setting["error"].is_null(), "{setting}");
+        drop(daemon);
+        for agent in &agents {
+            store
+                .insert_interrupted_agent(agent, &workspace, "active", &intent_core::now_iso())
+                .await
+                .unwrap();
+        }
+        Self {
+            root,
+            store,
+            agents,
+            script,
+        }
+    }
+
+    fn start(&self, resume: bool) -> (Daemon, tokio::net::UnixListener) {
+        self.start_mode(resume, "both")
+    }
+
+    fn start_mode(&self, resume: bool, mode: &str) -> (Daemon, tokio::net::UnixListener) {
+        let data_dir = self.root.path();
+        let gate_path = data_dir.join("recovery-gate.sock");
+        let gate = tokio::net::UnixListener::bind(&gate_path).unwrap();
+        let env = [
+            ("INTENTD_AUTH_TOKEN", TOKEN),
+            ("MOCK_AGENT_SCRIPT_PATH", self.script.as_str()),
+            (
+                "INTENTD_TEST_STARTUP_RESUME_GATE",
+                gate_path.to_str().unwrap(),
+            ),
+        ];
+        (
+            Daemon {
+                child: spawn_serve(data_dir, mode, &env, resume),
+                data_dir: data_dir.to_owned(),
+            },
+            gate,
+        )
+    }
+
+    async fn wss(&self) -> WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>> {
+        let socket = self.root.path().join("intentd.sock");
+        assert!(await_uds(&socket).await);
+        let status = common::await_wss_status(&socket).await;
+        let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+        connect_ws(
+            port,
+            client_config(status["result"]["fingerprint"].as_str().unwrap()),
+        )
+        .await
+    }
+}
+
+async fn wait_for_sweep(data_dir: &Path) {
+    timeout(common::rpc_read_timeout(), async {
+        loop {
+            let log = std::fs::read_to_string(data_dir.join("daemon.log")).unwrap();
+            if log.contains("resume-on-start: auto-resume sweep complete") {
+                return;
+            }
+            // timing-guard: poll an observable sweep-completion barrier
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("sweep completes after release");
+}
+
+/// The gate holds the actual startup sweep, rather than a provider turn (which
+/// already runs in the background). Neither transport may depend on its release.
+#[tokio::test]
+async fn startup_recovery_serves_rpcs_while_sweep_is_held() {
+    let fixture = RecoveryFixture::new().await;
+    let (_daemon, gate) = fixture.start(true);
+    let (mut release, _) = timeout(common::daemon_startup_timeout(), gate.accept())
+        .await
+        .expect("sweep reached gate")
+        .unwrap();
+    timeout(Duration::from_secs(5), async {
+        let mut ws = fixture.wss().await;
+        let pending = wss_rpc(&mut ws, 1, "agent.listInterrupted", json!({})).await;
+        assert_eq!(
+            pending["agents"],
+            json!([]),
+            "automatic candidates must not flash in the manual recovery dialog"
+        );
+        let workspaces = wss_rpc(&mut ws, 2, "workspace.list", json!({})).await;
+        assert!(workspaces.is_object());
+    })
+    .await
+    .expect("UDS and authenticated WSS RPCs must finish before releasing recovery");
+    assert_eq!(
+        fixture.store.list_interrupted_agents().await.unwrap().len(),
+        2,
+        "the sweep is still held"
+    );
+    release.write_u8(1).await.unwrap();
+    wait_for_sweep(fixture.root.path()).await;
+    assert!(fixture
+        .store
+        .list_interrupted_agents()
+        .await
+        .unwrap()
+        .is_empty());
+    fixture.store.close().await;
+}
+
+#[tokio::test]
+async fn startup_recovery_disabled_keeps_candidates_visible() {
+    let fixture = RecoveryFixture::new().await;
+    let (_daemon, _gate) = fixture.start(false);
+    let mut ws = fixture.wss().await;
+    let pending = wss_rpc(&mut ws, 1, "agent.listInterrupted", json!({})).await;
+    assert_eq!(pending["agents"].as_array().unwrap().len(), 2);
+    let log = std::fs::read_to_string(fixture.root.path().join("daemon.log")).unwrap();
+    assert!(!log.contains("resume-on-start: resuming interrupted agents"));
+    fixture.store.close().await;
+}
+
+#[tokio::test]
+async fn startup_recovery_manual_resolution_wins_before_automatic_claim() {
+    let fixture = RecoveryFixture::new().await;
+    let (_daemon, gate) = fixture.start(true);
+    let (mut release, _) = timeout(common::daemon_startup_timeout(), gate.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut ws = fixture.wss().await;
+    let result = wss_rpc(
+        &mut ws,
+        1,
+        "agent.resolveInterrupted",
+        json!({"resume": [fixture.agents[0]], "abandon": [fixture.agents[1]]}),
+    )
+    .await;
+    assert_eq!(result["resumed"], json!([fixture.agents[0]]));
+    assert_eq!(result["abandoned"], json!([fixture.agents[1]]));
+    release.write_u8(1).await.unwrap();
+    wait_for_sweep(fixture.root.path()).await;
+    for (i, id) in fixture.agents.iter().enumerate() {
+        let session = fixture.store.get_agent_session(id).await.unwrap();
+        assert_eq!(
+            session.messages.iter().filter(|m| m.role == "user").count(),
+            usize::from(i == 0),
+            "automatic recovery cannot duplicate or undo manual resolution"
+        );
+    }
+    fixture.store.close().await;
+}
+
+#[tokio::test]
+async fn startup_recovery_shutdown_releases_unclaimed_candidates() {
+    let fixture = RecoveryFixture::new().await;
+    let (mut daemon, gate) = fixture.start(true);
+    let (_release, _) = timeout(common::daemon_startup_timeout(), gate.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut ws = fixture.wss().await;
+    assert_eq!(
+        wss_rpc(&mut ws, 1, "agent.listInterrupted", json!({})).await["agents"],
+        json!([])
+    );
+    let stopped = uds_rpc(
+        &fixture.root.path().join("intentd.sock"),
+        2,
+        "system.shutdown",
+        json!({}),
+    )
+    .await;
+    assert!(stopped["error"].is_null(), "{stopped}");
+    timeout(common::daemon_startup_timeout(), async {
+        loop {
+            if let Some(status) = daemon.child.try_wait().unwrap() {
+                assert!(status.success(), "shutdown failed: {status}");
+                break;
+            }
+            // timing-guard: wait for graceful daemon exit while recovery stays held
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("shutdown does not wait for an unclaimed resume");
+    assert_eq!(
+        fixture.store.list_interrupted_agents().await.unwrap().len(),
+        2
+    );
+    for agent in &fixture.agents {
+        assert!(fixture
+            .store
+            .get_agent_session(agent)
+            .await
+            .unwrap()
+            .messages
+            .is_empty());
+    }
+    drop(daemon);
+    drop(gate);
+    std::fs::remove_file(fixture.root.path().join("recovery-gate.sock")).unwrap();
+    let (_restarted, _gate) = fixture.start(false);
+    let mut reconnected = fixture.wss().await;
+    let pending = wss_rpc(&mut reconnected, 3, "agent.listInterrupted", json!({})).await;
+    assert_eq!(
+        pending["agents"].as_array().unwrap().len(),
+        2,
+        "unclaimed work survives a restart"
+    );
+    fixture.store.close().await;
+}
+
+#[tokio::test]
+async fn startup_recovery_insecure_ws_serves_while_sweep_is_held() {
+    let fixture = RecoveryFixture::new().await;
+    let (_daemon, gate) = fixture.start_mode(true, "insecure");
+    let (mut release, _) = timeout(common::daemon_startup_timeout(), gate.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    timeout(Duration::from_secs(5), async {
+        let socket = fixture.root.path().join("intentd.sock");
+        assert!(await_uds(&socket).await);
+        let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+        let port = status["result"]["port"].as_u64().unwrap();
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+            .await
+            .unwrap();
+        ws.send(Message::Text(
+            json!({"jsonrpc":"2.0", "id": 2, "method":"agent.listInterrupted", "params":{}})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let frame = ws.next().await.unwrap().unwrap();
+        let value: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(value["jsonrpc"], "2.0");
+        assert_eq!(value["id"], 2);
+        assert_eq!(value["result"]["agents"], json!([]));
+    })
+    .await
+    .expect("insecure WS and UDS ready before recovery release");
+    release.write_u8(1).await.unwrap();
+    wait_for_sweep(fixture.root.path()).await;
+    fixture.store.close().await;
+}
+
+#[tokio::test]
+async fn startup_recovery_failure_can_be_retried_on_the_same_connection() {
+    let fixture = RecoveryFixture::new().await;
+    let (_daemon, gate) = fixture.start(true);
+    let (mut release, _) = timeout(common::daemon_startup_timeout(), gate.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut ws = fixture.wss().await;
+    let id = &fixture.agents[0];
+    wss_rpc(&mut ws, 1, "agent.retire", json!({"agentId": id})).await;
+    assert_eq!(
+        wss_rpc(&mut ws, 10, "agent.listInterrupted", json!({})).await["agents"],
+        json!([])
+    );
+    let workspace = fixture
+        .store
+        .get_agent_session(id)
+        .await
+        .unwrap()
+        .workspace_id;
+    wss_rpc(
+        &mut ws,
+        11,
+        "events.subscribe",
+        json!({"workspaceId": workspace, "eventTypes": ["agent:updated"]}),
+    )
+    .await;
+    release.write_u8(1).await.unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let frame = ws.next().await.unwrap().unwrap();
+            if let Message::Text(text) = frame {
+                let frame: Value = serde_json::from_str(&text).unwrap();
+                let event = &frame["params"]["event"];
+                if event["type"] == "agent:updated"
+                    && event["data"]["startupRecoveryFailed"] == true
+                {
+                    assert_eq!(event["data"]["agentId"], json!(id));
+                    assert_eq!(event["workspaceId"], json!(workspace));
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .expect("failed recovery must notify the already connected client");
+    let pending = wss_rpc(&mut ws, 2, "agent.listInterrupted", json!({})).await;
+    assert_eq!(pending["agents"].as_array().unwrap().len(), 1);
+    assert_eq!(pending["agents"][0]["agentId"], json!(id));
+    wss_rpc(&mut ws, 3, "agent.restore", json!({"agentId": id})).await;
+    let retried = wss_rpc(
+        &mut ws,
+        4,
+        "agent.resolveInterrupted",
+        json!({"resume": [id]}),
+    )
+    .await;
+    assert_eq!(retried["resumed"], json!([id]));
+    assert_eq!(
+        wss_rpc(&mut ws, 5, "agent.listInterrupted", json!({})).await["agents"],
+        json!([])
+    );
+    fixture.store.close().await;
+}
+
+/// Persisted watch/group bookkeeping is visible while completion delivery is
+/// held. The real authenticated WSS transport must answer before release.
+#[tokio::test]
+async fn startup_completion_recovery_serves_wss_before_waking_parents() {
+    for (grouped, stop_while_held) in [(false, false), (true, false), (true, true)] {
+        let fixture = RecoveryFixture::new().await;
+        let parent = &fixture.agents[0];
+        let child = &fixture.agents[1];
+        let mut session = fixture
+            .store
+            .get_agent_session_summary(child)
+            .await
+            .unwrap();
+        let workspace = session.workspace_id.clone();
+        session.status = intent_core::AgentStatus::Completed;
+        session.completion_report = Some("finished during downtime".into());
+        session.completion_report_timestamp = Some(intent_core::now_iso());
+        fixture
+            .store
+            .update_agent_session(&workspace, &session)
+            .await
+            .unwrap();
+        fixture
+            .store
+            .set_interrupted_resolution(child, "abandoned", &intent_core::now_iso())
+            .await
+            .unwrap();
+        let group_id = grouped.then(|| "startup-group".to_string());
+        if let Some(id) = &group_id {
+            fixture
+                .store
+                .upsert_delegation_group(&intent_store::PersistedDelegationGroup {
+                    group_id: id.clone(),
+                    workspace_id: workspace.clone(),
+                    parent_agent_id: parent.clone(),
+                    await_mode: "after_all".into(),
+                    expected_agent_ids: vec![child.clone()],
+                    completed_agent_ids: vec![],
+                    deleted_agent_ids: vec![],
+                    sealed: true,
+                    delivered: false,
+                    event_summaries: vec![],
+                    raw_events_json: vec![],
+                    created_at: intent_core::now_iso(),
+                    updated_at: intent_core::now_iso(),
+                })
+                .await
+                .unwrap();
+        }
+        fixture
+            .store
+            .upsert_completion_watch(&intent_store::PersistedCompletionWatch {
+                id: "startup-watch".into(),
+                parent_workspace_id: workspace.clone(),
+                child_workspace_id: workspace.clone(),
+                parent_agent_id: parent.clone(),
+                parent_agent_name: "First".into(),
+                child_agent_id: child.clone(),
+                group_id,
+                report_delivered: false,
+                wake_on_attention: false,
+                completion_only: false,
+                created_at: intent_core::now_iso(),
+            })
+            .await
+            .unwrap();
+        let gate_path = fixture.root.path().join("completion-gate.sock");
+        let gate = tokio::net::UnixListener::bind(&gate_path).unwrap();
+        let provider_log = fixture.root.path().join("provider-sessions.jsonl");
+        let env = [
+            ("INTENTD_AUTH_TOKEN", TOKEN),
+            ("MOCK_AGENT_SCRIPT_PATH", fixture.script.as_str()),
+            ("MOCK_AGENT_SESSION_LOG", provider_log.to_str().unwrap()),
+            (
+                "INTENTD_TEST_STARTUP_COMPLETION_GATE",
+                gate_path.to_str().unwrap(),
+            ),
+        ];
+        let mut daemon = Daemon {
+            child: spawn_serve(fixture.root.path(), "both", &env, true),
+            data_dir: fixture.root.path().to_owned(),
+        };
+        let (mut release, _) = timeout(common::daemon_startup_timeout(), gate.accept())
+            .await
+            .expect("completion recovery reached gate")
+            .unwrap();
+        let mut ws = fixture.wss().await;
+        let status = wss_rpc(&mut ws, 10, "system.status", json!({})).await;
+        assert!(status.is_object(), "{status}");
+        let pending = wss_rpc(&mut ws, 11, "agent.listInterrupted", json!({})).await;
+        assert_eq!(
+            pending["agents"],
+            json!([]),
+            "reservations precede early completion wakes"
+        );
+        let subscriptions = wss_rpc(
+            &mut ws,
+            12,
+            "agent.getSubscriptions",
+            json!({"workspaceId": workspace, "agentId": parent}),
+        )
+        .await;
+        assert_eq!(
+            subscriptions["subscriptions"].as_array().unwrap().len(),
+            1,
+            "watch registry ready before reconciliation"
+        );
+        assert_eq!(
+            subscriptions["delegationGroups"].as_array().unwrap().len(),
+            usize::from(grouped),
+            "group registry ready before reconciliation"
+        );
+        assert!(
+            !provider_log.exists(),
+            "no recovery provider may start before release"
+        );
+        assert_eq!(
+            fixture.store.list_completion_watches().await.unwrap().len(),
+            1
+        );
+        if stop_while_held {
+            let stopped = uds_rpc(
+                &fixture.root.path().join("intentd.sock"),
+                13,
+                "system.shutdown",
+                json!({}),
+            )
+            .await;
+            assert!(stopped["error"].is_null(), "{stopped}");
+            timeout(common::daemon_startup_timeout(), async {
+                loop {
+                    if let Some(status) = daemon.child.try_wait().unwrap() {
+                        assert!(status.success(), "{status}");
+                        break;
+                    }
+                    // timing-guard: observe graceful shutdown while completion recovery is held
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("shutdown cancels unadmitted completion recovery");
+            assert_eq!(
+                fixture.store.list_completion_watches().await.unwrap().len(),
+                1
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .list_undelivered_groups(&workspace)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                fixture.store.list_interrupted_agents().await.unwrap().len(),
+                1
+            );
+            assert!(!provider_log.exists());
+            // Exercise the composition root again: shutdown must leave both
+            // watch/group state and the interrupted parent recoverable, and
+            // the next startup must deliver exactly one completion wake.
+            drop(ws);
+            daemon = Daemon {
+                child: spawn_serve(
+                    fixture.root.path(),
+                    "both",
+                    &[
+                        ("INTENTD_AUTH_TOKEN", TOKEN),
+                        ("MOCK_AGENT_SCRIPT_PATH", fixture.script.as_str()),
+                        ("MOCK_AGENT_SESSION_LOG", provider_log.to_str().unwrap()),
+                    ],
+                    true,
+                ),
+                data_dir: fixture.root.path().to_owned(),
+            };
+            let mut restarted_ws = fixture.wss().await;
+            assert!(wss_rpc(&mut restarted_ws, 14, "system.status", json!({}))
+                .await
+                .is_object());
+            assert!(daemon.child.try_wait().unwrap().is_none());
+        } else {
+            release.write_u8(1).await.unwrap();
+        }
+        wait_for_sweep(fixture.root.path()).await;
+        timeout(common::rpc_read_timeout(), async {
+            loop {
+                if fixture
+                    .store
+                    .list_completion_watches()
+                    .await
+                    .unwrap()
+                    .is_empty()
+                {
+                    break;
+                }
+                // timing-guard: wait for durable completion-watch retirement
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("completion delivered after release");
+        let messages = fixture
+            .store
+            .get_agent_session(parent)
+            .await
+            .unwrap()
+            .messages;
+        let wakes = messages
+            .iter()
+            .filter(|m| {
+                m.metadata
+                    .as_ref()
+                    .is_some_and(|v| v["type"] == "event_notification")
+            })
+            .count();
+        assert_eq!(
+            wakes, 1,
+            "exactly one recovery wake, grouped={grouped}: {messages:?}"
+        );
+        assert!(fixture
+            .store
+            .list_undelivered_groups(&workspace)
+            .await
+            .unwrap()
+            .is_empty());
+    }
 }

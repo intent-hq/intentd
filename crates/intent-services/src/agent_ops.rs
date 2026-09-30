@@ -98,6 +98,26 @@ pub(crate) fn is_terminal_status(status: AgentStatus) -> bool {
     )
 }
 
+/// Serialize each retirement transition with restore without blocking other
+/// targets. Weak entries keep completed transitions out of the lock registry.
+#[derive(Clone, Default)]
+pub(crate) struct AgentRetirementGates {
+    gates: Arc<Mutex<HashMap<AgentId, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
+}
+
+impl AgentRetirementGates {
+    pub(crate) fn for_agent(&self, agent_id: &AgentId) -> Arc<tokio::sync::Mutex<()>> {
+        let mut gates = self.gates.lock().expect("retirement gate map poisoned");
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        if let Some(gate) = gates.get(agent_id).and_then(std::sync::Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        gates.insert(agent_id.clone(), Arc::downgrade(&gate));
+        gate
+    }
+}
+
 /// Per-agent ordering gate for pending-question marker writes and their
 /// matching `agent:updated` events. Different agents never contend.
 #[derive(Clone, Default)]
@@ -1342,6 +1362,22 @@ pub(crate) struct QueuedMessage {
 /// retracted and folded into the terminal wake when the child settles first.
 pub(crate) const REPORT_DEBOUNCE_HOLD_KIND: &str = "report-debounce";
 
+fn queued_usage_origin(entry: &QueuedMessage) -> intent_store::UsageMessageOrigin {
+    if entry.user_origin {
+        intent_store::UsageMessageOrigin::Human
+    } else if entry
+        .message_metadata
+        .as_ref()
+        .and_then(|m| m.get("fromAgentId"))
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.is_empty())
+    {
+        intent_store::UsageMessageOrigin::Agent
+    } else {
+        intent_store::UsageMessageOrigin::Excluded
+    }
+}
+
 impl QueuedMessage {
     /// The camelCase wire shape for `agent.getQueue` / queue results, matching the
     /// TS `QueuedMessage` and the iOS decoder (`{id, content, queuedAt, position,
@@ -1432,10 +1468,12 @@ impl QueuedMessage {
 /// Dropping the guard retires the entries from the overlay — on the settled
 /// path right before the shrunk `agent:queue:updated` is published, on every
 /// hand-back / failure path at scope exit, and when an aborted worker's
-/// future is dropped mid-drain, so no ghost entry ever outlives its arm.
+/// future is dropped mid-drain. Shutdown freezes this overlay first so
+/// cancelled owners leave their payloads available for durable recovery.
 #[must_use = "drop the guard only once the drained rows are persisted"]
 pub(crate) struct DrainingGuard {
     overlay: Arc<Mutex<HashMap<AgentId, Vec<QueuedMessage>>>>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
     agent_id: AgentId,
     ids: Vec<String>,
 }
@@ -1455,6 +1493,9 @@ impl Drop for DrainingGuard {
             .overlay
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         if let Some(entries) = overlay.get_mut(&self.agent_id) {
             entries.retain(|m| !self.ids.contains(&m.id));
             if entries.is_empty() {
@@ -4449,6 +4490,15 @@ impl Services {
         // Harvest the persistence-gap fields the FE writer kept under
         // `metadata` (P3-1.2b). Top-level params win over the metadata copy.
         let meta = metadata.as_ref().and_then(Value::as_object);
+        if metadata.as_ref().is_some_and(|m| {
+            m.get(intent_core::CHIEF_PROMPT_VERSION_KEY)
+                .is_some_and(|v| !v.is_null())
+                && intent_core::chief_prompt_version(m).is_none()
+        }) {
+            return Err(Error::InvalidParams(format!(
+                "{method}: `metadata.chiefPromptVersion` must be a positive integer (1..4294967295)"
+            )));
+        }
         let meta_get = |key: &str| meta.and_then(|m| m.get(key)).cloned();
         let delegation_depth = meta_get("delegationDepth").and_then(|v| v.as_i64());
         let initial_message = meta_get("initialMessage")
@@ -5238,7 +5288,12 @@ impl Services {
         workspace_id: Option<WorkspaceId>,
         reason: Option<String>,
     ) -> Result<Value> {
-        let session = self.store.get_agent_session_summary(&agent_id).await?;
+        let session = {
+            // An idempotent retry also waits for the winning retire's cleanup.
+            let gate = self.agent_retirement_gates.for_agent(&agent_id);
+            let _retirement = gate.lock().await;
+            self.store.get_agent_session_summary(&agent_id).await?
+        };
         if let Some(ws) = workspace_id.as_ref() {
             if session.workspace_id != *ws {
                 return Err(Error::NotFound(format!("agent session {agent_id}")));
@@ -5353,6 +5408,8 @@ impl Services {
         session: &AgentSession,
         reason: Option<&str>,
     ) -> Result<Option<String>> {
+        let gate = self.agent_retirement_gates.for_agent(&session.id);
+        let _retirement = gate.lock().await;
         let now = now_iso();
         // Unread state observed BEFORE the retire write (derived + stored
         // flag): a retired session drops out of the unread derivation, so
@@ -5369,6 +5426,19 @@ impl Services {
             .await?;
         if !transitioned {
             return Ok(None);
+        }
+        // The persisted mark closes new requests before teardown. A wire
+        // caller retires another agent, whose current worker must be aborted;
+        // MCP self-retirement instead lets its own response unwind normally.
+        // The runtime fence also rejects send/wake work that passed a store
+        // check before this transition and reaches worker installation later.
+        if matches!(
+            intent_core::current_caller(),
+            Some(intent_core::Caller::Wire { .. })
+        ) {
+            if let Some(manager) = self.agent_manager() {
+                manager.retire(&session.id).await;
+            }
         }
         self.invalidate_agent_list_cache(&session.workspace_id);
         // Drop the retired agent's event subscriptions: the wake target is
@@ -5458,6 +5528,8 @@ impl Services {
         agent_id: AgentId,
         workspace_id: Option<WorkspaceId>,
     ) -> Result<Value> {
+        let gate = self.agent_retirement_gates.for_agent(&agent_id);
+        let _retirement = gate.lock().await;
         let session = self.store.get_agent_session_summary(&agent_id).await?;
         if let Some(ws) = workspace_id.as_ref() {
             if session.workspace_id != *ws {
@@ -5477,6 +5549,9 @@ impl Services {
             .await?;
         if !transitioned {
             return Ok(json!({ "success": true, "restored": false }));
+        }
+        if let Some(manager) = self.agent_manager() {
+            manager.restore_retired(&agent_id);
         }
         self.invalidate_agent_list_cache(&session.workspace_id);
         crate::publish_event(
@@ -5561,6 +5636,8 @@ impl Services {
         let mut session = self.store.get_agent_session(&agent_id).await?;
         let prior_model = session.model.clone();
         let prior_muted = session.notifications_muted;
+        let prior_system_prompt = session.system_prompt.clone();
+        let prior_specialist = session.specialist.clone();
         let allowed = [
             "status",
             "isActive",
@@ -5784,7 +5861,12 @@ impl Services {
                 _ => unreachable!("guarded by allow-list above"),
             }
         }
-        session.updated_at = now_iso();
+        if session.system_prompt != prior_system_prompt || session.specialist != prior_specialist {
+            if let Some(metadata) = session.metadata.as_mut().and_then(Value::as_object_mut) {
+                metadata.remove(intent_core::CHIEF_PROMPT_VERSION_KEY);
+            }
+        }
+        let mute_only = obj.len() == 1 && obj.contains_key("notificationsMuted");
         let workspace_id = session.workspace_id.clone();
         // Muting drops the session out of the workspace unread derivation
         // (§5.1), so snapshot the unread state BEFORE the write — the
@@ -5796,9 +5878,14 @@ impl Services {
         } else {
             None
         };
-        self.store
-            .update_agent_session(&workspace_id, &session)
-            .await?;
+        // A preference-only request is not agent activity. Skip the full-row
+        // write entirely so it cannot overwrite concurrent session progress.
+        if !mute_only {
+            session.updated_at = now_iso();
+            self.store
+                .update_agent_session(&workspace_id, &session)
+                .await?;
+        }
         // `notifications_muted` is excluded from the full-row write above
         // (its only post-insert mutator is this scoped UPDATE), so a
         // concurrent `agent.update` on unrelated fields — or a long-lived
@@ -5810,9 +5897,13 @@ impl Services {
                     &workspace_id,
                     &agent_id,
                     session.notifications_muted,
-                    &session.updated_at,
                 )
                 .await?;
+        }
+        if mute_only {
+            // Return current activity and preference state, including any
+            // genuine session update that raced the scoped preference write.
+            session = self.store.get_agent_session(&agent_id).await?;
         }
         // The stored model changed, so any persisted display resolution now
         // names the wrong model — clear it, same anti-staleness contract as
@@ -5863,6 +5954,27 @@ impl Services {
         if let Some(before) = unread_before {
             self.settle_workspace_unread_after_seen(&workspace_id, before)
                 .await;
+        }
+        // The atomic store guard may have removed a stale marker during a
+        // concurrent identity edit. Do not echo that marker from our old
+        // in-memory snapshot after persistence correctly rejected it.
+        if session
+            .metadata
+            .as_ref()
+            .and_then(intent_core::chief_prompt_version)
+            .is_some()
+        {
+            let stored = self.store.get_agent_session_summary(&agent_id).await?;
+            if stored
+                .metadata
+                .as_ref()
+                .and_then(intent_core::chief_prompt_version)
+                .is_none()
+            {
+                if let Some(metadata) = session.metadata.as_mut().and_then(Value::as_object_mut) {
+                    metadata.remove(intent_core::CHIEF_PROMPT_VERSION_KEY);
+                }
+            }
         }
         let lite = self.project_lite_with_flags(session);
         Ok(json!({ "success": true, "agent": lite }))
@@ -7110,7 +7222,7 @@ impl Services {
                     message_metadata,
                     None,
                     false,
-                    MessageOrigin::Automatic,
+                    MessageOrigin::User,
                 );
                 let result = json!({
                     "success": true,
@@ -7212,13 +7324,14 @@ impl Services {
         let created_at = now_iso();
         let message = match self
             .store
-            .append_agent_message_with_id(
+            .append_agent_message_with_provenance(
                 &agent_id,
                 &entry.id,
                 "user",
                 &blocks,
                 entry.message_metadata.as_ref(),
                 &created_at,
+                queued_usage_origin(&entry),
             )
             .await
         {
@@ -11180,12 +11293,12 @@ impl Services {
     ) -> Result<Value> {
         if !workspace_id.is_chief() {
             return Err(Error::InvalidParams(
-                "ws.app.* is only available in the Chief of Staff workspace".to_string(),
+                "ws.app.* is only available in the Assistant workspace".to_string(),
             ));
         }
         if caller_agent_id == target_agent_id {
             return Err(Error::InvalidParams(
-                "Chief of Staff cannot send a message to itself".to_string(),
+                "Assistant cannot send a message to itself".to_string(),
             ));
         }
 
@@ -11197,13 +11310,13 @@ impl Services {
             || !caller.workspace_id.is_chief()
         {
             return Err(Error::InvalidParams(format!(
-                "caller agent {} is not an active Chief of Staff agent",
+                "caller agent {} is not an active Assistant agent",
                 caller_agent_id.0
             )));
         }
         let source_message_id = caller.last_message_id.ok_or_else(|| {
             Error::InvalidParams(
-                "Chief conversation has no persisted source message to link".to_string(),
+                "Assistant conversation has no persisted source message to link".to_string(),
             )
         })?;
 
@@ -11216,7 +11329,8 @@ impl Services {
         }
         if target.workspace_id.is_chief() {
             return Err(Error::InvalidParams(
-                "Chief messages can only target agents outside the Chief workspace".to_string(),
+                "Assistant messages can only target agents outside the Assistant workspace"
+                    .to_string(),
             ));
         }
 
@@ -11227,7 +11341,7 @@ impl Services {
         let metadata = json!({
             "type": "chief_message",
             "fromAgentId": caller_agent_id.0,
-            "fromAgentName": "Chief of Staff",
+            "fromAgentName": "Assistant",
             "fromWorkspaceId": workspace_id.0,
             "sourceMessageId": source_message_id,
             "sourceUrl": source_url,
@@ -11278,7 +11392,7 @@ impl Services {
     ) -> Result<Value> {
         if !workspace_id.is_chief() {
             return Err(Error::InvalidParams(
-                "ws.app.* is only available in the Chief of Staff workspace".to_string(),
+                "ws.app.* is only available in the Assistant workspace".to_string(),
             ));
         }
         let caller = self.require_agent_session(&caller_agent_id).await?;
@@ -11295,7 +11409,9 @@ impl Services {
             .get("workspaceId")
             .and_then(Value::as_str)
             .map(WorkspaceId::from)
-            .ok_or_else(|| Error::Internal("Chief send omitted target workspace".to_string()))?;
+            .ok_or_else(|| {
+                Error::Internal("Assistant send omitted target workspace".to_string())
+            })?;
         let subscription_id = self
             .register_completion_watch_strict_durable(
                 &workspace_id,
@@ -11316,7 +11432,7 @@ impl Services {
         let target_name = sent
             .get("agentName")
             .and_then(Value::as_str)
-            .ok_or_else(|| Error::Internal("Chief send omitted target name".to_string()))?
+            .ok_or_else(|| Error::Internal("Assistant send omitted target name".to_string()))?
             .to_string();
         Ok(json!({
             "ok": true,
@@ -13743,7 +13859,7 @@ impl Services {
         //   3. Spawn the worker with the same content in-memory (the worker
         //      path does not re-persist).
         let content_owned = content.to_string();
-        if !manager.try_begin_turn(agent_id, workspace_id).await {
+        let Some(admission) = manager.try_begin_turn(agent_id, workspace_id).await else {
             // Fast enqueue branch: the manager is already draining a turn. The
             // metadata rides along on the queue entry so the drain re-persist
             // keeps the wake tag.
@@ -13763,7 +13879,7 @@ impl Services {
                 "queued": true,
                 "queuedMessage": queued.to_value(position),
             }));
-        }
+        };
         let blocks = json!([build_block()]);
         let created_at = now_iso();
         // Row-level metadata rides along with the in-block fold (monorepo#1217)
@@ -13771,12 +13887,22 @@ impl Services {
         // the FE attribution chip reads the row's `metadata` column.
         let message = match self
             .store
-            .append_agent_message_with_metadata(
+            .append_agent_message_with_provenance(
                 agent_id,
+                &new_message_id(),
                 "user",
                 &blocks,
                 message_metadata,
                 &created_at,
+                if message_metadata
+                    .and_then(|m| m.get("fromAgentId"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| !id.is_empty())
+                {
+                    intent_store::UsageMessageOrigin::Agent
+                } else {
+                    intent_store::UsageMessageOrigin::Excluded
+                },
             )
             .await
         {
@@ -13785,7 +13911,7 @@ impl Services {
                 msg
             }
             Err(append_err) => {
-                manager.release_slot(agent_id).await;
+                manager.release_slot(agent_id, admission).await;
                 // Fail closed on a vanished session (intent-hq/monorepo#2762):
                 // the only FK on `agent_message` is `agent_id →
                 // agent_session(id)`, so an append failure against a gone row
@@ -13857,6 +13983,7 @@ impl Services {
                 message_metadata: message_metadata.cloned(),
                 ..Default::default()
             },
+            admission,
         );
         Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
     }
@@ -13882,12 +14009,22 @@ impl Services {
         // Row-level metadata parity with the runtime branch (monorepo#1217).
         match self
             .store
-            .append_agent_message_with_metadata(
+            .append_agent_message_with_provenance(
                 agent_id,
+                &new_message_id(),
                 "user",
                 &blocks,
                 message_metadata,
                 &created_at,
+                if message_metadata
+                    .and_then(|m| m.get("fromAgentId"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| !id.is_empty())
+                {
+                    intent_store::UsageMessageOrigin::Agent
+                } else {
+                    intent_store::UsageMessageOrigin::Excluded
+                },
             )
             .await
         {
@@ -15267,6 +15404,12 @@ impl Services {
             .draining_queue_entries
             .lock()
             .expect("draining queue registry poisoned");
+        if self
+            .draining_shutdown
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return None;
+        }
         let popped = pop(self)?;
         let entries = entries(&popped);
         if commit == PopCommit::Delivery {
@@ -15288,6 +15431,7 @@ impl Services {
             .extend(entries.iter().cloned());
         DrainingGuard {
             overlay: Arc::clone(&self.draining_queue_entries),
+            shutdown: Arc::clone(&self.draining_shutdown),
             agent_id: agent_id.clone(),
             ids: entries.iter().map(|m| m.id.clone()).collect(),
         }
@@ -15351,26 +15495,81 @@ impl Services {
     /// dropped on return). Callers that persist the result must hold
     /// `agent_queue_persist_gate` across snapshot + store write.
     fn queue_rows(&self, agent_id: &AgentId) -> Vec<intent_store::AgentQueueRow> {
-        let guard = self
-            .agent_queues
-            .lock()
-            .expect("agent queue registry poisoned");
-        guard
+        let draining = self.draining_queue_entries.lock().unwrap();
+        let live = self.agent_queues.lock().unwrap();
+        let live = live.get(agent_id).map(Vec::as_slice).unwrap_or_default();
+        let frozen = self
+            .draining_shutdown
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let retained: Vec<_> = draining
             .get(agent_id)
-            .map(|q| {
-                q.iter()
-                    .enumerate()
-                    .map(|(i, m)| intent_store::AgentQueueRow {
-                        id: m.id.clone(),
-                        agent_id: agent_id.clone(),
-                        position: i64::try_from(i).expect("value fits in i64"),
-                        payload: serde_json::to_value(m).unwrap_or(Value::Null),
-                        created_at: m.queued_at.clone(),
-                        turn_id: m.turn_id.clone(),
-                    })
-                    .collect()
+            .into_iter()
+            .flatten()
+            .filter(|_| frozen)
+            .collect();
+        let mut seen_ids = HashSet::new();
+        // Frozen order is authoritative even when a partially persisted batch
+        // explicitly hands back just its head/tail. Prefer updated live flags
+        // without moving the missing middle entry ahead of its original head.
+        retained
+            .iter()
+            .map(|d| {
+                live.iter()
+                    .find(|m| m.id == d.id || m.turn_id == d.turn_id)
+                    .unwrap_or(d)
             })
-            .unwrap_or_default()
+            .chain(live.iter().filter(|m| {
+                !retained
+                    .iter()
+                    .any(|d| d.id == m.id || d.turn_id == m.turn_id)
+            }))
+            .filter(|m| seen_ids.insert(m.id.clone()))
+            .enumerate()
+            .map(|(i, m)| intent_store::AgentQueueRow {
+                id: m.id.clone(),
+                agent_id: agent_id.clone(),
+                position: i64::try_from(i).expect("value fits in i64"),
+                payload: {
+                    let mut payload = serde_json::to_value(m).unwrap_or(Value::Null);
+                    if frozen
+                        && draining.get(agent_id).is_some_and(|entries| {
+                            entries
+                                .iter()
+                                .any(|d| d.id == m.id || d.turn_id == m.turn_id)
+                        })
+                    {
+                        payload["shutdownRecovery"] = Value::Bool(true);
+                    }
+                    payload
+                },
+                created_at: m.queued_at.clone(),
+                turn_id: m.turn_id.clone(),
+            })
+            .collect()
+    }
+
+    /// Keep the last copy of a popped payload alive when its owner is aborted.
+    /// This lock also orders closure against new pops and guard drops.
+    pub(crate) fn freeze_shutdown_drains(&self) {
+        let _draining = self.draining_queue_entries.lock().unwrap();
+        self.draining_shutdown
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Called after delivery/worker joins. Keep the overlay frozen for any
+    /// previously admitted request still unwinding; subsequent queue writes
+    /// must not overwrite its payloads either.
+    pub(crate) async fn persist_shutdown_drains(&self) {
+        let ids: Vec<_> = self
+            .draining_queue_entries
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        for id in ids {
+            self.persist_queue_snapshot(&id).await;
+        }
     }
 
     /// Rehydrate every persisted agent queue into the in-memory map at daemon
@@ -15400,7 +15599,11 @@ impl Services {
     pub async fn rehydrate_agent_queues(&self) -> Result<usize> {
         let rows = self.store.load_all_agent_queues().await?;
         let mut map: HashMap<AgentId, Vec<QueuedMessage>> = HashMap::new();
+        let mut recover = HashSet::new();
         for row in rows {
+            if row.payload.get("shutdownRecovery").and_then(Value::as_bool) == Some(true) {
+                recover.insert((row.agent_id.clone(), row.id.clone()));
+            }
             match serde_json::from_value::<QueuedMessage>(row.payload) {
                 Ok(mut message) => {
                     message.editing = false;
@@ -15416,6 +15619,22 @@ impl Services {
                         error = %e,
                         "skipping undecodable persisted queue entry"
                     );
+                }
+            }
+        }
+        // A cancelled append may have committed before its future observed the
+        // result. Recover the payload, but never append that user row twice.
+        for (agent_id, queue) in &mut map {
+            if !queue
+                .iter()
+                .any(|m| recover.contains(&(agent_id.clone(), m.id.clone())))
+            {
+                continue;
+            }
+            let persisted = self.store.persisted_queue_message_ids(agent_id).await?;
+            for message in queue {
+                if recover.contains(&(agent_id.clone(), message.id.clone())) {
+                    message.persisted |= persisted.contains(&message.id);
                 }
             }
         }
@@ -16222,6 +16441,104 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
     })
 }
 
+/// In-memory visibility reservations for one boot-time recovery sweep. These
+/// never change durable resolution; the normal atomic claim still decides which
+/// automatic or manual resolver wins. Dropping the sweep exposes any unfinished
+/// candidates again, including when startup fails or the worker panics.
+pub struct StartupResumeCandidates {
+    ids: Vec<AgentId>,
+    reserved: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<AgentId>>>,
+}
+
+impl StartupResumeCandidates {
+    /// The fixed candidate set captured before listeners become available.
+    #[must_use]
+    pub fn ids(&self) -> &[AgentId] {
+        &self.ids
+    }
+
+    /// Release one attempted candidate, so a failed resume is immediately
+    /// discoverable even while the remainder of the sweep is still running.
+    pub fn finished(&self, id: &AgentId) {
+        self.reserved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id);
+    }
+}
+
+impl Drop for StartupResumeCandidates {
+    fn drop(&mut self) {
+        let mut reserved = self
+            .reserved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for id in &self.ids {
+            reserved.remove(id);
+        }
+    }
+}
+
+impl Services {
+    /// Resume one reserved startup candidate, then expose and notify failures.
+    /// The notification invalidates the recovery list; it does not declare a
+    /// terminal agent failure or drive completion watches.
+    ///
+    /// # Errors
+    /// Returns the original resume error after releasing the reservation.
+    pub async fn resume_startup_candidate(
+        &self,
+        candidates: &StartupResumeCandidates,
+        agent_id: &AgentId,
+    ) -> Result<()> {
+        let result = self.resume_interrupted_agent(agent_id).await;
+        candidates.finished(agent_id);
+        if result.is_err() {
+            // Use the durable pending row's workspace, never a caller-supplied
+            // envelope. A concurrent manual winner may already have removed it.
+            match self.store.get_interrupted_agent(agent_id).await {
+                Ok(Some(pending)) => {
+                    self.publish_agent_mutation_event(
+                        &pending.workspace_id,
+                        agent_id,
+                        AGENT_UPDATED,
+                        json!({"agentId": agent_id, "startupRecoveryFailed": true}),
+                    )
+                    .await;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%agent_id, %error, "startup recovery failure notification lookup failed");
+                }
+            }
+        }
+        result
+    }
+
+    /// Capture automatic recovery candidates before exposing listeners.
+    ///
+    /// # Errors
+    /// Returns a store error if the candidate query fails; no reservations are
+    /// installed in that case, so manual recovery remains available.
+    pub async fn prepare_startup_resume(&self) -> Result<StartupResumeCandidates> {
+        let ids: Vec<_> = self
+            .store
+            .list_interrupted_agents()
+            .await?
+            .into_iter()
+            .map(|row| row.agent_id)
+            .collect();
+        self.startup_resume_candidates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(ids.iter().cloned());
+        Ok(StartupResumeCandidates {
+            ids,
+            reserved: self.startup_resume_candidates.clone(),
+        })
+    }
+}
+
 impl Services {
     /// Wake-triggered auto-resume sweep (sleep-resume Task D): on a host wake the
     /// daemon's resume orchestrator calls this to resume every turn Task C
@@ -16583,10 +16900,16 @@ impl Services {
         // `TurnOptions::prepend_content`; the store-only fallback (no manager
         // attached) keeps the plain trait call — it drives no outbound
         // prompt, so there is no context to repair.
+        #[cfg(test)]
+        if let Some(park) = &self.interrupted_resume_park {
+            park.entered.notify_one();
+            park.release.notified().await;
+        }
         let send_result = match self.agent_manager() {
             Some(manager) => {
                 let options = match recap {
                     Some(recap) => crate::agent_manager::TurnOptions {
+                        reject_on_shutdown: true,
                         prepend_content: Some(recap.text),
                         prepend_image_blocks: recap.image_blocks,
                         prepend_file_blocks: recap.file_blocks,
@@ -16595,6 +16918,7 @@ impl Services {
                         ..crate::agent_manager::TurnOptions::default()
                     },
                     None => crate::agent_manager::TurnOptions {
+                        reject_on_shutdown: true,
                         message_metadata: Some(continuation_metadata.clone()),
                         origin: intent_core::MessageOrigin::Automatic,
                         ..crate::agent_manager::TurnOptions::default()
@@ -16657,6 +16981,41 @@ impl Services {
         let workspace_id = interrupted.workspace_id.clone();
         let _mutation = self.workspace_mutations.enter(&workspace_id)?;
 
+        // Claim before transcript/group effects, just like resume. A losing
+        // manual abandon must never settle a child or append a false notice.
+        if !self
+            .store
+            .set_interrupted_resolution(agent_id, "abandoned", &now_iso())
+            .await?
+        {
+            return Err(Error::InvalidParams(format!(
+                "Agent {agent_id} is not in pending interrupted state (already resolved)"
+            )));
+        }
+
+        let text = "This conversation was interrupted because intentd restarted. The agent's in-flight work was terminated.";
+        let content = json!([{
+            "type": "text",
+            "text": text,
+            "meta": { "kind": "interruption" }
+        }]);
+        // Persist the only fallible effect before group settlement. If it fails,
+        // release our claim so a later manual or automatic retry can succeed.
+        let message = match self
+            .store
+            .append_agent_message(agent_id, "system", &content, &now_iso())
+            .await
+        {
+            Ok(message) => message,
+            Err(error) => {
+                if let Err(reset_error) = self.store.reset_interrupted_resolution(agent_id).await {
+                    tracing::warn!(%agent_id, %reset_error, "failed to reset abandoned interruption");
+                }
+                return Err(error);
+            }
+        };
+        self.invalidate_agent_list_cache(&workspace_id);
+
         // Rehydrate delegation groups for this workspace (idempotent, best-effort).
         let _ = self.rehydrate_delegation_groups(&workspace_id).await;
 
@@ -16711,32 +17070,6 @@ impl Services {
                     }
                 }
             }
-        }
-
-        // Build the system interruption message
-        let text = "This conversation was interrupted because intentd restarted. The agent's in-flight work was terminated.";
-        let content = json!([{
-            "type": "text",
-            "text": text,
-            "meta": { "kind": "interruption" }
-        }]);
-
-        // Append the system message
-        let message = self
-            .store
-            .append_agent_message(agent_id, "system", &content, &now_iso())
-            .await?;
-        self.invalidate_agent_list_cache(&workspace_id);
-
-        // Mark the interrupted_agent row as resolved
-        let updated = self
-            .store
-            .set_interrupted_resolution(agent_id, "abandoned", &now_iso())
-            .await?;
-        if !updated {
-            return Err(Error::InvalidParams(format!(
-                "Agent {agent_id} is not in pending interrupted state"
-            )));
         }
 
         // Emit agent:message events so live UIs see the new message

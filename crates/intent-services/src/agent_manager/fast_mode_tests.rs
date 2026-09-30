@@ -82,7 +82,10 @@ async fn turn(mgr: &AgentManager, id: &AgentId) -> Value {
         .ensure_started(id, &WorkspaceId::from("ws-1"))
         .await
         .unwrap();
-    let conn = mgr.handles.lock().unwrap()[id].connection.clone();
+    let conn = mgr.handles.lock().unwrap()[id]
+        .execution
+        .connection()
+        .unwrap();
     conn.request(
         "session/prompt",
         json!({"sessionId":sid,"prompt":[{"type":"text","text":"inspect"}]}),
@@ -110,8 +113,8 @@ async fn fast_mode_setting_change_leaves_running_turn_untouched() {
     let (conn, notifications) = {
         let handles = mgr.handles.lock().unwrap();
         (
-            handles[&id].connection.clone(),
-            handles[&id].notifications.clone(),
+            handles[&id].execution.connection().unwrap(),
+            handles[&id].execution.runtime.notifications(),
         )
     };
     let request_conn = conn.clone();
@@ -190,7 +193,10 @@ async fn fast_mode_absent_option_allows_off_then_rechecks_eligible_model() {
     assert_eq!(state["controls"], json!([]));
     preference(&mgr, "claude-code", true);
     assert_eq!(turn(&mgr, &id).await["controls"], json!([]));
-    let conn = mgr.handles.lock().unwrap()[&id].connection.clone();
+    let conn = mgr.handles.lock().unwrap()[&id]
+        .execution
+        .connection()
+        .unwrap();
     let response = intent_acp::session::set_session_config_option_response(
         &conn,
         "fast-session",

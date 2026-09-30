@@ -1176,6 +1176,10 @@ mod tests {
                 f.services.owned_workspace_ids().await.map(drop),
             ),
             (
+                "skill.list",
+                f.services.skill_list(f.ws.clone()).await.map(drop),
+            ),
+            (
                 "workspace.get",
                 f.services.get_workspace(f.ws.clone()).await.map(drop),
             ),

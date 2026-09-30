@@ -27,6 +27,8 @@
 #![cfg(unix)]
 
 mod common;
+#[path = "common/invitation_fixture_lifecycle.rs"]
+mod fixture_lifecycle;
 
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
@@ -75,14 +77,9 @@ const HOST: &str = "gitlab.com";
 const PROOF_FILE_NAME: &str = "intent-join-proof.txt";
 
 struct Daemon {
+    // Let GuardedChild stop the whole group before it reaps the daemon.
+    // A parent-only kill/wait here would disable that owned-group teardown.
     child: GuardedChild,
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 fn temp_data_dir() -> tempfile::TempDir {
@@ -110,7 +107,7 @@ case "$1" in
   serve)
     printf '{"listenAddr":"tc-%s"}\n' "$(cat "$key")"
     # // timing-guard: the fake sidecar stays alive until the daemon that spawned it dies
-    sleep 600
+    exec sleep 600
     ;;
 esac
 "#;

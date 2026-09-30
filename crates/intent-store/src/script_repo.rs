@@ -195,6 +195,25 @@ impl Store {
         rows.iter().map(map_script_row).collect()
     }
 
+    /// Read one persisted definition only if it belongs to this workspace.
+    ///
+    /// # Errors
+    /// Returns `Error::Internal` if the database read or decoding fails.
+    pub async fn get_script_in_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &str,
+    ) -> Result<Option<Script>> {
+        let sql = format!("SELECT {SCRIPT_COLUMNS} FROM script WHERE id = ? AND workspace_id = ?");
+        let row = sqlx::query(&sql)
+            .bind(id)
+            .bind(&workspace_id.0)
+            .fetch_optional(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("get script failed: {e}")))?;
+        row.as_ref().map(map_script_row).transpose()
+    }
+
     /// Set or clear the service was-running marker (stored-on-write): set on a
     /// service-mode script's successful start, cleared on user `script.stop`
     /// and natural exit (`script.remove` deletes the row). Scoped to
