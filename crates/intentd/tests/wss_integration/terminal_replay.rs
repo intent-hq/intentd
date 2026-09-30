@@ -1,6 +1,7 @@
 //! Cursor fields through authenticated TLS WebSocket RPC and event delivery.
 use super::*;
 use base64::Engine as _;
+use serde_json::json;
 
 async fn rpc(client: &mut PresenceClient, method: &str, params: Value) -> Value {
     let response = client.call(1, method, params).await;
