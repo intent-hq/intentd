@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.121] - 2026-09-30
+
+### 🚀 Features
+
+- Add exact cross-filter token usage ([#1719](https://github.com/intent-hq/intentd/pull/1719))
+
+
 ## [0.9.120] - 2026-09-30
 
 ### 🐛 Bug Fixes
