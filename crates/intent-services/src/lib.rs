@@ -77,6 +77,7 @@ mod conditional_write_precedence_tests;
 mod config_watcher;
 mod create_progress;
 mod delete_grace;
+mod delivery_tasks;
 mod device_ops;
 mod discovery_cache;
 mod disk_usage;
@@ -430,9 +431,12 @@ pub struct Services {
     /// snapshots ([`agent_ops::Services::queue_snapshot`]) keep listing them
     /// ahead of the live queue until the owning [`agent_ops::DrainingGuard`]
     /// is dropped, so an unrelated concurrent mutation's `agent:queue:updated`
-    /// never shows the entry gone before its row exists. Never persisted.
+    /// never shows the entry gone before its row exists. Shutdown freezes and
+    /// persists this overlay before dropping cancelled owners.
     /// Lock order: this mutex is taken BEFORE `agent_queues`, never after.
     draining_queue_entries: Arc<Mutex<HashMap<AgentId, Vec<agent_ops::QueuedMessage>>>>,
+    /// Freeze popped payloads before cancelling their owners at shutdown.
+    draining_shutdown: Arc<std::sync::atomic::AtomicBool>,
     /// Queue-entry id of an `agent.sendMessage` into an `Error` session that
     /// lost the in-flight slot to a worker still holding it
     /// (intent-hq/intent#4962). The documented recovery for an `Error`
@@ -572,6 +576,8 @@ pub struct Services {
     /// Serializes strict completion-only ask registration so a watch is
     /// durably persisted before it becomes visible to completion delivery.
     completion_watch_registration_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Cancellation and drain ownership for automatic agent delivery tasks.
+    delivery_tasks: Arc<delivery_tasks::DeliveryTasks>,
     /// Child agent ids with an active terminal-delivery retry task, mapped
     /// to pending attempts and a schedule generation. Ownership is coalesced per CHILD, not per
     /// watch (intent-hq/intent#3728): one delivery pass processes ALL of the
@@ -789,6 +795,10 @@ pub struct Services {
     /// deterministic. `None` in production wiring; tests inject via the
     /// `#[cfg(test)]`-only `with_completion_classify_park`.
     completion_classify_park: Option<Arc<CompletionClassifyPark>>,
+    #[cfg(test)]
+    hook_wake_park: Option<Arc<CompletionClassifyPark>>,
+    #[cfg(test)]
+    hook_eval_park: Option<Arc<CompletionClassifyPark>>,
     /// Test park seam (intent-hq/intent#4367) for the completion-delivery
     /// claim→send window: parks the ungrouped terminal delivery right after
     /// it claims the watch and before the durable send, so a concurrent
@@ -1308,6 +1318,8 @@ pub struct Services {
     #[cfg(test)]
     interrupted_list_park: Option<Arc<script_ops::SupervisePark>>,
     #[cfg(test)]
+    interrupted_resume_park: Option<Arc<CompletionClassifyPark>>,
+    #[cfg(test)]
     workspace_delete_test_gate: tests::workspace_delete::DeleteGate,
     /// In-memory pending agent-session deletions for the delete grace window
     /// (§5.5): `agent.delete` with `undoDelayMs > 0` registers the timer
@@ -1411,6 +1423,7 @@ impl Services {
             event_bus: None,
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
             draining_queue_entries: Arc::new(Mutex::new(HashMap::new())),
+            draining_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             parked_recovery_sends: Arc::new(Mutex::new(HashMap::new())),
             agent_queue_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
             agent_queue_publish_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -1434,6 +1447,7 @@ impl Services {
             )),
             group_persist_lane: Arc::new(OnceLock::new()),
             completion_watch_registration_gate: Arc::new(tokio::sync::Mutex::new(())),
+            delivery_tasks: Arc::new(delivery_tasks::DeliveryTasks::default()),
             completion_delivery_retries: Arc::new(Mutex::new(HashMap::new())),
             completion_group_delivery_retries: Arc::new(Mutex::new(HashSet::new())),
             agent_failure_streaks: Arc::new(Mutex::new(HashMap::new())),
@@ -1463,6 +1477,10 @@ impl Services {
             script_too_fast_ms: script_ops::TOO_FAST_MS,
             script_parks: script_ops::ScriptParks::default(),
             completion_classify_park: None,
+            #[cfg(test)]
+            hook_wake_park: None,
+            #[cfg(test)]
+            hook_eval_park: None,
             completion_claim_park: None,
             completion_flip_take_park: None,
             attention_write_park: None,
@@ -1572,6 +1590,8 @@ impl Services {
             startup_resume_candidates: Arc::default(),
             #[cfg(test)]
             interrupted_list_park: None,
+            #[cfg(test)]
+            interrupted_resume_park: None,
             #[cfg(test)]
             workspace_delete_test_gate: tests::workspace_delete::DeleteGate::default(),
             pending_agent_deletes: delete_grace::PendingDeletes::default(),
@@ -6249,25 +6269,44 @@ impl Services {
             return intent_core::spawn_daemon(async {});
         };
         let services = self.clone();
-        intent_core::spawn_daemon(async move {
-            // Span every workspace (workspace_id = None) and deliver each matched
-            // event immediately (batch_window = None) so wakes are never coalesced.
-            let filter = SubscriptionFilter {
-                event_types: vec![
-                    AGENT_IDLE.to_string(),
-                    AGENT_FAILED.to_string(),
-                    AGENT_DELETED.to_string(),
-                    AGENT_RETIRED.to_string(),
-                ],
-                ..Default::default()
-            };
-            let mut sub = bus.subscribe(filter);
-            while let Some(events) = sub.recv().await {
-                for event in events {
-                    services.handle_completion_event(&event).await;
+        self.delivery_tasks
+            .spawn(async move {
+                // Span every workspace (workspace_id = None) and deliver each matched
+                // event immediately (batch_window = None) so wakes are never coalesced.
+                let filter = SubscriptionFilter {
+                    event_types: vec![
+                        AGENT_IDLE.to_string(),
+                        AGENT_FAILED.to_string(),
+                        AGENT_DELETED.to_string(),
+                        AGENT_RETIRED.to_string(),
+                    ],
+                    ..Default::default()
+                };
+                let mut sub = bus.subscribe(filter);
+                while let Some(events) = sub.recv().await {
+                    for event in events {
+                        services.handle_completion_event(&event).await;
+                    }
                 }
-            }
-        })
+            })
+            .unwrap_or_else(|| intent_core::spawn_daemon(async {}))
+    }
+
+    /// Stop and drain automatic delivery work without retiring its durable
+    /// watches, hooks, subscriptions, or queued messages. New registrations
+    /// are refused atomically with this close.
+    ///
+    /// # Panics
+    /// Panics if an internal mutex is poisoned.
+    pub async fn shutdown_agent_deliveries(&self) {
+        self.delivery_tasks.shutdown().await;
+        self.completion_delivery_retries.lock().unwrap().clear();
+        self.completion_group_delivery_retries
+            .lock()
+            .unwrap()
+            .clear();
+        self.hook_tasks.lock().unwrap().clear();
+        self.event_subscriptions.lock().unwrap().clear();
     }
 
     /// Resolve the completed child + workspace from a completion event and fan
@@ -7307,6 +7346,9 @@ impl Services {
         event: Event,
         watch_ids: Option<&HashSet<String>>,
     ) {
+        if self.delivery_tasks.is_closed() {
+            return;
+        }
         {
             let mut retries = self
                 .completion_delivery_retries
@@ -7336,7 +7378,8 @@ impl Services {
         }
 
         let services = self.clone();
-        intent_core::spawn_daemon(async move {
+        let retry_key = child_id.0.clone();
+        let task = self.delivery_tasks.spawn(async move {
             // 500ms initial (monorepo#4183): the old 100ms start burst three
             // attempts inside the first second on every transient failure;
             // wakes are not latency-critical enough to justify that.
@@ -7396,11 +7439,20 @@ impl Services {
                 // another pass so it keeps a retry owner.
             }
         });
+        if task.is_none() {
+            self.completion_delivery_retries
+                .lock()
+                .unwrap()
+                .remove(&retry_key);
+        }
     }
 
     /// Retry one failed durable aggregated wake until its group settles or is
     /// removed. The stable group message id makes every attempt idempotent.
     fn schedule_completion_group_delivery_retry(&self, group_id: String) {
+        if self.delivery_tasks.is_closed() {
+            return;
+        }
         if !self
             .completion_group_delivery_retries
             .lock()
@@ -7411,7 +7463,8 @@ impl Services {
         }
 
         let services = self.clone();
-        intent_core::spawn_daemon(async move {
+        let retry_key = group_id.clone();
+        let task = self.delivery_tasks.spawn(async move {
             // 500ms initial backoff, aligned with the per-child retry task
             // (monorepo#4183): wakes are not latency-critical enough to
             // justify bursting attempts inside the first second.
@@ -7434,6 +7487,12 @@ impl Services {
                 .expect("completion group delivery retries poisoned")
                 .remove(&group_id);
         });
+        if task.is_none() {
+            self.completion_group_delivery_retries
+                .lock()
+                .unwrap()
+                .remove(&retry_key);
+        }
     }
 
     /// Wake every parent whose watch matches `child_id`, then drop that watch:
@@ -9642,6 +9701,11 @@ impl Services {
         message_metadata: Option<serde_json::Value>,
         message_id: Option<String>,
     ) -> Result<serde_json::Value> {
+        if self.delivery_tasks.is_closed() {
+            // A transient refusal keeps completion watches armed for restart;
+            // it must not be mistaken for a deleted parent.
+            return Err(Error::Internal("daemon is shutting down".into()));
+        }
         if let Some(id) = message_id.as_deref() {
             // queue-egress: allow — id-only idempotency probe; no entry leaves the daemon
             let queued = self

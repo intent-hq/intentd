@@ -1971,12 +1971,12 @@ async fn cmd_serve(
     // table) into the in-memory map before any listener serves RPCs, so
     // messages queued at the previous shutdown survive the restart. This only
     // restores state — it never starts a turn; queued messages sit until an
-    // explicit kick (resume, sendMessage, queueMessage, retry). Best-effort:
-    // a failure is logged but never aborts startup.
-    match services.rehydrate_agent_queues().await {
-        Ok(0) => {}
-        Ok(rehydrated) => tracing::info!(rehydrated, "rehydrated persisted agent queue messages"),
-        Err(e) => tracing::warn!(error = %e, "agent queue rehydration failed"),
+    // explicit kick (resume, sendMessage, queueMessage, retry). Any recovery
+    // error is fatal before listeners start: a new queue mutation must never
+    // replace durable entries from an unreconciled, empty in-memory map.
+    let rehydrated = restore_startup_queues(&services).await?;
+    if rehydrated > 0 {
+        tracing::info!(rehydrated, "rehydrated persisted agent queue messages");
     }
     // Rehydrate persisted zero-output stop-redelivery payloads (write-through
     // `agent_stop_redelivery` mirror, intent-hq/monorepo#1899) so a stop armed
@@ -2572,6 +2572,7 @@ async fn cmd_serve(
 
     let (startup_stop, startup_stopping) = tokio::sync::watch::channel(false);
     let shutdown = {
+        let manager = manager.clone();
         let startup_stop = startup_stop.clone();
         let notify = shutdown_notify.clone();
         #[cfg(unix)]
@@ -2581,6 +2582,7 @@ async fn cmd_serve(
                 () = shutdown_signal() => {}
                 () = notify.notified() => tracing::info!("shutdown requested via system.shutdown"),
             }
+            manager.begin_shutdown();
             let _ = startup_stop.send(true);
             // Latch the cause at the decision point, before any teardown
             // await: a staged restart that fires later must not overwrite a
@@ -2712,6 +2714,8 @@ async fn cmd_serve(
         shutdown,
     )
     .await;
+    // Also covers listener startup failure, where the signal future did not run.
+    manager.begin_shutdown();
     repository_metadata_prewarm.abort();
     // The shutdown cause is latched by now; retire the sitter handshake tasks
     // FIRST, before any teardown await (the tunnel stop below can block for
@@ -2728,6 +2732,8 @@ async fn cmd_serve(
     // let the current service operation commit/reset its claim, skip later
     // candidates, then let manager.shutdown capture any admitted turns.
     let _ = startup_stop.send(true);
+    manager.checkpoint_shutdown().await;
+    services.shutdown_agent_deliveries().await;
     if let Err(error) = startup_recovery.await {
         tracing::error!(%error, "startup recovery worker failed");
     }
@@ -6821,6 +6827,11 @@ fn should_resume_on_start(
     }
 }
 
+/// Queue restoration must succeed before serving any queue mutations.
+async fn restore_startup_queues(services: &Services) -> intent_core::Result<usize> {
+    services.rehydrate_agent_queues().await
+}
+
 /// Run recovery off the listener path. Shutdown stops between operations;
 /// an admitted operation drains so its durable claim cannot be stranded by
 /// cancellation. Provider turns themselves remain owned by `AgentManager`.
@@ -7365,6 +7376,72 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_queue_lookup_failure_prevents_serving_and_preserves_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("queues.db")).await.unwrap();
+        let agent = AgentId::from("queue-recovery");
+        let now = intent_core::now_iso();
+        sqlx::query("INSERT INTO workspace (id,title,branch,created_at,updated_at) VALUES ('queue-ws','queues','main',?,?)").bind(&now).bind(&now).execute(store.write_pool()).await.unwrap();
+        sqlx::query("INSERT INTO agent_session (id,workspace_id,name,status,created_at,updated_at) VALUES (?,'queue-ws','queue recovery','idle',?,?)").bind(&agent.0).bind(&now).bind(&now).execute(store.write_pool()).await.unwrap();
+        let rows: Vec<_> = (0..2).map(|n| intent_store::AgentQueueRow {
+            id: format!("recovered-{n}"), agent_id: agent.clone(), position:n,
+            payload: json!({"id":format!("recovered-{n}"),"turnId":format!("recovered-{n}"),"content":format!("saved {n}"),"imageBlocks":null,"fileBlocks":null,"queuedAt":now,"messageMetadata":null,"shutdownRecovery":true}),
+            created_at:now.clone(),turn_id:format!("recovered-{n}")
+        }).collect();
+        store.replace_agent_queue(&agent, &rows).await.unwrap();
+        store
+            .append_agent_message_with_metadata(
+                &agent,
+                "user",
+                &json!([{"type":"text","text":"saved 0"}]),
+                Some(&json!({"queueInfo":{"queuedMessageId":"recovered-0"}})),
+                &now,
+            )
+            .await
+            .unwrap();
+        // Loading agent_queue succeeds; only the new reconciliation lookup fails.
+        sqlx::query("ALTER TABLE agent_message RENAME TO hidden_recovery_messages")
+            .execute(store.write_pool())
+            .await
+            .unwrap();
+        let services = Services::new(store.clone());
+        let startup: intent_core::Result<()> = async {
+            restore_startup_queues(&services).await?;
+            // Models the first request after listeners are allowed to start:
+            // an empty in-memory queue would replace the saved snapshot.
+            store.replace_agent_queue(&agent, &[]).await?;
+            Ok(())
+        }
+        .await;
+        sqlx::query("ALTER TABLE hidden_recovery_messages RENAME TO agent_message")
+            .execute(store.write_pool())
+            .await
+            .unwrap();
+        assert!(
+            startup.is_err(),
+            "failed reconciliation must stop startup before queue writes are served"
+        );
+        let saved = store.load_all_agent_queues().await.unwrap();
+        assert_eq!(
+            saved.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["recovered-0", "recovered-1"]
+        );
+        assert_eq!(restore_startup_queues(&services).await.unwrap(), 2);
+        intent_core::with_caller(
+            intent_core::Caller::Daemon,
+            services.agent_queue_message(agent, "later send".into(), None, None, None),
+        )
+        .await
+        .unwrap();
+        let saved = store.load_all_agent_queues().await.unwrap();
+        assert_eq!(saved.len(), 3);
+        assert_eq!(saved[0].id, "recovered-0");
+        assert_eq!(saved[1].id, "recovered-1");
+        assert_eq!(saved[0].payload["persisted"], true);
+        assert_eq!(saved[1].payload["persisted"], false);
+    }
 
     #[test]
     fn doctor_codex_unavailable_names_both_runtime_prerequisites() {

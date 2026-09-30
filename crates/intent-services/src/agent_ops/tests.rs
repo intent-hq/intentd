@@ -47093,3 +47093,199 @@ async fn completion_startup_and_live_retries_keep_distinct_payloads_and_scopes()
         assert!(!text.contains("historical completion"), "{text}");
     }
 }
+
+#[tokio::test]
+async fn shutdown_admission_stops_retry_and_preserves_durable_watch() {
+    let (_t, svc, manager, _bus, ws) = setup_with_manager().await;
+    let parent = create_agent(&svc, &ws, "Shutdown parent").await;
+    let child = create_agent(&svc, &ws, "Shutdown child").await;
+    svc.register_completion_watch_durable(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .await
+    .unwrap();
+    let event = completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "lastResponseSummary": "done" }),
+    );
+    // Arm the same retry used after a transient delivery failure. Freeze time
+    // after fixture I/O so no backoff pass can race the shutdown assertion.
+    tokio::time::pause();
+    svc.schedule_completion_delivery_retry(child.clone(), event.clone(), None);
+    assert_eq!(svc.completion_delivery_retries.lock().unwrap().len(), 1);
+    manager.shutdown().await;
+    assert!(
+        svc.completion_delivery_retries.lock().unwrap().is_empty(),
+        "shutdown must drain completion retry ownership"
+    );
+    // A delivery already in progress may request a retry after shutdown closed.
+    svc.schedule_completion_delivery_retry(child.clone(), event.clone(), None);
+    assert!(svc.completion_delivery_retries.lock().unwrap().is_empty());
+    tokio::time::resume();
+    assert_eq!(
+        svc.store().list_completion_watches().await.unwrap().len(),
+        1
+    );
+    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+
+    // Restart wiring can still recover the watch and deliver its stable wake.
+    let restarted = Services::new(svc.store().clone());
+    restarted
+        .heal_completion_watches_on_startup()
+        .await
+        .unwrap();
+    restarted.handle_completion_event(&event).await;
+    assert_eq!(parent_message_count(&restarted, &parent).await, 1);
+    assert!(restarted
+        .store()
+        .list_completion_watches()
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[intent_test_macros::daemon_test]
+async fn shutdown_claimed_startup_resume_remains_recoverable() {
+    shutdown_claimed_resume_at_barrier(false).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn shutdown_claimed_startup_resume_rechecks_actual_admission() {
+    shutdown_claimed_resume_at_barrier(true).await;
+}
+
+async fn shutdown_claimed_resume_at_barrier(inside_send: bool) {
+    let (_tmp, svc, ws) = setup().await;
+    let bus = EventBus::new(svc.store.clone());
+    let mut svc = svc.with_event_bus(bus.clone());
+    let park = Arc::new(crate::CompletionClassifyPark::default());
+    if inside_send {
+        svc.interrupted_resume_park = Some(park.clone());
+    }
+    let manager = Arc::new(crate::agent_manager::AgentManager::new(
+        svc.clone(),
+        Arc::new(crate::agent_manager::BusEventSink::new(bus)),
+        4,
+    ));
+    svc.attach_agent_manager(&manager);
+    // Only one layer pauses: either resume before send, or the manager after
+    // its entry check. Attach once, as the real composition root does.
+    svc.interrupted_resume_park = if inside_send {
+        None
+    } else {
+        Some(park.clone())
+    };
+    let agent = create_agent(&svc, &ws, "claimed resume").await;
+    svc.store
+        .set_agent_session_status(
+            &ws,
+            &agent,
+            AgentStatus::RuntimeIdle,
+            false,
+            &now_iso(),
+            None,
+        )
+        .await
+        .unwrap();
+    svc.store
+        .insert_interrupted_agent(&agent, &ws, "active", &now_iso())
+        .await
+        .unwrap();
+    assert_eq!(
+        svc.store
+            .get_agent_session_summary(&agent)
+            .await
+            .unwrap()
+            .status,
+        AgentStatus::RuntimeIdle
+    );
+    let candidates = svc.prepare_startup_resume().await.unwrap();
+    let resuming = svc.clone();
+    let id = agent.clone();
+    let resume = intent_core::spawn_daemon(async move {
+        resuming.resume_startup_candidate(&candidates, &id).await
+    });
+    timeout(Duration::from_secs(5), park.entered.notified())
+        .await
+        .unwrap();
+    assert!(
+        svc.store
+            .get_interrupted_agent(&agent)
+            .await
+            .unwrap()
+            .is_none(),
+        "resume has claimed the interruption"
+    );
+    assert!(
+        manager.list_busy().is_empty(),
+        "claim precedes turn admission"
+    );
+    manager.begin_shutdown();
+    manager.checkpoint_shutdown().await;
+    svc.shutdown_agent_deliveries().await;
+    park.release.notify_one();
+    let outcome = timeout(Duration::from_secs(5), resume)
+        .await
+        .unwrap()
+        .unwrap();
+    manager.shutdown().await;
+    assert!(
+        outcome.is_err(),
+        "a shutdown-parked continuation must not resolve recovery as resumed"
+    );
+    assert!(
+        svc.store
+            .get_interrupted_agent(&agent)
+            .await
+            .unwrap()
+            .is_some(),
+        "unadmitted recovery stays pending for the next boot"
+    );
+    let restarted = Services::new(svc.store.clone());
+    restarted.rehydrate_agent_queues().await.unwrap();
+    assert!(
+        restarted.queue_snapshot(&agent).is_empty(),
+        "no duplicate continuation may be stranded in an ordinary queue"
+    );
+    let candidates = restarted.prepare_startup_resume().await.unwrap();
+    assert_eq!(candidates.ids(), std::slice::from_ref(&agent));
+    restarted
+        .resume_startup_candidate(&candidates, &agent)
+        .await
+        .unwrap();
+    assert!(restarted
+        .store
+        .get_interrupted_agent(&agent)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(restarted.resume_interrupted_agent(&agent).await.is_err());
+    let messages = restarted
+        .store
+        .get_agent_session(&agent)
+        .await
+        .unwrap()
+        .messages;
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|m| m
+                .metadata
+                .as_ref()
+                .is_some_and(|v| v["type"] == super::RESUME_CONTINUATION_METADATA_TYPE))
+            .count(),
+        1
+    );
+    assert_eq!(
+        messages.iter().filter(|m| m.role == "system").count(),
+        1,
+        "retry does not duplicate the interruption marker"
+    );
+}

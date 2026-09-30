@@ -24507,3 +24507,526 @@ async fn shutdown_snapshots_and_aborts_all_workers_before_persistence() {
         "shutdown must abort every worker before persistence"
     );
 }
+
+#[tokio::test]
+async fn shutdown_admission_rejects_idle_agent_outside_snapshot() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-shutdown-admission");
+    let busy = AgentId::from("shutdown-busy");
+    let idle = AgentId::from("shutdown-idle");
+    seed_agent(&mgr, &ws, &busy).await;
+    let idle_ws = WorkspaceId::from("ws-shutdown-idle");
+    seed_agent(&mgr, &idle_ws, &idle).await;
+    assert!(mgr.try_begin(&busy, &ws).await);
+    let pause = Arc::new(super::TurnStartPause::default());
+    *mgr.shutdown_persist_pause.lock().unwrap() = Some(pause.clone());
+    let shutdown = {
+        let mgr = mgr.clone();
+        intent_core::spawn_daemon(async move { mgr.shutdown().await })
+    };
+    timeout(Duration::from_secs(5), pause.reached.notified())
+        .await
+        .unwrap();
+    let admitted = mgr.try_begin(&idle, &idle_ws).await;
+    pause.resume.notify_one();
+    timeout(Duration::from_secs(5), shutdown)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !admitted,
+        "shutdown must reject agents absent from its snapshot"
+    );
+    assert!(!mgr.is_busy(&idle));
+    assert!(mgr.workers.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn shutdown_admission_rejects_preclaimed_worker_registration() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-shutdown-preclaimed");
+    let id = AgentId::from("shutdown-preclaimed");
+    seed_agent(&mgr, &ws, &id).await;
+    let admission = mgr.try_begin_turn(&id, &ws).await.unwrap();
+    let pause = Arc::new(super::TurnStartPause::default());
+    *mgr.shutdown_persist_pause.lock().unwrap() = Some(pause.clone());
+    let shutdown = {
+        let mgr = mgr.clone();
+        intent_core::spawn_daemon(async move { mgr.shutdown().await })
+    };
+    timeout(Duration::from_secs(5), pause.reached.notified())
+        .await
+        .unwrap();
+    mgr.spawn_worker(
+        id.clone(),
+        ws.clone(),
+        "durable admitted turn".into(),
+        super::TurnOptions::default(),
+        true,
+        admission,
+    );
+    // No await: observe registration before a worker can run, then clean it up.
+    let late_worker = mgr.workers.lock().unwrap().remove(&id);
+    let registered = late_worker.is_some();
+    if let Some(worker) = late_worker {
+        worker.abort();
+        let _ = worker.await;
+    }
+    pause.resume.notify_one();
+    timeout(Duration::from_secs(5), shutdown)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !registered,
+        "pre-shutdown admission must not register after the abort sweep"
+    );
+    assert!(mgr
+        .services
+        .store
+        .get_interrupted_agent(&id)
+        .await
+        .unwrap()
+        .is_some());
+    assert_ne!(
+        mgr.services
+            .store
+            .get_agent_session_status(&id)
+            .await
+            .unwrap(),
+        AgentStatus::Error
+    );
+}
+
+#[tokio::test]
+async fn shutdown_admission_parks_late_send_durably_without_provider_failure() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-shutdown-queued");
+    let id = AgentId::from("shutdown-queued");
+    seed_agent(&mgr, &ws, &id).await;
+    mgr.begin_shutdown();
+    let result = mgr
+        .send_message(
+            id.clone(),
+            ws,
+            "keep for restart".into(),
+            Some("shutdown-queued-message".into()),
+            super::TurnOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["queued"], true);
+    mgr.shutdown().await;
+    assert!(!mgr.contains(&id));
+    assert!(mgr.workers.lock().unwrap().is_empty());
+    assert_ne!(
+        mgr.services
+            .store
+            .get_agent_session_status(&id)
+            .await
+            .unwrap(),
+        AgentStatus::Error
+    );
+    let restarted = Services::new(mgr.services.store.clone());
+    restarted.rehydrate_agent_queues().await.unwrap();
+    let queue = restarted.queue_snapshot(&id);
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0]["id"], "shutdown-queued-message");
+}
+
+#[tokio::test]
+async fn shutdown_admission_orders_claimed_startup_writes_before_persistence() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-shutdown-start-write");
+    let id = AgentId::from("shutdown-start-write");
+    seed_agent(&mgr, &ws, &id).await;
+    let pause = Arc::new(super::TurnStartPause::default());
+    *mgr.turn_start_pause.lock().unwrap() = Some(pause.clone());
+    let start = {
+        let (mgr, id, ws) = (mgr.clone(), id.clone(), ws.clone());
+        intent_core::spawn_daemon(async move { mgr.try_begin_turn(&id, &ws).await })
+    };
+    timeout(Duration::from_secs(5), pause.reached.notified())
+        .await
+        .unwrap();
+    mgr.begin_shutdown();
+    let shutdown = {
+        let mgr = mgr.clone();
+        intent_core::spawn_daemon(async move { mgr.shutdown().await })
+    };
+    pause.resume.notify_one();
+    let admission = start.await.unwrap().unwrap();
+    timeout(Duration::from_secs(5), shutdown)
+        .await
+        .unwrap()
+        .unwrap();
+    mgr.spawn_worker(
+        id.clone(),
+        ws,
+        "late claimed message".into(),
+        super::TurnOptions::default(),
+        true,
+        admission,
+    );
+    assert!(mgr.workers.lock().unwrap().is_empty());
+    assert!(!mgr.is_busy(&id));
+    assert!(mgr
+        .services
+        .store
+        .get_interrupted_agent(&id)
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        mgr.services
+            .store
+            .get_agent_session_status(&id)
+            .await
+            .unwrap(),
+        AgentStatus::RuntimeIdle
+    );
+}
+
+#[tokio::test]
+async fn shutdown_admission_requeues_flush_popped_before_closure() {
+    let (_tmp, mgr) = manager().await;
+    let ws = WorkspaceId::from("ws-shutdown-flush-popped");
+    let id = AgentId::from("shutdown-flush-popped");
+    seed_agent(&mgr, &ws, &id).await;
+    let admission = mgr.try_begin_turn(&id, &ws).await.unwrap();
+    mgr.services.enqueue_message_with_id(
+        &id,
+        Some("popped-before-shutdown".into()),
+        "preserve popped entry".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        intent_core::MessageOrigin::User,
+    );
+    mgr.services.persist_queue_snapshot(&id).await;
+    let (entry, draining) = mgr.services.dequeue_message_draining(&id).unwrap();
+    mgr.begin_shutdown();
+    assert!(matches!(
+        mgr.prepare_admitted_flush_turn(&id, &ws, vec![entry], draining, admission)
+            .await,
+        super::FlushPrep::Parked
+    ));
+    // An unrelated queue mutation must not durably overwrite the popped entry.
+    mgr.services.persist_queue_snapshot(&id).await;
+    mgr.shutdown().await;
+    let restarted = Services::new(mgr.services.store.clone());
+    restarted.rehydrate_agent_queues().await.unwrap();
+    let queue = restarted.queue_snapshot(&id);
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0]["id"], "popped-before-shutdown");
+}
+
+#[tokio::test]
+async fn shutdown_durable_failed_persist_handback_keeps_original_entry() {
+    let (_tmp, mgr) = manager().await;
+    let ws = WorkspaceId::from("ws-shutdown-failed-handback");
+    let id = AgentId::from("shutdown-failed-handback");
+    seed_agent(&mgr, &ws, &id).await;
+    let admission = mgr.try_begin_turn(&id, &ws).await.unwrap();
+    let images = json!([{ "type": "image", "data": "fixture" }]);
+    mgr.services.enqueue_message_with_id(
+        &id,
+        Some("original-failed-entry".into()),
+        "keep failed handback".into(),
+        Some(images.clone()),
+        None,
+        None,
+        None,
+        false,
+        intent_core::MessageOrigin::User,
+    );
+    mgr.services.persist_queue_snapshot(&id).await;
+    let (entry, draining) = mgr.services.dequeue_message_draining(&id).unwrap();
+    mgr.services.persist_queue_snapshot(&id).await;
+    mgr.begin_shutdown();
+    mgr.fail_admitted_persist(
+        &id,
+        &ws,
+        &entry.content,
+        &super::turn_options_for_entry(&entry, false),
+        admission,
+    )
+    .await;
+    drop(draining);
+    mgr.shutdown().await;
+    let restarted = Services::new(mgr.services.store.clone());
+    restarted.rehydrate_agent_queues().await.unwrap();
+    let recovered = restarted
+        .dequeue_message(&id)
+        .expect("failed handback remains recoverable");
+    assert_eq!(recovered.id, entry.id);
+    assert_eq!(recovered.content, entry.content);
+    assert_eq!(recovered.image_blocks, Some(images));
+    assert_ne!(
+        mgr.services
+            .store
+            .get_agent_session_status(&id)
+            .await
+            .unwrap(),
+        AgentStatus::Error
+    );
+}
+
+async fn shutdown_durable_cancelled_drain(count: usize, persisted_head: bool) {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-shutdown-drain-cancel");
+    let id = AgentId::from("shutdown-drain-cancel");
+    seed_agent(&mgr, &ws, &id).await;
+    assert!(mgr.try_begin(&id, &ws).await);
+    for n in 0..count {
+        mgr.services.enqueue_message_with_id(
+            &id,
+            Some(format!("cancel-entry-{n}")),
+            format!("keep entry {n}"),
+            None,
+            Some(json!([{ "type": "file", "name": format!("file-{n}") }])),
+            None,
+            None,
+            false,
+            intent_core::MessageOrigin::User,
+        );
+    }
+    mgr.services.persist_queue_snapshot(&id).await;
+    let (mut entries, draining) = mgr
+        .services
+        .dequeue_flush_batch_draining(&id, intent_core::FlushQueuedMessagesMode::All, false, 1)
+        .unwrap();
+    mgr.services.persist_queue_snapshot(&id).await;
+    // A different agent may use the same client-supplied queue ID. Its
+    // transcript must never mark this agent's recovered payload as persisted.
+    let other = AgentId::from("shutdown-drain-other");
+    let other_ws = WorkspaceId::from("ws-shutdown-drain-other");
+    seed_agent(&mgr, &other_ws, &other).await;
+    let mut unrelated = entries[0].clone();
+    super::stamp_queued_message_id(&mut unrelated);
+    assert!(
+        super::persist_user(
+            &mgr,
+            &other,
+            &other_ws,
+            &unrelated.content,
+            None,
+            None,
+            unrelated.message_metadata.as_ref(),
+            Some(&unrelated.turn_id),
+            true
+        )
+        .await
+    );
+    if persisted_head {
+        super::stamp_queued_message_id(&mut entries[0]);
+        assert!(
+            super::persist_user(
+                &mgr,
+                &id,
+                &ws,
+                &entries[0].content,
+                entries[0].image_blocks.as_ref(),
+                entries[0].file_blocks.as_ref(),
+                entries[0].message_metadata.as_ref(),
+                Some(&entries[0].turn_id),
+                true
+            )
+            .await
+        );
+    }
+    let (entered, ready) = tokio::sync::oneshot::channel();
+    let worker = intent_core::spawn_daemon(async move {
+        let _draining = draining;
+        entered.send(()).unwrap();
+        std::future::pending::<()>().await;
+    });
+    mgr.workers.lock().unwrap().insert(id.clone(), worker);
+    ready.await.unwrap();
+    mgr.begin_shutdown();
+    mgr.services.enqueue_message_with_id(
+        &id,
+        Some("late-unrelated-entry".into()),
+        "late unrelated send".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        intent_core::MessageOrigin::User,
+    );
+    mgr.services.persist_queue_snapshot(&id).await;
+    mgr.shutdown().await;
+    let restarted = Services::new(mgr.services.store.clone());
+    restarted.rehydrate_agent_queues().await.unwrap();
+    for (n, original) in entries.iter().enumerate() {
+        let recovered = restarted
+            .dequeue_message(&id)
+            .expect("cancelled drain remains recoverable");
+        assert_eq!(recovered.id, original.id);
+        assert_eq!(recovered.content, original.content);
+        assert_eq!(recovered.turn_id, original.turn_id);
+        assert_eq!(recovered.user_origin, original.user_origin);
+        assert_eq!(recovered.file_blocks, original.file_blocks);
+        assert_eq!(
+            recovered.persisted,
+            persisted_head && n == 0,
+            "a committed transcript row must not be appended again on recovery"
+        );
+    }
+    assert_eq!(
+        restarted.dequeue_message(&id).unwrap().id,
+        "late-unrelated-entry"
+    );
+    assert!(restarted.dequeue_message(&id).is_none());
+    assert_ne!(
+        mgr.services
+            .store
+            .get_agent_session_status(&id)
+            .await
+            .unwrap(),
+        AgentStatus::Error
+    );
+}
+
+#[tokio::test]
+async fn shutdown_durable_single_drain_cancellation_keeps_entry() {
+    shutdown_durable_cancelled_drain(1, false).await;
+}
+
+#[tokio::test]
+async fn shutdown_durable_batch_drain_cancellation_keeps_all_entries() {
+    shutdown_durable_cancelled_drain(2, false).await;
+}
+
+#[tokio::test]
+async fn shutdown_durable_partial_batch_marks_committed_head() {
+    shutdown_durable_cancelled_drain(2, true).await;
+}
+
+#[tokio::test]
+async fn shutdown_durable_batch_append_failure_is_not_terminal() {
+    let _env = EnvGuard::set_all(&[("INTENTD_PERSIST_RETRY_BACKOFF_MS", "1,1")]);
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-shutdown-batch-failure");
+    let id = AgentId::from("shutdown-batch-failure");
+    seed_agent(&mgr, &ws, &id).await;
+    let admission = mgr.try_begin_turn(&id, &ws).await.unwrap();
+    for n in 0..3 {
+        mgr.services.enqueue_message_with_id(
+            &id,
+            Some(format!("batch-failure-{n}")),
+            format!("entry {n}"),
+            None,
+            None,
+            None,
+            None,
+            false,
+            intent_core::MessageOrigin::User,
+        );
+    }
+    let (mut entries, draining) = mgr
+        .services
+        .dequeue_flush_batch_draining(&id, intent_core::FlushQueuedMessagesMode::All, false, 1)
+        .unwrap();
+    // Force the failure after an already-durable head, exercising the real
+    // batch handback order as well as the shared terminal-failure handler.
+    entries[0].persisted = true;
+    let pause = Arc::new(super::TurnStartPause::default());
+    *mgr.user_persist_pause.lock().unwrap() = Some(pause.clone());
+    let worker_mgr = mgr.clone();
+    let worker_id = id.clone();
+    let worker_ws = ws.clone();
+    let preparation = tokio::spawn(async move {
+        matches!(
+            worker_mgr
+                .prepare_admitted_flush_turn(&worker_id, &worker_ws, entries, draining, admission)
+                .await,
+            super::FlushPrep::Parked
+        )
+    });
+    timeout(Duration::from_secs(5), pause.reached.notified())
+        .await
+        .unwrap();
+    sqlx::query("CREATE TRIGGER fail_shutdown_append BEFORE INSERT ON agent_message WHEN NEW.role = 'user' BEGIN SELECT RAISE(ABORT, 'test append failure'); END").execute(mgr.services.store.write_pool()).await.unwrap();
+    mgr.begin_shutdown();
+    pause.resume.notify_one();
+    assert!(timeout(Duration::from_secs(5), preparation)
+        .await
+        .unwrap()
+        .unwrap());
+    let status = mgr
+        .services
+        .store
+        .get_agent_session_status(&id)
+        .await
+        .unwrap();
+    sqlx::query("DROP TRIGGER fail_shutdown_append")
+        .execute(mgr.services.store.write_pool())
+        .await
+        .unwrap();
+    mgr.shutdown().await;
+    assert_ne!(
+        status,
+        AgentStatus::Error,
+        "shutdown batch handback must not manufacture terminal failure"
+    );
+    let restarted = Services::new(mgr.services.store.clone());
+    restarted.rehydrate_agent_queues().await.unwrap();
+    let queue = restarted.queue_snapshot(&id);
+    assert_eq!(
+        queue
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["batch-failure-0", "batch-failure-1", "batch-failure-2"]
+    );
+}
+
+#[tokio::test]
+async fn shutdown_durable_duplicate_draining_guards_preserve_one_entry() {
+    let (_tmp, mgr) = manager().await;
+    let ws = WorkspaceId::from("ws-shutdown-duplicate-drain");
+    let id = AgentId::from("shutdown-duplicate-drain");
+    seed_agent(&mgr, &ws, &id).await;
+    mgr.services.enqueue_message_with_id(
+        &id,
+        Some("duplicate-drain-entry".into()),
+        "keep once".into(),
+        None,
+        Some(json!([{ "name":"attachment" }])),
+        None,
+        None,
+        false,
+        intent_core::MessageOrigin::User,
+    );
+    mgr.services.persist_queue_snapshot(&id).await;
+    let (entry, first) = mgr.services.dequeue_message_draining(&id).unwrap();
+    mgr.services.requeue_front_batch(&id, vec![entry.clone()]);
+    // The first handback has not dropped its guard when the next owner pops.
+    let (_entry, second) = mgr.services.dequeue_message_draining(&id).unwrap();
+    mgr.services.persist_queue_snapshot(&id).await;
+    mgr.begin_shutdown();
+    drop(first);
+    drop(second);
+    mgr.shutdown().await;
+    let restarted = Services::new(mgr.services.store.clone());
+    restarted.rehydrate_agent_queues().await.unwrap();
+    let queue = restarted.queue_snapshot(&id);
+    assert_eq!(
+        queue.len(),
+        1,
+        "duplicate frozen copies must not prevent queue persistence"
+    );
+    assert_eq!(queue[0]["id"], entry.id);
+    assert_eq!(queue[0]["content"], entry.content);
+    assert_eq!(queue[0]["fileBlocks"], entry.file_blocks.unwrap());
+}

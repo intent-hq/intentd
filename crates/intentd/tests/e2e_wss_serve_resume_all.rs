@@ -1225,9 +1225,31 @@ async fn startup_completion_recovery_serves_wss_before_waking_parents() {
                 1
             );
             assert!(!provider_log.exists());
-            continue;
+            // Exercise the composition root again: shutdown must leave both
+            // watch/group state and the interrupted parent recoverable, and
+            // the next startup must deliver exactly one completion wake.
+            drop(ws);
+            daemon = Daemon {
+                child: spawn_serve(
+                    fixture.root.path(),
+                    "both",
+                    &[
+                        ("INTENTD_AUTH_TOKEN", TOKEN),
+                        ("MOCK_AGENT_SCRIPT_PATH", fixture.script.as_str()),
+                        ("MOCK_AGENT_SESSION_LOG", provider_log.to_str().unwrap()),
+                    ],
+                    true,
+                ),
+                data_dir: fixture.root.path().to_owned(),
+            };
+            let mut restarted_ws = fixture.wss().await;
+            assert!(wss_rpc(&mut restarted_ws, 14, "system.status", json!({}))
+                .await
+                .is_object());
+            assert!(daemon.child.try_wait().unwrap().is_none());
+        } else {
+            release.write_u8(1).await.unwrap();
         }
-        release.write_u8(1).await.unwrap();
         wait_for_sweep(fixture.root.path()).await;
         timeout(common::rpc_read_timeout(), async {
             loop {
