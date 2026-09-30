@@ -303,7 +303,14 @@ fn cortex_and_droid_gate_on_enable_env_vars() {
 /// added provider can't accidentally opt in without updating this partition.
 #[test]
 fn session_mcp_servers_partition() {
-    let opted_in = ["claude-code", "codex", "droid", "grok", "antigravity", "mock"];
+    let opted_in = [
+        "claude-code",
+        "codex",
+        "droid",
+        "grok",
+        "antigravity",
+        "mock",
+    ];
     for id in all_provider_ids() {
         let p = find_provider(id).unwrap();
         assert_eq!(
@@ -326,7 +333,10 @@ fn mock_session_mcp_preserves_discovery_and_authentication() {
     );
     assert_eq!(mock.runtime, ProviderRuntime::Node);
     assert!(mock.supports_authenticate);
-    assert_eq!(mock.injection_mechanism, InjectionMechanism::FirstTurnPrepend);
+    assert_eq!(
+        mock.injection_mechanism,
+        InjectionMechanism::FirstTurnPrepend
+    );
     assert!(!mock.supports_mcp_config && !mock.mcp_via_pi_extension);
     assert!(
         mock.supports_session_mcp_servers,
