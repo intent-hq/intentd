@@ -495,7 +495,11 @@ async fn wss_linked_skills_custom_config_directory_and_empty_fallback() {
         let status = common::await_wss_status_logged(&socket, &log_path).await;
         let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
         let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
-        let created = wss_call(port, cfg.clone(), &json!({"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Config skills","skipWorktree":true,"path":project}}).to_string()).await;
+        let created = wss_call(port, cfg.clone(), &json!({"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Config skills","skipIsolation":true,"worktreePath":project}}).to_string()).await;
+        assert_eq!(
+            created["result"]["workspace"]["worktreePath"],
+            project.to_string_lossy().as_ref()
+        );
         let id = created["result"]["workspace"]["id"].as_str().unwrap();
         let listed = wss_call(
             port,

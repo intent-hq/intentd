@@ -358,13 +358,22 @@ async fn claude_agents_report_exclusions_and_clear_repaired_diagnostics() {
         duplicate["winnerPath"],
         root.join("a.md").to_string_lossy().as_ref()
     );
+    let checkout = dir.path().join("checkout");
+    std::fs::create_dir_all(&checkout).unwrap();
     let workspace = wss_rpc(
         &mut client,
         3,
         "workspace.create",
-        json!({"title":"Import diagnostic repair"}),
+        json!({"title":"Import diagnostic repair","skipIsolation":true,"worktreePath":checkout}),
     )
     .await;
+    assert_eq!(
+        workspace["workspace"]["worktreePath"],
+        checkout.to_string_lossy().as_ref()
+    );
+    stop(daemon, &dir.path().join("intentd.sock")).await;
+    let (daemon, port, cfg) = boot(dir.path(), &home).await;
+    let mut client = connect_ws(port, cfg.clone()).await;
     let mut subscription = connect_ws(port, cfg).await;
     wss_rpc(
         &mut subscription,
@@ -373,6 +382,25 @@ async fn claude_agents_report_exclusions_and_clear_repaired_diagnostics() {
         json!({"eventTypes":["specialists:changed"],"workspaceId":workspace["workspace"]["id"]}),
     )
     .await;
+    let mut watch_ready = None;
+    for attempt in 0..20 {
+        write_agent(
+            &root.join("a.md"),
+            "collision",
+            "",
+            &format!("Watcher readiness probe {attempt}."),
+        );
+        if let Ok(event) = tokio::time::timeout(
+            common::test_timeout(Duration::from_millis(750)),
+            next_event(&mut subscription, &["specialists:changed"], 20),
+        )
+        .await
+        {
+            watch_ready = Some(event);
+            break;
+        }
+    }
+    let watch_ready = watch_ready.expect("specialist watch must observe a readiness probe");
     write_agent(&root.join("invalid.md"), "repaired", "", "Repaired.");
     let event = next_event(&mut subscription, &["specialists:changed"], 20).await;
     let after = wss_rpc(&mut client, 2, "specialist.list", json!({})).await;
@@ -384,7 +412,10 @@ async fn claude_agents_report_exclusions_and_clear_repaired_diagnostics() {
         .any(|d| d["path"] == root.join("invalid.md").to_string_lossy().as_ref()));
     std::fs::write(
         dir.path().join("claude-diagnostics-evidence.json"),
-        serde_json::to_vec_pretty(&json!({"before":before,"event":event,"after":after})).unwrap(),
+        serde_json::to_vec_pretty(
+            &json!({"before":before,"watchReady":watch_ready,"event":event,"after":after}),
+        )
+        .unwrap(),
     )
     .unwrap();
     stop(daemon, &dir.path().join("intentd.sock")).await;
@@ -424,9 +455,13 @@ async fn claude_agents_missing_skills_block_creation_and_recover_in_project_scop
         &mut client,
         2,
         "workspace.create",
-        json!({"title":"Required skill repair", "skipWorktree":true,"path":checkout}),
+        json!({"title":"Required skill repair", "skipIsolation":true,"worktreePath":checkout}),
     )
     .await;
+    assert_eq!(
+        workspace["workspace"]["worktreePath"],
+        checkout.to_string_lossy().as_ref()
+    );
     let workspace_id = workspace["workspace"]["id"].clone();
     let denied = wss_reply(
         &mut client,
@@ -645,13 +680,27 @@ async fn claude_agents_custom_config_root_discovers_and_watches_agents_and_skill
         .unwrap()
         .iter()
         .any(|d| d["id"] == "not-from-config"));
+    let checkout = dir.path().join("checkout");
+    std::fs::create_dir_all(&checkout).unwrap();
     let workspace = wss_rpc(
         &mut client,
         2,
         "workspace.create",
-        json!({"title":"Custom config"}),
+        json!({"title":"Custom config","skipIsolation":true,"worktreePath":checkout}),
     )
     .await;
+    assert_eq!(
+        workspace["workspace"]["worktreePath"],
+        checkout.to_string_lossy().as_ref()
+    );
+    stop(daemon, &dir.path().join("intentd.sock")).await;
+    let child = common::DaemonGuard::process_only(spawn_serve_with_claude_config(
+        dir.path(),
+        &home,
+        Some(&config),
+    ));
+    let (daemon, port, cfg) = await_boot(dir.path(), child).await;
+    let mut client = connect_ws(port, cfg.clone()).await;
     let workspace_id = workspace["workspace"]["id"].clone();
     let skills = wss_rpc(
         &mut client,
