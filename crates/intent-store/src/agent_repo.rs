@@ -5563,6 +5563,28 @@ impl Store {
         }
     }
 
+    /// Queue IDs whose user transcript rows already committed. Shutdown
+    /// recovery uses this narrow metadata projection to avoid replaying an
+    /// append whose acknowledgement was lost to cancellation.
+    ///
+    /// # Errors
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn persisted_queue_message_ids(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<std::collections::HashSet<String>> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT json_extract(metadata, '$.queueInfo.queuedMessageId') FROM agent_message \
+             WHERE agent_id = ? AND role = 'user' \
+             AND json_type(metadata, '$.queueInfo.queuedMessageId') = 'text'",
+        )
+        .bind(&agent_id.0)
+        .fetch_all(self.read_pool())
+        .await
+        .map(|ids| ids.into_iter().collect())
+        .map_err(|e| Error::Internal(format!("read persisted queue message IDs failed: {e}")))
+    }
+
     /// One message of an agent's log by row id, hydrated as a single row —
     /// the pending-questions marker resolver (PROTOCOL §5.5). One statement
     /// over the primary key, at most ONE decoded message regardless of

@@ -46463,3 +46463,60 @@ async fn startup_resume_listing_never_exposes_a_stale_successful_candidate() {
         "an old pending-row read must not expose a successfully resumed candidate"
     );
 }
+
+#[tokio::test]
+async fn shutdown_admission_stops_retry_and_preserves_durable_watch() {
+    let (_t, svc, manager, _bus, ws) = setup_with_manager().await;
+    let parent = create_agent(&svc, &ws, "Shutdown parent").await;
+    let child = create_agent(&svc, &ws, "Shutdown child").await;
+    svc.register_completion_watch_durable(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .await
+    .unwrap();
+    let event = completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "lastResponseSummary": "done" }),
+    );
+    // Arm the same retry used after a transient delivery failure. Freeze time
+    // after fixture I/O so no backoff pass can race the shutdown assertion.
+    tokio::time::pause();
+    svc.schedule_completion_delivery_retry(child.clone(), event.clone());
+    assert_eq!(svc.completion_delivery_retries.lock().unwrap().len(), 1);
+    manager.shutdown().await;
+    assert!(
+        svc.completion_delivery_retries.lock().unwrap().is_empty(),
+        "shutdown must drain completion retry ownership"
+    );
+    // A delivery already in progress may request a retry after shutdown closed.
+    svc.schedule_completion_delivery_retry(child.clone(), event.clone());
+    assert!(svc.completion_delivery_retries.lock().unwrap().is_empty());
+    tokio::time::resume();
+    assert_eq!(
+        svc.store().list_completion_watches().await.unwrap().len(),
+        1
+    );
+    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+
+    // Restart wiring can still recover the watch and deliver its stable wake.
+    let restarted = Services::new(svc.store().clone());
+    restarted
+        .heal_completion_watches_on_startup()
+        .await
+        .unwrap();
+    restarted.handle_completion_event(&event).await;
+    assert_eq!(parent_message_count(&restarted, &parent).await, 1);
+    assert!(restarted
+        .store()
+        .list_completion_watches()
+        .await
+        .unwrap()
+        .is_empty());
+}
