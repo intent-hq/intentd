@@ -1,5 +1,5 @@
-//! Command-only regressions: inspect fixture inputs before any daemon, CLI,
-//! credential read or identity request can run.
+//! Inspect fixture inputs before spawning, then exercise saved-credential
+//! isolation using only a private synthetic host and a local CLI stub.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -33,8 +33,7 @@ fn assert_isolated(command: &Command, data_dir: &Path) {
         );
     }
     assert!(
-        environment.get(OsStr::new("INTENTD_ASSERT_HERMETIC_ROOT"))
-            == Some(&Some(OsStr::new("1"))),
+        environment.get(OsStr::new("INTENTD_ASSERT_HERMETIC_ROOT")) == Some(&Some(OsStr::new("1"))),
         "wake fixture must keep the hermetic-root guard enabled"
     );
 }
@@ -56,7 +55,10 @@ fn host_canaries_cannot_override_fixture_isolation() {
         ("GH_TOKEN", "synthetic-gh-token"),
         ("GH_HOST", "synthetic-enterprise.invalid"),
         ("GH_ENTERPRISE_TOKEN", "synthetic-gh-enterprise-token"),
-        ("GITHUB_ENTERPRISE_TOKEN", "synthetic-github-enterprise-token"),
+        (
+            "GITHUB_ENTERPRISE_TOKEN",
+            "synthetic-github-enterprise-token",
+        ),
         ("INTENTD_DATA_DIR", "synthetic-host/data"),
         ("INTENTD_CONFIG", "synthetic-host/config.toml"),
         ("INTENTD_SECRETS_FILE", "synthetic-host/secrets.json"),
@@ -74,7 +76,10 @@ fn fixture_command_preserves_mock_provider_inputs() {
     let inputs = [
         ("INTENTD_AUTH_TOKEN", super::TOKEN),
         ("MOCK_AGENT_SCRIPT_PATH", "synthetic-provider.mjs"),
-        ("MOCK_AGENT_BEHAVIOR", r#"{"promptRpcError":{"code":-32603}}"#),
+        (
+            "MOCK_AGENT_BEHAVIOR",
+            r#"{"promptRpcError":{"code":-32603}}"#,
+        ),
     ];
     let command = super::serve_command(data_dir.path(), "both", &inputs);
     let environment: HashMap<_, _> = command.get_envs().collect();
@@ -88,9 +93,78 @@ fn fixture_command_preserves_mock_provider_inputs() {
         command.get_program(),
         OsStr::new(env!("CARGO_BIN_EXE_intentd"))
     );
-    assert_eq!(command.get_args().collect::<Vec<_>>(), [OsStr::new("serve")]);
+    assert_eq!(
+        command.get_args().collect::<Vec<_>>(),
+        [OsStr::new("serve")]
+    );
     assert!(
         environment.get(OsStr::new("INTENTD_TCP_PORT")) == Some(&Some(OsStr::new("0"))),
         "wake fixture must retain the ephemeral WSS port"
     );
+}
+
+#[intent_test_macros::daemon_test]
+async fn saved_host_credentials_are_not_used_by_daemon() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let host = super::common::test_tempdir("itd-woc-synthetic-host-");
+    let gh_config = host.path().join("gh");
+    let bin = host.path().join("bin");
+    std::fs::create_dir(&gh_config).unwrap();
+    std::fs::create_dir(&bin).unwrap();
+    let saved_login = "github.com:\n    user: synthetic-host\n    oauth_token: synthetic-token\n";
+    let saved_secret = r#"{"sourceControl.github.token":"synthetic-saved-token"}"#;
+    std::fs::write(gh_config.join("hosts.yml"), saved_login).unwrap();
+    let secrets = host.path().join("secrets.json");
+    std::fs::write(&secrets, saved_secret).unwrap();
+    let observations = host.path().join("gh-config-observations");
+    let gh = bin.join("gh");
+    // Never emits credentials or makes a network request. Record the actual
+    // child boundary; an unsafe fallback cannot hide behind an invalid token.
+    std::fs::write(
+        &gh,
+        "#!/bin/sh\nprintf '%s\\n' \"$GH_CONFIG_DIR\" >> \"$WOC_GH_OBSERVATIONS\"\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap();
+    let inputs = [
+        ("GH_TOKEN", "synthetic-env-token"),
+        ("GITHUB_TOKEN", "synthetic-env-token"),
+        ("GH_HOST", "synthetic-enterprise.invalid"),
+        ("GH_ENTERPRISE_TOKEN", "synthetic-enterprise-token"),
+        ("GITHUB_ENTERPRISE_TOKEN", "synthetic-enterprise-token"),
+        ("GH_CONFIG_DIR", gh_config.to_str().unwrap()),
+        ("INTENTD_SECRETS_FILE", secrets.to_str().unwrap()),
+        ("PATH", path.to_str().unwrap()),
+        ("WOC_GH_OBSERVATIONS", observations.to_str().unwrap()),
+    ];
+    // A broken command policy fails before a synthetic token can be offered to
+    // a forge. The real daemon below uses exactly the same builder and inputs.
+    let command_root = super::common::test_tempdir("itd-woc-command-");
+    assert_isolated(
+        &super::serve_command(command_root.path(), "both", &inputs),
+        command_root.path(),
+    );
+    let (daemon, _, _, port, fingerprint) =
+        super::boot_daemon_with_task_env("Isolated Identity", &inputs).await;
+    let mut rpc = super::connect_ws(port, super::client_config(&fingerprint)).await;
+    let status = super::wss_rpc(&mut rpc, 1, "github.authStatus", serde_json::json!({})).await;
+    assert_eq!(status["isConfigured"], false, "{status}");
+    let expected = daemon.data_dir.path().join("gh-config");
+    let reads =
+        std::fs::read_to_string(&observations).expect("the CLI fallback was actually exercised");
+    assert!(!reads.is_empty());
+    assert!(reads.lines().all(|line| Path::new(line) == expected));
+    assert!(std::fs::read_dir(&expected).unwrap().next().is_none());
+    drop(rpc);
+    drop(daemon);
+    assert_eq!(
+        std::fs::read_to_string(gh_config.join("hosts.yml")).unwrap(),
+        saved_login
+    );
+    assert_eq!(std::fs::read_to_string(&secrets).unwrap(), saved_secret);
 }

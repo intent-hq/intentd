@@ -27,13 +27,10 @@
 #![cfg(unix)]
 
 mod common;
-#[path = "e2e_wss_wake_or_create/fixture_identity.rs"]
-mod fixture_identity;
 #[path = "e2e_wss_wake_or_create/daemon_exit.rs"]
 mod daemon_exit;
-#[cfg(all(feature = "probe-wait-observer", target_os = "linux"))]
-#[path = "e2e_wss_wake_or_create/probe_settlement.rs"]
-mod probe_settlement;
+#[path = "e2e_wss_wake_or_create/fixture_identity.rs"]
+mod fixture_identity;
 
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -57,8 +54,6 @@ struct Daemon {
     child: Child,
     /// Kept alive for the daemon's lifetime; the store lives under it.
     data_dir: daemon_exit::FixtureDir,
-    #[cfg(all(feature = "probe-wait-observer", target_os = "linux"))]
-    probe_observation: Option<probe_settlement::TeardownObservation>,
 }
 
 impl Drop for Daemon {
@@ -71,30 +66,31 @@ impl Drop for Daemon {
         let mut events = vec![json!({"event": "TeardownEntered", "pid": pid})];
         let mut wait_attempted = false;
         let attempt = catch_unwind(AssertUnwindSafe(|| -> std::io::Result<()> {
-            #[cfg(all(feature = "probe-wait-observer", target_os = "linux"))]
-            if let Some(observation) = &self.probe_observation { observation.graceful_entered(pid)?; }
             let mut wait = daemon_exit::ExitWait::new(&mut self.child)?;
-            daemon_exit::shutdown(&self.data_dir.path().join("intentd.sock"), pid, deadline, &mut events)?;
+            daemon_exit::shutdown(
+                &self.data_dir.path().join("intentd.sock"),
+                pid,
+                deadline,
+                &mut events,
+            )?;
             wait.until_exit(deadline, || {
                 events.push(json!({"event": "DaemonExitWaitPending", "pid": pid,
                     "scope": "fixture direct-child exit readiness; not production admission"}));
-                #[cfg(all(feature = "probe-wait-observer", target_os = "linux"))]
-                if let Some(observation) = &self.probe_observation { observation.wait_pending(pid, deadline)?; }
+
                 Ok(())
             })?;
             events.push(json!({"event": "DaemonExitReadyUnreaped", "pid": pid}));
-            #[cfg(all(feature = "probe-wait-observer", target_os = "linux"))]
-            if let Some(observation) = &self.probe_observation { observation.before_reap(pid, deadline)?; }
+
             daemon_exit::remaining(deadline)?;
             wait_attempted = true;
             let waited = wait.reap();
             events.push(daemon_exit::wait_record(&waited));
-            #[cfg(all(feature = "probe-wait-observer", target_os = "linux"))]
-            if let Some(observation) = &self.probe_observation { observation.normal_wait_result(&waited); }
+
             let status = waited?;
-            if !daemon_exit::normal(&status) { return Err(daemon_exit::invalid("unexpected daemon termination status")) }
-            #[cfg(all(feature = "probe-wait-observer", target_os = "linux"))]
-            if let Some(observation) = &self.probe_observation { observation.after_reap(pid, deadline)?; }
+            if !daemon_exit::normal(status) {
+                return Err(daemon_exit::invalid("unexpected daemon termination status"));
+            }
+
             daemon_exit::remaining(deadline)?;
             Ok(())
         }));
@@ -108,25 +104,23 @@ impl Drop for Daemon {
             // Latch before cleanup. The original error/panic remains primary;
             // cleanup cannot turn a forced termination or unknown owner into success.
             events.push(json!({"event": "TeardownFailed", "error": error}));
-            #[cfg(all(feature = "probe-wait-observer", target_os = "linux"))]
-            if let Some(observation) = &self.probe_observation { observation.failed(error); }
+
             if !wait_attempted {
                 let cleanup = catch_unwind(AssertUnwindSafe(|| -> std::io::Result<()> {
                     events.push(json!({"event": "FailureCleanupKillAttempt", "pid": pid}));
-                    #[cfg(all(feature = "probe-wait-observer", target_os = "linux"))]
-                    if let Some(observation) = &self.probe_observation { observation.kill_attempt(pid); }
+
                     let killed = self.child.kill();
-                    #[cfg(all(feature = "probe-wait-observer", target_os = "linux"))]
-                    if let Some(observation) = &self.probe_observation { observation.kill_result(&killed); }
-                    events.push(json!({"event": "FailureCleanupKillResult", "ok": killed.is_ok(),
-                        "error": killed.as_ref().err().map(ToString::to_string)}));
+
+                    events.push(
+                        json!({"event": "FailureCleanupKillResult", "ok": killed.is_ok(),
+                        "error": killed.as_ref().err().map(ToString::to_string)}),
+                    );
                     killed?;
                     let mut wait = daemon_exit::ExitWait::new(&mut self.child)?;
                     wait.until_exit(deadline, || Ok(()))?;
                     let waited = wait.reap();
                     events.push(daemon_exit::wait_record(&waited));
-                    #[cfg(all(feature = "probe-wait-observer", target_os = "linux"))]
-                    if let Some(observation) = &self.probe_observation { observation.cleanup_wait_result(&waited); }
+
                     waited.map(|_| ())
                 }));
                 events.push(json!({"event": "FailureCleanupResult", "result": match cleanup {
@@ -136,57 +130,65 @@ impl Drop for Daemon {
             }
         }
         let finalizing = catch_unwind(AssertUnwindSafe(|| {
-            daemon_exit::finalize_and_measure(started, deadline, || {
-                let mut failed = failure.is_some() || daemon_exit::remaining(deadline).is_err();
-                #[cfg(all(feature = "probe-wait-observer", target_os = "linux"))]
-                let provider = self.probe_observation.as_ref().map(|observation| {
-                    let row = observation.finalize_provider(failed, deadline);
-                    failed |= row["complete"] != true;
-                    row
-                });
-                #[cfg(not(all(feature = "probe-wait-observer", target_os = "linux")))]
-                let provider: Option<Value> = None;
-                failed |= daemon_exit::remaining(deadline).is_err();
-                let directory = self.data_dir.finalize(failed);
-                json!({"complete": !failed && daemon_exit::directory_complete(&directory),
-                    "provider": provider, "daemonDirectory": directory})
-            }, std::time::Instant::now)
+            daemon_exit::finalize_and_measure(
+                started,
+                deadline,
+                || {
+                    let failed = failure.is_some() || daemon_exit::remaining(deadline).is_err();
+                    let directory = self.data_dir.finalize(failed);
+                    json!({"complete": !failed && daemon_exit::directory_complete(&directory),
+                    "daemonDirectory": directory})
+                },
+                std::time::Instant::now,
+            )
         }));
         let (resources, completion) = match &finalizing {
             Ok((resources, completion)) => (resources.clone(), completion.clone()),
-            Err(_) => (json!({"complete":false,"error":"resource finalization panicked"}),
-                daemon_exit::completion(started, deadline, std::time::Instant::now(), false)),
+            Err(_) => (
+                json!({"complete":false,"error":"resource finalization panicked"}),
+                daemon_exit::completion(started, deadline, std::time::Instant::now(), false),
+            ),
         };
         if completion["normalCompletion"] != true {
-            failure.get_or_insert_with(|| "incomplete, failed or late semantic finalization".into());
-        }
-        #[cfg(all(feature = "probe-wait-observer", target_os = "linux"))]
-        if let Some(observation) = &self.probe_observation {
-            if let Some(error) = &failure { observation.failed(error); }
-            observation.completed(&completion);
+            failure
+                .get_or_insert_with(|| "incomplete, failed or late semantic finalization".into());
         }
         let receipt = json!({"pid":pid,"events":events,"failure":failure,"completion":completion,
-            "resources":resources,"observerFeature":cfg!(feature="probe-wait-observer"),
+            "resources":resources,
             "platform":std::env::consts::OS,"normalCompletion":failure.is_none() && completion["normalCompletion"] == true,
             "timingScope":"semantic finalization before serialization; synchronous syscalls are not hard-preemptible"});
         if failure.is_some() {
             if let Some(path) = receipt["resources"]["daemonDirectory"]["retained"].as_str() {
                 // Already failed; retain the write result without hiding the
                 // original panic/error. No additional success grace is granted.
-                let retained = serde_json::to_vec_pretty(&receipt).map_err(std::io::Error::other)
-                    .and_then(|bytes| std::fs::write(Path::new(path).join("teardown-failure.json"), bytes));
+                let retained = serde_json::to_vec_pretty(&receipt)
+                    .map_err(std::io::Error::other)
+                    .and_then(|bytes| {
+                        std::fs::write(Path::new(path).join("teardown-failure.json"), bytes)
+                    });
                 events.push(json!({"event":"FailureEvidenceWrite","ok":retained.is_ok(),
                     "error":retained.err().map(|e|e.to_string())}));
             }
         }
         let mut receipt = receipt;
         receipt["events"] = json!(events);
-        let reporting = catch_unwind(AssertUnwindSafe(|| daemon_exit::report("fixture-graceful-teardown", &receipt)));
-        daemon_exit::propagate_teardown_outcome(was_panicking, attempt, finalizing, failure, reporting,
-            |outcomes| std::io::Write::write_fmt(&mut std::io::stderr(),
-                format_args!("fixture-teardown-outcomes {outcomes}\n")));
+        let reporting = catch_unwind(AssertUnwindSafe(|| {
+            daemon_exit::report("fixture-graceful-teardown", &receipt)
+        }));
+        daemon_exit::propagate_teardown_outcome(
+            was_panicking,
+            attempt,
+            finalizing,
+            failure,
+            reporting,
+            |outcomes| {
+                std::io::Write::write_fmt(
+                    &mut std::io::stderr(),
+                    format_args!("fixture-teardown-outcomes {outcomes}\n"),
+                )
+            },
+        );
     }
-
 }
 
 fn temp_data_dir() -> tempfile::TempDir {
@@ -489,8 +491,6 @@ async fn boot_daemon_with_task_env(
     let daemon = Daemon {
         child,
         data_dir: data_dir_guard,
-        #[cfg(all(feature = "probe-wait-observer", target_os = "linux"))]
-        probe_observation: None,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");

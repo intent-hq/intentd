@@ -42,8 +42,6 @@ default = []
 # WSAPI-1 spike: link the QuickJS-backed JS engine. Off by default so the
 # baseline binary is unchanged; enable to measure size / build impact.
 js-engine = ["dep:intent-js"]
-# Forward only when building the Linux fixture ownership controls explicitly.
-probe-wait-observer = ["intent-services/probe-wait-observer"]
 
 [dev-dependencies]
 uuid = { workspace = true }

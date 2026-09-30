@@ -24,10 +24,6 @@ use std::path::PathBuf;
 
 use intent_providers::{auggie_cli_gate, PiCliGate, PiCliProbe};
 
-#[cfg(all(feature = "probe-wait-observer", target_os = "linux"))]
-#[path = "auggie_cli/probe_observer.rs"]
-mod probe_observer;
-
 /// One probed auggie candidate: its path plus the pure version-gate verdict.
 #[derive(Debug, Clone)]
 pub(crate) struct AuggieCandidate {
@@ -130,88 +126,43 @@ fn run_version_probe(path: &std::path::Path) -> Option<String> {
     } else {
         std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
     };
-    let mut command = Command::new(path);
-    command.arg("--version")
+    let mut child = Command::new(path)
+        .arg("--version")
         .env("PATH", intent_providers::enhanced_path(Some(&abs)))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    #[cfg(all(feature = "probe-wait-observer", target_os = "linux"))]
-    let mut observation = probe_observer::Observation::begin(&abs);
-    #[cfg(all(feature = "probe-wait-observer", target_os = "linux"))]
-    probe_observer::remove_child_channel(&mut command);
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            #[cfg(all(feature = "probe-wait-observer", target_os = "linux"))]
-            observation.spawn_error(&error);
-            let _ = error;
-            return None;
-        }
-    };
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
 
     let timeout = Duration::from_secs(3);
     let start = std::time::Instant::now();
-    #[cfg(all(feature = "probe-wait-observer", target_os = "linux"))]
-    observation.spawned(&child);
 
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                #[cfg(all(feature = "probe-wait-observer", target_os = "linux"))]
-                observation.waited(child.id(), &Ok(status), false);
                 if !status.success() {
                     return None;
                 }
-                let stdout_handle = child.stdout.take();
-                #[cfg(all(feature = "probe-wait-observer", target_os = "linux"))]
-                if stdout_handle.is_none() {
-                    observation.output_error("missing stdout");
-                }
-                let mut stdout_handle = stdout_handle?;
+                let mut stdout_handle = child.stdout.take()?;
                 let mut output = Vec::new();
-                let read = stdout_handle.read_to_end(&mut output);
-                #[cfg(all(feature = "probe-wait-observer", target_os = "linux"))]
-                if let Err(error) = &read {
-                    observation.output_error(&error.to_string());
-                }
-                read.ok()?;
+                stdout_handle.read_to_end(&mut output).ok()?;
                 let stdout = String::from_utf8_lossy(&output);
-                let first_line = stdout.lines().next();
-                #[cfg(all(feature = "probe-wait-observer", target_os = "linux"))]
-                if first_line.is_none() {
-                    observation.output_error("missing first stdout line");
-                }
-                let first_line = first_line?.trim();
+                let first_line = stdout.lines().next()?.trim();
                 if first_line.is_empty() {
-                    #[cfg(all(feature = "probe-wait-observer", target_os = "linux"))]
-                    observation.output_error("empty first stdout line");
                     return None;
                 }
                 return Some(first_line.to_string());
             }
             Ok(None) => {
                 if start.elapsed() >= timeout {
-                    #[cfg(all(feature = "probe-wait-observer", target_os = "linux"))]
-                    observation.timed_out();
-                    let killed = child.kill();
-                    #[cfg(all(feature = "probe-wait-observer", target_os = "linux"))]
-                    observation.killed(&killed);
-                    let _ = killed;
-                    let waited = child.wait();
-                    #[cfg(all(feature = "probe-wait-observer", target_os = "linux"))]
-                    observation.waited(child.id(), &waited, true);
-                    let _ = waited;
+                    let _ = child.kill();
+                    let _ = child.wait();
                     return None;
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(error) => {
-                #[cfg(all(feature = "probe-wait-observer", target_os = "linux"))]
-                observation.wait_error(&error);
-                let _ = error;
-                return None;
-            }
+            Err(_) => return None,
         }
     }
 }
