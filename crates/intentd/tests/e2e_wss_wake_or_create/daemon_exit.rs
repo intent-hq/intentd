@@ -1203,7 +1203,10 @@ fn finalization_expiry_and_incomplete_cleanup_cannot_pass() {
             assert_eq!(directory["retained"], json!(path));
             let metadata = std::fs::symlink_metadata(&path).unwrap();
             assert!(metadata.is_dir());
-            assert_eq!(directory["identity"], json!([metadata.dev(), metadata.ino()]));
+            assert_eq!(
+                directory["identity"],
+                json!([metadata.dev(), metadata.ino()])
+            );
         } else {
             assert_eq!(directory["closeAttempted"], true);
             assert_eq!(directory["closeOk"], true);
