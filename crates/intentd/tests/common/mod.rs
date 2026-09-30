@@ -1294,10 +1294,46 @@ mod tests {
     }
 
     #[test]
+    fn suppressed_caught_panic_preserves_successful_drop_policy() {
+        with_retention_test_root(&std::env::temp_dir(), |base| {
+            let (original, retained) = on_fresh_thread(move || {
+                let dir = test_tempdir_in(base.to_str().expect("UTF-8 temp root"), "itd-retain-");
+                let original = dir.path().to_path_buf();
+                std::fs::write(original.join("daemon.log"), "successful-owner-evidence")
+                    .expect("write owned evidence");
+                {
+                    let _suppress = suppress_failure_retention();
+                    caught_panic();
+                }
+                assert!(original.is_dir(), "caught panic leaves original untouched");
+                let retained = retained_path_for(&original);
+                assert!(!retained.exists(), "suppression must not rename the dir");
+                drop(dir);
+                (original, retained)
+            });
+            assert!(
+                !retained.exists(),
+                "successful drop does not retain a failure"
+            );
+            if keep_tmp_requested() {
+                assert!(original.is_dir(), "KEEP_TMP keeps successful dirs too");
+                assert_eq!(
+                    std::fs::read_to_string(original.join("daemon.log")).unwrap(),
+                    "successful-owner-evidence"
+                );
+                std::fs::remove_dir_all(&original).expect("clean up owned kept dir");
+            }
+            assert!(!original.exists(), "owned original removed after teardown");
+        });
+    }
+
+    #[test]
     fn suppressed_thread_keeps_normal_cleanup_on_caught_panic() {
         with_retention_test_root(&std::env::temp_dir(), |base| {
             let (original, retained) = on_fresh_thread(move || {
                 let dir = test_tempdir_in(base.to_str().expect("UTF-8 temp root"), "itd-retain-");
+                std::fs::write(dir.path().join("daemon.log"), "suppression-owner-evidence")
+                    .expect("write owned evidence");
                 let original = dir.path().to_path_buf();
                 {
                     let _suppress = suppress_failure_retention();
@@ -1305,18 +1341,38 @@ mod tests {
                 }
                 assert!(original.is_dir(), "suppressed: dir untouched by the hook");
                 caught_panic();
-                assert!(
-                    !original.exists(),
-                    "retention is back once the guard is dropped"
-                );
+                if keep_tmp_requested() {
+                    assert!(original.is_dir(), "KEEP_TMP keeps the dir in place");
+                    assert!(
+                        !retained_path_for(&original).exists(),
+                        "KEEP_TMP does not rename the dir after suppression"
+                    );
+                } else {
+                    assert!(
+                        !original.exists(),
+                        "retention is back once the guard is dropped"
+                    );
+                }
                 (original.clone(), retained_path_for(&original))
             });
             if keep_tmp_requested() {
-                let _ = std::fs::remove_dir_all(&original);
+                assert!(original.is_dir(), "KEEP_TMP preserves the owned original");
+                assert!(!retained.exists(), "KEEP_TMP must not also rename the dir");
+                assert_eq!(
+                    std::fs::read_to_string(original.join("daemon.log")).unwrap(),
+                    "suppression-owner-evidence"
+                );
+                std::fs::remove_dir_all(&original).expect("clean up owned kept dir");
+                assert!(!original.exists(), "explicit owned teardown completed");
                 return;
             }
             assert!(retained.is_dir(), "renamed by the post-guard panic");
+            assert_eq!(
+                std::fs::read_to_string(retained.join("daemon.log")).unwrap(),
+                "suppression-owner-evidence"
+            );
             std::fs::remove_dir_all(&retained).expect("clean up retained dir");
+            assert!(!retained.exists(), "explicit owned teardown completed");
         });
     }
 
@@ -1326,6 +1382,8 @@ mod tests {
             let (tx, rx) = std::sync::mpsc::channel();
             let outcome = std::thread::spawn(move || {
                 let dir = test_tempdir_in(base.to_str().expect("UTF-8 temp root"), "itd-retain-");
+                std::fs::write(dir.path().join("daemon.log"), "suppression-owner-evidence")
+                    .expect("write owned evidence");
                 let original = dir.path().to_path_buf();
                 tx.send((original.clone(), retained_path_for(&original)))
                     .expect("send paths");
@@ -1338,7 +1396,14 @@ mod tests {
             assert!(outcome.is_err(), "thread must have failed");
             let (original, retained) = rx.recv().expect("paths");
             if keep_tmp_requested() {
-                let _ = std::fs::remove_dir_all(&original);
+                assert!(original.is_dir(), "KEEP_TMP preserves the owned original");
+                assert!(!retained.exists(), "KEEP_TMP must not also rename the dir");
+                assert_eq!(
+                    std::fs::read_to_string(original.join("daemon.log")).unwrap(),
+                    "suppression-owner-evidence"
+                );
+                std::fs::remove_dir_all(&original).expect("clean up owned kept dir");
+                assert!(!original.exists(), "explicit owned teardown completed");
                 return;
             }
             assert!(!original.exists(), "original swept after retention");
@@ -1347,7 +1412,12 @@ mod tests {
                 "guard dropped during unwinding retained {}",
                 retained.display()
             );
+            assert_eq!(
+                std::fs::read_to_string(retained.join("daemon.log")).unwrap(),
+                "suppression-owner-evidence"
+            );
             std::fs::remove_dir_all(&retained).expect("clean up retained dir");
+            assert!(!retained.exists(), "explicit owned teardown completed");
         });
     }
 
