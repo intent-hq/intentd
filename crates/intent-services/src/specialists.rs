@@ -1117,6 +1117,35 @@ fn auto_generate_role_reminder(behavior_prompt: &str) -> String {
     first_meaningful
 }
 
+/// Read a non-empty configuration scalar from an already resolved definition.
+pub(crate) fn config_scalar<'a>(definition: &'a Value, key: &str) -> Option<&'a str> {
+    definition
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+}
+
+/// Match the provider/model effort without reopening the specialist's source.
+pub(crate) fn model_option_effort(
+    definition: &Value,
+    provider: Option<&str>,
+    model: &str,
+) -> Option<String> {
+    definition
+        .get(MODEL_OPTIONS_KEY)
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|option| {
+            option.get("model").and_then(Value::as_str) == Some(model)
+                && match option.get("provider").and_then(Value::as_str) {
+                    None => true,
+                    Some(option_provider) => provider == Some(option_provider),
+                }
+        })
+        .and_then(|option| config_scalar(option, "reasoningEffort"))
+        .map(str::to_string)
+}
+
 /// Stateless executor for the file-backed `specialist.*` namespace. Construct
 /// one per call from the long-lived `Services`; it carries the resolved user and
 /// bundled directory roots (project comes from each call's `workspacePath`).
@@ -1498,12 +1527,8 @@ impl SpecialistsService {
     /// unknown or declares no `model`, allowing the caller to fall through to
     /// the settings chain. Validation is now performed inside `resolve()`.
     pub(crate) fn resolve_model(&self, id: &str, workspace_path: Option<&Path>) -> Option<String> {
-        self.resolve(id, workspace_path).and_then(|def| {
-            def.get("model")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-        })
+        self.resolve(id, workspace_path)
+            .and_then(|def| config_scalar(&def, "model").map(str::to_string))
     }
 
     /// Resolve a specialist's `reasoningEffort` frontmatter scalar through the
@@ -1517,12 +1542,8 @@ impl SpecialistsService {
         id: &str,
         workspace_path: Option<&Path>,
     ) -> Option<String> {
-        self.resolve(id, workspace_path).and_then(|def| {
-            def.get("reasoningEffort")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-        })
+        self.resolve(id, workspace_path)
+            .and_then(|def| config_scalar(&def, "reasoningEffort").map(str::to_string))
     }
 
     /// Resolve the `reasoningEffort` declared by the specialist's
@@ -1541,22 +1562,8 @@ impl SpecialistsService {
         provider: Option<&str>,
         model: &str,
     ) -> Option<String> {
-        self.resolve(id, workspace_path).and_then(|def| {
-            def.get(MODEL_OPTIONS_KEY)
-                .and_then(Value::as_array)?
-                .iter()
-                .find(|o| {
-                    o.get("model").and_then(Value::as_str) == Some(model)
-                        && match o.get("provider").and_then(Value::as_str) {
-                            None => true,
-                            Some(op) => provider == Some(op),
-                        }
-                })
-                .and_then(|o| o.get("reasoningEffort"))
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-        })
+        self.resolve(id, workspace_path)
+            .and_then(|def| model_option_effort(&def, provider, model))
     }
 
     /// Resolve a specialist's `codingAgent` frontmatter scalar through the
@@ -1571,12 +1578,8 @@ impl SpecialistsService {
         id: &str,
         workspace_path: Option<&Path>,
     ) -> Option<String> {
-        self.resolve(id, workspace_path).and_then(|def| {
-            def.get("codingAgent")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-        })
+        self.resolve(id, workspace_path)
+            .and_then(|def| config_scalar(&def, "codingAgent").map(str::to_string))
     }
 
     /// Enumerate every `<id>.md` in `dir`, inserting resolved defs into `acc`
@@ -1748,7 +1751,18 @@ impl SpecialistsService {
     /// unknown id → `-32602` (PROTOCOL §5.11).
     pub(crate) fn get(&self, id: &str, workspace_path: Option<&Path>) -> Result<Value> {
         validate_id(id)?;
-        match self.resolve(id, workspace_path) {
+        // Resolve direct ids and aliases against one request-local catalog.
+        // In particular, an alias miss must not trigger another import scan.
+        let catalog = self.collect_catalog(workspace_path);
+        let definition = catalog.get(id).or_else(|| {
+            catalog.values().find(|definition| {
+                definition
+                    .get(ALIASES_KEY)
+                    .and_then(Value::as_array)
+                    .is_some_and(|aliases| aliases.iter().any(|alias| alias.as_str() == Some(id)))
+            })
+        });
+        match definition {
             Some(def) => Ok(json!({ "specialist": def })),
             None => Err(Error::NotFound(format!("specialist not found: {id}"))),
         }

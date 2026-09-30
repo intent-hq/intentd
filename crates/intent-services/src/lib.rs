@@ -2043,16 +2043,15 @@ impl Services {
                 if options.is_empty() {
                     return None;
                 }
-                let provider =
-                    agent_ops::resolve_delegate_provider_preview(self, Some(id), workspace_path);
+                let provider = agent_ops::resolve_delegate_provider_preview(self, def);
                 Some(intent_acp::SpecialistModelOptions {
                     specialist: id.to_string(),
-                    default_model: agent_ops::resolve_agent_default_model(
+                    default_model: agent_ops::resolve_agent_default_model_with_pin(
                         self,
-                        Some(id),
-                        workspace_path,
+                        specialists::config_scalar(def, "model"),
                         provider.as_deref(),
-                    ),
+                    )
+                    .0,
                     options,
                 })
             })
@@ -11206,35 +11205,29 @@ fn specialist_preview_provider(provider: Option<String>) -> Result<Option<String
 fn decorate_specialist_resolved(
     services: &Services,
     def: &mut serde_json::Value,
-    workspace_path: Option<&Path>,
     provider: Option<&str>,
 ) {
-    let Some(id) = def
-        .get("id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
-    else {
-        return;
-    };
     let own;
     let provider = if let Some(p) = provider {
         p
     } else {
-        own = agent_ops::resolve_delegate_provider_preview(services, Some(&id), workspace_path);
+        own = agent_ops::resolve_delegate_provider_preview(services, def);
         match own.as_deref() {
             Some(p) => p,
             None => return,
         }
     };
-    let Some(model) =
-        agent_ops::resolve_agent_default_model(services, Some(&id), workspace_path, Some(provider))
+    let Some(model) = agent_ops::resolve_agent_default_model_with_pin(
+        services,
+        specialists::config_scalar(def, "model"),
+        Some(provider),
+    )
+    .0
     else {
         return;
     };
-    let specialists_svc = services.specialists_service();
-    let effort = specialists_svc
-        .resolve_model_option_effort(&id, workspace_path, Some(provider), &model)
-        .or_else(|| specialists_svc.resolve_reasoning_effort(&id, workspace_path));
+    let effort = specialists::model_option_effort(def, Some(provider), &model)
+        .or_else(|| specialists::config_scalar(def, "reasoningEffort").map(str::to_string));
     if let Some(obj) = def.as_object_mut() {
         obj.insert("resolvedModel".into(), serde_json::json!(model));
         obj.insert("resolvedProvider".into(), serde_json::json!(provider));
@@ -17489,10 +17482,8 @@ impl WorkspaceApi for Services {
         workspace_path: Option<String>,
         provider: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        // Catalog assembly walks every specialist tier on disk and the
-        // per-row decoration re-resolves through the same tiers, so the
-        // whole read runs on the blocking pool — never inline on the async
-        // runtime (monorepo#4148).
+        // Assemble one catalog on the blocking pool (monorepo#4148).
+        // Decoration uses those resolved rows without further filesystem reads.
         let services = self.clone();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
@@ -17504,7 +17495,7 @@ impl WorkspaceApi for Services {
                     .and_then(serde_json::Value::as_array_mut)
                 {
                     for def in specs {
-                        decorate_specialist_resolved(&services, def, ws_path, provider.as_deref());
+                        decorate_specialist_resolved(&services, def, provider.as_deref());
                     }
                 }
                 Ok(result)
@@ -17534,7 +17525,7 @@ impl WorkspaceApi for Services {
                         // `resolve_delegate_provider_preview` — the specialist's
                         // own pin first, else the settings-derived default —
                         // exactly what a no-model `agent.delegate` would spawn on.
-                        decorate_specialist_resolved(&services, def, ws_path, None);
+                        decorate_specialist_resolved(&services, def, None);
                     }
                 }
                 Ok(result)
@@ -17559,7 +17550,7 @@ impl WorkspaceApi for Services {
                 let ws_path = workspace_path.as_deref().map(Path::new);
                 let mut result = services.specialists_service().get(&id, ws_path)?;
                 if let Some(def) = result.get_mut("specialist") {
-                    decorate_specialist_resolved(&services, def, ws_path, provider.as_deref());
+                    decorate_specialist_resolved(&services, def, provider.as_deref());
                 }
                 Ok(result)
             })

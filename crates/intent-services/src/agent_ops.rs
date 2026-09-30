@@ -596,6 +596,21 @@ pub(crate) fn resolve_agent_default_model_with_source(
     workspace_path: Option<&Path>,
     provider: Option<&str>,
 ) -> (Option<String>, DefaultModelSource) {
+    let model = specialist.and_then(|id| {
+        services
+            .specialists_service()
+            .resolve_model(id, workspace_path)
+    });
+    resolve_agent_default_model_with_pin(services, model.as_deref(), provider)
+}
+
+/// Resolve the shared model-default chain using an already resolved specialist
+/// pin. Catalog previews pass their row's pin to avoid reopening files per row.
+pub(crate) fn resolve_agent_default_model_with_pin(
+    services: &Services,
+    specialist_model: Option<&str>,
+    provider: Option<&str>,
+) -> (Option<String>, DefaultModelSource) {
     // Normalize through provider_config so legacy default-provider aliases
     // guard as the provider the spawn would actually run. With no explicit
     // provider, guard against the settings-derived default
@@ -612,23 +627,16 @@ pub(crate) fn resolve_agent_default_model_with_source(
             .map(|p| intent_providers::provider_config(p).id)
     };
 
-    if let Some(spec_id) = specialist {
-        let specialists_svc = services.specialists_service();
-
-        // Step 2: specialist frontmatter `model` (3-tier: project > user >
-        // bundled) — only if it belongs to the resolved provider; a model
-        // owned by another provider falls through instead of leaking.
-        if let Some(m) = specialists_svc.resolve_model(spec_id, workspace_path) {
-            if default_model_belongs_to_provider(services, effective_provider, &m) {
-                return (Some(m), DefaultModelSource::Specialist);
-            }
-            tracing::debug!(
-                model = m,
-                provider = effective_provider.unwrap_or_default(),
-                specialist = spec_id,
-                "specialist frontmatter model belongs to another provider; ignoring"
-            );
+    // Step 2: specialist frontmatter model, guarded against foreign providers.
+    if let Some(model) = specialist_model {
+        if default_model_belongs_to_provider(services, effective_provider, model) {
+            return (Some(model.to_string()), DefaultModelSource::Specialist);
         }
+        tracing::debug!(
+            model,
+            provider = effective_provider.unwrap_or_default(),
+            "specialist frontmatter model belongs to another provider; ignoring"
+        );
     }
 
     // Step 3: settings chain, provider-guarded — a configured default owned
@@ -944,16 +952,11 @@ fn resolve_specialist_provider(
 /// provider previously showed that other provider's fallback/`None`).
 pub(crate) fn resolve_delegate_provider_preview(
     services: &Services,
-    specialist: Option<&str>,
-    workspace_path: Option<&Path>,
+    definition: &serde_json::Value,
 ) -> Option<String> {
-    if let Some(spec_id) = specialist {
-        let specialists_svc = services.specialists_service();
-        let explicit = specialists_svc.resolve_coding_agent(spec_id, workspace_path);
-        if let Some(provider_id) = explicit {
-            if intent_providers::find_provider(&provider_id).is_some() {
-                return Some(provider_id);
-            }
+    if let Some(provider_id) = crate::specialists::config_scalar(definition, "codingAgent") {
+        if intent_providers::find_provider(provider_id).is_some() {
+            return Some(provider_id.to_string());
         }
     }
     crate::agent_session::derived_default_provider(&services.effective_settings())

@@ -747,3 +747,65 @@ async fn claude_agents_custom_config_root_discovers_and_watches_agents_and_skill
     .unwrap();
     stop(daemon, &dir.path().join("intentd.sock")).await;
 }
+
+#[tokio::test]
+async fn claude_agents_preview_requests_stay_fresh_and_workspace_scoped() {
+    let dir = scratch_dir("claude-preview-snapshot");
+    let home = dir.path().join("home");
+    let project = dir.path().join("project");
+    let other = dir.path().join("other-project");
+    let user_file = home.join(".claude/agents/reviewer.md");
+    let project_file = project.join(".claude/agents/reviewer.md");
+    write_agent(&user_file, "reviewer", "model: sonnet\n", "User prompt.");
+    write_agent(
+        &project_file,
+        "reviewer",
+        "model: opus\n",
+        "Project prompt.",
+    );
+    let (daemon, port, cfg) = boot(dir.path(), &home).await;
+    let mut client = connect_ws(port, cfg).await;
+    let mut evidence = Vec::new();
+    let mut request_id = 1;
+    for (path, model, prompt) in [
+        (&project, "opus", "Project prompt."),
+        (&other, "sonnet", "User prompt."),
+        (&project, "haiku", "Revised project prompt."),
+    ] {
+        if model == "haiku" {
+            write_agent(&project_file, "reviewer", "model: haiku\n", prompt);
+        }
+        for method in ["specialist.list", "specialist.get"] {
+            let mut params = json!({"workspacePath":path});
+            if method == "specialist.get" {
+                params["id"] = json!("reviewer");
+            }
+            let result = wss_rpc(&mut client, request_id, method, params).await;
+            request_id += 1;
+            let row = if method == "specialist.get" {
+                &result["specialist"]
+            } else {
+                definition(&result, "reviewer")
+            };
+            let (expected_model, expected_prompt) = if method == "specialist.list" {
+                ("sonnet", "User prompt.")
+            } else {
+                (model, prompt)
+            };
+            assert_eq!(row["model"], expected_model);
+            assert_eq!(row["resolvedModel"], expected_model);
+            assert_eq!(row["resolvedProvider"], "claude-code");
+            assert_eq!(row["prompt"], expected_prompt);
+            if method == "specialist.list" {
+                assert!(result.get("importDiagnostics").is_none());
+            }
+            evidence.push(json!({"method":method,"workspacePath":path,"result":result}));
+        }
+    }
+    std::fs::write(
+        dir.path().join("claude-preview-snapshot-evidence.json"),
+        serde_json::to_vec_pretty(&evidence).unwrap(),
+    )
+    .unwrap();
+    stop(daemon, &dir.path().join("intentd.sock")).await;
+}
