@@ -1991,29 +1991,40 @@ async fn cmd_serve(
         ),
         Err(e) => tracing::warn!(error = %e, "stop-redelivery rehydration failed"),
     }
-    // STAB-108: Rehydrate undelivered delegation groups on startup so groups
-    // survive daemon restarts without requiring the resume path. Groups are
-    // reconciled against current agent state (already-completed children are
-    // recorded) and ready groups fire immediately. Best-effort: a failure is
-    // logged but never aborts startup.
-    match services.heal_delegation_groups_on_startup().await {
-        Ok(0) => {}
-        Ok(loaded) => tracing::info!(
-            loaded,
-            "rehydrated undelivered delegation groups on startup"
-        ),
-        Err(e) => tracing::warn!(error = %e, "delegation group startup rehydration failed"),
-    }
-    // Rehydrate persisted completion watches AFTER delegation groups so
-    // grouped watches can find their live groups (a grouped watch whose group
-    // is gone is pruned). Watches whose child completed during the downtime
-    // wake the parent immediately. Best-effort: a failure is logged but never
-    // aborts startup.
-    match services.heal_completion_watches_on_startup().await {
-        Ok(0) => {}
-        Ok(loaded) => tracing::info!(loaded, "rehydrated persisted completion watches on startup"),
-        Err(e) => tracing::warn!(error = %e, "completion watch startup rehydration failed"),
-    }
+    // Reserve the boot-time candidates before exposing any listener. Only the
+    // bounded candidate read gates startup; per-agent service work runs below
+    // in an owned background sweep. Reservations prevent a manual-dialog flash.
+    // --resume-all and update-triggered restarts still override the setting.
+    let resume_setting = boot_settings.effective.agents.resume_interrupted_on_start;
+    let has_display = detect_has_display();
+    // Captured in `main()` before the env var was scrubbed from the
+    // environment (so it never leaks into daemon-spawned subprocesses).
+    let update_restart = UPDATE_RESTART.load(std::sync::atomic::Ordering::Relaxed);
+    let resume_on_start =
+        should_resume_on_start(resume_all, update_restart, resume_setting, has_display);
+    tracing::info!(
+        resume_all,
+        update_restart,
+        setting = resume_setting.as_str(),
+        has_display,
+        resume = resume_on_start,
+        "startup interrupted-agent resume decision"
+    );
+    let startup_candidates = if resume_on_start {
+        match services.prepare_startup_resume().await {
+            Ok(candidates) => Some(candidates),
+            Err(error) => {
+                tracing::error!(%error, "resume-on-start: failed to list interrupted agents");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Restore groups before watches, without reconciling or waking agents.
+    // Live requests must see the complete registries as soon as listeners open.
+    let startup_completions = services.prepare_startup_completion_recovery().await;
     // Rehydrate persisted event subscriptions (monorepo#937) so `event.subscribe`
     // registrations survive daemon restarts; rows whose subscriber agent is
     // gone are pruned. Best-effort: a failure is logged but never aborts
@@ -2443,37 +2454,6 @@ async fn cmd_serve(
         idle_update_state.clone(),
     );
 
-    // Reserve the boot-time candidates before exposing any listener. Only the
-    // bounded candidate read gates startup; per-agent service work runs below
-    // in an owned background sweep. Reservations prevent a manual-dialog flash.
-    // --resume-all and update-triggered restarts still override the setting.
-    let resume_setting = boot_settings.effective.agents.resume_interrupted_on_start;
-    let has_display = detect_has_display();
-    // Captured in `main()` before the env var was scrubbed from the
-    // environment (so it never leaks into daemon-spawned subprocesses).
-    let update_restart = UPDATE_RESTART.load(std::sync::atomic::Ordering::Relaxed);
-    let resume_on_start =
-        should_resume_on_start(resume_all, update_restart, resume_setting, has_display);
-    tracing::info!(
-        resume_all,
-        update_restart,
-        setting = resume_setting.as_str(),
-        has_display,
-        resume = resume_on_start,
-        "startup interrupted-agent resume decision"
-    );
-    let startup_candidates = if resume_on_start {
-        match services.prepare_startup_resume().await {
-            Ok(candidates) => Some(candidates),
-            Err(error) => {
-                tracing::error!(%error, "resume-on-start: failed to list interrupted agents");
-                None
-            }
-        }
-    } else {
-        None
-    };
-
     // Wire ServerControl to Services for settings-driven runtime control (§5.12).
     // The control is attached after the api Arc is built via the `OnceLock` seam.
     let server_control: Arc<dyn intent_core::ServerControl> = control.clone();
@@ -2685,12 +2665,42 @@ async fn cmd_serve(
             services.prewarm_repository_metadata().await;
         })
     };
-    let startup_resume = startup_candidates.map(|candidates| {
+    let startup_recovery = {
         let services = services.clone();
+        let socket_path = config.socket_path.clone();
         intent_core::spawn_daemon(async move {
-            run_startup_resume_sweep(&services, candidates, startup_stopping).await;
+            let mut stopping = startup_stopping;
+            // WSS boot has finished above. Wait for UDS acceptance as well,
+            // rather than relying on the order in which spawned tasks are polled.
+            tokio::select! {
+                biased;
+                _ = stopping.wait_for(|stop| *stop) => return,
+                () = async {
+                    while !uds_is_live(&socket_path).await {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                } => {},
+            }
+            #[cfg(unix)]
+            if let Some(path) = std::env::var_os("INTENTD_TEST_STARTUP_COMPLETION_GATE") {
+                use tokio::io::AsyncReadExt;
+                tokio::select! {
+                    biased;
+                    _ = stopping.wait_for(|stop| *stop) => return,
+                    () = async {
+                        let mut gate = tokio::net::UnixStream::connect(path).await.expect("completion test gate");
+                        let _ = gate.read_u8().await;
+                    } => {},
+                }
+            }
+            services
+                .reconcile_startup_completions(startup_completions, &stopping)
+                .await;
+            if let Some(candidates) = startup_candidates {
+                run_startup_resume_sweep(&services, candidates, stopping).await;
+            }
         })
-    });
+    };
     let serve_result = serve_uds_with_reverse(
         api,
         bus,
@@ -2714,14 +2724,12 @@ async fn cmd_serve(
         idle_update_requester.abort();
         staged_restart_watcher.abort();
     }
-    // Also stop on a UDS bind error. Never detach or abort a claimed resume:
+    // Also stop on a UDS bind error. Never detach or abort an admitted wake/resume:
     // let the current service operation commit/reset its claim, skip later
     // candidates, then let manager.shutdown capture any admitted turns.
     let _ = startup_stop.send(true);
-    if let Some(task) = startup_resume {
-        if let Err(error) = task.await {
-            tracing::error!(%error, "resume-on-start: recovery worker failed");
-        }
+    if let Err(error) = startup_recovery.await {
+        tracing::error!(%error, "startup recovery worker failed");
     }
     serve_result?;
 
