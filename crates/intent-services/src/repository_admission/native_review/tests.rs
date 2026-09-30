@@ -3614,3 +3614,227 @@ async fn native_review_companion_overlapping_original_delivery_attempts_never_re
         .await;
     }
 }
+
+// Sidebar preview contract: preparation describes the existing index when the
+// original commit does not request staging. The original owner still admits it.
+#[intent_test_macros::daemon_test]
+async fn native_review_sidebar_staged_preview_original_owner() {
+    for form in ["marked", "omitted", "null", "empty"] {
+        with_review_clock(async {
+            let f = Fixture::new().await;
+            let s = f.socket().await;
+            std::fs::write(f.git.path.join("staged.txt"), "index line\n").unwrap();
+            f.git.git(&f.git.path, &["add", "staged.txt"]);
+            std::fs::write(f.git.path.join("unstaged.txt"), "workdir only\n").unwrap();
+            if form != "marked" {
+                std::fs::write(f.git.path.join("staged.txt"), "index line\nworkdir tail\n").unwrap();
+            }
+            let workdir = std::fs::read(f.git.path.join("staged.txt")).unwrap();
+            let index_tree = f.git.git(&f.git.path, &["write-tree"]);
+            let remote = f.server.control.sha.lock().unwrap().clone();
+            let mut wire = serde_json::to_value(f.query(Stage::Commit)).unwrap();
+            wire.as_object_mut().unwrap().remove("files");
+            wire.as_object_mut().unwrap().remove("options");
+            match form {
+                "marked" => wire["review"]["companion"] = json!({"kind":"create-pr"}),
+                "null" => wire["files"] = Value::Null,
+                "empty" => wire["files"] = json!([]),
+                _ => {}
+            }
+            let prepared = s.prepare(&f, serde_json::from_value(wire).unwrap()).await;
+            eprintln!("sidebar A1 {form} preparation={prepared} indexTree={} posts={}", index_tree.trim(), f.server.control.posts.load(Ordering::SeqCst));
+            assert_eq!(prepared["files"], json!([{"path":"staged.txt","staged":true,"additions":1,"deletions":0}]));
+            assert_eq!(prepared["filesCount"], 1);
+            assert_eq!(prepared["additions"], 1);
+            assert_eq!(prepared["deletions"], 0);
+            let q = command(&f, &prepared, Stage::Commit);
+            let reply = s.request(&f.services, Frame::Execute(q.clone())).await;
+            let head = f.git.git(&f.git.path, &["rev-parse", "HEAD"]);
+            let tree = f.git.git(&f.git.path, &["rev-parse", "HEAD^{tree}"]);
+            let status = f.git.git(&f.git.path, &["status", "--porcelain=v1"]);
+            let c = s.concrete(&f).await;
+            let workers = c.review.workers.available_permits();
+            eprintln!("sidebar A1 {form} execution={reply:?} head={} tree={} status={status:?} workers={workers} posts={}", head.trim(), tree.trim(), f.server.control.posts.load(Ordering::SeqCst));
+            let reply = reply.unwrap();
+            assert_eq!(reply["success"], true);
+            assert_eq!(reply["reviewExecution"]["gitReceipts"], json!([{"stage":"commit","commitHash":head.trim()}]));
+            assert_eq!(tree, index_tree);
+            assert_eq!(f.git.git(&f.git.path, &["write-tree"]), index_tree);
+            assert_eq!(std::fs::read(f.git.path.join("staged.txt")).unwrap(), workdir);
+            assert_eq!(std::fs::read_to_string(f.git.path.join("unstaged.txt")).unwrap(), "workdir only\n");
+            assert!(status.contains("?? unstaged.txt"));
+            assert_eq!(f.server.control.posts.load(Ordering::SeqCst), 0);
+            assert_eq!(*f.server.control.sha.lock().unwrap(), remote);
+            assert_eq!(workers, WORKERS);
+            assert_eq!(f.services.repository_review_capacity.workers.available_permits(), GLOBAL_WORKERS);
+            let history = s.request(&f.services, Frame::Reconcile(bound(&q))).await.unwrap();
+            assert_eq!(history["reviewExecution"], reply["reviewExecution"]);
+        }).await;
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_review_sidebar_preview_partial_rename_binary_and_empty_index() {
+    let f = Fixture::new().await;
+    for name in ["old.txt", "deleted.txt", "partial.txt"] {
+        std::fs::write(f.git.path.join(name), "baseline\n").unwrap();
+    }
+    f.git.git(
+        &f.git.path,
+        &["add", "old.txt", "deleted.txt", "partial.txt"],
+    );
+    f.git
+        .git(&f.git.path, &["commit", "-m", "preview baseline"]);
+    f.git.git(&f.git.path, &["mv", "old.txt", "renamed.txt"]);
+    f.git.git(&f.git.path, &["rm", "deleted.txt"]);
+    std::fs::write(f.git.path.join("partial.txt"), "index one\nindex two\n").unwrap();
+    std::fs::write(f.git.path.join("added.txt"), "added\n").unwrap();
+    std::fs::write(f.git.path.join("binary.bin"), [0, 1, 0, 2]).unwrap();
+    f.git.git(
+        &f.git.path,
+        &["add", "partial.txt", "added.txt", "binary.bin"],
+    );
+    std::fs::write(
+        f.git.path.join("partial.txt"),
+        "index one\nindex two\nworkdir three\n",
+    )
+    .unwrap();
+    std::fs::write(f.git.path.join("untracked.txt"), "not staged\n").unwrap();
+    let before = f.git.git(&f.git.path, &["status", "--porcelain=v1"]);
+    let tree = f.git.git(&f.git.path, &["write-tree"]);
+    let preview =
+        crate::accept_changes::build_native_prepare_value(&f.git.path, &f.query(Stage::Commit))
+            .unwrap();
+    eprintln!(
+        "sidebar A2 preview={preview} status={before:?} indexTree={}",
+        tree.trim()
+    );
+    assert_eq!(
+        preview["files"],
+        json!([
+            {"path":"added.txt","staged":true,"additions":1,"deletions":0},
+            {"path":"binary.bin","staged":true,"additions":0,"deletions":0},
+            {"path":"deleted.txt","staged":true,"additions":0,"deletions":1},
+            {"path":"old.txt","staged":true,"additions":0,"deletions":1},
+            {"path":"partial.txt","staged":true,"additions":2,"deletions":1},
+            {"path":"renamed.txt","staged":true,"additions":1,"deletions":0}
+        ])
+    );
+    assert_eq!(preview["filesCount"], 6);
+    assert_eq!(preview["additions"], 4);
+    assert_eq!(preview["deletions"], 3);
+    assert_eq!(
+        f.git.git(&f.git.path, &["status", "--porcelain=v1"]),
+        before
+    );
+    assert_eq!(f.git.git(&f.git.path, &["write-tree"]), tree);
+    f.git.git(&f.git.path, &["reset", "--mixed", "HEAD"]);
+    let before = f.git.git(&f.git.path, &["status", "--porcelain=v1"]);
+    let empty =
+        crate::accept_changes::build_native_prepare_value(&f.git.path, &f.query(Stage::Commit))
+            .unwrap();
+    eprintln!("sidebar A2 zero-index={empty} status={before:?}");
+    assert_eq!(empty["files"], json!([]));
+    assert_eq!(empty["filesCount"], 0);
+    assert_eq!(empty["additions"], 0);
+    assert_eq!(empty["deletions"], 0);
+    assert_eq!(
+        f.git.git(&f.git.path, &["status", "--porcelain=v1"]),
+        before
+    );
+    assert_eq!(f.server.control.posts.load(Ordering::SeqCst), 0);
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_review_sidebar_preview_explicit_stage_all_and_other_actions() {
+    let f = Fixture::new().await;
+    std::fs::write(f.git.path.join("partial.txt"), "index\n").unwrap();
+    f.git.git(&f.git.path, &["add", "partial.txt"]);
+    std::fs::write(f.git.path.join("partial.txt"), "index\nworkdir\n").unwrap();
+    std::fs::write(f.git.path.join("extra.txt"), "extra\n").unwrap();
+    let before = f.git.git(&f.git.path, &["status", "--porcelain=v1"]);
+    let tree = f.git.git(&f.git.path, &["write-tree"]);
+    for mode in [
+        "explicit",
+        "stage-all",
+        "create-pr",
+        "push",
+        "after-commit",
+        "commit-push-create",
+    ] {
+        let mut q = f.query(Stage::Commit);
+        match mode {
+            "explicit" => q.files = Some(vec!["partial.txt".into()]),
+            "stage-all" => q.options.stage_unstaged = true,
+            "create-pr" => q.action = Stage::CreatePr,
+            "push" => q.action = Stage::Push,
+            "after-commit" => {
+                q.action = Stage::CreatePr;
+                q.review.choice = Choice::AfterCommit {
+                    operation_id: uuid::Uuid::new_v4().to_string(),
+                    capture_id: uuid::Uuid::new_v4().to_string(),
+                };
+                q.review.target_branch = None;
+            }
+            "commit-push-create" => {
+                q.options.push_after_commit = true;
+                q.options.create_pr_after_push = true;
+            }
+            _ => unreachable!(),
+        }
+        let preview = crate::accept_changes::build_native_prepare_value(&f.git.path, &q).unwrap();
+        eprintln!("sidebar A3 {mode} preview={preview}");
+        let rows = preview["files"].as_array().unwrap();
+        let staged_only = mode == "commit-push-create";
+        assert_eq!(
+            rows.len(),
+            if staged_only {
+                1
+            } else if mode == "explicit" {
+                2
+            } else {
+                3
+            }
+        );
+        assert!(rows
+            .iter()
+            .any(|r| r["path"] == "partial.txt" && r["staged"] == true));
+        assert_eq!(
+            rows.iter()
+                .any(|r| r["path"] == "partial.txt" && r["staged"] == false),
+            !staged_only
+        );
+        assert_eq!(
+            rows.iter().any(|r| r["path"] == "extra.txt"),
+            !staged_only && mode != "explicit"
+        );
+        assert_eq!(preview["filesCount"], rows.len());
+    }
+    for filter in [None, Some(vec!["partial.txt".into()])] {
+        let legacy = crate::accept_changes::build_prepare_value(
+            &f.git.path,
+            &f.git.workspace,
+            "commit",
+            filter.as_deref(),
+        )
+        .unwrap();
+        eprintln!("sidebar A3 legacy filter={filter:?} preview={legacy}");
+        let rows = legacy["files"].as_array().unwrap();
+        assert!(rows
+            .iter()
+            .any(|r| r["path"] == "partial.txt" && r["staged"] == true));
+        assert!(rows
+            .iter()
+            .any(|r| r["path"] == "partial.txt" && r["staged"] == false));
+        assert_eq!(
+            rows.iter().any(|r| r["path"] == "extra.txt"),
+            filter.is_none()
+        );
+    }
+    assert_eq!(
+        f.git.git(&f.git.path, &["status", "--porcelain=v1"]),
+        before
+    );
+    assert_eq!(f.git.git(&f.git.path, &["write-tree"]), tree);
+    assert_eq!(f.server.control.posts.load(Ordering::SeqCst), 0);
+}

@@ -492,6 +492,9 @@ pub(crate) fn build_native_prepare_value(
     path: &Path,
     query: &intent_core::repository_request::NativeReviewPrepareQuery,
 ) -> Result<Value> {
+    let staged_only = query.action == intent_core::NativeReviewStage::Commit
+        && !query.options.stage_unstaged
+        && query.files.as_ref().is_none_or(Vec::is_empty);
     let mut files = Vec::new();
     let mut additions = 0;
     let mut deletions = 0;
@@ -499,6 +502,11 @@ pub(crate) fn build_native_prepare_value(
         (true, intent_git::diff::diff_head_to_index(path)?),
         (false, intent_git::diff::diff_index_to_workdir(path)?),
     ] {
+        // The original commit consumes the index unless staging was requested.
+        // Keep both diff calls and their errors; only its preview omits workdir rows.
+        if staged_only && !staged {
+            continue;
+        }
         for d in diffs {
             if query
                 .files
