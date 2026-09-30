@@ -115,6 +115,8 @@ pub(crate) struct ManagedScript {
     run_reserved: Option<Arc<tokio::sync::Notify>>,
     /// Durable command admission token; consumed only by CAS settlement or abandonment.
     run_id: Option<String>,
+    /// Generation allowed to report this token; absent during restart teardown.
+    run_generation: Option<u64>,
     cancellation: Option<&'static str>,
     /// Terminal result awaiting the owned finalizer; never cleared by a waiter.
     pending_result: Option<intent_core::ScriptLastRun>,
@@ -455,6 +457,7 @@ impl ScriptManager {
                 running_at_shutdown: false,
                 run_reserved: None,
                 run_id: None,
+                run_generation: None,
                 cancellation: None,
                 pending_result: None,
             },
@@ -543,6 +546,7 @@ impl ScriptManager {
                         running_at_shutdown: false,
                         run_reserved: None,
                         run_id: None,
+                        run_generation: None,
                         cancellation: None,
                         pending_result: None,
                     }
@@ -604,6 +608,7 @@ impl ScriptManager {
                 running_at_shutdown: false,
                 run_reserved: None,
                 run_id: None,
+                run_generation: None,
                 cancellation: None,
                 pending_result: None,
             },
@@ -745,6 +750,7 @@ impl ScriptManager {
                                             running_at_shutdown: false,
                                             run_reserved: None,
                                             run_id: None,
+                                            run_generation: None,
                                             cancellation: None,
                                             pending_result: None,
                                         },
@@ -989,6 +995,7 @@ impl ScriptManager {
         }
         m.stopped_by_user = false;
         m.generation = next_generation();
+        m.run_generation = Some(m.generation);
         m.pending_result = None;
         m.cancellation = None;
         let launching = if m.state.status == ScriptStatus::Restarting {
@@ -1215,23 +1222,22 @@ impl ScriptManager {
         let mut settles = tokio::task::JoinSet::new();
         let mut markers = Vec::new();
         for v in victims {
-            if let Some(generation) = v.finalization {
-                let finalizer = self.queue_settlement(&v.ws, &v.id, generation);
-                settles.spawn(async move {
-                    let _ = finalizer.await;
-                });
-            }
             if v.running {
-                markers.push((v.ws, v.id.clone()));
+                markers.push((v.ws.clone(), v.id.clone()));
             }
-            if let Some(handle) = v.handle {
-                let id = v.id;
-                settles.spawn(async move {
+            let mgr = self.clone();
+            settles.spawn(async move {
+                // stop-all owns this handle, so a finalizer cannot join it.
+                // Let terminal state publication finish before archiving.
+                if let Some(handle) = v.handle {
                     if let Err(e) = handle.await {
-                        tracing::warn!(script = %id, error = %e, "script supervisor join failed during shutdown stop-all");
+                        tracing::warn!(script = %v.id, error = %e, "script supervisor join failed during shutdown stop-all");
                     }
-                });
-            }
+                }
+                if let Some(generation) = v.finalization {
+                    let _ = mgr.queue_settlement(&v.ws, &v.id, generation).await;
+                }
+            });
         }
         let drain = async {
             while let Some(res) = settles.join_next().await {
@@ -1275,8 +1281,9 @@ impl ScriptManager {
     async fn restart_owned(&self, workspace_id: &WorkspaceId, script_id: &str) -> Result<Value> {
         let lock = self.locks.definition_lock(script_id);
         let _guard = lock.lock().await;
-        // Admission survives a daemon stop during predecessor teardown.
-        self.prepare_launch(workspace_id, script_id).await?;
+        // Admission survives teardown, but its predecessor cannot report an
+        // outcome for the successor token while shutdown is draining it.
+        self.prepare_restart(workspace_id, script_id).await?;
         self.stop_inner(workspace_id, script_id, false).await?;
         let state = {
             let mut guard = self.scripts.lock().unwrap();
@@ -1464,9 +1471,8 @@ impl ScriptManager {
             // when the group is already empty.
             mgr.pty.reap_group_stragglers(pty_id).await;
             let exit = mgr.pty.try_exit(pty_id).ok().flatten();
-            mgr.mark_exited(&ws_task, &sid, generation, exit.clone())
+            mgr.mark_exited(&ws_task, &sid, generation, exit.clone(), timed_out)
                 .await;
-            mgr.record_result(&ws_task, &sid, generation, false, timed_out);
             mgr.queue_settlement(&ws_task, &sid, generation);
             (exit, timed_out)
         });
@@ -1554,13 +1560,13 @@ impl ScriptManager {
             // whole group is gone — the script can never sit `running` (or
             // flip to `exited`) while trapped survivors linger.
             self.pty.reap_group_stragglers(pty_id).await;
-            let Some((stopped_by_user, restart_count)) =
-                self.mark_exited(&ws, &script_id, generation, exit).await
+            let Some((stopped_by_user, restart_count)) = self
+                .mark_exited(&ws, &script_id, generation, exit, false)
+                .await
             else {
                 return;
             };
             if stopped_by_user || def.mode != ScriptMode::Service {
-                self.record_result(&ws, &script_id, generation, false, false);
                 self.queue_settlement(&ws, &script_id, generation);
                 break;
             }
@@ -1856,6 +1862,7 @@ impl ScriptManager {
         script_id: &str,
         generation: u64,
         exit: Option<PtyExit>,
+        timed_out: bool,
     ) -> Option<(bool, u32)> {
         let (state, flags, keep_marker) = {
             let mut guard = self.scripts.lock().unwrap();
@@ -1869,6 +1876,7 @@ impl ScriptManager {
                 m.state.error = Some(EXIT_UNOBSERVABLE_ERROR.to_string());
             }
             m.state.stopped_at = Some(now_iso());
+            Self::record_result_locked(m, false, timed_out);
             (
                 m.state.clone(),
                 (m.stopped_by_user, m.state.restart_count),
@@ -1953,6 +1961,7 @@ impl ScriptManager {
                 m.state.stopped_at = Some(now_iso());
             }
             m.pty_id = None;
+            Self::record_result_locked(m, true, false);
             (
                 m.state.clone(),
                 std::mem::take(&mut m.lost_at_daemon_stop) || m.def.mode == ScriptMode::Command,
@@ -1966,7 +1975,6 @@ impl ScriptManager {
             self.persist_was_running(ws, script_id, false).await;
         }
         self.emit_state(ws, script_id, &state).await;
-        self.record_result(ws, script_id, generation, true, false);
         self.queue_settlement(ws, script_id, generation);
     }
 
@@ -4077,7 +4085,7 @@ mod tests {
             .expect("registered")
             .generation;
         assert!(
-            mgr.mark_exited(&h.ws, &id, generation, None)
+            mgr.mark_exited(&h.ws, &id, generation, None, false)
                 .await
                 .is_some(),
             "same-generation entry is written"

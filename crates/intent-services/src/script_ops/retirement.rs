@@ -2,7 +2,7 @@
 //! The finalizer may take the definition lock; a supervisor must only enqueue it,
 //! never await it (stop/restart/remove join supervisors while holding that lock).
 use super::{
-    json, now_iso, publish_event, script_event, Result, ScriptManager, WorkspaceId,
+    json, now_iso, publish_event, script_event, ManagedScript, Result, ScriptManager, WorkspaceId,
     EXIT_CODE_UNOBSERVABLE, LOST_AT_DAEMON_STOP_ERROR, SCRIPT_CHANGED,
 };
 use intent_core::{ScriptLastRun, ScriptPurpose, ScriptRunOutcome};
@@ -23,6 +23,18 @@ impl ScriptManager {
         else {
             return;
         };
+        Self::record_result_locked(m, failure, timeout);
+    }
+
+    /// Capture the outcome under the same registry lock as the terminal state.
+    /// Shutdown must never see `exited` without its already-observed result.
+    pub(super) fn record_result_locked(m: &mut ManagedScript, failure: bool, timeout: bool) {
+        if m.run_id.is_none()
+            || m.run_generation != Some(m.generation)
+            || m.pending_result.is_some()
+        {
+            return;
+        }
         let cancelled = m.cancellation.is_some() || timeout;
         let interrupted = m.running_at_shutdown
             || (!failure && m.state.exit_code == Some(EXIT_CODE_UNOBSERVABLE));

@@ -25,6 +25,14 @@ impl ScriptManager {
     /// Caller holds the definition lock through launch admission. A failed
     /// durable restore refuses the launch; the invalidation precedes live state.
     pub(super) async fn prepare_launch(&self, ws: &WorkspaceId, id: &str) -> Result<()> {
+        self.prepare_admission(ws, id, false).await
+    }
+
+    pub(super) async fn prepare_restart(&self, ws: &WorkspaceId, id: &str) -> Result<()> {
+        self.prepare_admission(ws, id, true).await
+    }
+
+    async fn prepare_admission(&self, ws: &WorkspaceId, id: &str, restart: bool) -> Result<()> {
         self.set_archive(ws, id, None).await?;
         let command = self
             .scripts
@@ -35,12 +43,11 @@ impl ScriptManager {
         if command {
             let token = uuid::Uuid::new_v4().to_string();
             self.store.admit_script_run(ws, id, &token).await?;
-            self.scripts
-                .lock()
-                .unwrap()
-                .get_mut(&(ws.clone(), id.to_owned()))
-                .unwrap()
-                .run_id = Some(token);
+            let mut scripts = self.scripts.lock().unwrap();
+            let m = scripts.get_mut(&(ws.clone(), id.to_owned())).unwrap();
+            m.run_id = Some(token);
+            m.run_generation = (!restart).then_some(m.generation);
+            m.pending_result = None;
         }
         Ok(())
     }

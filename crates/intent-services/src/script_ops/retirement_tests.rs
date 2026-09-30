@@ -516,7 +516,9 @@ async fn retirement_unobservable_exit_and_stale_finalizer_are_fenced() {
         .get(&(h.ws.clone(), id.clone()))
         .unwrap()
         .generation;
-    mgr.mark_exited(&h.ws, &id, generation, None).await.unwrap();
+    mgr.mark_exited(&h.ws, &id, generation, None, false)
+        .await
+        .unwrap();
     mgr.record_result(&h.ws, &id, generation, false, false);
     mgr.finish_run_locked(&h.ws, &id, generation).await;
     let def = retired(&h, &id).await;
@@ -811,6 +813,7 @@ async fn retirement_shutdown_preserves_terminal_result_before_marker_persistence
             },
         )
         .await;
+        let mut sub = subscribe(&h);
         let park = Arc::new(SupervisePark::default());
         let mut mgr = h.services.script_manager();
         mgr.parks.terminal_persist = Some(park.clone());
@@ -879,6 +882,26 @@ async fn retirement_shutdown_preserves_terminal_result_before_marker_persistence
             "shutdown drains terminal owner before returning"
         );
         assert_eq!(before.last_run.as_ref().unwrap().outcome, expected);
+        tokio::time::timeout(LIVENESS, async {
+            let mut terminal_seen = false;
+            loop {
+                for event in sub.recv().await.unwrap() {
+                    let event = serde_json::to_value(event).unwrap();
+                    if event["type"] == "script:state" && event["data"]["status"] == "exited" {
+                        terminal_seen = true;
+                    }
+                    if event["type"] == "script:changed" {
+                        assert!(
+                            terminal_seen,
+                            "terminal state precedes automatic archive during shutdown"
+                        );
+                        return;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
         let fresh = Services::new(Store::open(&h.tmp.path).await.unwrap());
         fresh.hydrate_scripts().await.unwrap();
         let after = fresh
@@ -890,4 +913,69 @@ async fn retirement_shutdown_preserves_terminal_result_before_marker_persistence
         assert_eq!(after.last_run, before.last_run);
         assert_eq!(after.archived_at, before.archived_at);
     }
+}
+
+#[intent_test_macros::daemon_test]
+async fn retirement_shutdown_does_not_attach_predecessor_result_to_restart_admission() {
+    let h = harness().await;
+    let id = one_off(&h, "true").await;
+    let park = Arc::new(SupervisePark::default());
+    let mut mgr = h.services.script_manager();
+    mgr.parks.terminal_persist = Some(park.clone());
+    mgr.start(&h.ws, &id).await.unwrap();
+    tokio::time::timeout(LIVENESS, park.entered.notified())
+        .await
+        .unwrap();
+    let lock = mgr.locks.definition_lock(&id);
+    let guard = lock.lock().await;
+    // Commit successor admission while the predecessor still owns terminal
+    // publication. This is the durable restart-before-teardown boundary.
+    mgr.prepare_restart(&h.ws, &id).await.unwrap();
+    let token = h.services.store.pending_script_runs().await.unwrap()[0]
+        .2
+        .clone();
+    let shutdown = {
+        let mgr = mgr.clone();
+        intent_core::spawn_daemon(async move { mgr.stop_all().await })
+    };
+    tokio::time::timeout(LIVENESS, async {
+        loop {
+            if mgr
+                .scripts
+                .lock()
+                .unwrap()
+                .get(&(h.ws.clone(), id.clone()))
+                .unwrap()
+                .stopped_by_user
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    park.release.notify_one();
+    tokio::time::timeout(LIVENESS, shutdown)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(guard);
+    assert_eq!(
+        h.services.store.pending_script_runs().await.unwrap()[0].2,
+        token
+    );
+    let fresh = Services::new(Store::open(&h.tmp.path).await.unwrap());
+    fresh.hydrate_scripts().await.unwrap();
+    let def = fresh
+        .store
+        .get_script_in_workspace(&h.ws, &id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        def.last_run.unwrap().outcome,
+        intent_core::ScriptRunOutcome::Interrupted
+    );
+    assert!(def.archived_at.is_some());
 }
