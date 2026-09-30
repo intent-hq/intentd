@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.120] - 2026-09-30
+
+### 🐛 Bug Fixes
+
+- Preserve newer GitLab device authorization ([#5899](https://github.com/intent-hq/intentd/pull/5899)) ([#2140](https://github.com/intent-hq/intentd/pull/2140))
+- Preserve buffered WSS presence test frames ([#5827](https://github.com/intent-hq/intentd/pull/5827)) ([#2143](https://github.com/intent-hq/intentd/pull/2143))
+
+
 ## [0.9.119] - 2026-09-29
 
 ### 🐛 Bug Fixes
