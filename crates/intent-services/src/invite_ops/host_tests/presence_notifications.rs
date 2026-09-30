@@ -41,8 +41,11 @@ async fn membership_addition_presence(cached: bool, online: bool, self_removal: 
     let (person, token) = f.first_join(&guest("guest", 4242)).await;
     let inherited = crate::tests::workspace(&WorkspaceId::new());
     f.store.insert_workspace(&inherited).await.unwrap();
-    let chief = crate::tests::workspace(&WorkspaceId::from(intent_core::CHIEF_WORKSPACE_ID));
-    f.store.insert_workspace(&chief).await.unwrap();
+    // Services initialization already seeds the chief workspace.
+    f.store
+        .get_workspace(&WorkspaceId::from(intent_core::CHIEF_WORKSPACE_ID))
+        .await
+        .unwrap();
     with_caller(
         wire(&f.collaborator),
         f.services.presence_connect_op("remaining-guest".into()),
@@ -105,25 +108,30 @@ async fn membership_addition_presence(cached: bool, online: bool, self_removal: 
 
     let link = create(&f, "guest").await;
     if cached && !online {
-        with_caller(
-            wire(&person),
-            f.services.note_presence_update_op(
-                "cached-note",
+        // Joining as a different person does not ensure/repair the target's
+        // cache. Its existing viewer proves the lease survived disconnect;
+        // gc_profile retains a profile for every such connection/viewer.
+        // Snapshot profile values themselves come from durable membership.
+        let observed = with_caller(
+            wire(&f.collaborator),
+            f.services.note_presence_join_op(
+                "note-observer".into(),
+                "observer-lease".into(),
                 f.ws.clone(),
                 note,
-                &json!({"rev":1,"anchor":0,"head":0}),
             ),
         )
         .await
         .unwrap();
-        let proof = through_marker(&bus, &mut events, &f.ws).await;
-        let update = proof
+        let viewer = observed["viewers"]
+            .as_array()
+            .unwrap()
             .iter()
-            .find(|event| event.event_type == NOTE_PRESENCE && event.data["kind"] == "updated")
-            .expect("live note lease publishes its cached profile before acceptance");
-        assert_eq!(update.data["principalId"], person.0);
-        assert_eq!(update.data["login"], "guest");
-        assert_eq!(update.data["hostRole"], "guest");
+            .find(|row| row["principalId"] == person.0)
+            .expect("target's note lease survives its hello disconnect");
+        assert_eq!(viewer["login"], "guest");
+        assert_eq!(viewer["hostRole"], "guest");
+        through_marker(&bus, &mut events, &f.ws).await;
     }
     let immediately_before = with_caller(
         wire(&f.collaborator),
@@ -246,6 +254,9 @@ async fn membership_addition_presence(cached: bool, online: bool, self_removal: 
                 && event.data["kind"] == "left"
                 && event.data["principalId"] == person.0
         }));
+        f.services
+            .note_presence_leave_op("note-observer", "observer-lease");
+        through_marker(&bus, &mut events, &f.ws).await;
     }
     if self_removal {
         with_caller(

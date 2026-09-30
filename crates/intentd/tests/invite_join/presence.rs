@@ -3,6 +3,82 @@
 //! disposable fixtures; no frontend action is injected.
 use super::*;
 use intent_core::{Principal, PrincipalId, PrincipalIdentity, WorkspaceId, WorkspaceRole};
+use std::collections::VecDeque;
+
+/// Keep channel frames received before the subscribe reply. Unlike wss_rpc,
+/// this observer must retain every proof frame, including the seq-0 snapshot.
+struct NoteObserver {
+    socket: Ws,
+    subscription: String,
+    pending: VecDeque<Value>,
+}
+
+impl NoteObserver {
+    async fn subscribe(host: &Host, token: &str, workspace: &str) -> Self {
+        let mut socket = connect_ws(host.port, host.cfg.clone(), token).await;
+        socket
+            .send(Message::Text(
+                json!({"jsonrpc":"2.0","id":897,"method":"note.presence.subscribe",
+                    "params":{"workspaceId":workspace,"noteId":"spec"}})
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let mut pending = VecDeque::new();
+        let subscription = timeout(Duration::from_secs(10), async {
+            loop {
+                match socket.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let frame: Value = serde_json::from_str(&text).unwrap();
+                        if frame["id"] == 897 {
+                            return result(&frame, 897)["subscriptionId"]
+                                .as_str()
+                                .unwrap()
+                                .to_owned();
+                        }
+                        pending.push_back(frame);
+                    }
+                    Some(Ok(Message::Ping(payload))) => {
+                        socket.send(Message::Pong(payload)).await.unwrap();
+                    }
+                    other => panic!("note observer subscribe: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("note observer subscribe deadline");
+        Self {
+            socket,
+            subscription,
+            pending,
+        }
+    }
+
+    async fn next_push(&mut self) -> Value {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let frame = if let Some(frame) = self.pending.pop_front() {
+                    frame
+                } else {
+                    match self.socket.next().await {
+                        Some(Ok(Message::Text(text))) => serde_json::from_str(&text).unwrap(),
+                        Some(Ok(Message::Ping(payload))) => {
+                            self.socket.send(Message::Pong(payload)).await.unwrap();
+                            continue;
+                        }
+                        other => panic!("note observer push: {other:?}"),
+                    }
+                };
+                assert_eq!(frame["method"], "subscription.push", "{frame}");
+                assert_eq!(frame["params"]["subscriptionId"], self.subscription);
+                return frame["params"].clone();
+            }
+        })
+        .await
+        .expect("note observer push deadline")
+    }
+}
 
 async fn seed_guest(store: &intent_store::Store, login: &str, id: i64, token: &str) -> Principal {
     let person = Principal {
@@ -74,6 +150,7 @@ async fn events_through_marker(
 fn assert_scoped(events: &[Value], workspace: &str) {
     for event in events {
         assert_eq!(event["workspaceId"], workspace, "{event}");
+        assert_ne!(event["type"], "note:presence", "channel-only event leaked");
         assert!(
             !matches!(
                 event["type"].as_str(),
@@ -123,7 +200,7 @@ async fn offline_addition_notifies_guest(cached: bool) {
         })).await,
         884,
     );
-    let mut cached_lease = if cached {
+    let cached_lease = if cached {
         // This separate connection never says hello: the authorized note
         // lease retains its profile while the workspace roster stays offline.
         let mut lease = connect_ws(host.port, host.cfg.clone(), &token).await;
@@ -220,27 +297,29 @@ async fn offline_addition_notifies_guest(cached: bool) {
     );
     let link = host_invite(&mut owner, "github").await;
     let mut join = connect_invite(host.port, host.cfg.clone()).await;
-    if let Some((lease, _)) = &mut cached_lease {
-        result(
-            &wss_rpc(
-                lease,
-                897,
-                "note.presence.update",
-                json!({"workspaceId":workspace,"noteId":"spec","rev":1,"anchor":0,"head":0}),
-            )
-            .await,
-            897,
-        );
+    let mut note_observer = if cached {
+        // This different principal's join ensures only its own profile. The
+        // target's existing viewer proves lease retention; gc_profile keeps
+        // the cache while that connection/viewer remains. The snapshot's
+        // profile fields are durable projections, not direct cache inspection.
+        let mut observer = NoteObserver::subscribe(&host, &remaining_token, &workspace).await;
+        let snapshot = observer.next_push().await;
+        assert_eq!(snapshot["kind"], "snapshot");
+        assert_eq!(snapshot["seq"], 0);
+        let viewer = snapshot["snapshot"]["viewers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["principalId"] == person.id.0)
+            .expect("target's note lease survives its hello disconnect");
+        assert_eq!(viewer["login"], "gh-guest");
+        assert_eq!(viewer["hostRole"], "guest");
         let proof = events_through_marker(&mut owner, &mut subscriber, &workspace, "Cached").await;
         assert_scoped(&proof, &workspace);
-        let update = proof
-            .iter()
-            .find(|event| event["type"] == "note:presence" && event["data"]["kind"] == "updated")
-            .expect("live note lease publishes its cached profile before acceptance");
-        assert_eq!(update["data"]["principalId"], person.id.0);
-        assert_eq!(update["data"]["login"], "gh-guest");
-        assert_eq!(update["data"]["hostRole"], "guest");
-    }
+        Some(observer)
+    } else {
+        None
+    };
     assert_eq!(
         result(
             &wss_rpc(
@@ -353,15 +432,36 @@ async fn offline_addition_notifies_guest(cached: bool) {
             .await,
             899,
         );
+        let observer = note_observer.as_mut().unwrap();
+        let left = timeout(Duration::from_secs(10), async {
+            loop {
+                let push = observer.next_push().await;
+                if push["kind"] == "delta"
+                    && push["delta"]["kind"] == "left"
+                    && push["delta"]["viewer"]["principalId"] == person.id.0
+                {
+                    return push;
+                }
+            }
+        })
+        .await
+        .expect("target lease left on the dedicated note channel");
+        assert_eq!(left["delta"]["viewer"]["hostRole"], "member");
         let left =
             events_through_marker(&mut owner, &mut subscriber, &workspace, "Lease released").await;
         assert_scoped(&left, &workspace);
-        assert!(left.iter().any(|event| {
-            event["type"] == "note:presence"
-                && event["data"]["kind"] == "left"
-                && event["data"]["principalId"] == person.id.0
-        }));
         lease.close(None).await.unwrap();
+        result(
+            &wss_rpc(
+                &mut observer.socket,
+                900,
+                "note.presence.unsubscribe",
+                json!({"subscriptionId":observer.subscription}),
+            )
+            .await,
+            900,
+        );
+        observer.socket.close(None).await.unwrap();
     }
     result(
         &wss_rpc(
