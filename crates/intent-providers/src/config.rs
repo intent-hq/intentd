@@ -661,6 +661,8 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
     ProviderConfig {
         runtime: ProviderRuntime::Node,
         supports_authenticate: true,
+        // Mock journeys delegate through the real per-agent workspace bridge.
+        supports_session_mcp_servers: true,
         can_be_disabled: true,
         injection_mechanism: InjectionMechanism::FirstTurnPrepend,
         requires_env_var: Some("MOCK_AGENT_SCRIPT_PATH"),

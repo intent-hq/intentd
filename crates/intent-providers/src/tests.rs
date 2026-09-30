@@ -296,14 +296,14 @@ fn cortex_and_droid_gate_on_enable_env_vars() {
     }
 }
 
-/// Exactly claude-code, codex, droid, and grok consume MCP servers from the
-/// ACP `session/new` / `session/load` `mcpServers` field; every other
+/// The pinned opt-in set consumes MCP servers from the ACP `session/new` /
+/// `session/load` `mcpServers` field; every other
 /// provider receives MCP config out-of-band (auggie `--mcp-config`, opencode
 /// env config) or not at all. Asserted over the full registry so a newly
 /// added provider can't accidentally opt in without updating this partition.
 #[test]
 fn session_mcp_servers_partition() {
-    let opted_in = ["claude-code", "codex", "droid", "grok", "antigravity"];
+    let opted_in = ["claude-code", "codex", "droid", "grok", "antigravity", "mock"];
     for id in all_provider_ids() {
         let p = find_provider(id).unwrap();
         assert_eq!(
@@ -312,6 +312,26 @@ fn session_mcp_servers_partition() {
             "{id}: supports_session_mcp_servers must match the pinned opt-in set {opted_in:?}"
         );
     }
+}
+
+#[test]
+fn mock_session_mcp_preserves_discovery_and_authentication() {
+    let mock = find_provider("mock").unwrap();
+    let reason = gated_reason_with_env(mock, &|_| false).expect("mock stays hidden by default");
+    assert!(reason.contains("MOCK_AGENT_SCRIPT_PATH"));
+    assert_eq!(
+        gated_reason_with_env(mock, &|var| var == "MOCK_AGENT_SCRIPT_PATH"),
+        None,
+        "the mock fixture is discoverable only with its script configured"
+    );
+    assert_eq!(mock.runtime, ProviderRuntime::Node);
+    assert!(mock.supports_authenticate);
+    assert_eq!(mock.injection_mechanism, InjectionMechanism::FirstTurnPrepend);
+    assert!(!mock.supports_mcp_config && !mock.mcp_via_pi_extension);
+    assert!(
+        mock.supports_session_mcp_servers,
+        "mock sessions need the real workspace MCP bridge for parent-aware delegation"
+    );
 }
 
 /// These providers apply the stored model post-session via
