@@ -26984,17 +26984,10 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
-            // Retain the thread identity before deleting the row. Scope the
-            // lookup to both workspace and note, including same-id notes in
-            // different workspaces, and keep the existing failure envelope.
-            let comment = store
-                .list_comments_in_workspace(&workspace_id, &note_id)
-                .await?
-                .into_iter()
-                .find(|comment| comment.id == comment_id)
-                .ok_or_else(|| Error::Internal("Failed to delete comment".to_string()))?;
-            store
-                .delete_comment(&workspace_id, &comment_id)
+            // Capture the thread identity in the scoped DELETE itself, so a
+            // concurrent same-ID replacement cannot invalidate a prior read.
+            let thread_id = store
+                .delete_comment_in_note(&workspace_id, &note_id, &comment_id)
                 .await
                 .map_err(|err| match err {
                     Error::NotFound(_) => Error::Internal("Failed to delete comment".to_string()),
@@ -27014,7 +27007,7 @@ impl WorkspaceApi for Services {
                     data: serde_json::json!({
                         "noteId": note_id.as_str(),
                         "commentId": comment_id,
-                        "threadId": comment.thread_id,
+                        "threadId": thread_id,
                     }),
                 },
             )

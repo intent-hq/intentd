@@ -12127,6 +12127,116 @@ mod change_event_parity {
     }
 
     #[intent_test_macros::daemon_test]
+    async fn comment_delete_replacement_on_other_note_survives() {
+        comment_delete_replacement_race(false).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn comment_delete_replacement_on_same_note_emits_current_thread() {
+        comment_delete_replacement_race(true).await;
+    }
+
+    async fn comment_delete_replacement_race(same_note: bool) {
+        let h = harness().await;
+        let original = note(&h.ws, "original", "hello world");
+        let other = note(&h.ws, "other", "hello world");
+        h.store.insert_note(&original).await.unwrap();
+        h.store.insert_note(&other).await.unwrap();
+        let added = h
+            .services
+            .comment_add(
+                h.ws.clone(),
+                original.id.clone(),
+                "hello world".into(),
+                "hello".into(),
+                "root".into(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let reply = h
+            .services
+            .comment_respond(
+                h.ws.clone(),
+                original.id.clone(),
+                Some(added.comment_id.clone()),
+                None,
+                "reply".into(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let comment_id = reply.comment.id;
+        let mut subscription = subscribe(&h);
+        // As in the credential-revoke regression, hold the sole writer and
+        // drive deletion past its read-pool lookup while writes remain gated.
+        let mut held = h.store.write_pool().acquire().await.unwrap();
+        let mut deletion =
+            h.services
+                .comment_delete(h.ws.clone(), original.id.clone(), comment_id.clone());
+        let completed = super::poll_until(&mut deletion, 20, || async {
+            assert!(h.store.get_comment(&comment_id).await.is_ok());
+            false
+        })
+        .await;
+        assert!(!completed);
+        let replacement_note = if same_note { &original.id } else { &other.id };
+        // SQLite REPLACE deletes/reinserts the same client-supplied UUID,
+        // modeling another successful deletion followed by recreation while
+        // this request is parked. The original was a reply in thread R;
+        // the replacement is a root C with id == thread_id and no parent,
+        // as comment.add(commentId=C) creates after C has been deleted.
+        sqlx::query(
+            "INSERT OR REPLACE INTO comment
+            (id, thread_id, note_id, kind, content, author, author_type, status,
+             parent_id, anchor_json, anchor_text, extra_json, created_at, updated_at, workspace_id)
+            SELECT id, id, ?, kind, content, author, author_type, status,
+             NULL, anchor_json, anchor_text, extra_json, created_at, updated_at, workspace_id
+            FROM comment WHERE id = ?",
+        )
+        .bind(replacement_note.as_str())
+        .bind(&comment_id)
+        .execute(&mut *held)
+        .await
+        .unwrap();
+        drop(held);
+        let result = deletion.await;
+        if same_note {
+            assert!(result.is_ok(), "{result:?}");
+            let event = recv_one(&mut subscription).await;
+            assert_eq!(event["type"], "comment:deleted");
+            assert_eq!(
+                event["data"],
+                json!({"noteId":original.id,"commentId":comment_id,"threadId":comment_id})
+            );
+            assert!(h.store.get_comment(&comment_id).await.is_err());
+        } else {
+            assert!(
+                result.is_err(),
+                "replacement on a different note must survive"
+            );
+            let remaining = h.store.get_comment(&comment_id).await.unwrap();
+            assert_eq!(remaining.note_id, Some(other.id));
+            assert_eq!(remaining.thread_id, comment_id);
+            assert!(remaining.parent_id.is_none());
+            assert!(h
+                .store
+                .events_by_type(&h.ws, "comment:deleted", 10)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
     async fn comment_resolved_payload() {
         let h = harness().await;
         let tn = note(&h.ws, "n-1", "hello world");
