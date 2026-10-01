@@ -616,3 +616,200 @@ async fn retirement_run_records_success_failure_and_saved_summary() {
         }
     }
 }
+
+#[intent_test_macros::daemon_test]
+async fn new_command_defaults_to_one_off_but_upserts_and_reload_preserve_purpose() {
+    use intent_core::ScriptPurpose;
+    let h = harness().await;
+    for (id, mode, purpose, expected) in [
+        ("new-command", ScriptMode::Command, None, "oneOff"),
+        (
+            "saved-command",
+            ScriptMode::Command,
+            Some(ScriptPurpose::Saved),
+            "saved",
+        ),
+        (
+            "explicit-one-off",
+            ScriptMode::Command,
+            Some(ScriptPurpose::OneOff),
+            "oneOff",
+        ),
+        ("new-service", ScriptMode::Service, None, "saved"),
+    ] {
+        let params = ScriptCreateParams {
+            name: id.into(),
+            command: "true".into(),
+            mode,
+            script_id: Some(id.into()),
+            purpose,
+            ..Default::default()
+        };
+        let created = h
+            .services
+            .script_create(h.ws.clone(), params.clone())
+            .await
+            .unwrap();
+        assert_eq!(created["purpose"], expected, "new {id}");
+        let updated = h
+            .services
+            .script_create(
+                h.ws.clone(),
+                ScriptCreateParams {
+                    purpose: None,
+                    name: "updated".into(),
+                    ..params
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated["purpose"], expected, "upsert {id}");
+    }
+    h.services
+        .script_archive(
+            h.ws.clone(),
+            vec!["new-command".into(), "saved-command".into()],
+        )
+        .await
+        .unwrap();
+    // Reload archived definitions from SQLite, then upsert: classification
+    // survives both paths even though the replacement returns to active.
+    let restarted = Services::new(Store::open(&h.tmp.path).await.unwrap());
+    restarted.hydrate_scripts().await.unwrap();
+    for (id, expected) in [("new-command", "oneOff"), ("saved-command", "saved")] {
+        let updated = restarted
+            .script_create(
+                h.ws.clone(),
+                ScriptCreateParams {
+                    script_id: Some(id.into()),
+                    name: "reloaded".into(),
+                    command: "true".into(),
+                    mode: ScriptMode::Command,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated["purpose"], expected, "reloaded {id}");
+        assert!(updated.get("archivedAt").is_none());
+    }
+    // Legacy persisted definitions still use the compatibility default on read.
+    let legacy: intent_core::Script = serde_json::from_value(json!({
+        "id":"legacy-command", "workspaceId":h.ws.as_str(), "name":"legacy",
+        "command":"true", "mode":"command", "source":"user", "createdAt":now_iso()
+    }))
+    .unwrap();
+    assert_eq!(legacy.purpose, ScriptPurpose::Saved);
+    restarted.store.upsert_script(&legacy).await.unwrap();
+    restarted.hydrate_scripts().await.unwrap();
+    let updated = restarted
+        .script_create(
+            h.ws.clone(),
+            ScriptCreateParams {
+                script_id: Some(legacy.id),
+                name: "legacy updated".into(),
+                command: "true".into(),
+                mode: ScriptMode::Command,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated["purpose"], "saved");
+}
+
+#[intent_test_macros::daemon_test]
+async fn new_autostart_command_requires_explicit_saved_purpose() {
+    let h = harness().await;
+    let params = ScriptCreateParams {
+        name: "autostart".into(),
+        command: "true".into(),
+        mode: ScriptMode::Command,
+        auto_start: Some(true),
+        ..Default::default()
+    };
+    assert!(matches!(
+        h.services.script_create(h.ws.clone(), params.clone()).await,
+        Err(Error::InvalidParams(_))
+    ));
+    assert!(
+        h.services.script_list(h.ws.clone()).await.unwrap()["scripts"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let saved = h
+        .services
+        .script_create(
+            h.ws.clone(),
+            ScriptCreateParams {
+                purpose: Some(intent_core::ScriptPurpose::Saved),
+                ..params.clone()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(saved["purpose"], "saved");
+    let updated = h
+        .services
+        .script_create(
+            h.ws.clone(),
+            ScriptCreateParams {
+                script_id: Some(saved["id"].as_str().unwrap().into()),
+                ..params
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated["purpose"], "saved");
+    assert_eq!(updated["autoStart"], true);
+}
+
+#[intent_test_macros::daemon_test]
+async fn omitted_purpose_upserts_preserve_unhydrated_store_definitions() {
+    let h = harness().await;
+    for (id, purpose, expected) in [
+        ("saved", intent_core::ScriptPurpose::Saved, "saved"),
+        ("one-off", intent_core::ScriptPurpose::OneOff, "oneOff"),
+    ] {
+        create(
+            &h,
+            ScriptCreateParams {
+                name: id.into(),
+                command: "true".into(),
+                mode: ScriptMode::Command,
+                script_id: Some(id.into()),
+                purpose: Some(purpose),
+                ..Default::default()
+            },
+        )
+        .await;
+        // Boot continues after failed hydration. The durable row remains an
+        // update, even when it has no corresponding in-memory definition.
+        let unhydrated = Services::new(h.services.store().clone());
+        let result = unhydrated
+            .script_create(
+                h.ws.clone(),
+                ScriptCreateParams {
+                    name: "updated".into(),
+                    command: "true".into(),
+                    mode: ScriptMode::Command,
+                    script_id: Some(id.into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["purpose"], expected);
+        assert_eq!(
+            h.services
+                .store()
+                .get_script_in_workspace(&h.ws, id)
+                .await
+                .unwrap()
+                .unwrap()
+                .purpose,
+            purpose
+        );
+    }
+}
