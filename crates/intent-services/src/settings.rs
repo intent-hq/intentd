@@ -8014,10 +8014,10 @@ mod rollback_order_tests {
         compensating_hook_case(false).await;
     }
 
-    struct PausedRollbackStore {
-        raw: InMemorySecretStore,
-        parked: Arc<tokio::sync::Notify>,
-        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    pub(super) struct PausedRollbackStore {
+        pub(super) raw: InMemorySecretStore,
+        pub(super) parked: Arc<tokio::sync::Notify>,
+        pub(super) release: Mutex<std::sync::mpsc::Receiver<()>>,
     }
     impl SecretStore for PausedRollbackStore {
         fn load(&self, account: &str) -> Result<Option<String>> {
@@ -8144,5 +8144,265 @@ mod rollback_order_tests {
             json!({"revision":1,"changes":newer["applied"]})
         );
         assert_no_settings_events(&mut sub).await;
+    }
+}
+
+#[cfg(test)]
+mod port_assignment_publication_tests {
+    use super::*;
+    use intent_core::{ServerControl, WorkspaceApi};
+    use std::{
+        future::Future,
+        pin::Pin,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    struct AssignPort {
+        registry: Arc<SettingsRegistry>,
+        port: u16,
+        starts: AtomicUsize,
+        fail_tunnel: bool,
+    }
+    impl ServerControl for AssignPort {
+        fn start_ws_listener(&self) -> Pin<Box<dyn Future<Output = Result<u16>> + Send + '_>> {
+            Box::pin(async move {
+                self.starts.fetch_add(1, Ordering::SeqCst);
+                self.registry
+                    .persist_selected_ws_api_port(&self.registry.snapshot(), self.port)?;
+                Ok(self.port)
+            })
+        }
+        fn stop_ws_listener(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(async {})
+        }
+        fn ws_listener_port(&self) -> Pin<Box<dyn Future<Output = Option<u16>> + Send + '_>> {
+            Box::pin(async { None })
+        }
+        fn start_tunnel(&self) -> Pin<Box<dyn Future<Output = Result<String>> + Send + '_>> {
+            Box::pin(async move {
+                if self.fail_tunnel {
+                    Err(Error::Internal("injected tunnel failure".into()))
+                } else {
+                    Ok("test-tunnel".into())
+                }
+            })
+        }
+        fn is_tcp_connection(&self) -> bool {
+            false
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn settings_port_assignment_publishes_final_value_without_recursive_hooks() {
+        for external in [false, true] {
+            for port in [5181, 5183] {
+                let dir = crate::test_support::test_tempdir("port-publication");
+                let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+                let path = dir.path().join("config.toml");
+                let registry = Arc::new(SettingsRegistry::load(path.clone()).unwrap());
+                let bus = crate::EventBus::new(store.clone());
+                let mut sub = bus.subscribe(crate::events::SubscriptionFilter {
+                    event_types: vec!["settings:changed".into()],
+                    ..Default::default()
+                });
+                let services = crate::Services::new(store)
+                    .with_settings_registry(registry.clone())
+                    .with_event_bus(bus);
+                let control = Arc::new(AssignPort {
+                    registry: registry.clone(),
+                    port,
+                    starts: AtomicUsize::new(0),
+                    fail_tunnel: false,
+                });
+                services.attach_server_control(control.clone());
+                let response = if external {
+                    let _gate = services.settings_revision_gate.write().await;
+                    let text = "[server.wsApi]\nenabled = true\n";
+                    std::fs::write(path, text).unwrap();
+                    let notice = registry.reload(text).unwrap();
+                    services.apply_external_settings_change(&notice).await;
+                    None
+                } else {
+                    Some(
+                        services
+                            .settings_update(json!([{"path":"server.wsApi.enabled","value":true}]))
+                            .await
+                            .unwrap(),
+                    )
+                };
+                let events = tokio::time::timeout(Duration::from_secs(5), sub.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(events.len(), 1);
+                let changes = &events[0].data["changes"];
+                let assignment = changes
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|entry| entry["path"] == "server.wsApi.port")
+                    .unwrap();
+                assert_eq!(
+                    assignment,
+                    &json!({"path":"server.wsApi.port","value":f64::from(port),"origin":"file"})
+                );
+                assert_eq!(control.starts.load(Ordering::SeqCst), 1);
+                assert_eq!(events[0].data["revision"], 1);
+                if let Some(response) = response {
+                    assert_eq!(response["applied"], *changes);
+                }
+                let setting = services
+                    .settings_get("server.wsApi.port".into())
+                    .await
+                    .unwrap();
+                assert_eq!(setting["value"], json!(f64::from(port)));
+                assert_eq!(setting["origin"], "file");
+                assert_eq!(setting["revision"], 1);
+            }
+        }
+    }
+    #[intent_test_macros::daemon_test]
+    async fn settings_port_assignment_surviving_failed_batch_gets_revision_and_event() {
+        let dir = crate::test_support::test_tempdir("port-publication-rollback");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let registry = Arc::new(SettingsRegistry::load(dir.path().join("config.toml")).unwrap());
+        let bus = crate::EventBus::new(store.clone());
+        let mut sub = bus.subscribe(crate::events::SubscriptionFilter {
+            event_types: vec!["settings:changed".into()],
+            ..Default::default()
+        });
+        let services = crate::Services::new(store)
+            .with_settings_registry(registry.clone())
+            .with_event_bus(bus);
+        let control = Arc::new(AssignPort {
+            registry: registry.clone(),
+            port: 5183,
+            starts: AtomicUsize::new(0),
+            fail_tunnel: true,
+        });
+        services.attach_server_control(control.clone());
+        let error = services
+            .settings_update(json!([
+                {"path":"server.wsApi.enabled","value":true},
+                {"path":"server.tunnel.enabled","value":true}
+            ]))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("injected tunnel failure"));
+        assert!(!registry.snapshot().effective.server.ws_api.enabled);
+        assert_eq!(
+            registry.snapshot().ws_api_port_policy(),
+            crate::WsApiPortPolicy::Fixed(5183)
+        );
+        let events = tokio::time::timeout(Duration::from_secs(5), sub.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].data["changes"],
+            json!([{"path":"server.wsApi.port","value":5183.0,"origin":"file"}])
+        );
+        assert_eq!(events[0].data["revision"], 1);
+        assert_eq!(
+            services
+                .settings_get("server.wsApi.port".into())
+                .await
+                .unwrap()["revision"],
+            1
+        );
+        assert_eq!(control.starts.load(Ordering::SeqCst), 1);
+    }
+    #[intent_test_macros::daemon_test]
+    async fn settings_port_assignment_is_published_before_secret_rollback_releases_revision_gate() {
+        use super::rollback_order_tests::PausedRollbackStore;
+        use std::{future::poll_fn, task::Poll};
+        let dir = crate::test_support::test_tempdir("port-publication-secret-rollback");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let registry = Arc::new(SettingsRegistry::load(dir.path().join("config.toml")).unwrap());
+        let bus = crate::EventBus::new(store.clone());
+        let mut sub = bus.subscribe(crate::events::SubscriptionFilter {
+            event_types: vec!["settings:changed".into()],
+            ..Default::default()
+        });
+        let raw = InMemorySecretStore::default();
+        raw.store(crate::github_auth_ops::SECRET_ACCOUNT, "original-device")
+            .unwrap();
+        let parked = Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let services = Arc::new(
+            crate::Services::new(store)
+                .with_settings_registry(registry.clone())
+                .with_event_bus(bus)
+                .with_secret_store(Arc::new(PausedRollbackStore {
+                    raw,
+                    parked: parked.clone(),
+                    release: Mutex::new(release_rx),
+                })),
+        );
+        let control = Arc::new(AssignPort {
+            registry,
+            port: 5183,
+            starts: AtomicUsize::new(0),
+            fail_tunnel: true,
+        });
+        services.attach_server_control(control.clone());
+        let writer = services.clone();
+        let failed = intent_core::spawn_daemon(async move {
+            writer
+                .settings_update(json!([
+                    {"path":crate::github_auth_ops::SECRET_ACCOUNT,"value":"settings-pat"},
+                    {"path":"server.wsApi.enabled","value":true},
+                    {"path":"server.tunnel.enabled","value":true}
+                ]))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), parked.notified())
+            .await
+            .unwrap();
+        let assigned = services
+            .settings_get("server.wsApi.port".into())
+            .await
+            .unwrap();
+        assert_eq!(assigned["value"], 5183.0);
+        assert_eq!(
+            assigned["revision"], 1,
+            "assignment must have a revision before another reader enters"
+        );
+        let first = tokio::time::timeout(Duration::from_secs(5), sub.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(
+            first[0].data["changes"],
+            json!([{"path":"server.wsApi.port","value":5183.0,"origin":"file"}])
+        );
+        let newer = services
+            .settings_update(json!([{"path":"server.wsApi.port","value":62000}]))
+            .await
+            .unwrap();
+        assert_eq!(newer["revision"], 2);
+        release_tx.send(()).unwrap();
+        let error = failed.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("injected tunnel failure"));
+        let final_port = services
+            .settings_get("server.wsApi.port".into())
+            .await
+            .unwrap();
+        assert_eq!(final_port["value"], 62000.0);
+        assert_eq!(
+            final_port["revision"], 2,
+            "old rollback must not announce newer assignment again"
+        );
+        let second = tokio::time::timeout(Duration::from_secs(5), sub.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].data["changes"], newer["applied"]);
+        let mut next = Box::pin(sub.recv());
+        assert!(poll_fn(|cx| Poll::Ready(next.as_mut().poll(cx).is_pending())).await);
+        assert_eq!(control.starts.load(Ordering::SeqCst), 1);
     }
 }

@@ -450,6 +450,8 @@ pub struct WsApiSettings {
     /// `server.wsApi.enabled` — enable the TCP/WSS listener at runtime.
     pub enabled: bool,
     /// `server.wsApi.port` — TCP port for the WSS listener (1024–65535).
+    /// An omitted key is unassigned; the registry tracks that distinction
+    /// while this typed view keeps the effective default 5181 for clients.
     pub port: u16,
 }
 
@@ -1752,8 +1754,11 @@ maxOutstandingRpcs = 256
 [server.wsApi]
 # WS API enabled -- enable the TCP/WSS listener at runtime.
 enabled = false
-# WSS API port -- TCP port for the WSS listener (1024-65535).
-port = 5181
+# WSS API port -- omit to select once on first enable, trying 5181 upward.
+# The selected port is saved here and required on every later start.
+# Set a number (1024-65535) to require that port without selection.
+# To deliberately select again, disable WSS, remove this key, and re-enable.
+# port = 5181
 
 [server.tunnel]
 # Tunnel enabled -- run the bundled tailcat sidecar forwarding tunnel traffic

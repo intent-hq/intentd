@@ -2429,6 +2429,8 @@ async fn cmd_serve(
             bind_addresses: None,
         }),
         control: std::sync::OnceLock::new(),
+        start_gate: tokio::sync::Mutex::new(()),
+        stop_generation: std::sync::atomic::AtomicU64::new(0),
     });
 
     // System control surface (§5.7 + §5.12): exposes `system.status` /
@@ -2603,33 +2605,25 @@ async fn cmd_serve(
     let config_watcher_task =
         spawn_config_watcher_init(watch_hub, settings_registry.clone(), services.clone());
 
-    // Boot-time secure WSS listener auto-start when the effective
-    // server.wsApi.enabled is true (config.toml or persisted runtime toggle).
-    // A bind failure at boot (port in use) is non-fatal: UDS stays up, setting
-    // stays true, warning logged (UI shows "not running" via pairingInfo.port=null).
-    if boot_listener == BootWsListener::SecureWss {
+    // Enabled secure WSS is a startup requirement. Preserve the error through
+    // the canonical teardown below, without ever publishing UDS readiness.
+    let boot_error = if boot_listener == BootWsListener::SecureWss {
         match control.start_ws_listener().await {
             Ok(port) => {
-                tracing::info!(
-                    port,
-                    "WSS listener auto-started at boot (persisted server.wsApi.enabled=true)"
-                );
+                tracing::info!(port, "WSS listener auto-started at boot");
+                None
             }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "failed to auto-start WSS listener at boot (persisted enabled=true); \
-                     UDS still serving, setting remains true, toggle OFF→ON to retry"
-                );
-            }
+            Err(e) => Some(anyhow::anyhow!("secure WSS startup failed: {e}")),
         }
-    }
+    } else {
+        None
+    };
 
     // Boot-time tailcat tunnel auto-start when the effective
     // server.tunnel.enabled is true. Requires the WSS listener up (checked by
     // start_tunnel); a start failure at boot is non-fatal — setting stays
     // true, warning logged, toggle OFF→ON to retry.
-    if boot_settings.effective.server.tunnel.enabled {
+    if boot_error.is_none() && boot_settings.effective.server.tunnel.enabled {
         match intent_core::ServerControl::start_tunnel(control.as_ref()).await {
             Ok(address) => {
                 tracing::info!(
@@ -2647,7 +2641,7 @@ async fn cmd_serve(
         }
     }
 
-    let (startup_stop, startup_stopping) = tokio::sync::watch::channel(false);
+    let (startup_stop, startup_stopping) = tokio::sync::watch::channel(boot_error.is_some());
     let shutdown = {
         let manager = manager.clone();
         let startup_stop = startup_stop.clone();
@@ -2780,17 +2774,22 @@ async fn cmd_serve(
             }
         })
     };
-    let serve_result = serve_uds_with_reverse(
-        api,
-        bus,
-        &config.socket_path,
-        Some(system_control),
-        pairing_info,
-        reverse_registry.clone(),
-        rpc_limiter,
-        shutdown,
-    )
-    .await;
+    let serve_result = if let Some(error) = boot_error {
+        Err(error)
+    } else {
+        serve_uds_with_reverse(
+            api,
+            bus,
+            &config.socket_path,
+            Some(system_control),
+            pairing_info,
+            reverse_registry.clone(),
+            rpc_limiter,
+            shutdown,
+        )
+        .await
+        .map_err(anyhow::Error::from)
+    };
     let cleanup = shutdown::Phase::start("cleanup");
     // Also covers listener startup failure, where the signal future did not run.
     manager.begin_shutdown();
@@ -2824,8 +2823,6 @@ async fn cmd_serve(
             tracing::error!(%error, "startup recovery worker failed");
         }
     }
-    serve_result?;
-
     // Clean shutdown: stop the tailcat tunnel sidecar (kill the child), stop
     // the WSS listener (graceful close + port release), stop the PR refresh
     // loop, then kill every spawned agent child and clear the registry (§6.8
@@ -2920,6 +2917,7 @@ async fn cmd_serve(
     shutdown_store.close().await;
     phase.complete();
     cleanup.complete();
+    serve_result?;
 
     #[cfg(unix)]
     if idle_update_state.restart_exit_fired() {
@@ -3980,6 +3978,8 @@ fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: &Arc<ChildTreeUsa
 /// the lifecycle hooks (§5.12). Holds `WsApiServer` construction args plus mutable
 /// state guarded by a Mutex so settings.update can start/stop the listener.
 struct WsRuntimeControl {
+    start_gate: tokio::sync::Mutex<()>,
+    stop_generation: std::sync::atomic::AtomicU64,
     api: Arc<dyn WorkspaceApi>,
     /// Direct access to daemon-local effective settings for listener startup.
     /// Runtime hooks execute while `settings.update` holds the settings revision
@@ -4008,6 +4008,24 @@ struct WsRuntimeState {
     /// one listener per address) so pairing surfaces advertise the reachable
     /// host(s), not all local IPs.
     bind_addresses: Option<Vec<std::net::IpAddr>>,
+}
+
+/// Atomically check cancellation and publish the in-flight transport handle.
+/// Stop either finds this handle or its generation bump prevents publication.
+async fn publish_starting_ws_server(
+    state: &tokio::sync::Mutex<WsRuntimeState>,
+    stop_generation: &std::sync::atomic::AtomicU64,
+    generation: u64,
+    server: WsApiServer,
+) -> intent_core::Result<()> {
+    let mut state = state.lock().await;
+    if stop_generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
+        return Err(intent_core::Error::Internal(
+            "WSS start cancelled by stop".into(),
+        ));
+    }
+    state.ws_server = Some(server);
+    Ok(())
 }
 
 /// Pairing info provider for `server.pairingInfo` / `server.rotateToken` (§5.2).
@@ -4313,18 +4331,38 @@ impl intent_core::ServerControl for DaemonControl {
     {
         Box::pin(async move {
             let runtime = &self.ws_runtime;
+            let generation = runtime
+                .stop_generation
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let _start = runtime.start_gate.lock().await;
+            if runtime
+                .stop_generation
+                .load(std::sync::atomic::Ordering::SeqCst)
+                != generation
+            {
+                return Err(intent_core::Error::Internal(
+                    "WSS start cancelled by stop".into(),
+                ));
+            }
 
-            // Check if already running (don't hold lock across await)
-            let existing_server = {
+            // A cancelled caller can leave an in-flight transport handle.
+            // Drain an unpublished start before replacing it. Also consult the
+            // transport: a concurrent stop may already have cleared its port.
+            let (existing_server, published_port) = {
                 let state = runtime.state.lock().await;
-                state.ws_server.clone()
+                (state.ws_server.clone(), state.port)
             };
-
-            // If already started, return the current port (idempotent)
-            if let Some(ref server) = existing_server {
-                if let Some(port) = server.bound_port().await {
-                    return Ok(port);
+            if let Some(server) = existing_server {
+                if published_port.is_some() {
+                    if let Some(port) = server.bound_port().await {
+                        return Ok(port);
+                    }
                 }
+                server.stop().await;
+                let mut state = runtime.state.lock().await;
+                state.ws_server = None;
+                state.port = None;
+                state.bind_addresses = None;
             }
 
             // Read the persisted port from settings, then resolve against the
@@ -4345,6 +4383,10 @@ impl intent_core::ServerControl for DaemonControl {
                 settings_port,
                 runtime.ws_options.base_port,
             );
+
+            let assign_port = runtime.tls_cert.is_some()
+                && desired_port != 0
+                && settings.ws_api_port_policy() == intent_services::WsApiPortPolicy::Unassigned;
 
             // Read the persisted bind address set (server.bindAddress — a
             // single IP string or a list of IP strings; monorepo#3314) so a
@@ -4452,7 +4494,61 @@ impl intent_core::ServerControl for DaemonControl {
                 server.install_pairing_info(pairing_provider);
             }
 
-            let port = server.start().await.map_err(|e| {
+            // Publish only the handle, never readiness, so stop can cancel an
+            // in-flight scan. start_gate prevents duplicate server construction.
+            publish_starting_ws_server(
+                &runtime.state,
+                &runtime.stop_generation,
+                generation,
+                server.clone(),
+            )
+            .await?;
+            let start_result = if assign_port {
+                let runtime = runtime.clone();
+                let cancellation = runtime.clone();
+                server
+                    .start_with_cancellable_port_assignment(
+                        move |port| {
+                            if runtime
+                                .stop_generation
+                                .load(std::sync::atomic::Ordering::SeqCst)
+                                != generation
+                            {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::Interrupted,
+                                    "WSS start cancelled by stop",
+                                ));
+                            }
+                            runtime
+                                .settings_registry
+                                .persist_selected_ws_api_port(&settings, port)
+                                .map_err(|e| {
+                                    std::io::Error::other(format!(
+                                        "could not save selected WSS port {port}: {e}"
+                                    ))
+                                })
+                        },
+                        move || {
+                            cancellation
+                                .stop_generation
+                                .load(std::sync::atomic::Ordering::SeqCst)
+                                != generation
+                        },
+                    )
+                    .await
+            } else {
+                server.start().await
+            };
+            if start_result.is_err()
+                || runtime
+                    .stop_generation
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    != generation
+            {
+                server.stop().await;
+                runtime.state.lock().await.ws_server = None;
+            }
+            let port = start_result.map_err(|e| {
                 // Map bind failures to friendly, actionable error messages.
                 // The bind is all-or-nothing across the configured set, and
                 // the transport error names the failing address:port — keep
@@ -4471,9 +4567,29 @@ impl intent_core::ServerControl for DaemonControl {
                 intent_core::Error::Internal(error_msg)
             })?;
 
+            if runtime
+                .stop_generation
+                .load(std::sync::atomic::Ordering::SeqCst)
+                != generation
+            {
+                return Err(intent_core::Error::Internal(
+                    "WSS start cancelled by stop".into(),
+                ));
+            }
             // Store server + port (acquire lock only after all awaits done)
             {
                 let mut state = runtime.state.lock().await;
+                if runtime
+                    .stop_generation
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    != generation
+                {
+                    drop(state);
+                    server.stop().await;
+                    return Err(intent_core::Error::Internal(
+                        "WSS start cancelled by stop".into(),
+                    ));
+                }
                 state.ws_server = Some(server);
                 state.port = Some(port);
                 state.bind_addresses = Some(bind_addresses);
@@ -4488,17 +4604,23 @@ impl intent_core::ServerControl for DaemonControl {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             let runtime = &self.ws_runtime;
-            // Extract server without holding lock across await
+            runtime
+                .stop_generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Cancel a scan before waiting for the serialized start to unwind.
+            let starting = runtime.state.lock().await.ws_server.clone();
+            if let Some(server) = starting {
+                server.stop().await;
+            }
+            let _start = runtime.start_gate.lock().await;
             let server = {
                 let mut state = runtime.state.lock().await;
                 state.port = None;
                 state.bind_addresses = None;
                 state.ws_server.take()
             };
-
-            // Stop the WS server
-            if let Some(s) = server {
-                s.stop().await;
+            if let Some(server) = server {
+                server.stop().await;
             }
         })
     }
@@ -7480,6 +7602,113 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ws_stop_before_handle_publication_prevents_binding_and_assignment() {
+        use std::future::{poll_fn, Future};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::task::Poll;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let bus = EventBus::new(store.clone());
+        let api: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store));
+        let server = WsApiServer::new_insecure(
+            api,
+            bus,
+            WsOptions {
+                base_port: 0,
+                ..WsOptions::default()
+            },
+            None,
+        );
+        let state = tokio::sync::Mutex::new(WsRuntimeState {
+            ws_server: None,
+            port: None,
+            bind_addresses: None,
+        });
+        let stop_generation = AtomicU64::new(0);
+        let attempted_assignment = Arc::new(AtomicBool::new(false));
+        let observed = attempted_assignment.clone();
+        // Stop holds the same state lock that publication needs. Start has
+        // already captured generation zero and constructed its transport.
+        let stopping = state.lock().await;
+        let start = async {
+            publish_starting_ws_server(&state, &stop_generation, 0, server.clone()).await?;
+            server
+                .start_with_port_assignment(move |_| {
+                    observed.store(true, Ordering::SeqCst);
+                    Err(std::io::Error::other("unexpected assignment after stop"))
+                })
+                .await
+                .map_err(|e| intent_core::Error::Internal(e.to_string()))
+        };
+        tokio::pin!(start);
+        assert!(poll_fn(|cx| Poll::Ready(start.as_mut().poll(cx).is_pending())).await);
+        stop_generation.fetch_add(1, Ordering::SeqCst);
+        assert!(
+            stopping.ws_server.is_none(),
+            "stop cannot yet see the new transport"
+        );
+        drop(stopping);
+        let error = start.await.unwrap_err();
+        assert!(error.to_string().contains("cancelled by stop"), "{error}");
+        assert!(!attempted_assignment.load(Ordering::SeqCst));
+        assert!(state.lock().await.ws_server.is_none());
+        assert_eq!(server.bound_port().await, None);
+    }
+
+    #[tokio::test]
+    async fn ws_stop_after_handle_publication_prevents_late_transport_start() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let bus = EventBus::new(store.clone());
+        let api: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store));
+        let server = WsApiServer::new_insecure(
+            api,
+            bus,
+            WsOptions {
+                base_port: 0,
+                ..WsOptions::default()
+            },
+            None,
+        );
+        let state = tokio::sync::Mutex::new(WsRuntimeState {
+            ws_server: None,
+            port: None,
+            bind_addresses: None,
+        });
+        let stop_generation = Arc::new(AtomicU64::new(0));
+        publish_starting_ws_server(&state, &stop_generation, 0, server.clone())
+            .await
+            .unwrap();
+        // Runtime stop finds the handle and finishes transport shutdown before
+        // the original start ever polls the transport start future.
+        stop_generation.fetch_add(1, Ordering::SeqCst);
+        let stopping = state.lock().await.ws_server.clone().unwrap();
+        stopping.stop().await;
+        let attempted_assignment = Arc::new(AtomicBool::new(false));
+        let observed = attempted_assignment.clone();
+        let error = server
+            .start_with_cancellable_port_assignment(
+                move |_| {
+                    observed.store(true, Ordering::SeqCst);
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "cancelled at persistence",
+                    ))
+                },
+                move || stop_generation.load(Ordering::SeqCst) != 0,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        assert!(
+            !attempted_assignment.load(Ordering::SeqCst),
+            "cancel before binding, not only at persistence"
+        );
+        assert_eq!(server.bound_port().await, None);
+    }
 
     #[tokio::test]
     async fn shutdown_queue_lookup_failure_prevents_serving_and_preserves_recovery() {
