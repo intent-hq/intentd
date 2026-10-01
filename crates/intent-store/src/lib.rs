@@ -539,12 +539,39 @@ impl Store {
     /// This ensures WAL changes are visible to subsequent daemon instances
     /// (regression: persisted settings must survive app relaunches in sidecar mode).
     pub async fn close(&self) {
+        let started = std::time::Instant::now();
+        self.log_close_phase("wal_checkpoint", "started", 0);
         // Best-effort WAL checkpoint before closing the pools (via write pool).
-        let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(&self.write_pool)
+        // SQLite can return a busy checkpoint as a successful query. Inspect
+        // its existing result row so that this is not logged as a full checkpoint.
+        let result = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .fetch_one(&self.write_pool)
             .await;
+        let state = match result.and_then(|row| row.try_get::<i64, _>(0)) {
+            Ok(0) => "completed",
+            Ok(_) => "busy",
+            Err(_) => "failed",
+        };
+        self.log_close_phase("wal_checkpoint", state, elapsed_ms(started));
+        let started = std::time::Instant::now();
+        self.log_close_phase("write_pool_close", "started", 0);
         self.write_pool.close().await;
+        self.log_close_phase("write_pool_close", "completed", elapsed_ms(started));
+        let started = std::time::Instant::now();
+        self.log_close_phase("read_pool_close", "started", 0);
         self.read_pool.close().await;
+        self.log_close_phase("read_pool_close", "completed", elapsed_ms(started));
+    }
+
+    fn log_close_phase(&self, phase: &'static str, state: &'static str, elapsed_ms: u64) {
+        // Independent SQLx snapshots, not a coherent accounting of checkouts.
+        // In particular num_idle may temporarily remain nonzero after close.
+        tracing::info!(target: "intent_store::close", phase, state, elapsed_ms,
+            write_pool_size = self.write_pool.size(),
+            write_pool_idle = self.write_pool.num_idle(),
+            read_pool_size = self.read_pool.size(),
+            read_pool_idle = self.read_pool.num_idle(),
+            "store close phase");
     }
 
     /// Compare the migrations embedded in the binary against the versions
@@ -778,4 +805,8 @@ pub(crate) fn enum_to_db<T: serde::Serialize>(v: &T) -> Result<String> {
 pub(crate) fn enum_from_db<T: serde::de::DeserializeOwned>(s: &str) -> Result<T> {
     serde_json::from_value(serde_json::Value::String(s.to_string()))
         .map_err(|e| Error::Internal(format!("failed to decode enum '{s}': {e}")))
+}
+
+fn elapsed_ms(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }

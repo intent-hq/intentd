@@ -41,6 +41,7 @@ mod import;
 mod legacy_import;
 mod provider;
 mod rpc_profile;
+mod shutdown;
 mod suspend;
 mod tunnel;
 use client::rpc_call;
@@ -327,7 +328,15 @@ fn main() -> ExitCode {
     {
         std::env::set_var("INTENTD_SPECIALISTS_DIR", dir);
     }
-    build_runtime().block_on(async_main(cli))
+    let serving = matches!(cli.command, Command::Serve { .. });
+    let runtime = build_runtime();
+    let result = runtime.block_on(async_main(cli));
+    if serving {
+        shutdown::drop_runtime(runtime);
+    } else {
+        drop(runtime);
+    }
+    result
 }
 
 /// Stack size for the runtime's worker (and blocking) threads. Tokio's
@@ -359,7 +368,7 @@ async fn async_main(cli: Cli) -> ExitCode {
         }
         command => command,
     };
-    init_tracing();
+    init_tracing(matches!(command, Command::Serve { .. }));
     install_panic_hook();
     // Rust starts with SIGPIPE ignored, so `println!` to a pipe whose reader
     // closed early (`intentd status | head`) gets EPIPE and panics — and the
@@ -394,13 +403,22 @@ async fn async_main(cli: Cli) -> ExitCode {
                 resume_all,
                 // Folded into INTENTD_SPECIALISTS_DIR in `main()`, pre-runtime.
                 specialists_dir: _,
-            } => match cmd_serve(mode.as_deref(), insecure, resume_all).await {
-                Ok(code) => code,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    ExitCode::FAILURE
+            } => {
+                // This measures the entire serve call, including startup and local
+                // destruction on return; cleanup has its own shutdown-only timer.
+                let serve = shutdown::Phase::start("serve_lifetime");
+                match cmd_serve(mode.as_deref(), insecure, resume_all).await {
+                    Ok(code) => {
+                        serve.complete();
+                        code
+                    }
+                    Err(e) => {
+                        serve.failed();
+                        eprintln!("error: {e}");
+                        ExitCode::FAILURE
+                    }
                 }
-            },
+            }
             Command::Call { method, params } => to_exit(cmd_call(&method, params.as_deref()).await),
             Command::Status => cmd_status().await,
             Command::Stop => cmd_stop().await,
@@ -1387,7 +1405,7 @@ fn to_exit(result: anyhow::Result<()>) -> ExitCode {
     }
 }
 
-fn init_tracing() {
+fn init_tracing(serving: bool) {
     use std::io::IsTerminal;
     use tracing_subscriber::{
         fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
@@ -1441,6 +1459,14 @@ fn init_tracing() {
     let output_filter =
         || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
+    // Store::close is also used by offline CLI commands. Keep all lifecycle
+    // timing output scoped to serve, independently of the user's RUST_LOG.
+    let timing_filter = || {
+        tracing_subscriber::filter::filter_fn(move |meta| {
+            serving || !shutdown::is_timing_target(meta.target())
+        })
+    };
+
     // Set up dual output: stderr (for interactive use) and optionally file (for diagnostics)
     let mut stderr_layer = fmt::layer().with_writer(std::io::stderr);
     // Preserve fmt's NO_COLOR policy on terminals, but never emit ANSI to
@@ -1448,7 +1474,9 @@ fn init_tracing() {
     if !std::io::stderr().is_terminal() {
         stderr_layer = stderr_layer.with_ansi(false);
     }
-    let stderr_layer = stderr_layer.with_filter(output_filter());
+    let stderr_layer = stderr_layer
+        .with_filter(output_filter())
+        .with_filter(timing_filter());
 
     // Per-RPC statement-count / duration WARN profiling (expensive-RPC
     // guardrail); its warns flow through the output layers above.
@@ -1460,11 +1488,13 @@ fn init_tracing() {
         .with(stderr_layer);
 
     if let Some(appender) = file_appender {
-        let (non_blocking, guard) = tracing_appender::non_blocking(appender);
+        let direct = shutdown::SharedAppender::new(appender);
+        let (queued, guard) = tracing_appender::non_blocking(direct.clone());
         let file_layer = fmt::layer()
-            .with_writer(non_blocking)
+            .with_writer(shutdown::FileWriter { direct, queued })
             .with_ansi(false)
-            .with_filter(output_filter());
+            .with_filter(output_filter())
+            .with_filter(timing_filter());
         match subscriber.with(file_layer).try_init() {
             Ok(()) => {
                 // Store the guard in a static to keep it alive for the process lifetime.
@@ -1605,8 +1635,8 @@ async fn cmd_serve(
     insecure: bool,
     resume_all: bool,
 ) -> anyhow::Result<ExitCode> {
-    // Build-identity banner as the first serve log line so every log file
-    // opens with which build produced it (monorepo#3649). Same identity
+    // Build-identity banner on entering serve so every startup records
+    // which build produced it (monorepo#3649). Same identity
     // values `system.info` and the hello handshake expose.
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -2761,6 +2791,7 @@ async fn cmd_serve(
         shutdown,
     )
     .await;
+    let cleanup = shutdown::Phase::start("cleanup");
     // Also covers listener startup failure, where the signal future did not run.
     manager.begin_shutdown();
     repository_metadata_prewarm.abort();
@@ -2779,10 +2810,19 @@ async fn cmd_serve(
     // let the current service operation commit/reset its claim, skip later
     // candidates, then let manager.shutdown capture any admitted turns.
     let _ = startup_stop.send(true);
+    let phase = shutdown::Phase::start("agent_checkpoint");
     manager.checkpoint_shutdown().await;
+    phase.complete();
+    let phase = shutdown::Phase::start("agent_deliveries");
     services.shutdown_agent_deliveries().await;
-    if let Err(error) = startup_recovery.await {
-        tracing::error!(%error, "startup recovery worker failed");
+    phase.complete();
+    let phase = shutdown::Phase::start("startup_recovery_join");
+    match startup_recovery.await {
+        Ok(()) => phase.complete(),
+        Err(error) => {
+            phase.failed();
+            tracing::error!(%error, "startup recovery worker failed");
+        }
     }
     serve_result?;
 
@@ -2792,8 +2832,12 @@ async fn cmd_serve(
     // teardown). Idle reaping during the run is the M5 `reap_idle` hook. Stop
     // via ServerControl so we stop the runtime listener
     // (ws_runtime.state.ws_server), not the stale boot-time ws_server variable.
+    let phase = shutdown::Phase::start("tunnel_stop");
     intent_core::ServerControl::stop_tunnel(control.as_ref()).await;
+    phase.complete();
+    let phase = shutdown::Phase::start("wss_stop");
     control.stop_ws_listener().await;
+    phase.complete();
     pr_refresh.abort();
     pr_monitor_loop.abort();
     token_usage_scan.abort();
@@ -2821,10 +2865,9 @@ async fn cmd_serve(
     // survive (`kill_on_drop` only covers the direct child). Letting the sweep
     // settle first puts every child it spawned in the map, so `shutdown` reaps
     // them. Only if the grace expires do we abort and accept the drop path.
-    if tokio::time::timeout(MCP_START_JOIN_GRACE, &mut mcp_start_task)
-        .await
-        .is_err()
-    {
+    let phase = shutdown::Phase::start("mcp_start_join");
+    let mcp_start_result = tokio::time::timeout(MCP_START_JOIN_GRACE, &mut mcp_start_task).await;
+    if mcp_start_result.is_err() {
         tracing::warn!(
             grace_ms = u64::try_from(MCP_START_JOIN_GRACE.as_millis()).unwrap_or(u64::MAX),
             "deferred MCP start sweep did not settle within the shutdown grace; \
@@ -2832,9 +2875,18 @@ async fn cmd_serve(
         );
         mcp_start_task.abort();
     }
+    if matches!(mcp_start_result, Ok(Ok(()))) {
+        phase.complete();
+    } else {
+        phase.failed();
+    }
     mcp_monitor.abort();
+    let phase = shutdown::Phase::start("mcp_shutdown");
     mcp_hub.shutdown().await;
+    phase.complete();
+    let phase = shutdown::Phase::start("agent_shutdown");
     manager.shutdown().await;
+    phase.complete();
 
     // Kill every daemon-owned PTY session — terminals and scripts — so no
     // child survives the daemon as an orphan (monorepo#1526). Scripts are
@@ -2842,7 +2894,9 @@ async fn cmd_serve(
     // races the sweep; the whole teardown is bounded by one SIGTERM grace
     // (plus a bounded supervisor-settle backstop), staying well inside the
     // FE sidecar's own kill grace.
+    let phase = shutdown::Phase::start("pty_shutdown");
     let (scripts_stopped, ptys_killed) = services.shutdown_pty_sessions().await;
+    phase.complete();
     if scripts_stopped > 0 || ptys_killed > 0 {
         tracing::info!(
             scripts = scripts_stopped,
@@ -2862,7 +2916,10 @@ async fn cmd_serve(
 
     // Close the store pool gracefully, checkpointing the WAL so persisted data
     // is visible to the next daemon instance.
+    let phase = shutdown::Phase::start("store_close");
     shutdown_store.close().await;
+    phase.complete();
+    cleanup.complete();
 
     #[cfg(unix)]
     if idle_update_state.restart_exit_fired() {
