@@ -95,3 +95,70 @@ async fn wss_task_list_latency_baseline() {
     socket.close(None).await.unwrap();
     srv.ws.stop().await;
 }
+
+#[intent_test_macros::daemon_test]
+async fn wss_task_list_filtered_dependencies_and_spec_fallback() {
+    let srv = start(WsOptions::default()).await;
+    let ws = WorkspaceId::new();
+    srv.store
+        .insert_workspace(&fixture_workspace(&ws))
+        .await
+        .unwrap();
+    for (id, status) in [
+        ("pending", TaskStatus::NotStarted),
+        ("done", TaskStatus::Complete),
+        ("cancelled", TaskStatus::Cancelled),
+    ] {
+        let mut n = fixture_note(&ws, id, &"body".repeat(65536));
+        n.title.clear();
+        n.parent_id = Some(NoteId::from("spec"));
+        n.metadata.task = Some(TaskMetadata {
+            status,
+            depends_on: if id == "pending" {
+                ["done", "cancelled", "missing"].map(NoteId::from).to_vec()
+            } else {
+                vec![]
+            },
+            conflicts_with: if id == "pending" {
+                vec![NoteId::from("cancelled")]
+            } else {
+                vec![]
+            },
+            ..Default::default()
+        });
+        srv.store.insert_note(&n).await.unwrap();
+    }
+    for spec in [
+        None,
+        Some("No task links"),
+        Some("[pending](intent://local/task/pending)"),
+    ] {
+        if let Some(content) = spec {
+            let note = fixture_note(&ws, "spec", content);
+            if srv
+                .store
+                .note_exists(&ws, &NoteId::from("spec"))
+                .await
+                .unwrap()
+            {
+                srv.store.update_note(&note).await.unwrap();
+            } else {
+                srv.store.insert_note(&note).await.unwrap();
+            }
+        }
+        let req = serde_json::json!({"jsonrpc":"2.0", "id":42, "method":"task.list", "params":{"workspaceId":ws, "status":"not_started"}}).to_string();
+        let response = wss_call(srv.port, srv.cfg.clone(), &req).await;
+        let linked = spec.is_some_and(|s| s.contains("intent://"));
+        assert_eq!(
+            response,
+            serde_json::json!({"jsonrpc":"2.0", "id":42, "result": {
+                "tasks":[{"id":"pending", "title":"Untitled task", "status":"not_started",
+                    "updatedAt":response["result"]["tasks"][0]["updatedAt"], "parentId":"spec", "specLinked":linked,
+                    "dependsOn":["done","cancelled","missing"], "conflictsWith":["cancelled"], "unmetDependsOn":["cancelled","missing"]}],
+                "stats":{"total":if linked {1} else {2},"completed":i32::from(!linked),"inProgress":0}
+            }})
+        );
+        assert!(response["result"]["tasks"][0]["updatedAt"].is_string());
+    }
+    srv.ws.stop().await;
+}

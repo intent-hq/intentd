@@ -11373,6 +11373,7 @@ pub(crate) fn compute_task_stats(notes: &[Note]) -> WorkspaceTaskStats {
 /// `parentId` so clients can tell subtasks from top-level tasks. Order
 /// follows the stored note order (deduped by id); the title falls back to
 /// `Untitled task` to match the TS `note.title || 'Untitled task'`.
+#[cfg(test)]
 fn workspace_task_list(notes: &[Note]) -> Vec<WorkspaceTask> {
     let linked = notes
         .iter()
@@ -25736,7 +25737,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    #[expect(clippy::similar_names)] // stats/status are both the natural domain names
     fn task_list(
         &self,
         workspace_id: WorkspaceId,
@@ -25749,17 +25749,7 @@ impl WorkspaceApi for Services {
                 Some(s) => Some(parse_task_status_strict(s)?),
                 None => None,
             };
-            let notes = store.list_notes(&workspace_id).await?;
-            // `tasks` membership is workspace-wide (every task note, flagged
-            // with `specLinked`); `stats` stays the rollup over the full
-            // spec-linked set (mirrors the FE `computeTaskStats`). The
-            // optional `status` filter narrows `tasks` only.
-            let stats = compute_task_stats(&notes);
-            let mut tasks = workspace_task_list(&notes);
-            if let Some(f) = filter {
-                tasks.retain(|t| t.status == f);
-            }
-            Ok(TaskListResult { tasks, stats })
+            store.list_workspace_tasks(&workspace_id, filter).await
         })
     }
 
