@@ -8023,10 +8023,10 @@ mod rollback_order_tests {
         compensating_hook_case(false).await;
     }
 
-    struct PausedRollbackStore {
-        raw: InMemorySecretStore,
-        parked: Arc<tokio::sync::Notify>,
-        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    pub(super) struct PausedRollbackStore {
+        pub(super) raw: InMemorySecretStore,
+        pub(super) parked: Arc<tokio::sync::Notify>,
+        pub(super) release: Mutex<std::sync::mpsc::Receiver<()>>,
     }
     impl SecretStore for PausedRollbackStore {
         fn load(&self, account: &str) -> Result<Option<String>> {
@@ -8320,6 +8320,98 @@ mod port_assignment_publication_tests {
                 .unwrap()["revision"],
             1
         );
+        assert_eq!(control.starts.load(Ordering::SeqCst), 1);
+    }
+    #[intent_test_macros::daemon_test]
+    async fn settings_port_assignment_is_published_before_secret_rollback_releases_revision_gate() {
+        use super::rollback_order_tests::PausedRollbackStore;
+        use std::{future::poll_fn, task::Poll};
+        let dir = crate::test_support::test_tempdir("port-publication-secret-rollback");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let registry = Arc::new(SettingsRegistry::load(dir.path().join("config.toml")).unwrap());
+        let bus = crate::EventBus::new(store.clone());
+        let mut sub = bus.subscribe(crate::events::SubscriptionFilter {
+            event_types: vec!["settings:changed".into()],
+            ..Default::default()
+        });
+        let raw = InMemorySecretStore::default();
+        raw.store(crate::github_auth_ops::SECRET_ACCOUNT, "original-device")
+            .unwrap();
+        let parked = Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let services = Arc::new(
+            crate::Services::new(store)
+                .with_settings_registry(registry.clone())
+                .with_event_bus(bus)
+                .with_secret_store(Arc::new(PausedRollbackStore {
+                    raw,
+                    parked: parked.clone(),
+                    release: Mutex::new(release_rx),
+                })),
+        );
+        let control = Arc::new(AssignPort {
+            registry,
+            port: 5183,
+            starts: AtomicUsize::new(0),
+            fail_tunnel: true,
+        });
+        services.attach_server_control(control.clone());
+        let writer = services.clone();
+        let failed = intent_core::spawn_daemon(async move {
+            writer
+                .settings_update(json!([
+                    {"path":crate::github_auth_ops::SECRET_ACCOUNT,"value":"settings-pat"},
+                    {"path":"server.wsApi.enabled","value":true},
+                    {"path":"server.tunnel.enabled","value":true}
+                ]))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), parked.notified())
+            .await
+            .unwrap();
+        let assigned = services
+            .settings_get("server.wsApi.port".into())
+            .await
+            .unwrap();
+        assert_eq!(assigned["value"], 5183.0);
+        assert_eq!(
+            assigned["revision"], 1,
+            "assignment must have a revision before another reader enters"
+        );
+        let first = tokio::time::timeout(Duration::from_secs(5), sub.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(
+            first[0].data["changes"],
+            json!([{"path":"server.wsApi.port","value":5183.0,"origin":"file"}])
+        );
+        let newer = services
+            .settings_update(json!([{"path":"server.wsApi.port","value":62000}]))
+            .await
+            .unwrap();
+        assert_eq!(newer["revision"], 2);
+        release_tx.send(()).unwrap();
+        let error = failed.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("injected tunnel failure"));
+        let final_port = services
+            .settings_get("server.wsApi.port".into())
+            .await
+            .unwrap();
+        assert_eq!(final_port["value"], 62000.0);
+        assert_eq!(
+            final_port["revision"], 2,
+            "old rollback must not announce newer assignment again"
+        );
+        let second = tokio::time::timeout(Duration::from_secs(5), sub.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].data["changes"], newer["applied"]);
+        let mut next = Box::pin(sub.recv());
+        assert!(poll_fn(|cx| Poll::Ready(next.as_mut().poll(cx).is_pending())).await);
         assert_eq!(control.starts.load(Ordering::SeqCst), 1);
     }
 }

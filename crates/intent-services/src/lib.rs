@@ -16220,6 +16220,20 @@ impl Services {
         }
     }
 
+    async fn publish_ws_port_assignment(&self, was_unassigned: bool) {
+        let mut assigned = Vec::new();
+        self.include_ws_port_assignment(was_unassigned, &mut assigned);
+        if !assigned.is_empty() {
+            let revision = self.settings_revision.fetch_add(1, Ordering::SeqCst) + 1;
+            publish_event(
+                self.event_bus.as_ref(),
+                settings_changed_event(&assigned, revision),
+            )
+            .await;
+            self.on_settings_applied(&assigned);
+        }
+    }
+
     /// Apply server runtime control hooks after `settings.update` persists
     /// `server.wsApi.*` changes (§5.12): `server.wsApi.enabled` starts/stops the
     /// WSS listener; `server.wsApi.port` / `server.bindAddress` restart it when
@@ -17015,6 +17029,7 @@ impl WorkspaceApi for Services {
                             // (a single config.toml rewrite + one change publication) instead of
                             // per-key applies.
                             let mut rollback_failed = false;
+                            let mut port_needs_publication = port_was_unassigned_before_update;
                             let mut compensating_changes = Vec::new();
                             let mut registry_restores: Vec<(String, serde_json::Value)> = Vec::new();
                             for (path, old_val, old_store) in old_values {
@@ -17087,11 +17102,20 @@ impl WorkspaceApi for Services {
                             // the original ordering. A GitHub revoke/device completion during
                             // those hooks must not be overwritten by a later secret restore.
                             if has_secrets {
+                                // Readers/writers may enter while secret rollback is
+                                // pending. Commit the surviving assignment's revision
+                                // before releasing the gate, never exposing new values
+                                // under the previous revision.
+                                self.publish_ws_port_assignment(port_needs_publication).await;
                                 let runtime_before = self.settings_service().server_values().await;
                                 drop(revision_guard.take());
                                 rollback_failed |= secrets.rollback(&self.secrets).await;
                                 secrets_compensated = true;
                                 revision_guard = Some(self.settings_revision_gate.write().await);
+                                // A newer transaction may already have published its
+                                // own port. Only a subsequent compensating assignment
+                                // can now belong to this recovery.
+                                port_needs_publication = registry.is_some_and(|reg| reg.snapshot().ws_api_port_policy() == WsApiPortPolicy::Unassigned);
                                 let runtime_after = self.settings_service().server_values().await;
                                 match (runtime_before, runtime_after) {
                                     (Ok(before), Ok(after)) => {
@@ -17180,13 +17204,7 @@ impl WorkspaceApi for Services {
                             // A successful listener assignment is durable even if a later
                             // hook fails (for example tunnel startup). Publish only that
                             // surviving change after compensation, at its own revision.
-                            let mut assigned = Vec::new();
-                            self.include_ws_port_assignment(port_was_unassigned_before_update, &mut assigned);
-                            if !assigned.is_empty() {
-                                let revision = self.settings_revision.fetch_add(1, Ordering::SeqCst) + 1;
-                                publish_event(self.event_bus.as_ref(), settings_changed_event(&assigned, revision)).await;
-                                self.on_settings_applied(&assigned);
-                            }
+                            self.publish_ws_port_assignment(port_needs_publication).await;
 
                             // Return an error that indicates incomplete rollback if any writes failed
                             if rollback_failed {
