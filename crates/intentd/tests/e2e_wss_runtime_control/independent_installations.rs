@@ -1,5 +1,5 @@
 //! Real independent processes using production port selection. Isolated data
-//! directories simulate installations; they do not prove macOS LaunchAgent or
+//! directories simulate installations; they do not prove macOS `LaunchAgent` or
 //! two-OS-user behavior. Exact numeric scan/exhaustion has transport unit coverage.
 
 use super::*;
@@ -123,7 +123,7 @@ async fn reject_other_token(port: u16, fp: &str, token: &str) {
     .unwrap();
     match result {
         Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
-            assert_eq!(response.status(), 401)
+            assert_eq!(response.status(), 401);
         }
         other => panic!("another installation's token must fail authentication: {other:?}"),
     }
@@ -204,7 +204,8 @@ async fn simultaneous_installations_keep_identity_and_saved_ports_across_restart
         // Repeated supervisor-like starts must fail at the saved port; they
         // must not assign a new number or degrade to a UDS-only service.
         let log_path = a_dir.path().join("daemon.log");
-        let previous_log_len = std::fs::metadata(&log_path).unwrap().len() as usize;
+        let previous_log_len =
+            usize::try_from(std::fs::metadata(&log_path).unwrap().len()).unwrap();
         let mut failed = spawn_installation(a_dir.path(), TOKEN);
         let exit = failed
             .wait_with_timeout(common::daemon_startup_timeout())
