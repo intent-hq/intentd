@@ -1883,16 +1883,6 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             f64::from(intent_core::config::DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS),
         ),
         enumerated(
-            "agents.flushQueuedMessages",
-            "Flush queued messages",
-            "Controls how messages waiting in the queue are delivered to the agent when a turn ends: \
-             all batches every ready entry into one turn, systemOnly batches only system-origin \
-             entries (user-origin entries stay FIFO), off delivers one turn per queued message",
-            "agents",
-            &["all", "systemOnly", "off"],
-            "all",
-        ),
-        enumerated(
             "agents.resumeInterruptedOnStart",
             "Resume interrupted agents on start",
             "Whether the daemon resumes interrupted agents at startup when --resume-all is absent: \
@@ -2775,6 +2765,7 @@ impl<'a> SettingsService<'a> {
             // monorepo#1729 compatibility: pre-rename clients still write the
             // `backgroundAgents.*` paths. Same tolerate-and-ignore treatment —
             // the renamed `quickActions.*` keys are the only writable surface.
+            // Retired batching preferences are ignored: every ready entry batches.
             // The deprecated `providers.active` gets the same treatment so a
             // write can never recreate the key `migrate_active_provider_setting`
             // removed from config.toml (its catalog entry is read-only, but a
@@ -2782,6 +2773,7 @@ impl<'a> SettingsService<'a> {
             if path == RETIRED_WORKSPACE_OVERRIDES_PATH
                 || RETIRED_BACKGROUND_AGENT_PATHS.contains(&path)
                 || path == DEPRECATED_ACTIVE_PROVIDER_PATH
+                || path == "agents.flushQueuedMessages"
             {
                 tracing::debug!(path, "ignoring settings.update for retired setting");
                 continue;
@@ -3298,7 +3290,7 @@ mod tests {
     async fn rejected_settings_batches_preserve_all_stores() {
         for (invalid_path, invalid_value) in [
             ("future.setting", json!(true)),
-            ("agents.flushQueuedMessages", json!("future-policy")),
+            ("agents.resumeInterruptedOnStart", json!("future-policy")),
             (
                 "quickActions.providerSettings",
                 json!({"future-provider": {"option": null}}),
@@ -5878,84 +5870,10 @@ mod tests {
         }
     }
 
-    /// `agents.flushQueuedMessages` is a TOML-backed enum (`all` / `systemOnly`
-    /// / `off`) defaulting to `all`: the catalog entry and wire round-trip
-    /// through the registry-wired service (default origin → file override →
-    /// reset). Also covers a legacy boolean already on disk loading as the
-    /// wire-reported string.
-    #[tokio::test]
-    async fn agents_flush_queued_messages_round_trip_via_registry() {
-        let def = find_definition("agents.flushQueuedMessages")
-            .expect("agents.flushQueuedMessages missing");
-        assert!(!def.sensitive);
-        assert!(!def.read_only);
-        assert_eq!(def.category, "agents");
-        assert!(
-            matches!(def.ty, SettingType::Enum(values) if values == ["all", "systemOnly", "off"])
-        );
-        assert_eq!(def.default_value, Some(json!("all")));
-        assert!(KNOWN_PATHS.contains(&"agents.flushQueuedMessages"));
-
-        let tag = uuid::Uuid::new_v4();
-        let tmp = std::env::temp_dir().join(format!("intentd-settings-flushq-{tag}.db"));
-        let store = Store::open(&tmp).await.expect("open store");
-        let config_path = std::env::temp_dir().join(format!("intentd-settings-flushq-{tag}.toml"));
-        std::fs::write(&config_path, "").expect("write empty config");
-        let registry = SettingsRegistry::load(&config_path).expect("load registry");
-        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
-        let secrets = AsyncSecretStore::new(secrets);
-        let svc = SettingsService::new(&store, &secrets, Some(&registry));
-
-        // Default with `default` origin.
-        let got = svc.get("agents.flushQueuedMessages").await.expect("get");
-        assert_eq!(got["value"], json!("all"));
-        assert_eq!(got["origin"], json!("default"));
-
-        // Update persists to config.toml with `file` origin, never SQLite.
-        svc.update(&json!([
-            { "path": "agents.flushQueuedMessages", "value": "systemOnly" },
-        ]))
-        .await
-        .expect("update");
-        let got = svc.get("agents.flushQueuedMessages").await.expect("get");
-        assert_eq!(got["value"], json!("systemOnly"));
-        assert_eq!(got["origin"], json!("file"));
-        let text = std::fs::read_to_string(&config_path).expect("read config");
-        assert!(text.contains("flushQueuedMessages"), "{text}");
-        assert_eq!(
-            store
-                .get_setting("agents.flushQueuedMessages")
-                .await
-                .expect("read settings table"),
-            None,
-            "TOML-backed keys must never write a SQLite settings row"
-        );
-
-        // Rejects an unknown enum value.
-        let err = svc
-            .update(&json!([
-                { "path": "agents.flushQueuedMessages", "value": "sometimes" },
-            ]))
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("flushQueuedMessages"), "{err}");
-
-        // Reset restores the default.
-        let reset = svc
-            .reset("agents.flushQueuedMessages")
-            .await
-            .expect("reset");
-        assert_eq!(reset["value"], json!("all"));
-        let got = svc.get("agents.flushQueuedMessages").await.expect("get");
-        assert_eq!(got["origin"], json!("default"));
-
-        let _ = std::fs::remove_file(&config_path);
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
-                "{}{suffix}",
-                tmp.display()
-            )));
-        }
+    #[test]
+    fn agents_flush_queued_messages_is_not_supported() {
+        assert!(find_definition("agents.flushQueuedMessages").is_none());
+        assert!(!KNOWN_PATHS.contains(&"agents.flushQueuedMessages"));
     }
 
     /// `agents.resumeInterruptedOnStart` is a TOML-backed enum (`auto` / `on`
@@ -6037,36 +5955,6 @@ mod tests {
             .await
             .expect("get");
         assert_eq!(got["origin"], json!("default"));
-
-        let _ = std::fs::remove_file(&config_path);
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
-                "{}{suffix}",
-                tmp.display()
-            )));
-        }
-    }
-
-    /// A `config.toml` written by an older daemon (`flushQueuedMessages =
-    /// true/false`) still loads through the registry, wire-reporting the
-    /// equivalent string value.
-    #[tokio::test]
-    async fn agents_flush_queued_messages_legacy_boolean_loads_via_registry() {
-        let tag = uuid::Uuid::new_v4();
-        let tmp = std::env::temp_dir().join(format!("intentd-settings-flushq-legacy-{tag}.db"));
-        let store = Store::open(&tmp).await.expect("open store");
-        let config_path =
-            std::env::temp_dir().join(format!("intentd-settings-flushq-legacy-{tag}.toml"));
-        std::fs::write(&config_path, "[agents]\nflushQueuedMessages = false\n")
-            .expect("write legacy config");
-        let registry = SettingsRegistry::load(&config_path).expect("load registry");
-        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
-        let secrets = AsyncSecretStore::new(secrets);
-        let svc = SettingsService::new(&store, &secrets, Some(&registry));
-
-        let got = svc.get("agents.flushQueuedMessages").await.expect("get");
-        assert_eq!(got["value"], json!("off"));
-        assert_eq!(got["origin"], json!("file"));
 
         let _ = std::fs::remove_file(&config_path);
         for suffix in ["", "-wal", "-shm"] {

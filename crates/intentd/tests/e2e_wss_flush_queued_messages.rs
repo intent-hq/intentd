@@ -1,8 +1,7 @@
-//! WSS end-to-end coverage for the queued-message batch flush
-//! (`agents.flushQueuedMessages`, default `"all"`): messages queued while an
-//! agent is busy are delivered as ONE combined turn when the busy turn ends.
+//! WSS end-to-end coverage for queued-message batching.
+//! Messages queued while an agent is busy are delivered as ONE combined turn when the busy turn ends.
 //!
-//! Case 1 (default `"all"`): start a slow turn, queue 2 messages behind it,
+//! Case 1 (default): start a slow turn, queue 2 messages behind it,
 //! let the turn end. The provider-received prompt (via the mock fixture's
 //! `MOCK_AGENT_PROMPT_LOG` seam) is a single message starting with
 //! `2 queued messages while you were working` carrying `Message #1:` /
@@ -11,17 +10,10 @@
 //! one snapshot (2 → 0, never through 1) and exactly ONE
 //! `agent:queue:processing` fires.
 //!
-//! Case 2 (`flushQueuedMessages = "off"` in `config.toml`): the same setup
-//! drains legacy one-at-a-time — one turn per queued message, no combined
-//! header, and the queue shrinks 2 → 1 → 0.
+//! Legacy off, systemOnly, and boolean preferences are retired: all ready
+//! entries still batch, the catalog omits the setting, and old writes are ignored.
 //!
-//! Case 3 (`flushQueuedMessages = "systemOnly"`): `agent.queueMessage` is the
-//! FE's user-typed mid-turn reply path and parks as `user_origin: true`, so
-//! two messages queued behind a busy turn via that RPC are EXCLUDED from the
-//! system-only batch and drain one-at-a-time — same observable shape as
-//! case 2 (one turn per message, no combined header, queue 2 → 1 → 0).
-//!
-//! Case 4 (two members, default `"all"`): the owner and a collaborator each
+//! Case 4 (two members): the owner and a collaborator each
 //! queue one message behind the busy turn. Per-user queue visibility holds
 //! on every egress — `agent.getQueue` and the `agent:queue:updated` push
 //! show the collaborator only its own entry (owner sees both, `position`
@@ -443,7 +435,7 @@ fn seed_flush_mode(data_dir: &Path, mode: &str) {
     std::fs::write(
         &path,
         format!(
-            "[agents]\nflushQueuedMessages = \"{mode}\"\n\n[agentFeatures]\nstateSnapshot = false\n"
+            "[agents]\nflushQueuedMessages = {mode}\n\n[agentFeatures]\nstateSnapshot = false\n"
         ),
     )
     .expect("seed config.toml with flushQueuedMessages mode");
@@ -777,7 +769,7 @@ fn shrink_lengths(queue_lengths: &[usize]) -> &[usize] {
     &queue_lengths[last_two + 1..]
 }
 
-/// FLUSH-1 (default `agents.flushQueuedMessages = true`): two messages
+/// FLUSH-1 (default batching): two messages
 /// queued behind a busy turn are delivered as ONE combined turn.
 ///
 /// Contract locked down:
@@ -981,203 +973,78 @@ async fn flush_combines_queued_messages_into_one_turn_over_wss() {
     );
 }
 
-/// FLUSH-2 (`agents.flushQueuedMessages = "off"` in `config.toml`): the same
-/// two-queued setup drains legacy one-at-a-time — one turn per queued
-/// message (three prompts total, none with the batch header), TWO
-/// `agent:queue:processing` signals, and the queue shrinking through 1.
+/// Legacy preferences load safely and cannot disable batching.
 #[tokio::test]
-async fn flush_disabled_drains_queue_one_turn_per_message_over_wss() {
-    let Some(script) = gate("WSS queued-message flush-disabled E2E") else {
+async fn legacy_flush_preferences_always_batch_over_wss() {
+    let Some(script) = gate("WSS legacy queued-message preferences E2E") else {
         return;
     };
-    let data_dir_guard = temp_data_dir();
-    let data_dir = data_dir_guard.path().to_path_buf();
-    seed_flush_mode(&data_dir, "off");
-    let mut setup = setup_busy_agent_with_two_queued(&data_dir, &script).await;
-
-    // Three terminal stream:ends: kick-off + one turn PER queued message.
-    let obs = observe_drain(&mut setup.sub, &setup.agent_id, 3).await;
-
-    let shrink = shrink_lengths(&obs.queue_lengths);
-    assert!(
-        shrink.contains(&1),
-        "one-at-a-time drain shrinks the queue through 1: {:?}",
-        obs.queue_lengths
-    );
-    assert!(
-        shrink.ends_with(&[0]),
-        "final queue snapshot is empty: {:?}",
-        obs.queue_lengths
-    );
-    assert_eq!(
-        obs.processing_turn_ids.len(),
-        2,
-        "one agent:queue:processing per drained message: {:?}",
-        obs.processing_turn_ids
-    );
-    // Legacy one-at-a-time correlation: each drained row's echo carries its
-    // own turn's turnId, matching the processing signals in drain order (the
-    // first user-row echo is the kick-off's, from its own direct turn).
-    assert_eq!(
-        obs.user_row_turn_ids.len(),
-        3,
-        "kick-off + one echo per drained message: {:?}",
-        obs.user_row_turn_ids
-    );
-    assert_eq!(
-        &obs.user_row_turn_ids[1..],
-        &obs.processing_turn_ids[..],
-        "each user-row echo correlates with its own turn"
-    );
-
-    // Prompts #2 and #3 carry one queued message each, FIFO, and neither
-    // (nor any prompt) carries the batch header.
-    let prompts = await_prompts(&setup.prompt_log, 3).await;
-    assert_eq!(
-        prompts.len(),
-        3,
-        "kick-off + one turn per queued message: {prompts:?}"
-    );
-    assert!(
-        prompts[1].starts_with(QUEUED_ONE),
-        "second turn delivers the first queued message: {}",
-        prompts[1]
-    );
-    assert!(
-        prompts[2].starts_with(QUEUED_TWO),
-        "third turn delivers the second queued message: {}",
-        prompts[2]
-    );
-    assert!(
-        !prompts[1].contains(QUEUED_TWO),
-        "messages are NOT combined when flush is disabled: {}",
-        prompts[1]
-    );
-    for p in &prompts {
+    for raw in [r#""off""#, r#""systemOnly""#, "false", "true", r#""all""#] {
+        let data_dir_guard = temp_data_dir();
+        let data_dir = data_dir_guard.path();
+        seed_flush_mode(data_dir, raw);
+        let mut setup = setup_busy_agent_with_two_queued(data_dir, &script).await;
+        let obs = observe_drain(&mut setup.sub, &setup.agent_id, 2).await;
+        let shrink = shrink_lengths(&obs.queue_lengths);
+        assert!(!shrink.contains(&1), "{raw}: queue must batch: {shrink:?}");
         assert!(
-            !p.contains("queued messages while you were working"),
-            "no batch header on the legacy drain path: {p}"
+            shrink.ends_with(&[0]),
+            "{raw}: queue must empty: {shrink:?}"
+        );
+        assert_eq!(obs.processing_turn_ids.len(), 1, "{raw}: one batch turn");
+        let prompts = await_prompts(&setup.prompt_log, 2).await;
+        assert_eq!(prompts.len(), 2, "{raw}: kickoff plus batch");
+        assert!(
+            prompts[1].starts_with(FLUSH_HEADER),
+            "{raw}: {}",
+            prompts[1]
+        );
+        assert!(prompts[1].find(QUEUED_ONE).unwrap() < prompts[1].find(QUEUED_TWO).unwrap());
+        assert_eq!(prompts[1].matches(WAIT_NOTE_PREFIX).count(), 2);
+        let conv = wss_rpc(
+            &mut setup.rpc,
+            20,
+            "agent.getConversation",
+            json!({"agentId": setup.agent_id}),
+        )
+        .await;
+        let first = user_row(&conv, QUEUED_ONE);
+        let second = user_row(&conv, QUEUED_TWO);
+        assert!(first["metadata"]["queueInfo"]["batchId"].is_string());
+        assert_eq!(
+            first["metadata"]["queueInfo"]["batchId"],
+            second["metadata"]["queueInfo"]["batchId"]
+        );
+        let settings = wss_rpc(&mut setup.rpc, 21, "settings.list", json!({})).await;
+        assert!(settings["settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["path"] != "agents.flushQueuedMessages"));
+        let updated = wss_rpc(
+            &mut setup.rpc,
+            22,
+            "settings.update",
+            json!({"changes":[{"path":"agents.flushQueuedMessages","value":"off"}]}),
+        )
+        .await;
+        assert_eq!(updated["applied"], json!([]));
+        let got = wss_rpc_envelope(
+            &mut setup.rpc,
+            23,
+            "settings.get",
+            json!({"path":"agents.flushQueuedMessages"}),
+        )
+        .await;
+        assert_eq!(got["jsonrpc"], "2.0");
+        assert_eq!(got["id"], 23);
+        assert_eq!(got["error"]["code"], -32602);
+        let config = std::fs::read_to_string(data_dir.join("config.toml")).unwrap();
+        assert!(
+            !config.contains("flushQueuedMessages"),
+            "{raw}: legacy key stripped"
         );
     }
-    // The legacy drain still annotates each delivery with its wait note.
-    assert_eq!(
-        prompts[1].matches(WAIT_NOTE_PREFIX).count(),
-        1,
-        "per-message dequeue-wait note: {}",
-        prompts[1]
-    );
-    assert_eq!(
-        prompts[2].matches(WAIT_NOTE_PREFIX).count(),
-        1,
-        "per-message dequeue-wait note: {}",
-        prompts[2]
-    );
-
-    // One-at-a-time drains group nothing: no user row carries a batchId.
-    let conv = wss_rpc(
-        &mut setup.rpc,
-        20,
-        "agent.getConversation",
-        json!({ "agentId": setup.agent_id }),
-    )
-    .await;
-    for needle in [KICKOFF_MSG, QUEUED_ONE, QUEUED_TWO] {
-        assert!(
-            user_row(&conv, needle)["metadata"]["queueInfo"]["batchId"].is_null(),
-            "single-message drains never stamp a batchId: {needle:?}"
-        );
-    }
-}
-
-/// FLUSH-3 (`agents.flushQueuedMessages = "systemOnly"` in `config.toml`):
-/// `agent.queueMessage` is the FE's user-typed mid-turn reply path and
-/// enqueues with `user_origin: true`, so two messages queued behind a busy
-/// turn via that RPC are excluded from the system-only batch and drain
-/// one-at-a-time over WSS — one turn per message, no batch header, TWO
-/// `agent:queue:processing` signals, and the queue shrinking through 1
-/// (the same observable shape as FLUSH-2). A combined turn here would mean
-/// `agent.queueMessage` regressed to system-origin.
-#[tokio::test]
-async fn flush_system_only_excludes_queue_message_entries_over_wss() {
-    let Some(script) = gate("WSS queued-message flush systemOnly E2E") else {
-        return;
-    };
-    let data_dir_guard = temp_data_dir();
-    let data_dir = data_dir_guard.path().to_path_buf();
-    seed_flush_mode(&data_dir, "systemOnly");
-    let mut setup = setup_busy_agent_with_two_queued(&data_dir, &script).await;
-
-    // Three terminal stream:ends: kick-off + one turn PER queued message
-    // (two would mean the user-origin entries were batched).
-    let obs = observe_drain(&mut setup.sub, &setup.agent_id, 3).await;
-
-    let shrink = shrink_lengths(&obs.queue_lengths);
-    assert!(
-        shrink.contains(&1),
-        "user-origin entries drain one-at-a-time under systemOnly (2 → 1 → 0): {:?}",
-        obs.queue_lengths
-    );
-    assert!(
-        shrink.ends_with(&[0]),
-        "final queue snapshot is empty: {:?}",
-        obs.queue_lengths
-    );
-    assert_eq!(
-        obs.processing_turn_ids.len(),
-        2,
-        "one agent:queue:processing per drained message: {:?}",
-        obs.processing_turn_ids
-    );
-
-    let prompts = await_prompts(&setup.prompt_log, 3).await;
-    assert_eq!(
-        prompts.len(),
-        3,
-        "kick-off + one turn per queued message: {prompts:?}"
-    );
-    assert!(
-        prompts[1].starts_with(QUEUED_ONE),
-        "second turn delivers the first queued message: {}",
-        prompts[1]
-    );
-    assert!(
-        prompts[2].starts_with(QUEUED_TWO),
-        "third turn delivers the second queued message: {}",
-        prompts[2]
-    );
-    for p in &prompts {
-        assert!(
-            !p.starts_with(FLUSH_HEADER),
-            "user-origin agent.queueMessage entries never batch under systemOnly: {p}"
-        );
-    }
-
-    // One-at-a-time drains group nothing: no user row carries a batchId.
-    let conv = wss_rpc(
-        &mut setup.rpc,
-        20,
-        "agent.getConversation",
-        json!({ "agentId": setup.agent_id }),
-    )
-    .await;
-    for needle in [KICKOFF_MSG, QUEUED_ONE, QUEUED_TWO] {
-        assert!(
-            user_row(&conv, needle)["metadata"]["queueInfo"]["batchId"].is_null(),
-            "single-message drains never stamp a batchId: {needle:?}"
-        );
-    }
-
-    let queue = wss_rpc(
-        &mut setup.rpc,
-        21,
-        "agent.getQueue",
-        json!({ "agentId": setup.agent_id }),
-    )
-    .await;
-    assert!(
-        queue["queue"].as_array().expect("queue array").is_empty(),
-        "queue empty after drain: {queue}"
-    );
 }
 
 /// Queue entry ids of an `agent:queue:updated` payload, in drain order.
@@ -1226,7 +1093,7 @@ async fn await_queue_snapshots(
     panic!("never observed the awaited agent:queue:updated snapshot: {seen:?}")
 }
 
-/// FLUSH-4 (two members, default `agents.flushQueuedMessages = "all"`): the
+/// FLUSH-4 (two members): the
 /// owner (administrator) and a collaborator (`guest`, seeded as a workspace
 /// member) each queue ONE message behind the busy turn. Per-user queue
 /// visibility holds on every egress, and the batched flush still drains

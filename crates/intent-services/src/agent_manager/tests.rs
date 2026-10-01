@@ -22334,11 +22334,9 @@ mod archived_flush_gates {
         assert!(!after.archived, "direct claim auto-unarchived");
     }
 
-    /// The conversion requires the `all` flush mode: without batching no
-    /// combined turn exists to carry the parked entries, so the user send
-    /// stays a DIRECT send under `off` — the pre-fix contract.
+    /// Legacy off preferences still let a user revive the parked batch.
     #[tokio::test]
-    async fn user_send_stays_direct_when_flush_mode_off() {
+    async fn user_send_batches_parked_messages_with_legacy_off() {
         let script = mock_agent_script();
         let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
         let tmp = TempDb::new();
@@ -22350,8 +22348,8 @@ mod archived_flush_gates {
                 .expect("load registry"),
         );
         registry
-            .apply(&[("agents.flushQueuedMessages".to_string(), json!("off"))])
-            .expect("disable flush");
+            .reload("[agents]\nflushQueuedMessages = \"off\"\n")
+            .expect("load legacy preference");
         let services = Services::new(store)
             .with_event_bus(bus.clone())
             .with_settings_registry(registry);
@@ -22390,8 +22388,8 @@ mod archived_flush_gates {
             .expect("user send");
         assert_eq!(
             r["queued"],
-            json!(false),
-            "no combined turn exists in `off` mode — the direct send stands: {r}"
+            json!(true),
+            "legacy off must still revive the combined batch: {r}"
         );
         await_settled(&mgr, &id).await;
     }
@@ -23192,7 +23190,7 @@ mod flush_queued_messages_tests {
     }
 
     #[tokio::test]
-    async fn setting_off_keeps_one_turn_per_message() {
+    async fn legacy_setting_off_still_batches_messages() {
         let script = mock_agent_script();
         let scratch = test_tempdir("itd-flush-off-");
         let prompt_log = scratch.path().join("prompts.log");
@@ -23211,8 +23209,8 @@ mod flush_queued_messages_tests {
                 .expect("load registry"),
         );
         registry
-            .apply(&[("agents.flushQueuedMessages".to_string(), json!("off"))])
-            .expect("disable flush");
+            .reload("[agents]\nflushQueuedMessages = \"off\"\n")
+            .expect("load legacy preference");
         let services = Services::new(store)
             .with_event_bus(bus.clone())
             .with_settings_registry(registry);
@@ -23258,28 +23256,16 @@ mod flush_queued_messages_tests {
             }
         })
         .await
-        .expect("both turns complete");
+        .expect("batch turn completes");
 
         let prompts = read_prompt_log(&prompt_log);
-        assert_eq!(
-            prompts.len(),
-            2,
-            "setting off: one turn per message: {prompts:?}"
-        );
-        assert!(
-            prompts
-                .iter()
-                .all(|t| !t.contains("queued messages while you were working")),
-            "no combined header on the single-entry path: {prompts:?}"
-        );
+        assert_eq!(prompts.len(), 1, "legacy off still batches: {prompts:?}");
+        assert!(prompts[0].contains("2 queued messages while you were working"));
     }
 
-    /// `systemOnly` mode: with ≥2 ready system-origin entries interleaved
-    /// with a user-origin entry, the system entries batch into ONE combined
-    /// turn while the user-origin entry stays queued and drains solo
-    /// afterward (its own single-entry FIFO turn).
+    /// Legacy system-only preferences cannot split mixed-origin batches.
     #[tokio::test]
-    async fn system_only_batches_system_entries_and_leaves_user_entry_for_solo_fifo_drain() {
+    async fn legacy_system_only_batches_mixed_origins_in_fifo_order() {
         let script = mock_agent_script();
         let scratch = test_tempdir("itd-flush-systemonly-");
         let prompt_log = scratch.path().join("prompts.log");
@@ -23298,11 +23284,8 @@ mod flush_queued_messages_tests {
                 .expect("load registry"),
         );
         registry
-            .apply(&[(
-                "agents.flushQueuedMessages".to_string(),
-                json!("systemOnly"),
-            )])
-            .expect("set flush mode to systemOnly");
+            .reload("[agents]\nflushQueuedMessages = \"systemOnly\"\n")
+            .expect("load legacy preference");
         let services = Services::new(store)
             .with_event_bus(bus.clone())
             .with_settings_registry(registry);
@@ -23358,31 +23341,16 @@ mod flush_queued_messages_tests {
             }
         })
         .await
-        .expect("both the combined system turn and the solo user turn complete");
+        .expect("mixed-origin batch completes");
 
         let prompts = read_prompt_log(&prompt_log);
-        assert_eq!(
-            prompts.len(),
-            2,
-            "one combined system turn + one solo user turn: {prompts:?}"
-        );
+        assert_eq!(prompts.len(), 1, "one mixed-origin batch: {prompts:?}");
         let combined = &prompts[0];
-        assert!(
-            combined.contains("2 queued messages while you were working"),
-            "first turn combines the two system entries: {combined}"
-        );
-        let s1 = combined.find("sys-1").expect("sys-1 in combined turn");
-        let s2 = combined.find("sys-2").expect("sys-2 in combined turn");
-        assert!(s1 < s2, "system entries in relative order: {combined}");
-        assert!(
-            !combined.contains("user-1"),
-            "user entry excluded from the system-only batch: {combined}"
-        );
-        let solo = &prompts[1];
-        assert!(
-            solo.contains("user-1") && !solo.contains("queued messages while you were working"),
-            "second turn is the solo FIFO drain of the user entry: {solo}"
-        );
+        assert!(combined.contains("3 queued messages while you were working"));
+        let s1 = combined.find("sys-1").unwrap();
+        let u1 = combined.find("user-1").unwrap();
+        let s2 = combined.find("sys-2").unwrap();
+        assert!(s1 < u1 && u1 < s2, "FIFO across origins: {combined}");
     }
 
     /// `systemOnly` mode with only ONE ready system entry (no batching
@@ -23407,11 +23375,8 @@ mod flush_queued_messages_tests {
                 .expect("load registry"),
         );
         registry
-            .apply(&[(
-                "agents.flushQueuedMessages".to_string(),
-                json!("systemOnly"),
-            )])
-            .expect("set flush mode to systemOnly");
+            .reload("[agents]\nflushQueuedMessages = \"systemOnly\"\n")
+            .expect("load legacy preference");
         let services = Services::new(store)
             .with_event_bus(bus.clone())
             .with_settings_registry(registry);
@@ -24801,7 +24766,7 @@ async fn shutdown_durable_cancelled_drain(count: usize, persisted_head: bool) {
     mgr.services.persist_queue_snapshot(&id).await;
     let (mut entries, draining) = mgr
         .services
-        .dequeue_flush_batch_draining(&id, intent_core::FlushQueuedMessagesMode::All, false, 1)
+        .dequeue_ready_batch_draining(&id, false, 1)
         .unwrap();
     mgr.services.persist_queue_snapshot(&id).await;
     // A different agent may use the same client-supplied queue ID. Its
@@ -24935,7 +24900,7 @@ async fn shutdown_durable_batch_append_failure_is_not_terminal() {
     }
     let (mut entries, draining) = mgr
         .services
-        .dequeue_flush_batch_draining(&id, intent_core::FlushQueuedMessagesMode::All, false, 1)
+        .dequeue_ready_batch_draining(&id, false, 1)
         .unwrap();
     // Force the failure after an already-durable head, exercising the real
     // batch handback order as well as the shared terminal-failure handler.

@@ -835,12 +835,6 @@ pub struct AgentsSettings {
     /// [`TOOL_PAYLOAD_RETENTION_DAYS_MAX`]; read live at each sweep tick, no
     /// restart required).
     pub tool_payload_retention_days: u32,
-    /// `agents.flushQueuedMessages` — how the whole queued-message backlog
-    /// is delivered when an idle agent drains its queue: `all` batches every
-    /// ready entry into one turn, `systemOnly` batches only system-origin
-    /// entries (user-origin entries stay FIFO), `off` is one turn per queued
-    /// message.
-    pub flush_queued_messages: FlushQueuedMessagesMode,
     /// `agents.resumeInterruptedOnStart` — whether the daemon resumes
     /// interrupted agents at startup when `--resume-all` is absent: `auto`
     /// resumes only on headless hosts (no display detected), `on` always
@@ -861,7 +855,6 @@ impl Default for AgentsSettings {
             report_to_parent_debounce_seconds: DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS,
             history_replay_tool_content_chars: DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS,
             tool_payload_retention_days: DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS,
-            flush_queued_messages: FlushQueuedMessagesMode::All,
             resume_interrupted_on_start: ResumeInterruptedOnStart::Auto,
         }
     }
@@ -892,49 +885,6 @@ impl ResumeInterruptedOnStart {
             ResumeInterruptedOnStart::Auto => "auto",
             ResumeInterruptedOnStart::On => "on",
             ResumeInterruptedOnStart::Off => "off",
-        }
-    }
-}
-
-/// `agents.flushQueuedMessages` values. Serializes as camelCase strings
-/// (`"all"`, `"systemOnly"`, `"off"`); deserialization also accepts the
-/// legacy boolean shape (`true` → [`FlushQueuedMessagesMode::All`], `false` →
-/// [`FlushQueuedMessagesMode::Off`]) so an existing `config.toml` written by
-/// an older daemon still loads.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum FlushQueuedMessagesMode {
-    /// Batch every ready-to-send entry into one combined turn.
-    #[default]
-    All,
-    /// Batch only system-origin ready entries; user-origin entries stay FIFO.
-    SystemOnly,
-    /// One turn per queued message (legacy `false`).
-    Off,
-}
-
-impl<'de> Deserialize<'de> for FlushQueuedMessagesMode {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Repr {
-            Bool(bool),
-            String(String),
-        }
-        match Repr::deserialize(deserializer)? {
-            Repr::Bool(true) => Ok(FlushQueuedMessagesMode::All),
-            Repr::Bool(false) => Ok(FlushQueuedMessagesMode::Off),
-            Repr::String(s) => match s.as_str() {
-                "all" => Ok(FlushQueuedMessagesMode::All),
-                "systemOnly" => Ok(FlushQueuedMessagesMode::SystemOnly),
-                "off" => Ok(FlushQueuedMessagesMode::Off),
-                other => Err(serde::de::Error::custom(format!(
-                    "unknown variant `{other}`, expected one of `all`, `systemOnly`, `off`"
-                ))),
-            },
         }
     }
 }
@@ -1270,6 +1220,7 @@ pub const LEGACY_SETTINGS_PATHS: &[&str] = &[
     "server.listenMode",
     "workspace.autoFetch",
     "backgroundAgents",
+    "agents.flushQueuedMessages",
 ];
 
 /// Legacy values captured during a tolerant parse: dotted wire path → the
@@ -1963,9 +1914,6 @@ historyReplayToolContentChars = 4000
 # be recovered); 0 disables the sweep and keeps full bodies forever (max 3650;
 # read live at each sweep tick, no restart required).
 toolPayloadRetentionDays = 0
-# Flush queued messages -- how the queued-message backlog is delivered when
-# an idle agent drains its queue: "all", "systemOnly", or "off".
-flushQueuedMessages = "all"
 # Resume interrupted on start -- whether the daemon resumes interrupted
 # agents at startup when --resume-all is absent: "auto" resumes only on
 # headless hosts (no display detected), "on" always resumes, "off" never
@@ -2165,7 +2113,6 @@ mod tests {
             d.agents.tool_payload_retention_days,
             DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS
         );
-        assert_eq!(d.agents.flush_queued_messages, FlushQueuedMessagesMode::All);
         assert_eq!(
             d.events.stream_retention_hours,
             DEFAULT_STREAM_RETENTION_HOURS
@@ -2199,17 +2146,13 @@ mod tests {
     #[test]
     fn camel_case_keys_parse() {
         let parsed = SettingsFile::parse_str(
-            "[agents]\nidleReapMinutes = 5\nmaxConcurrent = 4\nhistoryReplayToolContentChars = 8000\ntoolPayloadRetentionDays = 30\nflushQueuedMessages = false\n\n[events]\nstreamRetentionHours = 24\n\n[workspaceApi]\nmaxOutputChars = 5000\ntoonOutput = false\n\n[server.wsApi]\nenabled = true\nport = 2000\n\n[hooks]\nmaxPerAgent = 9\n\n[agentFeatures]\nbackgroundHooks = false\nhostExec = false\nrichChatBlocks = false\n",
+            "[agents]\nidleReapMinutes = 5\nmaxConcurrent = 4\nhistoryReplayToolContentChars = 8000\ntoolPayloadRetentionDays = 30\n\n[events]\nstreamRetentionHours = 24\n\n[workspaceApi]\nmaxOutputChars = 5000\ntoonOutput = false\n\n[server.wsApi]\nenabled = true\nport = 2000\n\n[hooks]\nmaxPerAgent = 9\n\n[agentFeatures]\nbackgroundHooks = false\nhostExec = false\nrichChatBlocks = false\n",
         )
         .unwrap();
         assert_eq!(parsed.agents.idle_reap_minutes, 5);
         assert_eq!(parsed.agents.max_concurrent, 4);
         assert_eq!(parsed.agents.history_replay_tool_content_chars, 8000);
         assert_eq!(parsed.agents.tool_payload_retention_days, 30);
-        assert_eq!(
-            parsed.agents.flush_queued_messages,
-            FlushQueuedMessagesMode::Off
-        );
         assert_eq!(parsed.events.stream_retention_hours, 24);
         assert_eq!(parsed.workspace_api.max_output_chars, 5000);
         assert!(!parsed.workspace_api.toon_output);
@@ -2328,40 +2271,16 @@ mod tests {
     }
 
     #[test]
-    fn flush_queued_messages_accepts_string_variants() {
-        for (raw, expected) in [
-            ("\"all\"", FlushQueuedMessagesMode::All),
-            ("\"systemOnly\"", FlushQueuedMessagesMode::SystemOnly),
-            ("\"off\"", FlushQueuedMessagesMode::Off),
-        ] {
-            let parsed =
-                SettingsFile::parse_str(&format!("[agents]\nflushQueuedMessages = {raw}\n"))
-                    .expect("parses");
-            assert_eq!(parsed.agents.flush_queued_messages, expected, "{raw}");
+    fn flush_queued_messages_is_captured_as_retired() {
+        for raw in [r#""all""#, r#""systemOnly""#, r#""off""#, "true", "false"] {
+            let text = format!("[agents]\nflushQueuedMessages = {raw}\n");
+            let (parsed, legacy) =
+                SettingsFile::parse_str_with_legacy(&text).expect("legacy parses");
+            assert!(legacy.contains_key("agents.flushQueuedMessages"));
+            assert!(!serde_json::to_string(&parsed)
+                .unwrap()
+                .contains("flushQueuedMessages"));
         }
-    }
-
-    #[test]
-    fn flush_queued_messages_accepts_legacy_booleans() {
-        let parsed = SettingsFile::parse_str("[agents]\nflushQueuedMessages = true\n")
-            .expect("legacy true parses");
-        assert_eq!(
-            parsed.agents.flush_queued_messages,
-            FlushQueuedMessagesMode::All
-        );
-        let parsed = SettingsFile::parse_str("[agents]\nflushQueuedMessages = false\n")
-            .expect("legacy false parses");
-        assert_eq!(
-            parsed.agents.flush_queued_messages,
-            FlushQueuedMessagesMode::Off
-        );
-    }
-
-    #[test]
-    fn flush_queued_messages_rejects_unknown_string() {
-        let err =
-            SettingsFile::parse_str("[agents]\nflushQueuedMessages = \"sometimes\"\n").unwrap_err();
-        assert!(err.to_string().contains("flushQueuedMessages"), "{err}");
     }
 
     #[test]

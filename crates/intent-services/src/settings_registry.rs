@@ -114,7 +114,6 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "agents.reportToParentDebounceSeconds",
     "agents.historyReplayToolContentChars",
     "agents.toolPayloadRetentionDays",
-    "agents.flushQueuedMessages",
     "agents.resumeInterruptedOnStart",
     "events.streamRetentionHours",
     "workspaceApi.maxOutputChars",
@@ -591,10 +590,18 @@ impl SettingsRegistry {
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn reload(&self, text: &str) -> Result<SettingsChanged> {
-        let file = SettingsFile::parse_str(text)?;
         let mut doc: DocumentMut = text
             .parse()
             .map_err(|e| Error::InvalidInput(format!("invalid config.toml: {e}")))?;
+        // An older client or editor may restore the retired batching key
+        // after boot stripped it. Ignore it without relaxing other keys.
+        let file = if doc_has_path(&doc, "agents.flushQueuedMessages") {
+            let mut supported = doc.clone();
+            doc_remove(&mut supported, "agents.flushQueuedMessages");
+            SettingsFile::parse_str(&supported.to_string())?
+        } else {
+            SettingsFile::parse_str(text)?
+        };
         sync_normalized_compounds(&mut doc, &file)?;
         let mut inner = self.inner.lock().expect("settings registry lock poisoned");
         inner.file = file;
@@ -1260,7 +1267,6 @@ mod tests {
         for (invalid_path, value) in [
             ("future.setting", json!(true)),
             ("logging.level", json!("future-level")),
-            ("agents.flushQueuedMessages", json!("future-policy")),
         ] {
             let seed = "# preserve me\n[git]\nautoCommit = true\n";
             let (_dir, path) = temp_config(Some(seed));
@@ -1636,58 +1642,29 @@ mod tests {
     }
 
     #[test]
-    fn flush_queued_messages_defaults_on_overrides_and_reloads() {
-        let (_dir, path) = temp_config(Some(""));
-        let reg = SettingsRegistry::load(&path).expect("load");
-        // Schema default: "all".
-        assert_eq!(reg.get("agents.flushQueuedMessages"), Some(json!("all")));
-        assert_eq!(
-            reg.origin("agents.flushQueuedMessages"),
-            Some(SettingOrigin::Default)
-        );
-
-        // File override via apply, surviving a fresh load from disk.
-        reg.apply(&set("agents.flushQueuedMessages", json!("systemOnly")))
-            .expect("apply");
-        assert_eq!(
-            reg.get("agents.flushQueuedMessages"),
-            Some(json!("systemOnly"))
-        );
-        assert_eq!(
-            reg.origin("agents.flushQueuedMessages"),
-            Some(SettingOrigin::File)
-        );
-        let reloaded = SettingsRegistry::load(&path).expect("reload from disk");
-        assert_eq!(
-            reloaded.get("agents.flushQueuedMessages"),
-            Some(json!("systemOnly"))
-        );
-
-        // External reload without the key restores the schema default.
-        let notice = reg.reload("").expect("reload");
-        assert!(notice.changed.contains("agents.flushQueuedMessages"));
-        assert_eq!(reg.get("agents.flushQueuedMessages"), Some(json!("all")));
-    }
-
-    #[test]
-    fn flush_queued_messages_legacy_boolean_file_loads_and_reapplies() {
-        // A `config.toml` written by an older daemon still loads, reporting
-        // the equivalent string value with `File` origin.
-        let (_dir, path) = temp_config(Some("[agents]\nflushQueuedMessages = true\n"));
-        let reg = SettingsRegistry::load(&path).expect("load legacy true");
-        assert_eq!(reg.get("agents.flushQueuedMessages"), Some(json!("all")));
-        assert_eq!(
-            reg.origin("agents.flushQueuedMessages"),
-            Some(SettingOrigin::File)
-        );
-
-        let (_dir2, path2) = temp_config(Some("[agents]\nflushQueuedMessages = false\n"));
-        let reg2 = SettingsRegistry::load(&path2).expect("load legacy false");
-        assert_eq!(reg2.get("agents.flushQueuedMessages"), Some(json!("off")));
-        assert_eq!(
-            reg2.origin("agents.flushQueuedMessages"),
-            Some(SettingOrigin::File)
-        );
+    fn retired_flush_preferences_load_and_strip() {
+        for raw in [r#""all""#, r#""systemOnly""#, r#""off""#, "true", "false"] {
+            let seed = format!("[agents]\nflushQueuedMessages = {raw}\n");
+            let (_dir, path) = temp_config(Some(&seed));
+            let reg = SettingsRegistry::load(&path).expect("load legacy preference");
+            assert_eq!(reg.get("agents.flushQueuedMessages"), None);
+            assert_eq!(reg.origin("agents.flushQueuedMessages"), None);
+            assert!(reg
+                .apply(&set("agents.flushQueuedMessages", json!("off")))
+                .is_err());
+            reg.reload(&seed).expect("legacy preference reloads");
+            assert_eq!(
+                reg.strip_legacy().unwrap(),
+                vec!["agents.flushQueuedMessages"]
+            );
+            assert!(!std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("flushQueuedMessages"));
+            assert!(SettingsRegistry::load(&path)
+                .unwrap()
+                .legacy_values()
+                .is_empty());
+        }
     }
 
     #[test]

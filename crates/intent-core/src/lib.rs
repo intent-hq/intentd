@@ -157,8 +157,7 @@ pub use server_control::{
     InviteLinkBuilder, InviteLinkEnvelope, ResolvedInviteLinkEnvelope, ServerControl,
 };
 pub use settings_file::{
-    FlushQueuedMessagesMode, LegacySettings, SettingsFile, DEFAULT_CONFIG_TEMPLATE,
-    LEGACY_SETTINGS_PATHS,
+    LegacySettings, SettingsFile, DEFAULT_CONFIG_TEMPLATE, LEGACY_SETTINGS_PATHS,
 };
 pub use tilde::{expand_tilde, expand_tilde_string, expand_tilde_with};
 pub use traits::{

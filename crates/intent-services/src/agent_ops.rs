@@ -1330,8 +1330,7 @@ pub(crate) struct QueuedMessage {
     /// `agent.sendMessage` parked by a queue-fallback path (busy race,
     /// quarantine, append-failure) or a user-typed `agent.queueMessage`
     /// entry (the FE's mid-turn reply front door). A drained user-origin
-    /// entry keeps its originator's semantics (attention-request clear,
-    /// `systemOnly` flush exclusion),
+    /// entry keeps its originator's semantics (attention-request clear),
     /// and a user entry queued into an ARCHIVED workspace is the explicit
     /// resurrection signal its drain gate exempts (intent-hq/intent#3883).
     /// Persisted so the marker survives daemon restarts.
@@ -14789,7 +14788,7 @@ impl Services {
         Some(queue.remove(idx))
     }
 
-    /// Batch-flush dequeue (`agents.flushQueuedMessages`, PROTOCOL §5.5): pop
+    /// Batch-flush dequeue (PROTOCOL §5.5): pop
     /// EVERY ready-to-send entry in stored order — which IS the drain order
     /// (interrupt-priority first, then FIFO); `editing: true` entries stay
     /// queued — so the drain can deliver them as one combined provider turn.
@@ -14831,75 +14830,6 @@ impl Services {
             }
         }
         Some(drained)
-    }
-
-    /// System-only batch dequeue (`agents.flushQueuedMessages = "systemOnly"`):
-    /// scan the WHOLE queue — regardless of interleaving with user-origin
-    /// entries — for ready-to-send (`!editing`) SYSTEM-origin entries
-    /// (`user_origin == false`) and, when at least `min_ready` are found,
-    /// remove ALL of them, preserving their relative order; user-origin
-    /// entries are left untouched in their original queue positions. System
-    /// entries may thus be delivered ahead of earlier-queued, interleaved
-    /// user entries. Returns `None` — leaving the queue untouched — when
-    /// fewer than `min_ready` system entries are ready, so the caller falls
-    /// through to the single-entry drain path.
-    pub(crate) fn dequeue_system_only_batch(
-        &self,
-        agent_id: &AgentId,
-        min_ready: usize,
-    ) -> Option<Vec<QueuedMessage>> {
-        let mut guard = self
-            .agent_queues
-            .lock()
-            .expect("agent queue registry poisoned");
-        let queue = guard.get_mut(agent_id)?;
-        let eligible = |m: &QueuedMessage| m.ready_to_send() && !m.user_origin;
-        if queue.iter().filter(|m| eligible(m)).count() < min_ready {
-            return None;
-        }
-        let mut drained = Vec::new();
-        let mut i = 0;
-        while i < queue.len() {
-            if eligible(&queue[i]) {
-                drained.push(queue.remove(i));
-            } else {
-                i += 1;
-            }
-        }
-        Some(drained)
-    }
-
-    /// Mode-dispatching batch dequeue for `agents.flushQueuedMessages`: `All`
-    /// defers to [`Services::dequeue_ready_batch`] (every ready entry;
-    /// `require_user_origin` under the archived-workspace exemption — the
-    /// flush fires only when a user-origin entry is ready, carrying the
-    /// parked automatic entries along FIFO, intent-hq/intent#3883);
-    /// `SystemOnly` defers to [`Services::dequeue_system_only_batch`]
-    /// (system-origin entries anywhere in the queue) but NEVER batches under
-    /// that exemption (`require_user_origin`) — the exemption's trigger is a
-    /// user-origin entry, which `SystemOnly` by definition excludes; `Off`
-    /// always returns `None` so every caller falls through to the
-    /// single-entry FIFO path.
-    pub(crate) fn dequeue_flush_batch(
-        &self,
-        agent_id: &AgentId,
-        mode: intent_core::FlushQueuedMessagesMode,
-        require_user_origin: bool,
-        min_ready: usize,
-    ) -> Option<Vec<QueuedMessage>> {
-        match mode {
-            intent_core::FlushQueuedMessagesMode::All => {
-                self.dequeue_ready_batch(agent_id, require_user_origin, min_ready)
-            }
-            intent_core::FlushQueuedMessagesMode::SystemOnly => {
-                if require_user_origin {
-                    None
-                } else {
-                    self.dequeue_system_only_batch(agent_id, min_ready)
-                }
-            }
-            intent_core::FlushQueuedMessagesMode::Off => None,
-        }
     }
 
     /// Re-insert a batch of messages at the front of an agent's queue,
@@ -15254,23 +15184,6 @@ impl Services {
         )
     }
 
-    /// [`Services::dequeue_flush_batch`] with the same draining registration
-    /// as [`Services::dequeue_message_draining`]; one guard covers the batch.
-    pub(crate) fn dequeue_flush_batch_draining(
-        &self,
-        agent_id: &AgentId,
-        mode: intent_core::FlushQueuedMessagesMode,
-        require_user_origin: bool,
-        min_ready: usize,
-    ) -> Option<(Vec<QueuedMessage>, DrainingGuard)> {
-        self.pop_draining(
-            agent_id,
-            |s| s.dequeue_flush_batch(agent_id, mode, require_user_origin, min_ready),
-            Vec::as_slice,
-            PopCommit::Delivery,
-        )
-    }
-
     /// [`Services::dequeue_ready_batch`] with the same draining registration
     /// as [`Services::dequeue_message_draining`]; one guard covers the batch.
     pub(crate) fn dequeue_ready_batch_draining(
@@ -15282,21 +15195,6 @@ impl Services {
         self.pop_draining(
             agent_id,
             |s| s.dequeue_ready_batch(agent_id, require_user_origin, min_ready),
-            Vec::as_slice,
-            PopCommit::Delivery,
-        )
-    }
-
-    /// [`Services::dequeue_system_only_batch`] with the same draining
-    /// registration as [`Services::dequeue_message_draining`].
-    pub(crate) fn dequeue_system_only_batch_draining(
-        &self,
-        agent_id: &AgentId,
-        min_ready: usize,
-    ) -> Option<(Vec<QueuedMessage>, DrainingGuard)> {
-        self.pop_draining(
-            agent_id,
-            |s| s.dequeue_system_only_batch(agent_id, min_ready),
             Vec::as_slice,
             PopCommit::Delivery,
         )

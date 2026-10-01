@@ -359,7 +359,7 @@ async fn annotate_unblocked_hints(
     }
 }
 
-/// Combined provider prompt for a batch flush (`agents.flushQueuedMessages`):
+/// Combined provider prompt for a batch flush:
 /// a header naming the flushed count, then each entry's content under a
 /// `Message #N:` label in delivery order. Entry contents already carry their
 /// per-entry [`dequeue_wait_note`] (and any #576 stale-redrive note), so each
@@ -6837,9 +6837,7 @@ impl AgentManager {
         // auto-unarchives at the single existing choke point, and the batch
         // flush delivers the parked entries FIFO in the SAME combined turn
         // as this user message with the trailing unarchive prompt notice.
-        // Requires the `all` flush mode (without batching no combined turn
-        // exists to carry the parked entries), skipped when nothing is
-        // parked (the common
+        // Skipped when nothing is parked (the common
         // direct-send path is untouched), and skipped for a session parked
         // in `Error`, whose documented recovery IS the direct fresh send
         // (the STAB-52 gate in `try_drain_queue` would strand a converted
@@ -6849,8 +6847,6 @@ impl AgentManager {
         if options.origin.is_user()
             && session.status != AgentStatus::Error
             && !workspace_id.is_chief()
-            && self.services.flush_queued_messages_mode()
-                == intent_core::FlushQueuedMessagesMode::All
             && self.services.has_ready_to_send(&agent_id)
             && matches!(
                 self.services.store.get_workspace(&workspace_id).await,
@@ -7127,7 +7123,7 @@ impl AgentManager {
     /// will start a turn, so it runs alone, exactly like the direct
     /// Error-redrive arm of `send_message`, rather than whatever the generic
     /// drain would pick (a terminal-failure requeue sits at the queue FRONT;
-    /// under `flushQueuedMessages = off`/`systemOnly` the head pop would
+    /// without batching the head pop would
     /// retry the failed entry instead and leave the recovery send parked).
     /// The marker is only PEEKED here: the drain claims it atomically with
     /// the in-flight slot and the entry pop
@@ -7386,19 +7382,17 @@ impl AgentManager {
                 return;
             };
             admission = claimed;
-            // Batch flush (`agents.flushQueuedMessages`, default `all`): with
-            // a batching mode and MORE THAN ONE eligible entry waiting, drain
+            // Batch flush: with MORE THAN ONE eligible entry waiting, drain
             // them all into ONE combined provider turn while persisting each
             // entry as its own transcript row. Under an archived-workspace
             // exemption (`archived_drain`) the flush fires only because a
             // user-origin entry is ready — the parked automatic entries ride
             // its combined turn FIFO instead of being bypassed
-            // (intent-hq/intent#3883). A single eligible entry (or the `off`
-            // mode) falls through to the existing single-entry path unchanged.
-            let mode = self.services.flush_queued_messages_mode();
+            // (intent-hq/intent#3883). A single eligible entry falls through
+            // to the existing single-entry path unchanged.
             if let Some((batch, draining)) =
                 self.services
-                    .dequeue_flush_batch_draining(&agent_id, mode, archived_drain, 2)
+                    .dequeue_ready_batch_draining(&agent_id, archived_drain, 2)
             {
                 match self
                     .prepare_admitted_flush_turn(
@@ -11823,15 +11817,14 @@ async fn run_message_worker(
         }
         #[cfg(test)]
         mgr.services.queue_drain_commit_pause.pause().await;
-        // Batch flush (`agents.flushQueuedMessages`): same contract as the
+        // Batch flush: same contract as the
         // `try_drain_queue` flush arm — ≥2 ready entries drain into one
         // combined provider turn; otherwise the single-entry arm below runs
         // unchanged.
         {
-            let mode = mgr.services.flush_queued_messages_mode();
             if let Some((batch, draining)) = mgr
                 .services
-                .dequeue_flush_batch_draining(&agent_id, mode, false, 2)
+                .dequeue_ready_batch_draining(&agent_id, false, 2)
             {
                 match prepare_flush_turn(&mgr, &agent_id, &workspace_id, batch, draining).await {
                     FlushPrep::Turn {
@@ -12032,30 +12025,11 @@ async fn run_message_worker(
                 .commit_recovery_send_delivery(&agent_id, &raced);
             let mut next = raced.pop().expect("raced batch non-empty");
             let mut draining = raced_draining.take().expect("raced batch guard");
-            // Batch flush (`agents.flushQueuedMessages`): the single `next`
-            // was popped before the slot re-claim, so fold any FURTHER
-            // eligible entries in behind it and run them as one combined
-            // turn. Mode `all`: any further ready entry (min 1 more ⇒ ≥2
-            // total). Mode `systemOnly`: only when `next` is ITSELF
-            // system-origin — a user-origin `next` never batches under
-            // `systemOnly`, so it falls through to the single-entry path
-            // below unchanged. With no extra entry (or the `off` mode) the
-            // single-entry path below also runs unchanged.
-            let mode = mgr.services.flush_queued_messages_mode();
-            let extra_batch = match mode {
-                intent_core::FlushQueuedMessagesMode::All => mgr
-                    .services
-                    .dequeue_ready_batch_draining(&agent_id, false, 1),
-                intent_core::FlushQueuedMessagesMode::SystemOnly => {
-                    if next.user_origin {
-                        None
-                    } else {
-                        mgr.services
-                            .dequeue_system_only_batch_draining(&agent_id, 1)
-                    }
-                }
-                intent_core::FlushQueuedMessagesMode::Off => None,
-            };
+            // The first entry was popped before re-claiming the slot.
+            // Fold any further ready entries into the same provider turn.
+            let extra_batch = mgr
+                .services
+                .dequeue_ready_batch_draining(&agent_id, false, 1);
             if let Some((mut batch, extra_draining)) = extra_batch {
                 batch.insert(0, next);
                 draining.merge(extra_draining);
@@ -12243,7 +12217,7 @@ enum FlushPrep {
     Parked,
 }
 
-/// Prepare a batch-flushed turn (`agents.flushQueuedMessages`, default on):
+/// Prepare a batch-flushed turn:
 /// the caller has already claimed the in-flight slot and batch-dequeued ≥2
 /// ready-to-send entries in drain order. This mirrors the single-entry drain
 /// sequence once per entry — stale-redrive (#576) + dequeue-wait annotation,

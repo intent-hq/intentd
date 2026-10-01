@@ -449,7 +449,7 @@ async fn newer_client_settings_batches_reject_atomically_and_restart() {
     let paths = [
         "git.autoCommit",
         "workspace.branchPrefix",
-        "agents.flushQueuedMessages",
+        "agents.resumeInterruptedOnStart",
         "quickActions.providerSettings",
     ];
     let before = settings_snapshot(&mut rpc, &paths).await;
@@ -458,7 +458,7 @@ async fn newer_client_settings_batches_reject_atomically_and_restart() {
 
     for (path, value) in [
         ("future.setting", json!(true)),
-        ("agents.flushQueuedMessages", json!("future-policy")),
+        ("agents.resumeInterruptedOnStart", json!("future-policy")),
         // Object-shaped at the wire catalog, but invalid for the daemon's
         // typed config: provider option values must be strings.
         (
