@@ -7,6 +7,9 @@
 
 mod common;
 
+#[path = "e2e_wss_runtime_control/independent_installations.rs"]
+mod independent_installations;
+
 use intentd_test_support::GuardedChild;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
