@@ -3884,10 +3884,34 @@ async fn dispatch(
         }
         "search.notes" => {
             let query = require_str_param(params, "query")?;
-            let request_id = opt_str(params, "requestId");
-            api.search_notes(query, request_id)
-                .await
-                .map_err(domain_to_rpc)
+            let workspace_id = opt_str_strict(params, "workspaceId")?;
+            let prefer_workspace_id = opt_str_strict(params, "preferWorkspaceId")?;
+            for (name, id) in [
+                ("workspaceId", &workspace_id),
+                ("preferWorkspaceId", &prefer_workspace_id),
+            ] {
+                if id.as_ref().is_some_and(String::is_empty) {
+                    return Err(invalid_params(format!("{name} must not be empty")));
+                }
+            }
+            let limit = match params.get("limit") {
+                None | Some(Value::Null) => None,
+                Some(value) => Some(value.as_i64().filter(|n| *n >= 0).ok_or_else(|| {
+                    invalid_params("limit must be a nonnegative signed 64-bit integer")
+                })?),
+            };
+            let include_archived = opt_bool_strict(params, "includeArchived")?.unwrap_or(true);
+            let request_id = opt_str_strict(params, "requestId")?;
+            api.search_notes(
+                query,
+                workspace_id.map(WorkspaceId::from),
+                prefer_workspace_id.map(WorkspaceId::from),
+                limit,
+                include_archived,
+                request_id,
+            )
+            .await
+            .map_err(domain_to_rpc)
         }
         "search.codebase" => {
             let ws = require_ws_note(params)?;

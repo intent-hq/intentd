@@ -38,6 +38,7 @@ mod metrics_repo;
 mod node_repo;
 mod note_line_attribution_repo;
 mod note_repo;
+mod note_search_repo;
 mod note_version_repo;
 mod pr_monitor_repo;
 mod principal_repo;
@@ -77,6 +78,7 @@ pub use host_membership_repo::{
     OwnerQueuePermit,
 };
 pub use metrics_repo::{AgentMetricsRow, WorkspaceMetricsRow};
+pub use note_search_repo::{NoteFtsMatch, NoteFtsOptions};
 #[cfg(test)]
 pub(crate) use note_version_repo::MAX_NOTE_VERSIONS;
 pub use pr_monitor_repo::{
@@ -487,6 +489,8 @@ impl Store {
         // (TEXT primary key), which key the rowid-mapped `agent_message_fts`
         // index (0074) — rebuild it so the mapping stays correct.
         self.rebuild_agent_message_fts().await?;
+        // note_fts (0141) uses note_search_ctx.search_id, an explicit INTEGER
+        // PRIMARY KEY preserved by VACUUM, so it needs no recovery/rebuild.
         let duration = started.elapsed();
         let pages_after = self.page_count().await?;
         Ok(AutoVacuumActivation::Activated {

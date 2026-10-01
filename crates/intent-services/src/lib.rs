@@ -18122,24 +18122,52 @@ impl WorkspaceApi for Services {
     fn search_notes(
         &self,
         query: String,
+        workspace_id: Option<WorkspaceId>,
+        prefer_workspace_id: Option<WorkspaceId>,
+        limit: Option<i64>,
+        include_archived: bool,
         request_id: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
-        let registry = self.search_cancels.clone();
-        let services = self.clone();
         Box::pin(async move {
-            let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
-            let token = registry.register_as(&request_id, capability::search_owner()?);
-            let mut notes = store.list_all_notes().await?;
-            // Multiplayer w3: a collaborator matches only its member
-            // workspaces' notes (filtered before matching — unbounded list).
-            if let Some(visible) = self.visible_workspace_ids().await? {
-                notes.retain(|n| visible.contains(&n.workspace_id));
+            if limit.is_some_and(|n| n < 0) {
+                return Err(Error::InvalidParams("limit must be nonnegative".into()));
             }
-            let matches = search_ops::note_matches(&notes, &query);
-            let matches = to_value_vec(matches)?;
-            // Global search (no workspaceId) → always inline (notes sets are small).
-            Ok(services.deliver_search(&request_id, None, matches, token))
+            for (name, id) in [
+                ("workspaceId", &workspace_id),
+                ("preferWorkspaceId", &prefer_workspace_id),
+            ] {
+                if id.as_ref().is_some_and(|id| id.as_str().is_empty()) {
+                    return Err(Error::InvalidParams(format!("{name} must not be empty")));
+                }
+            }
+            if let Some(ws) = workspace_id.as_ref() {
+                self.require_member(ws).await?;
+                // The unrestricted owner path's membership gate does not look
+                // up existence. Hard scope still requires a real workspace,
+                // even for tokenless queries or a zero limit.
+                self.store.get_workspace(ws).await?;
+            }
+            let visible = self
+                .visible_workspace_ids()
+                .await?
+                .map(|ids| ids.into_iter().collect::<Vec<_>>());
+            let options = intent_store::NoteFtsOptions {
+                workspace_id: workspace_id.as_ref(),
+                prefer_workspace_id: prefer_workspace_id.as_ref(),
+                allowed_workspace_ids: visible.as_deref(),
+                include_archived,
+                limit,
+            };
+            let hits = match intent_search::fts_match_expr(&query) {
+                Some(expr) => self.store.search_notes_fts(&expr, &options).await?,
+                None => Vec::new(),
+            };
+            let matches = search_ops::note_fts_matches(hits, &query);
+            let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
+            // This single indexed query never streams, even for a large hard
+            // scope. There is no lingering cancellation registration; cancelling
+            // this completed request is the usual no-op success.
+            Ok(serde_json::json!({ "requestId": request_id, "matches": matches, "indexed": true }))
         })
     }
 

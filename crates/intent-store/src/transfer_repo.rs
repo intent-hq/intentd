@@ -98,6 +98,12 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
 /// new table cannot silently skip the transfer decision.
 #[cfg(test)]
 pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
+    ("note_search_ctx", "derived note search identities/context; note import triggers rebuild them"),
+    ("note_fts", "derived note full-text index; note import triggers rebuild it"),
+    ("note_fts_config", "FTS5 shadow table of the derived note index"),
+    ("note_fts_data", "FTS5 shadow table of the derived note index"),
+    ("note_fts_docsize", "FTS5 shadow table of the derived note index"),
+    ("note_fts_idx", "FTS5 shadow table of the derived note index"),
     (
         "_sqlx_migrations",
         "sqlx's own migration bookkeeping; every database maintains its own",
