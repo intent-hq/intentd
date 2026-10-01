@@ -379,29 +379,28 @@ impl ScriptManager {
         };
         // Creation defaults do not reclassify stored definitions. Startup
         // hydration is best-effort, so a registry miss must consult SQLite.
-        let purpose = match params.purpose {
-            Some(purpose) => purpose,
-            None => {
-                let registered = self
-                    .scripts
-                    .lock()
-                    .unwrap()
-                    .get(&(workspace_id.clone(), id.clone()))
-                    .map(|old| old.def.purpose);
-                match registered {
-                    Some(purpose) => purpose,
-                    None => self
-                        .store
-                        .get_script_in_workspace(&workspace_id, &id)
-                        .await?
-                        .map_or(
-                            match params.mode {
-                                ScriptMode::Command => intent_core::ScriptPurpose::OneOff,
-                                ScriptMode::Service => intent_core::ScriptPurpose::Saved,
-                            },
-                            |old| old.purpose,
-                        ),
-                }
+        let purpose = if let Some(purpose) = params.purpose {
+            purpose
+        } else {
+            let registered = self
+                .scripts
+                .lock()
+                .unwrap()
+                .get(&(workspace_id.clone(), id.clone()))
+                .map(|old| old.def.purpose);
+            match registered {
+                Some(purpose) => purpose,
+                None => self
+                    .store
+                    .get_script_in_workspace(&workspace_id, &id)
+                    .await?
+                    .map_or(
+                        match params.mode {
+                            ScriptMode::Command => intent_core::ScriptPurpose::OneOff,
+                            ScriptMode::Service => intent_core::ScriptPurpose::Saved,
+                        },
+                        |old| old.purpose,
+                    ),
             }
         };
         if purpose == intent_core::ScriptPurpose::OneOff
