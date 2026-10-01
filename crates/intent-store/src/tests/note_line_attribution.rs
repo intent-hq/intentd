@@ -1,4 +1,5 @@
 //! Attribution refreshes must survive transient saturation of the sole writer.
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -88,7 +89,7 @@ async fn attribution_does_not_retry_a_closed_pool() {
         note_id: NoteId::from("note"),
         workspace_id: WorkspaceId::new(),
         computed_at: "2026-10-01T00:00:00Z".into(),
-        attributions: Default::default(),
+        attributions: BTreeMap::default(),
     };
     let error = tokio::time::timeout(
         Duration::from_secs(1),
