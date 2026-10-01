@@ -2871,7 +2871,11 @@ impl<'a> SettingsService<'a> {
                     // Per-account guards remain held by the caller, without
                     // the revision gate. Never compensate untouched accounts
                     // or a failing operation whose state is still unknown.
-                    update.rollback(self.secrets).await;
+                    if update.rollback(self.secrets).await {
+                        return Err(Error::Internal(format!(
+                            "settings.update failed ({error}), and secret rollback was incomplete (see logs)"
+                        )));
+                    }
                     return Err(error);
                 }
                 for (path, value) in prior.iter().filter(|(path, _)| owns_account(path)) {
@@ -7877,6 +7881,7 @@ mod rollback_order_tests {
 
     struct RejectSecondSecret {
         raw: InMemorySecretStore,
+        reject_rollback: bool,
         rollback: Option<(
             Arc<tokio::sync::Notify>,
             Mutex<std::sync::mpsc::Receiver<()>>,
@@ -7895,6 +7900,9 @@ mod rollback_order_tests {
             if account == intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT
                 && value == "original-device"
             {
+                if self.reject_rollback {
+                    return Err(Error::Internal("injected restoration failure".into()));
+                }
                 if let Some((entered, release)) = &self.rollback {
                     entered.notify_one();
                     let _ = release.lock().unwrap().recv();
@@ -7938,6 +7946,7 @@ mod rollback_order_tests {
             .with_settings_registry(registry)
             .with_secret_store(Arc::new(RejectSecondSecret {
                 raw: raw.clone(),
+                reject_rollback: false,
                 rollback: concurrent.then_some((entered.clone(), Mutex::new(release_rx))),
             }))
             .with_event_bus(bus);
@@ -8029,6 +8038,61 @@ mod rollback_order_tests {
     #[intent_test_macros::daemon_test]
     async fn failed_secret_batch_restores_a_completed_repeated_account() {
         failed_secret_batch_case(true, false, true).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn failed_secret_batch_reports_incomplete_restoration() {
+        use intent_sourcecontrol::gitlab_token::{
+            EXPIRES_AT_SECRET_ACCOUNT, REFRESH_SECRET_ACCOUNT, SECRET_ACCOUNT,
+        };
+        let dir = crate::test_support::test_tempdir("settings-incomplete-secret-rollback");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let (bus, mut sub) = settings_subscription(&store);
+        let raw = InMemorySecretStore::default();
+        for (account, value) in [
+            (SECRET_ACCOUNT, "original-device"),
+            (REFRESH_SECRET_ACCOUNT, "original-refresh"),
+            (EXPIRES_AT_SECRET_ACCOUNT, "12345"),
+        ] {
+            raw.store(account, value).unwrap();
+        }
+        let services = crate::Services::new(store)
+            .with_secret_store(Arc::new(RejectSecondSecret {
+                raw: raw.clone(),
+                reject_rollback: true,
+                rollback: None,
+            }))
+            .with_event_bus(bus);
+        let error = services
+            .settings_update(json!([
+                {"path":SECRET_ACCOUNT, "value":"temporary-pat"},
+                {"path":"accounts.sentry.token", "value":"rejected-sentry"}
+            ]))
+            .await
+            .expect_err("second write and earlier restoration fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("injected second-secret failure"),
+            "{message}"
+        );
+        assert!(
+            message.contains("secret rollback was incomplete"),
+            "{message}"
+        );
+        assert_eq!(
+            raw.load(SECRET_ACCOUNT).unwrap().as_deref(),
+            Some("temporary-pat")
+        );
+        assert_eq!(
+            raw.load(REFRESH_SECRET_ACCOUNT).unwrap().as_deref(),
+            Some("original-refresh")
+        );
+        assert_eq!(
+            raw.load(EXPIRES_AT_SECRET_ACCOUNT).unwrap().as_deref(),
+            Some("12345")
+        );
+        assert_no_settings_events(&mut sub).await;
+        assert_next_commit_is_revision_one(&services, &mut sub).await;
     }
 
     async fn unsettled_secret_batch_case(repeated: bool) {
