@@ -19,9 +19,11 @@ done
 case "$1" in
   genkey) printf 'test-key' > "$key" ;;
   serve)
+    fifo="$(dirname "$0")/sidecar-stop"
+    [ -p "$fifo" ] || mkfifo "$fifo"
     printf '%s\n' "$port" > "$(dirname "$0")/tunnel-target-port"
     printf '{"listenAddr":"tc-test-installation"}\n'
-    exec sleep 600 # timing-guard: sidecar stays alive until the daemon's owned teardown kills it.
+    exec cat "$fifo"
     ;;
 esac
 "#;
