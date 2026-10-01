@@ -4010,6 +4010,24 @@ struct WsRuntimeState {
     bind_addresses: Option<Vec<std::net::IpAddr>>,
 }
 
+/// Atomically check cancellation and publish the in-flight transport handle.
+/// Stop either finds this handle or its generation bump prevents publication.
+async fn publish_starting_ws_server(
+    state: &tokio::sync::Mutex<WsRuntimeState>,
+    stop_generation: &std::sync::atomic::AtomicU64,
+    generation: u64,
+    server: WsApiServer,
+) -> intent_core::Result<()> {
+    let mut state = state.lock().await;
+    if stop_generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
+        return Err(intent_core::Error::Internal(
+            "WSS start cancelled by stop".into(),
+        ));
+    }
+    state.ws_server = Some(server);
+    Ok(())
+}
+
 /// Pairing info provider for `server.pairingInfo` / `server.rotateToken` (§5.2).
 /// Implemented by the daemon composition root and wired to UDS and WSS listeners.
 struct DaemonPairingInfo {
@@ -4478,7 +4496,13 @@ impl intent_core::ServerControl for DaemonControl {
 
             // Publish only the handle, never readiness, so stop can cancel an
             // in-flight scan. start_gate prevents duplicate server construction.
-            runtime.state.lock().await.ws_server = Some(server.clone());
+            publish_starting_ws_server(
+                &runtime.state,
+                &runtime.stop_generation,
+                generation,
+                server.clone(),
+            )
+            .await?;
             let start_result = if assign_port {
                 let runtime = runtime.clone();
                 server
@@ -7569,6 +7593,60 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ws_stop_before_handle_publication_prevents_binding_and_assignment() {
+        use std::future::{poll_fn, Future};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::task::Poll;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let bus = EventBus::new(store.clone());
+        let api: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store));
+        let server = WsApiServer::new_insecure(
+            api,
+            bus,
+            WsOptions {
+                base_port: 0,
+                ..WsOptions::default()
+            },
+            None,
+        );
+        let state = tokio::sync::Mutex::new(WsRuntimeState {
+            ws_server: None,
+            port: None,
+            bind_addresses: None,
+        });
+        let stop_generation = AtomicU64::new(0);
+        let attempted_assignment = Arc::new(AtomicBool::new(false));
+        let observed = attempted_assignment.clone();
+        // Stop holds the same state lock that publication needs. Start has
+        // already captured generation zero and constructed its transport.
+        let stopping = state.lock().await;
+        let start = async {
+            publish_starting_ws_server(&state, &stop_generation, 0, server.clone()).await?;
+            server
+                .start_with_port_assignment(move |_| {
+                    observed.store(true, Ordering::SeqCst);
+                    Err(std::io::Error::other("unexpected assignment after stop"))
+                })
+                .await
+                .map_err(|e| intent_core::Error::Internal(e.to_string()))
+        };
+        tokio::pin!(start);
+        assert!(poll_fn(|cx| Poll::Ready(start.as_mut().poll(cx).is_pending())).await);
+        stop_generation.fetch_add(1, Ordering::SeqCst);
+        assert!(
+            stopping.ws_server.is_none(),
+            "stop cannot yet see the new transport"
+        );
+        drop(stopping);
+        let error = start.await.unwrap_err();
+        assert!(error.to_string().contains("cancelled by stop"), "{error}");
+        assert!(!attempted_assignment.load(Ordering::SeqCst));
+        assert!(state.lock().await.ws_server.is_none());
+        assert_eq!(server.bound_port().await, None);
+    }
 
     #[tokio::test]
     async fn shutdown_queue_lookup_failure_prevents_serving_and_preserves_recovery() {
