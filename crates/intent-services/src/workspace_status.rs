@@ -4535,11 +4535,13 @@ mod display_status_events {
             .await
             .expect("insert task");
         let mut ws = h.store.get_workspace(&h.ws).await.expect("get ws");
-        // Force list_notes to fail so taskStats is not computable.
-        sqlx::query("DROP TABLE note")
+        // Force note reads to fail so taskStats is not computable. Renaming
+        // avoids DROP's implicit cascading deletes into the FTS virtual table,
+        // which can lock the schema before the intended read failure is tested.
+        sqlx::query("ALTER TABLE note RENAME TO unavailable_note")
             .execute(h.store.write_pool())
             .await
-            .expect("drop note table");
+            .expect("make note table unavailable");
 
         services.enrich_workspace_aggregates(&mut ws).await;
         assert!(ws.task_stats.is_none(), "taskStats must be absent");

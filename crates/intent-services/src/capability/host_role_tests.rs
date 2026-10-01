@@ -791,7 +791,10 @@ async fn member_search_inherits_workspaces_but_excludes_chief() {
             svc.visible_workspace_ids().await.unwrap().unwrap(),
             HashSet::from([ws])
         );
-        let result = svc.search_notes("needle".into(), None).await.unwrap();
+        let result = svc
+            .search_notes("needle".into(), None, None, None, true, None)
+            .await
+            .unwrap();
         let text = result.to_string();
         assert!(text.contains("needle ordinary"), "{result}");
         assert!(!text.contains("needle administration"), "{result}");

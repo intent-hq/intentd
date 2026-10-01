@@ -1592,11 +1592,17 @@ impl WorkspaceApi for FakeApi {
     fn search_notes(
         &self,
         _query: String,
+        workspace_id: Option<WorkspaceId>,
+        prefer_workspace_id: Option<WorkspaceId>,
+        limit: Option<i64>,
+        include_archived: bool,
         request_id: Option<String>,
     ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             let request_id = request_id.unwrap_or_else(|| "srch-minted".to_string());
-            Ok(serde_json::json!({ "requestId": request_id, "matches": [] }))
+            Ok(
+                serde_json::json!({ "requestId": request_id, "matches": [], "workspaceId":workspace_id, "preferWorkspaceId":prefer_workspace_id, "limit":limit, "includeArchived":include_archived, "indexed":true }),
+            )
         })
     }
 
@@ -5598,6 +5604,62 @@ async fn search_notes_requires_query_and_is_global() {
     .await
     .unwrap();
     assert_eq!(v["result"]["requestId"], serde_json::json!("srch-n"));
+}
+
+#[tokio::test]
+async fn search_notes_routes_filters_and_null_defaults() {
+    for (params, expected) in [
+        (
+            serde_json::json!({"query":"body", "workspaceId":"hard", "preferWorkspaceId":"soft",
+            "limit":0,"includeArchived":false,"requestId":"notes"}),
+            serde_json::json!({"workspaceId":"hard","preferWorkspaceId":"soft","limit":0,"includeArchived":false}),
+        ),
+        (
+            serde_json::json!({"query":"body","workspaceId":null,"preferWorkspaceId":null,
+            "limit":null,"includeArchived":null,"requestId":null}),
+            serde_json::json!({"workspaceId":null,"preferWorkspaceId":null,"limit":null,"includeArchived":true}),
+        ),
+        (
+            serde_json::json!({"query":"body"}),
+            serde_json::json!({"workspaceId":null,"preferWorkspaceId":null,"limit":null,"includeArchived":true}),
+        ),
+    ] {
+        let reply = call(
+            &serde_json::json!({"jsonrpc":"2.0","id":1,
+            "method":"search.notes","params":params})
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        for (key, value) in expected.as_object().unwrap() {
+            assert_eq!(&reply["result"][key], value, "{key}: {reply}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn search_notes_rejects_invalid_optional_params() {
+    for (key, value) in [
+        ("workspaceId", serde_json::json!("")),
+        ("preferWorkspaceId", serde_json::json!(false)),
+        ("requestId", serde_json::json!([])),
+        ("includeArchived", serde_json::json!("false")),
+        ("limit", serde_json::json!(-1)),
+        ("limit", serde_json::json!(1.5)),
+        ("limit", serde_json::json!(9_223_372_036_854_775_808_u64)),
+    ] {
+        let mut params = serde_json::json!({"query":""});
+        params[key] = value;
+        let reply = call(
+            &serde_json::json!({"jsonrpc":"2.0","id":1,
+            "method":"search.notes","params":params})
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(err_code(&reply), -32602, "{reply}");
+        assert_eq!(reply["error"]["data"]["code"], "invalid-params");
+    }
 }
 
 #[tokio::test]
