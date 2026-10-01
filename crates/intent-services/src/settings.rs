@@ -21,8 +21,9 @@
 //! from the registry snapshot (`Services::effective_settings`); the `SQLite`
 //! `settings` table only persists the machine-state blobs. Retired keys
 //! (`model.workspaceOverrides`, monorepo#1000) have no catalog entry:
-//! `settings.update` tolerates-and-ignores them and
-//! [`cleanup_retired_settings`] deletes their stale rows on boot.
+//! writes to this path fail as unknown settings. Boot-only compatibility
+//! strips legacy config values and [`cleanup_retired_settings`] deletes stale
+//! rows without restoring a writable setting.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -43,10 +44,10 @@ use crate::settings_registry::{SettingOrigin, SettingsRegistry, KNOWN_PATHS};
 pub(crate) const REDACTED_PLACEHOLDER: &str = "********";
 
 /// The retired per-workspace model override path (monorepo#1000). No catalog
-/// entry remains: `settings.get`/`settings.reset` reject it as unknown, but
-/// old clients still writing it via `settings.update` are tolerated-and-
-/// ignored, and [`cleanup_retired_settings`] deletes the stale `SQLite` row on
-/// boot.
+/// entry remains: `settings.get`/`settings.reset`/`settings.update` reject it
+/// as unknown. This terminal-state shim only names the stale `SQLite` row
+/// that [`cleanup_retired_settings`] deletes on boot. Legacy config parsing
+/// and stripping remain supported independently of settings writes.
 pub(crate) const RETIRED_WORKSPACE_OVERRIDES_PATH: &str = "model.workspaceOverrides";
 
 /// The retired `backgroundAgents.*` paths, renamed to `quickActions.*`
@@ -2767,20 +2768,14 @@ impl<'a> SettingsService<'a> {
                 .get("path")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| Error::InvalidParams("each change requires a 'path'".to_string()))?;
-            // monorepo#1000 compatibility: old clients still write the retired
-            // per-workspace override path on every workspace-scoped model
-            // pick. Tolerate-and-ignore the entry (nothing validated,
-            // persisted, echoed, or published) instead of rejecting the whole
-            // batch as an unknown path.
             // monorepo#1729 compatibility: pre-rename clients still write the
-            // `backgroundAgents.*` paths. Same tolerate-and-ignore treatment —
+            // `backgroundAgents.*` paths. Tolerate-and-ignore these entries —
             // the renamed `quickActions.*` keys are the only writable surface.
             // The deprecated `providers.active` gets the same treatment so a
             // write can never recreate the key `migrate_active_provider_setting`
             // removed from config.toml (its catalog entry is read-only, but a
             // hard rejection would fail whole batches from old clients).
-            if path == RETIRED_WORKSPACE_OVERRIDES_PATH
-                || RETIRED_BACKGROUND_AGENT_PATHS.contains(&path)
+            if RETIRED_BACKGROUND_AGENT_PATHS.contains(&path)
                 || path == DEPRECATED_ACTIVE_PROVIDER_PATH
             {
                 tracing::debug!(path, "ignoring settings.update for retired setting");
@@ -6955,61 +6950,65 @@ mod tests {
         }
     }
 
-    /// `model.workspaceOverrides` is retired (monorepo#1000) but old clients
-    /// still write it on every workspace-scoped model pick: `settings.update`
-    /// tolerates-and-ignores the entry (nothing persisted, nothing echoed in
-    /// `applied`) instead of rejecting the batch, while the rest of a mixed
-    /// batch still applies. `settings.get`/`settings.reset` reject the path
-    /// as unknown like any other uncataloged key.
+    /// Retired writes fail like unknown settings, including in mixed batches:
+    /// validation must finish before any TOML, `SQLite`, or secret write occurs.
     #[tokio::test]
-    async fn workspace_overrides_update_is_tolerated_and_ignored() {
-        let tag = uuid::Uuid::new_v4();
-        let tmp = std::env::temp_dir().join(format!("intentd-settings-wsov-{tag}.db"));
-        let store = Store::open(&tmp).await.expect("open store");
-        let config_path = std::env::temp_dir().join(format!("intentd-settings-wsov-{tag}.toml"));
+    async fn workspace_overrides_update_is_rejected_atomically() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&dir.path().join("settings.db"))
+            .await
+            .expect("store");
+        let config_path = dir.path().join("config.toml");
         let registry = SettingsRegistry::load(&config_path).expect("load registry");
         let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
         let secrets = AsyncSecretStore::new(secrets);
         let svc = SettingsService::new(&store, &secrets, Some(&registry));
-
-        // A retired-path-only batch succeeds with nothing applied.
-        let applied = svc
-            .update(&json!([{
-                "path": "model.workspaceOverrides",
-                "value": { "ws-1": "auggie:opus" }
-            }]))
-            .await
-            .expect("retired path must be tolerated");
-        assert_eq!(applied, Vec::<Value>::new());
-        // Even a malformed entry (no 'value') is ignored, not validated.
-        let applied = svc
+        let config_before = std::fs::read_to_string(&config_path).expect("read config");
+        let prefix_before = svc.get("workspace.branchPrefix").await.expect("prefix");
+        let secret_before = svc.get("linear.token").await.expect("token");
+        let retired = json!({ "path": "model.workspaceOverrides", "value": { "ws-1": "m1" } });
+        let live = vec![
+            json!({ "path": "workspace.branchPrefix", "value": "feat/" }),
+            json!({ "path": "workspace.changeHistory", "value": { "ws-1": [] } }),
+            json!({ "path": "linear.token", "value": "new-token" }),
+        ];
+        for changes in [
+            vec![retired.clone()],
+            [vec![retired.clone()], live.clone()].concat(),
+            [live, vec![retired]].concat(),
+        ] {
+            let err = svc
+                .update(&json!(changes))
+                .await
+                .expect_err("retired path must fail");
+            assert!(
+                matches!(err, Error::InvalidParams(ref message)
+                if message == "unknown setting: model.workspaceOverrides"),
+                "{err}"
+            );
+            assert_eq!(
+                svc.get("workspace.branchPrefix").await.expect("prefix"),
+                prefix_before
+            );
+            assert_eq!(svc.get("linear.token").await.expect("token"), secret_before);
+            for path in ["model.workspaceOverrides", "workspace.changeHistory"] {
+                assert_eq!(store.get_setting(path).await.expect("stored setting"), None);
+            }
+            assert_eq!(
+                std::fs::read_to_string(&config_path).expect("config"),
+                config_before
+            );
+        }
+        // Missing values follow the same validation as any unknown path.
+        let err = svc
             .update(&json!([{ "path": "model.workspaceOverrides" }]))
             .await
-            .expect("retired path must be tolerated without a value");
-        assert_eq!(applied, Vec::<Value>::new());
-        // Nothing was persisted to SQLite or config.toml.
-        assert_eq!(
-            store
-                .get_setting("model.workspaceOverrides")
-                .await
-                .expect("read settings table"),
-            None
+            .expect_err("missing value must fail");
+        assert!(
+            matches!(err, Error::InvalidParams(ref message)
+            if message == "change for model.workspaceOverrides requires a 'value'"),
+            "{err}"
         );
-        let text = std::fs::read_to_string(&config_path).expect("read config");
-        assert!(!text.contains("workspaceOverrides"), "{text}");
-
-        // A mixed batch still applies the live entries.
-        let applied = svc
-            .update(&json!([
-                { "path": "model.workspaceOverrides", "value": { "ws-1": "m1" } },
-                { "path": "workspace.branchPrefix", "value": "feat/" },
-            ]))
-            .await
-            .expect("mixed batch must apply the live entry");
-        assert_eq!(applied.len(), 1);
-        assert_eq!(applied[0]["path"], "workspace.branchPrefix");
-
-        // get/reset reject the retired path as unknown.
         assert!(matches!(
             svc.get("model.workspaceOverrides").await,
             Err(Error::InvalidParams(_))
@@ -7018,14 +7017,6 @@ mod tests {
             svc.reset("model.workspaceOverrides").await,
             Err(Error::InvalidParams(_))
         ));
-
-        let _ = std::fs::remove_file(&config_path);
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
-                "{}{suffix}",
-                tmp.display()
-            )));
-        }
     }
 
     /// monorepo#1729: the renamed `backgroundAgents.*` paths are tolerated-

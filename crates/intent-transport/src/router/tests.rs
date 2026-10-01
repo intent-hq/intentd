@@ -1699,10 +1699,17 @@ impl WorkspaceApi for FakeApi {
         workspace_id: WorkspaceId,
         path: String,
         _caller_agent_id: Option<AgentId>,
+        git_root_id: Option<intent_core::WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<Value>> {
         // Echo a bare string so the wire test can assert file.read is NOT
         // wrapped in an object.
-        Box::pin(async move { Ok(Value::String(format!("{}:{path}", workspace_id.as_str()))) })
+        Box::pin(async move {
+            let scope = git_root_id.map(|id| format!("{id}:")).unwrap_or_default();
+            Ok(Value::String(format!(
+                "{}:{scope}{path}",
+                workspace_id.as_str()
+            )))
+        })
     }
 
     fn file_read_chunk(
@@ -1712,10 +1719,12 @@ impl WorkspaceApi for FakeApi {
         offset: u64,
         length: u64,
         _caller_agent_id: Option<AgentId>,
+        git_root_id: Option<intent_core::WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<Value>> {
         // Echo the window so the wire test can assert offset/length reach the
         // service, alongside the documented result shape.
         Box::pin(async move {
+            let path = git_root_id.map(|id| format!("{id}:{path}")).unwrap_or(path);
             Ok(serde_json::json!({
                 "content": format!("b64:{path}:{offset}:{length}"),
                 "bytesRead": length,
@@ -5786,6 +5795,46 @@ async fn terminal_kill_and_list_dispatch() {
         v["result"]["terminals"][0]["alive"],
         serde_json::json!(true)
     );
+}
+
+#[tokio::test]
+async fn file_read_routes_registered_root_selector() {
+    for (selector, expected) in [
+        (serde_json::json!("root-1"), "ws-1:root-1:a.txt"),
+        (serde_json::json!(""), "ws-1:a.txt"),
+        (serde_json::json!("   "), "ws-1:a.txt"),
+        (Value::Null, "ws-1:a.txt"),
+    ] {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "file.read",
+            "params": { "workspaceId": "ws-1", "path": "a.txt", "gitRootId": selector }
+        });
+        let response = call(&request.to_string()).await.unwrap();
+        assert_eq!(response["result"], expected, "{response}");
+    }
+}
+
+#[tokio::test]
+async fn file_read_chunk_routes_registered_root_selector() {
+    for (selector, scope) in [
+        (serde_json::json!("root-1"), "root-1:"),
+        (serde_json::json!(""), ""),
+        (serde_json::json!("   "), ""),
+        (Value::Null, ""),
+    ] {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "file.readChunk",
+            "params": { "workspaceId": "ws-1", "path": "a.bin", "gitRootId": selector, "offset": 64, "length": 32 }
+        });
+        let response = call(&request.to_string()).await.unwrap();
+        assert_eq!(
+            response["result"],
+            serde_json::json!({
+                "content": format!("b64:{scope}a.bin:64:32"), "bytesRead": 32, "size": 1000
+            }),
+            "{response}"
+        );
+    }
 }
 
 #[tokio::test]
