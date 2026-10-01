@@ -1718,3 +1718,96 @@ mod emit_path_taxonomy {
         assert_eq!(found, vec!["note:real-emit".to_string()]);
     }
 }
+
+#[tokio::test]
+async fn permission_delivery_rechecks_guest_management_without_visibility_cache() {
+    use intent_core::{BoxFuture, HostRole, Workspace, WorkspaceMembership, WorkspaceRole};
+    use std::sync::atomic::AtomicBool;
+
+    struct PermissionApi {
+        manages: AtomicBool,
+        role: std::sync::Mutex<Option<HostRole>>,
+    }
+    impl WorkspaceApi for PermissionApi {
+        fn principal_host_role(
+            &self,
+            _: PrincipalId,
+        ) -> BoxFuture<'_, intent_core::Result<HostRole>> {
+            let role = *self.role.lock().unwrap();
+            Box::pin(
+                async move { role.ok_or_else(|| intent_core::Error::NotFound("revoked".into())) },
+            )
+        }
+        fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, intent_core::Result<Workspace>> {
+            let manages = self.manages.load(Ordering::SeqCst);
+            Box::pin(async move {
+                if id.as_str() != "owned" {
+                    return Err(intent_core::Error::NotFound("hidden".into()));
+                }
+                Ok(Workspace {
+                    id,
+                    membership: Some(WorkspaceMembership {
+                        can_manage: manages,
+                        owner_principal_id: None,
+                        my_role: Some(if manages {
+                            WorkspaceRole::Owner
+                        } else {
+                            WorkspaceRole::Collaborator
+                        }),
+                        member_count: 1,
+                        open_invite_count: 0,
+                    }),
+                    ..intent_core::chief_workspace()
+                })
+            })
+        }
+    }
+    let api = Arc::new(PermissionApi {
+        manages: AtomicBool::new(true),
+        role: std::sync::Mutex::new(Some(HostRole::Guest)),
+    });
+    let dyn_api: Arc<dyn WorkspaceApi> = api.clone();
+    let caller = Caller::Wire {
+        principal_id: PrincipalId::new(),
+        host_role: HostRole::Guest,
+    };
+    crate::context::with_request_context(true, Some(caller), async {
+        let mut gate = MembershipGate::for_current_caller(&dyn_api).unwrap();
+        let mut ev = Event {
+            id: "permission-event".into(),
+            workspace_id: WorkspaceId::from("owned"),
+            timestamp: intent_core::now_iso(),
+            event_type: intent_core::events::AGENT_PERMISSION_REQUEST.into(),
+            actor: EventActor::default(),
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: json!({"requestId":"secret", "workspaceId":"owned", "canManage":true}),
+        };
+        assert!(gate.allows(&ev).await);
+        ev.event_type = intent_core::events::AGENT_PERMISSION_RESOLVED.into();
+        assert!(gate.allows(&ev).await);
+        ev.workspace_id = WorkspaceId::from("unrelated");
+        assert!(
+            !gate.allows(&ev).await,
+            "payload workspace claim cannot grant access"
+        );
+        ev.workspace_id = WorkspaceId::from("owned");
+        ev.event_type = intent_core::events::TERMINAL_DATA.into();
+        assert!(!gate.allows(&ev).await, "no other guest management events");
+        ev.event_type = intent_core::events::AGENT_PERMISSION_REQUEST.into();
+        api.manages.store(false, Ordering::SeqCst);
+        assert!(
+            !gate.allows(&ev).await,
+            "demotion must bypass cached visibility"
+        );
+        api.manages.store(true, Ordering::SeqCst);
+        assert!(gate.allows(&ev).await, "restored ownership");
+        *api.role.lock().unwrap() = None;
+        assert!(!gate.allows(&ev).await, "revoked identity fails closed");
+        *api.role.lock().unwrap() = Some(HostRole::Member);
+        assert!(gate.allows(&ev).await, "member behavior retained");
+    })
+    .await;
+}
