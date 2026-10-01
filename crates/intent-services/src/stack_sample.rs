@@ -256,6 +256,87 @@ mod tests {
     /// runs tests on parallel threads by default.
     static CAPTURE_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    /// A fresh process owns each TMP directory. Inspect it only after that
+    /// process exits: dropping a capture guard alone cannot prove cleanup of
+    /// a collector retained in a process-global static.
+    #[cfg(unix)]
+    #[test]
+    fn sampling_leaves_no_temporary_files_after_process_exit() {
+        const WORKER: &str = "INTENT_TEST_STACK_SAMPLE_COUNT";
+        if let Ok(count) = std::env::var(WORKER) {
+            let count: usize = count.parse().unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                for _ in 0..count {
+                    let payload = sample_stacks(Some(100), Some(99)).await.unwrap();
+                    assert_eq!(payload["durationMs"], 100);
+                    assert_eq!(payload["frequencyHz"], 99);
+                    assert!(payload["report"]
+                        .as_str()
+                        .unwrap()
+                        .contains("intentd stack sample"));
+                    assert!(payload["sampleCount"].is_i64());
+                    assert!(payload["distinctStacks"].is_u64());
+                }
+            });
+            println!("completed {count} captures");
+            return;
+        }
+
+        // Zero captures is the control for runtime/test-harness startup;
+        // one and repeated captures exercise both collector creation and reuse.
+        let mut failures = Vec::new();
+        for count in [0, 1, 3] {
+            let mut root = crate::test_support::test_tempdir("stack-sample-exit-");
+            let tmp = root.path().join("tmp");
+            std::fs::create_dir(&tmp).unwrap();
+            let log_path = root.path().join("worker.log");
+            let log = std::fs::File::create(&log_path).unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "stack_sample::tests::sampling_leaves_no_temporary_files_after_process_exit",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(WORKER, count.to_string())
+                .env("TMPDIR", &tmp)
+                .env("TMP", &tmp)
+                .env("TEMP", &tmp)
+                .stdout(log.try_clone().unwrap())
+                .stderr(log);
+            let mut child = intentd_test_support::GuardedChild::spawn(&mut command).unwrap();
+            let status = child
+                .wait_with_timeout(std::time::Duration::from_secs(60))
+                .unwrap();
+            let output = std::fs::read_to_string(log_path).unwrap();
+            let residue: Vec<_> = std::fs::read_dir(&tmp)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    let metadata = entry.metadata().unwrap();
+                    (entry.file_name(), metadata.len(), metadata.file_type())
+                })
+                .collect();
+            if !status.is_some_and(|s| s.success())
+                || !output.contains(&format!("completed {count} captures"))
+                || !residue.is_empty()
+            {
+                // Keep the actual failing inventory and child log as evidence.
+                root.disable_cleanup(true);
+                failures.push(format!(
+                    "{count} captures: status {status:?}, residue {residue:?}, evidence {}\n{output}",
+                    root.path().display()
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
     #[test]
     fn duration_defaults_and_clamps() {
         assert_eq!(effective_duration_ms(None), DEFAULT_DURATION_MS);
