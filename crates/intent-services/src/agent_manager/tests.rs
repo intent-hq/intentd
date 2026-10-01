@@ -13268,7 +13268,7 @@ async fn end_turn_persists_runtime_idle_and_emits_event() {
 }
 
 /// #5669: an idle lifecycle event is emitted before the worker saves its
-/// RuntimeIdle status. Hold both boundaries so scheduler speed cannot hide
+/// `RuntimeIdle` status. Hold both boundaries so scheduler speed cannot hide
 /// the distinction between turn completion and durable worker settlement.
 #[tokio::test]
 async fn prompt_idle_event_precedes_end_turn_status_persistence() {
