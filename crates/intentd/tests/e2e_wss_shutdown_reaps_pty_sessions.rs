@@ -308,6 +308,7 @@ async fn shutdown_reaps_terminal_and_script_pty_sessions() {
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
+        .env("RUST_LOG", "info")
         .stdout(Stdio::null())
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
@@ -437,6 +438,30 @@ async fn shutdown_reaps_terminal_and_script_pty_sessions() {
     .await
     .expect("daemon-exit phase timed out after system.shutdown acknowledgement and terminal and script PTYs reap");
     assert!(exit_ok, "daemon-exit phase returned a non-zero status");
+    // Both stderr and the rotated file must contain the final record immediately
+    // after process exit, with no writer-drain sleep hiding lost final logs.
+    let stderr_log = std::fs::read_to_string(data_dir.join("daemon.log")).unwrap();
+    assert_shutdown_phase_order(&stderr_log);
+    let mut log_paths = Vec::new();
+    for entry in std::fs::read_dir(&data_dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("intentd.")
+            && path.extension().is_some_and(|ext| ext == "log")
+        {
+            log_paths.push(path);
+        }
+    }
+    // The daemon can cross midnight; dated filenames preserve phase order.
+    log_paths.sort();
+    let file_log = log_paths
+        .into_iter()
+        .map(|path| std::fs::read_to_string(path).unwrap())
+        .collect::<String>();
+    assert_shutdown_phase_order(&file_log);
     eprintln!("shutdown complete: terminal and script PTYs reaped; daemon exited successfully");
 }
 
@@ -490,4 +515,70 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         pending_delete_at: None,
         membership: None,
     }
+}
+
+fn assert_shutdown_phase_order(log: &str) {
+    let phases = [
+        "cleanup",
+        "agent_checkpoint",
+        "agent_deliveries",
+        "startup_recovery_join",
+        "tunnel_stop",
+        "wss_stop",
+        "mcp_start_join",
+        "mcp_shutdown",
+        "agent_shutdown",
+        "pty_shutdown",
+        "store_close",
+        "wal_checkpoint",
+        "write_pool_close",
+        "read_pool_close",
+        "runtime_drop",
+    ];
+    let mut previous_start = 0;
+    for phase in phases {
+        let start = format!("phase=\"{phase}\" state=\"started\"");
+        let end = format!("phase=\"{phase}\" state=\"completed\"");
+        let start_at = log
+            .find(&start)
+            .unwrap_or_else(|| panic!("missing {start}: {log}"));
+        let end_at = log
+            .find(&end)
+            .unwrap_or_else(|| panic!("missing {end}: {log}"));
+        assert!(
+            start_at >= previous_start && end_at > start_at,
+            "out of order {phase}: {log}"
+        );
+        assert_eq!(log.matches(&start).count(), 1, "duplicate {start}");
+        assert_eq!(log.matches(&end).count(), 1, "duplicate {end}");
+        assert!(log[end_at..]
+            .lines()
+            .next()
+            .unwrap()
+            .contains("elapsed_ms="));
+        previous_start = start_at;
+    }
+    let completions = [
+        "read_pool_close",
+        "store_close",
+        "cleanup",
+        "serve_lifetime",
+        "runtime_drop",
+    ];
+    let mut previous_end = 0;
+    for phase in completions {
+        let end = format!("phase=\"{phase}\" state=\"completed\"");
+        let at = log
+            .find(&end)
+            .unwrap_or_else(|| panic!("missing {end}: {log}"));
+        assert!(at > previous_end, "out of order {end}: {log}");
+        previous_end = at;
+    }
+    assert!(
+        log.find("phase=\"serve_lifetime\" state=\"completed\"")
+            .unwrap()
+            < log
+                .find("phase=\"runtime_drop\" state=\"started\"")
+                .unwrap()
+    );
 }
