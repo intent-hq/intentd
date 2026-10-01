@@ -420,6 +420,33 @@ impl Store {
         Ok(())
     }
 
+    /// Delete a comment within a note and return its authoritative thread ID.
+    /// The scope check and identity capture share the DELETE statement: a
+    /// concurrent same-ID replacement cannot be deleted outside this note or
+    /// cause a notification naming a thread read before the mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` for an absent or out-of-scope row;
+    /// `Error::Internal` if the database operation fails.
+    pub async fn delete_comment_in_note(
+        &self,
+        workspace_id: &WorkspaceId,
+        note_id: &NoteId,
+        id: &str,
+    ) -> Result<String> {
+        sqlx::query_scalar::<_, String>(
+            "DELETE FROM comment WHERE id = ? AND workspace_id = ? AND note_id = ? RETURNING thread_id",
+        )
+        .bind(id)
+        .bind(workspace_id.as_str())
+        .bind(note_id.as_str())
+        .fetch_optional(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("delete comment failed: {e}")))?
+        .ok_or_else(|| Error::NotFound(format!("comment {id}")))
+    }
+
     /// List a note's comments, ordered by creation time.
     ///
     /// # Errors

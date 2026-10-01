@@ -11989,6 +11989,254 @@ mod change_event_parity {
     }
 
     #[intent_test_macros::daemon_test]
+    async fn comment_delete_publishes_only_after_authorized_scoped_mutation() {
+        use intent_core::{with_caller, Caller, HostRole};
+        let h = harness().await;
+        let tn = note(&h.ws, "n-delete", "hello world");
+        h.store.insert_note(&tn).await.unwrap();
+        let other_note = note(&h.ws, "other-note", "hello world");
+        h.store.insert_note(&other_note).await.unwrap();
+        let added = h
+            .services
+            .comment_add(
+                h.ws.clone(),
+                tn.id.clone(),
+                "hello world".into(),
+                "hello".into(),
+                "root".into(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let reply = h
+            .services
+            .comment_respond(
+                h.ws.clone(),
+                tn.id.clone(),
+                Some(added.comment_id.clone()),
+                None,
+                "reply".into(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let outsider = guest_principal(&h, "outsider").await;
+        let member = seat_collaborator(&h, "member").await;
+        let caller = |id| Caller::Wire {
+            principal_id: id,
+            host_role: HostRole::Guest,
+        };
+        let mut sub = subscribe(&h);
+        let denied = with_caller(
+            caller(outsider),
+            h.services
+                .comment_delete(h.ws.clone(), tn.id.clone(), added.comment_id.clone()),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(intent_core::Error::NotFound(_))),
+            "{denied:?}"
+        );
+        let wrong_note = with_caller(
+            caller(member.clone()),
+            h.services
+                .comment_delete(h.ws.clone(), other_note.id, added.comment_id.clone()),
+        )
+        .await;
+        assert!(
+            wrong_note.is_err(),
+            "a comment in another note must survive"
+        );
+        assert!(h.store.get_comment(&added.comment_id).await.is_ok());
+        // Successful root deletion is the event-stream barrier for the failed
+        // attempts. Retain the original thread ID while the reply survives.
+        with_caller(
+            caller(member.clone()),
+            h.services
+                .comment_delete(h.ws.clone(), tn.id.clone(), added.comment_id.clone()),
+        )
+        .await
+        .unwrap();
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "comment:deleted");
+        assert_eq!(ev["workspaceId"], h.ws.as_str());
+        assert!(ev["id"].is_string());
+        assert!(ev["timestamp"].is_string());
+        assert_eq!(
+            ev["actor"],
+            json!({"type":"user","id":member,"name":"member"})
+        );
+        assert_eq!(
+            ev["data"],
+            json!({"noteId":tn.id,"commentId":added.comment_id,"threadId":added.comment_id})
+        );
+        assert!(h.store.get_comment(&added.comment_id).await.is_err());
+        let threads = h
+            .services
+            .comment_list(h.ws.clone(), tn.id.clone(), None, None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(threads.threads[0].thread_id, added.comment_id);
+        assert_eq!(threads.total_comments, 1);
+        // Repeated deletion fails and publishes nothing; the reply's deletion
+        // is the next observable event (no timeout-as-success assertion).
+        assert!(with_caller(
+            caller(member.clone()),
+            h.services
+                .comment_delete(h.ws.clone(), tn.id.clone(), added.comment_id.clone())
+        )
+        .await
+        .is_err());
+        with_caller(
+            caller(member),
+            h.services
+                .comment_delete(h.ws.clone(), tn.id.clone(), reply.comment.id.clone()),
+        )
+        .await
+        .unwrap();
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(
+            ev["data"],
+            json!({"noteId":tn.id,"commentId":reply.comment.id,"threadId":added.comment_id})
+        );
+        assert!(h
+            .services
+            .comment_list(h.ws.clone(), tn.id, None, None, None, true)
+            .await
+            .unwrap()
+            .threads
+            .is_empty());
+        let persisted = h
+            .store
+            .events_by_type(&h.ws, "comment:deleted", 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            persisted.len(),
+            2,
+            "only successful deletes are durable events"
+        );
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn comment_delete_replacement_on_other_note_survives() {
+        comment_delete_replacement_race(false).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn comment_delete_replacement_on_same_note_emits_current_thread() {
+        comment_delete_replacement_race(true).await;
+    }
+
+    async fn comment_delete_replacement_race(same_note: bool) {
+        let h = harness().await;
+        let original = note(&h.ws, "original", "hello world");
+        let other = note(&h.ws, "other", "hello world");
+        h.store.insert_note(&original).await.unwrap();
+        h.store.insert_note(&other).await.unwrap();
+        let added = h
+            .services
+            .comment_add(
+                h.ws.clone(),
+                original.id.clone(),
+                "hello world".into(),
+                "hello".into(),
+                "root".into(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let reply = h
+            .services
+            .comment_respond(
+                h.ws.clone(),
+                original.id.clone(),
+                Some(added.comment_id.clone()),
+                None,
+                "reply".into(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let comment_id = reply.comment.id;
+        let mut subscription = subscribe(&h);
+        // As in the credential-revoke regression, hold the sole writer and
+        // drive deletion past its read-pool lookup while writes remain gated.
+        let mut held = h.store.write_pool().acquire().await.unwrap();
+        let mut deletion =
+            h.services
+                .comment_delete(h.ws.clone(), original.id.clone(), comment_id.clone());
+        let completed = super::poll_until(&mut deletion, 20, || async {
+            assert!(h.store.get_comment(&comment_id).await.is_ok());
+            false
+        })
+        .await;
+        assert!(!completed);
+        let replacement_note = if same_note { &original.id } else { &other.id };
+        // SQLite REPLACE deletes/reinserts the same client-supplied UUID,
+        // modeling another successful deletion followed by recreation while
+        // this request is parked. The original was a reply in thread R;
+        // the replacement is a root C with id == thread_id and no parent,
+        // as comment.add(commentId=C) creates after C has been deleted.
+        sqlx::query(
+            "INSERT OR REPLACE INTO comment
+            (id, thread_id, note_id, kind, content, author, author_type, status,
+             parent_id, anchor_json, anchor_text, extra_json, created_at, updated_at, workspace_id)
+            SELECT id, id, ?, kind, content, author, author_type, status,
+             NULL, anchor_json, anchor_text, extra_json, created_at, updated_at, workspace_id
+            FROM comment WHERE id = ?",
+        )
+        .bind(replacement_note.as_str())
+        .bind(&comment_id)
+        .execute(&mut *held)
+        .await
+        .unwrap();
+        drop(held);
+        let result = deletion.await;
+        if same_note {
+            assert!(result.is_ok(), "{result:?}");
+            let event = recv_one(&mut subscription).await;
+            assert_eq!(event["type"], "comment:deleted");
+            assert_eq!(
+                event["data"],
+                json!({"noteId":original.id,"commentId":comment_id,"threadId":comment_id})
+            );
+            assert!(h.store.get_comment(&comment_id).await.is_err());
+        } else {
+            assert!(
+                result.is_err(),
+                "replacement on a different note must survive"
+            );
+            let remaining = h.store.get_comment(&comment_id).await.unwrap();
+            assert_eq!(remaining.note_id, Some(other.id));
+            assert_eq!(remaining.thread_id, comment_id);
+            assert!(remaining.parent_id.is_none());
+            assert!(h
+                .store
+                .events_by_type(&h.ws, "comment:deleted", 10)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
     async fn comment_resolved_payload() {
         let h = harness().await;
         let tn = note(&h.ws, "n-1", "hello world");
@@ -35319,6 +35567,203 @@ mod setup_lifecycle_events {
 mod file_ops_service {
     use super::*;
 
+    #[intent_test_macros::daemon_test]
+    async fn file_read_registered_root_preserves_content_and_confinement() {
+        use base64::Engine as _;
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.unwrap();
+        let dir = test_tempdir("intentd-file-read-roots-");
+        let primary = dir.path().join("primary");
+        let external = dir.path().join("external");
+        let sandbox = dir.path().join("sandbox");
+        for path in [&primary, &external, &sandbox] {
+            std::fs::create_dir_all(path).unwrap();
+            git2::Repository::init(path).unwrap();
+        }
+        let ws = WorkspaceId::new();
+        let mut w = workspace(&ws);
+        w.worktree_path = Some(primary.to_string_lossy().into_owned());
+        store.insert_workspace(&w).await.unwrap();
+        let caller = AgentId::new();
+        let mut session = super::turn_end_unread_gate::session(&caller, &ws);
+        session.sandbox_path = Some(sandbox.to_string_lossy().into_owned());
+        store.insert_agent_session(&session).await.unwrap();
+        let svc = Services::new(store);
+        let root = svc
+            .git_root_register(
+                ws.clone(),
+                external.to_string_lossy().into_owned(),
+                caller.clone(),
+            )
+            .await
+            .unwrap();
+        let root_id = intent_core::WorkspaceGitRootId::from(root["id"].as_str().unwrap());
+        std::fs::write(primary.join("new.txt"), "primary").unwrap();
+        std::fs::write(sandbox.join("new.txt"), "sandbox").unwrap();
+        std::fs::write(external.join("new.txt"), "external λ\n").unwrap();
+        for (agent, root, expected) in [
+            (None, None, "primary"),
+            (Some(caller.clone()), None, "sandbox"),
+            (None, Some(root_id.clone()), "external λ\n"),
+            (Some(caller), Some(root_id.clone()), "external λ\n"),
+        ] {
+            assert_eq!(
+                svc.file_read(ws.clone(), "new.txt".into(), agent.clone(), root.clone())
+                    .await
+                    .unwrap(),
+                serde_json::json!(expected)
+            );
+            let chunk = svc
+                .file_read_chunk(ws.clone(), "new.txt".into(), 0, 100, agent, root)
+                .await
+                .unwrap();
+            assert_eq!(
+                chunk["content"],
+                base64::engine::general_purpose::STANDARD.encode(expected)
+            );
+            assert_eq!(chunk["bytesRead"], expected.len());
+        }
+        // Existing full-text behavior has no chunk-size cap and no truncation.
+        let large = "x".repeat(crate::file_ops::READ_CHUNK_MAX_BYTES + 1);
+        std::fs::write(external.join("large.txt"), &large).unwrap();
+        assert_eq!(
+            svc.file_read(ws.clone(), "large.txt".into(), None, Some(root_id.clone()))
+                .await
+                .unwrap(),
+            serde_json::json!(large)
+        );
+        std::fs::write(external.join("empty.txt"), "").unwrap();
+        assert_eq!(
+            svc.file_read(ws.clone(), "empty.txt".into(), None, Some(root_id.clone()))
+                .await
+                .unwrap(),
+            serde_json::json!("")
+        );
+        std::fs::write(external.join("binary.bin"), [0xff, 0xfe]).unwrap();
+        for (offset, length, expected) in [
+            (0, 1, vec![0xff]),
+            (1, 16, vec![0xfe]),
+            (2, 16, vec![]),
+            (20, 16, vec![]),
+        ] {
+            let chunk = svc
+                .file_read_chunk(
+                    ws.clone(),
+                    "binary.bin".into(),
+                    offset,
+                    length,
+                    None,
+                    Some(root_id.clone()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                chunk,
+                serde_json::json!({"content": base64::engine::general_purpose::STANDARD.encode(&expected), "bytesRead": expected.len(), "size": 2})
+            );
+        }
+        for length in [0, crate::file_ops::READ_CHUNK_MAX_BYTES as u64 + 1] {
+            assert!(matches!(
+                svc.file_read_chunk(
+                    ws.clone(),
+                    "binary.bin".into(),
+                    0,
+                    length,
+                    None,
+                    Some(root_id.clone())
+                )
+                .await,
+                Err(Error::InvalidParams(_))
+            ));
+        }
+        for path in ["missing.txt", "../primary/new.txt"] {
+            assert!(matches!(
+                svc.file_read_chunk(ws.clone(), path.into(), 0, 16, None, Some(root_id.clone()))
+                    .await,
+                Err(Error::Internal(_))
+            ));
+        }
+        assert!(matches!(
+            svc.file_read_chunk(ws.clone(), ".".into(), 0, 16, None, Some(root_id.clone()))
+                .await,
+            Err(Error::InvalidParams(_))
+        ));
+        for path in ["binary.bin", "missing.txt", ".", "../primary/new.txt"] {
+            assert!(
+                matches!(
+                    svc.file_read(ws.clone(), path.into(), None, Some(root_id.clone()))
+                        .await,
+                    Err(Error::Internal(_))
+                ),
+                "{path}"
+            );
+        }
+        let outside = primary.join("new.txt").to_string_lossy().into_owned();
+        assert!(matches!(
+            svc.file_read_chunk(
+                ws.clone(),
+                outside.clone(),
+                0,
+                16,
+                None,
+                Some(root_id.clone())
+            )
+            .await,
+            Err(Error::Internal(_))
+        ));
+        assert!(matches!(
+            svc.file_read(ws.clone(), outside, None, Some(root_id.clone()))
+                .await,
+            Err(Error::Internal(_))
+        ));
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(primary.join("new.txt"), external.join("escape.txt"))
+                .unwrap();
+            std::os::unix::fs::symlink(external.join("new.txt"), external.join("alias.txt"))
+                .unwrap();
+            assert!(matches!(
+                svc.file_read(ws.clone(), "escape.txt".into(), None, Some(root_id.clone()))
+                    .await,
+                Err(Error::Internal(_))
+            ));
+            assert!(matches!(
+                svc.file_read_chunk(
+                    ws.clone(),
+                    "escape.txt".into(),
+                    0,
+                    16,
+                    None,
+                    Some(root_id.clone())
+                )
+                .await,
+                Err(Error::Internal(_))
+            ));
+            let chunk = svc
+                .file_read_chunk(
+                    ws.clone(),
+                    "alias.txt".into(),
+                    0,
+                    100,
+                    None,
+                    Some(root_id.clone()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                chunk["content"],
+                base64::engine::general_purpose::STANDARD.encode("external λ\n")
+            );
+            assert_eq!(
+                svc.file_read(ws, "alias.txt".into(), None, Some(root_id))
+                    .await
+                    .unwrap(),
+                serde_json::json!("external λ\n")
+            );
+        }
+    }
+
     /// `file.*` wired through `WorkspaceApi`: the workspace root resolves from
     /// `worktreePath`, writes/reads round-trip, and an out-of-workspace path
     /// surfaces as `Error::Internal` (→ `-32603`).
@@ -35350,7 +35795,7 @@ mod file_ops_service {
         );
 
         let read = svc
-            .file_read(ws.clone(), "notes/x.txt".to_string(), None)
+            .file_read(ws.clone(), "notes/x.txt".to_string(), None, None)
             .await
             .expect("read");
         assert_eq!(read, serde_json::Value::String("hi".to_string()));
@@ -35365,7 +35810,7 @@ mod file_ops_service {
         );
 
         let denied = svc
-            .file_read(ws.clone(), "../escape".to_string(), None)
+            .file_read(ws.clone(), "../escape".to_string(), None, None)
             .await;
         assert!(matches!(denied, Err(Error::Internal(_))));
     }

@@ -832,10 +832,10 @@ fn channel_event_types_full_matrix() {
         assert!(ws.iter().any(|s| s == t), "workspace missing {t}");
     }
     assert_eq!(ws.len(), 11);
-    // Comment channel — single type.
+    // Comment channel — creation and deletion refresh the affected thread.
     assert_eq!(
         channel_event_types(Channel::Comment),
-        vec!["comment:added".to_string()]
+        vec!["comment:added".to_string(), "comment:deleted".to_string()]
     );
 }
 

@@ -700,7 +700,13 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "10.11";
+// Version 11.0 changes omitted-purpose creation: new commands default to
+// oneOff; services remain saved. Omitted-purpose upserts preserve stored
+// purpose. Autostart commands must explicitly request saved. There is no
+// per-client negotiation of this default; scriptLifecycle remains version 1.
+// Version 11.1 adds optional gitRootId to file.read and file.readChunk:
+// registered workspace-owned roots share existing filesystem confinement.
+pub const PROTOCOL_VERSION: &str = "11.1";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text
