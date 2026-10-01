@@ -7806,6 +7806,85 @@ impl AgentManager {
         }))
     }
 
+    /// Send exactly the caller's ready snapshot as one interrupt-priority turn.
+    pub(crate) async fn send_queued_messages_now(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        workspace_id: WorkspaceId,
+        message_ids: Vec<String>,
+    ) -> Result<Value> {
+        self.services
+            .discard_revoked_instructions(&agent_id)
+            .await?;
+        let session = self.services.require_agent_session(&agent_id).await?;
+        let workspace_id = Self::session_workspace(&agent_id, &workspace_id, &session);
+        let _mutation = self.services.workspace_mutations.enter(&workspace_id)?;
+        let gate = self.services.queue_entry_gate(&agent_id, false).await?;
+        self.services.park_queue_mutation_gate(gate.as_ref()).await;
+        let quarantined = self.services.session_poisoned(&session);
+        let (mut entries, draining) = self.services.take_queued_messages_draining_gated(
+            &agent_id,
+            &message_ids,
+            gate.as_ref(),
+            !quarantined,
+        )?;
+        let ids: Vec<_> = entries.iter().map(|m| m.id.clone()).collect();
+        if quarantined {
+            return Ok(json!({"success":true,"queued":true,"quarantined":true,"messageIds":ids}));
+        }
+        let draining = draining.expect("a non-quarantined selection owns its draining guard");
+        let mut interrupt = TurnOptions {
+            origin: intent_core::MessageOrigin::User,
+            interrupt_priority: true,
+            ..TurnOptions::default()
+        };
+        self.preempt_busy_turn(&agent_id, &mut interrupt).await;
+        // Keep the preempted zero-output payload on an entry, so both a lost
+        // slot and a partial persist failure retain it for the retry batch.
+        let last = entries.last_mut().expect("selection is nonempty");
+        merge_prepend_payload(
+            &mut last.prepend_content,
+            &mut last.prepend_image_blocks,
+            &mut last.prepend_file_blocks,
+            crate::agent_ops::QueuedPrepend {
+                content: interrupt.prepend_content,
+                image_blocks: interrupt.prepend_image_blocks,
+                file_blocks: interrupt.prepend_file_blocks,
+            },
+        );
+        let Some(admission) = self.try_begin_turn(&agent_id, &workspace_id).await else {
+            self.services.requeue_front_batch(&agent_id, entries);
+            drop(draining);
+            self.services.publish_queue_updated(&agent_id).await;
+            self.redrive_parked_recovery_send(&agent_id, &workspace_id)
+                .await;
+            return Ok(json!({"success":true,"queued":true,"messageIds":ids}));
+        };
+        self.services
+            .commit_recovery_send_delivery(&agent_id, &entries);
+        match self
+            .prepare_admitted_flush_turn(&agent_id, &workspace_id, entries, draining, admission)
+            .await
+        {
+            FlushPrep::Turn {
+                content,
+                mut options,
+            } => {
+                // The action is human initiated, but each entry keeps its own
+                // captured provenance, including automatic messages.
+                options.origin = intent_core::MessageOrigin::User;
+                options.interrupt_priority = true;
+                let turn_id = options.turn_id.clone();
+                self.spawn_worker(agent_id, workspace_id, content, *options, true, admission);
+                Ok(json!({"success":true,"queued":false,"messageIds":ids,"turnId":turn_id}))
+            }
+            FlushPrep::Parked => {
+                self.finish_admission(&agent_id, admission, false).await;
+                Ok(json!({"success":true,"queued":true,"messageIds":ids}))
+            }
+        }
+    }
+
     /// `agent.editAndRegenerate` runtime path (§5.5): edit a past user message
     /// and regenerate from that point. Orchestrates, in order:
     ///
@@ -12330,7 +12409,10 @@ async fn prepare_flush_turn(
         let failed = entries.remove(i);
         let tail = entries.split_off(i);
         let head = entries;
-        let options = turn_options_for_entry(&failed, stale);
+        let options = TurnOptions {
+            flushed_entries: Some(vec![failed.clone()]),
+            ..turn_options_for_entry(&failed, stale)
+        };
         mgr.services.requeue_front_batch(agent_id, tail);
         let vanished =
             handle_drain_persist_failure(mgr, agent_id, workspace_id, &failed.content, &options)
@@ -13255,6 +13337,10 @@ async fn publish_error_status_and_requeue(
     // the retry correlates with the turn it redrives; a missing option (bare
     // test wiring — spawn_worker always mints one) falls back to the new id.
     //
+    // A failed pre-turn batch append also supplies its original failed
+    // entry through `flushed_entries`: retain its id and provenance so a
+    // send-all caller can retry the same snapshot without a phantom new row.
+    //
     // Context-size failure on an oversized entry (intent-hq/intent#4703): a
     // 413 against a payload above `CONTEXT_SIZE_REQUEUE_THRESHOLD_CHARS`
     // means the MESSAGE itself cannot fit, so re-queueing it verbatim would
@@ -13291,11 +13377,17 @@ async fn publish_error_status_and_requeue(
     if let Some(entries) = options
         .flushed_entries
         .as_ref()
-        .filter(|entries| context_size_failure && !entries.is_empty())
+        .filter(|entries| (context_size_failure || !persisted) && !entries.is_empty())
     {
         let restored: Vec<crate::agent_ops::QueuedMessage> = entries
             .iter()
             .map(|entry| {
+                if !context_size_failure {
+                    return crate::agent_ops::QueuedMessage {
+                        requeued_after_failure: true,
+                        ..entry.clone()
+                    };
+                }
                 let (content, persisted, prepend_content) = requeue_payload_after_context_failure(
                     agent_id,
                     &entry.content,

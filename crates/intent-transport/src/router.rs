@@ -1917,6 +1917,18 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(result)
         }
+        "agent.sendQueuedMessagesNow" => {
+            let agent_id = require_agent_id(params)?;
+            let ws = require_ws_note(params)?;
+            let ids = params
+                .get("messageIds")
+                .ok_or_else(|| invalid_params("messageIds is required"))?;
+            let message_ids: Vec<String> =
+                serde_json::from_value(ids.clone()).map_err(|e| invalid_params(e.to_string()))?;
+            api.agent_send_queued_messages_now(ws, agent_id, message_ids)
+                .await
+                .map_err(domain_to_rpc)
+        }
         "agent.sendQueuedMessageNow" => {
             let agent_id = require_agent_id(params)?;
             let message_id = require_str_param(params, "messageId")?;

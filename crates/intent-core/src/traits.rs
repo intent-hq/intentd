@@ -1958,6 +1958,22 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `agent.sendQueuedMessagesNow`: atomically select a nonempty set of
+    /// visible, ready entries and deliver them in queue order as one turn.
+    fn agent_send_queued_messages_now(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        message_ids: Vec<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, message_ids);
+        Box::pin(async {
+            Err(Error::Unsupported(
+                "explicit queue batching requires an agent manager".into(),
+            ))
+        })
+    }
+
     /// `agent.dismissQuestions`: persist the question-dismissal marker
     /// (`message_id` — the assistant message whose trailing question resource
     /// blocks the user dismissed) on the agent session, emit `agent:updated`,

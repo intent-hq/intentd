@@ -29839,6 +29839,24 @@ impl WorkspaceApi for Services {
         }))
     }
 
+    fn agent_send_queued_messages_now(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        message_ids: Vec<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        self.execution_call(self.instruction_admission(async move {
+            self.require_agent_member_in(&agent_id, &workspace_id)
+                .await?;
+            let manager = self.agent_manager().ok_or_else(|| {
+                Error::Unsupported("explicit queue batching requires an agent manager".into())
+            })?;
+            manager
+                .send_queued_messages_now(agent_id, workspace_id, message_ids)
+                .await
+        }))
+    }
+
     fn agent_dismiss_questions(
         &self,
         workspace_id: WorkspaceId,

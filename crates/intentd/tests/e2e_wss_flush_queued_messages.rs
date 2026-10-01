@@ -1896,3 +1896,273 @@ async fn diagnostics_queue_projection(teardown: impl FnOnce(Daemon), release_kic
     }
     teardown(daemon);
 }
+
+#[tokio::test]
+async fn explicit_batch_validates_snapshot_and_sends_once_over_wss() {
+    explicit_batch_over_wss(false).await;
+}
+
+#[tokio::test]
+async fn explicit_batch_restores_partial_persistence_without_duplicate_rows_over_wss() {
+    explicit_batch_over_wss(true).await;
+}
+
+async fn explicit_batch_over_wss(fail_second_append: bool) {
+    let Some(script) = gate("WSS explicit queue batch") else {
+        return;
+    };
+    let scratch = temp_data_dir();
+    let data_dir = scratch.path();
+    let (workspace_id, guest) = seed_workspace_with_guest(data_dir).await;
+    let release = data_dir.join("release-kickoff");
+    let Booted {
+        daemon: _daemon,
+        port,
+        cfg,
+        prompt_log,
+    } = boot_daemon(data_dir, &script, 0, Some(&release), &[]).await;
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let mut guest_rpc = connect_ws_as(port, cfg.clone(), GUEST_TOKEN).await;
+    let mut sub = connect_ws(port, cfg).await;
+    wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({"workspaceId":workspace_id,"eventTypes":["agent:*"]}),
+    )
+    .await;
+    let created = wss_rpc(&mut rpc, 2, "agent.create", json!({"workspaceId":workspace_id,"name":"explicit-batch","model":"default","provider":"mock"})).await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
+    wss_rpc(
+        &mut rpc,
+        3,
+        "agent.sendMessage",
+        json!({"workspaceId":workspace_id,"agentId":agent_id,"content":KICKOFF_MSG}),
+    )
+    .await;
+    await_prompts(&prompt_log, 1).await;
+    let first = wss_rpc(
+        &mut rpc,
+        4,
+        "agent.queueMessage",
+        json!({"workspaceId":workspace_id,"agentId":agent_id,"content":QUEUED_ONE}),
+    )
+    .await;
+    let second = wss_rpc(
+        &mut guest_rpc,
+        5,
+        "agent.queueMessage",
+        json!({"workspaceId":workspace_id,"agentId":agent_id,"content":QUEUED_TWO}),
+    )
+    .await;
+    let first_id = first["queuedMessage"]["id"].as_str().unwrap().to_string();
+    let second_id = second["queuedMessage"]["id"].as_str().unwrap().to_string();
+    let selected = vec![first_id.clone(), second_id.clone()];
+    for ids in [
+        json!([]),
+        json!([first_id, first_id]),
+        json!([first_id, "missing"]),
+        json!([first_id, 3]),
+    ] {
+        let response = wss_rpc_envelope(
+            &mut rpc,
+            6,
+            "agent.sendQueuedMessagesNow",
+            json!({"workspaceId":workspace_id,"agentId":agent_id,"messageIds":ids}),
+        )
+        .await;
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], 6);
+        assert_eq!(response["error"]["code"], -32602, "{response}");
+    }
+    let forbidden = wss_rpc_envelope(
+        &mut guest_rpc,
+        7,
+        "agent.sendQueuedMessagesNow",
+        json!({"workspaceId":workspace_id,"agentId":agent_id,"messageIds":selected}),
+    )
+    .await;
+    assert_eq!(
+        forbidden["error"]["code"], -32602,
+        "foreign entry rejects the whole batch: {forbidden}"
+    );
+    wss_rpc(
+        &mut rpc,
+        8,
+        "agent.editQueuedMessage",
+        json!({"agentId":agent_id,"messageId":first_id,"content":QUEUED_ONE,"editing":true}),
+    )
+    .await;
+    let held = wss_rpc_envelope(
+        &mut rpc,
+        9,
+        "agent.sendQueuedMessagesNow",
+        json!({"workspaceId":workspace_id,"agentId":agent_id,"messageIds":selected}),
+    )
+    .await;
+    assert_eq!(held["error"]["code"], -32602, "{held}");
+    wss_rpc(
+        &mut rpc,
+        10,
+        "agent.editQueuedMessage",
+        json!({"agentId":agent_id,"messageId":first_id,"content":QUEUED_ONE,"editing":false}),
+    )
+    .await;
+    let later = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.queueMessage",
+        json!({"agentId":agent_id,"content":"later held entry"}),
+    )
+    .await;
+    let later_id = later["queuedMessage"]["id"].as_str().unwrap().to_string();
+    wss_rpc(&mut rpc, 12, "agent.editQueuedMessage", json!({"agentId":agent_id,"messageId":later_id,"content":"later held entry","editing":true})).await;
+    let queue = wss_rpc(&mut rpc, 13, "agent.getQueue", json!({"agentId":agent_id})).await;
+    assert_eq!(
+        queue_ids(&queue["queue"]),
+        vec![first_id.clone(), second_id.clone(), later_id.clone()]
+    );
+    assert_eq!(
+        std::fs::read_to_string(&prompt_log)
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "rejections never preempt"
+    );
+    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
+        .await
+        .unwrap();
+    if !fail_second_append {
+        sqlx::query("UPDATE agent_session SET status='error', stop_reason='The model provider blocked this response for safety reasons' WHERE id=?")
+            .bind(&agent_id).execute(store.write_pool()).await.unwrap();
+        let quarantined = wss_rpc(
+            &mut rpc,
+            131,
+            "agent.sendQueuedMessagesNow",
+            json!({"workspaceId":workspace_id,"agentId":agent_id,"messageIds":selected}),
+        )
+        .await;
+        assert_eq!(
+            quarantined,
+            json!({"success":true,"queued":true,"quarantined":true,"messageIds":selected})
+        );
+        let preserved = wss_rpc(&mut rpc, 132, "agent.getQueue", json!({"agentId":agent_id})).await;
+        assert_eq!(preserved, queue, "quarantine leaves every entry untouched");
+        sqlx::query("UPDATE agent_session SET status='active', stop_reason=NULL WHERE id=?")
+            .bind(&agent_id)
+            .execute(store.write_pool())
+            .await
+            .unwrap();
+    }
+    if fail_second_append {
+        sqlx::query("CREATE TRIGGER fail_explicit_batch BEFORE INSERT ON agent_message WHEN NEW.role='user' AND (SELECT COUNT(*) FROM agent_message WHERE role='user') >= 2 BEGIN SELECT RAISE(ABORT, 'injected second batch append failure'); END")
+            .execute(store.write_pool()).await.unwrap();
+    }
+    let response = wss_rpc_envelope(
+        &mut rpc,
+        14,
+        "agent.sendQueuedMessagesNow",
+        json!({"workspaceId":workspace_id,"agentId":agent_id,"messageIds":[second_id,first_id]}),
+    )
+    .await;
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 14);
+    assert_eq!(response["result"]["success"], true, "{response}");
+    assert_eq!(
+        response["result"]["messageIds"],
+        json!(selected),
+        "queue order wins over request order"
+    );
+    assert_eq!(
+        response["result"]["queued"], fail_second_append,
+        "{response}"
+    );
+    if fail_second_append {
+        let restored = wss_rpc(&mut rpc, 15, "agent.getQueue", json!({"agentId":agent_id})).await;
+        assert_eq!(
+            queue_ids(&restored["queue"]),
+            vec![first_id.clone(), second_id.clone(), later_id.clone()],
+            "{restored}"
+        );
+        sqlx::query("DROP TRIGGER fail_explicit_batch")
+            .execute(store.write_pool())
+            .await
+            .unwrap();
+        let retry = wss_rpc(
+            &mut rpc,
+            16,
+            "agent.sendQueuedMessagesNow",
+            json!({"workspaceId":workspace_id,"agentId":agent_id,"messageIds":selected}),
+        )
+        .await;
+        assert_eq!(retry["queued"], false, "{retry}");
+    } else {
+        assert!(response["result"]["turnId"].is_string(), "{response}");
+        let mut echoes = Vec::new();
+        let mut processing = Vec::new();
+        loop {
+            let frame = wss_event(&mut sub, 30).await;
+            let event = &frame["params"]["event"];
+            if event["data"]["agentId"] != agent_id {
+                continue;
+            }
+            match event["type"].as_str() {
+                Some("agent:queue:processing") => processing.push(event["data"]["turnId"].clone()),
+                Some("agent:message") if event["data"]["role"] == "user" => {
+                    if selected
+                        .iter()
+                        .any(|id| event["data"]["queuedMessageId"] == *id)
+                    {
+                        echoes.push(event["data"]["turnId"].clone());
+                    }
+                }
+                Some("agent:queue:updated")
+                    if queue_ids(&event["data"]["queue"]) == vec![later_id.clone()] =>
+                {
+                    break
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(processing, vec![response["result"]["turnId"].clone()]);
+        assert_eq!(
+            echoes,
+            vec![response["result"]["turnId"].clone(); 2],
+            "row echoes precede the single shrink"
+        );
+    }
+    let prompts = await_prompts(&prompt_log, 2).await;
+    assert_eq!(prompts.len(), 2, "one explicit batch prompt: {prompts:?}");
+    assert!(prompts[1].find(QUEUED_ONE).unwrap() < prompts[1].find(QUEUED_TWO).unwrap());
+    assert!(prompts[1].contains(FLUSH_HEADER));
+    let remaining = wss_rpc(&mut rpc, 17, "agent.getQueue", json!({"agentId":agent_id})).await;
+    assert_eq!(queue_ids(&remaining["queue"]), vec![later_id]);
+    let conv = wss_rpc(
+        &mut rpc,
+        18,
+        "agent.getConversation",
+        json!({"agentId":agent_id}),
+    )
+    .await;
+    let texts = user_row_texts(&conv);
+    assert_eq!(texts.iter().filter(|s| s.contains(QUEUED_ONE)).count(), 1);
+    assert_eq!(texts.iter().filter(|s| s.contains(QUEUED_TWO)).count(), 1);
+    assert_eq!(
+        user_row(&conv, GUEST_PREAMBLE)["author"]["principalId"],
+        guest.id.0
+    );
+    let stale = wss_rpc_envelope(
+        &mut rpc,
+        19,
+        "agent.sendQueuedMessagesNow",
+        json!({"workspaceId":workspace_id,"agentId":agent_id,"messageIds":selected}),
+    )
+    .await;
+    assert_eq!(stale["error"]["code"], -32602);
+    std::fs::write(&release, "release").unwrap();
+    eprintln!(
+        "EXPLICIT_BATCH_EVIDENCE {}",
+        json!({"partialPersistence":fail_second_append,"response":response,"prompts":prompts,"remainingQueue":remaining,"conversation":conv})
+    );
+}

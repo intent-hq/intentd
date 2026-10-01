@@ -15269,6 +15269,68 @@ impl Services {
         }
     }
 
+    /// Validate the complete explicit selection before changing anything. The
+    /// queue and draining locks make concurrent selections and drains exclusive.
+    /// A quarantined session validates with `take = false` and stays untouched.
+    pub(crate) fn take_queued_messages_draining_gated(
+        &self,
+        agent_id: &AgentId,
+        message_ids: &[String],
+        gate: Option<&QueueEntryGate>,
+        take: bool,
+    ) -> Result<(Vec<QueuedMessage>, Option<DrainingGuard>)> {
+        let selected: HashSet<&str> = message_ids.iter().map(String::as_str).collect();
+        if selected.is_empty()
+            || selected.len() != message_ids.len()
+            || selected.iter().any(|id| id.trim().is_empty())
+        {
+            return Err(Error::InvalidParams(
+                "messageIds must contain distinct nonempty IDs".into(),
+            ));
+        }
+        let mut draining = self
+            .draining_queue_entries
+            .lock()
+            .expect("draining queue registry poisoned");
+        if self
+            .draining_shutdown
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(Error::Internal("daemon is shutting down".into()));
+        }
+        let mut queues = self
+            .agent_queues
+            .lock()
+            .expect("agent queue registry poisoned");
+        let queue = queues
+            .get_mut(agent_id)
+            .ok_or_else(|| Error::InvalidParams("queued message not found".into()))?;
+        let entries: Vec<_> = queue
+            .iter()
+            .filter(|m| selected.contains(m.id.as_str()))
+            .cloned()
+            .collect();
+        if entries.len() != selected.len() {
+            return Err(Error::InvalidParams("queued message not found".into()));
+        }
+        for entry in &entries {
+            if let Some(gate) = gate {
+                gate.check(entry)?;
+            }
+            if !entry.ready_to_send() {
+                return Err(Error::InvalidParams(
+                    "queued message is not ready to send".into(),
+                ));
+            }
+        }
+        if !take {
+            return Ok((entries, None));
+        }
+        queue.retain(|m| !selected.contains(m.id.as_str()));
+        let guard = self.register_draining(&mut draining, agent_id, &entries);
+        Ok((entries, Some(guard)))
+    }
+
     /// Record already-popped `entries` as draining for `agent_id` (a batch a
     /// caller assembled outside the pop helpers above).
     #[cfg(test)]

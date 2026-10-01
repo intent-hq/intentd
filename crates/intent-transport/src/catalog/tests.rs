@@ -182,14 +182,15 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// GitLab snippet proof by `provider`); the `github.identityProof.*` pair
 /// stays as byte-identical aliases.
 /// Direct user retirement (protocol 10.10): +1 router method (`agent.retire`).
+/// Explicit queued batch sending (protocol 10.12): +1 router method.
 /// Reversible script history (protocol 10.11): +2 router methods
 /// (`script.archive`, `script.restore`).
-const EXPECTED_TOTAL_METHODS: usize = 410;
+const EXPECTED_TOTAL_METHODS: usize = 411;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 350;
+const EXPECTED_ROUTER_METHODS: usize = 351;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 58;
@@ -464,6 +465,10 @@ const USER_ORIGIN_MESSAGE_ENTRY_POINTS: &[(&str, &str)] = &[
     (
         "agent.sendQueuedMessageNow",
         "drains the entry with the stamp captured at enqueue (the drainer is not the author)",
+    ),
+    (
+        "agent.sendQueuedMessagesNow",
+        "drains the selected entries with their captured stamps; the drainer is not the author (WSS explicit batch coverage)",
     ),
     (
         "agent.sendToTask",
@@ -996,10 +1001,10 @@ fn user_origin_message_entry_points_frozen() {
     }
     assert_eq!(
         USER_ORIGIN_MESSAGE_ENTRY_POINTS.len(),
-        11,
-        "the Product Brief's ten user-origin entry points plus `workspace.create`'s \
-         initialAgent kickoff; a change here needs the service matrix and \
-         docs/protocol/ updated alongside"
+        12,
+        "the user-origin entry points including explicit queue batching and \
+         workspace.create's initialAgent kickoff; a change here needs \
+         attribution coverage and docs/protocol/ updated alongside"
     );
 
     // Exhaustive partition of the FULL catalog (router + fast path): a new
