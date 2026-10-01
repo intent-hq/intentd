@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::bus::EventBus;
-use super::linked_watch::LinkedWatches;
+use super::linked_watch::{uncovered_directories, ScopedLinkedWatches};
 use super::root_watch::{watch_root, RootWatch};
 use super::shared_watch::{watch_tiers, SharedWatchHub, TierWatch};
 
@@ -198,23 +198,25 @@ fn start_project_watch(
 
 /// Linked targets are scoped to workspace lifetime, like the ordinary tiers.
 struct LinkedSkillWatches {
-    hub: Arc<SharedWatchHub>,
-    tx: mpsc::UnboundedSender<SkillsMsg>,
-    workspaces: HashMap<WorkspaceId, LinkedWatches>,
+    watches: ScopedLinkedWatches,
 }
 
 impl LinkedSkillWatches {
+    async fn refresh_user(&mut self) {
+        let directories = crate::skills::linked_skill_watch_directories("").await;
+        self.watches.sync_user(directories);
+    }
+
     async fn refresh(&mut self, id: &WorkspaceId, path: &Path) {
         let directories =
             crate::skills::linked_skill_watch_directories(&path.to_string_lossy()).await;
-        let watches = self.workspaces.entry(id.clone()).or_insert_with(|| {
-            let tx = self.tx.clone();
-            let id = id.clone();
-            LinkedWatches::new(Arc::clone(&self.hub), move || {
-                let _ = tx.send(SkillsMsg::Change(Some(id.clone())));
-            })
-        });
-        watches.sync(directories);
+        let root = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let covered: Vec<_> = PROJECT_SKILL_TIERS
+            .iter()
+            .map(|tier| root.join(tier))
+            .collect();
+        self.watches
+            .sync_project(id.clone(), uncovered_directories(directories, &covered));
     }
 }
 
@@ -319,16 +321,18 @@ async fn debounce_loop(
     // archive/resume. A reader must not swallow the next change notification.
     let mut suspend_baselines: HashMap<WorkspaceId, u64> = HashMap::new();
     let mut linked = LinkedSkillWatches {
-        hub,
-        tx,
-        workspaces: HashMap::new(),
+        watches: ScopedLinkedWatches::new(hub, move |scope| {
+            let _ = tx.send(SkillsMsg::Change(scope));
+        }),
     };
+    linked.refresh_user().await;
+    let mut user_deadline: Option<tokio::time::Instant> = None;
     for (id, path) in &workspace_paths {
         linked.refresh(id, path).await;
     }
 
     loop {
-        let next_deadline = pending.values().copied().min();
+        let next_deadline = pending.values().copied().chain(user_deadline).min();
 
         tokio::select! {
             maybe = raw_rx.recv() => match maybe {
@@ -337,6 +341,8 @@ async fn debounce_loop(
                     match workspace_id {
                         // User-tier change: affects all workspaces
                         None => {
+                            crate::skills::invalidate_skills_cache(Path::new(""));
+                            user_deadline.get_or_insert(deadline);
                             for (ws_id, path) in &workspace_paths {
                                 crate::skills::invalidate_skills_cache(path);
                                 pending.entry(ws_id.clone()).or_insert(deadline);
@@ -357,13 +363,13 @@ async fn debounce_loop(
                     workspace_paths.insert(ws_id, path);
                 }
                 Some(SkillsMsg::Remove(ws_id)) => {
-                    linked.workspaces.remove(&ws_id);
+                    linked.watches.remove(&ws_id);
                     workspace_paths.remove(&ws_id);
                     suspend_baselines.remove(&ws_id);
                     pending.remove(&ws_id);
                 }
                 Some(SkillsMsg::Pause(ws_id)) => {
-                    linked.workspaces.remove(&ws_id);
+                    linked.watches.remove(&ws_id);
                     if let Some(path) = workspace_paths.get(&ws_id) {
                         suspend_baselines.insert(ws_id.clone(), skills_fingerprint(path).await);
                     }
@@ -388,6 +394,10 @@ async fn debounce_loop(
                 }
             },
             () = sleep_until(next_deadline), if next_deadline.is_some() => {
+                if user_deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
+                    user_deadline = None;
+                    linked.refresh_user().await;
+                }
                 flush_due(&bus, &workspace_paths, &mut suspend_baselines, &mut pending, &mut linked).await;
             }
         }

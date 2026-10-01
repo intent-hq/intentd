@@ -96,6 +96,7 @@ struct CachePayload {
     catalog: String,
     fingerprints: Vec<PathFingerprint>,
     watch_directories: Vec<PathBuf>,
+    project_watch_directories: Vec<PathBuf>,
 }
 
 struct CacheEntry {
@@ -321,6 +322,7 @@ async fn load_skills_payload_with_home(
                         catalog: String::new(),
                         fingerprints: Vec::new(),
                         watch_directories: Vec::new(),
+                        project_watch_directories: Vec::new(),
                     }),
                     dirty: false,
                     load_promise: Some(load_lock.clone()),
@@ -376,6 +378,7 @@ fn scan_skills_sync(workspace_path: Option<&str>, home_override: Option<PathBuf>
     let mut observed_paths = std::collections::HashSet::new();
     let mut discovered_by_name = BTreeMap::new();
     let mut scan_state = ScanState::default();
+    let mut project_watch_directories = HashSet::new();
 
     // Visit the winning tier first so canonical deduplication cannot erase it.
     for target in get_scan_targets(workspace_path, home_override)
@@ -384,6 +387,11 @@ fn scan_skills_sync(workspace_path: Option<&str>, home_override: Option<PathBuf>
     {
         observed_paths.insert(target.root.clone());
         let skill_files = find_skill_files(&target.root, &mut observed_paths, &mut scan_state);
+        // Project tiers are visited first. Capture their paths before user
+        // discovery adds shared directories to the same bounded scan state.
+        if target.scope == "project" {
+            project_watch_directories.extend(scan_state.watch_directories.iter().cloned());
+        }
 
         for skill_file in skill_files {
             if let Some(parsed) = parse_skill_file(&skill_file, &mut scan_state) {
@@ -440,13 +448,19 @@ fn scan_skills_sync(workspace_path: Option<&str>, home_override: Option<PathBuf>
         catalog,
         fingerprints,
         watch_directories,
+        project_watch_directories: project_watch_directories.into_iter().collect(),
     }
 }
 
 /// Canonical directories outside the ordinary tier streams, including link
 /// parents. Every subscription is non-recursive; the scan bounds its coverage.
 pub(crate) async fn linked_skill_watch_directories(workspace_path: &str) -> Vec<PathBuf> {
-    load_skills_payload(workspace_path).await.watch_directories
+    let payload = load_skills_payload(workspace_path).await;
+    if workspace_path.is_empty() {
+        payload.watch_directories
+    } else {
+        payload.project_watch_directories
+    }
 }
 
 #[derive(Default)]

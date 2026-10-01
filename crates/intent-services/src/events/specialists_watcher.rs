@@ -26,7 +26,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::bus::EventBus;
-use super::linked_watch::LinkedWatches;
+use super::linked_watch::{uncovered_directories, ScopedLinkedWatches};
 use super::root_watch::{watch_root, RootWatch};
 use super::shared_watch::{watch_tiers, SharedWatchHub, TierWatch};
 use crate::specialists::{claude_agents, SpecialistsService};
@@ -242,6 +242,9 @@ fn watch_directory(
 
 fn is_md(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()) == Some("md")
+        || path
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.is_symlink())
 }
 
 /// Default user-tier specialists directory (`~/.intent/specialists/`).
@@ -309,13 +312,17 @@ async fn debounce_loop(
         );
     }
 
-    let mut linked: HashMap<WorkspaceId, LinkedWatches> = HashMap::new();
+    let mut linked = ScopedLinkedWatches::new(hub, move |scope| {
+        let _ = raw_tx.send(SpecialistsMsg::Change(scope));
+    });
+    refresh_claude_user_watches(user_dir.as_deref(), &mut linked).await;
+    let mut user_deadline: Option<tokio::time::Instant> = None;
     for (id, path) in &workspace_paths {
-        refresh_claude_watches(&hub, &raw_tx, id, path, user_dir.as_deref(), &mut linked).await;
+        refresh_claude_watches(id, path, &mut linked).await;
     }
 
     loop {
-        let next_deadline = pending.values().copied().min();
+        let next_deadline = pending.values().copied().chain(user_deadline).min();
 
         tokio::select! {
             maybe = raw_rx.recv() => match maybe {
@@ -324,24 +331,23 @@ async fn debounce_loop(
                     match workspace_id {
                         // User-tier change: affects all workspaces
                         None => {
-                            for (ws_id, path) in &workspace_paths {
-                                refresh_claude_watches(&hub, &raw_tx, ws_id, path, user_dir.as_deref(), &mut linked).await;
-                                pending.insert(ws_id.clone(), deadline);
+                            user_deadline.get_or_insert(deadline);
+                            for ws_id in workspace_paths.keys() {
+                                pending.entry(ws_id.clone()).or_insert(deadline);
                             }
                         }
                         // Project-tier change: affects specific workspace
                         Some(ws_id) => {
-                            if let Some(path) = workspace_paths.get(&ws_id) {
-                                refresh_claude_watches(&hub, &raw_tx, &ws_id, path, user_dir.as_deref(), &mut linked).await;
+                            if workspace_paths.contains_key(&ws_id) {
+                                pending.entry(ws_id).or_insert(deadline);
                             }
-                            pending.insert(ws_id, deadline);
                         }
                     }
                 }
                 Some(SpecialistsMsg::Add(ws_id, path)) => {
                     // Prime the fingerprint like the start-time priming above.
                     fingerprints.insert(ws_id.clone(), specialists_fingerprint(user_dir.as_ref(), &path).await);
-                    refresh_claude_watches(&hub, &raw_tx, &ws_id, &path, user_dir.as_deref(), &mut linked).await;
+                    refresh_claude_watches(&ws_id, &path, &mut linked).await;
                     workspace_paths.insert(ws_id, path);
                 }
                 Some(SpecialistsMsg::Remove(ws_id)) => {
@@ -358,7 +364,7 @@ async fn debounce_loop(
                     linked.remove(&ws_id);
                 }
                 Some(SpecialistsMsg::Resume(ws_id, path)) => {
-                    refresh_claude_watches(&hub, &raw_tx, &ws_id, &path, user_dir.as_deref(), &mut linked).await;
+                    refresh_claude_watches(&ws_id, &path, &mut linked).await;
                     workspace_paths.insert(ws_id.clone(), path);
                     // Catch-up: flush after the normal debounce so the
                     // re-registered watch's own events coalesce into it.
@@ -371,42 +377,54 @@ async fn debounce_loop(
                 }
             },
             () = sleep_until(next_deadline), if next_deadline.is_some() => {
+                if user_deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
+                    user_deadline = None;
+                    refresh_claude_user_watches(user_dir.as_deref(), &mut linked).await;
+                }
+                for (id, deadline) in &pending {
+                    if *deadline <= tokio::time::Instant::now() {
+                        if let Some(path) = workspace_paths.get(id) {
+                            refresh_claude_watches(id, path, &mut linked).await;
+                        }
+                    }
+                }
                 flush_due(&bus, &workspace_paths, user_dir.as_ref(), &mut fingerprints, &mut pending).await;
             }
         }
     }
 }
 
+async fn refresh_claude_user_watches(user_dir: Option<&Path>, linked: &mut ScopedLinkedWatches) {
+    let root = claude_agents::user_root(user_dir);
+    if let Ok(directories) = tokio::task::spawn_blocking(move || {
+        root.map_or_else(Vec::new, |root| claude_agents::watch_directories(&root))
+    })
+    .await
+    {
+        linked.sync_user(directories);
+    }
+}
+
 async fn refresh_claude_watches(
-    hub: &Arc<SharedWatchHub>,
-    tx: &mpsc::UnboundedSender<SpecialistsMsg>,
     id: &WorkspaceId,
     workspace_path: &Path,
-    user_dir: Option<&Path>,
-    linked: &mut HashMap<WorkspaceId, LinkedWatches>,
+    linked: &mut ScopedLinkedWatches,
 ) {
-    let mut roots = vec![workspace_path.join(".claude/agents")];
-    if let Some(root) = claude_agents::user_root(user_dir) {
-        roots.push(root);
-    }
+    let workspace = workspace_path.to_path_buf();
     let Ok(directories) = tokio::task::spawn_blocking(move || {
-        roots
+        let workspace = workspace.canonicalize().unwrap_or(workspace);
+        let root = workspace.join(".claude/agents");
+        let covered: Vec<_> = PROJECT_TIERS
             .iter()
-            .flat_map(|root| claude_agents::watch_directories(root))
-            .collect()
+            .map(|tier| workspace.join(tier))
+            .collect();
+        uncovered_directories(claude_agents::watch_directories(&root), &covered)
     })
     .await
     else {
         return;
     };
-    let watch = linked.entry(id.clone()).or_insert_with(|| {
-        let tx = tx.clone();
-        let id = id.clone();
-        LinkedWatches::new(Arc::clone(hub), move || {
-            let _ = tx.send(SpecialistsMsg::Change(Some(id.clone())));
-        })
-    });
-    watch.sync(directories);
+    linked.sync_project(id.clone(), directories);
 }
 
 async fn flush_due(

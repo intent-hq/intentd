@@ -569,7 +569,12 @@ async fn wss_linked_skills_custom_config_directory_and_empty_fallback() {
                 }
             }).await.expect("live custom config skills update");
         }
-        evidence.push(json!({"mode":mode,"listed":listed,"changed":changed}));
+        let fanout = if mode == "linked" {
+            shared_user_update_evidence(port, cfg.clone(), &data, id, &config).await
+        } else {
+            Value::Null
+        };
+        evidence.push(json!({"mode":mode,"listed":listed,"changed":changed,"fanout":fanout}));
         drop(daemon);
     }
     let artifact = temp.path().join("config-directory-evidence.json");
@@ -578,4 +583,108 @@ async fn wss_linked_skills_custom_config_directory_and_empty_fallback() {
         "linked skills configuration evidence: {}",
         artifact.display()
     );
+}
+
+async fn shared_user_update_evidence(
+    port: u16,
+    cfg: Arc<ClientConfig>,
+    data: &Path,
+    first: &str,
+    config: &Path,
+) -> Value {
+    let second_path = data.join("second-project");
+    std::fs::create_dir_all(&second_path).unwrap();
+    let created = wss_call(port, cfg.clone(), &json!({"jsonrpc":"2.0","id":80,"method":"workspace.create","params":{"title":"Shared user watcher","skipIsolation":true,"worktreePath":second_path}}).to_string()).await;
+    let second = created["result"]["workspace"]["id"].as_str().unwrap();
+    let mut streams = Vec::new();
+    for id in [first, second] {
+        let mut stream = connect_ws(port, cfg.clone()).await;
+        stream.send(Message::text(json!({"jsonrpc":"2.0","id":81,"method":"events.subscribe","params":{"workspaceId":id,"eventTypes":["skills:changed"]}}).to_string())).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(Ok(Message::Text(text))) = stream.next().await {
+                    let reply: Value = serde_json::from_str(&text).unwrap();
+                    if reply["id"] == 81 {
+                        assert!(reply["result"]["subscriptionId"].is_string());
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("fanout subscription");
+        streams.push((id.to_string(), stream));
+    }
+    let mut evidence = Vec::new();
+    for description in ["fanout warmup", "fanout final"] {
+        write_skill(
+            &config.join("skills/custom/SKILL.md"),
+            "custom-config-fixture",
+            description,
+        );
+        for (id, stream) in &mut streams {
+            let mut events = Vec::new();
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match stream.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let event: Value = serde_json::from_str(&text).unwrap();
+                            if event["method"] == "events.event"
+                                && event["params"]["event"]["type"] == "skills:changed"
+                            {
+                                events.push(event);
+                                break;
+                            }
+                        }
+                        Some(Ok(Message::Ping(p))) => stream.send(Message::Pong(p)).await.unwrap(),
+                        Some(Ok(_)) => {}
+                        other => panic!("fanout stream closed: {other:?}"),
+                    }
+                }
+            })
+            .await
+            .expect("shared user edit must reach every workspace");
+            // A bounded negative assertion detects duplicate coalesced events.
+            let _ = tokio::time::timeout(Duration::from_millis(1500), async {
+                loop {
+                    match stream.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let event: Value = serde_json::from_str(&text).unwrap();
+                            if event["method"] == "events.event"
+                                && event["params"]["event"]["type"] == "skills:changed"
+                            {
+                                events.push(event);
+                            }
+                        }
+                        Some(Ok(Message::Ping(p))) => stream.send(Message::Pong(p)).await.unwrap(),
+                        Some(Ok(_)) => {}
+                        other => panic!("fanout stream closed: {other:?}"),
+                    }
+                }
+            })
+            .await;
+            let listed = wss_call(
+                port,
+                cfg.clone(),
+                &json!({"jsonrpc":"2.0","id":82,"method":"skill.list","params":{"workspaceId":id}})
+                    .to_string(),
+            )
+            .await;
+            assert_eq!(
+                named(&listed["result"], "custom-config-fixture")["description"],
+                description
+            );
+            if description == "fanout final" {
+                assert_eq!(
+                    events.len(),
+                    1,
+                    "one meaningful event per workspace: {events:?}"
+                );
+            }
+            evidence.push(
+                json!({"workspaceId":id,"description":description,"events":events,"skills":listed}),
+            );
+        }
+    }
+    json!(evidence)
 }

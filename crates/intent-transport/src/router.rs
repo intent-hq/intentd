@@ -4293,14 +4293,17 @@ async fn dispatch(
             }
         }
         "specialist.list" => {
-            // Optional workspaceId is routing-only. This method merges
-            // user > bundled tiers only (the project tier is not part of the live
-            // wire contract iOS calls). `specialist.get` still accepts an optional
-            // `workspacePath` for the project tier (PROTOCOL §5.11). The optional
-            // `provider` supplies the resolution context for the additive
-            // `resolvedModel`/`resolvedProvider` preview fields.
+            let workspace_path = if opt_bool_strict(params, "includeProject")?.unwrap_or(false) {
+                let workspace = api
+                    .get_workspace(require_workspace_id(params)?)
+                    .await
+                    .map_err(workspace_err)?;
+                workspace.effective_path().map(str::to_owned)
+            } else {
+                None
+            };
             let provider = opt_str(params, "provider");
-            match api.specialist_list(None, provider).await {
+            match api.specialist_list(workspace_path, provider).await {
                 Ok(v) => Ok(v),
                 // Unknown provider → -32602 with the raw message.
                 Err(Error::InvalidParams(m)) => Err(invalid_params(m)),

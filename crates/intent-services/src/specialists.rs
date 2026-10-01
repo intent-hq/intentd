@@ -1284,7 +1284,7 @@ impl SpecialistsService {
                 resolved = Some(def);
             }
         }
-        resolved.or_else(|| self.claude_catalog(workspace_path).remove(id))
+        resolved.or_else(|| self.collect_catalog(workspace_path).remove(id))
     }
 
     /// Map an alias to the canonical id of the specialist claiming it via
@@ -1620,10 +1620,10 @@ impl SpecialistsService {
             .definitions
     }
 
-    fn collect_catalog_with_diagnostics(
+    fn collect_native_catalog(
         &self,
         workspace_path: Option<&Path>,
-    ) -> claude_agents::Catalog {
+    ) -> std::collections::BTreeMap<String, Value> {
         let mut acc = std::collections::BTreeMap::new();
         for (id, content) in self.embedded {
             acc.insert(
@@ -1640,9 +1640,32 @@ impl SpecialistsService {
         if let Some(wp) = workspace_path {
             Self::collect_dir(&project_dir(wp), "project", &mut acc);
         }
+        acc
+    }
+
+    fn collect_catalog_with_diagnostics(
+        &self,
+        workspace_path: Option<&Path>,
+    ) -> claude_agents::Catalog {
+        let mut acc = self.collect_native_catalog(workspace_path);
+        let mut native_aliases = std::collections::BTreeMap::new();
+        for (canonical, definition) in &acc {
+            if let Some(aliases) = definition.get(ALIASES_KEY).and_then(Value::as_array) {
+                for alias in aliases.iter().filter_map(Value::as_str) {
+                    native_aliases
+                        .entry(alias.to_string())
+                        .or_insert_with(|| canonical.clone());
+                }
+            }
+        }
         let mut imports = self.claude_catalog_with_diagnostics(workspace_path);
         for (id, definition) in imports.definitions {
-            if let Some(winner) = acc.get(&id) {
+            let native_winner = acc.get(&id).or_else(|| {
+                native_aliases
+                    .get(&id)
+                    .and_then(|canonical| acc.get(canonical))
+            });
+            if let Some(winner) = native_winner {
                 claude_agents::add_diagnostic(
                     &mut imports.diagnostics,
                     claude_agents::shadowed(&definition, winner),
@@ -1655,14 +1678,6 @@ impl SpecialistsService {
             definitions: acc,
             diagnostics: imports.diagnostics,
         }
-    }
-
-    fn claude_catalog(
-        &self,
-        workspace_path: Option<&Path>,
-    ) -> std::collections::BTreeMap<String, Value> {
-        self.claude_catalog_with_diagnostics(workspace_path)
-            .definitions
     }
 
     fn claude_catalog_with_diagnostics(

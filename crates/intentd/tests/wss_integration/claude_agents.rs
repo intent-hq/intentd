@@ -809,3 +809,243 @@ async fn claude_agents_preview_requests_stay_fresh_and_workspace_scoped() {
     .unwrap();
     stop(daemon, &dir.path().join("intentd.sock")).await;
 }
+
+#[tokio::test]
+async fn claude_agents_project_catalog_requires_explicit_stored_workspace_scope() {
+    let dir = scratch_dir("claude-project-catalog");
+    let home = dir.path().join("home");
+    let project = dir.path().join("project");
+    let other = dir.path().join("other");
+    let project_file = project.join(".claude/agents/reviewer.md");
+    write_agent(
+        &home.join(".claude/agents/reviewer.md"),
+        "reviewer",
+        "skills: [project-kit]\n",
+        "User prompt.",
+    );
+    write_agent(
+        &project_file,
+        "reviewer",
+        "skills: [project-kit]\n",
+        "Project prompt.",
+    );
+    std::fs::create_dir_all(project.join(".claude/skills/project-kit")).unwrap();
+    std::fs::write(
+        project.join(".claude/skills/project-kit/SKILL.md"),
+        "---\nname: project-kit\ndescription: Project kit\n---\nProject instructions.",
+    )
+    .unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    let (daemon, port, cfg) = boot(dir.path(), &home).await;
+    let mut client = connect_ws(port, cfg).await;
+    let mut workspace_ids = Vec::new();
+    for (id, path) in [(1, &project), (2, &other)] {
+        let workspace = wss_rpc(
+            &mut client,
+            id,
+            "workspace.create",
+            json!({"title":"Project catalog","skipIsolation":true,"worktreePath":path}),
+        )
+        .await;
+        assert_eq!(
+            workspace["workspace"]["worktreePath"],
+            path.to_string_lossy().as_ref()
+        );
+        workspace_ids.push(workspace["workspace"]["id"].clone());
+    }
+    let mut evidence = Vec::new();
+    let mut request_id = 3;
+    for params in [
+        json!({}),
+        json!({"workspaceId":workspace_ids[0],"workspacePath":project}),
+        json!({"workspaceId":workspace_ids[0],"includeProject":false}),
+        json!({"workspaceId":workspace_ids[0],"includeProject":null}),
+    ] {
+        let result = wss_rpc(&mut client, request_id, "specialist.list", params.clone()).await;
+        request_id += 1;
+        let row = definition(&result, "reviewer");
+        assert_eq!(row["source"], "user");
+        assert_eq!(row["missingSkills"], json!(["project-kit"]));
+        evidence.push(json!({"params":params,"result":result}));
+    }
+    for (workspace_id, spoofed_path, expected_source) in [
+        (&workspace_ids[0], &other, "project"),
+        (&workspace_ids[1], &project, "user"),
+    ] {
+        let params =
+            json!({"workspaceId":workspace_id,"workspacePath":spoofed_path,"includeProject":true});
+        let result = wss_rpc(&mut client, request_id, "specialist.list", params.clone()).await;
+        request_id += 1;
+        let row = definition(&result, "reviewer");
+        assert_eq!(row["source"], expected_source);
+        assert_eq!(
+            row.get("missingSkills").is_none(),
+            expected_source == "project"
+        );
+        if expected_source == "project" {
+            assert_eq!(row["path"], project_file.to_string_lossy().as_ref());
+            assert!(result["importDiagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d["code"] == "shadowed"));
+        }
+        evidence.push(json!({"params":params,"result":result}));
+    }
+    for params in [
+        json!({"includeProject":true}),
+        json!({"workspaceId":workspace_ids[0],"includeProject":"true"}),
+        json!({"workspaceId":workspace_ids[0],"includeProject":1}),
+        json!({"workspaceId":"unknown-workspace","includeProject":true}),
+    ] {
+        let reply = wss_reply(&mut client, request_id, "specialist.list", params.clone()).await;
+        request_id += 1;
+        assert_eq!(reply["error"]["code"], -32602, "{reply}");
+        evidence.push(json!({"params":params,"reply":reply}));
+    }
+    write_agent(&project_file, "reviewer", "", "Updated project prompt.");
+    let updated = wss_rpc(
+        &mut client,
+        request_id,
+        "specialist.list",
+        json!({"workspaceId":workspace_ids[0],"includeProject":true}),
+    )
+    .await;
+    request_id += 1;
+    assert_eq!(
+        definition(&updated, "reviewer")["prompt"],
+        "Updated project prompt."
+    );
+    std::fs::remove_file(&project_file).unwrap();
+    let removed = wss_rpc(
+        &mut client,
+        request_id,
+        "specialist.list",
+        json!({"workspaceId":workspace_ids[0],"includeProject":true}),
+    )
+    .await;
+    assert_eq!(definition(&removed, "reviewer")["source"], "user");
+    assert!(definition(&removed, "reviewer")
+        .get("missingSkills")
+        .is_none());
+    assert!(removed.get("importDiagnostics").is_none());
+    evidence.push(json!({"updated":updated,"removed":removed}));
+    std::fs::write(
+        dir.path().join("claude-project-catalog-evidence.json"),
+        serde_json::to_vec_pretty(&evidence).unwrap(),
+    )
+    .unwrap();
+    stop(daemon, &dir.path().join("intentd.sock")).await;
+}
+
+#[tokio::test]
+async fn claude_agents_preserve_native_aliases_in_catalogs_and_creation() {
+    let dir = scratch_dir("claude-native-alias");
+    let home = dir.path().join("home");
+    let project = dir.path().join("project");
+    for id in ["coordinator", "review-alias", "native-review"] {
+        write_agent(
+            &home.join(format!(".claude/agents/{id}.md")),
+            id,
+            "",
+            "Imported prompt.",
+        );
+    }
+    write_agent(
+        &home.join(".intent/specialists/native-review.md"),
+        "Native reviewer",
+        "aliases: [\"review-alias\"]\n",
+        "Native prompt.",
+    );
+    std::fs::create_dir_all(&project).unwrap();
+    let (daemon, port, cfg) = boot(dir.path(), &home).await;
+    let mut client = connect_ws(port, cfg).await;
+    let list = wss_rpc(&mut client, 1, "specialist.list", json!({})).await;
+    for id in ["coordinator", "review-alias"] {
+        assert!(!list["specialists"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == id));
+        assert!(list["importDiagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"] == "shadowed" && d["specialistId"] == id));
+    }
+    assert!(definition(&list, "native-review")
+        .get("importedFrom")
+        .is_none());
+    let workspace = wss_rpc(
+        &mut client,
+        2,
+        "workspace.create",
+        json!({"title":"Native aliases","skipIsolation":true,"worktreePath":project}),
+    )
+    .await;
+    wss_rpc(
+        &mut client,
+        3,
+        "settings.update",
+        json!({"changes":[{"path":"providers.paths","value":{"auggie":"/bin/sh"}}]}),
+    )
+    .await;
+    let mut evidence = vec![json!({"catalog":list})];
+    let mut request_id = 4;
+    for (alias, canonical) in [
+        ("coordinator", "spec-writer"),
+        ("review-alias", "native-review"),
+    ] {
+        let got = wss_rpc(
+            &mut client,
+            request_id,
+            "specialist.get",
+            json!({"id":alias}),
+        )
+        .await;
+        request_id += 1;
+        assert_eq!(got["specialist"]["id"], canonical);
+        let created = wss_rpc(&mut client, request_id, "agent.create", json!({"workspaceId":workspace["workspace"]["id"],"specialistId":alias,"provider":"auggie"})).await;
+        request_id += 1;
+        assert_eq!(created["agent"]["metadata"]["specialist"], canonical);
+        evidence.push(json!({"alias":alias,"got":got,"created":created}));
+    }
+    write_agent(
+        &project.join(".intent/specialists/native-review.md"),
+        "Project reviewer",
+        "aliases: []\n",
+        "Project prompt.",
+    );
+    let released = wss_rpc(
+        &mut client,
+        request_id,
+        "specialist.get",
+        json!({"id":"review-alias","workspacePath":project}),
+    )
+    .await;
+    request_id += 1;
+    assert_eq!(released["specialist"]["id"], "review-alias");
+    assert_eq!(released["specialist"]["importedFrom"], "claude-code");
+    write_agent(
+        &project.join(".intent/specialists/review-alias.md"),
+        "Explicit native",
+        "",
+        "Explicit native prompt.",
+    );
+    let explicit = wss_rpc(
+        &mut client,
+        request_id,
+        "specialist.get",
+        json!({"id":"review-alias","workspacePath":project}),
+    )
+    .await;
+    assert_eq!(explicit["specialist"]["id"], "review-alias");
+    assert!(explicit["specialist"].get("importedFrom").is_none());
+    evidence.push(json!({"releasedAlias":released,"explicitNative":explicit}));
+    std::fs::write(
+        dir.path().join("claude-native-alias-evidence.json"),
+        serde_json::to_vec_pretty(&evidence).unwrap(),
+    )
+    .unwrap();
+    stop(daemon, &dir.path().join("intentd.sock")).await;
+}
