@@ -205,7 +205,7 @@ pub use settings::{
     migrate_quick_action_settings, report_to_parent_debounce_seconds, tool_payload_retention_days,
     InMemorySecretStore, SecretStore,
 };
-pub use settings_registry::{SettingOrigin, SettingsRegistry};
+pub use settings_registry::{SettingOrigin, SettingsRegistry, SettingsSnapshot, WsApiPortPolicy};
 pub(crate) use settings_registry::{SettingsChanged, KNOWN_PATHS};
 pub(crate) use terminal_ops::PtyTerminalHost;
 

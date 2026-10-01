@@ -157,6 +157,16 @@ pub enum SettingOrigin {
     Flag,
 }
 
+/// Binding policy for the secure WSS listener. The effective default remains
+/// 5181 for older clients, but only an absent, unpinned key permits selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WsApiPortPolicy {
+    /// Select once, then persist the bound port before advertising readiness.
+    Unassigned,
+    /// Bind exactly this configured or startup-pinned port; never fall back.
+    Fixed(u16),
+}
+
 impl SettingOrigin {
     /// Wire spelling of the origin (`default` | `file` | `flag`).
     #[must_use]
@@ -175,7 +185,8 @@ impl SettingOrigin {
 pub struct SettingsChanged {
     /// Self-write generation when the change was published.
     pub generation: u64,
-    /// Dotted wire paths whose **effective** value changed.
+    /// Dotted wire paths whose effective value changed, or whose WSS port
+    /// assignment policy changed even though its numeric value did not.
     pub changed: BTreeSet<String>,
 }
 
@@ -219,6 +230,8 @@ struct Inner {
     file: SettingsFile,
     /// Raw document for comment-preserving write-back.
     doc: DocumentMut,
+    /// Exact last loaded/written bytes, before read-time normalization.
+    source_text: String,
     /// Legacy values captured at load
     /// ([`intent_core::settings_file::LEGACY_SETTINGS_PATHS`] keys found in
     /// the file), pending the one-time boot import-and-strip.
@@ -237,6 +250,7 @@ impl Inner {
     /// Record a successful self-write of `text`: bump the generation and
     /// push its stamp onto the bounded history.
     fn record_write(&mut self, text: &str) {
+        self.source_text = text.to_string();
         self.generation += 1;
         if self.recent_writes.len() == SELF_WRITE_HISTORY {
             self.recent_writes.pop_front();
@@ -264,6 +278,17 @@ pub struct SettingsSnapshot {
 }
 
 impl SettingsSnapshot {
+    /// Distinguish an unassigned installation from an explicit port, including
+    /// an explicit 5181. Retain this snapshot across binding and pass it to
+    /// [`SettingsRegistry::persist_selected_ws_api_port`] before readiness.
+    pub fn ws_api_port_policy(&self) -> WsApiPortPolicy {
+        if self.origin("server.wsApi.port") == Some(SettingOrigin::Default) {
+            WsApiPortPolicy::Unassigned
+        } else {
+            WsApiPortPolicy::Fixed(self.effective.server.ws_api.port)
+        }
+    }
+
     /// Effective JSON value for a dotted wire path. `None` for unknown paths
     /// (including secrets and SQLite-backed state blobs, which are not this
     /// registry's concern). Known-but-unset optional keys read `Some(Null)`.
@@ -318,6 +343,7 @@ impl SettingsRegistry {
         let inner = Inner {
             file,
             doc,
+            source_text: text,
             legacy,
             pins: BTreeMap::new(),
             generation: 0,
@@ -513,6 +539,53 @@ impl SettingsRegistry {
         Ok(self.publish_snapshot(snapshot, inner.generation))
     }
 
+    /// Remember a first WSS allocation while the caller retains all bound
+    /// sockets. `expected` must be this registry's current, unassigned snapshot
+    /// used to choose the bind policy. Any intervening registry mutation or
+    /// on-disk edit observed at the final pre-rename check rejects the assignment
+    /// instead of overwriting user intent. External editors do not hold the
+    /// registry lock: a write in the final check-to-rename window can still race.
+    ///
+    /// This synchronous operation atomically writes the config and installs its
+    /// snapshot without notifying subscribers or invoking runtime hooks. The
+    /// self-write guard suppresses the watcher event; a later reload of the same
+    /// file also sees no change. The listener caller owns readiness/publication
+    /// and must drop its sockets on error. Startup overrides (including the
+    /// composition root's ephemeral port-zero test seam) must not call this.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a stale/assigned snapshot, an invalid port, an
+    /// external edit, or a failed read/write. Registry state stays unchanged.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a registry lock is poisoned.
+    pub fn persist_selected_ws_api_port(
+        &self,
+        expected: &Arc<SettingsSnapshot>,
+        port: u16,
+    ) -> Result<()> {
+        let mut inner = self.inner.lock().expect("settings registry lock poisoned");
+        if !Arc::ptr_eq(expected, &self.snapshot())
+            || expected.ws_api_port_policy() != WsApiPortPolicy::Unassigned
+        {
+            return Err(Error::InvalidParams(
+                "WSS port assignment changed while binding; discard the listeners and retry with current settings".into(),
+            ));
+        }
+        let changes = [("server.wsApi.port".to_string(), Value::from(port))];
+        let (mut candidate, text, snapshot) = Self::validate_changes(&inner, &changes)?;
+        atomic_write_checked(&self.path, &text, Some(&inner.source_text))?;
+        candidate.record_write(&text);
+        *inner = candidate;
+        *self
+            .snapshot
+            .write()
+            .expect("settings snapshot lock poisoned") = snapshot;
+        Ok(())
+    }
+
     /// Check a mixed settings batch before secret I/O without adopting or
     /// publishing anything. `apply` validates again under its own lock: this
     /// preflight is not a reservation across an awaited secret-store write.
@@ -599,6 +672,7 @@ impl SettingsRegistry {
         let mut inner = self.inner.lock().expect("settings registry lock poisoned");
         inner.file = file;
         inner.doc = doc;
+        inner.source_text = text.to_string();
         // The accepted external edit supersedes every earlier self-write:
         // clear the history so a later external edit that happens to match
         // earlier self-written bytes (e.g. a manual revert) is not
@@ -620,7 +694,11 @@ impl SettingsRegistry {
         let old = self.snapshot();
         let changed: BTreeSet<String> = KNOWN_PATHS
             .iter()
-            .filter(|p| json_get(&old.effective_json, p) != json_get(&new.effective_json, p))
+            .filter(|p| {
+                json_get(&old.effective_json, p) != json_get(&new.effective_json, p)
+                    || (**p == "server.wsApi.port"
+                        && old.ws_api_port_policy() != new.ws_api_port_policy())
+            })
             .map(std::string::ToString::to_string)
             .collect();
         let notice = SettingsChanged {
@@ -926,6 +1004,10 @@ fn json_to_toml_value(value: &Value) -> Result<toml_edit::Value> {
 /// directory, fsync, then rename over the target. Readers only ever observe
 /// the old or the new complete content.
 fn atomic_write(path: &Path, text: &str) -> Result<()> {
+    atomic_write_checked(path, text, None)
+}
+
+fn atomic_write_checked(path: &Path, text: &str, expected: Option<&str>) -> Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| Error::Internal(format!("config path has no parent: {}", path.display())))?;
@@ -940,6 +1022,16 @@ fn atomic_write(path: &Path, text: &str) -> Result<()> {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(text.as_bytes())?;
         f.sync_all()?;
+        // Recheck immediately before rename, including edits made while the
+        // candidate was being written. The registry lock serializes API edits;
+        // arbitrary external editors do not participate in that lock.
+        if let Some(expected) = expected {
+            if std::fs::read_to_string(path)? != expected {
+                return Err(std::io::Error::other(
+                    "config.toml changed while selecting the WSS port; reload settings and retry",
+                ));
+            }
+        }
         std::fs::rename(&tmp, path)?;
         // Best-effort directory fsync so the rename itself is durable across
         // a crash/power loss (without it some filesystems may surface the old
@@ -981,6 +1073,294 @@ mod tests {
 
     fn set(path: &str, value: Value) -> Vec<(String, Value)> {
         vec![(path.to_string(), value)]
+    }
+
+    #[test]
+    fn ws_port_generated_config_is_unassigned_but_explicit_default_is_fixed() {
+        let (_dir, path) = temp_config(None);
+        let reg = SettingsRegistry::load(&path).unwrap();
+        assert_eq!(reg.get("server.wsApi.port"), Some(json!(5181)));
+        assert_eq!(
+            reg.origin("server.wsApi.port"),
+            Some(SettingOrigin::Default)
+        );
+        assert!(!reg.snapshot().effective.server.ws_api.enabled);
+
+        let (_dir, path) = temp_config(Some("[server.wsApi]\nport = 5181\n"));
+        let reg = SettingsRegistry::load(&path).unwrap();
+        assert_eq!(reg.origin("server.wsApi.port"), Some(SettingOrigin::File));
+    }
+
+    #[test]
+    fn ws_port_reset_and_explicit_default_notify_even_without_numeric_change() {
+        let (_dir, path) = temp_config(Some(""));
+        let reg = SettingsRegistry::load(&path).unwrap();
+        let mut rx = reg.subscribe();
+        let change = reg.apply(&set("server.wsApi.port", json!(5181))).unwrap();
+        assert!(change.changed.contains("server.wsApi.port"));
+        assert!(rx.has_changed().unwrap());
+        rx.borrow_and_update();
+        let change = reg.apply(&set("server.wsApi.port", Value::Null)).unwrap();
+        assert!(change.changed.contains("server.wsApi.port"));
+        assert_eq!(
+            reg.origin("server.wsApi.port"),
+            Some(SettingOrigin::Default)
+        );
+        assert!(rx.has_changed().unwrap());
+    }
+
+    #[test]
+    fn ws_port_assignment_is_durable_comment_preserving_and_silent() {
+        for port in [5181, 5183, 65535] {
+            let seed = "# my config\n[server.wsApi]\n# choose on first enable\nenabled = true\n";
+            let (_dir, path) = temp_config(Some(seed));
+            let reg = SettingsRegistry::load(&path).unwrap();
+            let before = reg.snapshot();
+            assert_eq!(before.ws_api_port_policy(), WsApiPortPolicy::Unassigned);
+            let rx = reg.subscribe();
+            reg.persist_selected_ws_api_port(&before, port).unwrap();
+            assert_eq!(
+                reg.snapshot().ws_api_port_policy(),
+                WsApiPortPolicy::Fixed(port)
+            );
+            assert_eq!(reg.origin("server.wsApi.port"), Some(SettingOrigin::File));
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(text.contains("# my config"));
+            assert!(text.contains("# choose on first enable"));
+            assert!(reg.is_self_write(&text));
+            assert!(
+                !rx.has_changed().unwrap(),
+                "assignment must not restart listeners"
+            );
+            assert!(matches!(
+                crate::config_watcher::process_config_change(&reg),
+                crate::config_watcher::ReloadOutcome::SelfWrite
+            ));
+            assert!(reg.reload(&text).unwrap().changed.is_empty());
+            assert!(!rx.has_changed().unwrap());
+            let fresh = SettingsRegistry::load(&path).unwrap();
+            assert_eq!(
+                fresh.snapshot().ws_api_port_policy(),
+                WsApiPortPolicy::Fixed(port)
+            );
+            assert!(reg.persist_selected_ws_api_port(&before, port).is_err());
+        }
+    }
+
+    #[test]
+    fn ws_port_assignment_rejects_explicit_choices_and_startup_pins() {
+        for seed in ["", "[server.wsApi]\nport = 5181\n"] {
+            let (_dir, path) = temp_config(Some(seed));
+            let reg = SettingsRegistry::load(&path).unwrap();
+            if !seed.is_empty() {
+                assert_eq!(
+                    reg.snapshot().ws_api_port_policy(),
+                    WsApiPortPolicy::Fixed(5181)
+                );
+                assert!(reg
+                    .persist_selected_ws_api_port(&reg.snapshot(), 5182)
+                    .is_err());
+            }
+            reg.pin("server.wsApi.port", json!(7000), "INTENTD_TCP_PORT")
+                .unwrap();
+            assert_eq!(
+                reg.snapshot().ws_api_port_policy(),
+                WsApiPortPolicy::Fixed(7000)
+            );
+            assert!(reg
+                .persist_selected_ws_api_port(&reg.snapshot(), 5182)
+                .is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), seed);
+        }
+    }
+
+    #[test]
+    fn ws_port_assignment_rejects_stale_snapshots_including_reset_and_pin() {
+        for edit in [0, 1, 2, 3] {
+            let (_dir, path) = temp_config(Some(""));
+            let reg = SettingsRegistry::load(&path).unwrap();
+            let before = reg.snapshot();
+            match edit {
+                0 => {
+                    reg.apply(&set("server.wsApi.port", json!(5181))).unwrap();
+                }
+                1 => {
+                    reg.apply(&set("server.wsApi.port", json!(6000))).unwrap();
+                    reg.apply(&set("server.wsApi.port", Value::Null)).unwrap();
+                }
+                2 => {
+                    reg.pin("server.wsApi.port", json!(7000), "INTENTD_TCP_PORT")
+                        .unwrap();
+                }
+                _ => {
+                    reg.apply(&set("server.wsApi.enabled", json!(false)))
+                        .unwrap();
+                }
+            }
+            let current = reg.snapshot();
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(reg.persist_selected_ws_api_port(&before, 5182).is_err());
+            assert!(Arc::ptr_eq(&current, &reg.snapshot()));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        }
+    }
+
+    #[test]
+    fn ws_port_assignment_preserves_unreloaded_external_edits_and_errors() {
+        for text in [
+            "[server.wsApi]\nport = 5181\n",
+            "# edited comment\n",
+            "[server.wsApi]\nport = 'broken'\n",
+        ] {
+            let (_dir, path) = temp_config(Some(""));
+            let reg = SettingsRegistry::load(&path).unwrap();
+            let before = reg.snapshot();
+            std::fs::write(&path, text).unwrap();
+            assert!(reg.persist_selected_ws_api_port(&before, 5182).is_err());
+            assert!(Arc::ptr_eq(&before, &reg.snapshot()));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+            assert_eq!(reg.generation(), 0);
+        }
+    }
+
+    #[test]
+    fn ws_port_assignment_rejects_missing_file_and_invalid_ports_without_changes() {
+        let (_dir, path) = temp_config(Some(""));
+        let reg = SettingsRegistry::load(&path).unwrap();
+        let before = reg.snapshot();
+        let rx = reg.subscribe();
+        for port in [0, 80, 1023] {
+            assert!(reg.persist_selected_ws_api_port(&before, port).is_err());
+            assert_apply_unchanged(&reg, &before, "", 0, None, &rx);
+        }
+        std::fs::remove_file(&path).unwrap();
+        assert!(reg.persist_selected_ws_api_port(&before, 5182).is_err());
+        assert!(!path.exists());
+        assert!(Arc::ptr_eq(&before, &reg.snapshot()));
+        assert!(!rx.has_changed().unwrap());
+    }
+
+    #[test]
+    fn ws_port_assignments_are_per_config_and_reset_is_deliberate() {
+        let (_a, a) = temp_config(Some(""));
+        let (_b, b) = temp_config(Some(""));
+        let first = SettingsRegistry::load(&a).unwrap();
+        let second = SettingsRegistry::load(&b).unwrap();
+        assert!(second
+            .persist_selected_ws_api_port(&first.snapshot(), 5182)
+            .is_err());
+        first
+            .persist_selected_ws_api_port(&first.snapshot(), 5181)
+            .unwrap();
+        second
+            .persist_selected_ws_api_port(&second.snapshot(), 5182)
+            .unwrap();
+        first
+            .apply(&set("server.wsApi.enabled", json!(true)))
+            .unwrap();
+        first
+            .apply(&set("server.wsApi.enabled", json!(false)))
+            .unwrap();
+        assert_eq!(
+            first.snapshot().ws_api_port_policy(),
+            WsApiPortPolicy::Fixed(5181)
+        );
+        first.apply(&set("server.wsApi.port", json!(6000))).unwrap();
+        assert_eq!(
+            first.snapshot().ws_api_port_policy(),
+            WsApiPortPolicy::Fixed(6000)
+        );
+        first.apply(&set("server.wsApi.port", Value::Null)).unwrap();
+        assert_eq!(
+            first.snapshot().ws_api_port_policy(),
+            WsApiPortPolicy::Unassigned
+        );
+        first
+            .persist_selected_ws_api_port(&first.snapshot(), 5183)
+            .unwrap();
+        assert_eq!(
+            SettingsRegistry::load(&b)
+                .unwrap()
+                .snapshot()
+                .ws_api_port_policy(),
+            WsApiPortPolicy::Fixed(5182)
+        );
+    }
+
+    #[test]
+    fn ws_port_assignment_write_failure_keeps_state_and_cleans_temp_file() {
+        let (dir, path) = temp_config(Some("# retained\n"));
+        let reg = SettingsRegistry::load(&path).unwrap();
+        let before = reg.snapshot();
+        let rx = reg.subscribe();
+        let saved = dir.path().join("saved.toml");
+        std::fs::rename(&path, &saved).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(reg.persist_selected_ws_api_port(&before, 5182).is_err());
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&saved, &path).unwrap();
+        assert_apply_unchanged(&reg, &before, "# retained\n", 0, None, &rx);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        reg.persist_selected_ws_api_port(&before, 5183).unwrap();
+        assert_eq!(
+            reg.snapshot().ws_api_port_policy(),
+            WsApiPortPolicy::Fixed(5183)
+        );
+    }
+
+    #[test]
+    fn ws_port_assignment_has_only_one_winner() {
+        let (_dir, path) = temp_config(Some(""));
+        let reg = SettingsRegistry::load(&path).unwrap();
+        let before = reg.snapshot();
+        let barrier = std::sync::Barrier::new(2);
+        let results = std::thread::scope(|scope| {
+            let a = scope.spawn(|| {
+                barrier.wait();
+                reg.persist_selected_ws_api_port(&before, 5181)
+            });
+            let b = scope.spawn(|| {
+                barrier.wait();
+                reg.persist_selected_ws_api_port(&before, 5182)
+            });
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        assert_ne!(results.0.is_ok(), results.1.is_ok());
+        let port = if results.0.is_ok() { 5181 } else { 5182 };
+        assert_eq!(
+            reg.snapshot().ws_api_port_policy(),
+            WsApiPortPolicy::Fixed(port)
+        );
+        assert_eq!(
+            SettingsRegistry::load(&path)
+                .unwrap()
+                .snapshot()
+                .ws_api_port_policy(),
+            WsApiPortPolicy::Fixed(port)
+        );
+        assert_eq!(reg.generation(), 1);
+    }
+
+    #[test]
+    fn ws_port_assignment_tracks_exact_source_across_normalization_and_reload() {
+        // Loading normalizes this compound in the TOML document. The disk
+        // comparison must still use the original bytes, not the normalized doc.
+        let (_dir, path) = temp_config(Some("[model]\ndefault = 'claude-code:model-id'\n"));
+        let reg = SettingsRegistry::load(&path).unwrap();
+        reg.persist_selected_ws_api_port(&reg.snapshot(), 5182)
+            .unwrap();
+        let text = "# deliberate reset\n[server.wsApi]\n# port removed\n";
+        std::fs::write(&path, text).unwrap();
+        assert!(reg
+            .reload(text)
+            .unwrap()
+            .changed
+            .contains("server.wsApi.port"));
+        reg.persist_selected_ws_api_port(&reg.snapshot(), 5183)
+            .unwrap();
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("# deliberate reset"));
     }
 
     #[test]
