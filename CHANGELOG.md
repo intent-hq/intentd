@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.129] - 2026-10-01
+
+### 🚀 Features
+
+- Add indexed global note search with ranked previews ([#2199](https://github.com/intent-hq/intentd/pull/2199))
+
+### 🐛 Bug Fixes
+
+- Notify workspace guests after host membership additions ([#2196](https://github.com/intent-hq/intentd/pull/2196))
+
+
 ## [0.9.128] - 2026-10-01
 
 ### 🚀 Features
