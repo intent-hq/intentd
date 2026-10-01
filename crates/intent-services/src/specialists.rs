@@ -795,8 +795,7 @@ fn validate_aliases_spec(value: Option<&Value>) -> Result<Option<Vec<Value>>> {
     Ok(Some(out))
 }
 
-/// Retired frontmatter/wire keys, tolerated-and-ignored like the retired
-/// `model.workspaceOverrides` setting (PROTOCOL §5.11/§5.12): old files and
+/// Retired frontmatter/wire keys, tolerated-and-ignored (PROTOCOL §5.11): old files and
 /// old-client `specialist.create`/`edit` specs may still carry them, but they
 /// are stripped on parse (never echoed by `get`/`list`), silently skipped by
 /// `render_file` (never rejected with `-32602`), and dropped from the file on
