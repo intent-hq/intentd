@@ -105,6 +105,7 @@ mod source_control_auth_ops;
 
 mod agent_list_cache;
 pub mod checkpoint;
+mod codex_home;
 mod fast_mode;
 mod harness;
 mod history_xml;

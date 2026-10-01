@@ -12776,18 +12776,9 @@ async fn wss_host_provider_test_prompt_success_and_auth_required_paths() {
     ) {
         return;
     }
-    // host.providerTestPrompt (§5.14) over the real wire, both terminal
-    // shapes against the mock ACP fixture. A provider whose adapter answers
-    // the live "say hello" turn is `{ ok: true }` and the cached
-    // host.providerAuthStatus verdict is promoted to a hard `true`; an
-    // adapter that rejects session/prompt with an auth-required JSON-RPC
-    // error is `{ ok: false, reason: "auth-required" }` and the verdict is
-    // demoted to `false` — observed here through non-forced
-    // host.providerAuthStatus reads, which serve the cache before any probe.
-    //
-    // One sequential test (not two) because the daemon runs in-process and
-    // the auth-verdict cache is process-global: two parallel tests promoting
-    // and demoting the same provider would race each other's assertions.
+    // Verify both live prompt outcomes without letting an isolated Codex
+    // home overwrite the default home's auth status. Capture that status
+    // first: its value depends on the host, but must survive either outcome.
     if intent_providers::resolve_on_path("node").is_none() {
         eprintln!("skipping providerTestPrompt e2e: node not on PATH");
         return;
@@ -12799,6 +12790,14 @@ async fn wss_host_provider_test_prompt_success_and_auth_required_paths() {
     );
     let srv = start(WsOptions::default()).await;
     common::codex_npx::select_adapter(&ok_bin);
+
+    let baseline = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":69,"method":"host.providerAuthStatus","params":{"providerId":"codex"}}"#,
+    ).await;
+    assert!(baseline["result"]["providers"].is_array(), "{baseline}");
+    let original_auth = baseline["result"]["providers"][0]["authenticated"].clone();
 
     let resp = wss_call(
         srv.port,
@@ -12819,8 +12818,8 @@ async fn wss_host_provider_test_prompt_success_and_auth_required_paths() {
     )
     .await;
     assert_eq!(
-        status["result"]["providers"][0]["authenticated"], true,
-        "a passed test prompt promotes the cached verdict: {status}"
+        status["result"]["providers"][0]["authenticated"], original_auth,
+        "a passed isolated Codex prompt must not promote another home's verdict: {status}"
     );
 
     // Same provider, now behind an adapter that rejects the prompt with the
@@ -12853,8 +12852,8 @@ async fn wss_host_provider_test_prompt_success_and_auth_required_paths() {
     )
     .await;
     assert_eq!(
-        status["result"]["providers"][0]["authenticated"], false,
-        "an auth-required test prompt demotes the cached verdict: {status}"
+        status["result"]["providers"][0]["authenticated"], original_auth,
+        "an isolated Codex auth failure must not demote another home's verdict: {status}"
     );
     srv.ws.stop().await;
 }

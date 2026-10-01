@@ -3919,7 +3919,12 @@ impl Services {
                         crate::host_execution::ai_authorization_error(
                             Error::InvalidParams(format!(
                                 "session/prompt: {}",
-                                crate::provider_auth::not_authenticated_message(&provider_id)
+                                self.agent_manager().map_or_else(
+                                    || crate::provider_auth::not_authenticated_message(
+                                        &provider_id
+                                    ),
+                                    |manager| manager.provider_auth_message(&provider_id, agent_id),
+                                )
                             )),
                             &provider_id,
                             intent_core::execution::ExecutionAuthorizationReason::Rejected,

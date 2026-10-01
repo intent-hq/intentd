@@ -749,6 +749,12 @@ fn auth_cache_key(provider_id: &str) -> &'static str {
 /// alias-backed create would actually spawn. Identity metadata never
 /// influences the gate — it is wire-only enrichment.
 pub(crate) fn cached_auth_verdict(provider_id: &str) -> Option<bool> {
+    // Codex agents can use different homes (and keychain identities). The
+    // default-home probe cannot gate them; runtime adapter auth is authoritative.
+    if auth_cache_key(provider_id) == "codex" {
+        return None;
+    }
+
     cache()
         .fresh(auth_cache_key(provider_id))
         .and_then(|verdict| verdict.authenticated)
@@ -787,6 +793,12 @@ pub(crate) fn not_authenticated_message(provider_id: &str) -> String {
 /// overwrite this authoritative `false`, and clears any cached identity
 /// metadata with it.
 pub(crate) fn demote_auth_verdict(provider_id: &str) {
+    // Codex agents can use different homes (and keychain identities). The
+    // default-home probe cannot gate them; runtime adapter auth is authoritative.
+    if auth_cache_key(provider_id) == "codex" {
+        return;
+    }
+
     cache().demote(auth_cache_key(provider_id));
 }
 
@@ -800,6 +812,12 @@ pub(crate) fn demote_auth_verdict(provider_id: &str) {
 /// this authoritative `true`. Cached identity metadata is preserved on the
 /// refreshed entry.
 pub(crate) fn promote_auth_verdict(provider_id: &str) {
+    // Codex agents can use different homes (and keychain identities). The
+    // default-home probe cannot gate them; runtime adapter auth is authoritative.
+    if auth_cache_key(provider_id) == "codex" {
+        return;
+    }
+
     cache().promote(auth_cache_key(provider_id));
 }
 
@@ -922,6 +940,18 @@ fn auth_status_entry(id: &str, verdict: &AuthVerdict) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_runtime_auth_does_not_gate_other_homes() {
+        seed_auth_verdict_for_tests("codex", Some(false));
+        assert_eq!(cached_auth_verdict("codex"), None);
+        promote_auth_verdict("codex");
+        assert_eq!(cache().fresh("codex").unwrap().authenticated, Some(false));
+        seed_auth_verdict_for_tests("codex", Some(true));
+        demote_auth_verdict("codex");
+        assert_eq!(cache().fresh("codex").unwrap().authenticated, Some(true));
+        seed_auth_verdict_for_tests("codex", None);
+    }
 
     #[test]
     fn cli_probe_wire_mapping() {
