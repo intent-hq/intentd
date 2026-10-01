@@ -5,14 +5,16 @@ use super::{note, workspace, TempDb};
 use crate::{compute_task_stats, workspace_task_list, Services};
 use intent_core::{NoteId, TaskListResult, TaskMetadata, WorkspaceApi, WorkspaceId};
 use intent_store::Store;
+use std::fmt::Write as _;
 use std::time::Instant;
 
 async fn seed(store: &Store, tasks: usize, plain: usize) -> WorkspaceId {
     let ws = WorkspaceId::from("task-list-benchmark");
     store.insert_workspace(&workspace(&ws)).await.unwrap();
-    let spec = (0..tasks)
-        .map(|i| format!("- [Task](intent://local/task/task-{i:03})\n"))
-        .collect::<String>();
+    let mut spec = String::new();
+    for i in 0..tasks {
+        writeln!(spec, "- [Task](intent://local/task/task-{i:03})").unwrap();
+    }
     store.insert_note(&note(&ws, "spec", &spec)).await.unwrap();
     for i in 0..tasks + plain {
         let id = if i < tasks {

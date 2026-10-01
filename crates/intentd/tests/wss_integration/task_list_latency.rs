@@ -12,9 +12,10 @@ async fn wss_task_list_latency_baseline() {
         .insert_workspace(&fixture_workspace(&ws))
         .await
         .unwrap();
-    let spec = (0..64)
-        .map(|i| format!("- [Task](intent://local/task/task-{i:03})\n"))
-        .collect::<String>();
+    let mut spec = String::new();
+    for i in 0..64 {
+        writeln!(spec, "- [Task](intent://local/task/task-{i:03})").unwrap();
+    }
     srv.store
         .insert_note(&fixture_note(&ws, "spec", &spec))
         .await
@@ -62,7 +63,7 @@ async fn wss_task_list_latency_baseline() {
                     match socket.next().await {
                         Some(Ok(Message::Text(text))) => break text,
                         Some(Ok(Message::Ping(payload))) => {
-                            socket.send(Message::Pong(payload)).await.unwrap()
+                            socket.send(Message::Pong(payload)).await.unwrap();
                         }
                         other => panic!("expected task.list response, got {other:?}"),
                     }
