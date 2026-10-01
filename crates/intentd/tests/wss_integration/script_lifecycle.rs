@@ -146,7 +146,7 @@ async fn script_archive_restore_contract_over_wss() {
 }
 
 #[intent_test_macros::daemon_test]
-async fn script_one_off_settlement_and_output_over_wss() {
+async fn script_default_one_off_settlement_and_output_over_wss() {
     let srv = start(WsOptions::default()).await;
     let mut client = connect_ws(srv.port, srv.cfg.clone()).await;
     let hello = rpc(
@@ -156,6 +156,14 @@ async fn script_one_off_settlement_and_output_over_wss() {
         json!({"clientId":"script-lifecycle-e2e","clientType":"web"}),
     )
     .await;
+    assert_eq!(
+        hello["result"]["protocolVersion"],
+        intent_transport::PROTOCOL_VERSION
+    );
+    assert_eq!(
+        hello["result"]["server"]["protocolVersion"],
+        intent_transport::PROTOCOL_VERSION
+    );
     assert_eq!(
         hello["result"]["server"]["capabilities"]["scriptLifecycle"], 1,
         "{hello}"
@@ -180,7 +188,7 @@ async fn script_one_off_settlement_and_output_over_wss() {
         ("success", "printf retained", "succeeded", 0),
         ("failure", "exit 9", "failed", 9),
     ] {
-        let def = rpc(&mut client,3,"script.create",json!({"workspaceId":ws,"scriptId":sid,"name":"check","mode":"command","purpose":"oneOff","command":command})).await;
+        let def = rpc(&mut client,3,"script.create",json!({"workspaceId":ws,"scriptId":sid,"name":"check","mode":"command","command":command})).await;
         assert_eq!(def["result"]["purpose"], "oneOff");
         let run = rpc(
             &mut client,
@@ -248,5 +256,69 @@ async fn script_one_off_settlement_and_output_over_wss() {
             assert!(output["result"].as_str().unwrap().contains("retained"));
         }
     }
+    srv.ws.stop().await;
+}
+
+/// Drive the public MCP tools/call + JS binding and WSS router against the
+/// same real services/store. Neither caller may replace omission with Saved.
+#[intent_test_macros::daemon_test]
+async fn script_creation_defaults_through_mcp_and_wss() {
+    let srv = start(WsOptions::default()).await;
+    let mut client = connect_ws(srv.port, srv.cfg.clone()).await;
+    let created = rpc(
+        &mut client,
+        1,
+        "workspace.create",
+        json!({"title":"Creation defaults"}),
+    )
+    .await;
+    let ws = created["result"]["workspace"]["id"].as_str().unwrap();
+    let mcp = intent_acp::WorkspaceMcpServer::new(srv.api.clone(), WorkspaceId::from_string(ws));
+    for via_mcp in [false, true] {
+        for (suffix, mode, purpose, expected) in [
+            ("default", "command", None, "oneOff"),
+            ("saved", "command", Some("saved"), "saved"),
+            ("explicit", "command", Some("oneOff"), "oneOff"),
+            ("service", "service", None, "saved"),
+        ] {
+            let id = format!("{via_mcp}-{suffix}");
+            for updating in [false, true] {
+                let mut options = json!({"scriptId":id});
+                if !updating {
+                    if let Some(purpose) = purpose {
+                        options["purpose"] = json!(purpose);
+                    }
+                }
+                if via_mcp {
+                    let code =
+                        format!("return await ws.script.create('test','true','{mode}',{options});");
+                    let response = mcp.handle_message(&json!({
+                        "jsonrpc":"2.0", "id":2, "method":"tools/call",
+                        "params":{"name":"workspace_api", "arguments":{"code":code,"summary":"Create script regression"}}
+                    })).await.unwrap();
+                    assert_eq!(response["result"]["isError"], false, "{response}");
+                } else {
+                    options["workspaceId"] = json!(ws);
+                    options["name"] = json!("test");
+                    options["command"] = json!("true");
+                    options["mode"] = json!(mode);
+                    let response = rpc(&mut client, 2, "script.create", options).await;
+                    assert_eq!(response["result"]["purpose"], expected, "{response}");
+                }
+                let listed = rpc(&mut client, 3, "script.list", json!({"workspaceId":ws})).await;
+                let row = listed["result"]["scripts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|s| s["id"] == id)
+                    .unwrap();
+                assert_eq!(row["purpose"], expected, "{id}, updating={updating}");
+            }
+        }
+    }
+    let invalid = rpc(&mut client, 4, "script.create", json!({"workspaceId":ws,"name":"autostart", "command":"true", "mode":"command", "autoStart":true})).await;
+    assert_eq!(invalid["error"]["code"], -32602, "{invalid}");
+    let saved = rpc(&mut client, 5, "script.create", json!({"workspaceId":ws,"name":"autostart", "command":"true", "mode":"command", "autoStart":true,"purpose":"saved"})).await;
+    assert_eq!(saved["result"]["purpose"], "saved", "{saved}");
     srv.ws.stop().await;
 }
