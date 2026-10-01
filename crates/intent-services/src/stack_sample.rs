@@ -256,6 +256,40 @@ mod tests {
     /// runs tests on parallel threads by default.
     static CAPTURE_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    /// Force hash collisions so reports exercise the spill file, not just
+    /// the in-memory buckets. Reading must not move the next write position.
+    #[cfg(unix)]
+    #[test]
+    fn collector_spills_survive_repeated_reports_and_further_samples() {
+        use std::collections::BTreeMap;
+        use std::hash::{Hash, Hasher};
+
+        #[derive(Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+        struct CollidingKey(usize);
+        impl Hash for CollidingKey {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                state.write_u8(0);
+            }
+        }
+
+        let mut collector = pprof::Collector::<CollidingKey>::new().unwrap();
+        let mut expected = BTreeMap::new();
+        for batch in 0..2 {
+            for key in batch * 10_000..(batch + 1) * 10_000 {
+                collector.add(CollidingKey(key), 3).unwrap();
+                expected.insert(key, 3);
+            }
+            for _ in 0..2 {
+                let actual: BTreeMap<_, _> = collector
+                    .try_iter()
+                    .unwrap()
+                    .map(|entry| (entry.item.0, entry.count))
+                    .collect();
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+
     /// A fresh process owns each TMP directory. Inspect it only after that
     /// process exits: dropping a capture guard alone cannot prove cleanup of
     /// a collector retained in a process-global static.
@@ -264,7 +298,6 @@ mod tests {
     fn sampling_leaves_no_temporary_files_after_process_exit() {
         const WORKER: &str = "INTENT_TEST_STACK_SAMPLE_COUNT";
         if let Ok(count) = std::env::var(WORKER) {
-            let count: usize = count.parse().unwrap();
             assert_eq!(
                 std::env::temp_dir(),
                 std::path::PathBuf::from(std::env::var_os("TMPDIR").unwrap())
@@ -274,7 +307,16 @@ mod tests {
                 .build()
                 .unwrap();
             runtime.block_on(async {
-                for _ in 0..count {
+                if count == "error" {
+                    for _ in 0..2 {
+                        let error = sample_stacks(Some(100), Some(99)).await.unwrap_err();
+                        assert!(matches!(error, Error::Internal(ref message)
+                            if message.contains("failed to start stack sampler")),
+                            "creation failure must propagate and release the capture flag: {error:?}");
+                    }
+                    return;
+                }
+                for _ in 0..count.parse::<usize>().unwrap() {
                     let payload = sample_stacks(Some(100), Some(99)).await.unwrap();
                     assert_eq!(payload["durationMs"], 100);
                     assert_eq!(payload["frequencyHz"], 99);
@@ -292,13 +334,19 @@ mod tests {
 
         // Zero captures is the control for runtime/test-harness startup;
         // one and repeated captures exercise both collector creation and reuse.
+        // A missing TMP directory exercises creation errors and flag release.
         let mut failures = Vec::new();
-        for count in [0, 1, 3] {
+        for count in ["0", "1", "3", "error"] {
             let mut root = crate::test_support::test_tempdir("stack-sample-exit-");
             let tmp = root.path().join("tmp");
             std::fs::create_dir(&tmp).unwrap();
             let log_path = root.path().join("worker.log");
             let log = std::fs::File::create(&log_path).unwrap();
+            let worker_tmp = if count == "error" {
+                tmp.join("nonexistent")
+            } else {
+                tmp.clone()
+            };
             let mut command = std::process::Command::new(std::env::current_exe().unwrap());
             command
                 .args([
@@ -307,10 +355,10 @@ mod tests {
                     "--nocapture",
                     "--test-threads=1",
                 ])
-                .env(WORKER, count.to_string())
-                .env("TMPDIR", &tmp)
-                .env("TMP", &tmp)
-                .env("TEMP", &tmp)
+                .env(WORKER, count)
+                .env("TMPDIR", &worker_tmp)
+                .env("TMP", &worker_tmp)
+                .env("TEMP", &worker_tmp)
                 .stdout(log.try_clone().unwrap())
                 .stderr(log);
             let mut child = intentd_test_support::GuardedChild::spawn(&mut command).unwrap();
