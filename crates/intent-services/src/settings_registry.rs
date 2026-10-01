@@ -281,6 +281,7 @@ impl SettingsSnapshot {
     /// Distinguish an unassigned installation from an explicit port, including
     /// an explicit 5181. Retain this snapshot across binding and pass it to
     /// [`SettingsRegistry::persist_selected_ws_api_port`] before readiness.
+    #[must_use]
     pub fn ws_api_port_policy(&self) -> WsApiPortPolicy {
         if self.origin("server.wsApi.port") == Some(SettingOrigin::Default) {
             WsApiPortPolicy::Unassigned
@@ -292,6 +293,7 @@ impl SettingsSnapshot {
     /// Effective JSON value for a dotted wire path. `None` for unknown paths
     /// (including secrets and SQLite-backed state blobs, which are not this
     /// registry's concern). Known-but-unset optional keys read `Some(Null)`.
+    #[must_use]
     pub fn get(&self, path: &str) -> Option<Value> {
         if !KNOWN_PATHS.contains(&path) {
             return None;
@@ -300,11 +302,13 @@ impl SettingsSnapshot {
     }
 
     /// Origin of a dotted wire path, or `None` when unknown.
+    #[must_use]
     pub fn origin(&self, path: &str) -> Option<SettingOrigin> {
         self.origins.get(path).copied()
     }
 
     /// All known paths with their origins (for `settings.list`-style views).
+    #[must_use]
     pub fn origins(&self) -> &BTreeMap<String, SettingOrigin> {
         &self.origins
     }
