@@ -15,6 +15,7 @@ use intent_store::Store;
 
 use crate::{repository_backfill_probe_count, BackfillCandidate, Services};
 
+mod line_attribution_retry;
 mod skill_list;
 mod task_list_latency;
 pub(crate) mod workspace_delete;
