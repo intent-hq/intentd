@@ -16,6 +16,7 @@ use intent_store::Store;
 use crate::{repository_backfill_probe_count, BackfillCandidate, Services};
 
 mod skill_list;
+mod task_list_latency;
 pub(crate) mod workspace_delete;
 
 /// Runs before `main()` — and therefore before any test threads exist, making
