@@ -1,0 +1,18 @@
+Upstream: https://github.com/tikv/pprof-rs
+Version: pprof 0.15.0, registry source commit c2d6e7b9aa0abf405fcd435d949e6502771fbce0
+Archive: https://static.crates.io/crates/pprof/pprof-0.15.0.crate
+Archive SHA256: 38a01da47675efa7673b032bf8efd8214f1917d89685e07e395ab125ea42b187
+License: Apache-2.0 (LICENSE and upstream copyright notices retained)
+
+Local changes for https://github.com/intent-hq/intent/issues/6364:
+- collector.rs uses an anonymous tempfile::tempfile handle instead of
+  NamedTempFile, so the process-global collector leaves no pathname at exit.
+- Positional reads replace pathname reopening and leave the write cursor alone.
+- Collector tests cover anonymous lifetime, repeated reads/appends and read errors.
+
+All other shipped upstream files are unchanged. Cargo.lock, Cargo.toml.orig and
+.cargo_vcs_info.json are omitted: the workspace lock and this file record origin.
+The Cargo config patch applies to normal builds and release-plz's sanitized
+package verification. The crate remains outside the workspace member list and
+is still only a dependency on Unix. Remove this copy and override when upstream
+ships an equivalent fix; retain the service process-exit regression.
