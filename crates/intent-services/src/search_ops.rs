@@ -6,12 +6,12 @@
 
 use std::path::PathBuf;
 
-use intent_core::{Error, Event, Note, Result, RetrieveResult, WorkspaceId};
+use intent_core::{Error, Event, Result, RetrieveResult, WorkspaceId};
 use intent_search::{
     contains_ci, extract_symbol, fts_preview, make_preview, CodebaseMatch, ContentSearchResult,
     EventMatch, MessageMatch, NoteMatch,
 };
-use intent_store::{MessageFtsMatch, Store};
+use intent_store::{MessageFtsMatch, NoteFtsMatch, Store};
 use serde_json::Value;
 
 /// Result sets at or below this many matches are returned inline in the method
@@ -115,22 +115,24 @@ pub(crate) fn event_matches(
     out
 }
 
-/// Build `search.notes` matches over the notes store. The searchable text is the
-/// note title plus its content.
-pub(crate) fn note_matches(notes: &[Note], query: &str) -> Vec<NoteMatch> {
-    let mut out = Vec::new();
-    for note in notes {
-        let text = format!("{} {}", note.title, note.content);
-        if !contains_ci(&text, query) {
-            continue;
-        }
-        out.push(NoteMatch {
-            note_id: note.id.as_str().to_string(),
-            preview: make_preview(&text, query),
-            score: None,
-        });
-    }
-    out
+/// Build bounded, plain-text previews only for the indexed winners, preserving
+/// the store's ranked order and negating its lower-is-better rank for the wire.
+pub(crate) fn note_fts_matches(hits: Vec<NoteFtsMatch>, query: &str) -> Vec<NoteMatch> {
+    hits.into_iter()
+        .map(|hit| {
+            let text = format!("{} {} {}", hit.title, hit.content, hit.tags.join(" "));
+            NoteMatch {
+                note_id: hit.note_id,
+                workspace_id: hit.workspace_id,
+                title: hit.title,
+                preview: fts_preview(&text, query),
+                score: Some(-hit.rank),
+                updated_at: hit.updated_at,
+                is_archived: hit.is_archived,
+                workspace_archived: hit.workspace_archived,
+            }
+        })
+        .collect()
 }
 
 /// Map a ripgrep content-search result into `search.codebase` matches, attaching

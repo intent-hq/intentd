@@ -6499,14 +6499,26 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `search.notes`: GLOBAL substring search over the BE notes store (no
-    /// `workspaceId`). Returns `{ requestId, matches: NoteMatch[] }` (PROTOCOL §5.15).
+    /// `search.notes`: ranked full-text search across visible workspaces, with
+    /// optional hard scope and soft preference. Always returns inline
+    /// `{ requestId, matches: NoteMatch[], indexed: true }` (PROTOCOL §5.15).
     fn search_notes(
         &self,
         query: String,
+        workspace_id: Option<WorkspaceId>,
+        prefer_workspace_id: Option<WorkspaceId>,
+        limit: Option<i64>,
+        include_archived: bool,
         request_id: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (query, request_id);
+        let _ = (
+            query,
+            workspace_id,
+            prefer_workspace_id,
+            limit,
+            include_archived,
+            request_id,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::search_notes not implemented".to_string(),

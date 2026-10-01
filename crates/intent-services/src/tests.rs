@@ -29012,11 +29012,152 @@ mod search_adapters {
         let svc = Services::new(store);
         // No workspaceId param — global search.
         let r = svc
-            .search_notes("alpha".into(), Some("srch-n".into()))
+            .search_notes(
+                "alpha".into(),
+                None,
+                None,
+                None,
+                true,
+                Some("srch-n".into()),
+            )
             .await
             .unwrap();
         assert_eq!(r["requestId"], "srch-n");
         assert_eq!(r["matches"].as_array().unwrap().len(), 2);
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn notes_search_uses_tokens_tags_and_readable_ranked_snippets() {
+        let (_tmp, store, ws) = store_with_ws().await;
+        let mut body = note(
+            &ws,
+            "body",
+            &format!("{} café running\n  checklist", "padding ".repeat(50)),
+        );
+        body.title = "Plain title".into();
+        body.tags = vec!["tagonly".into()];
+        store.insert_note(&body).await.unwrap();
+        let svc = Services::new(store);
+        for query in ["CAFÉ run", "run checklist", "tagonly", "café:(checkl"] {
+            let result = svc
+                .search_notes(query.into(), None, None, None, true, None)
+                .await
+                .unwrap();
+            assert_eq!(result["indexed"], true);
+            let hit = &result["matches"][0];
+            assert_eq!(hit["noteId"], "body", "{query}: {result}");
+            assert_eq!(hit["workspaceId"], ws.as_str());
+            assert!(hit["score"].is_number());
+            let preview = hit["preview"].as_str().unwrap();
+            assert!(preview.chars().count() <= 162);
+            assert!(!preview.contains('\n'));
+            if query != "tagonly" {
+                assert!(preview.contains("checklist"), "{preview}");
+            }
+        }
+        // FTS operators are literal search tokens, never parser instructions.
+        assert!(svc
+            .search_notes("café OR nonexistent".into(), None, None, None, true, None)
+            .await
+            .unwrap()["matches"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn notes_search_propagates_index_failure() {
+        let (_tmp, store, _) = store_with_ws().await;
+        sqlx::query("DROP TABLE note_fts")
+            .execute(store.write_pool())
+            .await
+            .unwrap();
+        let svc = Services::new(store);
+        assert!(svc
+            .search_notes("needle".into(), None, None, None, true, None)
+            .await
+            .is_err());
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn notes_search_validates_typed_scope_and_limit_before_empty_queries() {
+        let (_tmp, store, _) = store_with_ws().await;
+        let svc = Services::new(store);
+        assert!(matches!(
+            svc.search_notes(String::new(), None, None, Some(-1), true, None)
+                .await,
+            Err(intent_core::Error::InvalidParams(_))
+        ));
+        for (hard, soft) in [
+            (Some(WorkspaceId::from("")), None),
+            (None, Some(WorkspaceId::from(""))),
+        ] {
+            assert!(matches!(
+                svc.search_notes(String::new(), hard, soft, None, true, None)
+                    .await,
+                Err(intent_core::Error::InvalidParams(_))
+            ));
+        }
+        assert!(matches!(
+            svc.search_notes(
+                String::new(),
+                Some(WorkspaceId::from("missing")),
+                None,
+                Some(0),
+                true,
+                None
+            )
+            .await,
+            Err(intent_core::Error::NotFound(_))
+        ));
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn notes_search_preserves_rank_ties_and_soft_preference() {
+        let (_tmp, store, ws1) = store_with_ws().await;
+        let ws2 = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws2)).await.unwrap();
+        for ws in [&ws1, &ws2] {
+            for id in ["z", "a"] {
+                let mut row = note(ws, id, "identicalterm");
+                row.title = "Same title".into();
+                row.updated_at = "2026-01-01T00:00:00Z".into();
+                store.insert_note(&row).await.unwrap();
+            }
+        }
+        let svc = Services::new(store);
+        let ranked = svc
+            .search_notes(
+                "identicalterm".into(),
+                None,
+                Some(ws2.clone()),
+                Some(3),
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        let hits = ranked["matches"].as_array().unwrap();
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0]["workspaceId"], ws2.as_str());
+        assert_eq!(hits[0]["noteId"], "a");
+        assert_eq!(hits[1]["workspaceId"], ws2.as_str());
+        assert_eq!(hits[1]["noteId"], "z");
+        assert_eq!(hits[2]["workspaceId"], ws1.as_str());
+        assert!(hits[0]["score"].as_f64().unwrap() > hits[2]["score"].as_f64().unwrap());
+        let scoped = svc
+            .search_notes(
+                "identicalterm".into(),
+                Some(ws1.clone()),
+                Some(ws2),
+                None,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(scoped["matches"].as_array().unwrap().len(), 2);
+        assert_eq!(scoped["matches"][0]["workspaceId"], ws1.as_str());
     }
 
     /// A fake [`ContextEngine`] so the engine-available and graceful-degradation
