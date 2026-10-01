@@ -20,10 +20,10 @@ use intent_core::events::{
     AGENT_COMPLETED, AGENT_CREATED, AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_MESSAGE,
     AGENT_RENAMED, AGENT_RESTORED, AGENT_RETIRED, AGENT_STARTED, AGENT_STATUS_CHANGED,
     AGENT_STREAM_END, AGENT_TOOL_CALL, AGENT_UPDATED, CHAT_STREAM_DELTA, COMMENT_ADDED,
-    NOTE_CREATED, NOTE_DELETED, NOTE_PRESENCE, NOTE_UPDATED, PR_LINKED, PR_UNLINKED, PR_UPDATED,
-    TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED, WORKSPACE_ATTENTION_CHANGED,
-    WORKSPACE_CREATED, WORKSPACE_DELETED, WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_UPDATED,
-    WORKSPACE_WAITING_CHANGED,
+    COMMENT_DELETED, NOTE_CREATED, NOTE_DELETED, NOTE_PRESENCE, NOTE_UPDATED, PR_LINKED,
+    PR_UNLINKED, PR_UPDATED, TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED,
+    WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED,
+    WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_UPDATED, WORKSPACE_WAITING_CHANGED,
 };
 use intent_core::{
     extract_spec_task_ids, note_list_slim_row, now_iso, AgentId, AgentLite, ConversationProjection,
@@ -693,7 +693,7 @@ pub(crate) fn channel_event_types(channel: Channel) -> Vec<String> {
             PR_UPDATED,
             PR_UNLINKED,
         ],
-        Channel::Comment => &[COMMENT_ADDED],
+        Channel::Comment => &[COMMENT_ADDED, COMMENT_DELETED],
         // The chat channel is the one consumer of the content-bearing
         // `chat:stream:delta` firehose (CS-0); the forwarder additionally
         // filters these to one agent by `sessionId == agentId`.
@@ -2261,14 +2261,15 @@ fn is_unshare_of_current_caller(event: &Event) -> bool {
 /// `comment:added` for the subscribed note re-lists the threads (with their
 /// comments) and emits the thread carrying the new comment as `updated` (a new
 /// thread upserts by `threadId`; the client merges idempotently). Events for a
-/// different note are ignored.
+/// different note are ignored. `comment:deleted` retains the thread ID, so a
+/// surviving thread is re-read and an empty thread emits `removedIds`.
 pub(crate) async fn comment_delta(
     api: &dyn WorkspaceApi,
     workspace_id: &WorkspaceId,
     note_id: &NoteId,
     event: &Event,
 ) -> Option<Value> {
-    if event.event_type != COMMENT_ADDED {
+    if !matches!(event.event_type.as_str(), COMMENT_ADDED | COMMENT_DELETED) {
         return None;
     }
     let event_note = event.data.get("noteId").and_then(Value::as_str)?;
@@ -2287,6 +2288,17 @@ pub(crate) async fn comment_delta(
         )
         .await
         .ok()?;
+    if event.event_type == COMMENT_DELETED {
+        let thread_id = event.data.get("threadId").and_then(Value::as_str)?;
+        return match result
+            .threads
+            .into_iter()
+            .find(|t| t.thread_id == thread_id)
+        {
+            Some(thread) => Some(json!({ "updated": [serde_json::to_value(thread).ok()?] })),
+            None => Some(json!({ "removedIds": [thread_id] })),
+        };
+    }
     let thread = result.threads.into_iter().find(|t| {
         t.comments
             .as_ref()

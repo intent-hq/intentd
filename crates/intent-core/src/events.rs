@@ -361,6 +361,8 @@ pub(crate) const GOAL_UPDATED: &str = "goal:updated";
 
 // Comment events.
 pub const COMMENT_ADDED: &str = "comment:added";
+/// A durable deletion; retain the thread identity after the row is gone.
+pub const COMMENT_DELETED: &str = "comment:deleted";
 // Emitted by `comment.resolveThread` when a thread is (un)resolved. The
 // self-sufficient payload `{ noteId, threadId, resolved }` lets a client flip
 // the thread's resolved state without a follow-up read.
@@ -662,6 +664,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     SPEC_UPDATED,
     GOAL_UPDATED,
     COMMENT_ADDED,
+    COMMENT_DELETED,
     COMMENT_RESOLVED,
     PRESENCE_CHANGED,
     NOTE_PRESENCE,
@@ -868,6 +871,7 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (CLIENT_DISCONNECTED, "Authenticated devices: same audience as client.list; final connection departed."),
     (CLIENT_UPDATED, "Authenticated devices: full row after metadata, profile or role changes; same audience as client.list."),
     (COMMENT_ADDED, "Comment: a comment landed on a note."),
+    (COMMENT_DELETED, "Comment: a comment was deleted from a note."),
     (COMMENT_RESOLVED, "Comment: a thread was resolved."),
     (DRAFT_CHANGED, "Draft: a client's composer draft exists or was cleared; { workspaceId, agentId, clientId, hasDraft } — never the text."),
     (FILE_CHANGED, "File: a watched file changed; payload paths are workspace-relative (`events::watcher::relative_path`), never absolute."),
