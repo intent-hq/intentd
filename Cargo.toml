@@ -3,6 +3,11 @@ resolver = "2"
 members = ["crates/*"]
 exclude = ["vendor/pprof"]
 
+[patch.crates-io]
+# Also cover --manifest-path builds launched outside this directory, where
+# Cargo does not discover .cargo/config.toml (which covers package verification).
+pprof = { path = "vendor/pprof" }
+
 [workspace.package]
 edition = "2021"
 rust-version = "1.88"
