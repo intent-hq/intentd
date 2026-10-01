@@ -349,7 +349,10 @@ impl Drop for Harness {
             let _ = shutdown.send(());
         }
         let _ = self.fixture.kill();
-        let _ = self.fixture.wait();
+        let _ = startup_milestones::waited(self.fixture.id(), self.fixture.wait(), |s| {
+            use std::os::unix::process::ExitStatusExt;
+            (s.code(), s.signal())
+        });
     }
 }
 impl Harness {
@@ -375,13 +378,18 @@ impl Harness {
         if let Some(driver) = driver {
             private_json(&dir.path().join("driver.json"), &json!({"version":1,"matchingReview":driver.scenarios.iter().any(|s| s == "held-stop")})).unwrap();
         }
+        let startup_repositories =
+            startup_milestones::begin(startup_milestones::Phase::Repositories);
         let root = dir.path().join("repo");
         std::fs::create_dir(&root).unwrap();
         let registered_path = dir.path().join("secondary");
         std::fs::create_dir(&registered_path).unwrap();
         init_repo(&root);
         init_repo(&registered_path);
+        startup_repositories.returned();
+        let startup_provider = startup_milestones::begin(startup_milestones::Phase::Provider);
         let (fixture, instance, endpoint, fixture_state) = remote_fixture(dir.path(), &root).await;
+        startup_provider.returned();
         git(
             &root,
             &[
@@ -407,6 +415,7 @@ impl Harness {
                 git(path, &["add", "staged.txt"]);
             }
         }
+        let startup_store = startup_milestones::begin(startup_milestones::Phase::Store);
         let store = Store::open(&dir.path().join("intentd.db")).await.unwrap();
         let mut ws = intent_core::chief_workspace();
         ws.id = ids
@@ -420,6 +429,8 @@ impl Harness {
         let registered = ids.map_or_else(WorkspaceGitRootId::new, |ids| ids.1);
         let row=serde_json::from_value(json!({"id":registered,"workspaceId":ws.id,"path":registered_path,"source":"auto","registeredByAgentIds":[],"createdAt":now_iso(),"updatedAt":now_iso()})).unwrap();
         store.upsert_workspace_git_root(&row).await.unwrap();
+        startup_store.returned();
+        let startup_roles = startup_milestones::begin(startup_milestones::Phase::Roles);
         let guest = Principal {
             id: PrincipalId::new(),
             identity: None,
@@ -491,6 +502,8 @@ impl Harness {
             .add_workspace_member(&ws.id, &member.id, WorkspaceRole::Collaborator)
             .await
             .unwrap();
+        startup_roles.returned();
+        let startup_services = startup_milestones::begin(startup_milestones::Phase::Services);
         std::fs::write(dir.path().join("config.toml"),"[providers]\nenabled = {}\n[mcp]\nenableUserServers = false\n[agents]\nresumeInterruptedOnStart = \"off\"\n").unwrap();
         let mut config = std::fs::OpenOptions::new()
             .append(true)
@@ -574,7 +587,11 @@ impl Harness {
         ws_server.install_pairing_info(metadata.clone());
         let ws_server = Arc::new(ws_server);
         metadata.ws.set(Arc::downgrade(&ws_server)).unwrap();
+        startup_services.returned();
+        let startup_wss = startup_milestones::begin(startup_milestones::Phase::Wss);
         let port = ws_server.start().await.unwrap();
+        startup_wss.returned();
+        let startup_uds = startup_milestones::begin(startup_milestones::Phase::Uds);
         let (shutdown, receive) = tokio::sync::oneshot::channel();
         let socket = dir.path().join("intentd.sock");
         let socket_task = socket.clone();
@@ -615,6 +632,7 @@ impl Harness {
         metadata
             .uds
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        startup_uds.returned();
         Self {
             metadata,
             metadata_token,
@@ -871,6 +889,8 @@ async fn remote_fixture(
             std::fs::File::create(dir.join("fixture.log")).unwrap(),
         ));
     let child = GuardedChild::spawn(&mut command).unwrap();
+    startup_milestones::allocated(child.id());
+    let startup_endpoints = startup_milestones::begin(startup_milestones::Phase::ProviderEndpoints);
     let endpoint = dir.join("endpoints.json");
     timeout(Duration::from_secs(5), async {
         while !endpoint.exists() {
@@ -881,6 +901,7 @@ async fn remote_fixture(
     .await
     .unwrap();
     let data: Value = serde_json::from_slice(&std::fs::read(endpoint).unwrap()).unwrap();
+    startup_endpoints.returned();
     (
         child,
         data["instance"].as_str().unwrap().into(),
@@ -1415,31 +1436,41 @@ fn driver_source_hash() -> String {
 
 fn driver_identity() -> Value {
     let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    json!({"sourceCommit":git(&repository,&["rev-parse","HEAD"]),
-        "sourceTree":git(&repository,&["rev-parse","HEAD^{tree}"]),
-        "sourceSha256":driver_source_hash(),
-        "executableSha256":driver_hash(&std::fs::read(std::env::current_exe().unwrap()).unwrap())})
+    json!({"sourceCommit":startup_milestones::call(startup_milestones::Phase::IdentityCommit, || git(&repository,&["rev-parse","HEAD"])),
+        "sourceTree":startup_milestones::call(startup_milestones::Phase::IdentityTree, || git(&repository,&["rev-parse","HEAD^{tree}"])),
+        "sourceSha256":startup_milestones::call(startup_milestones::Phase::IdentitySource, driver_source_hash),
+        "executableSha256":startup_milestones::call(startup_milestones::Phase::IdentityExecutable, || driver_hash(&std::fs::read(std::env::current_exe().unwrap()).unwrap()))})
 }
 
 fn private_json(path: &std::path::Path, value: &Value) -> DriverResult<()> {
     use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
-    serde_json::to_writer(&mut file, value)?;
+    let mut file = startup_milestones::io(startup_milestones::Phase::FileOpen, || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+    })?;
+    startup_milestones::io(startup_milestones::Phase::Serialize, || {
+        serde_json::to_writer(&mut file, value)
+    })?;
     file.write_all(b"\n")?;
-    file.sync_all()?;
+    startup_milestones::io(startup_milestones::Phase::Sync, || file.sync_all())?;
     Ok(())
 }
 
 fn publish_driver(path: &std::path::Path, value: &Value) -> DriverResult<()> {
+    let startup_publication = startup_milestones::begin(startup_milestones::Phase::Publication);
     let temporary = path.with_extension("pending");
     private_json(&temporary, value)?;
     // Atomic no-clobber publication: an existing destination is never overwritten.
-    std::fs::hard_link(&temporary, path)?;
-    std::fs::remove_file(temporary)?;
+    startup_milestones::result(startup_milestones::Phase::Link, || {
+        std::fs::hard_link(&temporary, path)
+    })?;
+    startup_milestones::result(startup_milestones::Phase::Unlink, || {
+        std::fs::remove_file(temporary)
+    })?;
+    startup_publication.returned();
     Ok(())
 }
 
@@ -1479,7 +1510,8 @@ fn driver_descriptor_phase(
         "private descriptor"
     );
     anyhow::ensure!(file.len() <= DRIVER_FRAME as u64, "descriptor bound");
-    let mut descriptor: DriverDescriptor = serde_json::from_slice(&std::fs::read(path)?)?;
+    let startup_descriptor_bytes = std::fs::read(path)?;
+    let mut descriptor: DriverDescriptor = serde_json::from_slice(&startup_descriptor_bytes)?;
     anyhow::ensure!(
         descriptor.version == 1 && uuid::Uuid::parse_str(&descriptor.run_id).is_ok(),
         "descriptor version/run"
@@ -1558,6 +1590,9 @@ fn driver_descriptor_phase(
         }
     }
     descriptor.directory = parent.into();
+    if child {
+        startup_milestones::binding(&descriptor, &startup_descriptor_bytes);
+    }
     Ok(descriptor)
 }
 
@@ -1797,23 +1832,32 @@ async fn driver_action(
 async fn driver_loop(descriptor: &DriverDescriptor) -> DriverResult<()> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let started = std::time::Instant::now();
+    startup_milestones::reached();
+    let startup_host_a = startup_milestones::host(startup_milestones::Host::A);
     let a = Harness::boot_driver(None, true, Some(descriptor)).await;
+    startup_host_a.returned();
+    let startup_host_b = startup_milestones::host(startup_milestones::Host::B);
     let b = Harness::boot_driver(
         Some((a.workspace.clone(), a.registered.clone())),
         true,
         Some(descriptor),
     )
     .await;
+    startup_host_b.returned();
     let mut hosts = vec![a, b];
+    let startup_credentials = startup_milestones::begin(startup_milestones::Phase::Credentials);
     let credentials = descriptor.directory.join("credentials");
     std::fs::create_dir(&credentials)?;
     std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o700))?;
     for (name, token) in [("owner", TOKEN), ("member", MEMBER), ("guest", GUEST)] {
         private_json(&credentials.join(name), &json!({"token":token}))?;
     }
+    startup_credentials.returned();
+    let startup_control = startup_milestones::begin(startup_milestones::Phase::Control);
     let socket = descriptor.directory.join("control.sock");
     let listener = tokio::net::UnixListener::bind(&socket)?;
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+    startup_control.returned();
     let endpoints: Vec<_> = hosts
         .iter()
         .map(|host| {
@@ -1830,6 +1874,7 @@ async fn driver_loop(descriptor: &DriverDescriptor) -> DriverResult<()> {
         "identity":driver_identity(),"pid":std::process::id(),"process":driver_process(std::process::id()),"hosts":endpoints,"credentialDirectory":credentials,
         "control":socket,"readyIsAdmission":false}),
     )?;
+    startup_milestones::finish_ready();
     let mut journal = std::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -2032,7 +2077,9 @@ async fn driver_shutdown(mut host: Harness) -> DriverResult<Value> {
     }
     anyhow::ensure!(host.ws.bound_port().await.is_none(), "WSS did not stop");
     host.fixture.kill()?;
-    let status = host.fixture.wait()?;
+    let status = startup_milestones::waited(host.fixture.id(), host.fixture.wait(), |s| {
+        (s.code(), s.signal())
+    })?;
     Ok(
         json!({"code":status.code(),"signal":status.signal(),"reason":"owned fixture server stopped after handler drain"}),
     )
@@ -2983,22 +3030,37 @@ mod driver_ownership {
             let mut gate = [0];
             std::io::stdin().read_exact(&mut gate)?;
             anyhow::ensure!(gate == *b"R", "worker not enrolled");
-            let descriptor = driver_descriptor_phase(&path, true, true, false)?;
+            // startup-milestones: original enrolled worker only; no observer task.
+            let _startup_journal = startup_milestones::Session::from_environment();
+            let descriptor =
+                startup_milestones::result(startup_milestones::Phase::Validation, || {
+                    driver_descriptor_phase(&path, true, true, false)
+                })?;
             if let Ok(case) = std::env::var("INTENT_REVIEW_DRIVER_INERT") {
                 return inert_worker(&descriptor.directory, &case);
             }
+            let startup_tls = startup_milestones::begin(startup_milestones::Phase::Tls);
             let tls = descriptor.directory.join("tls");
             std::fs::create_dir(&tls)?;
             std::fs::set_permissions(&tls, std::fs::Permissions::from_mode(0o700))?;
             make_fixture_certificate(&tls);
-            let descriptor = driver_descriptor(&path, true)?;
+            startup_tls.returned();
+            let descriptor =
+                startup_milestones::result(startup_milestones::Phase::Validation, || {
+                    driver_descriptor(&path, true)
+                })?;
             // companion-observation: begin worker collector
-            let _companion_observer = CompanionFixtureObservation::install(&descriptor.directory);
+            let _companion_observer =
+                startup_milestones::call(startup_milestones::Phase::Observer, || {
+                    CompanionFixtureObservation::install(&descriptor.directory)
+                });
             // companion-observation: end worker collector
-            return tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()?
-                .block_on(driver_loop(&descriptor));
+            return startup_milestones::result(startup_milestones::Phase::Runtime, || {
+                tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+            })?
+            .block_on(driver_loop(&descriptor));
         }
         preflight()?;
         let started = Instant::now();
@@ -4100,3 +4162,1161 @@ async fn native_fixture_metadata_failed_bind_releases_original_owners() {
     assert!(failed);
     assert_eq!(before, after);
 }
+
+// startup-milestones: begin private producer and reader
+// One original worker thread owns this diagnostic journal. It does not propagate
+// into spawned tasks, change tracing, or own a host/child. Completion covers only
+// original startup through ready publication, never request or shutdown success.
+mod startup_milestones {
+    use super::*;
+    use std::cell::RefCell;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    pub(super) const FILE: &str = "native-startup-milestones-v1.jsonl";
+    const RECORDS: usize = 96;
+    const BYTES: usize = 48 * 1024;
+    const FRAME: usize = 1024;
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub(super) enum Phase {
+        Process,
+        Validation,
+        Tls,
+        Observer,
+        Runtime,
+        Loop,
+        Host,
+        Repositories,
+        Provider,
+        ProviderEndpoints,
+        Store,
+        Roles,
+        Services,
+        Wss,
+        Uds,
+        Credentials,
+        Control,
+        IdentityCommit,
+        IdentityTree,
+        IdentitySource,
+        IdentityExecutable,
+        Publication,
+        FileOpen,
+        Serialize,
+        Sync,
+        Link,
+        Unlink,
+        Binding,
+        Child,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub(super) enum Host {
+        A,
+        B,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    enum Outcome {
+        Enter,
+        Return,
+        Error,
+        Unwind,
+        Abandoned,
+        Allocated,
+        Waited,
+        Bound,
+        Reached,
+        Complete,
+    }
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Binding {
+        run: uuid::Uuid,
+        descriptor: String,
+        artifact: String,
+        source: String,
+        commit: String,
+        tree: String,
+    }
+    #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Counts {
+        observed: u64,
+        written: u64,
+        dropped: u64,
+        overflow: u64,
+        io: u64,
+        unmatched: u64,
+    }
+    #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Frame {
+        v: u8,
+        pid: u32,
+        parent: u32,
+        wall_ms: u64,
+        clock: String,
+        seq: u64,
+        ns: u64,
+        phase: Phase,
+        outcome: Outcome,
+        span: Option<u64>,
+        host: Option<Host>,
+        child: Option<u32>,
+        code: Option<i32>,
+        signal: Option<i32>,
+        binding: Option<Binding>,
+        counts: Option<Counts>,
+    }
+    struct State {
+        file: std::fs::File,
+        start: std::time::Instant,
+        pid: u32,
+        parent: u32,
+        wall: u64,
+        counts: Counts,
+        bytes: usize,
+        stack: Vec<(u64, Phase, Option<Host>)>,
+        host: Option<Host>,
+        children: Vec<(u32, Host)>,
+        bound: Option<Binding>,
+        failed: bool,
+        ready: bool,
+        ended: bool,
+    }
+    thread_local! { static STATE: RefCell<Option<State>> = const { RefCell::new(None) }; }
+    pub(super) struct Session(bool);
+    impl Session {
+        pub(super) fn from_environment() -> Self {
+            if std::env::var("NATIVE_REVIEW_COMPANION_DIAGNOSTIC_6328").as_deref() != Ok("1") {
+                return Self(false);
+            }
+            let Some(path) = std::env::var_os("NATIVE_REVIEW_EVIDENCE_DIR") else {
+                return Self(false);
+            };
+            Self::open(&PathBuf::from(path))
+        }
+        pub(super) fn open(path: &std::path::Path) -> Self {
+            if STATE.with(|s| s.borrow().is_some()) {
+                return Self(false);
+            }
+            let opened = (|| -> std::io::Result<std::fs::File> {
+                if !path.is_absolute() || std::fs::canonicalize(path)? != path {
+                    return Err(std::io::ErrorKind::PermissionDenied.into());
+                }
+                let directory = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(path)?;
+                let metadata = directory.metadata()?;
+                // SAFETY: geteuid has no arguments; openat uses an owned directory fd
+                // and a fixed NUL-terminated basename, never a caller-controlled path.
+                let uid = unsafe { libc::geteuid() };
+                if !metadata.is_dir() || metadata.mode() & 0o777 != 0o700 || metadata.uid() != uid {
+                    return Err(std::io::ErrorKind::PermissionDenied.into());
+                }
+                // SAFETY: the directory and literal remain live through the call.
+                let fd = unsafe {
+                    libc::openat(
+                        directory.as_raw_fd(),
+                        c"native-startup-milestones-v1.jsonl".as_ptr(),
+                        libc::O_WRONLY
+                            | libc::O_CREAT
+                            | libc::O_EXCL
+                            | libc::O_NOFOLLOW
+                            | libc::O_CLOEXEC,
+                        0o600,
+                    )
+                };
+                if fd < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // SAFETY: openat returned a new owned fd exactly once.
+                let file = unsafe { std::fs::File::from_raw_fd(fd) };
+                let metadata = file.metadata()?;
+                if !metadata.is_file()
+                    || metadata.mode() & 0o777 != 0o600
+                    || metadata.nlink() != 1
+                    || metadata.uid() != uid
+                {
+                    return Err(std::io::ErrorKind::PermissionDenied.into());
+                }
+                Ok(file)
+            })();
+            Self::with_file(opened)
+        }
+        fn with_file(file: std::io::Result<std::fs::File>) -> Self {
+            let occupied = STATE.with(|s| s.borrow().is_some());
+            if occupied {
+                return Self(false);
+            }
+            let Ok(file) = file else {
+                eprintln!("native-startup-milestones-v1: private journal unavailable");
+                return Self(false);
+            };
+            let wall = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |n| u64::try_from(n.as_millis()).unwrap_or(u64::MAX));
+            STATE.with(|s| {
+                *s.borrow_mut() = Some(State {
+                    file,
+                    start: std::time::Instant::now(),
+                    pid: std::process::id(),
+                    // SAFETY: getppid has no arguments and is diagnostic identity only.
+                    parent: u32::try_from(unsafe { libc::getppid() }).unwrap_or(0),
+                    wall,
+                    counts: Counts {
+                        observed: 0,
+                        written: 0,
+                        dropped: 0,
+                        overflow: 0,
+                        io: 0,
+                        unmatched: 0,
+                    },
+                    bytes: 0,
+                    stack: vec![],
+                    host: None,
+                    children: vec![],
+                    bound: None,
+                    failed: false,
+                    ready: false,
+                    ended: false,
+                });
+            });
+            let _ = begin(Phase::Process).disarm();
+            Self(true)
+        }
+    }
+    impl Drop for Session {
+        fn drop(&mut self) {
+            if self.0 {
+                STATE.with(|s| {
+                    if let Some(mut state) = s.borrow_mut().take() {
+                        if !state.ended {
+                            state.end(if std::thread::panicking() {
+                                Outcome::Unwind
+                            } else {
+                                Outcome::Abandoned
+                            });
+                        }
+                    }
+                });
+            }
+        }
+    }
+    impl State {
+        fn frame(&mut self, phase: Phase, outcome: Outcome, span: Option<u64>) -> Frame {
+            self.counts.observed += 1;
+            Frame {
+                v: 1,
+                pid: self.pid,
+                parent: self.parent,
+                wall_ms: self.wall,
+                clock: "worker-instant".into(),
+                seq: self.counts.observed,
+                ns: u64::try_from(self.start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                phase,
+                outcome,
+                span,
+                host: self.host,
+                child: None,
+                code: None,
+                signal: None,
+                binding: None,
+                counts: None,
+            }
+        }
+        fn write(&mut self, frame: &Frame, final_row: bool) {
+            let Ok(mut bytes) = serde_json::to_vec(frame) else {
+                self.counts.dropped += 1;
+                self.failed = true;
+                return;
+            };
+            bytes.push(b'\n');
+            let reserved = if final_row { 0 } else { FRAME };
+            if bytes.len() > FRAME
+                || self.counts.written >= u64::try_from(RECORDS).unwrap() - u64::from(!final_row)
+                || self
+                    .bytes
+                    .saturating_add(bytes.len())
+                    .saturating_add(reserved)
+                    > BYTES
+            {
+                self.counts.dropped += 1;
+                self.counts.overflow += 1;
+                self.failed = true;
+                return;
+            }
+            self.bytes += bytes.len(); // Conservatively accounts attempted bytes, including partial I/O.
+            if self.file.write_all(&bytes).is_ok() {
+                self.counts.written += 1;
+            } else {
+                self.counts.dropped += 1;
+                self.counts.io += 1;
+                self.failed = true;
+            }
+        }
+        fn end(&mut self, outcome: Outcome) {
+            if self.ended {
+                return;
+            }
+            let valid = self.stack == [(1, Phase::Process, None)];
+            if !valid {
+                self.counts.unmatched += 1;
+                self.failed = true;
+            }
+            let outcome = if outcome == Outcome::Complete
+                && (!self.ready || self.bound.is_none() || self.failed)
+            {
+                Outcome::Abandoned
+            } else {
+                outcome
+            };
+            let mut frame = self.frame(Phase::Process, outcome, Some(1));
+            frame.host = None;
+            frame.counts = Some(self.counts.clone());
+            self.write(&frame, true);
+            self.ended = true;
+        }
+    }
+    pub(super) struct Span {
+        key: Option<(u64, Phase, Option<Host>)>,
+    }
+    impl Span {
+        fn disarm(mut self) -> Option<(u64, Phase, Option<Host>)> {
+            self.key.take()
+        }
+        pub(super) fn returned(mut self) {
+            self.close(Outcome::Return);
+        }
+        fn close(&mut self, outcome: Outcome) {
+            if let Some(key) = self.key.take() {
+                STATE.with(|s| {
+                    if let Some(state) = s.borrow_mut().as_mut().filter(|s| !s.ended) {
+                        if state.stack.pop() != Some(key) {
+                            state.counts.unmatched += 1;
+                            state.failed = true;
+                        }
+                        state.failed |= outcome != Outcome::Return;
+                        let mut frame = state.frame(key.1, outcome, Some(key.0));
+                        frame.host = key.2;
+                        self::State::write(state, &frame, false);
+                        if key.1 == Phase::Publication && outcome == Outcome::Return {
+                            state.ready = true;
+                        }
+                    }
+                });
+            }
+        }
+    }
+    impl Drop for Span {
+        fn drop(&mut self) {
+            self.close(if std::thread::panicking() {
+                Outcome::Unwind
+            } else {
+                Outcome::Abandoned
+            });
+        }
+    }
+    pub(super) fn begin(phase: Phase) -> Span {
+        let key = STATE.with(|s| {
+            let mut s = s.borrow_mut();
+            let state = s.as_mut().filter(|s| !s.ended)?;
+            if state.stack.len() >= 32 {
+                state.failed = true;
+                state.counts.observed += 1;
+                state.counts.dropped += 1;
+                state.counts.overflow += 1;
+                return None;
+            }
+            let seq = state.counts.observed + 1;
+            let key = (seq, phase, state.host);
+            state.stack.push(key);
+            let frame = state.frame(phase, Outcome::Enter, Some(seq));
+            state.write(&frame, false);
+            Some(key)
+        });
+        Span { key }
+    }
+    pub(super) fn call<T>(phase: Phase, call: impl FnOnce() -> T) -> T {
+        let span = begin(phase);
+        let value = call();
+        span.returned();
+        value
+    }
+    pub(super) fn result<T, E>(phase: Phase, call: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
+        let mut span = begin(phase);
+        let value = call();
+        span.close(if value.is_ok() {
+            Outcome::Return
+        } else {
+            Outcome::Error
+        });
+        value
+    }
+    pub(super) struct HostScope {
+        previous: Option<Host>,
+        span: Option<Span>,
+    }
+    pub(super) fn host(host: Host) -> HostScope {
+        let previous = STATE.with(|s| s.borrow_mut().as_mut().and_then(|s| s.host.replace(host)));
+        HostScope {
+            previous,
+            span: Some(begin(Phase::Host)),
+        }
+    }
+    impl HostScope {
+        pub(super) fn returned(mut self) {
+            if let Some(span) = self.span.take() {
+                span.returned();
+            }
+        }
+    }
+    impl Drop for HostScope {
+        fn drop(&mut self) {
+            drop(self.span.take());
+            STATE.with(|s| {
+                if let Some(s) = s.borrow_mut().as_mut() {
+                    s.host = self.previous;
+                }
+            });
+        }
+    }
+    pub(super) fn binding(descriptor: &DriverDescriptor, bytes: &[u8]) {
+        STATE.with(|s| {
+            if let Some(s) = s.borrow_mut().as_mut().filter(|s| !s.ended) {
+                let Ok(run) = uuid::Uuid::parse_str(&descriptor.run_id) else {
+                    s.failed = true;
+                    return;
+                };
+                let valid =
+                    |text: &str, n| text.len() == n && text.bytes().all(|c| c.is_ascii_hexdigit());
+                if !valid(&descriptor.executable_sha256, 64)
+                    || !valid(&descriptor.source_sha256, 64)
+                    || !valid(&descriptor.source_commit, 40)
+                    || !valid(&descriptor.source_tree, 40)
+                {
+                    s.failed = true;
+                    return;
+                }
+                let binding = Binding {
+                    run,
+                    descriptor: driver_hash(bytes),
+                    artifact: descriptor.executable_sha256.clone(),
+                    source: descriptor.source_sha256.clone(),
+                    commit: descriptor.source_commit.clone(),
+                    tree: descriptor.source_tree.clone(),
+                };
+                if let Some(original) = &s.bound {
+                    if original != &binding {
+                        s.failed = true;
+                        s.counts.unmatched += 1;
+                    }
+                    return;
+                }
+                let mut frame = s.frame(Phase::Binding, Outcome::Bound, None);
+                frame.binding = Some(binding.clone());
+                s.write(&frame, false);
+                s.bound = Some(binding);
+            }
+        });
+    }
+    pub(super) fn reached() {
+        STATE.with(|s| {
+            if let Some(s) = s.borrow_mut().as_mut().filter(|s| !s.ended) {
+                let frame = s.frame(Phase::Loop, Outcome::Reached, None);
+                s.write(&frame, false);
+            }
+        });
+    }
+    pub(super) fn allocated(pid: u32) {
+        STATE.with(|s| {
+            if let Some(s) = s.borrow_mut().as_mut().filter(|s| !s.ended) {
+                if let Some(host) = s.host.filter(|_| s.children.len() < 2) {
+                    s.children.push((pid, host));
+                    let mut frame = s.frame(Phase::Child, Outcome::Allocated, None);
+                    frame.child = Some(pid);
+                    s.write(&frame, false);
+                } else {
+                    s.failed = true;
+                    s.counts.unmatched += 1;
+                }
+            }
+        });
+    }
+    pub(super) fn waited<T>(
+        pid: u32,
+        result: std::io::Result<T>,
+        status: impl FnOnce(&T) -> (Option<i32>, Option<i32>),
+    ) -> std::io::Result<T> {
+        STATE.with(|s| {
+            if let Some(s) = s.borrow_mut().as_mut().filter(|s| !s.ended) {
+                if let Some((_, host)) = s.children.iter().find(|(p, _)| *p == pid).copied() {
+                    let mut frame = s.frame(
+                        Phase::Child,
+                        if result.is_ok() {
+                            Outcome::Waited
+                        } else {
+                            Outcome::Error
+                        },
+                        None,
+                    );
+                    frame.child = Some(pid);
+                    frame.host = Some(host);
+                    if let Ok(value) = &result {
+                        (frame.code, frame.signal) = status(value);
+                    }
+                    s.write(&frame, false);
+                }
+            }
+        });
+        result
+    }
+    pub(super) fn finish_ready() {
+        STATE.with(|s| {
+            if let Some(s) = s.borrow_mut().as_mut() {
+                s.end(Outcome::Complete);
+            }
+        });
+    }
+    pub(super) fn publishing() -> bool {
+        STATE.with(|s| {
+            s.borrow()
+                .as_ref()
+                .is_some_and(|s| !s.ended && s.stack.iter().any(|k| k.1 == Phase::Publication))
+        })
+    }
+    pub(super) fn io<T, E>(phase: Phase, call: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
+        if publishing() {
+            result(phase, call)
+        } else {
+            call()
+        }
+    }
+    #[derive(Debug)]
+    pub(super) struct Report {
+        pub complete: bool,
+        pub malformed: bool,
+        pub records: usize,
+        pub open: usize,
+    }
+    pub(super) fn read(bytes: &[u8]) -> Report {
+        if bytes.len() > BYTES {
+            return Report {
+                complete: false,
+                malformed: true,
+                records: 0,
+                open: 0,
+            };
+        }
+        let mut malformed = !bytes.is_empty() && !bytes.ends_with(b"\n");
+        let mut stack = vec![];
+        let mut seen = std::collections::HashSet::new();
+        let mut identity = None;
+        let mut children = std::collections::HashMap::new();
+        let mut previous = 0;
+        let mut ns = 0;
+        let mut bound = false;
+        let mut ready = false;
+        let mut ended = false;
+        let mut loss = false;
+        let mut records = 0;
+        for line in bytes.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
+            records += 1;
+            if records > RECORDS {
+                malformed = true;
+                break;
+            }
+            let Ok(frame) = serde_json::from_slice::<Frame>(line) else {
+                malformed = true;
+                continue;
+            };
+            if line.len() + 1 > FRAME
+                || records > RECORDS
+                || ended
+                || frame.v != 1
+                || frame.clock != "worker-instant"
+                || frame.pid == 0
+                || frame.parent == 0
+                || frame.wall_ms == 0
+                || frame.seq != previous + 1
+                || frame.ns < ns
+            {
+                malformed = true;
+            }
+            if records == 1
+                && (frame.phase != Phase::Process
+                    || frame.outcome != Outcome::Enter
+                    || frame.span != Some(1)
+                    || frame.host.is_some())
+            {
+                malformed = true;
+            }
+            if frame.phase != Phase::Process && frame.counts.is_some() {
+                malformed = true;
+            }
+            previous = frame.seq;
+            ns = frame.ns;
+            let key = (frame.pid, frame.parent, frame.wall_ms);
+            if identity.is_some_and(|i| i != key) {
+                malformed = true;
+            }
+            identity = Some(key);
+            match frame.outcome {
+                Outcome::Enter => {
+                    if let Some(span) = frame.span {
+                        if span != frame.seq || !seen.insert(span) {
+                            malformed = true;
+                        }
+                        stack.push((span, frame.phase, frame.host));
+                    } else {
+                        malformed = true;
+                    }
+                }
+                Outcome::Return
+                | Outcome::Error
+                | Outcome::Unwind
+                | Outcome::Abandoned
+                | Outcome::Complete
+                    if frame.span.is_some() =>
+                {
+                    let paired = stack.pop() == frame.span.map(|s| (s, frame.phase, frame.host));
+                    if !paired {
+                        malformed = true;
+                    }
+                    if frame.phase == Phase::Publication
+                        && frame.outcome == Outcome::Return
+                        && paired
+                    {
+                        ready = true;
+                    }
+                    loss |= frame.outcome != Outcome::Return && frame.outcome != Outcome::Complete;
+                    if frame.phase == Phase::Process {
+                        ended = true;
+                        let valid = frame.counts.as_ref().is_some_and(|c| {
+                            c.observed == frame.seq
+                                && c.written + 1 == records as u64
+                                && c.dropped == 0
+                                && c.overflow == 0
+                                && c.io == 0
+                                && c.unmatched == 0
+                        });
+                        loss |= !valid || frame.outcome != Outcome::Complete || !stack.is_empty();
+                    } else if frame.counts.is_some() {
+                        malformed = true;
+                    }
+                }
+                Outcome::Bound if frame.phase == Phase::Binding && frame.span.is_none() => {
+                    let valid = frame.binding.as_ref().is_some_and(|b| {
+                        !b.run.is_nil()
+                            && [
+                                (&b.descriptor, 64),
+                                (&b.artifact, 64),
+                                (&b.source, 64),
+                                (&b.commit, 40),
+                                (&b.tree, 40),
+                            ]
+                            .iter()
+                            .all(|(v, n)| v.len() == *n && v.bytes().all(|c| c.is_ascii_hexdigit()))
+                    });
+                    malformed |= bound || !valid;
+                    bound = true;
+                }
+                Outcome::Allocated | Outcome::Waited
+                    if frame.phase == Phase::Child
+                        && frame.span.is_none()
+                        && frame.child.is_some_and(|pid| pid > 0)
+                        && frame.host.is_some() =>
+                {
+                    let pid = frame.child.unwrap();
+                    let host = frame.host.unwrap();
+                    if frame.outcome == Outcome::Allocated {
+                        malformed |= children.values().any(|h| *h == host)
+                            || children.insert(pid, host).is_some();
+                    } else {
+                        malformed |= children.get(&pid) != Some(&host);
+                    }
+                }
+                Outcome::Reached if frame.phase == Phase::Loop && frame.span.is_none() => {}
+                Outcome::Error if frame.phase == Phase::Child && frame.span.is_none() => {
+                    loss = true;
+                }
+                _ => {
+                    malformed = true;
+                }
+            }
+            if frame.phase != Phase::Binding && frame.binding.is_some() {
+                malformed = true;
+            }
+            if frame.phase != Phase::Child
+                && (frame.child.is_some() || frame.code.is_some() || frame.signal.is_some())
+            {
+                malformed = true;
+            }
+        }
+        Report {
+            complete: !malformed && !loss && ended && bound && ready && stack.is_empty(),
+            malformed,
+            records,
+            open: stack.len(),
+        }
+    }
+    #[test]
+    fn native_startup_milestones_reader_bounds_and_privacy() {
+        let dir = super::startup_test_directory("nsm-reader-");
+        let session = Session::open(dir.path());
+        let descriptor = DriverDescriptor {
+            version: 1,
+            run_id: uuid::Uuid::new_v4().to_string(),
+            source_commit: "a".repeat(40),
+            source_tree: "b".repeat(40),
+            source_sha256: "c".repeat(64),
+            executable_sha256: "d".repeat(64),
+            lifetime_seconds: 90,
+            scenarios: vec!["ready-stop".into()],
+            directory: dir.path().into(),
+        };
+        // Deliberate controlled descriptor, not an executed driver/artifact claim.
+        binding(&descriptor, b"controlled schema qualification");
+        let value = call(Phase::Runtime, || 17);
+        assert_eq!(value, 17);
+        super::publish_driver(
+            &dir.path().join("ready.json"),
+            &json!({"secret":"not collected"}),
+        )
+        .unwrap();
+        finish_ready();
+        drop(session);
+        let bytes = super::startup_test_read(dir.path(), "reader-valid-source-publish");
+        let report = read(&bytes);
+        assert!(report.complete, "{report:?}");
+        assert!(!String::from_utf8_lossy(&bytes).contains("not collected"));
+        assert!(!String::from_utf8_lossy(&bytes).contains(dir.path().to_str().unwrap()));
+        let frames: Vec<Value> = bytes
+            .split(|b| *b == b'\n')
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_slice(l).unwrap())
+            .collect();
+        let encode = |frames: &[Value]| {
+            frames
+                .iter()
+                .fold(String::new(), |mut text, frame| {
+                    writeln!(text, "{frame}").unwrap();
+                    text
+                })
+                .into_bytes()
+        };
+        for terminal in ["complete", "unwind"] {
+            let mut one = frames.last().unwrap().clone();
+            one["seq"] = json!(1);
+            one["span"] = Value::Null;
+            one["outcome"] = json!(terminal);
+            one["counts"]["observed"] = json!(1);
+            one["counts"]["written"] = json!(0);
+            let invalid = read(&encode(&[one]));
+            assert!(invalid.malformed && !invalid.complete);
+        }
+        for subcase in [
+            "missing",
+            "duplicate",
+            "order",
+            "clock",
+            "span",
+            "unknown-field",
+            "unknown-enum",
+            "counter",
+            "trailing",
+            "child-host",
+        ] {
+            let mut altered = frames.clone();
+            match subcase {
+                "missing" => {
+                    altered.remove(2);
+                }
+                "duplicate" => {
+                    altered.insert(2, altered[1].clone());
+                }
+                "order" => {
+                    altered.swap(2, 3);
+                }
+                "clock" => {
+                    altered[2]["clock"] = json!("foreign-clock");
+                }
+                "span" => {
+                    altered.last_mut().unwrap()["span"] = json!(999);
+                }
+                "unknown-field" => {
+                    altered[2]["credential"] = json!("never accepted");
+                }
+                "unknown-enum" => {
+                    altered[2]["phase"] = json!("arbitrary stage");
+                }
+                "counter" => {
+                    altered.last_mut().unwrap()["counts"]["dropped"] = json!(1);
+                }
+                "trailing" => {
+                    altered.push(altered[0].clone());
+                }
+                "child-host" => {
+                    altered[2]["child"] = json!(42);
+                }
+                _ => unreachable!(),
+            }
+            let bad = read(&encode(&altered));
+            assert!(!bad.complete, "{subcase}: {bad:?}");
+        }
+        let partial = read(&encode(&frames[..frames.len() - 1]));
+        assert!(!partial.complete && !partial.malformed);
+        let truncated = read(&bytes[..bytes.len() - 2]);
+        assert!(truncated.malformed && !truncated.complete);
+        let cap = super::startup_test_directory("nsm-cap-");
+        let session = Session::open(cap.path());
+        for _ in 0..100 {
+            call(Phase::Runtime, || ());
+        }
+        finish_ready();
+        drop(session);
+        let bytes = super::startup_test_read(cap.path(), "cap-loss");
+        assert!(bytes.len() <= BYTES);
+        assert!(
+            bytes
+                .split(|b| *b == b'\n')
+                .filter(|l| !l.is_empty())
+                .count()
+                <= RECORDS
+        );
+        assert!(!read(&bytes).complete);
+        assert!(String::from_utf8_lossy(&bytes).contains("\"overflow\":"));
+        let full = std::fs::OpenOptions::new().write(true).open("/dev/full");
+        let session = Session::with_file(full);
+        let original: Result<(), u8> = result(Phase::Runtime, || Err(23));
+        assert_eq!(original, Err(23));
+        let counters = STATE.with(|s| {
+            let s = s.borrow();
+            let s = s.as_ref().unwrap();
+            (s.counts.io, s.counts.dropped, s.failed)
+        });
+        eprintln!("startup real write failure: {counters:?}");
+        assert!(counters.0 > 0 && counters.1 > 0 && counters.2);
+        drop(session);
+    }
+    #[test]
+    fn native_startup_milestones_destination_and_lifetime() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = super::startup_test_directory("nsm-path-");
+        let foreign = super::startup_test_directory("nsm-foreign-");
+        let alias = dir.path().join("alias");
+        symlink(foreign.path(), &alias).unwrap();
+        let rejected = Session::open(&alias);
+        assert!(!rejected.0);
+        assert!(!foreign.path().join(FILE).exists());
+        let target = foreign.path().join("sentinel");
+        std::fs::write(&target, b"original").unwrap();
+        symlink(&target, dir.path().join(FILE)).unwrap();
+        let rejected = Session::open(dir.path());
+        assert!(!rejected.0);
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        let mode = super::startup_test_directory("nsm-mode-");
+        std::fs::set_permissions(mode.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!Session::open(mode.path()).0);
+        assert!(!mode.path().join(FILE).exists());
+        let valid = super::startup_test_directory("nsm-life-");
+        let other = super::startup_test_directory("nsm-nested-");
+        let session = Session::open(valid.path());
+        assert!(session.0);
+        assert!(!Session::open(other.path()).0);
+        assert!(!other.path().join(FILE).exists());
+        let metadata = std::fs::metadata(valid.path().join(FILE)).unwrap();
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+        drop(session);
+        let raw = super::startup_test_read(valid.path(), "once-only-drop");
+        assert!(!read(&raw).complete);
+        assert!(!Session::open(valid.path()).0);
+        assert_eq!(std::fs::read(valid.path().join(FILE)).unwrap(), raw);
+    }
+}
+// startup-milestones: end private producer and reader
+
+// startup-milestones: begin finite source controls
+fn startup_test_directory(prefix: &str) -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = common::test_tempdir_in("/tmp", prefix);
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    dir
+}
+fn startup_test_descriptor(directory: &std::path::Path) -> (DriverDescriptor, Vec<u8>) {
+    let identity = driver_identity();
+    let value = json!({"version":1,"runId":uuid::Uuid::new_v4(),"sourceCommit":identity["sourceCommit"],
+        "sourceTree":identity["sourceTree"],"sourceSha256":identity["sourceSha256"],
+        "executableSha256":identity["executableSha256"],"lifetimeSeconds":90,"scenarios":["ready-stop"]});
+    private_json(&directory.join("descriptor.json"), &value).unwrap();
+    let bytes = std::fs::read(directory.join("descriptor.json")).unwrap();
+    let descriptor = startup_milestones::result(startup_milestones::Phase::Validation, || {
+        driver_descriptor_phase(&directory.join("descriptor.json"), false, true, false)
+    })
+    .unwrap();
+    (descriptor, bytes)
+}
+fn startup_test_read(directory: &std::path::Path, label: &str) -> Vec<u8> {
+    let bytes = std::fs::read(directory.join(startup_milestones::FILE)).unwrap();
+    eprintln!(
+        "startup-milestone-checkpoint {label}: {}",
+        String::from_utf8_lossy(&bytes)
+    );
+    bytes
+}
+async fn startup_test_control(descriptor: &DriverDescriptor, phase: &str) -> Value {
+    let mut connection = BufReader::new(
+        UnixStream::connect(descriptor.directory.join("control.sock"))
+            .await
+            .unwrap(),
+    );
+    driver_write(
+        &mut connection,
+        &json!({"version":1,"runId":descriptor.run_id,"id":uuid::Uuid::new_v4(),
+        "action":{"command":"stop","phase":phase,"pending":[],"envelopes":[]}}),
+    )
+    .await
+    .unwrap();
+    serde_json::from_slice(
+        &timeout(Duration::from_secs(5), driver_frame(&mut connection))
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap()
+}
+#[test]
+fn native_startup_milestones_actual_startup() {
+    use startup_milestones::{Phase, Session};
+    let bootstrap = tokio::runtime::Runtime::new().unwrap();
+    if bootstrap.block_on(run_in_tls_process(
+        "native_startup_milestones_actual_startup",
+    )) {
+        return;
+    }
+    drop(bootstrap);
+    let directory = startup_test_directory("nsm-host-");
+    let evidence = startup_test_directory("nsm-proof-");
+    // This control invokes original source functions, never the standalone driver
+    // entry, supervisor, external controller, copied artifact or native operation.
+    let session = Session::open(evidence.path());
+    let (descriptor, bytes) = startup_test_descriptor(directory.path());
+    startup_milestones::binding(&descriptor, &bytes);
+    let observer = startup_milestones::call(Phase::Observer, || {
+        CompanionFixtureObservation::install(directory.path())
+    });
+    let runtime = startup_milestones::result(Phase::Runtime, || {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+    })
+    .unwrap();
+    let (result,replies,partial,ready)=runtime.block_on(async {
+        let mut work=Box::pin(driver_loop(&descriptor));
+        let first=futures_util::poll!(&mut work);
+        let partial=startup_test_read(evidence.path(),"original-first-poll");
+        eprintln!("startup original first poll pending: {}",first.is_pending());
+        if let std::task::Poll::Ready(result)=first {return (result,Vec::new(),partial,Value::Null);}
+        // Retaining the original future unpolled is the only hold. The prefix
+        // identifies observed calls, not an internal mutex/timer wait instruction.
+        let control=async {
+            let ready=timeout(Duration::from_secs(25),async {
+                loop {
+                    if let Ok(bytes)=std::fs::read(directory.path().join("ready.json")) {break serde_json::from_slice::<Value>(&bytes).unwrap();}
+                    // timing-guard: original atomic publication of this owned source control
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.unwrap();
+            let begin=startup_test_control(&descriptor,"begin").await;
+            let finish=startup_test_control(&descriptor,"finish").await;
+            (ready,vec![begin,finish])
+        };
+        let (result,(ready,replies))=futures_util::future::join(work,control).await;
+        eprintln!("startup original ready observed: {}",json!({"runId":ready["runId"],"identity":ready["identity"],"hosts":ready["hosts"].as_array().map(Vec::len),"pid":ready["pid"]}));
+        (result,replies,partial,ready)
+    });
+    let raw = startup_test_read(evidence.path(), "original-ready-and-source-join");
+    let stopped = std::fs::read(directory.path().join("worker-stopped.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+    eprintln!(
+        "startup original result/stop: {}",
+        json!({"returnedOk":result.is_ok(),"replies":replies,"stopped":stopped.as_ref().map(|s|json!({"success":s["success"],"cleanup":s["cleanup"]}))})
+    );
+    drop(runtime);
+    drop(observer);
+    drop(session);
+    let report = startup_milestones::read(&raw);
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(ready["runId"], descriptor.run_id);
+    assert_eq!(ready["pid"], std::process::id());
+    assert_eq!(ready["hosts"].as_array().unwrap().len(), 2);
+    for (field, expected) in [
+        ("sourceCommit", &descriptor.source_commit),
+        ("sourceTree", &descriptor.source_tree),
+        ("sourceSha256", &descriptor.source_sha256),
+        ("executableSha256", &descriptor.executable_sha256),
+    ] {
+        assert_eq!(ready["identity"][field], *expected);
+    }
+    assert_eq!(replies.len(), 2);
+    assert!(replies.iter().all(|r| r.get("error").is_none()));
+    assert!(report.complete, "{report:?}");
+    assert!(!report.malformed);
+    let pending = startup_milestones::read(&partial);
+    assert!(!pending.complete);
+    assert!(pending.open > 0);
+    let frames: Vec<Value> = raw
+        .split(|b| *b == b'\n')
+        .filter(|l| !l.is_empty())
+        .map(|b| serde_json::from_slice(b).unwrap())
+        .collect();
+    for host in ["a", "b"] {
+        assert!(frames
+            .iter()
+            .any(|f| f["phase"] == "host" && f["host"] == host && f["outcome"] == "return"));
+        let allocated: Vec<_> = frames
+            .iter()
+            .filter(|f| f["phase"] == "child" && f["host"] == host && f["outcome"] == "allocated")
+            .collect();
+        assert_eq!(allocated.len(), 1);
+        assert!(stopped.as_ref().unwrap()["cleanup"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["fixturePid"] == allocated[0]["child"]
+                && c["reaped"] == true
+                && c["udsClosed"] == true
+                && c["tcpClosed"] == true));
+    }
+    assert_eq!(stopped.as_ref().unwrap()["success"], true);
+    assert!(report.records <= 96 && raw.len() <= 48 * 1024);
+}
+#[test]
+fn native_startup_milestones_publication_failures_and_off() {
+    use startup_milestones::{Phase, Session};
+    use std::io::{Read as _, Seek as _};
+    let off = startup_test_directory("nsm-off-");
+    let value = json!({"sentinel":7});
+    publish_driver(&off.path().join("ready.json"), &value).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&std::fs::read(off.path().join("ready.json")).unwrap())
+            .unwrap(),
+        value
+    );
+    assert!(!off.path().join(startup_milestones::FILE).exists());
+    for existing in [true, false] {
+        let dir = startup_test_directory("nsm-error-");
+        let evidence = startup_test_directory("nsm-error-proof-");
+        let session = Session::open(evidence.path());
+        let path = if existing {
+            dir.path().join("ready.json")
+        } else {
+            dir.path().join("absent/ready.json")
+        };
+        if existing {
+            private_json(&path, &value).unwrap();
+        }
+        let result = publish_driver(&path, &json!({"replacement":true}));
+        let partial = startup_test_read(evidence.path(), "original-publication-error");
+        eprintln!(
+            "startup publication error category: {}",
+            result
+                .as_ref()
+                .unwrap_err()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .kind()
+        );
+        assert!(result.is_err());
+        assert!(!startup_milestones::read(&partial).complete);
+        if existing {
+            assert_eq!(
+                serde_json::from_slice::<Value>(&std::fs::read(&path).unwrap()).unwrap(),
+                value
+            );
+        } else {
+            assert!(!path.exists());
+        }
+        drop(session);
+        let report = startup_milestones::read(&startup_test_read(
+            evidence.path(),
+            "publication-failure-final",
+        ));
+        assert!(!report.complete);
+        assert!(!report.malformed, "{report:?}");
+    }
+    let dir = startup_test_directory("nsm-unwind-");
+    let evidence = startup_test_directory("nsm-unwind-proof-");
+    let session = Session::open(evidence.path());
+    let file = dir.path().join("not-a-repository");
+    std::fs::write(&file, b"owned").unwrap();
+    // The existing panic hook renames registered test directories before catch_unwind
+    // returns. Retain this original file handle, not a guessed post-mortem path.
+    let mut original_journal =
+        std::fs::File::open(evidence.path().join(startup_milestones::FILE)).unwrap();
+    let panic = std::panic::catch_unwind(|| {
+        startup_milestones::call(Phase::Repositories, || init_repo(&file));
+    });
+    let mut raw = Vec::new();
+    original_journal.read_to_end(&mut raw).unwrap();
+    eprintln!(
+        "startup-milestone-checkpoint original-git-panic-owned-handle: {}",
+        String::from_utf8_lossy(&raw)
+    );
+    assert!(panic.is_err());
+    assert!(String::from_utf8_lossy(&raw).contains("\"outcome\":\"unwind\""));
+    drop(session);
+    original_journal.rewind().unwrap();
+    raw.clear();
+    original_journal.read_to_end(&mut raw).unwrap();
+    eprintln!(
+        "startup-milestone-checkpoint unwind-final-owned-handle: {}",
+        String::from_utf8_lossy(&raw)
+    );
+    let report = startup_milestones::read(&raw);
+    assert!(!report.complete && !report.malformed, "{report:?}");
+}
+#[intent_test_macros::daemon_test]
+async fn native_startup_milestones_original_child_exit() {
+    use startup_milestones::{Host, Session};
+    use std::os::unix::process::ExitStatusExt;
+    if run_in_tls_process("native_startup_milestones_original_child_exit").await {
+        return;
+    }
+    let dir = startup_test_directory("nsm-child-");
+    let evidence = startup_test_directory("nsm-child-proof-");
+    let root = dir.path().join("repo");
+    std::fs::create_dir(&root).unwrap();
+    init_repo(&root);
+    let session = Session::open(evidence.path());
+    let host = startup_milestones::host(Host::A);
+    let (mut child, _, _, _) = remote_fixture(dir.path(), &root).await;
+    let pid = child.id();
+    child.kill().unwrap();
+    let wait = startup_milestones::waited(pid, child.wait(), |s| (s.code(), s.signal()));
+    let raw = startup_test_read(evidence.path(), "actual-child-wait");
+    eprintln!(
+        "startup original child wait: {}",
+        json!({"pid":pid,"waited":wait.is_ok(),"code":wait.as_ref().ok().and_then(std::process::ExitStatus::code),"signal":wait.as_ref().ok().and_then(std::os::unix::process::ExitStatusExt::signal)})
+    );
+    host.returned();
+    drop(session);
+    assert!(wait.is_ok());
+    assert!(!startup_milestones::read(&raw).complete);
+    let frames: Vec<Value> = raw
+        .split(|b| *b == b'\n')
+        .filter(|b| !b.is_empty())
+        .map(|b| serde_json::from_slice(b).unwrap())
+        .collect();
+    assert!(frames
+        .iter()
+        .any(|f| f["outcome"] == "allocated" && f["child"] == pid && f["host"] == "a"));
+    assert!(frames
+        .iter()
+        .any(|f| f["outcome"] == "waited" && f["child"] == pid && f["host"] == "a"));
+}
+// startup-milestones: end finite source controls
