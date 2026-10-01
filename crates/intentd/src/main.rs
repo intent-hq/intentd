@@ -4505,27 +4505,36 @@ impl intent_core::ServerControl for DaemonControl {
             .await?;
             let start_result = if assign_port {
                 let runtime = runtime.clone();
+                let cancellation = runtime.clone();
                 server
-                    .start_with_port_assignment(move |port| {
-                        if runtime
-                            .stop_generation
-                            .load(std::sync::atomic::Ordering::SeqCst)
-                            != generation
-                        {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::Interrupted,
-                                "WSS start cancelled by stop",
-                            ));
-                        }
-                        runtime
-                            .settings_registry
-                            .persist_selected_ws_api_port(&settings, port)
-                            .map_err(|e| {
-                                std::io::Error::other(format!(
-                                    "could not save selected WSS port {port}: {e}"
-                                ))
-                            })
-                    })
+                    .start_with_cancellable_port_assignment(
+                        move |port| {
+                            if runtime
+                                .stop_generation
+                                .load(std::sync::atomic::Ordering::SeqCst)
+                                != generation
+                            {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::Interrupted,
+                                    "WSS start cancelled by stop",
+                                ));
+                            }
+                            runtime
+                                .settings_registry
+                                .persist_selected_ws_api_port(&settings, port)
+                                .map_err(|e| {
+                                    std::io::Error::other(format!(
+                                        "could not save selected WSS port {port}: {e}"
+                                    ))
+                                })
+                        },
+                        move || {
+                            cancellation
+                                .stop_generation
+                                .load(std::sync::atomic::Ordering::SeqCst)
+                                != generation
+                        },
+                    )
                     .await
             } else {
                 server.start().await
@@ -7645,6 +7654,59 @@ mod tests {
         assert!(error.to_string().contains("cancelled by stop"), "{error}");
         assert!(!attempted_assignment.load(Ordering::SeqCst));
         assert!(state.lock().await.ws_server.is_none());
+        assert_eq!(server.bound_port().await, None);
+    }
+
+    #[tokio::test]
+    async fn ws_stop_after_handle_publication_prevents_late_transport_start() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let bus = EventBus::new(store.clone());
+        let api: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store));
+        let server = WsApiServer::new_insecure(
+            api,
+            bus,
+            WsOptions {
+                base_port: 0,
+                ..WsOptions::default()
+            },
+            None,
+        );
+        let state = tokio::sync::Mutex::new(WsRuntimeState {
+            ws_server: None,
+            port: None,
+            bind_addresses: None,
+        });
+        let stop_generation = Arc::new(AtomicU64::new(0));
+        publish_starting_ws_server(&state, &stop_generation, 0, server.clone())
+            .await
+            .unwrap();
+        // Runtime stop finds the handle and finishes transport shutdown before
+        // the original start ever polls the transport start future.
+        stop_generation.fetch_add(1, Ordering::SeqCst);
+        let stopping = state.lock().await.ws_server.clone().unwrap();
+        stopping.stop().await;
+        let attempted_assignment = Arc::new(AtomicBool::new(false));
+        let observed = attempted_assignment.clone();
+        let error = server
+            .start_with_cancellable_port_assignment(
+                move |_| {
+                    observed.store(true, Ordering::SeqCst);
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "cancelled at persistence",
+                    ))
+                },
+                move || stop_generation.load(Ordering::SeqCst) != 0,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        assert!(
+            !attempted_assignment.load(Ordering::SeqCst),
+            "cancel before binding, not only at persistence"
+        );
         assert_eq!(server.bound_port().await, None);
     }
 

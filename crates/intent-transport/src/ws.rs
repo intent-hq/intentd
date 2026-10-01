@@ -623,7 +623,28 @@ impl WsApiServer {
         &self,
         persist: impl Fn(u16) -> std::io::Result<()> + Send + Sync + 'static,
     ) -> std::io::Result<u16> {
-        self.inner.start(Some(Arc::new(persist))).await
+        self.start_with_cancellable_port_assignment(persist, || false)
+            .await
+    }
+
+    /// Like `start_with_port_assignment`, with caller cancellation checked before
+    /// every bind attempt and before persistence/readiness. The predicate must
+    /// retain the caller's original cancellation state even if transport stop
+    /// completes before this start future is first polled.
+    ///
+    /// # Errors
+    /// Returns bind, cancellation, or persistence errors without serving.
+    pub async fn start_with_cancellable_port_assignment(
+        &self,
+        persist: impl Fn(u16) -> std::io::Result<()> + Send + Sync + 'static,
+        cancelled: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> std::io::Result<u16> {
+        self.inner
+            .start(Some(crate::lifecycle::PortAssignment {
+                persist: Arc::new(persist),
+                cancelled: Arc::new(cancelled),
+            }))
+            .await
     }
 
     /// Gracefully stop the listener (idempotent).

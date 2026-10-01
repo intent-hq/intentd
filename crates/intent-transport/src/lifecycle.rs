@@ -116,7 +116,10 @@ impl WsInner {
         let select = assignment.is_some() && assigned_port.is_none();
         let first = assigned_port.unwrap_or(self.base_port);
         let last = if select { u16::MAX } else { first };
-        let cancelled = || self.external_stop_generation.load(Ordering::SeqCst) != generation;
+        let cancelled = || {
+            self.external_stop_generation.load(Ordering::SeqCst) != generation
+                || assignment.as_ref().is_some_and(|a| (a.cancelled)())
+        };
         let (listeners, port) = select_port(first, last, cancelled, |port| {
             bind_all(&self.bind_addresses, port)
         })
@@ -129,7 +132,11 @@ impl WsInner {
         // No accept task, readiness, or bound port is published until this
         // synchronous commit succeeds. Errors drop every reserved socket.
         if select {
-            assignment.expect("selection has a persistence callback")(port).map_err(Arc::new)?;
+            (assignment
+                .as_ref()
+                .expect("selection has a persistence callback")
+                .persist)(port)
+            .map_err(Arc::new)?;
             st.assigned_port = Some(port);
         }
         if cancelled() || st.shutting_down {
@@ -221,7 +228,10 @@ impl WsInner {
 }
 
 /// The composition root commits the selected port while all listeners are held.
-pub(crate) type PortAssignment = Arc<dyn Fn(u16) -> io::Result<()> + Send + Sync>;
+pub(crate) struct PortAssignment {
+    pub persist: Arc<dyn Fn(u16) -> io::Result<()> + Send + Sync>,
+    pub cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+}
 
 fn start_cancelled() -> io::Error {
     io::Error::new(
