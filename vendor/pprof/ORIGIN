@@ -10,8 +10,10 @@ Local changes for https://github.com/intent-hq/intent/issues/6364:
 - Positional reads replace pathname reopening and leave the write cursor alone.
 - Collector tests cover anonymous lifetime, repeated reads/appends and read errors.
 
-All other shipped upstream files are unchanged. Cargo.lock, Cargo.toml.orig and
-.cargo_vcs_info.json are omitted: the workspace lock and this file record origin.
+Other retained upstream files are unchanged. Upstream CI configuration, changelog,
+Cargo.toml.orig and .cargo_vcs_info.json are omitted. The workspace lock records
+production dependencies; the generated local Cargo.lock pins standalone collector
+tests, including upstream dev dependencies. This file records source origin.
 The Cargo config patch applies to normal builds and release-plz's sanitized
 package verification. The crate remains outside the workspace member list and
 is still only a dependency on Unix. Remove this copy and override when upstream
