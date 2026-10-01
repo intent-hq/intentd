@@ -35567,6 +35567,203 @@ mod setup_lifecycle_events {
 mod file_ops_service {
     use super::*;
 
+    #[intent_test_macros::daemon_test]
+    async fn file_read_registered_root_preserves_content_and_confinement() {
+        use base64::Engine as _;
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.unwrap();
+        let dir = test_tempdir("intentd-file-read-roots-");
+        let primary = dir.path().join("primary");
+        let external = dir.path().join("external");
+        let sandbox = dir.path().join("sandbox");
+        for path in [&primary, &external, &sandbox] {
+            std::fs::create_dir_all(path).unwrap();
+            git2::Repository::init(path).unwrap();
+        }
+        let ws = WorkspaceId::new();
+        let mut w = workspace(&ws);
+        w.worktree_path = Some(primary.to_string_lossy().into_owned());
+        store.insert_workspace(&w).await.unwrap();
+        let caller = AgentId::new();
+        let mut session = super::turn_end_unread_gate::session(&caller, &ws);
+        session.sandbox_path = Some(sandbox.to_string_lossy().into_owned());
+        store.insert_agent_session(&session).await.unwrap();
+        let svc = Services::new(store);
+        let root = svc
+            .git_root_register(
+                ws.clone(),
+                external.to_string_lossy().into_owned(),
+                caller.clone(),
+            )
+            .await
+            .unwrap();
+        let root_id = intent_core::WorkspaceGitRootId::from(root["id"].as_str().unwrap());
+        std::fs::write(primary.join("new.txt"), "primary").unwrap();
+        std::fs::write(sandbox.join("new.txt"), "sandbox").unwrap();
+        std::fs::write(external.join("new.txt"), "external λ\n").unwrap();
+        for (agent, root, expected) in [
+            (None, None, "primary"),
+            (Some(caller.clone()), None, "sandbox"),
+            (None, Some(root_id.clone()), "external λ\n"),
+            (Some(caller), Some(root_id.clone()), "external λ\n"),
+        ] {
+            assert_eq!(
+                svc.file_read(ws.clone(), "new.txt".into(), agent.clone(), root.clone())
+                    .await
+                    .unwrap(),
+                serde_json::json!(expected)
+            );
+            let chunk = svc
+                .file_read_chunk(ws.clone(), "new.txt".into(), 0, 100, agent, root)
+                .await
+                .unwrap();
+            assert_eq!(
+                chunk["content"],
+                base64::engine::general_purpose::STANDARD.encode(expected)
+            );
+            assert_eq!(chunk["bytesRead"], expected.len());
+        }
+        // Existing full-text behavior has no chunk-size cap and no truncation.
+        let large = "x".repeat(crate::file_ops::READ_CHUNK_MAX_BYTES + 1);
+        std::fs::write(external.join("large.txt"), &large).unwrap();
+        assert_eq!(
+            svc.file_read(ws.clone(), "large.txt".into(), None, Some(root_id.clone()))
+                .await
+                .unwrap(),
+            serde_json::json!(large)
+        );
+        std::fs::write(external.join("empty.txt"), "").unwrap();
+        assert_eq!(
+            svc.file_read(ws.clone(), "empty.txt".into(), None, Some(root_id.clone()))
+                .await
+                .unwrap(),
+            serde_json::json!("")
+        );
+        std::fs::write(external.join("binary.bin"), [0xff, 0xfe]).unwrap();
+        for (offset, length, expected) in [
+            (0, 1, vec![0xff]),
+            (1, 16, vec![0xfe]),
+            (2, 16, vec![]),
+            (20, 16, vec![]),
+        ] {
+            let chunk = svc
+                .file_read_chunk(
+                    ws.clone(),
+                    "binary.bin".into(),
+                    offset,
+                    length,
+                    None,
+                    Some(root_id.clone()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                chunk,
+                serde_json::json!({"content": base64::engine::general_purpose::STANDARD.encode(&expected), "bytesRead": expected.len(), "size": 2})
+            );
+        }
+        for length in [0, crate::file_ops::READ_CHUNK_MAX_BYTES as u64 + 1] {
+            assert!(matches!(
+                svc.file_read_chunk(
+                    ws.clone(),
+                    "binary.bin".into(),
+                    0,
+                    length,
+                    None,
+                    Some(root_id.clone())
+                )
+                .await,
+                Err(Error::InvalidParams(_))
+            ));
+        }
+        for path in ["missing.txt", "../primary/new.txt"] {
+            assert!(matches!(
+                svc.file_read_chunk(ws.clone(), path.into(), 0, 16, None, Some(root_id.clone()))
+                    .await,
+                Err(Error::Internal(_))
+            ));
+        }
+        assert!(matches!(
+            svc.file_read_chunk(ws.clone(), ".".into(), 0, 16, None, Some(root_id.clone()))
+                .await,
+            Err(Error::InvalidParams(_))
+        ));
+        for path in ["binary.bin", "missing.txt", ".", "../primary/new.txt"] {
+            assert!(
+                matches!(
+                    svc.file_read(ws.clone(), path.into(), None, Some(root_id.clone()))
+                        .await,
+                    Err(Error::Internal(_))
+                ),
+                "{path}"
+            );
+        }
+        let outside = primary.join("new.txt").to_string_lossy().into_owned();
+        assert!(matches!(
+            svc.file_read_chunk(
+                ws.clone(),
+                outside.clone(),
+                0,
+                16,
+                None,
+                Some(root_id.clone())
+            )
+            .await,
+            Err(Error::Internal(_))
+        ));
+        assert!(matches!(
+            svc.file_read(ws.clone(), outside, None, Some(root_id.clone()))
+                .await,
+            Err(Error::Internal(_))
+        ));
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(primary.join("new.txt"), external.join("escape.txt"))
+                .unwrap();
+            std::os::unix::fs::symlink(external.join("new.txt"), external.join("alias.txt"))
+                .unwrap();
+            assert!(matches!(
+                svc.file_read(ws.clone(), "escape.txt".into(), None, Some(root_id.clone()))
+                    .await,
+                Err(Error::Internal(_))
+            ));
+            assert!(matches!(
+                svc.file_read_chunk(
+                    ws.clone(),
+                    "escape.txt".into(),
+                    0,
+                    16,
+                    None,
+                    Some(root_id.clone())
+                )
+                .await,
+                Err(Error::Internal(_))
+            ));
+            let chunk = svc
+                .file_read_chunk(
+                    ws.clone(),
+                    "alias.txt".into(),
+                    0,
+                    100,
+                    None,
+                    Some(root_id.clone()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                chunk["content"],
+                base64::engine::general_purpose::STANDARD.encode("external λ\n")
+            );
+            assert_eq!(
+                svc.file_read(ws, "alias.txt".into(), None, Some(root_id))
+                    .await
+                    .unwrap(),
+                serde_json::json!("external λ\n")
+            );
+        }
+    }
+
     /// `file.*` wired through `WorkspaceApi`: the workspace root resolves from
     /// `worktreePath`, writes/reads round-trip, and an out-of-workspace path
     /// surfaces as `Error::Internal` (→ `-32603`).
@@ -35598,7 +35795,7 @@ mod file_ops_service {
         );
 
         let read = svc
-            .file_read(ws.clone(), "notes/x.txt".to_string(), None)
+            .file_read(ws.clone(), "notes/x.txt".to_string(), None, None)
             .await
             .expect("read");
         assert_eq!(read, serde_json::Value::String("hi".to_string()));
@@ -35613,7 +35810,7 @@ mod file_ops_service {
         );
 
         let denied = svc
-            .file_read(ws.clone(), "../escape".to_string(), None)
+            .file_read(ws.clone(), "../escape".to_string(), None, None)
             .await;
         assert!(matches!(denied, Err(Error::Internal(_))));
     }
