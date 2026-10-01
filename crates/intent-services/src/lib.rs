@@ -32057,7 +32057,6 @@ impl WorkspaceApi for Services {
             )
             .await
             .map_err(pr_ops::map_sc_err)?;
-            let flow = flow.with_identity_guard(api_base.as_deref(), identity_guard);
             let mut slot = state.lock().await;
             // A concurrent connect raced us while the lock was released: keep
             // the resident live flow (single-flow invariant) and drop ours —
@@ -32068,6 +32067,11 @@ impl WorkspaceApi for Services {
                 }
             }
             let flow_id = github_auth_ops::next_flow_id();
+            let owner = github_auth_ops::CredentialOwner::new(secrets);
+            let flow = flow.with_identity_guard(
+                api_base.as_deref(),
+                owner.identity_guard(identity_guard, state.clone(), flow_id),
+            );
             let deadline =
                 tokio::time::Instant::now() + std::time::Duration::from_secs(auth.expires_in);
             // gh CLI sync only makes sense against the production login host
@@ -32076,7 +32080,7 @@ impl WorkspaceApi for Services {
             intent_core::spawn_daemon(github_auth_ops::run_poll_loop(
                 state.clone(),
                 bus,
-                secrets,
+                owner,
                 flow_id,
                 flow,
                 deadline,
@@ -32145,6 +32149,11 @@ impl WorkspaceApi for Services {
         );
         Box::pin(async move {
             Self::require_administrator("github.revoke")?;
+            // Per-credential ownership never spans unrelated settings I/O.
+            // Advance before mutation: even a partial failed revoke must not
+            // let an older batch or device completion resurrect credentials.
+            let mut credential = secrets.github_mutation().await?;
+            *credential += 1;
             // Capture the stored token BEFORE it is deleted so the detached
             // logout can match it against gh's active login. Fail-soft: a
             // load failure only skips the logout, never the revoke. 🔒 The
