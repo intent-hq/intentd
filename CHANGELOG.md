@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.128] - 2026-10-01
+
+### 🚀 Features
+
+- Discover Claude agents and follow linked skills ([#2197](https://github.com/intent-hq/intentd/pull/2197))
+
+
 ## [0.9.127] - 2026-09-30
 
 ### 🚀 Features
