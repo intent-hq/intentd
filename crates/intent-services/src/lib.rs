@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use base64::Engine as _;
 use intent_core::events::{
     AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_RETIRED, CHANGES_GIT_STATUS,
-    CHANGES_METRICS_CHANGED, COMMENT_ADDED, COMMENT_RESOLVED, GIT_BRANCH, GIT_COMMIT, GIT_PULL,
-    GIT_PUSH, GIT_ROOT_REGISTERED, GIT_ROOT_UNREGISTERED, GIT_ROOT_UPDATED,
+    CHANGES_METRICS_CHANGED, COMMENT_ADDED, COMMENT_DELETED, COMMENT_RESOLVED, GIT_BRANCH,
+    GIT_COMMIT, GIT_PULL, GIT_PUSH, GIT_ROOT_REGISTERED, GIT_ROOT_UNREGISTERED, GIT_ROOT_UPDATED,
     LINE_ATTRIBUTION_UPDATED, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, PR_LINKED, PR_UNLINKED,
     PR_UPDATED, SEARCH_DONE, SEARCH_RESULT, SETTINGS_CHANGED, SKILLS_CHANGED, TASK_AGENT_LINKED,
     TASK_AGENT_UNLINKED, TASK_CREATED, TASK_READY_TASKS_CHANGED, TASK_STATUS_CHANGED,
@@ -26680,7 +26680,9 @@ impl WorkspaceApi for Services {
                 }
             }
             fetch_note_peer(&store, &workspace_id, &note_id).await?;
-            let comments = store.list_comments(&note_id).await?;
+            let comments = store
+                .list_comments_in_workspace(&workspace_id, &note_id)
+                .await?;
 
             // Group by thread id (roots carry thread_id == id).
             let mut order: Vec<String> = Vec::new();
@@ -26979,18 +26981,48 @@ impl WorkspaceApi for Services {
         comment_id: String,
     ) -> BoxFuture<'_, Result<CommentDeleteResult>> {
         let store = self.store.clone();
+        let bus = self.event_bus.clone();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
-            match store.delete_comment(&workspace_id, &comment_id).await {
-                Ok(()) => Ok(CommentDeleteResult {
-                    success: true,
-                    message: format!("Comment {comment_id} deleted from note {note_id}"),
-                }),
-                Err(Error::NotFound(_)) => {
-                    Err(Error::Internal("Failed to delete comment".to_string()))
-                }
-                Err(e) => Err(e),
-            }
+            // Retain the thread identity before deleting the row. Scope the
+            // lookup to both workspace and note, including same-id notes in
+            // different workspaces, and keep the existing failure envelope.
+            let comment = store
+                .list_comments_in_workspace(&workspace_id, &note_id)
+                .await?
+                .into_iter()
+                .find(|comment| comment.id == comment_id)
+                .ok_or_else(|| Error::Internal("Failed to delete comment".to_string()))?;
+            store
+                .delete_comment(&workspace_id, &comment_id)
+                .await
+                .map_err(|err| match err {
+                    Error::NotFound(_) => Error::Internal("Failed to delete comment".to_string()),
+                    other => other,
+                })?;
+            publish_event(
+                bus.as_ref(),
+                NewEvent {
+                    workspace_id,
+                    timestamp: now_iso(),
+                    event_type: COMMENT_DELETED.to_string(),
+                    actor: system_actor(),
+                    session_id: None,
+                    correlation_id: None,
+                    parent_event_id: None,
+                    metadata: None,
+                    data: serde_json::json!({
+                        "noteId": note_id.as_str(),
+                        "commentId": comment_id,
+                        "threadId": comment.thread_id,
+                    }),
+                },
+            )
+            .await;
+            Ok(CommentDeleteResult {
+                success: true,
+                message: format!("Comment {comment_id} deleted from note {note_id}"),
+            })
         })
     }
 
