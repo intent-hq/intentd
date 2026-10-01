@@ -265,6 +265,10 @@ mod tests {
         const WORKER: &str = "INTENT_TEST_STACK_SAMPLE_COUNT";
         if let Ok(count) = std::env::var(WORKER) {
             let count: usize = count.parse().unwrap();
+            assert_eq!(
+                std::env::temp_dir(),
+                std::path::PathBuf::from(std::env::var_os("TMPDIR").unwrap())
+            );
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -313,6 +317,8 @@ mod tests {
             let status = child
                 .wait_with_timeout(std::time::Duration::from_secs(60))
                 .unwrap();
+            // Reap even a timed-out worker before inspecting its directory.
+            drop(child);
             let output = std::fs::read_to_string(log_path).unwrap();
             let residue: Vec<_> = std::fs::read_dir(&tmp)
                 .unwrap()
