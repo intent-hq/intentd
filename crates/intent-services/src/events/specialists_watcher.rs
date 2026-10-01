@@ -26,9 +26,10 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::bus::EventBus;
+use super::linked_watch::{uncovered_directories, ScopedLinkedWatches};
 use super::root_watch::{watch_root, RootWatch};
 use super::shared_watch::{watch_tiers, SharedWatchHub, TierWatch};
-use crate::specialists::SpecialistsService;
+use crate::specialists::{claude_agents, SpecialistsService};
 
 const DEBOUNCE: Duration = Duration::from_millis(500);
 
@@ -89,7 +90,14 @@ impl SpecialistsWatcher {
             );
         }
 
-        let task = intent_core::spawn_daemon(debounce_loop(bus, workspaces, user_dir, raw_rx));
+        let task = intent_core::spawn_daemon(debounce_loop(
+            bus,
+            workspaces,
+            user_dir,
+            raw_rx,
+            Arc::clone(hub),
+            raw_tx.clone(),
+        ));
 
         Self {
             hub: Arc::clone(hub),
@@ -234,6 +242,9 @@ fn watch_directory(
 
 fn is_md(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()) == Some("md")
+        || path
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.is_symlink())
 }
 
 /// Default user-tier specialists directory (`~/.intent/specialists/`).
@@ -242,7 +253,7 @@ fn default_user_dir() -> Option<PathBuf> {
 }
 
 /// The project-tier specialists directory, relative to the workspace root.
-const PROJECT_TIERS: &[&str] = &[".intent/specialists"];
+const PROJECT_TIERS: &[&str] = &[".intent/specialists", ".claude/agents"];
 
 /// The project-tier specialists directory for a workspace.
 #[cfg(test)]
@@ -261,14 +272,20 @@ fn home_dir() -> Option<PathBuf> {
 /// serialized `specialist.list` view (ids + tier-resolved content), so an
 /// event is emitted only when the resolved set actually changed (analogous to
 /// `check_skills_changed`).
-fn specialists_fingerprint(user_dir: Option<&PathBuf>, workspace_path: &Path) -> u64 {
-    let svc = SpecialistsService::new(user_dir.cloned(), None);
-    let list = svc
-        .list(Some(workspace_path))
-        .unwrap_or(serde_json::Value::Null);
-    let mut hasher = DefaultHasher::new();
-    list.to_string().hash(&mut hasher);
-    hasher.finish()
+async fn specialists_fingerprint(user_dir: Option<&PathBuf>, workspace_path: &Path) -> u64 {
+    let user_dir = user_dir.cloned();
+    let workspace_path = workspace_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let svc = SpecialistsService::new(user_dir, None);
+        let list = svc
+            .list(Some(&workspace_path))
+            .unwrap_or(serde_json::Value::Null);
+        let mut hasher = DefaultHasher::new();
+        list.to_string().hash(&mut hasher);
+        hasher.finish()
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// Debounce loop that coalesces rapid specialist file changes per workspace.
@@ -279,24 +296,33 @@ async fn debounce_loop(
     workspaces: Vec<(WorkspaceId, PathBuf)>,
     user_dir: Option<PathBuf>,
     mut raw_rx: mpsc::UnboundedReceiver<SpecialistsMsg>,
+    hub: Arc<SharedWatchHub>,
+    raw_tx: mpsc::UnboundedSender<SpecialistsMsg>,
 ) {
     let mut pending: HashMap<WorkspaceId, tokio::time::Instant> = HashMap::new();
     let mut workspace_paths: HashMap<WorkspaceId, PathBuf> = workspaces.into_iter().collect();
 
     // Prime the per-workspace fingerprints so the first flush compares against
     // the set as it stood at watcher start (no spurious first event).
-    let mut fingerprints: HashMap<WorkspaceId, u64> = workspace_paths
-        .iter()
-        .map(|(ws_id, path)| {
-            (
-                ws_id.clone(),
-                specialists_fingerprint(user_dir.as_ref(), path),
-            )
-        })
-        .collect();
+    let mut fingerprints: HashMap<WorkspaceId, u64> = HashMap::new();
+    for (id, path) in &workspace_paths {
+        fingerprints.insert(
+            id.clone(),
+            specialists_fingerprint(user_dir.as_ref(), path).await,
+        );
+    }
+
+    let mut linked = ScopedLinkedWatches::new(hub, move |scope| {
+        let _ = raw_tx.send(SpecialistsMsg::Change(scope));
+    });
+    refresh_claude_user_watches(user_dir.as_deref(), &mut linked).await;
+    let mut user_deadline: Option<tokio::time::Instant> = None;
+    for (id, path) in &workspace_paths {
+        refresh_claude_watches(id, path, &mut linked).await;
+    }
 
     loop {
-        let next_deadline = pending.values().copied().min();
+        let next_deadline = pending.values().copied().chain(user_deadline).min();
 
         tokio::select! {
             maybe = raw_rx.recv() => match maybe {
@@ -305,33 +331,40 @@ async fn debounce_loop(
                     match workspace_id {
                         // User-tier change: affects all workspaces
                         None => {
+                            user_deadline.get_or_insert(deadline);
                             for ws_id in workspace_paths.keys() {
-                                pending.insert(ws_id.clone(), deadline);
+                                pending.entry(ws_id.clone()).or_insert(deadline);
                             }
                         }
                         // Project-tier change: affects specific workspace
                         Some(ws_id) => {
-                            pending.insert(ws_id, deadline);
+                            if workspace_paths.contains_key(&ws_id) {
+                                pending.entry(ws_id).or_insert(deadline);
+                            }
                         }
                     }
                 }
                 Some(SpecialistsMsg::Add(ws_id, path)) => {
                     // Prime the fingerprint like the start-time priming above.
-                    fingerprints.insert(ws_id.clone(), specialists_fingerprint(user_dir.as_ref(), &path));
+                    fingerprints.insert(ws_id.clone(), specialists_fingerprint(user_dir.as_ref(), &path).await);
+                    refresh_claude_watches(&ws_id, &path, &mut linked).await;
                     workspace_paths.insert(ws_id, path);
                 }
                 Some(SpecialistsMsg::Remove(ws_id)) => {
                     workspace_paths.remove(&ws_id);
                     fingerprints.remove(&ws_id);
                     pending.remove(&ws_id);
+                    linked.remove(&ws_id);
                 }
                 Some(SpecialistsMsg::Pause(ws_id)) => {
                     // Path drop stops emission (user-tier fan-out and flushes
                     // both key on `workspace_paths`); the fingerprint stays.
                     workspace_paths.remove(&ws_id);
                     pending.remove(&ws_id);
+                    linked.remove(&ws_id);
                 }
                 Some(SpecialistsMsg::Resume(ws_id, path)) => {
+                    refresh_claude_watches(&ws_id, &path, &mut linked).await;
                     workspace_paths.insert(ws_id.clone(), path);
                     // Catch-up: flush after the normal debounce so the
                     // re-registered watch's own events coalesce into it.
@@ -344,10 +377,64 @@ async fn debounce_loop(
                 }
             },
             () = sleep_until(next_deadline), if next_deadline.is_some() => {
+                if user_deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
+                    user_deadline = None;
+                    refresh_claude_user_watches(user_dir.as_deref(), &mut linked).await;
+                }
+                for (id, deadline) in &pending {
+                    if *deadline <= tokio::time::Instant::now() {
+                        if let Some(path) = workspace_paths.get(id) {
+                            refresh_claude_watches(id, path, &mut linked).await;
+                        }
+                    }
+                }
                 flush_due(&bus, &workspace_paths, user_dir.as_ref(), &mut fingerprints, &mut pending).await;
             }
         }
     }
+}
+
+async fn refresh_claude_user_watches(user_dir: Option<&Path>, linked: &mut ScopedLinkedWatches) {
+    let root = claude_agents::user_root(user_dir);
+    if let Ok(directories) = tokio::task::spawn_blocking(move || {
+        root.map_or_else(Vec::new, |root| {
+            let directories = claude_agents::watch_directories(&root);
+            directories
+                .ordinary
+                .into_iter()
+                .chain(directories.linked)
+                .collect()
+        })
+    })
+    .await
+    {
+        linked.sync_user(directories);
+    }
+}
+
+async fn refresh_claude_watches(
+    id: &WorkspaceId,
+    workspace_path: &Path,
+    linked: &mut ScopedLinkedWatches,
+) {
+    let workspace = workspace_path.to_path_buf();
+    let Ok(directories) = tokio::task::spawn_blocking(move || {
+        let workspace = workspace.canonicalize().unwrap_or(workspace);
+        let root = workspace.join(".claude/agents");
+        let covered: Vec<_> = PROJECT_TIERS
+            .iter()
+            .map(|tier| workspace.join(tier))
+            .collect();
+        let directories = claude_agents::watch_directories(&root);
+        let mut supplemental = uncovered_directories(directories.ordinary, &covered);
+        supplemental.extend(directories.linked);
+        supplemental
+    })
+    .await
+    else {
+        return;
+    };
+    linked.sync_project(id.clone(), directories);
 }
 
 async fn flush_due(
@@ -395,7 +482,7 @@ async fn emit_specialists_changed(
     fingerprints: &mut HashMap<WorkspaceId, u64>,
 ) {
     // Re-resolve the set to check if it actually changed
-    let fingerprint = specialists_fingerprint(user_dir, workspace_path);
+    let fingerprint = specialists_fingerprint(user_dir, workspace_path).await;
     let changed = fingerprints.get(workspace_id) != Some(&fingerprint);
     fingerprints.insert(workspace_id.clone(), fingerprint);
 

@@ -8,6 +8,8 @@
 
 #![cfg(unix)]
 
+#[path = "wss_integration/claude_agents.rs"]
+mod claude_agents;
 mod common;
 
 use std::io::Write;
@@ -38,6 +40,14 @@ fn scratch_dir(prefix: &str) -> tempfile::TempDir {
 /// Spawn `intentd serve` with a hermetic HOME so the user-tier specialists
 /// directory (`~/.intent/specialists`) never touches the real home.
 fn spawn_serve(data_dir: &Path, home_dir: &Path) -> Child {
+    spawn_serve_with_claude_config(data_dir, home_dir, None)
+}
+
+fn spawn_serve_with_claude_config(
+    data_dir: &Path,
+    home_dir: &Path,
+    claude_config: Option<&Path>,
+) -> Child {
     // Keep both boots' logs so restart teardown can be diagnosed.
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -60,8 +70,12 @@ fn spawn_serve(data_dir: &Path, home_dir: &Path) -> Child {
         .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
         .stdin(Stdio::null())
         .env("HOME", home_dir)
+        .env_remove("CLAUDE_CONFIG_DIR")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
+    if let Some(path) = claude_config {
+        cmd.env("CLAUDE_CONFIG_DIR", path);
+    }
     // Assert before spawning, so a broken fixture fails without using an
     // inherited credential. Name missing contracts without printing values.
     for key in [
@@ -197,6 +211,18 @@ async fn wss_rpc<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: 
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    let reply = wss_reply(ws, id, method, params).await;
+    assert!(
+        reply.get("error").is_none(),
+        "rpc {method} errored: {reply}"
+    );
+    reply["result"].clone()
+}
+
+async fn wss_reply<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: Value) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
     ws.send(Message::Text(frame.to_string().into()))
         .await
@@ -209,8 +235,7 @@ where
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
                 if v["id"] == json!(id) {
-                    assert!(v.get("error").is_none(), "rpc {method} errored: {v}");
-                    return v["result"].clone();
+                    return v;
                 }
             }
             Some(Ok(Message::Ping(p))) => {
@@ -301,6 +326,13 @@ where
 /// and a pinned-TLS WSS client config for its live port.
 async fn boot(data_dir: &Path, home_dir: &Path) -> (common::DaemonGuard, u16, Arc<ClientConfig>) {
     let child = common::DaemonGuard::process_only(spawn_serve(data_dir, home_dir));
+    await_boot(data_dir, child).await
+}
+
+async fn await_boot(
+    data_dir: &Path,
+    child: common::DaemonGuard,
+) -> (common::DaemonGuard, u16, Arc<ClientConfig>) {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;

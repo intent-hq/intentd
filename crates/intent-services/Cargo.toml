@@ -33,7 +33,6 @@ serde = { workspace = true }
 time = { workspace = true, features = ["formatting", "local-offset"] }
 similar = { version = "3.1.1", default-features = false }
 serde_yaml = "0.9"
-async-recursion = "1.1"
 toml_edit = "0.25.5"
 tempfile = "3"
 reqwest.workspace = true

@@ -18,6 +18,9 @@ mod human_attribution;
 mod imported_queue_authorization;
 #[path = "wss_integration/integration_context.rs"]
 mod integration_context;
+#[cfg(unix)]
+#[path = "wss_integration/linked_skills.rs"]
+mod linked_skills;
 #[path = "wss_integration/resource_context.rs"]
 mod resource_context;
 #[path = "wss_integration/script_lifecycle.rs"]
