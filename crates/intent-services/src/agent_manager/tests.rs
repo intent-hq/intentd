@@ -13267,84 +13267,120 @@ async fn end_turn_persists_runtime_idle_and_emits_event() {
     assert!(!mgr.is_busy(&id));
 }
 
-/// The prompt's idle signal precedes the worker's final status write. Drive
-/// those existing phases separately to pin the observation boundary without
-/// timing sleeps or a production hook (the ordering predates deletion guards).
-#[intent_test_macros::daemon_test]
+/// #5669: an idle lifecycle event is emitted before the worker saves its
+/// `RuntimeIdle` status. Hold both boundaries so scheduler speed cannot hide
+/// the distinction between turn completion and durable worker settlement.
+#[tokio::test]
 async fn prompt_idle_event_precedes_end_turn_status_persistence() {
     use intent_core::events::{AGENT_IDLE, AGENT_STATUS_CHANGED};
+
     let (_tmp, mgr, bus) = manager_with_bus().await;
-    let (ws, id) = (
-        WorkspaceId::from("idle-boundary"),
-        AgentId::from("idle-boundary-agent"),
-    );
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let ws = WorkspaceId::from("ws-idle-settlement");
+    let id = AgentId::from("idle-settlement");
     seed_agent(&mgr, &ws, &id).await;
-    let mock = track_mock_agent(&mgr, &id, false);
-    assert!(mgr.try_begin(&id, &ws).await);
-    let (connection, notifications) = {
-        let handles = mgr.handles.lock().unwrap();
-        let handle = handles.get(&id).unwrap();
-        (
-            handle.execution.connection().unwrap(),
-            handle.execution.runtime.notifications(),
-        )
-    };
-    let mut sub = bus.subscribe(SubscriptionFilter::default());
-    mgr.services
-        .run_connection_prompt_turn(
-            &connection,
-            &mut *notifications.lock().await,
-            &id,
-            &ws,
-            MGR_ACP_SID,
-            text_prompt("hi"),
+    let mock = track_mock_agent(&mgr, &id, true);
+    mgr.start_session(&id, PathBuf::from("/tmp/ws"), &test_provider())
+        .await
+        .unwrap();
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_IDLE.into(), AGENT_STATUS_CHANGED.into()],
+        batch_window: None,
+        ..Default::default()
+    });
+    let (reached, release) = mgr.services.queue_drain_commit_pause.arm();
+    let sent = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "finish this turn".into(),
             None,
+            super::TurnOptions {
+                origin: MessageOrigin::User,
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
+    assert_eq!(sent["queued"], false);
+    timeout(Duration::from_secs(10), reached)
+        .await
+        .expect("worker reached post-turn drain barrier")
+        .unwrap();
     timeout(Duration::from_secs(10), async {
         loop {
-            if sub
-                .recv()
-                .await
-                .unwrap()
+            let batch = sub.recv().await.expect("event subscription open");
+            if batch
                 .iter()
-                .any(|event| event.event_type == AGENT_IDLE)
+                .any(|ev| ev.event_type == AGENT_IDLE && ev.data["agentId"] == id.0)
             {
                 break;
             }
         }
     })
     .await
-    .unwrap();
-    assert!(!mgr.services.has_ready_to_send(&id));
-    let observed = mgr.services.agent_get(id.clone(), None).await.unwrap();
+    .expect("real turn published idle before releasing the slot");
+    assert!(mgr.is_busy(&id));
+    assert!(mgr.services.queue_snapshot(&id).is_empty());
+
+    // Take the only writer while the worker is parked after its last turn.
+    // WAL readers remain available, but end_turn cannot persist RuntimeIdle.
+    let writer = mgr.services.store.write_pool().begin().await.unwrap();
+    release.send(()).unwrap();
+    timeout(Duration::from_secs(10), async {
+        while mgr.is_busy(&id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("end_turn releases the busy slot before awaiting the writer");
+    let early = mgr
+        .services
+        .agent_get_op(id.clone(), Some(ws.clone()))
+        .await
+        .unwrap();
+    assert!(!early.is_streaming);
+    assert!(!early.is_processing);
+    assert!(!early.is_responding);
+    assert!(!early.is_waiting_on_tool);
+    assert!(!early.turn_in_flight);
     assert_eq!(
-        observed.status,
+        early.status,
         AgentStatus::Active,
-        "idle event alone is not the final status barrier"
+        "idle event and released busy slot do not imply durable idle"
     );
-    mgr.end_turn(&id).await;
+
+    writer.rollback().await.unwrap();
     timeout(Duration::from_secs(10), async {
         loop {
-            if sub.recv().await.unwrap().iter().any(|event| {
-                event.event_type == AGENT_STATUS_CHANGED && event.data["status"] == "idle"
+            let batch = sub.recv().await.expect("event subscription open");
+            if batch.iter().any(|ev| {
+                ev.event_type == AGENT_STATUS_CHANGED
+                    && ev.data["agentId"] == id.0
+                    && ev.data["status"] == "idle"
             }) {
                 break;
             }
         }
     })
     .await
-    .unwrap();
-    let settled = mgr.services.agent_get(id.clone(), None).await.unwrap();
-    assert_eq!(
-        settled.status,
-        AgentStatus::RuntimeIdle,
-        "final status event follows the persisted idle row"
-    );
-    assert!(!mgr.is_busy(&id));
+    .expect("worker publishes durable idle after the writer is released");
+    let settled = mgr
+        .services
+        .agent_get_op(id.clone(), Some(ws))
+        .await
+        .unwrap();
+    assert_eq!(settled.status, AgentStatus::RuntimeIdle);
+    assert!(!settled.is_streaming);
+    assert!(!settled.is_processing);
+    assert!(!settled.is_responding);
+    assert!(!settled.is_waiting_on_tool);
+    assert!(!settled.turn_in_flight);
+    assert!(mgr.services.queue_snapshot(&id).is_empty());
     mgr.stop(&id).await;
     mock.abort();
+    let _ = mock.await;
 }
 
 #[tokio::test]
