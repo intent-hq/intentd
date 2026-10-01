@@ -1769,7 +1769,7 @@ jobs:
           PI_CLI_TEST_ENTRY: ${{ github.workspace }}/.pi-runtime-test/node_modules/@earendil-works/pi-coding-agent/dist/cli.js
           PI_ACP_EVIDENCE_DIR: ${{ github.workspace }}/pi-path-evidence
         run: node --test --test-reporter=tap crates/intentd/tests/fixtures/pi-runtime-compat.test.mjs | tee pi-path-evidence/runtime.tap
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: pi-session-pinned-${{ matrix.os }}-node${{ matrix.node }}
