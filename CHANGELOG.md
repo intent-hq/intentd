@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.130] - 2026-10-01
+
+### 🚀 Features
+
+- Log daemon shutdown phase timings ([#2201](https://github.com/intent-hq/intentd/pull/2201))
+
+
 ## [0.9.129] - 2026-10-01
 
 ### 🚀 Features
