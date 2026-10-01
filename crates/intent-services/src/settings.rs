@@ -2587,9 +2587,9 @@ impl SecretSettingsUpdate {
         ordinary.into_iter().map(|(_, entry)| entry).collect()
     }
 
-    /// Only used after ALL secret writes succeeded. A timed-out write's own
-    /// settlement/rollback stays in `store_secret_and_clear_siblings`; never
-    /// blind-restore here after its unknown-state error.
+    /// Restore completed writes only. A failed write's own settlement/rollback
+    /// stays in `store_secret_and_clear_siblings`; never add its unknown-state
+    /// accounts to this ledger.
     pub(crate) async fn rollback(&self, secrets: &AsyncSecretStore) -> bool {
         let mut failed = false;
         for (path, prior) in &self.prior {
@@ -2810,14 +2810,13 @@ impl<'a> SettingsService<'a> {
     pub(crate) async fn update_secrets(&self, changes: &Value) -> Result<SecretSettingsUpdate> {
         let planned = self.validate_update(changes)?;
         let mut update = SecretSettingsUpdate::default();
+        let mut prior = Vec::new();
         for (def, _) in planned.iter().filter(|(def, _)| def.sensitive) {
             for path in std::iter::once(def.path)
                 .chain(forge_token_secret_siblings(def.path).iter().copied())
             {
-                if !update.prior.iter().any(|(p, _)| p == path) {
-                    update
-                        .prior
-                        .push((path.to_string(), self.secrets.load_fresh(path).await?));
+                if !prior.iter().any(|(p, _)| p == path) {
+                    prior.push((path.to_string(), self.secrets.load_fresh(path).await?));
                 }
             }
         }
@@ -2826,10 +2825,7 @@ impl<'a> SettingsService<'a> {
         for (def, value) in &planned {
             if def.sensitive
                 && value.as_str() == Some(REDACTED_PLACEHOLDER)
-                && update
-                    .prior
-                    .iter()
-                    .any(|(p, v)| p == def.path && v.is_none())
+                && prior.iter().any(|(p, v)| p == def.path && v.is_none())
             {
                 return Err(Error::InvalidParams(format!(
                     "{}: the redaction placeholder cannot be stored as a secret (no secret is currently stored for this setting)", def.path
@@ -2846,21 +2842,43 @@ impl<'a> SettingsService<'a> {
                     Value::String(s) => s.clone(),
                     other => other.to_string(),
                 };
-                let unchanged = update
-                    .prior
+                let unchanged = prior
                     .iter()
                     .any(|(p, v)| p == def.path && v.as_deref() == Some(&desired))
-                    && forge_token_secret_siblings(def.path).iter().all(|sibling| {
-                        update
-                            .prior
-                            .iter()
-                            .any(|(p, v)| p == sibling && v.is_none())
-                    });
+                    && forge_token_secret_siblings(def.path)
+                        .iter()
+                        .all(|sibling| prior.iter().any(|(p, v)| p == sibling && v.is_none()));
                 if unchanged {
                     continue;
                 }
-                self.store_secret_and_clear_siblings(def.path, &desired)
-                    .await?;
+                let siblings = forge_token_secret_siblings(def.path);
+                let owns_account = |path: &str| path == def.path || siblings.contains(&path);
+                if let Err(error) = self
+                    .store_secret_and_clear_siblings(def.path, &desired)
+                    .await
+                {
+                    // A repeated path may already have a completed write in
+                    // this batch. Restore its original state only if the later
+                    // failed mutation (including siblings) has settled.
+                    if update.prior.iter().any(|(path, _)| owns_account(path)) {
+                        for path in std::iter::once(def.path).chain(siblings.iter().copied()) {
+                            if self.secrets.settle_detached(path).await.is_err() {
+                                update.prior.retain(|(path, _)| !owns_account(path));
+                                break;
+                            }
+                        }
+                    }
+                    // Per-account guards remain held by the caller, without
+                    // the revision gate. Never compensate untouched accounts
+                    // or a failing operation whose state is still unknown.
+                    update.rollback(self.secrets).await;
+                    return Err(error);
+                }
+                for (path, value) in prior.iter().filter(|(path, _)| owns_account(path)) {
+                    if !update.prior.iter().any(|(p, _)| p == path) {
+                        update.prior.push((path.clone(), value.clone()));
+                    }
+                }
             }
             update.applied.push((
                 index,
@@ -7856,6 +7874,259 @@ mod rollback_order_tests {
         pin::Pin,
         task::Poll,
     };
+
+    struct RejectSecondSecret {
+        raw: InMemorySecretStore,
+        rollback: Option<(
+            Arc<tokio::sync::Notify>,
+            Mutex<std::sync::mpsc::Receiver<()>>,
+        )>,
+    }
+
+    impl SecretStore for RejectSecondSecret {
+        fn load(&self, account: &str) -> Result<Option<String>> {
+            self.raw.load(account)
+        }
+
+        fn store(&self, account: &str, value: &str) -> Result<()> {
+            if account == "accounts.sentry.token" && value == "rejected-sentry" {
+                return Err(Error::Internal("injected second-secret failure".into()));
+            }
+            if account == intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT
+                && value == "original-device"
+            {
+                if let Some((entered, release)) = &self.rollback {
+                    entered.notify_one();
+                    let _ = release.lock().unwrap().recv();
+                }
+            }
+            self.raw.store(account, value)
+        }
+
+        fn delete(&self, account: &str) -> Result<()> {
+            self.raw.delete(account)
+        }
+    }
+
+    async fn failed_secret_batch_case(seeded: bool, concurrent: bool, repeated: bool) {
+        use intent_sourcecontrol::gitlab_token::{
+            EXPIRES_AT_SECRET_ACCOUNT, REFRESH_SECRET_ACCOUNT, SECRET_ACCOUNT,
+        };
+        let dir = crate::test_support::test_tempdir("settings-failed-secret-batch");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let registry = Arc::new(SettingsRegistry::load(dir.path().join("config.toml")).unwrap());
+        registry
+            .apply(&[("notifications.volume".into(), json!(0.5))])
+            .unwrap();
+        let (bus, mut sub) = settings_subscription(&store);
+        let raw = InMemorySecretStore::default();
+        let originals = [
+            (SECRET_ACCOUNT, "original-device"),
+            (REFRESH_SECRET_ACCOUNT, "original-refresh"),
+            (EXPIRES_AT_SECRET_ACCOUNT, "12345"),
+        ];
+        if seeded {
+            for (account, value) in originals {
+                raw.store(account, value).unwrap();
+            }
+        }
+        raw.store("accounts.sentry.token", "original-sentry")
+            .unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let services = crate::Services::new(store)
+            .with_settings_registry(registry)
+            .with_secret_store(Arc::new(RejectSecondSecret {
+                raw: raw.clone(),
+                rollback: concurrent.then_some((entered.clone(), Mutex::new(release_rx))),
+            }))
+            .with_event_bus(bus);
+        let writer = services.clone();
+        let failed = intent_core::spawn_daemon(async move {
+            let mut changes = vec![
+                json!({"path":"notifications.volume", "value":0.75}),
+                json!({"path":SECRET_ACCOUNT, "value":"temporary-pat"}),
+            ];
+            if repeated {
+                changes.push(json!({"path":"accounts.sentry.token", "value":"first-sentry"}));
+            }
+            changes.push(json!({"path":"accounts.sentry.token", "value":"rejected-sentry"}));
+            writer.settings_update(json!(changes)).await
+        });
+        let mut newer = services.settings_update(json!([
+            {"path":SECRET_ACCOUNT, "value":"newer-pat"}
+        ]));
+        if concurrent {
+            timeout(Duration::from_secs(5), entered.notified())
+                .await
+                .expect("rollback parked");
+            assert!(
+                poll_fn(|cx| Poll::Ready(newer.as_mut().poll(cx).is_pending())).await,
+                "a newer credential must wait for compensation to finish"
+            );
+            let ordinary = timeout(
+                Duration::from_secs(3),
+                services.settings_get("notifications.volume".into()),
+            )
+            .await
+            .expect("compensation must not hold the revision gate")
+            .unwrap();
+            assert_eq!(ordinary["value"], json!(0.5));
+            assert_eq!(ordinary["revision"], json!(0));
+            release_tx.send(()).unwrap();
+        }
+        let error = failed.await.unwrap().expect_err("second secret must fail");
+        assert!(
+            error.to_string().contains("injected second-secret failure"),
+            "{error}"
+        );
+        for (account, value) in originals {
+            assert_eq!(
+                raw.load(account).unwrap().as_deref(),
+                seeded.then_some(value),
+                "failed batch must restore {account}"
+            );
+        }
+        assert_eq!(
+            raw.load("accounts.sentry.token").unwrap().as_deref(),
+            Some("original-sentry")
+        );
+        let ordinary = services
+            .settings_get("notifications.volume".into())
+            .await
+            .unwrap();
+        assert_eq!(ordinary["value"], json!(0.5));
+        assert_eq!(ordinary["origin"], json!("file"));
+        assert_eq!(ordinary["revision"], json!(0));
+        assert_no_settings_events(&mut sub).await;
+        assert_next_commit_is_revision_one(&services, &mut sub).await;
+        if concurrent {
+            assert_eq!(newer.await.unwrap()["revision"], json!(2));
+            assert_eq!(
+                raw.load(SECRET_ACCOUNT).unwrap().as_deref(),
+                Some("newer-pat")
+            );
+            assert_eq!(raw.load(REFRESH_SECRET_ACCOUNT).unwrap(), None);
+            assert_eq!(raw.load(EXPIRES_AT_SECRET_ACCOUNT).unwrap(), None);
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn failed_secret_batch_restores_earlier_token_and_siblings() {
+        failed_secret_batch_case(true, false, false).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn failed_secret_batch_removes_previously_absent_token() {
+        failed_secret_batch_case(false, false, false).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn failed_secret_batch_preserves_newer_credential() {
+        failed_secret_batch_case(true, true, false).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn failed_secret_batch_restores_a_completed_repeated_account() {
+        failed_secret_batch_case(true, false, true).await;
+    }
+
+    async fn unsettled_secret_batch_case(repeated: bool) {
+        struct ParkWrite {
+            raw: InMemorySecretStore,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+            attempts: Mutex<Vec<String>>,
+        }
+        impl SecretStore for ParkWrite {
+            fn load(&self, account: &str) -> Result<Option<String>> {
+                self.raw.load(account)
+            }
+            fn store(&self, account: &str, value: &str) -> Result<()> {
+                if account == "accounts.sentry.token" {
+                    self.attempts.lock().unwrap().push(value.into());
+                    if value == "late-write" {
+                        let _ = self.release.lock().unwrap().recv();
+                    }
+                }
+                self.raw.store(account, value)
+            }
+            fn delete(&self, account: &str) -> Result<()> {
+                self.raw.delete(account)
+            }
+        }
+        let dir = crate::test_support::test_tempdir("settings-unsettled-secret-batch");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let raw = InMemorySecretStore::default();
+        raw.store("linear.token", "original-linear").unwrap();
+        raw.store("accounts.sentry.token", "original-sentry")
+            .unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let parked = Arc::new(ParkWrite {
+            raw: raw.clone(),
+            release: Mutex::new(release_rx),
+            attempts: Mutex::new(Vec::new()),
+        });
+        let secrets = AsyncSecretStore::with_timings(
+            parked.clone(),
+            Duration::from_secs(2),
+            Duration::from_millis(100),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .with_settle_timeout(Duration::from_millis(100));
+        let service = SettingsService::new(&store, &secrets, None);
+        let mut changes = vec![json!({"path":"linear.token", "value":"temporary-linear"})];
+        if repeated {
+            changes.push(json!({"path":"accounts.sentry.token", "value":"first-write"}));
+        }
+        changes.push(json!({"path":"accounts.sentry.token", "value":"late-write"}));
+        let error = service
+            .update(&json!(changes))
+            .await
+            .expect_err("parked write times out");
+        assert!(error.to_string().contains("timed out"), "{error}");
+        assert_eq!(
+            raw.load("linear.token").unwrap().as_deref(),
+            Some("original-linear")
+        );
+        assert_eq!(
+            raw.load("accounts.sentry.token").unwrap().as_deref(),
+            Some(if repeated {
+                "first-write"
+            } else {
+                "original-sentry"
+            })
+        );
+        assert_eq!(
+            *parked.attempts.lock().unwrap(),
+            if repeated {
+                vec!["first-write", "late-write"]
+            } else {
+                vec!["late-write"]
+            },
+            "never blindly restore the unsettled credential"
+        );
+        assert_eq!(secrets.detached_len("accounts.sentry.token"), 1);
+        release_tx.send(()).unwrap();
+        assert!(secrets
+            .settle_detached("accounts.sentry.token")
+            .await
+            .unwrap());
+        assert_eq!(
+            raw.load("accounts.sentry.token").unwrap().as_deref(),
+            Some("late-write")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_secret_batch_restores_completed_write_while_later_write_is_unsettled() {
+        unsettled_secret_batch_case(false).await;
+    }
+
+    #[tokio::test]
+    async fn failed_secret_batch_never_restores_an_unsettled_repeated_account() {
+        unsettled_secret_batch_case(true).await;
+    }
     fn settings_subscription(store: &Store) -> (crate::EventBus, crate::events::Subscription) {
         let bus = crate::EventBus::new(store.clone());
         let sub = bus.subscribe(crate::events::SubscriptionFilter {
