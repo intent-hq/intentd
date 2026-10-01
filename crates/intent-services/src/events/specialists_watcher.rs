@@ -397,7 +397,14 @@ async fn debounce_loop(
 async fn refresh_claude_user_watches(user_dir: Option<&Path>, linked: &mut ScopedLinkedWatches) {
     let root = claude_agents::user_root(user_dir);
     if let Ok(directories) = tokio::task::spawn_blocking(move || {
-        root.map_or_else(Vec::new, |root| claude_agents::watch_directories(&root))
+        root.map_or_else(Vec::new, |root| {
+            let directories = claude_agents::watch_directories(&root);
+            directories
+                .ordinary
+                .into_iter()
+                .chain(directories.linked)
+                .collect()
+        })
     })
     .await
     {
@@ -418,7 +425,10 @@ async fn refresh_claude_watches(
             .iter()
             .map(|tier| workspace.join(tier))
             .collect();
-        uncovered_directories(claude_agents::watch_directories(&root), &covered)
+        let directories = claude_agents::watch_directories(&root);
+        let mut supplemental = uncovered_directories(directories.ordinary, &covered);
+        supplemental.extend(directories.linked);
+        supplemental
     })
     .await
     else {

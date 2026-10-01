@@ -452,8 +452,8 @@ fn scan_skills_sync(workspace_path: Option<&str>, home_override: Option<PathBuf>
     }
 }
 
-/// Canonical directories outside the ordinary tier streams, including link
-/// parents. Every subscription is non-recursive; the scan bounds its coverage.
+/// Link parents and targets need supplemental watches even inside ordinary
+/// tiers, whose filename filters can exclude the target. The scan bounds them.
 pub(crate) async fn linked_skill_watch_directories(workspace_path: &str) -> Vec<PathBuf> {
     let payload = load_skills_payload(workspace_path).await;
     if workspace_path.is_empty() {

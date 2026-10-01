@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::bus::EventBus;
-use super::linked_watch::{uncovered_directories, ScopedLinkedWatches};
+use super::linked_watch::ScopedLinkedWatches;
 use super::root_watch::{watch_root, RootWatch};
 use super::shared_watch::{watch_tiers, SharedWatchHub, TierWatch};
 
@@ -210,13 +210,7 @@ impl LinkedSkillWatches {
     async fn refresh(&mut self, id: &WorkspaceId, path: &Path) {
         let directories =
             crate::skills::linked_skill_watch_directories(&path.to_string_lossy()).await;
-        let root = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        let covered: Vec<_> = PROJECT_SKILL_TIERS
-            .iter()
-            .map(|tier| root.join(tier))
-            .collect();
-        self.watches
-            .sync_project(id.clone(), uncovered_directories(directories, &covered));
+        self.watches.sync_project(id.clone(), directories);
     }
 }
 

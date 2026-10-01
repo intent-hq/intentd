@@ -124,7 +124,8 @@ impl ScopedLinkedWatches {
     }
 }
 
-/// Filter only paths whose events the ordinary tier subscription forwards.
+/// Remove ordinary scan directories covered by a tier subscription.
+/// Explicit link parents must bypass this filter: target filenames can differ.
 /// Do not canonicalize covered tier paths: a symlinked tier's external target
 /// needs its own subscription, as do targets outside the tier within a workspace.
 pub(crate) fn uncovered_directories(

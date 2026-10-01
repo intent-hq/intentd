@@ -70,16 +70,25 @@ pub(crate) fn collect(root: &Path, source: &str) -> Catalog {
     }
 }
 
-pub(crate) fn watch_directories(root: &Path) -> Vec<PathBuf> {
+pub(crate) struct WatchDirectories {
+    pub ordinary: Vec<PathBuf>,
+    pub linked: Vec<PathBuf>,
+}
+
+pub(crate) fn watch_directories(root: &Path) -> WatchDirectories {
     let mut scan = Scan {
         watching: true,
         ..Scan::default()
     };
-    scan.observe_link(root);
     scan.watch_parent(root);
+    let mut ordinary: Vec<_> = std::mem::take(&mut scan.watches).into_iter().collect();
+    scan.observe_link(root);
     scan.walk(root, "user", 0);
-    scan.watches.extend(scan.directories.into_keys());
-    scan.watches.into_iter().collect()
+    ordinary.extend(scan.directories.into_keys());
+    WatchDirectories {
+        ordinary,
+        linked: scan.watches.into_iter().collect(),
+    }
 }
 
 #[derive(Default)]

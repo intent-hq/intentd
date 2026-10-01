@@ -1049,3 +1049,186 @@ async fn claude_agents_preserve_native_aliases_in_catalogs_and_creation() {
     .unwrap();
     stop(daemon, &dir.path().join("intentd.sock")).await;
 }
+
+#[tokio::test]
+async fn project_linked_agent_and_skill_targets_emit_live_updates() {
+    let dir = scratch_dir("project-link-targets");
+    let home = dir.path().join("home");
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(&home).unwrap();
+    let cases = [
+        (
+            "agent-ancestor",
+            true,
+            ".claude/agents/ancestor.md",
+            ".claude/agent-ancestor.txt",
+            "../agent-ancestor.txt",
+        ),
+        (
+            "agent-inside",
+            true,
+            ".claude/agents/inside.md",
+            ".claude/agents/agent-inside.txt",
+            "agent-inside.txt",
+        ),
+        (
+            "skill-ancestor",
+            false,
+            ".claude/skills/ancestor/SKILL.md",
+            ".claude/skill-ancestor.txt",
+            "../../skill-ancestor.txt",
+        ),
+        (
+            "skill-inside",
+            false,
+            ".claude/skills/inside/SKILL.md",
+            ".claude/skills/skill-inside.txt",
+            "../skill-inside.txt",
+        ),
+    ];
+    let write = |path: &Path, name: &str, value: &str| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            format!("---\nname: {name}\ndescription: {value}\n---\n{value}\n"),
+        )
+        .unwrap();
+    };
+    for (name, _, alias, target, relative) in cases {
+        write(&project.join(target), name, "Initial");
+        let alias = project.join(alias);
+        std::fs::create_dir_all(alias.parent().unwrap()).unwrap();
+        symlink(relative, alias).unwrap();
+    }
+    let (daemon, port, cfg) = boot(dir.path(), &home).await;
+    let mut client = connect_ws(port, cfg).await;
+    let workspace = wss_rpc(
+        &mut client,
+        1,
+        "workspace.create",
+        json!({
+            "title":"Project linked targets", "skipIsolation":true, "worktreePath":project
+        }),
+    )
+    .await;
+    let workspace_id = workspace["workspace"]["id"].clone();
+    stop(daemon, &dir.path().join("intentd.sock")).await;
+    let (daemon, port, cfg) = boot(dir.path(), &home).await;
+    let mut client = connect_ws(port, cfg.clone()).await;
+    let mut subscription = connect_ws(port, cfg).await;
+    wss_rpc(
+        &mut subscription,
+        1,
+        "events.subscribe",
+        json!({
+            "eventTypes":["specialists:changed","skills:changed"], "workspaceId":workspace_id
+        }),
+    )
+    .await;
+    let mut ready = None;
+    for attempt in 0..20 {
+        write(
+            &project.join(".intent/specialists/watch-probe.md"),
+            "watch-probe",
+            &format!("Ready {attempt}"),
+        );
+        if let Ok(event) = tokio::time::timeout(
+            common::test_timeout(Duration::from_millis(750)),
+            next_event(&mut subscription, &["specialists:changed"], 20),
+        )
+        .await
+        {
+            ready = Some(event);
+            break;
+        }
+    }
+    let mut evidence = vec![json!({"ready":ready.expect("project watcher readiness")})];
+    let mut request_id = 2;
+    for (name, agent, alias, target, _) in cases {
+        let alias = project.join(alias);
+        let mut target = project.join(target);
+        let bridge = project.join(format!(".claude/{name}-bridge.txt"));
+        for step in [
+            "edit-one",
+            "edit-two",
+            "replace",
+            "delete",
+            "recreate",
+            "retarget",
+            "edit-retargeted",
+            "retarget-intermediate",
+            "edit-final",
+        ] {
+            let value = format!("{name} {step}");
+            match step {
+                "replace" => {
+                    let staging = target.with_extension("tmp");
+                    write(&staging, name, &value);
+                    std::fs::rename(staging, &target).unwrap();
+                }
+                "delete" => std::fs::remove_file(&target).unwrap(),
+                "retarget" => {
+                    target = project.join(format!(".claude/{name}-retargeted.txt"));
+                    write(&target, name, &value);
+                    symlink(&target, &bridge).unwrap();
+                    let staging = alias.with_extension("next");
+                    symlink(&bridge, &staging).unwrap();
+                    std::fs::rename(staging, &alias).unwrap();
+                }
+                "retarget-intermediate" => {
+                    target = project.join(format!(".claude/{name}-final.txt"));
+                    write(&target, name, &value);
+                    let staging = bridge.with_extension("next");
+                    symlink(&target, &staging).unwrap();
+                    std::fs::rename(staging, &bridge).unwrap();
+                }
+                _ => write(&target, name, &value),
+            }
+            let event_type = if agent {
+                "specialists:changed"
+            } else {
+                "skills:changed"
+            };
+            let event = next_event(&mut subscription, &[event_type], 20).await;
+            assert_eq!(event["workspaceId"], workspace_id, "{name} {step}");
+            let (method, params) = if agent {
+                (
+                    "specialist.list",
+                    json!({"workspaceId":workspace_id,"includeProject":true}),
+                )
+            } else {
+                ("skill.list", json!({"workspaceId":workspace_id}))
+            };
+            let catalog = wss_rpc(&mut client, request_id, method, params).await;
+            request_id += 1;
+            let rows = if agent {
+                &catalog["specialists"]
+            } else {
+                &catalog
+            };
+            let row = rows
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row[if agent { "id" } else { "name" }] == name);
+            if step == "delete" {
+                assert!(row.is_none(), "{name} {step}: {catalog}");
+            } else {
+                assert_eq!(
+                    row.expect("linked definition")[if agent { "prompt" } else { "description" }],
+                    value,
+                    "{name} {step}"
+                );
+            }
+            evidence.push(
+                json!({"name":name,"step":step,"target":target,"event":event,"catalog":catalog}),
+            );
+        }
+    }
+    std::fs::write(
+        dir.path().join("project-linked-targets-evidence.json"),
+        serde_json::to_vec_pretty(&evidence).unwrap(),
+    )
+    .unwrap();
+    stop(daemon, &dir.path().join("intentd.sock")).await;
+}
