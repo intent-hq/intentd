@@ -19744,6 +19744,127 @@ async fn wss_file_attachment_idempotency_key_round_trip() {
     srv.ws.stop().await;
 }
 
+/// Registered-root file reads retain root identity and containment over WSS.
+#[intent_test_macros::daemon_test]
+async fn wss_file_read_registered_roots() {
+    use base64::Engine as _;
+
+    let srv = start(WsOptions::default()).await;
+    let dir = test_tempdir("intentd-wss-read-roots-");
+    let primary = dir.path().join("primary");
+    let nested = primary.join("nested");
+    let external = dir.path().join("external");
+    for path in [&primary, &nested, &external] {
+        std::fs::create_dir_all(path).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(path)
+            .status()
+            .unwrap()
+            .success());
+    }
+    let ws = WorkspaceId::new();
+    let foreign_ws = WorkspaceId::new();
+    let mut w = fixture_workspace(&ws);
+    w.worktree_path = Some(primary.to_string_lossy().into_owned());
+    srv.store.insert_workspace(&w).await.unwrap();
+    srv.store
+        .insert_workspace(&fixture_workspace(&foreign_ws))
+        .await
+        .unwrap();
+    std::fs::write(primary.join("new.txt"), "primary").unwrap();
+
+    for (path, content) in [(&nested, "nested"), (&external, "external")] {
+        std::fs::write(path.join("new.txt"), content).unwrap();
+        let ts = now_iso();
+        let mut root = intent_core::WorkspaceGitRoot {
+            id: intent_core::WorkspaceGitRootId::new(),
+            workspace_id: ws.clone(),
+            path: path.to_string_lossy().into_owned(),
+            source: intent_core::WorkspaceGitRootSource::Agent,
+            repo_owner: None,
+            repo_name: None,
+            registered_by_agent_ids: vec![],
+            registered_commit_sha: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            pull_requests: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+        };
+        srv.store.upsert_workspace_git_root(&root).await.unwrap();
+        let request = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "file.read",
+            "params": { "workspaceId": ws, "gitRootId": root.id, "path": "new.txt" }
+        });
+        let response = wss_call(srv.port, srv.cfg.clone(), &request.to_string()).await;
+        assert_eq!(response["result"], content, "{response}");
+        assert_eq!(response["id"], 1);
+        assert_eq!(response["jsonrpc"], "2.0");
+
+        let payload = [0xff, 0xfe, 0x01, 0x02];
+        std::fs::write(path.join("binary.bin"), payload).unwrap();
+        let chunk_request = serde_json::json!({
+            "jsonrpc": "2.0", "id": 3, "method": "file.readChunk",
+            "params": { "workspaceId": ws, "gitRootId": root.id, "path": "binary.bin", "offset": 1, "length": 2 }
+        });
+        let response = wss_call(srv.port, srv.cfg.clone(), &chunk_request.to_string()).await;
+        assert_eq!(
+            response["result"],
+            serde_json::json!({
+                "content": base64::engine::general_purpose::STANDARD.encode(&payload[1..3]),
+                "bytesRead": 2, "size": 4
+            }),
+            "{response}"
+        );
+        for request in [&request, &chunk_request] {
+            for escape in [
+                "../new.txt".to_owned(),
+                primary.join("new.txt").to_string_lossy().into_owned(),
+            ] {
+                let mut denied = request.clone();
+                denied["params"]["path"] = serde_json::json!(escape);
+                let response = wss_call(srv.port, srv.cfg.clone(), &denied.to_string()).await;
+                assert_eq!(response["error"]["code"], -32603, "{response}");
+            }
+        }
+        // A foreign registered id is indistinguishable from that same unknown id.
+        srv.store.delete_workspace_git_root(&root.id).await.unwrap();
+        root.workspace_id = foreign_ws.clone();
+        srv.store.upsert_workspace_git_root(&root).await.unwrap();
+        for request in [&request, &chunk_request] {
+            let foreign = wss_call(srv.port, srv.cfg.clone(), &request.to_string()).await;
+            srv.store.delete_workspace_git_root(&root.id).await.unwrap();
+            let unknown = wss_call(srv.port, srv.cfg.clone(), &request.to_string()).await;
+            assert_eq!(foreign["error"]["code"], -32602, "{foreign}");
+            assert_eq!(foreign["error"], unknown["error"]);
+            srv.store.upsert_workspace_git_root(&root).await.unwrap();
+        }
+    }
+    for selector in [None, Some(""), Some("   ")] {
+        let mut request = serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "file.read",
+            "params": { "workspaceId": ws, "path": "new.txt" }
+        });
+        if let Some(selector) = selector {
+            request["params"]["gitRootId"] = serde_json::json!(selector);
+        }
+        let response = wss_call(srv.port, srv.cfg.clone(), &request.to_string()).await;
+        assert_eq!(response["result"], "primary", "{response}");
+        request["method"] = serde_json::json!("file.readChunk");
+        request["params"]["offset"] = serde_json::json!(0);
+        request["params"]["length"] = serde_json::json!(16);
+        let response = wss_call(srv.port, srv.cfg.clone(), &request.to_string()).await;
+        assert_eq!(
+            response["result"]["content"],
+            base64::engine::general_purpose::STANDARD.encode("primary"),
+            "{response}"
+        );
+    }
+    srv.ws.stop().await;
+}
+
 /// `file.readChunk` over the real WSS wire (PROTOCOL §5.9, v6.18,
 /// monorepo#2458): raw bytes of a binary workspace file are served as
 /// offset-windowed base64 chunks `{ content, bytesRead, size }` and

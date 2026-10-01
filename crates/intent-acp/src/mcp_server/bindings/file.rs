@@ -38,7 +38,7 @@ pub(crate) async fn dispatch(
     match method {
         "read" => {
             let path = req_str(args, "path").map_err(|_| "path is required".to_string())?;
-            api.file_read(ws.clone(), path, caller)
+            api.file_read(ws.clone(), path, caller, None)
                 .await
                 .map_err(map_err)
         }

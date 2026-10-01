@@ -2603,6 +2603,23 @@ impl Services {
         Ok(Some(PathBuf::from(root.path)))
     }
 
+    /// Registered file reads share Git-root ownership validation; unscoped
+    /// reads retain the workspace/agent sandbox resolver.
+    async fn resolve_file_read_root(
+        &self,
+        workspace_id: &WorkspaceId,
+        caller_agent_id: Option<&AgentId>,
+        git_root_id: Option<&WorkspaceGitRootId>,
+    ) -> Result<String> {
+        if let Some(id) = git_root_id {
+            let ws = self.store.get_workspace(workspace_id).await?;
+            let root = self.resolve_git_read_root(&ws, Some(id)).await?;
+            Ok(root.unwrap_or_default().to_string_lossy().into_owned())
+        } else {
+            Ok(file_ops::resolve_root(&self.store, workspace_id, caller_agent_id).await)
+        }
+    }
+
     /// Find a registered secondary git root that contains every path in
     /// `files` (relative paths joined to the root; an absolute path counts
     /// only when it lies under the root — `Path::join` with an absolute
@@ -18368,12 +18385,17 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         path: String,
         caller_agent_id: Option<AgentId>,
+        git_root_id: Option<WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
-            let root =
-                file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
+            let root = self
+                .resolve_file_read_root(
+                    &workspace_id,
+                    caller_agent_id.as_ref(),
+                    git_root_id.as_ref(),
+                )
+                .await?;
             file_ops::read(&root, &path)
         })
     }
@@ -18385,12 +18407,17 @@ impl WorkspaceApi for Services {
         offset: u64,
         length: u64,
         caller_agent_id: Option<AgentId>,
+        git_root_id: Option<WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
-            let root =
-                file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
+            let root = self
+                .resolve_file_read_root(
+                    &workspace_id,
+                    caller_agent_id.as_ref(),
+                    git_root_id.as_ref(),
+                )
+                .await?;
             // Blocking thread: a 16 MiB window read should not stall the
             // async executor (matching workspace.export.read).
             tokio::task::spawn_blocking(move || file_ops::read_chunk(&root, &path, offset, length))

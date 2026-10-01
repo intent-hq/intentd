@@ -437,6 +437,7 @@ impl WorkspaceApi for FakeApi {
         _id: WorkspaceId,
         path: String,
         _caller_agent_id: Option<AgentId>,
+        _git_root_id: Option<intent_core::WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<Value>> {
         self.file_read_calls.lock().unwrap().push(path.clone());
         Box::pin(async move {

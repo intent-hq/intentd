@@ -7076,13 +7076,15 @@ pub trait WorkspaceApi: Send + Sync {
     /// `file.read`: the file's UTF-8 contents as a **bare JSON string** (not an
     /// object), per the TS `ws.file.read` builder (PROTOCOL §5.10).
     /// `caller_agent_id` enables `CoW` sandbox containment (prefers sandbox path).
+    /// `git_root_id` selects a registered root owned by this workspace instead.
     fn file_read(
         &self,
         workspace_id: WorkspaceId,
         path: String,
         caller_agent_id: Option<AgentId>,
+        git_root_id: Option<WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, path, caller_agent_id);
+        let _ = (workspace_id, path, caller_agent_id, git_root_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::file_read not implemented".to_string(),
@@ -7096,6 +7098,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// monorepo#2458). `length` is capped at 16 MiB decoded (over-cap →
     /// `Error::InvalidParams`); a read at/past EOF returns an empty chunk.
     /// `caller_agent_id` enables `CoW` sandbox containment (prefers sandbox path).
+    /// `git_root_id` selects a registered root owned by this workspace instead.
     fn file_read_chunk(
         &self,
         workspace_id: WorkspaceId,
@@ -7103,8 +7106,16 @@ pub trait WorkspaceApi: Send + Sync {
         offset: u64,
         length: u64,
         caller_agent_id: Option<AgentId>,
+        git_root_id: Option<WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, path, offset, length, caller_agent_id);
+        let _ = (
+            workspace_id,
+            path,
+            offset,
+            length,
+            caller_agent_id,
+            git_root_id,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::file_read_chunk not implemented".to_string(),
