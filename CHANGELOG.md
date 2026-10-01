@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.132] - 2026-10-01
+
+### 🚀 Features
+
+- Support registered roots in file readers ([#2207](https://github.com/intent-hq/intentd/pull/2207))
+
+### 🐛 Bug Fixes
+
+- Use anonymous stack sampler spill files ([#2210](https://github.com/intent-hq/intentd/pull/2210))
+- Reject retired workspace model setting writes ([#1646](https://github.com/intent-hq/intentd/pull/1646)) ([#2208](https://github.com/intent-hq/intentd/pull/2208))
+
+### 🧪 Testing
+
+- Await durable idle after interrupted queue drain ([#2212](https://github.com/intent-hq/intentd/pull/2212))
+
+
 ## [0.9.131] - 2026-10-01
 
 ### 🐛 Bug Fixes
