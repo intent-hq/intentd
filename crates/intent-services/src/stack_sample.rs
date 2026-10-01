@@ -256,6 +256,141 @@ mod tests {
     /// runs tests on parallel threads by default.
     static CAPTURE_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    /// Force hash collisions so reports exercise the spill file, not just
+    /// the in-memory buckets. Reading must not move the next write position.
+    #[cfg(unix)]
+    #[test]
+    fn collector_spills_survive_repeated_reports_and_further_samples() {
+        use std::collections::BTreeMap;
+        use std::hash::{Hash, Hasher};
+
+        #[derive(Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+        struct CollidingKey(usize);
+        impl Hash for CollidingKey {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                state.write_u8(0);
+            }
+        }
+
+        let mut collector = pprof::Collector::<CollidingKey>::new().unwrap();
+        let mut expected = BTreeMap::new();
+        for batch in 0..2 {
+            for key in batch * 10_000..(batch + 1) * 10_000 {
+                collector.add(CollidingKey(key), 3).unwrap();
+                expected.insert(key, 3);
+            }
+            for _ in 0..2 {
+                let actual: BTreeMap<_, _> = collector
+                    .try_iter()
+                    .unwrap()
+                    .map(|entry| (entry.item.0, entry.count))
+                    .collect();
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    /// A fresh process owns each TMP directory. Inspect it only after that
+    /// process exits: dropping a capture guard alone cannot prove cleanup of
+    /// a collector retained in a process-global static.
+    #[cfg(unix)]
+    #[test]
+    fn sampling_leaves_no_temporary_files_after_process_exit() {
+        const WORKER: &str = "INTENT_TEST_STACK_SAMPLE_COUNT";
+        if let Ok(count) = std::env::var(WORKER) {
+            assert_eq!(
+                std::env::temp_dir(),
+                std::path::PathBuf::from(std::env::var_os("TMPDIR").unwrap())
+            );
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                if count == "error" {
+                    for _ in 0..2 {
+                        let error = sample_stacks(Some(100), Some(99)).await.unwrap_err();
+                        assert!(matches!(error, Error::Internal(ref message)
+                            if message.contains("failed to start stack sampler")),
+                            "creation failure must propagate and release the capture flag: {error:?}");
+                    }
+                    return;
+                }
+                for _ in 0..count.parse::<usize>().unwrap() {
+                    let payload = sample_stacks(Some(100), Some(99)).await.unwrap();
+                    assert_eq!(payload["durationMs"], 100);
+                    assert_eq!(payload["frequencyHz"], 99);
+                    assert!(payload["report"]
+                        .as_str()
+                        .unwrap()
+                        .contains("intentd stack sample"));
+                    assert!(payload["sampleCount"].is_i64());
+                    assert!(payload["distinctStacks"].is_u64());
+                }
+            });
+            println!("completed {count} captures");
+            return;
+        }
+
+        // Zero captures is the control for runtime/test-harness startup;
+        // one and repeated captures exercise both collector creation and reuse.
+        // A missing TMP directory exercises creation errors and flag release.
+        let mut failures = Vec::new();
+        for count in ["0", "1", "3", "error"] {
+            let mut root = crate::test_support::test_tempdir("stack-sample-exit-");
+            let tmp = root.path().join("tmp");
+            std::fs::create_dir(&tmp).unwrap();
+            let log_path = root.path().join("worker.log");
+            let log = std::fs::File::create(&log_path).unwrap();
+            let worker_tmp = if count == "error" {
+                tmp.join("nonexistent")
+            } else {
+                tmp.clone()
+            };
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "stack_sample::tests::sampling_leaves_no_temporary_files_after_process_exit",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(WORKER, count)
+                .env("TMPDIR", &worker_tmp)
+                .env("TMP", &worker_tmp)
+                .env("TEMP", &worker_tmp)
+                .stdout(log.try_clone().unwrap())
+                .stderr(log);
+            let mut child = intentd_test_support::GuardedChild::spawn(&mut command).unwrap();
+            let status = child
+                .wait_with_timeout(std::time::Duration::from_secs(60))
+                .unwrap();
+            // Reap even a timed-out worker before inspecting its directory.
+            drop(child);
+            let output = std::fs::read_to_string(log_path).unwrap();
+            let residue: Vec<_> = std::fs::read_dir(&tmp)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    let metadata = entry.metadata().unwrap();
+                    (entry.file_name(), metadata.len(), metadata.file_type())
+                })
+                .collect();
+            if !status.is_some_and(|s| s.success())
+                || !output.contains(&format!("completed {count} captures"))
+                || !residue.is_empty()
+            {
+                // Keep the actual failing inventory and child log as evidence.
+                root.disable_cleanup(true);
+                failures.push(format!(
+                    "{count} captures: status {status:?}, residue {residue:?}, evidence {}\n{output}",
+                    root.path().display()
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
     #[test]
     fn duration_defaults_and_clamps() {
         assert_eq!(effective_duration_ms(None), DEFAULT_DURATION_MS);
