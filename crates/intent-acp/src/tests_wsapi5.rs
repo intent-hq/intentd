@@ -1541,3 +1541,37 @@ async fn script_create_purpose_is_forwarded_and_null_refused() {
     assert_eq!(resp["result"]["isError"], true);
     assert_eq!(api.script_create_calls.lock().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn script_create_keeps_omission_distinct_from_explicit_purpose() {
+    let (srv, api) = server();
+    for (code, purpose, script_id) in [
+        (
+            "return await ws.script.create('check','true','command');",
+            None,
+            None,
+        ),
+        (
+            "return await ws.script.create('check','true','command',{purpose:'saved'});",
+            Some(intent_core::ScriptPurpose::Saved),
+            None,
+        ),
+        (
+            "return await ws.script.create('dev','cat','service');",
+            None,
+            None,
+        ),
+        (
+            "return await ws.script.create('check','true','command',{scriptId:'existing'});",
+            None,
+            Some("existing"),
+        ),
+    ] {
+        let resp = call(&srv, code).await;
+        assert_eq!(resp["result"]["isError"], false, "{resp}");
+        let calls = api.script_create_calls.lock().unwrap();
+        let params = calls.last().unwrap();
+        assert_eq!(params.purpose, purpose);
+        assert_eq!(params.script_id.as_deref(), script_id);
+    }
+}

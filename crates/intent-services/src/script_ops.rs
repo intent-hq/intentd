@@ -377,13 +377,33 @@ impl ScriptManager {
                 None => ("user".to_string(), now_iso(), None),
             }
         };
-        let purpose = params.purpose.unwrap_or_else(|| {
-            self.scripts
-                .lock()
-                .unwrap()
-                .get(&(workspace_id.clone(), id.clone()))
-                .map_or(intent_core::ScriptPurpose::Saved, |old| old.def.purpose)
-        });
+        // Creation defaults do not reclassify stored definitions. Startup
+        // hydration is best-effort, so a registry miss must consult SQLite.
+        let purpose = match params.purpose {
+            Some(purpose) => purpose,
+            None => {
+                let registered = self
+                    .scripts
+                    .lock()
+                    .unwrap()
+                    .get(&(workspace_id.clone(), id.clone()))
+                    .map(|old| old.def.purpose);
+                match registered {
+                    Some(purpose) => purpose,
+                    None => self
+                        .store
+                        .get_script_in_workspace(&workspace_id, &id)
+                        .await?
+                        .map_or(
+                            match params.mode {
+                                ScriptMode::Command => intent_core::ScriptPurpose::OneOff,
+                                ScriptMode::Service => intent_core::ScriptPurpose::Saved,
+                            },
+                            |old| old.purpose,
+                        ),
+                }
+            }
+        };
         if purpose == intent_core::ScriptPurpose::OneOff
             && (params.mode != ScriptMode::Command || params.auto_start == Some(true))
         {
@@ -2830,6 +2850,8 @@ mod tests {
         v["id"].as_str().expect("script id").to_string()
     }
 
+    // Existing runtime/lifecycle fixtures represent reusable definitions.
+    // Creation-default regressions call script_create with omission explicitly.
     async fn create_simple(h: &Harness, name: &str, command: &str, mode: ScriptMode) -> String {
         create(
             h,
@@ -2837,6 +2859,7 @@ mod tests {
                 name: name.to_string(),
                 command: command.to_string(),
                 mode,
+                purpose: Some(intent_core::ScriptPurpose::Saved),
                 ..Default::default()
             },
         )
@@ -2996,6 +3019,7 @@ mod tests {
             &h,
             ScriptCreateParams {
                 name: "named".into(),
+                purpose: Some(intent_core::ScriptPurpose::Saved),
                 command: "echo".into(),
                 mode: ScriptMode::Command,
                 script_id: Some("custom-id".into()),
@@ -3724,6 +3748,7 @@ mod tests {
             &h,
             ScriptCreateParams {
                 name: "cmd".into(),
+                purpose: Some(intent_core::ScriptPurpose::Saved),
                 command: SERVICE_CMD.into(),
                 mode: ScriptMode::Command,
                 auto_start: Some(true),
