@@ -264,6 +264,13 @@ pub(crate) async fn run_poll_loop(
             Ok(guard) => guard,
             Err(error) => {
                 tracing::warn!(%error, "could not finalize GitHub credential ownership");
+                // This poller is exiting with unknown credential state. Retire
+                // only its resident flow so callers can start a new attempt;
+                // credentials and any replacement flow belong to another owner.
+                let mut slot = state.lock().await;
+                if let Some(slot) = slot.as_mut().filter(|slot| slot.flow_id == flow_id) {
+                    slot.phase = FlowPhase::Error;
+                }
                 return;
             }
         };

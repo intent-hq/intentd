@@ -320,7 +320,7 @@ impl AsyncSecretStore {
     /// Override the [`settle_detached`](Self::settle_detached) cap so a test can
     /// drive the past-the-cap path without waiting out the production budget.
     #[cfg(test)]
-    fn with_settle_timeout(mut self, settle_timeout: Duration) -> Self {
+    pub(crate) fn with_settle_timeout(mut self, settle_timeout: Duration) -> Self {
         self.settle_timeout = settle_timeout;
         self
     }

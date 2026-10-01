@@ -65,17 +65,18 @@ pub(crate) fn accept_identity() -> IdentityGuard {
     Arc::new(|_| Box::pin(async { Ok(Box::new(()) as IdentityLease) }))
 }
 
+struct ParkLease {
+    entered: Arc<tokio::sync::Notify>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+impl Drop for ParkLease {
+    fn drop(&mut self) {
+        self.entered.notify_one();
+        let _ = self.release.lock().unwrap().recv();
+    }
+}
+
 async fn revoke_or_cancel_before_publication(cancel: bool) {
-    struct ParkLease {
-        entered: Arc<tokio::sync::Notify>,
-        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
-    }
-    impl Drop for ParkLease {
-        fn drop(&mut self) {
-            self.entered.notify_one();
-            let _ = self.release.lock().unwrap().recv();
-        }
-    }
     let dir = crate::test_support::test_tempdir("github-credential-completion-owner");
     let store = intent_store::Store::open(&dir.path().join("state.db"))
         .await
@@ -170,4 +171,111 @@ async fn github_revoke_wins_before_authorization_publication() {
 #[intent_test_macros::daemon_test]
 async fn github_cancel_cleans_its_persisted_grant_without_authorized_notification() {
     revoke_or_cancel_before_publication(true).await;
+}
+
+async fn finalizer_ownership_timeout(replace_flow: bool) {
+    let dir = crate::test_support::test_tempdir("github-finalizer-timeout");
+    let store = intent_store::Store::open(&dir.path().join("state.db"))
+        .await
+        .unwrap();
+    let raw = intent_core::FileSecretStore::with_path(dir.path().join("secrets.json"));
+    let bus = EventBus::new(store.clone());
+    let mut events = bus.subscribe(crate::events::SubscriptionFilter {
+        event_types: vec![
+            GITHUB_AUTH_CHANGED.into(),
+            intent_core::events::SOURCE_CONTROL_AUTH_CHANGED.into(),
+        ],
+        ..Default::default()
+    });
+    let mut services = crate::Services::new(store).with_event_bus(bus);
+    services.secrets = Arc::new(
+        crate::settings::AsyncSecretStore::new(Arc::new(raw.clone()))
+            .with_settle_timeout(Duration::from_millis(100)),
+    );
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release = Arc::new(std::sync::Mutex::new(Some(release_rx)));
+    let identity: IdentityGuard = Arc::new({
+        let entered = entered.clone();
+        move |_| {
+            let lease = ParkLease {
+                entered: entered.clone(),
+                release: std::sync::Mutex::new(release.lock().unwrap().take().unwrap()),
+            };
+            Box::pin(async move { Ok(Box::new(lease) as IdentityLease) })
+        }
+    });
+    let flow = authorize(&services, raw.clone(), identity).await;
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .unwrap();
+    // Queue ahead of the finalizer while the persistence lease is still held.
+    let mut mutation = Box::pin(services.secrets.github_mutation());
+    assert!(
+        std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(mutation.as_mut().poll(cx).is_pending())
+        })
+        .await
+    );
+    release_tx.send(()).unwrap();
+    let mut owner = mutation.await.unwrap();
+    *owner += 1;
+    raw.store(SECRET_ACCOUNT, "newer-token").unwrap();
+    raw.store(
+        crate::source_control_auth_ops::GITHUB_TOKEN_METHOD_ACCOUNT,
+        "pat",
+    )
+    .unwrap();
+    let resident_id = {
+        let mut slot = services.github_auth_flow.lock().await;
+        let slot = slot.as_mut().unwrap();
+        if replace_flow {
+            slot.flow_id = next_flow_id();
+        }
+        slot.flow_id
+    };
+    // Keep the newer mutation owned until the finalizer's bounded wait expires.
+    tokio::time::timeout(Duration::from_secs(5), flow)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        raw.load(SECRET_ACCOUNT).unwrap().as_deref(),
+        Some("newer-token")
+    );
+    assert_eq!(
+        raw.load(crate::source_control_auth_ops::GITHUB_TOKEN_METHOD_ACCOUNT)
+            .unwrap()
+            .as_deref(),
+        Some("pat")
+    );
+    assert!(
+        std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(Box::pin(events.recv()).as_mut().poll(cx).is_pending())
+        })
+        .await,
+        "a timed-out finalizer must not announce authorization"
+    );
+    let slot = services.github_auth_flow.lock().await;
+    let slot = slot.as_ref().unwrap();
+    assert_eq!(slot.flow_id, resident_id);
+    assert_eq!(
+        slot.phase,
+        if replace_flow {
+            FlowPhase::Pending
+        } else {
+            FlowPhase::Error
+        }
+    );
+    drop(owner);
+}
+
+#[intent_test_macros::daemon_test]
+async fn github_finalizer_ownership_timeout_terminates_resident_flow() {
+    finalizer_ownership_timeout(false).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn github_finalizer_ownership_timeout_preserves_replacement_flow() {
+    finalizer_ownership_timeout(true).await;
 }
