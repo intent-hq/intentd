@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.131] - 2026-10-01
+
+### 🐛 Bug Fixes
+
+- Publish scoped comment deletion updates ([#2205](https://github.com/intent-hq/intentd/pull/2205))
+- Default new command scripts to one-off ([#2204](https://github.com/intent-hq/intentd/pull/2204))
+
+
 ## [0.9.130] - 2026-10-01
 
 ### 🚀 Features
