@@ -632,11 +632,12 @@ mod tests {
             },
             Caller::Daemon,
         ] {
-            let task = with_caller(caller.clone(), async {
-                spawn_with_current_caller(async {
+            // Return the handle as data; join it only after the parent scope ends.
+            let (task,) = with_caller(caller.clone(), async {
+                (spawn_with_current_caller(async {
                     tokio::task::yield_now().await;
                     (current_caller(), current_wire_credential().is_none())
-                })
+                }),)
             })
             .await;
             let observed = with_caller(Caller::Daemon, task).await.unwrap();
@@ -658,13 +659,13 @@ mod tests {
             principal_id: PrincipalId("p-1".into()),
             token_hash: "fixture-hash".into(),
         };
-        let task = with_wire_credential(
+        let (task,) = with_wire_credential(
             Some(credential),
             with_caller(wire(false), async {
-                spawn_with_current_caller(async {
+                (spawn_with_current_caller(async {
                     tokio::task::yield_now().await;
                     (current_caller(), current_wire_credential())
-                })
+                }),)
             }),
         )
         .await;
@@ -688,13 +689,13 @@ mod tests {
             principal_id: PrincipalId("p-1".into()),
             token_hash: "fixture-hash".into(),
         };
-        let task = with_wire_credential(Some(credential), async {
-            spawn_with_current_caller(async {
+        let (task,) = with_wire_credential(Some(credential), async {
+            (spawn_with_current_caller(async {
                 (
                     current_caller(),
                     current_wire_credential().map(|c| c.principal_id().clone()),
                 )
-            })
+            }),)
         })
         .await;
         assert_eq!(task.await.unwrap(), (None, Some(PrincipalId("p-1".into()))));
@@ -729,10 +730,10 @@ mod tests {
             authority: expected.clone(),
         };
         let (release, released) = tokio::sync::oneshot::channel();
-        let task = with_wire_credential(
+        let (task,) = with_wire_credential(
             Some(credential),
             with_caller(wire(false), async {
-                spawn_with_current_caller(async move {
+                (spawn_with_current_caller(async move {
                     released.await.unwrap();
                     let Some(WireCredential::Legacy {
                         principal_id,
@@ -748,7 +749,7 @@ mod tests {
                         current_caller(),
                         matches!(result, Err(crate::Error::Forbidden(_))),
                     )
-                })
+                }),)
             }),
         )
         .await;
@@ -761,11 +762,11 @@ mod tests {
     async fn spawn_with_current_caller_detached_owner_finishes_without_elevation() {
         let (release, released) = tokio::sync::oneshot::channel();
         let (finished, completion) = tokio::sync::oneshot::channel();
-        let owner = with_caller(wire(false), async {
-            spawn_with_current_caller(async move {
+        let (owner,) = with_caller(wire(false), async {
+            (spawn_with_current_caller(async move {
                 released.await.unwrap();
                 finished.send(current_caller()).unwrap();
-            })
+            }),)
         })
         .await;
         drop(owner);
