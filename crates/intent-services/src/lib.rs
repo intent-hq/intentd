@@ -28790,6 +28790,18 @@ impl WorkspaceApi for Services {
                 };
                 #[cfg(test)]
                 this.hold_periodic_commit("git").await;
+                if let Some(error) = &outcome.index_refresh_error {
+                    // HEAD already advanced: keep the original successful receipt
+                    // and committed bookkeeping, just as for merge-state cleanup.
+                    // Returning an error here would invite callers to replay Git.
+                    tracing::warn!(
+                        workspace = %workspace_id.0,
+                        git_root_id = ?git_root_id,
+                        hash = %outcome.hash,
+                        error = %error,
+                        "agentCommit: commit created but index refresh failed; do not retry the commit"
+                    );
+                }
                 // Staged content became a commit → the cached scan still lists it
                 // as pending (monorepo#1648).
                 this.git_status_cache.invalidate(&worktree);

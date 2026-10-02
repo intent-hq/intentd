@@ -483,6 +483,60 @@ async fn clean_tree_is_silent_skip() {
 }
 
 #[intent_test_macros::daemon_test]
+async fn index_refresh_failure_does_not_repeat_auto_commit() {
+    let repo = init_git_repo();
+    let (_tmp, svc, ws) = setup_dirty_workspace(&repo).await;
+    let agent = session("agent-refresh", &ws, None, false, "Builder", true);
+    svc.store().insert_agent_session(&agent).await.unwrap();
+    attribute_dirty_change(&svc, &ws, "agent-refresh").await;
+    std::fs::write(repo.dir.join("unrelated.txt"), "other actor\n").unwrap();
+    intent_git::stage::stage(&repo.dir, &["unrelated.txt".to_string()]).unwrap();
+    let git = Repository::open(&repo.dir).unwrap();
+    let parent = git.head().unwrap().target().unwrap();
+    let index_before = std::fs::read(git.path().join("index")).unwrap();
+    let lock = git.path().join("index.lock");
+    std::fs::write(&lock, "held by test\n").unwrap();
+    let event = idle_event(&ws, "agent-refresh", "end_turn");
+
+    svc.handle_agent_idle_auto_commit(&event).await;
+    let committed = git.head().unwrap().peel_to_commit().unwrap();
+    assert_ne!(committed.id(), parent);
+    assert_eq!(committed.parent_id(0).unwrap(), parent);
+    assert!(committed
+        .tree()
+        .unwrap()
+        .get_name("unrelated.txt")
+        .is_none());
+    assert_eq!(
+        std::fs::read(git.path().join("index")).unwrap(),
+        index_before
+    );
+    assert_eq!(
+        svc.store()
+            .list_tracked_changes(&ws)
+            .await
+            .unwrap()
+            .iter()
+            .find(|r| r.path == "change.txt")
+            .unwrap()
+            .stage,
+        "committed"
+    );
+
+    // Both with the lock held and after it is released, a later idle event
+    // cannot recommit the stale index or sweep in another actor's staged work.
+    svc.handle_agent_idle_auto_commit(&event).await;
+    std::fs::remove_file(lock).unwrap();
+    svc.handle_agent_idle_auto_commit(&event).await;
+    assert_eq!(git.head().unwrap().target(), Some(committed.id()));
+    assert_eq!(
+        std::fs::read(git.path().join("index")).unwrap(),
+        index_before
+    );
+    assert_eq!(intent_git::history::history(&repo.dir, 5).unwrap().len(), 2);
+}
+
+#[intent_test_macros::daemon_test]
 async fn non_task_agent_commits_with_agent_id_only() {
     let repo = init_git_repo();
     let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
