@@ -163,6 +163,74 @@ impl Runtime {
             .cloned()
             .unwrap_or_default()
     }
+    /// Commit against the current request and cohort together. Invalidation
+    /// can remove them while a responder awaits storage; never insert a stale
+    /// snapshot back into either map. False is a nonterminal candidate denial.
+    fn commit_decision(
+        &self,
+        live: &mut Live,
+        request: &str,
+        decision: &str,
+    ) -> DesktopResult<bool> {
+        let stale = || {
+            error(
+                "desktop-stale-request",
+                "Desktop request is stale or already answered",
+            )
+        };
+        let mut states = self.live.lock().expect("desktop states");
+        let current = states.get_mut(&live.binding.agent_id).ok_or_else(stale)?;
+        match &current.phase {
+            Phase::Pending {
+                request_id,
+                expires,
+                accepted: false,
+                claim_generation,
+                ..
+            } if request_id == request
+                && *expires > Instant::now()
+                && claim_generation.as_ref().is_none_or(|generation| {
+                    generation == &self.assignment_generation(&live.binding.workspace_id)
+                }) => {}
+            _ => return Err(stale()),
+        }
+        let mut cohorts = self.candidates.lock().expect("desktop candidates");
+        let candidates = cohorts.get_mut(request).ok_or_else(stale)?;
+        if !candidates
+            .iter()
+            .any(|candidate| candidate.connection == live.binding.connection)
+        {
+            return Err(stale());
+        }
+        if decision == "deny" && candidates.len() > 1 {
+            candidates.retain(|candidate| candidate.connection != live.binding.connection);
+            current.binding = candidates[0].clone();
+            return Ok(false);
+        }
+        current.binding = live.binding.clone();
+        if let Phase::Pending { accepted, .. } = &mut current.phase {
+            *accepted = true;
+        }
+        *live = current.clone();
+        if decision == "deny" {
+            states.remove(&live.binding.agent_id);
+        }
+        Ok(true)
+    }
+    fn cancel_decision(&self, agent: &AgentId, request: &str) {
+        if let Some(current) = self.live.lock().expect("desktop states").get_mut(agent) {
+            if let Phase::Pending {
+                request_id,
+                accepted,
+                ..
+            } = &mut current.phase
+            {
+                if request_id == request {
+                    *accepted = false;
+                }
+            }
+        }
+    }
     fn get(&self, agent: &AgentId) -> Option<Live> {
         self.live.lock().expect("desktop state").get(agent).cloned()
     }
@@ -1007,65 +1075,47 @@ impl Services {
                 Phase::Active { .. } => None,
             };
             let claims_primary = claim_generation.is_some();
-            match &mut live.phase {
-                Phase::Pending {
-                    request_id,
-                    expires,
-                    accepted,
-                    ..
-                } if request_id == &request && *expires > Instant::now() && !*accepted => {
-                    // Only commit acceptance after all authority/claim checks.
-                }
-                _ => {
-                    return Err(error(
-                        "desktop-stale-request",
-                        "Desktop request is stale or already answered",
-                    ))
-                }
-            }
-            if decision == "deny" && candidates.len() > 1 {
-                self.desktop
-                    .candidates
-                    .lock()
-                    .expect("desktop candidates")
-                    .get_mut(&request)
-                    .unwrap()
-                    .retain(|binding| binding.connection != connection);
-                if let Some(binding) = self.desktop.candidates(&request).first() {
-                    live.binding = binding.clone();
-                    self.desktop.put(live);
-                }
+            if !self
+                .desktop
+                .commit_decision(&mut live, &request, &decision)?
+            {
                 return Ok(json!({"accepted":true,"requestId":request}));
             }
             if decision != "deny" && claims_primary {
-                // Share both existing mutation gates. The SQL CAS also checks
-                // owner and claimed tabs to close races with direct writers.
-                self.desktop_validate(&live.binding).await?;
-                if claim_generation.as_ref()
-                    != Some(&self.desktop.assignment_generation(&workspace))
-                    || !matches!(
-                        self.driving_client_target(&workspace).await?,
-                        intent_core::ReverseTarget::Default
-                    )
-                    || !self
-                        .store
-                        .desktop_claim_primary(
-                            &request,
-                            &value(&live.binding),
-                            claim_generation.as_deref().unwrap(),
-                            decision == "allow_future",
+                // Acceptance is reserved in the current runtime request before
+                // awaiting the durable claim. A failed write may release that
+                // reservation, but must never restore an invalidated request.
+                let claimed: DesktopResult<()> = async {
+                    self.desktop_validate(&live.binding).await?;
+                    if claim_generation.as_ref()
+                        != Some(&self.desktop.assignment_generation(&workspace))
+                        || !matches!(
+                            self.driving_client_target(&workspace).await?,
+                            intent_core::ReverseTarget::Default
                         )
-                        .await?
-                {
-                    return Err(error(
-                        "desktop-stale-request",
-                        "Workspace primary was assigned before this approval",
-                    ));
+                        || !self
+                            .store
+                            .desktop_claim_primary(
+                                &request,
+                                &value(&live.binding),
+                                claim_generation.as_deref().unwrap(),
+                                decision == "allow_future",
+                            )
+                            .await?
+                    {
+                        return Err(error(
+                            "desktop-stale-request",
+                            "Workspace primary was assigned before this approval",
+                        ));
+                    }
+                    Ok(())
                 }
-                if let Phase::Pending { accepted, .. } = &mut live.phase {
-                    *accepted = true;
+                .await;
+                if let Err(error) = claimed {
+                    self.desktop
+                        .cancel_decision(&live.binding.agent_id, &request);
+                    return Err(error);
                 }
-                self.desktop.put(live.clone());
                 self.desktop.assignment_changed(&workspace);
                 crate::publish_event(
                     self.event_bus.as_ref(),
@@ -1076,26 +1126,14 @@ impl Services {
                 )
                 .await;
             }
-            if let Phase::Pending { accepted, .. } = &mut live.phase {
-                *accepted = true;
-            }
-            self.desktop.put(live.clone());
-            if decision != "deny" {
-                self.desktop
-                    .candidates
-                    .lock()
-                    .expect("desktop candidates")
-                    .insert(request.clone(), vec![live.binding.clone()]);
-            }
             let services = self.clone();
             let gate = gate.clone();
             intent_core::spawn_daemon(async move {
                 let _guard = gate.lock().await;
                 let current = services.desktop.get(&live.binding.agent_id);
-                if !current.is_some_and(|l| matches!(l.phase,Phase::Pending { ref request_id,.. } if request_id==&request)) { return; }
+                if decision != "deny" && !current.is_some_and(|l| matches!(l.phase,Phase::Pending { ref request_id,.. } if request_id==&request)) { return; }
                 let result: DesktopResult<()> = async {
                     if decision == "deny" {
-                        services.desktop.remove(&live.binding.agent_id);
                         services
                             .desktop_outcome(&live, &request, "denied", None)
                             .await?;
@@ -1120,7 +1158,9 @@ impl Services {
                 }
                 .await;
                 if let Err(e) = result {
-                    services.desktop.remove(&live.binding.agent_id);
+                    if decision != "deny" {
+                        services.desktop.remove(&live.binding.agent_id);
+                    }
                     let _ = services
                         .desktop_outcome(&live, &request, "failed", Some(&e))
                         .await;
