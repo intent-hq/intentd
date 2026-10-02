@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.2] - 2026-10-02
+
+### 🚀 Features
+
+- Always batch ready queued messages ([#2249](https://github.com/intent-hq/intentd/pull/2249))
+
+
 ## [0.10.1] - 2026-10-02
 
 ### 🐛 Bug Fixes
