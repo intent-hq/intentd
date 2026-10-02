@@ -1,5 +1,5 @@
 //! Over-the-wire git write-ops slice: drive `git.status`, `git.agentCommit`, and
-//! `git.commit` against a real worktree through the daemon over a temp UDS.
+//! `git.agentCommit` against a real worktree through the daemon over a temp UDS.
 
 #![cfg(unix)]
 
@@ -202,10 +202,10 @@ async fn uds_git_write_ops_round_trip() {
         .expect("branch")
         .to_string();
 
-    // (d) git.commit with nothing staged → -32603 (nothing to commit).
+    // (d) git.agentCommit with nothing staged → -32603 (nothing to commit).
     let resp = send(
         &config.socket_path,
-        r#"{"jsonrpc":"2.0","id":4,"method":"git.commit","params":{"workspaceId":"ws-git","message":"empty"}}"#,
+        r#"{"jsonrpc":"2.0","id":4,"method":"git.agentCommit","params":{"workspaceId":"ws-git","message":"empty","userRequested":true}}"#,
     )
     .await;
     assert_eq!(resp["error"]["code"], json!(-32603));

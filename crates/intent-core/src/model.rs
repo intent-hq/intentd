@@ -5070,16 +5070,6 @@ pub struct GitPullResult {
     pub error: Option<String>,
 }
 
-/// `git.commit` service result (the `ok` flag is added by the transport). Mirrors
-/// the TS `ws.git.commit` payload `{ hash?, files? }`; on success both are
-/// present (`hash` is the new commit SHA, `files` the files it changed).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GitCommitResult {
-    pub hash: String,
-    pub files: Vec<String>,
-}
-
 /// `git.agentCommit` service result (the `ok` flag is added by the transport).
 /// Mirrors the TS `ws.git.agentCommit` payload `{ hash, files, fileCount }`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

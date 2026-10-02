@@ -716,7 +716,10 @@ use std::time::{Duration, Instant};
 // pr.refresh, metrics.getAgentStats, MCP operations and binary /tunnel remain.
 // Version 12.1 adds durable one-shot script monitors with guarded cancellation,
 // bounded output triggers and automatic owner wakes (scriptMonitors: 1).
-pub const PROTOCOL_VERSION: &str = "12.1";
+// Version 13.0 removes the deprecated keyed git.commit RPC. Human and agent
+// commits continue to use git.agentCommit with its existing permissions and
+// non-idempotent contract; MCP ws.git.commit is unchanged.
+pub const PROTOCOL_VERSION: &str = "13.0";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text
