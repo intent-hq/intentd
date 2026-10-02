@@ -47680,7 +47680,7 @@ async fn send_queued_message_now_store_only_processing_requires_successful_persi
                 agent.clone(),
                 "queued text".into(),
                 Some(json!([{"type":"image","data":"payload","mimeType":"image/png"}])),
-                Some(json!([{"type":"resource_link","uri":"file:///payload","name":"payload"}])),
+                Some(json!([{"type":"file","attachmentId":"att-payload","mimeType":"text/plain","fileName":"payload.txt"}])),
                 Some(json!({"type":"question_answers","answeredQuestionsMessageId":"question"})),
             )
             .await
