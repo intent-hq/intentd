@@ -20994,6 +20994,24 @@ async fn get_subscriptions_projection_cost_is_batched_and_preview_only() {
         .unwrap();
     let group = svc.get_or_create_delegation_group(&ws, &parent);
     svc.enroll_child_in_group(&group, &first);
+    // A single warm read is insufficient: sqlx returns connections asynchronously,
+    // so the next acquisition can open another slot and count its setup PRAGMAs.
+    // Initialize every read-pool slot outside the measured operation. Keep the
+    // statement counter unchanged so additional application queries still fail.
+    let pool = svc.store().read_pool();
+    let capacity = pool.options().get_max_connections();
+    let mut connections = Vec::new();
+    for _ in 0..capacity {
+        connections.push(pool.acquire().await.unwrap());
+    }
+    drop(connections);
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while pool.num_idle() != capacity as usize {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("initialized read connections must return to the pool");
     svc.agent_get_subscriptions_op(ws.clone(), parent.clone())
         .await
         .unwrap();
@@ -21006,6 +21024,17 @@ async fn get_subscriptions_projection_cost_is_batched_and_preview_only() {
     assert_eq!(
         one_count, 4,
         "status + session/preview + hook + PR projections"
+    );
+    let (with_extra_query, extra_count) = crate::test_tracing::count_sqlx_statements(async {
+        sqlx::query("SELECT 1").execute(pool).await.unwrap();
+        svc.agent_get_subscriptions_op(ws.clone(), parent.clone())
+            .await
+    })
+    .await;
+    assert_eq!(with_extra_query.unwrap(), one);
+    assert_eq!(
+        extra_count, 5,
+        "an extra application query must remain visible"
     );
     // An unrelated corrupt row must never be decoded by this targeted read.
     let unrelated = create_agent(&svc, &ws, "Unrelated").await;
