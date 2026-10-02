@@ -124,6 +124,7 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "agentFeatures.scripts",
     "agentFeatures.terminalAccess",
     "agentFeatures.browserAutomation",
+    "agentFeatures.desktopControl",
     "agentFeatures.richChatBlocks",
     "agentFeatures.structuredQuestions",
     "agentFeatures.attentionRequests",
