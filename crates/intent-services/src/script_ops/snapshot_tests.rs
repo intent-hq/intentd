@@ -331,5 +331,22 @@ async fn script_snapshot_finished_stop_publishes_idle_without_changing_history()
         assert_eq!(after["runtime"]["status"], "idle");
         assert_eq!(after["archivedAt"], before["archivedAt"]);
         assert_eq!(after["lastRun"], before["lastRun"]);
+        mgr.stop(&h.ws, &id).await.unwrap();
+        let after_noop = h
+            .services
+            .store
+            .query_events(&EventQuery {
+                workspace_id: Some(h.ws.clone()),
+                event_types: vec![SCRIPT_STATE.to_string()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            after_noop.len(),
+            events.len(),
+            "an already-idle stop is a true no-op"
+        );
+        assert_eq!(mgr.list(&h.ws).await.unwrap()["scripts"][0], after);
     }
 }
