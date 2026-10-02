@@ -887,6 +887,58 @@ child.on('exit',code=>process.exit(code||0));
     }
 
     #[tokio::test]
+    async fn installed_cli_identity_and_raw_catalog_survive_adapter_start_failure() {
+        let fixture = Fixture::new(&json!({"installed":true}));
+        let mut launch = fixture.launch(true);
+        let installed_dir = fixture.root.path().join("installed");
+        std::fs::create_dir(&installed_dir).unwrap();
+        symlink(&fixture.runtime, installed_dir.join("codex")).unwrap();
+        let runtime = intent_providers::installed_cli::InstalledCli::Codex
+            .resolve_in_dirs(std::slice::from_ref(&installed_dir), false)
+            .unwrap();
+        let context = crate::installed_cli::InstalledContext::from_inputs(
+            runtime,
+            &std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::from([
+                (
+                    OsString::from("HOME"),
+                    fixture.root.path().as_os_str().to_owned(),
+                ),
+                (OsString::from("PATH"), fixture.path.clone()),
+            ]),
+            &intent_core::cli_env::CodexEnvNames::default(),
+        )
+        .unwrap();
+        launch.codex_path = Some(installed_dir.join("codex").into_os_string());
+        launch.installed = Some(context);
+        for missing in [false, true] {
+            let npx = fixture.root.path().join("bin/npx");
+            if missing {
+                std::fs::remove_file(npx).unwrap();
+            } else {
+                executable(&npx, "#!/bin/sh\nexit 7\n");
+            }
+            let before = launch.inspect_local().await;
+            assert!(before.report.runtime_path.is_some());
+            let report = launch
+                .catalogs_with_auth(Ok(fixture.auth().await), Limits::default())
+                .await;
+            assert_eq!(report.runtime.runtime_path, before.report.runtime_path);
+            assert_eq!(
+                report.runtime.runtime_source,
+                RuntimeSource::EnvironmentOverride
+            );
+            assert!(matches!(
+                report.runtime.adapter_version,
+                VersionMeasurement::Unknown(_)
+            ));
+            assert!(matches!(report.acp, CatalogOutcome::Failed(_)));
+            assert_eq!(catalog(&report.raw).models[0].id, "fixture-model");
+            fixture.assert_clean();
+        }
+    }
+
+    #[tokio::test]
     async fn missing_prerequisites_never_fall_back_to_a_local_adapter() {
         let fixture = Fixture::new(&json!({}));
         let mut launch = fixture.launch(false);

@@ -258,6 +258,11 @@ fn context_key(cli: InstalledCli, env: &BTreeMap<OsString, OsString>) -> Result<
         "AWS_SHARED_CREDENTIALS_FILE",
         "AWS_CONFIG_FILE",
         "GOOGLE_APPLICATION_CREDENTIALS",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AZURE_FEDERATED_TOKEN_FILE",
+        "AZURE_CLIENT_CERTIFICATE_PATH",
+        "CLAUDE_CODE_CLIENT_CERT",
+        "CLAUDE_CODE_CLIENT_KEY",
     ] {
         if let Some(path) = nonempty(env, key) {
             files.push(PathBuf::from(path));
@@ -296,7 +301,12 @@ fn bounded_config(path: &Path) -> Result<Option<Vec<u8>>, String> {
     Ok(Some(data))
 }
 
+// macOS has no equivalent private descendant owner in the current platform
+// layer. Preserve bounded CLI launch compatibility there; this best-effort
+// reaper cannot guarantee cleanup of detached children after their parent exits.
+#[cfg(any(target_os = "macos", all(test, unix)))]
 struct VersionChild(Option<(tokio::process::Child, u32)>);
+#[cfg(any(target_os = "macos", all(test, unix)))]
 impl VersionChild {
     async fn reap(&mut self) {
         if let Some((mut child, pid)) = self.0.take() {
@@ -304,6 +314,7 @@ impl VersionChild {
         }
     }
 }
+#[cfg(any(target_os = "macos", all(test, unix)))]
 impl Drop for VersionChild {
     fn drop(&mut self) {
         if let Some((mut child, pid)) = self.0.take() {
@@ -316,7 +327,13 @@ impl Drop for VersionChild {
     }
 }
 
-async fn version_output(mut command: Command) -> Result<Vec<u8>, String> {
+#[cfg(target_os = "macos")]
+async fn version_output(command: Command) -> Result<Vec<u8>, String> {
+    version_output_uncontained(command).await
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+async fn version_output_uncontained(mut command: Command) -> Result<Vec<u8>, String> {
     use std::process::Stdio;
     command
         .stdin(Stdio::null())
@@ -361,6 +378,66 @@ async fn version_output(mut command: Command) -> Result<Vec<u8>, String> {
     .map_err(str::to_owned);
     guard.reap().await;
     result
+}
+
+// Reuse the private Linux subreaper / Windows Job owner. Unlike a snapshot of
+// the version leader, it retains descendants after successful exit and sets no
+// daemon-wide process flags. The command keeps its exact launch env and cwd.
+#[cfg(any(target_os = "linux", windows))]
+async fn version_output(command: Command) -> Result<Vec<u8>, String> {
+    use crate::codex_diagnostics::process::ProbeProcess;
+    let directory = tokio::task::spawn_blocking(tempfile::tempdir)
+        .await
+        .map_err(|_| "installed CLI version owner failed")?
+        .map_err(|_| "installed CLI version owner failed")?;
+    let mut guard = ProbeProcess::spawn(command, directory)
+        .await
+        .map_err(|_| "installed CLI version check could not start")?;
+    drop(guard.stdin.take());
+    let stdout = guard
+        .stdout
+        .take()
+        .ok_or("installed CLI version check has no stdout")?;
+    let mut stderr = guard
+        .stderr
+        .take()
+        .ok_or("installed CLI version check has no stderr")?;
+    let result = tokio::time::timeout(Duration::from_secs(3), async {
+        let read = async {
+            let mut bytes = Vec::new();
+            stdout
+                .take(4097)
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|_| "installed CLI version read failed")?;
+            if bytes.len() > 4096 {
+                return Err("installed CLI version output exceeds the limit");
+            }
+            Ok(bytes)
+        };
+        let discard = async {
+            tokio::io::copy(&mut stderr, &mut tokio::io::sink())
+                .await
+                .map_err(|_| "installed CLI version read failed")
+        };
+        let (bytes, _) = tokio::try_join!(read, discard)?;
+        if !guard
+            .wait()
+            .await
+            .map_err(|_| "installed CLI version check failed")?
+            .success()
+        {
+            return Err("installed CLI version check exited unsuccessfully");
+        }
+        Ok(bytes)
+    })
+    .await
+    .unwrap_or(Err("installed CLI version check timed out"));
+    guard
+        .cleanup()
+        .await
+        .map_err(|_| "installed CLI version cleanup failed")?;
+    result.map_err(str::to_owned)
 }
 
 #[cfg(all(test, unix))]

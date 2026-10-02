@@ -261,7 +261,16 @@ impl CodexLaunch {
         if matches!(self.selection(), ProviderLaunch::Managed { .. }) {
             // Explicit launch may install even if it never reaches the capture
             // hook. Do not reuse the offline reason claiming nothing installed.
-            inspection = self.unknown(UnknownReason::PackageUnreadable);
+            let mut unknown = self.unknown(UnknownReason::PackageUnreadable);
+            // Installed runtime identity is independent of npm materialization.
+            // An adapter failure must not erase it or suppress the raw probe.
+            if self.installed.is_some() {
+                unknown.runtime = inspection.runtime;
+                unknown.report.runtime_path = inspection.report.runtime_path;
+                unknown.report.runtime_source = inspection.report.runtime_source;
+                unknown.report.runtime_version = inspection.report.runtime_version;
+            }
+            inspection = unknown;
         }
 
         let acp_deadline = tokio::time::Instant::now() + limits.timeout;

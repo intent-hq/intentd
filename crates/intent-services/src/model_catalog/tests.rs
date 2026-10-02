@@ -1323,3 +1323,111 @@ async fn installed_cli_failed_refresh_only_serves_same_runtime_and_auth_last_goo
     assert!(changed.models.is_none());
     assert!(!changed.stale);
 }
+
+/// Run production discovery in a fresh process so cached shell state and the
+/// developer's credentials cannot participate in this account-change test.
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cli_credential_file_rotation_rejects_last_good_account() {
+    use intent_core::WorkspaceApi;
+    use std::os::unix::fs::PermissionsExt;
+    const CHILD: &str = "INTENT_TEST_CREDENTIAL_FILE";
+    if let Ok(key) = std::env::var(CHILD) {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let root = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+            let services = crate::Services::new(
+                intent_store::Store::open(&root.join("test.db"))
+                    .await
+                    .unwrap(),
+            );
+            let first = services
+                .models_list(Some("claude-code".into()), true)
+                .await
+                .unwrap();
+            assert_eq!(first["models"][0]["id"], "account-a", "{key}: {first}");
+            std::fs::write(root.join("fail"), "").unwrap();
+            let unchanged = services
+                .models_list(Some("claude-code".into()), true)
+                .await
+                .unwrap();
+            assert_eq!(unchanged["models"], first["models"], "{key}: {unchanged}");
+            assert_eq!(unchanged["stale"], true, "{key}: {unchanged}");
+            std::fs::write(root.join("credential"), "account-b").unwrap();
+            let second = services
+                .models_list(Some("claude-code".into()), true)
+                .await
+                .unwrap();
+            assert_eq!(
+                second["models"].as_array().unwrap().len(),
+                0,
+                "{key}: {second}"
+            );
+            assert!(
+                !second["stale"].as_bool().unwrap_or(false),
+                "{key}: {second}"
+            );
+        });
+        return;
+    }
+    let node = intent_providers::find_node().expect("Node required");
+    for key in [
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "AWS_CONFIG_FILE",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AZURE_FEDERATED_TOKEN_FILE",
+        "AZURE_CLIENT_CERTIFICATE_PATH",
+        "CLAUDE_CODE_CLIENT_CERT",
+        "CLAUDE_CODE_CLIENT_KEY",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        // Discovery pairs npx with the real Node location. A symlink would
+        // select the host's npx, so keep a launcher inside the fixture directory.
+        let launcher = format!(
+            "#!/bin/sh\nexec '{}' \"$@\"\n",
+            node.to_string_lossy().replace('\'', "'\\''")
+        );
+        std::fs::write(bin.join("node"), launcher).unwrap();
+        std::fs::set_permissions(bin.join("node"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        for (name, script) in [
+            ("claude", "#!/bin/sh\nprintf '2.0.0 (Claude Code)\\n'\n"),
+            (
+                "npx",
+                r"#!/usr/bin/env node
+const fs=require('fs'),path=require('path'),root=process.env.HOME;
+if(process.argv.includes('--version')) { console.log('11.0.0');process.exit(0); }
+if(process.env.CLAUDE_CODE_EXECUTABLE!==path.join(root,'bin/claude')) process.exit(8);
+require('readline').createInterface({input:process.stdin}).on('line',line=>{
+ const m=JSON.parse(line); if(m.id===undefined)return;
+ if(m.method==='session/new' && fs.existsSync(path.join(root,'fail'))) {
+  console.log(JSON.stringify({jsonrpc:'2.0',id:m.id,error:{code:-32000,message:'fixture auth unavailable'}}));return;
+ }
+ const token=fs.readFileSync(process.env[process.env.INTENT_TEST_CREDENTIAL_FILE],'utf8');
+ const result=m.method==='initialize'?{protocolVersion:1,agentCapabilities:{}}:
+ {sessionId:'fixture',models:{availableModels:[{modelId:token,name:token}],currentModelId:token}};
+ console.log(JSON.stringify({jsonrpc:'2.0',id:m.id,result}));
+});
+",
+            ),
+        ] {
+            let file = bin.join(name);
+            std::fs::write(&file, script).unwrap();
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let credential = root.path().join("credential");
+        std::fs::write(&credential, "account-a").unwrap();
+        let output=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "model_catalog::tests::installed_cli_credential_file_rotation_rejects_last_good_account", "--nocapture"])
+            .env_clear().env("HOME",root.path()).env("SHELL","/bin/sh")
+            .env("PATH",std::env::join_paths([bin,std::path::PathBuf::from("/usr/bin"),std::path::PathBuf::from("/bin")]).unwrap())
+            .env(CHILD,key).env(key,&credential).output().unwrap();
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{key}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
