@@ -103,6 +103,9 @@ pub(super) struct LocalResources {
     pub(super) _rules_config: Option<TempConfigFile>,
     pub(super) _pi_extension: Option<PiExtensionDelivery>,
     pub(super) npx_launch_dir: Option<NpxLaunchDir>,
+    pub(super) cleanup_lease: Option<tokio::sync::oneshot::Sender<()>>,
+    #[cfg(test)]
+    pub(super) cleanup_services: Option<crate::Services>,
 }
 
 impl LocalAgentRuntime {
@@ -310,7 +313,10 @@ impl AgentRuntime for ConnectionRuntime<'_> {
 ///
 /// Cleanup ownership is persistent, not the awaiting caller's: [`Self::kill_tree`]
 /// and [`Self::kill_trees`] move the child, its pgid and the launch dir into
-/// ONE owned task on the current runtime and await that task. Cancelling the
+/// ONE owned task on the current runtime and await that task. A completion
+/// lease acquired by the manager before child creation travels with these
+/// resources through that task; final manager shutdown joins it even after
+/// the handle has left the map. Cancelling the
 /// caller — `stop()` aborting a worker inside `kill_child_only` after the
 /// handle left the map, an RPC deadline dropping a `stop` / `stop_many`
 /// future — leaves the task, and the descendant snapshot it already took,
@@ -327,6 +333,9 @@ pub(super) struct DetachedChild {
     pub(super) spawn_pid: Option<u32>,
     /// `None` once moved into the owned cleanup task.
     pub(super) npx_launch_dir: Option<NpxLaunchDir>,
+    pub(super) cleanup_lease: Option<tokio::sync::oneshot::Sender<()>>,
+    #[cfg(test)]
+    pub(super) cleanup_services: Option<crate::Services>,
 }
 
 impl DetachedChild {
@@ -343,6 +352,9 @@ impl DetachedChild {
             child: Some(child),
             spawn_pid: resources.child_pid,
             npx_launch_dir: resources.npx_launch_dir.take(),
+            cleanup_lease: resources.cleanup_lease.take(),
+            #[cfg(test)]
+            cleanup_services: resources.cleanup_services.take(),
         })
     }
 
@@ -360,6 +372,9 @@ impl DetachedChild {
     pub(super) fn start_cleanup(&mut self) -> Option<JoinHandle<()>> {
         let child = self.child.take()?;
         let spawn_pid = self.spawn_pid;
+        let lease = self.cleanup_lease.take();
+        #[cfg(test)]
+        let services = self.cleanup_services.take();
         let launch_dir = RetainUnlessSwept(self.npx_launch_dir.take());
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             drop(launch_dir);
@@ -367,6 +382,11 @@ impl DetachedChild {
             return None;
         };
         Some(spawn_owned_cleanup(&runtime, async move {
+            let _lease = lease;
+            #[cfg(test)]
+            if let Some(services) = services {
+                services.hold_periodic_commit("physical-cleanup").await;
+            }
             kill_child_tree(child, spawn_pid).await;
             launch_dir.remove();
         }))
@@ -377,8 +397,10 @@ impl DetachedChild {
     /// leaves the batch sweep running.
     pub(super) async fn kill_trees(children: Vec<Self>) {
         let mut trees = Vec::with_capacity(children.len());
+        let mut leases = Vec::with_capacity(children.len());
         let mut launch_dirs = Vec::with_capacity(children.len());
         for mut detached in children {
+            leases.push(detached.cleanup_lease.take());
             if let Some(child) = detached.child.take() {
                 trees.push((child, detached.spawn_pid));
             }
@@ -388,6 +410,7 @@ impl DetachedChild {
             return;
         };
         let _ = spawn_owned_cleanup(&runtime, async move {
+            let _leases = leases;
             kill_child_trees(trees).await;
             for dir in launch_dirs {
                 dir.remove();

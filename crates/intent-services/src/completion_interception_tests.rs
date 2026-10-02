@@ -28,14 +28,14 @@ mod tests {
     /// the `-wal`/`-shm` sidecars.
     struct TempDb {
         path: PathBuf,
-        _dir: tempfile::TempDir,
+        dir: tempfile::TempDir,
     }
 
     impl TempDb {
         fn new() -> Self {
             let dir = crate::test_support::test_tempdir("completion-test-");
             let path = dir.path().join("completion.db");
-            Self { path, _dir: dir }
+            Self { path, dir }
         }
     }
 
@@ -868,6 +868,139 @@ mod tests {
             .with_workspaces_root(workspaces_root);
 
         Some((test_root, repo_path, sandbox_path, ws, services, bus))
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn merge_sweep_finishes_marked_sandbox_after_caller_abort() {
+        use tokio::time::{timeout, Duration};
+        let (store, db) = temp_store().await;
+        let canonical = db.dir.path().join("canonical");
+        let sandbox_path = db.dir.path().join("sandbox");
+        init_test_repo(&canonical);
+        let agent = AgentId::from("sweep-shutdown");
+        let branch = format!("sb/{}", agent.0);
+        // A real Git clone and commit exercise merge-back without a native CoW dependency.
+        let base = {
+            let repo = Repository::clone(canonical.to_str().unwrap(), &sandbox_path).unwrap();
+            let parent = repo.head().unwrap().peel_to_commit().unwrap();
+            let base = parent.id().to_string();
+            repo.branch(&branch, &parent, false).unwrap();
+            repo.set_head(&format!("refs/heads/{branch}")).unwrap();
+            fs::write(sandbox_path.join("swept.txt"), "retained merge").unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("swept.txt")).unwrap();
+            index.write().unwrap();
+            let oid = index.write_tree().unwrap();
+            let tree = repo.find_tree(oid).unwrap();
+            let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "Retained work", &tree, &[&parent])
+                .unwrap();
+            base
+        };
+        let ws = workspace_for_repo(&canonical);
+        store.insert_workspace(&ws).await.unwrap();
+        create_agent_session(
+            &store,
+            &ws.id,
+            &agent,
+            None,
+            Some(sandbox_path.to_string_lossy().into()),
+        )
+        .await;
+        store
+            .insert_sandbox(&intent_store::Sandbox {
+                id: "shutdown-sandbox".into(),
+                workspace_id: ws.id.clone(),
+                agent_id: agent.clone(),
+                path: sandbox_path.to_string_lossy().into(),
+                branch,
+                base_commit_sha: base,
+                snapshot_commit_sha: None,
+                status: SandboxStatus::MergePending,
+                retry_count: 0,
+                created_at: now_iso(),
+                updated_at: now_iso(),
+            })
+            .await
+            .unwrap();
+        let bus = EventBus::new(store.clone());
+        let services = Services::new_with_file_secrets(
+            store.clone(),
+            intent_core::FileSecretStore::with_path(db.dir.path().join("secrets.json")),
+        )
+        .with_event_bus(bus.clone());
+        let (release, released) = tokio::sync::oneshot::channel();
+        *services.sandbox_merge_finish.lock().unwrap() = Some(released);
+        let owner = services.clone();
+        let caller =
+            intent_core::spawn_daemon(async move { owner.sweep_merge_pending_sandboxes().await });
+        timeout(
+            Duration::from_secs(10),
+            services.sandbox_merge_marked.notified(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store
+                .get_sandbox(&ws.id, &agent)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            SandboxStatus::Merged
+        );
+        assert_eq!(
+            fs::read_to_string(canonical.join("swept.txt")).unwrap(),
+            "retained merge"
+        );
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        let (entered, entering) = tokio::sync::oneshot::channel();
+        *services.secrets.writer_drain_pending.lock().unwrap() = Some(entered);
+        let owner = services.clone();
+        let mut drain =
+            intent_core::spawn_daemon(async move { owner.shutdown_store_writers().await });
+        let pending = timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                point = entering => { assert_eq!(point.unwrap(), "store-tasks"); true }
+                result = &mut drain => { result.unwrap(); false }
+            }
+        })
+        .await
+        .unwrap();
+        let _ = release.send(());
+        if pending {
+            timeout(Duration::from_secs(5), drain)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert!(pending, "shutdown discarded marked merge cleanup and event");
+        bus.shutdown().await.unwrap();
+        store.close().await;
+        let reopened = Store::open(&db.path).await.unwrap();
+        assert!(reopened
+            .get_sandbox(&ws.id, &agent)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!sandbox_path.exists());
+        assert_eq!(
+            fs::read_to_string(canonical.join("swept.txt")).unwrap(),
+            "retained merge"
+        );
+        let events = reopened
+            .query_events(&intent_store::EventQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "sandbox:cow:merged")
+                .count(),
+            1
+        );
+        reopened.close().await;
     }
 
     #[tokio::test]

@@ -145,6 +145,7 @@ enum StdinMsg {
 #[derive(Clone, Default)]
 pub struct HostExecStreamRegistry {
     inner: Arc<Mutex<HashMap<String, StreamHandle>>>,
+    terminal_tasks: Arc<tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 impl HostExecStreamRegistry {
@@ -152,6 +153,30 @@ impl HostExecStreamRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Cancel all streams and join their durable terminal publications. The
+    /// composition root has already drained request admission before this call.
+    ///
+    /// # Errors
+    /// Returns an error if a terminal writer panicked or was cancelled.
+    ///
+    /// # Panics
+    /// Panics if the registry mutex is poisoned.
+    pub async fn shutdown(&self) -> Result<(), HostExecError> {
+        for handle in self.inner.lock().expect("registry poisoned").values() {
+            handle.cancel_token.store(true, Ordering::SeqCst);
+        }
+        let mut tasks = self.terminal_tasks.lock().await;
+        while let Some(task) = tasks.last_mut() {
+            let result = task.await;
+            tasks.pop();
+            result.map_err(|error| HostExecError {
+                code: -32603,
+                message: format!("host.execStream terminal writer failed: {error}"),
+            })?;
+        }
+        Ok(())
     }
 
     /// Number of live streams (test/diagnostics use).
@@ -379,7 +404,7 @@ pub async fn start_stream(
     let ws_wait = workspace_id.clone();
     let req_wait = request_id.clone();
     let timeout_ms = common.timeout_ms;
-    intent_core::spawn_daemon(async move {
+    let terminal = intent_core::spawn_daemon(async move {
         run_wait_loop(
             bus_wait,
             ws_wait,
@@ -391,6 +416,10 @@ pub async fn start_stream(
         )
         .await;
     });
+
+    let mut tasks = registry().terminal_tasks.lock().await;
+    tasks.retain(|task| !task.is_finished());
+    tasks.push(terminal);
 
     Ok(request_id)
 }
@@ -466,8 +495,6 @@ async fn run_wait_loop(
         }
     };
 
-    registry().remove(&request_id);
-
     let exit_code = status
         .as_ref()
         .ok()
@@ -506,6 +533,7 @@ async fn run_wait_loop(
     if let Err(e) = bus.publish(&ev).await {
         tracing::warn!(error = %e, "failed to publish host:exec:exit");
     }
+    registry().remove(&request_id);
     // Prevent unused-var lints on the caller side.
     let _ = pid;
 }
@@ -569,6 +597,53 @@ fn chunk_event(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_joins_terminal_publication_racing_cancel_and_exit() {
+        let tmp = crate::test_support::test_tempdir("intentd-stream-shutdown-");
+        let store = intent_store::Store::open(&tmp.path().join("store.db"))
+            .await
+            .unwrap();
+        let services = crate::Services::new(store.clone());
+        let bus = EventBus::new(store.clone());
+        let args = parse_args(&map(&json!({"command":"cat"}))).unwrap();
+        let id = start_stream(&services, bus.clone(), args).await.unwrap();
+        let held = store.write_pool().acquire().await.unwrap();
+        let eof = registry().write(&id, None, true);
+        let cancel = async {
+            let _ = registry().cancel(&id);
+        };
+        let _ = tokio::join!(eof, cancel);
+        let shutdown = registry().shutdown();
+        tokio::pin!(shutdown);
+        tokio::select! {
+            biased;
+            result = &mut shutdown => panic!("terminal persistence passed held connection: {result:?}"),
+            () = std::future::ready(()) => {}
+        }
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(10), shutdown)
+            .await
+            .unwrap()
+            .unwrap();
+        bus.shutdown().await.unwrap();
+        let rows = store
+            .query_events(&intent_store::EventQuery::default())
+            .await
+            .unwrap();
+        let exits = rows
+            .iter()
+            .filter(|event| event.event_type == HOST_EXEC_EXIT && event.data["requestId"] == id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            exits.len(),
+            1,
+            "exactly one durable exit must precede store close"
+        );
+        assert!(registry().is_empty());
+        store.close().await;
+    }
 
     fn map(v: &Value) -> Map<String, Value> {
         v.as_object().cloned().unwrap_or_default()

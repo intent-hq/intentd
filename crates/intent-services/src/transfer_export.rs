@@ -120,6 +120,9 @@ impl Services {
         &self,
         id: WorkspaceId,
     ) -> Result<serde_json::Value> {
+        if self.store_tasks.is_closed() {
+            return Err(Error::Internal("daemon is shutting down".into()));
+        }
         if id.is_chief() {
             return Err(Error::InvalidParams(
                 "The chief workspace cannot be exported".to_string(),
@@ -166,9 +169,19 @@ impl Services {
         }
         let svc = self.clone();
         let export_id_for_task = export_id.clone();
-        intent_core::spawn_daemon(async move {
-            svc.run_export_build(export_id_for_task, ws).await;
-        });
+        if self
+            .store_tasks
+            .spawn_draining(async move {
+                // This owner includes every awaited local blocking stage, agent
+                // capture and terminal publication. Dropping a response must not
+                // detach any of them from the store-close barrier.
+                svc.run_export_build(export_id_for_task, ws).await;
+            })
+            .is_none()
+        {
+            self.cleanup_export(&export_id).await;
+            return Err(Error::Internal("daemon is shutting down".into()));
+        }
         Ok(serde_json::json!({
             "exportId": export_id,
             "maxChunkBytes": EXPORT_MAX_CHUNK_BYTES,
@@ -1061,6 +1074,56 @@ mod tests {
         let dir = assets_root.join(&id.0);
         std::fs::create_dir_all(&dir).expect("assets dir");
         std::fs::write(dir.join("img.png"), b"asset-bytes").expect("asset");
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn shutdown_retains_export_capture_and_terminal_event() {
+        let root = crate::test_support::test_tempdir("export-shutdown");
+        let assets = root.path().join("assets");
+        let workspaces = root.path().join("workspaces");
+        let (db, svc) = fresh_services(&workspaces, &assets).await;
+        let bus = crate::EventBus::new(svc.store.clone());
+        let svc = svc.with_event_bus(bus.clone());
+        let id = WorkspaceId::new();
+        seed_workspace(&svc, &assets, &workspaces.join("checkout"), &id).await;
+        svc.shutdown_group_persistence().await;
+        let held = svc.store.write_pool().acquire().await.unwrap();
+        let export = svc.workspace_export_start_op(id.clone()).await.unwrap();
+        let shutdown = svc.shutdown_store_writers();
+        tokio::pin!(shutdown);
+        let returned_early = tokio::select! {
+            biased;
+            () = &mut shutdown => true,
+            () = std::future::ready(()) => false,
+        };
+        drop(held);
+        if !returned_early {
+            tokio::time::timeout(std::time::Duration::from_secs(10), &mut shutdown)
+                .await
+                .unwrap();
+        }
+        assert!(
+            !returned_early,
+            "shutdown abandoned the admitted export builder"
+        );
+        bus.shutdown().await.unwrap();
+        svc.store.close().await;
+        let reopened = Store::open(&db.path().join("store.db")).await.unwrap();
+        assert!(reopened
+            .list_interrupted_agents()
+            .await
+            .unwrap()
+            .iter()
+            .any(|row| row.agent_id.as_str() == "agent-exp"));
+        let events = reopened
+            .query_events(&intent_store::EventQuery::default())
+            .await
+            .unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "workspace:transfer:ready"
+                && event.data["exportId"] == export["exportId"]));
+        reopened.close().await;
     }
 
     /// Wait until the background build settles the session (Ready) or the

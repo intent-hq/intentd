@@ -447,6 +447,15 @@ pub async fn run(
     args: HostExecArgs,
     policy: &dyn ExecPolicy,
 ) -> Result<Value, HostExecError> {
+    let cwd_resolved = prepare(api, &args, policy).await?;
+    run_prepared(args, cwd_resolved, std::future::pending()).await
+}
+
+async fn prepare(
+    api: &dyn WorkspaceApi,
+    args: &HostExecArgs,
+    policy: &dyn ExecPolicy,
+) -> Result<Option<PathBuf>, HostExecError> {
     policy
         .evaluate(&args.command, &args.args)
         .map_err(HostExecError::internal)?;
@@ -461,6 +470,14 @@ pub async fn run(
         _ => None,
     };
 
+    Ok(cwd_resolved)
+}
+
+async fn run_prepared(
+    args: HostExecArgs,
+    cwd_resolved: Option<PathBuf>,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<Value, HostExecError> {
     let mut cmd = build_command(&args, cwd_resolved.as_deref());
     let mut child = cmd
         .spawn()
@@ -488,18 +505,29 @@ pub async fn run(
         (out, err, status)
     };
 
-    let (stdout_bytes, stderr_bytes, wait_result, timed_out) = if let Some(ms) = args.timeout_ms {
-        if let Ok((out, err, status)) =
-            tokio::time::timeout(Duration::from_millis(ms), wait_fut).await
-        {
+    let deadline = async {
+        match args.timeout_ms {
+            Some(ms) => tokio::time::sleep(Duration::from_millis(ms)).await,
+            None => std::future::pending().await,
+        }
+    };
+    let mut shutting_down = false;
+    let completed = tokio::select! {
+        biased;
+        () = shutdown => { shutting_down = true; None },
+        result = wait_fut => Some(result),
+        () = deadline => None,
+    };
+    let (stdout_bytes, stderr_bytes, wait_result, timed_out) =
+        if let Some((out, err, status)) = completed {
             (out, err, status, false)
         } else {
             // Reap the whole process group: SIGTERM → grace → SIGKILL,
             // plus a snapshot-before-kill descendant sweep for anything
             // that escaped into its own process group
-            // (`intent_acp::descendant_sweep`). On non-unix `kill_on_drop`
-            // will still reap the direct child when `child` is dropped by
-            // the returned future's scope.
+            // (`intent_acp::descendant_sweep`). On non-Unix explicitly kill
+            // the direct child before awaiting it: kill_on_drop cannot help
+            // while this scope is still waiting for that child to exit.
             #[cfg(unix)]
             if let Some(pid) = pid {
                 let descendants = intent_acp::descendant_pids(pid).await;
@@ -513,7 +541,12 @@ pub async fn run(
                 intent_acp::sweep_escaped_descendants(&descendants).await;
             }
             #[cfg(not(unix))]
-            let _ = pid;
+            {
+                let _ = pid;
+                child.start_kill().map_err(|error| {
+                    HostExecError::internal(format!("command cancellation failed: {error}"))
+                })?;
+            }
             // Best-effort drain of whatever the child produced pre-timeout.
             let status = child.wait().await;
             let mut out = Vec::new();
@@ -525,11 +558,10 @@ pub async fn run(
                 let _ = r.read_to_end(&mut err).await;
             }
             (out, err, status, true)
-        }
-    } else {
-        let (out, err, status) = wait_fut.await;
-        (out, err, status, false)
-    };
+        };
+    if shutting_down {
+        return Err(HostExecError::internal("daemon shutting down"));
+    }
 
     let status = wait_result.map_err(|e| HostExecError::internal(format!("wait failed: {e}")))?;
     let exit_code = status.code().unwrap_or(-1);
@@ -542,6 +574,62 @@ pub async fn run(
         result["timedOut"] = json!(true);
     }
     Ok(result)
+}
+
+/// Owns one-shot command completion even if the requesting task is cancelled.
+/// Shutdown interrupts external command waits, reaps their owned process trees,
+/// and joins cleanup before the daemon closes its store.
+#[derive(Default)]
+pub struct HostExecRuntime {
+    tasks: std::sync::Arc<crate::delivery_tasks::DeliveryTasks>,
+}
+
+impl HostExecRuntime {
+    /// Cancel external waits without aborting process-tree cleanup.
+    pub fn begin_shutdown(&self) {
+        self.tasks.close();
+    }
+
+    /// Wait until every admitted command has completed its owned cleanup.
+    pub async fn shutdown(&self) {
+        self.tasks.shutdown().await;
+    }
+
+    /// Execute using the ordinary host.exec policy with daemon shutdown ownership.
+    ///
+    /// # Errors
+    /// Returns validation/execution errors, or an internal shutdown error.
+    pub async fn run(
+        &self,
+        api: &dyn WorkspaceApi,
+        args: HostExecArgs,
+    ) -> Result<Value, HostExecError> {
+        let cwd = prepare(api, &args, &AllowAllPolicy).await?;
+        let tasks = self.tasks.clone();
+        let (result, done) = tokio::sync::oneshot::channel();
+        let Some(_handle) = self.tasks.spawn_draining(async move {
+            let outcome = run_prepared(args, cwd, tasks.closed()).await;
+            let _ = result.send(outcome);
+        }) else {
+            return Err(HostExecError::internal("daemon shutting down"));
+        };
+        done.await
+            .map_err(|_| HostExecError::internal("host.exec worker failed"))?
+    }
+
+    /// Execute an agent request with its workspace fixed as the containment root.
+    ///
+    /// # Errors
+    /// Returns validation, execution or shutdown errors.
+    pub async fn run_for_workspace(
+        &self,
+        api: &dyn WorkspaceApi,
+        workspace_id: WorkspaceId,
+        params: Value,
+    ) -> intent_core::Result<Value> {
+        let args = workspace_args(&workspace_id, params)?;
+        self.run(api, args).await.map_err(domain_err)
+    }
 }
 
 /// Convenience for the transport layer: run with the default v1 policy.
@@ -571,6 +659,11 @@ pub async fn run_for_workspace(
     workspace_id: WorkspaceId,
     params: Value,
 ) -> intent_core::Result<Value> {
+    let args = workspace_args(&workspace_id, params)?;
+    run_default(api, args).await.map_err(domain_err)
+}
+
+fn workspace_args(workspace_id: &WorkspaceId, params: Value) -> intent_core::Result<HostExecArgs> {
     let mut map = match params {
         Value::Object(m) => m,
         Value::Null => Map::new(),
@@ -584,8 +677,7 @@ pub async fn run_for_workspace(
         "workspaceId".to_string(),
         Value::String(workspace_id.as_str().to_string()),
     );
-    let args = parse_args(&map).map_err(domain_err)?;
-    run_default(api, args).await.map_err(domain_err)
+    parse_args(&map).map_err(domain_err)
 }
 
 /// Fold a [`HostExecError`] onto the domain error enum for the trait seam.
@@ -600,6 +692,46 @@ fn domain_err(e: HostExecError) -> intent_core::Error {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_reaps_a_command_without_timeout_after_its_caller_is_cancelled() {
+        let tmp = crate::test_support::test_tempdir("intentd-exec-shutdown-");
+        let store = intent_store::Store::open(&tmp.path().join("store.db"))
+            .await
+            .unwrap();
+        let services = crate::Services::new(store.clone());
+        let runtime = services.host_exec_runtime();
+        let pid_file = tmp.path().join("pid");
+        let fifo = tmp.path().join("gate");
+        let args = parse_args(&map(&json!({
+            "command": "sh",
+            "args": ["-c", "mkfifo \"$2\"; echo $$ > \"$1\"; read line < \"$2\"", "shutdown-child", pid_file, fifo]
+        }))).unwrap();
+        let caller_runtime = runtime.clone();
+        let caller = tokio::spawn(async move { caller_runtime.run(&services, args).await });
+        let pid = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+                    if let Ok(pid) = pid.trim().parse::<i32>() {
+                        break pid;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // The caller disappearing must not detach the command from shutdown.
+        caller.abort();
+        let _ = caller.await;
+        runtime.begin_shutdown();
+        tokio::time::timeout(Duration::from_secs(10), runtime.shutdown())
+            .await
+            .unwrap();
+        assert!(nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err());
+        store.close().await;
+    }
 
     fn map(v: &Value) -> Map<String, Value> {
         v.as_object().cloned().unwrap_or_default()

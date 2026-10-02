@@ -7,6 +7,26 @@ use tokio::sync::mpsc;
 
 use super::*;
 
+#[tokio::test]
+async fn shutdown_releases_reverse_request_blocked_on_full_outbound_lane() {
+    let (tx, _idle_peer) = mpsc::channel(1);
+    tx.send("occupied".to_string()).await.unwrap();
+    let reverse = ReverseChannel::new(tx);
+    let request = reverse.request("browser.exec", json!({}), Duration::from_secs(60));
+    tokio::pin!(request);
+    tokio::select! {
+        biased;
+        result = &mut request => panic!("request did not wait for outbound space: {result:?}"),
+        () = std::future::ready(()) => {}
+    }
+    reverse.close();
+    let error = tokio::time::timeout(Duration::from_secs(1), request)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(error.message.contains("closed"));
+}
+
 #[test]
 fn screenshot_requests_use_a_shorter_inner_deadline() {
     let timeout = request_timeout(

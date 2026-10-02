@@ -574,7 +574,7 @@ fn parent_dir(path: &str) -> String {
 /// workspace's whole pipeline down and releases its share of the stream — the
 /// clean-shutdown contract for `serve`.
 pub struct FileWatcher {
-    _sub: SubHandle,
+    _sub: Option<SubHandle>,
     /// Non-recursive subscription on [`external_exclude_dir`] when there is
     /// one: a linked worktree's `<common>/info`, whose `exclude` edits would
     /// otherwise never reach the gitignore matcher (intent-hq/intent#5057).
@@ -591,6 +591,14 @@ impl Drop for FileWatcher {
 }
 
 impl FileWatcher {
+    /// Stop raw admission, flush pending paths, and join the publisher.
+    #[expect(clippy::used_underscore_binding)]
+    pub(super) async fn shutdown(mut self) {
+        self._sub.take();
+        self._exclude_sub.take();
+        let _ = (&mut self.task).await;
+    }
+
     /// Start watching `root`, publishing debounced `file:changed` events for
     /// `workspace_id` to `bus`. Raw events arrive from the shared stream `hub`
     /// owns for `root`'s group, demuxed to this workspace, and are fed to the
@@ -615,7 +623,7 @@ impl FileWatcher {
         let task =
             intent_core::spawn_daemon(debounce_loop(bus, workspace_id, root, raw_rx, exclude_rx));
         Self {
-            _sub: sub,
+            _sub: Some(sub),
             _exclude_sub: exclude_sub,
             task,
         }
@@ -631,7 +639,7 @@ impl FileWatcher {
     #[cfg(test)]
     #[expect(clippy::used_underscore_binding)] // RAII field; underscore documents production lifetime-only intent
     pub(super) async fn wait_established(&self, timeout: Duration) {
-        self._sub.probe().wait_live(timeout).await;
+        self._sub.as_ref().unwrap().probe().wait_live(timeout).await;
         if let Some(sub) = &self._exclude_sub {
             sub.probe().wait_live(timeout).await;
         }

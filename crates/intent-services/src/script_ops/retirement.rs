@@ -79,7 +79,7 @@ impl ScriptManager {
         let mgr = self.clone();
         let ws = ws.clone();
         let id = id.to_owned();
-        intent_core::spawn_daemon(async move {
+        self.spawn_owned(async move {
             let lock = mgr.locks.definition_lock(&id);
             let _guard = lock.lock().await;
             mgr.finish_run_locked(&ws, &id, generation).await;

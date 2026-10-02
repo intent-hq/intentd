@@ -230,6 +230,7 @@ pub struct ClientPresence {
 /// entries plus the two indexes derived from them.
 #[derive(Default)]
 struct State {
+    closed: bool,
     entries: VecDeque<Entry>,
     presence: HashMap<ClientId, ClientPresence>,
     /// Entry id → the `clientId` its hello bound, for hello'd connections
@@ -301,6 +302,8 @@ struct Inner {
     /// The queue's consumer end, parked until a publisher claims it via
     /// [`PrimaryReverseRegistry::take_transitions`].
     transition_rx: Mutex<Option<mpsc::UnboundedReceiver<ClientTransition>>>,
+    publisher_stop: tokio::sync::watch::Sender<bool>,
+    publisher: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Default for Inner {
@@ -312,6 +315,8 @@ impl Default for Inner {
             next_hello_seq: AtomicU64::new(0),
             transitions,
             transition_rx: Mutex::new(Some(transition_rx)),
+            publisher_stop: tokio::sync::watch::channel(false).0,
+            publisher: Mutex::new(None),
         }
     }
 }
@@ -436,7 +441,12 @@ impl PrimaryReverseRegistry {
         transport: ReverseTransport,
     ) -> PrimaryReverseGuard {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
-        self.inner.lock().entries.push_back(Entry {
+        let mut state = self.inner.lock();
+        if state.closed {
+            channel.close();
+            return PrimaryReverseGuard { registry: None, id };
+        }
+        state.entries.push_back(Entry {
             id,
             channel,
             transport,
@@ -615,15 +625,68 @@ impl PrimaryReverseRegistry {
     /// registry-mutation order. Every listener sharing the registry calls this
     /// on start; the first call spawns the publisher and later calls are
     /// no-ops. Must be called from within a tokio runtime.
+    ///
+    /// # Panics
+    /// Panics if the publisher mutex is poisoned or no Tokio runtime is active.
     pub fn spawn_client_event_publisher(&self, api: Arc<dyn WorkspaceApi>) {
         let Some(mut rx) = self.take_transitions() else {
             return;
         };
-        tokio::spawn(async move {
+        let mut stop = self.inner.publisher_stop.subscribe();
+        let publisher = tokio::spawn(async move {
+            loop {
+                if *stop.borrow() {
+                    rx.close();
+                    break;
+                }
+                tokio::select! {
+                    _ = stop.changed() => {},
+                    transition = rx.recv() => match transition {
+                        Some(transition) => publish_client_event(api.as_ref(), &transition).await,
+                        None => return,
+                    },
+                }
+            }
             while let Some(transition) = rx.recv().await {
                 publish_client_event(api.as_ref(), &transition).await;
             }
         });
+        *self.inner.publisher.lock().unwrap() = Some(publisher);
+    }
+
+    /// Refuse new channels and release all remote waits, even on idle sockets.
+    /// Connection guards may subsequently drop; removal is idempotent.
+    pub fn begin_shutdown(&self) {
+        let ids = {
+            let mut state = self.inner.lock();
+            state.closed = true;
+            state
+                .entries
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>()
+        };
+        for id in ids {
+            if let Some(channel) = self.inner.remove(id) {
+                channel.close();
+            }
+        }
+    }
+
+    /// Drain client transitions after request and connection producers settle.
+    ///
+    /// # Errors
+    /// Returns an error if the publisher did not finish normally.
+    ///
+    /// # Panics
+    /// Panics if the publisher mutex is poisoned.
+    pub async fn shutdown_publisher(&self) -> Result<(), tokio::task::JoinError> {
+        self.inner.publisher_stop.send_replace(true);
+        let publisher = self.inner.publisher.lock().unwrap().take();
+        if let Some(publisher) = publisher {
+            publisher.await?;
+        }
+        Ok(())
     }
 
     /// Whether the registry currently has no live entries.

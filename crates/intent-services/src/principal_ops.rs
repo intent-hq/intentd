@@ -918,12 +918,18 @@ impl Services {
             }
             *last = Some(Instant::now());
         }
-        let this = self.clone();
-        intent_core::spawn_daemon(async move {
+        let mut this = self.clone();
+        let owner = async move {
+            this.primary_auth_admitted = true;
             if let Err(e) = this.refresh_primary_identity(principal).await {
                 tracing::debug!(error = %e, "primary github identity refresh skipped");
             }
-        });
+        };
+        if self.primary_auth_admitted {
+            let _ = self.store_tasks.spawn_draining(owner);
+        } else {
+            let _ = self.settings_tasks.spawn_draining(owner);
+        }
     }
 
     /// Refresh the primary principal's cached forge profile from the forge
@@ -1045,17 +1051,7 @@ impl Services {
         let Some(host) = self.bound_gitlab_host() else {
             return ForgeLink::NotConnected;
         };
-        let client_id = self.gitlab_client_id(&host);
-        match source_control_auth_ops::probe_gitlab(
-            &host,
-            &|| self.gitlab_host_is_bound(&host),
-            client_id.as_deref(),
-            self.gitlab_secret_store.clone(),
-            &self.gitlab_credential_gate,
-            self.event_bus.as_ref(),
-        )
-        .await
-        {
+        match source_control_auth_ops::probe_gitlab(self, &host).await {
             Ok(source_control_auth_ops::ProbeOutcome::Configured { user, .. }) => {
                 ForgeLink::Connected(ForgeUser::gitlab(host.host(), &user))
             }
@@ -1117,8 +1113,9 @@ impl Services {
             .identity_rekey_generation
             .fetch_add(1, Ordering::SeqCst)
             + 1;
-        let this = self.clone();
-        intent_core::spawn_daemon(async move {
+        let mut this = self.clone();
+        let owner = async move {
+            this.primary_auth_admitted = true;
             let primary = match this.store.get_primary_principal().await {
                 Ok(p) => p,
                 Err(e) => {
@@ -1132,7 +1129,14 @@ impl Services {
             {
                 tracing::warn!(error = %e, "identity.provider changed: identity re-key deferred");
             }
-        });
+        };
+        // A committed reload callback can outlive early root closure. Its
+        // watcher is joined before the finite derived tail lane is drained.
+        if self.primary_auth_admitted || crate::config_watcher::owns_admitted_callback() {
+            let _ = self.store_tasks.spawn_draining(owner);
+        } else {
+            let _ = self.settings_tasks.spawn_draining(owner);
+        }
     }
 
     /// The explicit re-key an `identity.provider` write performs (protocol

@@ -201,6 +201,7 @@ pub(crate) struct ScriptManager {
     /// production wiring.
     parks: ScriptParks,
     settings: Option<Arc<crate::SettingsRegistry>>,
+    tasks: Arc<crate::delivery_tasks::DeliveryTasks>,
 }
 
 /// Test seam for a race window: lets a test hold a task inside a window
@@ -283,7 +284,7 @@ impl Drop for RunReservation {
         if let Some((token, preserve_marker)) = abandoned {
             let mgr = self.mgr.clone();
             let (ws, id) = self.key.clone();
-            intent_core::spawn_daemon(async move {
+            self.mgr.spawn_owned(async move {
                 let lock = mgr.locks.definition_lock(&id);
                 let _guard = lock.lock().await;
                 if let Err(error) = mgr
@@ -318,7 +319,22 @@ impl ScriptManager {
             too_fast_ms,
             parks,
             settings: None,
+            tasks: Arc::new(crate::delivery_tasks::DeliveryTasks::default()),
         }
+    }
+
+    pub(crate) fn with_tasks(mut self, tasks: Arc<crate::delivery_tasks::DeliveryTasks>) -> Self {
+        self.tasks = tasks;
+        self
+    }
+
+    fn spawn_owned<T: Send + 'static>(
+        &self,
+        future: impl std::future::Future<Output = T> + Send + 'static,
+    ) -> tokio::task::JoinHandle<T> {
+        self.tasks
+            .spawn_draining(future)
+            .expect("script owner must settle before service writer admission closes")
     }
 
     pub(crate) fn with_settings(mut self, settings: Option<Arc<crate::SettingsRegistry>>) -> Self {
@@ -970,7 +986,7 @@ impl ScriptManager {
         let mgr = self.clone();
         let ws = workspace_id.clone();
         let id = script_id.to_owned();
-        intent_core::spawn_daemon(async move { mgr.start_owned(&ws, &id, restoring).await })
+        self.spawn_owned(async move { mgr.start_owned(&ws, &id, restoring).await })
             .await
             .map_err(|e| Error::Internal(format!("script start admission failed: {e}")))?
     }
@@ -1034,7 +1050,7 @@ impl ScriptManager {
         let mgr = self.clone();
         let ws = workspace_id.clone();
         let sid = script_id.to_string();
-        m.supervisor = Some(intent_core::spawn_daemon(async move {
+        m.supervisor = Some(self.spawn_owned(async move {
             if let Some(state) = launching {
                 mgr.emit_state(&ws, &sid, &state).await;
             }
@@ -1064,7 +1080,7 @@ impl ScriptManager {
         let mgr = self.clone();
         let ws = workspace_id.clone();
         let id = script_id.to_owned();
-        intent_core::spawn_daemon(async move {
+        self.spawn_owned(async move {
             let lock = mgr.locks.definition_lock(&id);
             let _guard = lock.lock().await;
             mgr.stop_inner(&ws, &id, true).await
@@ -1238,14 +1254,14 @@ impl ScriptManager {
         };
         let scripts = victims.len();
         let ptys = self.pty.kill_all().await;
-        let mut settles = tokio::task::JoinSet::new();
+        let mut settles = Vec::new();
         let mut markers = Vec::new();
         for v in victims {
             if v.running {
                 markers.push((v.ws.clone(), v.id.clone()));
             }
             let mgr = self.clone();
-            settles.spawn(async move {
+            settles.push(self.spawn_owned(async move {
                 // stop-all owns this handle, so a finalizer cannot join it.
                 // Let terminal state publication finish before archiving.
                 if let Some(handle) = v.handle {
@@ -1256,11 +1272,11 @@ impl ScriptManager {
                 if let Some(generation) = v.finalization {
                     let _ = mgr.queue_settlement(&v.ws, &v.id, generation).await;
                 }
-            });
+            }));
         }
         let drain = async {
-            while let Some(res) = settles.join_next().await {
-                if let Err(e) = res {
+            for settle in settles {
+                if let Err(e) = settle.await {
                     tracing::warn!(error = %e, "shutdown stop-all settle task failed");
                 }
             }
@@ -1292,7 +1308,7 @@ impl ScriptManager {
         let mgr = self.clone();
         let ws = workspace_id.clone();
         let id = script_id.to_owned();
-        intent_core::spawn_daemon(async move { mgr.restart_owned(&ws, &id).await })
+        self.spawn_owned(async move { mgr.restart_owned(&ws, &id).await })
             .await
             .map_err(|e| Error::Internal(format!("script restart failed: {e}")))?
     }
@@ -1350,12 +1366,13 @@ impl ScriptManager {
         let mgr = self.clone();
         let ws = workspace_id.clone();
         let id = script_id.to_owned();
-        let admission = intent_core::spawn_daemon(async move {
-            mgr.finish_previous_locked(&ws, &id).await;
-            admission
-        })
-        .await
-        .map_err(|e| Error::Internal(format!("script prior settlement failed: {e}")))?;
+        let admission = self
+            .spawn_owned(async move {
+                mgr.finish_previous_locked(&ws, &id).await;
+                admission
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("script prior settlement failed: {e}")))?;
         let (def, prev_status, generation) = {
             let mut guard = self.scripts.lock().unwrap();
             let m = guard
@@ -1413,13 +1430,21 @@ impl ScriptManager {
         let mgr = self.clone();
         let ws = workspace_id.clone();
         let id = script_id.to_owned();
-        let mut reservation = intent_core::spawn_daemon(async move {
+        let (ready, receive) = tokio::sync::oneshot::channel();
+        self.spawn_owned(async move {
             let _admission = admission;
-            mgr.prepare_launch(&ws, &id).await?;
-            Ok::<_, Error>(reservation)
-        })
-        .await
-        .map_err(|e| Error::Internal(format!("script run admission failed: {e}")))??;
+            let result = match mgr.prepare_launch(&ws, &id).await {
+                Ok(()) => Ok(reservation),
+                Err(error) => Err(error),
+            };
+            // Drop an abandoned reservation inside its tracked owner. Returning
+            // it as a JoinHandle output could run its persistence Drop after
+            // the owner's completion signal had already released the drain.
+            drop(ready.send(result));
+        });
+        let mut reservation = receive
+            .await
+            .map_err(|e| Error::Internal(format!("script run admission failed: {e}")))??;
         let ws = workspace_id.clone();
         let cwd = match self.resolve_cwd(&ws, &def).await {
             Ok(cwd) => cwd,
@@ -1445,7 +1470,7 @@ impl ScriptManager {
         let ws_task = ws.clone();
         let sid = script_id.to_string();
         reservation.armed = false;
-        let completion = intent_core::spawn_daemon(async move {
+        let completion = self.spawn_owned(async move {
             let _lease = RunLease {
                 mgr: mgr.clone(),
                 key: (ws_task.clone(), sid.clone()),
@@ -1510,7 +1535,7 @@ impl ScriptManager {
     /// is published, then release it before joining the owned finalizer.
     fn fail_run(&self, reservation: RunReservation, error: String) -> tokio::task::JoinHandle<()> {
         let mgr = self.clone();
-        intent_core::spawn_daemon(async move {
+        self.spawn_owned(async move {
             let (ws, id) = reservation.key.clone();
             let generation = reservation.generation;
             mgr.fail(&ws, &id, generation, &error, false).await;
