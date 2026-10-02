@@ -488,12 +488,9 @@ pub(crate) async fn probe_pi_auth() -> Option<bool> {
 /// unknown — it can never confirm `Some(true)`, because the adapter serves
 /// its model catalog without credentials (see
 /// [`claude_code_acp_auth_verdict`]). The caller gates on the `claude` CLI
-/// being installed. The probe runs the SAME adapter a session spawn would
-/// (intent-hq/monorepo#4352): `adapter_override` — the validated
-/// `providers.paths["claude-code"]` binary
-/// ([`intent_providers::resolve_npx_only_override`]) — when set, else the
-/// pinned npx adapter ([`intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE`]),
-/// so the verdict reflects what sessions actually run.
+/// being installed. The probe runs the pinned adapter with that canonical CLI,
+/// matching session launches. The legacy `adapter_override` argument is ignored;
+/// it cannot replace the reviewed package or satisfy the installed-CLI gate.
 pub(crate) async fn probe_claude_code_auth(adapter_override: Option<PathBuf>) -> Option<bool> {
     let provider = intent_providers::find_provider("claude-code")?;
     let _ = intent_providers::discover::resolve_npx_only_override(
