@@ -10,6 +10,11 @@ user-facing feature, update the affected section of
 [`crates/intent-services/resources/assistant-app-guide.md`](crates/intent-services/resources/assistant-app-guide.md)
 in the same change. This is the single bundled guide; keep it concise and replace
 obsolete paths, labels, and prerequisites, including changes coordinated with the frontend.
+Keep the guide and user-facing help focused on features ready for users. Do not promote
+unfinished, experimental, Labs-only, internal, or unreleased features as normal options;
+code or tool availability is not proof of readiness. When explicitly asked about such
+a feature, or assigned to develop or test it, discuss it honestly and label its status.
+Update the guide when a feature becomes ready or returns to experimental status.
 
 > **Merge permission**: never merge a PR or arm auto-merge without explicit permission
 > from a human — approved + green is not enough. See the
