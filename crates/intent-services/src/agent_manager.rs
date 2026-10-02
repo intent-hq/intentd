@@ -14533,7 +14533,12 @@ mod npx_launch_dir_lifetime_tests {
             .unwrap()
             .unwrap();
         assert!(!pid_alive(leader.cast_signed()));
-        assert!(!pid_alive(tree.grandchild));
+        assert!(
+            !pid_alive(tree.grandchild),
+            "grandchild {} alive after shutdown; launch_dir_exists={}",
+            tree.grandchild,
+            tree.launch_path.exists()
+        );
         assert!(!tree.launch_path.exists());
         // An aborted acquire skips its existing post-kill deregistration.
         // Preserve that stale in-memory slot: late ID-only removal could erase
@@ -14755,7 +14760,8 @@ mod npx_launch_dir_lifetime_tests {
     }
 
     fn pid_alive(pid: i32) -> bool {
-        if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() {
+        let signal_probe = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None);
+        if signal_probe.is_err() {
             return false;
         }
         // kill(pid, 0) still succeeds for an exited child until its parent
@@ -14763,7 +14769,15 @@ mod npx_launch_dir_lifetime_tests {
         // Keep unknown states conservative: a live/stopped process must still
         // fail the lifetime assertions if cleanup removes its directory.
         #[cfg(target_os = "linux")]
-        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        if let Ok(stat) = {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
+            eprintln!(
+                "pid_alive({pid}): signal_probe={signal_probe:?}, stat={stat:?}, cwd={:?}, subsequent_stat={:?}",
+                std::fs::read_link(format!("/proc/{pid}/cwd")),
+                std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            );
+            stat
+        } {
             if matches!(
                 stat.rsplit_once(") ")
                     .and_then(|(_, fields)| fields.split_whitespace().next()),
