@@ -710,9 +710,9 @@ use std::time::{Duration, Instant};
 // events, including committed result/archive state. Presence detects support.
 // Version 11.3 adds workspace-scoped manual specialist preferences; platform
 // support remains independently capability-gated.
-// It also adds durable one-shot script monitors with guarded cancellation,
+// Version 11.4 adds durable one-shot script monitors with guarded cancellation,
 // bounded output triggers and automatic owner wakes (scriptMonitors: 1).
-pub const PROTOCOL_VERSION: &str = "11.3";
+pub const PROTOCOL_VERSION: &str = "11.4";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text
