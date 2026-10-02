@@ -47,6 +47,8 @@ pub struct State {
     pub rest_unreadable: bool,
     pub rest_fault: Option<CheckFault>,
     pub rest_head: Option<String>,
+    pub mergeable: String,
+    pub in_merge_queue: bool,
     pub compare_status: u16,
     pub compare: Value,
     pub ancestry_page_change: Option<(&'static str, Value)>,
@@ -83,6 +85,8 @@ impl State {
             rest_unreadable: false,
             rest_fault: None,
             rest_head: None,
+            mergeable: "MERGEABLE".into(),
+            in_merge_queue: false,
             compare_status: 200,
             compare: json!({"behind_by": 1, "commits": []}),
             ancestry_page_change: None,
@@ -101,8 +105,8 @@ impl State {
         pr["headRefName"] = json!("fixture");
         pr["baseRefName"] = json!(self.base_branch);
         pr["author"] = json!({"login": "fixture"});
-        pr["mergeable"] = json!("MERGEABLE");
-        pr["isInMergeQueue"] = json!(false);
+        pr["mergeable"] = json!(self.mergeable);
+        pr["isInMergeQueue"] = json!(self.in_merge_queue);
         pr["timelineItems"] = json!({"nodes": []});
         pr["reviewDecision"] = Value::Null;
         pr["reviews"] = json!({"nodes": [], "pageInfo": {"hasPreviousPage": false}});

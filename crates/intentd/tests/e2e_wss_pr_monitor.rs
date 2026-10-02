@@ -11,6 +11,8 @@
 
 #![cfg(unix)]
 
+#[path = "e2e_wss_pr_monitor/ancestry.rs"]
+mod ancestry;
 mod common;
 #[path = "../../intent-sourcecontrol/tests/support/qwen.rs"]
 mod qwen;
@@ -677,6 +679,8 @@ async fn next_event(ws: &mut TlsWs, event_type: &str) -> Value {
                     if v["method"] == json!("events.event")
                         && v["params"]["event"]["type"] == json!(event_type)
                     {
+                        assert_eq!(v["jsonrpc"], "2.0");
+                        assert!(v.get("id").is_none(), "events are notifications: {v}");
                         return v["params"]["event"].clone();
                     }
                 }
