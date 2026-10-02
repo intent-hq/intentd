@@ -182,7 +182,7 @@ async fn ancestry_old_baseline_and_neutral_changes_over_wss() {
     ] {
         match browser_connect(&fx, origin, token).await {
             Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
-                assert_eq!(response.status().as_u16(), status)
+                assert_eq!(response.status().as_u16(), status);
             }
             other => panic!("expected rejected upgrade: {other:?}"),
         }
