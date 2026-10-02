@@ -299,6 +299,15 @@ async fn archive_batch_failure_commits_only_successful_predecessors() {
         .unwrap()
         .archived_at
         .is_none());
+    let changes = h.services.store.query_events(&EventQuery {
+        workspace_id: Some(h.ws.clone()),
+        event_types: vec![SCRIPT_CHANGED.to_string()],
+        ..Default::default()
+    }).await.unwrap();
+    let updates: Vec<_> = changes.iter().filter(|e| e.data["action"] == "updated").collect();
+    assert_eq!(updates.len(), 1, "only the committed part of a failed batch is published");
+    assert_eq!(updates[0].data["script"]["id"], a);
+    assert!(updates[0].data["script"]["archivedAt"].is_string());
     sqlx::query("DROP TRIGGER refuse_second_archive")
         .execute(h.services.store.write_pool())
         .await
@@ -446,6 +455,7 @@ async fn archive_run_cancelled_after_restore_commit_keeps_registry_consistent() 
     let park = Arc::new(SupervisePark::default());
     let mut mgr = h.services.script_manager();
     mgr.parks.archive_committed = Some(park.clone());
+    let mut sub = subscribe(&h);
     let run = {
         let mgr = mgr.clone();
         let ws = h.ws.clone();
@@ -487,6 +497,10 @@ async fn archive_run_cancelled_after_restore_commit_keeps_registry_consistent() 
         .unwrap()
         .archived_at
         .is_none());
+    let event = await_script_change(&mut sub, "updated").await;
+    assert_eq!(event["data"]["script"]["runtime"]["status"], "idle",
+        "a cancelled reservation was never published as running");
+    assert_eq!(event["data"]["script"], mgr.list(&h.ws).await.unwrap()["scripts"][0]);
     let scripts = mgr.scripts.lock().unwrap();
     let entry = scripts.get(&(h.ws.clone(), id)).unwrap();
     assert!(

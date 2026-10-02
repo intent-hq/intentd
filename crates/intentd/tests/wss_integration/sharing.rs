@@ -311,6 +311,7 @@ async fn sharing_authorship_and_sender_spoofing_over_wss() {
     let note_id = note["result"]["note"]["id"]
         .as_str()
         .unwrap_or_else(|| panic!("{note}"));
+    let mut previous_queue = Vec::<Value>::new();
     for client in [&mut a, &mut b, &mut guest] {
         let sent=client.call("agent.sendMessage",json!({"workspaceId":ws,"agentId":agent_id,"content":"Real human","messageMetadata":{"humanAuthor":{"login":"forged"},"fromPrincipalId":owner.id,"fromAgentId":"forged-agent","fromAgentName":"Forged agent","author":{"principalId":owner.id}}})).await;
         assert_eq!(sent["result"]["success"], true, "{sent}");
@@ -361,7 +362,7 @@ async fn sharing_authorship_and_sender_spoofing_over_wss() {
         assert!(appended["result"]["message"]["metadata"]
             .get("fromAgentId")
             .is_none());
-        let queued=client.call("agent.queueMessage",json!({"agentId":agent_id,"content":"My private queue","messageMetadata":{"humanAuthor":{"login":"forged"},"fromPrincipalId":owner.id,"fromAgentId":"forged-agent"}})).await;
+        let queued=client.call("agent.queueMessage",json!({"agentId":agent_id,"content":"My shared queue","messageMetadata":{"humanAuthor":{"login":"forged"},"fromPrincipalId":owner.id,"fromAgentId":"forged-agent"}})).await;
         assert_eq!(queued["result"]["success"], true, "{queued}");
         let queue = client
             .call("agent.getQueue", json!({"agentId":agent_id}))
@@ -369,10 +370,17 @@ async fn sharing_authorship_and_sender_spoofing_over_wss() {
         let entries = queue["result"]["queue"].as_array().unwrap();
         assert_eq!(
             entries.len(),
-            1,
-            "each person sees only their own queued human entry: {queue}"
+            previous_queue.len() + 1,
+            "shared queue: {queue}"
         );
-        let entry = &entries[0];
+        assert_eq!(&entries[..previous_queue.len()], previous_queue.as_slice());
+        let queued_id = &queued["result"]["queuedMessage"]["id"];
+        assert!(queued_id.is_string(), "canonical queued identity: {queued}");
+        let entry = entries
+            .iter()
+            .find(|entry| &entry["id"] == queued_id)
+            .unwrap();
+        assert_eq!(entry["position"], previous_queue.len());
         assert_eq!(entry["author"]["principalId"], client.principal.id.0);
         assert_eq!(
             entry["messageMetadata"]["fromPrincipalId"],
@@ -390,7 +398,13 @@ async fn sharing_authorship_and_sender_spoofing_over_wss() {
         let queue = client
             .call("agent.getQueue", json!({"agentId":agent_id}))
             .await;
-        let edited = &queue["result"]["queue"][0];
+        let entries = queue["result"]["queue"].as_array().unwrap();
+        assert_eq!(entries.len(), previous_queue.len() + 1);
+        assert_eq!(&entries[..previous_queue.len()], previous_queue.as_slice());
+        let edited = entries
+            .iter()
+            .find(|entry| &entry["id"] == queued_id)
+            .unwrap();
         assert_eq!(edited["author"]["principalId"], client.principal.id.0);
         assert!(edited["content"]
             .as_str()
@@ -400,6 +414,7 @@ async fn sharing_authorship_and_sender_spoofing_over_wss() {
             .as_str()
             .unwrap()
             .ends_with("My edited queue"));
+        previous_queue = entries.clone();
         let added=client.call("comment.add",json!({"workspaceId":ws,"noteId":note_id,"searchContext":"Anchor here","commentTarget":"Anchor here","comment":"My comment","author":"Forged owner","authorType":"agent","authorPrincipalId":owner.id,"authorIdentity":{"provider":"github","host":"github.com","externalUserId":"forged"}})).await;
         assert_eq!(added["result"]["success"], true, "{added}");
         let stored = srv

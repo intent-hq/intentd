@@ -13625,19 +13625,23 @@ async fn get_queue_is_projected_to_the_calling_principal() {
     let guest_view = read_as(as_guest).await;
     assert_eq!(
         ids(&guest_view),
-        vec![guest_entry.clone(), agent_entry.clone()],
-        "guest sees own + null-author entries only: {}",
+        vec![
+            owner_entry.clone(),
+            guest_entry.clone(),
+            agent_entry.clone()
+        ],
+        "guest sees the shared queue: {}",
         json!(guest_view)
     );
-    assert_eq!(guest_view[0]["author"]["principalId"], guest.0);
-    assert_eq!(guest_view[1]["author"], Value::Null);
+    assert_eq!(guest_view[1]["author"]["principalId"], guest.0);
+    assert_eq!(guest_view[2]["author"], Value::Null);
     assert_eq!(
-        guest_view[0]["position"],
+        guest_view[1]["position"],
         json!(1),
         "position keeps the drain-order index (not renumbered): {}",
-        guest_view[0]
+        guest_view[1]
     );
-    assert_eq!(guest_view[1]["position"], json!(2));
+    assert_eq!(guest_view[2]["position"], json!(2));
 
     let owner_view = read_as(as_owner).await;
     assert_eq!(
@@ -13742,8 +13746,16 @@ async fn queue_mutations_enforce_entry_ownership() {
     };
     let owner_entry = queue_as(as_admin.clone(), "from owner").await;
     let guest_entry = queue_as(as_guest.clone(), "from guest").await;
+    let barrier = queue_as(as_admin.clone(), "barrier").await;
     let guest_entry_2 = queue_as(as_guest.clone(), "from guest 2").await;
+    let barrier2 = queue_as(as_admin.clone(), "barrier 2").await;
     let guest_entry_3 = queue_as(as_guest.clone(), "from guest 3").await;
+    svc.agent_remove_queued_message_op(id.clone(), barrier)
+        .await
+        .unwrap();
+    svc.agent_remove_queued_message_op(id.clone(), barrier2)
+        .await
+        .unwrap();
     let agent_entry = svc
         .agent_queue_message_op(
             id.clone(),
@@ -14152,7 +14164,7 @@ async fn queue_mutations_recheck_ownership_against_the_entry_at_mutation_time() 
 /// filtering it, the administrator still sees everything, and the mutation
 /// gate (stamp-keyed, no principal read) keeps refusing it.
 #[tokio::test]
-async fn stamped_entries_stay_hidden_from_guests_when_the_principal_lookup_fails() {
+async fn stamped_entries_stay_shared_when_the_principal_lookup_fails() {
     use intent_core::{with_caller, Caller};
     use serde_json::Value;
 
@@ -14228,12 +14240,12 @@ async fn stamped_entries_stay_hidden_from_guests_when_the_principal_lookup_fails
     let guest_view = read_as(as_guest.clone()).await;
     assert_eq!(
         ids(&guest_view),
-        vec![guest_entry.clone()],
-        "guest: the owner's stamped entry stays hidden when its profile is unreadable: {}",
+        vec![owner_entry.clone(), guest_entry.clone()],
+        "guest: shared entries retain attribution when profiles are unreadable: {}",
         json!(guest_view)
     );
     assert_eq!(
-        guest_view[0]["author"],
+        guest_view[1]["author"],
         bare_author(&guest),
         "{}",
         guest_view[0]
@@ -14308,10 +14320,11 @@ async fn stamped_entries_stay_hidden_from_guests_when_the_principal_lookup_fails
             event_queue.clone()
         )),
         vec![
+            owner_entry.clone(),
             guest_entry.clone(),
             event_queue[2]["id"].as_str().unwrap().to_string()
         ],
-        "the per-subscriber projection drops the owner's entry"
+        "the per-subscriber projection shares the owner's entry"
     );
 
     // The mutation gate keys on the stamp too: the foreign entry is refused.
@@ -14433,8 +14446,12 @@ async fn unstamped_human_entries_fail_closed_when_the_fallback_lookup_fails() {
     let guest_view = read_as(as_guest.clone()).await;
     assert_eq!(
         ids(&guest_view),
-        vec![from_agent.id.clone(), guest_entry.clone()],
-        "guest: the unattributable human entry is withheld, the agent-sent one is not: {}",
+        vec![
+            legacy.id.clone(),
+            from_agent.id.clone(),
+            guest_entry.clone()
+        ],
+        "guest: unknown human and agent entries are both visible: {}",
         json!(guest_view)
     );
     let owner_view = read_as(as_admin.clone()).await;
@@ -14498,11 +14515,12 @@ async fn unstamped_human_entries_fail_closed_when_the_fallback_lookup_fails() {
     assert_eq!(
         ids(&projected),
         vec![
+            legacy.id.clone(),
             from_agent.id.clone(),
             guest_entry.clone(),
             event_queue[3]["id"].as_str().unwrap().to_string()
         ],
-        "the per-subscriber projection drops the unattributable entry: {}",
+        "the per-subscriber projection shares the unattributable entry: {}",
         json!(projected)
     );
     assert_eq!(
@@ -14517,7 +14535,8 @@ async fn unstamped_human_entries_fail_closed_when_the_fallback_lookup_fails() {
         event_types: vec![intent_core::events::AGENT_QUEUE_PROCESSING.to_string()],
         ..Default::default()
     });
-    svc.publish_queue_processing(&id, &ws, &legacy).await;
+    svc.publish_queue_processing(&id, &ws, std::slice::from_ref(&legacy))
+        .await;
     let mut processing_event = None;
     while let Ok(Some(batch)) = timeout(Duration::from_secs(5), processing.recv()).await {
         for evt in batch
@@ -14542,8 +14561,8 @@ async fn unstamped_human_entries_fail_closed_when_the_fallback_lookup_fails() {
         processing_event.metadata
     );
     assert!(
-        !intent_core::queue_attribution_visible_to(&as_guest, &attribution),
-        "the guest's frame is redacted"
+        intent_core::queue_attribution_visible_to(&as_guest, &attribution),
+        "the guest's frame includes shared content"
     );
     assert!(
         intent_core::queue_attribution_visible_to(&as_admin, &attribution),
@@ -20816,6 +20835,268 @@ async fn get_subscriptions_has_stable_shape() {
     // A freshly created agent watches nobody, so both lists are empty.
     assert!(r["subscriptions"].as_array().expect("array").is_empty());
     assert!(r["delegationGroups"].as_array().expect("array").is_empty());
+}
+
+/// The footer can render every participant from this one read, without
+/// accidentally treating the caller (present in statuses) as a participant.
+#[intent_test_macros::daemon_test]
+async fn get_subscriptions_bundles_slim_participants() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let retired = create_agent(&svc, &ws, "Retired").await;
+    let missing = AgentId::from("agent-missing");
+    let group = svc.get_or_create_delegation_group(&ws, &parent);
+    for id in [&child, &retired, &missing] {
+        svc.enroll_child_in_group(&group, id);
+    }
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .unwrap();
+    sqlx::query("UPDATE agent_session SET retired_at = '2026-10-01T00:00:00Z' WHERE id = ?")
+        .bind(&retired.0)
+        .execute(svc.store().write_pool())
+        .await
+        .unwrap();
+    let expected = svc
+        .agent_list_including_retired_op(ws.clone())
+        .await
+        .unwrap();
+    let r = svc
+        .agent_get_subscriptions_op(ws.clone(), parent.clone())
+        .await
+        .unwrap();
+    let rows = r["agents"].as_array().expect("bundled agents array");
+    assert_eq!(
+        rows.len(),
+        2,
+        "overlapping watch/group deduplicates, missing skipped"
+    );
+    for id in [&child, &retired] {
+        let row = rows.iter().find(|a| a["id"] == id.0).unwrap();
+        let canonical = expected.iter().find(|a| a.id == *id).unwrap();
+        assert_eq!(*row, serde_json::to_value(canonical).unwrap());
+    }
+    assert!(rows.iter().all(|a| a["id"] != parent.0));
+    assert!(
+        r["agentStatuses"].get(&parent.0).is_some(),
+        "caller status is retained"
+    );
+    assert!(r["agentStatuses"].get(&missing.0).is_none());
+    assert_eq!(
+        r["delegationGroups"][0]["expectedAgentIds"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    let empty = svc
+        .agent_get_subscriptions_op(ws.clone(), child.clone())
+        .await
+        .unwrap();
+    assert_eq!(empty["agents"], json!([]));
+    // Extant Deleted rows retain their canonical list shape; only physical
+    // removal omits the participant, without editing its group reference.
+    sqlx::query("UPDATE agent_session SET status = 'deleted' WHERE id = ?")
+        .bind(&child.0)
+        .execute(svc.store().write_pool())
+        .await
+        .unwrap();
+    svc.enroll_child_in_group(&group, &parent);
+    let r = svc
+        .agent_get_subscriptions_op(ws.clone(), parent.clone())
+        .await
+        .unwrap();
+    assert_eq!(r["agents"].as_array().unwrap().len(), 3);
+    assert!(r["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|a| a["id"] == parent.0));
+    sqlx::query("DELETE FROM agent_session WHERE id = ?")
+        .bind(&child.0)
+        .execute(svc.store().write_pool())
+        .await
+        .unwrap();
+    let r = svc.agent_get_subscriptions_op(ws, parent).await.unwrap();
+    assert_eq!(r["agents"].as_array().unwrap().len(), 2);
+    assert!(r["agentStatuses"].get(&child.0).is_none());
+    assert!(r["delegationGroups"][0]["expectedAgentIds"]
+        .as_array()
+        .unwrap()
+        .contains(&json!(child.0)));
+}
+
+#[intent_test_macros::daemon_test]
+async fn get_subscriptions_preserves_chief_identity_and_runtime_overlays() {
+    let (_t, svc, manager, _bus, ws) = setup_with_manager().await;
+    let chief = WorkspaceId::chief();
+    let parent = create_agent(&svc, &chief, "Chief").await;
+    let child = create_agent(&svc, &ws, "Remote participant").await;
+    svc.register_completion_watch(
+        &chief,
+        &ws,
+        parent.clone(),
+        "Chief".into(),
+        child.clone(),
+        None,
+    )
+    .unwrap();
+    seed_active_hook(&svc, &ws, &child, "Build watcher").await;
+    seed_active_pr_monitor(&svc, &ws, &child, 42).await;
+    svc.record_context_usage(&child, 123, 1000);
+    let _admission = manager.try_begin_turn(&child, &ws).await.unwrap();
+    svc.set_live_turn(
+        &child,
+        "live-subscription",
+        vec![json!({
+            "type":"text", "id":"live-subscription:0", "text":format!("Live {}\n", "x".repeat(2000))
+        })],
+    );
+    let canonical = svc.agent_list_op(ws.clone()).await.unwrap();
+    let result = svc
+        .agent_get_subscriptions_op(chief.clone(), parent)
+        .await
+        .unwrap();
+    let row = &result["agents"][0];
+    assert_eq!(row["workspaceId"], ws.0);
+    assert_eq!(result["subscriptions"][0]["workspaceId"], chief.0);
+    assert_eq!(
+        *row,
+        serde_json::to_value(canonical.iter().find(|a| a.id == child).unwrap()).unwrap()
+    );
+    assert_eq!(row["isResponding"], true);
+    assert_eq!(row["turnInFlight"], true);
+    let preview = row["lastAgentResponse"].as_str().unwrap();
+    assert!(preview.starts_with("Live "));
+    assert!(preview.len() <= intent_core::AGENT_LIST_PREVIEW_BUDGET_BYTES);
+    assert_eq!(row["contextUsage"]["used"], 123);
+    assert_eq!(row["waitingOnHooks"][0]["name"], "Build watcher");
+    assert_eq!(row["waitingOnPrMonitors"][0]["prNumber"], 42);
+}
+
+/// SQL events are attributed to this read's span (the production profiler's
+/// signal). Transcript bodies are deliberately malformed so hydration fails;
+/// both small and large reads must still use the persisted previews only.
+#[intent_test_macros::daemon_test]
+async fn get_subscriptions_projection_cost_is_batched_and_preview_only() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let first = create_agent(&svc, &ws, "Participant").await;
+    let mut template = svc.store().get_agent_session_summary(&first).await.unwrap();
+    template.completion_report = Some("r".repeat(8192));
+    template.initial_message = Some("initial".repeat(10000));
+    template.system_prompt = Some("prompt".repeat(10000));
+    template.context_references = Some(json!([{"body":"context".repeat(10000)}]));
+    template.metadata = Some(json!({"pendingProposals":[{"body":"proposal".repeat(10000)}]}));
+    svc.store()
+        .update_agent_session(&ws, &template)
+        .await
+        .unwrap();
+    svc.store()
+        .append_agent_message(
+            &first,
+            "assistant",
+            &json!([{"type":"text","text":"Persisted preview"}]),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE agent_message SET content = 'not-json' WHERE agent_id = ?")
+        .bind(&first.0)
+        .execute(svc.store().write_pool())
+        .await
+        .unwrap();
+    let group = svc.get_or_create_delegation_group(&ws, &parent);
+    svc.enroll_child_in_group(&group, &first);
+    svc.agent_get_subscriptions_op(ws.clone(), parent.clone())
+        .await
+        .unwrap();
+    // Initialize every slot: a single warm-up read can leave lazy connection
+    // PRAGMAs inside the counted span while earlier connections return to the
+    // pool. Keep all but one reserved to exercise the final initialized slot.
+    let pool = svc.store().read_pool();
+    let mut reserved = Vec::new();
+    for _ in 0..pool.options().get_max_connections() {
+        reserved.push(pool.acquire().await.unwrap());
+    }
+    drop(reserved.pop());
+    let (one, one_count) = crate::test_tracing::count_sqlx_statements(
+        svc.agent_get_subscriptions_op(ws.clone(), parent.clone()),
+    )
+    .await;
+    let one = one.unwrap();
+    assert_eq!(one["agents"][0]["lastAgentResponse"], "Persisted preview");
+    assert_eq!(
+        one_count, 4,
+        "status + session/preview + hook + PR projections"
+    );
+    drop(reserved);
+    // An unrelated corrupt row must never be decoded by this targeted read.
+    let unrelated = create_agent(&svc, &ws, "Unrelated").await;
+    sqlx::query("UPDATE agent_session SET metadata = 'not-json' WHERE id = ?")
+        .bind(&unrelated.0)
+        .execute(svc.store().write_pool())
+        .await
+        .unwrap();
+    // Enough participants to cross the bounded query chunk size.
+    for i in 1..501 {
+        template.id = AgentId::from(format!("agent-batch-{i:04}"));
+        svc.store().insert_agent_session(&template).await.unwrap();
+        svc.enroll_child_in_group(&group, &template.id);
+        if i == 29 {
+            let (many, count) = crate::test_tracing::count_sqlx_statements(
+                svc.agent_get_subscriptions_op(ws.clone(), parent.clone()),
+            )
+            .await;
+            assert_eq!(many.unwrap()["agents"].as_array().unwrap().len(), 30);
+            assert_eq!(count, one_count, "30 participants cost the same as one");
+        }
+    }
+    let preview = json!(["p".repeat(8192)]).to_string();
+    sqlx::query("UPDATE agent_session SET last_assistant_preview = ?, last_user_preview = ?, attention_request_reason = ?, name = ?, model = ? WHERE id LIKE 'agent-batch-%'")
+        .bind(&preview).bind(&preview).bind("reason".repeat(2000)).bind("name".repeat(200)).bind("model".repeat(200))
+        .execute(svc.store().write_pool()).await.unwrap();
+    let (many, count) =
+        crate::test_tracing::count_sqlx_statements(svc.agent_get_subscriptions_op(ws, parent))
+            .await;
+    let many = many.unwrap();
+    assert_eq!(many["agents"].as_array().unwrap().len(), 501);
+    assert_eq!(
+        count, 7,
+        "two 500-ID projection chunks plus one status read"
+    );
+    for row in many["agents"].as_array().unwrap() {
+        assert!(row.to_string().len() <= intent_core::AGENT_LIST_ROW_BUDGET_BYTES);
+        for key in [
+            "messages",
+            "harnessFeatures",
+            "contextReferences",
+            "fileBlocks",
+            "effortLevels",
+            "stats",
+        ] {
+            assert!(row.get(key).is_none(), "detail-only {key}");
+        }
+        assert!(row["metadata"].get("initialMessage").is_none());
+        assert!(row["metadata"].get("pendingProposals").is_none());
+    }
+    assert!(
+        many["agents"].as_array().unwrap().iter().any(|row| {
+            row["id"] != first.0
+                && row["lastAgentResponse"]
+                    .as_str()
+                    .is_some_and(|text| text.len() < intent_core::AGENT_LIST_PREVIEW_BUDGET_BYTES)
+        }),
+        "large participant array must tighten the default preview cap"
+    );
+    assert!(many["agents"].to_string().len() <= intent_core::AGENT_LIST_FRAME_BUDGET_BYTES);
 }
 
 /// After an immediate (default) delegate, `getSubscriptions(parent)` lists the
@@ -33658,6 +33939,13 @@ async fn requeued_after_failure_marker_surfaces_in_queue_snapshot() {
         hold_kind: None,
         hold_until: None,
         child_agent_id: None,
+        merged_submission_ids: Vec::new(),
+        edit_appended: String::new(),
+        edit_prepended: String::new(),
+        editing_message_id: None,
+        latest_human_submission_at: None,
+        provisional: false,
+        submission_order: 0,
     };
 
     svc.requeue_front(&id, queued);
@@ -34236,6 +34524,13 @@ async fn turn_id_fresh_enqueue_identity_and_restart_round_trip() {
             hold_kind: None,
             hold_until: None,
             child_agent_id: None,
+            merged_submission_ids: Vec::new(),
+            edit_appended: String::new(),
+            edit_prepended: String::new(),
+            editing_message_id: None,
+            latest_human_submission_at: None,
+            provisional: false,
+            submission_order: 0,
         },
     );
     svc.publish_queue_updated(&id).await;
@@ -34686,6 +34981,13 @@ fn parked_entry(id: &str, content: &str) -> crate::agent_ops::QueuedMessage {
         hold_kind: None,
         hold_until: None,
         child_agent_id: None,
+        merged_submission_ids: Vec::new(),
+        edit_appended: String::new(),
+        edit_prepended: String::new(),
+        editing_message_id: None,
+        latest_human_submission_at: None,
+        provisional: false,
+        submission_order: 0,
     }
 }
 
@@ -47630,4 +47932,66 @@ async fn shutdown_claimed_resume_at_barrier(inside_send: bool) {
         1,
         "retry does not duplicate the interruption marker"
     );
+}
+
+#[tokio::test]
+async fn send_queued_message_now_store_only_processing_requires_successful_persistence() {
+    for outcome in ["new", "persisted", "failure"] {
+        let (_tmp, svc, ws, _bus) = setup_with_bus().await;
+        let agent = create_agent(&svc, &ws, "Processing").await;
+        let queued = svc
+            .agent_queue_message_op(
+                agent.clone(),
+                "queued text".into(),
+                Some(json!([{"type":"image","data":"payload","mimeType":"image/png"}])),
+                Some(json!([{"type":"file","attachmentId":"att-payload","mimeType":"text/plain","fileName":"payload.txt"}])),
+                Some(json!({"type":"question_answers","answeredQuestionsMessageId":"question"})),
+            )
+            .await
+            .unwrap();
+        let entry_id = queued["queuedMessage"]["id"].as_str().unwrap().to_string();
+        if outcome != "new" {
+            svc.store
+                .append_agent_message_with_id(
+                    &agent,
+                    &entry_id,
+                    "user",
+                    &json!([{"type":"text","text":"existing"}]),
+                    None,
+                    &now_iso(),
+                )
+                .await
+                .unwrap();
+        }
+        if outcome == "persisted" {
+            svc.agent_queues.lock().unwrap().get_mut(&agent).unwrap()[0].persisted = true;
+        }
+        let result = svc
+            .agent_send_queued_message_now_op(agent.clone(), entry_id.clone())
+            .await;
+        assert_eq!(result.is_ok(), outcome != "failure");
+        let events: Vec<_> = svc
+            .store
+            .query_events(&intent_store::EventQuery::default())
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event_type == intent_core::events::AGENT_QUEUE_PROCESSING)
+            .collect();
+        if outcome == "failure" {
+            assert!(events.is_empty());
+            assert_eq!(svc.queue_snapshot(&agent)[0]["id"], entry_id);
+        } else {
+            assert_eq!(events.len(), 1);
+            let row = &events[0].data["queuedMessages"][0];
+            for field in ["id", "turnId", "content", "imageBlocks", "fileBlocks"] {
+                assert_eq!(row[field], queued["queuedMessage"][field], "{field}");
+            }
+            assert_eq!(
+                row["messageMetadata"]["answeredQuestionsMessageId"],
+                "question"
+            );
+            assert!(svc.queue_snapshot(&agent).is_empty());
+        }
+    }
 }
