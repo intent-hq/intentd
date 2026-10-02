@@ -61,7 +61,8 @@ const ENV_END_SENTINEL: &str = "__INTENT_ENV_E__";
 /// CLI (or its backing SDK) reads it for authentication/configuration —
 /// exact names for cross-provider credentials (Anthropic/OpenAI/xAI keys,
 /// AWS credentials for Bedrock, Hugging Face tokens), one prefix per
-/// provider CLI's own env namespace. Keep both in sync with the provider
+/// provider CLI's own env namespace. Codex/Claude use the audited exact names
+/// in `cli_env` instead of namespace-wide forwarding. Keep in sync with the provider
 /// catalog (`intent-providers`) as providers are added or removed.
 #[cfg(unix)]
 const CREDENTIAL_ENV_EXACT: &[&str] = &[
@@ -80,21 +81,14 @@ const CREDENTIAL_ENV_EXACT: &[&str] = &[
 /// Credential env vars captured by name prefix. See the inclusion criterion
 /// on [`CREDENTIAL_ENV_EXACT`].
 #[cfg(unix)]
-const CREDENTIAL_ENV_PREFIXES: &[&str] = &[
-    "AUGGIE_",
-    "CLAUDE_",
-    "CODEX_",
-    "OPENCODE_",
-    "DROID_",
-    "CORTEX_",
-    "GROK_",
-    "PI_",
-];
+const CREDENTIAL_ENV_PREFIXES: &[&str] =
+    &["AUGGIE_", "OPENCODE_", "DROID_", "CORTEX_", "GROK_", "PI_"];
 
 /// Whether an env var name is on the credential allow-list.
 #[cfg(unix)]
 fn is_credential_env_allow_listed(name: &str) -> bool {
-    CREDENTIAL_ENV_EXACT.contains(&name)
+    crate::cli_env::is_installed_cli_env(name)
+        || CREDENTIAL_ENV_EXACT.contains(&name)
         || CREDENTIAL_ENV_PREFIXES
             .iter()
             .any(|prefix| name.starts_with(prefix))
@@ -534,15 +528,29 @@ fn enriched_tool_dirs_impl<F>(home: Option<&std::path::Path>, login_dirs_fn: F) 
 where
     F: FnOnce() -> &'static [PathBuf],
 {
+    enriched_tool_dirs_for(home, login_dirs_fn, cfg!(windows))
+}
+
+fn enriched_tool_dirs_for<F>(
+    home: Option<&std::path::Path>,
+    login_dirs_fn: F,
+    is_windows: bool,
+) -> Vec<PathBuf>
+where
+    F: FnOnce() -> &'static [PathBuf],
+{
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
 
-    if cfg!(windows) {
+    if is_windows {
         if let Some(appdata) = std::env::var_os("APPDATA") {
             push_dir(&mut dirs, &mut seen, PathBuf::from(&appdata).join("npm"));
         }
         if let Some(home) = home {
             push_dir(&mut dirs, &mut seen, home.join(".npm-global"));
+            // Claude's native Windows installer and Volta's Windows shims.
+            push_dir(&mut dirs, &mut seen, home.join(".local").join("bin"));
+            push_dir(&mut dirs, &mut seen, home.join(".volta").join("bin"));
         }
     } else {
         // Add common Unix/macOS bin directories
@@ -872,6 +880,16 @@ mod tests {
     }
 
     #[test]
+    fn installed_cli_known_user_directories_include_windows_native_installs() {
+        let home = unique_temp_dir("cli-tool-dirs");
+        for windows in [false, true] {
+            let dirs = enriched_tool_dirs_for(Some(home.path()), || &[], windows);
+            assert!(dirs.contains(&home.path().join(".local").join("bin")));
+            assert!(dirs.contains(&home.path().join(".volta").join("bin")));
+        }
+    }
+
+    #[test]
     #[cfg(not(windows))]
     fn enriched_tool_dirs_scans_every_nvm_node_version_newest_first() {
         let unique = format!(
@@ -1105,8 +1123,44 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn installed_cli_environment_capture_includes_config_endpoints_and_network() {
+        for key in [
+            "CODEX_HOME",
+            "CODEX_CA_CERTIFICATE",
+            "OPENAI_BASE_URL",
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CONFIG_DIR",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "AWS_CONFIG_FILE",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "NO_PROXY",
+            "SSL_CERT_FILE",
+            "NODE_EXTRA_CA_CERTS",
+        ] {
+            assert!(is_credential_env_allow_listed(key), "missing {key}");
+        }
+        for key in [
+            "CODEX_PATH",
+            "CLAUDE_CODE_EXECUTABLE",
+            "CODEX_CONFIG",
+            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS",
+            "NODE_OPTIONS",
+            "UNRELATED_SECRET",
+        ] {
+            assert!(
+                !is_credential_env_allow_listed(key),
+                "must not capture {key}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn parse_credential_env_filters_and_tolerates_newlines() {
-        let payload = "ANTHROPIC_API_KEY=exact-value\0AUGGIE_SESSION=prefix-value\0RANDOM_SECRET=dropped\0MULTI=a\nb\0CODEX_KEY=line1\nline2\0";
+        let payload = "ANTHROPIC_API_KEY=exact-value\0AUGGIE_SESSION=prefix-value\0RANDOM_SECRET=dropped\0MULTI=a\nb\0OPENAI_API_KEY=line1\nline2\0";
         let map = parse_credential_env(payload);
         assert_eq!(map.len(), 3);
         assert_eq!(
@@ -1118,7 +1172,7 @@ mod tests {
             Some("prefix-value")
         );
         assert_eq!(
-            map.get("CODEX_KEY").map(String::as_str),
+            map.get("OPENAI_API_KEY").map(String::as_str),
             Some("line1\nline2")
         );
         assert!(!map.contains_key("RANDOM_SECRET"));
@@ -1182,13 +1236,16 @@ mod tests {
         // re-anchor the PATH extraction into the env payload.
         let capture = write_and_capture(
             &fake_shell,
-            "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/real/bin__INTENT_PATH_E__'\n  printf '__INTENT_ENV_S__'\n  printf 'CODEX_EVIL=/fake/bin__INTENT_PATH_E__\\0'\n  printf '__INTENT_ENV_E__'\nfi\n",
+            "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/real/bin__INTENT_PATH_E__'\n  printf '__INTENT_ENV_S__'\n  printf 'OPENAI_BASE_URL=/fake/bin__INTENT_PATH_E__\\0'\n  printf '__INTENT_ENV_E__'\nfi\n",
         );
         fs::remove_file(&fake_shell).ok();
 
         assert_eq!(capture.dirs, vec![PathBuf::from("/real/bin")]);
         assert_eq!(
-            capture.credential_env.get("CODEX_EVIL").map(String::as_str),
+            capture
+                .credential_env
+                .get("OPENAI_BASE_URL")
+                .map(String::as_str),
             Some("/fake/bin__INTENT_PATH_E__")
         );
     }
@@ -1209,14 +1266,14 @@ mod tests {
         // Value contains a newline; NUL separation must keep it intact
         let capture = write_and_capture(
             &fake_shell,
-            "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/env/bin__INTENT_PATH_E__'\n  printf '__INTENT_ENV_S__'\n  printf 'CODEX_MULTI=line1\\nline2\\0HF_TOKEN=test-hf\\0'\n  printf '__INTENT_ENV_E__'\nfi\n",
+            "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/env/bin__INTENT_PATH_E__'\n  printf '__INTENT_ENV_S__'\n  printf 'OPENAI_API_KEY=line1\\nline2\\0HF_TOKEN=test-hf\\0'\n  printf '__INTENT_ENV_E__'\nfi\n",
         );
         fs::remove_file(&fake_shell).ok();
 
         assert_eq!(
             capture
                 .credential_env
-                .get("CODEX_MULTI")
+                .get("OPENAI_API_KEY")
                 .map(String::as_str),
             Some("line1\nline2")
         );

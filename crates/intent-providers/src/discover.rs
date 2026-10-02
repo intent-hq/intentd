@@ -892,7 +892,11 @@ fn find_in_dirs(dirs: &[PathBuf], command: &str) -> Option<PathBuf> {
 /// [`find_in_dirs`] parametrized on the platform (test seam — Windows CI is
 /// disabled, so the Windows candidate/executability arm is unit-tested on
 /// POSIX).
-fn find_in_dirs_for(dirs: &[PathBuf], command: &str, is_windows: bool) -> Option<PathBuf> {
+pub(crate) fn find_in_dirs_for(
+    dirs: &[PathBuf],
+    command: &str,
+    is_windows: bool,
+) -> Option<PathBuf> {
     let candidates = name_candidates_for(command, is_windows);
     for dir in dirs {
         for candidate in &candidates {
