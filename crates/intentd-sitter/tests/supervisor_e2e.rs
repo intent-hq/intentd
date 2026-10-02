@@ -2894,6 +2894,65 @@ fn restart_command_respawns_state_version_without_exiting_sitter() {
 }
 
 #[test]
+fn duplicate_serve_preserves_live_sitter_discovery() {
+    let _serial = SERVE_LOOP_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    // Model the daemon's exclusive data-directory claim. A duplicate child
+    // exits unsuccessfully while the original remains alive.
+    let script = long_running_script("0.1.0").replacen(
+        "#!/bin/sh\n",
+        "#!/bin/sh\nmkdir \"$INTENTD_DATA_DIR/daemon-owner\" 2>/dev/null || exit 1\n",
+        1,
+    );
+    preinstall(&paths, "0.1.0", &script);
+    let base_url = dead_url();
+    let mut owner = spawn_guarded(
+        sitter_command(dir.path(), &base_url)
+            .env(CHECK_MIN_ENV, "3600000")
+            .env(CHECK_MAX_ENV, "3600001")
+            .arg("serve"),
+    );
+    wait_until("original daemon to start", Duration::from_secs(15), || {
+        read_or_empty(&daemon_log_path(dir.path())).contains("start 0.1.0")
+    });
+    assert_eq!(
+        read_or_empty(&paths.pid_path).trim(),
+        owner.id().to_string()
+    );
+    let state_before = fs::read(&paths.state_path).unwrap();
+    let mut duplicate = spawn_guarded(
+        sitter_command(dir.path(), &base_url)
+            .env(GIVE_UP_AFTER_ENV, "1")
+            .arg("serve"),
+    );
+    let status = wait_exit(&mut duplicate, Duration::from_secs(15));
+    assert!(owner.try_wait().unwrap().is_none());
+    assert_eq!(
+        read_or_empty(&paths.pid_path).trim(),
+        owner.id().to_string(),
+        "a failed duplicate start must preserve discovery of the live owner"
+    );
+    assert_eq!(status.code(), Some(1), "duplicate must fail immediately");
+    assert!(read_or_empty(&stderr_path(dir.path())).contains("cannot claim serve ownership"));
+    assert_eq!(
+        fs::read(&paths.state_path).unwrap(),
+        state_before,
+        "duplicate must not perform a startup update check"
+    );
+    assert_eq!(
+        intentd_sitter::supervisor::read_live_pid(&paths.pid_path),
+        Some(Pid::from_raw(owner.id().cast_signed()))
+    );
+    send_signal(&owner, "TERM");
+    assert_eq!(
+        wait_exit(&mut owner, Duration::from_secs(10)).code(),
+        Some(0)
+    );
+    assert!(!paths.pid_path.exists());
+}
+
+#[test]
 fn restart_without_live_sitter_or_with_stale_pidfile_fails() {
     let dir = tempfile::tempdir().unwrap();
     let paths = SitterPaths::from_data_dir(dir.path());
