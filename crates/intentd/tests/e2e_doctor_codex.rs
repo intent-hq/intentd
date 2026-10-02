@@ -877,8 +877,9 @@ fn macos_catalog_rejection_precedes_npm_authentication_and_probe_state() {
         assert!(!stdout.contains("catalog: advertised"));
         assert!(!stdout.contains("authentication is unavailable"));
         assert!(!stdout.contains("fresh catalogs: checking"));
-        // Discovery rejects the non-regular auth input before version execution.
-        assert!(fixture.events().is_empty());
+        // Unsupported catalogs reject before reading auth or setting up probes.
+        // Ordinary installed-runtime version measurement remains available.
+        fixture.assert_version_only();
         fixture.assert_clean();
         println!("{stdout}");
     }
