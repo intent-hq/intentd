@@ -3435,7 +3435,7 @@ impl AgentManager {
             let mut prepared = intent_acp::spawn::prepare_provider(&spawn_opts)
                 .map_err(|e| Error::Internal(format!("prepare provider failed: {e}")))?;
             context.apply(&mut prepared.command);
-            let prepared = tokio::spawn(async move {
+            let prepared = intent_core::caller::spawn_with_current_caller(async move {
                 let prepared = Arc::new(prepared);
                 let dependency =
                     crate::codex_diagnostics::process::ProbeDependency::hold(prepared.clone());

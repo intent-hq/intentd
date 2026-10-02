@@ -577,7 +577,12 @@ async fn installed_cli_preparation_retains_actual_directories_on_owner_failure()
         )
         .prepare_with_context(context)
         .await;
-        assert_eq!(result.is_err(), fail);
+        assert_eq!(
+            result.is_err(),
+            fail,
+            "owner failure={fail}: {:?}",
+            result.as_ref().err()
+        );
         let profile =
             PathBuf::from(std::fs::read_to_string(root.path().join("version-profile")).unwrap());
         let cwd = PathBuf::from(std::fs::read_to_string(root.path().join("version-cwd")).unwrap());

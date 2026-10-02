@@ -228,9 +228,10 @@ impl InstalledContext {
         }
         // The task owns the process and its resource leases even if its caller
         // stops awaiting. Only confirmed cleanup releases the actual resources.
-        let bytes = tokio::spawn(version_output(command, dependency))
-            .await
-            .map_err(|_| "installed CLI version owner failed")??;
+        let bytes =
+            intent_core::caller::spawn_with_current_caller(version_output(command, dependency))
+                .await
+                .map_err(|_| "installed CLI version owner failed")??;
         let version = std::str::from_utf8(&bytes)
             .ok()
             .map(str::trim)

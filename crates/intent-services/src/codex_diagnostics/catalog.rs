@@ -446,7 +446,7 @@ impl CodexLaunch {
         };
         // Keep the isolated profile alive through bounded version cleanup even
         // when the outer diagnostic deadline cancels its caller.
-        tokio::spawn(async move {
+        intent_core::caller::spawn_with_current_caller(async move {
             let home = std::sync::Arc::new(home);
             let dependency = ProbeDependency::hold(home.clone());
             let (_, version) = context

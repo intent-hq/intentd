@@ -292,7 +292,7 @@ impl AcpAdapterCommand {
         // Own the profile until bounded version cleanup finishes, even if the
         // caller cancels while waiting for the version child.
         self.installed = Some(
-            tokio::spawn(async move {
+            intent_core::caller::spawn_with_current_caller(async move {
                 let dependency = crate::codex_diagnostics::process::ProbeDependency::hold((
                     npx_dir.clone(),
                     codex_home.clone(),
@@ -332,7 +332,7 @@ impl AcpAdapterCommand {
         };
         let mut command = self.command_in(&p.cwd);
         p.apply(&mut command);
-        tokio::spawn(async move {
+        intent_core::caller::spawn_with_current_caller(async move {
             p.context
                 .still_current(
                     &p.identity,
@@ -727,7 +727,7 @@ pub(crate) async fn spawn_adapter_in(
             // Validate the original runtime again at the actual launch boundary.
             let mut command = cmd.command_in(&selected.cwd);
             selected.apply(&mut command);
-            tokio::spawn(async move {
+            intent_core::caller::spawn_with_current_caller(async move {
                 let (identity, _) = selected
                     .context
                     .observe_with_dependency(
