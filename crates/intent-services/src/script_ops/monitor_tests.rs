@@ -509,6 +509,40 @@ async fn monitor_restart_cancel_before_spawn_does_not_reuse_predecessor_timing()
 }
 
 #[intent_test_macros::daemon_test]
+async fn monitor_restart_spawn_failure_does_not_reuse_predecessor_timing() {
+    let h = harness().await;
+    let owner = monitor_owner(&h, "owner").await;
+    let id = create_simple(&h, "controlled", "read value", ScriptMode::Command).await;
+    let mut sub = subscribe(&h);
+    let prior = h.services.script_start(h.ws.clone(), id.clone()).await.unwrap();
+    await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+    let park = Arc::new(SupervisePark::default());
+    let mut mgr = h.services.script_manager();
+    mgr.parks.before_spawn = Some(park.clone());
+    let successor = mgr.restart(&h.ws, &id).await.unwrap();
+    assert_ne!(successor["runId"], prior["runId"]);
+    tokio::time::timeout(LIVENESS, park.entered.notified()).await.unwrap();
+    let row = mgr.monitor(&h.ws, &owner, &id, json!({"ttlMs":60000})).await.unwrap()["monitor"].clone();
+    let mid = row["monitorId"].as_str().unwrap();
+    // Closing the isolated PTY host forces spawn to fail before a process exists.
+    h.services.pty().kill_all_sync();
+    park.release.notify_one();
+    let result = tokio::time::timeout(LIVENESS, async {
+        loop {
+            let row = h.services.store.script_monitor(&h.ws, mid).await.unwrap();
+            if row.state != "active" {
+                break serde_json::to_value(row).unwrap();
+            }
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    assert_eq!(result["runId"], successor["runId"]);
+    assert_eq!(result["result"]["outcome"], "failed");
+    assert!(result["result"].get("startedAt").is_none());
+    assert!(result["result"].get("exitCode").is_none());
+}
+
+#[intent_test_macros::daemon_test]
 async fn monitor_recovery_prior_result_deadline_interruption_and_cancel_intent() {
     for scenario in ["result", "deadline", "interrupted", "cancel-intent"] {
         let h = harness().await;

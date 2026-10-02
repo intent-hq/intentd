@@ -387,8 +387,9 @@ impl DetachedChild {
             if let Some(services) = services {
                 services.hold_periodic_commit("physical-cleanup").await;
             }
-            kill_child_tree(child, spawn_pid).await;
-            launch_dir.remove();
+            if kill_child_tree(child, spawn_pid).await {
+                launch_dir.remove();
+            }
         }))
     }
 

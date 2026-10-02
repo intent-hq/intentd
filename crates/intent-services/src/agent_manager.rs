@@ -10418,7 +10418,7 @@ impl Drop for RetainUnlessSwept {
 /// into their OWN process groups survive the `killpg`, so they are snapshotted
 /// before the kill and swept afterwards (`intent_acp::descendant_sweep`).
 #[cfg(unix)]
-async fn kill_child_tree(mut child: Child, spawn_pid: Option<u32>) {
+async fn kill_child_tree(mut child: Child, spawn_pid: Option<u32>) -> bool {
     use intent_acp::{descendant_pids, sweep_escaped_descendants};
     use nix::sys::signal::{killpg, Signal};
     use nix::unistd::Pid;
@@ -10429,7 +10429,10 @@ async fn kill_child_tree(mut child: Child, spawn_pid: Option<u32>) {
     // and same-group descendants still need the killpg sweep.
     let Some(pid) = child.id().or(spawn_pid) else {
         let _ = child.start_kill();
-        return;
+        return matches!(
+            tokio::time::timeout(KILL_SWEEP_REAP_GRACE, child.wait()).await,
+            Ok(Ok(_))
+        );
     };
     let descendants = descendant_pids(pid).await;
     let pgid = Pid::from_raw(pid.cast_signed());
@@ -10439,13 +10442,57 @@ async fn kill_child_tree(mut child: Child, spawn_pid: Option<u32>) {
     let _ = tokio::time::timeout(PROCESS_GROUP_TERM_GRACE, child.wait()).await;
     let _ = killpg(pgid, Signal::SIGKILL);
     sweep_escaped_descendants(&descendants).await;
+    confirm_tree_exit(&mut child, pgid, &descendants, KILL_SWEEP_REAP_GRACE).await
+}
+
+/// Observe the existing sweep's completion under one fixed deadline. These
+/// probes never signal: a recycled pid/group can only cause conservative
+/// retention of the launch directory, never kill an unrelated process.
+#[cfg(unix)]
+async fn confirm_tree_exit(
+    child: &mut Child,
+    pgid: nix::unistd::Pid,
+    descendants: &[i32],
+    grace: Duration,
+) -> bool {
+    use nix::errno::Errno;
+    use nix::sys::signal::{kill, killpg};
+    use nix::unistd::Pid;
+
+    let deadline = tokio::time::Instant::now() + grace;
+    if !matches!(
+        tokio::time::timeout_at(deadline, child.wait()).await,
+        Ok(Ok(_))
+    ) {
+        return false;
+    }
+    loop {
+        if killpg(pgid, None) == Err(Errno::ESRCH)
+            && descendants
+                .iter()
+                .all(|&pid| pid > 1 && kill(Pid::from_raw(pid), None) == Err(Errno::ESRCH))
+        {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep_until(
+            deadline.min(tokio::time::Instant::now() + Duration::from_millis(10)),
+        )
+        .await;
+    }
 }
 
 /// Non-unix fallback: no process groups, so fall back to killing the direct
 /// child (`kill_on_drop` remains the safety net on drop).
 #[cfg(not(unix))]
-async fn kill_child_tree(mut child: Child, _spawn_pid: Option<u32>) {
+async fn kill_child_tree(mut child: Child, _spawn_pid: Option<u32>) -> bool {
     let _ = child.start_kill();
+    matches!(
+        tokio::time::timeout(Duration::from_millis(500), child.wait()).await,
+        Ok(Ok(_))
+    )
 }
 
 #[expect(clippy::similar_names)] // pid/pgid are the POSIX terms
@@ -10540,6 +10587,58 @@ mod kill_sweep_tests {
     //! sequential ones.
 
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn exit_acknowledgement_deadline_never_signals_a_live_group() {
+        use nix::sys::signal::killpg;
+        use nix::unistd::Pid;
+
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pgid = Pid::from_raw(child.id().unwrap().cast_signed());
+        let before = tokio::time::Instant::now();
+        let grace = Duration::from_millis(50);
+        assert!(!confirm_tree_exit(&mut child, pgid, &[], grace).await);
+        assert_eq!(before.elapsed(), grace);
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(killpg(pgid, None).is_ok(), "observation must not signal");
+        child.kill().await.unwrap();
+        assert!(confirm_tree_exit(&mut child, pgid, &[], grace).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exit_acknowledgement_bounds_descendant_probe_after_reaped_leader() {
+        use nix::sys::signal::killpg;
+        use nix::unistd::Pid;
+
+        let mut leader = tokio::process::Command::new("true")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = Pid::from_raw(leader.id().unwrap().cast_signed());
+        leader.wait().await.unwrap();
+        let mut other = tokio::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let other_pid = other.id().unwrap().cast_signed();
+        let before = tokio::time::Instant::now();
+        let grace = Duration::from_millis(50);
+        // A still-live snapshot pid (including a recycled one) prevents a
+        // positive acknowledgement but must never receive another signal.
+        assert!(!confirm_tree_exit(&mut leader, pgid, &[other_pid], grace).await);
+        assert_eq!(before.elapsed(), grace);
+        assert!(other.try_wait().unwrap().is_none());
+        assert!(killpg(Pid::from_raw(other_pid), None).is_ok());
+        other.kill().await.unwrap();
+        assert!(confirm_tree_exit(&mut leader, pgid, &[other_pid], grace).await);
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn slow_children_tear_down_in_one_shared_grace_window() {

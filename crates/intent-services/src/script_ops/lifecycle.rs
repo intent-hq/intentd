@@ -49,6 +49,10 @@ impl ScriptManager {
         self.store.admit_script_run(ws, id, &token).await?;
         let mut scripts = self.scripts.lock().unwrap();
         let m = scripts.get_mut(&(ws.clone(), id.to_owned())).unwrap();
+        // A fresh logical run has not spawned yet, including manual restarts.
+        // Automatic service attempts retain the logical run and bypass admission.
+        m.state.started_at = None;
+        m.state.stopped_at = None;
         m.state.run_id = Some(token.clone());
         m.run_id = Some(token);
         m.run_generation = (!restart).then_some(m.generation);
