@@ -2788,7 +2788,6 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
-        // `git.diff` is accepted as an alias for the wire-canonical `git.diffs`.
         "git.diffs" => {
             let ws = require_ws_note(params)?;
             // §5.6 extension: `paths` narrows the diff to exactly those
@@ -2827,7 +2826,6 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
-        // `git.log` is accepted as an alias for the wire-canonical `git.commits`.
         "git.commits" => {
             let ws = require_ws_note(params)?;
             // §5.5 page params arrive nested under `page` ({ continuationToken,
