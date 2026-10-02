@@ -797,9 +797,8 @@ async fn create_agent_with_optional_name(
 }
 
 /// A name-less create carrying a specialist derives the agent name from the
-/// specialist's frontmatter display name and counts it as explicitly set
-/// (matches the desktop FE, which resolves the display name client-side and
-/// sends it as an explicit `name`).
+/// specialist's frontmatter display name and keeps it eligible for a
+/// first-message task-specific rename.
 #[tokio::test]
 async fn omitted_name_derives_from_specialist_display_name() {
     let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
@@ -818,7 +817,7 @@ async fn omitted_name_derives_from_specialist_display_name() {
     )
     .await;
     assert_eq!(agent["name"], "Fancy Display Name");
-    assert_eq!(agent["nameExplicitlySet"], true);
+    assert_eq!(agent["nameExplicitlySet"], false);
 }
 
 /// The embedded bundled `spec-writer` resolves with zero local files: a
@@ -835,7 +834,7 @@ async fn omitted_name_derives_from_embedded_spec_writer() {
     )
     .await;
     assert_eq!(agent["name"], "Coordinator");
-    assert_eq!(agent["nameExplicitlySet"], true);
+    assert_eq!(agent["nameExplicitlySet"], false);
 }
 
 /// An explicit client-supplied name beats the specialist display name.

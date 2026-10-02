@@ -13,6 +13,9 @@
 
 mod common;
 
+#[path = "e2e_wss_agent_lifecycle/creation_preferences.rs"]
+mod creation_preferences;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -11226,8 +11229,8 @@ async fn workspace_create_no_prompt_creates_agent_over_wss() {
 /// `workspace.create` with a name-less `initialAgent` carrying a specialist
 /// derives the agent's name from the specialist's resolved display name
 /// (frontmatter `name` — "Coordinator" for the embedded `spec-writer`) and
-/// marks it explicitly set, so the opening-turn `setAgentName`
-/// (`skipIfExplicitlySet: true`) cannot rename it away.
+/// leaves it generated, so the opening-turn `setAgentName` can give it a
+/// task-specific name.
 #[intent_test_macros::daemon_test]
 async fn workspace_create_nameless_initial_agent_derives_specialist_name_over_wss() {
     let Some(script) = gate("WSS workspace.create specialist-derived initial-agent name E2E")
@@ -11278,14 +11281,14 @@ async fn workspace_create_nameless_initial_agent_derives_specialist_name_over_ws
         "name derived from spec-writer's display name: {created}"
     );
     assert_eq!(
-        created["initialAgent"]["nameExplicitlySet"], true,
-        "specialist-derived default counts as explicitly set: {created}"
+        created["initialAgent"]["nameExplicitlySet"], false,
+        "specialist-derived default remains a generated placeholder: {created}"
     );
 
     // The derived name is persisted, not just projected into the create result.
     let got = wss_rpc(&mut rpc, 11, "agent.get", json!({ "agentId": agent_id })).await;
     assert_eq!(got["agent"]["name"], "Coordinator");
-    assert_eq!(got["agent"]["nameExplicitlySet"], true);
+    assert_eq!(got["agent"]["nameExplicitlySet"], false);
 }
 
 /// When a delegated agent calls `report_to_parent`, the report persists and is
@@ -19155,3 +19158,122 @@ mod member_tools;
 
 #[path = "e2e_wss_agent_lifecycle/member_transport.rs"]
 mod member_transport;
+
+/// Generated specialist names receive the first-user-message naming hint over
+/// WSS even in a titled workspace. Explicit and task-derived names are retained.
+#[intent_test_macros::daemon_test]
+async fn specialist_placeholder_first_message_naming_over_wss() {
+    let Some(script) = gate("specialist placeholder naming E2E") else {
+        return;
+    };
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path();
+    let ws_id = seed_workspace_only(data_dir).await;
+    let prompt_log = data_dir.join("naming-prompts.jsonl");
+    let prompt_log_str = prompt_log.to_string_lossy().into_owned();
+    let behavior = json!({"response": "Naming test response"}).to_string();
+    let env = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+        ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
+        ("MOCK_AGENT_PROMPT_LOG", prompt_log_str.as_str()),
+    ];
+    let _daemon = Daemon {
+        child: spawn_serve(data_dir, "both", &env),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let mut sub = connect_ws(port, cfg).await;
+    let subscribed = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({
+            "eventTypes": ["agent:*"], "workspaceId": ws_id,
+        }),
+    )
+    .await;
+    assert!(subscribed["subscriptionId"].is_string());
+
+    for (index, (name, explicit, needs_name)) in [
+        (None, false, true),
+        (Some("Implementor 2"), false, true),
+        (Some("Implementor"), true, false),
+        (Some("Fix the sidebar"), false, false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut params = json!({
+            "workspaceId": ws_id, "provider": "mock", "model": "default",
+            "specialistId": "implementor",
+        });
+        if let Some(name) = name {
+            params["name"] = json!(name);
+            params["nameExplicitlySet"] = json!(explicit);
+        }
+        let created = wss_rpc(&mut rpc, 10, "agent.create", params).await;
+        let agent_id = created["agent"]["id"].as_str().unwrap();
+        assert_eq!(created["agent"]["name"], name.unwrap_or("Implementor"));
+        assert_eq!(created["agent"]["nameExplicitlySet"], explicit);
+
+        for turn in 0..2 {
+            let content = format!("Naming case {index} turn {turn}: fix sidebar selection");
+            let sent = wss_rpc(
+                &mut rpc,
+                11,
+                "agent.sendMessage",
+                json!({
+                    "workspaceId": ws_id, "agentId": agent_id, "content": content,
+                }),
+            )
+            .await;
+            assert_eq!(sent["success"], true);
+            timeout(Duration::from_secs(30), async {
+                loop {
+                    let frame = wss_event(&mut sub, 30).await;
+                    let event = &frame["params"]["event"];
+                    if event["type"] == "agent:status-changed"
+                        && event["data"]["agentId"] == agent_id
+                        && event["data"]["status"] == "idle"
+                    {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("agent turn settled");
+            let log = std::fs::read_to_string(&prompt_log).expect("provider prompt log");
+            let prompts: Vec<Value> = log
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let text = prompts
+                .iter()
+                .rev()
+                .filter_map(|prompt| prompt["text"].as_str())
+                .find(|text| text.contains(&content))
+                .expect("user message reached provider");
+            assert_eq!(
+                text.contains("This agent still has a generated name"),
+                needs_name && turn == 0,
+                "case {index} turn {turn}: {text}"
+            );
+            assert!(!text.contains("This workspace needs a title"));
+            if needs_name && turn == 0 {
+                assert!(text.contains("ws.workspace.setAgentName"));
+                assert!(text.contains("task-specific name"));
+            }
+        }
+        let got = wss_rpc(&mut rpc, 12, "agent.get", json!({"agentId": agent_id})).await;
+        assert_eq!(
+            got["agent"]["name"],
+            name.unwrap_or("Implementor"),
+            "the hint itself never mutates the stored name"
+        );
+    }
+}

@@ -4727,9 +4727,10 @@ impl AgentManager {
     ///
     /// * Fires only on the agent's **first** turn — detected by the absence of
     ///   any prior `assistant` message in the persisted transcript.
-    /// * Agent naming fires only when the name was not explicitly set and the
-    ///   session has no recognized specialist. It uses the provider-correct
-    ///   workspace API MCP tool to call `ws.workspace.setAgentName`.
+    /// * Agent naming fires only for generated generic/specialist placeholders
+    ///   whose name was not explicitly set. Intentional task names are retained.
+    ///   It uses the provider-correct workspace API MCP tool to call
+    ///   `ws.workspace.setAgentName`.
     /// * Workspace naming fires only when the workspace lookup succeeds AND
     ///   the current title is empty/whitespace or still shaped like an
     ///   auto-generated slug ([`intent_core::slug::is_workspace_slug`]).
@@ -4753,10 +4754,13 @@ impl AgentManager {
         let workspace = self.services.store.get_workspace(workspace_id).await.ok();
         let workspace_path = workspace.as_ref().and_then(crate::git_ops::worktree_path);
         let needs_agent_name = session.as_ref().is_ok_and(|s| {
-            !s.name_explicitly_set
-                && !self
-                    .services
-                    .session_has_recognized_specialist(s, workspace_path.as_deref())
+            if s.name_explicitly_set {
+                return false;
+            }
+            let specialist_name = self
+                .services
+                .session_specialist_display_name(s, workspace_path.as_deref());
+            is_generated_agent_name(&s.name, specialist_name.as_deref())
         });
         let needs_workspace_title = workspace.as_ref().is_some_and(|workspace| {
             let title = workspace.title.trim();
@@ -4843,7 +4847,7 @@ impl AgentManager {
         let body = self.build_turn_body(agent_id, &combined).await;
         // Fire-once agent/workspace naming instruction (port of
         // `agent-backend-handler.service.ts` `namingInstructions`): on the
-        // first turn, a `<system>` block asks eligible ordinary agents to name
+        // first turn, a `<system>` block asks agents with generated names to name
         // themselves and independently asks for a workspace title when needed.
         // Never mutates the persisted user message.
         let naming = self
@@ -11035,6 +11039,30 @@ pub(crate) use crate::harness::v1::{
     GENERIC_AGENT_NAMING_TOOL_REFERENCE, GENERIC_NAMING_TOOL_REFERENCE,
 };
 
+/// Generated UI names use a display name plus an optional collision number;
+/// daemon-created General agents use `Agent` plus six hexadecimal characters.
+/// Task-derived names can also have `name_explicitly_set=false`, so the flag alone
+/// does not imply a placeholder.
+pub(crate) fn is_generated_agent_name(name: &str, specialist_name: Option<&str>) -> bool {
+    let name = name.trim();
+    let matches_base = |base: &str| {
+        name == base
+            || name
+                .strip_prefix(base)
+                .and_then(|suffix| suffix.strip_prefix(' '))
+                .is_some_and(|suffix| {
+                    !suffix.starts_with('0')
+                        && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                        && suffix.parse::<u64>().is_ok_and(|number| number >= 2)
+                })
+    };
+    matches_base("Agent")
+        || name.strip_prefix("Agent ").is_some_and(|suffix| {
+            suffix.len() == 6 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        || specialist_name.is_some_and(matches_base)
+}
+
 /// Provider-correct spelling of the workspace API MCP tool used for agent
 /// self-naming.
 pub(crate) fn agent_naming_tool_reference(provider_id: &str) -> &'static str {
@@ -15455,42 +15483,113 @@ mod role_reminder_tests {
     }
 
     #[tokio::test]
-    async fn explicit_and_specialist_names_do_not_receive_agent_naming_instruction() {
-        let (explicit_mgr, explicit_id, _explicit_db) = manager_with(None, None).await;
-        configure_agent_name(&explicit_mgr, &explicit_id, "User Choice", true, None).await;
-        let explicit = prompt_text(
-            &explicit_mgr
-                .build_turn_prompt(
-                    &explicit_id,
-                    &WorkspaceId::from("ws-1"),
-                    "start",
-                    &TurnOptions::default(),
-                )
-                .await,
-        );
-        assert_eq!(explicit, "start");
+    async fn specialist_placeholder_naming_instruction_covers_titles_and_providers() {
+        for name in ["Implementor", "Implementor 2", "Implementor 12"] {
+            for title in ["", "Existing workspace title"] {
+                for (provider, tool) in [
+                    ("auggie", "workspace_api_workspace-mcp"),
+                    ("opencode", "workspace-mcp_workspace_api"),
+                    ("codex", "workspace_api"),
+                ] {
+                    let (mgr, agent_id, _db) = manager_with(Some("implementor"), None).await;
+                    let workspace_id = WorkspaceId::from("ws-1");
+                    configure_agent_name(&mgr, &agent_id, name, false, Some("implementor")).await;
+                    set_workspace_title(&mgr, &workspace_id, title).await;
+                    let mut session = mgr
+                        .services
+                        .store
+                        .get_agent_session(&agent_id)
+                        .await
+                        .unwrap();
+                    session.provider = Some(provider.to_string());
+                    mgr.services
+                        .store
+                        .update_agent_session(&workspace_id, &session)
+                        .await
+                        .unwrap();
+                    let instruction = mgr
+                        .build_first_turn_naming_instruction(&agent_id, &workspace_id)
+                        .await
+                        .expect("specialist placeholder needs a name");
+                    assert!(
+                        instruction.contains("ws.workspace.setAgentName"),
+                        "{name}: {instruction}"
+                    );
+                    assert!(instruction.contains(tool), "{provider}: {instruction}");
+                    assert!(instruction.contains("task-specific name"));
+                    assert_eq!(
+                        instruction.contains("This workspace needs a title"),
+                        title.is_empty()
+                    );
+                }
+            }
+        }
+    }
 
-        let (specialist_mgr, specialist_id, _specialist_db) =
-            manager_with(Some("implementor"), None).await;
+    #[tokio::test]
+    async fn explicit_and_task_names_do_not_receive_agent_naming_instruction() {
+        for (name, explicitly_set, specialist) in [
+            ("User Choice", true, None),
+            ("Implementor", true, Some("implementor")),
+            ("Implementor 2", true, Some("implementor")),
+            ("Fix the sidebar", false, Some("implementor")),
+            ("Implementor for authentication", false, Some("implementor")),
+            ("Implementor 0", false, Some("implementor")),
+            ("Fix the sidebar", false, None),
+        ] {
+            let (mgr, agent_id, _db) = manager_with(specialist, None).await;
+            configure_agent_name(&mgr, &agent_id, name, explicitly_set, specialist).await;
+            assert!(
+                mgr.build_first_turn_naming_instruction(&agent_id, &WorkspaceId::from("ws-1"))
+                    .await
+                    .is_none(),
+                "preserve intentional name {name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn specialist_naming_instruction_uses_frozen_display_name() {
+        let (mgr, agent_id, _db) = manager_with(Some("deleted-specialist"), None).await;
         configure_agent_name(
-            &specialist_mgr,
-            &specialist_id,
-            "Implementor",
+            &mgr,
+            &agent_id,
+            "Custom Builder 2",
             false,
-            Some("implementor"),
+            Some("deleted-specialist"),
         )
         .await;
-        let specialist = prompt_text(
-            &specialist_mgr
-                .build_turn_prompt(
-                    &specialist_id,
-                    &WorkspaceId::from("ws-1"),
-                    "start",
-                    &TurnOptions::default(),
-                )
-                .await,
-        );
-        assert!(!specialist.contains("ws.workspace.setAgentName"));
+        let mut session = mgr
+            .services
+            .store
+            .get_agent_session(&agent_id)
+            .await
+            .unwrap();
+        session.metadata = Some(serde_json::json!({"specialistName": "Custom Builder"}));
+        let workspace_id = WorkspaceId::from("ws-1");
+        mgr.services
+            .store
+            .update_agent_session(&workspace_id, &session)
+            .await
+            .unwrap();
+        let instruction = mgr
+            .build_first_turn_naming_instruction(&agent_id, &workspace_id)
+            .await
+            .expect("frozen specialist placeholder needs a name");
+        assert!(instruction.contains("ws.workspace.setAgentName"));
+    }
+
+    #[tokio::test]
+    async fn general_placeholder_naming_instruction_covers_numbered_names() {
+        for name in ["Agent", "Agent 2", "Agent abc123"] {
+            let (mgr, agent_id, _db) = manager_with(None, None).await;
+            configure_agent_name(&mgr, &agent_id, name, false, None).await;
+            assert!(mgr
+                .build_first_turn_naming_instruction(&agent_id, &WorkspaceId::from("ws-1"))
+                .await
+                .unwrap()
+                .contains("ws.workspace.setAgentName"));
+        }
     }
 
     #[tokio::test]
@@ -15518,8 +15617,8 @@ mod role_reminder_tests {
 
     #[tokio::test]
     async fn agent_naming_instruction_is_first_turn_only() {
-        let (mgr, agent_id, _db) = manager_with(None, None).await;
-        configure_agent_name(&mgr, &agent_id, "Agent abc123", false, None).await;
+        let (mgr, agent_id, _db) = manager_with(Some("implementor"), None).await;
+        configure_agent_name(&mgr, &agent_id, "Implementor", false, Some("implementor")).await;
         let workspace_id = WorkspaceId::from("ws-1");
         let first = prompt_text(
             &mgr.build_turn_prompt(&agent_id, &workspace_id, "first", &TurnOptions::default())
@@ -15540,7 +15639,8 @@ mod role_reminder_tests {
             &mgr.build_turn_prompt(&agent_id, &workspace_id, "later", &TurnOptions::default())
                 .await,
         );
-        assert_eq!(later, "later");
+        assert!(!later.contains("ws.workspace.setAgentName"));
+        assert!(later.ends_with("later"));
     }
 
     /// `stop()` clears `recreated`/`prepend_pending` (stale-flag hygiene) but

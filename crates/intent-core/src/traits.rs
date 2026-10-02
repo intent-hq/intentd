@@ -1851,6 +1851,19 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Read the workspace's last explicitly remembered manual specialist.
+    fn agent_get_creation_preferences(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "agent.getCreationPreferences not implemented".into(),
+            ))
+        })
+    }
+
     /// `agent.sendToTask`: follow up with the agent assigned to a task note
     /// (PROTOCOL §5.5). `message_metadata` is the same opaque per-message
     /// payload as `agent.sendMessage` (persisted on the user row; e.g. the
