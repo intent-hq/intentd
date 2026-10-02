@@ -961,10 +961,6 @@ pub fn is_collaborator_event_type(event_type: &str) -> bool {
 /// membership/context notifications have explicit delivery rules. Permission
 /// types also admit guests with current workspace-management authority.
 pub const MEMBER_EVENT_TYPES: &[&str] = &[
-    DESKTOP_PERMISSION_REQUESTED,
-    DESKTOP_PERMISSION_RESOLVED,
-    DESKTOP_PERMISSION_CHANGED,
-    DESKTOP_SESSION_CHANGED,
     AGENT_PERMISSION_REQUEST,
     AGENT_PERMISSION_RESOLVED,
     BROWSER_TAB_CLOSED,
