@@ -439,3 +439,99 @@ async fn installed_cli_macos_fallback_timeout_reaps_process_group() {
 async fn installed_cli_macos_fallback_cancellation_reaps_process_group() {
     ordinary_version_children("cancel").await;
 }
+
+#[cfg(target_os = "linux")]
+pub(crate) fn owner_failure_context(root: &Path) -> InstalledContext {
+    let context = context_in(InstalledCli::Codex, root);
+    executable(
+        &root.join("codex"),
+        r"#!/usr/bin/python3
+import pathlib,os,signal,time
+root=pathlib.Path(os.environ['HOME'])
+(root/'version-profile').write_text(os.environ['CODEX_HOME'])
+(root/'version-cwd').write_text(os.getcwd())
+if (root/'hang-owner').exists(): time.sleep(30)
+if (root/'fail-owner').exists():
+    parent=os.getppid()
+    assert b'intentd-codex-diagnostic' in pathlib.Path(f'/proc/{parent}/cmdline').read_bytes()
+    os.kill(parent,signal.SIGKILL)
+print('codex-cli 1.2.3')
+",
+    );
+    context
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn installed_cli_preparation_retains_actual_directories_on_owner_failure() {
+    for fail in [false, true] {
+        let root = crate::test_support::test_tempdir("installed-version-profile");
+        let context = owner_failure_context(root.path());
+        if fail {
+            std::fs::write(root.path().join("fail-owner"), "").unwrap();
+        }
+        let result = crate::acp_adapter::AcpAdapterCommand::npx(
+            root.path().join("npx"),
+            intent_providers::CODEX_ACP_NPX_PACKAGE,
+        )
+        .prepare_with_context(context)
+        .await;
+        assert_eq!(result.is_err(), fail);
+        let profile =
+            PathBuf::from(std::fs::read_to_string(root.path().join("version-profile")).unwrap());
+        let cwd = PathBuf::from(std::fs::read_to_string(root.path().join("version-cwd")).unwrap());
+        drop(result);
+        let retained = (profile.exists(), cwd.exists());
+        if fail {
+            let _ = std::fs::remove_dir_all(&profile);
+            let _ = std::fs::remove_dir_all(&cwd);
+        }
+        assert_eq!(
+            retained,
+            (fail, fail),
+            "retain the actual profile and launch directory only when cleanup is unconfirmed"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) async fn cancel_version_owner(operation: tokio::task::JoinHandle<()>, root: &Path) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !root.join("version-cwd").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let profile = PathBuf::from(std::fs::read_to_string(root.join("version-profile")).unwrap());
+    let cwd = PathBuf::from(std::fs::read_to_string(root.join("version-cwd")).unwrap());
+    operation.abort();
+    assert!(operation.await.unwrap_err().is_cancelled());
+    assert!(profile.is_dir());
+    assert!(cwd.is_dir());
+    tokio::time::timeout(Duration::from_secs(8), async {
+        while profile.exists() || cwd.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("actual profile and launch directory released after confirmed cleanup");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn installed_cli_cancelled_preparation_releases_actual_directories_after_cleanup() {
+    let root = crate::test_support::test_tempdir("installed-version-cancel");
+    let context = owner_failure_context(root.path());
+    std::fs::write(root.path().join("hang-owner"), "").unwrap();
+    let npx = root.path().join("npx");
+    let operation = tokio::spawn(async move {
+        let _ = crate::acp_adapter::AcpAdapterCommand::npx(
+            npx,
+            intent_providers::CODEX_ACP_NPX_PACKAGE,
+        )
+        .prepare_with_context(context)
+        .await;
+    });
+    cancel_version_owner(operation, root.path()).await;
+}

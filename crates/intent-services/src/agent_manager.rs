@@ -3429,11 +3429,16 @@ impl AgentManager {
                 .map_err(|e| Error::Internal(format!("prepare provider failed: {e}")))?;
             context.apply(&mut prepared.command);
             let prepared = tokio::spawn(async move {
+                let prepared = Arc::new(prepared);
+                let dependency =
+                    crate::codex_diagnostics::process::ProbeDependency::hold(prepared.clone());
                 context
-                    .observe(&prepared.command)
+                    .observe_with_dependency(&prepared.command, Some(dependency))
                     .await
                     .map_err(Error::InvalidInput)?;
-                Ok::<_, Error>(prepared)
+                Arc::try_unwrap(prepared).map_err(|_| {
+                    Error::Internal("installed CLI cleanup still owns the launch directory".into())
+                })
             })
             .await
             .map_err(|_| Error::Internal("installed CLI preparation task failed".into()))??;

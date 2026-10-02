@@ -1,6 +1,8 @@
 //! One installed runtime and environment per operation. Never render this state:
 //! it contains credentials. Blocking discovery/config reads stay off the executor.
 
+use crate::codex_diagnostics::process::ProbeDependency;
+
 use std::collections::{hash_map::RandomState, BTreeMap};
 use std::ffi::OsString;
 use std::hash::{BuildHasher, Hash};
@@ -172,19 +174,32 @@ impl InstalledContext {
     }
 
     /// Re-discovery is validation only: it never redirects an in-flight launch.
-    pub async fn still_current(&self, identity: &InstalledCliIdentity, command: &Command) -> bool {
+    pub async fn still_current(
+        &self,
+        identity: &InstalledCliIdentity,
+        command: &Command,
+        dependency: ProbeDependency,
+    ) -> bool {
         let Ok(current) = Self::discover(self.runtime.cli()).await else {
             return false;
         };
         if current.runtime != self.runtime || current.context_key != self.context_key {
             return false;
         }
-        matches!(self.observe(command).await, Ok((now,_)) if &now==identity)
+        matches!(self.observe_with_dependency(command, Some(dependency)).await, Ok((now,_)) if &now==identity)
     }
 
     pub async fn observe(
         &self,
         launch: &Command,
+    ) -> Result<(InstalledCliIdentity, String), String> {
+        self.observe_with_dependency(launch, None).await
+    }
+
+    pub async fn observe_with_dependency(
+        &self,
+        launch: &Command,
+        dependency: Option<ProbeDependency>,
     ) -> Result<(InstalledCliIdentity, String), String> {
         let mut command = Command::new(self.runtime.path());
         command.arg("--version").env_clear();
@@ -197,7 +212,11 @@ impl InstalledContext {
         if let Some(cwd) = launch.as_std().get_current_dir() {
             command.current_dir(cwd);
         }
-        let bytes = version_output(command).await?;
+        // The task owns the process and its resource leases even if its caller
+        // stops awaiting. Only confirmed cleanup releases the actual resources.
+        let bytes = tokio::spawn(version_output(command, dependency))
+            .await
+            .map_err(|_| "installed CLI version owner failed")??;
         let version = std::str::from_utf8(&bytes)
             .ok()
             .map(str::trim)
@@ -328,8 +347,17 @@ impl Drop for VersionChild {
 }
 
 #[cfg(target_os = "macos")]
-async fn version_output(command: Command) -> Result<Vec<u8>, String> {
-    version_output_uncontained(command).await
+async fn version_output(
+    command: Command,
+    dependency: Option<ProbeDependency>,
+) -> Result<Vec<u8>, String> {
+    let lease = dependency.map(crate::codex_diagnostics::process::ProbeHome::from);
+    let result = version_output_uncontained(command).await;
+    // The compatible macOS path retains its documented best-effort reaper.
+    if let Some(lease) = lease {
+        let _ = lease.remove();
+    }
+    result
 }
 
 #[cfg(any(target_os = "macos", all(test, unix)))]
@@ -384,13 +412,16 @@ async fn version_output_uncontained(mut command: Command) -> Result<Vec<u8>, Str
 // the version leader, it retains descendants after successful exit and sets no
 // daemon-wide process flags. The command keeps its exact launch env and cwd.
 #[cfg(any(target_os = "linux", windows))]
-async fn version_output(command: Command) -> Result<Vec<u8>, String> {
+async fn version_output(
+    command: Command,
+    dependency: Option<ProbeDependency>,
+) -> Result<Vec<u8>, String> {
     use crate::codex_diagnostics::process::ProbeProcess;
     let directory = tokio::task::spawn_blocking(tempfile::tempdir)
         .await
         .map_err(|_| "installed CLI version owner failed")?
         .map_err(|_| "installed CLI version owner failed")?;
-    let mut guard = ProbeProcess::spawn(command, directory)
+    let mut guard = ProbeProcess::spawn_with_dependency(command, directory, dependency)
         .await
         .map_err(|_| "installed CLI version check could not start")?;
     drop(guard.stdin.take());
@@ -445,3 +476,6 @@ mod tests;
 
 #[cfg(all(test, unix))]
 pub(crate) use tests::context_in as test_context_in;
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use tests::{cancel_version_owner, owner_failure_context};

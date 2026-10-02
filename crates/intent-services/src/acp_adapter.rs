@@ -282,7 +282,13 @@ impl AcpAdapterCommand {
         // caller cancels while waiting for the version child.
         self.installed = Some(
             tokio::spawn(async move {
-                let (identity, _version) = context.observe(&command).await?;
+                let dependency = crate::codex_diagnostics::process::ProbeDependency::hold((
+                    npx_dir.clone(),
+                    codex_home.clone(),
+                ));
+                let (identity, _version) = context
+                    .observe_with_dependency(&command, Some(dependency))
+                    .await?;
                 let env = command
                     .as_std()
                     .get_envs()
@@ -313,9 +319,17 @@ impl AcpAdapterCommand {
         };
         let mut command = self.command_in(&p.cwd);
         p.apply(&mut command);
-        tokio::spawn(async move { p.context.still_current(&p.identity, &command).await })
-            .await
-            .unwrap_or(false)
+        tokio::spawn(async move {
+            p.context
+                .still_current(
+                    &p.identity,
+                    &command,
+                    crate::codex_diagnostics::process::ProbeDependency::hold(p.clone()),
+                )
+                .await
+        })
+        .await
+        .unwrap_or(false)
     }
 
     pub(crate) fn probe_session_meta(&self) -> Option<Value> {
@@ -701,7 +715,15 @@ pub(crate) async fn spawn_adapter_in(
             let mut command = cmd.command_in(&selected.cwd);
             selected.apply(&mut command);
             tokio::spawn(async move {
-                let (identity, _) = selected.context.observe(&command).await?;
+                let (identity, _) = selected
+                    .context
+                    .observe_with_dependency(
+                        &command,
+                        Some(crate::codex_diagnostics::process::ProbeDependency::hold(
+                            selected.clone(),
+                        )),
+                    )
+                    .await?;
                 if identity != selected.identity {
                     return Err(crate::provider_models::INSTALLED_SOURCE_CHANGED.to_owned());
                 }

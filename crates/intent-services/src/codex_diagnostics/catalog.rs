@@ -269,6 +269,7 @@ impl CodexLaunch {
                 unknown.report.runtime_path = inspection.report.runtime_path;
                 unknown.report.runtime_source = inspection.report.runtime_source;
                 unknown.report.runtime_version = inspection.report.runtime_version;
+                unknown.report.removes_codex_overrides = inspection.report.removes_codex_overrides;
             }
             inspection = unknown;
         }
@@ -446,8 +447,10 @@ impl CodexLaunch {
         // Keep the isolated profile alive through bounded version cleanup even
         // when the outer diagnostic deadline cancels its caller.
         tokio::spawn(async move {
+            let home = std::sync::Arc::new(home);
+            let dependency = ProbeDependency::hold(home.clone());
             let (_, version) = context
-                .observe(&command)
+                .observe_with_dependency(&command, Some(dependency))
                 .await
                 .map_err(|_| CatalogFailure::RuntimeUnverified)?;
             let measured = super::parse_version(version.as_bytes(), super::VersionKind::Runtime)
@@ -455,6 +458,8 @@ impl CodexLaunch {
                     super::VersionMeasurement::Unknown(UnknownReason::InvalidVersion),
                     super::VersionMeasurement::Measured,
                 );
+            let home =
+                std::sync::Arc::try_unwrap(home).map_err(|_| CatalogFailure::RuntimeUnverified)?;
             Ok((command, home, Some(measured)))
         })
         .await

@@ -920,10 +920,12 @@ child.on('exit',code=>process.exit(code||0));
             }
             let before = launch.inspect_local().await;
             assert!(before.report.runtime_path.is_some());
+            assert!(!before.report.removes_codex_overrides);
             let report = launch
                 .catalogs_with_auth(Ok(fixture.auth().await), Limits::default())
                 .await;
             assert_eq!(report.runtime.runtime_path, before.report.runtime_path);
+            assert!(!report.runtime.removes_codex_overrides);
             assert_eq!(
                 report.runtime.runtime_source,
                 RuntimeSource::EnvironmentOverride
@@ -966,4 +968,59 @@ child.on('exit',code=>process.exit(code||0));
         assert!(fixture.events().is_empty());
         fixture.assert_clean();
     }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn installed_cli_diagnostic_version_retains_actual_profile_on_owner_failure() {
+    for fail in [false, true] {
+        let root = crate::test_support::test_tempdir("diagnostic-version-profile");
+        let context = crate::installed_cli::owner_failure_context(root.path());
+        if fail {
+            std::fs::write(root.path().join("fail-owner"), "").unwrap();
+        }
+        let launch = CodexLaunch {
+            installed: Some(context.clone()),
+            selection: ProviderLaunch::Bare { command: "unused" },
+            path: std::ffi::OsString::from("/usr/bin:/bin"),
+            codex_path: Some(root.path().join("codex").into_os_string()),
+        };
+        let home = crate::test_support::test_tempdir("diagnostic-version-owned-home");
+        let path = home.path().to_owned();
+        let mut command = Command::new("unused");
+        command.current_dir(&path).env("CODEX_HOME", &path);
+        context.apply(&mut command);
+        let result = launch.validate_installed_command(command, home).await;
+        assert_eq!(result.is_err(), fail);
+        drop(result);
+        let retained = path.exists();
+        if fail {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+        assert_eq!(retained, fail);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn installed_cli_cancelled_diagnostic_version_releases_actual_profile_after_cleanup() {
+    let root = crate::test_support::test_tempdir("diagnostic-version-cancel");
+    let context = crate::installed_cli::owner_failure_context(root.path());
+    std::fs::write(root.path().join("hang-owner"), "").unwrap();
+    let launch = CodexLaunch {
+        installed: Some(context.clone()),
+        selection: ProviderLaunch::Bare { command: "unused" },
+        path: std::ffi::OsString::from("/usr/bin:/bin"),
+        codex_path: Some(root.path().join("codex").into_os_string()),
+    };
+    let home = crate::test_support::test_tempdir("diagnostic-version-owned-home");
+    let mut command = Command::new("unused");
+    command
+        .current_dir(home.path())
+        .env("CODEX_HOME", home.path());
+    context.apply(&mut command);
+    let operation = tokio::spawn(async move {
+        let _ = launch.validate_installed_command(command, home).await;
+    });
+    crate::installed_cli::cancel_version_owner(operation, root.path()).await;
 }
