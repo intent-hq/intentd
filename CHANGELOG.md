@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.135] - 2026-10-02
+
+### 🐛 Bug Fixes
+
+- Retry contended note attribution refreshes ([#2218](https://github.com/intent-hq/intentd/pull/2218))
+- Restore earlier credentials after a settings batch failure ([#2219](https://github.com/intent-hq/intentd/pull/2219))
+- Drain admitted writers before closing the store ([#2225](https://github.com/intent-hq/intentd/pull/2225))
+
+### ⚡ Performance
+
+- Avoid full note reads in task listing ([#2217](https://github.com/intent-hq/intentd/pull/2217))
+
+### ⚙️ Miscellaneous Tasks
+
+- Bump rquickjs from 0.12.2 to 0.14.0 ([#1932](https://github.com/intent-hq/intentd/pull/1932))
+
+
 ## [0.9.134] - 2026-10-01
 
 ### 🐛 Bug Fixes
