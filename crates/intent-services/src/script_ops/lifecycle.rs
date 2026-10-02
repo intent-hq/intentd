@@ -1,7 +1,7 @@
 //! Durable definition changes share admission locks with start/run/restart.
 use super::{
-    json, now_iso, publish_event, script_event, Error, HashSet, ManagedScript, Result,
-    ScriptManager, ScriptMode, ScriptStatus, Value, WorkspaceId, SCRIPT_CHANGED,
+    json, now_iso, Error, HashSet, ManagedScript, Result, ScriptManager, ScriptMode, ScriptStatus,
+    Value, WorkspaceId,
 };
 
 impl ScriptManager {
@@ -53,7 +53,7 @@ impl ScriptManager {
     }
 
     /// Persist first, then change the registry. Never replace the runtime/PTY.
-    async fn set_archive(
+    pub(super) async fn set_archive(
         &self,
         ws: &WorkspaceId,
         id: &str,
@@ -71,6 +71,8 @@ impl ScriptManager {
         if old == timestamp {
             return Ok(());
         }
+        let publication = self.locks.publication_lock(id);
+        let _publishing = publication.lock().await;
         if timestamp.is_some() {
             if let Some(park) = &self.parks.archive_persist {
                 park.entered.notify_one();
@@ -91,15 +93,7 @@ impl ScriptManager {
             .ok_or_else(|| Error::NotFound(format!("script {id}")))?
             .def
             .archived_at = timestamp;
-        publish_event(
-            self.bus.as_ref(),
-            script_event(
-                ws,
-                SCRIPT_CHANGED,
-                json!({"scriptId": id, "action": "updated"}),
-            ),
-        )
-        .await;
+        self.emit_changed_locked(ws, id, "updated").await;
         Ok(())
     }
 

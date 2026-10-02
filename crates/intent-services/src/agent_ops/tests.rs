@@ -21013,7 +21013,13 @@ async fn get_subscriptions_projection_cost_is_batched_and_preview_only() {
         .unwrap();
     let group = svc.get_or_create_delegation_group(&ws, &parent);
     svc.enroll_child_in_group(&group, &first);
-    crate::test_tracing::warm_sqlx_pool(svc.store().read_pool()).await;
+    let pool = svc.store().read_pool();
+    crate::test_tracing::warm_sqlx_pool(pool).await;
+    // Keep all but one reserved to exercise the final initialized slot.
+    let mut reserved = Vec::new();
+    for _ in 1..pool.options().get_max_connections() {
+        reserved.push(pool.acquire().await.unwrap());
+    }
     let (one, one_count) = crate::test_tracing::count_sqlx_statements(
         svc.agent_get_subscriptions_op(ws.clone(), parent.clone()),
     )
@@ -21024,6 +21030,7 @@ async fn get_subscriptions_projection_cost_is_batched_and_preview_only() {
         one_count, 4,
         "status + session/preview + hook + PR projections"
     );
+    drop(reserved);
     // An unrelated corrupt row must never be decoded by this targeted read.
     let unrelated = create_agent(&svc, &ws, "Unrelated").await;
     sqlx::query("UPDATE agent_session SET metadata = 'not-json' WHERE id = ?")
