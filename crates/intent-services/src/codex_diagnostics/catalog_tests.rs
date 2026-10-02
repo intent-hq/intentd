@@ -52,6 +52,7 @@ fn malformed_empty_and_absent_catalogs_are_distinct() {
 async fn command_isolation_replaces_inherited_configuration_and_preloads() {
     let root = crate::test_support::test_tempdir("codex-command-isolation");
     let launch = CodexLaunch {
+        installed: None,
         selection: ProviderLaunch::Managed {
             npx: root.path().join("npx"),
             package: intent_providers::config::CODEX_ACP_NPX_PACKAGE,
@@ -205,6 +206,7 @@ child.on('exit',code=>process.exit(code||0));
 
         fn launch(&self, managed: bool) -> CodexLaunch {
             CodexLaunch {
+                installed: None,
                 selection: if managed {
                     ProviderLaunch::Managed {
                         npx: self.root.path().join("bin/npx"),
@@ -824,7 +826,7 @@ child.on('exit',code=>process.exit(code||0));
 
     #[tokio::test]
     async fn catalog_launch_keeps_the_production_policy_and_ignores_runtime_overrides() {
-        let fixture = Fixture::new(&json!({}));
+        let fixture = Fixture::new(&json!({"installed":true}));
         let custom = Fixture::new(&json!({"model":"custom-model"}));
         let mut launch = fixture.launch(true);
         let mut options = launch.spawn_options();
@@ -834,15 +836,44 @@ child.on('exit',code=>process.exit(code||0));
         options
             .extra_env
             .insert("CODEX_CONFIG".into(), "credential-canary".into());
-        let command = intent_acp::spawn::build_command(&options);
+        let installed_dir = fixture.root.path().join("installed");
+        std::fs::create_dir(&installed_dir).unwrap();
+        symlink(&fixture.runtime, installed_dir.join("codex")).unwrap();
+        let runtime = intent_providers::installed_cli::InstalledCli::Codex
+            .resolve_in_dirs(std::slice::from_ref(&installed_dir), false)
+            .unwrap();
+        let context = crate::installed_cli::InstalledContext::from_inputs(
+            runtime,
+            &std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::from([
+                (
+                    OsString::from("HOME"),
+                    fixture.root.path().as_os_str().to_owned(),
+                ),
+                (OsString::from("PATH"), fixture.path.clone()),
+            ]),
+            &intent_core::cli_env::CodexEnvNames::default(),
+        )
+        .unwrap();
+        let mut command = intent_acp::spawn::build_command(&options);
+        context.apply(&mut command);
         launch.codex_path = super::super::super::effective_env(&command, "CODEX_PATH");
-        assert!(launch.codex_path.is_none());
+        assert_eq!(
+            launch.codex_path,
+            Some(installed_dir.join("codex").into_os_string())
+        );
+        launch.installed = Some(context);
         let report = launch
             .catalogs_with_auth(Ok(fixture.auth().await), Limits::default())
             .await;
         assert_eq!(
             report.runtime.runtime_source,
-            RuntimeSource::AdapterDependency
+            RuntimeSource::EnvironmentOverride
+        );
+        assert_eq!(
+            report.runtime.runtime_version,
+            VersionMeasurement::Measured("0.333.5".into()),
+            "measure the version with the final isolated probe environment and cwd"
         );
         assert_eq!(catalog(&report.raw).models[0].id, "fixture-model");
         assert!(matches!(report.acp, CatalogOutcome::Success(_)));
@@ -851,7 +882,7 @@ child.on('exit',code=>process.exit(code||0));
             .into_iter()
             .find(|v| v["started"] == true)
             .unwrap();
-        assert!(boot["codexPath"].is_null());
+        assert_eq!(boot["codexPath"], json!(installed_dir.join("codex")));
         fixture.assert_clean();
     }
 

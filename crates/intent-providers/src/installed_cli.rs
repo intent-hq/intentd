@@ -72,7 +72,11 @@ impl InstalledCli {
         self.resolve_in_dirs(&enhanced_path_dirs(), cfg!(windows))
     }
 
-    fn resolve_in_dirs(
+    /// Resolve against an explicit ordered host search path. The same canonical
+    /// name and executable validation as `resolve` apply.
+    /// # Errors
+    /// Returns an actionable error when no installed CLI is found.
+    pub fn resolve_in_dirs(
         self,
         dirs: &[PathBuf],
         is_windows: bool,

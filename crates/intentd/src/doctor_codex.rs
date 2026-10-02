@@ -70,7 +70,7 @@ fn render_runtime(report: &CodexRuntimeReport) -> String {
     render_version(&mut text, "adapter", &report.adapter_version);
     let runtime_source = match report.runtime_source {
         RuntimeSource::AdapterDependency => "selected adapter dependency",
-        RuntimeSource::EnvironmentOverride => "effective CODEX_PATH override",
+        RuntimeSource::EnvironmentOverride => "installed CLI on the execution host (CODEX_PATH)",
         RuntimeSource::Unknown => "unknown",
     };
     writeln!(text, "    runtime source: {runtime_source}").unwrap();
@@ -228,7 +228,7 @@ mod tests {
         report.runtime_version = VersionMeasurement::Measured("0.333.4".into());
         let text = render_runtime(&report);
         assert!(text.contains("configured managed package (not a measured version)"));
-        assert!(text.contains("runtime source: effective CODEX_PATH override"));
+        assert!(text.contains("runtime source: installed CLI on the execution host (CODEX_PATH)"));
         assert!(text.contains("measured runtime version: 0.333.4"));
         assert!(!text.contains("launch policy:"));
     }

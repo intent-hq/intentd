@@ -632,12 +632,11 @@ fn build_command_in(
         cmd.env(key, value);
     }
 
-    // Every Codex launch uses the pinned npx adapter. Enforce both denial
-    // settings after every env merge so user/captured overrides cannot enable
-    // V2 or select an incompatible Codex executable. The adapter applies this
-    // config on each thread start and resume; Intent's MCP tools are unchanged.
+    // Enforce both native-subagent denial settings after every env merge.
+    // The services launch boundary selects the installed executable on this
+    // prepared command before version validation and spawning. The adapter
+    // applies this config on thread start and resume.
     if opts.provider.id == "codex" {
-        cmd.env_remove("CODEX_PATH");
         cmd.env("CODEX_CONFIG", CODEX_SUBAGENT_POLICY_CONFIG);
         tracing::debug!(
             mechanism = "CODEX_CONFIG",
@@ -756,9 +755,19 @@ impl SpawnedAgent {
 /// [`AcpError::Spawn`] for every other spawn failure, when the neutral npx
 /// launch directory cannot be created, or when the stdio pipes cannot be
 /// taken.
-pub fn spawn_provider(opts: &SpawnOptions, hooks: ConnectionHooks) -> AcpResult<SpawnedAgent> {
+/// A fully assembled launch; callers may validate its exact environment and cwd
+/// before spawning. The neutral directory remains owned through process cleanup.
+pub struct PreparedProvider {
+    pub command: Command,
+    npx_launch_dir: Option<NpxLaunchDir>,
+}
+
+/// Build a launch without starting a process.
+/// # Errors
+/// Returns a spawn error when the neutral directory cannot be created.
+pub fn prepare_provider(opts: &SpawnOptions) -> AcpResult<PreparedProvider> {
     let nice_increment = agent_nice();
-    let (launch, target) = opts.launch_target();
+    let (_, target) = opts.launch_target();
     let command_name = target.to_string_lossy().into_owned();
     // An npx launch starts in a fresh neutral directory, never the workspace
     // (intent-hq/intent#5738); the workspace remains the ACP session cwd.
@@ -772,7 +781,36 @@ pub fn spawn_provider(opts: &SpawnOptions, hooks: ConnectionHooks) -> AcpResult<
         None
     };
     let launch_cwd = npx_launch_dir.as_ref().map(NpxLaunchDir::path);
-    let mut cmd = build_command_in(opts, captured_credential_env(), nice_increment, launch_cwd);
+    let command = build_command_in(opts, captured_credential_env(), nice_increment, launch_cwd);
+    Ok(PreparedProvider {
+        command,
+        npx_launch_dir,
+    })
+}
+
+/// Prepare and spawn a provider.
+/// # Errors
+/// Returns launch-directory, process, or stdio setup failures.
+pub fn spawn_provider(opts: &SpawnOptions, hooks: ConnectionHooks) -> AcpResult<SpawnedAgent> {
+    spawn_prepared_provider(opts, prepare_provider(opts)?, hooks)
+}
+
+/// Spawn a previously validated launch without rebuilding its environment.
+/// # Errors
+/// Returns process/stdio setup failures, like `spawn_provider`.
+pub fn spawn_prepared_provider(
+    opts: &SpawnOptions,
+    prepared: PreparedProvider,
+    hooks: ConnectionHooks,
+) -> AcpResult<SpawnedAgent> {
+    let PreparedProvider {
+        command: mut cmd,
+        npx_launch_dir,
+    } = prepared;
+    let nice_increment = agent_nice();
+    let (launch, target) = opts.launch_target();
+    let command_name = target.to_string_lossy().into_owned();
+    let launch_cwd = npx_launch_dir.as_ref().map(NpxLaunchDir::path);
     let process_cwd = process_cwd(opts, launch_cwd);
     let mut child = cmd.spawn().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -1547,6 +1585,23 @@ mod build_command_tests {
     }
 
     #[test]
+    fn installed_cli_regression_preserves_selected_codex_path() {
+        let provider = intent_providers::find_provider("codex").unwrap();
+        let mut opts = SpawnOptions::new(provider);
+        opts.extra_env
+            .insert("CODEX_PATH".into(), "/selected/codex".into());
+        let cmd = build_command(&opts);
+        assert_eq!(
+            env_value(&cmd, "CODEX_PATH"),
+            Some("/selected/codex".into())
+        );
+        assert_eq!(
+            env_value(&cmd, "CODEX_CONFIG"),
+            Some(CODEX_SUBAGENT_POLICY_CONFIG.into())
+        );
+    }
+
+    #[test]
     fn build_command_sets_codex_subagent_policy_on_npx_spawn() {
         // The pinned npx adapter is daemon-managed: a stray CODEX_PATH /
         // CODEX_CONFIG in the daemon env must not redirect the adapter (#555).
@@ -1557,8 +1612,8 @@ mod build_command_tests {
         opts.npx_fallback_package = provider.npx_only_package;
         let cmd = build_command(&opts);
         assert!(
-            env_removed(&cmd, "CODEX_PATH"),
-            "pinned npx Codex spawn must remove CODEX_PATH from the child env"
+            !env_removed(&cmd, "CODEX_PATH"),
+            "command assembly must preserve the selected installed runtime"
         );
         let config = env_value(&cmd, "CODEX_CONFIG")
             .expect("pinned npx Codex spawn must set daemon-owned CODEX_CONFIG");
@@ -1817,7 +1872,7 @@ mod captured_env_tests {
     #[test]
     fn codex_subagent_policy_overrides_captured_and_extra_env_on_npx() {
         // The daemon policy runs after every env merge, replacing arbitrary
-        // CODEX_CONFIG and keeping CODEX_PATH removed (#555).
+        // CODEX_CONFIG; installed runtime selection follows on the prepared launch.
         let provider = intent_providers::find_provider("codex").unwrap();
         let mut opts = SpawnOptions::new(provider);
         let npx_path = PathBuf::from("/usr/local/bin/npx");
@@ -1846,8 +1901,8 @@ mod captured_env_tests {
             assert!(
                 cmd.as_std()
                     .get_envs()
-                    .any(|(k, v)| k == "CODEX_PATH" && v.is_none()),
-                "CODEX_PATH must stay removed for {source} env"
+                    .any(|(k, v)| k == "CODEX_PATH" && v.is_some()),
+                "runtime selection is finalized on the prepared launch for {source} env"
             );
             let config = env_value(&cmd, "CODEX_CONFIG")
                 .expect("pinned adapter must set the daemon-owned subagent policy");

@@ -3419,8 +3419,29 @@ impl AgentManager {
                 "info",
             )
             .await;
-        let spawned = spawn_provider(&spawn_opts, hooks)
-            .map_err(|e| Error::Internal(format!("spawn provider failed: {e}")))?;
+        let spawned = if let Some(cli) =
+            intent_providers::installed_cli::InstalledCli::for_provider(spawn_opts.provider.id)
+        {
+            let context = crate::installed_cli::InstalledContext::discover(cli)
+                .await
+                .map_err(Error::InvalidInput)?;
+            let mut prepared = intent_acp::spawn::prepare_provider(&spawn_opts)
+                .map_err(|e| Error::Internal(format!("prepare provider failed: {e}")))?;
+            context.apply(&mut prepared.command);
+            let prepared = tokio::spawn(async move {
+                context
+                    .observe(&prepared.command)
+                    .await
+                    .map_err(Error::InvalidInput)?;
+                Ok::<_, Error>(prepared)
+            })
+            .await
+            .map_err(|_| Error::Internal("installed CLI preparation task failed".into()))??;
+            intent_acp::spawn::spawn_prepared_provider(&spawn_opts, prepared, hooks)
+        } else {
+            spawn_provider(&spawn_opts, hooks)
+        }
+        .map_err(|e| Error::Internal(format!("spawn provider failed: {e}")))?;
         let (child, connection, npx_launch_dir) = spawned.into_parts();
         // Pin the spawned child's pid for the exit watcher armed below: the
         // watcher stands down when the handle's child no longer matches it
@@ -18944,28 +18965,22 @@ mod provider_path_override_tests {
         s
     }
 
-    /// monorepo#4352: a valid `providers.paths["claude-code"]` override is
-    /// exec'd directly — the resolved spawn carries the override as
-    /// `provider_binary` and NO npx fallback, so `build_command` spawns the
-    /// override instead of `npx -y <pinned>`.
+    /// Legacy adapter paths must not split session and model-catalog sources.
     #[test]
-    fn claude_code_spawn_honors_valid_path_override() {
+    fn claude_code_spawn_ignores_legacy_path_override() {
+        if intent_providers::find_npx().is_none() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let adapter_stub = exec_stub(dir.path(), "claude-agent-acp-override");
         let settings = settings_with_paths(&[("claude-code", &adapter_stub)]);
-
         let resolved = resolve_spawn(&claude_code_session(), None, &settings, None).unwrap();
+        assert!(resolved.provider_binary.is_none());
+        assert!(resolved.npx_fallback_binary.is_some());
         assert_eq!(
-            resolved.provider_binary.as_deref(),
-            Some(adapter_stub.as_path()),
-            "a valid claude-code override must be the spawned binary"
+            resolved.npx_fallback_package,
+            Some(intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE)
         );
-        assert_eq!(resolved.npx_fallback_binary, None);
-        assert_eq!(resolved.npx_fallback_package, None);
-        let mut opts = SpawnOptions::new(&resolved.provider);
-        opts.provider_binary = resolved.provider_binary.as_deref();
-        let cmd = intent_acp::spawn::build_command(&opts);
-        assert_eq!(cmd.as_std().get_program(), adapter_stub.as_os_str());
     }
 
     /// An invalid override (missing file) contributes nothing: claude-code

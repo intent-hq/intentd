@@ -1182,3 +1182,144 @@ async fn antigravity_inflight_and_negative_results_cannot_cross_executables() {
     .await;
     assert_eq!(b_result.models.unwrap()[0]["id"], "model-b-new");
 }
+
+fn installed_selection(key: &str) -> super::InstalledSelection {
+    super::InstalledSelection {
+        observed: tokio::time::Instant::now(),
+        key: key.into(),
+        command: Err("must not start a CLI on a cached read".into()),
+    }
+}
+
+#[tokio::test]
+async fn installed_cli_cached_reads_do_not_start_version_or_adapter_processes() {
+    let cache = Arc::new(ModelCatalogCache::new(None));
+    let key = "installed-test:cached";
+    cache
+        .installed
+        .lock()
+        .unwrap()
+        .insert("codex".into(), installed_selection(key));
+    cache.test_store(
+        "codex",
+        key,
+        vec![serde_json::json!({"id":"new-model"})],
+        ModelCatalogCache::now_ms(),
+    );
+    for _ in 0..5 {
+        let resolved = cache.resolve_installed("codex", false).await;
+        assert_eq!(resolved.models.unwrap()[0]["id"], "new-model");
+        assert!(!resolved.stale);
+    }
+    assert_eq!(
+        cache
+            .reader(None)
+            .cached_catalog_claims("codex", "new-model"),
+        Some(true)
+    );
+}
+
+#[tokio::test]
+async fn installed_cli_obsolete_inflight_probe_cannot_overwrite_or_serve_new_source() {
+    let cache = Arc::new(ModelCatalogCache::new(None));
+    cache
+        .installed
+        .lock()
+        .unwrap()
+        .insert("codex".into(), installed_selection("installed-test:old"));
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let old_cache = cache.clone();
+    let old = tokio::spawn(async move {
+        resolve_with_cache(
+            &old_cache,
+            "codex",
+            "installed-test:old",
+            true,
+            ModelCatalogCache::now_ms(),
+            move || {
+                Box::pin(async move {
+                    started_tx.send(()).unwrap();
+                    release_rx.await.unwrap();
+                    ModelFetchResult {
+                        models: Some(vec![serde_json::json!({"id":"old"})]),
+                        warning: None,
+                    }
+                })
+            },
+        )
+        .await
+    });
+    started_rx.await.unwrap();
+    cache
+        .installed
+        .lock()
+        .unwrap()
+        .insert("codex".into(), installed_selection("installed-test:new"));
+    cache.test_store(
+        "codex",
+        "installed-test:new",
+        vec![serde_json::json!({"id":"new"})],
+        ModelCatalogCache::now_ms(),
+    );
+    release_tx.send(()).unwrap();
+    let result = old.await.unwrap();
+    assert!(result.models.is_none());
+    assert_eq!(
+        cache.last_good("codex", "installed-test:new").unwrap()[0]["id"],
+        "new"
+    );
+}
+
+#[tokio::test]
+async fn installed_cli_failed_refresh_only_serves_same_runtime_and_auth_last_good() {
+    let cache = Arc::new(ModelCatalogCache::new(None));
+    let key = "installed-test:account-a";
+    cache
+        .installed
+        .lock()
+        .unwrap()
+        .insert("codex".into(), installed_selection(key));
+    cache.test_store(
+        "codex",
+        key,
+        vec![serde_json::json!({"id":"a-model"})],
+        ModelCatalogCache::now_ms(),
+    );
+    let failure = || {
+        Box::pin(async {
+            ModelFetchResult {
+                models: None,
+                warning: Some("offline".into()),
+            }
+        }) as intent_core::BoxFuture<'static, ModelFetchResult>
+    };
+    let same = resolve_with_cache(
+        &cache,
+        "codex",
+        key,
+        true,
+        ModelCatalogCache::now_ms(),
+        failure,
+    )
+    .await;
+    assert!(same.stale);
+    assert_eq!(same.models.unwrap()[0]["id"], "a-model");
+    let next = "installed-test:account-b";
+    cache
+        .installed
+        .lock()
+        .unwrap()
+        .insert("codex".into(), installed_selection(next));
+    let changed = resolve_with_cache(
+        &cache,
+        "codex",
+        next,
+        true,
+        ModelCatalogCache::now_ms(),
+        failure,
+    )
+    .await;
+    assert!(changed.models.is_none());
+    assert!(!changed.stale);
+}
