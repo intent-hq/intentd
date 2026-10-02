@@ -120,15 +120,24 @@ pub(crate) type FlowState = Arc<tokio::sync::Mutex<Option<FlowSlot>>>;
 /// travels into the engine's blocking write, so timeout/cancellation cannot
 /// release ownership while that write can still land.
 pub(crate) struct CredentialOwner {
+    settings_tasks: Arc<crate::delivery_tasks::DeliveryTasks>,
     secrets: Arc<crate::settings::AsyncSecretStore>,
     generation: Arc<AtomicU64>,
+    // The supervisor owns this guard through receipt finalization, including
+    // an algorithm panic with an outstanding provenance/orphan mutation.
+    finalization_guard: std::sync::Mutex<Option<tokio::sync::OwnedMutexGuard<u64>>>,
 }
 
 impl CredentialOwner {
-    pub(crate) fn new(secrets: Arc<crate::settings::AsyncSecretStore>) -> Self {
+    pub(crate) fn new(
+        secrets: &crate::settings::AsyncSecretStore,
+        settings_tasks: Arc<crate::delivery_tasks::DeliveryTasks>,
+    ) -> Self {
         Self {
-            secrets,
+            settings_tasks,
+            secrets: Arc::new(secrets.settled_operation(Arc::new(tokio::sync::Notify::new()))),
             generation: Arc::new(AtomicU64::new(0)),
+            finalization_guard: std::sync::Mutex::new(None),
         }
     }
 
@@ -212,6 +221,68 @@ pub(crate) async fn run_poll_loop(
     bus: Option<EventBus>,
     owner: CredentialOwner,
     flow_id: u64,
+    flow: DeviceFlow,
+    deadline: Instant,
+    sync_gh: bool,
+) {
+    let owner = Arc::new(owner);
+    let persistence = {
+        let secrets = owner.secrets.clone();
+        Arc::new(move |grant, lease| {
+            let secrets = secrets.clone();
+            Box::pin(async move {
+                secrets
+                    .persist_github_grant(grant, lease)
+                    .await
+                    .map_err(|error| {
+                        intent_sourcecontrol::Error::Api(format!(
+                            "could not persist github token: {error}"
+                        ))
+                    })
+            })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = intent_sourcecontrol::Result<()>> + Send>,
+                >
+        }) as intent_sourcecontrol::device_flow::GrantPersistence
+    };
+    let worker = intent_core::spawn_daemon({
+        let owner = owner.clone();
+        let state = state.clone();
+        async move {
+            run_poll_algorithm(
+                state,
+                bus,
+                owner,
+                flow_id,
+                flow.with_persistence(persistence),
+                deadline,
+                sync_gh,
+            )
+            .await;
+        }
+    });
+    let result = worker.await;
+    #[cfg(test)]
+    if result.is_err() {
+        owner.secrets.github_poll_worker_failed.notify_one();
+    }
+    owner.secrets.finish_operation().await;
+    if let Err(error) = result {
+        tracing::warn!(%error, "GitHub poll worker failed; credential state may be unknown");
+        // Do not synthesize an authorize/failure event from a worker panic.
+        // Physical completion is now known, but skipped reconciliation is not.
+        let mut slot = state.lock().await;
+        if slot.as_ref().is_some_and(|slot| slot.flow_id == flow_id) {
+            *slot = None;
+        }
+    }
+}
+
+async fn run_poll_algorithm(
+    state: FlowState,
+    bus: Option<EventBus>,
+    owner: Arc<CredentialOwner>,
+    flow_id: u64,
     mut flow: DeviceFlow,
     deadline: Instant,
     sync_gh: bool,
@@ -228,7 +299,28 @@ pub(crate) async fn run_poll_loop(
             // so the loop cannot poll forever.
             break Some(FlowPhase::Expired);
         }
-        tokio::time::sleep(poll_sleep(flow.interval_secs()).min(remaining)).await;
+        let sleep = tokio::time::sleep(poll_sleep(flow.interval_secs()).min(remaining));
+        #[cfg(test)]
+        let sleep = {
+            let mut sleep = Box::pin(sleep);
+            std::future::poll_fn(move |cx| {
+                let result = std::future::Future::poll(sleep.as_mut(), cx);
+                if result.is_pending() {
+                    if let Some(pending) = secrets.github_poll_sleep_pending.lock().unwrap().take()
+                    {
+                        let _ = pending.send(());
+                    }
+                }
+                result
+            })
+        };
+        // Stop only idle recurrence. An exchange or credential write already
+        // entered below still runs through the supervisor's receipt settlement.
+        tokio::select! {
+            biased;
+            () = owner.settings_tasks.closed() => return,
+            () = sleep => {}
+        }
         // Cooperative cancellation: stop before touching the network once
         // cancel/revoke/a newer connect removed or replaced the slot.
         if !is_resident(&state, flow_id).await {
@@ -259,7 +351,7 @@ pub(crate) async fn run_poll_loop(
     // Serialize the provenance marker, orphan cleanup and auth notification
     // with revoke/settings. A newer owner invalidates this completion before
     // it can delete the newer credential or announce an obsolete authorize.
-    let _credential = if outcome.is_none() {
+    if outcome.is_none() {
         let guard = match secrets.github_mutation().await {
             Ok(guard) => guard,
             Err(error) => {
@@ -281,10 +373,8 @@ pub(crate) async fn run_poll_loop(
             }
             return;
         }
-        Some(guard)
-    } else {
-        None
-    };
+        *owner.finalization_guard.lock().unwrap() = Some(guard);
+    }
     {
         let mut slot = state.lock().await;
         match slot.as_mut() {

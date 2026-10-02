@@ -1082,3 +1082,34 @@ async fn retirement_cancelled_run_waiter_after_cwd_failure_still_retires() {
 async fn retirement_cancelled_run_waiter_after_spawn_failure_still_retires() {
     cancelled_observed_failure_retires(false).await;
 }
+
+#[intent_test_macros::daemon_test]
+async fn retirement_shutdown_joins_finalizer_past_supervisor_grace() {
+    let h = harness().await;
+    let id = one_off(&h, "printf final").await;
+    let park = Arc::new(SupervisePark::default());
+    let mut mgr = h.services.script_manager();
+    mgr.parks.settlement_ready = Some(park.clone());
+    let run = {
+        let mgr = mgr.clone();
+        let ws = h.ws.clone();
+        let id = id.clone();
+        intent_core::spawn_daemon(async move { mgr.run(&ws, &id, None, None).await })
+    };
+    tokio::time::timeout(LIVENESS, park.entered.notified()).await.unwrap();
+    // Exercise the existing grace path with final durable settlement held.
+    tokio::time::timeout(LIVENESS, mgr.stop_all()).await.unwrap();
+    let drain = h.services.shutdown_store_writers();
+    tokio::pin!(drain);
+    let escaped = tokio::select! {
+        biased;
+        () = &mut drain => true,
+        () = std::future::ready(()) => false,
+    };
+    park.release.notify_one();
+    tokio::time::timeout(LIVENESS, run).await.unwrap().unwrap().unwrap();
+    if !escaped { tokio::time::timeout(LIVENESS, drain).await.unwrap(); }
+    let settled = retired(&h, &id).await;
+    assert_eq!(settled.last_run.unwrap().outcome, intent_core::ScriptRunOutcome::Succeeded);
+    assert!(!escaped, "store barrier returned while a known script result was still unpersisted");
+}

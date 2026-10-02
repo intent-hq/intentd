@@ -4,6 +4,90 @@ use intent_sourcecontrol::device_flow::{IdentityGuard, IdentityLease};
 use std::future::Future;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
+#[intent_test_macros::daemon_test]
+async fn github_connect_refuses_flow_when_shutdown_wins_http_start() {
+    connect_after_shutdown_fence(true).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn github_connect_refuses_flow_at_early_shutdown_fence() {
+    connect_after_shutdown_fence(false).await;
+}
+
+async fn connect_after_shutdown_fence(drain_writers: bool) {
+    let dir = crate::test_support::test_tempdir("github-connect-shutdown-admission");
+    let store = intent_store::Store::open(&dir.path().join("state.db"))
+        .await
+        .unwrap();
+    let raw = intent_core::FileSecretStore::with_path(dir.path().join("secrets.json"));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut length = 0;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            if line == "\r\n" {
+                break;
+            }
+            if let Some((key, value)) = line.split_once(':') {
+                if key.eq_ignore_ascii_case("content-length") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+        }
+        reader.read_exact(&mut vec![0; length]).await.unwrap();
+        entered_tx.send(()).unwrap();
+        release_rx.await.unwrap();
+        let body = json!({"device_code":"held-code", "user_code":"HELD", "verification_uri":"https://github.com/login/device", "expires_in":60, "interval":1}).to_string();
+        reader.get_mut().write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
+    });
+    let services = Arc::new(
+        crate::Services::new(store)
+            .with_secret_store(Arc::new(raw.clone()))
+            .with_github_login_base_uri(&base),
+    );
+    let request = intent_core::spawn_daemon({
+        let services = services.clone();
+        async move { services.github_connect().await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    if drain_writers {
+        services.shutdown_store_writers().await;
+        assert!(services.store_tasks.is_closed());
+    } else {
+        services.begin_settings_shutdown();
+        assert!(!services.store_tasks.is_closed());
+    }
+    release_tx.send(()).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), request)
+        .await
+        .unwrap()
+        .unwrap();
+    server.await.unwrap();
+    let advertised = services.github_auth_flow.lock().await.is_some();
+    // Clean up even on the failing baseline, which starts a resident poller.
+    services.shutdown_store_writers().await;
+    assert!(
+        result.is_err(),
+        "connect advertised a flow without an admitted poll owner: {result:?}"
+    );
+    assert!(!advertised, "shutdown admitted a new resident poll flow");
+    assert_eq!(raw.load(SECRET_ACCOUNT).unwrap(), None);
+    assert_eq!(
+        raw.load(crate::source_control_auth_ops::GITHUB_TOKEN_METHOD_ACCOUNT)
+            .unwrap(),
+        None
+    );
+}
+
 pub(crate) async fn authorize(
     services: &crate::Services,
     raw: intent_core::FileSecretStore,
@@ -50,15 +134,23 @@ pub(crate) async fn authorize(
         deadline,
         phase: FlowPhase::Pending,
     });
-    let owner = CredentialOwner::new(services.secrets.clone());
+    let owner = CredentialOwner::new(&services.secrets, services.settings_tasks.clone());
     let flow = flow
-        .with_store(raw)
+        .with_store(raw.clone())
         .with_identity_guard(None, owner.identity_guard(identity, state.clone(), flow_id));
+    assert_eq!(
+        flow.persistence_path(),
+        raw.path(),
+        "engine must use the dedicated secrets file before any poll"
+    );
     let bus = services.event_bus.clone();
-    intent_core::spawn_daemon(async move {
-        run_poll_loop(state, bus, owner, flow_id, flow, deadline, false).await;
-        server.await.unwrap();
-    })
+    services
+        .store_tasks
+        .spawn_draining(async move {
+            run_poll_loop(state, bus, owner, flow_id, flow, deadline, false).await;
+            server.await.unwrap();
+        })
+        .expect("poll owner admitted")
 }
 
 pub(crate) fn accept_identity() -> IdentityGuard {
@@ -74,6 +166,61 @@ impl Drop for ParkLease {
         self.entered.notify_one();
         let _ = self.release.lock().unwrap().recv();
     }
+}
+
+#[intent_test_macros::daemon_test]
+async fn github_poll_retains_engine_result_after_write_wait_budget() {
+    let dir = crate::test_support::test_tempdir("github-poll-late-write-result");
+    let store = intent_store::Store::open(&dir.path().join("state.db"))
+        .await
+        .unwrap();
+    let raw = intent_core::FileSecretStore::with_path(dir.path().join("secrets.json"));
+    let services = crate::Services::new(store).with_secret_store(Arc::new(raw.clone()));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release = Arc::new(std::sync::Mutex::new(Some(release_rx)));
+    let identity: IdentityGuard = Arc::new({
+        let entered = entered.clone();
+        move |_| {
+            let lease = ParkLease {
+                entered: entered.clone(),
+                release: std::sync::Mutex::new(release.lock().unwrap().take().unwrap()),
+            };
+            Box::pin(async move { Ok(Box::new(lease) as IdentityLease) })
+        }
+    });
+    let mut flow = authorize(&services, raw.clone(), identity).await;
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .unwrap();
+    // The engine's existing public wait cap is ten seconds. Its real blocking
+    // closure has written the token but remains held in lease destruction,
+    // before the actual Result can be returned to a completion owner.
+    let early = tokio::time::timeout(Duration::from_secs(11), &mut flow).await;
+    release_tx.send(()).unwrap();
+    if early.is_err() {
+        tokio::time::timeout(Duration::from_secs(5), flow)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert!(
+        early.is_err(),
+        "poll returned before the held engine result"
+    );
+    assert_eq!(
+        raw.load(SECRET_ACCOUNT).unwrap().as_deref(),
+        Some("new-device-token")
+    );
+    assert_eq!(
+        raw.load(crate::source_control_auth_ops::GITHUB_TOKEN_METHOD_ACCOUNT)
+            .unwrap()
+            .as_deref(),
+        Some("device"),
+        "late successful engine result lost its provenance continuation"
+    );
+    assert!(services.github_auth_flow.lock().await.is_none());
+    services.shutdown_store_writers().await;
 }
 
 async fn revoke_or_cancel_before_publication(cancel: bool) {

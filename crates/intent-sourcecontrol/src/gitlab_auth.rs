@@ -300,6 +300,22 @@ pub async fn refresh_access_token_with_lease(
     store: FileSecretStore,
     lease: Option<PersistenceLease>,
 ) -> Result<Option<Vec<String>>> {
+    let grant = refresh_grant(host, client_id, store).await?;
+    let scopes = grant.scopes.clone();
+    grant.commit_with_lease(lease).await?;
+    Ok(scopes)
+}
+
+/// Exchange the stored refresh token without starting credential persistence.
+/// The caller must retain this opaque grant through owned completion.
+///
+/// # Errors
+/// Returns the same exchange/read errors as [`refresh_access_token`].
+pub async fn refresh_grant(
+    host: &GitlabHost,
+    client_id: &str,
+    store: FileSecretStore,
+) -> Result<GitlabGrant> {
     let client_id = client_id.trim();
     if client_id.is_empty() {
         return Err(Error::Config(
@@ -376,18 +392,16 @@ pub async fn refresh_access_token_with_lease(
         } => {
             // Doorkeeper always rotates; keep the old one only if the body
             // somehow omitted a replacement so the next refresh can still try.
-            persist_tokens_with_lease(
+            Ok(GitlabGrant {
                 store,
                 access_token,
-                Some(rotated.unwrap_or(refresh_token)),
-                expires_in.map(|secs| unix_now().saturating_add(secs)),
-                lease,
-            )
-            .await?;
-            Ok(body
-                .get("scope")
-                .and_then(Value::as_str)
-                .map(crate::device_flow::parse_scopes))
+                refresh_token: Some(rotated.unwrap_or(refresh_token)),
+                expires_at: expires_in.map(|secs| unix_now().saturating_add(secs)),
+                scopes: body
+                    .get("scope")
+                    .and_then(Value::as_str)
+                    .map(crate::device_flow::parse_scopes),
+            })
         }
         other => Err(Error::Decode(format!(
             "unexpected gitlab token refresh response: {other:?}"
@@ -502,6 +516,27 @@ impl std::fmt::Debug for GitlabGrant {
 }
 
 impl GitlabGrant {
+    /// Scopes reported by the actual grant, not the requested scope list.
+    #[must_use]
+    pub fn granted_scopes(&self) -> Option<&[String]> {
+        self.scopes.as_deref()
+    }
+
+    /// Transfer this opaque grant and its lease to a caller-owned completion
+    /// record. The caller must register ownership before executing the closure.
+    pub fn into_persistence(
+        self,
+        lease: Option<PersistenceLease>,
+    ) -> impl FnOnce() -> intent_core::Result<()> + Send + 'static {
+        token_persistence(
+            self.store,
+            self.access_token,
+            self.refresh_token,
+            self.expires_at,
+            lease,
+        )
+    }
+
     /// Persist the pair into the flow's secret store (replacing whatever it
     /// held, clearing a stale refresh token / expiry when the grant has none).
     ///
@@ -1068,6 +1103,31 @@ pub async fn persist_gitlab_token_with_lease(
     persist_tokens_with_lease(store, token, None, None, Some(lease)).await
 }
 
+/// Build a PAT write whose caller owns admission, physical completion and
+/// publication. The returned closure retains the credential lease until all
+/// sequential token/refresh/expiry changes finish.
+pub fn pat_persistence(
+    store: FileSecretStore,
+    token: SecretString,
+    lease: PersistenceLease,
+) -> impl FnOnce() -> intent_core::Result<()> + Send + 'static {
+    token_persistence(store, token, None, None, Some(lease))
+}
+
+/// Build an owned revocation with the same sequential deletion semantics as
+/// [`revoke_gitlab_token`]. No effect occurs until the closure executes.
+pub fn token_revocation(
+    store: FileSecretStore,
+    lease: Option<PersistenceLease>,
+) -> impl FnOnce() -> intent_core::Result<()> + Send + 'static {
+    move || {
+        let _lease = lease;
+        store.delete(SECRET_ACCOUNT)?;
+        store.delete(REFRESH_SECRET_ACCOUNT)?;
+        store.delete(EXPIRES_AT_SECRET_ACCOUNT)
+    }
+}
+
 async fn persist_tokens_with_lease(
     store: FileSecretStore,
     token: SecretString,
@@ -1076,21 +1136,31 @@ async fn persist_tokens_with_lease(
     lease: Option<PersistenceLease>,
 ) -> Result<()> {
     run_blocking(
-        move || {
-            let _lease = lease;
-            store.store(SECRET_ACCOUNT, token.expose_secret())?;
-            match refresh_token {
-                Some(refresh) => store.store(REFRESH_SECRET_ACCOUNT, refresh.expose_secret())?,
-                None => store.delete(REFRESH_SECRET_ACCOUNT)?,
-            }
-            match expires_at {
-                Some(at) => store.store(EXPIRES_AT_SECRET_ACCOUNT, &at.to_string()),
-                None => store.delete(EXPIRES_AT_SECRET_ACCOUNT),
-            }
-        },
+        token_persistence(store, token, refresh_token, expires_at, lease),
         "persist",
     )
     .await
+}
+
+fn token_persistence(
+    store: FileSecretStore,
+    token: SecretString,
+    refresh_token: Option<SecretString>,
+    expires_at: Option<u64>,
+    lease: Option<PersistenceLease>,
+) -> impl FnOnce() -> intent_core::Result<()> + Send + 'static {
+    move || {
+        let _lease = lease;
+        store.store(SECRET_ACCOUNT, token.expose_secret())?;
+        match refresh_token {
+            Some(refresh) => store.store(REFRESH_SECRET_ACCOUNT, refresh.expose_secret())?,
+            None => store.delete(REFRESH_SECRET_ACCOUNT)?,
+        }
+        match expires_at {
+            Some(at) => store.store(EXPIRES_AT_SECRET_ACCOUNT, &at.to_string()),
+            None => store.delete(EXPIRES_AT_SECRET_ACCOUNT),
+        }
+    }
 }
 
 /// Delete the stored `sourceControl.gitlab.token` (and refresh token +
@@ -1102,15 +1172,7 @@ async fn persist_tokens_with_lease(
 ///
 /// Returns [`Error::Api`] when the delete fails or times out.
 pub async fn revoke_gitlab_token(store: FileSecretStore) -> Result<()> {
-    run_blocking(
-        move || {
-            store.delete(SECRET_ACCOUNT)?;
-            store.delete(REFRESH_SECRET_ACCOUNT)?;
-            store.delete(EXPIRES_AT_SECRET_ACCOUNT)
-        },
-        "delete",
-    )
-    .await
+    run_blocking(token_revocation(store, None), "delete").await
 }
 
 async fn run_blocking<F>(write: F, what: &str) -> Result<()>

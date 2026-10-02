@@ -520,6 +520,8 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
 fn assert_shutdown_phase_order(log: &str) {
     let phases = [
         "cleanup",
+        "pty_shutdown",
+        "request_drain",
         "agent_checkpoint",
         "agent_deliveries",
         "startup_recovery_join",
@@ -528,7 +530,7 @@ fn assert_shutdown_phase_order(log: &str) {
         "mcp_start_join",
         "mcp_shutdown",
         "agent_shutdown",
-        "pty_shutdown",
+        "writer_drain",
         "store_close",
         "wal_checkpoint",
         "write_pool_close",

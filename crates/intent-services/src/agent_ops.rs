@@ -5187,8 +5187,14 @@ impl Services {
         if let Some(existing) =
             self.pending_agent_deletes
                 .schedule(key, delete_at.clone(), move |generation| {
-                    intent_core::spawn_daemon(async move {
-                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    let tasks = timer_services.pending_delete_tasks.clone();
+                    let stopping = tasks.clone();
+                    tasks.spawn_draining(async move {
+                        tokio::select! {
+                            biased;
+                            () = stopping.closed() => return,
+                            () = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {}
+                        }
                         // Claim-or-abstain: only the timer that still owns the
                         // entry commits. A cancel or an immediate delete that
                         // raced ahead removed/superseded the entry — do nothing.
@@ -5211,7 +5217,7 @@ impl Services {
                                 "scheduled agent delete failed at commit"
                             );
                         }
-                    })
+                    }).unwrap_or_else(|| intent_core::spawn_daemon(async {}))
                 })
         {
             return Ok(existing);
@@ -9897,27 +9903,6 @@ impl Services {
                     Some(intent_core::CheckoutMode::Cow | intent_core::CheckoutMode::Direct)
                 ) && ws.worktree_path.is_some();
                 if is_direct_mode || is_standalone_checkout {
-                    // Drop guard: settles the gate even if provisioning
-                    // panics, so the gate map never accumulates stale
-                    // entries. Constructed BEFORE the spawn (and moved into
-                    // the task) so cleanup is unconditional even when the
-                    // runtime drops the task unpolled at shutdown. On the
-                    // normal path the guard drops AFTER
-                    // `provision_delegate_sandbox` returns — the session's
-                    // sandbox fields and the `sandbox:cow:created` event are
-                    // already published, so a released waiter observes the
-                    // settled state. Dropping the held sender (also via the
-                    // guard) releases every waiter.
-                    struct SettleGuard {
-                        services: Services,
-                        aid: AgentId,
-                        _release: tokio::sync::watch::Sender<()>,
-                    }
-                    impl Drop for SettleGuard {
-                        fn drop(&mut self) {
-                            self.services.settle_sandbox_provisioning(&self.aid);
-                        }
-                    }
                     // Same root fallback as `workspace.create` (the intentd
                     // binary configures the root via INTENTD_WORKSPACES_DIR /
                     // `workspaces.root` rather than `.with_workspaces_root`).
@@ -9934,20 +9919,16 @@ impl Services {
                     // so the child's turn worker (`ensure_started`) blocks its
                     // first ACP spawn until the clone settles — the child
                     // never spawns against a half-copied sandbox.
-                    let settled = self.begin_sandbox_provisioning(&aid);
-                    effective_isolation = Some("pending");
-                    let guard = SettleGuard {
-                        services: self.clone(),
-                        aid,
-                        _release: settled,
-                    };
+                    let owner = self.clone();
                     let ws_id = workspace_id.clone();
-                    intent_core::spawn_daemon(async move {
-                        guard
-                            .services
-                            .provision_delegate_sandbox(&ws_id, &guard.aid, root)
+                    let worker_aid = aid.clone();
+                    if self.spawn_sandbox_provisioning(&aid, async move {
+                        owner
+                            .provision_delegate_sandbox(&ws_id, &worker_aid, root)
                             .await;
-                    });
+                    }) {
+                        effective_isolation = Some("pending");
+                    }
                 }
             }
         }
@@ -10625,6 +10606,45 @@ impl Services {
             }
         }
         Ok(result)
+    }
+
+    /// Keep the wait gate alive through the complete clone and settlement.
+    fn spawn_sandbox_provisioning(
+        &self,
+        agent_id: &AgentId,
+        provision: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> bool {
+        struct SettleGuard {
+            services: Services,
+            aid: AgentId,
+            _release: tokio::sync::watch::Sender<()>,
+        }
+        impl Drop for SettleGuard {
+            fn drop(&mut self) {
+                self.services.settle_sandbox_provisioning(&self.aid);
+            }
+        }
+        // Register before publishing the wait gate. The admitted task waits
+        // for that gate before cloning; rejection cannot strand a waiter or
+        // start filesystem work. No await separates admission and publication.
+        let (ready, admitted) = tokio::sync::oneshot::channel::<SettleGuard>();
+        if self
+            .store_tasks
+            .spawn_draining(async move {
+                if let Ok(_guard) = admitted.await {
+                    provision.await;
+                }
+            })
+            .is_none()
+        {
+            return false;
+        }
+        let guard = SettleGuard {
+            services: self.clone(),
+            aid: agent_id.clone(),
+            _release: self.begin_sandbox_provisioning(agent_id),
+        };
+        ready.send(guard).is_ok()
     }
 
     /// Background half of the delegate CoW-isolation path (monorepo#871): run
@@ -16562,6 +16582,22 @@ impl Services {
     ///
     /// Returns the number of agents successfully resumed by this sweep.
     pub async fn resume_suspend_interrupted_agents(&self) -> usize {
+        let services = self.clone();
+        let Some(owner) = self.settings_tasks.spawn_draining(async move {
+            services.resume_suspend_interrupted_agents_owned().await
+        }) else {
+            return 0;
+        };
+        match owner.await {
+            Ok(resumed) => resumed,
+            Err(error) => {
+                tracing::error!(%error, "suspend resume owner failed");
+                0
+            }
+        }
+    }
+
+    async fn resume_suspend_interrupted_agents_owned(&self) -> usize {
         let rows = match self.store.list_interrupted_agents().await {
             Ok(rows) => rows,
             Err(e) => {
@@ -16572,6 +16608,12 @@ impl Services {
         let suspend_reason = crate::agent_session::InterruptReason::SystemSuspend.as_str();
         let mut resumed = 0usize;
         for interrupted in rows {
+            // A claimed resume must finish or reset, but later rows stay
+            // pending for startup/manual recovery once root admission closes.
+            if self.settings_tasks.is_closed() {
+                break;
+            }
+
             // Never blanket-resume rows a user left pending for another reason.
             if interrupted.reason.as_deref() != Some(suspend_reason) {
                 continue;

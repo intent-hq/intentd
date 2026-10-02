@@ -193,6 +193,9 @@ const DEFAULT_WARN_INTERVAL: Duration = Duration::from_secs(60);
 /// cap the credential state is unknown and the caller must not blind-restore.
 const DEFAULT_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[cfg(test)]
+type MutationHook<T> = Arc<Mutex<Option<Box<dyn FnOnce() -> T + Send>>>>;
+
 /// Async, single-flight, TTL-cached wrapper around a synchronous [`SecretStore`]
 /// so blocking secret-store calls (file I/O) never wedge
 /// the tokio runtime. Every backing call runs on the blocking pool via
@@ -200,12 +203,38 @@ const DEFAULT_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// coalesced per account via single-flight so a hung backing store occupies at
 /// most one blocking-pool thread total (not one per request). Cache entries are
 /// invalidated on successful writes and expire on TTL.
+#[derive(Clone)]
 pub(crate) struct AsyncSecretStore {
     inner: Arc<dyn SecretStore>,
     state: Arc<Mutex<AsyncState>>,
+    mutation_tasks: Arc<crate::delivery_tasks::DeliveryTasks>,
+    mutation_owner: Option<u64>,
+    mutation_timeout: Option<Arc<tokio::sync::Notify>>,
+    #[cfg(test)]
+    before_mutation_admission: MutationHook<()>,
+    #[cfg(test)]
+    completion_start: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+    #[cfg(test)]
+    pending_polled: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    #[cfg(test)]
+    pub(crate) panic_mutation_caller: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+    #[cfg(test)]
+    pub(crate) before_github_persistence: MutationHook<Result<()>>,
+    #[cfg(test)]
+    pub(crate) github_poll_worker_failed: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    pub(crate) github_poll_sleep_pending: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    #[cfg(test)]
+    pub(crate) before_gitlab_persistence: MutationHook<Result<()>>,
+    #[cfg(test)]
+    pub(crate) gitlab_poll_worker_failed: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    pub(crate) writer_drain_pending: Arc<Mutex<Option<tokio::sync::oneshot::Sender<&'static str>>>>,
     /// Shared by settings, revoke and the device flow's persistence lease.
     /// A ledger may compensate only the generation it wrote, under this lock.
     github_mutation: Arc<tokio::sync::Mutex<u64>>,
+    #[cfg(test)]
+    github_lock_pending: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
     load_timeout: Duration,
     write_timeout: Duration,
     cache_ttl: Duration,
@@ -226,7 +255,43 @@ struct AsyncState {
     /// be cancelled, so the mutation may still land; the handles are kept so
     /// [`AsyncSecretStore::settle_detached`] can wait for them before a
     /// compensating write touches the same account.
-    detached: Vec<(String, tokio::task::JoinHandle<Result<()>>)>,
+    mutations: Vec<Arc<SecretMutation>>,
+    next_mutation: u64,
+    next_owner: u64,
+}
+
+/// Results remain attached to the originating operation until it acknowledges
+/// them. Serialization observers never consume that operation's receipt.
+struct SecretMutation {
+    id: u64,
+    owner: Option<u64>,
+    account: String,
+    state: tokio::sync::Mutex<MutationState>,
+    timed_out: std::sync::atomic::AtomicBool,
+    settling: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    after_capture: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+enum MutationState {
+    Unstarted(Option<Box<dyn FnOnce() -> Result<()> + Send>>),
+    Pending(tokio::task::JoinHandle<Result<()>>),
+    Captured(Result<()>),
+    Finalized {
+        result: Option<Result<()>>,
+        outcome: std::result::Result<(), String>,
+    },
+}
+
+#[cfg(test)]
+#[path = "settings_shutdown_tests.rs"]
+mod shutdown_tests;
+
+struct SettlementObserver<'a>(&'a std::sync::atomic::AtomicUsize);
+impl Drop for SettlementObserver<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// One per-account cache slot: either an in-flight load that later resolvers
@@ -279,9 +344,36 @@ impl AsyncSecretStore {
                 entries: HashMap::new(),
                 last_warn: HashMap::new(),
                 next_load_id: 0,
-                detached: Vec::new(),
+                mutations: Vec::new(),
+                next_mutation: 0,
+                next_owner: 0,
             })),
+            mutation_tasks: Arc::new(crate::delivery_tasks::DeliveryTasks::default()),
+            mutation_owner: None,
+            mutation_timeout: None,
+            #[cfg(test)]
+            before_mutation_admission: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            completion_start: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            pending_polled: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            panic_mutation_caller: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            before_github_persistence: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            github_poll_worker_failed: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            github_poll_sleep_pending: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            before_gitlab_persistence: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            gitlab_poll_worker_failed: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            writer_drain_pending: Arc::new(Mutex::new(None)),
             github_mutation: Arc::new(tokio::sync::Mutex::new(0)),
+            #[cfg(test)]
+            github_lock_pending: Arc::new(Mutex::new(None)),
             load_timeout,
             write_timeout,
             cache_ttl,
@@ -294,12 +386,22 @@ impl AsyncSecretStore {
     /// before another mutation. Device persistence retains an owned guard in
     /// its blocking write lease; waiting for that lease is bounded too.
     pub(crate) async fn github_mutation(&self) -> Result<tokio::sync::OwnedMutexGuard<u64>> {
-        let guard = timeout(
-            self.settle_timeout,
-            self.github_mutation.clone().lock_owned(),
-        )
-        .await
-        .map_err(|_| {
+        let acquire = self.github_mutation.clone().lock_owned();
+        #[cfg(test)]
+        let acquire = {
+            let mut acquire = Box::pin(acquire);
+            std::future::poll_fn(move |cx| {
+                use std::future::Future;
+                let result = acquire.as_mut().poll(cx);
+                if result.is_pending() {
+                    if let Some(signal) = self.github_lock_pending.lock().unwrap().take() {
+                        let _ = signal.send(());
+                    }
+                }
+                result
+            })
+        };
+        let guard = timeout(self.settle_timeout, acquire).await.map_err(|_| {
             Error::Internal(
                 "GitHub credential mutation is still running; credential state is unknown".into(),
             )
@@ -389,134 +491,365 @@ impl AsyncSecretStore {
         self.load(account).await
     }
 
-    /// Persist `value` for `account`. Runs the blocking write off the async
-    /// runtime with a bounded timeout, then refreshes the cache slot so
-    /// subsequent `load` calls observe the new value without re-hitting the
-    /// backing store. Timeouts / backing errors surface as [`Error::Internal`].
-    pub(crate) async fn store(&self, account: &str, value: &str) -> Result<()> {
-        let inner = self.inner.clone();
-        let account_owned = account.to_string();
-        let value_owned = value.to_string();
-        let mut handle =
-            tokio::task::spawn_blocking(move || inner.store(&account_owned, &value_owned));
-        match timeout(self.write_timeout, &mut handle).await {
-            Ok(Ok(Ok(()))) => {
-                self.set_cached(account, Some(value.to_string()));
-                Ok(())
-            }
-            Ok(Ok(Err(e))) => Err(e),
-            Ok(Err(join_err)) => Err(Error::Internal(format!(
-                "secret-store write task panicked: {join_err}"
-            ))),
-            Err(_) => {
-                self.warn_timeout(account, "secret-store write timed out");
-                self.detach(account, handle);
-                Err(Error::Internal(format!(
-                    "secret-store write timed out for {account}"
-                )))
-            }
+    /// A private receipt namespace for one admitted settings operation. The
+    /// backend/cache and completion owners remain shared across all clones.
+    pub(crate) fn operation(&self) -> Self {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let owner = state.next_owner;
+        state.next_owner += 1;
+        Self {
+            mutation_owner: Some(owner),
+            ..self.clone()
         }
     }
 
-    /// Delete the stored secret for `account`. Runs the blocking delete off the
-    /// async runtime with a bounded timeout, then updates the cache to reflect
-    /// absence. Absent secrets are idempotent successes per [`SecretStore`].
-    pub(crate) async fn delete(&self, account: &str) -> Result<()> {
-        let inner = self.inner.clone();
-        let account_owned = account.to_string();
-        let mut handle = tokio::task::spawn_blocking(move || inner.delete(&account_owned));
-        match timeout(self.write_timeout, &mut handle).await {
-            Ok(Ok(Ok(()))) => {
-                self.set_cached(account, None);
-                Ok(())
-            }
-            Ok(Ok(Err(e))) => Err(e),
-            Ok(Err(join_err)) => Err(Error::Internal(format!(
-                "secret-store delete task panicked: {join_err}"
-            ))),
-            Err(_) => {
-                self.warn_timeout(account, "secret-store delete timed out");
-                self.detach(account, handle);
-                Err(Error::Internal(format!(
-                    "secret-store delete timed out for {account}"
-                )))
-            }
+    /// Direct credential/config owners retain their continuation after the
+    /// caller's write budget expires. Only the response is allowed to time out.
+    pub(crate) fn settled_operation(&self, expired: Arc<tokio::sync::Notify>) -> Self {
+        Self {
+            mutation_timeout: Some(expired),
+            ..self.operation()
         }
     }
 
-    /// Keep the handle of a timed-out write / delete so a later
-    /// [`settle_detached`](Self::settle_detached) can wait for it. Finished
-    /// handles are pruned on every insert, so the list stays bounded by the
-    /// number of mutations still running.
-    fn detach(&self, account: &str, handle: tokio::task::JoinHandle<Result<()>>) {
-        let mut state = self.state.lock().unwrap();
-        state.detached.retain(|(_, h)| !h.is_finished());
-        state.detached.push((account.to_string(), handle));
+    #[cfg(test)]
+    pub(crate) fn mutation_counts_for_test(&self) -> (usize, u64) {
+        let state = self.state.lock().unwrap();
+        (state.mutations.len(), state.next_owner)
     }
 
-    /// Wait until every timed-out write / delete on `account` has finished, so
-    /// a compensating write issued afterwards cannot be undone by a mutation
-    /// that was still running. `Ok(false)` when no such mutation existed,
-    /// `Ok(true)` once all of them landed (the cache slot is dropped because
-    /// the late completion bypassed the cache refresh). The wait is bounded by
-    /// [`DEFAULT_SETTLE_TIMEOUT`]: a `spawn_blocking` task cannot be cancelled,
-    /// so past the cap the mutation may still land later and the account's
-    /// state is unknown — `Err(Error::Internal)` tells the caller to surface
-    /// that instead of blind-restoring, and the unfinished handles go back on
-    /// the list so a later settle still waits for them.
-    pub(crate) async fn settle_detached(&self, account: &str) -> Result<bool> {
-        let handles: Vec<_> = {
-            let mut state = self.state.lock().unwrap();
-            let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut state.detached)
-                .into_iter()
-                .partition(|(a, _)| a == account);
-            state.detached = rest;
-            mine.into_iter().map(|(_, h)| h).collect()
-        };
-        if handles.is_empty() {
-            return Ok(false);
+    /// Settle and acknowledge only this originating operation's receipts.
+    /// Called with its account guards held, after response/compensation handling.
+    pub(crate) async fn finish_operation(&self) {
+        let records: Vec<_> = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .mutations
+            .iter()
+            .filter(|record| record.owner == self.mutation_owner)
+            .cloned()
+            .collect();
+        for record in records {
+            if let Err(error) = self.finish_mutation(&record).await {
+                tracing::warn!(account = %record.account, %error, "settings mutation settled with failure");
+            }
+            self.acknowledge(&record);
         }
-        let deadline = Instant::now() + self.settle_timeout;
-        let mut handles = handles.into_iter();
-        while let Some(mut handle) = handles.next() {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            match timeout(remaining, &mut handle).await {
-                Ok(Ok(Ok(()))) => {}
-                Ok(Ok(Err(e))) => tracing::warn!(
-                    account = %account,
-                    error = %e,
-                    "timed-out secret-store mutation finished with an error"
-                ),
-                Ok(Err(join_err)) => tracing::warn!(
-                    account = %account,
-                    error = %join_err,
-                    "timed-out secret-store mutation panicked"
-                ),
-                Err(_) => {
-                    let unfinished: Vec<_> = std::iter::once(handle)
-                        .chain(handles)
-                        .map(|h| (account.to_string(), h))
-                        .collect();
-                    let pending = unfinished.len();
-                    self.state.lock().unwrap().detached.extend(unfinished);
-                    tracing::warn!(
-                        account = %account,
-                        pending,
-                        cap_secs = self.settle_timeout.as_secs_f64(),
-                        "secret-store mutation still running past the settle cap; credential state unknown"
-                    );
-                    return Err(Error::Internal(format!(
-                        "secret-store mutation on {account} still running after {:.0?}; the stored credential state is unknown — reconcile it (re-authenticate) before retrying",
-                        self.settle_timeout
-                    )));
+    }
+
+    pub(crate) async fn shutdown_mutations(&self) {
+        self.mutation_tasks.drain_finite().await;
+    }
+
+    fn acknowledge(&self, record: &SecretMutation) {
+        // Only the originating operation may retire a finalized receipt.
+        debug_assert_eq!(record.owner, self.mutation_owner);
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .mutations
+            .retain(|entry| entry.id != record.id);
+    }
+
+    /// Polling observers borrow the handle. Ready -> Captured is synchronous
+    /// under the record lock, before finalization can fail or suspend. A later
+    /// observer never polls a `JoinHandle` whose output has already been taken.
+    async fn finish_mutation(&self, record: &SecretMutation) -> std::result::Result<(), String> {
+        let mut state = record.state.lock().await;
+        if let MutationState::Unstarted(write) = &mut *state {
+            let write = write
+                .take()
+                .ok_or_else(|| "secret mutation lost its operation".to_string())?;
+            *state = MutationState::Pending(tokio::task::spawn_blocking(write));
+        }
+        if let MutationState::Pending(handle) = &mut *state {
+            #[cfg(not(test))]
+            let joined = handle.await;
+            #[cfg(test)]
+            let joined = std::future::poll_fn(|cx| {
+                use std::future::Future;
+                let polled = std::pin::Pin::new(&mut *handle).poll(cx);
+                if polled.is_pending() {
+                    if let Some(notify) = self.pending_polled.lock().unwrap().take() {
+                        let _ = notify.send(());
+                    }
+                }
+                polled
+            })
+            .await;
+            let result = match joined {
+                Ok(result) => result,
+                Err(error) => Err(Error::Internal(format!(
+                    "secret-store mutation task panicked: {error}"
+                ))),
+            };
+            *state = MutationState::Captured(result);
+            #[cfg(test)]
+            {
+                let fail = record.after_capture.lock().unwrap().take();
+                if let Some(fail) = fail {
+                    fail();
                 }
             }
         }
-        let mut state = self.state.lock().unwrap();
-        if matches!(state.entries.get(account), Some(Entry::Cached { .. })) {
-            state.entries.remove(account);
+        if let MutationState::Captured(result) = &*state {
+            let outcome = result.as_ref().copied().map_err(ToString::to_string);
+            // Invalidate cached and in-flight values before exposing settlement.
+            let mut cache = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.entries.remove(&record.account);
+            if record.account == intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT {
+                for sibling in forge_token_secret_siblings(&record.account) {
+                    cache.entries.remove(*sibling);
+                }
+            }
+            drop(cache);
+            let MutationState::Captured(result) =
+                std::mem::replace(&mut *state, MutationState::Captured(Ok(())))
+            else {
+                unreachable!()
+            };
+            *state = MutationState::Finalized {
+                result: Some(result),
+                outcome,
+            };
         }
-        Ok(true)
+        match &*state {
+            MutationState::Finalized { outcome, .. } => outcome.clone(),
+            _ => Err("secret mutation completion unavailable".into()),
+        }
+    }
+
+    /// Only the originating writer consumes the original typed result. Other
+    /// observers use the retained diagnostic outcome without taking its receipt.
+    async fn mutation_result(&self, record: &SecretMutation) -> Result<()> {
+        let _ = self.finish_mutation(record).await;
+        let mut state = record.state.lock().await;
+        match &mut *state {
+            MutationState::Finalized { result, .. } => result
+                .take()
+                .ok_or_else(|| Error::Internal("secret mutation result already consumed".into()))?,
+            _ => Err(Error::Internal("secret mutation result unavailable".into())),
+        }
+    }
+
+    async fn mutate(
+        &self,
+        account: &str,
+        write: impl FnOnce() -> Result<()> + Send + 'static,
+    ) -> Result<()> {
+        let record = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let id = state.next_mutation;
+            state.next_mutation += 1;
+            let record = Arc::new(SecretMutation {
+                id,
+                owner: self.mutation_owner,
+                account: account.into(),
+                state: tokio::sync::Mutex::new(MutationState::Unstarted(Some(Box::new(write)))),
+                timed_out: std::sync::atomic::AtomicBool::new(false),
+                settling: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
+                after_capture: Mutex::new(None),
+            });
+            #[cfg(test)]
+            {
+                let pause = self.before_mutation_admission.lock().unwrap().take();
+                if let Some(pause) = pause {
+                    pause();
+                }
+            }
+            let this = self.clone();
+            let completion = record.clone();
+            // AsyncState -> tracker admission is synchronous. The tracker never
+            // polls this future under its lock, and its drainer releases that
+            // lock before joining. Do not await a record/task while holding
+            // AsyncState: completion uses record -> AsyncState to invalidate.
+            if self.mutation_tasks.spawn_draining(async move {
+                #[cfg(test)]
+                {
+                    let held = this.completion_start.lock().unwrap().take();
+                    if let Some(held) = held {
+                        let _ = held.await;
+                    }
+                }
+                if let Err(error) = this.finish_mutation(&completion).await {
+                    tracing::warn!(account = %completion.account, %error, "secret-store mutation failed");
+                }
+            }).is_none() {
+                // The private record was never observable. In particular, do
+                // not acknowledge here: that would re-lock AsyncState.
+                return Err(Error::Internal("daemon is shutting down".into()));
+            }
+            state.mutations.push(record.clone());
+            record
+        };
+        #[cfg(test)]
+        {
+            let fail = self.panic_mutation_caller.lock().unwrap().take();
+            if let Some(fail) = fail {
+                let _ = fail.await;
+                panic!("injected operation-worker failure with outstanding mutation");
+            }
+        }
+        if let Ok(result) = timeout(self.write_timeout, self.mutation_result(&record)).await {
+            self.acknowledge(&record);
+            result
+        } else {
+            record
+                .timed_out
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.warn_timeout(account, "secret-store write timed out");
+            if let Some(expired) = &self.mutation_timeout {
+                expired.notify_one();
+                let result = self.mutation_result(&record).await;
+                self.acknowledge(&record);
+                return result;
+            }
+            Err(Error::Internal(format!(
+                "secret-store write timed out for {account}"
+            )))
+        }
+    }
+
+    /// Caller waits remain bounded; the independently owned record retains
+    /// the actual blocking result after timeout or cancellation.
+    pub(crate) async fn store(&self, account: &str, value: &str) -> Result<()> {
+        let inner = self.inner.clone();
+        let owned_account = account.to_string();
+        let owned_value = value.to_string();
+        self.mutate(account, move || inner.store(&owned_account, &owned_value))
+            .await?;
+        self.set_cached(account, Some(value.into()));
+        Ok(())
+    }
+
+    /// Keep the engine's opaque token write in the same completion records as
+    /// provenance and orphan cleanup. Registration precedes the first effect;
+    /// cache invalidation and the actual typed result survive worker failure.
+    pub(crate) async fn persist_github_grant(
+        &self,
+        grant: intent_sourcecontrol::device_flow::GithubGrant,
+        lease: Option<intent_sourcecontrol::device_flow::IdentityLease>,
+    ) -> Result<()> {
+        let write = grant.into_persistence(lease);
+        #[cfg(test)]
+        let write = {
+            let before = self.before_github_persistence.lock().unwrap().take();
+            move || {
+                if let Some(before) = before {
+                    before()?;
+                }
+                write()
+            }
+        };
+        self.mutate(crate::github_auth_ops::SECRET_ACCOUNT, write)
+            .await
+    }
+
+    /// The primary GitLab poll retains the opaque pair write and its actual
+    /// result through the same completion records as settings mutations.
+    pub(crate) async fn persist_gitlab_grant(
+        &self,
+        grant: intent_sourcecontrol::gitlab_auth::GitlabGrant,
+        lease: intent_sourcecontrol::gitlab_auth::PersistenceLease,
+    ) -> Result<()> {
+        self.mutate_gitlab(grant.into_persistence(Some(lease)))
+            .await
+    }
+
+    pub(crate) async fn persist_gitlab_pat(
+        &self,
+        store: intent_core::FileSecretStore,
+        token: intent_sourcecontrol::SecretString,
+        lease: intent_sourcecontrol::gitlab_auth::PersistenceLease,
+    ) -> Result<()> {
+        self.mutate_gitlab(intent_sourcecontrol::gitlab_auth::pat_persistence(
+            store, token, lease,
+        ))
+        .await
+    }
+
+    pub(crate) async fn revoke_gitlab_token(
+        &self,
+        store: intent_core::FileSecretStore,
+        lease: intent_sourcecontrol::gitlab_auth::PersistenceLease,
+    ) -> Result<()> {
+        self.mutate_gitlab(intent_sourcecontrol::gitlab_auth::token_revocation(
+            store,
+            Some(lease),
+        ))
+        .await
+    }
+
+    async fn mutate_gitlab(
+        &self,
+        write: impl FnOnce() -> Result<()> + Send + 'static,
+    ) -> Result<()> {
+        #[cfg(test)]
+        let write = {
+            let before = self.before_gitlab_persistence.lock().unwrap().take();
+            move || {
+                if let Some(before) = before {
+                    before()?;
+                }
+                write()
+            }
+        };
+        self.mutate(intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT, write)
+            .await
+    }
+
+    pub(crate) async fn delete(&self, account: &str) -> Result<()> {
+        let inner = self.inner.clone();
+        let owned_account = account.to_string();
+        self.mutate(account, move || inner.delete(&owned_account))
+            .await?;
+        self.set_cached(account, None);
+        Ok(())
+    }
+
+    /// Observation only: a serialization observer cannot acknowledge another
+    /// operation's receipt. Even a completed timeout remains visible to its
+    /// original rollback. The bool means a timed-out mutation was observed,
+    /// not that its backend result was successful.
+    pub(crate) async fn settle_detached(&self, account: &str) -> Result<bool> {
+        let records: Vec<_> = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .mutations
+            .iter()
+            .filter(|r| r.account == account)
+            .cloned()
+            .collect();
+        let observed = records
+            .iter()
+            .any(|r| r.timed_out.load(std::sync::atomic::Ordering::SeqCst));
+        let deadline = Instant::now() + self.settle_timeout;
+        for record in records {
+            record
+                .settling
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _observer = SettlementObserver(&record.settling);
+            match timeout(deadline.saturating_duration_since(Instant::now()), self.finish_mutation(&record)).await {
+                Ok(Ok(())) => {},
+                Ok(Err(error)) => tracing::warn!(%account, %error, "timed-out secret-store mutation failed"),
+                Err(_) => return Err(Error::Internal(format!(
+                    "secret-store mutation on {account} still running after {:.0?}; the stored credential state is unknown — reconcile it (re-authenticate) before retrying", self.settle_timeout
+                ))),
+            }
+        }
+        Ok(observed)
     }
 
     /// Kick off the blocking load for `account`, publishing the result via `tx`
@@ -673,9 +1006,13 @@ impl AsyncSecretStore {
         self.state
             .lock()
             .unwrap()
-            .detached
+            .mutations
             .iter()
-            .filter(|(a, _)| a == account)
+            .filter(|record| {
+                record.account == account
+                    && record.timed_out.load(std::sync::atomic::Ordering::SeqCst)
+                    && record.settling.load(std::sync::atomic::Ordering::SeqCst) == 0
+            })
             .count()
     }
 }
@@ -4430,6 +4767,123 @@ mod tests {
             .with_settings_registry(registry)
             .with_event_bus(bus);
         (dir, services, raw, entered, ReleaseWrite(Some(tx)), sub)
+    }
+
+    async fn shutdown_cancelled_settings_write(delete: bool, during_settle: bool) {
+        use intent_core::WorkspaceApi;
+        use intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT;
+
+        let (_dir, mut services, raw, entered, mut release, _sub) =
+            parked_settings_harness(delete).await;
+        if during_settle {
+            Arc::get_mut(&mut services.secrets).unwrap().write_timeout = Duration::from_millis(10);
+        }
+        let prior_volume = services
+            .settings_get("notifications.volume".into())
+            .await
+            .unwrap()["value"]
+            .clone();
+        // This fixture has no group producers. Settle the unrelated idle lane
+        // before admission so its first scheduling turn cannot masquerade as
+        // ownership of the held settings write at the drain assertion.
+        services.shutdown_group_persistence().await;
+        let writer = services.clone();
+        let request = intent_core::spawn_daemon(async move {
+            if delete {
+                writer.settings_reset(SECRET_ACCOUNT.into()).await
+            } else {
+                writer
+                    .settings_update(json!([
+                        { "path": "notifications.volume", "value": 0.75 },
+                        { "path": SECRET_ACCOUNT, "value": "new-token" }
+                    ]))
+                    .await
+            }
+        });
+        timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("actual secret write entered");
+        if during_settle {
+            // The initial write timeout puts its handle into detached; the
+            // settler takes it out before waiting. Observe that handoff, not
+            // an arbitrary sleep that might cancel the wrong stage.
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    let (timed_out, taken) = {
+                        let state = services.secrets.state.lock().unwrap();
+                        let timed_out = state.last_warn.contains_key(SECRET_ACCOUNT);
+                        let taken = state.mutations.iter().any(|record| {
+                            record.account == SECRET_ACCOUNT
+                                && record.settling.load(std::sync::atomic::Ordering::SeqCst) > 0
+                        });
+                        (timed_out, taken)
+                    };
+                    if timed_out && taken {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("settler owns the timed-out mutation");
+        }
+        request.abort();
+        let _ = request.await;
+        let shutdown = services.shutdown_store_writers();
+        tokio::pin!(shutdown);
+        let returned_early = tokio::select! {
+            biased;
+            () = &mut shutdown => true,
+            () = std::future::ready(()) => false,
+        };
+        // Always release real blocking work, including when RED asserts below.
+        release.release();
+        if !returned_early {
+            timeout(Duration::from_secs(5), &mut shutdown)
+                .await
+                .expect("shutdown settles the cancelled settings owner");
+        }
+        assert!(
+            !returned_early,
+            "shutdown abandoned an admitted settings mutation"
+        );
+        assert_eq!(
+            raw.load(SECRET_ACCOUNT).unwrap().as_deref(),
+            if delete {
+                None
+            } else if during_settle {
+                Some("old-token")
+            } else {
+                Some("new-token")
+            },
+        );
+        let value = services
+            .settings_get("notifications.volume".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            value["value"],
+            if delete || during_settle {
+                prior_volume
+            } else {
+                json!(0.75)
+            }
+        );
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn shutdown_retains_settings_update_after_caller_cancel() {
+        shutdown_cancelled_settings_write(false, false).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn shutdown_retains_settings_reset_after_caller_cancel() {
+        shutdown_cancelled_settings_write(true, false).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn shutdown_retains_settings_mutation_during_settle_cancel() {
+        shutdown_cancelled_settings_write(false, true).await;
     }
 
     async fn parked_settings_success(delete: bool) {

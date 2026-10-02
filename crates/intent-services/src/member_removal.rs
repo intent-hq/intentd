@@ -117,6 +117,8 @@ impl Services {
             }
         }
         if changed {
+            #[cfg(test)]
+            self.hold_periodic_commit("revoked-queue").await;
             self.publish_queue_updated(agent).await;
         }
         Ok(())

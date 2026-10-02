@@ -5531,6 +5531,72 @@ async fn suspend_interrupt_ignores_non_transient_error_during_suspend() {
     );
 }
 
+#[intent_test_macros::daemon_test]
+async fn suspend_late_enrollment_persists_after_early_close() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let bus = EventBus::new(store.clone());
+    let services = Services::new_with_file_secrets(
+        store.clone(),
+        intent_core::FileSecretStore::with_path(tmp.path.with_extension("secrets")),
+    )
+    .with_event_bus(bus.clone());
+    let workspace_id = WorkspaceId::from("late-suspend-workspace");
+    let agent_id = AgentId::from("late-suspend-agent");
+    store
+        .insert_workspace(&workspace(&workspace_id))
+        .await
+        .unwrap();
+    store
+        .insert_agent_session(&new_session(&agent_id, &workspace_id))
+        .await
+        .unwrap();
+    store
+        .set_acp_session_id(&workspace_id, &agent_id, ACP_SID)
+        .await
+        .unwrap();
+    services.begin_settings_shutdown();
+    let _ = services
+        .enroll_suspend_interrupted_turn(
+            &agent_id,
+            &workspace_id,
+            uuid::Uuid::new_v4().to_string(),
+            vec![json!({"type":"text","text":"retained partial"})],
+            None,
+            intent_acp::AcpError::Transport("Connection reset by peer".into()),
+        )
+        .await;
+    timeout(Duration::from_secs(5), services.shutdown_store_writers())
+        .await
+        .unwrap();
+    bus.shutdown().await.unwrap();
+    store.close().await;
+    let reopened = Store::open(&tmp.path).await.unwrap();
+    let row = reopened
+        .get_interrupted_agent(&agent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.reason.as_deref(), Some("system_suspend"));
+    let messages = reopened.get_agent_messages(&agent_id, None).await.unwrap();
+    assert!(messages
+        .iter()
+        .any(|message| message.content.to_string().contains("retained partial")));
+    assert!(!messages.iter().any(|message| message.role == "user"));
+    let events = reopened
+        .query_events(&intent_store::EventQuery::default())
+        .await
+        .unwrap();
+    assert!(!events
+        .iter()
+        .any(|event| event.event_type == "agent:failed"));
+    assert!(events
+        .iter()
+        .any(|event| event.event_type == "agent:stream:end"
+            && event.data["stopReason"] == "interrupted"));
+    reopened.close().await;
+}
+
 /// Task D end-to-end: a turn ENROLLED by Task C's classifier (a suspend-
 /// overlapping transient disconnect via the real `run_prompt_turn` path) is
 /// resumed by the wake-triggered sweep. The enrolled row is tagged
@@ -7551,6 +7617,74 @@ async fn detached_turn_end_usage_bookkeeping_still_lands() {
     let usage = ws.token_usage.expect("workspace tally persisted");
     assert_eq!(usage.totals.input_tokens, 70);
     assert_eq!(usage.by_agent_id[&agent_id.0].input_tokens, 70);
+}
+
+#[tokio::test]
+async fn shutdown_retains_turn_bookkeeping_after_handle_leaves_chain() {
+    let (tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let (conn, mut note_rx, _agent) = connect_with_prompt_result(
+        prompt_updates(),
+        json!({"stopReason":"end_turn", "usage": {
+            "totalTokens":100, "inputTokens":100, "outputTokens":0,
+            "cachedReadTokens":0, "cachedWriteTokens":0
+        }}),
+    );
+    let (release, wait) = tokio::sync::oneshot::channel();
+    let prev = tokio::spawn(async move {
+        let _ = wait.await;
+    });
+    services
+        .turn_bookkeeping
+        .lock()
+        .unwrap()
+        .insert(agent_id.clone(), prev);
+    services
+        .run_connection_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        )
+        .await
+        .unwrap();
+    // The cost-only path can take this handle out of the map. Losing that
+    // caller must not detach the underlying bookkeeping from shutdown.
+    let handle = services
+        .turn_bookkeeping
+        .lock()
+        .unwrap()
+        .remove(&agent_id)
+        .unwrap();
+    drop(handle);
+    let drain = services.shutdown_store_writers();
+    tokio::pin!(drain);
+    let returned_early = tokio::select! {
+        biased;
+        () = &mut drain => true,
+        () = std::future::ready(()) => false,
+    };
+    release.send(()).unwrap();
+    if !returned_early {
+        tokio::time::timeout(Duration::from_secs(10), drain)
+            .await
+            .unwrap();
+    }
+    assert!(
+        !returned_early,
+        "shutdown abandoned turn bookkeeping behind its predecessor"
+    );
+    bus.shutdown().await.unwrap();
+    bus.store().close().await;
+    let reopened = Store::open(&tmp.path).await.unwrap();
+    let (_, _, _, snapshot) = reopened
+        .get_agent_session_token_usage(&workspace_id, &agent_id)
+        .await
+        .unwrap();
+    assert_eq!(snapshot.unwrap().input_tokens, 100);
+    reopened.close().await;
 }
 
 /// Cross-turn bookkeeping ordering (monorepo#738): detached turn-end

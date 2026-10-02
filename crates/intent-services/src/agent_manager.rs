@@ -1214,6 +1214,7 @@ pub struct ProcessRegistry {
     /// Optional callback for lifecycle events (queue/resume/evict). Wired by the
     /// manager to publish events + log; the registry stays testable without it.
     event_fn: Option<ProcessEventFn>,
+    event_tasks: crate::delivery_tasks::DeliveryTasks,
     /// Optional aggregate memory budget, installed once by the composition root
     /// when `agents.memoryBudgetMb` resolves to a positive budget (auto, the
     /// absent key, resolves to the recommended value; explicit 0 = off). Not
@@ -1257,6 +1258,16 @@ fn budget_admits(
 }
 
 impl ProcessRegistry {
+    // The sender travels with the physical child, including detached and
+    // Drop-started cleanup. Shutdown removes live handles before draining it.
+    fn cleanup_lease(&self) -> Option<tokio::sync::oneshot::Sender<()>> {
+        let (finished, completion) = tokio::sync::oneshot::channel();
+        self.event_tasks.spawn_draining(async move {
+            let _ = completion.await;
+        })?;
+        Some(finished)
+    }
+
     /// A registry with a fixed concurrency `cap`.
     #[must_use]
     pub fn new(cap: usize) -> Self {
@@ -1264,6 +1275,7 @@ impl ProcessRegistry {
             cap: cap.max(1),
             inner: Mutex::new(RegistryInner::default()),
             event_fn: None,
+            event_tasks: crate::delivery_tasks::DeliveryTasks::default(),
             memory: std::sync::OnceLock::new(),
         }
     }
@@ -1453,7 +1465,7 @@ impl ProcessRegistry {
             );
             if let Some(ref f) = self.event_fn {
                 let fut = f(&resumed_id, "agent:process:resumed", used, self.cap, reason);
-                intent_core::spawn_daemon(fut);
+                let _ = self.event_tasks.spawn_draining(fut);
             }
         }
         true
@@ -1531,7 +1543,7 @@ impl ProcessRegistry {
             );
             if let Some(ref f) = self.event_fn {
                 let fut = f(&resumed_id, "agent:process:resumed", used, self.cap, reason);
-                intent_core::spawn_daemon(fut);
+                let _ = self.event_tasks.spawn_draining(fut);
             }
         }
     }
@@ -1554,7 +1566,7 @@ impl ProcessRegistry {
         );
         if let Some(ref f) = self.event_fn {
             let fut = f(agent_id, "agent:process:resumed", used, self.cap, reason);
-            intent_core::spawn_daemon(fut);
+            let _ = self.event_tasks.spawn_draining(fut);
         }
     }
 
@@ -1692,7 +1704,7 @@ impl ProcessRegistry {
                     }
                     if let Some(ref f) = self.event_fn {
                         let fut = f(agent_id, "agent:process:queued", used, self.cap, reason);
-                        intent_core::spawn_daemon(fut);
+                        let _ = self.event_tasks.spawn_draining(fut);
                     }
                     owed_resume = Some(reason);
                     // A claim-contention wait re-checks on a timer too: the
@@ -1744,7 +1756,7 @@ impl ProcessRegistry {
                         );
                         if let Some(ref f) = self.event_fn {
                             let fut = f(&id, "agent:process:evicted", used, self.cap, reason);
-                            intent_core::spawn_daemon(fut);
+                            let _ = self.event_tasks.spawn_draining(fut);
                         }
                         kill().await;
                         self.deregister(&id);
@@ -1878,7 +1890,7 @@ impl ProcessRegistry {
                                 self.cap,
                                 REASON_MEMORY_BUDGET,
                             );
-                            intent_core::spawn_daemon(fut);
+                            let _ = self.event_tasks.spawn_draining(fut);
                         }
                         owed_resume = Some(REASON_MEMORY_BUDGET);
                         Action::Wait(rx)
@@ -1930,7 +1942,7 @@ impl ProcessRegistry {
                                 self.cap,
                                 REASON_MEMORY_BUDGET,
                             );
-                            intent_core::spawn_daemon(fut);
+                            let _ = self.event_tasks.spawn_draining(fut);
                         }
                         kill().await;
                         self.deregister(&id);
@@ -2110,7 +2122,7 @@ impl ProcessRegistry {
                     self.cap,
                     REASON_IDLE_TTL,
                 );
-                intent_core::spawn_daemon(fut);
+                let _ = self.event_tasks.spawn_draining(fut);
             }
             kill().await;
             self.deregister(&id);
@@ -2205,7 +2217,7 @@ impl ProcessRegistry {
                     self.cap,
                     REASON_MEMORY_BUDGET,
                 );
-                intent_core::spawn_daemon(fut);
+                let _ = self.event_tasks.spawn_draining(fut);
             }
             kill().await;
             self.deregister(&id);
@@ -2570,6 +2582,8 @@ pub struct AgentManager {
     /// Abortable background turn workers, keyed by agent. `stop` aborts the
     /// in-flight worker (interrupting the current stream).
     workers: Arc<Mutex<HashMap<AgentId, JoinHandle<()>>>>,
+    /// Workers whose slot is released but whose persistence tail is still live.
+    finishing_workers: Mutex<Vec<JoinHandle<()>>>,
     /// Agents whose ACP session was recreated (the resume-impossible fallback in
     /// [`AgentManager::start_session`] replaced a lost `acpSessionId` with a fresh
     /// `session/new`). The next turn prepends the prior conversation history as
@@ -2702,6 +2716,24 @@ pub struct AgentManager {
     user_persist_pause: Mutex<Option<Arc<TurnStartPause>>>,
 }
 
+fn spawn_unsloth_status_publisher(
+    services: Services,
+    workspace_id: WorkspaceId,
+    agent_id: AgentId,
+) -> tokio::sync::mpsc::UnboundedSender<(crate::unsloth_server::StatusLevel, String)> {
+    let (status_tx, mut status_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(crate::unsloth_server::StatusLevel, String)>();
+    let tasks = services.store_tasks.clone();
+    let _ = tasks.spawn_draining(async move {
+        while let Some((level, message)) = status_rx.recv().await {
+            services
+                .publish_status_event(&workspace_id, &agent_id, "launch", &message, level.as_str())
+                .await;
+        }
+    });
+    status_tx
+}
+
 impl AgentManager {
     /// Wire a manager over the services surface and a concrete event sink, with
     /// a global concurrency `cap`.
@@ -2768,6 +2800,7 @@ impl AgentManager {
             reap_claims: Arc::new(Mutex::new(HashSet::new())),
             agent_ws: Arc::new(Mutex::new(HashMap::new())),
             workers: Arc::new(Mutex::new(HashMap::new())),
+            finishing_workers: Mutex::new(Vec::new()),
             recreated: Arc::new(Mutex::new(HashSet::new())),
             setup_failure_notified: Arc::new(Mutex::new(HashSet::new())),
             prepend_pending: Arc::new(Mutex::new(HashSet::new())),
@@ -3069,9 +3102,15 @@ impl AgentManager {
         cwd: PathBuf,
         opts: &SpawnOptions<'_>,
     ) -> Result<()> {
-        if self.is_shutting_down() {
-            return Err(Error::NotFound("daemon is shutting down".into()));
-        }
+        let cleanup_lease = {
+            let closed = self.admission_closed.lock().unwrap();
+            if *closed {
+                return Err(Error::NotFound("daemon is shutting down".into()));
+            }
+            self.registry
+                .cleanup_lease()
+                .ok_or_else(|| Error::NotFound("daemon process cleanup is shutting down".into()))?
+        };
         // Claim-before-kill (monorepo#2247): the slot-cap/budget eviction
         // inside `acquire` claims its victim against `try_begin` exactly like
         // the reap sweeps, so a turn cannot start on the victim mid-kill. The
@@ -3431,6 +3470,9 @@ impl AgentManager {
                 _rules_config: rules_config,
                 _pi_extension: pi_extension,
                 npx_launch_dir,
+                cleanup_lease: Some(cleanup_lease),
+                #[cfg(test)]
+                cleanup_services: Some(self.services.clone()),
             }),
             antigravity_profile,
             session_mcp_servers,
@@ -5132,6 +5174,7 @@ impl AgentManager {
         self.services.pin_live_turn(agent_id);
         if let Some(worker) = self.workers.lock().unwrap().remove(agent_id) {
             worker.abort();
+            self.retain_finishing_worker(worker);
         }
         self.services
             .flush_pinned_turn_on_interruption(agent_id, InterruptReason::AgentStopped, None)
@@ -5293,6 +5336,7 @@ impl AgentManager {
         // child is kept alive (unlike `stop`, which also kills the child).
         if let Some(worker) = self.workers.lock().unwrap().remove(agent_id) {
             worker.abort();
+            self.retain_finishing_worker(worker);
         }
         // The abort may have landed between the streaming path's terminal-
         // error stash and the handler's take (monorepo#2050); the orphaned
@@ -6615,9 +6659,17 @@ impl AgentManager {
         }
     }
 
-    /// Forget a finished worker's join handle.
+    /// Release per-agent ownership while retaining the task's persistence tail.
     fn clear_worker(&self, agent_id: &AgentId) {
-        self.workers.lock().unwrap().remove(agent_id);
+        if let Some(worker) = self.workers.lock().unwrap().remove(agent_id) {
+            self.retain_finishing_worker(worker);
+        }
+    }
+
+    fn retain_finishing_worker(&self, worker: JoinHandle<()>) {
+        let mut finishing = self.finishing_workers.lock().unwrap();
+        finishing.retain(|worker| !worker.is_finished());
+        finishing.push(worker);
     }
 
     /// The workspace a delivery to `agent_id` is bound to: the target's OWN
@@ -8288,7 +8340,9 @@ impl AgentManager {
                 run_message_worker(mgr, id, workspace_id, content, options, user_persisted).await;
             },
         ));
-        self.workers.lock().unwrap().insert(agent_id, handle);
+        if let Some(previous) = self.workers.lock().unwrap().insert(agent_id, handle) {
+            self.retain_finishing_worker(previous);
+        }
     }
 
     /// Claim the in-flight slot for a delivery-driven turn. Companion to
@@ -8642,6 +8696,7 @@ impl AgentManager {
         // cleared above — retry is the clean-slate escape hatch.
         if let Some(worker) = self.workers.lock().unwrap().remove(&agent_id) {
             worker.abort();
+            self.retain_finishing_worker(worker);
         }
         self.services.discard_pending_terminal_error(&agent_id);
         // Retry is the clean-slate escape hatch for the truncation-redrive
@@ -9466,22 +9521,11 @@ impl AgentManager {
             // message per agent, so publishes must preserve emission order
             // or a restart warning could be clobbered by a later-emitted
             // but earlier-published progress update.
-            let (status_tx, mut status_rx) = tokio::sync::mpsc::unbounded_channel::<(
-                crate::unsloth_server::StatusLevel,
-                String,
-            )>();
-            {
-                let services = self.services.clone();
-                let ws = workspace_id.clone();
-                let aid = agent_id.clone();
-                intent_core::spawn_daemon(async move {
-                    while let Some((level, message)) = status_rx.recv().await {
-                        services
-                            .publish_status_event(&ws, &aid, "launch", &message, level.as_str())
-                            .await;
-                    }
-                });
-            }
+            let status_tx = spawn_unsloth_status_publisher(
+                self.services.clone(),
+                workspace_id.clone(),
+                agent_id.clone(),
+            );
             let status_cb = move |level: crate::unsloth_server::StatusLevel, message: String| {
                 let _ = status_tx.send((level, message));
             };
@@ -9685,6 +9729,12 @@ impl AgentManager {
         for (_, worker) in workers {
             let _ = worker.await;
         }
+        // A worker releases its slot before redelivery and unread/attention
+        // writes. Those tails cannot be detached at the store-close boundary.
+        let finishing = std::mem::take(&mut *self.finishing_workers.lock().unwrap());
+        for worker in finishing {
+            let _ = worker.await;
+        }
         self.services.persist_shutdown_drains().await;
         // The lazy-spawn fence remains for this manager's lifetime. Persist the
         // captured identities, never a post-await re-read of the mutable maps.
@@ -9800,13 +9850,56 @@ impl AgentManager {
         // The daemon-managed Unsloth server is not an agent child — tear it
         // down explicitly so a clean shutdown never orphans it.
         self.unsloth.shutdown().await;
+        let finish = self.registry.event_tasks.drain_finite();
+        #[cfg(test)]
+        let finish = {
+            let mut finish = Box::pin(finish);
+            std::future::poll_fn(move |cx| {
+                let result = std::future::Future::poll(finish.as_mut(), cx);
+                if result.is_pending() {
+                    if let Some(tx) = self
+                        .services
+                        .secrets
+                        .writer_drain_pending
+                        .lock()
+                        .unwrap()
+                        .take()
+                    {
+                        let _ = tx.send("process-registry");
+                    }
+                }
+                result
+            })
+        };
+        finish.await;
     }
 
     /// Idle-reap hook: evict up to `max` idle agents in LRU order (count-based;
     /// the LRU `acquire`-eviction companion). Same claim-before-kill semantics
     /// (monorepo#2247) and post-sweep drain kick as
     /// [`Self::reap_idle_older_than`].
+    ///
+    /// # Panics
+    /// Panics if the shutdown admission mutex is poisoned.
     pub async fn reap_idle(self: &Arc<Self>, max: Option<usize>) -> usize {
+        let task = {
+            // Serialize admission with shutdown before any candidate is claimed.
+            let closed = self.admission_closed.lock().unwrap();
+            if *closed {
+                return 0;
+            }
+            let manager = self.clone();
+            self.registry
+                .event_tasks
+                .spawn_draining(async move { manager.reap_idle_owned(max).await })
+        };
+        match task {
+            Some(task) => task.await.unwrap_or_default(),
+            None => 0,
+        }
+    }
+
+    async fn reap_idle_owned(self: &Arc<Self>, max: Option<usize>) -> usize {
         let (try_claim, release, released) = self.reap_claim_fns();
         let reaped = self.registry.evict_idle(max, try_claim, release).await;
         self.kick_released(released).await;
@@ -9826,7 +9919,28 @@ impl AgentManager {
     /// the sweep, any released agent with a ready queue gets a drain kick so
     /// a message that parked behind the claim starts a fresh turn (the agent
     /// respawns on demand) rather than stranding until the next queue event.
+    ///
+    /// # Panics
+    /// Panics if the shutdown admission mutex is poisoned.
     pub async fn reap_idle_older_than(self: &Arc<Self>, ttl: Duration) -> usize {
+        let task = {
+            // Serialize admission with shutdown before any candidate is claimed.
+            let closed = self.admission_closed.lock().unwrap();
+            if *closed {
+                return 0;
+            }
+            let manager = self.clone();
+            self.registry
+                .event_tasks
+                .spawn_draining(async move { manager.reap_idle_older_than_owned(ttl).await })
+        };
+        match task {
+            Some(task) => task.await.unwrap_or_default(),
+            None => 0,
+        }
+    }
+
+    async fn reap_idle_older_than_owned(self: &Arc<Self>, ttl: Duration) -> usize {
         let (try_claim, release, released) = self.reap_claim_fns();
         let reaped = self
             .registry
@@ -9843,7 +9957,28 @@ impl AgentManager {
     /// a spawn attempt. No budget / no sample / under budget → no-op. Same
     /// claim-before-kill semantics (monorepo#2118) and post-sweep drain kick
     /// as [`Self::reap_idle_older_than`]. Returns the number reaped.
+    ///
+    /// # Panics
+    /// Panics if the shutdown admission mutex is poisoned.
     pub async fn reap_over_budget(self: &Arc<Self>) -> usize {
+        let task = {
+            // Serialize admission with shutdown before any candidate is claimed.
+            let closed = self.admission_closed.lock().unwrap();
+            if *closed {
+                return 0;
+            }
+            let manager = self.clone();
+            self.registry
+                .event_tasks
+                .spawn_draining(async move { manager.reap_over_budget_owned().await })
+        };
+        match task {
+            Some(task) => task.await.unwrap_or_default(),
+            None => 0,
+        }
+    }
+
+    async fn reap_over_budget_owned(self: &Arc<Self>) -> usize {
         let (try_claim, release, released) = self.reap_claim_fns();
         let reaped = self
             .registry
@@ -9861,12 +9996,16 @@ impl AgentManager {
     fn reap_claim_fns(
         &self,
     ) -> (
-        impl Fn(&AgentId) -> bool,
+        impl Fn(&AgentId) -> bool + '_,
         impl Fn(&AgentId),
         Arc<Mutex<Vec<AgentId>>>,
     ) {
         let released: Arc<Mutex<Vec<AgentId>>> = Arc::new(Mutex::new(Vec::new()));
-        let try_claim = self.try_claim_fn();
+        let claim = self.try_claim_fn();
+        let try_claim = move |id: &AgentId| {
+            let closed = self.admission_closed.lock().unwrap();
+            !*closed && claim(id)
+        };
         let release = {
             let claims = self.reap_claims.clone();
             let released = released.clone();
@@ -9918,12 +10057,15 @@ impl AgentManager {
             let services = self.services.clone();
             move |id: &AgentId| {
                 claims.lock().unwrap().remove(id);
-                let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                let Ok(_handle) = tokio::runtime::Handle::try_current() else {
                     return;
                 };
                 let services = services.clone();
                 let id = id.clone();
-                handle.spawn(async move {
+                // The released claim can discover revoked queue entries before
+                // delivery admission. Own that durable cleanup through final drain.
+                let tasks = services.store_tasks.clone();
+                let _ = tasks.spawn_draining(async move {
                     let Some(mgr) = services.agent_manager() else {
                         return;
                     };
@@ -9974,15 +10116,21 @@ impl AgentManager {
     /// loop, so no orphaned grandchildren linger.
     fn make_kill(&self, agent_id: AgentId) -> KillFn {
         let handles: Weak<Mutex<HashMap<AgentId, AgentHandle>>> = Arc::downgrade(&self.handles);
+        #[cfg(test)]
+        let services = self.services.clone();
         Arc::new(move || {
             let handles = handles.clone();
             let id = agent_id.clone();
+            #[cfg(test)]
+            let services = services.clone();
             Box::pin(async move {
                 let removed = handles
                     .upgrade()
                     .and_then(|h| h.lock().unwrap().remove(&id));
                 if let Some(mut handle) = removed {
                     if let Some(child) = RuntimeTeardown::take(&mut handle) {
+                        #[cfg(test)]
+                        services.hold_periodic_commit("reap").await;
                         child.kill_tree().await;
                     }
                 }
@@ -10349,6 +10497,54 @@ mod kill_sweep_tests {
                     .unwrap(),
             "sweep returned after {elapsed:?}, before the shared grace window elapsed"
         );
+    }
+}
+
+#[cfg(test)]
+mod shutdown_writer_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shutdown_joins_a_worker_after_it_releases_its_agent_slot() {
+        let (manager, agent, _dir) = super::role_reminder_tests::manager_with(None, None).await;
+        let manager = Arc::new(manager);
+        let (start, started) = tokio::sync::oneshot::channel();
+        let (reached, ready) = tokio::sync::oneshot::channel();
+        let (release, resumed) = tokio::sync::oneshot::channel();
+        let worker_manager = manager.clone();
+        let worker_agent = agent.clone();
+        let worker = intent_core::spawn_daemon(async move {
+            started.await.unwrap();
+            worker_manager.clear_worker(&worker_agent);
+            reached.send(()).unwrap();
+            resumed.await.unwrap();
+            worker_manager
+                .services
+                .raise_attention(&WorkspaceId::from("ws-1"), WorkspaceAttention::Unread)
+                .await
+                .unwrap();
+        });
+        manager.workers.lock().unwrap().insert(agent, worker);
+        start.send(()).unwrap();
+        ready.await.unwrap();
+        let shutdown = manager.shutdown();
+        tokio::pin!(shutdown);
+        tokio::select! {
+            biased;
+            () = &mut shutdown => panic!("shutdown detached the finishing writer"),
+            () = std::future::ready(()) => {}
+        }
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), shutdown)
+            .await
+            .unwrap();
+        let workspace = manager
+            .services
+            .store
+            .get_workspace(&WorkspaceId::from("ws-1"))
+            .await
+            .unwrap();
+        assert_eq!(workspace.attention, WorkspaceAttention::Unread);
     }
 }
 
@@ -14164,6 +14360,104 @@ mod npx_launch_dir_lifetime_tests {
     use super::role_reminder_tests::manager_with;
     use super::*;
 
+    async fn removed_cleanup_shutdown(unexpected: bool) {
+        use crate::periodic_shutdown_tests::{entered, hold};
+        let tmp = crate::tests::test_tempdir("intentd-6388-cleanup-");
+        let (original, agent_id, _db) = manager_with(None, None).await;
+        let svc = original.services.clone();
+        let mgr = Arc::new(AgentManager::new(
+            svc.clone(),
+            Arc::new(BusEventSink::new(svc.event_bus.clone().unwrap())),
+            1,
+        ));
+        let mut tree = spawn_tree(tmp.path(), "owned").await;
+        let leader = tree.child.as_ref().unwrap().id().unwrap();
+        let _leader_cleanup = KillGrandchildOnDrop(leader.cast_signed());
+        let _ends = install_tree(&mgr, &mut tree, &agent_id);
+        {
+            let handles = mgr.handles.lock().unwrap();
+            let handle = handles.get(&agent_id).unwrap();
+            let mut resources = handle
+                .execution
+                .local
+                .as_ref()
+                .unwrap()
+                .resources
+                .lock()
+                .unwrap();
+            resources.cleanup_services = Some(svc.clone());
+            resources.cleanup_lease = mgr.registry.cleanup_lease();
+        }
+        mgr.registry
+            .register(agent_id.clone(), mgr.make_kill(agent_id.clone()));
+        let (rx, release) = hold(&svc, "physical-cleanup");
+        let task = if unexpected {
+            nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(leader.cast_signed()),
+                nix::sys::signal::Signal::SIGKILL,
+            )
+            .unwrap();
+            let watcher = mgr.arm_child_exit_watcher(agent_id.clone(), Some(leader));
+            intent_core::spawn_daemon(async move {
+                assert!(watcher.await.unwrap());
+            })
+        } else {
+            let owner = mgr.clone();
+            intent_core::spawn_daemon(async move {
+                let (claim, release) = owner.admission_claim_fns();
+                owner
+                    .registry
+                    .acquire(&AgentId::from("new-admission"), claim, release)
+                    .await;
+            })
+        };
+        entered(rx).await;
+        assert!(!mgr.contains(&agent_id));
+        assert!(pid_alive(tree.grandchild));
+        assert!(tree.launch_path.is_dir());
+        if unexpected {
+            drop(task);
+        } else {
+            abort_and_settle(task, "abortable admission").await;
+        }
+        let (tx, pending) = tokio::sync::oneshot::channel();
+        *svc.secrets.writer_drain_pending.lock().unwrap() = Some(tx);
+        let owner = mgr.clone();
+        let mut shutdown = intent_core::spawn_daemon(async move { owner.shutdown().await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                result = pending => assert_eq!(result.unwrap(), "process-registry"),
+                result = &mut shutdown => { result.unwrap(); panic!("shutdown omitted removed physical cleanup"); }
+            }
+        }).await.unwrap();
+        assert!(pid_alive(tree.grandchild));
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), shutdown)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!pid_alive(leader.cast_signed()));
+        assert!(!pid_alive(tree.grandchild));
+        assert!(!tree.launch_path.exists());
+        // An aborted acquire skips its existing post-kill deregistration.
+        // Preserve that stale in-memory slot: late ID-only removal could erase
+        // a replacement runtime. The exit watcher deregisters before cleanup.
+        assert_eq!(mgr.registry.is_registered(&agent_id), !unexpected);
+        svc.shutdown_store_writers().await;
+        svc.event_bus.as_ref().unwrap().shutdown().await.unwrap();
+        svc.store.close().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_admission_cleanup_is_joined_by_shutdown() {
+        removed_cleanup_shutdown(false).await;
+    }
+
+    #[tokio::test]
+    async fn unexpected_exit_cleanup_is_joined_by_shutdown() {
+        removed_cleanup_shutdown(true).await;
+    }
+
     /// A child whose cwd is `dir`: on SIGTERM it writes `cwd-present` or
     /// `cwd-gone` to `marker` (a path outside `dir`) and exits, so the kill's
     /// `child.wait()` returns only after the verdict is on disk.
@@ -16495,6 +16789,8 @@ mod dead_child_respawn_tests {
                 _rules_config: None,
                 _pi_extension: None,
                 npx_launch_dir,
+                cleanup_lease: None,
+                cleanup_services: None,
             }),
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
