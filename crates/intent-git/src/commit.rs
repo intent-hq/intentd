@@ -1,4 +1,4 @@
-//! Commit creation (`git.commit` / `git.agentCommit`).
+//! Commit creation for agent commits and accept-changes.
 //!
 //! Ports `gitService.commit`: a commit is built from the current index
 //! (already-staged changes) using the repository's configured identity, mirroring
@@ -138,7 +138,7 @@ pub fn commit(worktree_path: &Path, message: &str) -> Result<CommitOutcome> {
 /// Create a commit whose body carries attribution trailers, building the message
 /// via [`build_commit_message`] before committing the staged index. Mirrors
 /// [`commit`] except for the trailer-aware message; used by the agent commit path
-/// while bare [`commit`] backs `git.commit`.
+/// while bare [`commit`] also serves accept-changes.
 ///
 /// # Errors
 ///

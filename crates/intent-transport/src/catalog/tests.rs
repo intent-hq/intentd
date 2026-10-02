@@ -184,12 +184,14 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// Reversible script history (protocol 10.11): +2 router methods
 /// (`script.archive`, `script.restore`).
 /// Durable script monitors (protocol 12.1): +3 router methods.
-const EXPECTED_TOTAL_METHODS: usize = 404;
+/// Protocol 13.0 removes the deprecated git.commit router method.
+const EXPECTED_TOTAL_METHODS: usize = 403;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.
 /// Protocol 12.1 adds the three script-monitor controls.
-const EXPECTED_ROUTER_METHODS: usize = 349;
+/// The subsequent git.commit removal removes one more router method.
+const EXPECTED_ROUTER_METHODS: usize = 348;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 55;
@@ -603,7 +605,6 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "git.checkMergeConflicts",
     "git.checkoutBranch",
     "git.clone",
-    "git.commit",
     "git.commitDetails",
     "git.commits",
     "git.createBranch",
@@ -1548,7 +1549,6 @@ fn collaborator_lookup_canonicalises_aliases_and_denies_by_default() {
         "agent.sendMessage",
         "agent.setModel",
         "hook.list",
-        "git.commit",
         "git.push",
     ] {
         assert!(collaborator_may_call(allowed), "{allowed} must be allowed");
@@ -2549,4 +2549,12 @@ fn member_methods_and_administrator_remainder_are_classified() {
     for method in REVERSE_METHODS {
         assert_eq!(super::member_may_call(method), *method == "browser.exec");
     }
+}
+
+#[test]
+fn removed_git_commit_is_not_advertised_or_authorized() {
+    assert!(!super::ROUTER_METHODS.contains(&"git.commit"));
+    assert!(!super::collaborator_may_call("git.commit"));
+    assert!(!super::collaborator_may_call("git.agentCommit"));
+    assert!(super::member_may_call("git.agentCommit"));
 }

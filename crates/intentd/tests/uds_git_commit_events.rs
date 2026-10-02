@@ -1,4 +1,4 @@
-//! `git.commit` change-event emissions (FIX 2 parity): drives `git.commit`
+//! `git.agentCommit` change-event emissions (FIX 2 parity): drives `git.agentCommit`
 //! against a live UDS listener and asserts the daemon publishes both
 //! `git:commit` (reserved `GitOperationEvent` FE shape) and
 //! `changes:git-status` (feeds the FE bridge's `git:status-changed` relay)
@@ -207,15 +207,14 @@ fn boot(
     (socket, shutdown_tx, server, bus, ws_root, sock_dir)
 }
 
-/// `git.commit` inside a workspace worktree publishes both `git:commit`
+/// `git.agentCommit` inside a workspace worktree publishes both `git:commit`
 /// (reserved `GitOperationEvent` FE shape) and `changes:git-status` (feeds
 /// the FE bridge's `git:status-changed` relay) per PROTOCOL §6.5. Emissions
-/// live inside the idempotency scope so a replayed commit (same
-/// idempotencyKey) returns the cached result without re-firing.
+/// accompany the supported staged-index human commit path.
 #[intent_test_macros::daemon_test]
-async fn git_commit_emits_git_commit_and_changes_git_status_over_uds() {
+async fn git_agent_commit_emits_git_commit_and_changes_git_status_over_uds() {
     if !gate() {
-        eprintln!("skipping git.commit UDS e2e: git not on PATH");
+        eprintln!("skipping git.agentCommit UDS e2e: git not on PATH");
         return;
     }
     let tmp_db = TempDb::new();
@@ -238,7 +237,7 @@ async fn git_commit_emits_git_commit_and_changes_git_status_over_uds() {
     std::fs::write(repo.join("README.md"), "hello world\n").unwrap();
     git(repo, &["add", "README.md"]);
 
-    // Persist the workspace row pointing at the worktree so `git.commit`
+    // Persist the workspace row pointing at the worktree so `git.agentCommit`
     // (which is workspace-scoped) can resolve the path.
     let ws_id = WorkspaceId::from("ws-gc-1");
     let ws = workspace_row(&ws_id, repo, "main");
@@ -267,7 +266,7 @@ async fn git_commit_emits_git_commit_and_changes_git_status_over_uds() {
     assert!(sub_resp["result"]["subscriptionId"].is_string());
     wait_for_sub_count(&bus, 1).await;
 
-    // Drive git.commit over a separate connection.
+    // Drive git.agentCommit over a separate connection.
     let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
     let mut rpc_reader = BufReader::new(rpc_read);
     send(
@@ -275,11 +274,11 @@ async fn git_commit_emits_git_commit_and_changes_git_status_over_uds() {
         &serde_json::to_string(&json!({
             "jsonrpc": "2.0",
             "id": 2,
-            "method": "git.commit",
+            "method": "git.agentCommit",
             "params": {
                 "workspaceId": ws_id,
                 "message": "second commit",
-                "idempotencyKey": "gc-key-1",
+                "userRequested": true,
             },
         }))
         .unwrap(),

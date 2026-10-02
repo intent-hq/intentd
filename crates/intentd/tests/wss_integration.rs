@@ -12,6 +12,8 @@ mod comment_deletion;
 mod common;
 #[path = "wss_integration/discovery_context.rs"]
 mod discovery_context;
+#[path = "wss_integration/git_commit_removal.rs"]
+mod git_commit_removal;
 #[path = "wss_integration/host_roles.rs"]
 mod host_roles;
 #[path = "wss_integration/human_attribution.rs"]
@@ -6245,8 +6247,17 @@ async fn wss_collaborator_allowlist_refuses_owner_only_methods_and_tunnel() {
         }
     }
 
-    // Owner-only methods are refused before dispatch with -32003.
+    // Methods outside guest access are refused before dispatch with -32003.
+    // Removing git.commit must not widen git.agentCommit guest access.
     for (method, params) in [
+        (
+            "git.commit",
+            json!({ "message": "retired", "idempotencyKey": "key" }),
+        ),
+        (
+            "git.agentCommit",
+            json!({ "message": "member only", "userRequested": true }),
+        ),
         ("host.exec", json!({ "command": "true" })),
         ("system.shutdown", json!({})),
         (

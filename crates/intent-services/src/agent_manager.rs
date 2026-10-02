@@ -14785,8 +14785,18 @@ mod npx_launch_dir_lifetime_tests {
             .unwrap()
             .unwrap();
         assert!(!pid_alive(leader.cast_signed()));
-        assert!(!pid_alive(tree.grandchild));
         assert!(!tree.launch_path.exists());
+        // Cleanup has issued the group kill and released its lease, but an
+        // orphaned descendant can remain signal-0-visible until init reaps it.
+        // Keep the shutdown/launch-dir assertions immediate; bound only the
+        // observation that the identified descendant's PID has disappeared.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while pid_alive(tree.grandchild) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("cleanup killed the descendant; its orphan PID must be reaped");
         // An aborted acquire skips its existing post-kill deregistration.
         // Preserve that stale in-memory slot: late ID-only removal could erase
         // a replacement runtime. The exit watcher deregisters before cleanup.

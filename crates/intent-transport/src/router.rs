@@ -2741,16 +2741,6 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
-        "git.commit" => {
-            let ws = require_ws_note(params)?;
-            let message = require_str_param(params, "message")?;
-            let idempotency_key = opt_str(params, "idempotencyKey");
-            let r = api
-                .git_commit(ws, message, idempotency_key)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(json!({ "ok": true, "hash": r.hash, "files": r.files }))
-        }
         "git.agentCommit" => {
             let ws = require_ws_note(params)?;
             let message = require_str_param(params, "message")?;
