@@ -14542,8 +14542,15 @@ mod npx_launch_dir_lifetime_tests {
             .unwrap()
             .unwrap();
         assert!(!pid_alive(leader.cast_signed()));
-        assert!(!pid_alive(tree.grandchild));
         assert!(!tree.launch_path.exists());
+        // SIGKILL delivery and reaping the orphan can finish after the sweep returns.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while pid_alive(tree.grandchild) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("grandchild must exit after the shutdown sweep");
         // An aborted acquire skips its existing post-kill deregistration.
         // Preserve that stale in-memory slot: late ID-only removal could erase
         // a replacement runtime. The exit watcher deregisters before cleanup.
