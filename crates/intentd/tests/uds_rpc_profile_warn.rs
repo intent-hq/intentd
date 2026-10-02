@@ -510,6 +510,7 @@ async fn queue_mutations_stay_within_statement_budget_at_depth() {
     .await;
     assert_eq!(restored["result"]["queue"].as_array().unwrap().len(), 39);
 
+    let mut human_id = None;
     for i in 0..40 {
         let resp = rpc_with_params(
             &socket,
@@ -527,6 +528,20 @@ async fn queue_mutations_stay_within_statement_budget_at_depth() {
             json!(true),
             "sendToTask {i} parked behind the archived gate: {resp}"
         );
+        let snapshot = rpc_with_params(
+            &socket,
+            "agent.getQueue",
+            json!({"workspaceId": workspace_id, "agentId": agent_id}),
+        )
+        .await;
+        let queue = snapshot["result"]["queue"].as_array().unwrap();
+        assert_eq!(
+            queue.len(),
+            40,
+            "mutation {i} must persist real depth40: {snapshot}"
+        );
+        let id = queue[39]["id"].as_str().expect("human row id");
+        assert_eq!(human_id.get_or_insert_with(|| id.to_string()).as_str(), id);
     }
 
     // All 40 entries are parked (the workspace stays archived).
@@ -569,7 +584,7 @@ async fn queue_mutations_stay_within_statement_budget_at_depth() {
         json!({"workspaceId": workspace_id}),
     )
     .await;
-    assert_eq!(workspace["result"]["workspace"]["status"], "archived");
+    assert_eq!(workspace["result"]["workspace"]["status"], "Archived");
 
     // The WARNs (were they wrongly emitted) land on stderr before each
     // response frame is written, so a single read after the calls suffices.
