@@ -13,6 +13,7 @@ use std::sync::OnceLock;
 #[cfg(unix)]
 use std::time::Duration;
 
+use crate::cli_env::CodexEnvNames;
 use directories::BaseDirs;
 
 fn home_dir() -> Option<PathBuf> {
@@ -27,6 +28,7 @@ fn home_dir() -> Option<PathBuf> {
 struct LoginShellCapture {
     dirs: Vec<PathBuf>,
     credential_env: BTreeMap<String, String>,
+    codex_env_names: CodexEnvNames,
 }
 
 impl LoginShellCapture {
@@ -34,6 +36,7 @@ impl LoginShellCapture {
         Self {
             dirs: Vec::new(),
             credential_env: BTreeMap::new(),
+            codex_env_names: CodexEnvNames::default(),
         }
     }
 }
@@ -97,12 +100,20 @@ fn is_credential_env_allow_listed(name: &str) -> bool {
 /// Parse a NUL-separated `env -0` payload into the allow-listed credential
 /// vars. NUL separation tolerates values containing newlines. Non-allow-listed
 /// vars are discarded here and never leave this function.
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn parse_credential_env(payload: &str) -> BTreeMap<String, String> {
+    parse_credential_env_with_names(payload, &CodexEnvNames::default())
+}
+
+#[cfg(unix)]
+fn parse_credential_env_with_names(
+    payload: &str,
+    names: &CodexEnvNames,
+) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
     for entry in payload.split('\0') {
         if let Some((name, value)) = entry.split_once('=') {
-            if is_credential_env_allow_listed(name) {
+            if is_credential_env_allow_listed(name) || names.contains(name) {
                 map.insert(name.to_string(), value.to_string());
             }
         }
@@ -341,15 +352,51 @@ fn try_capture_with_flags(shell: &str, flags: &[&str]) -> Option<LoginShellCaptu
     // Extract the env payload from the same output; missing env sentinels
     // degrade to an empty map (PATH capture still succeeds). Only allow-listed
     // vars survive parsing — the raw payload never leaves this function.
-    let credential_env =
-        extract_between_sentinels(&output_str, ENV_START_SENTINEL, ENV_END_SENTINEL)
-            .map(parse_credential_env)
-            .unwrap_or_default();
+    let payload = extract_between_sentinels(&output_str, ENV_START_SENTINEL, ENV_END_SENTINEL)
+        .unwrap_or_default();
+    let (credential_env, codex_env_names) = capture_credential_env(payload);
 
     Some(LoginShellCapture {
         dirs,
         credential_env,
+        codex_env_names,
     })
+}
+
+/// Load only names referenced by the user's selected Codex configuration before
+/// discarding the raw shell payload. The config is never executed or logged.
+#[cfg(unix)]
+fn capture_credential_env(payload: &str) -> (BTreeMap<String, String>, CodexEnvNames) {
+    // Unit tests inject homes directly below; never inspect the developer's
+    // actual Codex config as a side effect of a fake-shell fixture.
+    #[cfg(not(test))]
+    let (inherited_home, default_home) = (std::env::var_os("CODEX_HOME"), home_dir());
+    #[cfg(test)]
+    let (inherited_home, default_home): (Option<std::ffi::OsString>, Option<PathBuf>) =
+        (None, None);
+    capture_credential_env_for(payload, inherited_home.as_deref(), default_home.as_deref())
+}
+
+#[cfg(unix)]
+fn capture_credential_env_for(
+    payload: &str,
+    inherited_home: Option<&std::ffi::OsStr>,
+    default_home: Option<&Path>,
+) -> (BTreeMap<String, String>, CodexEnvNames) {
+    let shell_home = payload
+        .split('\0')
+        .filter_map(|entry| entry.split_once('='))
+        .find_map(|(name, value)| (name == "CODEX_HOME").then_some(value));
+    let home = inherited_home
+        .map(PathBuf::from)
+        .or_else(|| shell_home.map(PathBuf::from))
+        .or_else(|| default_home.map(|home| home.join(".codex")));
+    let names = home.filter(|home| !home.as_os_str().is_empty())
+        .map(|home| CodexEnvNames::from_home(&home).unwrap_or_else(|_| {
+            tracing::warn!("could not read Codex config credential references; custom shell credentials unavailable");
+            CodexEnvNames::default()
+        })).unwrap_or_default();
+    (parse_credential_env_with_names(payload, &names), names)
 }
 
 /// Extract the value between a sentinel pair in shell output.
@@ -389,6 +436,15 @@ pub(crate) fn login_shell_dirs() -> &'static [PathBuf] {
 #[must_use]
 pub fn login_shell_credential_env() -> &'static BTreeMap<String, String> {
     &login_shell_capture().credential_env
+}
+
+/// Custom Codex credential names selected in the same capture as
+/// [`login_shell_credential_env`]. Carry these into the provider environment
+/// overlay, including when a probe subsequently isolates `CODEX_HOME`.
+/// Like the captured shell values, this selection is cached until restart.
+#[must_use]
+pub fn login_shell_codex_env_names() -> &'static CodexEnvNames {
+    &login_shell_capture().codex_env_names
 }
 
 /// Force the login-shell PATH capture (`$SHELL -ilc`, falling back to `-lc`;
@@ -528,29 +584,52 @@ fn enriched_tool_dirs_impl<F>(home: Option<&std::path::Path>, login_dirs_fn: F) 
 where
     F: FnOnce() -> &'static [PathBuf],
 {
-    enriched_tool_dirs_for(home, login_dirs_fn, cfg!(windows))
+    enriched_tool_dirs_for(home, login_dirs_fn, cfg!(windows), &|key| {
+        std::env::var_os(key).or_else(|| {
+            (key == "VOLTA_HOME")
+                .then(|| login_shell_credential_env().get(key).map(Into::into))
+                .flatten()
+        })
+    })
 }
 
 fn enriched_tool_dirs_for<F>(
     home: Option<&std::path::Path>,
     login_dirs_fn: F,
     is_windows: bool,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Vec<PathBuf>
 where
     F: FnOnce() -> &'static [PathBuf],
 {
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
+    // Volta documents a distinct Windows default. Keep its configurable home
+    // consistent with the environment inherited by installed CLI shims.
+    let volta_home = env("VOLTA_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            if is_windows {
+                env("LOCALAPPDATA")
+                    .filter(|value| !value.is_empty())
+                    .map(|local| PathBuf::from(local).join("Volta"))
+            } else {
+                home.map(|home| home.join(".volta"))
+            }
+        });
 
     if is_windows {
-        if let Some(appdata) = std::env::var_os("APPDATA") {
+        if let Some(appdata) = env("APPDATA") {
             push_dir(&mut dirs, &mut seen, PathBuf::from(&appdata).join("npm"));
         }
         if let Some(home) = home {
             push_dir(&mut dirs, &mut seen, home.join(".npm-global"));
-            // Claude's native Windows installer and Volta's Windows shims.
+            // Claude's native Windows installer.
             push_dir(&mut dirs, &mut seen, home.join(".local").join("bin"));
-            push_dir(&mut dirs, &mut seen, home.join(".volta").join("bin"));
+        }
+        if let Some(volta_home) = volta_home {
+            push_dir(&mut dirs, &mut seen, volta_home.join("bin"));
         }
     } else {
         // Add common Unix/macOS bin directories
@@ -573,10 +652,14 @@ where
                 [".npm-global", "bin"],
                 [".npm-packages", "bin"],
                 [".local", "bin"],
-                [".volta", "bin"],
             ] {
                 push_dir(&mut dirs, &mut seen, home.join(sub[0]).join(sub[1]));
             }
+        }
+        if let Some(volta_home) = volta_home {
+            push_dir(&mut dirs, &mut seen, volta_home.join("bin"));
+        }
+        if let Some(home) = home {
             push_dir(&mut dirs, &mut seen, home.join(".asdf").join("shims"));
         }
     }
@@ -883,12 +966,47 @@ mod tests {
     fn installed_cli_known_user_directories_include_windows_native_installs() {
         let home = unique_temp_dir("cli-tool-dirs");
         for windows in [false, true] {
-            let dirs = enriched_tool_dirs_for(Some(home.path()), || &[], windows);
+            let dirs = enriched_tool_dirs_for(Some(home.path()), || &[], windows, &|_| None);
             assert!(dirs.contains(&home.path().join(".local").join("bin")));
-            assert!(dirs.contains(&home.path().join(".volta").join("bin")));
+            if !windows {
+                assert!(dirs.contains(&home.path().join(".volta").join("bin")));
+            }
         }
     }
 
+    #[test]
+    fn review_regression_windows_volta_uses_local_appdata_and_custom_home() {
+        let home = unique_temp_dir("volta-home");
+        let local = home.path().join("Local AppData");
+        let custom = home.path().join("Custom Volta");
+        let dirs = enriched_tool_dirs_for(Some(home.path()), || &[], true, &|key| {
+            (key == "LOCALAPPDATA").then(|| local.as_os_str().to_owned())
+        });
+        assert!(
+            dirs.contains(&local.join("Volta").join("bin")),
+            "missing documented Windows Volta default"
+        );
+        assert!(
+            !dirs.contains(&home.path().join(".volta").join("bin")),
+            "must not use Unix default on Windows"
+        );
+        let dirs = enriched_tool_dirs_for(Some(home.path()), || &[], true, &|key| match key {
+            "LOCALAPPDATA" => Some(local.as_os_str().to_owned()),
+            "VOLTA_HOME" => Some(custom.as_os_str().to_owned()),
+            _ => None,
+        });
+        assert!(dirs.contains(&custom.join("bin")));
+        assert!(!dirs.contains(&local.join("Volta").join("bin")));
+        for name in ["codex.exe", "claude.cmd"] {
+            std::fs::create_dir_all(custom.join("bin")).unwrap();
+            let fixture = custom.join("bin").join(name);
+            std::fs::write(&fixture, "synthetic wrapper").unwrap();
+            assert!(dirs
+                .iter()
+                .map(|dir| dir.join(name))
+                .any(|path| is_executable_file_for(&path, true)));
+        }
+    }
     #[test]
     #[cfg(not(windows))]
     fn enriched_tool_dirs_scans_every_nvm_node_version_newest_first() {
@@ -1155,6 +1273,65 @@ mod tests {
                 "must not capture {key}"
             );
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn review_regression_claude_auth_refresh_and_network_optouts() {
+        let captured = parse_credential_env(concat!(
+            "CLAUDE_CODE_API_KEY_HELPER_TTL_MS=30000\0",
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\0",
+            "DISABLE_TELEMETRY=1\0DISABLE_ERROR_REPORTING=1\0",
+        ));
+        for name in [
+            "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+            "DISABLE_TELEMETRY",
+            "DISABLE_ERROR_REPORTING",
+        ] {
+            assert!(captured.contains_key(name), "lost supported setting {name}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn configured_codex_credentials_survive_shell_capture_with_home_precedence() {
+        let root = unique_temp_dir("codex-config-env");
+        let shell_home = root.path().join("shell home");
+        let daemon_home = root.path().join("daemon home");
+        for (home, key) in [
+            (&shell_home, "CODEX_GATEWAY_TOKEN"),
+            (&daemon_home, "DAEMON_TOKEN"),
+        ] {
+            std::fs::create_dir_all(home).unwrap();
+            std::fs::write(home.join("config.toml"), format!(
+                "[model_providers.gateway]\nenv_key = \"{key}\"\nenv_http_headers = {{Auth = \"GATEWAY_HEADER_TOKEN\"}}"
+            )).unwrap();
+        }
+        let payload = format!("CODEX_HOME={}\0CODEX_GATEWAY_TOKEN=synthetic\0DAEMON_TOKEN=other\0GATEWAY_HEADER_TOKEN=header\0UNRELATED_SECRET=excluded\0CODEX_PATH=/wrong\0", shell_home.display());
+        let (captured, names) = capture_credential_env_for(&payload, None, Some(root.path()));
+        assert!(captured.contains_key("CODEX_GATEWAY_TOKEN"));
+        assert!(captured.contains_key("GATEWAY_HEADER_TOKEN"));
+        assert!(names.contains("CODEX_GATEWAY_TOKEN"));
+        assert!(!captured.contains_key("DAEMON_TOKEN"));
+        assert!(!captured.contains_key("UNRELATED_SECRET"));
+        assert!(!captured.contains_key("CODEX_PATH"));
+        let (captured, names) =
+            capture_credential_env_for(&payload, Some(daemon_home.as_os_str()), Some(root.path()));
+        assert!(captured.contains_key("DAEMON_TOKEN"));
+        assert!(captured.contains_key("GATEWAY_HEADER_TOKEN"));
+        assert!(!captured.contains_key("CODEX_GATEWAY_TOKEN"));
+        assert!(names.contains("DAEMON_TOKEN"));
+        let default_home = root.path().join(".codex");
+        std::fs::create_dir(&default_home).unwrap();
+        std::fs::write(
+            default_home.join("config.toml"),
+            "[model_providers.gateway]\nenv_key=\"DEFAULT_TOKEN\"",
+        )
+        .unwrap();
+        let (captured, _) =
+            capture_credential_env_for("DEFAULT_TOKEN=synthetic\0", None, Some(root.path()));
+        assert!(captured.contains_key("DEFAULT_TOKEN"));
     }
 
     #[test]

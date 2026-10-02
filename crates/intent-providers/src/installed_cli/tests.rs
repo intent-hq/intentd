@@ -158,10 +158,12 @@ fn audited_environment_preserves_empty_values_and_daemon_authority() {
             ("NODE_OPTIONS", "daemon-node-policy"),
             ("CODEX_CONFIG", "unsafe"),
             ("CODEX_PATH", "/override/alternate"),
+            ("codex_path", "/override/lowercase"),
+            ("Codex_Config", "unsafe"),
             ("CLAUDE_CODE_EXECUTABLE", "/override/alternate"),
         ]);
         let selected = runtime
-            .environment(&captured, &inherited, &overrides)
+            .environment(&captured, &inherited, &overrides, &CodexEnvNames::default())
             .unwrap();
         assert_eq!(selected["HTTPS_PROXY"], "daemon-proxy");
         assert_eq!(selected["NO_PROXY"], "");
@@ -170,6 +172,7 @@ fn audited_environment_preserves_empty_values_and_daemon_authority() {
         assert_eq!(selected["CLAUDE_CONFIG_DIR"], "/isolated/probe");
         assert_eq!(selected["NODE_OPTIONS"], "daemon-node-policy");
         assert!(!selected.contains_key("RANDOM_SECRET"));
+        assert!(!selected.contains_key("codex_path"));
         assert_eq!(selected[cli.path_env()], runtime.path().to_str().unwrap());
         if cli == InstalledCli::Codex {
             assert_eq!(
@@ -265,7 +268,12 @@ fn non_unicode_path_is_rejected_instead_of_launching_a_lossy_spelling() {
     let runtime = InstalledCli::Codex.resolve_in_dirs(&[bin], false).unwrap();
     assert_eq!(
         runtime
-            .environment(&BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new())
+            .environment(
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &CodexEnvNames::default()
+            )
             .unwrap_err()
             .kind(),
         std::io::ErrorKind::InvalidInput
@@ -297,6 +305,7 @@ fn unchanged_script_wrapper_observes_upgraded_payload_and_environment() {
             ]),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &CodexEnvNames::default(),
         )
         .unwrap();
     let version = || {
@@ -322,4 +331,53 @@ fn unchanged_script_wrapper_observes_upgraded_payload_and_environment() {
     let second_version = version();
     assert_eq!(second_version, "2.0:synthetic:synthetic-proxy");
     assert!(first != runtime.identity(&second_version).unwrap());
+}
+
+#[test]
+fn custom_codex_auth_and_header_credentials_survive_overlay_and_isolation() {
+    let dir = scratch();
+    executable(&dir.path().join("codex"), "#!/bin/sh\nexit 0\n");
+    let runtime = InstalledCli::Codex
+        .resolve_in_dirs(&[dir.path().into()], false)
+        .unwrap();
+    let names = CodexEnvNames::from_config(
+        r#"
+        [model_providers.gateway]
+        env_key = "CODEX_GATEWAY_TOKEN"
+        env_http_headers = { "Authorization" = "CUSTOM_HEADER_TOKEN", "Reserved" = "CODEX_PATH" }
+    "#,
+    )
+    .unwrap();
+    let captured = env(&[
+        ("CODEX_GATEWAY_TOKEN", "shell-key"),
+        ("CUSTOM_HEADER_TOKEN", "shell-header"),
+        ("CODEX_UNRELATED", "excluded"),
+        ("CODEX_PATH", "/wrong"),
+        ("CLAUDE_CODE_API_KEY_HELPER_TTL_MS", "30000"),
+        ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
+    ]);
+    let inherited = env(&[("CODEX_GATEWAY_TOKEN", "")]);
+    let overrides = env(&[
+        ("CUSTOM_HEADER_TOKEN", "daemon-header"),
+        ("CODEX_HOME", "/isolated"),
+    ]);
+    let selected = runtime
+        .environment(&captured, &inherited, &overrides, &names)
+        .unwrap();
+    assert_eq!(selected["CODEX_GATEWAY_TOKEN"], "");
+    assert_eq!(selected["CUSTOM_HEADER_TOKEN"], "daemon-header");
+    assert_eq!(selected["CODEX_HOME"], "/isolated");
+    assert_eq!(selected["CODEX_PATH"], runtime.path().to_str().unwrap());
+    assert!(!selected.contains_key("CODEX_UNRELATED"));
+    executable(&dir.path().join("claude"), "#!/bin/sh\nexit 0\n");
+    let claude = InstalledCli::Claude
+        .resolve_in_dirs(&[dir.path().into()], false)
+        .unwrap();
+    let selected = claude
+        .environment(&captured, &BTreeMap::new(), &BTreeMap::new(), &names)
+        .unwrap();
+    assert!(!selected.contains_key("CODEX_GATEWAY_TOKEN"));
+    assert!(!selected.contains_key("CUSTOM_HEADER_TOKEN"));
+    assert_eq!(selected["CLAUDE_CODE_API_KEY_HELPER_TTL_MS"], "30000");
+    assert_eq!(selected["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"], "1");
 }

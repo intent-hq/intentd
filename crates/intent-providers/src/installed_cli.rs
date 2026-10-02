@@ -9,7 +9,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use intent_core::cli_env::{CLAUDE_CLI_ENV, CLI_NETWORK_ENV, CODEX_CLI_ENV};
+use intent_core::cli_env::{
+    CodexEnvNames, CLAUDE_CLI_ENV, CLI_NETWORK_ENV, CLI_RUNTIME_ENV, CODEX_CLI_ENV,
+};
 use intent_core::path_utils::{enhanced_path_dirs, is_executable_file};
 
 /// Provider runtime, distinct from its ACP adapter executable/package.
@@ -51,7 +53,9 @@ impl InstalledCli {
             Self::Codex => CODEX_CLI_ENV,
             Self::Claude => CLAUDE_CLI_ENV,
         };
-        provider_keys.contains(&key) || CLI_NETWORK_ENV.contains(&key)
+        provider_keys.contains(&key)
+            || CLI_NETWORK_ENV.contains(&key)
+            || CLI_RUNTIME_ENV.contains(&key)
     }
 
     /// Inherited PATH, then Intent's known install/version-manager directories,
@@ -125,8 +129,10 @@ impl InstalledCliRuntime {
     /// Returned values may contain credentials: never log/serialize this map.
     /// This is an overlay, not `env_clear`: callers retain their existing process
     /// inheritance and removals. Unlisted custom credentials already inherited
-    /// by the daemon still reach children. Shell-only custom names require an
-    /// explicit daemon override. Non-Unicode daemon env should remain inherited
+    /// by the daemon still reach children. Pass `login_shell_codex_env_names()`
+    /// for `codex_names`, or names parsed from the user config before isolating
+    /// a probe's home. This preserves config-referenced shell-only credentials.
+    /// Non-Unicode daemon env should remain inherited
     /// (callers must prevent captured values replacing such entries).
     ///
     /// # Errors
@@ -137,21 +143,28 @@ impl InstalledCliRuntime {
         captured: &BTreeMap<String, String>,
         inherited: &BTreeMap<String, String>,
         overrides: &BTreeMap<String, String>,
+        codex_names: &CodexEnvNames,
     ) -> std::io::Result<BTreeMap<String, String>> {
         let mut env = BTreeMap::new();
         for source in [captured, inherited] {
             env.extend(
                 source
                     .iter()
-                    .filter(|(key, _)| self.cli.accepts_env(key))
+                    .filter(|(key, _)| {
+                        self.cli.accepts_env(key)
+                            || (self.cli == InstalledCli::Codex && codex_names.contains(key))
+                    })
                     .map(|(key, value)| (key.clone(), value.clone())),
             );
         }
         env.extend(overrides.clone());
         // An old user/adapter override must never choose the runtime, even if
         // it survived another merge. The daemon-selected path is authoritative.
-        env.remove("CODEX_PATH");
-        env.remove("CLAUDE_CODE_EXECUTABLE");
+        env.retain(|key, _| {
+            !(key.eq_ignore_ascii_case("CODEX_PATH")
+                || key.eq_ignore_ascii_case("CLAUDE_CODE_EXECUTABLE")
+                || self.cli == InstalledCli::Codex && key.eq_ignore_ascii_case("CODEX_CONFIG"))
+        });
         let path = self.path.to_str().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
