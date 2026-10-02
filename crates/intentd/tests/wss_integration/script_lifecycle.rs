@@ -349,13 +349,14 @@ async fn script_event_frame(watching: &mut Ws, sid: &str, event_type: &str) -> V
 
 #[intent_test_macros::daemon_test]
 async fn script_changed_full_rows_and_terminal_order_over_wss() {
+    let worktree = common::test_tempdir("script-snapshot-wss");
     let srv = start(WsOptions::default()).await;
     let mut client = connect_ws(srv.port, srv.cfg.clone()).await;
     let created = rpc(
         &mut client,
         1,
         "workspace.create",
-        json!({"title":"Script snapshots"}),
+        json!({"title":"Script snapshots","path":worktree.path(),"worktreePath":worktree.path()}),
     )
     .await;
     let ws = created["result"]["workspace"]["id"].as_str().unwrap();
@@ -489,7 +490,7 @@ async fn script_changed_full_rows_and_terminal_order_over_wss() {
                 break event["data"]["script"].clone();
             }
         };
-        assert_eq!(snapshot["lastRun"]["outcome"], outcome);
+        assert_eq!(snapshot["lastRun"]["outcome"], outcome, "{sid}: {snapshot}");
         assert_eq!(snapshot["archivedAt"].is_string(), purpose == "oneOff");
         let list = rpc(&mut client, 6, "script.list", json!({"workspaceId":ws})).await;
         assert_eq!(
