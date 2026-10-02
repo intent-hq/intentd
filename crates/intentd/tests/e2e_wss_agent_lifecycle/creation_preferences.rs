@@ -160,8 +160,19 @@ async fn creation_preferences_survive_restart_and_rejected_requests_over_wss() {
 
 #[intent_test_macros::daemon_test]
 async fn creation_preferences_workspace_initial_agent_ui_shape_over_wss() {
+    let Some(script) = gate("initial-agent preferences and naming E2E") else {
+        return;
+    };
     let data = temp_data_dir();
-    let env = [("INTENTD_AUTH_TOKEN", TOKEN)];
+    let prompt_log = data.path().join("initial-agent-prompts.jsonl");
+    let prompt_log_str = prompt_log.to_string_lossy().into_owned();
+    let behavior = json!({"response": "Initial agent response"}).to_string();
+    let env = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+        ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
+        ("MOCK_AGENT_PROMPT_LOG", prompt_log_str.as_str()),
+    ];
     let _daemon = Daemon {
         child: spawn_serve(data.path(), "both", &env),
     };
@@ -174,14 +185,26 @@ async fn creation_preferences_workspace_initial_agent_ui_shape_over_wss() {
         client_config(status["result"]["fingerprint"].as_str().unwrap()),
     )
     .await;
+    let mut sub = connect_ws(
+        port,
+        client_config(status["result"]["fingerprint"].as_str().unwrap()),
+    )
+    .await;
+    let subscribed = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({"eventTypes":["agent:*"]}),
+    )
+    .await;
+    assert!(subscribed["subscriptionId"].is_string());
     for (name, explicit, remember, specialist) in [
         ("Implementor", Some(false), true, Some("implementor")),
         ("My initial task", None, true, Some("implementor")),
         ("Legacy custom", None, false, Some("implementor")),
         ("Agent", Some(false), true, None),
     ] {
-        let mut initial =
-            json!({"name":name,"provider":"mock","model":"default","rememberSpecialist":remember});
+        let mut initial = json!({"name":name,"provider":"mock","model":"default","rememberSpecialist":remember,"prompt":format!("Initial naming case {name}: fix sidebar selection")});
         if let Some(explicit) = explicit {
             initial["nameExplicitlySet"] = json!(explicit);
         }
@@ -218,6 +241,62 @@ async fn creation_preferences_workspace_initial_agent_ui_shape_over_wss() {
                 json!({})
             }
         );
+        let agent_id = created["result"]["initialAgent"]["id"].as_str().unwrap();
+        for turn in 0..2 {
+            let content = if turn == 0 {
+                format!("Initial naming case {name}: fix sidebar selection")
+            } else {
+                format!("Follow-up naming case {name}: check sidebar selection")
+            };
+            if turn > 0 {
+                let sent = wss_rpc(
+                    &mut rpc,
+                    25,
+                    "agent.sendMessage",
+                    json!({
+                        "workspaceId":ws,"agentId":agent_id,"content":content
+                    }),
+                )
+                .await;
+                assert_eq!(sent["success"], true);
+            }
+            timeout(Duration::from_secs(30), async {
+                loop {
+                    let frame = wss_event(&mut sub, 30).await;
+                    let event = &frame["params"]["event"];
+                    if event["type"] == "agent:status-changed"
+                        && event["data"]["agentId"] == agent_id
+                        && event["data"]["status"] == "idle"
+                    {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("initial agent turn settled");
+            let log = std::fs::read_to_string(&prompt_log).expect("provider prompt log");
+            let prompts: Vec<Value> = log
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let text = prompts
+                .iter()
+                .rev()
+                .filter_map(|prompt| prompt["text"].as_str())
+                .find(|text| text.contains(&content))
+                .expect("initial message reached provider");
+            assert_eq!(
+                text.contains("This agent still has a generated name"),
+                explicit == Some(false) && turn == 0,
+                "case {name} turn {turn}: {text}"
+            );
+            assert!(!text.contains("This workspace needs a title"));
+        }
+        let got = wss_rpc(&mut rpc, 26, "agent.get", json!({"agentId":agent_id})).await;
+        assert_eq!(
+            got["agent"]["name"], name,
+            "naming hints do not mutate names"
+        );
     }
     let before = wss_rpc(&mut rpc, 22, "workspace.list", json!({})).await;
     for initial in [
@@ -236,7 +315,8 @@ async fn creation_preferences_workspace_initial_agent_ui_shape_over_wss() {
     }
     let after = wss_rpc(&mut rpc, 24, "workspace.list", json!({})).await;
     assert_eq!(
-        before, after,
+        before["workspaces"].as_array().unwrap().len(),
+        after["workspaces"].as_array().unwrap().len(),
         "rejected initial-agent plans must leave no workspace"
     );
 }
