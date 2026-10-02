@@ -6257,6 +6257,32 @@ impl AgentManager {
         }
     }
 
+    /// A suppressed or transfer-parked monitor never starts a provider turn.
+    /// Deregister while owning the slot, then release it before re-kicking;
+    /// an old worker must never clear a replacement worker or its admission.
+    async fn finish_monitor_worker(
+        self: &Arc<Self>,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        admission: TurnAdmission,
+    ) {
+        let gate = self.turn_start_gates.for_agent(agent_id);
+        let starting = gate.lock().await;
+        if self.is_shutting_down() || !self.owns_admission(agent_id, admission) {
+            return;
+        }
+        self.clear_worker(agent_id);
+        self.end_turn(agent_id).await;
+        drop(starting);
+        self.services.persist_queue_snapshot(agent_id).await;
+        self.services
+            .redeliver_completion_after_queue_mutation(agent_id)
+            .await;
+        self.clone()
+            .try_drain_queue(agent_id.clone(), workspace_id.clone())
+            .await;
+    }
+
     async fn fail_admitted_persist(
         &self,
         agent_id: &AgentId,
@@ -8381,7 +8407,16 @@ impl AgentManager {
                 if consumed_redelivery {
                     mgr.sync_stop_redelivery(&id).await;
                 }
-                run_message_worker(mgr, id, workspace_id, content, options, user_persisted).await;
+                run_message_worker(
+                    mgr,
+                    id,
+                    workspace_id,
+                    content,
+                    options,
+                    user_persisted,
+                    admission,
+                )
+                .await;
             },
         ));
         if let Some(previous) = self.workers.lock().unwrap().insert(agent_id, handle) {
@@ -11503,6 +11538,7 @@ async fn run_message_worker(
     initial_content: String,
     initial_options: TurnOptions,
     initial_persisted: bool,
+    mut admission: TurnAdmission,
 ) {
     let mut content = initial_content;
     // Only the first turn carries the caller's per-turn prompt-assembly hints
@@ -11535,7 +11571,9 @@ async fn run_message_worker(
             &content,
             options.message_metadata.as_ref(),
         ) {
-            break 'outer;
+            mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
+                .await;
+            return;
         }
         if !mgr
             .services
@@ -11543,7 +11581,9 @@ async fn run_message_worker(
             .await
             .unwrap_or(false)
         {
-            break 'outer;
+            mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
+                .await;
+            return;
         }
 
         // Turn-start budget re-check (monorepo#2063 B8): a warm idle process
@@ -11571,14 +11611,18 @@ async fn run_message_worker(
             &content,
             options.message_metadata.as_ref(),
         ) {
-            break 'outer;
+            mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
+                .await;
+            return;
         }
         if !mgr
             .services
             .admit_script_monitor_turn(&agent_id, options.message_metadata.as_ref())
             .await
         {
-            break 'outer;
+            mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
+                .await;
+            return;
         }
         match retry_spawn(&mgr, &agent_id, &workspace_id).await {
             Ok(acp_session_id) => {
@@ -11631,14 +11675,18 @@ async fn run_message_worker(
                     &content,
                     options.message_metadata.as_ref(),
                 ) {
-                    break 'outer;
+                    mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
+                        .await;
+                    return;
                 }
                 if !mgr
                     .services
                     .admit_script_monitor_turn(&agent_id, options.message_metadata.as_ref())
                     .await
                 {
-                    break 'outer;
+                    mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
+                        .await;
+                    return;
                 }
                 match mgr
                     .run_turn(
@@ -12303,10 +12351,10 @@ async fn run_message_worker(
                 .await;
             break 'outer;
         }
-        if matches!(
-            mgr.try_begin_outcome(&agent_id, &workspace_id, false).await,
-            TryBeginOutcome::Started(_)
-        ) {
+        if let TryBeginOutcome::Started(next_admission) =
+            mgr.try_begin_outcome(&agent_id, &workspace_id, false).await
+        {
+            admission = next_admission;
             // Archived re-check on the raced pop (intent-hq/monorepo#2513):
             // the popped entry can be a wake parked by the archived gates
             // AFTER the gate at the top of this drain ran — e.g. the
@@ -20006,7 +20054,7 @@ mod agent_retry_tests {
         let agent = AgentId::from("monitor-worker-owner");
         let ws = WorkspaceId::from("monitor-worker-workspace");
         let (mgr, _db) = manager_with_session(&agent, &ws, AgentStatus::RuntimeIdle).await;
-        assert!(mgr.try_begin(&agent, &ws).await);
+        let admission = mgr.try_begin_turn(&agent, &ws).await.unwrap();
         if exporting {
             mgr.services.transfer_exports.lock().unwrap().insert(
                 "monitor-worker-export".into(),
@@ -20032,6 +20080,7 @@ mod agent_retry_tests {
                 ..TurnOptions::default()
             },
             true,
+            admission,
         )
         .await;
         assert!(
