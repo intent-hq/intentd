@@ -51,7 +51,7 @@
 //! Actual spend on a quiet PR is lower than the cost model: every sweep
 //! poll issues `get_pr`, but the sub-reads (merge-requirements probe,
 //! reviews, review threads, conversation comments) are skipped while the
-//! PR's change fingerprint — `updatedAt`, head SHA, lifecycle/draft flags,
+//! PR's change fingerprint — `updatedAt`, head/live base SHA, target/fork, lifecycle/draft flags,
 //! mergeability — is unchanged since the last full fetch, bounded by
 //! [`PR_MONITOR_MAX_CHEAP_POLLS`] and [`PR_MONITOR_MAX_CHEAP_AGE`] so
 //! signals the fingerprint does not cover (check runs, merge-queue events)
@@ -490,6 +490,7 @@ impl PrMonitorSnapshot {
 /// removed" change from a sibling monitor's baseline.
 #[derive(Debug, Clone)]
 pub struct SharedPrSnapshot {
+    ancestry_identity: Option<intent_sourcecontrol::PrAncestryIdentity>,
     pub(crate) title: String,
     pub(crate) url: String,
     pub(crate) head_sha: Option<String>,
@@ -623,6 +624,8 @@ impl SharedPrSnapshot {
 struct PrFingerprint {
     updated_at: String,
     head_sha: Option<String>,
+    target_branch: String,
+    ancestry_identity: Option<intent_sourcecontrol::PrAncestryIdentity>,
     state: PrState,
     draft: bool,
     mergeable: Option<bool>,
@@ -630,10 +633,15 @@ struct PrFingerprint {
 }
 
 impl PrFingerprint {
-    fn of(pr: &PullRequest) -> Self {
+    fn of(
+        pr: &PullRequest,
+        ancestry_identity: Option<&intent_sourcecontrol::PrAncestryIdentity>,
+    ) -> Self {
         Self {
             updated_at: pr.updated_at.clone(),
             head_sha: pr.head_sha.clone(),
+            target_branch: pr.target_branch.clone(),
+            ancestry_identity: ancestry_identity.cloned(),
             state: pr.state,
             draft: pr.draft,
             mergeable: pr.mergeable,
@@ -732,7 +740,7 @@ impl PrCacheEntry {
         Self {
             authorization: None,
             record_started_at: now,
-            fingerprint: PrFingerprint::of(&pr),
+            fingerprint: PrFingerprint::of(&pr, snapshot.ancestry_identity.as_ref()),
             pr,
             snapshot,
             fetched_at: now,
@@ -906,7 +914,7 @@ static NONE: std::sync::LazyLock<HashSet<PrKey>> = std::sync::LazyLock::new(Hash
 ///
 /// | path | before | after |
 /// |---|---|---|
-/// | happy (host folds the read) | 6 — `get_pr`, `merge_requirements` (GraphQL + branch-rules REST = 2 HTTP), `list_reviews`, `review_decision`, `get_review_threads`, `list_comments` (7 HTTP) | 2 — `pr_observation` (1 GraphQL request, 1 rate-limit point), `branch_rules` |
+/// | happy (host folds the read) | 6 — `get_pr`, `merge_requirements` (GraphQL + branch-rules REST = 2 HTTP), `list_reviews`, `review_decision`, `get_review_threads`, `list_comments` (7 HTTP) | up to 3 — `pr_observation` (1 GraphQL request), `branch_rules` (unless cached), `pr_ancestry` (one REST compare when live revisions are known and PR open) |
 /// | host without a folded read | 6 (7 HTTP) | 6 (7 HTTP), unchanged |
 /// | REST fallback (probe + threads down), host without a folded read | 8 | 8, unchanged |
 /// | REST fallback, host with a folded read whose GraphQL is down | 8 | 9 — the failed `pr_observation` attempt, then the 8 |
@@ -978,6 +986,7 @@ async fn shared_snapshot_from_observation(
     let read =
         pr_ops::merge_requirements_from_observation(sc, repo_ref, number, &observation).await?;
     let snapshot = SharedPrSnapshot {
+        ancestry_identity: observation.ancestry_identity.clone(),
         title: observation.pr.title.clone(),
         url: observation.pr.url.clone(),
         head_sha: observation.pr.head_sha.clone(),
@@ -1139,7 +1148,12 @@ async fn poll_pr(
         .map_err(pr_ops::map_sc_err)?,
     };
     ensure_current_pr_authorization(authorization.as_ref())?;
-    let fingerprint = PrFingerprint::of(&pr);
+    let fingerprint = PrFingerprint::of(
+        &pr,
+        observation
+            .as_ref()
+            .and_then(|o| o.ancestry_identity.as_ref()),
+    );
     let now = Instant::now();
     let reused = {
         let mut cache = cache.lock().unwrap();
@@ -1235,6 +1249,7 @@ async fn finish_shared_snapshot(
         }
     };
     let snapshot = SharedPrSnapshot {
+        ancestry_identity: None,
         title: pr.title.clone(),
         url: pr.url.clone(),
         head_sha: pr.head_sha.clone(),
@@ -1408,18 +1423,20 @@ impl PrMonitorRefusal {
 /// `none` decision while the branch rules still demand approvals the PR
 /// does not have), no unresolved threads when resolution is required (an
 /// unreadable thread count — `threads.unresolved == None` — never promotes
-/// while resolution is required, since the state is unknown, not clear), no
-/// `merge_blocked_reason`, and no blocked/behind/dirty/unknown
+/// while resolution is required, since the state is unknown, not clear), a
+/// forge-confirmed `branch_update_required == Some(false)` (ancestry counts
+/// never block), no `merge_blocked_reason`, and no blocked/behind/dirty/unknown
 /// `merge_state_status` (`UNKNOWN` means the forge has not established
 /// mergeability yet, so it never promotes). A PR already queued in the
 /// merge queue is being handled by the queue, not awaiting action, so a
 /// CLEAN-but-queued snapshot stays non-ready too.
-fn requirements_ready(req: &MergeRequirements) -> bool {
+pub(crate) fn requirements_ready(req: &MergeRequirements) -> bool {
     req.state == "open"
         && !req.is_draft
         && req.mergeable == Some(true)
         && !req.has_conflicts
         && !req.is_behind
+        && req.branch_update_required == Some(false)
         && req.merge_blocked_reason.is_none()
         && req.checks.failing_required.is_empty()
         && req.checks.pending_required.is_empty()
@@ -1707,6 +1724,7 @@ fn pr_monitor_wire(m: &PrMonitor, paused_until: Option<&str>) -> Value {
             "isDraft": r.is_draft,
             "hasConflicts": r.has_conflicts,
             "isBehind": r.is_behind,
+            "ancestry": r.ancestry,
             "mergeable": r.mergeable,
             "mergeBlockedReason": r.merge_blocked_reason,
             "checks": {
@@ -1729,6 +1747,9 @@ fn pr_monitor_wire(m: &PrMonitor, paused_until: Option<&str>) -> Value {
             },
             "rulesKnown": r.rules_known,
         });
+        if let Some(required) = r.branch_update_required {
+            last["branchUpdateRequired"] = json!(required);
+        }
         // Presence-detected: the count appears only when the thread
         // resolution state was readable (never null).
         if let Some(unresolved) = r.threads.unresolved {
@@ -4356,6 +4377,8 @@ impl Services {
 
 #[cfg(test)]
 mod tests {
+    mod ancestry_messages;
+    mod ancestry_regression;
     mod quota_regression;
     mod qwen_regression;
     use std::path::PathBuf;
@@ -4914,6 +4937,7 @@ mod tests {
             let (review_comment_count, unresolved) =
                 crate::pr_ops::count_thread_comments(&thread_page(&s.threads));
             Ok(Some(PrObservation {
+                ancestry_identity: None,
                 pr: s.pr_record(number),
                 signals: s.signals(),
                 reviews: (!folded.overflow_reviews).then(|| s.reviews()),
@@ -5368,6 +5392,8 @@ mod tests {
             conversation_count: 1,
             review_comment_count: 2,
             requirements: MergeRequirements {
+                ancestry: intent_sourcecontrol::PrAncestry::Unknown,
+                branch_update_required: None,
                 state: "open".into(),
                 is_draft: false,
                 has_conflicts: false,
@@ -5418,6 +5444,7 @@ mod tests {
     /// Clear every merge-requirements blocker on the [`snapshot`] fixture —
     /// the truly-mergeable checklist shape [`requirements_ready`] accepts.
     fn ready_requirements(req: &mut MergeRequirements) {
+        req.branch_update_required = Some(false);
         req.checks.passed = 1;
         req.checks.pending = 0;
         req.checks.items[0].status = "passed".into();
@@ -5699,10 +5726,13 @@ mod tests {
             .iter()
             .any(|c| c == "merge conflicts appeared"));
 
-        let behind = snapshot(|s| s.requirements.is_behind = true);
+        let behind = snapshot(|s| {
+            s.requirements.is_behind = true;
+            s.requirements.branch_update_required = Some(true);
+        });
         assert!(diff_snapshots(&base, &behind)
             .iter()
-            .any(|c| c == "branch is now behind its base"));
+            .any(|c| c == "forge branch-update requirement available: required before merging"));
 
         let queued = snapshot(|s| s.requirements.is_in_merge_queue = Some(true));
         assert!(diff_snapshots(&base, &queued)
@@ -5776,41 +5806,51 @@ mod tests {
     }
 
     /// The same transient recomputation also clears the DERIVED fields
-    /// (`hasConflicts` / `isBehind` / `mergeBlockedReason`): while the NEW
+    /// (`hasConflicts` / `mergeBlockedReason`): while the NEW
     /// snapshot's mergeability is unknown, the clearing direction of those
     /// lines is suppressed too — a DIRTY/BEHIND/blocked PR blipping to
-    /// UNKNOWN stays fully silent. A real clear to a known state still
-    /// reports, and the appearing direction reports even while unknown.
+    /// UNKNOWN reports only the neutral update-requirement availability.
+    /// A real clear to a known state still reports, and the appearing direction reports even while unknown.
     #[test]
     fn diff_suppresses_derived_clears_while_mergeability_is_unknown() {
         let dirty = snapshot(|s| {
             s.requirements.has_conflicts = true;
             s.requirements.is_behind = true;
+            s.requirements.branch_update_required = Some(true);
             s.requirements.mergeable = Some(false);
             s.requirements.merge_state_status = Some("DIRTY".into());
             s.requirements.merge_blocked_reason = Some("merge conflicts".into());
         });
         // DIRTY → UNKNOWN blip: the recomputation resets the derived fields
-        // alongside the raw ones; nothing reports.
+        // alongside the raw ones; only lost availability reports.
         let blip = snapshot(|s| {
             s.requirements.mergeable = None;
             s.requirements.merge_state_status = Some("UNKNOWN".into());
         });
-        assert!(diff_snapshots(&dirty, &blip).is_empty());
+        assert_eq!(
+            diff_snapshots(&dirty, &blip),
+            vec!["forge branch-update requirement unknown"]
+        );
         // Same with the merge state absent entirely.
         let blip_none = snapshot(|s| {
             s.requirements.mergeable = None;
             s.requirements.merge_state_status = None;
         });
-        assert!(diff_snapshots(&dirty, &blip_none).is_empty());
+        assert_eq!(
+            diff_snapshots(&dirty, &blip_none),
+            vec!["forge branch-update requirement unknown"]
+        );
 
         // A real clear to a known state still reports all three.
-        let cleared = snapshot(|s| s.requirements.merge_state_status = Some("CLEAN".into()));
+        let cleared = snapshot(|s| {
+            s.requirements.merge_state_status = Some("CLEAN".into());
+            s.requirements.branch_update_required = Some(false);
+        });
         let changes = diff_snapshots(&dirty, &cleared);
         assert!(changes.iter().any(|c| c == "merge conflicts resolved"));
         assert!(changes
             .iter()
-            .any(|c| c == "branch is no longer behind its base"));
+            .any(|c| c == "forge no longer requires a branch update before merging"));
         assert!(changes.iter().any(|c| c == "merge is no longer blocked"));
 
         // The appearing direction keeps reporting even while unknown.
@@ -5818,13 +5858,16 @@ mod tests {
         let appearing = snapshot(|s| {
             s.requirements.has_conflicts = true;
             s.requirements.is_behind = true;
+            s.requirements.branch_update_required = Some(true);
             s.requirements.merge_blocked_reason = Some("blocked".into());
             s.requirements.mergeable = None;
             s.requirements.merge_state_status = None;
         });
         let changes = diff_snapshots(&base, &appearing);
         assert!(changes.iter().any(|c| c == "merge conflicts appeared"));
-        assert!(changes.iter().any(|c| c == "branch is now behind its base"));
+        assert!(changes
+            .iter()
+            .any(|c| c == "forge branch-update requirement available: required before merging"));
         assert!(changes.iter().any(|c| c == "merge blocked: blocked"));
     }
 
@@ -5896,6 +5939,7 @@ mod tests {
     /// materialize tests vary `ejection_known` and the previous snapshot.
     fn shared_from(s: &PrMonitorSnapshot, ejection_known: bool) -> SharedPrSnapshot {
         SharedPrSnapshot {
+            ancestry_identity: None,
             title: s.title.clone(),
             url: s.url.clone(),
             head_sha: s.head_sha.clone(),

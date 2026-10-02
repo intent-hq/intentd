@@ -24792,6 +24792,102 @@ mod file_tracking {
         assert_eq!(stage_of("b.txt"), "unstaged");
     }
 
+    /// An index-refresh failure must not discard a successful receipt or skip
+    /// attribution/events. A later HEAD cannot substitute for the original SHA.
+    #[intent_test_macros::daemon_test]
+    async fn agent_commit_reports_created_sha_when_index_refresh_fails() {
+        let repo = init_git_repo();
+        let (_t, svc, ws) = svc_with_repo(&repo).await;
+        let bus = crate::events::EventBus::new(svc.store().clone());
+        let svc = svc.with_event_bus(bus);
+        std::fs::write(repo.dir.join("prestaged.txt"), "other actor\n").unwrap();
+        intent_git::stage::stage(&repo.dir, &["prestaged.txt".to_string()]).unwrap();
+        std::fs::write(repo.dir.join("a.txt"), "agent a\n").unwrap();
+        svc.store()
+            .upsert_tracked_change(&tracked(&ws, "a.txt", "unstaged", Some("agent-a")))
+            .await
+            .unwrap();
+        let git = git2::Repository::open(&repo.dir).unwrap();
+        let parent = git.head().unwrap().target().unwrap();
+        let index_before = std::fs::read(git.path().join("index")).unwrap();
+        std::fs::write(git.path().join("index.lock"), "held by test\n").unwrap();
+
+        let (entered, release) = crate::periodic_shutdown_tests::hold(&svc, "git");
+        let committing = svc.clone();
+        let workspace_id = ws.clone();
+        let operation = tokio::spawn(intent_core::with_caller(
+            intent_core::Caller::Daemon,
+            async move {
+                committing
+                    .git_agent_commit(
+                        workspace_id,
+                        "agent a only".to_string(),
+                        Some(AgentId::from("agent-a")),
+                        None,
+                        None,
+                        false,
+                        None,
+                    )
+                    .await
+            },
+        ));
+        crate::periodic_shutdown_tests::entered(entered).await;
+        let committed = git.head().unwrap().peel_to_commit().unwrap();
+        assert_ne!(committed.id(), parent);
+        assert_eq!(committed.parent_id(0).unwrap(), parent);
+        assert_eq!(
+            std::fs::read(git.path().join("index")).unwrap(),
+            index_before
+        );
+        assert!(committed
+            .tree()
+            .unwrap()
+            .get_name("prestaged.txt")
+            .is_none());
+        // Advance HEAD while the service holds the original outcome. Keep the
+        // stale index intact so the emitted status must still report its state.
+        let sig = git.signature().unwrap();
+        let later = git
+            .commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "later commit",
+                &committed.tree().unwrap(),
+                &[&committed],
+            )
+            .unwrap();
+        release.send(()).unwrap();
+        let outcome = operation.await.unwrap().unwrap();
+        assert_eq!(outcome.hash, committed.id().to_string());
+        assert_ne!(outcome.hash, later.to_string());
+        assert_eq!(outcome.files, vec!["a.txt".to_string()]);
+        assert_eq!(outcome.file_count, 1);
+        let rows = svc.store().list_tracked_changes(&ws).await.unwrap();
+        assert_eq!(
+            rows.iter().find(|r| r.path == "a.txt").unwrap().stage,
+            "committed"
+        );
+        let events = svc
+            .store()
+            .events_by_type(&ws, "git:commit", 10)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data["commit"], outcome.hash);
+        assert_eq!(events[0].data["files"], serde_json::json!(["a.txt"]));
+        let status_events = svc
+            .store()
+            .events_by_type(&ws, "changes:git-status", 10)
+            .await
+            .unwrap();
+        assert_eq!(status_events.len(), 1);
+        assert_eq!(
+            status_events[0].data["status"],
+            serde_json::to_value(intent_git::status::status(&repo.dir).unwrap()).unwrap()
+        );
+    }
+
     /// A path another actor already staged is not swept into the
     /// attribution-filtered commit — the commit tree is built from exactly
     /// the attributed paths (`git commit -- <paths>` semantics), and the
