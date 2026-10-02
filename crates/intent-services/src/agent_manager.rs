@@ -11467,6 +11467,27 @@ fn auggie_explicit_path_setting(
         .or_else(|| read_provider_path_setting(settings, "auggie"))
 }
 
+fn dequeue_worker_raced_tail(
+    services: &Services,
+    agent_id: &AgentId,
+    next: &QueuedMessage,
+    mode: intent_core::FlushQueuedMessagesMode,
+) -> Option<(Vec<QueuedMessage>, DrainingGuard)> {
+    match mode {
+        intent_core::FlushQueuedMessagesMode::All => {
+            services.dequeue_ready_batch_draining(agent_id, false, 1)
+        }
+        intent_core::FlushQueuedMessagesMode::SystemOnly => {
+            if next.user_origin {
+                None
+            } else {
+                services.dequeue_system_only_batch_draining(agent_id, 1)
+            }
+        }
+        intent_core::FlushQueuedMessagesMode::Off => None,
+    }
+}
+
 /// Background turn worker: drive the current message to completion, then drain
 /// any queued messages (flipping each to in-flight). After the slot is released
 /// the loop re-checks the queue and reclaims the slot **as long as another
@@ -12354,20 +12375,7 @@ async fn run_message_worker(
             // below unchanged. With no extra entry (or the `off` mode) the
             // single-entry path below also runs unchanged.
             let mode = mgr.services.flush_queued_messages_mode();
-            let extra_batch = match mode {
-                intent_core::FlushQueuedMessagesMode::All => mgr
-                    .services
-                    .dequeue_ready_batch_draining(&agent_id, false, 1),
-                intent_core::FlushQueuedMessagesMode::SystemOnly => {
-                    if next.user_origin {
-                        None
-                    } else {
-                        mgr.services
-                            .dequeue_system_only_batch_draining(&agent_id, 1)
-                    }
-                }
-                intent_core::FlushQueuedMessagesMode::Off => None,
-            };
+            let extra_batch = dequeue_worker_raced_tail(&mgr.services, &agent_id, &next, mode);
             if let Some((mut batch, extra_draining)) = extra_batch {
                 batch.insert(0, next);
                 draining.merge(extra_draining);
@@ -19954,6 +19962,44 @@ mod agent_retry_tests {
     #[intent_test_macros::daemon_test]
     async fn exported_monitor_worker_releases_slot_and_allows_followup() {
         monitor_worker_exit_releases_slot(true).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn raced_monitor_head_never_consumes_ordinary_tail() {
+        for mode in [
+            intent_core::FlushQueuedMessagesMode::All,
+            intent_core::FlushQueuedMessagesMode::SystemOnly,
+        ] {
+            let agent = AgentId::from("monitor-raced-owner");
+            let ws = WorkspaceId::from("monitor-raced-workspace");
+            let (mgr, _db) = manager_with_session(&agent, &ws, AgentStatus::RuntimeIdle).await;
+            let (head, _) = mgr.services.enqueue_message(
+                &agent, "monitor head".into(), None, None,
+                Some(json!({"type":"script_monitor_wake","monitorId":"raced-monitor","workspaceId":ws})),
+                None, false, intent_core::MessageOrigin::Automatic,
+            );
+            let (next, draining) = mgr
+                .services
+                .dequeue_message_draining_provisional(&agent)
+                .unwrap();
+            assert_eq!(next.id, head.id);
+            let (tail, _) = mgr.services.enqueue_message(
+                &agent,
+                "ordinary tail".into(),
+                None,
+                None,
+                None,
+                None,
+                false,
+                intent_core::MessageOrigin::Automatic,
+            );
+            assert!(
+                dequeue_worker_raced_tail(&mgr.services, &agent, &next, mode).is_none(),
+                "popped monitor must not absorb ordinary entries: {mode:?}"
+            );
+            assert!(mgr.services.is_message_queued(&agent, &tail.id));
+            drop(draining);
+        }
     }
 
     async fn monitor_worker_exit_releases_slot(exporting: bool) {
