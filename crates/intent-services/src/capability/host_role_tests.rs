@@ -791,7 +791,10 @@ async fn member_search_inherits_workspaces_but_excludes_chief() {
             svc.visible_workspace_ids().await.unwrap().unwrap(),
             HashSet::from([ws])
         );
-        let result = svc.search_notes("needle".into(), None).await.unwrap();
+        let result = svc
+            .search_notes("needle".into(), None, None, None, true, None)
+            .await
+            .unwrap();
         let text = result.to_string();
         assert!(text.contains("needle ordinary"), "{result}");
         assert!(!text.contains("needle administration"), "{result}");
@@ -1958,4 +1961,216 @@ async fn member_pr_status_rejection_publishes_durable_safe_context() {
     assert!(stored
         .iter()
         .any(|e| e.id == batch[0].id && e.data == batch[0].data));
+}
+
+#[tokio::test]
+async fn script_archive_restore_enforce_workspace_scope_and_guest_authority() {
+    use intent_core::{ScriptCreateParams, ScriptMode};
+    let tmp = TempDb::new();
+    let (svc, _, member) = fixture(&tmp).await;
+    let a = WorkspaceId::new();
+    let b = WorkspaceId::new();
+    for ws in [&a, &b] {
+        svc.store.insert_workspace(&workspace(ws)).await.unwrap();
+    }
+    let def = with_caller(
+        Caller::Daemon,
+        svc.script_create(
+            a.clone(),
+            ScriptCreateParams {
+                name: "kept".into(),
+                command: "true".into(),
+                mode: ScriptMode::Command,
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    let id = def["id"].as_str().unwrap().to_owned();
+    with_caller(caller(&member), async {
+        assert_eq!(
+            svc.script_archive(b.clone(), vec![id.clone()])
+                .await
+                .unwrap(),
+            serde_json::json!({"archived":[],"skipped":[{"scriptId":id,"reason":"notFound"}]})
+        );
+        svc.script_archive(a.clone(), vec![id.clone()])
+            .await
+            .unwrap();
+        svc.script_restore(a.clone(), vec![id.clone()])
+            .await
+            .unwrap();
+    })
+    .await;
+    sqlx::query("DELETE FROM host_member WHERE principal_id=?")
+        .bind(member.as_str())
+        .execute(svc.store.write_pool())
+        .await
+        .unwrap();
+    let guest = Caller::Wire {
+        principal_id: member.clone(),
+        host_role: HostRole::Guest,
+    };
+    with_caller(guest.clone(), async {
+        assert!(matches!(
+            svc.script_archive(a.clone(), vec![id.clone()]).await,
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            svc.script_restore(a.clone(), vec![id.clone()]).await,
+            Err(Error::NotFound(_))
+        ));
+    })
+    .await;
+    svc.store
+        .add_workspace_member(&a, &member, WorkspaceRole::Collaborator)
+        .await
+        .unwrap();
+    with_caller(guest, async {
+        assert!(matches!(
+            svc.script_archive(a.clone(), vec![id.clone()]).await,
+            Err(Error::Forbidden(_))
+        ));
+        assert!(matches!(
+            svc.script_restore(a.clone(), vec![id.clone()]).await,
+            Err(Error::Forbidden(_))
+        ));
+    })
+    .await;
+}
+
+#[tokio::test]
+#[expect(
+    clippy::float_cmp,
+    reason = "exact event counts over a one-minute window"
+)]
+async fn guest_owner_permission_history_tracks_current_management_scope() {
+    use intent_core::events::{AGENT_PERMISSION_REQUEST, AGENT_PERMISSION_RESOLVED, TERMINAL_DATA};
+    use intent_core::{ActorType, EventActor, EventQueryParams};
+    use intent_store::NewEvent;
+
+    let tmp = TempDb::new();
+    let (svc, primary, guest) = fixture(&tmp).await;
+    svc.store.remove_host_member(&guest).await.unwrap();
+    let owned = WorkspaceId::new();
+    let shared = WorkspaceId::new();
+    let hidden = WorkspaceId::new();
+    for id in [&owned, &shared, &hidden] {
+        svc.store.insert_workspace(&workspace(id)).await.unwrap();
+        for kind in [
+            AGENT_PERMISSION_REQUEST,
+            AGENT_PERMISSION_RESOLVED,
+            TERMINAL_DATA,
+        ] {
+            svc.store
+                .insert_event(&NewEvent {
+                    workspace_id: id.clone(),
+                    timestamp: now_iso(),
+                    event_type: kind.into(),
+                    actor: EventActor {
+                        actor_type: ActorType::Agent,
+                        id: Some("permission-agent".into()),
+                        ..Default::default()
+                    },
+                    session_id: None,
+                    correlation_id: None,
+                    parent_event_id: None,
+                    metadata: None,
+                    data: json!({"requestId":"permission-secret", "title":"permission-secret"}),
+                })
+                .await
+                .unwrap();
+        }
+    }
+    svc.store
+        .set_workspace_member_role(&owned, &primary, WorkspaceRole::Collaborator)
+        .await
+        .unwrap();
+    svc.store
+        .add_workspace_member(&owned, &guest, WorkspaceRole::Owner)
+        .await
+        .unwrap();
+    svc.store
+        .add_workspace_member(&shared, &guest, WorkspaceRole::Collaborator)
+        .await
+        .unwrap();
+    let guest_caller = Caller::Wire {
+        principal_id: guest.clone(),
+        host_role: HostRole::Guest,
+    };
+    for allowed in [true, false] {
+        if !allowed {
+            svc.store
+                .set_workspace_member_role(&owned, &guest, WorkspaceRole::Collaborator)
+                .await
+                .unwrap();
+        }
+        with_caller(guest_caller.clone(), async {
+            for ws in [&owned, &shared] {
+                let expected = if allowed && ws == &owned { 2 } else { 0 };
+                for kind in [None, Some("agent:permission:*".to_string())] {
+                    let rows = svc
+                        .event_query(
+                            ws.clone(),
+                            EventQueryParams {
+                                event_type: kind,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        rows.as_array().unwrap().len(),
+                        expected,
+                        "history scope {ws}"
+                    );
+                }
+                let rows = svc
+                    .event_query(
+                        ws.clone(),
+                        EventQueryParams {
+                            paginate: Some(true),
+                            limit: Some(1),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    rows["items"].as_array().unwrap().len(),
+                    usize::from(expected > 0)
+                );
+                assert_eq!(rows["nextToken"].is_string(), expected > 1);
+                let activity = svc
+                    .event_agent_activity(ws.clone(), None, None)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    activity.as_array().unwrap().len(),
+                    usize::from(expected > 0)
+                );
+                let summary = svc
+                    .event_workspace_summary(ws.clone(), Some(1))
+                    .await
+                    .unwrap();
+                assert_eq!(summary.event_rate, if expected > 0 { 2.0 } else { 0.0 });
+            }
+            let search = svc
+                .search_events("permission-secret".into(), None, None, None)
+                .await
+                .unwrap();
+            let rows = search["matches"].as_array().expect("search matches");
+            assert_eq!(
+                rows.len(),
+                if allowed { 2 } else { 0 },
+                "aggregate search: {search}"
+            );
+            assert!(svc
+                .event_query(hidden.clone(), EventQueryParams::default())
+                .await
+                .is_err());
+        })
+        .await;
+    }
 }

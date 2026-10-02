@@ -133,8 +133,20 @@ impl MembershipGate {
                 ) || (event.data["principalId"].as_str() == Some(self.principal_id.as_str())
                     && event.data["action"] == "removed"));
         }
+        if intent_core::events::is_permission_event_type(&event.event_type) {
+            // Permission grants match snapshot/answer authority, not the cached
+            // collaborator visibility verdict. Recheck retained guest ownership
+            // even when no membership invalidation event reached this stream.
+            return role.is_some()
+                && !workspace_id.is_empty()
+                && self
+                    .api
+                    .get_workspace(WorkspaceId::from(workspace_id))
+                    .await
+                    .is_ok_and(|ws| ws.membership.is_some_and(|m| m.can_manage));
+        }
         if intent_core::events::is_member_execution_event_type(&event.event_type) {
-            // Prompt/context events never use the cached visibility verdict.
+            // Execution/context events never use the cached visibility verdict.
             // Revocation takes effect before a socket is physically closed.
             if !matches!(
                 role,

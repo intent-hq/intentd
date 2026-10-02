@@ -596,6 +596,21 @@ pub(crate) fn resolve_agent_default_model_with_source(
     workspace_path: Option<&Path>,
     provider: Option<&str>,
 ) -> (Option<String>, DefaultModelSource) {
+    let model = specialist.and_then(|id| {
+        services
+            .specialists_service()
+            .resolve_model(id, workspace_path)
+    });
+    resolve_agent_default_model_with_pin(services, model.as_deref(), provider)
+}
+
+/// Resolve the shared model-default chain using an already resolved specialist
+/// pin. Catalog previews pass their row's pin to avoid reopening files per row.
+pub(crate) fn resolve_agent_default_model_with_pin(
+    services: &Services,
+    specialist_model: Option<&str>,
+    provider: Option<&str>,
+) -> (Option<String>, DefaultModelSource) {
     // Normalize through provider_config so legacy default-provider aliases
     // guard as the provider the spawn would actually run. With no explicit
     // provider, guard against the settings-derived default
@@ -612,23 +627,16 @@ pub(crate) fn resolve_agent_default_model_with_source(
             .map(|p| intent_providers::provider_config(p).id)
     };
 
-    if let Some(spec_id) = specialist {
-        let specialists_svc = services.specialists_service();
-
-        // Step 2: specialist frontmatter `model` (3-tier: project > user >
-        // bundled) — only if it belongs to the resolved provider; a model
-        // owned by another provider falls through instead of leaking.
-        if let Some(m) = specialists_svc.resolve_model(spec_id, workspace_path) {
-            if default_model_belongs_to_provider(services, effective_provider, &m) {
-                return (Some(m), DefaultModelSource::Specialist);
-            }
-            tracing::debug!(
-                model = m,
-                provider = effective_provider.unwrap_or_default(),
-                specialist = spec_id,
-                "specialist frontmatter model belongs to another provider; ignoring"
-            );
+    // Step 2: specialist frontmatter model, guarded against foreign providers.
+    if let Some(model) = specialist_model {
+        if default_model_belongs_to_provider(services, effective_provider, model) {
+            return (Some(model.to_string()), DefaultModelSource::Specialist);
         }
+        tracing::debug!(
+            model,
+            provider = effective_provider.unwrap_or_default(),
+            "specialist frontmatter model belongs to another provider; ignoring"
+        );
     }
 
     // Step 3: settings chain, provider-guarded — a configured default owned
@@ -944,16 +952,11 @@ fn resolve_specialist_provider(
 /// provider previously showed that other provider's fallback/`None`).
 pub(crate) fn resolve_delegate_provider_preview(
     services: &Services,
-    specialist: Option<&str>,
-    workspace_path: Option<&Path>,
+    definition: &serde_json::Value,
 ) -> Option<String> {
-    if let Some(spec_id) = specialist {
-        let specialists_svc = services.specialists_service();
-        let explicit = specialists_svc.resolve_coding_agent(spec_id, workspace_path);
-        if let Some(provider_id) = explicit {
-            if intent_providers::find_provider(&provider_id).is_some() {
-                return Some(provider_id);
-            }
+    if let Some(provider_id) = crate::specialists::config_scalar(definition, "codingAgent") {
+        if intent_providers::find_provider(provider_id).is_some() {
+            return Some(provider_id.to_string());
         }
     }
     crate::agent_session::derived_default_provider(&services.effective_settings())
@@ -5195,8 +5198,14 @@ impl Services {
         if let Some(existing) =
             self.pending_agent_deletes
                 .schedule(key, delete_at.clone(), move |generation| {
-                    intent_core::spawn_daemon(async move {
-                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    let tasks = timer_services.pending_delete_tasks.clone();
+                    let stopping = tasks.clone();
+                    tasks.spawn_draining(async move {
+                        tokio::select! {
+                            biased;
+                            () = stopping.closed() => return,
+                            () = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {}
+                        }
                         // Claim-or-abstain: only the timer that still owns the
                         // entry commits. A cancel or an immediate delete that
                         // raced ahead removed/superseded the entry — do nothing.
@@ -5219,7 +5228,7 @@ impl Services {
                                 "scheduled agent delete failed at commit"
                             );
                         }
-                    })
+                    }).unwrap_or_else(|| intent_core::spawn_daemon(async {}))
                 })
         {
             return Ok(existing);
@@ -9905,27 +9914,6 @@ impl Services {
                     Some(intent_core::CheckoutMode::Cow | intent_core::CheckoutMode::Direct)
                 ) && ws.worktree_path.is_some();
                 if is_direct_mode || is_standalone_checkout {
-                    // Drop guard: settles the gate even if provisioning
-                    // panics, so the gate map never accumulates stale
-                    // entries. Constructed BEFORE the spawn (and moved into
-                    // the task) so cleanup is unconditional even when the
-                    // runtime drops the task unpolled at shutdown. On the
-                    // normal path the guard drops AFTER
-                    // `provision_delegate_sandbox` returns — the session's
-                    // sandbox fields and the `sandbox:cow:created` event are
-                    // already published, so a released waiter observes the
-                    // settled state. Dropping the held sender (also via the
-                    // guard) releases every waiter.
-                    struct SettleGuard {
-                        services: Services,
-                        aid: AgentId,
-                        _release: tokio::sync::watch::Sender<()>,
-                    }
-                    impl Drop for SettleGuard {
-                        fn drop(&mut self) {
-                            self.services.settle_sandbox_provisioning(&self.aid);
-                        }
-                    }
                     // Same root fallback as `workspace.create` (the intentd
                     // binary configures the root via INTENTD_WORKSPACES_DIR /
                     // `workspaces.root` rather than `.with_workspaces_root`).
@@ -9942,20 +9930,16 @@ impl Services {
                     // so the child's turn worker (`ensure_started`) blocks its
                     // first ACP spawn until the clone settles — the child
                     // never spawns against a half-copied sandbox.
-                    let settled = self.begin_sandbox_provisioning(&aid);
-                    effective_isolation = Some("pending");
-                    let guard = SettleGuard {
-                        services: self.clone(),
-                        aid,
-                        _release: settled,
-                    };
+                    let owner = self.clone();
                     let ws_id = workspace_id.clone();
-                    intent_core::spawn_daemon(async move {
-                        guard
-                            .services
-                            .provision_delegate_sandbox(&ws_id, &guard.aid, root)
+                    let worker_aid = aid.clone();
+                    if self.spawn_sandbox_provisioning(&aid, async move {
+                        owner
+                            .provision_delegate_sandbox(&ws_id, &worker_aid, root)
                             .await;
-                    });
+                    }) {
+                        effective_isolation = Some("pending");
+                    }
                 }
             }
         }
@@ -10633,6 +10617,45 @@ impl Services {
             }
         }
         Ok(result)
+    }
+
+    /// Keep the wait gate alive through the complete clone and settlement.
+    fn spawn_sandbox_provisioning(
+        &self,
+        agent_id: &AgentId,
+        provision: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> bool {
+        struct SettleGuard {
+            services: Services,
+            aid: AgentId,
+            _release: tokio::sync::watch::Sender<()>,
+        }
+        impl Drop for SettleGuard {
+            fn drop(&mut self) {
+                self.services.settle_sandbox_provisioning(&self.aid);
+            }
+        }
+        // Register before publishing the wait gate. The admitted task waits
+        // for that gate before cloning; rejection cannot strand a waiter or
+        // start filesystem work. No await separates admission and publication.
+        let (ready, admitted) = tokio::sync::oneshot::channel::<SettleGuard>();
+        if self
+            .store_tasks
+            .spawn_draining(async move {
+                if let Ok(_guard) = admitted.await {
+                    provision.await;
+                }
+            })
+            .is_none()
+        {
+            return false;
+        }
+        let guard = SettleGuard {
+            services: self.clone(),
+            aid: agent_id.clone(),
+            _release: self.begin_sandbox_provisioning(agent_id),
+        };
+        ready.send(guard).is_ok()
     }
 
     /// Background half of the delegate CoW-isolation path (monorepo#871): run
@@ -16570,6 +16593,22 @@ impl Services {
     ///
     /// Returns the number of agents successfully resumed by this sweep.
     pub async fn resume_suspend_interrupted_agents(&self) -> usize {
+        let services = self.clone();
+        let Some(owner) = self.settings_tasks.spawn_draining(async move {
+            services.resume_suspend_interrupted_agents_owned().await
+        }) else {
+            return 0;
+        };
+        match owner.await {
+            Ok(resumed) => resumed,
+            Err(error) => {
+                tracing::error!(%error, "suspend resume owner failed");
+                0
+            }
+        }
+    }
+
+    async fn resume_suspend_interrupted_agents_owned(&self) -> usize {
         let rows = match self.store.list_interrupted_agents().await {
             Ok(rows) => rows,
             Err(e) => {
@@ -16580,6 +16619,12 @@ impl Services {
         let suspend_reason = crate::agent_session::InterruptReason::SystemSuspend.as_str();
         let mut resumed = 0usize;
         for interrupted in rows {
+            // A claimed resume must finish or reset, but later rows stay
+            // pending for startup/manual recovery once root admission closes.
+            if self.settings_tasks.is_closed() {
+                break;
+            }
+
             // Never blanket-resume rows a user left pending for another reason.
             if interrupted.reason.as_deref() != Some(suspend_reason) {
                 continue;

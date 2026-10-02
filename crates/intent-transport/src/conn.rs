@@ -9,7 +9,9 @@
 //! transports handle by draining the two-lane outbound queue
 //! ([`OutboundSender`] / [`OutboundReceiver`], priority lane first).
 
-use intent_core::events::{NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, WORKSPACE_UPDATED};
+use intent_core::events::{
+    AGENT_UPDATED, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, WORKSPACE_UPDATED,
+};
 use intent_core::{AgentId, ClientId, Event, NoteId, WorkspaceApi, WorkspaceId};
 use intent_services::{Delivery, EventBus, Subscription, SubscriptionFilter};
 use serde_json::{json, Value};
@@ -73,13 +75,28 @@ pub(crate) const BULK_CAPACITY: usize = 256;
 pub(crate) struct OutboundSender {
     priority: mpsc::Sender<String>,
     bulk: mpsc::Sender<String>,
+    shutdown: Option<RpcLimiter>,
 }
 
 impl OutboundSender {
     /// Queue a latency-critical frame (RPC response / error / reverse
     /// request). `Err` means the connection's writer is gone.
     pub(crate) async fn send_priority(&self, frame: String) -> Result<(), ()> {
-        self.priority.send(frame).await.map_err(|_| ())
+        match self.priority.try_send(frame) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(()),
+            Err(mpsc::error::TrySendError::Full(frame)) => tokio::select! {
+                () = self.shutdown_requested() => Err(()),
+                result = self.priority.send(frame) => result.map_err(|_| ()),
+            },
+        }
+    }
+
+    async fn shutdown_requested(&self) {
+        match &self.shutdown {
+            Some(shutdown) => shutdown.closed().await,
+            None => std::future::pending().await,
+        }
     }
 
     /// Queue a bulk frame (event notification / subscription push). `Err`
@@ -96,7 +113,10 @@ impl OutboundSender {
     /// claimed (see [`finish_slow_path_rpc`]). `Err` means the connection's
     /// writer is gone.
     pub(crate) async fn reserve_priority(&self) -> Result<mpsc::OwnedPermit<String>, ()> {
-        self.priority.clone().reserve_owned().await.map_err(|_| ())
+        tokio::select! {
+            () = self.shutdown_requested() => Err(()),
+            result = self.priority.clone().reserve_owned() => result.map_err(|_| ()),
+        }
     }
 
     /// Whether the writer has stopped draining (both lanes closed together;
@@ -192,6 +212,7 @@ pub(crate) fn outbound_channel() -> (OutboundSender, OutboundReceiver) {
         OutboundSender {
             priority: priority_tx,
             bulk: bulk_tx,
+            shutdown: None,
         },
         OutboundReceiver {
             priority: priority_rx,
@@ -399,6 +420,13 @@ pub(crate) async fn process_frame(
     is_local: bool,
     limiter: &RpcLimiter,
 ) -> bool {
+    let Some(request_guard) = limiter.admit_request() else {
+        return false;
+    };
+    // Shutdown releases response backpressure without cancelling the handler.
+    let mut outbound = out_tx.clone();
+    outbound.shutdown = Some(limiter.clone());
+    let out_tx = &outbound;
     let parsed = serde_json::from_str::<Value>(raw).ok();
     if let Some(value) = &parsed {
         // A reply to a daemon-initiated reverse request (FE-served intents such
@@ -546,6 +574,7 @@ pub(crate) async fn process_frame(
             };
         }
         if let Some(req) = host::classify(value) {
+            let exec_runtime = limiter.host_exec();
             let host_environment = control
                 .map(|control| control.host_environment())
                 .or_else(|| server_pairing_info.map(|info| info.host_environment()));
@@ -574,6 +603,7 @@ pub(crate) async fn process_frame(
             let credential = intent_core::caller::current_wire_credential();
             let (rpc_id, method) = (rpc_id.clone(), method.clone());
             tokio::spawn(async move {
+                let _request_guard = request_guard;
                 crate::context::with_credential_context(is_tcp, caller, credential, async {
                     finish_slow_path_rpc(
                         permit,
@@ -587,6 +617,7 @@ pub(crate) async fn process_frame(
                                 host_environment,
                                 is_local,
                                 &reverse,
+                                &exec_runtime,
                             ),
                         ),
                         slot,
@@ -632,6 +663,7 @@ pub(crate) async fn process_frame(
             let credential = intent_core::caller::current_wire_credential();
             let (rpc_id, method) = (rpc_id.clone(), method.clone());
             tokio::spawn(async move {
+                let _request_guard = request_guard;
                 crate::context::with_credential_context(is_tcp, caller, credential, async {
                     let tabs = browser::TabContext {
                         api: api.as_ref(),
@@ -807,6 +839,7 @@ pub(crate) async fn process_frame(
     let caller = crate::context::current_caller();
     let credential = intent_core::caller::current_wire_credential();
     tokio::spawn(async move {
+        let _request_guard = request_guard;
         crate::context::with_credential_context(is_tcp, caller, credential, async {
             finish_slow_path_rpc(
                 permit,
@@ -1705,6 +1738,11 @@ async fn forward_note_subscription(
 /// after that id (`resumed: true`) or falls back to the standard full page
 /// (`resumed: false`) — see [`subscriptions::chat_snapshot`].
 ///
+/// Transcript edits and replacements also re-emit a bounded snapshot at the
+/// next seq. Recovery snapshots carry `resumed: false` so clients discard old
+/// cached rows, including history outside the served page. Metadata-only
+/// `agent:updated` events do not invalidate the transcript.
+///
 /// **Lag self-heal.** The broadcast ring drops this subscriber's oldest
 /// undelivered events when it falls behind (slow consumer — e.g. the bulk lane
 /// starved by large priority-lane responses). The loss is silent on the wire:
@@ -1840,8 +1878,8 @@ async fn chat_subscription_loop(
     // its turn's terminal frame.
     let mut buffer: ConflationBuffer<ChatItem> = ConflationBuffer::new();
     let mut seq: u64 = 1;
-    // `Some(skipped)` while a lag recovery snapshot is owed but not yet
-    // emitted (read failed persistently); cleared once a good page goes out.
+    // Some(skipped) while a recovery snapshot is owed; zero denotes an
+    // explicit transcript invalidation rather than a lag marker.
     let mut pending_recovery: Option<u64> = None;
     loop {
         tokio::select! {
@@ -1947,6 +1985,28 @@ async fn chat_subscription_loop(
                         continue;
                     }
                 };
+                // Transcript edits/replacements invalidate both the client's
+                // accumulated rows and this forwarder's per-turn block state.
+                // Coalesce the already-published backlog before reading, just
+                // like lag recovery: replaying it after the snapshot could
+                // restore deleted rows or append incremental text twice.
+                if batch.iter().any(|event| {
+                    event.session_id.as_deref() == Some(agent_id.as_str())
+                        && event.event_type == AGENT_UPDATED
+                        && (event.data.get("truncatedCount").is_some()
+                            || event.data.get("replacedCount").is_some())
+                }) {
+                    while subscription.try_recv_delivery().is_some() {}
+                    buffer = ConflationBuffer::new();
+                    pending_recovery = Some(0);
+                    if !attempt_chat_recovery(
+                        api.as_ref(), &agent_id, &subscription_id, delta_encoding, projection,
+                        &mut seq, &out_tx, &mut state, &mut pending_recovery,
+                    ).await {
+                        return "client_closed";
+                    }
+                    continue;
+                }
                 for event in batch {
                     // Cross-agent isolation: only this agent's stream events
                     // belong to this subscription.
@@ -2025,13 +2085,13 @@ async fn chat_subscription_loop(
     }
 }
 
-/// Retry cadence for a pending lag recovery whose bounded page read keeps
+/// Retry cadence for a pending recovery whose bounded page read keeps
 /// failing (see [`forward_chat_subscription`]). Long enough to give a
 /// transient store failure room to clear, short enough that a quiet bus does
 /// not leave the client stale for long.
 const CHAT_RECOVERY_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// One attempt at the owed lag-recovery snapshot: read the bounded page
+/// One attempt at the owed recovery snapshot: read the bounded page
 /// (fallibly — see [`subscriptions::chat_recovery_snapshot`]), and on success
 /// emit it at the next `seq`, reseed the mapper, and clear the pending flag.
 /// On a failed read the recovery stays pending for the caller to re-attempt.
@@ -2052,11 +2112,15 @@ async fn attempt_chat_recovery(
     else {
         tracing::warn!(
             agent = %agent_id,
-            "chat lag recovery read failed; keeping recovery pending"
+            "chat recovery read failed; keeping recovery pending"
         );
         return true;
     };
     subscriptions::stamp_delta_encoding(&mut snapshot, delta_encoding);
+    // Recovery invalidates the whole cached transcript, including older pages.
+    // Lag may itself have swallowed a truncation event, so this also applies
+    // when recovery was triggered by lost delivery rather than a known edit.
+    snapshot["resumed"] = Value::Bool(false);
     let frame = subscriptions::build_snapshot_push(subscription_id, *seq, &snapshot);
     *seq += 1;
     if out_tx.send(frame).await.is_err() {
@@ -2288,6 +2352,114 @@ async fn forward_channel_subscription(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_fences_real_dispatch_and_waits_for_admitted_persistence() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        struct HeldWriter {
+            store: intent_store::Store,
+            entered: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+            calls: AtomicUsize,
+        }
+        impl WorkspaceApi for HeldWriter {
+            fn list_workspaces(
+                &self,
+                _: bool,
+            ) -> intent_core::BoxFuture<'_, intent_core::Result<Vec<intent_core::Workspace>>>
+            {
+                Box::pin(async {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                    self.store.set_setting("test.admitted", "durable").await?;
+                    Ok(Vec::new())
+                })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = intent_store::Store::open(&dir.path().join("store.db"))
+            .await
+            .unwrap();
+        let writer = Arc::new(HeldWriter {
+            store: store.clone(),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            calls: AtomicUsize::new(0),
+        });
+        let api: Arc<dyn WorkspaceApi> = writer.clone();
+        let bus = EventBus::new(store.clone());
+        let (tx, _idle_peer) = outbound_channel();
+        let reverse = ReverseChannel::new(tx.priority_sender());
+        let primary = crate::reverse::PrimaryReverseRegistry::new();
+        let guard = primary.register(reverse.clone(), crate::reverse::ReverseTransport::Wss);
+        let limiter = RpcLimiter::unlimited();
+        let mut subs = ConnSubs::default();
+        let mut forwards = ForwardRegistry::default();
+        let mut client = None;
+        let frame = r#"{"jsonrpc":"2.0","id":1,"method":"workspace.list"}"#;
+        assert!(
+            process_frame(
+                frame,
+                &api,
+                &bus,
+                &tx,
+                &mut subs,
+                &mut forwards,
+                &reverse,
+                &guard,
+                None,
+                None,
+                &mut client,
+                true,
+                &limiter
+            )
+            .await
+        );
+        tokio::time::timeout(Duration::from_secs(10), writer.entered.notified())
+            .await
+            .unwrap();
+        limiter.begin_shutdown();
+        assert!(
+            !process_frame(
+                frame,
+                &api,
+                &bus,
+                &tx,
+                &mut subs,
+                &mut forwards,
+                &reverse,
+                &guard,
+                None,
+                None,
+                &mut client,
+                true,
+                &limiter
+            )
+            .await
+        );
+        let drained = limiter.drain();
+        tokio::pin!(drained);
+        tokio::select! {
+            biased;
+            () = &mut drained => panic!("admitted writer escaped request drain"),
+            () = std::future::ready(()) => {}
+        }
+        writer.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), drained)
+            .await
+            .unwrap();
+        assert_eq!(writer.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store.get_setting("test.admitted").await.unwrap().as_deref(),
+            Some("durable")
+        );
+        // Idle peer remains alive throughout drain; no socket-close handshake.
+        bus.shutdown().await.unwrap();
+        store.close().await;
+    }
 
     /// A request rejected at the outstanding-RPC cap answers `-32011 "Server
     /// overloaded"` echoing its id, and the connection stays open.
@@ -2628,3 +2800,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "conn_terminal_replay_tests.rs"]
+mod terminal_replay_tests;

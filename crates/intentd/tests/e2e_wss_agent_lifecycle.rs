@@ -222,7 +222,7 @@ where
                 let _ = ws.send(Message::Pong(p)).await;
             }
             Some(Ok(_)) => {}
-            other => panic!("expected text frame, got {other:?}"),
+            other => panic!("rpc {method} expected text frame, got {other:?}"),
         }
     }
 }
@@ -13152,6 +13152,12 @@ async fn interrupt_mid_tool_call_settles_and_drains_queue_over_wss() {
         Some(2),
         "both entries parked behind the tool call: {queue}"
     );
+    let queued_turn_ids: Vec<String> = queue["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["turnId"].as_str().expect("queued turn id").to_owned())
+        .collect();
 
     // (1) The interrupt lands mid tool-call: preempted, never parked.
     let interrupted = wss_rpc(
@@ -13179,19 +13185,21 @@ async fn interrupt_mid_tool_call_settles_and_drains_queue_over_wss() {
     let mut saw_preempt_end = false;
     let mut saw_interrupt_chunk = false;
     let mut stream_ends = 0usize;
+    let mut last_end_was_queued_turn = false;
     let mut saw_settle_idle = false;
+    let mut saw_persisted_idle = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while let Some(frame) = wss_event_opt_until(&mut sub, deadline).await {
         let event = &frame["params"]["event"];
-        if event["data"]["agentId"]
-            .as_str()
-            .is_some_and(|id| id != agent_id)
-        {
+        if event["data"]["agentId"] != json!(agent_id) {
             continue;
         }
         match event["type"].as_str() {
             Some("agent:stream:end") => {
                 stream_ends += 1;
+                last_end_was_queued_turn = event["data"]["turnId"]
+                    .as_str()
+                    .is_some_and(|id| queued_turn_ids.iter().any(|queued| queued == id));
                 if !saw_preempt_end {
                     assert_eq!(
                         event["data"]["interruptReason"], "preempted_by_message",
@@ -13211,11 +13219,23 @@ async fn interrupt_mid_tool_call_settles_and_drains_queue_over_wss() {
                 }
             }
             Some("agent:idle") if saw_preempt_end => {
+                assert!(
+                    last_end_was_queued_turn,
+                    "idle must follow a queued turn's terminal: {event}"
+                );
                 assert_ne!(
                     event["data"]["reason"], "interrupted",
                     "a preemption is not a settlement — no synthetic interrupted idle: {event}"
                 );
                 saw_settle_idle = true;
+            }
+            Some("agent:status-changed")
+                if saw_settle_idle && event["data"]["status"] == "idle" =>
+            {
+                // The earlier idle event precedes end_turn's durable status
+                // write. Ignore the preemption's idle status before this turn.
+                assert_eq!(event["data"]["isActive"], false);
+                saw_persisted_idle = true;
                 break;
             }
             _ => {}
@@ -13238,6 +13258,11 @@ async fn interrupt_mid_tool_call_settles_and_drains_queue_over_wss() {
         "preempt end + interrupt turn end + at least one drained turn end: {stream_ends}"
     );
 
+    assert!(
+        saw_persisted_idle,
+        "worker persisted idle after the final turn's idle event"
+    );
+
     // Settled: nothing left parked, status idle.
     let queue = wss_rpc(
         &mut rpc,
@@ -13256,6 +13281,16 @@ async fn interrupt_mid_tool_call_settles_and_drains_queue_over_wss() {
         got["agent"]["status"], "idle",
         "session settled to idle, not stuck responding: {got}"
     );
+
+    for flag in [
+        "isStreaming",
+        "isProcessing",
+        "isResponding",
+        "isWaitingOnTool",
+        "turnInFlight",
+    ] {
+        assert_eq!(got["agent"][flag], false, "settled {flag}: {got}");
+    }
 
     // Transcript: every user row landed, in delivery order, after the marker.
     let conv = wss_rpc(
@@ -13482,6 +13517,12 @@ async fn a2a_interrupt_during_in_flight_tool_call_settles_and_drains_over_wss() 
         Some(2),
         "both entries parked behind the tool call: {queue}"
     );
+    let queued_turn_ids: Vec<String> = queue["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["turnId"].as_str().expect("queued turn id").to_owned())
+        .collect();
 
     // The sibling relays an interrupt-priority send into the busy target.
     let relayed = wss_rpc(
@@ -13500,6 +13541,7 @@ async fn a2a_interrupt_during_in_flight_tool_call_settles_and_drains_over_wss() 
     let mut sender_done = false;
     let mut saw_preempt_end = false;
     let mut target_complete_ends = 0usize;
+    let mut last_end_was_queued_turn = false;
     let is_target_stream_end = |event: &Value| {
         event["type"] == "agent:stream:end" && event["data"]["agentId"] == json!(target_id)
     };
@@ -13508,6 +13550,9 @@ async fn a2a_interrupt_during_in_flight_tool_call_settles_and_drains_over_wss() 
     while let Some(frame) = wss_event_opt_until(&mut sub, deadline).await {
         let event = &frame["params"]["event"];
         if is_target_stream_end(event) {
+            last_end_was_queued_turn = event["data"]["turnId"]
+                .as_str()
+                .is_some_and(|id| queued_turn_ids.iter().any(|queued| queued == id));
             if is_target_preempt_end(event) {
                 saw_preempt_end = true;
             } else {
@@ -13571,9 +13616,13 @@ async fn a2a_interrupt_during_in_flight_tool_call_settles_and_drains_over_wss() 
     // Settlement: the target drains its queue and goes idle.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     let mut saw_settle_idle = false;
+    let mut saw_persisted_idle = false;
     while let Some(frame) = wss_event_opt_until(&mut sub, deadline).await {
         let event = &frame["params"]["event"];
         if is_target_stream_end(event) {
+            last_end_was_queued_turn = event["data"]["turnId"]
+                .as_str()
+                .is_some_and(|id| queued_turn_ids.iter().any(|queued| queued == id));
             if is_target_preempt_end(event) {
                 saw_preempt_end = true;
             } else {
@@ -13581,11 +13630,25 @@ async fn a2a_interrupt_during_in_flight_tool_call_settles_and_drains_over_wss() 
             }
         }
         if event["type"] == "agent:idle" && event["data"]["agentId"] == json!(target_id) {
+            assert!(
+                last_end_was_queued_turn,
+                "idle must follow a queued turn's terminal: {event}"
+            );
             assert_ne!(
                 event["data"]["reason"], "interrupted",
                 "a preemption is not a settlement — no synthetic interrupted idle: {event}"
             );
             saw_settle_idle = true;
+        }
+        if saw_settle_idle
+            && event["type"] == "agent:status-changed"
+            && event["data"]["agentId"] == json!(target_id)
+            && event["data"]["status"] == "idle"
+        {
+            // Unlike agent:idle, this event follows end_turn's status write.
+            // Filtering by target also excludes the sibling's settlement.
+            assert_eq!(event["data"]["isActive"], false);
+            saw_persisted_idle = true;
             break;
         }
     }
@@ -13600,6 +13663,10 @@ async fn a2a_interrupt_during_in_flight_tool_call_settles_and_drains_over_wss() 
     assert!(
         saw_settle_idle,
         "the target settled (agent:idle) after the A2A interrupt"
+    );
+    assert!(
+        saw_persisted_idle,
+        "target worker persisted idle after the final turn's idle event"
     );
     let listed = wss_rpc(&mut rpc, 23, "note.list", json!({ "workspaceId": &ws_id })).await;
     assert!(
@@ -13627,6 +13694,16 @@ async fn a2a_interrupt_during_in_flight_tool_call_settles_and_drains_over_wss() 
         got["agent"]["status"], "idle",
         "target settled to idle, not stuck responding: {got}"
     );
+
+    for flag in [
+        "isStreaming",
+        "isProcessing",
+        "isResponding",
+        "isWaitingOnTool",
+        "turnInFlight",
+    ] {
+        assert_eq!(got["agent"][flag], false, "settled {flag}: {got}");
+    }
 
     let conv = wss_rpc(
         &mut rpc,
@@ -15048,6 +15125,27 @@ async fn edit_and_regenerate_truncates_and_replays_history_over_wss() {
     assert_eq!(messages[2]["role"], "user");
     let edit_target = messages[2]["id"].as_str().expect("target id").to_string();
 
+    // A second client already holds the old transcript. Editing must reset
+    // this standing subscription without a reconnect or a manufactured gap.
+    let removed_ids = [messages[2]["id"].clone(), messages[3]["id"].clone()];
+    let mut chat = connect_ws(port, cfg.clone()).await;
+    let chat_response = wss_rpc(
+        &mut chat,
+        1,
+        "chat.subscribe",
+        json!({ "agentId": agent_id, "deltaEncoding": "incremental" }),
+    )
+    .await;
+    let initial = wss_push(&mut chat, 15).await;
+    assert_eq!(initial["params"]["seq"], 0);
+    assert_eq!(
+        initial["params"]["snapshot"]["messages"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+
     let edited = wss_rpc(
         &mut rpc,
         14,
@@ -15132,6 +15230,59 @@ async fn edit_and_regenerate_truncates_and_replays_history_over_wss() {
         "result messageId names the persisted regenerated user row (PROTOCOL §5.5)"
     );
     assert_eq!(messages[3]["role"], "assistant");
+
+    let replacement_assistant_id = messages[3]["id"].clone();
+    timeout(Duration::from_secs(30), async {
+        let mut saw_reset = false;
+        let mut seq = 0;
+        loop {
+            let frame = wss_push(&mut chat, 30).await;
+            let params = &frame["params"];
+            assert_eq!(params["subscriptionId"], chat_response["subscriptionId"]);
+            seq += 1;
+            assert_eq!(params["seq"], seq, "reset keeps the sequence contiguous");
+            if params["kind"] == "snapshot" {
+                let snapshot = &params["snapshot"];
+                assert_eq!(snapshot["resumed"], false, "discard the cached suffix");
+                assert_eq!(snapshot["deltaEncoding"], "incremental");
+                let rows = snapshot["messages"].as_array().expect("reset rows");
+                assert!(rows.iter().all(|row| !removed_ids.contains(&row["id"])));
+                saw_reset = true;
+                // A fast replacement can finish before the bounded reset read.
+                if rows
+                    .iter()
+                    .any(|row| row["id"] == replacement_assistant_id && row["isStreaming"] != true)
+                {
+                    break;
+                }
+            } else {
+                let entities = ["added", "updated"]
+                    .into_iter()
+                    .flat_map(|key| params["delta"][key].as_array().into_iter().flatten());
+                let mut completed = false;
+                for entity in entities {
+                    if saw_reset {
+                        assert!(
+                            !removed_ids.contains(&entity["messageId"]),
+                            "old row restored: {frame}"
+                        );
+                    }
+                    completed |= entity["messageId"] == replacement_assistant_id
+                        && entity["streamingComplete"] == true;
+                }
+                if completed {
+                    assert!(
+                        saw_reset,
+                        "replacement streamed without invalidating the old transcript"
+                    );
+                    break;
+                }
+            }
+        }
+        assert!(saw_reset, "edit must reset the standing chat subscription");
+    })
+    .await
+    .expect("standing chat converged through the regenerated turn");
 
     // Outbound-prompt contract (fresh session + history replay): the
     // regenerated turn's prompt carries the kept prefix as `<supervisor>` XML

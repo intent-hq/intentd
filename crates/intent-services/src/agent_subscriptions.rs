@@ -65,11 +65,50 @@ pub(crate) enum GroupPersistOp {
 type GroupPersistAck = oneshot::Sender<Result<()>>;
 
 /// Sender half of the group persistence lane (see [`GroupPersistOp`]).
-pub(crate) type GroupPersistSender =
-    mpsc::UnboundedSender<(GroupPersistOp, Option<GroupPersistAck>)>;
+type GroupPersistSender = mpsc::UnboundedSender<(GroupPersistOp, Option<GroupPersistAck>)>;
+
+/// The ordered lane has its own owner: its receiver must remain available while
+/// finite producers drain, including producers awaiting an acknowledgement.
+/// Close it only after those producers have settled.
+pub(crate) struct GroupPersistLane {
+    sender: std::sync::Mutex<Option<GroupPersistSender>>,
+    worker: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl GroupPersistLane {
+    fn new(store: Store) -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        Self {
+            sender: std::sync::Mutex::new(Some(tx)),
+            worker: tokio::sync::Mutex::new(Some(intent_core::spawn_daemon(
+                run_group_persist_lane(store, rx),
+            ))),
+        }
+    }
+
+    fn send(&self, op: GroupPersistOp, ack: Option<GroupPersistAck>) {
+        let sender = self.sender.lock().unwrap();
+        if sender.as_ref().is_none_or(|tx| tx.send((op, ack)).is_err()) {
+            tracing::warn!("delegation_group persistence lane closed; write refused");
+        }
+    }
+
+    async fn shutdown(&self) {
+        self.sender.lock().unwrap().take();
+        // Serialize drainers and retain the handle if an awaiting caller is
+        // cancelled. No cloned sender may outlive the admission mutex above.
+        let mut worker = self.worker.lock().await;
+        if let Some(handle) = worker.as_mut() {
+            if let Err(error) = handle.await {
+                tracing::error!(%error, "delegation_group persistence worker failed");
+            }
+        }
+        worker.take();
+    }
+}
 
 /// The lane worker: drains ops strictly in enqueue order, one at a time.
-/// Exits when the last [`Services`] clone drops its sender.
+/// Shutdown closes admission, drains all accepted ops and joins this worker.
 async fn run_group_persist_lane(
     store: Store,
     mut rx: mpsc::UnboundedReceiver<(GroupPersistOp, Option<GroupPersistAck>)>,
@@ -667,7 +706,7 @@ impl Services {
         if changed || rearmed {
             let store = self.store.clone();
             let watch_id = id.clone();
-            intent_core::spawn_daemon(async move {
+            self.store_tasks.spawn_draining(async move {
                 if changed {
                     if let Err(e) = store
                         .update_completion_watch_parent(&watch_id, &name, &home_ws)
@@ -868,7 +907,7 @@ impl Services {
             // duplicate agent:idle wake after a restart.
             let store = self.store.clone();
             let watch_id = subscription_id.to_string();
-            intent_core::spawn_daemon(async move {
+            self.store_tasks.spawn_draining(async move {
                 if let Err(e) = store
                     .mark_completion_watch_report_delivered(&watch_id)
                     .await
@@ -927,7 +966,7 @@ impl Services {
             // Best-effort DB sweep of every persisted watch for this parent.
             let store = self.store.clone();
             let parent = parent_agent_id.clone();
-            intent_core::spawn_daemon(async move {
+            self.store_tasks.spawn_draining(async move {
                 if let Err(e) = store.delete_completion_watches_for_parent(&parent).await {
                     tracing::warn!("completion_watch parent sweep failed {}: {e}", parent.0);
                 }
@@ -1355,7 +1394,7 @@ impl Services {
         };
         if !watch_ids.is_empty() {
             let store = self.store.clone();
-            intent_core::spawn_daemon(async move {
+            self.store_tasks.spawn_draining(async move {
                 for id in watch_ids {
                     if let Err(e) = store.delete_completion_watch(&id).await {
                         tracing::warn!("completion_watch delete failed {id}: {e}");
@@ -1441,19 +1480,19 @@ impl Services {
 
     /// The group persistence lane sender, spawning the single worker on first
     /// use (see [`GroupPersistOp`]).
-    fn group_persist_sender(&self) -> &GroupPersistSender {
-        self.group_persist_lane.get_or_init(|| {
-            let (tx, rx) = mpsc::unbounded_channel();
-            intent_core::spawn_daemon(run_group_persist_lane(self.store.clone(), rx));
-            tx
-        })
+    fn group_persist_lane(&self) -> &GroupPersistLane {
+        self.group_persist_lane
+            .get_or_init(|| GroupPersistLane::new(self.store.clone()))
     }
 
-    /// Fire-and-forget lane enqueue; a closed lane (worker gone) is logged.
+    pub(crate) async fn shutdown_group_persistence(&self) {
+        // Initialize even an unused lane so later calls cannot reopen admission.
+        self.group_persist_lane().shutdown().await;
+    }
+
+    /// Fire-and-forget lane enqueue; a closed lane is logged.
     fn enqueue_group_persist(&self, op: GroupPersistOp) {
-        if self.group_persist_sender().send((op, None)).is_err() {
-            tracing::warn!("delegation_group persistence lane closed; write dropped");
-        }
+        self.group_persist_lane().send(op, None);
     }
 
     /// Lane enqueue whose outcome the caller awaits via
@@ -1463,9 +1502,7 @@ impl Services {
         op: GroupPersistOp,
     ) -> oneshot::Receiver<Result<()>> {
         let (tx, rx) = oneshot::channel();
-        if self.group_persist_sender().send((op, Some(tx))).is_err() {
-            tracing::warn!("delegation_group persistence lane closed; write dropped");
-        }
+        self.group_persist_lane().send(op, Some(tx));
         rx
     }
 
@@ -1514,7 +1551,7 @@ impl Services {
     ) {
         let store = self.store.clone();
         let persisted = completion_watch_to_persisted(watch);
-        intent_core::spawn_daemon(async move {
+        self.store_tasks.spawn_draining(async move {
             // Keep registration admitted through the write. Otherwise a
             // delayed upsert could resurrect a watch after deletion swept it.
             let _mutations = mutations;
@@ -1530,7 +1567,7 @@ impl Services {
     fn delete_persisted_watch(&self, subscription_id: &str) {
         let store = self.store.clone();
         let id = subscription_id.to_string();
-        intent_core::spawn_daemon(async move {
+        self.store_tasks.spawn_draining(async move {
             if let Err(e) = store.delete_completion_watch(&id).await {
                 tracing::warn!("completion_watch delete failed {id}: {e}");
             }
@@ -2866,6 +2903,110 @@ mod tests {
         let root = tempfile::tempdir().expect("temp workspaces root");
         let services = Services::new(store).with_workspaces_root(root.path().to_path_buf());
         (tmp, root, services, ws)
+    }
+
+    async fn held_subscription_shutdown(
+        svc: &Services,
+        held: sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    ) {
+        let drain = svc.shutdown_store_writers();
+        tokio::pin!(drain);
+        let returned_early = tokio::select! {
+            biased;
+            () = &mut drain => true,
+            () = std::future::ready(()) => false,
+        };
+        drop(held);
+        if !returned_early {
+            tokio::time::timeout(std::time::Duration::from_secs(10), drain)
+                .await
+                .unwrap();
+        }
+        assert!(
+            !returned_early,
+            "shutdown passed an admitted subscription write held at the Store"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_retains_completion_watch_upsert() {
+        let (tmp, _root, svc, ws) = setup().await;
+        let held = svc.store.write_pool().acquire().await.unwrap();
+        let id = svc
+            .register_completion_watch(
+                &ws,
+                &ws,
+                AgentId::from("agent-parent"),
+                "parent".into(),
+                AgentId::from("agent-child"),
+                None,
+            )
+            .unwrap();
+        held_subscription_shutdown(&svc, held).await;
+        svc.store.close().await;
+        let reopened = Store::open(&tmp.path).await.unwrap();
+        assert!(reopened
+            .list_completion_watches()
+            .await
+            .unwrap()
+            .iter()
+            .any(|watch| watch.id == id));
+        reopened.close().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_retains_completion_watch_delete() {
+        let (tmp, _root, svc, ws) = setup().await;
+        let id = svc
+            .register_completion_watch_durable(
+                &ws,
+                &ws,
+                AgentId::from("agent-parent"),
+                "parent".into(),
+                AgentId::from("agent-child"),
+                None,
+            )
+            .await
+            .unwrap();
+        let held = svc.store.write_pool().acquire().await.unwrap();
+        svc.delete_persisted_watch(&id);
+        held_subscription_shutdown(&svc, held).await;
+        svc.store.close().await;
+        let reopened = Store::open(&tmp.path).await.unwrap();
+        assert!(reopened
+            .list_completion_watches()
+            .await
+            .unwrap()
+            .iter()
+            .all(|watch| watch.id != id));
+        reopened.close().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_retains_ordered_group_lane() {
+        let (tmp, _root, svc, ws) = setup().await;
+        let parent = AgentId::from("agent-parent");
+        let id = svc.get_or_create_delegation_group(&ws, &parent);
+        let mut group = svc.delegation_group_for_parent(&parent).unwrap();
+        group.expected_agent_ids.push(AgentId::from("agent-child"));
+        let held = svc.store.write_pool().acquire().await.unwrap();
+        svc.persist_delegation_group(group);
+        let ack = svc.enqueue_group_persist_acked(GroupPersistOp::Delete(id));
+        held_subscription_shutdown(&svc, held).await;
+        Services::await_group_persist(ack).await.unwrap();
+        let refused = svc.enqueue_group_persist_acked(GroupPersistOp::Delete("late".into()));
+        assert!(Services::await_group_persist(refused).await.is_err());
+        svc.store.close().await;
+        let reopened = Store::open(&tmp.path).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM delegation_group")
+            .fetch_one(reopened.read_pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "ordered delete must not be resurrected by the earlier upsert"
+        );
+        reopened.close().await;
     }
 
     async fn enriched(svc: &Services, ws: &WorkspaceId) -> (WorkspaceDisplayStatus, bool) {

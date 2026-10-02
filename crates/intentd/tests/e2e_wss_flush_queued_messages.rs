@@ -121,6 +121,7 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
     common::enable_ws_api(data_dir);
     let mut cmd = common::serve_command();
     cmd.env("INTENTD_DATA_DIR", data_dir)
+        .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())

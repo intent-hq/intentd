@@ -2044,6 +2044,7 @@ fn golden_rtk_instruction_line() {
 #[test]
 fn golden_skills_catalog_wrapper() {
     let skill = |name: &str, description: &str, location: &str| crate::skills::SkillMetadata {
+        resource_directory: None,
         name: name.to_string(),
         description: description.to_string(),
         location: location.to_string(),

@@ -92,15 +92,11 @@ use crate::workspace_status::MonitorPrSignals;
 use crate::{publish_event, system_actor, Services};
 
 use intent_core::config::{
-    MAX_PR_CACHE_MAX_AGE_SECONDS, MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET,
+    MAX_PR_CACHE_MAX_AGE_SECONDS, MAX_PR_MONITORS_PER_AGENT, MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET,
     MAX_PR_MONITOR_QUOTA_SHARE_PERCENT, MIN_PR_CACHE_MAX_AGE_SECONDS,
     MIN_PR_MONITOR_DEBOUNCE_SECONDS, MIN_PR_MONITOR_HOURLY_REQUEST_BUDGET,
     MIN_PR_MONITOR_POLL_SECONDS, MIN_PR_MONITOR_QUOTA_SHARE_PERCENT,
 };
-
-/// Cap on concurrently ACTIVE monitors per agent (mirrors the background-hook
-/// `maxPerAgent` convention).
-pub(crate) const DEFAULT_PR_MONITORS_MAX_PER_AGENT: u32 = 5;
 
 /// Forge REST calls one distinct-PR poll is COSTED at on the steady-state
 /// GitHub path: the PR read, the reviews list, and the conversation-comment
@@ -1926,6 +1922,14 @@ impl Services {
         Duration::from_secs(secs)
     }
 
+    /// Active monitors allowed per owner. Read live on registration/adoption;
+    /// existing watches and same-owner refreshes survive a lowered limit.
+    fn pr_monitor_max_per_agent(&self) -> u32 {
+        self.pr_monitors_max_per_agent
+            .unwrap_or_else(|| self.effective_settings().pr_monitor.max_per_agent)
+            .clamp(1, MAX_PR_MONITORS_PER_AGENT)
+    }
+
     /// The tick cadence of the centralized monitor loop and the per-PR poll
     /// interval floor (`prMonitor.pollSeconds`), clamped to
     /// [`MIN_PR_MONITOR_POLL_SECONDS`]. Read live from the settings registry
@@ -2164,6 +2168,8 @@ impl Services {
         repo_name: &str,
         pr_number: u64,
     ) -> Result<PrMonitorRegistration> {
+        let registration = self.pr_monitor_registration.enter(agent_id.clone());
+        let _admission = registration.acquire().await;
         let _mutation = self.workspace_mutations.enter(workspace_id)?;
         let existing = self
             .store
@@ -2189,7 +2195,7 @@ impl Services {
                 }
                 None => {}
             }
-            let cap = self.pr_monitors_max_per_agent as usize;
+            let cap = self.pr_monitor_max_per_agent() as usize;
             let active = self
                 .store
                 .list_pr_monitors_by_agent(agent_id)
@@ -2199,7 +2205,7 @@ impl Services {
                 .count();
             if active >= cap {
                 return Err(Error::InvalidParams(format!(
-                    "pr.monitor: agent already monitors {active} PRs (max {cap})"
+                    "pr.monitor: agent already monitors {active} PRs (max {cap}); configure prMonitor.maxPerAgent (1–100) for a larger inventory"
                 )));
             }
         }
@@ -3046,7 +3052,11 @@ impl Services {
         let services = self.clone();
         intent_core::spawn_daemon(async move {
             loop {
-                tokio::time::sleep(services.pr_monitor_poll_interval()).await;
+                tokio::select! {
+                    biased;
+                    () = services.settings_tasks.closed() => break,
+                    () = tokio::time::sleep(services.pr_monitor_poll_interval()) => {}
+                }
                 services.poll_due_pr_monitors().await;
             }
         })
@@ -3139,11 +3149,21 @@ impl Services {
     /// either way; a full sweep (`skip_fresh == false`) plans no cadence and
     /// spends none.
     async fn sweep_pr_monitors(&self, skip_fresh: bool) {
-        intent_sourcecontrol::traffic::with_caller(
-            intent_sourcecontrol::traffic::Caller::PrMonitor,
-            self.sweep_pr_monitors_accounted(skip_fresh),
-        )
-        .await;
+        let services = self.clone();
+        if let Some(owner) =
+            self.store_tasks
+                .spawn_draining(intent_sourcecontrol::traffic::inherit_context(async move {
+                    intent_sourcecontrol::traffic::with_caller(
+                        intent_sourcecontrol::traffic::Caller::PrMonitor,
+                        services.sweep_pr_monitors_accounted(skip_fresh),
+                    )
+                    .await;
+                }))
+        {
+            if let Err(error) = owner.await {
+                tracing::error!(%error, "PR monitor sweep failed");
+            }
+        }
     }
 
     async fn sweep_pr_monitors_accounted(&self, skip_fresh: bool) {
@@ -3655,6 +3675,25 @@ impl Services {
     /// set (a PR that fully reverted to its baseline) also returns `false`:
     /// there is nothing to report, so no wake is sent.
     async fn emit_pending_changes(&self, monitor: &PrMonitor) -> Result<bool> {
+        let services = self.clone();
+        let monitor = monitor.clone();
+        let caller = intent_core::current_caller().unwrap_or(intent_core::Caller::Daemon);
+        let wire = intent_core::caller::current_wire_credential();
+        let owner = self
+            .store_tasks
+            .spawn_draining(intent_core::with_caller(
+                caller,
+                intent_core::caller::with_wire_credential(wire, async move {
+                    services.emit_pending_changes_owned(&monitor).await
+                }),
+            ))
+            .ok_or_else(|| Error::Internal("PR monitor writers are shutting down".into()))?;
+        owner
+            .await
+            .map_err(|error| Error::Internal(format!("PR monitor worker failed: {error}")))?
+    }
+
+    async fn emit_pending_changes_owned(&self, monitor: &PrMonitor) -> Result<bool> {
         if monitor.pending_changes.is_empty() {
             return Ok(false);
         }
@@ -3689,6 +3728,8 @@ impl Services {
         {
             return Ok(false);
         }
+        #[cfg(test)]
+        self.hold_periodic_commit("monitor").await;
         let mut emitted = monitor.clone();
         emitted.baseline_snapshot = monitor.last_snapshot.clone();
         emitted.pending_changes = Vec::new();
@@ -3712,6 +3753,32 @@ impl Services {
     /// flush/cancel/re-register/adoption moved the row, or a cancel already
     /// terminalized it and delivered its own notice) skipped it.
     async fn complete_pr_monitor(
+        &self,
+        monitor: &PrMonitor,
+        snapshot: &PrMonitorSnapshot,
+    ) -> Result<bool> {
+        let services = self.clone();
+        let monitor = monitor.clone();
+        let snapshot = snapshot.clone();
+        let caller = intent_core::current_caller().unwrap_or(intent_core::Caller::Daemon);
+        let wire = intent_core::caller::current_wire_credential();
+        let owner = self
+            .store_tasks
+            .spawn_draining(intent_core::with_caller(
+                caller,
+                intent_core::caller::with_wire_credential(wire, async move {
+                    services
+                        .complete_pr_monitor_owned(&monitor, &snapshot)
+                        .await
+                }),
+            ))
+            .ok_or_else(|| Error::Internal("PR monitor writers are shutting down".into()))?;
+        owner
+            .await
+            .map_err(|error| Error::Internal(format!("PR monitor worker failed: {error}")))?
+    }
+
+    async fn complete_pr_monitor_owned(
         &self,
         monitor: &PrMonitor,
         snapshot: &PrMonitorSnapshot,
@@ -3742,6 +3809,8 @@ impl Services {
             // re-detects the terminal state under the row's current owner.
             return Ok(false);
         }
+        #[cfg(test)]
+        self.hold_periodic_commit("monitor").await;
         let mut completed = monitor.clone();
         completed.state = PrMonitorState::Completed;
         completed.pending_changes = Vec::new();
@@ -3767,39 +3836,12 @@ impl Services {
         Ok(true)
     }
 
-    /// Best-effort refresh of the owning workspace's PR linkage after its
-    /// monitored PR reached a terminal state (merged/closed), through
-    /// [`Services::refresh_workspace_pr`] — which persists the delta and
-    /// emits `pr:updated`/`pr:linked`/`pr:unlinked` itself. Bounded by
-    /// `pr_refresh_fetch_timeout` — the refresh sweep's *aggregate* budget
-    /// over one workspace's whole refresh (the linked-PR re-fetch, possible
-    /// relink discovery via `list_prs`, and the store writes; not a
-    /// per-request bound) — so a hung forge call can never wedge the
-    /// serialized monitor sweep; errors and timeouts are logged, never
-    /// propagated — the monitor's own terminal transition already persisted,
-    /// and the background refresh sweep remains the backstop. Timeout caveat
-    /// (shared with the sweep's wrap): the dropped future can land between
-    /// the store write and the event publish, persisting the delta without
-    /// `pr:updated` — rare (the client-level network timeouts fire first)
-    /// and self-limiting, since clients re-read on the next snapshot.
+    /// Refresh linkage after monitor completion. The refresh owns its finite
+    /// write/publication tail; only forge reads are subject to its fetch budget.
     async fn refresh_workspace_pr_after_terminal(&self, workspace_id: &WorkspaceId) {
-        match tokio::time::timeout(
-            self.pr_refresh_fetch_timeout,
-            self.refresh_workspace_pr_cached(workspace_id),
-        )
-        .await
-        {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => tracing::warn!(
-                workspace = %workspace_id.0,
-                error = %e,
-                "pr monitor terminal: workspace PR refresh failed"
-            ),
-            Err(_) => tracing::warn!(
-                workspace = %workspace_id.0,
-                timeout = ?self.pr_refresh_fetch_timeout,
-                "pr monitor terminal: workspace PR refresh timed out"
-            ),
+        if let Err(error) = self.refresh_workspace_pr_cached(workspace_id).await {
+            tracing::warn!(workspace = %workspace_id.0, %error,
+                "pr monitor terminal: workspace PR refresh failed");
         }
     }
 
@@ -4314,6 +4356,7 @@ impl Services {
 
 #[cfg(test)]
 mod tests {
+    mod quota_regression;
     mod qwen_regression;
     use std::path::PathBuf;
 
@@ -5128,11 +5171,178 @@ mod tests {
         let bus = EventBus::new(store.clone());
         let forge = StubForge::new();
         let root = tempfile::tempdir().expect("temp workspaces root");
-        let services = Services::new(store)
-            .with_event_bus(bus)
-            .with_workspaces_root(root.path().to_path_buf())
-            .with_source_control(Arc::new(forge.clone()));
+        let services = Services::new_with_file_secrets(
+            store,
+            intent_core::FileSecretStore::with_path(root.path().join("secrets.json")),
+        )
+        .with_event_bus(bus)
+        .with_workspaces_root(root.path().to_path_buf())
+        .with_source_control(Arc::new(forge.clone()));
         (tmp, root, services, forge, ws, owner)
+    }
+
+    async fn committed_monitor_tail(terminal: bool, closing_manager: bool) {
+        use crate::periodic_shutdown_tests::{drain_held, entered, hold};
+        let (db, _root, svc, forge, ws, owner) = setup().await;
+        let monitor = register(&svc, &ws, &owner).await;
+        if terminal {
+            forge.edit(|s| s.pr_state = PrState::Merged);
+        } else {
+            forge.edit(|s| s.conversation_comments = 2);
+            svc.poll_pr_monitors().await;
+            assert!(!svc
+                .store()
+                .get_pr_monitor(&monitor.monitor_id)
+                .await
+                .unwrap()
+                .pending_changes
+                .is_empty());
+        }
+        let (rx, release) = hold(&svc, "monitor");
+        let service = svc.clone();
+        let workspace = ws.clone();
+        let id = monitor.monitor_id.clone();
+        let task = intent_core::spawn_daemon(async move {
+            if terminal {
+                service.poll_pr_monitors().await;
+            } else {
+                service.pr_monitor_flush(&workspace, &id).await.unwrap();
+            }
+        });
+        entered(rx).await;
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert!(row.pending_changes.is_empty());
+        assert_eq!(
+            row.state,
+            if terminal {
+                PrMonitorState::Completed
+            } else {
+                PrMonitorState::Active
+            }
+        );
+        if !terminal {
+            assert_eq!(row.baseline_snapshot, row.last_snapshot);
+        }
+        let manager = closing_manager.then(|| {
+            let manager = Arc::new(crate::agent_manager::AgentManager::new(
+                svc.clone(),
+                Arc::new(crate::agent_manager::BusEventSink::new(
+                    svc.event_bus.clone().unwrap(),
+                )),
+                1,
+            ));
+            svc.attach_agent_manager(&manager);
+            manager.begin_shutdown();
+            manager
+        });
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        drain_held(&svc, release).await;
+        if let Some(manager) = manager {
+            manager.shutdown().await;
+        }
+        svc.event_bus.as_ref().unwrap().shutdown().await.unwrap();
+        svc.store().close().await;
+        let reopened = Store::open(&db.path).await.unwrap();
+        let session = reopened.get_agent_session(&owner).await.unwrap();
+        if closing_manager {
+            let queue = reopened.load_all_agent_queues().await.unwrap();
+            assert_eq!(queue.len(), 1);
+            assert_eq!(queue[0].agent_id, owner);
+            assert!(queue[0].payload.to_string().contains("[PR monitor o/r#42]"));
+        } else {
+            assert!(serde_json::to_string(&session.messages)
+                .unwrap()
+                .contains("[PR monitor o/r#42]"));
+        }
+        let events = reopened
+            .query_events(&intent_store::EventQuery {
+                workspace_id: Some(ws),
+                event_types: vec![if terminal {
+                    PR_MONITOR_COMPLETED.into()
+                } else {
+                    PR_MONITOR_EMITTED.into()
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        reopened.close().await;
+    }
+
+    #[tokio::test]
+    async fn monitor_cleared_baseline_tail_survives_caller_abort() {
+        committed_monitor_tail(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn monitor_completed_tail_survives_poll_abort() {
+        committed_monitor_tail(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn workspace_pr_committed_delta_survives_refresh_loop_abort() {
+        use crate::periodic_shutdown_tests::{drain_held, entered, hold};
+        let (db, _root, svc, _forge, ws, _owner) = setup().await;
+        let svc = svc.with_pr_refresh_fetch_timeout(Duration::from_millis(100));
+        let mut workspace = svc.store().get_workspace(&ws).await.unwrap();
+        workspace.repository_owner = Some("o".into());
+        workspace.repository_name = Some("r".into());
+        workspace.branch = "definitely-other-branch".into();
+        workspace.pr_number = Some(42);
+        svc.store().update_workspace(&workspace).await.unwrap();
+        let (rx, release) = hold(&svc, "pr");
+        let task = svc.spawn_pr_refresh_loop(Duration::from_millis(1));
+        entered(rx).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !release.is_closed(),
+            "fetch deadline cancelled committed publication"
+        );
+        assert!(svc
+            .store()
+            .get_workspace(&ws)
+            .await
+            .unwrap()
+            .pr_number
+            .is_none());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        drain_held(&svc, release).await;
+        svc.event_bus.as_ref().unwrap().shutdown().await.unwrap();
+        svc.store().close().await;
+        let reopened = Store::open(&db.path).await.unwrap();
+        let events = reopened
+            .query_events(&intent_store::EventQuery {
+                workspace_id: Some(ws.clone()),
+                event_types: vec!["pr:unlinked".into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(reopened
+            .get_workspace(&ws)
+            .await
+            .unwrap()
+            .pr_number
+            .is_none());
+        reopened.close().await;
+    }
+
+    #[tokio::test]
+    async fn monitor_baseline_tail_queues_for_closing_manager() {
+        committed_monitor_tail(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn monitor_completed_tail_queues_for_closing_manager() {
+        committed_monitor_tail(true, true).await;
     }
 
     /// Register a monitor on PR 42 for the setup fixture's owner.

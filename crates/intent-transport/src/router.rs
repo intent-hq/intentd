@@ -3884,10 +3884,34 @@ async fn dispatch(
         }
         "search.notes" => {
             let query = require_str_param(params, "query")?;
-            let request_id = opt_str(params, "requestId");
-            api.search_notes(query, request_id)
-                .await
-                .map_err(domain_to_rpc)
+            let workspace_id = opt_str_strict(params, "workspaceId")?;
+            let prefer_workspace_id = opt_str_strict(params, "preferWorkspaceId")?;
+            for (name, id) in [
+                ("workspaceId", &workspace_id),
+                ("preferWorkspaceId", &prefer_workspace_id),
+            ] {
+                if id.as_ref().is_some_and(String::is_empty) {
+                    return Err(invalid_params(format!("{name} must not be empty")));
+                }
+            }
+            let limit = match params.get("limit") {
+                None | Some(Value::Null) => None,
+                Some(value) => Some(value.as_i64().filter(|n| *n >= 0).ok_or_else(|| {
+                    invalid_params("limit must be a nonnegative signed 64-bit integer")
+                })?),
+            };
+            let include_archived = opt_bool_strict(params, "includeArchived")?.unwrap_or(true);
+            let request_id = opt_str_strict(params, "requestId")?;
+            api.search_notes(
+                query,
+                workspace_id.map(WorkspaceId::from),
+                prefer_workspace_id.map(WorkspaceId::from),
+                limit,
+                include_archived,
+                request_id,
+            )
+            .await
+            .map_err(domain_to_rpc)
         }
         "search.codebase" => {
             let ws = require_ws_note(params)?;
@@ -3954,14 +3978,16 @@ async fn dispatch(
         "file.read" => {
             let ws = require_ws_note(params)?;
             let path = require_str_param(params, "path")?;
-            api.file_read(ws, path, None).await.map_err(domain_to_rpc)
+            api.file_read(ws, path, None, opt_git_root_id(params))
+                .await
+                .map_err(domain_to_rpc)
         }
         "file.readChunk" => {
             let ws = require_ws_note(params)?;
             let path = require_str_param(params, "path")?;
             let offset = require_u64(params, "offset")?;
             let length = require_u64(params, "length")?;
-            api.file_read_chunk(ws, path, offset, length, None)
+            api.file_read_chunk(ws, path, offset, length, None, opt_git_root_id(params))
                 .await
                 .map_err(domain_to_rpc)
         }
@@ -4153,12 +4179,38 @@ async fn dispatch(
         }
         "script.list" => {
             let ws = require_ws_note(params)?;
-            api.script_list(ws).await.map_err(domain_to_rpc)
+            let archive = params
+                .get("archive")
+                .map(|value| {
+                    serde_json::from_value::<intent_core::ScriptArchiveFilter>(value.clone())
+                })
+                .transpose()
+                .map_err(|e| invalid_params(e.to_string()))?
+                .unwrap_or_default();
+            api.script_list_filtered(ws, archive)
+                .await
+                .map_err(domain_to_rpc)
         }
         "script.create" => {
             let ws = require_ws_note(params)?;
             let create = parse_script_create(params)?;
             api.script_create(ws, create).await.map_err(domain_to_rpc)
+        }
+        "script.archive" | "script.restore" => {
+            let ws = require_workspace_id(params)?;
+            let ids = params
+                .get("scriptIds")
+                .ok_or_else(|| invalid_params("scriptIds is required"))?;
+            let ids: Vec<String> =
+                serde_json::from_value(ids.clone()).map_err(|e| invalid_params(e.to_string()))?;
+            if ids.is_empty() || ids.len() > 1000 || ids.iter().any(|id| id.trim().is_empty()) {
+                return Err(invalid_params("scriptIds must contain 1–1000 nonempty IDs"));
+            }
+            if method == "script.archive" {
+                api.script_archive(ws, ids).await.map_err(domain_to_rpc)
+            } else {
+                api.script_restore(ws, ids).await.map_err(domain_to_rpc)
+            }
         }
         "script.remove" => {
             let ws = require_ws_note(params)?;
@@ -4293,14 +4345,17 @@ async fn dispatch(
             }
         }
         "specialist.list" => {
-            // Optional workspaceId is routing-only. This method merges
-            // user > bundled tiers only (the project tier is not part of the live
-            // wire contract iOS calls). `specialist.get` still accepts an optional
-            // `workspacePath` for the project tier (PROTOCOL §5.11). The optional
-            // `provider` supplies the resolution context for the additive
-            // `resolvedModel`/`resolvedProvider` preview fields.
+            let workspace_path = if opt_bool_strict(params, "includeProject")?.unwrap_or(false) {
+                let workspace = api
+                    .get_workspace(require_workspace_id(params)?)
+                    .await
+                    .map_err(workspace_err)?;
+                workspace.effective_path().map(str::to_owned)
+            } else {
+                None
+            };
             let provider = opt_str(params, "provider");
-            match api.specialist_list(None, provider).await {
+            match api.specialist_list(workspace_path, provider).await {
                 Ok(v) => Ok(v),
                 // Unknown provider → -32602 with the raw message.
                 Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
@@ -4865,6 +4920,11 @@ fn parse_script_create(params: &Map<String, Value>) -> Result<ScriptCreateParams
         }
     };
     Ok(ScriptCreateParams {
+        purpose: params
+            .get("purpose")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+            .map_err(|e| invalid_params(format!("Invalid purpose: {e}")))?,
         name,
         command,
         mode,

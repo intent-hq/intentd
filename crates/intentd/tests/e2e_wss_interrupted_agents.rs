@@ -235,6 +235,7 @@ async fn interrupted_agents_persisted_across_restart() {
     common::disable_resume_on_start(&data_dir);
     let mut cmd1 = common::serve_command();
     cmd1.env("INTENTD_DATA_DIR", &data_dir)
+        .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .stdout(Stdio::null())
@@ -333,6 +334,7 @@ async fn interrupted_agents_persisted_across_restart() {
     }
     let mut cmd2 = common::serve_command();
     cmd2.env("INTENTD_DATA_DIR", &data_dir)
+        .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .stdout(Stdio::null())
@@ -384,6 +386,7 @@ async fn interrupted_agents_persisted_across_restart() {
     }
     let mut cmd3 = common::serve_command();
     cmd3.env("INTENTD_DATA_DIR", &data_dir)
+        .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .stdout(Stdio::null())
@@ -433,6 +436,431 @@ fn gate(test: &str) -> Option<String> {
 // Re-export the DaemonGuard from common module for use in this file
 use common::DaemonGuard;
 
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn blocked_exec_stream_stdin_does_not_prevent_shutdown() {
+    assert_blocked_exec_stream_shutdown(false).await;
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn blocked_exec_stream_eof_does_not_prevent_shutdown() {
+    assert_blocked_exec_stream_shutdown(true).await;
+}
+
+#[cfg(debug_assertions)]
+async fn assert_blocked_exec_stream_shutdown(eof: bool) {
+    struct StreamCleanup(i32);
+    impl Drop for StreamCleanup {
+        fn drop(&mut self) {
+            // Fallback owns only the process group identified by this fixture.
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(self.0),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    }
+    let dir = temp_data_dir();
+    let data = dir.path();
+    let socket = data.join("intentd.sock");
+    let log_path = data.join("daemon.log");
+    let pid_path = data.join("stream.pid");
+    common::enable_ws_api(data);
+    let mut command = common::serve_command();
+    command
+        .env("INTENTD_DATA_DIR", data)
+        .env("INTENTD_WORKSPACES_DIR", data.join("workspaces"))
+        .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
+        .env("INTENTD_AUTH_TOKEN", TOKEN)
+        .env("INTENTD_SECRETS_FILE", data.join("secrets.json"))
+        .env("INTENTD_TEST_EXEC_STREAM_WRITE_PENDING", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(std::fs::File::create(&log_path).unwrap()));
+    command.process_group(0);
+    let mut daemon = DaemonGuard::new(command.spawn().unwrap(), data.to_path_buf(), false);
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let mut rpc = connect_ws(
+        port,
+        client_config(status["result"]["fingerprint"].as_str().unwrap()),
+    )
+    .await;
+    let stream = wss_rpc(
+        &mut rpc,
+        1,
+        "host.execStream",
+        json!({
+            // timing-guard: keep the non-reading child alive beyond shutdown's assertion budget; shutdown must reap it.
+            "command":"sh", "args":["-c", "echo $$ > \"$1\"; exec sleep 600", "sh", pid_path]
+        }),
+    )
+    .await;
+    let id = stream["requestId"].as_str().unwrap();
+    let pid: i32 = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&pid_path) {
+                if let Ok(pid) = text.trim().parse() {
+                    break pid;
+                }
+            }
+            // timing-guard: wait for this child's observable PID publication.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let _stream_cleanup = StreamCleanup(pid);
+    let duplicate_path = data.join("duplicate-stream-started");
+    rpc.send(Message::Text(
+        json!({"jsonrpc":"2.0", "id":100,
+        "method":"host.execStream", "params":{
+            "requestId":id, "command":"sh",
+            "args":["-c", "echo started > \"$1\"", "sh", duplicate_path]
+        }})
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if let Message::Text(text) = rpc.next().await.unwrap().unwrap() {
+                let frame: Value = serde_json::from_str(&text).unwrap();
+                if frame["id"] == 100 {
+                    assert_eq!(frame["jsonrpc"], "2.0");
+                    assert_eq!(frame["error"]["code"], -32602);
+                    assert!(frame["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("already active"));
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    for request in 2..50 {
+        rpc.send(Message::Text(
+            json!({"jsonrpc":"2.0", "id":request,
+            "method":"host.execStream.write", "params":{"requestId":id,"stdin":"x".repeat(65536)}})
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    }
+    if eof {
+        rpc.send(Message::Text(
+            json!({"jsonrpc":"2.0", "id":50,
+            "method":"host.execStream.write", "params":{"requestId":id,"eof":true}})
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    }
+    let pending_message = if eof {
+        "host.execStream stdin EOF send pending"
+    } else {
+        "host.execStream stdin send pending"
+    };
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if std::fs::read_to_string(&log_path)
+                .unwrap()
+                .contains(pending_message)
+            {
+                break;
+            }
+            // timing-guard: await the actual bounded stdin send returning Pending in the admitted RPC.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        uds_rpc(&socket, 60, "system.shutdown", json!({})).await["result"]["ok"],
+        true
+    );
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(status) = daemon.child_mut().try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            // timing-guard: poll the real daemon exit after shutdown was acknowledged.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("request drain waited for stdin before cancelling its non-reading child");
+    assert_eq!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+        Err(nix::errno::Errno::ESRCH)
+    );
+    assert!(!duplicate_path.exists(), "rejected duplicate executed");
+    let store = intent_store::Store::open(&data.join("intentd.db"))
+        .await
+        .unwrap();
+    let events = store
+        .query_events(&intent_store::EventQuery::default())
+        .await
+        .unwrap();
+    let exits: Vec<_> = events
+        .iter()
+        .filter(|event| event.event_type == "host:exec:exit" && event.data["requestId"] == id)
+        .collect();
+    assert_eq!(exits.len(), 1);
+    assert_eq!(exits[0].data["cancelled"], true);
+    store.close().await;
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn cancelled_settings_hook_joins_before_main_listener_teardown() {
+    use tokio::io::AsyncReadExt;
+    let dir = temp_data_dir();
+    let data = dir.path();
+    let socket = data.join("intentd.sock");
+    let response_path = data.join("response-gate.sock");
+    let start_path = data.join("start-gate.sock");
+    let responses = tokio::net::UnixListener::bind(&response_path).unwrap();
+    let starts = tokio::net::UnixListener::bind(&start_path).unwrap();
+    let log_path = data.join("daemon.log");
+    let mut command = common::serve_command();
+    command
+        .env("INTENTD_DATA_DIR", data)
+        .env("INTENTD_WORKSPACES_DIR", data.join("workspaces"))
+        .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
+        .env("INTENTD_AUTH_TOKEN", TOKEN)
+        .env("INTENTD_TEST_SETTINGS_RESPONSE_GATE", response_path)
+        .env("INTENTD_TEST_SETTINGS_WS_START_GATE", start_path)
+        .env("INTENTD_SECRETS_FILE", data.join("secrets.json"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(std::fs::File::create(&log_path).unwrap()));
+    command.process_group(0);
+    let mut daemon = DaemonGuard::new(command.spawn().unwrap(), data.to_path_buf(), false);
+    let (mut response, _) = timeout(common::daemon_startup_timeout(), responses.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let (mut start, _) = timeout(common::daemon_startup_timeout(), starts.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(await_uds(&socket).await);
+    response.write_u8(1).await.unwrap();
+    assert_eq!(
+        response.read_u8().await.unwrap(),
+        1,
+        "response future must be cancelled before shutdown"
+    );
+    assert_eq!(
+        uds_rpc(&socket, 1, "system.shutdown", json!({})).await["result"]["ok"],
+        true
+    );
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let log = std::fs::read_to_string(&log_path).unwrap();
+            assert!(
+                !log.contains("phase=\"wss_stop\""),
+                "main stopped WSS before joining the cancelled settings owner: {log}"
+            );
+            if log.contains("phase=\"request_drain\" state=\"completed\"") {
+                break;
+            }
+            assert!(daemon.child_mut().try_wait().unwrap().is_none());
+            // timing-guard: poll the observable request-drain log while the startup barrier remains held.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // The held hook has not even captured stop_generation. It could start a
+    // fresh listener after final stop if main moved its settings join later.
+    assert!(daemon.child_mut().try_wait().unwrap().is_none());
+    start.write_u8(1).await.unwrap();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(status) = daemon.child_mut().try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            // timing-guard: poll std::process::Child::try_wait without blocking the async test runtime.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    let drained = log
+        .find("phase=\"request_drain\" state=\"completed\"")
+        .unwrap();
+    let listening = log.find("intentd WSS listening").unwrap();
+    let stopped = log.find("phase=\"wss_stop\" state=\"completed\"").unwrap();
+    let closed = log
+        .find("phase=\"store_close\" state=\"completed\"")
+        .unwrap();
+    assert!(
+        drained < listening && listening < stopped && stopped < closed,
+        "{log}"
+    );
+    let store = intent_store::Store::open(&data.join("intentd.db"))
+        .await
+        .unwrap();
+    assert!(store
+        .query_events(&intent_store::EventQuery::default())
+        .await
+        .unwrap()
+        .iter()
+        .any(|event| event.event_type == "settings:changed"
+            && event.data["changes"]
+                .as_array()
+                .is_some_and(|changes| changes
+                    .iter()
+                    .any(|change| change["path"] == "server.wsApi.enabled"
+                        && change["value"] == true))));
+    store.close().await;
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn cancelled_mcp_enable_joins_before_main_hub_teardown() {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+    let dir = temp_data_dir();
+    let data = dir.path();
+    let socket = data.join("intentd.sock");
+    let response_path = data.join("response-gate.sock");
+    let start_path = data.join("mcp-start-gate.sock");
+    let responses = tokio::net::UnixListener::bind(&response_path).unwrap();
+    let starts = tokio::net::UnixListener::bind(&start_path).unwrap();
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/mock-mcp-server.mjs"
+    );
+    let wrapper = data.join("held-mcp.mjs");
+    std::fs::write(
+        &wrapper,
+        format!(
+            r"
+import net from 'node:net';
+const gate = net.createConnection(process.env.MOCK_MCP_START_GATE);
+gate.on('connect', () => gate.write(JSON.stringify([process.pid, process.env.INTENTD_SECRETS_FILE]) + '\n'));
+await new Promise(resolve => gate.once('data', resolve));
+gate.end();
+await import({});
+",
+            serde_json::to_string(&format!("file://{fixture}")).unwrap()
+        ),
+    )
+    .unwrap();
+    let config = json!({"id":"shutdown-held","transport":"stdio","command":"node","args":[wrapper],"env":{"MOCK_MCP_START_GATE":start_path,"INTENTD_SECRETS_FILE":data.join("secrets.json")},"enabled":false});
+    let log_path = data.join("daemon.log");
+    let mut command = common::serve_command();
+    command
+        .env("INTENTD_DATA_DIR", data)
+        .env("INTENTD_SECRETS_FILE", data.join("secrets.json"))
+        .env("INTENTD_WORKSPACES_DIR", data.join("workspaces"))
+        .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
+        .env("INTENTD_AUTH_TOKEN", TOKEN)
+        .env("INTENTD_TEST_SETTINGS_RESPONSE_GATE", response_path)
+        .env("INTENTD_TEST_MCP_ENABLE_CONFIG", config.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(std::fs::File::create(&log_path).unwrap()));
+    command.process_group(0);
+    let mut daemon = DaemonGuard::new(command.spawn().unwrap(), data.to_path_buf(), false);
+    let (mut response, _) = timeout(common::daemon_startup_timeout(), responses.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let (start, _) = timeout(common::daemon_startup_timeout(), starts.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut start = BufReader::new(start);
+    let mut pid = String::new();
+    timeout(Duration::from_secs(5), start.read_line(&mut pid))
+        .await
+        .unwrap()
+        .unwrap();
+    let child_identity: Value = serde_json::from_str(pid.trim()).unwrap();
+    assert_eq!(
+        child_identity[1],
+        data.join("secrets.json").to_str().unwrap()
+    );
+    let pid = i32::try_from(child_identity[0].as_i64().unwrap()).unwrap();
+    assert!(await_uds(&socket).await);
+    response.write_u8(1).await.unwrap();
+    assert_eq!(response.read_u8().await.unwrap(), 1);
+    assert_eq!(
+        uds_rpc(&socket, 1, "system.shutdown", json!({})).await["result"]["ok"],
+        true
+    );
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let log = std::fs::read_to_string(&log_path).unwrap();
+            assert!(
+                !log.contains("phase=\"mcp_shutdown\""),
+                "MCP stop passed held enable: {log}"
+            );
+            if log.contains("phase=\"request_drain\" state=\"completed\"") {
+                break;
+            }
+            assert!(daemon.child_mut().try_wait().unwrap().is_none());
+            // timing-guard: poll the observable request-drain log while the startup barrier remains held.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // Child exists but is not registered in the hub until initialize completes.
+    assert!(nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok());
+    start.get_mut().write_u8(1).await.unwrap();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(status) = daemon.child_mut().try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            // timing-guard: poll std::process::Child::try_wait without blocking the async test runtime.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+        Err(nix::errno::Errno::ESRCH),
+        "MCP child escaped final hub reap"
+    );
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    let stopped = log
+        .find("phase=\"mcp_shutdown\" state=\"completed\"")
+        .unwrap();
+    let closed = log
+        .find("phase=\"store_close\" state=\"completed\"")
+        .unwrap();
+    assert!(stopped < closed, "{log}");
+    let store = intent_store::Store::open(&data.join("intentd.db"))
+        .await
+        .unwrap();
+    let events = store
+        .query_events(&intent_store::EventQuery::default())
+        .await
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event_type == "mcp.servers:status-changed"
+                && event.data["serverId"] == "shutdown-held"
+                && event.data["status"]["state"] == "running"),
+        "{events:?}"
+    );
+    store.close().await;
+}
+
 #[tokio::test]
 async fn graceful_shutdown_captures_interrupted_agents() {
     let Some(script) = gate("graceful_shutdown_captures_interrupted_agents") else {
@@ -473,6 +901,8 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     common::disable_resume_on_start(&data_dir);
     let mut cmd1 = common::serve_command();
     cmd1.env("INTENTD_DATA_DIR", &data_dir)
+        .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
+        .env("INTENTD_WORKSPACES_DIR", data_dir.join("workspaces"))
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .env("MOCK_AGENT_SCRIPT_PATH", &script)
@@ -509,7 +939,7 @@ async fn graceful_shutdown_captures_interrupted_agents() {
         &mut sub,
         10,
         "events.subscribe",
-        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+        json!({ "eventTypes": ["agent:*", "script:state"], "workspaceId": ws_id }),
     )
     .await;
     assert!(sub_resp["subscriptionId"].is_string());
@@ -552,6 +982,58 @@ async fn graceful_shutdown_captures_interrupted_agents() {
         "agent did not stream chunk (mid-turn capture relies on this)"
     );
 
+    // Keep an idle WSS peer connected and a no-timeout command waiting for
+    // stdin. Neither may prevent shutdown; the command's terminal event must
+    // become durable before the store closes.
+    let _idle_peer = connect_ws(port, cfg.clone()).await;
+    let stream = wss_rpc(
+        &mut rpc,
+        14,
+        "host.execStream",
+        json!({"workspaceId": ws_id, "command": "cat"}),
+    )
+    .await;
+    let stream_id = stream["requestId"]
+        .as_str()
+        .expect("stream request id")
+        .to_string();
+
+    let script_def = wss_rpc(
+        &mut rpc,
+        15,
+        "script.create",
+        json!({
+            "workspaceId": ws_id, "name": "Shutdown held command", "mode": "command",
+            "purpose": "oneOff", "command": "cat"
+        }),
+    )
+    .await;
+    let script_id = script_def["id"].as_str().unwrap().to_string();
+    // Send without awaiting the response: this request stays admitted while
+    // its PTY waits on stdin, with no timeout to release request_drain.
+    rpc.send(Message::Text(
+        json!({"jsonrpc":"2.0","id":16,"method":"script.run",
+        "params":{"workspaceId":ws_id,"scriptId":script_id}})
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    timeout(Duration::from_secs(20), async {
+        loop {
+            let frame = wss_event(&mut sub, 20).await;
+            let event = &frame["params"]["event"];
+            if event["type"] == "script:state"
+                && event["data"]["scriptId"] == script_id
+                && event["data"]["status"] == "running"
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("script.run must be admitted and running before shutdown");
+
     // Now trigger graceful shutdown via system.shutdown RPC over UDS (system.*
     // is UDS-only; see PROTOCOL §5.7).
     let shutdown_result = uds_rpc(&socket, 13, "system.shutdown", json!({})).await;
@@ -581,12 +1063,68 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     // Explicitly drop the first Daemon so its Drop guard doesn't kill data_dir cleanup.
     std::mem::drop(daemon);
 
+    let log = std::fs::read_to_string(data_dir.join("daemon.log")).unwrap();
+    assert!(
+        !log.contains("attempted to acquire a connection on a closed pool"),
+        "late store writer: {log}"
+    );
+    {
+        let store = intent_store::Store::open(&data_dir.join("intentd.db"))
+            .await
+            .unwrap();
+        let rows = store
+            .query_events(&intent_store::EventQuery {
+                workspace_id: Some(intent_core::WorkspaceId::from(ws_id)),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let exits = rows
+            .iter()
+            .filter(|event| {
+                event.event_type == "host:exec:exit" && event.data["requestId"] == stream_id
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            exits.len(),
+            1,
+            "stream terminal event must survive shutdown"
+        );
+        assert_eq!(exits[0].data["cancelled"], true);
+        assert!(
+            rows.iter().any(|event| event.event_type == "script:state"
+                && event.data["scriptId"] == script_id
+                && event.data["status"] == "exited"),
+            "terminal script state survives reopen"
+        );
+        let definition = store
+            .get_script_in_workspace(&intent_core::WorkspaceId::from(ws_id), &script_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(definition.last_run.is_none());
+        assert!(
+            store
+                .pending_script_runs()
+                .await
+                .unwrap()
+                .iter()
+                .any(|(workspace, id, _, started)| workspace.as_str() == ws_id
+                    && id == &script_id
+                    && started.is_some()),
+            "running command retains its durable admission for restart recovery"
+        );
+        store.close().await;
+    }
+
     // Phase 2: Restart daemon — should list the interrupted agent.
     if listen != "uds" {
         common::enable_ws_api(&data_dir);
     }
     let mut cmd2 = common::serve_command();
     cmd2.env("INTENTD_DATA_DIR", &data_dir)
+        .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
+        .env("INTENTD_WORKSPACES_DIR", data_dir.join("workspaces"))
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .stdout(Stdio::null())
@@ -608,6 +1146,15 @@ async fn graceful_shutdown_captures_interrupted_agents() {
         .expect("value fits in u16");
     let cfg = client_config(&fp);
     let mut ws = connect_ws(port2, cfg).await;
+
+    let scripts = wss_rpc(&mut ws, 17, "script.list", json!({"workspaceId":ws_id})).await;
+    let recovered = scripts["scripts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|script| script["id"] == script_id)
+        .expect("interrupted script remains in history");
+    assert_eq!(recovered["lastRun"]["outcome"], "interrupted");
 
     // Phase 3: Call agent.listInterrupted over WSS.
     let result = wss_rpc(&mut ws, 4, "agent.listInterrupted", json!({})).await;

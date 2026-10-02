@@ -411,9 +411,7 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), CloneFailure> {
 
     // Wait for the child under a hard timeout so a stalled clone never wedges
     // the daemon. On timeout, reap the process group and emit `ok:false`.
-    let wait_result = tokio::time::timeout(CLONE_TIMEOUT, child.wait()).await;
-    // Ensure the reader task drains any final stderr before we settle.
-    let tail_error = reader_task.await.ok().flatten();
+    let (wait_result, tail_error) = wait_for_clone(&mut child, reader_task, CLONE_TIMEOUT).await;
 
     match wait_result {
         Ok(Ok(status)) if status.success() => {
@@ -443,7 +441,6 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), CloneFailure> {
             })
         }
         Err(_) => {
-            reap_child_group(&mut child).await;
             // The daemon's own clone timeout is a `network`-category failure
             // per the clone failure taxonomy (PROTOCOL §9.1).
             let msg = "git clone timed out".to_string();
@@ -455,6 +452,33 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), CloneFailure> {
             })
         }
     }
+}
+
+/// Join both halves of a clone before publishing its terminal result.
+async fn wait_for_clone(
+    child: &mut tokio::process::Child,
+    reader: tokio::task::JoinHandle<Option<String>>,
+    timeout: Duration,
+) -> (
+    std::result::Result<std::io::Result<std::process::ExitStatus>, tokio::time::error::Elapsed>,
+    Option<String>,
+) {
+    #[cfg(unix)]
+    let process_group = child.id();
+    let result = tokio::time::timeout(timeout, child.wait()).await;
+    if !matches!(result, Ok(Ok(_))) {
+        reap_child_group(child).await;
+    }
+    // Even an exited parent may leave a helper holding its stderr pipe. Every
+    // helper belongs to this clone's dedicated group, never another command.
+    #[cfg(unix)]
+    if let Some(pid) = process_group {
+        kill_group(pid, nix::sys::signal::Signal::SIGKILL);
+    }
+    // Publishing clone done is the caller's next step, after all admitted
+    // progress has drained. Never await a live child's reader before reaping.
+    let tail = reader.await.ok().flatten();
+    (result, tail)
 }
 
 /// Reap a timed-out clone's whole process group: SIGTERM → grace → SIGKILL,
@@ -1590,6 +1614,63 @@ mod tests {
         let (end, _) = check(parser.parse("Resolving deltas: 100% (3/3), done."));
         assert!(end > start, "nested module shows forward movement");
         assert!(end <= 100);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clone_timeout_reaps_before_joining_open_stderr() {
+        use tokio::io::AsyncReadExt;
+
+        struct CleanupGroup(u32);
+        impl Drop for CleanupGroup {
+            fn drop(&mut self) {
+                kill_group(self.0, nix::sys::signal::Signal::SIGKILL);
+            }
+        }
+        // The fake clone's owned descendant keeps stderr open. Its PID is
+        // the readiness signal; killing only the parent cannot close stderr.
+        let fixture = tempfile::tempdir().unwrap();
+        let fifo = fixture.path().join("hold");
+        let mut child = Command::new("sh")
+            .args([
+                "-c",
+                "mkfifo \"$1\"; trap 'wait; exit' TERM; sh -c 'echo $$; read line < \"$1\"' sh \"$1\" & wait",
+            ])
+            .arg("sh")
+            .arg(&fifo)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let _cleanup = CleanupGroup(child.id().unwrap());
+        let parent_pid = child.id().unwrap();
+        let _stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut ready = String::new();
+        tokio::time::timeout(Duration::from_secs(10), stdout.read_line(&mut ready))
+            .await
+            .unwrap()
+            .unwrap();
+        let descendant_pid: u32 = ready.trim().parse().unwrap();
+        assert_ne!(parent_pid, descendant_pid);
+        let mut stderr = child.stderr.take().unwrap();
+        let reader = tokio::spawn(async move {
+            let mut tail = String::new();
+            stderr.read_to_string(&mut tail).await.unwrap();
+            Some(tail)
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            wait_for_clone(&mut child, reader, Duration::ZERO),
+        )
+        .await;
+        // Cleanup also on the fail-before path; no fake child survives.
+        reap_child_group(&mut child).await;
+        let (status, _) = result.expect("clone deadline must reap before joining stderr");
+        assert!(status.is_err(), "the child must report the clone deadline");
     }
 
     /// Spawn a shell that forks a `sleep 30` grandchild in the same process

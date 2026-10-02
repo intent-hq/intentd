@@ -6499,14 +6499,26 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `search.notes`: GLOBAL substring search over the BE notes store (no
-    /// `workspaceId`). Returns `{ requestId, matches: NoteMatch[] }` (PROTOCOL §5.15).
+    /// `search.notes`: ranked full-text search across visible workspaces, with
+    /// optional hard scope and soft preference. Always returns inline
+    /// `{ requestId, matches: NoteMatch[], indexed: true }` (PROTOCOL §5.15).
     fn search_notes(
         &self,
         query: String,
+        workspace_id: Option<WorkspaceId>,
+        prefer_workspace_id: Option<WorkspaceId>,
+        limit: Option<i64>,
+        include_archived: bool,
         request_id: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (query, request_id);
+        let _ = (
+            query,
+            workspace_id,
+            prefer_workspace_id,
+            limit,
+            include_archived,
+            request_id,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::search_notes not implemented".to_string(),
@@ -6663,6 +6675,56 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::script_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Select active, archived or all retained definitions, preserving the list envelope.
+    fn script_list_filtered(
+        &self,
+        workspace_id: WorkspaceId,
+        archive: crate::ScriptArchiveFilter,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let mut result = self.script_list(workspace_id).await?;
+            if let Some(scripts) = result
+                .get_mut("scripts")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                scripts.retain(|script| match archive {
+                    crate::ScriptArchiveFilter::All => true,
+                    crate::ScriptArchiveFilter::Active => script.get("archivedAt").is_none(),
+                    crate::ScriptArchiveFilter::Archived => script.get("archivedAt").is_some(),
+                });
+            }
+            Ok(result)
+        })
+    }
+
+    /// Archive an explicit workspace-scoped selection without stopping processes.
+    fn script_archive(
+        &self,
+        workspace_id: WorkspaceId,
+        script_ids: Vec<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, script_ids);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::script_archive not implemented".into(),
+            ))
+        })
+    }
+
+    /// Restore retained definitions without starting processes.
+    fn script_restore(
+        &self,
+        workspace_id: WorkspaceId,
+        script_ids: Vec<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, script_ids);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::script_restore not implemented".into(),
             ))
         })
     }
@@ -7014,13 +7076,15 @@ pub trait WorkspaceApi: Send + Sync {
     /// `file.read`: the file's UTF-8 contents as a **bare JSON string** (not an
     /// object), per the TS `ws.file.read` builder (PROTOCOL §5.10).
     /// `caller_agent_id` enables `CoW` sandbox containment (prefers sandbox path).
+    /// `git_root_id` selects a registered root owned by this workspace instead.
     fn file_read(
         &self,
         workspace_id: WorkspaceId,
         path: String,
         caller_agent_id: Option<AgentId>,
+        git_root_id: Option<WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, path, caller_agent_id);
+        let _ = (workspace_id, path, caller_agent_id, git_root_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::file_read not implemented".to_string(),
@@ -7034,6 +7098,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// monorepo#2458). `length` is capped at 16 MiB decoded (over-cap →
     /// `Error::InvalidParams`); a read at/past EOF returns an empty chunk.
     /// `caller_agent_id` enables `CoW` sandbox containment (prefers sandbox path).
+    /// `git_root_id` selects a registered root owned by this workspace instead.
     fn file_read_chunk(
         &self,
         workspace_id: WorkspaceId,
@@ -7041,8 +7106,16 @@ pub trait WorkspaceApi: Send + Sync {
         offset: u64,
         length: u64,
         caller_agent_id: Option<AgentId>,
+        git_root_id: Option<WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, path, offset, length, caller_agent_id);
+        let _ = (
+            workspace_id,
+            path,
+            offset,
+            length,
+            caller_agent_id,
+            git_root_id,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::file_read_chunk not implemented".to_string(),

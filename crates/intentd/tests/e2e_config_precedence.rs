@@ -285,8 +285,8 @@ async fn legacy_listen_mode_is_discarded_and_stripped_on_boot() {
 /// refuse startup — the daemon boots, DISCARDS both values (neither has a
 /// catalog entry since monorepo#1000), and strips both from the file with a
 /// comment-preserving rewrite. Over the wire the retired path is unknown to
-/// `settings.get` but tolerated-and-ignored by `settings.update` (old-client
-/// compatibility). A second boot then reads the clean file untouched.
+/// `settings.get` and `settings.update`. A second boot then reads the clean
+/// file untouched.
 #[tokio::test]
 async fn legacy_workspace_overrides_discards_and_strips_on_boot() {
     let data_dir_guard = temp_data_dir();
@@ -320,8 +320,7 @@ async fn legacy_workspace_overrides_discards_and_strips_on_boot() {
             "retired path must be unknown to settings.get: {get}"
         );
 
-        // But settings.update from an old client is tolerated-and-ignored:
-        // the batch succeeds with nothing applied.
+        // An old client cannot recreate the retired key through settings.update.
         let update = uds_rpc(
             &socket,
             2,
@@ -332,9 +331,9 @@ async fn legacy_workspace_overrides_discards_and_strips_on_boot() {
         )
         .await;
         assert_eq!(
-            update["result"]["applied"],
-            json!([]),
-            "retired path must be ignored, not applied: {update}"
+            update["error"]["code"],
+            json!(-32602),
+            "retired path must be rejected: {update}"
         );
 
         // The retired [ai] table is discarded: no catalog entry, so the wire

@@ -7,6 +7,8 @@
 //! M5.1 self-signed fingerprint. A separate insecure-mode test proves the
 //! plain-`ws://` accept path serves JSON-RPC with no TLS and no bearer token.
 
+#[path = "wss_integration/comment_deletion.rs"]
+mod comment_deletion;
 mod common;
 #[path = "wss_integration/discovery_context.rs"]
 mod discovery_context;
@@ -18,17 +20,29 @@ mod human_attribution;
 mod imported_queue_authorization;
 #[path = "wss_integration/integration_context.rs"]
 mod integration_context;
+#[cfg(unix)]
+#[path = "wss_integration/linked_skills.rs"]
+mod linked_skills;
 #[path = "wss_integration/resource_context.rs"]
 mod resource_context;
+#[path = "wss_integration/script_lifecycle.rs"]
+mod script_lifecycle;
 #[path = "wss_integration/sharing.rs"]
 mod sharing;
 #[path = "wss_integration/skills.rs"]
 mod skills;
+#[path = "wss_integration/task_list_latency.rs"]
+mod task_list_latency;
+#[cfg(unix)]
+#[path = "wss_integration/terminal_replay.rs"]
+mod terminal_replay;
 
 #[path = "wss_integration/authenticated_devices.rs"]
 mod authenticated_devices;
 #[path = "wss_integration/member_transport.rs"]
 mod member_transport;
+#[path = "wss_integration/note_search.rs"]
+mod note_search;
 #[path = "wss_integration/personal_pairing.rs"]
 mod personal_pairing;
 #[path = "wss_integration/workspace_delete.rs"]
@@ -19732,6 +19746,127 @@ async fn wss_file_attachment_idempotency_key_round_trip() {
     srv.ws.stop().await;
 }
 
+/// Registered-root file reads retain root identity and containment over WSS.
+#[intent_test_macros::daemon_test]
+async fn wss_file_read_registered_roots() {
+    use base64::Engine as _;
+
+    let srv = start(WsOptions::default()).await;
+    let dir = test_tempdir("intentd-wss-read-roots-");
+    let primary = dir.path().join("primary");
+    let nested = primary.join("nested");
+    let external = dir.path().join("external");
+    for path in [&primary, &nested, &external] {
+        std::fs::create_dir_all(path).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(path)
+            .status()
+            .unwrap()
+            .success());
+    }
+    let ws = WorkspaceId::new();
+    let foreign_ws = WorkspaceId::new();
+    let mut w = fixture_workspace(&ws);
+    w.worktree_path = Some(primary.to_string_lossy().into_owned());
+    srv.store.insert_workspace(&w).await.unwrap();
+    srv.store
+        .insert_workspace(&fixture_workspace(&foreign_ws))
+        .await
+        .unwrap();
+    std::fs::write(primary.join("new.txt"), "primary").unwrap();
+
+    for (path, content) in [(&nested, "nested"), (&external, "external")] {
+        std::fs::write(path.join("new.txt"), content).unwrap();
+        let ts = now_iso();
+        let mut root = intent_core::WorkspaceGitRoot {
+            id: intent_core::WorkspaceGitRootId::new(),
+            workspace_id: ws.clone(),
+            path: path.to_string_lossy().into_owned(),
+            source: intent_core::WorkspaceGitRootSource::Agent,
+            repo_owner: None,
+            repo_name: None,
+            registered_by_agent_ids: vec![],
+            registered_commit_sha: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            pull_requests: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+        };
+        srv.store.upsert_workspace_git_root(&root).await.unwrap();
+        let request = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "file.read",
+            "params": { "workspaceId": ws, "gitRootId": root.id, "path": "new.txt" }
+        });
+        let response = wss_call(srv.port, srv.cfg.clone(), &request.to_string()).await;
+        assert_eq!(response["result"], content, "{response}");
+        assert_eq!(response["id"], 1);
+        assert_eq!(response["jsonrpc"], "2.0");
+
+        let payload = [0xff, 0xfe, 0x01, 0x02];
+        std::fs::write(path.join("binary.bin"), payload).unwrap();
+        let chunk_request = serde_json::json!({
+            "jsonrpc": "2.0", "id": 3, "method": "file.readChunk",
+            "params": { "workspaceId": ws, "gitRootId": root.id, "path": "binary.bin", "offset": 1, "length": 2 }
+        });
+        let response = wss_call(srv.port, srv.cfg.clone(), &chunk_request.to_string()).await;
+        assert_eq!(
+            response["result"],
+            serde_json::json!({
+                "content": base64::engine::general_purpose::STANDARD.encode(&payload[1..3]),
+                "bytesRead": 2, "size": 4
+            }),
+            "{response}"
+        );
+        for request in [&request, &chunk_request] {
+            for escape in [
+                "../new.txt".to_owned(),
+                primary.join("new.txt").to_string_lossy().into_owned(),
+            ] {
+                let mut denied = request.clone();
+                denied["params"]["path"] = serde_json::json!(escape);
+                let response = wss_call(srv.port, srv.cfg.clone(), &denied.to_string()).await;
+                assert_eq!(response["error"]["code"], -32603, "{response}");
+            }
+        }
+        // A foreign registered id is indistinguishable from that same unknown id.
+        srv.store.delete_workspace_git_root(&root.id).await.unwrap();
+        root.workspace_id = foreign_ws.clone();
+        srv.store.upsert_workspace_git_root(&root).await.unwrap();
+        for request in [&request, &chunk_request] {
+            let foreign = wss_call(srv.port, srv.cfg.clone(), &request.to_string()).await;
+            srv.store.delete_workspace_git_root(&root.id).await.unwrap();
+            let unknown = wss_call(srv.port, srv.cfg.clone(), &request.to_string()).await;
+            assert_eq!(foreign["error"]["code"], -32602, "{foreign}");
+            assert_eq!(foreign["error"], unknown["error"]);
+            srv.store.upsert_workspace_git_root(&root).await.unwrap();
+        }
+    }
+    for selector in [None, Some(""), Some("   ")] {
+        let mut request = serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "file.read",
+            "params": { "workspaceId": ws, "path": "new.txt" }
+        });
+        if let Some(selector) = selector {
+            request["params"]["gitRootId"] = serde_json::json!(selector);
+        }
+        let response = wss_call(srv.port, srv.cfg.clone(), &request.to_string()).await;
+        assert_eq!(response["result"], "primary", "{response}");
+        request["method"] = serde_json::json!("file.readChunk");
+        request["params"]["offset"] = serde_json::json!(0);
+        request["params"]["length"] = serde_json::json!(16);
+        let response = wss_call(srv.port, srv.cfg.clone(), &request.to_string()).await;
+        assert_eq!(
+            response["result"]["content"],
+            base64::engine::general_purpose::STANDARD.encode("primary"),
+            "{response}"
+        );
+    }
+    srv.ws.stop().await;
+}
+
 /// `file.readChunk` over the real WSS wire (PROTOCOL §5.9, v6.18,
 /// monorepo#2458): raw bytes of a binary workspace file are served as
 /// offset-windowed base64 chunks `{ content, bytesRead, size }` and
@@ -22667,4 +22802,179 @@ async fn wss_quick_action_effort_settings_and_execution_contract() {
         .unwrap()
         .contains("session/prompt"));
     srv.ws.stop().await;
+}
+
+/// First assignment owns every socket before writing and serves authenticated
+/// WSS only after the registry accepts that write. Two racing callers commit once.
+#[intent_test_macros::daemon_test]
+async fn port_assignment_reserves_persists_then_serves_and_reuses() {
+    if !ipv6_loopback_available() {
+        return;
+    }
+    let hog = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let base = hog.local_addr().unwrap().port();
+    let (api, bus, _store, registry, dir) = make_services(None, None).await;
+    let snapshot = registry.snapshot();
+    let tls = ensure_tls_certificate(dir.path()).unwrap();
+    let tokens = Arc::new(MemTokenStore::default());
+    tokens.store_token(TOKEN).unwrap();
+    let tokens = Arc::new(AsyncTokenStore::new(tokens));
+    let addresses = vec![
+        Ipv4Addr::LOCALHOST.into(),
+        std::net::Ipv6Addr::LOCALHOST.into(),
+    ];
+    let ws = WsApiServer::new(
+        api,
+        bus,
+        &tls,
+        &tokens,
+        WsOptions {
+            base_port: base,
+            bind_addresses: addresses.clone(),
+            ..WsOptions::default()
+        },
+        None,
+    )
+    .unwrap();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let persist = {
+        let registry = registry.clone();
+        let calls = calls.clone();
+        move |port| {
+            for address in &addresses {
+                assert!(
+                    StdTcpListener::bind((*address, port)).is_err(),
+                    "all sockets reserved at commit"
+                );
+            }
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            registry
+                .persist_selected_ws_api_port(&snapshot, port)
+                .map_err(std::io::Error::other)
+        }
+    };
+    let (a, b) = tokio::join!(
+        ws.start_with_port_assignment(persist.clone()),
+        ws.start_with_port_assignment(persist)
+    );
+    let port = a.unwrap();
+    assert!(port > base);
+    assert_eq!(b.unwrap(), port);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        registry.snapshot().ws_api_port_policy(),
+        intent_services::WsApiPortPolicy::Fixed(port)
+    );
+    let mut client = connect_ws(port, client_config(&tls.fingerprint256)).await;
+    client.send(Message::Text(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"settings.get","params":{"path":"server.wsApi.port"}}).to_string().into())).await.unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Message::Text(text) = client
+                .next()
+                .await
+                .expect("WSS response")
+                .expect("WSS frame")
+            {
+                let frame: Value = serde_json::from_str(&text).unwrap();
+                if frame["id"] == 1 {
+                    break frame;
+                }
+            }
+        }
+    })
+    .await
+    .expect("settings response before timeout");
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["result"]["value"].as_f64(), Some(f64::from(port)));
+    drop(client);
+    ws.stop().await;
+    drop(hog);
+    let again = ws
+        .start_with_port_assignment(|_| panic!("must never assign twice"))
+        .await
+        .unwrap();
+    assert_eq!(
+        again, port,
+        "freeing preferred port does not move the assignment"
+    );
+    ws.stop().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn port_assignment_failure_drops_reservations_without_readiness() {
+    let (api, bus, _store, registry, dir) = make_services(None, None).await;
+    let tls = ensure_tls_certificate(dir.path()).unwrap();
+    let tokens = Arc::new(AsyncTokenStore::new(Arc::new(MemTokenStore::default())));
+    // Ephemeral first bind is only a hermetic transport seam here; daemon
+    // composition never combines env-zero with assignment.
+    let ws = WsApiServer::new(
+        api,
+        bus,
+        &tls,
+        &tokens,
+        WsOptions {
+            base_port: 0,
+            bind_addresses: vec![Ipv4Addr::LOCALHOST.into()],
+            ..WsOptions::default()
+        },
+        None,
+    )
+    .unwrap();
+    let held_port = Arc::new(std::sync::atomic::AtomicU16::new(0));
+    let observed = held_port.clone();
+    let snapshot = registry.snapshot();
+    let config = dir.path().join("config.toml");
+    std::fs::write(&config, "# external edit\n").unwrap();
+    let error = ws
+        .start_with_port_assignment(move |port| {
+            observed.store(port, std::sync::atomic::Ordering::SeqCst);
+            assert!(StdTcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_err());
+            registry
+                .persist_selected_ws_api_port(&snapshot, port)
+                .map_err(std::io::Error::other)
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("changed"), "{error}");
+    assert_eq!(ws.bound_port().await, None);
+    let port = held_port.load(std::sync::atomic::Ordering::SeqCst);
+    assert_ne!(port, 0);
+    let released = StdTcpListener::bind((Ipv4Addr::LOCALHOST, port))
+        .expect("no listener leaked after persistence error");
+    drop(released);
+    assert_eq!(
+        std::fs::read_to_string(config).unwrap(),
+        "# external edit\n"
+    );
+    ws.stop().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn port_assignment_stop_cancels_scan_without_commit_or_socket_leak() {
+    let hog = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let base = hog.local_addr().unwrap().port();
+    let (api, bus, _store, _registry, _dir) = make_services(None, None).await;
+    let ws = WsApiServer::new_insecure(
+        api,
+        bus,
+        WsOptions {
+            base_port: base,
+            bind_addresses: vec![Ipv4Addr::LOCALHOST.into()],
+            ..WsOptions::default()
+        },
+        None,
+    );
+    let (started, ()) = tokio::join!(
+        ws.start_with_port_assignment(|_| panic!("cancelled scan must not commit")),
+        ws.stop()
+    );
+    assert_eq!(started.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
+    assert_eq!(ws.bound_port().await, None);
+    drop(hog);
+    assert_eq!(
+        ws.start().await.unwrap(),
+        base,
+        "cancelled start leaves server reusable"
+    );
+    ws.stop().await;
 }

@@ -361,6 +361,8 @@ pub(crate) const GOAL_UPDATED: &str = "goal:updated";
 
 // Comment events.
 pub const COMMENT_ADDED: &str = "comment:added";
+/// A durable deletion; retain the thread identity after the row is gone.
+pub const COMMENT_DELETED: &str = "comment:deleted";
 // Emitted by `comment.resolveThread` when a thread is (un)resolved. The
 // self-sufficient payload `{ noteId, threadId, resolved }` lets a client flip
 // the thread's resolved state without a follow-up read.
@@ -662,6 +664,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     SPEC_UPDATED,
     GOAL_UPDATED,
     COMMENT_ADDED,
+    COMMENT_DELETED,
     COMMENT_RESOLVED,
     PRESENCE_CHANGED,
     NOTE_PRESENCE,
@@ -820,7 +823,7 @@ pub fn is_known_event_type(event_type: &str) -> bool {
 /// Owner-only by design (never listed): `terminal:*` (raw PTY bytes),
 /// `host:exec:*` (host command output), `script:*` (host process output /
 /// state), `browser:*` (the owner's tabs), `hook:run-*` (hook code and carried state),
-/// `agent:permission:*` (tool-permission prompts are the owner's to answer),
+/// `agent:permission:*` (separately admitted for current workspace managers),
 /// `workspace:transfer:*` and `git:clone:*` (host paths / transfer
 /// progress), `gitRoot:*` (host paths), `test:*` / `build:*` (host process
 /// results), `app:*` (steers a client's UI; owner clients only, like reverse
@@ -868,6 +871,7 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (CLIENT_DISCONNECTED, "Authenticated devices: same audience as client.list; final connection departed."),
     (CLIENT_UPDATED, "Authenticated devices: full row after metadata, profile or role changes; same audience as client.list."),
     (COMMENT_ADDED, "Comment: a comment landed on a note."),
+    (COMMENT_DELETED, "Comment: a comment was deleted from a note."),
     (COMMENT_RESOLVED, "Comment: a thread was resolved."),
     (DRAFT_CHANGED, "Draft: a client's composer draft exists or was cleared; { workspaceId, agentId, clientId, hasDraft } — never the text."),
     (FILE_CHANGED, "File: a watched file changed; payload paths are workspace-relative (`events::watcher::relative_path`), never absolute."),
@@ -941,7 +945,8 @@ pub fn is_collaborator_event_type(event_type: &str) -> bool {
 
 /// Additional types available to active host members. Workspace types still
 /// require effective access to the referenced ordinary workspace; global
-/// membership/context notifications have explicit delivery rules.
+/// membership/context notifications have explicit delivery rules. Permission
+/// types also admit guests with current workspace-management authority.
 pub const MEMBER_EVENT_TYPES: &[&str] = &[
     AGENT_PERMISSION_REQUEST,
     AGENT_PERMISSION_RESOLVED,
@@ -981,4 +986,14 @@ pub const MEMBER_EVENT_TYPES: &[&str] = &[
 #[must_use]
 pub fn is_member_execution_event_type(event_type: &str) -> bool {
     MEMBER_EVENT_TYPES.contains(&event_type)
+}
+
+/// Permission events use the current workspace-management grant, including
+/// retained guest ownership, rather than general host execution authority.
+#[must_use]
+pub fn is_permission_event_type(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        AGENT_PERMISSION_REQUEST | AGENT_PERMISSION_RESOLVED
+    )
 }

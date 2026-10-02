@@ -182,12 +182,14 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// GitLab snippet proof by `provider`); the `github.identityProof.*` pair
 /// stays as byte-identical aliases.
 /// Direct user retirement (protocol 10.10): +1 router method (`agent.retire`).
-const EXPECTED_TOTAL_METHODS: usize = 408;
+/// Reversible script history (protocol 10.11): +2 router methods
+/// (`script.archive`, `script.restore`).
+const EXPECTED_TOTAL_METHODS: usize = 410;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 348;
+const EXPECTED_ROUTER_METHODS: usize = 350;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 58;
@@ -775,11 +777,13 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "rules.update",
     "sandbox.cow.discard",
     "sandbox.cow.merge",
+    "script.archive",
     "script.create",
     "script.list",
     "script.output",
     "script.remove",
     "script.restart",
+    "script.restore",
     "script.run",
     "script.start",
     "script.status",
@@ -1306,11 +1310,13 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "rules.update",
     "sandbox.cow.discard",
     "sandbox.cow.merge",
+    "script.archive",
     "script.create",
     "script.list",
     "script.output",
     "script.remove",
     "script.restart",
+    "script.restore",
     "script.run",
     "script.start",
     "script.status",
@@ -1918,6 +1924,14 @@ mod unbound_owner_only_methods {
             (
                 "sandbox.cow.merge",
                 json!({ "workspaceId": ws, "agentId": "a1" }),
+            ),
+            (
+                "script.archive",
+                json!({"workspaceId": ws, "scriptIds": ["s1"]}),
+            ),
+            (
+                "script.restore",
+                json!({"workspaceId": ws, "scriptIds": ["s1"]}),
             ),
             (
                 "script.create",

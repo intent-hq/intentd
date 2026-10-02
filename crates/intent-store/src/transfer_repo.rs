@@ -98,6 +98,12 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
 /// new table cannot silently skip the transfer decision.
 #[cfg(test)]
 pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
+    ("note_search_ctx", "derived note search identities/context; note import triggers rebuild them"),
+    ("note_fts", "derived note full-text index; note import triggers rebuild it"),
+    ("note_fts_config", "FTS5 shadow table of the derived note index"),
+    ("note_fts_data", "FTS5 shadow table of the derived note index"),
+    ("note_fts_docsize", "FTS5 shadow table of the derived note index"),
+    ("note_fts_idx", "FTS5 shadow table of the derived note index"),
     (
         "_sqlx_migrations",
         "sqlx's own migration bookkeeping; every database maintains its own",
@@ -1511,7 +1517,7 @@ completion_watch: id, parent_workspace_id, child_workspace_id, parent_agent_id, 
 event_subscription: id, workspace_id, subscriber_agent_id, event_types, exclude_self, batch_window_ms, created_at
 hook: hook_id, workspace_id, agent_id, name, code, delay_ms, state, created_at, last_run_at, next_run_at, run_count, last_error, last_logs, last_state, expires_at, perpetual, dispatch_count, cron, run_at
 pr_monitor: monitor_id, workspace_id, agent_id, repo_owner, repo_name, pr_number, state, last_snapshot, pending_changes, pending_since, last_change_at, last_polled_at, last_error, created_at, updated_at, baseline_snapshot
-script: id, workspace_id, name, command, cwd, env, mode, category, source, auto_start, created_at, updated_at, was_running
+script: id, workspace_id, name, command, cwd, env, mode, category, source, auto_start, created_at, updated_at, was_running, purpose, archived_at, last_run, pending_run_id, pending_started_at
 task_agent_link: workspace_id, note_id, task_key, task_text, agent_id, created_at
 sandbox: id, workspace_id, agent_id, path, branch, base_commit_sha, snapshot_commit_sha, status, created_at, updated_at, retry_count
 tracked_changes: id, workspace_id, path, stage, status, agent_id, session_id, turn, commit_hash, old_blob_sha, new_blob_sha, additions, deletions, created_at, updated_at

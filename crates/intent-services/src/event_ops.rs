@@ -33,7 +33,8 @@ pub(crate) fn is_collaborator_caller() -> bool {
     )
 }
 
-/// Narrow a durable event read to the collaborator allowlist when the caller
+/// Narrow a durable event read to the collaborator allowlist plus permission
+/// types (whose workspace grants are enforced separately in SQL) when the caller
 /// is a collaborator ([`is_collaborator_caller`]); a no-op for everyone
 /// else. The narrowing is pushed into the SQL type filter so paging and
 /// limits stay exact: an explicit type list keeps only allowlisted entries,
@@ -48,6 +49,7 @@ pub(crate) fn narrow_query_for_caller(q: &mut EventQuery, member: bool) -> bool 
     if !q.event_types.is_empty() {
         q.event_types.retain(|t| {
             is_collaborator_event_type(t.as_str())
+                || intent_core::events::is_permission_event_type(t)
                 || (member && intent_core::events::is_member_execution_event_type(t))
         });
         return !q.event_types.is_empty();
@@ -56,7 +58,7 @@ pub(crate) fn narrow_query_for_caller(q: &mut EventQuery, member: bool) -> bool 
         intent_core::events::MEMBER_EVENT_TYPES
             .iter()
             .copied()
-            .filter(|_| member),
+            .filter(|t| member || intent_core::events::is_permission_event_type(t)),
     );
     q.event_types = match q.event_type_prefix.take() {
         Some(prefix) => allowed
@@ -80,6 +82,7 @@ impl crate::Services {
                     intent_core::HostRole::Member | intent_core::HostRole::Owner
                 );
                 if !member {
+                    q.guest_permission_principal_id = Some(principal_id.clone());
                     q.client_principal_id = Some(principal_id);
                 }
                 member

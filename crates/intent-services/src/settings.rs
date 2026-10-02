@@ -21,8 +21,9 @@
 //! from the registry snapshot (`Services::effective_settings`); the `SQLite`
 //! `settings` table only persists the machine-state blobs. Retired keys
 //! (`model.workspaceOverrides`, monorepo#1000) have no catalog entry:
-//! `settings.update` tolerates-and-ignores them and
-//! [`cleanup_retired_settings`] deletes their stale rows on boot.
+//! writes to this path fail as unknown settings. Boot-only compatibility
+//! strips legacy config values and [`cleanup_retired_settings`] deletes stale
+//! rows without restoring a writable setting.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -43,10 +44,10 @@ use crate::settings_registry::{SettingOrigin, SettingsRegistry, KNOWN_PATHS};
 pub(crate) const REDACTED_PLACEHOLDER: &str = "********";
 
 /// The retired per-workspace model override path (monorepo#1000). No catalog
-/// entry remains: `settings.get`/`settings.reset` reject it as unknown, but
-/// old clients still writing it via `settings.update` are tolerated-and-
-/// ignored, and [`cleanup_retired_settings`] deletes the stale `SQLite` row on
-/// boot.
+/// entry remains: `settings.get`/`settings.reset`/`settings.update` reject it
+/// as unknown. This terminal-state shim only names the stale `SQLite` row
+/// that [`cleanup_retired_settings`] deletes on boot. Legacy config parsing
+/// and stripping remain supported independently of settings writes.
 pub(crate) const RETIRED_WORKSPACE_OVERRIDES_PATH: &str = "model.workspaceOverrides";
 
 /// The retired `backgroundAgents.*` paths, renamed to `quickActions.*`
@@ -188,9 +189,12 @@ const DEFAULT_WARN_INTERVAL: Duration = Duration::from_secs(60);
 /// `delete` on the same account to finish ([`AsyncSecretStore::settle_detached`]).
 /// Three write budgets: long enough for a slow disk or a keychain prompt that
 /// is answered promptly, short enough that a wedged backing store cannot hold
-/// the settings gates (and every `settings.*` caller) indefinitely. Past the
+/// that credential's settings/forge gates indefinitely. Past the
 /// cap the credential state is unknown and the caller must not blind-restore.
 const DEFAULT_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[cfg(test)]
+type MutationHook<T> = Arc<Mutex<Option<Box<dyn FnOnce() -> T + Send>>>>;
 
 /// Async, single-flight, TTL-cached wrapper around a synchronous [`SecretStore`]
 /// so blocking secret-store calls (file I/O) never wedge
@@ -199,9 +203,38 @@ const DEFAULT_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// coalesced per account via single-flight so a hung backing store occupies at
 /// most one blocking-pool thread total (not one per request). Cache entries are
 /// invalidated on successful writes and expire on TTL.
+#[derive(Clone)]
 pub(crate) struct AsyncSecretStore {
     inner: Arc<dyn SecretStore>,
     state: Arc<Mutex<AsyncState>>,
+    mutation_tasks: Arc<crate::delivery_tasks::DeliveryTasks>,
+    mutation_owner: Option<u64>,
+    mutation_timeout: Option<Arc<tokio::sync::Notify>>,
+    #[cfg(test)]
+    before_mutation_admission: MutationHook<()>,
+    #[cfg(test)]
+    completion_start: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+    #[cfg(test)]
+    pending_polled: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    #[cfg(test)]
+    pub(crate) panic_mutation_caller: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+    #[cfg(test)]
+    pub(crate) before_github_persistence: MutationHook<Result<()>>,
+    #[cfg(test)]
+    pub(crate) github_poll_worker_failed: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    pub(crate) github_poll_sleep_pending: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    #[cfg(test)]
+    pub(crate) before_gitlab_persistence: MutationHook<Result<()>>,
+    #[cfg(test)]
+    pub(crate) gitlab_poll_worker_failed: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    pub(crate) writer_drain_pending: Arc<Mutex<Option<tokio::sync::oneshot::Sender<&'static str>>>>,
+    /// Shared by settings, revoke and the device flow's persistence lease.
+    /// A ledger may compensate only the generation it wrote, under this lock.
+    github_mutation: Arc<tokio::sync::Mutex<u64>>,
+    #[cfg(test)]
+    github_lock_pending: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
     load_timeout: Duration,
     write_timeout: Duration,
     cache_ttl: Duration,
@@ -222,7 +255,43 @@ struct AsyncState {
     /// be cancelled, so the mutation may still land; the handles are kept so
     /// [`AsyncSecretStore::settle_detached`] can wait for them before a
     /// compensating write touches the same account.
-    detached: Vec<(String, tokio::task::JoinHandle<Result<()>>)>,
+    mutations: Vec<Arc<SecretMutation>>,
+    next_mutation: u64,
+    next_owner: u64,
+}
+
+/// Results remain attached to the originating operation until it acknowledges
+/// them. Serialization observers never consume that operation's receipt.
+struct SecretMutation {
+    id: u64,
+    owner: Option<u64>,
+    account: String,
+    state: tokio::sync::Mutex<MutationState>,
+    timed_out: std::sync::atomic::AtomicBool,
+    settling: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    after_capture: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+enum MutationState {
+    Unstarted(Option<Box<dyn FnOnce() -> Result<()> + Send>>),
+    Pending(tokio::task::JoinHandle<Result<()>>),
+    Captured(Result<()>),
+    Finalized {
+        result: Option<Result<()>>,
+        outcome: std::result::Result<(), String>,
+    },
+}
+
+#[cfg(test)]
+#[path = "settings_shutdown_tests.rs"]
+mod shutdown_tests;
+
+struct SettlementObserver<'a>(&'a std::sync::atomic::AtomicUsize);
+impl Drop for SettlementObserver<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// One per-account cache slot: either an in-flight load that later resolvers
@@ -275,8 +344,36 @@ impl AsyncSecretStore {
                 entries: HashMap::new(),
                 last_warn: HashMap::new(),
                 next_load_id: 0,
-                detached: Vec::new(),
+                mutations: Vec::new(),
+                next_mutation: 0,
+                next_owner: 0,
             })),
+            mutation_tasks: Arc::new(crate::delivery_tasks::DeliveryTasks::default()),
+            mutation_owner: None,
+            mutation_timeout: None,
+            #[cfg(test)]
+            before_mutation_admission: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            completion_start: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            pending_polled: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            panic_mutation_caller: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            before_github_persistence: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            github_poll_worker_failed: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            github_poll_sleep_pending: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            before_gitlab_persistence: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            gitlab_poll_worker_failed: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            writer_drain_pending: Arc::new(Mutex::new(None)),
+            github_mutation: Arc::new(tokio::sync::Mutex::new(0)),
+            #[cfg(test)]
+            github_lock_pending: Arc::new(Mutex::new(None)),
             load_timeout,
             write_timeout,
             cache_ttl,
@@ -285,10 +382,47 @@ impl AsyncSecretStore {
         }
     }
 
+    /// Acquire token + provenance ownership, settling detached settings writes
+    /// before another mutation. Device persistence retains an owned guard in
+    /// its blocking write lease; waiting for that lease is bounded too.
+    pub(crate) async fn github_mutation(&self) -> Result<tokio::sync::OwnedMutexGuard<u64>> {
+        let acquire = self.github_mutation.clone().lock_owned();
+        #[cfg(test)]
+        let acquire = {
+            let mut acquire = Box::pin(acquire);
+            std::future::poll_fn(move |cx| {
+                use std::future::Future;
+                let result = acquire.as_mut().poll(cx);
+                if result.is_pending() {
+                    if let Some(signal) = self.github_lock_pending.lock().unwrap().take() {
+                        let _ = signal.send(());
+                    }
+                }
+                result
+            })
+        };
+        let guard = timeout(self.settle_timeout, acquire).await.map_err(|_| {
+            Error::Internal(
+                "GitHub credential mutation is still running; credential state is unknown".into(),
+            )
+        })?;
+        for account in [
+            crate::github_auth_ops::SECRET_ACCOUNT,
+            crate::source_control_auth_ops::GITHUB_TOKEN_METHOD_ACCOUNT,
+        ] {
+            self.settle_detached(account).await?;
+            // The device engine persists through FileSecretStore under its
+            // lease, outside this wrapper. Discard cached/in-flight snapshots
+            // before a new owner or finalizer observes that completed write.
+            self.state.lock().unwrap().entries.remove(account);
+        }
+        Ok(guard)
+    }
+
     /// Override the [`settle_detached`](Self::settle_detached) cap so a test can
     /// drive the past-the-cap path without waiting out the production budget.
     #[cfg(test)]
-    fn with_settle_timeout(mut self, settle_timeout: Duration) -> Self {
+    pub(crate) fn with_settle_timeout(mut self, settle_timeout: Duration) -> Self {
         self.settle_timeout = settle_timeout;
         self
     }
@@ -357,134 +491,365 @@ impl AsyncSecretStore {
         self.load(account).await
     }
 
-    /// Persist `value` for `account`. Runs the blocking write off the async
-    /// runtime with a bounded timeout, then refreshes the cache slot so
-    /// subsequent `load` calls observe the new value without re-hitting the
-    /// backing store. Timeouts / backing errors surface as [`Error::Internal`].
-    pub(crate) async fn store(&self, account: &str, value: &str) -> Result<()> {
-        let inner = self.inner.clone();
-        let account_owned = account.to_string();
-        let value_owned = value.to_string();
-        let mut handle =
-            tokio::task::spawn_blocking(move || inner.store(&account_owned, &value_owned));
-        match timeout(self.write_timeout, &mut handle).await {
-            Ok(Ok(Ok(()))) => {
-                self.set_cached(account, Some(value.to_string()));
-                Ok(())
-            }
-            Ok(Ok(Err(e))) => Err(e),
-            Ok(Err(join_err)) => Err(Error::Internal(format!(
-                "secret-store write task panicked: {join_err}"
-            ))),
-            Err(_) => {
-                self.warn_timeout(account, "secret-store write timed out");
-                self.detach(account, handle);
-                Err(Error::Internal(format!(
-                    "secret-store write timed out for {account}"
-                )))
-            }
+    /// A private receipt namespace for one admitted settings operation. The
+    /// backend/cache and completion owners remain shared across all clones.
+    pub(crate) fn operation(&self) -> Self {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let owner = state.next_owner;
+        state.next_owner += 1;
+        Self {
+            mutation_owner: Some(owner),
+            ..self.clone()
         }
     }
 
-    /// Delete the stored secret for `account`. Runs the blocking delete off the
-    /// async runtime with a bounded timeout, then updates the cache to reflect
-    /// absence. Absent secrets are idempotent successes per [`SecretStore`].
-    pub(crate) async fn delete(&self, account: &str) -> Result<()> {
-        let inner = self.inner.clone();
-        let account_owned = account.to_string();
-        let mut handle = tokio::task::spawn_blocking(move || inner.delete(&account_owned));
-        match timeout(self.write_timeout, &mut handle).await {
-            Ok(Ok(Ok(()))) => {
-                self.set_cached(account, None);
-                Ok(())
-            }
-            Ok(Ok(Err(e))) => Err(e),
-            Ok(Err(join_err)) => Err(Error::Internal(format!(
-                "secret-store delete task panicked: {join_err}"
-            ))),
-            Err(_) => {
-                self.warn_timeout(account, "secret-store delete timed out");
-                self.detach(account, handle);
-                Err(Error::Internal(format!(
-                    "secret-store delete timed out for {account}"
-                )))
-            }
+    /// Direct credential/config owners retain their continuation after the
+    /// caller's write budget expires. Only the response is allowed to time out.
+    pub(crate) fn settled_operation(&self, expired: Arc<tokio::sync::Notify>) -> Self {
+        Self {
+            mutation_timeout: Some(expired),
+            ..self.operation()
         }
     }
 
-    /// Keep the handle of a timed-out write / delete so a later
-    /// [`settle_detached`](Self::settle_detached) can wait for it. Finished
-    /// handles are pruned on every insert, so the list stays bounded by the
-    /// number of mutations still running.
-    fn detach(&self, account: &str, handle: tokio::task::JoinHandle<Result<()>>) {
-        let mut state = self.state.lock().unwrap();
-        state.detached.retain(|(_, h)| !h.is_finished());
-        state.detached.push((account.to_string(), handle));
+    #[cfg(test)]
+    pub(crate) fn mutation_counts_for_test(&self) -> (usize, u64) {
+        let state = self.state.lock().unwrap();
+        (state.mutations.len(), state.next_owner)
     }
 
-    /// Wait until every timed-out write / delete on `account` has finished, so
-    /// a compensating write issued afterwards cannot be undone by a mutation
-    /// that was still running. `Ok(false)` when no such mutation existed,
-    /// `Ok(true)` once all of them landed (the cache slot is dropped because
-    /// the late completion bypassed the cache refresh). The wait is bounded by
-    /// [`DEFAULT_SETTLE_TIMEOUT`]: a `spawn_blocking` task cannot be cancelled,
-    /// so past the cap the mutation may still land later and the account's
-    /// state is unknown — `Err(Error::Internal)` tells the caller to surface
-    /// that instead of blind-restoring, and the unfinished handles go back on
-    /// the list so a later settle still waits for them.
-    pub(crate) async fn settle_detached(&self, account: &str) -> Result<bool> {
-        let handles: Vec<_> = {
-            let mut state = self.state.lock().unwrap();
-            let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut state.detached)
-                .into_iter()
-                .partition(|(a, _)| a == account);
-            state.detached = rest;
-            mine.into_iter().map(|(_, h)| h).collect()
-        };
-        if handles.is_empty() {
-            return Ok(false);
+    /// Settle and acknowledge only this originating operation's receipts.
+    /// Called with its account guards held, after response/compensation handling.
+    pub(crate) async fn finish_operation(&self) {
+        let records: Vec<_> = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .mutations
+            .iter()
+            .filter(|record| record.owner == self.mutation_owner)
+            .cloned()
+            .collect();
+        for record in records {
+            if let Err(error) = self.finish_mutation(&record).await {
+                tracing::warn!(account = %record.account, %error, "settings mutation settled with failure");
+            }
+            self.acknowledge(&record);
         }
-        let deadline = Instant::now() + self.settle_timeout;
-        let mut handles = handles.into_iter();
-        while let Some(mut handle) = handles.next() {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            match timeout(remaining, &mut handle).await {
-                Ok(Ok(Ok(()))) => {}
-                Ok(Ok(Err(e))) => tracing::warn!(
-                    account = %account,
-                    error = %e,
-                    "timed-out secret-store mutation finished with an error"
-                ),
-                Ok(Err(join_err)) => tracing::warn!(
-                    account = %account,
-                    error = %join_err,
-                    "timed-out secret-store mutation panicked"
-                ),
-                Err(_) => {
-                    let unfinished: Vec<_> = std::iter::once(handle)
-                        .chain(handles)
-                        .map(|h| (account.to_string(), h))
-                        .collect();
-                    let pending = unfinished.len();
-                    self.state.lock().unwrap().detached.extend(unfinished);
-                    tracing::warn!(
-                        account = %account,
-                        pending,
-                        cap_secs = self.settle_timeout.as_secs_f64(),
-                        "secret-store mutation still running past the settle cap; credential state unknown"
-                    );
-                    return Err(Error::Internal(format!(
-                        "secret-store mutation on {account} still running after {:.0?}; the stored credential state is unknown — reconcile it (re-authenticate) before retrying",
-                        self.settle_timeout
-                    )));
+    }
+
+    pub(crate) async fn shutdown_mutations(&self) {
+        self.mutation_tasks.drain_finite().await;
+    }
+
+    fn acknowledge(&self, record: &SecretMutation) {
+        // Only the originating operation may retire a finalized receipt.
+        debug_assert_eq!(record.owner, self.mutation_owner);
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .mutations
+            .retain(|entry| entry.id != record.id);
+    }
+
+    /// Polling observers borrow the handle. Ready -> Captured is synchronous
+    /// under the record lock, before finalization can fail or suspend. A later
+    /// observer never polls a `JoinHandle` whose output has already been taken.
+    async fn finish_mutation(&self, record: &SecretMutation) -> std::result::Result<(), String> {
+        let mut state = record.state.lock().await;
+        if let MutationState::Unstarted(write) = &mut *state {
+            let write = write
+                .take()
+                .ok_or_else(|| "secret mutation lost its operation".to_string())?;
+            *state = MutationState::Pending(tokio::task::spawn_blocking(write));
+        }
+        if let MutationState::Pending(handle) = &mut *state {
+            #[cfg(not(test))]
+            let joined = handle.await;
+            #[cfg(test)]
+            let joined = std::future::poll_fn(|cx| {
+                use std::future::Future;
+                let polled = std::pin::Pin::new(&mut *handle).poll(cx);
+                if polled.is_pending() {
+                    if let Some(notify) = self.pending_polled.lock().unwrap().take() {
+                        let _ = notify.send(());
+                    }
+                }
+                polled
+            })
+            .await;
+            let result = match joined {
+                Ok(result) => result,
+                Err(error) => Err(Error::Internal(format!(
+                    "secret-store mutation task panicked: {error}"
+                ))),
+            };
+            *state = MutationState::Captured(result);
+            #[cfg(test)]
+            {
+                let fail = record.after_capture.lock().unwrap().take();
+                if let Some(fail) = fail {
+                    fail();
                 }
             }
         }
-        let mut state = self.state.lock().unwrap();
-        if matches!(state.entries.get(account), Some(Entry::Cached { .. })) {
-            state.entries.remove(account);
+        if let MutationState::Captured(result) = &*state {
+            let outcome = result.as_ref().copied().map_err(ToString::to_string);
+            // Invalidate cached and in-flight values before exposing settlement.
+            let mut cache = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.entries.remove(&record.account);
+            if record.account == intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT {
+                for sibling in forge_token_secret_siblings(&record.account) {
+                    cache.entries.remove(*sibling);
+                }
+            }
+            drop(cache);
+            let MutationState::Captured(result) =
+                std::mem::replace(&mut *state, MutationState::Captured(Ok(())))
+            else {
+                unreachable!()
+            };
+            *state = MutationState::Finalized {
+                result: Some(result),
+                outcome,
+            };
         }
-        Ok(true)
+        match &*state {
+            MutationState::Finalized { outcome, .. } => outcome.clone(),
+            _ => Err("secret mutation completion unavailable".into()),
+        }
+    }
+
+    /// Only the originating writer consumes the original typed result. Other
+    /// observers use the retained diagnostic outcome without taking its receipt.
+    async fn mutation_result(&self, record: &SecretMutation) -> Result<()> {
+        let _ = self.finish_mutation(record).await;
+        let mut state = record.state.lock().await;
+        match &mut *state {
+            MutationState::Finalized { result, .. } => result
+                .take()
+                .ok_or_else(|| Error::Internal("secret mutation result already consumed".into()))?,
+            _ => Err(Error::Internal("secret mutation result unavailable".into())),
+        }
+    }
+
+    async fn mutate(
+        &self,
+        account: &str,
+        write: impl FnOnce() -> Result<()> + Send + 'static,
+    ) -> Result<()> {
+        let record = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let id = state.next_mutation;
+            state.next_mutation += 1;
+            let record = Arc::new(SecretMutation {
+                id,
+                owner: self.mutation_owner,
+                account: account.into(),
+                state: tokio::sync::Mutex::new(MutationState::Unstarted(Some(Box::new(write)))),
+                timed_out: std::sync::atomic::AtomicBool::new(false),
+                settling: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
+                after_capture: Mutex::new(None),
+            });
+            #[cfg(test)]
+            {
+                let pause = self.before_mutation_admission.lock().unwrap().take();
+                if let Some(pause) = pause {
+                    pause();
+                }
+            }
+            let this = self.clone();
+            let completion = record.clone();
+            // AsyncState -> tracker admission is synchronous. The tracker never
+            // polls this future under its lock, and its drainer releases that
+            // lock before joining. Do not await a record/task while holding
+            // AsyncState: completion uses record -> AsyncState to invalidate.
+            if self.mutation_tasks.spawn_draining(async move {
+                #[cfg(test)]
+                {
+                    let held = this.completion_start.lock().unwrap().take();
+                    if let Some(held) = held {
+                        let _ = held.await;
+                    }
+                }
+                if let Err(error) = this.finish_mutation(&completion).await {
+                    tracing::warn!(account = %completion.account, %error, "secret-store mutation failed");
+                }
+            }).is_none() {
+                // The private record was never observable. In particular, do
+                // not acknowledge here: that would re-lock AsyncState.
+                return Err(Error::Internal("daemon is shutting down".into()));
+            }
+            state.mutations.push(record.clone());
+            record
+        };
+        #[cfg(test)]
+        {
+            let fail = self.panic_mutation_caller.lock().unwrap().take();
+            if let Some(fail) = fail {
+                let _ = fail.await;
+                panic!("injected operation-worker failure with outstanding mutation");
+            }
+        }
+        if let Ok(result) = timeout(self.write_timeout, self.mutation_result(&record)).await {
+            self.acknowledge(&record);
+            result
+        } else {
+            record
+                .timed_out
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.warn_timeout(account, "secret-store write timed out");
+            if let Some(expired) = &self.mutation_timeout {
+                expired.notify_one();
+                let result = self.mutation_result(&record).await;
+                self.acknowledge(&record);
+                return result;
+            }
+            Err(Error::Internal(format!(
+                "secret-store write timed out for {account}"
+            )))
+        }
+    }
+
+    /// Caller waits remain bounded; the independently owned record retains
+    /// the actual blocking result after timeout or cancellation.
+    pub(crate) async fn store(&self, account: &str, value: &str) -> Result<()> {
+        let inner = self.inner.clone();
+        let owned_account = account.to_string();
+        let owned_value = value.to_string();
+        self.mutate(account, move || inner.store(&owned_account, &owned_value))
+            .await?;
+        self.set_cached(account, Some(value.into()));
+        Ok(())
+    }
+
+    /// Keep the engine's opaque token write in the same completion records as
+    /// provenance and orphan cleanup. Registration precedes the first effect;
+    /// cache invalidation and the actual typed result survive worker failure.
+    pub(crate) async fn persist_github_grant(
+        &self,
+        grant: intent_sourcecontrol::device_flow::GithubGrant,
+        lease: Option<intent_sourcecontrol::device_flow::IdentityLease>,
+    ) -> Result<()> {
+        let write = grant.into_persistence(lease);
+        #[cfg(test)]
+        let write = {
+            let before = self.before_github_persistence.lock().unwrap().take();
+            move || {
+                if let Some(before) = before {
+                    before()?;
+                }
+                write()
+            }
+        };
+        self.mutate(crate::github_auth_ops::SECRET_ACCOUNT, write)
+            .await
+    }
+
+    /// The primary GitLab poll retains the opaque pair write and its actual
+    /// result through the same completion records as settings mutations.
+    pub(crate) async fn persist_gitlab_grant(
+        &self,
+        grant: intent_sourcecontrol::gitlab_auth::GitlabGrant,
+        lease: intent_sourcecontrol::gitlab_auth::PersistenceLease,
+    ) -> Result<()> {
+        self.mutate_gitlab(grant.into_persistence(Some(lease)))
+            .await
+    }
+
+    pub(crate) async fn persist_gitlab_pat(
+        &self,
+        store: intent_core::FileSecretStore,
+        token: intent_sourcecontrol::SecretString,
+        lease: intent_sourcecontrol::gitlab_auth::PersistenceLease,
+    ) -> Result<()> {
+        self.mutate_gitlab(intent_sourcecontrol::gitlab_auth::pat_persistence(
+            store, token, lease,
+        ))
+        .await
+    }
+
+    pub(crate) async fn revoke_gitlab_token(
+        &self,
+        store: intent_core::FileSecretStore,
+        lease: intent_sourcecontrol::gitlab_auth::PersistenceLease,
+    ) -> Result<()> {
+        self.mutate_gitlab(intent_sourcecontrol::gitlab_auth::token_revocation(
+            store,
+            Some(lease),
+        ))
+        .await
+    }
+
+    async fn mutate_gitlab(
+        &self,
+        write: impl FnOnce() -> Result<()> + Send + 'static,
+    ) -> Result<()> {
+        #[cfg(test)]
+        let write = {
+            let before = self.before_gitlab_persistence.lock().unwrap().take();
+            move || {
+                if let Some(before) = before {
+                    before()?;
+                }
+                write()
+            }
+        };
+        self.mutate(intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT, write)
+            .await
+    }
+
+    pub(crate) async fn delete(&self, account: &str) -> Result<()> {
+        let inner = self.inner.clone();
+        let owned_account = account.to_string();
+        self.mutate(account, move || inner.delete(&owned_account))
+            .await?;
+        self.set_cached(account, None);
+        Ok(())
+    }
+
+    /// Observation only: a serialization observer cannot acknowledge another
+    /// operation's receipt. Even a completed timeout remains visible to its
+    /// original rollback. The bool means a timed-out mutation was observed,
+    /// not that its backend result was successful.
+    pub(crate) async fn settle_detached(&self, account: &str) -> Result<bool> {
+        let records: Vec<_> = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .mutations
+            .iter()
+            .filter(|r| r.account == account)
+            .cloned()
+            .collect();
+        let observed = records
+            .iter()
+            .any(|r| r.timed_out.load(std::sync::atomic::Ordering::SeqCst));
+        let deadline = Instant::now() + self.settle_timeout;
+        for record in records {
+            record
+                .settling
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _observer = SettlementObserver(&record.settling);
+            match timeout(deadline.saturating_duration_since(Instant::now()), self.finish_mutation(&record)).await {
+                Ok(Ok(())) => {},
+                Ok(Err(error)) => tracing::warn!(%account, %error, "timed-out secret-store mutation failed"),
+                Err(_) => return Err(Error::Internal(format!(
+                    "secret-store mutation on {account} still running after {:.0?}; the stored credential state is unknown — reconcile it (re-authenticate) before retrying", self.settle_timeout
+                ))),
+            }
+        }
+        Ok(observed)
     }
 
     /// Kick off the blocking load for `account`, publishing the result via `tx`
@@ -641,9 +1006,13 @@ impl AsyncSecretStore {
         self.state
             .lock()
             .unwrap()
-            .detached
+            .mutations
             .iter()
-            .filter(|(a, _)| a == account)
+            .filter(|record| {
+                record.account == account
+                    && record.timed_out.load(std::sync::atomic::Ordering::SeqCst)
+                    && record.settling.load(std::sync::atomic::Ordering::SeqCst) == 0
+            })
             .count()
     }
 }
@@ -2036,6 +2405,15 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         )
         .with_token_impact("~170 tokens/session"),
         number(
+            "prMonitor.maxPerAgent",
+            "PR monitors per agent",
+            "Maximum active PR monitors per agent across repositories (1–100). Raise for review orchestrators; the shared scheduler slows polling as inventory grows. Applies immediately to registration and adoption; lowering it preserves existing monitors and same-owner re-registration.",
+            "prMonitor",
+            Some(1.0),
+            Some(100.0),
+            5.0,
+        ),
+        number(
             "prMonitor.debounceSeconds",
             "PR monitor debounce seconds",
             "Quiet window (in seconds) a changed PR must observe before its consolidated wake is delivered (minimum 10)",
@@ -2500,6 +2878,153 @@ pub(crate) struct SettingsService<'a> {
     registry: Option<&'a SettingsRegistry>,
 }
 
+/// Settings readers/writers of one secret wait for its whole mutation,
+/// including compensation and publication, without owning the global gate.
+/// The catalog bounds the map; sorted acquisition also orders mixed batches.
+pub(crate) struct SecretSettingsGates(
+    std::collections::BTreeMap<&'static str, Arc<tokio::sync::RwLock<()>>>,
+);
+
+impl Default for SecretSettingsGates {
+    fn default() -> Self {
+        Self(
+            definitions()
+                .into_iter()
+                .filter(|def| def.sensitive)
+                .map(|def| (def.path, Arc::new(tokio::sync::RwLock::new(()))))
+                .collect(),
+        )
+    }
+}
+
+impl SecretSettingsGates {
+    pub(crate) async fn write(
+        &self,
+        paths: &[&str],
+    ) -> Vec<tokio::sync::OwnedRwLockWriteGuard<()>> {
+        let mut guards = Vec::new();
+        for (path, gate) in &self.0 {
+            if paths.contains(path) {
+                guards.push(gate.clone().write_owned().await);
+            }
+        }
+        guards
+    }
+
+    pub(crate) async fn read(
+        &self,
+        path: Option<&str>,
+    ) -> Vec<tokio::sync::OwnedRwLockReadGuard<()>> {
+        // A list needs all credentials, but must not keep earlier locks while
+        // waiting for a later one: that would let a parked account indirectly
+        // block unrelated secret updates. The revision gate is taken AFTER
+        // this succeeds, so a waiting snapshot cannot queue ahead of commits.
+        loop {
+            let mut guards = Vec::new();
+            let mut blocked = None;
+            for (key, gate) in &self.0 {
+                if path.is_some_and(|path| path != *key) {
+                    continue;
+                }
+                if let Ok(guard) = gate.clone().try_read_owned() {
+                    guards.push(guard);
+                } else {
+                    blocked = Some(gate);
+                    break;
+                }
+            }
+            let Some(gate) = blocked else {
+                return guards;
+            };
+            drop(guards);
+            drop(gate.read().await);
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct SecretSettingsUpdate {
+    applied: Vec<(usize, Value)>,
+    prior: Vec<(String, Option<String>)>,
+    github_generation: Option<u64>,
+}
+
+fn is_github_credential(path: &str) -> bool {
+    path == crate::github_auth_ops::SECRET_ACCOUNT
+        || path == crate::source_control_auth_ops::GITHUB_TOKEN_METHOD_ACCOUNT
+}
+
+impl SecretSettingsUpdate {
+    pub(crate) fn merge_applied(&self, mut ordinary: Vec<(usize, Value)>) -> Vec<Value> {
+        ordinary.extend(self.applied.iter().cloned());
+        ordinary.sort_by_key(|(index, _)| *index);
+        ordinary.into_iter().map(|(_, entry)| entry).collect()
+    }
+
+    /// Restore completed writes only. A failed write's own settlement/rollback
+    /// stays in `store_secret_and_clear_siblings`; never add its unknown-state
+    /// accounts to this ledger.
+    pub(crate) async fn rollback(&self, secrets: &AsyncSecretStore) -> bool {
+        let mut failed = false;
+        for github in [true, false] {
+            // Never hold GitHub ownership across another account's backend
+            // wait. The version check and all sibling restores are atomic
+            // with respect to revoke and device authorization persistence.
+            let _github_guard = if github {
+                if !self
+                    .prior
+                    .iter()
+                    .any(|(path, _)| is_github_credential(path))
+                {
+                    continue;
+                }
+                let Some(generation) = self.github_generation else {
+                    continue;
+                };
+                match secrets.github_mutation().await {
+                    Ok(mut guard) if *guard == generation => {
+                        *guard += 1;
+                        Some(guard)
+                    }
+                    Ok(_) => continue,
+                    Err(error) => {
+                        tracing::error!(%error, "settings.update GitHub rollback could not acquire credential ownership");
+                        failed = true;
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            for (path, prior) in self
+                .prior
+                .iter()
+                .filter(|(path, _)| is_github_credential(path) == github)
+            {
+                let restored = match prior {
+                    Some(value) => secrets.store(path, value).await,
+                    None => secrets.delete(path).await,
+                };
+                if let Err(error) = restored {
+                    tracing::error!(path, %error, "settings.update secret rollback failed");
+                    failed = true;
+                }
+            }
+        }
+        failed
+    }
+
+    async fn compensate_error(&self, secrets: &AsyncSecretStore, error: Error) -> Error {
+        if self.rollback(secrets).await {
+            Error::Internal(format!(
+                "settings.update failed ({error}), and secret rollback was incomplete (see logs)"
+            ))
+        } else {
+            error
+        }
+    }
+}
+
 impl<'a> SettingsService<'a> {
     pub(crate) fn new(
         store: &'a Store,
@@ -2629,27 +3154,30 @@ impl<'a> SettingsService<'a> {
         Ok(out)
     }
 
-    /// `settings.update` — validate the whole batch first (unknown path,
-    /// read-only path, or type/enum/min/max failure → `-32602`, nothing
-    /// applied), then persist. TOML-backed keys go through the registry as
-    /// **one atomic apply** (typed-schema + pin validation, single
-    /// comment-preserving `config.toml` rewrite; a flag-pinned key rejects the
-    /// whole batch with `-32602` before anything mutates) and never touch the
-    /// `SQLite` `settings` table. Secrets and state-blob keys keep their
-    /// existing stores. If a later secret/DB write in a mixed batch fails,
-    /// the already-applied registry batch is compensated (prior values
-    /// restored, config.toml rewritten back) so an error return never leaves
-    /// a durable file change without a `settings:changed` event. Returns the
-    /// **redacted** applied `{ path, value, origin? }` pairs for the response +
-    /// `settings:changed` payload.
-    ///
-    /// A sensitive entry whose value is the [`REDACTED_PLACEHOLDER`] is what a
-    /// client echoes back from `settings.list`/`settings.get` for a secret it
-    /// did not touch (intent#4383): with a stored secret it is a no-op for
-    /// that path (the secret is left as is; the entry is still echoed
-    /// redacted), without one it is `-32602` and the whole batch is rejected
-    /// before anything is applied — the placeholder is never stored.
-    pub(crate) async fn update(&self, changes: &Value) -> Result<Vec<Value>> {
+    /// Capture ordinary server values while the revision gate is held. Hook
+    /// compensation compares these again after secret rollback releases the
+    /// gate, so it cannot undo a newer server-settings commit.
+    pub(crate) async fn server_values(&self) -> Result<Map<String, Value>> {
+        let mut values = Map::new();
+        for def in definitions()
+            .into_iter()
+            .filter(|def| def.path.starts_with("server.") && !def.sensitive)
+        {
+            values.insert(
+                def.path.to_string(),
+                self.get(def.path).await?["value"].clone(),
+            );
+        }
+        Ok(values)
+    }
+
+    /// Validate every setting and the registry's typed schema/pins before
+    /// starting secret persistence. The commit revalidates after awaited I/O;
+    /// placeholder presence is checked by `update_secrets` before any write.
+    pub(crate) fn validate_update(
+        &self,
+        changes: &Value,
+    ) -> Result<Vec<(SettingDefinition, Value)>> {
         let entries = changes
             .as_array()
             .ok_or_else(|| Error::InvalidParams("'changes' must be an array".to_string()))?;
@@ -2659,20 +3187,14 @@ impl<'a> SettingsService<'a> {
                 .get("path")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| Error::InvalidParams("each change requires a 'path'".to_string()))?;
-            // monorepo#1000 compatibility: old clients still write the retired
-            // per-workspace override path on every workspace-scoped model
-            // pick. Tolerate-and-ignore the entry (nothing validated,
-            // persisted, echoed, or published) instead of rejecting the whole
-            // batch as an unknown path.
             // monorepo#1729 compatibility: pre-rename clients still write the
-            // `backgroundAgents.*` paths. Same tolerate-and-ignore treatment —
+            // `backgroundAgents.*` paths. Tolerate-and-ignore these entries —
             // the renamed `quickActions.*` keys are the only writable surface.
             // The deprecated `providers.active` gets the same treatment so a
             // write can never recreate the key `migrate_active_provider_setting`
             // removed from config.toml (its catalog entry is read-only, but a
             // hard rejection would fail whole batches from old clients).
-            if path == RETIRED_WORKSPACE_OVERRIDES_PATH
-                || RETIRED_BACKGROUND_AGENT_PATHS.contains(&path)
+            if RETIRED_BACKGROUND_AGENT_PATHS.contains(&path)
                 || path == DEPRECATED_ACTIVE_PROVIDER_PATH
             {
                 tracing::debug!(path, "ignoring settings.update for retired setting");
@@ -2688,18 +3210,139 @@ impl<'a> SettingsService<'a> {
             }
             def.validate(&value)?;
             validate_bare_model_id(path, &value)?;
-            if def.sensitive
-                && value.as_str() == Some(REDACTED_PLACEHOLDER)
-                && self.secrets.load(def.path).await?.is_none()
-            {
-                return Err(Error::InvalidParams(format!(
-                    "{path}: the redaction placeholder cannot be stored as a secret \
-                     (no secret is currently stored for this setting)"
-                )));
-            }
             planned.push((def, value));
         }
 
+        if let Some(reg) = self.registry {
+            let changes = planned
+                .iter()
+                .filter(|(def, _)| KNOWN_PATHS.contains(&def.path))
+                .map(|(def, value)| (def.path.to_string(), registry_value(def, value)))
+                .collect::<Vec<_>>();
+            reg.validate(&changes)?;
+        }
+        Ok(planned)
+    }
+
+    /// Persist only credentials, with their per-setting write guards held by
+    /// the caller. No ordinary setting is changed until the final commit.
+    pub(crate) async fn update_secrets(&self, changes: &Value) -> Result<SecretSettingsUpdate> {
+        let planned = self.validate_update(changes)?;
+        let mut update = SecretSettingsUpdate::default();
+        let mut prior = Vec::new();
+        for (def, _) in planned.iter().filter(|(def, _)| def.sensitive) {
+            for path in std::iter::once(def.path)
+                .chain(forge_token_secret_siblings(def.path).iter().copied())
+            {
+                if !prior.iter().any(|(p, _)| p == path) {
+                    prior.push((path.to_string(), self.secrets.load_fresh(path).await?));
+                }
+            }
+        }
+        // Validate every placeholder before the first write, including when
+        // it appears after another secret in a mixed batch.
+        for (def, value) in &planned {
+            if def.sensitive
+                && value.as_str() == Some(REDACTED_PLACEHOLDER)
+                && prior.iter().any(|(p, v)| p == def.path && v.is_none())
+            {
+                return Err(Error::InvalidParams(format!(
+                    "{}: the redaction placeholder cannot be stored as a secret (no secret is currently stored for this setting)", def.path
+                )));
+            }
+        }
+        for (index, (def, value)) in planned
+            .into_iter()
+            .enumerate()
+            .filter(|(_, (def, _))| def.sensitive)
+        {
+            if value.as_str() != Some(REDACTED_PLACEHOLDER) {
+                let github_snapshot = async {
+                    let guard = if def.path == crate::github_auth_ops::SECRET_ACCOUNT {
+                        let guard = self.secrets.github_mutation().await?;
+                        if update.github_generation != Some(*guard) {
+                            // Preflight can precede another account's slow write.
+                            // Snapshot the owner we will replace, not an earlier
+                            // revoked/replaced credential from batch admission.
+                            for (path, value) in prior
+                                .iter_mut()
+                                .filter(|(path, _)| is_github_credential(path))
+                            {
+                                *value = self.secrets.load_fresh(path).await?;
+                            }
+                            update.prior.retain(|(path, _)| !is_github_credential(path));
+                            update.github_generation = None;
+                        }
+                        Some(guard)
+                    } else {
+                        None
+                    };
+                    Ok::<_, Error>(guard)
+                }
+                .await;
+                let mut github_guard = match github_snapshot {
+                    Ok(guard) => guard,
+                    Err(error) => return Err(update.compensate_error(self.secrets, error).await),
+                };
+                let desired = match &value {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                let unchanged = prior
+                    .iter()
+                    .any(|(p, v)| p == def.path && v.as_deref() == Some(&desired))
+                    && forge_token_secret_siblings(def.path)
+                        .iter()
+                        .all(|sibling| prior.iter().any(|(p, v)| p == sibling && v.is_none()));
+                if unchanged {
+                    continue;
+                }
+                if let Some(guard) = &mut github_guard {
+                    **guard += 1;
+                    update.github_generation = Some(**guard);
+                }
+                let siblings = forge_token_secret_siblings(def.path);
+                let owns_account = |path: &str| path == def.path || siblings.contains(&path);
+                if let Err(error) = self
+                    .store_secret_and_clear_siblings(def.path, &desired)
+                    .await
+                {
+                    // A repeated path may already have a completed write in
+                    // this batch. Restore its original state only if the later
+                    // failed mutation (including siblings) has settled.
+                    if update.prior.iter().any(|(path, _)| owns_account(path)) {
+                        for path in std::iter::once(def.path).chain(siblings.iter().copied()) {
+                            if self.secrets.settle_detached(path).await.is_err() {
+                                update.prior.retain(|(path, _)| !owns_account(path));
+                                break;
+                            }
+                        }
+                    }
+                    // Per-account guards remain held by the caller, without
+                    // the revision gate. Never compensate untouched accounts
+                    // or a failing operation whose state is still unknown.
+                    drop(github_guard.take());
+                    return Err(update.compensate_error(self.secrets, error).await);
+                }
+                for (path, value) in prior.iter().filter(|(path, _)| owns_account(path)) {
+                    if !update.prior.iter().any(|(p, _)| p == path) {
+                        update.prior.push((path.clone(), value.clone()));
+                    }
+                }
+            }
+            update.applied.push((
+                index,
+                json!({ "path": def.path, "value": REDACTED_PLACEHOLDER }),
+            ));
+        }
+        Ok(update)
+    }
+
+    /// Called with the revision gate held after secret persistence succeeds.
+    /// Re-check ordinary values here: another settings call or a config-file
+    /// reload may have committed while the secret store was busy.
+    pub(crate) async fn update_non_secrets(&self, changes: &Value) -> Result<Vec<(usize, Value)>> {
+        let planned = self.validate_update(changes)?;
         // Keep validated entries only when persisting them would change the
         // observable setting state. For TOML-backed keys, origin is part of
         // that state: writing an effective default while the key is absent is
@@ -2707,32 +3350,12 @@ impl<'a> SettingsService<'a> {
         // value is a no-op. Flag-pinned entries remain in the plan so the
         // registry preserves its read-only rejection semantics.
         let mut mutations = Vec::with_capacity(planned.len());
-        for (def, value) in planned {
-            let unchanged = if def.sensitive {
-                // The placeholder stays in the plan so the entry is echoed
-                // (redacted) even though the secret itself is left untouched.
-                if value.as_str() == Some(REDACTED_PLACEHOLDER) {
-                    false
-                } else {
-                    let desired = match &value {
-                        Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    };
-                    // Decided against the backing store, not the TTL cache:
-                    // a device grant may have replaced the token behind the
-                    // cache. A forge token whose device-grant siblings are
-                    // still stored is a change even when the token repeats —
-                    // the write reclassifies the credential as a PAT.
-                    let mut unchanged = self.secrets.load_fresh(def.path).await?.as_deref()
-                        == Some(desired.as_str());
-                    for sibling in forge_token_secret_siblings(def.path) {
-                        if unchanged && self.secrets.load_fresh(sibling).await?.is_some() {
-                            unchanged = false;
-                        }
-                    }
-                    unchanged
-                }
-            } else if let Some(reg) = self.registry_for(def.path) {
+        for (index, (def, value)) in planned
+            .into_iter()
+            .enumerate()
+            .filter(|(_, (def, _))| !def.sensitive)
+        {
+            let unchanged = if let Some(reg) = self.registry_for(def.path) {
                 match reg.origin(def.path) {
                     Some(SettingOrigin::File) => reg
                         .get(def.path)
@@ -2746,22 +3369,20 @@ impl<'a> SettingsService<'a> {
                 }
             };
             if !unchanged {
-                mutations.push((def, value));
+                mutations.push((index, def, value));
             }
         }
         let planned = mutations;
 
-        // Apply the TOML-backed subset first, as one atomic registry batch:
-        // unknown/pinned keys and typed-schema violations reject here with
-        // `-32602` before ANY store (secret, DB, file) has been touched.
-        // Capture the prior effective values so a later secret/DB failure in
-        // a mixed batch can compensate (restore + rewrite config.toml back).
+        // Commit the TOML-backed subset as one atomic registry batch after
+        // secret persistence. Capture current ordinary priors under the
+        // revision gate so a DB failure compensates only this commit.
         let mut registry_rollback: Vec<(String, Value)> = Vec::new();
         if let Some(reg) = self.registry {
             let registry_changes: Vec<(String, Value)> = planned
                 .iter()
-                .filter(|(def, _)| KNOWN_PATHS.contains(&def.path))
-                .map(|(def, value)| (def.path.to_string(), registry_value(def, value)))
+                .filter(|(_, def, _)| KNOWN_PATHS.contains(&def.path))
+                .map(|(_, def, value)| (def.path.to_string(), registry_value(def, value)))
                 .collect();
             if !registry_changes.is_empty() {
                 registry_rollback = registry_changes
@@ -2781,22 +3402,8 @@ impl<'a> SettingsService<'a> {
         }
 
         let mut applied = Vec::with_capacity(planned.len());
-        for (def, value) in planned {
-            let persisted = if def.sensitive {
-                if value.as_str() == Some(REDACTED_PLACEHOLDER) {
-                    // Presence was verified during validation: keep the
-                    // stored secret, echo the redacted entry.
-                    Ok(json!({ "path": def.path, "value": REDACTED_PLACEHOLDER }))
-                } else {
-                    let secret_value = match &value {
-                        Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    };
-                    self.store_secret_and_clear_siblings(def.path, &secret_value)
-                        .await
-                        .map(|()| json!({ "path": def.path, "value": REDACTED_PLACEHOLDER }))
-                }
-            } else if self.registry_for(def.path).is_some() {
+        for (index, def, value) in planned {
+            let persisted = if self.registry_for(def.path).is_some() {
                 // Already applied via the registry batch above. Normalize the
                 // echoed value so number-typed settings keep the float wire
                 // shape (`5181.0`) that `settings.get`/`settings.list` report.
@@ -2816,7 +3423,7 @@ impl<'a> SettingsService<'a> {
                     if let Some(origin) = self.origin_for(def.path) {
                         entry["origin"] = json!(origin);
                     }
-                    applied.push(entry);
+                    applied.push((index, entry));
                 }
                 Err(e) => {
                     // Compensate the registry batch: without this, the TOML
@@ -2828,7 +3435,7 @@ impl<'a> SettingsService<'a> {
                                 tracing::error!(
                                     error = %rollback_err,
                                     "settings.update registry rollback failed after \
-                                     secret/DB persistence error"
+                                     DB persistence error"
                                 );
                             }
                         }
@@ -2838,6 +3445,18 @@ impl<'a> SettingsService<'a> {
             }
         }
         Ok(applied)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn update(&self, changes: &Value) -> Result<Vec<Value>> {
+        let secrets = self.update_secrets(changes).await?;
+        match self.update_non_secrets(changes).await {
+            Ok(applied) => Ok(secrets.merge_applied(applied)),
+            Err(error) => {
+                secrets.rollback(self.secrets).await;
+                Err(error)
+            }
+        }
     }
 
     /// Persist `value` for the secret at `path`, then clear its
@@ -2924,6 +3543,13 @@ impl<'a> SettingsService<'a> {
         let def = find_definition(path)
             .ok_or_else(|| Error::InvalidParams(format!("unknown setting: {path}")))?;
         let changed = if def.sensitive {
+            let _github_guard = if def.path == crate::github_auth_ops::SECRET_ACCOUNT {
+                let mut guard = self.secrets.github_mutation().await?;
+                *guard += 1;
+                Some(guard)
+            } else {
+                None
+            };
             // Siblings are cleared even when the token itself is absent: a
             // device grant's refresh token / expiry can outlive its access
             // token, and a reset must not leave that metadata orphaned.
@@ -3943,6 +4569,660 @@ mod tests {
                 return Ok(());
             }
             self.inner.delete(account)
+        }
+    }
+
+    /// A timed-out credential mutation must not keep the global revision gate
+    /// while it waits for settlement. Ordinary settings still commit, and a
+    /// failed mixed batch must not roll back a concurrent ordinary update.
+    #[intent_test_macros::daemon_test]
+    async fn parked_secret_write_does_not_block_unrelated_settings() {
+        use intent_core::WorkspaceApi;
+        use intent_sourcecontrol::gitlab_token::{REFRESH_SECRET_ACCOUNT, SECRET_ACCOUNT};
+
+        let dir = crate::test_support::test_tempdir("settings-parked-write");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let registry = Arc::new(SettingsRegistry::load(dir.path().join("config.toml")).unwrap());
+        let raw = InMemorySecretStore::default();
+        raw.store(SECRET_ACCOUNT, "glo_device").unwrap();
+        raw.store(REFRESH_SECRET_ACCOUNT, "glr_device").unwrap();
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (done_tx, _done_rx) = std::sync::mpsc::channel();
+        let secrets = Arc::new(AsyncSecretStore::with_timings(
+            Arc::new(ParkedDeleteSecretStore {
+                inner: raw.clone(),
+                park_delete_for: REFRESH_SECRET_ACCOUNT,
+                parked: parked_tx,
+                release: Mutex::new(release_rx),
+                done: done_tx,
+            }),
+            Duration::from_secs(1),
+            Duration::from_millis(30),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        ));
+        let mut services = crate::Services::new(store).with_settings_registry(registry);
+        services.secrets = secrets.clone();
+        let writer = services.clone();
+        let update = intent_core::spawn_daemon(async move {
+            writer
+                .settings_update(json!([
+                    { "path": SECRET_ACCOUNT, "value": "glpat-new" },
+                    { "path": "git.autoCommit", "value": false }
+                ]))
+                .await
+        });
+        tokio::task::spawn_blocking(move || parked_rx.recv_timeout(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .expect("sibling delete parked");
+        timeout(Duration::from_secs(5), async {
+            while !secrets.timed_out(REFRESH_SECRET_ACCOUNT) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("write timeout fired");
+        assert!(
+            !update.is_finished(),
+            "the mutation is waiting for settlement"
+        );
+
+        let read = timeout(
+            secrets.load_timeout,
+            services.settings_get("git.autoCommit".into()),
+        )
+        .await;
+        let concurrent = timeout(
+            secrets.load_timeout,
+            services.settings_update(json!([
+                { "path": "git.autoCommit", "value": false }
+            ])),
+        )
+        .await;
+        // Release before asserting, so RED never strands a blocking worker.
+        release_tx.send(()).unwrap();
+        let failure = update.await.unwrap().expect_err("sibling delete timed out");
+        assert!(matches!(failure, Error::Internal(_)));
+        let read = read
+            .expect("unrelated settings.get must finish within the read timeout")
+            .unwrap();
+        assert_eq!(
+            read["value"],
+            json!(true),
+            "uncommitted mixed changes stay hidden"
+        );
+        assert_eq!(read["revision"], json!(0));
+        let concurrent = concurrent
+            .expect("unrelated settings.update must finish within the read timeout")
+            .unwrap();
+        assert_eq!(concurrent["revision"], json!(1));
+        let after = services
+            .settings_get("git.autoCommit".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            after["value"],
+            json!(false),
+            "rollback preserves the concurrent commit"
+        );
+        assert_eq!(after["revision"], json!(1));
+        assert_eq!(
+            raw.load(SECRET_ACCOUNT).unwrap().as_deref(),
+            Some("glo_device")
+        );
+        assert_eq!(
+            raw.load(REFRESH_SECRET_ACCOUNT).unwrap().as_deref(),
+            Some("glr_device")
+        );
+    }
+
+    struct ReleaseWrite(Option<std::sync::mpsc::Sender<()>>);
+
+    impl ReleaseWrite {
+        fn release(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    impl Drop for ReleaseWrite {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    struct ParkedSettingsWrite {
+        inner: InMemorySecretStore,
+        delete: bool,
+        entered: Arc<tokio::sync::Notify>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+        once: std::sync::atomic::AtomicBool,
+    }
+
+    impl ParkedSettingsWrite {
+        fn park(&self, account: &str, delete: bool) {
+            if account == intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT
+                && self.delete == delete
+                && self.once.swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.entered.notify_one();
+                // Drop of the test's sender also releases the blocking worker
+                // on an assertion failure, so runtime shutdown cannot hang.
+                let _ = self.release.lock().unwrap().recv();
+            }
+        }
+    }
+
+    impl SecretStore for ParkedSettingsWrite {
+        fn load(&self, account: &str) -> Result<Option<String>> {
+            self.inner.load(account)
+        }
+        fn store(&self, account: &str, value: &str) -> Result<()> {
+            self.inner.store(account, value)?;
+            self.park(account, false);
+            Ok(())
+        }
+        fn delete(&self, account: &str) -> Result<()> {
+            self.inner.delete(account)?;
+            self.park(account, true);
+            Ok(())
+        }
+    }
+
+    async fn parked_settings_harness(
+        delete: bool,
+    ) -> (
+        tempfile::TempDir,
+        crate::Services,
+        InMemorySecretStore,
+        Arc<tokio::sync::Notify>,
+        ReleaseWrite,
+        crate::events::Subscription,
+    ) {
+        let dir = crate::test_support::test_tempdir("settings-staged-write");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let registry = Arc::new(SettingsRegistry::load(dir.path().join("config.toml")).unwrap());
+        let bus = crate::EventBus::new(store.clone());
+        let sub = bus.subscribe(crate::events::SubscriptionFilter::default());
+        let raw = InMemorySecretStore::default();
+        raw.store(
+            intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT,
+            "old-token",
+        )
+        .unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let secrets = Arc::new(ParkedSettingsWrite {
+            inner: raw.clone(),
+            delete,
+            entered: entered.clone(),
+            release: Mutex::new(rx),
+            once: std::sync::atomic::AtomicBool::new(true),
+        });
+        let services = crate::Services::new(store)
+            .with_secret_store(secrets)
+            .with_settings_registry(registry)
+            .with_event_bus(bus);
+        (dir, services, raw, entered, ReleaseWrite(Some(tx)), sub)
+    }
+
+    async fn shutdown_cancelled_settings_write(delete: bool, during_settle: bool) {
+        use intent_core::WorkspaceApi;
+        use intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT;
+
+        let (_dir, mut services, raw, entered, mut release, _sub) =
+            parked_settings_harness(delete).await;
+        if during_settle {
+            Arc::get_mut(&mut services.secrets).unwrap().write_timeout = Duration::from_millis(10);
+        }
+        let prior_volume = services
+            .settings_get("notifications.volume".into())
+            .await
+            .unwrap()["value"]
+            .clone();
+        // This fixture has no group producers. Settle the unrelated idle lane
+        // before admission so its first scheduling turn cannot masquerade as
+        // ownership of the held settings write at the drain assertion.
+        services.shutdown_group_persistence().await;
+        let writer = services.clone();
+        let request = intent_core::spawn_daemon(async move {
+            if delete {
+                writer.settings_reset(SECRET_ACCOUNT.into()).await
+            } else {
+                writer
+                    .settings_update(json!([
+                        { "path": "notifications.volume", "value": 0.75 },
+                        { "path": SECRET_ACCOUNT, "value": "new-token" }
+                    ]))
+                    .await
+            }
+        });
+        timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("actual secret write entered");
+        if during_settle {
+            // The initial write timeout puts its handle into detached; the
+            // settler takes it out before waiting. Observe that handoff, not
+            // an arbitrary sleep that might cancel the wrong stage.
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    let (timed_out, taken) = {
+                        let state = services.secrets.state.lock().unwrap();
+                        let timed_out = state.last_warn.contains_key(SECRET_ACCOUNT);
+                        let taken = state.mutations.iter().any(|record| {
+                            record.account == SECRET_ACCOUNT
+                                && record.settling.load(std::sync::atomic::Ordering::SeqCst) > 0
+                        });
+                        (timed_out, taken)
+                    };
+                    if timed_out && taken {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("settler owns the timed-out mutation");
+        }
+        request.abort();
+        let _ = request.await;
+        let shutdown = services.shutdown_store_writers();
+        tokio::pin!(shutdown);
+        let returned_early = tokio::select! {
+            biased;
+            () = &mut shutdown => true,
+            () = std::future::ready(()) => false,
+        };
+        // Always release real blocking work, including when RED asserts below.
+        release.release();
+        if !returned_early {
+            timeout(Duration::from_secs(5), &mut shutdown)
+                .await
+                .expect("shutdown settles the cancelled settings owner");
+        }
+        assert!(
+            !returned_early,
+            "shutdown abandoned an admitted settings mutation"
+        );
+        assert_eq!(
+            raw.load(SECRET_ACCOUNT).unwrap().as_deref(),
+            if delete {
+                None
+            } else if during_settle {
+                Some("old-token")
+            } else {
+                Some("new-token")
+            },
+        );
+        let value = services
+            .settings_get("notifications.volume".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            value["value"],
+            if delete || during_settle {
+                prior_volume
+            } else {
+                json!(0.75)
+            }
+        );
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn shutdown_retains_settings_update_after_caller_cancel() {
+        shutdown_cancelled_settings_write(false, false).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn shutdown_retains_settings_reset_after_caller_cancel() {
+        shutdown_cancelled_settings_write(true, false).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn shutdown_retains_settings_mutation_during_settle_cancel() {
+        shutdown_cancelled_settings_write(false, true).await;
+    }
+
+    async fn parked_settings_success(delete: bool) {
+        use intent_core::WorkspaceApi;
+        use intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT;
+        use std::task::Poll;
+
+        let (_dir, services, raw, entered, mut release, mut sub) =
+            parked_settings_harness(delete).await;
+        let writer = services.clone();
+        let mutation = intent_core::spawn_daemon(async move {
+            if delete {
+                writer.settings_reset(SECRET_ACCOUNT.into()).await
+            } else {
+                writer
+                    .settings_update(json!([
+                        { "path": "notifications.volume", "value": 0.75 },
+                        { "path": SECRET_ACCOUNT, "value": "new-token" }
+                    ]))
+                    .await
+            }
+        });
+        timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("write parked");
+        assert_eq!(
+            raw.load(SECRET_ACCOUNT).unwrap().as_deref(),
+            if delete { None } else { Some("new-token") }
+        );
+
+        // Drive snapshots until they actually wait on the in-flight secret.
+        // Neither may return its backing value under the old revision, and a
+        // waiting list must release earlier account locks before it parks.
+        let mut list = services.settings_list();
+        let mut get_secret = services.settings_get(SECRET_ACCOUNT.into());
+        assert!(std::future::poll_fn(|cx| Poll::Ready(list.as_mut().poll(cx).is_pending())).await);
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(get_secret.as_mut().poll(cx).is_pending())).await
+        );
+        let ordinary = timeout(
+            DEFAULT_LOAD_TIMEOUT,
+            services.settings_get("notifications.volume".into()),
+        )
+        .await
+        .expect("ordinary read is not blocked")
+        .unwrap();
+        assert_eq!(ordinary["value"], json!(0.5));
+        assert_eq!(ordinary["revision"], json!(0));
+        let ordinary_update = timeout(
+            DEFAULT_LOAD_TIMEOUT,
+            services.settings_update(json!([
+                { "path": "git.autoCommit", "value": false }
+            ])),
+        )
+        .await
+        .expect("ordinary write is not blocked")
+        .unwrap();
+        assert_eq!(ordinary_update["revision"], json!(1));
+        let other_secret = timeout(
+            DEFAULT_LOAD_TIMEOUT,
+            services.settings_update(json!([
+                { "path": "linear.token", "value": "linear-new" }
+            ])),
+        )
+        .await
+        .expect("the waiting list does not block another account")
+        .unwrap();
+        assert_eq!(other_secret["revision"], json!(2));
+        let other_get = timeout(
+            DEFAULT_LOAD_TIMEOUT,
+            services.settings_get("linear.token".into()),
+        )
+        .await
+        .expect("another account can be read")
+        .unwrap();
+        assert_eq!(other_get["value"], json!(REDACTED_PLACEHOLDER));
+        assert_eq!(other_get["revision"], json!(2));
+
+        release.release();
+        let committed = mutation.await.unwrap().unwrap();
+        assert_eq!(committed["revision"], json!(3));
+        let (list, get_secret) = tokio::join!(list, get_secret);
+        let list = list.unwrap();
+        let get_secret = get_secret.unwrap();
+        assert_eq!(list["revision"], json!(3));
+        assert_eq!(get_secret["revision"], json!(3));
+        assert_eq!(
+            get_secret["value"],
+            if delete {
+                Value::Null
+            } else {
+                json!(REDACTED_PLACEHOLDER)
+            }
+        );
+        let volume = list["settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["path"] == "notifications.volume")
+            .unwrap();
+        assert_eq!(
+            volume["value"],
+            if delete { json!(0.5) } else { json!(0.75) }
+        );
+        let expected = if delete {
+            json!([{ "path": SECRET_ACCOUNT, "value": null }])
+        } else {
+            json!([
+                { "path": "notifications.volume", "value": 0.75, "origin": "file" },
+                { "path": SECRET_ACCOUNT, "value": REDACTED_PLACEHOLDER }
+            ])
+        };
+        if !delete {
+            assert_eq!(committed["applied"], expected);
+        }
+        for (revision, changes) in [
+            (1, ordinary_update["applied"].clone()),
+            (2, other_secret["applied"].clone()),
+            (3, expected),
+        ] {
+            let events = timeout(Duration::from_secs(5), sub.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].event_type, "settings:changed");
+            assert_eq!(
+                events[0].data,
+                json!({ "revision": revision, "changes": changes })
+            );
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn parked_secret_update_preserves_snapshot_revision_and_event_order() {
+        parked_settings_success(false).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn parked_secret_reset_does_not_block_other_accounts_or_settings() {
+        parked_settings_success(true).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn secret_update_revalidates_after_io_and_restores_on_commit_rejection() {
+        use intent_core::WorkspaceApi;
+        use intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT;
+        let (_dir, services, raw, entered, mut release, mut sub) =
+            parked_settings_harness(false).await;
+        let writer = services.clone();
+        let mutation = intent_core::spawn_daemon(async move {
+            writer
+                .settings_update(json!([
+                    { "path": SECRET_ACCOUNT, "value": "new-token" },
+                    { "path": "notifications.volume", "value": 0.75 }
+                ]))
+                .await
+        });
+        timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        {
+            let _revision = services.settings_revision_gate.write().await;
+            services
+                .settings_registry
+                .as_ref()
+                .unwrap()
+                .pin("notifications.volume", json!(0.5), "TEST_PIN")
+                .unwrap();
+        }
+        release.release();
+        assert!(matches!(
+            mutation.await.unwrap(),
+            Err(Error::InvalidParams(_))
+        ));
+        assert_eq!(
+            raw.load(SECRET_ACCOUNT).unwrap().as_deref(),
+            Some("old-token")
+        );
+        let snapshot = services
+            .settings_get("notifications.volume".into())
+            .await
+            .unwrap();
+        assert_eq!(snapshot["value"], json!(0.5));
+        assert_eq!(snapshot["origin"], json!("flag"));
+        assert_eq!(snapshot["revision"], json!(0));
+        // A sentinel commit must be the first event: the rejected mixed batch
+        // never announces its temporary credential or consumes a revision.
+        services
+            .settings_update(json!([{ "path": "git.autoCommit", "value": false }]))
+            .await
+            .unwrap();
+        let events = timeout(Duration::from_secs(5), sub.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(events[0].data["revision"], json!(1));
+        assert_eq!(
+            events[0].data["changes"][0]["path"],
+            json!("git.autoCommit")
+        );
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn parked_secret_compensation_keeps_account_ownership_without_global_gate() {
+        use intent_core::WorkspaceApi;
+        use intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT;
+        struct RejectThenParkRollback {
+            inner: InMemorySecretStore,
+            registry: Arc<SettingsRegistry>,
+            entered: Arc<tokio::sync::Notify>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl SecretStore for RejectThenParkRollback {
+            fn load(&self, path: &str) -> Result<Option<String>> {
+                self.inner.load(path)
+            }
+            fn delete(&self, path: &str) -> Result<()> {
+                self.inner.delete(path)
+            }
+            fn store(&self, path: &str, value: &str) -> Result<()> {
+                if path == SECRET_ACCOUNT && value == "first-write" {
+                    // Invalidate preflight after secret persistence started,
+                    // forcing the final commit to compensate this credential.
+                    self.registry
+                        .pin("notifications.volume", json!(0.5), "TEST_PIN")?;
+                } else if path == SECRET_ACCOUNT && value == "old-token" {
+                    self.entered.notify_one();
+                    let _ = self.release.lock().unwrap().recv();
+                }
+                self.inner.store(path, value)
+            }
+        }
+        let dir = crate::test_support::test_tempdir("settings-parked-compensation");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let registry = Arc::new(SettingsRegistry::load(dir.path().join("config.toml")).unwrap());
+        let raw = InMemorySecretStore::default();
+        raw.store(SECRET_ACCOUNT, "old-token").unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut release = ReleaseWrite(Some(tx));
+        let services = crate::Services::new(store)
+            .with_settings_registry(registry.clone())
+            .with_secret_store(Arc::new(RejectThenParkRollback {
+                inner: raw.clone(),
+                registry,
+                entered: entered.clone(),
+                release: Mutex::new(rx),
+            }));
+        let writer = services.clone();
+        let first = intent_core::spawn_daemon(async move {
+            writer
+                .settings_update(json!([
+                    { "path": SECRET_ACCOUNT, "value": "first-write" },
+                    { "path": "notifications.volume", "value": 0.75 }
+                ]))
+                .await
+        });
+        timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("rollback parked");
+        let mut second = services.settings_update(json!([
+            { "path": SECRET_ACCOUNT, "value": "second-write" }
+        ]));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                second.as_mut().poll(cx).is_pending()
+            ))
+            .await
+        );
+        let unrelated = timeout(
+            DEFAULT_LOAD_TIMEOUT,
+            services.settings_update(json!([
+                { "path": "git.autoCommit", "value": false }
+            ])),
+        )
+        .await
+        .expect("compensation must not hold the global gate")
+        .unwrap();
+        assert_eq!(unrelated["revision"], json!(1));
+        assert_eq!(
+            raw.load(SECRET_ACCOUNT).unwrap().as_deref(),
+            Some("first-write")
+        );
+        release.release();
+        assert!(matches!(first.await.unwrap(), Err(Error::InvalidParams(_))));
+        assert_eq!(second.await.unwrap()["revision"], json!(2));
+        assert_eq!(
+            raw.load(SECRET_ACCOUNT).unwrap().as_deref(),
+            Some("second-write"),
+            "the first rollback must finish before a newer credential commits"
+        );
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn mixed_settings_validation_rejects_before_any_secret_write() {
+        use intent_core::WorkspaceApi;
+        struct CountWrites(std::sync::atomic::AtomicUsize);
+        impl SecretStore for CountWrites {
+            fn load(&self, _: &str) -> Result<Option<String>> {
+                Ok(None)
+            }
+            fn store(&self, _: &str, _: &str) -> Result<()> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+            fn delete(&self, _: &str) -> Result<()> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let dir = crate::test_support::test_tempdir("settings-preflight");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let registry = Arc::new(SettingsRegistry::load(dir.path().join("config.toml")).unwrap());
+        registry
+            .pin("notifications.volume", json!(0.5), "TEST_PIN")
+            .unwrap();
+        let raw = Arc::new(CountWrites(std::sync::atomic::AtomicUsize::new(0)));
+        let services = crate::Services::new(store)
+            .with_secret_store(raw.clone())
+            .with_settings_registry(registry);
+        for entry in [
+            json!({ "path": "git.autoCommit", "value": "invalid" }),
+            json!({ "path": "notifications.volume", "value": 0.75 }),
+            json!({ "path": "providers.paths", "value": { "auggie": 42 } }),
+            // Open provider maps must also reject embedded nulls before
+            // any secret mutation.
+            json!({ "path": "quickActions.providerSettings", "value": {
+                "future-provider": { "option": null }
+            } }),
+        ] {
+            let error = services
+                .settings_update(json!([
+                    { "path": "linear.token", "value": "must-not-be-written" }, entry
+                ]))
+                .await
+                .expect_err("mixed batch rejects");
+            assert!(matches!(error, Error::InvalidParams(_)), "{error:?}");
+            assert_eq!(raw.0.load(std::sync::atomic::Ordering::SeqCst), 0);
         }
     }
 
@@ -5532,7 +6812,8 @@ mod tests {
         );
     }
 
-    /// `[prMonitor]` exposes four TOML-backed numbers: `debounceSeconds`
+    /// `[prMonitor]` exposes five TOML-backed numbers: `maxPerAgent`
+    /// (default 5, floor 1, max 100), `debounceSeconds`
     /// (default 60, floor 10), `pollSeconds` (default 30, floor 10),
     /// `hourlyRequestBudget` (default 1500, floor 60, max 5000) and
     /// `quotaSharePercent` (default 50, floor 1, max 100) — the latter
@@ -5542,6 +6823,7 @@ mod tests {
     #[tokio::test]
     async fn pr_monitor_intervals_round_trip_via_registry() {
         for (path, default, floor) in [
+            ("prMonitor.maxPerAgent", 5.0, 1.0),
             ("prMonitor.debounceSeconds", 60.0, 10.0),
             ("prMonitor.pollSeconds", 30.0, 10.0),
             ("prMonitor.hourlyRequestBudget", 1500.0, 60.0),
@@ -5581,6 +6863,13 @@ mod tests {
             ),
             "quotaSharePercent caps at 100"
         );
+        assert!(matches!(
+            find_definition("prMonitor.maxPerAgent").unwrap().ty,
+            SettingType::Number {
+                max: Some(100.0),
+                ..
+            }
+        ));
         // The catalog range and the read-time clamp constants must agree.
         assert_eq!(
             intent_core::config::MIN_PR_MONITOR_HOURLY_REQUEST_BUDGET,
@@ -5611,7 +6900,19 @@ mod tests {
         let secrets = AsyncSecretStore::new(secrets);
         let svc = SettingsService::new(&store, &secrets, Some(&registry));
 
+        for invalid in [json!(0), json!(101), json!(1.5), json!(-1), json!("55")] {
+            assert!(svc
+                .update(&json!([{ "path": "prMonitor.maxPerAgent", "value": invalid }]))
+                .await
+                .is_err());
+            assert_eq!(
+                svc.get("prMonitor.maxPerAgent").await.unwrap()["value"],
+                json!(5.0)
+            );
+        }
+
         for (path, default, updated, rejected) in [
+            ("prMonitor.maxPerAgent", 5.0, 55, 0),
             ("prMonitor.debounceSeconds", 60.0, 120, 5),
             ("prMonitor.pollSeconds", 30.0, 120, 5),
             ("prMonitor.hourlyRequestBudget", 1500.0, 120, 5),
@@ -6241,61 +7542,65 @@ mod tests {
         }
     }
 
-    /// `model.workspaceOverrides` is retired (monorepo#1000) but old clients
-    /// still write it on every workspace-scoped model pick: `settings.update`
-    /// tolerates-and-ignores the entry (nothing persisted, nothing echoed in
-    /// `applied`) instead of rejecting the batch, while the rest of a mixed
-    /// batch still applies. `settings.get`/`settings.reset` reject the path
-    /// as unknown like any other uncataloged key.
+    /// Retired writes fail like unknown settings, including in mixed batches:
+    /// validation must finish before any TOML, `SQLite`, or secret write occurs.
     #[tokio::test]
-    async fn workspace_overrides_update_is_tolerated_and_ignored() {
-        let tag = uuid::Uuid::new_v4();
-        let tmp = std::env::temp_dir().join(format!("intentd-settings-wsov-{tag}.db"));
-        let store = Store::open(&tmp).await.expect("open store");
-        let config_path = std::env::temp_dir().join(format!("intentd-settings-wsov-{tag}.toml"));
+    async fn workspace_overrides_update_is_rejected_atomically() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&dir.path().join("settings.db"))
+            .await
+            .expect("store");
+        let config_path = dir.path().join("config.toml");
         let registry = SettingsRegistry::load(&config_path).expect("load registry");
         let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
         let secrets = AsyncSecretStore::new(secrets);
         let svc = SettingsService::new(&store, &secrets, Some(&registry));
-
-        // A retired-path-only batch succeeds with nothing applied.
-        let applied = svc
-            .update(&json!([{
-                "path": "model.workspaceOverrides",
-                "value": { "ws-1": "auggie:opus" }
-            }]))
-            .await
-            .expect("retired path must be tolerated");
-        assert_eq!(applied, Vec::<Value>::new());
-        // Even a malformed entry (no 'value') is ignored, not validated.
-        let applied = svc
+        let config_before = std::fs::read_to_string(&config_path).expect("read config");
+        let prefix_before = svc.get("workspace.branchPrefix").await.expect("prefix");
+        let secret_before = svc.get("linear.token").await.expect("token");
+        let retired = json!({ "path": "model.workspaceOverrides", "value": { "ws-1": "m1" } });
+        let live = vec![
+            json!({ "path": "workspace.branchPrefix", "value": "feat/" }),
+            json!({ "path": "workspace.changeHistory", "value": { "ws-1": [] } }),
+            json!({ "path": "linear.token", "value": "new-token" }),
+        ];
+        for changes in [
+            vec![retired.clone()],
+            [vec![retired.clone()], live.clone()].concat(),
+            [live, vec![retired]].concat(),
+        ] {
+            let err = svc
+                .update(&json!(changes))
+                .await
+                .expect_err("retired path must fail");
+            assert!(
+                matches!(err, Error::InvalidParams(ref message)
+                if message == "unknown setting: model.workspaceOverrides"),
+                "{err}"
+            );
+            assert_eq!(
+                svc.get("workspace.branchPrefix").await.expect("prefix"),
+                prefix_before
+            );
+            assert_eq!(svc.get("linear.token").await.expect("token"), secret_before);
+            for path in ["model.workspaceOverrides", "workspace.changeHistory"] {
+                assert_eq!(store.get_setting(path).await.expect("stored setting"), None);
+            }
+            assert_eq!(
+                std::fs::read_to_string(&config_path).expect("config"),
+                config_before
+            );
+        }
+        // Missing values follow the same validation as any unknown path.
+        let err = svc
             .update(&json!([{ "path": "model.workspaceOverrides" }]))
             .await
-            .expect("retired path must be tolerated without a value");
-        assert_eq!(applied, Vec::<Value>::new());
-        // Nothing was persisted to SQLite or config.toml.
-        assert_eq!(
-            store
-                .get_setting("model.workspaceOverrides")
-                .await
-                .expect("read settings table"),
-            None
+            .expect_err("missing value must fail");
+        assert!(
+            matches!(err, Error::InvalidParams(ref message)
+            if message == "change for model.workspaceOverrides requires a 'value'"),
+            "{err}"
         );
-        let text = std::fs::read_to_string(&config_path).expect("read config");
-        assert!(!text.contains("workspaceOverrides"), "{text}");
-
-        // A mixed batch still applies the live entries.
-        let applied = svc
-            .update(&json!([
-                { "path": "model.workspaceOverrides", "value": { "ws-1": "m1" } },
-                { "path": "workspace.branchPrefix", "value": "feat/" },
-            ]))
-            .await
-            .expect("mixed batch must apply the live entry");
-        assert_eq!(applied.len(), 1);
-        assert_eq!(applied[0]["path"], "workspace.branchPrefix");
-
-        // get/reset reject the retired path as unknown.
         assert!(matches!(
             svc.get("model.workspaceOverrides").await,
             Err(Error::InvalidParams(_))
@@ -6304,14 +7609,6 @@ mod tests {
             svc.reset("model.workspaceOverrides").await,
             Err(Error::InvalidParams(_))
         ));
-
-        let _ = std::fs::remove_file(&config_path);
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
-                "{}{suffix}",
-                tmp.display()
-            )));
-        }
     }
 
     /// monorepo#1729: the renamed `backgroundAgents.*` paths are tolerated-
@@ -7139,5 +8436,1042 @@ mod tests {
                 tmp.display()
             )));
         }
+    }
+}
+
+#[cfg(test)]
+mod rollback_order_tests {
+    use super::*;
+    use intent_core::{ServerControl, WorkspaceApi};
+    use std::{
+        future::{poll_fn, Future},
+        pin::Pin,
+        task::Poll,
+    };
+
+    struct RejectSecondSecret {
+        raw: InMemorySecretStore,
+        reject_rollback: bool,
+        rollback: Option<(
+            Arc<tokio::sync::Notify>,
+            Mutex<std::sync::mpsc::Receiver<()>>,
+        )>,
+    }
+
+    impl SecretStore for RejectSecondSecret {
+        fn load(&self, account: &str) -> Result<Option<String>> {
+            self.raw.load(account)
+        }
+
+        fn store(&self, account: &str, value: &str) -> Result<()> {
+            if account == "accounts.sentry.token" && value == "rejected-sentry" {
+                return Err(Error::Internal("injected second-secret failure".into()));
+            }
+            if account == intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT
+                && value == "original-device"
+            {
+                if self.reject_rollback {
+                    return Err(Error::Internal("injected restoration failure".into()));
+                }
+                if let Some((entered, release)) = &self.rollback {
+                    entered.notify_one();
+                    let _ = release.lock().unwrap().recv();
+                }
+            }
+            self.raw.store(account, value)
+        }
+
+        fn delete(&self, account: &str) -> Result<()> {
+            self.raw.delete(account)
+        }
+    }
+
+    async fn failed_secret_batch_case(seeded: bool, concurrent: bool, repeated: bool) {
+        use intent_sourcecontrol::gitlab_token::{
+            EXPIRES_AT_SECRET_ACCOUNT, REFRESH_SECRET_ACCOUNT, SECRET_ACCOUNT,
+        };
+        let dir = crate::test_support::test_tempdir("settings-failed-secret-batch");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let registry = Arc::new(SettingsRegistry::load(dir.path().join("config.toml")).unwrap());
+        registry
+            .apply(&[("notifications.volume".into(), json!(0.5))])
+            .unwrap();
+        let (bus, mut sub) = settings_subscription(&store);
+        let raw = InMemorySecretStore::default();
+        let originals = [
+            (SECRET_ACCOUNT, "original-device"),
+            (REFRESH_SECRET_ACCOUNT, "original-refresh"),
+            (EXPIRES_AT_SECRET_ACCOUNT, "12345"),
+        ];
+        if seeded {
+            for (account, value) in originals {
+                raw.store(account, value).unwrap();
+            }
+        }
+        raw.store("accounts.sentry.token", "original-sentry")
+            .unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let services = crate::Services::new(store)
+            .with_settings_registry(registry)
+            .with_secret_store(Arc::new(RejectSecondSecret {
+                raw: raw.clone(),
+                reject_rollback: false,
+                rollback: concurrent.then_some((entered.clone(), Mutex::new(release_rx))),
+            }))
+            .with_event_bus(bus);
+        let writer = services.clone();
+        let failed = intent_core::spawn_daemon(async move {
+            let mut changes = vec![
+                json!({"path":"notifications.volume", "value":0.75}),
+                json!({"path":SECRET_ACCOUNT, "value":"temporary-pat"}),
+            ];
+            if repeated {
+                changes.push(json!({"path":"accounts.sentry.token", "value":"first-sentry"}));
+            }
+            changes.push(json!({"path":"accounts.sentry.token", "value":"rejected-sentry"}));
+            writer.settings_update(json!(changes)).await
+        });
+        let mut newer = services.settings_update(json!([
+            {"path":SECRET_ACCOUNT, "value":"newer-pat"}
+        ]));
+        if concurrent {
+            timeout(Duration::from_secs(5), entered.notified())
+                .await
+                .expect("rollback parked");
+            assert!(
+                poll_fn(|cx| Poll::Ready(newer.as_mut().poll(cx).is_pending())).await,
+                "a newer credential must wait for compensation to finish"
+            );
+            let ordinary = timeout(
+                Duration::from_secs(3),
+                services.settings_get("notifications.volume".into()),
+            )
+            .await
+            .expect("compensation must not hold the revision gate")
+            .unwrap();
+            assert_eq!(ordinary["value"], json!(0.5));
+            assert_eq!(ordinary["revision"], json!(0));
+            release_tx.send(()).unwrap();
+        }
+        let error = failed.await.unwrap().expect_err("second secret must fail");
+        assert!(
+            error.to_string().contains("injected second-secret failure"),
+            "{error}"
+        );
+        for (account, value) in originals {
+            assert_eq!(
+                raw.load(account).unwrap().as_deref(),
+                seeded.then_some(value),
+                "failed batch must restore {account}"
+            );
+        }
+        assert_eq!(
+            raw.load("accounts.sentry.token").unwrap().as_deref(),
+            Some("original-sentry")
+        );
+        let ordinary = services
+            .settings_get("notifications.volume".into())
+            .await
+            .unwrap();
+        assert_eq!(ordinary["value"], json!(0.5));
+        assert_eq!(ordinary["origin"], json!("file"));
+        assert_eq!(ordinary["revision"], json!(0));
+        assert_no_settings_events(&mut sub).await;
+        assert_next_commit_is_revision_one(&services, &mut sub).await;
+        if concurrent {
+            assert_eq!(newer.await.unwrap()["revision"], json!(2));
+            assert_eq!(
+                raw.load(SECRET_ACCOUNT).unwrap().as_deref(),
+                Some("newer-pat")
+            );
+            assert_eq!(raw.load(REFRESH_SECRET_ACCOUNT).unwrap(), None);
+            assert_eq!(raw.load(EXPIRES_AT_SECRET_ACCOUNT).unwrap(), None);
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn failed_secret_batch_restores_earlier_token_and_siblings() {
+        failed_secret_batch_case(true, false, false).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn failed_secret_batch_removes_previously_absent_token() {
+        failed_secret_batch_case(false, false, false).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn failed_secret_batch_preserves_newer_credential() {
+        failed_secret_batch_case(true, true, false).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn failed_secret_batch_restores_a_completed_repeated_account() {
+        failed_secret_batch_case(true, false, true).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn failed_secret_batch_reports_incomplete_restoration() {
+        use intent_sourcecontrol::gitlab_token::{
+            EXPIRES_AT_SECRET_ACCOUNT, REFRESH_SECRET_ACCOUNT, SECRET_ACCOUNT,
+        };
+        let dir = crate::test_support::test_tempdir("settings-incomplete-secret-rollback");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let (bus, mut sub) = settings_subscription(&store);
+        let raw = InMemorySecretStore::default();
+        for (account, value) in [
+            (SECRET_ACCOUNT, "original-device"),
+            (REFRESH_SECRET_ACCOUNT, "original-refresh"),
+            (EXPIRES_AT_SECRET_ACCOUNT, "12345"),
+        ] {
+            raw.store(account, value).unwrap();
+        }
+        let services = crate::Services::new(store)
+            .with_secret_store(Arc::new(RejectSecondSecret {
+                raw: raw.clone(),
+                reject_rollback: true,
+                rollback: None,
+            }))
+            .with_event_bus(bus);
+        let error = services
+            .settings_update(json!([
+                {"path":SECRET_ACCOUNT, "value":"temporary-pat"},
+                {"path":"accounts.sentry.token", "value":"rejected-sentry"}
+            ]))
+            .await
+            .expect_err("second write and earlier restoration fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("injected second-secret failure"),
+            "{message}"
+        );
+        assert!(
+            message.contains("secret rollback was incomplete"),
+            "{message}"
+        );
+        assert_eq!(
+            raw.load(SECRET_ACCOUNT).unwrap().as_deref(),
+            Some("temporary-pat")
+        );
+        assert_eq!(
+            raw.load(REFRESH_SECRET_ACCOUNT).unwrap().as_deref(),
+            Some("original-refresh")
+        );
+        assert_eq!(
+            raw.load(EXPIRES_AT_SECRET_ACCOUNT).unwrap().as_deref(),
+            Some("12345")
+        );
+        assert_no_settings_events(&mut sub).await;
+        assert_next_commit_is_revision_one(&services, &mut sub).await;
+    }
+
+    async fn github_mutation_during_failed_batch(action: &str) {
+        struct ParkFailure {
+            raw: intent_core::FileSecretStore,
+            entered: Arc<tokio::sync::Notify>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl SecretStore for ParkFailure {
+            fn load(&self, account: &str) -> Result<Option<String>> {
+                self.raw.load(account)
+            }
+            fn delete(&self, account: &str) -> Result<()> {
+                self.raw.delete(account)
+            }
+            fn store(&self, account: &str, value: &str) -> Result<()> {
+                if account == "accounts.sentry.token" {
+                    self.entered.notify_one();
+                    let _ = self.release.lock().unwrap().recv();
+                    return Err(Error::Internal("injected later secret failure".into()));
+                }
+                self.raw.store(account, value)
+            }
+        }
+        let dir = crate::test_support::test_tempdir("settings-github-revoke-during-batch");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let bus = crate::EventBus::new(store.clone());
+        let mut sub = bus.subscribe(crate::events::SubscriptionFilter {
+            event_types: vec![
+                intent_core::events::GITHUB_AUTH_CHANGED.into(),
+                intent_core::events::SOURCE_CONTROL_AUTH_CHANGED.into(),
+                "settings:changed".into(),
+            ],
+            ..Default::default()
+        });
+        let raw = intent_core::FileSecretStore::with_path(dir.path().join("secrets.json"));
+        raw.store(crate::github_auth_ops::SECRET_ACCOUNT, "original-device")
+            .unwrap();
+        raw.store(
+            crate::source_control_auth_ops::GITHUB_TOKEN_METHOD_ACCOUNT,
+            "device",
+        )
+        .unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let services = crate::Services::new(store)
+            .with_secret_store(Arc::new(ParkFailure {
+                raw: raw.clone(),
+                entered: entered.clone(),
+                release: Mutex::new(release_rx),
+            }))
+            .with_event_bus(bus)
+            .with_github_login_base_uri("http://127.0.0.1:1");
+        let writer = services.clone();
+        let failed = intent_core::spawn_daemon(async move {
+            writer
+                .settings_update(json!([
+                    {"path":crate::github_auth_ops::SECRET_ACCOUNT, "value":"temporary-pat"},
+                    {"path":"accounts.sentry.token", "value":"rejected"}
+                ]))
+                .await
+        });
+        timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        assert_eq!(
+            raw.load(crate::github_auth_ops::SECRET_ACCOUNT)
+                .unwrap()
+                .as_deref(),
+            Some("temporary-pat")
+        );
+        match action {
+            "revoke" => {
+                timeout(Duration::from_secs(3), services.github_revoke())
+                    .await
+                    .expect("revoke remains responsive during unrelated secret write")
+                    .unwrap();
+            }
+            "alias" => {
+                timeout(
+                    Duration::from_secs(3),
+                    services.source_control_revoke("github".into(), None),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            }
+            "authorize" => {
+                let flow = crate::github_auth_ops::credential_tests::authorize(
+                    &services,
+                    raw.clone(),
+                    crate::github_auth_ops::credential_tests::accept_identity(),
+                )
+                .await;
+                timeout(Duration::from_secs(5), flow)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        release_tx.send(()).unwrap();
+        let error = failed
+            .await
+            .unwrap()
+            .expect_err("later secret write failed");
+        assert!(error.to_string().contains("injected later secret failure"));
+        assert_eq!(
+            raw.load(crate::github_auth_ops::SECRET_ACCOUNT).unwrap(),
+            (action == "authorize").then(|| "new-device-token".into()),
+            "rollback must preserve the later credential owner"
+        );
+        assert_eq!(
+            raw.load(crate::source_control_auth_ops::GITHUB_TOKEN_METHOD_ACCOUNT)
+                .unwrap(),
+            (action == "authorize").then(|| "device".into())
+        );
+        assert_eq!(
+            services
+                .secrets
+                .load(crate::github_auth_ops::SECRET_ACCOUNT)
+                .await
+                .unwrap(),
+            (action == "authorize").then(|| "new-device-token".into()),
+            "cached credential reads must agree with the surviving owner"
+        );
+        assert_eq!(
+            services
+                .settings_get("notifications.volume".into())
+                .await
+                .unwrap()["revision"],
+            json!(0)
+        );
+        let mut seen = Vec::new();
+        loop {
+            let next = poll_fn(|cx| Poll::Ready(Box::pin(sub.recv()).as_mut().poll(cx))).await;
+            match next {
+                Poll::Ready(Some(events)) => seen.extend(events),
+                Poll::Pending => break,
+                Poll::Ready(None) => panic!("event subscription closed unexpectedly"),
+            }
+        }
+        assert_eq!(seen.len(), 2);
+        assert!(seen.iter().all(|event| event.data["status"]
+            == if action == "authorize" {
+                "authorized"
+            } else {
+                "revoked"
+            }));
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn failed_secret_batch_preserves_github_revoke_during_later_write() {
+        github_mutation_during_failed_batch("revoke").await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn failed_secret_batch_preserves_github_provider_revoke_during_later_write() {
+        github_mutation_during_failed_batch("alias").await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn failed_secret_batch_preserves_newer_github_authorization() {
+        github_mutation_during_failed_batch("authorize").await;
+    }
+
+    async fn unsettled_secret_batch_case(repeated: bool) {
+        struct ParkWrite {
+            raw: InMemorySecretStore,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+            attempts: Mutex<Vec<String>>,
+        }
+        impl SecretStore for ParkWrite {
+            fn load(&self, account: &str) -> Result<Option<String>> {
+                self.raw.load(account)
+            }
+            fn store(&self, account: &str, value: &str) -> Result<()> {
+                if account == "accounts.sentry.token" {
+                    self.attempts.lock().unwrap().push(value.into());
+                    if value == "late-write" {
+                        let _ = self.release.lock().unwrap().recv();
+                    }
+                }
+                self.raw.store(account, value)
+            }
+            fn delete(&self, account: &str) -> Result<()> {
+                self.raw.delete(account)
+            }
+        }
+        let dir = crate::test_support::test_tempdir("settings-unsettled-secret-batch");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let raw = InMemorySecretStore::default();
+        raw.store("linear.token", "original-linear").unwrap();
+        raw.store("accounts.sentry.token", "original-sentry")
+            .unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let parked = Arc::new(ParkWrite {
+            raw: raw.clone(),
+            release: Mutex::new(release_rx),
+            attempts: Mutex::new(Vec::new()),
+        });
+        let secrets = AsyncSecretStore::with_timings(
+            parked.clone(),
+            Duration::from_secs(2),
+            Duration::from_millis(100),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .with_settle_timeout(Duration::from_millis(100));
+        let service = SettingsService::new(&store, &secrets, None);
+        let mut changes = vec![json!({"path":"linear.token", "value":"temporary-linear"})];
+        if repeated {
+            changes.push(json!({"path":"accounts.sentry.token", "value":"first-write"}));
+        }
+        changes.push(json!({"path":"accounts.sentry.token", "value":"late-write"}));
+        let error = service
+            .update(&json!(changes))
+            .await
+            .expect_err("parked write times out");
+        assert!(error.to_string().contains("timed out"), "{error}");
+        assert_eq!(
+            raw.load("linear.token").unwrap().as_deref(),
+            Some("original-linear")
+        );
+        assert_eq!(
+            raw.load("accounts.sentry.token").unwrap().as_deref(),
+            Some(if repeated {
+                "first-write"
+            } else {
+                "original-sentry"
+            })
+        );
+        assert_eq!(
+            *parked.attempts.lock().unwrap(),
+            if repeated {
+                vec!["first-write", "late-write"]
+            } else {
+                vec!["late-write"]
+            },
+            "never blindly restore the unsettled credential"
+        );
+        assert_eq!(secrets.detached_len("accounts.sentry.token"), 1);
+        release_tx.send(()).unwrap();
+        assert!(secrets
+            .settle_detached("accounts.sentry.token")
+            .await
+            .unwrap());
+        assert_eq!(
+            raw.load("accounts.sentry.token").unwrap().as_deref(),
+            Some("late-write")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_secret_batch_restores_completed_write_while_later_write_is_unsettled() {
+        unsettled_secret_batch_case(false).await;
+    }
+
+    #[tokio::test]
+    async fn failed_secret_batch_never_restores_an_unsettled_repeated_account() {
+        unsettled_secret_batch_case(true).await;
+    }
+    fn settings_subscription(store: &Store) -> (crate::EventBus, crate::events::Subscription) {
+        let bus = crate::EventBus::new(store.clone());
+        let sub = bus.subscribe(crate::events::SubscriptionFilter {
+            event_types: vec!["settings:changed".into()],
+            ..Default::default()
+        });
+        (bus, sub)
+    }
+
+    async fn assert_no_settings_events(sub: &mut crate::events::Subscription) {
+        let mut next = Box::pin(sub.recv());
+        assert!(
+            poll_fn(|cx| Poll::Ready(next.as_mut().poll(cx).is_pending())).await,
+            "a failed settings batch must not emit settings events"
+        );
+    }
+
+    async fn assert_next_commit_is_revision_one(
+        services: &crate::Services,
+        sub: &mut crate::events::Subscription,
+    ) {
+        let next = services
+            .settings_update(json!([{"path":"git.autoCommit","value":false}]))
+            .await
+            .unwrap();
+        assert_eq!(next["revision"], json!(1));
+        let events = timeout(Duration::from_secs(5), sub.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data["revision"], json!(1));
+        assert_eq!(events[0].data["changes"], next["applied"]);
+        assert_no_settings_events(sub).await;
+    }
+
+    struct ParkCompensatingHook {
+        parked: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    impl ServerControl for ParkCompensatingHook {
+        fn start_ws_listener(&self) -> Pin<Box<dyn Future<Output = Result<u16>> + Send + '_>> {
+            Box::pin(async {
+                Err(Error::Internal(
+                    "injected first listener start failure".into(),
+                ))
+            })
+        }
+        fn stop_ws_listener(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(async move {
+                self.parked.notify_one();
+                self.release.notified().await;
+            })
+        }
+        fn ws_listener_port(&self) -> Pin<Box<dyn Future<Output = Option<u16>> + Send + '_>> {
+            Box::pin(async { None })
+        }
+        fn is_tcp_connection(&self) -> bool {
+            false
+        }
+    }
+
+    async fn compensating_hook_case(revoke: bool) {
+        let dir = crate::test_support::test_tempdir("b68g-compensating-hook-order");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let registry = Arc::new(SettingsRegistry::load(dir.path().join("config.toml")).unwrap());
+        let (bus, mut sub) = settings_subscription(&store);
+        let raw = InMemorySecretStore::default();
+        raw.store(crate::github_auth_ops::SECRET_ACCOUNT, "original-device")
+            .unwrap();
+        raw.store(
+            crate::source_control_auth_ops::GITHUB_TOKEN_METHOD_ACCOUNT,
+            "device",
+        )
+        .unwrap();
+        let services = Arc::new(
+            crate::Services::new(store)
+                .with_settings_registry(registry)
+                .with_secret_store(Arc::new(raw.clone()))
+                .with_event_bus(bus)
+                .with_github_login_base_uri("http://127.0.0.1:1"),
+        );
+        let parked = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        services.attach_server_control(Arc::new(ParkCompensatingHook {
+            parked: parked.clone(),
+            release: release.clone(),
+        }));
+        let writer = services.clone();
+        let update = intent_core::spawn_daemon(async move {
+            writer
+                .settings_update(json!([
+                    {"path":crate::github_auth_ops::SECRET_ACCOUNT,"value":"settings-pat"},
+                    {"path":"server.wsApi.enabled","value":true}
+                ]))
+                .await
+        });
+        timeout(Duration::from_secs(5), parked.notified())
+            .await
+            .unwrap();
+        eprintln!(
+            "at compensating hook: token={:?}; method={:?}",
+            raw.load(crate::github_auth_ops::SECRET_ACCOUNT).unwrap(),
+            raw.load(crate::source_control_auth_ops::GITHUB_TOKEN_METHOD_ACCOUNT)
+                .unwrap()
+        );
+        if revoke {
+            let revoked = timeout(Duration::from_secs(5), services.github_revoke())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(revoked["ok"], json!(true));
+        } else {
+            raw.store(crate::github_auth_ops::SECRET_ACCOUNT, "oauth-completed")
+                .unwrap();
+            raw.store(
+                crate::source_control_auth_ops::GITHUB_TOKEN_METHOD_ACCOUNT,
+                "device",
+            )
+            .unwrap();
+        }
+        release.notify_one();
+        let error = timeout(Duration::from_secs(5), update)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect_err("start failed");
+        let ordinary = services
+            .settings_get("server.wsApi.enabled".into())
+            .await
+            .unwrap();
+        assert_eq!(ordinary["value"], json!(false));
+        assert_eq!(ordinary["revision"], json!(0));
+        assert_no_settings_events(&mut sub).await;
+        eprintln!("after compensating hook: revoke={revoke}; error={error}; token={:?}; method={:?}; ordinary={ordinary}; settings_events=0",
+            raw.load(crate::github_auth_ops::SECRET_ACCOUNT).unwrap(),
+            raw.load(crate::source_control_auth_ops::GITHUB_TOKEN_METHOD_ACCOUNT).unwrap());
+        assert_next_commit_is_revision_one(&services, &mut sub).await;
+        assert_eq!(raw.load(crate::github_auth_ops::SECRET_ACCOUNT).unwrap().as_deref(),
+            if revoke {None} else {Some("oauth-completed")},
+            "secret rollback must finish before compensating runtime hooks can admit later GitHub mutations");
+        assert_eq!(
+            raw.load(crate::source_control_auth_ops::GITHUB_TOKEN_METHOD_ACCOUNT)
+                .unwrap()
+                .as_deref(),
+            if revoke { None } else { Some("device") }
+        );
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn compensating_hook_preserves_newer_github_revoke() {
+        compensating_hook_case(true).await;
+    }
+    #[intent_test_macros::daemon_test]
+    async fn compensating_hook_preserves_newer_github_flow() {
+        compensating_hook_case(false).await;
+    }
+
+    pub(super) struct PausedRollbackStore {
+        pub(super) raw: InMemorySecretStore,
+        pub(super) parked: Arc<tokio::sync::Notify>,
+        pub(super) release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl SecretStore for PausedRollbackStore {
+        fn load(&self, account: &str) -> Result<Option<String>> {
+            self.raw.load(account)
+        }
+        fn store(&self, account: &str, value: &str) -> Result<()> {
+            self.raw.store(account, value)?;
+            if account == crate::github_auth_ops::SECRET_ACCOUNT && value == "original-device" {
+                self.parked.notify_one();
+                let _ = self.release.lock().unwrap().recv();
+            }
+            Ok(())
+        }
+        fn delete(&self, account: &str) -> Result<()> {
+            self.raw.delete(account)
+        }
+    }
+
+    #[derive(Default)]
+    struct RecoverableControl {
+        starts: std::sync::atomic::AtomicUsize,
+        stops: std::sync::atomic::AtomicUsize,
+        running: std::sync::atomic::AtomicBool,
+    }
+    impl ServerControl for RecoverableControl {
+        fn start_ws_listener(&self) -> Pin<Box<dyn Future<Output = Result<u16>> + Send + '_>> {
+            Box::pin(async move {
+                if self
+                    .starts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    == 0
+                {
+                    return Err(Error::Internal("injected first start failure".into()));
+                }
+                self.running
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(5181)
+            })
+        }
+        fn stop_ws_listener(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(async move {
+                self.stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.running
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+            })
+        }
+        fn ws_listener_port(&self) -> Pin<Box<dyn Future<Output = Option<u16>> + Send + '_>> {
+            Box::pin(async move {
+                self.running
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    .then_some(5181)
+            })
+        }
+        fn is_tcp_connection(&self) -> bool {
+            false
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn parked_secret_rollback_preserves_newer_runtime_commit() {
+        let dir = crate::test_support::test_tempdir("settings-rollback-runtime-commit");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let registry = Arc::new(SettingsRegistry::load(dir.path().join("config.toml")).unwrap());
+        let (bus, mut sub) = settings_subscription(&store);
+        let raw = InMemorySecretStore::default();
+        raw.store(crate::github_auth_ops::SECRET_ACCOUNT, "original-device")
+            .unwrap();
+        let parked = Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let services = Arc::new(
+            crate::Services::new(store)
+                .with_settings_registry(registry)
+                .with_secret_store(Arc::new(PausedRollbackStore {
+                    raw,
+                    parked: parked.clone(),
+                    release: Mutex::new(release_rx),
+                }))
+                .with_event_bus(bus),
+        );
+        let control = Arc::new(RecoverableControl::default());
+        services.attach_server_control(control.clone());
+        let writer = services.clone();
+        let failed = intent_core::spawn_daemon(async move {
+            writer
+                .settings_update(json!([
+                    {"path":crate::github_auth_ops::SECRET_ACCOUNT,"value":"settings-pat"},
+                    {"path":"server.wsApi.enabled","value":true}
+                ]))
+                .await
+        });
+        timeout(Duration::from_secs(5), parked.notified())
+            .await
+            .unwrap();
+        let newer = timeout(
+            Duration::from_secs(3),
+            services.settings_update(json!([
+                {"path":"server.wsApi.enabled","value":true}
+            ])),
+        )
+        .await
+        .expect("secret compensation must not hold the revision gate")
+        .unwrap();
+        assert_eq!(newer["revision"], json!(1));
+        release_tx.send(()).unwrap();
+        failed.await.unwrap().expect_err("first start failed");
+        let current = services
+            .settings_get("server.wsApi.enabled".into())
+            .await
+            .unwrap();
+        assert_eq!(current["value"], json!(true));
+        assert_eq!(current["revision"], json!(1));
+        assert_eq!(
+            control.ws_listener_port().await,
+            Some(5181),
+            "stale compensation must not stop the newer listener"
+        );
+        let events = timeout(Duration::from_secs(5), sub.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].data,
+            json!({"revision":1,"changes":newer["applied"]})
+        );
+        assert_no_settings_events(&mut sub).await;
+    }
+}
+
+#[cfg(test)]
+mod port_assignment_publication_tests {
+    use super::*;
+    use intent_core::{ServerControl, WorkspaceApi};
+    use std::{
+        future::Future,
+        pin::Pin,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    struct AssignPort {
+        registry: Arc<SettingsRegistry>,
+        port: u16,
+        starts: AtomicUsize,
+        fail_tunnel: bool,
+    }
+    impl ServerControl for AssignPort {
+        fn start_ws_listener(&self) -> Pin<Box<dyn Future<Output = Result<u16>> + Send + '_>> {
+            Box::pin(async move {
+                self.starts.fetch_add(1, Ordering::SeqCst);
+                self.registry
+                    .persist_selected_ws_api_port(&self.registry.snapshot(), self.port)?;
+                Ok(self.port)
+            })
+        }
+        fn stop_ws_listener(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(async {})
+        }
+        fn ws_listener_port(&self) -> Pin<Box<dyn Future<Output = Option<u16>> + Send + '_>> {
+            Box::pin(async { None })
+        }
+        fn start_tunnel(&self) -> Pin<Box<dyn Future<Output = Result<String>> + Send + '_>> {
+            Box::pin(async move {
+                if self.fail_tunnel {
+                    Err(Error::Internal("injected tunnel failure".into()))
+                } else {
+                    Ok("test-tunnel".into())
+                }
+            })
+        }
+        fn is_tcp_connection(&self) -> bool {
+            false
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn settings_port_assignment_publishes_final_value_without_recursive_hooks() {
+        for external in [false, true] {
+            for port in [5181, 5183] {
+                let dir = crate::test_support::test_tempdir("port-publication");
+                let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+                let path = dir.path().join("config.toml");
+                let registry = Arc::new(SettingsRegistry::load(path.clone()).unwrap());
+                let bus = crate::EventBus::new(store.clone());
+                let mut sub = bus.subscribe(crate::events::SubscriptionFilter {
+                    event_types: vec!["settings:changed".into()],
+                    ..Default::default()
+                });
+                let services = crate::Services::new(store)
+                    .with_settings_registry(registry.clone())
+                    .with_event_bus(bus);
+                let control = Arc::new(AssignPort {
+                    registry: registry.clone(),
+                    port,
+                    starts: AtomicUsize::new(0),
+                    fail_tunnel: false,
+                });
+                services.attach_server_control(control.clone());
+                let response = if external {
+                    let _gate = services.settings_revision_gate.write().await;
+                    let text = "[server.wsApi]\nenabled = true\n";
+                    std::fs::write(path, text).unwrap();
+                    let notice = registry.reload(text).unwrap();
+                    services.apply_external_settings_change(&notice).await;
+                    None
+                } else {
+                    Some(
+                        services
+                            .settings_update(json!([{"path":"server.wsApi.enabled","value":true}]))
+                            .await
+                            .unwrap(),
+                    )
+                };
+                let events = tokio::time::timeout(Duration::from_secs(5), sub.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(events.len(), 1);
+                let changes = &events[0].data["changes"];
+                let assignment = changes
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|entry| entry["path"] == "server.wsApi.port")
+                    .unwrap();
+                assert_eq!(
+                    assignment,
+                    &json!({"path":"server.wsApi.port","value":f64::from(port),"origin":"file"})
+                );
+                assert_eq!(control.starts.load(Ordering::SeqCst), 1);
+                assert_eq!(events[0].data["revision"], 1);
+                if let Some(response) = response {
+                    assert_eq!(response["applied"], *changes);
+                }
+                let setting = services
+                    .settings_get("server.wsApi.port".into())
+                    .await
+                    .unwrap();
+                assert_eq!(setting["value"], json!(f64::from(port)));
+                assert_eq!(setting["origin"], "file");
+                assert_eq!(setting["revision"], 1);
+            }
+        }
+    }
+    #[intent_test_macros::daemon_test]
+    async fn settings_port_assignment_surviving_failed_batch_gets_revision_and_event() {
+        let dir = crate::test_support::test_tempdir("port-publication-rollback");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let registry = Arc::new(SettingsRegistry::load(dir.path().join("config.toml")).unwrap());
+        let bus = crate::EventBus::new(store.clone());
+        let mut sub = bus.subscribe(crate::events::SubscriptionFilter {
+            event_types: vec!["settings:changed".into()],
+            ..Default::default()
+        });
+        let services = crate::Services::new(store)
+            .with_settings_registry(registry.clone())
+            .with_event_bus(bus);
+        let control = Arc::new(AssignPort {
+            registry: registry.clone(),
+            port: 5183,
+            starts: AtomicUsize::new(0),
+            fail_tunnel: true,
+        });
+        services.attach_server_control(control.clone());
+        let error = services
+            .settings_update(json!([
+                {"path":"server.wsApi.enabled","value":true},
+                {"path":"server.tunnel.enabled","value":true}
+            ]))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("injected tunnel failure"));
+        assert!(!registry.snapshot().effective.server.ws_api.enabled);
+        assert_eq!(
+            registry.snapshot().ws_api_port_policy(),
+            crate::WsApiPortPolicy::Fixed(5183)
+        );
+        let events = tokio::time::timeout(Duration::from_secs(5), sub.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].data["changes"],
+            json!([{"path":"server.wsApi.port","value":5183.0,"origin":"file"}])
+        );
+        assert_eq!(events[0].data["revision"], 1);
+        assert_eq!(
+            services
+                .settings_get("server.wsApi.port".into())
+                .await
+                .unwrap()["revision"],
+            1
+        );
+        assert_eq!(control.starts.load(Ordering::SeqCst), 1);
+    }
+    #[intent_test_macros::daemon_test]
+    async fn settings_port_assignment_is_published_before_secret_rollback_releases_revision_gate() {
+        use super::rollback_order_tests::PausedRollbackStore;
+        use std::{future::poll_fn, task::Poll};
+        let dir = crate::test_support::test_tempdir("port-publication-secret-rollback");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let registry = Arc::new(SettingsRegistry::load(dir.path().join("config.toml")).unwrap());
+        let bus = crate::EventBus::new(store.clone());
+        let mut sub = bus.subscribe(crate::events::SubscriptionFilter {
+            event_types: vec!["settings:changed".into()],
+            ..Default::default()
+        });
+        let raw = InMemorySecretStore::default();
+        raw.store(crate::github_auth_ops::SECRET_ACCOUNT, "original-device")
+            .unwrap();
+        let parked = Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let services = Arc::new(
+            crate::Services::new(store)
+                .with_settings_registry(registry.clone())
+                .with_event_bus(bus)
+                .with_secret_store(Arc::new(PausedRollbackStore {
+                    raw,
+                    parked: parked.clone(),
+                    release: Mutex::new(release_rx),
+                })),
+        );
+        let control = Arc::new(AssignPort {
+            registry,
+            port: 5183,
+            starts: AtomicUsize::new(0),
+            fail_tunnel: true,
+        });
+        services.attach_server_control(control.clone());
+        let writer = services.clone();
+        let failed = intent_core::spawn_daemon(async move {
+            writer
+                .settings_update(json!([
+                    {"path":crate::github_auth_ops::SECRET_ACCOUNT,"value":"settings-pat"},
+                    {"path":"server.wsApi.enabled","value":true},
+                    {"path":"server.tunnel.enabled","value":true}
+                ]))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), parked.notified())
+            .await
+            .unwrap();
+        let assigned = services
+            .settings_get("server.wsApi.port".into())
+            .await
+            .unwrap();
+        assert_eq!(assigned["value"], 5183.0);
+        assert_eq!(
+            assigned["revision"], 1,
+            "assignment must have a revision before another reader enters"
+        );
+        let first = tokio::time::timeout(Duration::from_secs(5), sub.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(
+            first[0].data["changes"],
+            json!([{"path":"server.wsApi.port","value":5183.0,"origin":"file"}])
+        );
+        let newer = services
+            .settings_update(json!([{"path":"server.wsApi.port","value":62000}]))
+            .await
+            .unwrap();
+        assert_eq!(newer["revision"], 2);
+        release_tx.send(()).unwrap();
+        let error = failed.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("injected tunnel failure"));
+        let final_port = services
+            .settings_get("server.wsApi.port".into())
+            .await
+            .unwrap();
+        assert_eq!(final_port["value"], 62000.0);
+        assert_eq!(
+            final_port["revision"], 2,
+            "old rollback must not announce newer assignment again"
+        );
+        let second = tokio::time::timeout(Duration::from_secs(5), sub.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].data["changes"], newer["applied"]);
+        let mut next = Box::pin(sub.recv());
+        assert!(poll_fn(|cx| Poll::Ready(next.as_mut().poll(cx).is_pending())).await);
+        assert_eq!(control.starts.load(Ordering::SeqCst), 1);
     }
 }

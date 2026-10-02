@@ -2,6 +2,123 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.135] - 2026-10-02
+
+### 🐛 Bug Fixes
+
+- Retry contended note attribution refreshes ([#2218](https://github.com/intent-hq/intentd/pull/2218))
+- Restore earlier credentials after a settings batch failure ([#2219](https://github.com/intent-hq/intentd/pull/2219))
+- Drain admitted writers before closing the store ([#2225](https://github.com/intent-hq/intentd/pull/2225))
+
+### ⚡ Performance
+
+- Avoid full note reads in task listing ([#2217](https://github.com/intent-hq/intentd/pull/2217))
+
+### ⚙️ Miscellaneous Tasks
+
+- Bump rquickjs from 0.12.2 to 0.14.0 ([#1932](https://github.com/intent-hq/intentd/pull/1932))
+
+
+## [0.9.134] - 2026-10-01
+
+### 🐛 Bug Fixes
+
+- Deliver permission events to authorized guest owners ([#2215](https://github.com/intent-hq/intentd/pull/2215))
+
+
+## [0.9.133] - 2026-10-01
+
+### 🚀 Features
+
+- Select and persist an available WSS port on first enable ([#2213](https://github.com/intent-hq/intentd/pull/2213))
+
+### 🐛 Bug Fixes
+
+- Reset live chat transcripts after message edits ([#1973](https://github.com/intent-hq/intentd/pull/1973))
+
+
+## [0.9.132] - 2026-10-01
+
+### 🚀 Features
+
+- Support registered roots in file readers ([#2207](https://github.com/intent-hq/intentd/pull/2207))
+
+### 🐛 Bug Fixes
+
+- Use anonymous stack sampler spill files ([#2210](https://github.com/intent-hq/intentd/pull/2210))
+- Reject retired workspace model setting writes ([#1646](https://github.com/intent-hq/intentd/pull/1646)) ([#2208](https://github.com/intent-hq/intentd/pull/2208))
+
+### 🧪 Testing
+
+- Await durable idle after interrupted queue drain ([#2212](https://github.com/intent-hq/intentd/pull/2212))
+
+
+## [0.9.131] - 2026-10-01
+
+### 🐛 Bug Fixes
+
+- Publish scoped comment deletion updates ([#2205](https://github.com/intent-hq/intentd/pull/2205))
+- Default new command scripts to one-off ([#2204](https://github.com/intent-hq/intentd/pull/2204))
+
+
+## [0.9.130] - 2026-10-01
+
+### 🚀 Features
+
+- Log daemon shutdown phase timings ([#2201](https://github.com/intent-hq/intentd/pull/2201))
+
+
+## [0.9.129] - 2026-10-01
+
+### 🚀 Features
+
+- Add indexed global note search with ranked previews ([#2199](https://github.com/intent-hq/intentd/pull/2199))
+
+### 🐛 Bug Fixes
+
+- Notify workspace guests after host membership additions ([#2196](https://github.com/intent-hq/intentd/pull/2196))
+
+
+## [0.9.128] - 2026-10-01
+
+### 🚀 Features
+
+- Discover Claude agents and follow linked skills ([#2197](https://github.com/intent-hq/intentd/pull/2197))
+
+
+## [0.9.127] - 2026-09-30
+
+### 🚀 Features
+
+- *(terminal)* Add exact output replay cursors ([#2193](https://github.com/intent-hq/intentd/pull/2193))
+- Archive one-off scripts with durable run history ([#2195](https://github.com/intent-hq/intentd/pull/2195))
+
+### 🐛 Bug Fixes
+
+- *(settings)* Release revision gate during secret-store mutations ([#2112](https://github.com/intent-hq/intentd/pull/2112))
+
+
+## [0.9.126] - 2026-09-30
+
+### 🚀 Features
+
+- Configure bounded PR monitoring capacity ([#5887](https://github.com/intent-hq/intentd/pull/5887)) ([#2192](https://github.com/intent-hq/intentd/pull/2192))
+- Retain invocation-bound command exit evidence ([#5938](https://github.com/intent-hq/intentd/pull/5938)) ([#2191](https://github.com/intent-hq/intentd/pull/2191))
+
+
+## [0.9.125] - 2026-09-30
+
+### 🚀 Features
+
+- Extract reusable agent checkpoint capture and restore ([#2157](https://github.com/intent-hq/intentd/pull/2157))
+
+### 🐛 Bug Fixes
+
+- *(git)* Correct HTTPS IP certificate verification ([#2185](https://github.com/intent-hq/intentd/pull/2185))
+- Bound PTY teardown and preserve agent work during shutdown ([#2187](https://github.com/intent-hq/intentd/pull/2187))
+- Settle warm-cache fixtures before teardown ([#6356](https://github.com/intent-hq/intentd/pull/6356)) ([#2183](https://github.com/intent-hq/intentd/pull/2183))
+
+
 ## [0.9.124] - 2026-09-30
 
 ### 🐛 Bug Fixes

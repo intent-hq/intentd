@@ -22,7 +22,7 @@ use intent_acp::{
 };
 use intent_core::events::{TERMINAL_DATA, TERMINAL_EXIT};
 use intent_core::{now_iso, BoxFuture, Error, Result, WorkspaceId};
-use intent_pty::{LineSnapshot, PtyExit, PtyHost, PtyId, PtySize, SpawnSpec};
+use intent_pty::{LineSnapshot, OutputChunk, PtyExit, PtyHost, PtyId, PtySize, SpawnSpec};
 use intent_store::{NewEvent, Store};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -75,7 +75,8 @@ fn resolve(terminal_id: &str) -> Result<PtyId> {
 /// command launches zsh/bash with `-l` so login profiles are loaded; explicit
 /// commands and Windows defaults are unchanged.
 #[expect(clippy::too_many_arguments)]
-pub(crate) async fn create(
+pub(crate) async fn create_owned(
+    tasks: &crate::delivery_tasks::DeliveryTasks,
     pty: Arc<PtyHost>,
     bus: Option<EventBus>,
     store: Option<Store>,
@@ -119,8 +120,38 @@ pub(crate) async fn create(
     spec.cwd = spawn_cwd;
     let pty_id = pty.spawn(spec)?;
     let terminal_id = pty_id.to_string();
-    spawn_output_stream(pty, bus, workspace_id, pty_id, terminal_id.clone());
+    spawn_output_stream(tasks, pty, bus, workspace_id, pty_id, terminal_id.clone());
     Ok(json!({ "terminalId": terminal_id }))
+}
+
+#[cfg(all(test, unix))]
+#[expect(clippy::too_many_arguments)]
+async fn create(
+    pty: Arc<PtyHost>,
+    bus: Option<EventBus>,
+    store: Option<Store>,
+    settings: Option<Arc<SettingsRegistry>>,
+    workspace_id: WorkspaceId,
+    cols: u16,
+    rows: u16,
+    cwd: Option<String>,
+    command: Option<String>,
+    env: Option<std::collections::BTreeMap<String, String>>,
+) -> Result<Value> {
+    create_owned(
+        &crate::delivery_tasks::DeliveryTasks::default(),
+        pty,
+        bus,
+        store,
+        settings,
+        workspace_id,
+        cols,
+        rows,
+        cwd,
+        command,
+        env,
+    )
+    .await
 }
 
 /// Base spawn spec for an interactive workspace terminal. Only the omitted-
@@ -303,13 +334,17 @@ pub(crate) fn get_buffer(
     let id = resolve(terminal_id)?;
     // Omitted (and legacy negative) bounds retain full-history semantics. A
     // usable bound takes the ring tail directly, without cloning its prefix.
-    let bytes = if let Some(max) = max_bytes.and_then(|n| usize::try_from(n).ok()) {
-        pty.scrollback_tail(id, max)?
-    } else {
-        pty.scrollback(id)?
-    };
-    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    Ok(json!({ "terminalId": terminal_id, "data": data }))
+    let max = max_bytes
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(usize::MAX);
+    let snapshot = pty.positioned_scrollback(id, max)?;
+    let data = base64::engine::general_purpose::STANDARD.encode(&snapshot.bytes);
+    Ok(json!({
+        "terminalId": terminal_id, "data": data,
+        "daemonBootId": pty.daemon_boot_id(),
+        "startOffset": snapshot.start_offset.to_string(),
+        "endOffset": snapshot.end_offset.to_string(),
+    }))
 }
 
 /// The workspace's live terminals wrapped in the per-boot envelope
@@ -513,16 +548,20 @@ fn utf8_len(b: u8) -> usize {
 /// Attach to a freshly created PTY and fan its output onto the bus as
 /// `terminal:data`, emitting a terminal `terminal:exit` when the stream closes.
 pub(crate) fn spawn_output_stream(
+    tasks: &crate::delivery_tasks::DeliveryTasks,
     pty: Arc<PtyHost>,
     bus: Option<EventBus>,
     workspace_id: WorkspaceId,
     pty_id: PtyId,
     terminal_id: String,
 ) {
-    let Ok(attachment) = pty.attach(pty_id) else {
-        return;
-    };
-    intent_core::spawn_daemon(async move {
+    let attachment = pty.attach(pty_id);
+    let _ = tasks.spawn_draining(async move {
+        let Ok(attachment) = attachment else {
+            // A concurrent host shutdown can reap the PTY before attach.
+            emit_exit(bus.as_ref(), &workspace_id, &terminal_id, None).await;
+            return;
+        };
         let mut live = attachment.live;
         // Emit any output captured between spawn and attach exactly once, then
         // tail live chunks (the host guarantees history XOR live, never both).
@@ -531,13 +570,14 @@ pub(crate) fn spawn_output_stream(
                 bus.as_ref(),
                 &workspace_id,
                 &terminal_id,
+                pty.daemon_boot_id(),
                 &attachment.backlog,
             );
         }
         loop {
             tokio::select! {
                 recv = live.recv() => match recv {
-                    Ok(chunk) => emit_data(bus.as_ref(), &workspace_id, &terminal_id, &chunk),
+                    Ok(chunk) => emit_data(bus.as_ref(), &workspace_id, &terminal_id, pty.daemon_boot_id(), &chunk),
                     Err(RecvError::Lagged(_)) => {},
                     // A `terminal.kill` tore down the session and dropped the
                     // sender; the process is gone.
@@ -547,7 +587,7 @@ pub(crate) fn spawn_output_stream(
                     if matches!(pty.try_exit(pty_id), Ok(Some(_))) {
                         // Reaped: drain any output the reader flushed just before
                         // EOF, then stop tailing.
-                        drain_pending(&mut live, bus.as_ref(), &workspace_id, &terminal_id);
+                        drain_pending(&mut live, bus.as_ref(), &workspace_id, &terminal_id, pty.daemon_boot_id());
                         break;
                     }
                 }
@@ -561,14 +601,15 @@ pub(crate) fn spawn_output_stream(
 /// Flush any output buffered on the live channel without blocking (used once the
 /// child has exited so trailing output still streams before `terminal:exit`).
 fn drain_pending(
-    live: &mut tokio::sync::broadcast::Receiver<Arc<Vec<u8>>>,
+    live: &mut tokio::sync::broadcast::Receiver<Arc<OutputChunk>>,
     bus: Option<&EventBus>,
     workspace_id: &WorkspaceId,
     terminal_id: &str,
+    daemon_boot_id: &str,
 ) {
     loop {
         match live.try_recv() {
-            Ok(chunk) => emit_data(bus, workspace_id, terminal_id, &chunk),
+            Ok(chunk) => emit_data(bus, workspace_id, terminal_id, daemon_boot_id, &chunk),
             Err(TryRecvError::Lagged(_)) => {}
             Err(TryRecvError::Empty | TryRecvError::Closed) => break,
         }
@@ -585,14 +626,20 @@ fn drain_pending(
 /// `terminal:data` rows. Ordering vs `terminal:exit` is preserved: the stream
 /// task broadcasts every chunk synchronously before it awaits the durable
 /// `emit_exit`, so exit can never overtake data.
-fn emit_data(bus: Option<&EventBus>, ws: &WorkspaceId, terminal_id: &str, bytes: &[u8]) {
-    let chunk = base64::engine::general_purpose::STANDARD.encode(bytes);
+fn emit_data(
+    bus: Option<&EventBus>,
+    ws: &WorkspaceId,
+    terminal_id: &str,
+    daemon_boot_id: &str,
+    output: &OutputChunk,
+) {
+    let chunk = base64::engine::general_purpose::STANDARD.encode(&output.bytes);
     publish_event_transient(
         bus,
         &terminal_event(
             ws,
             TERMINAL_DATA,
-            json!({ "terminalId": terminal_id, "chunk": chunk }),
+            json!({ "terminalId": terminal_id, "chunk": chunk, "daemonBootId": daemon_boot_id, "startOffset": output.start_offset.to_string(), "endOffset": output.end_offset.to_string() }),
         ),
     );
 }
@@ -1076,6 +1123,50 @@ mod tests {
             }
         }
         acc
+    }
+
+    #[tokio::test]
+    async fn shutdown_joins_terminal_exit_after_host_reap() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+        let bus = EventBus::new(store.clone());
+        let pty = host();
+        let tasks = crate::delivery_tasks::DeliveryTasks::default();
+        let id = pty.spawn(SpawnSpec::new("ws-shutdown", "cat")).unwrap();
+        spawn_output_stream(
+            &tasks,
+            pty.clone(),
+            Some(bus.clone()),
+            ws("ws-shutdown"),
+            id,
+            id.to_string(),
+        );
+        let held = store.write_pool().acquire().await.unwrap();
+        pty.kill_all().await;
+        let drain = tasks.drain_finite();
+        tokio::pin!(drain);
+        tokio::select! {
+            biased;
+            () = &mut drain => panic!("terminal publisher escaped held durable write"),
+            () = std::future::ready(()) => {}
+        }
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(10), drain)
+            .await
+            .unwrap();
+        bus.shutdown().await.unwrap();
+        let events = store
+            .query_events(&intent_store::EventQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.event_type == TERMINAL_EXIT)
+                .count(),
+            1
+        );
+        store.close().await;
     }
 
     // ---- pure helpers (no spawn) ----

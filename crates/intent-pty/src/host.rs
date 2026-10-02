@@ -17,7 +17,7 @@ use tokio::sync::broadcast;
 
 use intent_core::{Error, Result};
 
-use crate::scrollback::{LineSnapshot, Scrollback, DEFAULT_SCROLLBACK_BYTES};
+use crate::scrollback::{LineSnapshot, OutputChunk, Scrollback, DEFAULT_SCROLLBACK_BYTES};
 
 #[cfg(unix)]
 mod unix_io;
@@ -194,9 +194,9 @@ impl SpawnSpec {
 /// receiver tailing every subsequent output chunk (§12.1 back-fill-then-tail).
 pub struct Attachment {
     /// Recent scrollback captured at attach time, to be written before tailing.
-    pub backlog: Vec<u8>,
+    pub backlog: OutputChunk,
     /// Live output stream; each item is a shared output chunk.
-    pub live: broadcast::Receiver<Arc<Vec<u8>>>,
+    pub live: broadcast::Receiver<Arc<OutputChunk>>,
 }
 
 /// Scrollback + broadcast guarded together so attach (snapshot + subscribe) and
@@ -204,7 +204,7 @@ pub struct Attachment {
 /// late subscriber sees each chunk exactly once (history XOR live, never both).
 struct Fanout {
     scrollback: Scrollback,
-    tx: broadcast::Sender<Arc<Vec<u8>>>,
+    tx: broadcast::Sender<Arc<OutputChunk>>,
 }
 
 /// A point-in-time view of a tracked PTY's metadata (`terminal.list` /
@@ -316,8 +316,8 @@ fn retry_transient<T, E: std::fmt::Display>(
 }
 
 /// The unified host owning every spawned PTY (terminals and scripts).
-#[derive(Default)]
 pub struct PtyHost {
+    daemon_boot_id: String,
     sessions: Mutex<HashMap<PtyId, Arc<PtySession>>>,
     next_id: AtomicU64,
     /// Latched by [`kill_all`](Self::kill_all) (clean daemon shutdown): once
@@ -327,11 +327,28 @@ pub struct PtyHost {
     closed: AtomicBool,
 }
 
+impl Default for PtyHost {
+    fn default() -> Self {
+        Self {
+            daemon_boot_id: uuid::Uuid::new_v4().to_string(),
+            sessions: Mutex::default(),
+            next_id: AtomicU64::default(),
+            closed: AtomicBool::default(),
+        }
+    }
+}
+
 impl PtyHost {
     /// Create an empty host.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Identity of this host lifetime, shared by terminal lists, snapshots and events.
+    #[must_use]
+    pub fn daemon_boot_id(&self) -> &str {
+        &self.daemon_boot_id
     }
 
     /// Spawn a process attached to a fresh PTY and start fanning out its output.
@@ -463,7 +480,7 @@ impl PtyHost {
     pub fn attach(&self, id: PtyId) -> Result<Attachment> {
         let session = self.get(id)?;
         let guard = session.fanout.lock().unwrap();
-        let backlog = guard.scrollback.snapshot();
+        let backlog = guard.scrollback.positioned_snapshot(usize::MAX);
         let live = guard.tx.subscribe();
         drop(guard);
         Ok(Attachment { backlog, live })
@@ -499,6 +516,19 @@ impl PtyHost {
         let session = self.get(id)?;
         let guard = session.fanout.lock().unwrap();
         Ok(guard.scrollback.snapshot_tail(max_bytes))
+    }
+
+    /// Atomically capture retained output and its byte positions.
+    ///
+    /// # Errors
+    /// Returns `Error::NotFound` if no session exists for `id`.
+    ///
+    /// # Panics
+    /// Panics if the session fanout mutex is poisoned.
+    pub fn positioned_scrollback(&self, id: PtyId, max_bytes: usize) -> Result<OutputChunk> {
+        let session = self.get(id)?;
+        let guard = session.fanout.lock().unwrap();
+        Ok(guard.scrollback.positioned_snapshot(max_bytes))
     }
 
     /// Snapshot an oldest-indexed line window from retained scrollback. The
@@ -949,9 +979,14 @@ fn read_loop(mut reader: Box<dyn Read + Send>, fanout: &Arc<Mutex<Fanout>>) {
         match reader.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                let chunk = Arc::new(buf[..n].to_vec());
                 let mut guard = fanout.lock().unwrap();
-                guard.scrollback.push(&chunk);
+                let start_offset = guard.scrollback.end_offset();
+                guard.scrollback.push(&buf[..n]);
+                let chunk = Arc::new(OutputChunk {
+                    bytes: buf[..n].to_vec(),
+                    start_offset,
+                    end_offset: guard.scrollback.end_offset(),
+                });
                 let _ = guard.tx.send(chunk);
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -1105,7 +1140,7 @@ mod tests {
 
     /// Drain a live receiver until `needle` is seen or the deadline passes.
     async fn collect_until(
-        rx: &mut broadcast::Receiver<Arc<Vec<u8>>>,
+        rx: &mut broadcast::Receiver<Arc<OutputChunk>>,
         needle: &[u8],
         timeout: Duration,
     ) -> Vec<u8> {
@@ -1128,7 +1163,7 @@ mod tests {
     /// deadline passes. Used when output arrives in an arbitrary order and no
     /// single chunk can serve as a completion sentinel.
     async fn collect_until_all(
-        rx: &mut broadcast::Receiver<Arc<Vec<u8>>>,
+        rx: &mut broadcast::Receiver<Arc<OutputChunk>>,
         needles: &[Vec<u8>],
         timeout: Duration,
     ) -> Vec<u8> {
@@ -1998,3 +2033,7 @@ mod tests {
         assert!(host.kill(id).await);
     }
 }
+
+#[cfg(test)]
+#[path = "replay_tests.rs"]
+mod replay_tests;

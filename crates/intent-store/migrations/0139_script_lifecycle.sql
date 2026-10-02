@@ -1,0 +1,3 @@
+ALTER TABLE script ADD COLUMN purpose TEXT NOT NULL DEFAULT 'saved';
+ALTER TABLE script ADD COLUMN archived_at TEXT;
+ALTER TABLE script ADD COLUMN last_run TEXT;

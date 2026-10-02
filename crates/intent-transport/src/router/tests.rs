@@ -1592,11 +1592,17 @@ impl WorkspaceApi for FakeApi {
     fn search_notes(
         &self,
         _query: String,
+        workspace_id: Option<WorkspaceId>,
+        prefer_workspace_id: Option<WorkspaceId>,
+        limit: Option<i64>,
+        include_archived: bool,
         request_id: Option<String>,
     ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             let request_id = request_id.unwrap_or_else(|| "srch-minted".to_string());
-            Ok(serde_json::json!({ "requestId": request_id, "matches": [] }))
+            Ok(
+                serde_json::json!({ "requestId": request_id, "matches": [], "workspaceId":workspace_id, "preferWorkspaceId":prefer_workspace_id, "limit":limit, "includeArchived":include_archived, "indexed":true }),
+            )
         })
     }
 
@@ -1693,10 +1699,17 @@ impl WorkspaceApi for FakeApi {
         workspace_id: WorkspaceId,
         path: String,
         _caller_agent_id: Option<AgentId>,
+        git_root_id: Option<intent_core::WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<Value>> {
         // Echo a bare string so the wire test can assert file.read is NOT
         // wrapped in an object.
-        Box::pin(async move { Ok(Value::String(format!("{}:{path}", workspace_id.as_str()))) })
+        Box::pin(async move {
+            let scope = git_root_id.map(|id| format!("{id}:")).unwrap_or_default();
+            Ok(Value::String(format!(
+                "{}:{scope}{path}",
+                workspace_id.as_str()
+            )))
+        })
     }
 
     fn file_read_chunk(
@@ -1706,10 +1719,12 @@ impl WorkspaceApi for FakeApi {
         offset: u64,
         length: u64,
         _caller_agent_id: Option<AgentId>,
+        git_root_id: Option<intent_core::WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<Value>> {
         // Echo the window so the wire test can assert offset/length reach the
         // service, alongside the documented result shape.
         Box::pin(async move {
+            let path = git_root_id.map(|id| format!("{id}:{path}")).unwrap_or(path);
             Ok(serde_json::json!({
                 "content": format!("b64:{path}:{offset}:{length}"),
                 "bytesRead": length,
@@ -5601,6 +5616,62 @@ async fn search_notes_requires_query_and_is_global() {
 }
 
 #[tokio::test]
+async fn search_notes_routes_filters_and_null_defaults() {
+    for (params, expected) in [
+        (
+            serde_json::json!({"query":"body", "workspaceId":"hard", "preferWorkspaceId":"soft",
+            "limit":0,"includeArchived":false,"requestId":"notes"}),
+            serde_json::json!({"workspaceId":"hard","preferWorkspaceId":"soft","limit":0,"includeArchived":false}),
+        ),
+        (
+            serde_json::json!({"query":"body","workspaceId":null,"preferWorkspaceId":null,
+            "limit":null,"includeArchived":null,"requestId":null}),
+            serde_json::json!({"workspaceId":null,"preferWorkspaceId":null,"limit":null,"includeArchived":true}),
+        ),
+        (
+            serde_json::json!({"query":"body"}),
+            serde_json::json!({"workspaceId":null,"preferWorkspaceId":null,"limit":null,"includeArchived":true}),
+        ),
+    ] {
+        let reply = call(
+            &serde_json::json!({"jsonrpc":"2.0","id":1,
+            "method":"search.notes","params":params})
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        for (key, value) in expected.as_object().unwrap() {
+            assert_eq!(&reply["result"][key], value, "{key}: {reply}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn search_notes_rejects_invalid_optional_params() {
+    for (key, value) in [
+        ("workspaceId", serde_json::json!("")),
+        ("preferWorkspaceId", serde_json::json!(false)),
+        ("requestId", serde_json::json!([])),
+        ("includeArchived", serde_json::json!("false")),
+        ("limit", serde_json::json!(-1)),
+        ("limit", serde_json::json!(1.5)),
+        ("limit", serde_json::json!(9_223_372_036_854_775_808_u64)),
+    ] {
+        let mut params = serde_json::json!({"query":""});
+        params[key] = value;
+        let reply = call(
+            &serde_json::json!({"jsonrpc":"2.0","id":1,
+            "method":"search.notes","params":params})
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(err_code(&reply), -32602, "{reply}");
+        assert_eq!(reply["error"]["data"]["code"], "invalid-params");
+    }
+}
+
+#[tokio::test]
 async fn search_codebase_requires_workspace_and_query_and_maps_regex() {
     let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"search.codebase","params":{"query":"x"}}"#)
         .await
@@ -5724,6 +5795,46 @@ async fn terminal_kill_and_list_dispatch() {
         v["result"]["terminals"][0]["alive"],
         serde_json::json!(true)
     );
+}
+
+#[tokio::test]
+async fn file_read_routes_registered_root_selector() {
+    for (selector, expected) in [
+        (serde_json::json!("root-1"), "ws-1:root-1:a.txt"),
+        (serde_json::json!(""), "ws-1:a.txt"),
+        (serde_json::json!("   "), "ws-1:a.txt"),
+        (Value::Null, "ws-1:a.txt"),
+    ] {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "file.read",
+            "params": { "workspaceId": "ws-1", "path": "a.txt", "gitRootId": selector }
+        });
+        let response = call(&request.to_string()).await.unwrap();
+        assert_eq!(response["result"], expected, "{response}");
+    }
+}
+
+#[tokio::test]
+async fn file_read_chunk_routes_registered_root_selector() {
+    for (selector, scope) in [
+        (serde_json::json!("root-1"), "root-1:"),
+        (serde_json::json!(""), ""),
+        (serde_json::json!("   "), ""),
+        (Value::Null, ""),
+    ] {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "file.readChunk",
+            "params": { "workspaceId": "ws-1", "path": "a.bin", "gitRootId": selector, "offset": 64, "length": 32 }
+        });
+        let response = call(&request.to_string()).await.unwrap();
+        assert_eq!(
+            response["result"],
+            serde_json::json!({
+                "content": format!("b64:{scope}a.bin:64:32"), "bytesRead": 32, "size": 1000
+            }),
+            "{response}"
+        );
+    }
 }
 
 #[tokio::test]
