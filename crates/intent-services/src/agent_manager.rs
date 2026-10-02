@@ -14785,13 +14785,23 @@ mod npx_launch_dir_lifetime_tests {
             .unwrap()
             .unwrap();
         assert!(!pid_alive(leader.cast_signed()));
+        assert!(
+            !pid_alive(tree.grandchild),
+            "grandchild {} alive after shutdown; launch_dir_exists={}",
+            tree.grandchild,
+            tree.launch_path.exists()
+        );
         assert!(!tree.launch_path.exists());
         // Cleanup has issued the group kill and released its lease, but an
         // orphaned descendant can remain signal-0-visible until init reaps it.
         // Keep the shutdown/launch-dir assertions immediate; bound only the
         // observation that the identified descendant's PID has disappeared.
+        // Use signal 0 directly: pid_alive above already rejects executable
+        // descendants, but deliberately treats unreaped zombies as dead.
         tokio::time::timeout(Duration::from_secs(10), async {
-            while pid_alive(tree.grandchild) {
+            while nix::sys::signal::kill(nix::unistd::Pid::from_raw(tree.grandchild), None)
+                != Err(nix::errno::Errno::ESRCH)
+            {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
@@ -15017,7 +15027,59 @@ mod npx_launch_dir_lifetime_tests {
     }
 
     fn pid_alive(pid: i32) -> bool {
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+        let signal_probe = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None);
+        if signal_probe.is_err() {
+            return false;
+        }
+        // kill(pid, 0) still succeeds for an exited child until its parent
+        // reaps it. Such a process cannot use the launch directory anymore.
+        // Keep unknown states conservative: a live/stopped process must still
+        // fail the lifetime assertions if cleanup removes its directory.
+        #[cfg(target_os = "linux")]
+        if let Ok(stat) = {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
+            eprintln!(
+                "pid_alive({pid}): signal_probe={signal_probe:?}, stat={stat:?}, cwd={:?}, subsequent_stat={:?}",
+                std::fs::read_link(format!("/proc/{pid}/cwd")),
+                std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            );
+            stat
+        } {
+            if matches!(
+                stat.rsplit_once(") ")
+                    .and_then(|(_, fields)| fields.split_whitespace().next()),
+                Some("Z" | "X")
+            ) {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pid_alive_distinguishes_live_stopped_and_unreaped_children() {
+        use nix::sys::signal::{kill, Signal};
+        use nix::sys::wait::{waitid, Id, WaitPidFlag};
+        use nix::unistd::Pid;
+
+        let mut child = intentd_test_support::GuardedChild::spawn(
+            std::process::Command::new("sleep").arg("300"),
+        )
+        .unwrap();
+        let pid = Pid::from_raw(child.id().cast_signed());
+        assert!(pid_alive(pid.as_raw()), "an executable process is alive");
+
+        kill(pid, Signal::SIGSTOP).unwrap();
+        waitid(Id::Pid(pid), WaitPidFlag::WSTOPPED | WaitPidFlag::WNOWAIT).unwrap();
+        assert!(pid_alive(pid.as_raw()), "a stopped process can resume");
+
+        child.kill().unwrap();
+        // Observe exit without reaping, deterministically retaining a zombie.
+        waitid(Id::Pid(pid), WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT).unwrap();
+        assert!(kill(pid, None).is_ok(), "the zombie still has a pid");
+        assert!(!pid_alive(pid.as_raw()), "a zombie cannot use its cwd");
+        child.wait().unwrap();
     }
 
     /// A leader whose cwd is `dir`: it starts a same-group grandchild that
