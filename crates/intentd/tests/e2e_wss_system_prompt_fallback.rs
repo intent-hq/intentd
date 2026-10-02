@@ -517,6 +517,216 @@ async fn first_turn_prepend_delivers_system_prompt_over_wss() {
     );
 }
 
+#[tokio::test]
+async fn assistant_app_guide_reaches_every_turn_over_wss() {
+    let Some(script) = gate("WSS Assistant app guide E2E") else {
+        return;
+    };
+    let guide = include_str!("../../intent-services/resources/assistant-app-guide.md").trim();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let regular_ws = seed_workspace_only(&data_dir).await;
+    let chief_ws = intent_core::CHIEF_WORKSPACE_ID;
+    let specialists_dir = data_dir.join("specialists");
+    std::fs::create_dir_all(&specialists_dir).expect("mkdir specialists");
+    std::fs::write(
+        specialists_dir.join("guide-e2e-tester.md"),
+        "---\nname: GuideTester\ndescription: d\nroleReminder: GUIDE_CUSTOM_REMINDER\n---\n\nGUIDE_CUSTOM_BEHAVIOR: Keep answers short.",
+    )
+    .expect("write customized specialist");
+    let prompt_log = data_dir.join("assistant-prompts.jsonl");
+    let release_file = data_dir.join("release-first-turn");
+    let behavior = json!({
+        "response": "ok",
+        "rules": [{ "ifPromptContains": "GUIDE_FIRST_USER", "releaseFile": release_file }],
+    })
+    .to_string();
+    let env = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+        ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
+        ("MOCK_AGENT_PROMPT_LOG", prompt_log.to_str().unwrap()),
+        (
+            "INTENTD_BUNDLED_SPECIALISTS_DIR",
+            specialists_dir.to_str().unwrap(),
+        ),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        _data_dir: data_dir_guard,
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": chief_ws }),
+    )
+    .await;
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "agent.create",
+        json!({
+            "workspaceId": chief_ws, "name": "Guide Assistant",
+            "model": "default", "provider": "mock",
+            "specialistId": "guide-e2e-tester",
+            "metadata": { "chiefPromptVersion": 1 },
+        }),
+    )
+    .await;
+    let agent = created["agent"]["id"].as_str().unwrap();
+    let sent = wss_rpc(
+        &mut rpc,
+        3,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": chief_ws, "agentId": agent, "content": "GUIDE_FIRST_USER",
+            "stdinContext": "GUIDE_REQUEST_CONTEXT",
+            "imageBlocks": [{ "type": "image", "mimeType": "image/png", "data": "aGVsbG8=" }],
+        }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "first send: {sent}");
+    let queued = wss_rpc(
+        &mut rpc,
+        4,
+        "agent.queueMessage",
+        json!({ "workspaceId": chief_ws, "agentId": agent, "content": "GUIDE_QUEUED_USER" }),
+    )
+    .await;
+    assert!(queued["queuedMessage"].is_object(), "queued send: {queued}");
+    std::fs::write(&release_file, "continue").expect("release first turn");
+    await_stream_end(&mut sub, agent).await;
+    await_stream_end(&mut sub, agent).await;
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let frame = wss_event(&mut sub, 10).await;
+            let event = &frame["params"]["event"];
+            if event["type"] == "agent:status-changed"
+                && event["data"]["agentId"] == agent
+                && event["data"]["status"] == "idle"
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("queued turns must release the busy slot before the next direct send");
+
+    let continued = wss_rpc(
+        &mut rpc,
+        5,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": chief_ws, "agentId": agent, "content": "GUIDE_CONTINUED_USER",
+            "contextReferences": [{ "type": "selection", "content": "GUIDE_SELECTED_CONTEXT" }],
+        }),
+    )
+    .await;
+    assert_eq!(continued["success"], true, "continued send: {continued}");
+    assert_ne!(continued["queued"], true, "continued send: {continued}");
+    await_stream_end(&mut sub, agent).await;
+    let conversation = wss_rpc(
+        &mut rpc,
+        6,
+        "agent.getConversation",
+        json!({ "agentId": agent }),
+    )
+    .await;
+    let user_messages: Vec<_> = conversation["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "user")
+        .collect();
+    assert_eq!(
+        user_messages.len(),
+        3,
+        "guide must not create user messages"
+    );
+    for (message, expected) in user_messages.iter().zip([
+        "GUIDE_FIRST_USER",
+        "GUIDE_QUEUED_USER",
+        "GUIDE_CONTINUED_USER",
+    ]) {
+        assert_eq!(message["contentBlocks"][0]["text"], expected);
+    }
+
+    let log = read_prompt_log(&prompt_log);
+    assert_eq!(log.len(), 3);
+    for (turn, text) in &log {
+        assert_eq!(text.matches(guide).count(), 1, "guide on turn {turn}");
+        assert!(text.contains("GUIDE_CUSTOM_REMINDER"));
+    }
+    assert!(log[0].1.contains("GUIDE_CUSTOM_BEHAVIOR"));
+    assert!(log[0].1.contains("GUIDE_REQUEST_CONTEXT"));
+    assert!(!log[1].1.contains("<specialist_role>"));
+    assert!(log[2].1.contains("GUIDE_SELECTED_CONTEXT"));
+    let raw_log = std::fs::read_to_string(&prompt_log).unwrap();
+    let first: Value = serde_json::from_str(raw_log.lines().next().unwrap()).unwrap();
+    assert!(first["blockTypes"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("image")));
+
+    let mut regular_sub = connect_ws(port, cfg).await;
+    wss_rpc(
+        &mut regular_sub,
+        7,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": regular_ws }),
+    )
+    .await;
+    let regular = wss_rpc(
+        &mut rpc,
+        8,
+        "agent.create",
+        json!({
+            "workspaceId": regular_ws, "name": "Regular agent",
+            "model": "default", "provider": "mock", "specialistId": "guide-e2e-tester",
+        }),
+    )
+    .await;
+    let regular_agent = regular["agent"]["id"].as_str().unwrap();
+    wss_rpc(
+        &mut rpc,
+        9,
+        "agent.sendMessage",
+        json!({ "workspaceId": regular_ws, "agentId": regular_agent, "content": "GUIDE_REGULAR_USER" }),
+    )
+    .await;
+    await_stream_end(&mut regular_sub, regular_agent).await;
+    let final_log = read_prompt_log(&prompt_log);
+    assert_eq!(final_log.len(), 4);
+    assert!(
+        !final_log[3].1.contains(guide),
+        "ordinary workspace is unchanged"
+    );
+    assert!(final_log[3].1.contains("GUIDE_REGULAR_USER"));
+    let artifact = data_dir.join("assistant-app-guide-evidence.json");
+    std::fs::write(
+        &artifact,
+        serde_json::to_vec_pretty(&json!({
+            "test": "assistant_app_guide_reaches_every_turn_over_wss",
+            "assistantPrompts": &final_log[..3],
+            "ordinaryWorkspacePrompt": final_log[3].1,
+            "persistedUserMessages": user_messages,
+            "attachmentBlockTypes": first["blockTypes"],
+        }))
+        .unwrap(),
+    )
+    .expect("write repeatable evidence");
+    eprintln!("Assistant app guide evidence: {}", artifact.display());
+}
+
 /// Specialist prompt freeze over the real WSS transport: `agent.create`
 /// snapshots the resolved specialist injection into the session, so a
 /// user-tier specialist file edited AFTER creation but BEFORE the first spawn
