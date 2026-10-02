@@ -70,31 +70,29 @@ pub(crate) async fn dispatch(
     args: &Value,
 ) -> Result<Value, String> {
     match method {
-        "monitor" | "monitors" | "unmonitor" => {
-            let owner = caller
-                .ok_or("script monitoring requires an authenticated agent caller")?
-                .clone();
-            match method {
-                "monitor" => api
-                    .script_monitor(ws.clone(), owner, req_str(args, "scriptId")?, args.clone())
-                    .await
-                    .map_err(map_err),
-                "monitors" => api
-                    .script_monitor_list(ws.clone(), Some(owner))
-                    .await
-                    .map(|v| v["monitors"].clone())
-                    .map_err(map_err),
-                _ => api
-                    .script_monitor_cancel(
-                        ws.clone(),
-                        req_str(args, "monitorId")?,
-                        Some(owner),
-                        false,
-                    )
-                    .await
-                    .map_err(map_err),
-            }
-        }
+        "monitor" => api
+            .script_monitor(
+                ws.clone(),
+                monitor_owner(caller)?,
+                req_str(args, "scriptId")?,
+                args.clone(),
+            )
+            .await
+            .map_err(map_err),
+        "monitors" => api
+            .script_monitor_list(ws.clone(), Some(monitor_owner(caller)?))
+            .await
+            .map(|v| v["monitors"].clone())
+            .map_err(map_err),
+        "unmonitor" => api
+            .script_monitor_cancel(
+                ws.clone(),
+                req_str(args, "monitorId")?,
+                Some(monitor_owner(caller)?),
+                false,
+            )
+            .await
+            .map_err(map_err),
         "list" => list(api, ws, args).await,
         "archive" => archive(api, ws, args, true).await,
         "restore" => archive(api, ws, args, false).await,
@@ -108,6 +106,12 @@ pub(crate) async fn dispatch(
         "run" => run(api, ws, budget, args).await,
         other => Err(format!("host: unknown method `script.{other}`")),
     }
+}
+
+fn monitor_owner(caller: Option<&AgentId>) -> Result<AgentId, String> {
+    caller
+        .cloned()
+        .ok_or_else(|| "script monitoring requires an authenticated agent caller".into())
 }
 
 async fn archive(
