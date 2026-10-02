@@ -3172,6 +3172,146 @@ mod chat_snapshot_bounded {
         assert_eq!(snap["resumed"], true);
     }
 
+    /// Exercise the existing snapshot entry points against the SAME page-window
+    /// helper as the conversation service. Unlike BoundedPageApi's fixed two
+    /// rows, this fixture observes the requested limit (including its default).
+    /// No future subscription parameter or parallel paginator is introduced.
+    struct TranscriptPageApi {
+        rows: Vec<Value>,
+        limits: std::sync::Mutex<Vec<Option<i64>>>,
+        live: BoundedPageApi,
+    }
+
+    impl TranscriptPageApi {
+        fn new(busy: bool) -> Self {
+            Self {
+                rows: (0..120)
+                    .map(|seq| {
+                        json!({
+                            "id": format!("m-{seq}"), "role": "assistant", "seq": seq,
+                            "contentBlocks": [{ "type": "text", "text": format!("message {seq}") }],
+                        })
+                    })
+                    .collect(),
+                limits: std::sync::Mutex::new(Vec::new()),
+                live: BoundedPageApi::new(busy),
+            }
+        }
+    }
+
+    impl WorkspaceApi for TranscriptPageApi {
+        fn agent_get_conversation(
+            &self,
+            agent_id: AgentId,
+            limit: Option<i64>,
+            _workspace_id: Option<WorkspaceId>,
+            page_token: Option<String>,
+            around_message_id: Option<String>,
+            around_index: Option<i64>,
+            _projection: Option<intent_core::ConversationProjection>,
+            _include_in_progress: bool,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.limits.lock().unwrap().push(limit);
+            assert!(page_token.is_none(), "snapshot must not walk older pages");
+            assert!(around_message_id.is_none() && around_index.is_none());
+            let window = intent_services::pagination::page_window(self.rows.len(), limit, None);
+            Box::pin(async move {
+                Ok(json!({
+                    "agentId": agent_id.as_str(),
+                    "messages": self.rows[window.start..window.end],
+                    "totalMessages": self.rows.len(),
+                    "truncated": window.start > 0,
+                    "nextToken": window.next_token,
+                }))
+            })
+        }
+
+        fn agent_is_busy(&self, agent_id: AgentId) -> bool {
+            self.live.agent_is_busy(agent_id)
+        }
+
+        fn agent_live_turn(&self, agent_id: AgentId) -> Option<Value> {
+            self.live.agent_live_turn(agent_id)
+        }
+    }
+
+    fn assert_five_message_snapshot(api: &TranscriptPageApi, snapshot: &Value, busy: bool) {
+        let messages = snapshot["messages"].as_array().unwrap();
+        eprintln!(
+            "snapshot rows={} bytes={} requested_limits={:?}",
+            messages.len(),
+            serde_json::to_vec(snapshot).unwrap().len(),
+            api.limits.lock().unwrap()
+        );
+        assert_eq!(messages.len(), 5, "newest page includes any live-turn row");
+        assert_eq!(messages[0]["id"], if busy { "m-116" } else { "m-115" });
+        assert_eq!(messages[4]["id"], if busy { "msg-live" } else { "m-119" });
+        assert_eq!(snapshot["truncated"], true);
+        assert!(snapshot["nextToken"].is_string());
+        let limits = api.limits.lock().unwrap();
+        assert_eq!(limits.len(), 1, "one bounded read, no history walk");
+        assert!(limits[0].is_some_and(|limit| (1..=5).contains(&limit)));
+        // The next backward page includes every row evicted by the live overlay.
+        let older =
+            intent_services::pagination::page_window(120, Some(5), snapshot["nextToken"].as_str());
+        assert_eq!(older.end, if busy { 116 } else { 115 });
+    }
+
+    #[tokio::test]
+    async fn five_message_initial_snapshot_uses_the_newest_page() {
+        let api = TranscriptPageApi::new(false);
+        let snapshot =
+            chat_snapshot(&api, &agent(), None, Some(ConversationProjection::Slim)).await;
+        assert_five_message_snapshot(&api, &snapshot, false);
+        assert!(snapshot.get("resumed").is_none());
+    }
+
+    #[tokio::test]
+    async fn five_message_stale_resume_resets_to_the_newest_page() {
+        let api = TranscriptPageApi::new(false);
+        let snapshot = chat_snapshot(&api, &agent(), Some("m-80"), None).await;
+        assert_eq!(
+            snapshot["resumed"], false,
+            "anchor outside newest five must reset"
+        );
+        assert_five_message_snapshot(&api, &snapshot, false);
+    }
+
+    #[tokio::test]
+    async fn five_message_snapshot_includes_live_turn_within_the_budget() {
+        let api = TranscriptPageApi::new(true);
+        let snapshot =
+            chat_snapshot(&api, &agent(), None, Some(ConversationProjection::Slim)).await;
+        assert_five_message_snapshot(&api, &snapshot, true);
+        assert_eq!(snapshot["messages"][4]["isStreaming"], true);
+        assert_eq!(snapshot["totalMessages"], 121);
+    }
+
+    #[tokio::test]
+    async fn five_message_recovery_snapshot_uses_the_same_budget() {
+        let api = TranscriptPageApi::new(true);
+        let snapshot = chat_recovery_snapshot(&api, &agent(), Some(ConversationProjection::Slim))
+            .await
+            .unwrap();
+        assert_five_message_snapshot(&api, &snapshot, true);
+    }
+
+    #[tokio::test]
+    async fn five_message_recent_resume_keeps_suffix_and_live_turn() {
+        let api = TranscriptPageApi::new(true);
+        let snapshot = chat_snapshot(&api, &agent(), Some("m-118"), None).await;
+        let ids: Vec<_> = snapshot["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["m-119", "msg-live"]);
+        assert_eq!(snapshot["resumed"], true);
+        assert_eq!(snapshot["nextToken"], Value::Null);
+        assert_eq!(api.limits.lock().unwrap().len(), 1);
+    }
+
     /// A `WorkspaceApi` that records the `projection` each conversation read
     /// was asked for — the snapshot paths must forward the subscription's
     /// projection so slim subscribers never receive a full-fidelity page.
