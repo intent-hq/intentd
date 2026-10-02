@@ -14740,6 +14740,33 @@ async fn wss_git_root_list_and_scoped_reads_round_trip() {
     .await;
     assert_eq!(resp["result"]["files"], serde_json::json!([]));
 
+    // The canonical history read must keep its root scope and page semantics
+    // independently of the retired git.log alias.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 11, "method": "git.commits",
+            "params": {"workspaceId": ws_id, "gitRootId": root.id.as_str(), "page": {"limit": 1}}
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 11);
+    assert!(resp.get("error").is_none(), "{resp}");
+    let items = resp["result"]["items"].as_array().expect("history page");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["message"], "nested-second");
+    assert!(
+        items[0].get("files").is_none(),
+        "history stays metadata-only"
+    );
+    assert!(
+        resp["result"]["nextToken"].is_string(),
+        "second commit remains: {resp}"
+    );
+
     // Unknown gitRootId on git.commitDetails → -32602 (never an empty fallback).
     let resp = wss_call(
         srv.port,
