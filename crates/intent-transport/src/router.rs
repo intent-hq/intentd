@@ -856,10 +856,12 @@ async fn dispatch(
             let clients = api.client_list().await.map_err(workspace_err)?;
             Ok(json!({ "clients": clients }))
         }
-        "desktop.getState" => dispatch_desktop(api, method, params).await,
-        "desktop.respondPermission" => dispatch_desktop(api, method, params).await,
-        "desktop.revoke" => dispatch_desktop(api, method, params).await,
-        "desktop.setPermission" => dispatch_desktop(api, method, params).await,
+        "desktop.getState" => dispatch_desktop(api, "desktop.getState", params).await,
+        "desktop.respondPermission" => {
+            dispatch_desktop(api, "desktop.respondPermission", params).await
+        }
+        "desktop.revoke" => dispatch_desktop(api, "desktop.revoke", params).await,
+        "desktop.setPermission" => dispatch_desktop(api, "desktop.setPermission", params).await,
         "workspace.getBrowserClient" => {
             let id = require_workspace_id(params)?;
             let browser_client = api
