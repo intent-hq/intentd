@@ -22,7 +22,7 @@ async fn create(
     .await
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn creation_preferences_persist_only_specialist_and_isolate_workspaces() {
     let (tmp, svc, ws) = setup().await;
     let other = WorkspaceId::new();
@@ -92,7 +92,7 @@ async fn creation_preferences_persist_only_specialist_and_isolate_workspaces() {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn creation_preferences_ignore_failed_unmarked_background_and_child_creates() {
     let (_tmp, svc, ws) = setup().await;
     let remembered = AgentCreateExtra {
@@ -143,7 +143,7 @@ async fn creation_preferences_ignore_failed_unmarked_background_and_child_create
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn creation_preferences_remember_successful_welcome_selection_and_general() {
     let (_tmp, svc, ws) = setup().await;
     let agent = create(&svc, &ws, None, AgentCreateExtra::default())
@@ -206,7 +206,7 @@ async fn creation_preferences_remember_successful_welcome_selection_and_general(
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn creation_preferences_roll_back_insert_and_update_when_memory_write_fails() {
     let (_tmp, svc, ws) = setup().await;
     let initial = create(
@@ -259,7 +259,7 @@ async fn creation_preferences_roll_back_insert_and_update_when_memory_write_fail
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn creation_preferences_do_not_replay_models_and_delete_with_workspace() {
     let (_tmp, svc, ws) = setup().await;
     let registry = svc.settings_registry().unwrap();
@@ -307,7 +307,7 @@ async fn creation_preferences_do_not_replay_models_and_delete_with_workspace() {
     assert!(svc.agent_get_creation_preferences(ws).await.is_err());
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn creation_preferences_background_updates_never_replace_manual_selection() {
     let (_tmp, svc, ws) = setup().await;
     let agent = create(
@@ -335,7 +335,7 @@ async fn creation_preferences_background_updates_never_replace_manual_selection(
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn creation_preferences_idempotent_replay_does_not_restore_old_choice() {
     let (_tmp, svc, ws) = setup().await;
     let first = svc
@@ -386,7 +386,7 @@ async fn creation_preferences_idempotent_replay_does_not_restore_old_choice() {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn creation_preferences_welcome_renames_only_generated_placeholders() {
     let (_tmp, svc, ws) = setup().await;
     for (name, explicit, expected) in [
