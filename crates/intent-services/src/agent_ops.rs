@@ -496,6 +496,10 @@ pub(crate) struct CreateModelAndEffort {
 /// validation, and depends on the new workspace's effective auto-commit,
 /// known only once the workspace row exists.
 #[derive(Debug, Clone)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Independent creation options carried from validation to atomic persistence"
+)]
 pub(crate) struct AgentCreatePlan {
     /// Error-label method (`agent.create` / `workspace.create`) for the
     /// persist half's infrastructure failures.
