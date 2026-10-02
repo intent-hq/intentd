@@ -320,13 +320,13 @@ import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { isDeepStrictEqual } from 'node:util';
 const [root, raw, component, mode, output, compiledRevision, compiledGenerator] = process.argv.slice(1);
-const { assertContract, assertGenerated, assertFresh, normalizeCases, hashJson } = await import(
+const { assertContract, assertGenerated, assertFresh, normalizeCases, hashJson, resolveGoldenPath } = await import(
   pathToFileURL(path.resolve(root, '../../../../scripts/check-transfer-selection-contract.mjs')));
 const read = p => JSON.parse(fs.readFileSync(p, 'utf8'));
 const contract = read(path.join(root, 'contract.json'));
 assertContract(contract);
 const cases = normalizeCases(read(raw));
-const goldenPath = path.join(root, 'public-sessions.json');
+const goldenPath = await resolveGoldenPath({fixtureRoot: root, intentdRoot: component});
 if (mode === 'check') {
   const golden = read(goldenPath);
   assertGenerated(contract, golden);
