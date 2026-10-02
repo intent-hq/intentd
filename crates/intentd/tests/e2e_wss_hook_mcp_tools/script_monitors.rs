@@ -1,4 +1,4 @@
-//! Real agent → workspace_api → native monitor → durable queued owner wake.
+//! Real agent → `workspace_api` → native monitor → durable queued owner wake.
 use super::*;
 
 #[tokio::test]
