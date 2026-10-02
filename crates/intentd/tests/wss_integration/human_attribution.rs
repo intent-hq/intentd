@@ -223,11 +223,30 @@ async fn transfer_human_authors_comments_and_pending_queue_over_wss() {
         .add_workspace_member(&ws, &guest_b.principal.id, WorkspaceRole::Collaborator)
         .await
         .unwrap();
+    let shared = owner_b
+        .call("agent.getQueue", json!({"agentId":agent}))
+        .await;
+    let imported_queue = &shared["result"]["queue"];
+    assert_eq!(imported_queue.as_array().unwrap().len(), 1, "{shared}");
+    let imported = &imported_queue[0];
+    assert_eq!(imported["id"], pending_id);
+    assert_eq!(
+        imported["turnId"],
+        pending["result"]["queuedMessage"]["turnId"]
+    );
+    assert_eq!(
+        imported["content"],
+        pending["result"]["queuedMessage"]["content"]
+    );
+    assert!(imported["author"]["principalId"].is_null());
+    assert_eq!(imported["author"]["identity"]["host"], "gitlab.example");
+    assert!(imported["messageMetadata"].get("fromPrincipalId").is_none());
+    // Imported human entries are shared reads, without conferring local authorship.
     for caller in [&mut member_b, &mut guest_b] {
         let queue = caller
             .call("agent.getQueue", json!({"agentId":agent}))
             .await;
-        assert_eq!(queue["result"]["queue"], json!([]), "{queue}");
+        assert_eq!(&queue["result"]["queue"], imported_queue, "{queue}");
         for method in [
             "agent.sendQueuedMessageNow",
             "agent.removeQueuedMessage",
@@ -237,6 +256,13 @@ async fn transfer_human_authors_comments_and_pending_queue_over_wss() {
             assert!(refused.get("error").is_some(), "{method}: {refused}");
         }
     }
+    let unchanged = owner_b
+        .call("agent.getQueue", json!({"agentId":agent}))
+        .await;
+    assert_eq!(
+        &unchanged["result"]["queue"], imported_queue,
+        "denied mutations changed queue: {unchanged}"
+    );
     let owner_edit = owner_b
         .call(
             "agent.editQueuedMessage",

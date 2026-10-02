@@ -499,6 +499,10 @@ pub struct TurnOptions {
     /// so the retry still suppresses the report clear). `None` for direct
     /// sends, whose requeue stamps `now_iso()` as before.
     pub queued_at: Option<String>,
+    /// Submission IDs absorbed by a queued row, retained through failed drains.
+    pub queued_submission_ids: Vec<String>,
+    pub queued_submission_order: u64,
+    pub latest_human_submission_at: Option<String>,
     /// STAB-114 / monorepo#1014: text of the user message preempted by a
     /// zero-output interrupt, delivered AHEAD of this turn's own `content` in
     /// the SAME `session/prompt` so both messages are honored in order.
@@ -605,6 +609,9 @@ fn turn_options_for_entry(entry: &QueuedMessage, stale: bool) -> TurnOptions {
         message_metadata: entry.message_metadata.clone(),
         suppress_report_clear: stale,
         queued_at: Some(entry.queued_at.clone()),
+        queued_submission_ids: entry.submission_ids(),
+        queued_submission_order: entry.submission_order,
+        latest_human_submission_at: entry.latest_human_submission_at.clone(),
         prepend_content: entry.prepend_content.clone(),
         prepend_image_blocks: entry.prepend_image_blocks.clone(),
         prepend_file_blocks: entry.prepend_file_blocks.clone(),
@@ -6742,6 +6749,13 @@ impl AgentManager {
                 )));
             }
         }
+        if options.queued_submission_order == 0 {
+            options.queued_submission_order = self
+                .services
+                .queue_submission_order
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+        }
         // A2A sender header (intent-hq/intent#3721, monorepo#1015): the runtime front door — gated
         // on the daemon-stamped `fromAgentId`, applied BEFORE every branch
         // below (quarantine/archived/hold parks, busy enqueue, direct
@@ -7527,7 +7541,7 @@ impl AgentManager {
         // append below. Emitted AFTER the stale-redrive annotation so the
         // payload's `content` matches what is persisted/sent to the provider.
         self.services
-            .publish_queue_processing(&agent_id, &workspace_id, &next)
+            .publish_queue_processing(&agent_id, &workspace_id, std::slice::from_ref(&next))
             .await;
         // Skip the transcript append for a terminal-failure requeue whose
         // user row already reached the transcript before the failed turn
@@ -7565,6 +7579,9 @@ impl AgentManager {
             message_metadata: next.message_metadata.clone(),
             suppress_report_clear: stale,
             queued_at: Some(next.queued_at.clone()),
+            queued_submission_ids: next.submission_ids(),
+            queued_submission_order: next.submission_order,
+            latest_human_submission_at: next.latest_human_submission_at.clone(),
             prepend_content: next.prepend_content.clone(),
             prepend_image_blocks: next.prepend_image_blocks.clone(),
             prepend_file_blocks: next.prepend_file_blocks.clone(),
@@ -7728,6 +7745,9 @@ impl AgentManager {
             message_metadata: entry.message_metadata.clone(),
             suppress_report_clear: stale,
             queued_at: Some(entry.queued_at.clone()),
+            queued_submission_ids: entry.submission_ids(),
+            queued_submission_order: entry.submission_order,
+            latest_human_submission_at: entry.latest_human_submission_at.clone(),
             prepend_content: entry.prepend_content.clone(),
             prepend_image_blocks: entry.prepend_image_blocks.clone(),
             prepend_file_blocks: entry.prepend_file_blocks.clone(),
@@ -7749,8 +7769,8 @@ impl AgentManager {
             // entry user-origin so the winner's end-of-turn drain keeps its
             // user-origin semantics (attention clear, archived exemption).
             entry.user_origin = true;
-            let restored = entry.to_value(0);
-            self.services.requeue_front(&agent_id, entry);
+            let (restored, position) = self.services.requeue_front(&agent_id, entry);
+            let restored = restored.to_value(position);
             drop(draining);
             self.services.publish_queue_updated(&agent_id).await;
             #[cfg(test)]
@@ -7774,11 +7794,19 @@ impl AgentManager {
         // lost-claim arm hands the entry back undelivered); the delivery is
         // committed now (intent-hq/intent#4962).
         self.services
-            .commit_recovery_send_delivery(&agent_id, std::slice::from_ref(&entry));
+            .commit_provisional_queue_delivery(&agent_id, std::slice::from_ref(&entry));
         // Skip the transcript append for a terminal-failure requeue whose
         // user row already reached the transcript (STAB-112) — the entry id
         // already names that row.
         if !entry.persisted {
+            #[cfg(test)]
+            {
+                let pause = self.user_persist_pause.lock().unwrap().take();
+                if let Some(pause) = pause {
+                    pause.reached.notify_one();
+                    pause.resume.notified().await;
+                }
+            }
             // STAB-133: persist the entry's attachments alongside the text
             // block, under the entry id so the RPC result's `messageId` and
             // the `agent:message` event both name the actual transcript row.
@@ -7802,6 +7830,7 @@ impl AgentManager {
                 .await
             {
                 Ok(message) => {
+                    self.services.commit_queue_history(&agent_id, &entry.id);
                     self.services.invalidate_agent_list_cache(&workspace_id);
                     message
                 }
@@ -7845,6 +7874,11 @@ impl AgentManager {
                     .await;
             }
         }
+        // Only a successful append (or an already-persisted retry) starts
+        // processing. Lost claims and failed writes restore without this event.
+        self.services
+            .publish_queue_processing(&agent_id, &workspace_id, std::slice::from_ref(&entry))
+            .await;
         drop(draining);
         self.services
             .publish_queue_updated_after_drain_persist(&agent_id, &workspace_id)
@@ -10723,7 +10757,7 @@ fn extract_user_prepend(content: &Value) -> crate::agent_ops::QueuedPrepend {
 /// zero-output preemption path to combine an entry-carried `prepend_*`
 /// payload with the just-preempted message's attachments instead of
 /// clobbering one with the other.
-fn merge_block_arrays(first: Option<Value>, second: Option<Value>) -> Option<Value> {
+pub(crate) fn merge_block_arrays(first: Option<Value>, second: Option<Value>) -> Option<Value> {
     match (first, second) {
         (Some(Value::Array(mut a)), Some(Value::Array(b))) => {
             a.extend(b);
@@ -12075,7 +12109,7 @@ async fn run_message_worker(
             // annotation so the payload's `content` matches what is
             // persisted/sent to the provider.
             mgr.services
-                .publish_queue_processing(&agent_id, &workspace_id, &next)
+                .publish_queue_processing(&agent_id, &workspace_id, std::slice::from_ref(&next))
                 .await;
             let next_image_blocks = next.image_blocks.clone();
             let next_file_blocks = next.file_blocks.clone();
@@ -12098,6 +12132,7 @@ async fn run_message_worker(
                 )
                 .await
             };
+            let queued_submission_ids = next.submission_ids();
             content = next.content;
             options = TurnOptions {
                 image_blocks: next_image_blocks,
@@ -12105,6 +12140,9 @@ async fn run_message_worker(
                 message_metadata: next.message_metadata.clone(),
                 suppress_report_clear: stale,
                 queued_at: Some(next.queued_at.clone()),
+                queued_submission_ids,
+                queued_submission_order: next.submission_order,
+                latest_human_submission_at: next.latest_human_submission_at.clone(),
                 prepend_content: next.prepend_content.clone(),
                 prepend_image_blocks: next.prepend_image_blocks.clone(),
                 prepend_file_blocks: next.prepend_file_blocks.clone(),
@@ -12228,7 +12266,7 @@ async fn run_message_worker(
                 }
             }
             mgr.services
-                .commit_recovery_send_delivery(&agent_id, &raced);
+                .commit_provisional_queue_delivery(&agent_id, &raced);
             let mut next = raced.pop().expect("raced batch non-empty");
             let mut draining = raced_draining.take().expect("raced batch guard");
             // Batch flush (`agents.flushQueuedMessages`): the single `next`
@@ -12297,7 +12335,7 @@ async fn run_message_worker(
             // pre-release drain arm — emitted AFTER the stale-redrive
             // annotation so the payload's `content` matches the turn.
             mgr.services
-                .publish_queue_processing(&agent_id, &workspace_id, &next)
+                .publish_queue_processing(&agent_id, &workspace_id, std::slice::from_ref(&next))
                 .await;
             let next_image_blocks = next.image_blocks.clone();
             let next_file_blocks = next.file_blocks.clone();
@@ -12317,6 +12355,7 @@ async fn run_message_worker(
                 )
                 .await
             };
+            let queued_submission_ids = next.submission_ids();
             content = next.content;
             options = TurnOptions {
                 image_blocks: next_image_blocks,
@@ -12324,6 +12363,9 @@ async fn run_message_worker(
                 message_metadata: next.message_metadata.clone(),
                 suppress_report_clear: stale,
                 queued_at: Some(next.queued_at.clone()),
+                queued_submission_ids,
+                queued_submission_order: next.submission_order,
+                latest_human_submission_at: next.latest_human_submission_at.clone(),
                 prepend_content: next.prepend_content.clone(),
                 prepend_image_blocks: next.prepend_image_blocks.clone(),
                 prepend_file_blocks: next.prepend_file_blocks.clone(),
@@ -12514,7 +12556,7 @@ async fn prepare_flush_turn(
     // Drain-start signal (monorepo#1022): one event for the combined turn,
     // keyed on the head entry (its `turn_id` IS the turn's id below).
     mgr.services
-        .publish_queue_processing(agent_id, workspace_id, &entries[0])
+        .publish_queue_processing(agent_id, workspace_id, &entries)
         .await;
     // All rows persist under the combined turn's id — the provider turn runs
     // once, under the head entry's `turn_id`, so a per-entry id on row #2+
@@ -12605,6 +12647,18 @@ async fn prepare_flush_turn(
         message_metadata: entries[0].message_metadata.clone(),
         suppress_report_clear: stale_flags.iter().all(|&s| s),
         queued_at: Some(entries[0].queued_at.clone()),
+        latest_human_submission_at: entries
+            .iter()
+            .filter(|entry| entry.user_origin)
+            .filter_map(|entry| {
+                let at = entry
+                    .latest_human_submission_at
+                    .as_deref()
+                    .unwrap_or(&entry.queued_at);
+                intent_core::parse_iso(at).map(|parsed| (parsed, at))
+            })
+            .max_by_key(|(parsed, _)| *parsed)
+            .map(|(_, at)| at.to_owned()),
         prepend_content,
         prepend_image_blocks,
         prepend_file_blocks,
@@ -12708,6 +12762,13 @@ async fn persist_user(
             .await
         {
             Ok(message) => {
+                if let Some(id) = message_metadata
+                    .and_then(|md| md.get("queueInfo"))
+                    .and_then(|info| info.get("queuedMessageId"))
+                    .and_then(Value::as_str)
+                {
+                    mgr.services.commit_queue_history(agent_id, id);
+                }
                 mgr.services.invalidate_agent_list_cache(workspace_id);
                 break message;
             }
@@ -13573,6 +13634,13 @@ async fn publish_error_status_and_requeue(
             hold_kind: None,
             hold_until: None,
             child_agent_id: None,
+            merged_submission_ids: options.queued_submission_ids.clone(),
+            edit_appended: String::new(),
+            edit_prepended: String::new(),
+            editing_message_id: None,
+            provisional: false,
+            submission_order: options.queued_submission_order,
+            latest_human_submission_at: options.latest_human_submission_at.clone(),
         };
         mgr.services.requeue_front(agent_id, queued);
     }
@@ -20518,7 +20586,7 @@ mod agent_retry_tests {
         // The provisional holder wins its claim and commits.
         assert!(mgr.try_begin(&agent_id, &ws).await);
         mgr.services
-            .commit_recovery_send_delivery(&agent_id, std::slice::from_ref(&entry));
+            .commit_provisional_queue_delivery(&agent_id, std::slice::from_ref(&entry));
         drop(draining);
         assert!(mgr.services.parked_recovery_send(&agent_id).is_none());
     }
