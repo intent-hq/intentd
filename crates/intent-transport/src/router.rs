@@ -1802,6 +1802,10 @@ async fn dispatch(
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
+        "agent.getCreationPreferences" => api
+            .agent_get_creation_preferences(require_ws_note(params)?)
+            .await
+            .map_err(domain_to_rpc),
         "agent.create" => {
             // Agent ids are server-assigned: reject stale clients that still
             // send `agentId` before the request reaches the service (checked
@@ -1841,6 +1845,8 @@ async fn dispatch(
             // default. The blank is dropped downstream, so the persisted
             // field is still `NULL` either way.
             let extra = AgentCreateExtra {
+                remember_specialist: opt_bool_strict(params, "rememberSpecialist")?
+                    .unwrap_or(false),
                 provider: opt_nonempty_str(params, "provider"),
                 reasoning_effort: opt_str(params, "reasoningEffort"),
                 agent_type: opt_nonempty_str(params, "agentType"),

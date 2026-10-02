@@ -185,12 +185,12 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// Reversible script history (protocol 10.11): +2 router methods
 /// (`script.archive`, `script.restore`).
 /// Desktop control: +4 client router methods and desktop.control reverse RPC.
-const EXPECTED_TOTAL_METHODS: usize = 414;
+const EXPECTED_TOTAL_METHODS: usize = 415;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 354;
+const EXPECTED_ROUTER_METHODS: usize = 355;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 58;
@@ -520,6 +520,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "agent.enhancePrompt",
     "agent.get",
     "agent.getConversation",
+    "agent.getCreationPreferences",
     "agent.getMessageBlock",
     "agent.getModels",
     "agent.getQueue",

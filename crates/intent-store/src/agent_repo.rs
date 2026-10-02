@@ -1016,28 +1016,60 @@ impl Store {
         s: &AgentSession,
         task_graph_enabled: bool,
     ) -> Result<()> {
+        self.insert_agent_session_with_preferences(s, task_graph_enabled, false)
+            .await
+    }
+
+    /// Atomically insert a session and optionally remember its manual specialist.
+    ///
+    /// # Errors
+    /// Returns an error if either write fails; neither write is committed.
+    pub async fn insert_agent_session_with_preferences(
+        &self,
+        s: &AgentSession,
+        task_graph_enabled: bool,
+        remember_specialist: bool,
+    ) -> Result<()> {
+        let mut tx = if remember_specialist {
+            Some(
+                self.write_pool()
+                    .begin()
+                    .await
+                    .map_err(|e| Error::Internal(format!("begin agent create: {e}")))?,
+            )
+        } else {
+            None
+        };
         let sql = format!(
             "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
              (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
-        bind_session_insert(sqlx::query(&sql), s, task_graph_enabled)?
-            .execute(self.write_pool())
-            .await
-            .map_err(|e| {
-                if e.as_database_error()
-                    .is_some_and(sqlx::error::DatabaseError::is_unique_violation)
-                {
-                    // Agent ids are server-minted (`agent-{uuid}`), so a
-                    // UNIQUE(id) violation is a server-side anomaly, not a
-                    // client params error.
-                    Error::Internal(format!(
-                        "server-minted agent id {} collided with an existing session",
-                        s.id
-                    ))
-                } else {
-                    Error::Internal(format!("insert agent session failed: {e}"))
-                }
-            })?;
+        let query = bind_session_insert(sqlx::query(&sql), s, task_graph_enabled)?;
+        match tx.as_mut() {
+            Some(tx) => query.execute(&mut **tx).await,
+            None => query.execute(self.write_pool()).await,
+        }
+        .map_err(|e| {
+            if e.as_database_error()
+                .is_some_and(sqlx::error::DatabaseError::is_unique_violation)
+            {
+                // Agent ids are server-minted (`agent-{uuid}`), so a
+                // UNIQUE(id) violation is a server-side anomaly, not a
+                // client params error.
+                Error::Internal(format!(
+                    "server-minted agent id {} collided with an existing session",
+                    s.id
+                ))
+            } else {
+                Error::Internal(format!("insert agent session failed: {e}"))
+            }
+        })?;
+        if let Some(mut tx) = tx {
+            crate::settings_repo::remember_agent_specialist(&mut tx, s).await?;
+            tx.commit()
+                .await
+                .map_err(|e| Error::Internal(format!("commit agent create: {e}")))?;
+        }
         Ok(())
     }
 
@@ -2764,6 +2796,23 @@ impl Store {
         workspace_id: &WorkspaceId,
         s: &AgentSession,
     ) -> Result<()> {
+        self.update_agent_session_with_preferences(workspace_id, s, false, None)
+            .await
+    }
+
+    /// Atomically update a session, optional manual specialist memory, and an
+    /// explicitly requested notification-mute patch. Ordinary row writes omit
+    /// the patch so stale session snapshots cannot revert the user's toggle.
+    ///
+    /// # Errors
+    /// Returns an error if validation or either write fails.
+    pub async fn update_agent_session_with_preferences(
+        &self,
+        workspace_id: &WorkspaceId,
+        s: &AgentSession,
+        remember_specialist: bool,
+        notifications_muted: Option<bool>,
+    ) -> Result<()> {
         // Lightweight invariant check: read only workspace_id, model,
         // provider, acp_session_id (finding F3: no message fetch). Workspace
         // mismatch → NotFound, provider immutable, acp_session_id write-once
@@ -2821,14 +2870,24 @@ impl Store {
         // Those two attention writers are
         // the only post-insert mutators of the attention columns.
         // `notifications_muted` (0123) is excluded for the same reason: it is
-        // a user toggle whose only post-insert mutator is
-        // `set_agent_notifications_muted`, so a concurrent or long-lived
-        // in-memory session persisted here can never revert the user's mute.
+        // a user toggle changed only by explicit scoped patches, so a
+        // concurrent or long-lived in-memory session persisted here without
+        // such a patch can never revert the user's mute.
         // The creation-only Assistant marker is monotonic: once absent or
         // invalidated, a stale full-row write cannot resurrect it. Evaluate
         // the stored value in this UPDATE, not in the earlier invariant read.
         let metadata = encode_metadata(s.metadata.as_ref())?;
-        let rows = sqlx::query(
+        let mut tx = if remember_specialist || notifications_muted.is_some() {
+            Some(
+                self.write_pool()
+                    .begin()
+                    .await
+                    .map_err(|e| Error::Internal(format!("begin agent update: {e}")))?,
+            )
+        } else {
+            None
+        };
+        let query = sqlx::query(
             "UPDATE agent_session SET backend_session_id=?, acp_session_id=?, name=?, \
              name_explicitly_set=?, model=?, provider=?, status=?, is_active=?, system_prompt=?, \
              updated_at=?, parent_agent_id=?, specialist=?, task_note_id=?, skip_auto_commit=?, \
@@ -2872,13 +2931,36 @@ impl Store {
         .bind(&s.stop_reason_timestamp)
         .bind(&s.reasoning_effort)
         .bind(&s.id.0)
-        .bind(&workspace_id.0)
-        .execute(self.write_pool())
-        .await
+        .bind(&workspace_id.0);
+        let rows = match tx.as_mut() {
+            Some(tx) => query.execute(&mut **tx).await,
+            None => query.execute(self.write_pool()).await,
+        }
         .map_err(|e| Error::Internal(format!("update agent session failed: {e}")))?
         .rows_affected();
         if rows == 0 {
             return Err(Error::NotFound(format!("agent session {}", s.id)));
+        }
+        if let Some(mut tx) = tx {
+            if let Some(muted) = notifications_muted {
+                sqlx::query(
+                    "UPDATE agent_session SET notifications_muted=? \
+                     WHERE id=? AND workspace_id=? AND notifications_muted != ?",
+                )
+                .bind(i64::from(muted))
+                .bind(&s.id.0)
+                .bind(&workspace_id.0)
+                .bind(i64::from(muted))
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("set notifications muted failed: {e}")))?;
+            }
+            if remember_specialist {
+                crate::settings_repo::remember_agent_specialist(&mut tx, s).await?;
+            }
+            tx.commit()
+                .await
+                .map_err(|e| Error::Internal(format!("commit agent update: {e}")))?;
         }
         Ok(())
     }
@@ -2886,8 +2968,9 @@ impl Store {
     /// Set the session's `notifications_muted` flag (0123) — the store side
     /// of `agent.update { notificationsMuted }`. Returns `true` when the
     /// stored value actually changed; an already-matching flag is a no-op.
-    /// Notification preferences never advance the activity timestamp. The ONLY
-    /// post-insert mutator of the column: the full-row
+    /// Notification preferences never advance the activity timestamp. Both this
+    /// narrow writer and explicit patches in mixed updates preserve the toggle:
+    /// the ordinary full-row
     /// [`Store::update_agent_session`] deliberately excludes it so a concurrent
     /// `agent.update` on unrelated fields, or a
     /// long-lived in-memory session persisted at turn end, can never revert
