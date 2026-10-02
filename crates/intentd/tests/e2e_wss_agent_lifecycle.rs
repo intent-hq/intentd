@@ -7035,7 +7035,13 @@ async fn seed_queue_collaborator(data_dir: &Path, workspace_id: &str) -> &'stati
         updated_at: now_iso(),
     };
     store.upsert_principal(&principal).await.unwrap();
-    let hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+    let hash = Sha256::digest(token.as_bytes())
+        .iter()
+        .fold(String::new(), |mut hash, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(hash, "{byte:02x}");
+            hash
+        });
     store
         .insert_principal_credential(&principal.id, &hash)
         .await
