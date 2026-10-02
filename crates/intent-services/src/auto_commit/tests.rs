@@ -1142,7 +1142,7 @@ async fn generated_message_preserves_trailers() {
 async fn generation_applies_commit_quick_action_effort_before_prompt() {
     let repo = init_git_repo();
     let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
-    let (_dir, bin, log) = crate::test_support::quick_action_effort_adapter(&json!({
+    let (_dir, bin, log, _cli_env) = crate::test_support::quick_action_effort_adapter(&json!({
         "response": "{\"subject\":\"feat: configured effort\"}"
     }));
     let (_config_dir, registry) = auggie_active_registry();

@@ -1,5 +1,5 @@
 //! Actual pinned npm adapters + controlled installed CLIs, through production WSS.
-//! Opt in with INTENTD_TEST_CODEX_ADAPTER / INTENTD_TEST_CLAUDE_ADAPTER pointing
+//! Opt in with `INTENTD_TEST_CODEX_ADAPTER` / `INTENTD_TEST_CLAUDE_ADAPTER` pointing
 //! at each package directory (containing package.json), then run this ignored test.
 //! No npm downloads, account credentials or paid prompts occur in this test.
 //! The only package-dispatch shim selects those unchanged adapter entrypoints.

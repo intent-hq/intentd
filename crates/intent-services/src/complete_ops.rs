@@ -2089,7 +2089,7 @@ rl.on('line', (line) => {
     #[cfg(unix)]
     #[tokio::test]
     async fn quick_action_effort_reaches_provider_with_explicit_model_and_cold_catalog() {
-        let (_dir, bin, _) = crate::test_support::quick_action_effort_adapter(&json!({}));
+        let (_dir, bin, _, _cli_env) = crate::test_support::quick_action_effort_adapter(&json!({}));
         let (_tmp, svc) = services_with_settings(&[
             ("model.defaultProvider", json!("claude-code")),
             ("providers.paths", json!({"claude-code":bin})),
@@ -2159,7 +2159,7 @@ rl.on('line', (line) => {
     #[tokio::test]
     async fn quick_action_effort_live_selector_overrules_nonempty_cached_levels() {
         for (cached, live, expected) in [("low", "high", "high"), ("high", "low", "low")] {
-            let (_dir, bin, _) =
+            let (_dir, bin, _, _cli_env) =
                 crate::test_support::quick_action_effort_adapter(&json!({"modelValues":[live]}));
             let (_tmp, svc) = services_with_settings(&[
                 ("model.defaultProvider", json!("claude-code")),
@@ -2222,7 +2222,7 @@ rl.on('line', (line) => {
     #[cfg(unix)]
     #[tokio::test]
     async fn quick_action_effort_legacy_compound_model_does_not_leak_provider_defaults() {
-        let (_dir, bin, _) = crate::test_support::quick_action_effort_adapter(&json!({}));
+        let (_dir, bin, _, _cli_env) = crate::test_support::quick_action_effort_adapter(&json!({}));
         let (tmp, svc) =
             services_with_settings(&[("providers.paths", json!({"claude-code":bin}))]).await;
         let config = tmp.dir.path().join("legacy.toml");

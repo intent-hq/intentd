@@ -9373,6 +9373,8 @@ async fn set_model_bare_model_with_explicit_provider_id() {
     // target, so pin claude-code to a deterministic executable rather than
     // depending on whether the test host happens to have it installed.
     seed_provider_path(&svc, "claude-code");
+    #[cfg(unix)]
+    let _cli_env = crate::test_support::installed_cli_env(_t.path.parent().unwrap(), "claude");
     // Warm caches: claude-code claims `haiku`, auggie's catalog lacks it.
     let now = crate::model_catalog::ModelCatalogCache::now_ms();
     svc.models_catalog.test_store(
