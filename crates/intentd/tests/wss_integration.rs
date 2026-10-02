@@ -31,6 +31,8 @@ mod script_lifecycle;
 mod sharing;
 #[path = "wss_integration/skills.rs"]
 mod skills;
+#[path = "wss_integration/task_list_latency.rs"]
+mod task_list_latency;
 #[cfg(unix)]
 #[path = "wss_integration/terminal_replay.rs"]
 mod terminal_replay;
