@@ -1073,6 +1073,106 @@ async fn first_eligible_allow_claims_unassigned_primary_once() {
 }
 
 #[tokio::test]
+async fn disconnected_candidate_does_not_prevent_last_live_denial() {
+    for rehello in [false, true] {
+        let h = Harness::new().await;
+        h.services
+            .store
+            .set_workspace_browser_client(&h.workspace, None)
+            .await
+            .unwrap();
+        let first = h.executor.connection.lock().unwrap().clone();
+        let second = DesktopConnection {
+            client_id: ClientId::from("second"),
+            connection_epoch: "second-epoch".into(),
+            ..first.clone()
+        };
+        h.executor
+            .extra_connections
+            .lock()
+            .unwrap()
+            .push(second.clone());
+        let pending = h.agent("startControl", json!({})).await.unwrap();
+        let request = pending["requestId"].as_str().unwrap();
+        let mut replacement = first.clone();
+        replacement.connection_epoch = "replacement-epoch".into();
+        if !rehello {
+            replacement.client_id = ClientId::from("unrelated-client");
+        }
+        *h.executor.connection.lock().unwrap() = replacement.clone();
+        if rehello {
+            let stale = intent_core::with_caller(
+                h.owner.clone(),
+                h.services.desktop_client_op(
+                    "respondPermission".into(),
+                    json!({"workspaceId":h.workspace,"requestId":request,"decision":"allow_once"}),
+                    replacement,
+                ),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(stale.code, "desktop-stale-request");
+        }
+        intent_core::with_caller(
+            h.owner.clone(),
+            h.services.desktop_client_op(
+                "respondPermission".into(),
+                json!({"workspaceId":h.workspace,"requestId":request,"decision":"deny"}),
+                second,
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !h.services
+                .desktop
+                .get(&h.agent)
+                .is_some_and(|live| matches!(
+                    live.phase,
+                    Phase::Pending {
+                        accepted: false,
+                        ..
+                    }
+                )),
+            "the last connected candidate's Deny must be terminal"
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let raw = h
+                    .services
+                    .store
+                    .get_setting(&format!("desktop.v1/request/{request}"))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let record: Value = serde_json::from_str(&raw).unwrap();
+                if !record["outcome"].is_null() {
+                    assert_eq!(record["outcome"], "denied");
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(h
+            .services
+            .store
+            .workspace_browser_client(&h.workspace)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!h
+            .executor
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call["operation"] == "startControl"));
+    }
+}
+
+#[tokio::test]
 async fn candidate_denial_or_withdrawal_never_claims_primary() {
     let h = Harness::new().await;
     h.services
