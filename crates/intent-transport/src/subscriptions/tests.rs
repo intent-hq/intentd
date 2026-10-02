@@ -2133,7 +2133,7 @@ fn merge_live_turn_rebudgets_slim_page_evicting_oldest_persisted_rows() {
 }
 
 /// The merge-time re-budget is slim-only and fit-tolerant: a full-fidelity
-/// merge never evicts (mirroring the unbudgeted full read), and a slim merge
+/// merge within five rows never evicts (mirroring the unbudgeted full read), and a slim merge
 /// whose page already fits keeps every row and the original cursor.
 #[test]
 fn merge_live_turn_rebudget_noop_for_full_projection_and_fitting_pages() {
@@ -2181,6 +2181,88 @@ fn merge_live_turn_rebudget_noop_for_full_projection_and_fitting_pages() {
         slim["nextToken"], "tok-old",
         "fitting page keeps its cursor"
     );
+}
+
+/// The count cap applies even without slim projection. Cursor re-minting must
+/// work when a complete five-row transcript first gains an unpersisted row.
+#[test]
+fn five_message_live_overlay_caps_full_and_slim_pages_without_losing_history() {
+    for projection in [None, Some(ConversationProjection::Slim)] {
+        let messages: Vec<Value> = (0..5)
+            .map(|seq| {
+                json!({ "id": format!("m-{seq}"), "seq": seq,
+                "role": "user", "contentBlocks": [{ "type": "text", "text": "small" }] })
+            })
+            .collect();
+        let mut snapshot = json!({ "messages": messages, "totalMessages": 5,
+            "truncated": false, "nextToken": null });
+        let live = json!({ "messageId": "live", "contentBlocks": [] });
+        merge_live_turn(&mut snapshot, &agent(), &live, true, projection);
+        assert_eq!(snapshot["messages"].as_array().unwrap().len(), 5);
+        assert_eq!(snapshot["messages"][0]["id"], "m-1");
+        assert_eq!(snapshot["messages"][4]["id"], "live");
+        assert_eq!(snapshot["totalMessages"], 6);
+        assert_eq!(snapshot["truncated"], true);
+        let older =
+            intent_services::pagination::page_window(5, Some(5), snapshot["nextToken"].as_str());
+        assert_eq!((older.start, older.end), (0, 1));
+        // A persist/slot-clear race must not count or append the same row twice.
+        let unchanged = snapshot.clone();
+        merge_live_turn(&mut snapshot, &agent(), &live, true, projection);
+        assert_eq!(snapshot, unchanged);
+    }
+}
+
+/// Byte eviction can shorten a count-bounded page further. An oversized live
+/// anchor still serves alone, and every displaced persisted row is reachable.
+#[test]
+fn five_message_live_overlay_preserves_byte_budget_and_one_message_floor() {
+    for live_bytes in [200 * 1024, 600 * 1024] {
+        let messages: Vec<Value> = (0..5)
+            .map(|seq| json!({ "id": format!("m-{seq}"), "seq": seq,
+                "role": "user", "contentBlocks": [{ "type": "text", "text": "p".repeat(90 * 1024) }] }))
+            .collect();
+        let mut snapshot = json!({ "messages": messages, "totalMessages": 5,
+            "truncated": false, "nextToken": null });
+        let live = json!({ "messageId": "live", "contentBlocks": [
+            { "type": "text", "text": "x".repeat(live_bytes) }] });
+        merge_live_turn(
+            &mut snapshot,
+            &agent(),
+            &live,
+            true,
+            Some(ConversationProjection::Slim),
+        );
+        let rows = snapshot["messages"].as_array().unwrap();
+        assert_eq!(
+            rows.len(),
+            if live_bytes > SLIM_PAGE_BUDGET_BYTES {
+                1
+            } else {
+                4
+            }
+        );
+        assert_eq!(rows.last().unwrap()["id"], "live");
+        let bytes: usize = rows
+            .iter()
+            .map(intent_services::pagination::serialized_size)
+            .sum();
+        assert!(bytes <= SLIM_PAGE_BUDGET_BYTES || rows.len() == 1);
+        assert_eq!(snapshot["totalMessages"], 6);
+        assert_eq!(snapshot["truncated"], true);
+        let older =
+            intent_services::pagination::page_window(5, Some(5), snapshot["nextToken"].as_str());
+        assert_eq!(
+            older.end,
+            usize::try_from(rows[0]["seq"].as_u64().unwrap()).unwrap()
+        );
+        assert_eq!(older.start, 0);
+        eprintln!(
+            "five-message live overlay: rows={} message_bytes={bytes} older_end={}",
+            rows.len(),
+            older.end
+        );
+    }
 }
 
 // --- task_delta re-read arm (channel-mapping regression) ------------------
@@ -3173,7 +3255,7 @@ mod chat_snapshot_bounded {
     }
 
     /// Exercise the existing snapshot entry points against the SAME page-window
-    /// helper as the conversation service. Unlike BoundedPageApi's fixed two
+    /// helper as the conversation service. Unlike `BoundedPageApi`'s fixed two
     /// rows, this fixture observes the requested limit (including its default).
     /// No future subscription parameter or parallel paginator is introduced.
     struct TranscriptPageApi {
