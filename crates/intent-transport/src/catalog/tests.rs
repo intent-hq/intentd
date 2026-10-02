@@ -1799,7 +1799,7 @@ mod unbound_owner_only_methods {
             ),
             (
                 "desktop.setPermission",
-                json!({ "workspaceId": ws, "agentId": "a1", "allowFuture": true }),
+                json!({ "workspaceId": ws, "agentId": "a1", "computerId": "physical", "allowed": true }),
             ),
             ("file-tracking.getAgentLocks", json!({ "workspaceId": ws })),
             ("file-tracking.getChanges", json!({ "workspaceId": ws })),
