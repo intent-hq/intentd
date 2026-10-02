@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.136] - 2026-10-02
+
+### 🚀 Features
+
+- Bundle slim subscription participant agents ([#2230](https://github.com/intent-hq/intentd/pull/2230))
+
+### 🐛 Bug Fixes
+
+- Bump Codex ACP fallback to v2.1.0 ([#2164](https://github.com/intent-hq/intentd/pull/2164))
+
+
 ## [0.9.135] - 2026-10-02
 
 ### 🐛 Bug Fixes
