@@ -7206,8 +7206,8 @@ async fn boot_daemon_with_seeded_note() -> (tempfile::TempDir, Daemon, String, S
 /// WSS-2 (router): drive a broad slice of untested-over-WSS read/lifecycle
 /// router arms — `note.*` (list/get/create/update/listTasks), `mcp.servers.list`,
 /// `script.*` (list/create/status/remove), `terminal.*` (create/list/kill),
-/// `primitive.*` (addReference/addCli + note mutation), and the `pr.status`
-/// error-envelope arm — all over ONE pinned WSS RPC connection so each match
+/// `primitive.*` (addReference/addCli + note mutation), and the `pr.refresh`
+/// unlinked-workspace result — all over ONE pinned WSS RPC connection so each match
 /// arm in `intent-transport::router::dispatch` is exercised through
 /// `conn::process_frame` (which is uncounted over WSS in the COV-1 baseline).
 /// No agent turn → no `node` dependency.
@@ -7497,20 +7497,9 @@ async fn router_read_lifecycle_arms_over_wss() {
         "primitive.* appended to note body: {body}"
     );
 
-    // --- pr.status: error-envelope arm on a fresh workspace -----------------
-    // The seeded workspace has no `repository_owner`/`repository_name`/`pr_number`,
-    // so `pr.status` returns the well-defined "no active PR" envelope — still a
-    // valid hit on the router arm via the WSS path.
-    let pr_env = wss_rpc_envelope(&mut rpc, 21, "pr.status", json!({ "workspaceId": ws_id })).await;
-    assert!(
-        pr_env.get("error").is_some(),
-        "pr.status returns an error envelope on a fresh workspace: {pr_env}"
-    );
-    assert_eq!(
-        pr_env["error"]["code"],
-        json!(-32603),
-        "pr.status `Error::Internal` → -32603 (§9): {pr_env}"
-    );
+    // Retiring pr.status must keep refresh working for an unlinked workspace.
+    let refreshed = wss_rpc(&mut rpc, 21, "pr.refresh", json!({ "workspaceId": ws_id })).await;
+    assert!(refreshed["pullRequests"].is_array(), "{refreshed}");
 }
 
 /// WSS-2 (terminal.create env, §5.13 gap): the `env` param is layered onto the

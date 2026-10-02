@@ -2789,7 +2789,7 @@ async fn dispatch(
             Ok(r)
         }
         // `git.diff` is accepted as an alias for the wire-canonical `git.diffs`.
-        "git.diffs" | "git.diff" => {
+        "git.diffs" => {
             let ws = require_ws_note(params)?;
             // §5.6 extension: `paths` narrows the diff to exactly those
             // workspace-relative files (literal matching). The legacy single
@@ -2828,7 +2828,7 @@ async fn dispatch(
             Ok(r)
         }
         // `git.log` is accepted as an alias for the wire-canonical `git.commits`.
-        "git.commits" | "git.log" => {
+        "git.commits" => {
             let ws = require_ws_note(params)?;
             // §5.5 page params arrive nested under `page` ({ continuationToken,
             // limit }); fall back to top-level `limit`/`nextToken` for parity
@@ -2906,11 +2906,6 @@ async fn dispatch(
                 Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
-        }
-        "pr.status" => {
-            let ws = require_ws_note(params)?;
-            let r = api.pr_status(ws).await.map_err(domain_to_rpc)?;
-            Ok(r)
         }
         "pr.refresh" => {
             let ws = require_ws_note(params)?;
@@ -3603,14 +3598,6 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
-        "file-tracking.getLineStats" => {
-            let ws = require_ws_note(params)?;
-            let r = api
-                .file_tracking_get_line_stats(ws)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(r)
-        }
         "file-tracking.stage" => {
             let ws = require_ws_note(params)?;
             require_present(params, "paths")?;
@@ -3631,33 +3618,10 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
-        "metrics.getWorkspaceStats" => {
-            let ws = require_ws_note(params)?;
-            let r = api
-                .metrics_get_workspace_stats(ws)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(r)
-        }
         "metrics.getAgentStats" => {
             let agent_id = require_str_param(params, "agentId")?;
             let r = api
                 .metrics_get_agent_stats(agent_id)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(r)
-        }
-        "metrics.getAllWorkspaceStats" => {
-            let r = api
-                .metrics_get_all_workspace_stats()
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(r)
-        }
-        "metrics.clearAgentStats" => {
-            let agent_id = require_str_param(params, "agentId")?;
-            let r = api
-                .metrics_clear_agent_stats(agent_id)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)

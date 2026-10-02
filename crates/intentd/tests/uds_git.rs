@@ -675,13 +675,13 @@ async fn uds_git_read_ops_round_trip() {
         .any(|l| l["type"] == json!("Addition")
             && l["content"].as_str().unwrap_or("").contains("added")));
 
-    // (b') git.diff alias resolves to the same handler.
+    // (b') Canonical git.diffs retains path filtering.
     let resp = send(
         &config.socket_path,
-        r#"{"jsonrpc":"2.0","id":3,"method":"git.diff","params":{"workspaceId":"ws-gitr","path":"seed.txt"}}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"git.diffs","params":{"workspaceId":"ws-gitr","path":"seed.txt"}}"#,
     )
     .await;
-    let arr = resp["result"].as_array().expect("diff alias array");
+    let arr = resp["result"].as_array().expect("filtered diffs array");
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0]["path"], json!("seed.txt"));
 
@@ -700,10 +700,10 @@ async fn uds_git_read_ops_round_trip() {
     assert_eq!(items[0]["email"], json!("test@example.com"));
     assert_eq!(resp["result"]["nextToken"], Value::Null);
 
-    // (c') git.log alias resolves to the same handler (top-level limit form).
+    // (c') Canonical git.commits also accepts the top-level limit form.
     let resp = send(
         &config.socket_path,
-        r#"{"jsonrpc":"2.0","id":5,"method":"git.log","params":{"workspaceId":"ws-gitr","limit":10}}"#,
+        r#"{"jsonrpc":"2.0","id":5,"method":"git.commits","params":{"workspaceId":"ws-gitr","limit":10}}"#,
     )
     .await;
     assert_eq!(resp["result"]["items"].as_array().expect("items").len(), 1);

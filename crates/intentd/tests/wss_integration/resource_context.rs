@@ -378,12 +378,10 @@ async fn resource_context_agent_queue_rename_stop_and_metrics() {
             stats,
             json!({"additions":12,"deletions":3,"filesChanged":2})
         );
-        rpc(
-            &mut c,
-            "metrics.clearAgentStats",
-            p(json!({"agentId":agent})),
-        )
-        .await;
+        srv.api
+            .metrics_clear_agent_stats(agent.as_str().unwrap().to_string())
+            .await
+            .unwrap();
         assert!(
             rpc(&mut c, "metrics.getAgentStats", p(json!({"agentId":agent})))
                 .await
@@ -1060,7 +1058,6 @@ async fn resource_context_cannot_grant_access_to_another_workspaces_resources() 
             json!({"agentId":agent,"name":"unauthorized"}),
         ),
         ("metrics.getAgentStats", json!({"agentId":agent})),
-        ("metrics.clearAgentStats", json!({"agentId":agent})),
         (
             "file.attachmentUpload.chunk",
             json!({"uploadId":upload,"seq":0,"data":"ZGF0YQ=="}),

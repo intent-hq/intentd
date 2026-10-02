@@ -23,6 +23,9 @@ mod integration_context;
 #[cfg(unix)]
 #[path = "wss_integration/linked_skills.rs"]
 mod linked_skills;
+#[cfg(unix)]
+#[path = "wss_integration/removed_rpc.rs"]
+mod removed_rpc;
 #[path = "wss_integration/resource_context.rs"]
 mod resource_context;
 #[path = "wss_integration/script_lifecycle.rs"]
@@ -955,8 +958,6 @@ async fn wss_fast_path_invalid_params_carry_data_code() {
             r#"{"jsonrpc":"2.0","id":1,"method":"events.subscribe","params":{}}"#.to_string(),
             // drafts.set: missing workspaceId/agentId.
             r#"{"jsonrpc":"2.0","id":2,"method":"drafts.set","params":{"text":"x"}}"#.to_string(),
-            // forward.create: missing remotePort.
-            r#"{"jsonrpc":"2.0","id":3,"method":"forward.create","params":{}}"#.to_string(),
             // host.directoryStatus: missing path.
             r#"{"jsonrpc":"2.0","id":4,"method":"host.directoryStatus","params":{}}"#.to_string(),
             // browser.exec: missing actions (rejected before the reverse RPC).
@@ -6272,15 +6273,13 @@ async fn wss_collaborator_allowlist_refuses_owner_only_methods_and_tunnel() {
         assert!(v.get("result").is_none(), "{v}");
     }
 
-    // The alias `git.diff` is canonicalised to `git.diffs` (allowed): it is
-    // not refused by the allowlist, so it reaches the router and fails on its
-    // params (unknown workspace) rather than with -32003.
-    let (id, frame) = call("git.diff", json!({ "workspaceId": WorkspaceId::new().0 }));
+    // The canonical git read remains allowed and reaches workspace validation.
+    let (id, frame) = call("git.diffs", json!({ "workspaceId": WorkspaceId::new().0 }));
     ws.send(Message::Text(frame.into())).await.expect("send");
     let v = reply(&mut ws, id).await;
     assert_ne!(
         v["error"]["code"], -32003,
-        "git.diff must classify like git.diffs (allowed): {v}"
+        "git.diffs must remain allowed: {v}"
     );
     drop(ws);
 

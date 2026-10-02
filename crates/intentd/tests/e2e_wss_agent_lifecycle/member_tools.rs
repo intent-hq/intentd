@@ -967,7 +967,7 @@ async fn seed_linked_member_pr(data_dir: &Path, ws: &WorkspaceId) {
 }
 
 #[tokio::test]
-async fn member_pr_status_missing_auth_does_not_consume_collaboration_credentials_over_wss() {
+async fn member_pr_read_missing_auth_does_not_consume_collaboration_credentials_over_wss() {
     let dir = temp_data_dir();
     let ws = WorkspaceId::new();
     seed_linked_member_pr(dir.path(), &ws).await;
@@ -1014,7 +1014,13 @@ async fn member_pr_status_missing_auth_does_not_consume_collaboration_credential
     .await;
     let context = wss_rpc(&mut client, 1, "host.executionContext", json!({})).await;
     assert_eq!(context["repositoryConnections"][0]["configured"], false);
-    let reply = wss_rpc_envelope(&mut client, 2, "pr.status", json!({"workspaceId":ws})).await;
+    let reply = wss_rpc_envelope(
+        &mut client,
+        2,
+        "github.pulls.get",
+        json!({"owner":"fake-org","repo":"fake-repo","number":7}),
+    )
+    .await;
     assert_eq!(reply["error"]["code"], -32603);
     assert_eq!(
         reply["error"]["data"],
@@ -1031,7 +1037,13 @@ async fn member_pr_status_missing_auth_does_not_consume_collaboration_credential
     }
     let event = wss_event(&mut observer, 10).await;
     assert_eq!(event["params"]["event"]["data"], context);
-    let legacy = wss_rpc_envelope(&mut owner, 1, "pr.status", json!({"workspaceId":ws})).await;
+    let legacy = wss_rpc_envelope(
+        &mut owner,
+        1,
+        "github.pulls.get",
+        json!({"owner":"fake-org","repo":"fake-repo","number":7}),
+    )
+    .await;
     assert_eq!(legacy["error"]["code"], -32603);
     assert!(legacy["error"]["data"]["executionAuthorization"].is_null());
     assert_eq!(legacy["error"]["message"], "Internal error");
@@ -1127,7 +1139,7 @@ impl PrAuthServer {
 }
 
 #[intent_test_macros::daemon_test]
-async fn member_pr_status_typed_rejections_are_safe_and_non_auth_errors_stay_legacy_over_wss() {
+async fn member_pr_read_typed_rejections_are_safe_and_non_auth_errors_stay_legacy_over_wss() {
     use intent_services::{EventBus, InMemorySecretStore, SecretStore, Services, SettingsRegistry};
     use intent_transport::{AsyncTokenStore, TokenStore, WsApiServer, WsOptions};
     use std::sync::atomic::Ordering;
@@ -1217,7 +1229,13 @@ async fn member_pr_status_typed_rejections_are_safe_and_non_auth_errors_stay_leg
     ] {
         fake.status.store(code, Ordering::SeqCst);
         let before_owner = fake.authorization.lock().unwrap().len();
-        let legacy = wss_rpc_envelope(&mut owner, 2, "pr.status", json!({"workspaceId":ws})).await;
+        let legacy = wss_rpc_envelope(
+            &mut owner,
+            2,
+            "github.pulls.get",
+            json!({"owner":"fake-org","repo":"fake-repo","number":7}),
+        )
+        .await;
         let before_member = fake.authorization.lock().unwrap().len();
         assert!(
             before_member > before_owner,
@@ -1238,7 +1256,13 @@ async fn member_pr_status_typed_rejections_are_safe_and_non_auth_errors_stay_leg
             let owner_event = wss_event(&mut observer, 10).await;
             assert_eq!(owner_event["params"]["event"]["data"], context);
         }
-        let reply = wss_rpc_envelope(&mut client, 2, "pr.status", json!({"workspaceId":ws})).await;
+        let reply = wss_rpc_envelope(
+            &mut client,
+            2,
+            "github.pulls.get",
+            json!({"owner":"fake-org","repo":"fake-repo","number":7}),
+        )
+        .await;
         assert!(
             fake.authorization.lock().unwrap().len() > before_member,
             "member PR read must reach the local forge"

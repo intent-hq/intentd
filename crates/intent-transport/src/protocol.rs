@@ -708,7 +708,11 @@ use std::time::{Duration, Instant};
 // registered workspace-owned roots share existing filesystem confinement.
 // Version 11.2 adds complete script.list rows to created/updated script:changed
 // events, including committed result/archive state. Presence detects support.
-pub const PROTOCOL_VERSION: &str = "11.2";
+// Version 12.0 retires git.diff/git.log aliases, pr.status,
+// file-tracking.getLineStats, metrics.getWorkspaceStats/getAllWorkspaceStats/
+// clearAgentStats, and forward.create/list/close. Canonical git reads,
+// pr.refresh, metrics.getAgentStats, MCP operations and binary /tunnel remain.
+pub const PROTOCOL_VERSION: &str = "12.0";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

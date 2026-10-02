@@ -29,7 +29,6 @@ use crate::conflate::{self, ChatItem, ConflationBuffer, Enqueue, EventItem};
 use crate::control::{self, SystemControl};
 use crate::drafts;
 use crate::events::{self, FastPath};
-use crate::forward::{self, ForwardRegistry};
 use crate::host;
 use crate::panic_guard;
 use crate::presence;
@@ -366,18 +365,18 @@ impl ConnSubs {
 /// `system.requestUpdate` on both transports;
 /// `system.shutdown`/`system.importLegacy` UDS-only via the
 /// `is_uds` guard inside `control::handle`), the `host.status` capability
-/// probe (both transports), the `forward.*` port-forwarding methods, and the
-/// `events.` fast-path, else hand to the JSON-RPC dispatcher. `control` is
+/// probe (both transports), and the `events.` fast-path, else hand to the
+/// JSON-RPC dispatcher. `control` is
 /// `Some` on every transport that wires the control surface — the composition
 /// root passes `Some(control)` to both the UDS and WSS listeners (remote
-/// `system.status` needs it); `forwards`/`reverse` are the connection's port-forward registry
-/// and reverse-RPC channel; `client_id` is the connection's logical-client
+/// `system.status` needs it); `reverse` is the connection's reverse-RPC channel;
+/// `client_id` is the connection's logical-client
 /// binding, set by `client.hello` and consumed by `drafts.*` (§16); `is_local`
 /// reflects that connection's resolved locality (§5.14). Returns `false` when
 /// the outbound channel is closed.
 ///
 /// The fast-paths that mutate per-connection state (`reverse.route_response`,
-/// `system.*`, `forward.*`, `client.hello`, `drafts.*`, `events.`/subscription
+/// `system.*`, `client.hello`, `drafts.*`, `events.`/subscription
 /// fast-paths) run inline on the read loop and stay serialized. A successful
 /// `client.hello` also binds the connection's logical identity onto its
 /// `reverse_guard` registry entry (REV-2 target selection) and publishes the
@@ -411,7 +410,6 @@ pub(crate) async fn process_frame(
     bus: &EventBus,
     out_tx: &OutboundSender,
     subs: &mut ConnSubs,
-    forwards: &mut ForwardRegistry,
     reverse: &ReverseChannel,
     reverse_guard: &PrimaryReverseGuard,
     control: Option<&Arc<dyn SystemControl>>,
@@ -460,7 +458,7 @@ pub(crate) async fn process_frame(
         );
         // Multiplayer w3 — default-deny allowlist for non-administrator
         // connections. Runs before every classify and dispatch path (control,
-        // server/pairing, provider setup, host, browser, forward, client,
+        // server/pairing, provider setup, host, browser, client,
         // drafts, subscription channels, events, router) so no fast path can
         // be reached by a method outside `COLLABORATOR_METHODS`; aliases are
         // canonicalised inside the lookup. Only a frame that already carries
@@ -684,18 +682,6 @@ pub(crate) async fn process_frame(
                 .await;
             });
             return true;
-        }
-        if let Some(req) = forward::classify(value) {
-            let frame = panic_guard::guard_frame(
-                &method,
-                rpc_id.clone(),
-                forward::handle(req, forwards, is_local, api.as_ref()),
-            )
-            .await;
-            return match frame {
-                Some(frame) => out_tx.send_priority(frame).await.is_ok(),
-                None => true,
-            };
         }
         if let Some(req) = client::classify(value) {
             let setup_requested = req.id_present
@@ -2397,7 +2383,6 @@ mod tests {
         let guard = primary.register(reverse.clone(), crate::reverse::ReverseTransport::Wss);
         let limiter = RpcLimiter::unlimited();
         let mut subs = ConnSubs::default();
-        let mut forwards = ForwardRegistry::default();
         let mut client = None;
         let frame = r#"{"jsonrpc":"2.0","id":1,"method":"workspace.list"}"#;
         assert!(
@@ -2407,7 +2392,6 @@ mod tests {
                 &bus,
                 &tx,
                 &mut subs,
-                &mut forwards,
                 &reverse,
                 &guard,
                 None,
@@ -2429,7 +2413,6 @@ mod tests {
                 &bus,
                 &tx,
                 &mut subs,
-                &mut forwards,
                 &reverse,
                 &guard,
                 None,
