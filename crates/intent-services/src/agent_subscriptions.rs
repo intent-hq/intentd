@@ -1945,7 +1945,11 @@ impl Services {
                         if settled
                             && matches!(call_site, WatchReconcileCallSite::Registration)
                             && (!self.active_hooks_for_agent(child_id).await.is_empty()
-                                || !self.active_pr_monitors_for_agent(child_id).await.is_empty()
+                                || (!self.active_pr_monitors_for_agent(child_id).await.is_empty()
+                                    || !self
+                                        .active_script_monitors_for_agent(child_id)
+                                        .await
+                                        .is_empty())
                                 || !self.list_event_subscriptions_for_agent(child_id).is_empty())
                         {
                             self.mark_interim_skipped_idle_stale_report(child_id);
@@ -2508,7 +2512,21 @@ impl Services {
         // settled — its group completion must not be recorded yet. Not
         // stamped onto `event_data` (internal classification only), so
         // probed live here, matching the agent-waiting check below.
-        if !completion_reported && !self.active_pr_monitors_for_agent(agent_id).await.is_empty() {
+        if !completion_reported
+            && (!self.active_pr_monitors_for_agent(agent_id).await.is_empty()
+                || !self
+                    .active_script_monitors_for_agent(agent_id)
+                    .await
+                    .is_empty())
+        {
+            return;
+        }
+        if self
+            .store
+            .script_monitor_pending_for_agent(agent_id)
+            .await
+            .unwrap_or(true)
+        {
             return;
         }
         // Agent-waiting deferral (issue intent-hq/monorepo#1468): an idle

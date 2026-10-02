@@ -183,11 +183,13 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// Direct user retirement (protocol 10.10): +1 router method (`agent.retire`).
 /// Reversible script history (protocol 10.11): +2 router methods
 /// (`script.archive`, `script.restore`).
-const EXPECTED_TOTAL_METHODS: usize = 401;
+/// Durable script monitors (protocol 12.1): +3 router methods.
+const EXPECTED_TOTAL_METHODS: usize = 404;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.
-const EXPECTED_ROUTER_METHODS: usize = 346;
+/// Protocol 12.1 adds the three script-monitor controls.
+const EXPECTED_ROUTER_METHODS: usize = 349;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 55;
@@ -779,6 +781,9 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "script.start",
     "script.status",
     "script.stop",
+    "scriptMonitor.cancel",
+    "scriptMonitor.cancelRun",
+    "scriptMonitor.list",
     "search.cancel",
     "search.codebase",
     "search.events",
@@ -1306,6 +1311,8 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "script.start",
     "script.status",
     "script.stop",
+    "scriptMonitor.cancel",
+    "scriptMonitor.cancelRun",
     "sentry.assignIssue",
     "sentry.authStatus",
     "sentry.getIssue",
@@ -1941,6 +1948,14 @@ mod unbound_owner_only_methods {
             ("script.start", script.clone()),
             ("script.status", script.clone()),
             ("script.stop", script.clone()),
+            (
+                "scriptMonitor.cancel",
+                json!({ "workspaceId": ws, "monitorId": "m1" }),
+            ),
+            (
+                "scriptMonitor.cancelRun",
+                json!({ "workspaceId": ws, "monitorId": "m1" }),
+            ),
             ("sentry.assignIssue", json!({ "id": "i" })),
             ("sentry.authStatus", json!({})),
             ("sentry.getIssue", json!({ "id": "i" })),

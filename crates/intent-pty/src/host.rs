@@ -203,6 +203,9 @@ pub struct Attachment {
 /// the reader (append + send) are atomic relative to each other — guaranteeing a
 /// late subscriber sees each chunk exactly once (history XOR live, never both).
 struct Fanout {
+    eof: bool,
+    eof_notify: Arc<tokio::sync::Notify>,
+    framing: intent_core::script_output::LineDecoder,
     scrollback: Scrollback,
     tx: broadcast::Sender<Arc<OutputChunk>>,
 }
@@ -409,6 +412,9 @@ impl PtyHost {
 
         let (tx, _rx) = broadcast::channel(FANOUT_CAPACITY);
         let fanout = Arc::new(Mutex::new(Fanout {
+            eof: false,
+            eof_notify: Arc::default(),
+            framing: intent_core::script_output::LineDecoder::new(false),
             scrollback: Scrollback::new(spec.scrollback_bytes),
             tx,
         }));
@@ -484,6 +490,46 @@ impl PtyHost {
         let live = guard.tx.subscribe();
         drop(guard);
         Ok(Attachment { backlog, live })
+    }
+
+    /// Whether the process output reader has observed EOF.
+    /// # Errors
+    /// Returns `NotFound` if the session was removed.
+    /// # Panics
+    /// Panics if the output lock is poisoned.
+    pub fn output_eof(&self, id: PtyId) -> Result<bool> {
+        Ok(self.get(id)?.fanout.lock().unwrap().eof)
+    }
+
+    /// Wait for the output reader to finish; callers decide their teardown deadline.
+    /// # Errors
+    /// Returns `NotFound` for a removed attempt.
+    /// # Panics
+    /// Panics if the output lock is poisoned.
+    pub async fn wait_output_eof(&self, id: PtyId) -> Result<()> {
+        let session = self.get(id)?;
+        let notify = session.fanout.lock().unwrap().eof_notify.clone();
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !session.fanout.lock().unwrap().eof {
+            notified.await;
+        }
+        Ok(())
+    }
+
+    /// Atomically capture the output cursor and constant-sized framing state.
+    /// # Errors
+    /// Returns `NotFound` if the attempt no longer exists.
+    /// # Panics
+    /// Panics if the fanout lock was poisoned.
+    pub fn observation_cursor(
+        &self,
+        id: PtyId,
+    ) -> Result<(u64, intent_core::script_output::LineDecoder)> {
+        let session = self.get(id)?;
+        let guard = session.fanout.lock().unwrap();
+        Ok((guard.scrollback.end_offset(), guard.framing.window()))
     }
 
     /// Snapshot the PTY's current scrollback for replay (`terminal.getBuffer` /
@@ -982,6 +1028,9 @@ fn read_loop(mut reader: Box<dyn Read + Send>, fanout: &Arc<Mutex<Fanout>>) {
                 let mut guard = fanout.lock().unwrap();
                 let start_offset = guard.scrollback.end_offset();
                 guard.scrollback.push(&buf[..n]);
+                for byte in &buf[..n] {
+                    guard.framing.push(*byte);
+                }
                 let chunk = Arc::new(OutputChunk {
                     bytes: buf[..n].to_vec(),
                     start_offset,
@@ -993,6 +1042,9 @@ fn read_loop(mut reader: Box<dyn Read + Send>, fanout: &Arc<Mutex<Fanout>>) {
             Err(_) => break,
         }
     }
+    let mut fanout = fanout.lock().unwrap();
+    fanout.eof = true;
+    fanout.eof_notify.notify_waiters();
 }
 
 /// Terminate a session's whole process group (SIGTERM→grace→SIGKILL), then

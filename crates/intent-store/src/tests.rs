@@ -19,6 +19,7 @@ use crate::{AgentQueueRow, AutoVacuumActivation, EventQuery, NewEvent, Store, MA
 
 mod host_membership;
 mod human_attribution;
+mod script_monitors;
 mod sharing;
 mod workspace_delete;
 
@@ -10761,6 +10762,7 @@ async fn script_lifecycle_legacy_defaults_and_durable_scope() {
     ));
     def.purpose = intent_core::ScriptPurpose::OneOff;
     def.last_run = Some(intent_core::ScriptLastRun {
+        run_id: None,
         outcome: intent_core::ScriptRunOutcome::Failed,
         exit_code: Some(2),
         started_at: Some("t1".into()),

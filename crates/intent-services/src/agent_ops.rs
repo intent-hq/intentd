@@ -3223,6 +3223,14 @@ impl Services {
                 self.active_pr_monitors_by_agent(&workspace_id).await,
             )
         };
+        let mut script_monitors_by_agent: HashMap<String, Vec<Value>> = HashMap::new();
+        for (agent, row) in self
+            .store
+            .script_monitor_waiting(Some(&workspace_id), None)
+            .await?
+        {
+            script_monitors_by_agent.entry(agent).or_default().push(row);
+        }
         let mut rows: Vec<AgentLite> = sessions
             .into_iter()
             .map(|s| {
@@ -3230,7 +3238,15 @@ impl Services {
                 let waiting_on_hooks = hooks_by_agent.remove(&s.id.0).unwrap_or_default();
                 let waiting_on_pr_monitors =
                     pr_monitors_by_agent.remove(&s.id.0).unwrap_or_default();
-                self.project_list_agent(s, &projection, waiting_on_hooks, waiting_on_pr_monitors)
+                let script_waiting = script_monitors_by_agent.remove(&s.id.0).unwrap_or_default();
+                let mut lite = self.project_list_agent(
+                    s,
+                    &projection,
+                    waiting_on_hooks,
+                    waiting_on_pr_monitors,
+                );
+                lite.waiting_on_script_monitors = script_waiting;
+                lite
             })
             .collect();
         // Response-level frame fit (intent-hq/intent#5531): the per-row pass
@@ -3314,6 +3330,7 @@ impl Services {
         let mut lite = self.project_lite_with_flags_from_projection(session, &projection);
         lite.waiting_on_hooks = waiting_on_hooks;
         lite.waiting_on_pr_monitors = waiting_on_pr_monitors;
+        lite.waiting_on_script_monitors = self.active_script_monitors_for_agent(&agent_id).await;
         Ok(lite)
     }
 
@@ -5242,6 +5259,10 @@ impl Services {
         // wrong workspace cannot mutate the row even if the pre-check above races
         // with a concurrent workspace move.
         if let Some(session_ws) = session_workspace_id.as_ref() {
+            let retirement = self.agent_retirement_gates.for_agent(&agent_id);
+            let _retirement = retirement.lock().await;
+            self.cancel_script_monitors(session_ws, Some(&agent_id), "owner-deleted")
+                .await?;
             self.store
                 .delete_agent_session(session_ws, &agent_id)
                 .await?;
@@ -5602,6 +5623,8 @@ impl Services {
         // so a transient probe failure can never publish a spurious
         // `{ none }` through the settle's fallback.
         let before = self.snapshot_workspace_unread(&session.workspace_id).await;
+        self.cancel_script_monitors(&session.workspace_id, Some(&session.id), "owner-retired")
+            .await?;
         // CAS write: only the request that actually flips NULL → set emits
         // the event.
         let transitioned = self
@@ -11431,6 +11454,20 @@ impl Services {
         session: &AgentSession,
     ) -> Result<bool> {
         let agent_id = &session.id;
+        if self
+            .store
+            .script_monitor_pending_for_agent(agent_id)
+            .await?
+        {
+            return Ok(true);
+        }
+        if !self
+            .active_script_monitors_for_agent(agent_id)
+            .await
+            .is_empty()
+        {
+            return Ok(true);
+        }
         if self.has_ready_to_send(agent_id)
             || self.agent_is_busy(agent_id.clone())
             || session.attention_request_kind.is_some()
@@ -12798,6 +12835,15 @@ impl Services {
         // monitor metadata (`waitingOnPrMonitors`, omitted when empty) from
         // one workspace-wide monitor query.
         let mut pr_monitors_by_agent = self.active_pr_monitors_by_agent(&workspace_id).await;
+        let mut script_monitors_by_agent: HashMap<String, Vec<Value>> = HashMap::new();
+        for (owner, row) in self
+            .store
+            .script_monitor_waiting(Some(&workspace_id), None)
+            .await?
+        {
+            script_monitors_by_agent.entry(owner).or_default().push(row);
+        }
+
         // Per-agent subtree memory attribution (monorepo#2063 A2): resident
         // bytes of each agent's descendant process tree from the runtime
         // manager's tree probe, stamped as `subtreeMemoryBytes` (omitted when
@@ -12907,6 +12953,9 @@ impl Services {
                 if !hooks.is_empty() {
                     row.insert("waitingOnHooks".into(), Value::Array(hooks));
                 }
+            }
+            if let Some(monitors) = script_monitors_by_agent.remove(id.as_str()) {
+                row.insert("waitingOnScriptMonitors".into(), Value::Array(monitors));
             }
             if let Some(monitors) = pr_monitors_by_agent.remove(id.as_str()) {
                 if !monitors.is_empty() {
@@ -15254,7 +15303,9 @@ impl Services {
             .lock()
             .expect("agent queue registry poisoned");
         let queue = guard.get_mut(agent_id)?;
-        let idx = queue.iter().position(QueuedMessage::ready_to_send)?;
+        let idx = queue.iter().position(|m| {
+            m.ready_to_send() && !self.script_monitor_export_blocked(m.message_metadata.as_ref())
+        })?;
         Some(queue.remove(idx))
     }
 
@@ -15300,6 +15351,14 @@ impl Services {
             .lock()
             .expect("agent queue registry poisoned");
         let queue = guard.get_mut(agent_id)?;
+        // Preserve each script wake's durable identity and lifecycle fence through worker admission.
+        if queue.iter().any(|m| {
+            m.ready_to_send()
+                && crate::script_monitor::monitor_id(m.message_metadata.as_ref()).is_some()
+        }) {
+            return None;
+        }
+
         let ready = QueuedMessage::ready_to_send;
         if require_user_origin && !queue.iter().any(|m| ready(m) && m.user_origin) {
             return None;
@@ -15339,6 +15398,14 @@ impl Services {
             .lock()
             .expect("agent queue registry poisoned");
         let queue = guard.get_mut(agent_id)?;
+        // Preserve each script wake's durable identity and lifecycle fence through worker admission.
+        if queue.iter().any(|m| {
+            m.ready_to_send()
+                && crate::script_monitor::monitor_id(m.message_metadata.as_ref()).is_some()
+        }) {
+            return None;
+        }
+
         let eligible = |m: &QueuedMessage| m.ready_to_send() && !m.user_origin;
         if queue.iter().filter(|m| eligible(m)).count() < min_ready {
             return None;
@@ -15541,7 +15608,12 @@ impl Services {
             .lock()
             .expect("agent queue registry poisoned")
             .get(agent_id)
-            .is_some_and(|q| q.iter().any(QueuedMessage::ready_to_send))
+            .is_some_and(|q| {
+                q.iter().any(|m| {
+                    m.ready_to_send()
+                        && !self.script_monitor_export_blocked(m.message_metadata.as_ref())
+                })
+            })
     }
 
     /// `true` iff the agent's queue still holds a ready-to-send entry with
