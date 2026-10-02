@@ -3070,17 +3070,7 @@ impl Services {
                 let waiting_on_hooks = hooks_by_agent.remove(&s.id.0).unwrap_or_default();
                 let waiting_on_pr_monitors =
                     pr_monitors_by_agent.remove(&s.id.0).unwrap_or_default();
-                let mut lite = self.project_lite_with_flags_from_projection(s, &projection);
-                lite.waiting_on_hooks = waiting_on_hooks;
-                lite.waiting_on_pr_monitors = waiting_on_pr_monitors;
-                // List-payload cost contract: drop the detail-only fields
-                // and bound the render-preview fields per row (see the doc
-                // comment above); the detail reads keep full values.
-                // Applied AFTER the runtime overlay so live-turn preview
-                // text is capped like persisted text.
-                lite.strip_detail_only_fields();
-                lite.cap_list_previews();
-                lite
+                self.project_list_agent(s, &projection, waiting_on_hooks, waiting_on_pr_monitors)
             })
             .collect();
         // Response-level frame fit (intent-hq/intent#5531): the per-row pass
@@ -3100,6 +3090,23 @@ impl Services {
             );
         }
         Ok(rows)
+    }
+
+    /// Canonical list shaping, shared by workspace lists and targeted
+    /// subscription participants. Cap after the live runtime overlay.
+    fn project_list_agent(
+        &self,
+        session: AgentSession,
+        projection: &intent_store::SessionMessageProjection,
+        waiting_on_hooks: Vec<Value>,
+        waiting_on_pr_monitors: Vec<Value>,
+    ) -> AgentLite {
+        let mut lite = self.project_lite_with_flags_from_projection(session, projection);
+        lite.waiting_on_hooks = waiting_on_hooks;
+        lite.waiting_on_pr_monitors = waiting_on_pr_monitors;
+        lite.strip_detail_only_fields();
+        lite.cap_list_previews();
+        lite
     }
 
     /// Drop the cached agent.list message projections for `workspace_id`.
@@ -11689,7 +11696,9 @@ impl Services {
     /// `agentStatuses` is best-effort, keyed off the persisted `AgentStatus` of
     /// the agents present in the payload. `eventSubscriptions` (additive,
     /// monorepo#947) lists the caller's live `event.subscribe` registrations
-    /// so an agent can recover a lost `subscriptionId`.
+    /// so an agent can recover a lost `subscriptionId`. `agents` bundles
+    /// deduplicated watched/group participants in the slim list shape, retaining
+    /// their real workspace and retired identity; missing rows are omitted.
     pub(crate) async fn agent_get_subscriptions_op(
         &self,
         _workspace_id: WorkspaceId,
@@ -11700,13 +11709,23 @@ impl Services {
 
         let event_types = [AGENT_IDLE, AGENT_FAILED, AGENT_DELETED];
 
-        let mut present: Vec<AgentId> = vec![agent_id.clone()];
+        // Distinguish participants from the status set, which also includes
+        // the caller. Deduplicate before SQL (including across groups).
+        let mut seen = std::collections::HashSet::new();
+        let participants: Vec<AgentId> = watches
+            .iter()
+            .map(|w| &w.child_agent_id)
+            .chain(groups.iter().flat_map(|g| &g.expected_agent_ids))
+            .filter(|id| seen.insert((*id).clone()))
+            .cloned()
+            .collect();
+        let mut present = participants.clone();
+        if seen.insert(agent_id.clone()) {
+            present.push(agent_id.clone());
+        }
         let subscriptions: Vec<Value> = watches
             .iter()
             .map(|w| {
-                if !present.contains(&w.child_agent_id) {
-                    present.push(w.child_agent_id.clone());
-                }
                 let delegation_group = w.group_id.as_ref().and_then(|gid| {
                     groups.iter().find(|g| &g.group_id == gid).map(|g| {
                         json!({
@@ -11738,11 +11757,6 @@ impl Services {
         let delegation_groups: Vec<Value> = groups
             .iter()
             .map(|g| {
-                for id in &g.expected_agent_ids {
-                    if !present.contains(id) {
-                        present.push(id.clone());
-                    }
-                }
                 json!({
                     "groupId": g.group_id,
                     "parentAgentId": g.parent_agent_id,
@@ -11770,6 +11784,23 @@ impl Services {
             }
         }
 
+        let mut agents: Vec<AgentLite> = self
+            .store
+            .get_subscription_agent_projections(&participants)
+            .await?
+            .into_iter()
+            .map(|row| {
+                self.project_list_agent(
+                    row.session,
+                    &row.messages,
+                    row.waiting_on_hooks,
+                    row.waiting_on_pr_monitors,
+                )
+            })
+            .collect();
+        // Same best-effort array budget as agent.list; no rows are evicted.
+        intent_core::fit_agent_list_frame(&mut agents);
+
         let event_subscriptions: Vec<Value> = self
             .list_event_subscriptions_for_agent(&agent_id)
             .iter()
@@ -11780,6 +11811,7 @@ impl Services {
             "subscriptions": subscriptions,
             "delegationGroups": delegation_groups,
             "agentStatuses": Value::Object(agent_statuses),
+            "agents": agents,
             "eventSubscriptions": event_subscriptions,
         }))
     }

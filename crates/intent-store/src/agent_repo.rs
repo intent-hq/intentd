@@ -46,7 +46,7 @@ const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session
 /// omitted: `AgentLite::from_session` strips them from the wire, and loading
 /// them made `agent.list` scale with the stored prompt/base64-image/spawn
 /// -message bytes.
-const SESSION_SUMMARY_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session_id, name, \
+pub(crate) const SESSION_SUMMARY_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session_id, name, \
     name_explicitly_set, model, provider, status, is_active, created_at, updated_at, parent_agent_id, \
     specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, \
     attention_request_kind, attention_request_reason, attention_request_timestamp, delegation_depth, \
@@ -817,7 +817,7 @@ fn last_tool_use_col_value(content: &serde_json::Value) -> Result<Option<String>
 /// `None`; a corrupt value degrades to `None` (with a warning) like
 /// [`decode_preview_col`] — no repair is attempted; the column converges the
 /// next time a user/assistant message is appended.
-fn decode_last_tool_use_col(raw: Option<String>) -> Option<serde_json::Value> {
+pub(crate) fn decode_last_tool_use_col(raw: Option<String>) -> Option<serde_json::Value> {
     let raw = raw?;
     match serde_json::from_str(&raw) {
         Ok(preview) => Some(preview),
@@ -837,7 +837,7 @@ fn decode_last_tool_use_col(raw: Option<String>) -> Option<serde_json::Value> {
 /// `None` (with a warning) instead of failing the whole projection read — no
 /// repair is attempted; the column converges naturally the next time a
 /// message of that role is appended.
-fn decode_preview_col(raw: Option<String>) -> Option<Vec<String>> {
+pub(crate) fn decode_preview_col(raw: Option<String>) -> Option<Vec<String>> {
     let raw = raw?;
     match serde_json::from_str(&raw) {
         Ok(blocks) => Some(blocks),
@@ -4084,7 +4084,7 @@ fn map_session_row(row: &SqliteRow) -> Result<AgentSession> {
     )
 }
 
-fn map_session_summary_row(row: &SqliteRow) -> Result<AgentSession> {
+pub(crate) fn map_session_summary_row(row: &SqliteRow) -> Result<AgentSession> {
     map_session_row_with_heavy_cols(row, None, None, None)
 }
 

@@ -47,6 +47,7 @@ mod script_repo;
 mod settings_repo;
 mod sharing_projection;
 mod stop_redelivery_repo;
+mod subscription_agent_repo;
 mod task_agent_link_repo;
 mod tracked_changes_repo;
 mod transfer_authorship;
@@ -90,6 +91,7 @@ pub use principal_repo::{
     InviteJoinOutcome, WorkspaceAuthorFallback, WorkspaceGuestCount,
 };
 pub use sandbox_repo::{Sandbox, SandboxStatus};
+pub use subscription_agent_repo::SubscriptionAgentProjection;
 pub use tracked_changes_repo::{NewTrackedChange, TrackedChangeRow};
 pub use transfer_repo::TRANSFER_TABLES;
 pub use usage_rate_repo::{UsageRateDelta, UsageRateRow};
