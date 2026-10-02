@@ -561,9 +561,8 @@ async fn desktop_wss_consent_tickets_revoke_and_no_replay() {
     .await
     .unwrap();
     let error = outcome.unwrap_err();
-    assert!(
-        error.code == "desktop-outcome-unknown" || error.execution.as_deref() == Some("unknown")
-    );
+    assert_eq!(error.code, "desktop-outcome-unknown");
+    assert_eq!(error.execution.as_deref(), Some("unknown"));
     let mut final_socket = common::wss_connect_with_retry(srv.port, srv.cfg.clone(), &url).await;
     call(&mut final_socket, "client.hello", hello, &mut calls).await;
     let state = call(
@@ -861,4 +860,127 @@ async fn wss_display_selection_errors_preserve_codes_and_do_not_execute() {
     .unwrap();
     socket.close(None).await.unwrap();
     srv.ws.stop().await;
+}
+
+#[tokio::test]
+async fn desktop_wss_disconnect_execution_classification_reaches_mcp() {
+    for (disconnect_at, expected_execution) in
+        [("prepareCommand", "not_started"), ("execute", "unknown")]
+    {
+        let (srv, services) = super::authenticated_devices::start_roster().await;
+        let ws = WorkspaceId::new();
+        srv.store
+            .insert_workspace(&fixture_workspace(&ws))
+            .await
+            .unwrap();
+        srv.registry
+            .apply(&[
+                ("model.defaultProvider".into(), json!("auggie")),
+                ("providers.paths".into(), json!({"auggie":"/bin/sh"})),
+            ])
+            .unwrap();
+        let principal = srv.store.get_primary_principal().await.unwrap();
+        let created = intent_core::with_caller(
+            Caller::Wire {
+                principal_id: principal.id,
+                host_role: HostRole::Owner,
+            },
+            services.agent_create(
+                ws.clone(),
+                Some("Display agent".into()),
+                None,
+                None,
+                None,
+                None,
+                intent_core::AgentCreateExtra::default(),
+            ),
+        )
+        .await
+        .unwrap();
+        let agent = AgentId::from(created["agent"]["id"].as_str().expect("created agent ID"));
+        let caller = Caller::Agent {
+            agent_id: agent.clone(),
+        };
+        let url = format!("wss://localhost:{}/ws?token={TOKEN}", srv.port);
+        let mut socket = common::wss_connect_with_retry(srv.port, srv.cfg.clone(), &url).await;
+        let mut calls = vec![json!({"displayCount":2})];
+        call(&mut socket,"client.hello",json!({"clientId":"display-desktop","capabilities":{"browserExec":true,"desktopControl":1}}),&mut calls).await;
+        srv.store
+            .set_workspace_browser_client(
+                &ws,
+                Some(&intent_core::ClientId::from("display-desktop")),
+            )
+            .await
+            .unwrap();
+        assert!(call(
+            &mut socket,
+            "desktop.setPermission",
+            json!({"workspaceId":ws,"agentId":agent,"computerId":"wss-physical","allowed":true}),
+            &mut calls
+        )
+        .await
+        .get("result")
+        .is_some());
+        drive(
+            &mut socket,
+            intent_core::with_caller(
+                caller.clone(),
+                services.desktop_agent_call(ws.clone(), "startControl".into(), json!({})),
+            ),
+            &mut calls,
+        )
+        .await
+        .unwrap();
+
+        let bridge = intent_acp::WorkspaceMcpServer::new(srv.api.clone(), ws.clone())
+            .with_caller_agent_id(Some(agent.clone()));
+        let request = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"workspace_api","arguments":{"code":"return await ws.desktop.type({text:'disconnect classification'});","summary":"Verify desktop disconnect classification"}}});
+        let disconnect = async {
+            loop {
+                if let Message::Text(text) = socket.next().await.unwrap().unwrap() {
+                    let reverse: Value = serde_json::from_str(&text).unwrap();
+                    if reverse["method"] == "desktop.control" {
+                        if reverse["params"]["operation"] == disconnect_at {
+                            calls.push(reverse["params"].clone());
+                            socket.close(None).await.unwrap();
+                            break;
+                        }
+                        executor_reply(&mut socket, reverse, &mut calls).await;
+                    }
+                }
+            }
+        };
+        let (response, ()) = tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::join!(bridge.handle_message(&request), disconnect)
+        })
+        .await
+        .unwrap();
+        let response = response.expect("MCP disconnect response");
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("desktop-outcome-unknown"), "{text}");
+        assert!(
+            text.contains(&format!("execution: {expected_execution}")),
+            "{text}"
+        );
+        let executed = calls.iter().filter(|p| p["operation"] == "execute").count();
+        assert_eq!(executed, usize::from(disconnect_at == "execute"));
+        let mut replacement = common::wss_connect_with_retry(srv.port, srv.cfg.clone(), &url).await;
+        call(&mut replacement,"client.hello",json!({"clientId":"display-desktop","capabilities":{"browserExec":true,"desktopControl":1}}),&mut calls).await;
+        let refused = drive(
+            &mut replacement,
+            bridge.handle_message(&request),
+            &mut calls,
+        )
+        .await
+        .expect("MCP refusal after reconnect");
+        assert_eq!(refused["result"]["isError"], true, "{refused}");
+        assert_eq!(
+            calls.iter().filter(|p| p["operation"] == "execute").count(),
+            executed,
+            "disconnect must never replay an action on the new connection"
+        );
+        replacement.close(None).await.unwrap();
+        srv.ws.stop().await;
+    }
 }
