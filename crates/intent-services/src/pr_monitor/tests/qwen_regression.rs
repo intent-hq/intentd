@@ -797,7 +797,7 @@ async fn silent_discovery_with_pending_changes(outcome: &str) {
     assert!(learned
         .pending_changes
         .iter()
-        .any(|c| c == "branch is now behind its base"));
+        .any(|c| c == "forge branch-update requirement available: required before merging"));
     assert!(!learned
         .pending_changes
         .iter()

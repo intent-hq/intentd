@@ -1423,18 +1423,20 @@ impl PrMonitorRefusal {
 /// `none` decision while the branch rules still demand approvals the PR
 /// does not have), no unresolved threads when resolution is required (an
 /// unreadable thread count — `threads.unresolved == None` — never promotes
-/// while resolution is required, since the state is unknown, not clear), no
-/// `merge_blocked_reason`, and no blocked/behind/dirty/unknown
+/// while resolution is required, since the state is unknown, not clear), a
+/// forge-confirmed `branch_update_required == Some(false)` (ancestry counts
+/// never block), no `merge_blocked_reason`, and no blocked/behind/dirty/unknown
 /// `merge_state_status` (`UNKNOWN` means the forge has not established
 /// mergeability yet, so it never promotes). A PR already queued in the
 /// merge queue is being handled by the queue, not awaiting action, so a
 /// CLEAN-but-queued snapshot stays non-ready too.
-fn requirements_ready(req: &MergeRequirements) -> bool {
+pub(crate) fn requirements_ready(req: &MergeRequirements) -> bool {
     req.state == "open"
         && !req.is_draft
         && req.mergeable == Some(true)
         && !req.has_conflicts
         && !req.is_behind
+        && req.branch_update_required == Some(false)
         && req.merge_blocked_reason.is_none()
         && req.checks.failing_required.is_empty()
         && req.checks.pending_required.is_empty()
@@ -1722,6 +1724,7 @@ fn pr_monitor_wire(m: &PrMonitor, paused_until: Option<&str>) -> Value {
             "isDraft": r.is_draft,
             "hasConflicts": r.has_conflicts,
             "isBehind": r.is_behind,
+            "ancestry": r.ancestry,
             "mergeable": r.mergeable,
             "mergeBlockedReason": r.merge_blocked_reason,
             "checks": {
@@ -1744,6 +1747,9 @@ fn pr_monitor_wire(m: &PrMonitor, paused_until: Option<&str>) -> Value {
             },
             "rulesKnown": r.rules_known,
         });
+        if let Some(required) = r.branch_update_required {
+            last["branchUpdateRequired"] = json!(required);
+        }
         // Presence-detected: the count appears only when the thread
         // resolution state was readable (never null).
         if let Some(unresolved) = r.threads.unresolved {
@@ -4371,6 +4377,7 @@ impl Services {
 
 #[cfg(test)]
 mod tests {
+    mod ancestry_messages;
     mod ancestry_regression;
     mod quota_regression;
     mod qwen_regression;
@@ -5437,6 +5444,7 @@ mod tests {
     /// Clear every merge-requirements blocker on the [`snapshot`] fixture —
     /// the truly-mergeable checklist shape [`requirements_ready`] accepts.
     fn ready_requirements(req: &mut MergeRequirements) {
+        req.branch_update_required = Some(false);
         req.checks.passed = 1;
         req.checks.pending = 0;
         req.checks.items[0].status = "passed".into();
@@ -5718,10 +5726,13 @@ mod tests {
             .iter()
             .any(|c| c == "merge conflicts appeared"));
 
-        let behind = snapshot(|s| s.requirements.is_behind = true);
+        let behind = snapshot(|s| {
+            s.requirements.is_behind = true;
+            s.requirements.branch_update_required = Some(true);
+        });
         assert!(diff_snapshots(&base, &behind)
             .iter()
-            .any(|c| c == "branch is now behind its base"));
+            .any(|c| c == "forge branch-update requirement available: required before merging"));
 
         let queued = snapshot(|s| s.requirements.is_in_merge_queue = Some(true));
         assert!(diff_snapshots(&base, &queued)
@@ -5795,41 +5806,51 @@ mod tests {
     }
 
     /// The same transient recomputation also clears the DERIVED fields
-    /// (`hasConflicts` / `isBehind` / `mergeBlockedReason`): while the NEW
+    /// (`hasConflicts` / `mergeBlockedReason`): while the NEW
     /// snapshot's mergeability is unknown, the clearing direction of those
     /// lines is suppressed too — a DIRTY/BEHIND/blocked PR blipping to
-    /// UNKNOWN stays fully silent. A real clear to a known state still
-    /// reports, and the appearing direction reports even while unknown.
+    /// UNKNOWN reports only the neutral update-requirement availability.
+    /// A real clear to a known state still reports, and the appearing direction reports even while unknown.
     #[test]
     fn diff_suppresses_derived_clears_while_mergeability_is_unknown() {
         let dirty = snapshot(|s| {
             s.requirements.has_conflicts = true;
             s.requirements.is_behind = true;
+            s.requirements.branch_update_required = Some(true);
             s.requirements.mergeable = Some(false);
             s.requirements.merge_state_status = Some("DIRTY".into());
             s.requirements.merge_blocked_reason = Some("merge conflicts".into());
         });
         // DIRTY → UNKNOWN blip: the recomputation resets the derived fields
-        // alongside the raw ones; nothing reports.
+        // alongside the raw ones; only lost availability reports.
         let blip = snapshot(|s| {
             s.requirements.mergeable = None;
             s.requirements.merge_state_status = Some("UNKNOWN".into());
         });
-        assert!(diff_snapshots(&dirty, &blip).is_empty());
+        assert_eq!(
+            diff_snapshots(&dirty, &blip),
+            vec!["forge branch-update requirement unknown"]
+        );
         // Same with the merge state absent entirely.
         let blip_none = snapshot(|s| {
             s.requirements.mergeable = None;
             s.requirements.merge_state_status = None;
         });
-        assert!(diff_snapshots(&dirty, &blip_none).is_empty());
+        assert_eq!(
+            diff_snapshots(&dirty, &blip_none),
+            vec!["forge branch-update requirement unknown"]
+        );
 
         // A real clear to a known state still reports all three.
-        let cleared = snapshot(|s| s.requirements.merge_state_status = Some("CLEAN".into()));
+        let cleared = snapshot(|s| {
+            s.requirements.merge_state_status = Some("CLEAN".into());
+            s.requirements.branch_update_required = Some(false);
+        });
         let changes = diff_snapshots(&dirty, &cleared);
         assert!(changes.iter().any(|c| c == "merge conflicts resolved"));
         assert!(changes
             .iter()
-            .any(|c| c == "branch is no longer behind its base"));
+            .any(|c| c == "forge no longer requires a branch update before merging"));
         assert!(changes.iter().any(|c| c == "merge is no longer blocked"));
 
         // The appearing direction keeps reporting even while unknown.
@@ -5837,13 +5858,16 @@ mod tests {
         let appearing = snapshot(|s| {
             s.requirements.has_conflicts = true;
             s.requirements.is_behind = true;
+            s.requirements.branch_update_required = Some(true);
             s.requirements.merge_blocked_reason = Some("blocked".into());
             s.requirements.mergeable = None;
             s.requirements.merge_state_status = None;
         });
         let changes = diff_snapshots(&base, &appearing);
         assert!(changes.iter().any(|c| c == "merge conflicts appeared"));
-        assert!(changes.iter().any(|c| c == "branch is now behind its base"));
+        assert!(changes
+            .iter()
+            .any(|c| c == "forge branch-update requirement available: required before merging"));
         assert!(changes.iter().any(|c| c == "merge blocked: blocked"));
     }
 
