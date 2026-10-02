@@ -1789,6 +1789,18 @@ mod unbound_owner_only_methods {
                 json!({ "workspaceId": ws, "taskNoteId": "t1", "contextMessage": "c" }),
             ),
             ("debug.sampleStacks", json!({ "durationMs": 1 })),
+            (
+                "desktop.getState",
+                json!({ "workspaceId": ws, "agentId": "a1" }),
+            ),
+            (
+                "desktop.respondPermission",
+                json!({ "workspaceId": ws, "requestId": "r1", "decision": "allow_once" }),
+            ),
+            (
+                "desktop.setPermission",
+                json!({ "workspaceId": ws, "agentId": "a1", "allowFuture": true }),
+            ),
             ("file-tracking.getAgentLocks", json!({ "workspaceId": ws })),
             ("file-tracking.getChanges", json!({ "workspaceId": ws })),
             ("file-tracking.getLineStats", json!({ "workspaceId": ws })),
