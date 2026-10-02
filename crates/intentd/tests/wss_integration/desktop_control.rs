@@ -675,6 +675,9 @@ async fn wss_display_selection_errors_preserve_codes_and_do_not_execute() {
     .await
     .unwrap();
     assert_eq!(listed["displays"].as_array().unwrap().len(), 2);
+    assert_eq!(listed["layoutId"], "l");
+    assert_eq!(listed["displays"][0]["displayId"], "d");
+    assert_eq!(listed["displays"][1]["displayId"], "e");
     assert!(listed["displays"]
         .as_array()
         .unwrap()
@@ -732,6 +735,39 @@ async fn wss_display_selection_errors_preserve_codes_and_do_not_execute() {
         if code == "desktop-display-selection-required" {
             assert!(error.detail.contains("ask the user"));
         }
+    }
+    // Exercise the actual model-facing JS binding, service and reverse WSS
+    // together: structured native errors must remain tool failures, retaining
+    // the selection guidance rather than becoming successes or generic errors.
+    let bridge = intent_acp::WorkspaceMcpServer::new(srv.api.clone(), ws.clone())
+        .with_caller_agent_id(Some(agent.clone()));
+    for (code, expected, detail) in [
+        (
+            "return await ws.desktop.screenshot();",
+            "desktop-display-selection-required",
+            "Multiple displays are available. Call ws.desktop.listDisplay() and ask the user which screen to use, then retry with displayId.",
+        ),
+        (
+            "return await ws.desktop.screenshot({displayId:'missing'});",
+            "desktop-display-unavailable",
+            "The requested display is unavailable.",
+        ),
+        (
+            "return await ws.desktop.screenshot({displayId:'d',layoutId:'old'});",
+            "desktop-stale-layout",
+            "Display layout changed.",
+        ),
+    ] {
+        let request = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"workspace_api","arguments":{"code":code,"summary":"Verify desktop display selection"}}});
+        let response = drive(&mut socket, bridge.handle_message(&request), &mut calls)
+            .await
+            .expect("MCP tool response");
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("model-visible failure");
+        assert!(text.contains(expected), "{text}");
+        assert!(text.contains(detail), "{text}");
     }
     assert_eq!(
         calls
