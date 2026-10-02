@@ -181,6 +181,9 @@ pub(crate) fn format_wait_duration(secs: i64) -> String {
 /// persisted-entry / unparseable-`queued_at` / sub-threshold skips above
 /// cover the stamp too.
 fn annotate_dequeue_wait(msg: &mut QueuedMessage) {
+    if crate::script_monitor::monitor_id(msg.message_metadata.as_ref()).is_some() {
+        return;
+    }
     if msg.persisted || msg.content.contains(DEQUEUE_WAIT_NOTE_PREFIX) {
         return;
     }
@@ -241,6 +244,9 @@ fn annotate_dequeue_wait(msg: &mut QueuedMessage) {
 /// is replaced the same way), an object is merged into — so EVERY drained
 /// row names its entry.
 pub(crate) fn stamp_queued_message_id(msg: &mut QueuedMessage) {
+    if crate::script_monitor::monitor_id(msg.message_metadata.as_ref()).is_some() {
+        return;
+    }
     if msg.persisted {
         return;
     }
@@ -4701,9 +4707,10 @@ impl AgentManager {
     ///
     /// * Fires only on the agent's **first** turn — detected by the absence of
     ///   any prior `assistant` message in the persisted transcript.
-    /// * Agent naming fires only when the name was not explicitly set and the
-    ///   session has no recognized specialist. It uses the provider-correct
-    ///   workspace API MCP tool to call `ws.workspace.setAgentName`.
+    /// * Agent naming fires only for generated generic/specialist placeholders
+    ///   whose name was not explicitly set. Intentional task names are retained.
+    ///   It uses the provider-correct workspace API MCP tool to call
+    ///   `ws.workspace.setAgentName`.
     /// * Workspace naming fires only when the workspace lookup succeeds AND
     ///   the current title is empty/whitespace or still shaped like an
     ///   auto-generated slug ([`intent_core::slug::is_workspace_slug`]).
@@ -4727,10 +4734,13 @@ impl AgentManager {
         let workspace = self.services.store.get_workspace(workspace_id).await.ok();
         let workspace_path = workspace.as_ref().and_then(crate::git_ops::worktree_path);
         let needs_agent_name = session.as_ref().is_ok_and(|s| {
-            !s.name_explicitly_set
-                && !self
-                    .services
-                    .session_has_recognized_specialist(s, workspace_path.as_deref())
+            if s.name_explicitly_set {
+                return false;
+            }
+            let specialist_name = self
+                .services
+                .session_specialist_display_name(s, workspace_path.as_deref());
+            is_generated_agent_name(&s.name, specialist_name.as_deref())
         });
         let needs_workspace_title = workspace.as_ref().is_some_and(|workspace| {
             let title = workspace.title.trim();
@@ -4817,7 +4827,7 @@ impl AgentManager {
         let body = self.build_turn_body(agent_id, &combined).await;
         // Fire-once agent/workspace naming instruction (port of
         // `agent-backend-handler.service.ts` `namingInstructions`): on the
-        // first turn, a `<system>` block asks eligible ordinary agents to name
+        // first turn, a `<system>` block asks agents with generated names to name
         // themselves and independently asks for a workspace title when needed.
         // Never mutates the persisted user message.
         let naming = self
@@ -6245,6 +6255,32 @@ impl AgentManager {
         } else {
             self.release_in_flight_slot(agent_id);
         }
+    }
+
+    /// A suppressed or transfer-parked monitor never starts a provider turn.
+    /// Deregister while owning the slot, then release it before re-kicking;
+    /// an old worker must never clear a replacement worker or its admission.
+    async fn finish_monitor_worker(
+        self: &Arc<Self>,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        admission: TurnAdmission,
+    ) {
+        let gate = self.turn_start_gates.for_agent(agent_id);
+        let starting = gate.lock().await;
+        if self.is_shutting_down() || !self.owns_admission(agent_id, admission) {
+            return;
+        }
+        self.clear_worker(agent_id);
+        self.end_turn(agent_id).await;
+        drop(starting);
+        self.services.persist_queue_snapshot(agent_id).await;
+        self.services
+            .redeliver_completion_after_queue_mutation(agent_id)
+            .await;
+        self.clone()
+            .try_drain_queue(agent_id.clone(), workspace_id.clone())
+            .await;
     }
 
     async fn fail_admitted_persist(
@@ -8371,7 +8407,16 @@ impl AgentManager {
                 if consumed_redelivery {
                     mgr.sync_stop_redelivery(&id).await;
                 }
-                run_message_worker(mgr, id, workspace_id, content, options, user_persisted).await;
+                run_message_worker(
+                    mgr,
+                    id,
+                    workspace_id,
+                    content,
+                    options,
+                    user_persisted,
+                    admission,
+                )
+                .await;
             },
         ));
         if let Some(previous) = self.workers.lock().unwrap().insert(agent_id, handle) {
@@ -10390,7 +10435,7 @@ impl Drop for RetainUnlessSwept {
 /// into their OWN process groups survive the `killpg`, so they are snapshotted
 /// before the kill and swept afterwards (`intent_acp::descendant_sweep`).
 #[cfg(unix)]
-async fn kill_child_tree(mut child: Child, spawn_pid: Option<u32>) {
+async fn kill_child_tree(mut child: Child, spawn_pid: Option<u32>) -> bool {
     use intent_acp::{descendant_pids, sweep_escaped_descendants};
     use nix::sys::signal::{killpg, Signal};
     use nix::unistd::Pid;
@@ -10401,7 +10446,10 @@ async fn kill_child_tree(mut child: Child, spawn_pid: Option<u32>) {
     // and same-group descendants still need the killpg sweep.
     let Some(pid) = child.id().or(spawn_pid) else {
         let _ = child.start_kill();
-        return;
+        return matches!(
+            tokio::time::timeout(KILL_SWEEP_REAP_GRACE, child.wait()).await,
+            Ok(Ok(_))
+        );
     };
     let descendants = descendant_pids(pid).await;
     let pgid = Pid::from_raw(pid.cast_signed());
@@ -10411,13 +10459,57 @@ async fn kill_child_tree(mut child: Child, spawn_pid: Option<u32>) {
     let _ = tokio::time::timeout(PROCESS_GROUP_TERM_GRACE, child.wait()).await;
     let _ = killpg(pgid, Signal::SIGKILL);
     sweep_escaped_descendants(&descendants).await;
+    confirm_tree_exit(&mut child, pgid, &descendants, KILL_SWEEP_REAP_GRACE).await
+}
+
+/// Observe the existing sweep's completion under one fixed deadline. These
+/// probes never signal: a recycled pid/group can only cause conservative
+/// retention of the launch directory, never kill an unrelated process.
+#[cfg(unix)]
+async fn confirm_tree_exit(
+    child: &mut Child,
+    pgid: nix::unistd::Pid,
+    descendants: &[i32],
+    grace: Duration,
+) -> bool {
+    use nix::errno::Errno;
+    use nix::sys::signal::{kill, killpg};
+    use nix::unistd::Pid;
+
+    let deadline = tokio::time::Instant::now() + grace;
+    if !matches!(
+        tokio::time::timeout_at(deadline, child.wait()).await,
+        Ok(Ok(_))
+    ) {
+        return false;
+    }
+    loop {
+        if killpg(pgid, None) == Err(Errno::ESRCH)
+            && descendants
+                .iter()
+                .all(|&pid| pid > 1 && kill(Pid::from_raw(pid), None) == Err(Errno::ESRCH))
+        {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep_until(
+            deadline.min(tokio::time::Instant::now() + Duration::from_millis(10)),
+        )
+        .await;
+    }
 }
 
 /// Non-unix fallback: no process groups, so fall back to killing the direct
 /// child (`kill_on_drop` remains the safety net on drop).
 #[cfg(not(unix))]
-async fn kill_child_tree(mut child: Child, _spawn_pid: Option<u32>) {
+async fn kill_child_tree(mut child: Child, _spawn_pid: Option<u32>) -> bool {
     let _ = child.start_kill();
+    matches!(
+        tokio::time::timeout(Duration::from_millis(500), child.wait()).await,
+        Ok(Ok(_))
+    )
 }
 
 #[expect(clippy::similar_names)] // pid/pgid are the POSIX terms
@@ -10512,6 +10604,58 @@ mod kill_sweep_tests {
     //! sequential ones.
 
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn exit_acknowledgement_deadline_never_signals_a_live_group() {
+        use nix::sys::signal::killpg;
+        use nix::unistd::Pid;
+
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pgid = Pid::from_raw(child.id().unwrap().cast_signed());
+        let before = tokio::time::Instant::now();
+        let grace = Duration::from_millis(50);
+        assert!(!confirm_tree_exit(&mut child, pgid, &[], grace).await);
+        assert_eq!(before.elapsed(), grace);
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(killpg(pgid, None).is_ok(), "observation must not signal");
+        child.kill().await.unwrap();
+        assert!(confirm_tree_exit(&mut child, pgid, &[], grace).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exit_acknowledgement_bounds_descendant_probe_after_reaped_leader() {
+        use nix::sys::signal::killpg;
+        use nix::unistd::Pid;
+
+        let mut leader = tokio::process::Command::new("true")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = Pid::from_raw(leader.id().unwrap().cast_signed());
+        leader.wait().await.unwrap();
+        let mut other = tokio::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let other_pid = other.id().unwrap().cast_signed();
+        let before = tokio::time::Instant::now();
+        let grace = Duration::from_millis(50);
+        // A still-live snapshot pid (including a recycled one) prevents a
+        // positive acknowledgement but must never receive another signal.
+        assert!(!confirm_tree_exit(&mut leader, pgid, &[other_pid], grace).await);
+        assert_eq!(before.elapsed(), grace);
+        assert!(other.try_wait().unwrap().is_none());
+        assert!(killpg(Pid::from_raw(other_pid), None).is_ok());
+        other.kill().await.unwrap();
+        assert!(confirm_tree_exit(&mut leader, pgid, &[other_pid], grace).await);
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn slow_children_tear_down_in_one_shared_grace_window() {
@@ -11030,6 +11174,30 @@ pub(crate) use crate::harness::v1::{
     GENERIC_AGENT_NAMING_TOOL_REFERENCE, GENERIC_NAMING_TOOL_REFERENCE,
 };
 
+/// Generated UI names use a display name plus an optional collision number;
+/// daemon-created General agents use `Agent` plus six hexadecimal characters.
+/// Task-derived names can also have `name_explicitly_set=false`, so the flag alone
+/// does not imply a placeholder.
+pub(crate) fn is_generated_agent_name(name: &str, specialist_name: Option<&str>) -> bool {
+    let name = name.trim();
+    let matches_base = |base: &str| {
+        name == base
+            || name
+                .strip_prefix(base)
+                .and_then(|suffix| suffix.strip_prefix(' '))
+                .is_some_and(|suffix| {
+                    !suffix.starts_with('0')
+                        && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                        && suffix.parse::<u64>().is_ok_and(|number| number >= 2)
+                })
+    };
+    matches_base("Agent")
+        || name.strip_prefix("Agent ").is_some_and(|suffix| {
+            suffix.len() == 6 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        || specialist_name.is_some_and(matches_base)
+}
+
 /// Provider-correct spelling of the workspace API MCP tool used for agent
 /// self-naming.
 pub(crate) fn agent_naming_tool_reference(provider_id: &str) -> &'static str {
@@ -11470,6 +11638,32 @@ fn auggie_explicit_path_setting(
         .or_else(|| read_provider_path_setting(settings, "auggie"))
 }
 
+fn dequeue_worker_raced_tail(
+    services: &Services,
+    agent_id: &AgentId,
+    next: &QueuedMessage,
+    mode: intent_core::FlushQueuedMessagesMode,
+) -> Option<(Vec<QueuedMessage>, DrainingGuard)> {
+    // The head was popped before the slot reclaim, so queue selectors can no
+    // longer see its monitor identity. Never attach unrelated work to its wake.
+    if crate::script_monitor::monitor_id(next.message_metadata.as_ref()).is_some() {
+        return None;
+    }
+    match mode {
+        intent_core::FlushQueuedMessagesMode::All => {
+            services.dequeue_ready_batch_draining(agent_id, false, 1)
+        }
+        intent_core::FlushQueuedMessagesMode::SystemOnly => {
+            if next.user_origin {
+                None
+            } else {
+                services.dequeue_system_only_batch_draining(agent_id, 1)
+            }
+        }
+        intent_core::FlushQueuedMessagesMode::Off => None,
+    }
+}
+
 /// Background turn worker: drive the current message to completion, then drain
 /// any queued messages (flipping each to in-flight). After the slot is released
 /// the loop re-checks the queue and reclaims the slot **as long as another
@@ -11485,6 +11679,7 @@ async fn run_message_worker(
     initial_content: String,
     initial_options: TurnOptions,
     initial_persisted: bool,
+    mut admission: TurnAdmission,
 ) {
     let mut content = initial_content;
     // Only the first turn carries the caller's per-turn prompt-assembly hints
@@ -11512,6 +11707,26 @@ async fn run_message_worker(
     // turn instead of failing; past it the timeout takes the terminal path.
     let mut consecutive_idle_timeouts: u32 = 0;
     'outer: loop {
+        if mgr.services.defer_script_monitor_for_export(
+            &agent_id,
+            &content,
+            options.message_metadata.as_ref(),
+        ) {
+            mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
+                .await;
+            return;
+        }
+        if !mgr
+            .services
+            .script_monitor_delivery_allowed(&agent_id, options.message_metadata.as_ref())
+            .await
+            .unwrap_or(false)
+        {
+            mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
+                .await;
+            return;
+        }
+
         // Turn-start budget re-check (monorepo#2063 B8): a warm idle process
         // about to go active re-checks the aggregate budget like a spawn
         // would — queued behind eviction, never refused. Sits at the top of
@@ -11531,6 +11746,24 @@ async fn run_message_worker(
             mgr.registry
                 .acquire_turn_start(&agent_id, try_claim, release)
                 .await;
+        }
+        if mgr.services.defer_script_monitor_for_export(
+            &agent_id,
+            &content,
+            options.message_metadata.as_ref(),
+        ) {
+            mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
+                .await;
+            return;
+        }
+        if !mgr
+            .services
+            .admit_script_monitor_turn(&agent_id, options.message_metadata.as_ref())
+            .await
+        {
+            mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
+                .await;
+            return;
         }
         match retry_spawn(&mgr, &agent_id, &workspace_id).await {
             Ok(acp_session_id) => {
@@ -11578,6 +11811,24 @@ async fn run_message_worker(
                 let prompt = mgr
                     .build_turn_prompt(&agent_id, &workspace_id, &content, &options)
                     .await;
+                if mgr.services.defer_script_monitor_for_export(
+                    &agent_id,
+                    &content,
+                    options.message_metadata.as_ref(),
+                ) {
+                    mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
+                        .await;
+                    return;
+                }
+                if !mgr
+                    .services
+                    .admit_script_monitor_turn(&agent_id, options.message_metadata.as_ref())
+                    .await
+                {
+                    mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
+                        .await;
+                    return;
+                }
                 match mgr
                     .run_turn(
                         &agent_id,
@@ -12241,10 +12492,10 @@ async fn run_message_worker(
                 .await;
             break 'outer;
         }
-        if matches!(
-            mgr.try_begin_outcome(&agent_id, &workspace_id, false).await,
-            TryBeginOutcome::Started(_)
-        ) {
+        if let TryBeginOutcome::Started(next_admission) =
+            mgr.try_begin_outcome(&agent_id, &workspace_id, false).await
+        {
+            admission = next_admission;
             // Archived re-check on the raced pop (intent-hq/monorepo#2513):
             // the popped entry can be a wake parked by the archived gates
             // AFTER the gate at the top of this drain ran — e.g. the
@@ -12313,20 +12564,7 @@ async fn run_message_worker(
             // below unchanged. With no extra entry (or the `off` mode) the
             // single-entry path below also runs unchanged.
             let mode = mgr.services.flush_queued_messages_mode();
-            let extra_batch = match mode {
-                intent_core::FlushQueuedMessagesMode::All => mgr
-                    .services
-                    .dequeue_ready_batch_draining(&agent_id, false, 1),
-                intent_core::FlushQueuedMessagesMode::SystemOnly => {
-                    if next.user_origin {
-                        None
-                    } else {
-                        mgr.services
-                            .dequeue_system_only_batch_draining(&agent_id, 1)
-                    }
-                }
-                intent_core::FlushQueuedMessagesMode::Off => None,
-            };
+            let extra_batch = dequeue_worker_raced_tail(&mgr.services, &agent_id, &next, mode);
             if let Some((mut batch, extra_draining)) = extra_batch {
                 batch.insert(0, next);
                 draining.merge(extra_draining);
@@ -12759,6 +12997,32 @@ async fn persist_user(
             pause.resume.notified().await;
         }
     }
+    if let Some(id) = crate::script_monitor::wake_id(message_metadata) {
+        // A suppressed wake is successfully discarded, not a failed user send.
+        // The worker independently fences delivery before starting a turn.
+        if !mgr
+            .services
+            .script_monitor_delivery_allowed(agent_id, message_metadata)
+            .await
+            .unwrap_or(false)
+        {
+            mgr.services.commit_queue_history(agent_id, &id);
+            return true;
+        }
+        match mgr
+            .services
+            .store
+            .get_agent_message_by_id_with_pruned(agent_id, &id)
+            .await
+        {
+            Ok(Some(_)) => {
+                mgr.services.commit_queue_history(agent_id, &id);
+                return true;
+            }
+            Err(_) => return false,
+            Ok(None) => {}
+        }
+    }
     let created_at = now_iso();
     let mut blocks = user_message_blocks(content, image_blocks, file_blocks);
     let block_md = message_metadata.and_then(|md| match md {
@@ -12779,7 +13043,8 @@ async fn persist_user(
     // Bounded retry (#547): initial attempt + one retry per backoff delay.
     let backoff = persist_retry_backoff_ms();
     let mut attempt = 0usize;
-    let message_id = new_message_id();
+    let message_id =
+        crate::script_monitor::wake_id(message_metadata).unwrap_or_else(new_message_id);
     let message = loop {
         match mgr
             .services
@@ -12796,6 +13061,10 @@ async fn persist_user(
             .await
         {
             Ok(message) => {
+                if let Some(id) = crate::script_monitor::wake_id(message_metadata) {
+                    mgr.services.commit_queue_history(agent_id, &id);
+                }
+
                 if let Some(id) = message_metadata
                     .and_then(|md| md.get("queueInfo"))
                     .and_then(|info| info.get("queuedMessageId"))
@@ -12807,6 +13076,17 @@ async fn persist_user(
                 break message;
             }
             Err(e) => {
+                if let Some(id) = crate::script_monitor::wake_id(message_metadata) {
+                    if !mgr
+                        .services
+                        .script_monitor_delivery_allowed(agent_id, message_metadata)
+                        .await
+                        .unwrap_or(false)
+                    {
+                        mgr.services.commit_queue_history(agent_id, &id);
+                        return true;
+                    }
+                }
                 // Vanished-session fast exit (intent-hq/monorepo#2762): the
                 // only FK on `agent_message` is `agent_id → agent_session(id)`,
                 // so an append failure against a deleted session is permanent
@@ -14543,14 +14823,17 @@ mod npx_launch_dir_lifetime_tests {
             .unwrap();
         assert!(!pid_alive(leader.cast_signed()));
         assert!(!tree.launch_path.exists());
-        // SIGKILL delivery and reaping the orphan can finish after the sweep returns.
+        // Cleanup has issued the group kill and released its lease, but an
+        // orphaned descendant can remain signal-0-visible until init reaps it.
+        // Keep the shutdown/launch-dir assertions immediate; bound only the
+        // observation that the identified descendant's PID has disappeared.
         tokio::time::timeout(Duration::from_secs(10), async {
             while pid_alive(tree.grandchild) {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
-        .expect("grandchild must exit after the shutdown sweep");
+        .expect("cleanup killed the descendant; its orphan PID must be reaped");
         // An aborted acquire skips its existing post-kill deregistration.
         // Preserve that stale in-memory slot: late ID-only removal could erase
         // a replacement runtime. The exit watcher deregisters before cleanup.
@@ -15462,42 +15745,113 @@ mod role_reminder_tests {
     }
 
     #[tokio::test]
-    async fn explicit_and_specialist_names_do_not_receive_agent_naming_instruction() {
-        let (explicit_mgr, explicit_id, _explicit_db) = manager_with(None, None).await;
-        configure_agent_name(&explicit_mgr, &explicit_id, "User Choice", true, None).await;
-        let explicit = prompt_text(
-            &explicit_mgr
-                .build_turn_prompt(
-                    &explicit_id,
-                    &WorkspaceId::from("ws-1"),
-                    "start",
-                    &TurnOptions::default(),
-                )
-                .await,
-        );
-        assert_eq!(explicit, "start");
+    async fn specialist_placeholder_naming_instruction_covers_titles_and_providers() {
+        for name in ["Implementor", "Implementor 2", "Implementor 12"] {
+            for title in ["", "Existing workspace title"] {
+                for (provider, tool) in [
+                    ("auggie", "workspace_api_workspace-mcp"),
+                    ("opencode", "workspace-mcp_workspace_api"),
+                    ("codex", "workspace_api"),
+                ] {
+                    let (mgr, agent_id, _db) = manager_with(Some("implementor"), None).await;
+                    let workspace_id = WorkspaceId::from("ws-1");
+                    configure_agent_name(&mgr, &agent_id, name, false, Some("implementor")).await;
+                    set_workspace_title(&mgr, &workspace_id, title).await;
+                    let mut session = mgr
+                        .services
+                        .store
+                        .get_agent_session(&agent_id)
+                        .await
+                        .unwrap();
+                    session.provider = Some(provider.to_string());
+                    mgr.services
+                        .store
+                        .update_agent_session(&workspace_id, &session)
+                        .await
+                        .unwrap();
+                    let instruction = mgr
+                        .build_first_turn_naming_instruction(&agent_id, &workspace_id)
+                        .await
+                        .expect("specialist placeholder needs a name");
+                    assert!(
+                        instruction.contains("ws.workspace.setAgentName"),
+                        "{name}: {instruction}"
+                    );
+                    assert!(instruction.contains(tool), "{provider}: {instruction}");
+                    assert!(instruction.contains("task-specific name"));
+                    assert_eq!(
+                        instruction.contains("This workspace needs a title"),
+                        title.is_empty()
+                    );
+                }
+            }
+        }
+    }
 
-        let (specialist_mgr, specialist_id, _specialist_db) =
-            manager_with(Some("implementor"), None).await;
+    #[tokio::test]
+    async fn explicit_and_task_names_do_not_receive_agent_naming_instruction() {
+        for (name, explicitly_set, specialist) in [
+            ("User Choice", true, None),
+            ("Implementor", true, Some("implementor")),
+            ("Implementor 2", true, Some("implementor")),
+            ("Fix the sidebar", false, Some("implementor")),
+            ("Implementor for authentication", false, Some("implementor")),
+            ("Implementor 0", false, Some("implementor")),
+            ("Fix the sidebar", false, None),
+        ] {
+            let (mgr, agent_id, _db) = manager_with(specialist, None).await;
+            configure_agent_name(&mgr, &agent_id, name, explicitly_set, specialist).await;
+            assert!(
+                mgr.build_first_turn_naming_instruction(&agent_id, &WorkspaceId::from("ws-1"))
+                    .await
+                    .is_none(),
+                "preserve intentional name {name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn specialist_naming_instruction_uses_frozen_display_name() {
+        let (mgr, agent_id, _db) = manager_with(Some("deleted-specialist"), None).await;
         configure_agent_name(
-            &specialist_mgr,
-            &specialist_id,
-            "Implementor",
+            &mgr,
+            &agent_id,
+            "Custom Builder 2",
             false,
-            Some("implementor"),
+            Some("deleted-specialist"),
         )
         .await;
-        let specialist = prompt_text(
-            &specialist_mgr
-                .build_turn_prompt(
-                    &specialist_id,
-                    &WorkspaceId::from("ws-1"),
-                    "start",
-                    &TurnOptions::default(),
-                )
-                .await,
-        );
-        assert!(!specialist.contains("ws.workspace.setAgentName"));
+        let mut session = mgr
+            .services
+            .store
+            .get_agent_session(&agent_id)
+            .await
+            .unwrap();
+        session.metadata = Some(serde_json::json!({"specialistName": "Custom Builder"}));
+        let workspace_id = WorkspaceId::from("ws-1");
+        mgr.services
+            .store
+            .update_agent_session(&workspace_id, &session)
+            .await
+            .unwrap();
+        let instruction = mgr
+            .build_first_turn_naming_instruction(&agent_id, &workspace_id)
+            .await
+            .expect("frozen specialist placeholder needs a name");
+        assert!(instruction.contains("ws.workspace.setAgentName"));
+    }
+
+    #[tokio::test]
+    async fn general_placeholder_naming_instruction_covers_numbered_names() {
+        for name in ["Agent", "Agent 2", "Agent abc123"] {
+            let (mgr, agent_id, _db) = manager_with(None, None).await;
+            configure_agent_name(&mgr, &agent_id, name, false, None).await;
+            assert!(mgr
+                .build_first_turn_naming_instruction(&agent_id, &WorkspaceId::from("ws-1"))
+                .await
+                .unwrap()
+                .contains("ws.workspace.setAgentName"));
+        }
     }
 
     #[tokio::test]
@@ -15525,8 +15879,8 @@ mod role_reminder_tests {
 
     #[tokio::test]
     async fn agent_naming_instruction_is_first_turn_only() {
-        let (mgr, agent_id, _db) = manager_with(None, None).await;
-        configure_agent_name(&mgr, &agent_id, "Agent abc123", false, None).await;
+        let (mgr, agent_id, _db) = manager_with(Some("implementor"), None).await;
+        configure_agent_name(&mgr, &agent_id, "Implementor", false, Some("implementor")).await;
         let workspace_id = WorkspaceId::from("ws-1");
         let first = prompt_text(
             &mgr.build_turn_prompt(&agent_id, &workspace_id, "first", &TurnOptions::default())
@@ -15547,7 +15901,8 @@ mod role_reminder_tests {
             &mgr.build_turn_prompt(&agent_id, &workspace_id, "later", &TurnOptions::default())
                 .await,
         );
-        assert_eq!(later, "later");
+        assert!(!later.contains("ws.workspace.setAgentName"));
+        assert!(later.ends_with("later"));
     }
 
     /// `stop()` clears `recreated`/`prepend_pending` (stale-flag hygiene) but
@@ -19813,6 +20168,178 @@ mod agent_retry_tests {
         let services = Services::new(db).with_event_bus(bus.clone());
         let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
         (Arc::new(AgentManager::new(services, sink, 8)), db_dir)
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn suppressed_monitor_worker_releases_slot_and_allows_followup() {
+        monitor_worker_exit_releases_slot(false).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn exported_monitor_worker_releases_slot_and_allows_followup() {
+        monitor_worker_exit_releases_slot(true).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn raced_monitor_head_never_consumes_ordinary_tail() {
+        for mode in [
+            intent_core::FlushQueuedMessagesMode::All,
+            intent_core::FlushQueuedMessagesMode::SystemOnly,
+        ] {
+            for exporting in [false, true] {
+                let agent = AgentId::from("monitor-raced-owner");
+                let ws = WorkspaceId::from("monitor-raced-workspace");
+                let (mgr, _db) = manager_with_session(&agent, &ws, AgentStatus::RuntimeIdle).await;
+                let (head, _) = mgr.services.enqueue_message(
+                &agent, "monitor head".into(), None, None,
+                Some(json!({"type":"script_monitor_wake","monitorId":"raced-monitor","workspaceId":ws})),
+                None, false, intent_core::MessageOrigin::Automatic,
+            );
+                let (next, draining) = mgr
+                    .services
+                    .dequeue_message_draining_provisional(&agent)
+                    .unwrap();
+                assert_eq!(next.id, head.id);
+                let (tail, _) = mgr.services.enqueue_message(
+                    &agent,
+                    "ordinary tail".into(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    intent_core::MessageOrigin::Automatic,
+                );
+                assert!(
+                    dequeue_worker_raced_tail(&mgr.services, &agent, &next, mode).is_none(),
+                    "popped monitor must not absorb ordinary entries: {mode:?}"
+                );
+                assert!(mgr.services.is_message_queued(&agent, &tail.id));
+                drop(draining);
+                let admission = mgr.try_begin_turn(&agent, &ws).await.unwrap();
+                if exporting {
+                    park_monitor_export(&mgr, &ws);
+                }
+                run_message_worker(
+                    mgr.clone(),
+                    agent.clone(),
+                    ws.clone(),
+                    next.content,
+                    TurnOptions {
+                        message_metadata: next.message_metadata,
+                        ..TurnOptions::default()
+                    },
+                    true,
+                    admission,
+                )
+                .await;
+                assert!(
+                    !mgr.services.is_message_queued(&agent, &tail.id),
+                    "ordinary tail must be re-kicked after monitor suppression/deferral"
+                );
+                assert!(
+                    mgr.is_busy(&agent),
+                    "ordinary tail owns a replacement admission"
+                );
+                if exporting {
+                    let rows = mgr.services.queue_snapshot(&agent);
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(rows[0]["content"], "monitor head");
+                }
+            }
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn stale_monitor_worker_cannot_release_successor_admission() {
+        let agent = AgentId::from("monitor-stale-worker");
+        let ws = WorkspaceId::from("monitor-stale-workspace");
+        let (mgr, _db) = manager_with_session(&agent, &ws, AgentStatus::RuntimeIdle).await;
+        let old = mgr.try_begin_turn(&agent, &ws).await.unwrap();
+        mgr.end_turn(&agent).await;
+        let new = mgr.try_begin_turn(&agent, &ws).await.unwrap();
+        mgr.finish_monitor_worker(&agent, &ws, old).await;
+        assert!(mgr.owns_admission(&agent, new));
+        assert!(mgr.is_busy(&agent));
+        assert_eq!(
+            mgr.services
+                .store
+                .get_agent_session(&agent)
+                .await
+                .unwrap()
+                .status,
+            AgentStatus::Active
+        );
+        mgr.end_turn(&agent).await;
+    }
+
+    fn park_monitor_export(mgr: &AgentManager, ws: &WorkspaceId) {
+        mgr.services.transfer_exports.lock().unwrap().insert(
+            "monitor-worker-export".into(),
+            crate::transfer_export::ExportSession {
+                initiator: None,
+                workspace_id: ws.clone(),
+                staging_dir: std::env::temp_dir(),
+                state: crate::transfer_export::ExportState::Building { aborted: false },
+                wip_paths: vec![],
+                max_chunk_bytes: 100,
+            },
+        );
+    }
+
+    async fn monitor_worker_exit_releases_slot(exporting: bool) {
+        let agent = AgentId::from("monitor-worker-owner");
+        let ws = WorkspaceId::from("monitor-worker-workspace");
+        let (mgr, _db) = manager_with_session(&agent, &ws, AgentStatus::RuntimeIdle).await;
+        let admission = mgr.try_begin_turn(&agent, &ws).await.unwrap();
+        if exporting {
+            park_monitor_export(&mgr, &ws);
+        }
+        let metadata =
+            json!({"type":"script_monitor_wake","monitorId":"removed-monitor","workspaceId":ws});
+        run_message_worker(
+            mgr.clone(),
+            agent.clone(),
+            ws.clone(),
+            "suppressed wake".into(),
+            TurnOptions {
+                message_metadata: Some(metadata),
+                ..TurnOptions::default()
+            },
+            true,
+            admission,
+        )
+        .await;
+        assert!(
+            !mgr.is_busy(&agent),
+            "a discarded/deferred wake must release its slot"
+        );
+        assert!(!mgr.turn_admissions.lock().unwrap().contains_key(&agent));
+        assert_eq!(
+            mgr.services
+                .store
+                .get_agent_session(&agent)
+                .await
+                .unwrap()
+                .status,
+            AgentStatus::RuntimeIdle
+        );
+        let (queued, _) = mgr.services.enqueue_message(
+            &agent,
+            "ordinary followup".into(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            intent_core::MessageOrigin::User,
+        );
+        mgr.clone().try_drain_queue(agent.clone(), ws).await;
+        assert!(
+            !mgr.services.is_message_queued(&agent, &queued.id),
+            "normal followup must drain even while the monitor is parked"
+        );
+        assert!(mgr.is_busy(&agent), "followup owns the new slot");
     }
 
     #[tokio::test]

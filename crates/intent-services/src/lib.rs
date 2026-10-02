@@ -141,6 +141,7 @@ pub mod repo_config;
 pub mod retention;
 mod rtk;
 mod sandbox_ops;
+mod script_monitor;
 mod script_ops;
 mod search_ops;
 mod sentry_ops;
@@ -1969,25 +1970,22 @@ impl Services {
             .resolve_agent_type(specialist_id, workspace_path)
     }
 
-    /// Whether a session's specialist id resolved to a real specialist. New
-    /// sessions carry a frozen identity snapshot; legacy sessions resolve from
-    /// the harness-pinned specialist registry.
-    pub(crate) fn session_has_recognized_specialist(
+    /// A session's specialist display name. New sessions carry a frozen
+    /// identity snapshot; legacy sessions resolve from the harness-pinned
+    /// specialist registry.
+    pub(crate) fn session_specialist_display_name(
         &self,
         session: &AgentSession,
         workspace_path: Option<&Path>,
-    ) -> bool {
-        let Some(specialist_id) = session.specialist.as_deref() else {
-            return false;
-        };
-        if Self::session_metadata_str(session, "specialistName").is_some() {
-            return true;
+    ) -> Option<String> {
+        let specialist_id = session.specialist.as_deref()?;
+        if let Some(name) = Self::session_metadata_str(session, "specialistName") {
+            return Some(name);
         }
         let entry = crate::harness::resolve_entry(&session.harness_version);
         self.specialists_service()
             .with_embedded(entry.doctrine.specialists)
             .resolve_display_name(specialist_id, workspace_path)
-            .is_some()
     }
 
     /// Whether a session's specialist resolves to the `orchestrator` role —
@@ -2283,6 +2281,7 @@ impl Services {
         )
         .with_settings(self.settings_registry.clone())
         .with_tasks(self.store_tasks.clone())
+        .with_owner_services(self.clone())
     }
 
     /// Test seam: raise the `script.*` too-fast-exit floor so the no-restart
@@ -2710,6 +2709,8 @@ impl Services {
     ///
     /// Returns `Error::Internal` if loading the persisted scripts from the store fails.
     pub async fn hydrate_scripts(&self) -> Result<usize> {
+        self.script_manager().recover_monitors().await?;
+        self.start_script_monitor_maintenance();
         self.script_manager().hydrate().await
     }
 
@@ -7325,7 +7326,11 @@ impl Services {
         let advisory_pending = self.has_advisory_pending_interim_skip(child_id);
         if !advisory_pending
             && (!self.active_hooks_for_agent(child_id).await.is_empty()
-                || !self.active_pr_monitors_for_agent(child_id).await.is_empty())
+                || (!self.active_pr_monitors_for_agent(child_id).await.is_empty()
+                    || !self
+                        .active_script_monitors_for_agent(child_id)
+                        .await
+                        .is_empty()))
         {
             // monorepo#2532 Gap B provenance gate: when the marker was
             // recorded by a REGISTRATION-TIME deferral, the persisted report
@@ -7936,7 +7941,13 @@ impl Services {
         let queue_ready = event.event_type == AGENT_IDLE && self.has_ready_to_send(child_id);
         let busy_interim =
             event.event_type == AGENT_IDLE && !queue_ready && self.agent_is_busy(child_id.clone());
-        let queue_interim = queue_ready || busy_interim;
+        let pending_script_wake = event.event_type == AGENT_IDLE
+            && self
+                .store
+                .script_monitor_pending_for_agent(child_id)
+                .await
+                .unwrap_or(true);
+        let queue_interim = queue_ready || busy_interim || pending_script_wake;
         // monorepo#1945: an `agent:idle` carrying a non-empty
         // completionReport (stamped by every idle emit site from the
         // session's persisted report, set exclusively by
@@ -7966,7 +7977,12 @@ impl Services {
             } else {
                 Vec::new()
             };
-        let hook_waiting = !active_hooks.is_empty();
+        let active_script_monitors = if event.event_type == AGENT_IDLE && !completion_reported {
+            self.active_script_monitors_for_agent(child_id).await
+        } else {
+            Vec::new()
+        };
+        let hook_waiting = !active_hooks.is_empty() || !active_script_monitors.is_empty();
         // Idle-visibility deferral (unified external-wait, mirrors
         // `hook_waiting` exactly): an `agent:idle` for a child that owns
         // active PR monitors is not its real completion — a monitored PR's
@@ -9010,7 +9026,7 @@ impl Services {
             );
             return false;
         }
-        let wake = format_monitoring_idle_advisory_wake(
+        let mut wake = format_monitoring_idle_advisory_wake(
             child_id,
             event,
             active_hooks,
@@ -9018,9 +9034,23 @@ impl Services {
             grouped,
             child_of_recipient,
         );
+        let script_waits = self.active_script_monitors_for_agent(child_id).await;
+        if !script_waits.is_empty() {
+            use std::fmt::Write as _;
+            wake.push_str("\nActive script monitors:");
+            for row in &script_waits {
+                let _ = write!(
+                    wake,
+                    "\n- {} (run {}, expires {})",
+                    row["scriptName"], row["runId"], row["expiresAt"]
+                );
+            }
+        }
         let mut metadata = build_event_notification_metadata(&[event]);
         metadata["watchStillArmed"] = serde_json::json!(true);
         metadata["childExternallyWaiting"] = serde_json::json!(true);
+        self.annotate_waiting_on_script_monitors(child_id, &mut metadata)
+            .await;
         if !active_hooks.is_empty() {
             metadata["waitingOnHooks"] = serde_json::Value::Array(active_hooks.to_vec());
         }
@@ -19150,6 +19180,53 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn script_monitor(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        script_id: String,
+        options: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let _admission = self.workspace_mutations.enter(&workspace_id)?;
+            self.require_member(&workspace_id).await?;
+            let _archive = self.archive_fence.acquire(&workspace_id).await;
+            let retirement = self.agent_retirement_gates.for_agent(&agent_id);
+            let _retirement = retirement.lock().await;
+            self.script_manager()
+                .monitor(&workspace_id, &agent_id, &script_id, options)
+                .await
+        })
+    }
+    fn script_monitor_list(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            Ok(
+                serde_json::json!({"monitors":self.store.script_monitors(&workspace_id,agent_id.as_ref()).await?}),
+            )
+        })
+    }
+    fn script_monitor_cancel(
+        &self,
+        workspace_id: WorkspaceId,
+        monitor_id: String,
+        owner: Option<AgentId>,
+        stop_run: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_workspace_manager(&workspace_id, "script.stop")
+                .await?;
+            self.require_member(&workspace_id).await?;
+            self.script_manager()
+                .cancel_monitor(&workspace_id, &monitor_id, owner.as_ref(), stop_run)
+                .await
+        })
+    }
+
     fn script_start(
         &self,
         workspace_id: WorkspaceId,
@@ -19686,6 +19763,8 @@ impl WorkspaceApi for Services {
                                 .or_else(|| metadata.get("imageBlocks").cloned())
                                 .filter(|v| !v.is_null());
                             let extra = intent_core::AgentCreateExtra {
+                                remember_specialist: agent.remember_specialist.unwrap_or(false),
+                                name_explicitly_set: agent.name_explicitly_set,
                                 provider: nonempty_owned(agent.provider),
                                 // Keep blank values: the shared create resolver
                                 // treats them as an explicit clear of defaults.
@@ -22009,6 +22088,9 @@ impl WorkspaceApi for Services {
             // creates/sends finish first; unrelated workspaces stay writable.
             // Keep the permit through cleanup and terminal event publication.
             let _deletion = services.workspace_mutations.delete(&id).await;
+            services
+                .cancel_script_monitors(&id, None, "workspace-deleted")
+                .await?;
             // Terminate live agent sessions BEFORE the store cascade drops
             // their rows. A same-slug recreate hitting `agent.list` after the
             // delete would otherwise surface ghost sessions whose workers are
@@ -22685,6 +22767,8 @@ impl WorkspaceApi for Services {
             // failure fails the RPC with the row still active: access
             // revocation is never best-effort. Unarchive does NOT restore
             // either; a guest rejoins by a fresh invite.
+            this.cancel_script_monitors(&id, None, "workspace-archived")
+                .await?;
             let guest_sweep = store.archive_workspace_detaching_guests(&id, &now).await?;
             ws.status = WorkspaceStatus::Archived;
             ws.archived = true;
@@ -28507,79 +28591,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    fn git_commit(
-        &self,
-        workspace_id: WorkspaceId,
-        message: String,
-        idempotency_key: Option<String>,
-    ) -> BoxFuture<'_, Result<intent_core::GitCommitResult>> {
-        let store = self.store.clone();
-        let bus = self.event_bus.clone();
-        let this = self.clone();
-        Box::pin(async move {
-            self.require_member(&workspace_id).await?;
-            // TS `ws.git.commit` gates on auto-commit (no userRequested
-            // bypass), resolved per-workspace (override → global fallback).
-            let auto_commit_enabled = this.effective_auto_commit(&workspace_id).await;
-            let ws_scope = workspace_id.0.clone();
-            let op_store = store.clone();
-            let event_bus = bus.clone();
-            let event_message = message.clone();
-            let status_cache = this.git_status_invalidator();
-            let inflight = this.idempotency_inflight.clone();
-            with_idempotency(
-                &inflight,
-                &store,
-                &ws_scope,
-                idempotency_key,
-                "git.commit",
-                move || async move {
-                    let store = op_store;
-                    git_ops::assert_agent_commit_allowed(auto_commit_enabled, false)?;
-                    // All commit failures surface as `-32603` (the TS handler wraps the
-                    // whole path in INTERNAL_ERROR), so a missing workspace is `Internal`.
-                    let ws = store
-                        .get_workspace(&workspace_id)
-                        .await
-                        .map_err(|e| Error::Internal(format!("Failed to commit: {e}")))?;
-                    let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
-                        Error::Internal("Failed to commit: workspace has no worktree".to_string())
-                    })?;
-                    let outcome = intent_git::commit::commit(&worktree, &message)?;
-                    // Staged content became a commit → the cached scan still
-                    // lists it as pending (monorepo#1648).
-                    status_cache.invalidate(&worktree);
-                    // Emissions live inside the idempotency scope so a replayed
-                    // commit (same idempotencyKey) returns the cached result
-                    // without re-firing events (parity with `workspace:created`
-                    // §6.5). `git:commit` mirrors the reserved
-                    // `GitOperationEvent` FE shape; `changes:git-status` feeds
-                    // the FE bridge's `git:status-changed` relay so the UI
-                    // refreshes without a follow-up `git.status` read.
-                    publish_event(
-                        event_bus.as_ref(),
-                        git_commit_event(&ws.id, &outcome.hash, &event_message, &outcome.files),
-                    )
-                    .await;
-                    let status = intent_git::status::status(&worktree)
-                        .unwrap_or_else(|_| intent_git::status::empty_status());
-                    let status_json =
-                        serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
-                    publish_event(
-                        event_bus.as_ref(),
-                        changes_git_status_event(&ws.id, &status_json),
-                    )
-                    .await;
-                    Ok(intent_core::GitCommitResult {
-                        hash: outcome.hash,
-                        files: outcome.files,
-                    })
-                },
-            )
-            .await
-        })
-    }
-
     fn git_agent_commit(
         &self,
         workspace_id: WorkspaceId,
@@ -29695,6 +29706,19 @@ impl WorkspaceApi for Services {
                     "lastStreamActivityAt": null,
                 }),
             }
+        })
+    }
+
+    fn agent_get_creation_preferences(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            self.store.get_workspace(&workspace_id).await?;
+            self.store
+                .get_agent_creation_preferences(&workspace_id)
+                .await
         })
     }
 

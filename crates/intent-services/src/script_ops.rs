@@ -29,6 +29,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::MissedTickBehavior;
 
 mod lifecycle;
+mod monitors;
 mod retirement;
 use lifecycle::RunLease;
 
@@ -90,6 +91,7 @@ pub(crate) struct ManagedScript {
     def: Script,
     state: ScriptRuntimeState,
     pty_id: Option<PtyId>,
+    monitor_attempt: Option<PtyId>,
     stopped_by_user: bool,
     supervisor: Option<tokio::task::JoinHandle<()>>,
     /// Identity stamp assigned at every registry insertion and admitted run:
@@ -134,8 +136,8 @@ fn next_generation() -> u64 {
 }
 
 /// The shared registry of scripts, keyed by `(workspace_id, script_id)` so a
-/// client-supplied `scriptId` (`"dev"`, `"build"`, …) can be minted concurrently
-/// by any number of workspaces without collision or cross-workspace mutation.
+/// workspace ownership cannot cross runtime keys. Persisted definition IDs are
+/// globally unique; this registry does not permit duplicate public definitions.
 pub(crate) type ScriptRegistry = Arc<Mutex<HashMap<(WorkspaceId, String), ManagedScript>>>;
 
 /// Shared async locks for workspace bootstrap and script definition updates.
@@ -143,6 +145,9 @@ pub(crate) type ScriptRegistry = Arc<Mutex<HashMap<(WorkspaceId, String), Manage
 /// all workspaces, matching the store's primary key and legacy owner moves.
 #[derive(Clone, Default)]
 pub(crate) struct ScriptLocks {
+    pub(crate) monitor_maintenance: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) monitor_lane: Arc<AsyncMutex<()>>,
+    monitor_windows: Arc<Mutex<HashMap<String, monitors::Window>>>,
     hydration: Arc<AsyncMutex<()>>,
     workspaces: Arc<Mutex<HashMap<WorkspaceId, Arc<AsyncMutex<()>>>>>,
     definitions: Arc<Mutex<HashMap<String, Weak<AsyncMutex<()>>>>>,
@@ -207,6 +212,7 @@ impl ScriptLocks {
 /// Cheap to clone (all handles); the supervisor task owns its own clone.
 #[derive(Clone)]
 pub(crate) struct ScriptManager {
+    owner_services: Option<crate::Services>,
     pty: Arc<PtyHost>,
     bus: Option<EventBus>,
     store: Store,
@@ -237,6 +243,9 @@ pub(crate) struct SupervisePark {
 /// grouped so the manager constructor stays within arity limits.
 #[derive(Clone, Default)]
 pub(crate) struct ScriptParks {
+    pub(crate) monitor_clock: Option<Arc<std::sync::atomic::AtomicI64>>,
+    /// Parks before process admission; cancellation must prevent the spawn.
+    pub(crate) before_spawn: Option<Arc<SupervisePark>>,
     /// Parks `supervise()` in its pre-registration window — after
     /// `pty.spawn`, before `mark_running` records the id (monorepo#1180).
     pub(crate) supervise: Option<Arc<SupervisePark>>,
@@ -278,41 +287,44 @@ impl Drop for RunReservation {
         // Release in-memory ownership synchronously. An ordinary cancelled
         // waiter must not leave a token that a racing stop mistakes for a run.
         // A user stop already in progress owns cancellation settlement instead.
-        let mut abandoned = None;
+        let mut settle = false;
         if let Ok(mut guard) = self.mgr.scripts.lock() {
             if let Some(m) = guard
                 .get_mut(&self.key)
                 .filter(|m| m.generation == self.generation)
             {
                 if m.state.status == ScriptStatus::Running {
+                    let run_id = m.state.run_id.clone();
                     m.state = if m.stopped_by_user {
                         ScriptRuntimeState::default()
                     } else {
                         self.prev.clone()
                     };
+                    m.state.run_id = run_id;
                 }
-                if !m.running_at_shutdown && !m.stopped_by_user && m.pending_result.is_none() {
-                    abandoned = m.run_id.take().map(|token| (token, m.lost_at_daemon_stop));
+                if !m.running_at_shutdown
+                    && !m.stopped_by_user
+                    && m.pending_result.is_none()
+                    && m.run_id.is_some()
+                {
+                    m.pending_result = Some(intent_core::ScriptLastRun {
+                        run_id: m.run_id.clone(),
+                        outcome: intent_core::ScriptRunOutcome::Interrupted,
+                        exit_code: Some(EXIT_CODE_UNOBSERVABLE),
+                        started_at: None,
+                        stopped_at: now_iso(),
+                        error: Some("script.run caller cancelled before launch".into()),
+                    });
+                    settle = true;
                 }
                 if let Some(done) = m.run_reserved.take() {
                     done.notify_waiters();
                 }
             }
         }
-        if let Some((token, preserve_marker)) = abandoned {
-            let mgr = self.mgr.clone();
-            let (ws, id) = self.key.clone();
-            self.mgr.spawn_owned(async move {
-                let lock = mgr.locks.definition_lock(&id);
-                let _guard = lock.lock().await;
-                if let Err(error) = mgr
-                    .store
-                    .abandon_script_run(&ws, &id, &token, preserve_marker)
-                    .await
-                {
-                    tracing::warn!(script = %id, %error, "abandon run reservation failed");
-                }
-            });
+        if settle {
+            self.mgr
+                .queue_settlement(&self.key.0, &self.key.1, self.generation);
         }
     }
 }
@@ -329,6 +341,7 @@ impl ScriptManager {
         parks: ScriptParks,
     ) -> Self {
         Self {
+            owner_services: None,
             pty,
             bus,
             store,
@@ -339,6 +352,11 @@ impl ScriptManager {
             settings: None,
             tasks: Arc::new(crate::delivery_tasks::DeliveryTasks::default()),
         }
+    }
+
+    pub(crate) fn with_owner_services(mut self, services: crate::Services) -> Self {
+        self.owner_services = Some(services);
+        self
     }
 
     pub(crate) fn with_tasks(mut self, tasks: Arc<crate::delivery_tasks::DeliveryTasks>) -> Self {
@@ -395,6 +413,16 @@ impl ScriptManager {
         // while this call awaits its predecessor's supervisor.
         let lock = self.locks.definition_lock(&id);
         let _guard = lock.lock().await;
+        if scoped
+            && self
+                .store
+                .script_workspace(&id)
+                .await?
+                .is_some_and(|actual| actual != workspace_id)
+        {
+            return Err(Error::NotFound(format!("script {id}")));
+        }
+
         // Upsert of an existing id (`ws.script.create` with `scriptId`):
         // the definition is replaced with `source`/`createdAt` preserved and
         // `updatedAt` stamped (FE parity), and — unlike the FE, whose manager
@@ -461,6 +489,21 @@ impl ScriptManager {
             created_at,
             updated_at,
         };
+        if self
+            .scripts
+            .lock()
+            .unwrap()
+            .get(&(workspace_id.clone(), id.clone()))
+            .is_some_and(|m| m.run_id.is_some())
+        {
+            self.stop_inner_reason(
+                &workspace_id,
+                &id,
+                true,
+                "cancelled by definition replacement",
+            )
+            .await?;
+        }
         let publication = self.locks.publication_lock(&id);
         let publishing = publication.lock().await;
         // Recheck scope atomically before runtime teardown: another request
@@ -507,6 +550,7 @@ impl ScriptManager {
                 def: def.clone(),
                 state: ScriptRuntimeState::default(),
                 pty_id: None,
+                monitor_attempt: None,
                 stopped_by_user: false,
                 supervisor: None,
                 generation: next_generation(),
@@ -575,6 +619,7 @@ impl ScriptManager {
             let Some(def) = self.store.get_script_in_workspace(&ws, &id).await? else {
                 continue;
             };
+            let latest = self.store.latest_script_run(&ws, &id).await?;
             let managed = {
                 loaded += 1;
                 let marked = was_running.contains(&(def.workspace_id.clone(), def.id.clone()));
@@ -586,7 +631,7 @@ impl ScriptManager {
                 {
                     restore.push(key.clone());
                 }
-                let state = if lost {
+                let mut state = if lost {
                     ScriptRuntimeState {
                         status: ScriptStatus::Exited,
                         exit_code: Some(EXIT_CODE_UNOBSERVABLE),
@@ -599,10 +644,12 @@ impl ScriptManager {
                         ..Default::default()
                     }
                 };
+                state.run_id = latest.map(|(run, _)| run);
                 ManagedScript {
                     def,
                     state,
                     pty_id: None,
+                    monitor_attempt: None,
                     stopped_by_user: false,
                     supervisor: None,
                     generation: next_generation(),
@@ -640,13 +687,40 @@ impl ScriptManager {
     ) -> Result<()> {
         let lock = self.locks.definition_lock(script_id);
         let _guard = lock.lock().await;
-        let Some(def) = self
+        let Some(mut def) = self
             .store
             .get_script_in_workspace(workspace_id, script_id)
             .await?
         else {
             return Ok(());
         };
+        let latest = self
+            .store
+            .latest_script_run(workspace_id, script_id)
+            .await?;
+        if let Some((run_id, None)) = &latest {
+            let started_at = self
+                .store
+                .pending_script_runs()
+                .await?
+                .into_iter()
+                .find(|(ws, id, run, _)| ws == workspace_id && id == script_id && run == run_id)
+                .and_then(|(_, _, _, started)| started);
+            let result = intent_core::ScriptLastRun {
+                run_id: Some(run_id.clone()),
+                outcome: intent_core::ScriptRunOutcome::Interrupted,
+                exit_code: Some(EXIT_CODE_UNOBSERVABLE),
+                started_at,
+                stopped_at: now_iso(),
+                error: Some(LOST_AT_DAEMON_STOP_ERROR.into()),
+            };
+            self.store
+                .settle_script_run(workspace_id, script_id, run_id, &result, false)
+                .await?;
+            if def.mode == ScriptMode::Command {
+                def.last_run = Some(result);
+            }
+        }
         let key = (workspace_id.clone(), script_id.to_string());
         let publication = self.locks.publication_lock(script_id);
         let publishing = publication.lock().await;
@@ -671,8 +745,12 @@ impl ScriptManager {
             key,
             ManagedScript {
                 def,
-                state: ScriptRuntimeState::default(),
+                state: ScriptRuntimeState {
+                    run_id: latest.map(|(run, _)| run),
+                    ..Default::default()
+                },
                 pty_id: None,
+                monitor_attempt: None,
                 stopped_by_user: false,
                 supervisor: None,
                 generation: next_generation(),
@@ -820,6 +898,7 @@ impl ScriptManager {
                                         def: script,
                                         state: ScriptRuntimeState::default(),
                                         pty_id: None,
+                                        monitor_attempt: None,
                                         stopped_by_user: false,
                                         supervisor: None,
                                         generation: next_generation(),
@@ -887,6 +966,25 @@ impl ScriptManager {
     ) -> Result<Value> {
         let lock = self.locks.definition_lock(script_id);
         let _guard = lock.lock().await;
+        if scoped && self.store.script_workspace(script_id).await?.as_ref() != Some(workspace_id) {
+            return Err(Error::NotFound(format!("script {script_id}")));
+        }
+
+        if self
+            .scripts
+            .lock()
+            .unwrap()
+            .get(&(workspace_id.clone(), script_id.to_owned()))
+            .is_some_and(|m| m.run_id.is_some())
+        {
+            self.stop_inner_reason(
+                workspace_id,
+                script_id,
+                true,
+                "cancelled by definition removal",
+            )
+            .await?;
+        }
         let publication = self.locks.publication_lock(script_id);
         let publishing = publication.lock().await;
         if scoped {
@@ -1020,6 +1118,16 @@ impl ScriptManager {
             .await
     }
 
+    fn start_reply(&self, ws: &WorkspaceId, id: &str) -> Value {
+        let mut reply = json!({"ok":true,"scriptId":id});
+        if let Ok(state) = self.status(ws, id) {
+            if let Some(run) = state.get("runId") {
+                reply["runId"] = run.clone();
+            }
+        }
+        reply
+    }
+
     async fn start_with_restore(
         &self,
         workspace_id: &WorkspaceId,
@@ -1027,7 +1135,7 @@ impl ScriptManager {
         restoring: bool,
     ) -> Result<Value> {
         if self.is_live(workspace_id, script_id)? {
-            return Ok(json!({"ok":true,"scriptId":script_id}));
+            return Ok(self.start_reply(workspace_id, script_id));
         }
         let mgr = self.clone();
         let ws = workspace_id.clone();
@@ -1046,7 +1154,7 @@ impl ScriptManager {
         let lock = self.locks.definition_lock(script_id);
         let _guard = lock.lock().await;
         if self.is_live(workspace_id, script_id)? {
-            return Ok(json!({ "ok": true, "scriptId": script_id }));
+            return Ok(self.start_reply(workspace_id, script_id));
         }
         self.finish_previous_locked(workspace_id, script_id).await;
         self.prepare_launch(workspace_id, script_id).await?;
@@ -1074,7 +1182,11 @@ impl ScriptManager {
             m.state.status,
             ScriptStatus::Running | ScriptStatus::Starting
         ) {
-            return Ok(json!({ "ok": true, "scriptId": script_id }));
+            let mut reply = json!({ "ok": true, "scriptId": script_id });
+            if let Some(run) = &m.state.run_id {
+                reply["runId"] = json!(run);
+            }
+            return Ok(reply);
         }
         m.stopped_by_user = false;
         m.generation = next_generation();
@@ -1104,8 +1216,9 @@ impl ScriptManager {
             }
             mgr.supervise(ws, sid, def, generation, restoring).await;
         }));
+        let run_id = m.state.run_id.clone();
         drop(guard);
-        Ok(json!({ "ok": true, "scriptId": script_id }))
+        Ok(json!({ "ok": true, "scriptId": script_id, "runId":run_id }))
     }
 
     /// `script.stop`: flag user-stop, kill the PTY (cancelling auto-restart), and
@@ -1143,6 +1256,17 @@ impl ScriptManager {
         script_id: &str,
         retire: bool,
     ) -> Result<Value> {
+        self.stop_inner_reason(workspace_id, script_id, retire, "cancelled by script.stop")
+            .await
+    }
+
+    async fn stop_inner_reason(
+        &self,
+        workspace_id: &WorkspaceId,
+        script_id: &str,
+        retire: bool,
+        reason: &'static str,
+    ) -> Result<Value> {
         let key = (workspace_id.clone(), script_id.to_string());
         let (handle, pty_id, was_running, run_done) = {
             let mut guard = self.scripts.lock().unwrap();
@@ -1150,12 +1274,7 @@ impl ScriptManager {
                 .get_mut(&key)
                 .ok_or_else(|| Error::NotFound(format!("script {script_id}")))?;
             m.stopped_by_user = true;
-            m.cancellation = (m.run_id.is_some()
-                && matches!(
-                    m.state.status,
-                    ScriptStatus::Running | ScriptStatus::Starting | ScriptStatus::Restarting
-                ))
-            .then_some("cancelled by script.stop");
+            m.cancellation = (m.run_id.is_some() && m.pending_result.is_none()).then_some(reason);
             (
                 m.supervisor.take(),
                 m.pty_id,
@@ -1188,7 +1307,10 @@ impl ScriptManager {
             let mut scripts = self.scripts.lock().unwrap();
             if let Some(m) = scripts.get_mut(&key) {
                 if m.state.status == ScriptStatus::Running && m.state.pid.is_none() {
-                    m.state = ScriptRuntimeState::default();
+                    m.state = ScriptRuntimeState {
+                        run_id: m.state.run_id.clone(),
+                        ..Default::default()
+                    };
                 }
             }
         }
@@ -1203,7 +1325,10 @@ impl ScriptManager {
                         }
                         let mut dismissed = m.state.previously_running.take().is_some();
                         if std::mem::take(&mut m.lost_at_daemon_stop) {
-                            m.state = ScriptRuntimeState::default();
+                            m.state = ScriptRuntimeState {
+                                run_id: m.state.run_id.clone(),
+                                ..Default::default()
+                            };
                             dismissed = true;
                         }
                         (
@@ -1235,6 +1360,25 @@ impl ScriptManager {
                 self.record_result(workspace_id, script_id, generation, false, false);
             }
             self.finish_previous_locked(workspace_id, script_id).await;
+            let unsettled = self
+                .scripts
+                .lock()
+                .unwrap()
+                .get(&key)
+                .filter(|m| !m.running_at_shutdown)
+                .and_then(|m| m.run_id.clone());
+            if let Some(token) = unsettled {
+                if self
+                    .store
+                    .latest_script_run(workspace_id, script_id)
+                    .await?
+                    .is_some_and(|(latest, result)| latest == token && result.is_none())
+                {
+                    return Err(Error::Internal(
+                        "stopped script run has not durably settled".into(),
+                    ));
+                }
+            }
         }
         self.persist_was_running(workspace_id, script_id, false)
             .await;
@@ -1367,8 +1511,8 @@ impl ScriptManager {
         let _guard = lock.lock().await;
         // Admission survives teardown, but its predecessor cannot report an
         // outcome for the successor token while shutdown is draining it.
+        self.stop_inner(workspace_id, script_id, true).await?;
         self.prepare_restart(workspace_id, script_id).await?;
-        self.stop_inner(workspace_id, script_id, false).await?;
         let publication = self.locks.publication_lock(script_id);
         let _publishing = publication.lock().await;
         let state = {
@@ -1511,7 +1655,15 @@ impl ScriptManager {
                 return Err(e);
             }
         };
-        let pty_id = match self.pty.spawn(self.build_spec(&ws, &def, cwd.as_ref())) {
+        let pty_id = match self
+            .spawn_monitored(
+                &ws,
+                script_id,
+                generation,
+                self.build_spec(&ws, &def, cwd.as_ref()),
+            )
+            .await
+        {
             Ok(id) => id,
             Err(e) => {
                 let _ = self.fail_run(reservation, e.to_string()).await;
@@ -1631,7 +1783,15 @@ impl ScriptManager {
             if let Some(old) = prev.take() {
                 self.pty.kill(old).await;
             }
-            let pty_id = match self.pty.spawn(self.build_spec(&ws, &def, cwd.as_ref())) {
+            let pty_id = match self
+                .spawn_monitored(
+                    &ws,
+                    &script_id,
+                    generation,
+                    self.build_spec(&ws, &def, cwd.as_ref()),
+                )
+                .await
+            {
                 Ok(id) => id,
                 Err(e) => {
                     self.fail(&ws, &script_id, generation, &e.to_string(), restoring)
@@ -1659,13 +1819,13 @@ impl ScriptManager {
                 return;
             }
             restoring = false;
-            let exit = self
+            let (exit, ended_at) = self
                 .run_one(&ws, &script_id, generation, pty_id, detect)
                 .await;
             // The too-fast decision is based on the shell's actual runtime:
-            // capture it before the straggler reap below, whose TERM-grace
-            // wait must not inflate a genuinely quick exit past the floor.
-            let ran_for = started.elapsed();
+            // run_one captures leader exit before output/straggler teardown;
+            // TERM grace must not inflate a quick exit past the floor.
+            let ran_for = ended_at.saturating_duration_since(started);
             // Group-keyed liveness (monorepo#1300): reap group
             // members that outlived the shell (a descendant trapping
             // TERM+HUP) before the exit is recorded, so `exited` means the
@@ -1728,6 +1888,8 @@ impl ScriptManager {
                 &format!("Restarting (attempt {attempt}/{AUTO_RESTART_MAX_RETRIES})"),
             );
         }
+        self.record_result(&ws, &script_id, generation, false, false);
+        self.queue_settlement(&ws, &script_id, generation);
     }
 
     /// Attach to a freshly spawned PTY, fan its output onto the bus as
@@ -1755,14 +1917,16 @@ impl ScriptManager {
         generation: u64,
         pty_id: PtyId,
         detect_url: bool,
-    ) -> Option<PtyExit> {
+    ) -> (Option<PtyExit>, Instant) {
         let Ok(attachment) = self.pty.attach(pty_id) else {
-            return self.pty.try_exit(pty_id).ok().flatten();
+            return (self.pty.try_exit(pty_id).ok().flatten(), Instant::now());
         };
         let pid = self.pty.pid(pty_id);
         let mut live = attachment.live;
         let mut url_done = !detect_url;
         if !attachment.backlog.is_empty() {
+            self.observe_monitor_chunk(ws, script_id, pty_id, &attachment.backlog)
+                .await;
             self.emit_output_for(ws, script_id, generation, &attachment.backlog);
             if !url_done {
                 url_done = self
@@ -1772,7 +1936,7 @@ impl ScriptManager {
         }
         let mut poll = tokio::time::interval_at(tokio::time::Instant::now() + EXIT_POLL, EXIT_POLL);
         poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        loop {
+        let ended_at = loop {
             tokio::select! {
                 biased;
                 _ = poll.tick() => {
@@ -1781,35 +1945,55 @@ impl ScriptManager {
                         Ok(None) => pid.is_some_and(pid_gone),
                     };
                     if ended {
+                        let ended_at = Instant::now();
+                        self.pty.reap_group_stragglers(pty_id).await;
+                        let _=tokio::time::timeout(Duration::from_secs(2),self.pty.wait_output_eof(pty_id)).await;
                         for _ in 0..EXIT_DRAIN_MAX_CHUNKS {
                             match live.try_recv() {
                                 Ok(chunk) => {
+                                    self.observe_monitor_chunk(ws,script_id,pty_id,&chunk).await;
                                     self.emit_output_for(ws, script_id, generation, &chunk);
                                     if !url_done {
                                         url_done =
                                             self.try_detect_url(ws, script_id, generation, &chunk).await;
                                     }
                                 }
-                                Err(TryRecvError::Lagged(_)) => {},
+                                Err(TryRecvError::Lagged(_)) => {self.monitor_gap(ws,script_id,pty_id).await;},
                                 Err(TryRecvError::Empty | TryRecvError::Closed) => break,
                             }
                         }
-                        break;
+                        break ended_at;
                     }
                 }
                 recv = live.recv() => match recv {
                     Ok(chunk) => {
-                        self.emit_output_for(ws, script_id, generation, &chunk);
+                        self.observe_monitor_chunk(ws,script_id,pty_id,&chunk).await;
+                                    self.emit_output_for(ws, script_id, generation, &chunk);
                         if !url_done {
                             url_done = self.try_detect_url(ws, script_id, generation, &chunk).await;
                         }
                     }
-                    Err(RecvError::Lagged(_)) => {},
-                    Err(RecvError::Closed) => break,
+                    Err(RecvError::Lagged(_)) => {self.monitor_gap(ws,script_id,pty_id).await;},
+                    Err(RecvError::Closed) => break Instant::now(),
                 },
             }
+        };
+        if !live.is_empty() {
+            self.monitor_gap(ws, script_id, pty_id).await;
         }
-        self.pty.try_exit(pty_id).ok().flatten()
+        if let Err(error) = self
+            .monitor_output(
+                ws,
+                script_id,
+                pty_id,
+                None,
+                self.pty.output_eof(pty_id).unwrap_or(false),
+            )
+            .await
+        {
+            tracing::warn!(%error,"monitor EOF failed");
+        }
+        (self.pty.try_exit(pty_id).ok().flatten(), ended_at)
     }
 
     /// Scan a chunk for the first local dev-server URL; on a first hit, latch it
@@ -2002,7 +2186,9 @@ impl ScriptManager {
                 m.state.error = Some(EXIT_UNOBSERVABLE_ERROR.to_string());
             }
             m.state.stopped_at = Some(now_iso());
-            Self::record_result_locked(m, false, timed_out);
+            if m.def.mode == ScriptMode::Command || m.stopped_by_user {
+                Self::record_result_locked(m, false, timed_out);
+            }
             (
                 (m.stopped_by_user, m.state.restart_count),
                 m.running_at_shutdown,
@@ -2083,6 +2269,7 @@ impl ScriptManager {
                 tracing::warn!(workspace = %ws, script = %script_id, error = %err, "restore auto-start script failed");
                 m.state = ScriptRuntimeState {
                     previously_running: m.state.previously_running,
+                    run_id: m.state.run_id.clone(),
                     ..Default::default()
                 };
             } else {
@@ -2093,6 +2280,16 @@ impl ScriptManager {
             }
             m.pty_id = None;
             Self::record_result_locked(m, true, false);
+            if restoring {
+                if let Some(result) = m
+                    .pending_result
+                    .as_mut()
+                    .filter(|r| r.outcome == intent_core::ScriptRunOutcome::Failed)
+                {
+                    result.exit_code = Some(EXIT_CODE_UNOBSERVABLE);
+                    result.error = Some(err.to_owned());
+                }
+            }
             std::mem::take(&mut m.lost_at_daemon_stop) || m.def.mode == ScriptMode::Command
         };
         if let Some(park) = &self.parks.terminal_persist {
@@ -2479,6 +2676,7 @@ fn script_event(workspace_id: &WorkspaceId, event_type: &str, data: Value) -> Ne
 mod tests {
     include!("script_ops/lifecycle_tests.rs");
     include!("script_ops/retirement_tests.rs");
+    include!("script_ops/monitor_tests.rs");
     include!("script_ops/snapshot_tests.rs");
     use std::path::PathBuf;
     use std::time::Duration;
@@ -5853,6 +6051,48 @@ mod tests {
         assert_eq!(st["status"], "exited");
     }
 
+    #[cfg(unix)]
+    #[intent_test_macros::daemon_test]
+    async fn fast_service_straggler_cleanup_does_not_enable_restart() {
+        let h = harness().await;
+        let (flag, pidfile) = straggler_paths("fast-service");
+        let cmd = straggler_command(&flag.0, &pidfile.0, "exit 1");
+        let id = create_simple(&h, "fast service", &cmd, ScriptMode::Service).await;
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .unwrap();
+        let straggler = await_straggler_pid(&pidfile.0).await;
+        let _guard = KillOnDrop(straggler);
+        let mgr = h.services.script_manager();
+        let restart_count = tokio::time::timeout(LIVENESS, async {
+            loop {
+                let result = {
+                    let scripts = mgr.scripts.lock().unwrap();
+                    let running = scripts.get(&(h.ws.clone(), id.clone())).unwrap();
+                    (running.state.restart_count > 0
+                        || running.run_id.is_none()
+                        || running
+                            .supervisor
+                            .as_ref()
+                            .is_some_and(tokio::task::JoinHandle::is_finished))
+                    .then_some(running.state.restart_count)
+                };
+                if let Some(count) = result {
+                    break count;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("service decides whether to restart after teardown");
+        assert_eq!(
+            restart_count, 0,
+            "TERM grace is cleanup time, not service runtime"
+        );
+        await_pid_dead(straggler, "fast service descendant").await;
+    }
+
     /// A saved script runs in a PTY with no keyboard, so a pager launched by
     /// `git` (or any `PAGER`-honouring tool) would hold the run open forever.
     /// The spawn env exports `GIT_PAGER=cat`/`PAGER=cat`, which outrank
@@ -6258,8 +6498,8 @@ mod tests {
         }
     }
 
-    /// Wait until the teardown under test has taken the registry entry (or,
-    /// pre-fix, already finished outright) before releasing the park.
+    /// Wait for teardown to reserve the predecessor (or finish) before releasing
+    /// its process barrier. The entry now remains until durable settlement.
     async fn await_entry_taken<T>(
         h: &Harness,
         p: &ParkedScript,
@@ -6271,12 +6511,20 @@ mod tests {
                 p.services.script_status(h.ws.clone(), p.id.clone()).await,
                 Err(Error::NotFound(_))
             );
-            if gone || task.is_finished() {
+            let stopping = p
+                .services
+                .script_manager()
+                .scripts
+                .lock()
+                .unwrap()
+                .get(&(h.ws.clone(), p.id.clone()))
+                .is_some_and(|m| m.stopped_by_user);
+            if gone || stopping || task.is_finished() {
                 break;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "teardown never took the registry entry"
+                "teardown never reserved the predecessor"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

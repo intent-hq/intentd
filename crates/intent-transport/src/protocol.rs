@@ -708,7 +708,18 @@ use std::time::{Duration, Instant};
 // registered workspace-owned roots share existing filesystem confinement.
 // Version 11.2 adds complete script.list rows to created/updated script:changed
 // events, including committed result/archive state. Presence detects support.
-pub const PROTOCOL_VERSION: &str = "11.2";
+// Version 11.3 adds workspace-scoped manual specialist preferences; platform
+// support remains independently capability-gated.
+// Version 12.0 retires git.diff/git.log aliases, pr.status,
+// file-tracking.getLineStats, metrics.getWorkspaceStats/getAllWorkspaceStats/
+// clearAgentStats, and forward.create/list/close. Canonical git reads,
+// pr.refresh, metrics.getAgentStats, MCP operations and binary /tunnel remain.
+// Version 12.1 adds durable one-shot script monitors with guarded cancellation,
+// bounded output triggers and automatic owner wakes (scriptMonitors: 1).
+// Version 13.0 removes the deprecated keyed git.commit RPC. Human and agent
+// commits continue to use git.agentCommit with its existing permissions and
+// non-idempotent contract; MCP ws.git.commit is unchanged.
+pub const PROTOCOL_VERSION: &str = "13.0";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

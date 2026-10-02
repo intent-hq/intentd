@@ -1779,8 +1779,8 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         bind_address_definition(),
         number(
             "server.port",
-            "WS port",
-            "TCP port for the WSS listener",
+            "Legacy port (unused)",
+            "Preserved for compatibility; unused by listeners. Use server.wsApi.port for backend connections",
             "server",
             Some(1024.0),
             Some(65535.0),
@@ -1788,8 +1788,8 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         ),
         number(
             "server.wsApi.port",
-            "WSS API port",
-            "TCP port for the WSS listener",
+            "Backend connection port",
+            "TCP port for backend connections over WSS (server.wsApi.port)",
             "server",
             Some(1024.0),
             Some(65535.0),
@@ -3914,6 +3914,20 @@ mod tests {
             find_definition("server.listenMode").is_none(),
             "server.listenMode must not be in the catalog"
         );
+    }
+
+    #[test]
+    fn connection_port_catalog_distinguishes_preserved_legacy_value() {
+        let legacy = find_definition("server.port").unwrap();
+        let live = find_definition("server.wsApi.port").unwrap();
+        assert_eq!(legacy.label, "Legacy port (unused)");
+        assert!(legacy.description.contains("server.wsApi.port"));
+        assert_eq!(live.label, "Backend connection port");
+        // Older clients can still read, update and reset their saved legacy key.
+        assert!(!legacy.read_only);
+        assert!(!live.read_only);
+        legacy.validate(&json!(5182)).unwrap();
+        live.validate(&json!(5182)).unwrap();
     }
 
     /// `model.workspaceOverrides` is retired (monorepo#1000): the per-workspace
