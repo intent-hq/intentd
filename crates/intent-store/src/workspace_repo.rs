@@ -762,6 +762,9 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn delete_workspace(&self, id: &WorkspaceId) -> Result<()> {
+        // Hold through every bounded sweep and final commit/failure. All private
+        // desktop producers use this same Store-level admission gate.
+        let _desktop_deletion = self.desktop_writes.delete(id).await;
         // In particular, a missing workspace must not delete opaque draft
         // keys. The final transaction also checks existence for racing deletes.
         let exists: bool =

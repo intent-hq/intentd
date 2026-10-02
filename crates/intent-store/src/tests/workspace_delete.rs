@@ -799,6 +799,12 @@ async fn desktop_write_during_workspace_teardown_cannot_leave_orphan_after_failu
         .await
         .unwrap();
     let principal = store.get_primary_principal().await.unwrap().id;
+    let keeper = seed_workspace(&store, "desktop-keeper").await;
+    let kept_agent = AgentId::from("desktop-kept-agent");
+    store
+        .insert_agent_session(&sample_agent_session(&kept_agent, &keeper))
+        .await
+        .unwrap();
     sqlx::query("CREATE TRIGGER fail_desktop_final_delete BEFORE DELETE ON workspace BEGIN SELECT RAISE(ABORT,'late workspace failure'); END")
         .execute(store.write_pool()).await.unwrap();
     let barrier = std::sync::Arc::new(crate::desktop_repo::DeleteBarrier::default());
@@ -819,6 +825,29 @@ async fn desktop_write_during_workspace_teardown_cannot_leave_orphan_after_failu
     )
     .await
     .unwrap();
+    let binding = serde_json::json!({
+        "workspaceId": workspace, "agentId": agent, "principalId": principal,
+        "clientId": "client", "computerId": "physical"
+    });
+    let late_request = store
+        .desktop_insert_request("late-request", &workspace, &agent, &binding)
+        .await;
+    let late_terminal = store
+        .desktop_insert_terminal("late-session", &workspace, &agent, &binding, "hash")
+        .await;
+    let late_outcome = store
+        .desktop_resolve_request("late-request", &workspace, &agent, "granted", &binding)
+        .await;
+    let late_claim = store
+        .desktop_claim_primary("late-request", &binding, "generation", true)
+        .await;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        store.desktop_set_permission(&principal, &keeper, &kept_agent, "physical", true),
+    )
+    .await
+    .unwrap()
+    .expect("unrelated workspace remains writable");
     barrier.release.notify_one();
     assert!(deleting.await.unwrap().is_err());
     assert!(store.get_agent_session_summary(&agent).await.is_err());
@@ -832,4 +861,26 @@ async fn desktop_write_during_workspace_teardown_cannot_leave_orphan_after_failu
         late_write.is_err(),
         "desktop writes must be refused during teardown"
     );
+    assert!(
+        late_request.is_err()
+            && late_terminal.is_err()
+            && late_outcome.is_err()
+            && late_claim.is_err()
+    );
+    assert!(store
+        .desktop_terminal("late-session")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(
+        store
+            .desktop_set_permission(&principal, &workspace, &agent, "physical", true)
+            .await
+            .is_err(),
+        "deleted agent cannot regain consent after the deletion guard is released"
+    );
+    assert!(store
+        .desktop_permission(&principal, &keeper, &kept_agent, "physical")
+        .await
+        .unwrap());
 }

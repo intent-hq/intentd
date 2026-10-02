@@ -6,6 +6,54 @@ use crate::Store;
 use intent_core::{AgentId, Error, PrincipalId, Result, WorkspaceId};
 use serde_json::{json, Value};
 use sqlx::{Row, Sqlite, Transaction};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, Weak};
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
+
+/// Exclude every desktop producer during workspace teardown, including detached
+/// activation/outcome tasks. Gates are shared by Store clones and contain no SQL
+/// state. A deleting workspace rejects new writes while other workspaces proceed.
+#[derive(Clone, Default)]
+pub(crate) struct DesktopWrites {
+    maintenance: Arc<RwLock<()>>,
+    scopes: Arc<Mutex<HashMap<WorkspaceId, Weak<RwLock<()>>>>>,
+}
+
+impl DesktopWrites {
+    fn scope(&self, workspace: &WorkspaceId) -> Arc<RwLock<()>> {
+        let mut scopes = self
+            .scopes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        scopes.retain(|_, gate| gate.strong_count() > 0);
+        if let Some(gate) = scopes.get(workspace).and_then(Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(RwLock::new(()));
+        scopes.insert(workspace.clone(), Arc::downgrade(&gate));
+        gate
+    }
+
+    fn enter(
+        &self,
+        workspace: &WorkspaceId,
+    ) -> Result<(OwnedRwLockReadGuard<()>, OwnedRwLockReadGuard<()>)> {
+        let denied =
+            |_| Error::Forbidden("Desktop state is unavailable during teardown or recovery".into());
+        let maintenance = self.maintenance.clone().try_read_owned().map_err(denied)?;
+        let scope = self.scope(workspace).try_read_owned().map_err(denied)?;
+        Ok((maintenance, scope))
+    }
+
+    pub(crate) async fn delete(
+        &self,
+        workspace: &WorkspaceId,
+    ) -> (OwnedRwLockReadGuard<()>, OwnedRwLockWriteGuard<()>) {
+        let maintenance = self.maintenance.clone().read_owned().await;
+        let scope = self.scope(workspace).write_owned().await;
+        (maintenance, scope)
+    }
+}
 
 #[cfg(test)]
 #[derive(Default)]
@@ -89,6 +137,7 @@ impl Store {
                 .ok_or_else(|| Error::InvalidParams(format!("missing desktop claim {name}")))
         };
         let workspace = WorkspaceId::from(field("workspaceId")?);
+        let _write = self.desktop_writes.enter(&workspace)?;
         let agent = AgentId::from(field("agentId")?);
         let principal = PrincipalId::from(field("principalId")?);
         let client = field("clientId")?;
@@ -143,6 +192,7 @@ impl Store {
         computer: &str,
         allowed: bool,
     ) -> Result<()> {
+        let _write = self.desktop_writes.enter(workspace)?;
         let k = consent_key(principal, workspace, agent, computer);
         let mut tx = self.write_pool().begin().await.map_err(db)?;
         sqlx::query("DELETE FROM settings WHERE key=?")
@@ -165,6 +215,7 @@ impl Store {
         agent: &AgentId,
         binding: &Value,
     ) -> Result<()> {
+        let _write = self.desktop_writes.enter(workspace)?;
         let mut record = binding.clone();
         record["workspaceId"] = workspace.as_str().into();
         record["agentId"] = agent.as_str().into();
@@ -184,6 +235,7 @@ impl Store {
         binding: &Value,
         token_hash: &str,
     ) -> Result<()> {
+        let _write = self.desktop_writes.enter(workspace)?;
         let mut record = binding.clone();
         record["workspaceId"] = workspace.as_str().into();
         record["agentId"] = agent.as_str().into();
@@ -212,6 +264,7 @@ impl Store {
         outcome: &str,
         payload: &Value,
     ) -> Result<bool> {
+        let _write = self.desktop_writes.enter(workspace)?;
         let mut tx = self.write_pool().begin().await.map_err(db)?;
         let changed=sqlx::query("UPDATE settings SET value=json_set(value,'$.outcome',?) WHERE key=? AND json_extract(value,'$.outcome') IS NULL AND json_extract(value,'$.workspaceId')=? AND json_extract(value,'$.agentId')=?")
             .bind(outcome).bind(key("request",request)).bind(workspace.as_str()).bind(agent.as_str()).execute(&mut *tx).await.map_err(db)?.rows_affected()==1;
@@ -238,6 +291,18 @@ impl Store {
         report: Option<&str>,
         payload: Option<&Value>,
     ) -> Result<bool> {
+        // Resolve the immutable scope, then re-read the credential inside the
+        // guarded transaction. Teardown may remove it between these two reads.
+        let scope = self
+            .desktop_terminal(session)
+            .await?
+            .ok_or_else(|| Error::NotFound("desktop session".into()))?;
+        let workspace = WorkspaceId::from(
+            scope["workspaceId"]
+                .as_str()
+                .ok_or_else(|| Error::Internal("desktop session missing workspace".into()))?,
+        );
+        let _write = self.desktop_writes.enter(&workspace)?;
         let mut tx = self.write_pool().begin().await.map_err(db)?;
         let terminal = key("terminal", session);
         let raw: String = sqlx::query_scalar("SELECT value FROM settings WHERE key=?")
@@ -306,6 +371,7 @@ impl Store {
     /// # Errors
     /// Returns a storage error if the journal write fails.
     pub async fn desktop_outbox_delivered(&self, id: &str) -> Result<()> {
+        // This can only update an existing row, never recreate a swept record.
         sqlx::query("UPDATE settings SET value=json_set(value,'$.delivered',json('true')) WHERE key=? AND key GLOB 'desktop.v1/outbox/*'").bind(id).execute(self.write_pool()).await.map_err(db)?;
         Ok(())
     }
@@ -322,6 +388,7 @@ impl Store {
     /// # Panics
     /// The internal namespace assertion only fails if the fixed SQL prefix changes.
     pub async fn desktop_invalidate_restart(&self) -> Result<()> {
+        let _maintenance = self.desktop_writes.maintenance.write().await;
         let mut tx = self.write_pool().begin().await.map_err(db)?;
         sqlx::query("DELETE FROM settings WHERE key GLOB 'desktop.v1/*' AND (NOT EXISTS(SELECT 1 FROM agent_session a JOIN workspace w ON w.id=a.workspace_id WHERE a.id=json_extract(value,'$.agentId') AND w.id=json_extract(value,'$.workspaceId')) OR (json_extract(value,'$.principalId') IS NOT NULL AND NOT EXISTS(SELECT 1 FROM principal WHERE id=json_extract(value,'$.principalId'))))").execute(&mut *tx).await.map_err(db)?;
         let requests=sqlx::query("SELECT key,value FROM settings WHERE key GLOB 'desktop.v1/request/*' AND json_extract(value,'$.outcome') IS NULL").fetch_all(&mut *tx).await.map_err(db)?;

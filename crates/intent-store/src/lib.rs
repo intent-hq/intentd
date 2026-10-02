@@ -334,6 +334,7 @@ pub struct Store {
     /// Process-local `displayed` overlay of the browser tab registry; see
     /// `browser_tab_repo::DisplayedOverlay`.
     browser_tab_displayed: browser_tab_repo::DisplayedOverlay,
+    desktop_writes: desktop_repo::DesktopWrites,
     #[cfg(test)]
     desktop_delete_barrier:
         std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<desktop_repo::DeleteBarrier>>>>,
@@ -385,6 +386,7 @@ impl Store {
             write_pool,
             read_pool,
             browser_tab_displayed: browser_tab_repo::DisplayedOverlay::default(),
+            desktop_writes: desktop_repo::DesktopWrites::default(),
             #[cfg(test)]
             desktop_delete_barrier: std::sync::Arc::default(),
             #[cfg(test)]

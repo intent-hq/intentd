@@ -238,6 +238,7 @@ async fn transfer_human_trust_migration_cleans_legacy_keys_once_and_fences_downg
         write_pool,
         read_pool: crate::connect_read(&tmp.path).await.unwrap(),
         browser_tab_displayed: crate::browser_tab_repo::DisplayedOverlay::default(),
+        desktop_writes: crate::desktop_repo::DesktopWrites::default(),
         desktop_delete_barrier: std::sync::Arc::default(),
         export_author_barrier: Arc::default(),
     };

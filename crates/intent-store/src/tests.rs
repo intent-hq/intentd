@@ -7265,6 +7265,7 @@ async fn append_agent_message_survives_write_pool_acquire_timeout() {
             .await
             .expect("open read pool"),
         browser_tab_displayed: crate::browser_tab_repo::DisplayedOverlay::default(),
+        desktop_writes: crate::desktop_repo::DesktopWrites::default(),
         desktop_delete_barrier: std::sync::Arc::default(),
         export_author_barrier: std::sync::Arc::default(),
     };
