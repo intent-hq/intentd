@@ -823,7 +823,7 @@ pub fn is_known_event_type(event_type: &str) -> bool {
 /// Owner-only by design (never listed): `terminal:*` (raw PTY bytes),
 /// `host:exec:*` (host command output), `script:*` (host process output /
 /// state), `browser:*` (the owner's tabs), `hook:run-*` (hook code and carried state),
-/// `agent:permission:*` (tool-permission prompts are the owner's to answer),
+/// `agent:permission:*` (separately admitted for current workspace managers),
 /// `workspace:transfer:*` and `git:clone:*` (host paths / transfer
 /// progress), `gitRoot:*` (host paths), `test:*` / `build:*` (host process
 /// results), `app:*` (steers a client's UI; owner clients only, like reverse
@@ -945,7 +945,8 @@ pub fn is_collaborator_event_type(event_type: &str) -> bool {
 
 /// Additional types available to active host members. Workspace types still
 /// require effective access to the referenced ordinary workspace; global
-/// membership/context notifications have explicit delivery rules.
+/// membership/context notifications have explicit delivery rules. Permission
+/// types also admit guests with current workspace-management authority.
 pub const MEMBER_EVENT_TYPES: &[&str] = &[
     AGENT_PERMISSION_REQUEST,
     AGENT_PERMISSION_RESOLVED,
@@ -985,4 +986,14 @@ pub const MEMBER_EVENT_TYPES: &[&str] = &[
 #[must_use]
 pub fn is_member_execution_event_type(event_type: &str) -> bool {
     MEMBER_EVENT_TYPES.contains(&event_type)
+}
+
+/// Permission events use the current workspace-management grant, including
+/// retained guest ownership, rather than general host execution authority.
+#[must_use]
+pub fn is_permission_event_type(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        AGENT_PERMISSION_REQUEST | AGENT_PERMISSION_RESOLVED
+    )
 }

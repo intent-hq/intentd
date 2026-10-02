@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.134] - 2026-10-01
+
+### 🐛 Bug Fixes
+
+- Deliver permission events to authorized guest owners ([#2215](https://github.com/intent-hq/intentd/pull/2215))
+
+
+## [0.9.133] - 2026-10-01
+
+### 🚀 Features
+
+- Select and persist an available WSS port on first enable ([#2213](https://github.com/intent-hq/intentd/pull/2213))
+
+### 🐛 Bug Fixes
+
+- Reset live chat transcripts after message edits ([#1973](https://github.com/intent-hq/intentd/pull/1973))
+
+
 ## [0.9.132] - 2026-10-01
 
 ### 🚀 Features
