@@ -2215,6 +2215,7 @@ async fn golden_snapshot_line_shape() {
 #[test]
 fn golden_snapshot_full_field_serialization() {
     let snap = crate::agent_ops::AgentSnapshot {
+        desktop_control: intent_core::desktop::DesktopState::Inactive,
         time: "2026-01-02T03:04:05Z".to_string(),
         hooks: 1,
         agent_watches: 2,
@@ -2244,7 +2245,7 @@ fn golden_snapshot_full_field_serialization() {
     };
     assert_eq!(
         serde_json::to_string(&snap).unwrap(),
-        "{\"time\":\"2026-01-02T03:04:05Z\",\"hooks\":1,\"agentWatches\":2,\
+        "{\"desktopControl\":{\"status\":\"inactive\"},\"time\":\"2026-01-02T03:04:05Z\",\"hooks\":1,\"agentWatches\":2,\
          \"queuedMessages\":3,\"eventSubscriptions\":4,\"activeSubAgents\":5,\
          \"unsettledSubAgents\":6,\"runningSubAgents\":6,\"numQuestionsAsked\":7,\
          \"prMonitors\":[\"intent-hq/intentd#7\",\

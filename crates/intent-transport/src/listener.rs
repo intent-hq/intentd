@@ -328,24 +328,27 @@ where
         // UDS is the local control transport, so `is_local = true` (§12.3).
         // Wrap in connection context (is_tcp=false for UDS) so server.* RPCs can
         // gate on real origin (§5.2), with the primary principal bound.
-        let frame_ok = crate::context::with_request_context(false, caller.clone(), async {
-            process_frame(
-                trimmed,
-                &api,
-                &bus,
-                &out_tx,
-                &mut subs,
-                &mut forwards,
-                &reverse,
-                &reverse_guard,
-                control.as_ref(),
-                server_pairing_info.as_ref(),
-                &mut client_id,
-                true,
-                &limiter,
-            )
-            .await
-        })
+        let frame_ok = intent_core::desktop::with_connection(
+            reverse_guard.desktop_connection(),
+            crate::context::with_request_context(false, caller.clone(), async {
+                process_frame(
+                    trimmed,
+                    &api,
+                    &bus,
+                    &out_tx,
+                    &mut subs,
+                    &mut forwards,
+                    &reverse,
+                    &reverse_guard,
+                    control.as_ref(),
+                    server_pairing_info.as_ref(),
+                    &mut client_id,
+                    true,
+                    &limiter,
+                )
+                .await
+            }),
+        )
         .await;
         if !frame_ok || subs.pairing.revoked {
             break Ok(());

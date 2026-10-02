@@ -549,7 +549,16 @@ pub fn is_client_event_type(event_type: &str) -> bool {
 
 /// Every canonical event-type string in the taxonomy above. Useful for
 /// validation and the filter/subscription wiring added in later M2 tasks.
+pub const DESKTOP_PERMISSION_REQUESTED: &str = "desktop:permission-requested";
+pub const DESKTOP_PERMISSION_RESOLVED: &str = "desktop:permission-resolved";
+pub const DESKTOP_PERMISSION_CHANGED: &str = "desktop:permission-changed";
+pub const DESKTOP_SESSION_CHANGED: &str = "desktop:session-changed";
+
 pub const ALL_EVENT_TYPES: &[&str] = &[
+    DESKTOP_PERMISSION_REQUESTED,
+    DESKTOP_PERMISSION_RESOLVED,
+    DESKTOP_PERMISSION_CHANGED,
+    DESKTOP_SESSION_CHANGED,
     FILE_CHANGED,
     FILE_CREATED,
     FILE_DELETED,
@@ -948,6 +957,10 @@ pub fn is_collaborator_event_type(event_type: &str) -> bool {
 /// membership/context notifications have explicit delivery rules. Permission
 /// types also admit guests with current workspace-management authority.
 pub const MEMBER_EVENT_TYPES: &[&str] = &[
+    DESKTOP_PERMISSION_REQUESTED,
+    DESKTOP_PERMISSION_RESOLVED,
+    DESKTOP_PERMISSION_CHANGED,
+    DESKTOP_SESSION_CHANGED,
     AGENT_PERMISSION_REQUEST,
     AGENT_PERMISSION_RESOLVED,
     BROWSER_TAB_CLOSED,

@@ -23,6 +23,7 @@ mod comment_repo;
 mod completion_wake_delivery_repo;
 mod completion_watch_repo;
 mod delegation_group_repo;
+mod desktop_repo;
 mod diffs_repo;
 mod draft_repo;
 mod event_repo;

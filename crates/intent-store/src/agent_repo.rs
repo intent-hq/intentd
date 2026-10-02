@@ -3991,12 +3991,21 @@ impl Store {
                     Error::Internal(format!("delete agent recovery history failed: {e}"))
                 })?;
         }
+        let mut tx = self
+            .write_pool()
+            .begin()
+            .await
+            .map_err(|e| Error::Internal(format!("delete agent transaction: {e}")))?;
+        crate::desktop_repo::delete_desktop_scope(&mut tx, workspace_id, Some(id)).await?;
         let result = sqlx::query(DELETE_AGENT_SESSION_SQL)
             .bind(&id.0)
             .bind(&workspace_id.0)
-            .execute(self.write_pool())
+            .execute(&mut *tx)
             .await
             .map_err(|e| Error::Internal(format!("delete agent session failed: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| Error::Internal(format!("delete agent commit: {e}")))?;
         Ok(result.rows_affected() > 0)
     }
 }

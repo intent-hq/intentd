@@ -293,6 +293,7 @@ impl State {
 struct Inner {
     state: Mutex<State>,
     next_id: AtomicU64,
+    desktop_changes: Arc<tokio::sync::Notify>,
     /// Source of [`Entry::hello_seq`]; bumped under the `entries` lock.
     next_hello_seq: AtomicU64,
     /// Ordered transition queue. Every `send` happens while `entries` is
@@ -312,6 +313,7 @@ impl Default for Inner {
         Self {
             state: Mutex::new(State::default()),
             next_id: AtomicU64::new(0),
+            desktop_changes: Arc::new(tokio::sync::Notify::new()),
             next_hello_seq: AtomicU64::new(0),
             transitions,
             transition_rx: Mutex::new(Some(transition_rx)),
@@ -335,6 +337,7 @@ struct Entry {
     hello_seq: u64,
     device: Option<devices::DeviceBinding>,
     device_managed: bool,
+    desktop_epoch: String,
 }
 
 impl Entry {
@@ -367,6 +370,7 @@ impl Inner {
         let mut state = self.lock();
         let pos = state.entries.iter().position(|e| e.id == id)?;
         let entry = state.entries.remove(pos)?;
+        self.desktop_changes.notify_waiters();
         if entry.device_managed {
             state.refresh_devices(&self.transitions);
         }
@@ -455,6 +459,7 @@ impl PrimaryReverseRegistry {
             hello_seq: 0,
             device: None,
             device_managed: false,
+            desktop_epoch: intent_core::desktop::new_connection_epoch(),
         });
         PrimaryReverseGuard {
             registry: Some(self.inner.clone()),
@@ -697,6 +702,32 @@ impl PrimaryReverseRegistry {
 }
 
 impl AgentReverseDispatch for PrimaryReverseRegistry {
+    fn desktop_candidates(
+        &self,
+        principal: &intent_core::PrincipalId,
+    ) -> Vec<intent_core::desktop::DesktopConnection> {
+        desktop::candidates(self, principal)
+    }
+    fn desktop_changes(&self) -> Option<Arc<tokio::sync::Notify>> {
+        Some(self.inner.desktop_changes.clone())
+    }
+
+    fn desktop_resolve(
+        &self,
+        target: &ReverseTarget,
+        principal: &intent_core::PrincipalId,
+    ) -> intent_core::desktop::DesktopResult<intent_core::desktop::DesktopConnection> {
+        desktop::resolve(self, target, principal)
+    }
+
+    fn desktop_dispatch(
+        &self,
+        connection: intent_core::desktop::DesktopConnection,
+        params: Value,
+    ) -> BoxFuture<'_, intent_core::desktop::DesktopResult<Value>> {
+        Box::pin(desktop::dispatch(self, connection, params))
+    }
+
     fn is_connected(&self) -> bool {
         self.primary().is_some()
     }
@@ -798,6 +829,18 @@ async fn publish_client_event(api: &dyn WorkspaceApi, transition: &ClientTransit
 }
 
 impl PrimaryReverseGuard {
+    pub(crate) fn desktop_connection(&self) -> Option<intent_core::desktop::DesktopConnection> {
+        let inner = self.registry.as_ref()?;
+        let state = inner.lock();
+        let entry = state.entries.iter().find(|entry| entry.id == self.id)?;
+        let device = entry.device.as_ref()?;
+        Some(intent_core::desktop::DesktopConnection {
+            client_id: device.identity.client_id.clone(),
+            principal_id: device.principal_id.clone(),
+            connection_epoch: entry.desktop_epoch.clone(),
+        })
+    }
+
     /// The registry this guard is registered in (`None` for a detached guard),
     /// so a connection-task fast-path can read presence
     /// ([`PrimaryReverseRegistry::host_presence`]) without threading the
@@ -841,6 +884,9 @@ impl PrimaryReverseGuard {
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn bind(&self, identity: ReverseClientIdentity) {
+        if let Some(inner) = &self.registry {
+            inner.desktop_changes.notify_waiters();
+        }
         let Some(inner) = &self.registry else {
             return;
         };
@@ -919,3 +965,5 @@ impl Drop for PrimaryReverseGuard {
 mod tests;
 
 mod devices;
+
+mod desktop;

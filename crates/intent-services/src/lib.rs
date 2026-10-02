@@ -78,6 +78,7 @@ mod config_watcher;
 mod create_progress;
 mod delete_grace;
 mod delivery_tasks;
+mod desktop;
 mod device_ops;
 mod discovery_cache;
 mod disk_usage;
@@ -482,6 +483,7 @@ pub struct Services {
     /// publish so concurrent setters never emit deltas out of order relative
     /// to the durable pin; the delta is read back from the committed row.
     browser_client_pin_gate: Arc<tokio::sync::Mutex<()>>,
+    desktop: Arc<desktop::Runtime>,
     /// Serializes each browser tab registry mutation (`browser.upsertTab` /
     /// `removeTab` / `syncTabs`) together with the publication of its
     /// `browser:tab-*` events. The store transaction alone orders the rows;
@@ -1455,6 +1457,7 @@ impl Services {
             agent_queue_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
             agent_queue_publish_gate: Arc::new(tokio::sync::Mutex::new(())),
             browser_client_pin_gate: Arc::new(tokio::sync::Mutex::new(())),
+            desktop: Arc::new(desktop::Runtime::default()),
             browser_tab_gate: Arc::new(tokio::sync::Mutex::new(())),
             agent_retirement_gates: agent_ops::AgentRetirementGates::default(),
             hold_release_timers: Arc::new(Mutex::new(HashMap::new())),
@@ -17148,6 +17151,23 @@ impl Services {
 }
 
 impl WorkspaceApi for Services {
+    fn desktop_agent_call(
+        &self,
+        workspace: WorkspaceId,
+        method: String,
+        args: serde_json::Value,
+    ) -> BoxFuture<'_, intent_core::desktop::DesktopResult<serde_json::Value>> {
+        Box::pin(self.desktop_agent_op(workspace, method, args))
+    }
+    fn desktop_client_call(
+        &self,
+        method: String,
+        args: serde_json::Value,
+        connection: intent_core::desktop::DesktopConnection,
+    ) -> BoxFuture<'_, intent_core::desktop::DesktopResult<serde_json::Value>> {
+        Box::pin(self.desktop_client_op(method, args, connection))
+    }
+
     fn settings_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             // Daemon settings are host state: administrator-only in the matrix.
@@ -23928,6 +23948,7 @@ impl WorkspaceApi for Services {
             store
                 .set_workspace_browser_client(&id, client_id.as_ref())
                 .await?;
+            self.desktop.assignment_changed(&id);
             let committed = store.workspace_browser_client(&id).await?;
             // Self-sufficient `workspace:updated` delta (§6.5); `null`
             // spells a cleared pin so clients can drop their copy.
@@ -23946,6 +23967,7 @@ impl WorkspaceApi for Services {
             if let Some(new_host) = &committed {
                 self.browser_tabs_migrate_claimed(&id, new_host).await?;
             }
+            self.desktop.changed.notify_waiters();
             self.browser_client_state(&id).await
         })
     }
@@ -30098,6 +30120,7 @@ impl WorkspaceApi for Services {
     fn agent_stop(&self, agent_id: AgentId) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.require_agent_member(&agent_id).await?;
+            self.desktop_terminate_agent(&agent_id).await;
             // Interrupt the in-flight turn while KEEPING the child alive (TS
             // `agent.stop` keep-alive: `provider.interrupt()`), emitting the
             // terminal `agent:stream:end`; falls back to a hard kill only when no

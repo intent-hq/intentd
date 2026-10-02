@@ -333,6 +333,9 @@ async fn annotate_unblocked_hints(
     entries: &mut [QueuedMessage],
 ) {
     use crate::agent_ops::ready_delta;
+    for entry in entries.iter_mut() {
+        services.desktop_refresh_wake(agent_id, entry).await;
+    }
     let candidates: Vec<usize> = entries
         .iter()
         .enumerate()
@@ -14280,6 +14283,7 @@ async fn handle_terminal_turn_failure(
     persisted: bool,
     error: &Error,
 ) {
+    mgr.services.desktop_terminate_agent(agent_id).await;
     // Tear down the (likely dead) child so the retry path spawns fresh. Safe
     // from within the worker: only kills child/handle, no worker/busy touch.
     mgr.kill_child_only(agent_id).await;
