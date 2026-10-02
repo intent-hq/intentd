@@ -156,12 +156,7 @@ impl Harness {
         )
         .await
         .unwrap();
-        let agent = AgentId::from(
-            created["id"]
-                .as_str()
-                .or_else(|| created["agent"]["id"].as_str())
-                .unwrap(),
-        );
+        let agent = AgentId::from(created["agent"]["id"].as_str().expect("created agent ID"));
         Self {
             _tmp: tmp,
             services,
@@ -723,7 +718,11 @@ async fn desktop_feature_is_frozen_per_session_and_release_is_always_available()
     )
     .await
     .unwrap();
-    let child = AgentId::from(child["id"].as_str().unwrap());
+    let child = AgentId::from(
+        child["agent"]["id"]
+            .as_str()
+            .expect("created child agent ID"),
+    );
     let child_session = h
         .services
         .store

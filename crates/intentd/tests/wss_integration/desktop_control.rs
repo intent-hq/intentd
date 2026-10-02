@@ -180,7 +180,7 @@ async fn simultaneous_wss_approvals_claim_one_primary_and_activate_only_that_con
     )
     .await
     .unwrap();
-    let agent = AgentId::from(created["id"].as_str().unwrap());
+    let agent = AgentId::from(created["agent"]["id"].as_str().expect("created agent ID"));
     let caller = Caller::Agent {
         agent_id: agent.clone(),
     };
@@ -312,12 +312,7 @@ async fn desktop_wss_consent_tickets_revoke_and_no_replay() {
     )
     .await
     .unwrap();
-    let agent = AgentId::from(
-        created["id"]
-            .as_str()
-            .or_else(|| created["agent"]["id"].as_str())
-            .unwrap(),
-    );
+    let agent = AgentId::from(created["agent"]["id"].as_str().expect("created agent ID"));
     let url = format!("wss://localhost:{}/ws?token={TOKEN}", srv.port);
     let mut socket = common::wss_connect_with_retry(srv.port, srv.cfg.clone(), &url).await;
     let mut calls = vec![];
@@ -636,7 +631,7 @@ async fn wss_display_selection_errors_preserve_codes_and_do_not_execute() {
     )
     .await
     .unwrap();
-    let agent = AgentId::from(created["id"].as_str().unwrap());
+    let agent = AgentId::from(created["agent"]["id"].as_str().expect("created agent ID"));
     let caller = Caller::Agent {
         agent_id: agent.clone(),
     };
