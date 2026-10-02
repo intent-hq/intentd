@@ -499,6 +499,7 @@ pub struct TurnOptions {
     /// Submission IDs absorbed by a queued row, retained through failed drains.
     pub queued_submission_ids: Vec<String>,
     pub queued_submission_order: u64,
+    pub latest_human_submission_at: Option<String>,
     /// STAB-114 / monorepo#1014: text of the user message preempted by a
     /// zero-output interrupt, delivered AHEAD of this turn's own `content` in
     /// the SAME `session/prompt` so both messages are honored in order.
@@ -607,6 +608,7 @@ fn turn_options_for_entry(entry: &QueuedMessage, stale: bool) -> TurnOptions {
         queued_at: Some(entry.queued_at.clone()),
         queued_submission_ids: entry.submission_ids(),
         queued_submission_order: entry.submission_order,
+        latest_human_submission_at: entry.latest_human_submission_at.clone(),
         prepend_content: entry.prepend_content.clone(),
         prepend_image_blocks: entry.prepend_image_blocks.clone(),
         prepend_file_blocks: entry.prepend_file_blocks.clone(),
@@ -7576,6 +7578,7 @@ impl AgentManager {
             queued_at: Some(next.queued_at.clone()),
             queued_submission_ids: next.submission_ids(),
             queued_submission_order: next.submission_order,
+            latest_human_submission_at: next.latest_human_submission_at.clone(),
             prepend_content: next.prepend_content.clone(),
             prepend_image_blocks: next.prepend_image_blocks.clone(),
             prepend_file_blocks: next.prepend_file_blocks.clone(),
@@ -7741,6 +7744,7 @@ impl AgentManager {
             queued_at: Some(entry.queued_at.clone()),
             queued_submission_ids: entry.submission_ids(),
             queued_submission_order: entry.submission_order,
+            latest_human_submission_at: entry.latest_human_submission_at.clone(),
             prepend_content: entry.prepend_content.clone(),
             prepend_image_blocks: entry.prepend_image_blocks.clone(),
             prepend_file_blocks: entry.prepend_file_blocks.clone(),
@@ -12130,6 +12134,7 @@ async fn run_message_worker(
                 queued_at: Some(next.queued_at.clone()),
                 queued_submission_ids,
                 queued_submission_order: next.submission_order,
+                latest_human_submission_at: next.latest_human_submission_at.clone(),
                 prepend_content: next.prepend_content.clone(),
                 prepend_image_blocks: next.prepend_image_blocks.clone(),
                 prepend_file_blocks: next.prepend_file_blocks.clone(),
@@ -12352,6 +12357,7 @@ async fn run_message_worker(
                 queued_at: Some(next.queued_at.clone()),
                 queued_submission_ids,
                 queued_submission_order: next.submission_order,
+                latest_human_submission_at: next.latest_human_submission_at.clone(),
                 prepend_content: next.prepend_content.clone(),
                 prepend_image_blocks: next.prepend_image_blocks.clone(),
                 prepend_file_blocks: next.prepend_file_blocks.clone(),
@@ -12633,6 +12639,18 @@ async fn prepare_flush_turn(
         message_metadata: entries[0].message_metadata.clone(),
         suppress_report_clear: stale_flags.iter().all(|&s| s),
         queued_at: Some(entries[0].queued_at.clone()),
+        latest_human_submission_at: entries
+            .iter()
+            .filter(|entry| entry.user_origin)
+            .filter_map(|entry| {
+                let at = entry
+                    .latest_human_submission_at
+                    .as_deref()
+                    .unwrap_or(&entry.queued_at);
+                intent_core::parse_iso(at).map(|parsed| (parsed, at))
+            })
+            .max_by_key(|(parsed, _)| *parsed)
+            .map(|(_, at)| at.to_owned()),
         prepend_content,
         prepend_image_blocks,
         prepend_file_blocks,
@@ -13614,6 +13632,7 @@ async fn publish_error_status_and_requeue(
             editing_message_id: None,
             provisional: false,
             submission_order: options.queued_submission_order,
+            latest_human_submission_at: options.latest_human_submission_at.clone(),
         };
         mgr.services.requeue_front(agent_id, queued);
     }

@@ -7006,6 +7006,7 @@ fn flush_entry(suffix: &str, content: String) -> crate::agent_ops::QueuedMessage
         edit_appended: String::new(),
         edit_prepended: String::new(),
         editing_message_id: None,
+        latest_human_submission_at: None,
         provisional: false,
         submission_order: 0,
     }
@@ -15042,6 +15043,7 @@ async fn flush_persist_failure_for_vanished_session_drops_whole_batch() {
         edit_appended: String::new(),
         edit_prepended: String::new(),
         editing_message_id: None,
+        latest_human_submission_at: None,
         provisional: false,
         submission_order: 0,
     };
@@ -18774,6 +18776,7 @@ mod stale_redrive_tests {
             edit_appended: String::new(),
             edit_prepended: String::new(),
             editing_message_id: None,
+            latest_human_submission_at: None,
             provisional: false,
             submission_order: 0,
         }
@@ -19229,6 +19232,7 @@ mod dequeue_wait_tests {
             edit_appended: String::new(),
             edit_prepended: String::new(),
             editing_message_id: None,
+            latest_human_submission_at: None,
             provisional: false,
             submission_order: 0,
         }
@@ -23206,6 +23210,7 @@ mod flush_queued_messages_tests {
             edit_appended: String::new(),
             edit_prepended: String::new(),
             editing_message_id: None,
+            latest_human_submission_at: None,
             provisional: false,
             submission_order: 0,
         }
@@ -25413,4 +25418,61 @@ async fn admission_release_revoked_queue_tail_drains() {
         .unwrap();
     assert_eq!(events.len(), 1);
     reopened.close().await;
+}
+
+#[tokio::test]
+async fn queue_merge_archive_signal_survives_failed_turn_recovery() {
+    for persisted in [false, true] {
+        let (_tmp, mgr) = manager().await;
+        let ws = WorkspaceId::from("archive-recovery");
+        let id = AgentId::from("archive-recovery-agent");
+        seed_agent(&mgr, &ws, &id).await;
+        let options = super::TurnOptions {
+            queued_at: Some("2000-01-01T00:00:00Z".into()),
+            latest_human_submission_at: Some("2002-01-01T00:00:00Z".into()),
+            origin: intent_core::MessageOrigin::User,
+            message_metadata: Some(json!({"fromPrincipalId":"a"})),
+            ..Default::default()
+        };
+        super::persist_error_and_requeue(&mgr, &id, &ws, "one\n\ntwo", &options, persisted, "boom")
+            .await;
+        assert!(mgr
+            .services
+            .has_user_origin_ready_since(&id, "2001-01-01T00:00:00Z"));
+        assert!(!mgr
+            .services
+            .has_user_origin_ready_since(&id, "2003-01-01T00:00:00Z"));
+        let row = mgr.services.dequeue_message(&id).unwrap();
+        assert_eq!(row.queued_at, "2000-01-01T00:00:00Z");
+        assert_eq!(
+            row.latest_human_submission_at,
+            options.latest_human_submission_at
+        );
+        assert_eq!(
+            super::turn_options_for_entry(&row, false).latest_human_submission_at,
+            options.latest_human_submission_at
+        );
+    }
+}
+
+#[tokio::test]
+async fn queue_merge_archive_signal_survives_combined_flush_failure() {
+    let (_tmp, mgr) = manager().await;
+    let ws = WorkspaceId::from("archive-flush-recovery");
+    let id = AgentId::from("archive-flush-recovery-agent");
+    seed_agent(&mgr, &ws, &id).await;
+    let mut first = flush_entry("first", "one".into());
+    first.user_origin = true;
+    first.queued_at = "2000-01-01T00:00:00Z".into();
+    let mut second = flush_entry("second", "two".into());
+    second.user_origin = true;
+    second.queued_at = "2000-01-01T00:00:00Z".into();
+    second.latest_human_submission_at = Some("2002-01-01T00:00:00Z".into());
+    let (_flushed, restored) = flush_then_fail(&mgr, &ws, &id, vec![first, second], "boom").await;
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].queued_at, "2000-01-01T00:00:00Z");
+    assert_eq!(
+        restored[0].latest_human_submission_at.as_deref(),
+        Some("2002-01-01T00:00:00Z")
+    );
 }

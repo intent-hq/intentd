@@ -1315,6 +1315,9 @@ pub(crate) struct QueuedMessage {
     pub image_blocks: Option<Value>,
     pub file_blocks: Option<Value>,
     pub queued_at: String,
+    /// Latest user contribution time; original queued_at remains the row identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_human_submission_at: Option<String>,
     #[serde(default)]
     pub editing: bool,
     /// `true` when the user-message row already reached the transcript before
@@ -1506,6 +1509,22 @@ impl QueuedMessage {
     }
 
     fn append_pending(&mut self, incoming: Self) {
+        if incoming.user_origin {
+            let incoming_time = incoming
+                .latest_human_submission_at
+                .as_deref()
+                .unwrap_or(&incoming.queued_at);
+            let current_time = self
+                .latest_human_submission_at
+                .as_deref()
+                .unwrap_or(&self.queued_at);
+            if parse_iso(incoming_time).is_some_and(|incoming| {
+                !self.user_origin
+                    || parse_iso(current_time).is_none_or(|current| incoming > current)
+            }) {
+                self.latest_human_submission_at = Some(incoming_time.to_owned());
+            }
+        }
         if incoming.editing && !self.editing {
             self.editing_message_id = Some(
                 incoming
@@ -6960,6 +6979,24 @@ impl Services {
             };
             if let Some(preamble) = preamble.as_deref().filter(|_| human_authored) {
                 crate::principal_ops::prepend_collaborator_preamble(&mut content, preamble);
+            }
+            // A second client may have read the combined row while the first
+            // still holds its original draft. Without an editor token there is
+            // only one represented baseline: accepting a rebased acquisition
+            // would append the retained suffix again when that client saves.
+            // Reject before mutation; compare the exact represented range,
+            // never deduplicate user text by occurrence.
+            let held = &queue[position];
+            if was
+                && editing == Some(true)
+                && (!held.edit_prepended.is_empty() || !held.edit_appended.is_empty())
+                && held
+                    .content
+                    .strip_prefix(&held.edit_prepended)
+                    .and_then(|draft| draft.strip_suffix(&held.edit_appended))
+                    != Some(content.as_str())
+            {
+                return Err(Error::InvalidParams("queued edit conflict: this message received more text while another draft was held; finish that edit before starting another".into()));
             }
             // Hold acquisition can race an append after the UI captured its
             // draft. Keep that suffix pending for the eventual save as well.
@@ -14498,6 +14535,7 @@ impl Services {
             edit_appended: String::new(),
             edit_prepended: String::new(),
             editing_message_id: None,
+            latest_human_submission_at: None,
             provisional: false,
             submission_order: self
                 .queue_submission_order
@@ -14636,6 +14674,7 @@ impl Services {
                     edit_appended: String::new(),
                     edit_prepended: String::new(),
                     editing_message_id: None,
+                    latest_human_submission_at: None,
                     provisional: false,
                     submission_order: 0,
                 };
@@ -15515,14 +15554,16 @@ impl Services {
             .is_some_and(|q| q.iter().any(|m| m.ready_to_send() && m.user_origin))
     }
 
-    /// `true` iff at least one ready-to-send user-origin entry was queued at
+    /// `true` iff at least one ready-to-send user-origin entry received human input at
     /// or after `since` (RFC-3339). The archived-drain exemption uses this so
     /// only a user send made INTO the archived workspace — the explicit
     /// resurrection signal — releases the park (intent-hq/intent#3883): a
     /// user entry parked by a busy race BEFORE archival must stay parked with
     /// everything else, or the interrupted worker's end-of-turn re-kick would
     /// auto-unarchive a freshly archived workspace with no post-archive user
-    /// action. An entry with an unparseable `queued_at` never matches; an
+    /// action. Merged rows use their latest human contribution timestamp while
+    /// retaining original queued_at for identity; legacy rows fall back to it.
+    /// An unparseable effective timestamp never matches; an
     /// unparseable `since` falls back to [`Self::has_user_origin_ready`]
     /// (fail open — a row without a usable `archivedAt` cannot be compared).
     pub(crate) fn has_user_origin_ready_since(&self, agent_id: &AgentId, since: &str) -> bool {
@@ -15537,7 +15578,12 @@ impl Services {
                 q.iter().any(|m| {
                     m.ready_to_send()
                         && m.user_origin
-                        && parse_iso(&m.queued_at).is_some_and(|t| t >= cutoff)
+                        && parse_iso(
+                            m.latest_human_submission_at
+                                .as_deref()
+                                .unwrap_or(&m.queued_at),
+                        )
+                        .is_some_and(|t| t >= cutoff)
                 })
             })
     }

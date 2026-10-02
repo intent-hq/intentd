@@ -33678,6 +33678,7 @@ async fn requeued_after_failure_marker_surfaces_in_queue_snapshot() {
         edit_appended: String::new(),
         edit_prepended: String::new(),
         editing_message_id: None,
+        latest_human_submission_at: None,
         provisional: false,
         submission_order: 0,
     };
@@ -34262,6 +34263,7 @@ async fn turn_id_fresh_enqueue_identity_and_restart_round_trip() {
             edit_appended: String::new(),
             edit_prepended: String::new(),
             editing_message_id: None,
+            latest_human_submission_at: None,
             provisional: false,
             submission_order: 0,
         },
@@ -34718,6 +34720,7 @@ fn parked_entry(id: &str, content: &str) -> crate::agent_ops::QueuedMessage {
         edit_appended: String::new(),
         edit_prepended: String::new(),
         editing_message_id: None,
+        latest_human_submission_at: None,
         provisional: false,
         submission_order: 0,
     }

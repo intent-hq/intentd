@@ -781,13 +781,196 @@ async fn queue_merge_migrated_hold_updates_keep_prefix_and_suffix_until_release(
         svc.requeue_front(&agent, popped);
         drop(guard);
         enqueue(&svc, &agent, "a3", "a", "three");
-        svc.agent_edit_queued_message_op(agent.clone(), "a2".into(), "interim".into(), reaffirm)
-            .await
-            .unwrap();
+        svc.agent_edit_queued_message_op(
+            agent.clone(),
+            "a2".into(),
+            if reaffirm.is_some() { "two" } else { "interim" }.into(),
+            reaffirm,
+        )
+        .await
+        .unwrap();
         let saved = svc
             .agent_edit_queued_message_op(agent, "a2".into(), "final".into(), Some(false))
             .await
             .unwrap();
         assert_eq!(saved["queuedMessage"]["content"], "one\n\nfinal\n\nthree");
     }
+}
+
+#[tokio::test]
+async fn queue_merge_post_archive_human_append_wakes_without_rewriting_queued_at() {
+    let (_tmp, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Archived append").await;
+    let first = enqueue(&svc, &agent, "a1", "a", "before archive");
+    let original_time = "2000-01-01T00:00:00Z";
+    let archived_at = "2001-01-01T00:00:00Z";
+    svc.agent_queues.lock().unwrap().get_mut(&agent).unwrap()[0].queued_at = original_time.into();
+    assert!(!svc.has_user_origin_ready_since(&agent, archived_at));
+    let merged = enqueue(&svc, &agent, "a2", "a", "after archive");
+    assert_eq!(merged.id, first.id);
+    assert_eq!(merged.queued_at, original_time);
+    assert!(
+        svc.has_user_origin_ready_since(&agent, archived_at),
+        "fresh appended human input must release the archive park"
+    );
+    svc.persist_queue_snapshot(&agent).await;
+    let restarted = Services::new(svc.store.clone());
+    restarted.rehydrate_agent_queues().await.unwrap();
+    assert!(restarted.has_user_origin_ready_since(&agent, archived_at));
+    assert_eq!(
+        restarted.queue_snapshot(&agent)[0]["queuedAt"],
+        original_time
+    );
+}
+
+#[tokio::test]
+async fn queue_merge_second_editor_rebased_acquisition_conflicts_without_duplication() {
+    for (later_append, draft) in [
+        (false, "edited one"),
+        (true, "edited one"),
+        (false, "one"),
+        (true, "one"),
+    ] {
+        let (_tmp, svc, ws) = setup().await;
+        let agent = create_agent(&svc, &ws, "Second editor").await;
+        enqueue(&svc, &agent, "a1", "a", "one");
+        svc.agent_edit_queued_message_op(agent.clone(), "a1".into(), "one".into(), Some(true))
+            .await
+            .unwrap();
+        enqueue(&svc, &agent, "a2", "a", "two");
+        let second_baseline = "one\n\ntwo";
+        if later_append {
+            enqueue(&svc, &agent, "a3", "a", "three");
+        }
+        let before = svc.queue_snapshot(&agent);
+        let result = svc
+            .agent_edit_queued_message_op(
+                agent.clone(),
+                "a1".into(),
+                second_baseline.into(),
+                Some(true),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(Error::InvalidParams(ref message)) if message.starts_with("queued edit conflict:")),
+            "an ambiguous second baseline must not acquire the shared hold: {result:?}"
+        );
+        assert_eq!(svc.queue_snapshot(&agent), before);
+        // Identical text is a valid additional submission, not a dedup hint.
+        enqueue(&svc, &agent, "a4", "a", "two");
+        let saved = svc
+            .agent_edit_queued_message_op(agent, "a1".into(), draft.into(), Some(false))
+            .await
+            .unwrap();
+        assert_eq!(
+            saved["queuedMessage"]["content"],
+            if later_append {
+                format!("{draft}\n\ntwo\n\nthree\n\ntwo")
+            } else {
+                format!("{draft}\n\ntwo\n\ntwo")
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn queue_merge_archive_signal_survives_handback_and_ignores_retry_and_automation() {
+    for handback in [false, true] {
+        let (_tmp, svc, ws) = setup().await;
+        let agent = create_agent(&svc, &ws, "Archive signal").await;
+        enqueue(&svc, &agent, "a1", "a", "before archive");
+        svc.agent_queues.lock().unwrap().get_mut(&agent).unwrap()[0].queued_at =
+            "2000-01-01T00:00:00Z".into();
+        svc.enqueue_message(
+            &agent,
+            "automatic".into(),
+            None,
+            None,
+            Some(json!({"source":"system","latest_human_submission_at":"2099-01-01T00:00:00Z"})),
+            None,
+            false,
+            MessageOrigin::Automatic,
+        );
+        assert!(!svc.has_user_origin_ready_since(&agent, "2001-01-01T00:00:00Z"));
+        let popped = handback.then(|| svc.dequeue_message_draining_provisional(&agent).unwrap());
+        enqueue(&svc, &agent, "a2", "a", "after archive");
+        if let Some((entry, guard)) = popped {
+            svc.requeue_front(&agent, entry);
+            drop(guard);
+        }
+        let row = svc.find_queued_message(&agent, "a1").unwrap();
+        assert_eq!(row.content, "before archive\n\nafter archive");
+        assert_eq!(row.queued_at, "2000-01-01T00:00:00Z");
+        assert!(svc.has_user_origin_ready_since(&agent, "2001-01-01T00:00:00Z"));
+        assert!(row.to_value(0).get("latest_human_submission_at").is_none());
+        // Simulate another archive after both contributions. Retrying an old
+        // absorbed request or editing its text must not count as fresh input.
+        {
+            let mut queues = svc.agent_queues.lock().unwrap();
+            let row = queues
+                .get_mut(&agent)
+                .unwrap()
+                .iter_mut()
+                .find(|m| m.id == "a1")
+                .unwrap();
+            row.latest_human_submission_at = Some("2002-01-01T00:00:00Z".into());
+        }
+        enqueue(&svc, &agent, "a2", "a", "retry");
+        svc.agent_edit_queued_message_op(agent.clone(), "a1".into(), "edited".into(), None)
+            .await
+            .unwrap();
+        assert!(!svc.has_user_origin_ready_since(&agent, "2003-01-01T00:00:00Z"));
+        svc.persist_queue_snapshot(&agent).await;
+        let restarted = Services::new(svc.store.clone());
+        restarted.rehydrate_agent_queues().await.unwrap();
+        assert!(restarted.has_user_origin_ready_since(&agent, "2001-01-01T00:00:00Z"));
+        assert!(!restarted.has_user_origin_ready_since(&agent, "2003-01-01T00:00:00Z"));
+        restarted
+            .agent_queues
+            .lock()
+            .unwrap()
+            .get_mut(&agent)
+            .unwrap()
+            .iter_mut()
+            .find(|m| m.id == "a1")
+            .unwrap()
+            .latest_human_submission_at = Some("invalid".into());
+        assert!(!restarted.has_user_origin_ready_since(&agent, "1999-01-01T00:00:00Z"));
+    }
+}
+
+#[tokio::test]
+async fn queue_merge_second_editor_uses_updated_held_baseline_with_prefix_and_suffix() {
+    let (_tmp, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Held baseline update").await;
+    enqueue(&svc, &agent, "a1", "a", "prefix");
+    let (popped, guard) = svc.dequeue_message_draining_provisional(&agent).unwrap();
+    enqueue(&svc, &agent, "a2", "a", "draft");
+    svc.agent_edit_queued_message_op(agent.clone(), "a2".into(), "draft".into(), Some(true))
+        .await
+        .unwrap();
+    svc.requeue_front(&agent, popped);
+    drop(guard);
+    enqueue(&svc, &agent, "a3", "a", "suffix");
+    svc.agent_edit_queued_message_op(agent.clone(), "a2".into(), "updated".into(), None)
+        .await
+        .unwrap();
+    let before = svc.queue_snapshot(&agent);
+    for invalid in ["draft", "prefix\n\nupdated\n\nsuffix", "prefix\n\ndraft"] {
+        assert!(
+            matches!(svc.agent_edit_queued_message_op(agent.clone(), "a2".into(), invalid.into(), Some(true)).await, Err(Error::InvalidParams(message)) if message.starts_with("queued edit conflict:"))
+        );
+        assert_eq!(svc.queue_snapshot(&agent), before);
+    }
+    svc.agent_edit_queued_message_op(agent.clone(), "a2".into(), "updated".into(), Some(true))
+        .await
+        .unwrap();
+    let saved = svc
+        .agent_edit_queued_message_op(agent, "a2".into(), "final".into(), Some(false))
+        .await
+        .unwrap();
+    assert_eq!(
+        saved["queuedMessage"]["content"],
+        "prefix\n\nfinal\n\nsuffix"
+    );
 }
