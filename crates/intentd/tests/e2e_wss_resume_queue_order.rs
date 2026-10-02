@@ -31,6 +31,7 @@ use rustls::crypto::CryptoProvider;
 use rustls::{ClientConfig, DigitallySignedStruct};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
@@ -39,9 +40,11 @@ use tokio_tungstenite::WebSocketStream;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
+const GUEST_TOKEN: &str = "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef";
+
 const START_MSG: &str = "Start the long-running task";
 const QUEUED_ONE: &str = "preserved queue message one";
-const QUEUED_TWO: &str = "preserved queue message two";
+const QUEUED_TWO: &str = "Message from @guest\n\npreserved queue message two";
 /// Stable prefix of the continuation wording in
 /// `Services::resume_interrupted_agent` — the delivered message embeds a
 /// per-resume humanized outage duration, so asserts match on this prefix.
@@ -232,6 +235,51 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)], resume_all: 
     cmd.spawn().expect("spawn intentd serve")
 }
 
+async fn seed_workspace_with_guest(data_dir: &Path) -> (String, intent_core::Principal) {
+    use intent_core::{now_iso, Principal, PrincipalId, WorkspaceId, WorkspaceRole};
+    use intent_store::Store;
+    let store = Store::open(&data_dir.join("intentd.db"))
+        .await
+        .expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&workspace_seed(&ws))
+        .await
+        .expect("insert ws");
+    let guest = Principal {
+        id: PrincipalId::new(),
+        identity: None,
+        github_user_id: None,
+        login: Some("guest".to_string()),
+        display_name: Some("Guest User".to_string()),
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    store
+        .upsert_principal(&guest)
+        .await
+        .expect("guest principal");
+    let token_hash =
+        Sha256::digest(GUEST_TOKEN.as_bytes())
+            .iter()
+            .fold(String::new(), |mut s, b| {
+                use std::fmt::Write as _;
+                let _ = write!(s, "{b:02x}");
+                s
+            });
+    store
+        .insert_principal_credential(&guest.id, &token_hash)
+        .await
+        .expect("guest credential");
+    store
+        .add_workspace_member(&ws, &guest.id, WorkspaceRole::Collaborator)
+        .await
+        .expect("guest membership");
+    (ws.0, guest)
+}
+
 fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
     use intent_core::{now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus};
     let ts = now_iso();
@@ -362,19 +410,7 @@ async fn interrupt_midturn_with_queued_messages(data_dir: &Path, script: &str) -
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon1 did not start");
 
-    let ws_id = {
-        use intent_core::WorkspaceId;
-        use intent_store::Store;
-        let store = Store::open(&data_dir.join("intentd.db"))
-            .await
-            .expect("open store");
-        let ws = WorkspaceId::new();
-        store
-            .insert_workspace(&workspace_seed(&ws))
-            .await
-            .expect("insert ws");
-        ws.0
-    };
+    let (ws_id, _guest) = seed_workspace_with_guest(data_dir).await;
 
     let create_result = uds_rpc(
         &socket,
@@ -428,8 +464,7 @@ async fn interrupt_midturn_with_queued_messages(data_dir: &Path, script: &str) -
     }
     assert!(active, "agent never reached active mid-turn state");
 
-    // Queue a human message and a system notice behind the parked turn.
-    // Different origins preserve two entries for the FIFO recovery assertions.
+    // Distinct human authors retain two rows for FIFO recovery assertions.
     let q1 = uds_rpc(
         &socket,
         4,
@@ -438,14 +473,20 @@ async fn interrupt_midturn_with_queued_messages(data_dir: &Path, script: &str) -
     )
     .await;
     assert_eq!(q1["result"]["success"], json!(true), "queue one: {q1}");
-    let q2 = uds_rpc(
-        &socket,
+    let status = common::await_wss_status(&socket).await;
+    let fp = status["result"]["fingerprint"].as_str().unwrap();
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let url = format!("wss://localhost:{port}/ws?token={GUEST_TOKEN}");
+    let mut guest_rpc =
+        common::wss_connect_with_retry(port, Arc::new(client_config(fp)), &url).await;
+    let q2 = wss_rpc(
+        &mut guest_rpc,
         5,
         "agent.queueMessage",
-        json!({ "agentId": agent_id, "content": QUEUED_TWO, "messageMetadata": {"source":"system"} }),
+        json!({"agentId":agent_id,"content":QUEUED_TWO}),
     )
     .await;
-    assert_eq!(q2["result"]["success"], json!(true), "queue two: {q2}");
+    assert_eq!(q2["success"], json!(true), "queue two: {q2}");
 
     let queue = uds_rpc(&socket, 6, "agent.getQueue", json!({ "agentId": agent_id })).await;
     let entries = queue["result"]["queue"].as_array().expect("queue array");

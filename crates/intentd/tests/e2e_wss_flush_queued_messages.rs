@@ -1369,7 +1369,9 @@ async fn two_members_see_shared_queue_and_flush_combines_both_over_wss() {
     .await;
     assert_eq!(
         saved["queuedMessage"]["content"],
-        format!("{OWNER_QUEUED}\n\nheld append")
+        format!(
+            "{OWNER_QUEUED}\n\nsecond owner submission\n\nbusy owner submission\n\nheld append"
+        )
     );
     // Restore the text so the existing full drain assertions stay precise.
     wss_rpc(

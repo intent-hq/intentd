@@ -33676,6 +33676,8 @@ async fn requeued_after_failure_marker_surfaces_in_queue_snapshot() {
         child_agent_id: None,
         merged_submission_ids: Vec::new(),
         edit_appended: String::new(),
+        edit_prepended: String::new(),
+        submission_order: 0,
     };
 
     svc.requeue_front(&id, queued);
@@ -34256,6 +34258,8 @@ async fn turn_id_fresh_enqueue_identity_and_restart_round_trip() {
             child_agent_id: None,
             merged_submission_ids: Vec::new(),
             edit_appended: String::new(),
+            edit_prepended: String::new(),
+            submission_order: 0,
         },
     );
     svc.publish_queue_updated(&id).await;
@@ -34708,6 +34712,8 @@ fn parked_entry(id: &str, content: &str) -> crate::agent_ops::QueuedMessage {
         child_agent_id: None,
         merged_submission_ids: Vec::new(),
         edit_appended: String::new(),
+        edit_prepended: String::new(),
+        submission_order: 0,
     }
 }
 

@@ -195,6 +195,10 @@ pub enum QueueAttribution {
 /// non-object metadata reads as human (a legacy typed message).
 #[must_use]
 pub fn is_human_authored_metadata(message_metadata: Option<&serde_json::Value>) -> bool {
+    // The daemon's authenticated stamp takes precedence over client labels.
+    if crate::lift_from_principal_id(message_metadata).is_some() {
+        return true;
+    }
     let Some(serde_json::Value::Object(obj)) = message_metadata else {
         return true;
     };

@@ -406,3 +406,173 @@ async fn queue_merge_interrupt_retains_position_and_carryover() {
         Some(json!([{"imageRef":"carryover"}]))
     );
 }
+
+#[tokio::test]
+async fn queue_merge_provisional_handback_coalesces_newer_held_input() {
+    for batch in [false, true] {
+        let (_tmp, svc, ws) = setup().await;
+        let agent = create_agent(&svc, &ws, "Handback").await;
+        let first = enqueue(&svc, &agent, "first", "a", "one");
+        let (mut popped, draining) = svc.dequeue_message_draining_provisional(&agent).unwrap();
+        popped.image_blocks = Some(json!([{"imageRef":"first"}]));
+        let (newer, _) = svc.enqueue_message_with_id(
+            &agent,
+            Some("second".into()),
+            "two".into(),
+            Some(json!([{"imageRef":"second"}])),
+            None,
+            Some(json!({"fromPrincipalId":"a"})),
+            None,
+            false,
+            MessageOrigin::User,
+        );
+        svc.mark_parked_recovery_send(&agent, newer.id.clone());
+        svc.agent_edit_queued_message_op(agent.clone(), newer.id.clone(), "two".into(), Some(true))
+            .await
+            .unwrap();
+        if batch {
+            svc.requeue_front_batch(&agent, vec![popped]);
+        } else {
+            svc.requeue_front(&agent, popped);
+        }
+        drop(draining);
+        let queue = svc.queue_snapshot(&agent);
+        assert_eq!(queue.len(), 1, "undelivered handback must coalesce");
+        assert_eq!(queue[0]["id"], first.id);
+        assert_eq!(queue[0]["content"], "one\n\ntwo");
+        assert_eq!(queue[0]["editing"], true);
+        assert_eq!(
+            queue[0]["imageBlocks"],
+            json!([{"imageRef":"first"},{"imageRef":"second"}])
+        );
+        assert!(matches!(
+            svc.claim_parked_recovery_send(&agent),
+            RecoverySendClaim::Deferred
+        ));
+        let saved = svc
+            .agent_edit_queued_message_op(agent.clone(), newer.id, "edited two".into(), Some(false))
+            .await
+            .unwrap();
+        assert_eq!(saved["queuedMessage"]["content"], "one\n\nedited two");
+        assert_eq!(
+            enqueue(&svc, &agent, "second", "a", "two").content,
+            "one\n\nedited two"
+        );
+        let RecoverySendClaim::Drained(pair) = svc.claim_parked_recovery_send(&agent) else {
+            panic!("absorbed recovery id must still authorize the survivor")
+        };
+        assert_eq!(pair.0.id, first.id);
+    }
+}
+
+#[tokio::test]
+async fn queue_merge_handback_keeps_persisted_and_foreign_author_barriers() {
+    for persisted in [false, true] {
+        let (_tmp, svc, ws) = setup().await;
+        let agent = create_agent(&svc, &ws, "Handback barriers").await;
+        enqueue(&svc, &agent, "first", "a", "one");
+        let mut popped = svc.dequeue_message(&agent).unwrap();
+        popped.persisted = persisted;
+        if !persisted {
+            enqueue(&svc, &agent, "other", "b", "barrier");
+        }
+        enqueue(&svc, &agent, "second", "a", "two");
+        svc.requeue_front(&agent, popped);
+        assert_eq!(
+            svc.queue_snapshot(&agent).len(),
+            if persisted { 2 } else { 3 }
+        );
+    }
+}
+
+#[tokio::test]
+async fn queue_merge_reaffirmed_edit_hold_preserves_appends_on_save_and_cancel() {
+    for draft in ["one", "edited"] {
+        let (_tmp, svc, ws) = setup().await;
+        let agent = create_agent(&svc, &ws, "Hold").await;
+        enqueue(&svc, &agent, "first", "a", "one");
+        svc.agent_edit_queued_message_op(agent.clone(), "first".into(), "one".into(), Some(true))
+            .await
+            .unwrap();
+        enqueue(&svc, &agent, "second", "a", "two");
+        svc.agent_edit_queued_message_op(agent.clone(), "first".into(), "one".into(), Some(true))
+            .await
+            .unwrap();
+        let saved = svc
+            .agent_edit_queued_message_op(agent, "first".into(), draft.into(), Some(false))
+            .await
+            .unwrap();
+        assert_eq!(saved["queuedMessage"]["content"], format!("{draft}\n\ntwo"));
+    }
+}
+
+#[tokio::test]
+async fn queue_merge_uses_arrival_order_across_priority_handback_and_restart() {
+    for handback in [false, true] {
+        let (_tmp, svc, ws) = setup().await;
+        let agent = create_agent(&svc, &ws, "Arrival").await;
+        enqueue(&svc, &agent, "a1", "a", "one");
+        let popped = handback.then(|| svc.dequeue_message(&agent).unwrap());
+        svc.enqueue_message_with_id(
+            &agent,
+            Some("b1".into()),
+            "barrier".into(),
+            None,
+            None,
+            Some(json!({"fromPrincipalId":"b","source":"system"})),
+            None,
+            true,
+            MessageOrigin::User,
+        );
+        enqueue(&svc, &agent, "a2", "a", "two");
+        if let Some(popped) = popped {
+            svc.requeue_front(&agent, popped);
+        }
+        assert_eq!(svc.queue_snapshot(&agent).len(), 3);
+        svc.persist_queue_snapshot(&agent).await;
+        svc.agent_queues.lock().unwrap().clear();
+        svc.rehydrate_agent_queues().await.unwrap();
+        let latest = enqueue(&svc, &agent, "a3", "a", "three");
+        assert_eq!(latest.id, "a2");
+        assert_eq!(latest.content, "two\n\nthree");
+        assert_eq!(svc.queue_snapshot(&agent).len(), 3);
+    }
+}
+
+#[tokio::test]
+async fn queue_merge_authenticated_authors_override_custom_metadata_labels() {
+    let (_tmp, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Identity").await;
+    enqueue(&svc, &agent, "first", "a", "one");
+    let (merged, _) = svc.enqueue_message_with_id(
+        &agent,
+        Some("second".into()),
+        "two".into(),
+        None,
+        None,
+        Some(json!({"fromPrincipalId":"a","type":"custom"})),
+        None,
+        false,
+        MessageOrigin::User,
+    );
+    assert_eq!(merged.id, "first");
+    assert_eq!(merged.content, "one\n\ntwo");
+    let automatic = crate::principal_ops::strip_principal_attribution(Some(
+        json!({"fromPrincipalId":"a","source":"system"}),
+    ));
+    svc.enqueue_message(
+        &agent,
+        "automatic".into(),
+        None,
+        None,
+        automatic,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
+    assert_eq!(
+        enqueue(&svc, &agent, "third", "a", "three").content,
+        "one\n\ntwo\n\nthree"
+    );
+    assert_eq!(svc.queue_snapshot(&agent).len(), 2);
+}

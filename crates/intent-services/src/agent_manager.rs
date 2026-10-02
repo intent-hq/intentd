@@ -498,6 +498,7 @@ pub struct TurnOptions {
     pub queued_at: Option<String>,
     /// Submission IDs absorbed by a queued row, retained through failed drains.
     pub queued_submission_ids: Vec<String>,
+    pub queued_submission_order: u64,
     /// STAB-114 / monorepo#1014: text of the user message preempted by a
     /// zero-output interrupt, delivered AHEAD of this turn's own `content` in
     /// the SAME `session/prompt` so both messages are honored in order.
@@ -605,6 +606,7 @@ fn turn_options_for_entry(entry: &QueuedMessage, stale: bool) -> TurnOptions {
         suppress_report_clear: stale,
         queued_at: Some(entry.queued_at.clone()),
         queued_submission_ids: entry.submission_ids(),
+        queued_submission_order: entry.submission_order,
         prepend_content: entry.prepend_content.clone(),
         prepend_image_blocks: entry.prepend_image_blocks.clone(),
         prepend_file_blocks: entry.prepend_file_blocks.clone(),
@@ -6690,6 +6692,13 @@ impl AgentManager {
                 )));
             }
         }
+        if options.queued_submission_order == 0 {
+            options.queued_submission_order = self
+                .services
+                .queue_submission_order
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+        }
         // A2A sender header (intent-hq/intent#3721, monorepo#1015): the runtime front door — gated
         // on the daemon-stamped `fromAgentId`, applied BEFORE every branch
         // below (quarantine/archived/hold parks, busy enqueue, direct
@@ -7514,6 +7523,7 @@ impl AgentManager {
             suppress_report_clear: stale,
             queued_at: Some(next.queued_at.clone()),
             queued_submission_ids: next.submission_ids(),
+            queued_submission_order: next.submission_order,
             prepend_content: next.prepend_content.clone(),
             prepend_image_blocks: next.prepend_image_blocks.clone(),
             prepend_file_blocks: next.prepend_file_blocks.clone(),
@@ -7678,6 +7688,7 @@ impl AgentManager {
             suppress_report_clear: stale,
             queued_at: Some(entry.queued_at.clone()),
             queued_submission_ids: entry.submission_ids(),
+            queued_submission_order: entry.submission_order,
             prepend_content: entry.prepend_content.clone(),
             prepend_image_blocks: entry.prepend_image_blocks.clone(),
             prepend_file_blocks: entry.prepend_file_blocks.clone(),
@@ -7699,8 +7710,7 @@ impl AgentManager {
             // entry user-origin so the winner's end-of-turn drain keeps its
             // user-origin semantics (attention clear, archived exemption).
             entry.user_origin = true;
-            let restored = entry.to_value(0);
-            self.services.requeue_front(&agent_id, entry);
+            let restored = self.services.requeue_front(&agent_id, entry).to_value(0);
             drop(draining);
             self.services.publish_queue_updated(&agent_id).await;
             #[cfg(test)]
@@ -11913,6 +11923,7 @@ async fn run_message_worker(
                 suppress_report_clear: stale,
                 queued_at: Some(next.queued_at.clone()),
                 queued_submission_ids,
+                queued_submission_order: next.submission_order,
                 prepend_content: next.prepend_content.clone(),
                 prepend_image_blocks: next.prepend_image_blocks.clone(),
                 prepend_file_blocks: next.prepend_file_blocks.clone(),
@@ -12134,6 +12145,7 @@ async fn run_message_worker(
                 suppress_report_clear: stale,
                 queued_at: Some(next.queued_at.clone()),
                 queued_submission_ids,
+                queued_submission_order: next.submission_order,
                 prepend_content: next.prepend_content.clone(),
                 prepend_image_blocks: next.prepend_image_blocks.clone(),
                 prepend_file_blocks: next.prepend_file_blocks.clone(),
@@ -13385,6 +13397,8 @@ async fn publish_error_status_and_requeue(
             child_agent_id: None,
             merged_submission_ids: options.queued_submission_ids.clone(),
             edit_appended: String::new(),
+            edit_prepended: String::new(),
+            submission_order: options.queued_submission_order,
         };
         mgr.services.requeue_front(agent_id, queued);
     }

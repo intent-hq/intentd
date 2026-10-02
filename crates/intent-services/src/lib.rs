@@ -427,6 +427,7 @@ pub struct Services {
     /// live-stream coupling (flipping `queued` while a turn is mid-flight) lands
     /// with the end-to-end orchestration flow; the queue surface itself is here.
     agent_queues: Arc<Mutex<HashMap<AgentId, Vec<agent_ops::QueuedMessage>>>>,
+    queue_submission_order: Arc<AtomicU64>,
     /// Entries a drain arm has popped from `agent_queues` but whose user rows
     /// are not yet persisted (PROTOCOL §6.5 drain ordering). Client-visible
     /// snapshots ([`agent_ops::Services::queue_snapshot`]) keep listing them
@@ -1422,6 +1423,7 @@ impl Services {
             event_subscriptions: Arc::new(Mutex::new(HashMap::new())),
             event_bus: None,
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
+            queue_submission_order: Arc::new(AtomicU64::new(0)),
             draining_queue_entries: Arc::new(Mutex::new(HashMap::new())),
             draining_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             parked_recovery_sends: Arc::new(Mutex::new(HashMap::new())),
