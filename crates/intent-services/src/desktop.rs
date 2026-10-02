@@ -31,6 +31,8 @@ pub(crate) struct Runtime {
     gates: Mutex<HashMap<AgentId, Arc<tokio::sync::Mutex<()>>>>,
     #[cfg(test)]
     decision_barrier: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    #[cfg(test)]
+    action_barrier: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -718,6 +720,14 @@ impl Services {
             .get(agent)
             .ok_or_else(|| error("desktop-not-active", "Desktop control is not active"))?;
         self.desktop_validate(&live.binding).await?;
+        #[cfg(test)]
+        {
+            let barrier = self.desktop.action_barrier.lock().unwrap().take();
+            if let Some((seen, resume)) = barrier {
+                seen.notify_one();
+                resume.notified().await;
+            }
+        }
         let Phase::Active {
             session_id,
             sequence,

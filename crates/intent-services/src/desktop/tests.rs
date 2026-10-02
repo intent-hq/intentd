@@ -1530,3 +1530,59 @@ async fn workspace_desktop_cleanup_failure_preserves_sessions_and_retry_removes_
             .unwrap();
     assert_eq!(count, 0);
 }
+
+#[tokio::test]
+async fn stop_during_action_validation_never_restores_active_control() {
+    let h = Harness::new().await;
+    h.remember().await;
+    let active = h.agent("startControl", json!({})).await.unwrap();
+    let start = h
+        .executor
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|call| call["operation"] == "startControl")
+        .unwrap()
+        .clone();
+    let seen = Arc::new(tokio::sync::Notify::new());
+    let resume = Arc::new(tokio::sync::Notify::new());
+    *h.services.desktop.action_barrier.lock().unwrap() = Some((seen.clone(), resume.clone()));
+    let services = h.services.clone();
+    let workspace = h.workspace.clone();
+    let agent = h.agent.clone();
+    let action = tokio::spawn(async move {
+        intent_core::with_caller(
+            Caller::Agent { agent_id: agent },
+            services.desktop_agent_op(workspace, "type".into(), json!({"text":"stopped action"})),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), seen.notified())
+        .await
+        .unwrap();
+    let stopped = h.client("revoke", json!({"sessionId":active["sessionId"],"reason":"user_stop","stopReport":{"reportId":id(),"computerId":"physical","connectionEpoch":"epoch","stopReportToken":start["stopReportToken"]}})).await.unwrap();
+    assert_eq!(stopped, json!({"revoked":true,"reported":true}));
+    assert_eq!(h.services.desktop.state(&h.agent), DesktopState::Inactive);
+    resume.notify_one();
+    let error = action
+        .await
+        .unwrap()
+        .expect_err("Stop must reject the paused action");
+    assert_eq!(error.code, "desktop-not-active");
+    assert_eq!(error.execution.as_deref(), Some("not_started"));
+    assert_eq!(
+        h.services.desktop_current_state(&h.agent).await,
+        DesktopState::Inactive
+    );
+    assert!(
+        !h.executor.calls.lock().unwrap().iter().any(|call| matches!(
+            call["operation"].as_str(),
+            Some("prepareCommand" | "execute")
+        ))
+    );
+    let restarted = h.agent("startControl", json!({})).await.unwrap();
+    assert_eq!(restarted["alreadyGranted"], false);
+    assert_ne!(restarted["sessionId"], active["sessionId"]);
+    h.agent("endControl", json!({})).await.unwrap();
+}
