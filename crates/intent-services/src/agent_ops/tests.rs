@@ -9375,6 +9375,8 @@ async fn set_model_bare_model_with_explicit_provider_id() {
     seed_provider_path(&svc, "claude-code");
     #[cfg(unix)]
     let _cli_env = crate::test_support::installed_cli_env(tmp.path.parent().unwrap(), "claude");
+    #[cfg(not(unix))]
+    let _fixture_owner = tmp;
     // Warm caches: claude-code claims `haiku`, auggie's catalog lacks it.
     let now = crate::model_catalog::ModelCatalogCache::now_ms();
     svc.models_catalog.test_store(
