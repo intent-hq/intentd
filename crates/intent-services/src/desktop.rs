@@ -220,10 +220,28 @@ impl Services {
                     "Workspace primary assignment changed",
                 ));
             }
+            let mut invalid = Vec::new();
             for candidate in self.desktop.candidates(request_id) {
-                if self.desktop_validate(&candidate).await.is_ok() {
-                    return Ok(());
+                if self.desktop_validate(&candidate).await.is_err() {
+                    invalid.push(candidate.connection);
                 }
+            }
+            // Remove only the invalid incarnations observed in this pass.
+            // A concurrent response may already have narrowed or removed the
+            // live cohort; never restore it from the validation snapshot. Keep
+            // original_candidates intact for the final correlated event.
+            let viable = self
+                .desktop
+                .candidates
+                .lock()
+                .expect("desktop candidates")
+                .get_mut(request_id)
+                .is_some_and(|candidates| {
+                    candidates.retain(|candidate| !invalid.contains(&candidate.connection));
+                    !candidates.is_empty()
+                });
+            if viable {
+                return Ok(());
             }
             return Err(error(
                 "desktop-not-active",
@@ -944,6 +962,7 @@ impl Services {
                 .desktop
                 .get(&live.binding.agent_id)
                 .ok_or_else(|| error("desktop-stale-request", "Desktop request was withdrawn"))?;
+            self.desktop_validate_live(&live).await?;
             let candidates = self.desktop.candidates(&request);
             let binding = candidates
                 .iter()
@@ -955,7 +974,6 @@ impl Services {
                         "Desktop request belongs to another connection or was dismissed",
                     )
                 })?;
-            self.desktop_validate_live(&live).await?;
             self.desktop_validate(&binding).await?;
             if !self
                 .session_agent_features(
