@@ -539,7 +539,8 @@ async fn monitor_restart_spawn_failure_does_not_reuse_predecessor_timing() {
     assert_eq!(result["runId"], successor["runId"]);
     assert_eq!(result["result"]["outcome"], "failed");
     assert!(result["result"].get("startedAt").is_none());
-    assert!(result["result"].get("exitCode").is_none());
+    assert_eq!(result["result"]["exitCode"], -1);
+    assert!(result["result"]["error"].is_string());
 }
 
 #[intent_test_macros::daemon_test]
