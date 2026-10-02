@@ -335,6 +335,9 @@ pub struct Store {
     /// `browser_tab_repo::DisplayedOverlay`.
     browser_tab_displayed: browser_tab_repo::DisplayedOverlay,
     #[cfg(test)]
+    desktop_delete_barrier:
+        std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<desktop_repo::DeleteBarrier>>>>,
+    #[cfg(test)]
     export_author_barrier: std::sync::Arc<
         std::sync::Mutex<Option<std::sync::Arc<transfer_authorship::ExportAuthorBarrier>>>,
     >,
@@ -382,6 +385,8 @@ impl Store {
             write_pool,
             read_pool,
             browser_tab_displayed: browser_tab_repo::DisplayedOverlay::default(),
+            #[cfg(test)]
+            desktop_delete_barrier: std::sync::Arc::default(),
             #[cfg(test)]
             export_author_barrier: std::sync::Arc::default(),
         })

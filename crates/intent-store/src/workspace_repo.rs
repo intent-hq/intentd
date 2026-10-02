@@ -806,6 +806,15 @@ impl Store {
             .await
             .map_err(|e| Error::Internal(format!("commit workspace desktop cleanup: {e}")))?;
 
+        #[cfg(test)]
+        {
+            let barrier = self.desktop_delete_barrier.lock().unwrap().clone();
+            if let Some(barrier) = barrier {
+                barrier.entered.notify_one();
+                barrier.release.notified().await;
+            }
+        }
+
         // IDs only: never hydrate sessions or their transcripts. Each session
         // uses the same bounded payload/message cleanup as agent.delete.
         while let Some(agent_id) = sqlx::query_scalar::<_, String>(
