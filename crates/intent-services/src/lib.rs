@@ -19676,6 +19676,8 @@ impl WorkspaceApi for Services {
                                 .or_else(|| metadata.get("imageBlocks").cloned())
                                 .filter(|v| !v.is_null());
                             let extra = intent_core::AgentCreateExtra {
+                                remember_specialist: agent.remember_specialist.unwrap_or(false),
+                                name_explicitly_set: agent.name_explicitly_set,
                                 provider: nonempty_owned(agent.provider),
                                 // Keep blank values: the shared create resolver
                                 // treats them as an explicit clear of defaults.

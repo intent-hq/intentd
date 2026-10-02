@@ -1365,6 +1365,10 @@ pub struct WorkspaceCreate {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct WorkspaceCreateInitialAgent {
+    /// Opt in to remembering a successful manual initial-agent selection.
+    pub remember_specialist: Option<bool>,
+    /// False marks a client-supplied name as a generated placeholder.
+    pub name_explicitly_set: Option<bool>,
     pub prompt: Option<String>,
     pub name: Option<String>,
     /// Bare model id (no `provider:` prefix — compound ids are rejected

@@ -157,3 +157,86 @@ async fn creation_preferences_survive_restart_and_rejected_requests_over_wss() {
     );
     drop(daemon);
 }
+
+#[intent_test_macros::daemon_test]
+async fn creation_preferences_workspace_initial_agent_ui_shape_over_wss() {
+    let data = temp_data_dir();
+    let env = [("INTENTD_AUTH_TOKEN", TOKEN)];
+    let _daemon = Daemon {
+        child: spawn_serve(data.path(), "both", &env),
+    };
+    let socket = data.path().join("intentd.sock");
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let mut rpc = connect_ws(
+        port,
+        client_config(status["result"]["fingerprint"].as_str().unwrap()),
+    )
+    .await;
+    for (name, explicit, remember, specialist) in [
+        ("Implementor", Some(false), true, Some("implementor")),
+        ("My initial task", None, true, Some("implementor")),
+        ("Legacy custom", None, false, Some("implementor")),
+        ("Agent", Some(false), true, None),
+    ] {
+        let mut initial =
+            json!({"name":name,"provider":"mock","model":"default","rememberSpecialist":remember});
+        if let Some(explicit) = explicit {
+            initial["nameExplicitlySet"] = json!(explicit);
+        }
+        if let Some(specialist) = specialist {
+            initial["specialist"] = json!(specialist);
+        }
+        let created = rpc_envelope(
+            &mut rpc,
+            20,
+            "workspace.create",
+            json!({"title":"Initial preference","initialAgent":initial}),
+        )
+        .await;
+        assert!(created.get("error").is_none(), "{created}");
+        assert_eq!(created["result"]["initialAgent"]["name"], name);
+        assert_eq!(
+            created["result"]["initialAgent"]["nameExplicitlySet"],
+            explicit.unwrap_or(true)
+        );
+        let ws = &created["result"]["workspace"]["id"];
+        assert!(ws.is_string(), "{created}");
+        let preferences = wss_rpc(
+            &mut rpc,
+            21,
+            "agent.getCreationPreferences",
+            json!({"workspaceId":ws}),
+        )
+        .await;
+        assert_eq!(
+            preferences,
+            if remember {
+                json!({"specialistId":specialist})
+            } else {
+                json!({})
+            }
+        );
+    }
+    let before = wss_rpc(&mut rpc, 22, "workspace.list", json!({})).await;
+    for initial in [
+        json!({"name":"Invalid specialist","specialist":"missing-specialist","rememberSpecialist":true,"nameExplicitlySet":false}),
+        json!({"name":"Bad memory flag","rememberSpecialist":"true"}),
+        json!({"name":"Bad name flag","nameExplicitlySet":"false"}),
+    ] {
+        let failed = rpc_envelope(
+            &mut rpc,
+            23,
+            "workspace.create",
+            json!({"title":"Rejected preference","initialAgent":initial}),
+        )
+        .await;
+        assert_eq!(failed["error"]["code"], -32602, "{failed}");
+    }
+    let after = wss_rpc(&mut rpc, 24, "workspace.list", json!({})).await;
+    assert_eq!(
+        before, after,
+        "rejected initial-agent plans must leave no workspace"
+    );
+}

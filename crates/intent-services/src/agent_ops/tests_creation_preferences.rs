@@ -439,3 +439,36 @@ async fn creation_preferences_welcome_renames_only_generated_placeholders() {
         );
     }
 }
+
+#[intent_test_macros::daemon_test]
+async fn creation_preferences_initial_agent_plan_preserves_opt_in_and_name_provenance() {
+    let (tmp, svc, _ws) = setup().await;
+    let svc = svc.with_workspaces_root(tmp.path.parent().unwrap().join("workspaces"));
+    let created = svc
+        .create_workspace(
+            intent_core::WorkspaceCreate {
+                title: Some("Initial choice".into()),
+                initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
+                    name: Some("Implementor".into()),
+                    specialist: Some("implementor".into()),
+                    remember_specialist: Some(true),
+                    name_explicitly_set: Some(false),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        created.initial_agent.as_ref().unwrap()["nameExplicitlySet"],
+        false
+    );
+    assert_eq!(
+        svc.agent_get_creation_preferences(created.workspace.id)
+            .await
+            .unwrap(),
+        json!({"specialistId":"implementor"})
+    );
+}
