@@ -427,6 +427,88 @@ async fn monitor_cancel_before_spawn_reserves_outcome_against_deadline() {
 }
 
 #[intent_test_macros::daemon_test]
+async fn monitor_restart_cancel_before_spawn_does_not_reuse_predecessor_timing() {
+    let h = harness().await;
+    let owner = monitor_owner(&h, "owner").await;
+    let id = create_simple(&h, "controlled", "read value", ScriptMode::Command).await;
+    let mut sub = subscribe(&h);
+    let prior = h
+        .services
+        .script_start(h.ws.clone(), id.clone())
+        .await
+        .unwrap();
+    await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+    let old = h
+        .services
+        .script_status(h.ws.clone(), id.clone())
+        .await
+        .unwrap();
+    assert!(old["startedAt"].is_string());
+    let now = chrono::Utc::now().timestamp_millis() + 60000;
+    let clock = Arc::new(std::sync::atomic::AtomicI64::new(now));
+    let park = Arc::new(SupervisePark::default());
+    let mut mgr = h.services.script_manager();
+    mgr.parks.before_spawn = Some(park.clone());
+    mgr.parks.monitor_clock = Some(clock.clone());
+    let successor = mgr.restart(&h.ws, &id).await.unwrap();
+    assert_ne!(successor["runId"], prior["runId"]);
+    tokio::time::timeout(LIVENESS, park.entered.notified())
+        .await
+        .unwrap();
+    let row = mgr
+        .monitor(&h.ws, &owner, &id, json!({"ttlMs":1000}))
+        .await
+        .unwrap()["monitor"]
+        .clone();
+    let mid = row["monitorId"].as_str().unwrap().to_owned();
+    let stop_mgr = mgr.clone();
+    let ws = h.ws.clone();
+    let stop_mid = mid.clone();
+    let stopped =
+        tokio::spawn(async move { stop_mgr.cancel_monitor(&ws, &stop_mid, None, true).await });
+    tokio::time::timeout(LIVENESS, async {
+        loop {
+            if h.services
+                .store
+                .pending_script_monitors()
+                .await
+                .unwrap()
+                .iter()
+                .any(|(row, reserved)| row.monitor_id == mid && *reserved)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    clock.store(now + 1000, Ordering::SeqCst);
+    mgr.reconcile_monitor(&h.ws, &mid).await.unwrap();
+    assert_eq!(
+        h.services
+            .store
+            .script_monitor(&h.ws, &mid)
+            .await
+            .unwrap()
+            .state,
+        "active"
+    );
+    park.release.notify_one();
+    let result = tokio::time::timeout(LIVENESS, stopped)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(result["runStopped"], true);
+    assert_eq!(result["monitor"]["runId"], successor["runId"]);
+    assert_ne!(result["monitor"]["runId"], prior["runId"]);
+    assert_eq!(result["monitor"]["result"]["outcome"], "cancelled");
+    assert!(result["monitor"]["result"].get("startedAt").is_none());
+    assert!(result["monitor"]["result"].get("exitCode").is_none());
+}
+
+#[intent_test_macros::daemon_test]
 async fn monitor_recovery_prior_result_deadline_interruption_and_cancel_intent() {
     for scenario in ["result", "deadline", "interrupted", "cancel-intent"] {
         let h = harness().await;
@@ -817,68 +899,172 @@ async fn monitor_cancel_terminal_write_failure_reconciles_reserved_result() {
 
 #[intent_test_macros::daemon_test]
 async fn monitor_transfer_round_trip_preserves_deadline_outbox_and_reimport_fences() {
-    for scenario in ["active", "deadline", "result", "pending", "delivered", "cancelled"] {
+    for scenario in [
+        "active",
+        "deadline",
+        "result",
+        "pending",
+        "delivered",
+        "cancelled",
+    ] {
         let h = harness().await;
         let owner = monitor_owner(&h, "transferred owner").await;
         let id = create_simple(&h, "source service", "read value", ScriptMode::Service).await;
-        h.services.store.admit_script_run(&h.ws, &id, "source-run").await.unwrap();
+        h.services
+            .store
+            .admit_script_run(&h.ws, &id, "source-run")
+            .await
+            .unwrap();
         let now = chrono::Utc::now().timestamp_millis() + 60_000;
         let mut source = h.services.script_manager();
         source.parks.monitor_clock = Some(Arc::new(std::sync::atomic::AtomicI64::new(now)));
-        let registered = source.monitor(&h.ws, &owner, &id,
-            json!({"ttlMs":1000,"outputPattern":"ready","lineCount":2})).await.unwrap();
-        let mut original: intent_core::ScriptMonitor = serde_json::from_value(registered["monitor"].clone()).unwrap();
+        let registered = source
+            .monitor(
+                &h.ws,
+                &owner,
+                &id,
+                json!({"ttlMs":1000,"outputPattern":"ready","lineCount":2}),
+            )
+            .await
+            .unwrap();
+        let mut original: intent_core::ScriptMonitor =
+            serde_json::from_value(registered["monitor"].clone()).unwrap();
         if scenario == "result" {
-            h.services.store.settle_script_run(&h.ws, &id, "source-run", &intent_core::ScriptLastRun {
-                run_id: Some("source-run".into()), outcome: intent_core::ScriptRunOutcome::Succeeded,
-                exit_code: Some(0), started_at: None, stopped_at: now_iso(), error: None,
-            }, false).await.unwrap();
+            h.services
+                .store
+                .settle_script_run(
+                    &h.ws,
+                    &id,
+                    "source-run",
+                    &intent_core::ScriptLastRun {
+                        run_id: Some("source-run".into()),
+                        outcome: intent_core::ScriptRunOutcome::Succeeded,
+                        exit_code: Some(0),
+                        started_at: None,
+                        stopped_at: now_iso(),
+                        error: None,
+                    },
+                    false,
+                )
+                .await
+                .unwrap();
         }
         if matches!(scenario, "pending" | "delivered" | "cancelled") {
-            original.state = if scenario == "cancelled" { "cancelled" } else { "expired" }.into();
-            original.reason = Some(if scenario == "cancelled" { "cancelled" } else { "ttl-expired" }.into());
+            original.state = if scenario == "cancelled" {
+                "cancelled"
+            } else {
+                "expired"
+            }
+            .into();
+            original.reason = Some(
+                if scenario == "cancelled" {
+                    "cancelled"
+                } else {
+                    "ttl-expired"
+                }
+                .into(),
+            );
             original.settled_at = Some(now_iso());
-            h.services.store.settle_script_monitor(&original).await.unwrap();
-            if scenario == "delivered" { h.services.dispatch_script_monitor(&original).await; }
+            h.services
+                .store
+                .settle_script_monitor(&original)
+                .await
+                .unwrap();
+            if scenario == "delivered" {
+                h.services.dispatch_script_monitor(&original).await;
+            }
         }
         let rows = h.services.store.transfer_export_rows(&h.ws).await.unwrap();
         let db = TempDb::new();
         let store = Store::open(&db.path).await.unwrap();
         store.transfer_import_rows(&rows).await.unwrap();
-        assert_eq!(store.script_monitor(&h.ws, &original.monitor_id).await.unwrap(), original);
+        assert_eq!(
+            store
+                .script_monitor(&h.ws, &original.monitor_id)
+                .await
+                .unwrap(),
+            original
+        );
         let target = Services::new(store.clone());
         let mut manager = target.script_manager();
         manager.parks.monitor_clock = Some(Arc::new(std::sync::atomic::AtomicI64::new(
-            now + if matches!(scenario, "deadline" | "result") { 1000 } else { 0 })));
+            now + if matches!(scenario, "deadline" | "result") {
+                1000
+            } else {
+                0
+            },
+        )));
         manager.recover_monitors().await.unwrap();
         manager.refresh_imported(&h.ws, &id).await.unwrap();
-        let settled = store.script_monitor(&h.ws, &original.monitor_id).await.unwrap();
+        let settled = store
+            .script_monitor(&h.ws, &original.monitor_id)
+            .await
+            .unwrap();
         assert_eq!(settled.expires_at, original.expires_at);
         assert_eq!(settled.run_id, "source-run");
         assert_eq!(settled.agent_id, owner);
         match scenario {
-            "active" => assert_eq!(settled.result.as_ref().unwrap().outcome, intent_core::ScriptRunOutcome::Interrupted),
-            "result" => assert_eq!(settled.result.as_ref().unwrap().outcome, intent_core::ScriptRunOutcome::Succeeded),
+            "active" => assert_eq!(
+                settled.result.as_ref().unwrap().outcome,
+                intent_core::ScriptRunOutcome::Interrupted
+            ),
+            "result" => assert_eq!(
+                settled.result.as_ref().unwrap().outcome,
+                intent_core::ScriptRunOutcome::Succeeded
+            ),
             "deadline" => assert_eq!(settled.state, "expired"),
             _ => assert_eq!(settled, original),
         }
-        assert_eq!(target.pty().count(), 0, "transfer never adopts or starts a source process");
-        assert_eq!(target.script_status(h.ws.clone(), id.clone()).await.unwrap()["runId"], "source-run");
+        assert_eq!(
+            target.pty().count(),
+            0,
+            "transfer never adopts or starts a source process"
+        );
+        assert_eq!(
+            target
+                .script_status(h.ws.clone(), id.clone())
+                .await
+                .unwrap()["runId"],
+            "source-run"
+        );
         target.dispatch_script_monitor(&settled).await;
         target.dispatch_script_monitor(&settled).await;
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_message WHERE id=?")
-            .bind(format!("script-monitor:{}", original.monitor_id)).fetch_one(store.read_pool()).await.unwrap();
+            .bind(format!("script-monitor:{}", original.monitor_id))
+            .fetch_one(store.read_pool())
+            .await
+            .unwrap();
         assert_eq!(count, i64::from(scenario != "cancelled"), "{scenario}");
-        sqlx::query("DELETE FROM workspace WHERE id=?").bind(h.ws.as_str()).execute(store.write_pool()).await.unwrap();
+        sqlx::query("DELETE FROM workspace WHERE id=?")
+            .bind(h.ws.as_str())
+            .execute(store.write_pool())
+            .await
+            .unwrap();
         store.transfer_import_rows(&rows).await.unwrap();
         manager.recover_monitors().await.unwrap();
-        let retained = store.script_monitor(&h.ws, &original.monitor_id).await.unwrap();
-        assert_ne!(retained.state, "active", "reimport cannot revive a deleted watch");
-        assert!(!store.script_monitor_wake_allowed(&original.monitor_id).await.unwrap());
+        let retained = store
+            .script_monitor(&h.ws, &original.monitor_id)
+            .await
+            .unwrap();
+        assert_ne!(
+            retained.state, "active",
+            "reimport cannot revive a deleted watch"
+        );
+        assert!(!store
+            .script_monitor_wake_allowed(&original.monitor_id)
+            .await
+            .unwrap());
         target.dispatch_script_monitor(&retained).await;
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_message WHERE id=?")
-            .bind(format!("script-monitor:{}", original.monitor_id)).fetch_one(store.read_pool()).await.unwrap();
-        assert_eq!(count, i64::from(scenario == "delivered"), "only exported history returns: {scenario}");
+            .bind(format!("script-monitor:{}", original.monitor_id))
+            .fetch_one(store.read_pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            count,
+            i64::from(scenario == "delivered"),
+            "only exported history returns: {scenario}"
+        );
     }
 }
 
@@ -887,25 +1073,61 @@ async fn monitor_export_defers_delivery_and_queue_drain_until_abort() {
     let h = harness().await;
     let owner = monitor_owner(&h, "export owner").await;
     let id = create_simple(&h, "source command", "true", ScriptMode::Command).await;
-    h.services.store.admit_script_run(&h.ws, &id, "source-run").await.unwrap();
-    let registered = h.services.script_manager().monitor(&h.ws, &owner, &id, json!({"ttlMs":60_000})).await.unwrap();
-    let mut row: intent_core::ScriptMonitor = serde_json::from_value(registered["monitor"].clone()).unwrap();
-    row.state = "expired".into(); row.reason = Some("ttl-expired".into()); row.settled_at = Some(now_iso());
+    h.services
+        .store
+        .admit_script_run(&h.ws, &id, "source-run")
+        .await
+        .unwrap();
+    let registered = h
+        .services
+        .script_manager()
+        .monitor(&h.ws, &owner, &id, json!({"ttlMs":60_000}))
+        .await
+        .unwrap();
+    let mut row: intent_core::ScriptMonitor =
+        serde_json::from_value(registered["monitor"].clone()).unwrap();
+    row.state = "expired".into();
+    row.reason = Some("ttl-expired".into());
+    row.settled_at = Some(now_iso());
     h.services.store.settle_script_monitor(&row).await.unwrap();
-    h.services.transfer_exports.lock().unwrap().insert("export-test".into(), crate::transfer_export::ExportSession {
-        initiator: None, workspace_id: h.ws.clone(), staging_dir: std::env::temp_dir(),
-        state: crate::transfer_export::ExportState::Building { aborted: false }, wip_paths: vec![], max_chunk_bytes: 100,
-    });
+    h.services.transfer_exports.lock().unwrap().insert(
+        "export-test".into(),
+        crate::transfer_export::ExportSession {
+            initiator: None,
+            workspace_id: h.ws.clone(),
+            staging_dir: std::env::temp_dir(),
+            state: crate::transfer_export::ExportState::Building { aborted: false },
+            wip_paths: vec![],
+            max_chunk_bytes: 100,
+        },
+    );
     h.services.dispatch_script_monitor(&row).await;
-    assert!(h.services.store.script_monitor_wake_pending(&row.monitor_id).await.unwrap());
-    let metadata = json!({"type":"script_monitor_wake","monitorId":row.monitor_id,"workspaceId":h.ws});
-    assert!(h.services.defer_script_monitor_for_export(&owner, "wake", Some(&metadata)));
+    assert!(h
+        .services
+        .store
+        .script_monitor_wake_pending(&row.monitor_id)
+        .await
+        .unwrap());
+    let metadata =
+        json!({"type":"script_monitor_wake","monitorId":row.monitor_id,"workspaceId":h.ws});
+    assert!(h
+        .services
+        .defer_script_monitor_for_export(&owner, "wake", Some(&metadata)));
     assert!(!h.services.has_ready_to_send(&owner));
     assert!(h.services.dequeue_message(&owner).is_none());
-    h.services.transfer_exports.lock().unwrap().remove("export-test");
+    h.services
+        .transfer_exports
+        .lock()
+        .unwrap()
+        .remove("export-test");
     assert!(h.services.has_ready_to_send(&owner));
     let queued = h.services.dequeue_message(&owner).unwrap();
     assert_eq!(queued.id, format!("script-monitor:{}", row.monitor_id));
     h.services.dispatch_script_monitor(&row).await;
-    assert!(!h.services.store.script_monitor_wake_pending(&row.monitor_id).await.unwrap());
+    assert!(!h
+        .services
+        .store
+        .script_monitor_wake_pending(&row.monitor_id)
+        .await
+        .unwrap());
 }
