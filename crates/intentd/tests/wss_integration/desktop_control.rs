@@ -11,6 +11,10 @@ async fn executor_reply(socket: &mut Socket, request: Value, calls: &mut Vec<Val
     assert!(p["connectionEpoch"].is_string());
     assert!(p["principalId"].is_string());
     calls.push(p.clone());
+    if p["operation"] == "execute" && calls[0]["executeFailure"] == "partial" {
+        socket.send(Message::Text(json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":-32603,"message":"Native operation failed after partial execution.","data":{"code":"desktop-execution-failed","detail":"Native operation failed after partial execution.","execution":"partial"}}}).to_string().into())).await.unwrap();
+        return;
+    }
     let display_count = calls.iter().find_map(|call| call["displayCount"].as_u64());
     if let Some(count) = display_count.filter(|_| {
         p["operation"] == "prepareCommand"
@@ -767,6 +771,7 @@ async fn wss_display_selection_errors_preserve_codes_and_do_not_execute() {
             .expect("model-visible failure");
         assert!(text.contains(expected), "{text}");
         assert!(text.contains(detail), "{text}");
+        assert!(text.contains("execution: not_started"), "{text}");
     }
     assert_eq!(
         calls
@@ -815,6 +820,40 @@ async fn wss_display_selection_errors_preserve_codes_and_do_not_execute() {
     .await
     .unwrap();
     assert_eq!(empty["displays"], json!([]));
+    calls[0]["displayCount"] = 1.into();
+    calls[0]["executeFailure"] = "partial".into();
+    let request = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"workspace_api","arguments":{"code":"return await ws.desktop.click({displayId:'d',layoutId:'l',x:0,y:0});","summary":"Verify partial desktop failure"}}});
+    let response = drive(&mut socket, bridge.handle_message(&request), &mut calls)
+        .await
+        .expect("MCP partial failure response");
+    assert_eq!(response["result"]["isError"], true, "{response}");
+    let text = response["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("desktop-execution-failed"), "{text}");
+    assert!(
+        text.contains("Native operation failed after partial execution."),
+        "{text}"
+    );
+    assert!(text.contains("execution: partial"), "{text}");
+    let executed = calls
+        .iter()
+        .filter(|call| call["operation"] == "execute")
+        .count();
+    let refused = drive(&mut socket, bridge.handle_message(&request), &mut calls)
+        .await
+        .expect("MCP inactive response");
+    assert_eq!(refused["result"]["isError"], true, "{refused}");
+    assert!(refused["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("desktop-not-active"));
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call["operation"] == "execute")
+            .count(),
+        executed,
+        "partial execution must invalidate control and never replay input"
+    );
     drive(
         &mut socket,
         intent_core::with_caller(

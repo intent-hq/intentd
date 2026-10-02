@@ -50,7 +50,11 @@ impl DesktopError {
 }
 impl std::fmt::Display for DesktopError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.code, self.detail)
+        write!(f, "{}: {}", self.code, self.detail)?;
+        if let Some(execution) = &self.execution {
+            write!(f, " (execution: {execution})")?;
+        }
+        Ok(())
     }
 }
 impl std::error::Error for DesktopError {}
@@ -218,6 +222,18 @@ pub fn validate_action(kind: &str, args: &Value) -> DesktopResult<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn model_visible_error_retains_execution_classification() {
+        for execution in ["not_started", "partial", "unknown"] {
+            let mut error =
+                DesktopError::new("desktop-execution-failed", "Native operation failed");
+            error.execution = Some(execution.into());
+            let rendered = error.to_string();
+            assert!(rendered.contains("desktop-execution-failed"));
+            assert!(rendered.contains("Native operation failed"));
+            assert!(rendered.contains(&format!("execution: {execution}")));
+        }
+    }
     use serde_json::json;
     #[test]
     fn refuses_identity_and_unknown_fields_for_every_operation() {
