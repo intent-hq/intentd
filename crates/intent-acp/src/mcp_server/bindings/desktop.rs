@@ -15,6 +15,18 @@ pub(crate) async fn dispatch(
     method: &str,
     args: &Value,
 ) -> Result<Value, String> {
+    let method = match method {
+        "startControl" => "startControl",
+        "endControl" => "endControl",
+        "listDisplay" => "listDisplay",
+        "screenshot" => "screenshot",
+        "click" => "click",
+        "type" => "type",
+        "keypress" => "keypress",
+        "scroll" => "scroll",
+        "drag" => "drag",
+        other => return Err(format!("Unknown desktop method: {other}")),
+    };
     intent_core::desktop::validate_action(method, args).map_err(|e| e.to_string())?;
     api.desktop_agent_call(workspace.clone(), method.to_string(), args.clone())
         .await

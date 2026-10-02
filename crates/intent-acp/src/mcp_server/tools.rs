@@ -140,7 +140,7 @@ Parameters:
   summary (required): Short description of what this call does, shown in the UI.
 
 Namespaces (index — full signatures in API below):
-  ws.help(namespace?) — runtime docs: ws.help() returns this index, ws.help("pr") the full pr docs
+  ws.help(namespace?) — full API docs
   ws.workspace.* — workspace info, title, status message
   ws.app.question.* — ask the user structured questions
   ws.note.* — notes; the spec is note id "spec"
@@ -153,7 +153,7 @@ Namespaces (index — full signatures in API below):
   ws.script.* — saved build/test/service scripts
   ws.host.* — host.exec = one-shot host command exec
   ws.hook.* — background watchers; can call full ws.* incl. pr.snapshot and host.exec
-  ws.desktop.* — Consent-based workspace primary desktop control
+  ws.desktop.* — desktop control
   ws.browser.* — Chrome DevTools browser automation
   ws.terminal.* — read workspace terminal output
   ws.mcp.* — external MCP tools
@@ -386,7 +386,7 @@ Parameters:
   summary (required): Short description of what this call does, shown in the UI.
 
 Namespaces (index — full signatures in API below):
-  ws.help(namespace?) — runtime docs: ws.help() returns this index, ws.help("pr") the full pr docs
+  ws.help(namespace?) — full API docs
   ws.workspace.* — workspace info, title, status message
   ws.app.* — Assistant app surface: agents, proposal, settings, specialists, ui, workspaces
   ws.app.question.* — ask the user structured questions
@@ -399,7 +399,7 @@ Namespaces (index — full signatures in API below):
   ws.event.* — activity queries + event subscriptions
   ws.script.* — saved build/test/service scripts
   ws.hook.* — background watchers; can call full ws.* incl. pr.snapshot
-  ws.desktop.* — Consent-based workspace primary desktop control
+  ws.desktop.* — desktop control
   ws.browser.* — Chrome DevTools browser automation
   ws.terminal.* — read workspace terminal output
   ws.mcp.* — external MCP tools
@@ -1333,6 +1333,7 @@ mod tests {
     const BINDINGS_CROSS_WORKSPACE: &str = include_str!("bindings/cross_workspace.rs");
     const BINDINGS_PR: &str = include_str!("bindings/pr.rs");
     const BINDINGS_BROWSER: &str = include_str!("bindings/browser.rs");
+    const BINDINGS_DESKTOP: &str = include_str!("bindings/desktop.rs");
     const BINDINGS_AGENT: &str = include_str!("bindings/agent.rs");
     const BINDINGS_EVENT: &str = include_str!("bindings/event.rs");
     const BINDINGS_GIT: &str = include_str!("bindings/git.rs");
@@ -1363,6 +1364,7 @@ mod tests {
             ("crossWorkspace", BINDINGS_CROSS_WORKSPACE),
             ("pr", BINDINGS_PR),
             ("browser", BINDINGS_BROWSER),
+            ("desktop", BINDINGS_DESKTOP),
             ("agent", BINDINGS_AGENT),
             ("event", BINDINGS_EVENT),
             ("git", BINDINGS_GIT),
@@ -2118,18 +2120,27 @@ mod tests {
         }
     }
 
-    // Size budget for the system-prompt copy: the all-defaults non-chief
-    // rendering (the common case for truncating providers) includes the
-    // retirement binding by default, adding ~330 bytes to the 22k budget.
+    // Keep the existing system-prompt budget independently of desktop control.
+    // Its nine new signatures get a bounded incremental allowance; the compact
+    // tool description itself must still fit the unchanged 2000-byte limit.
     #[test]
     fn condensed_description_size_budget() {
-        let condensed =
-            condensed_workspace_api_description(false, &AgentFeaturesSettings::default(), &[]);
-        assert!(
-            condensed.len() < 22_400,
-            "condensed all-on description is {} bytes, over the 22.4k budget",
-            condensed.len()
+        let features = AgentFeaturesSettings::default();
+        let condensed = condensed_workspace_api_description(false, &features, &[]);
+        let without_desktop = condensed_workspace_api_description(
+            false,
+            &AgentFeaturesSettings {
+                desktop_control: false,
+                ..features
+            },
+            &[],
         );
+        assert!(without_desktop.len() < 22_400);
+        assert!(
+            condensed.len() - without_desktop.len() <= 1_500,
+            "desktop signatures exceed their 1500-byte allowance"
+        );
+        assert!(condensed.len() < 23_900);
     }
 
     // `[agentFeatures]` gating composes: a disabled namespace is absent from

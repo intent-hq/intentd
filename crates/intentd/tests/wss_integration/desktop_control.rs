@@ -12,15 +12,14 @@ async fn executor_reply(socket: &mut Socket, request: Value, calls: &mut Vec<Val
     assert!(p["principalId"].is_string());
     calls.push(p.clone());
     let display_count = calls.iter().find_map(|call| call["displayCount"].as_u64());
-    if p["operation"] == "prepareCommand"
-        && display_count.is_some()
-        && matches!(
-            p["action"]["kind"].as_str(),
-            Some("screenshot" | "click" | "scroll" | "drag")
-        )
-    {
+    if let Some(count) = display_count.filter(|_| {
+        p["operation"] == "prepareCommand"
+            && matches!(
+                p["action"]["kind"].as_str(),
+                Some("screenshot" | "click" | "scroll" | "drag")
+            )
+    }) {
         let action = &p["action"];
-        let count = display_count.unwrap();
         let failure = if count == 0
             || action
                 .get("displayId")
