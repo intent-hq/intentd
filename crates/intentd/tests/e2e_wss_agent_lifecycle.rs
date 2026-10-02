@@ -19098,7 +19098,7 @@ async fn specialist_placeholder_first_message_naming_over_wss() {
     {
         let mut params = json!({
             "workspaceId": ws_id, "provider": "mock", "model": "default",
-            "specialist": "implementor",
+            "specialistId": "implementor",
         });
         if let Some(name) = name {
             params["name"] = json!(name);
