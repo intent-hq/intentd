@@ -302,6 +302,9 @@ pub fn read_live_pid(path: &Path) -> Option<nix::unistd::Pid> {
 /// On Unix the PID probe also protects older sitters that do not take the lock.
 struct PidFile {
     path: std::path::PathBuf,
+    #[cfg(unix)]
+    _lock: nix::fcntl::Flock<std::fs::File>,
+    #[cfg(not(unix))]
     _lock: std::fs::File,
 }
 
@@ -310,12 +313,18 @@ impl PidFile {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let lock = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(path.with_extension("lock"))?;
-        lock.try_lock().map_err(io::Error::from)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).truncate(false).write(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // An exclusive handle is the Windows lifetime ownership lock.
+            options.share_mode(0);
+        }
+        let lock = options.open(path.with_extension("lock"))?;
+        #[cfg(unix)]
+        let lock = nix::fcntl::Flock::lock(lock, nix::fcntl::FlockArg::LockExclusiveNonblock)
+            .map_err(|(_, error)| io::Error::from(error))?;
         #[cfg(unix)]
         {
             let contents = match std::fs::read_to_string(path) {
