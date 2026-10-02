@@ -388,6 +388,8 @@ mod tests_stab115;
 mod tests_specialist_frontmatter;
 
 #[cfg(test)]
+mod tests_creation_preferences;
+#[cfg(test)]
 mod tests_specialist_provider;
 
 #[cfg(test)]
@@ -496,6 +498,10 @@ pub(crate) struct CreateModelAndEffort {
 /// validation, and depends on the new workspace's effective auto-commit,
 /// known only once the workspace row exists.
 #[derive(Debug, Clone)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Independent creation options carried from validation to atomic persistence"
+)]
 pub(crate) struct AgentCreatePlan {
     /// Error-label method (`agent.create` / `workspace.create`) for the
     /// persist half's infrastructure failures.
@@ -517,6 +523,7 @@ pub(crate) struct AgentCreatePlan {
     pub(crate) image_blocks: Option<Value>,
     pub(crate) file_blocks: Option<Value>,
     pub(crate) is_background: bool,
+    pub(crate) remember_specialist: bool,
 }
 
 /// Why [`Services::persist_agent_create`] could not persist a planned session.
@@ -4615,19 +4622,9 @@ impl Services {
             }
             _ => None,
         };
-        // `name_explicitly_set` defaults to `name.is_some()` so an explicit
-        // `agent.create` with a client-supplied name still becomes
-        // renameable-with-guard. A specialist-derived default counts as
-        // explicitly set too — the desktop FE resolves the display name
-        // client-side and sends it as an explicit `name`, so the daemon-side
-        // derivation must survive the agent's opening-turn
-        // `ws.workspace.setAgentName` (`skipIfExplicitlySet: true`) the same
-        // way. Delegate flows override to `Some(false)` via
-        // `AgentCreateExtra.name_explicitly_set` so their task-derived name
-        // stays renameable by that opening-turn rename.
-        let name_explicitly_set = extra
-            .name_explicitly_set
-            .unwrap_or(name.is_some() || specialist_display_name.is_some());
+        // Only a caller-supplied name is explicit. A specialist display name
+        // is a generated placeholder eligible for the opening-turn rename.
+        let name_explicitly_set = extra.name_explicitly_set.unwrap_or(name.is_some());
         let name = name
             .or(specialist_display_name)
             .unwrap_or_else(|| format!("Agent {}", &Uuid::new_v4().simple().to_string()[..6]));
@@ -4638,6 +4635,7 @@ impl Services {
         // Project-tier specialist resolution reads the trusted `spec_wp`, not
         // `workspace_path`; `agent_type` and `workspace_context` remain deferred.
         let AgentCreateExtra {
+            remember_specialist,
             provider,
             reasoning_effort,
             agent_type: _,
@@ -4736,7 +4734,13 @@ impl Services {
                 spec_wp.as_deref(),
             )
             .await?;
+        let remember_specialist = remember_specialist
+            && parent_agent_id.is_none()
+            && task_note_id.is_none()
+            && !is_background
+            && !metadata.as_ref().is_some_and(is_agent_created_metadata);
         Ok(AgentCreatePlan {
+            remember_specialist,
             method,
             parent_agent_id,
             task_note_id,
@@ -4787,6 +4791,7 @@ impl Services {
             .enter(&workspace_id)
             .map_err(AgentPersistError::store)?;
         let AgentCreatePlan {
+            remember_specialist,
             method,
             parent_agent_id,
             task_note_id,
@@ -4820,6 +4825,11 @@ impl Services {
         // Unknown specialist / resolution failure writes no snapshot and
         // never fails the create; a non-object caller `metadata` is left
         // untouched.
+        // Only the daemon may classify a copied specialist body as generated.
+        // Strip caller provenance even for General agents with an override.
+        if let Some(obj) = metadata.as_mut().and_then(Value::as_object_mut) {
+            obj.remove("specialistGeneratedBehaviorPrompt");
+        }
         if let Some(spec_id) = specialist.as_deref() {
             // Both snapshot resolutions below walk the specialist tier
             // directories — blocking pool (monorepo#4148).
@@ -4848,6 +4858,7 @@ impl Services {
                         .is_some_and(|s| !s.trim().is_empty());
                     if !has_override {
                         if let Some(body) = body {
+                            obj.insert("specialistGeneratedBehaviorPrompt".into(), json!(body));
                             obj.insert("behaviorPrompt".to_string(), json!(body));
                         }
                     }
@@ -4967,7 +4978,11 @@ impl Services {
         // fallback reads; its value equals the snapshot's `taskGraph`.
         let task_graph_enabled = settings.agent_features.task_graph;
         self.store
-            .insert_agent_session_with_task_graph(&session, task_graph_enabled)
+            .insert_agent_session_with_preferences(
+                &session,
+                task_graph_enabled,
+                remember_specialist,
+            )
             .await
             .map_err(AgentPersistError::store)?;
         self.invalidate_agent_list_cache(&session.workspace_id);
@@ -5797,12 +5812,49 @@ impl Services {
     /// Emits `agent:updated` (or `agent:renamed` when `name` is the only field
     /// mutated) so subscribed clients invalidate their cached projection.
     pub(crate) async fn agent_update_op(&self, agent_id: AgentId, changes: Value) -> Result<Value> {
-        let Value::Object(obj) = changes else {
+        let Value::Object(mut obj) = changes else {
             return Err(Error::InvalidParams(
                 "agent.update: `changes` must be an object".to_string(),
             ));
         };
+        let remember_specialist = match obj.remove("rememberSpecialist") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(value)) => value,
+            Some(_) => {
+                return Err(Error::InvalidParams(
+                    "agent.update: `rememberSpecialist` must be a boolean".into(),
+                ))
+            }
+        };
+        if remember_specialist && !obj.contains_key("specialist") {
+            return Err(Error::InvalidParams(
+                "agent.update: remembering requires `specialist` in changes".into(),
+            ));
+        }
         let mut session = self.store.get_agent_session(&agent_id).await?;
+        let remember_specialist = remember_specialist && is_manual_foreground_agent(&session);
+        let rename_placeholder = if remember_specialist
+            && !session.name_explicitly_set
+            && !obj.contains_key("name")
+            && !obj.contains_key("nameExplicitlySet")
+        {
+            let wp = crate::git_ops::worktree_path(
+                &self.store.get_workspace(&session.workspace_id).await?,
+            );
+            let services = self.clone();
+            let prior = session.clone();
+            tokio::task::spawn_blocking(move || {
+                let display = services.session_specialist_display_name(&prior, wp.as_deref());
+                crate::agent_manager::is_generated_agent_name(&prior.name, display.as_deref())
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("agent.update name resolution failed: {e}")))?
+        } else {
+            false
+        };
+        let mut selected_specialist_name = None;
+        let mut selected_specialist_injection = None;
+
         let prior_model = session.model.clone();
         let prior_muted = session.notifications_muted;
         let prior_system_prompt = session.system_prompt.clone();
@@ -5919,15 +5971,25 @@ impl Services {
                         // walk the specialist tiers — blocking pool
                         // (monorepo#4148).
                         let services = self.clone();
-                        let (canonical, is_orchestrator) =
-                            tokio::task::spawn_blocking(move || -> Result<(String, bool)> {
+                        let (canonical, is_orchestrator, display_name, injection) =
+                            tokio::task::spawn_blocking(move || -> Result<_> {
                                 let canonical = services
                                     .specialists_service()
                                     .canonical_id_or_err(&spec_id, wp.as_deref())?;
                                 let is_orchestrator = services
                                     .specialists_service()
                                     .resolve_is_orchestrator(&canonical, wp.as_deref());
-                                Ok((canonical, is_orchestrator))
+                                let display_name = services
+                                    .specialists_service()
+                                    .resolve_display_name(&canonical, wp.as_deref());
+                                let injection = remember_specialist
+                                    .then(|| {
+                                        services
+                                            .specialists_service()
+                                            .resolve_prompt_injection(&canonical, wp.as_deref())
+                                    })
+                                    .flatten();
+                                Ok((canonical, is_orchestrator, display_name, injection))
                             })
                             .await
                             .map_err(|e| {
@@ -5935,6 +5997,8 @@ impl Services {
                                     "agent.update specialist resolution task failed: {e}"
                                 ))
                             })??;
+                        selected_specialist_name = display_name;
+                        selected_specialist_injection = injection;
                         let meta = session
                             .metadata
                             .get_or_insert_with(|| json!(serde_json::Map::new()));
@@ -6030,6 +6094,43 @@ impl Services {
                 _ => unreachable!("guarded by allow-list above"),
             }
         }
+        if remember_specialist && is_manual_foreground_agent(&session) {
+            if rename_placeholder {
+                session.name = selected_specialist_name
+                    .clone()
+                    .unwrap_or_else(|| "Agent".into());
+            }
+            let metadata = session.metadata.get_or_insert_with(|| json!({}));
+            if let Some(metadata) = metadata.as_object_mut() {
+                // Retire only a body we copied, and only if it is unchanged.
+                // Legacy unmarked bodies are indistinguishable from explicit
+                // overrides and must be preserved rather than guessed from text.
+                if let Some(generated) = metadata.remove("specialistGeneratedBehaviorPrompt") {
+                    if metadata.get("behaviorPrompt") == Some(&generated) {
+                        metadata.remove("behaviorPrompt");
+                    }
+                }
+                metadata.remove("specialistName");
+                metadata.remove("specialistRoleReminder");
+                if let Some((body, name, reminder)) = selected_specialist_injection {
+                    let has_override = metadata
+                        .get("behaviorPrompt")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| !s.trim().is_empty());
+                    if !has_override {
+                        if let Some(body) = body {
+                            metadata
+                                .insert("specialistGeneratedBehaviorPrompt".into(), json!(body));
+                            metadata.insert("behaviorPrompt".into(), json!(body));
+                        }
+                    }
+                    metadata.insert("specialistName".into(), json!(name));
+                    if let Some(reminder) = reminder {
+                        metadata.insert("specialistRoleReminder".into(), json!(reminder));
+                    }
+                }
+            }
+        }
         if session.system_prompt != prior_system_prompt || session.specialist != prior_specialist {
             if let Some(metadata) = session.metadata.as_mut().and_then(Value::as_object_mut) {
                 metadata.remove(intent_core::CHIEF_PROMPT_VERSION_KEY);
@@ -6052,15 +6153,20 @@ impl Services {
         if !mute_only {
             session.updated_at = now_iso();
             self.store
-                .update_agent_session(&workspace_id, &session)
+                .update_agent_session_with_preferences(
+                    &workspace_id,
+                    &session,
+                    remember_specialist && is_manual_foreground_agent(&session),
+                    obj.contains_key("notificationsMuted")
+                        .then_some(session.notifications_muted),
+                )
                 .await?;
         }
-        // `notifications_muted` is excluded from the full-row write above
-        // (its only post-insert mutator is this scoped UPDATE), so a
-        // concurrent `agent.update` on unrelated fields — or a long-lived
-        // in-memory session persisted at turn end — can never revert the
-        // user's toggle. Same-value writes are a store-level no-op.
-        if obj.contains_key("notificationsMuted") {
+        // Mute-only requests retain their narrow write without advancing
+        // activity. Mixed requests apply an explicit mute patch in the session
+        // transaction above; ordinary row writes still exclude this column so
+        // stale sessions cannot revert a toggle. Same-value patches are no-ops.
+        if mute_only {
             self.store
                 .set_agent_notifications_muted(
                     &workspace_id,
@@ -6096,6 +6202,9 @@ impl Services {
         event_data.insert("agentId".into(), json!(agent_id.0));
         for (k, v) in &obj {
             event_data.insert(k.clone(), v.clone());
+        }
+        if rename_placeholder {
+            event_data.insert("name".into(), json!(session.name));
         }
         self.publish_agent_mutation_event(
             &session.workspace_id,
@@ -10073,6 +10182,7 @@ impl Services {
         // always sets `metadata.isBackground: true`; G-A1/P3-1.2c).
         extra_metadata.insert("isBackground".to_string(), json!(true));
         let extra = AgentCreateExtra {
+            remember_specialist: false,
             provider: delegate_provider,
             reasoning_effort,
             metadata: (!extra_metadata.is_empty()).then_some(Value::Object(extra_metadata)),
@@ -13728,6 +13838,7 @@ impl Services {
             agent_type.clone(),
         );
         let extra = AgentCreateExtra {
+            remember_specialist: false,
             provider,
             reasoning_effort,
             agent_type,
@@ -17623,4 +17734,20 @@ impl Services {
 pub(crate) struct DestinationOwnerQueueAuthorization {
     _owner: intent_store::OwnerQueuePermit,
     _credential: Option<intent_core::caller::CredentialLease>,
+}
+
+fn is_agent_created_metadata(metadata: &Value) -> bool {
+    ["createdByAgentId", "sponsorAgentId", "taskNoteId"]
+        .iter()
+        .any(|key| metadata.get(key).is_some_and(|value| !value.is_null()))
+}
+
+fn is_manual_foreground_agent(session: &AgentSession) -> bool {
+    session.parent_agent_id.is_none()
+        && session.task_note_id.is_none()
+        && !session.is_background
+        && !session
+            .metadata
+            .as_ref()
+            .is_some_and(is_agent_created_metadata)
 }
