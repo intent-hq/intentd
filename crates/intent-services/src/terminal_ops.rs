@@ -124,7 +124,7 @@ pub(crate) async fn create_owned(
     Ok(json!({ "terminalId": terminal_id }))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[expect(clippy::too_many_arguments)]
 async fn create(
     pty: Arc<PtyHost>,
