@@ -2235,3 +2235,73 @@ mod managed {
         assert_eq!(s.count(), 0);
     }
 }
+
+#[tokio::test]
+async fn retained_cache_delivery_rechecks_original_complete_and_partial_observations() {
+    for partial in [false, true] {
+        let cache = PrCache::default();
+        let conn = connection("delivery");
+        let target = mr("team/app", 7);
+        let req = request(&conn, &target);
+        let mut value = observation(7, "original");
+        if partial {
+            value.availability.approvals = ProviderAvailability::Restricted;
+        }
+        let returned = review(&cache, &req, Duration::ZERO, Ok(value))
+            .await
+            .unwrap();
+        let mut sent = 0;
+        returned
+            .delivery
+            .with_current(&mut || {
+                sent += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(sent, 1);
+        assert!(review(
+            &cache,
+            &req,
+            Duration::ZERO,
+            Err(denied(ProviderFailureKind::ResourceDenied))
+        )
+        .await
+        .is_err());
+        assert!(returned
+            .delivery
+            .with_current(&mut || {
+                sent += 1;
+                Ok(())
+            })
+            .is_err());
+        assert_eq!(sent, 1);
+        let fresh = review(&cache, &req, Duration::ZERO, Ok(observation(7, "fresh")))
+            .await
+            .unwrap();
+        fresh
+            .delivery
+            .with_current(&mut || {
+                sent += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(sent, 2);
+        assert!(returned
+            .delivery
+            .with_current(&mut || {
+                sent += 1;
+                Ok(())
+            })
+            .is_err());
+        assert_eq!(sent, 2);
+        cache.lock().unwrap().clear();
+        assert!(fresh
+            .delivery
+            .with_current(&mut || {
+                sent += 1;
+                Ok(())
+            })
+            .is_err());
+        assert_eq!(sent, 2);
+    }
+}

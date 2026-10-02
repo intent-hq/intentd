@@ -384,16 +384,32 @@ impl ReadReceiptSink {
 pub(crate) struct RepositoryProviderRead<T> {
     result: intent_sourcecontrol::Result<T>,
     quota: RateLimitStatus,
-    attribution: RepositoryResponseAttribution,
+    attribution: Arc<RepositoryResponseAttribution>,
 }
 
 impl<T> RepositoryProviderRead<T> {
+    /// Retain this actual response for the original consuming disclosure fence.
+    /// The opaque record conveys evidence only, never reusable authority.
+    pub(crate) fn attribution(&self) -> Arc<RepositoryResponseAttribution> {
+        self.attribution.clone()
+    }
+
+    /// Reject a successful payload that does not match the consumer's original
+    /// explicit identity before cache installation. Actual failure and response
+    /// attribution remain unchanged; this cannot manufacture provider success.
+    pub(crate) fn reject_value_unless(mut self, matches: impl FnOnce(&T) -> bool) -> Self {
+        if self.result.as_ref().is_ok_and(|value| !matches(value)) {
+            self.result = Err(intent_sourcecontrol::Error::AdmissionRetired);
+        }
+        self
+    }
+
     pub(crate) fn into_parts(
         self,
     ) -> (
         intent_sourcecontrol::Result<T>,
         RateLimitStatus,
-        RepositoryResponseAttribution,
+        Arc<RepositoryResponseAttribution>,
     ) {
         (self.result, self.quota, self.attribution)
     }
@@ -500,7 +516,7 @@ impl RepositoryReadOperation {
             }
             Err(error) => (Err(error), RateLimitStatus::default()),
         };
-        let attribution = sink.seal(self.scope, self.target, &result);
+        let attribution = Arc::new(sink.seal(self.scope, self.target, &result));
         RepositoryProviderRead {
             result,
             quota,

@@ -142,10 +142,6 @@ where
 
 /// Managed issue reads retain the provider's opaque response evidence until
 /// the existing slot is borrowed and the original caller/response guards run.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "managed issue entry remains separately owned")
-)]
 pub(crate) async fn read_managed_issue<F, Fut>(
     cache: &IssueCache,
     request: &qualified_cache::ManagedCacheRequest<'_>,

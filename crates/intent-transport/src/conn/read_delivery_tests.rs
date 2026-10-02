@@ -133,6 +133,7 @@ struct Cohort {
 }
 
 pub(crate) struct FixtureConnection {
+    resource_frames: Mutex<Vec<intent_core::repository_request::RepositoryResourceFrame>>,
     review_frames: Mutex<Vec<intent_core::repository_request::NativeReviewFrame>>,
     selection_frames: Mutex<Vec<intent_core::repository_request::RepositorySelectionFrame>>,
     cohort: Mutex<Cohort>,
@@ -156,6 +157,13 @@ impl FixtureConnection {
 }
 
 impl RepositoryReadConnection for FixtureConnection {
+    fn capture_resource(
+        &self,
+        frame: &intent_core::repository_request::RepositoryResourceFrame,
+    ) -> Option<Arc<dyn RepositoryReadRequestScope>> {
+        self.resource_frames.lock().unwrap().push(frame.clone());
+        Some(self.capture())
+    }
     fn capture_review(
         &self,
         frame: &intent_core::repository_request::NativeReviewFrame,
@@ -337,6 +345,7 @@ impl WorkspaceApi for FixtureApi {
         entry: RepositoryWireEntry,
     ) -> Option<Arc<dyn RepositoryReadConnection>> {
         let connection = Arc::new(FixtureConnection {
+            resource_frames: Mutex::new(Vec::new()),
             review_frames: Mutex::new(Vec::new()),
             selection_frames: Mutex::new(Vec::new()),
             cohort: Mutex::default(),
@@ -1509,7 +1518,8 @@ async fn native_review_consumed_packet_faults_never_replay_primitive_or_reply() 
 #[test]
 fn native_review_companion_capability_is_explicit_and_versioned() {
     let server = crate::client::server_json(false, "linux", "fixture", "fixture", None, true);
-    assert_eq!(server["protocolVersion"], "10.13");
+    assert_eq!(server["protocolVersion"], "10.14");
+    assert_eq!(server["capabilities"]["repositoryResourceRead"], 1);
     assert_eq!(server["capabilities"]["nativeReview"], 1);
     assert_eq!(server["capabilities"]["nativeReviewCompanion"], 1);
 }
@@ -1560,4 +1570,53 @@ async fn native_review_companion_null_fields_refuse_before_original_capture() {
         until(|| h.limiter.available_permits() == Some(1)).await;
         assert!(h.rx.priority.try_recv().is_err());
     }
+}
+
+#[tokio::test]
+async fn resource_original_typed_capture_precedes_full_writer_queue() {
+    let h = Harness::new(FixtureApi::default(), HostRole::Member).await;
+    for _ in 0..PRIORITY_CAPACITY {
+        h.tx.priority.send("occupied".into()).await.unwrap();
+    }
+    let raw=json!({"jsonrpc":"2.0","id":91,"method":"sourceControl.read.detail","params":{"workspaceId":"original-workspace","readLifetimeId":"original-lifetime","target":{"repository":{"provider":"gitlab","instanceBaseUrl":"https://forge.test:8443/install","projectPath":"Team/Sub/Project"},"kind":"issue","number":7}}}).to_string();
+    let call = h.dispatch_selection(&raw);
+    tokio::pin!(call);
+    tokio::select! {biased;result=&mut call=>panic!("original queue did not wait {result}"),()=tokio::task::yield_now()=>{}}
+    let original = h.original();
+    let frames = original.resource_frames.lock().unwrap();
+    let [intent_core::repository_request::RepositoryResourceFrame::Detail(q)] = frames.as_slice()
+    else {
+        panic!("missing original typed frame")
+    };
+    assert_eq!(q.read_lifetime_id, "original-lifetime");
+    assert_eq!(q.target.kind, intent_core::RepositoryResourceKind::Issue);
+    assert_eq!(q.target.repository.project_path, "Team/Sub/Project");
+    assert_eq!(h.limiter.available_permits(), Some(1));
+    drop(frames);
+    h.connection.retire();
+}
+
+#[tokio::test]
+async fn resource_invalid_null_unknown_and_old_api_keep_refusal() {
+    for params in [
+        json!({"workspaceId":"w","target":null,"readLifetimeId":"original"}),
+        json!({"workspaceId":"w","readLifetimeId":"original","refresh":null}),
+        json!({"workspaceId":"w","account":"injected"}),
+    ] {
+        let mut h = Harness::new(FixtureApi::default(), HostRole::Owner).await;
+        let raw =
+            json!({"jsonrpc":"2.0","id":92,"method":"sourceControl.read.detail","params":params})
+                .to_string();
+        assert!(h.dispatch_selection(&raw).await);
+        let reply = h.response().await;
+        assert_eq!(reply["error"]["code"], -32602);
+        assert!(h.original().resource_frames.lock().unwrap().is_empty());
+    }
+    let mut h = Harness::new(FixtureApi::default(), HostRole::Owner).await;
+    assert!(h.dispatch_selection(&json!({"jsonrpc":"2.0","id":93,"method":"sourceControl.read.capture","params":{"workspaceId":"w"}}).to_string()).await);
+    let reply = h.response().await;
+    assert!(reply.get("result").is_none());
+    assert_eq!(h.original().resource_frames.lock().unwrap().len(), 1);
+    assert!(h.original().review_frames.lock().unwrap().is_empty());
+    assert!(h.original().selection_frames.lock().unwrap().is_empty());
 }

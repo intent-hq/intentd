@@ -181,12 +181,12 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// (`sourceControl.identityProof.create` / `delete`, the GitHub gist or
 /// GitLab snippet proof by `provider`); the `github.identityProof.*` pair
 /// stays as byte-identical aliases.
-const EXPECTED_TOTAL_METHODS: usize = 417;
+const EXPECTED_TOTAL_METHODS: usize = 420;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 357;
+const EXPECTED_ROUTER_METHODS: usize = 360;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 58;
@@ -195,7 +195,7 @@ const EXPECTED_FASTPATH_METHODS: usize = 58;
 const EXPECTED_ALIASES: usize = 2;
 
 /// Golden count: server→client notifications.
-const EXPECTED_NOTIFICATIONS: usize = 4;
+const EXPECTED_NOTIFICATIONS: usize = 5;
 
 /// Golden count: client-served reverse RPCs.
 const EXPECTED_REVERSE_METHODS: usize = 5;
@@ -812,6 +812,9 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "sourceControl.getUser",
     "sourceControl.identityProof.create",
     "sourceControl.identityProof.delete",
+    "sourceControl.read.capture",
+    "sourceControl.read.detail",
+    "sourceControl.read.release",
     "sourceControl.revoke",
     "specialist.create",
     "specialist.delete",
@@ -1750,6 +1753,14 @@ mod unbound_owner_only_methods {
             (
                 "accept-changes.prepare",
                 json!({ "workspaceId": ws, "action": "a" }),
+            ),
+            (
+                "accept-changes.reconcile",
+                json!({"workspaceId":ws,"operationId":"held-operation","root":{"workspaceId":ws,"kind":"primary"}}),
+            ),
+            (
+                "accept-changes.release",
+                json!({"workspaceId":ws,"operationId":"held-operation","root":{"workspaceId":ws,"kind":"primary"}}),
             ),
             ("agent.cancelDelete", json!({ "agentId": "a1" })),
             (

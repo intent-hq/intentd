@@ -305,6 +305,9 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "sourceControl.getUser",
     "sourceControl.identityProof.create",
     "sourceControl.identityProof.delete",
+    "sourceControl.read.capture",
+    "sourceControl.read.detail",
+    "sourceControl.read.release",
     "sourceControl.revoke",
     "specialist.create",
     "specialist.delete",
@@ -493,6 +496,7 @@ pub(crate) const FASTPATH_METHODS: &[&str] = &[
 pub(crate) const NOTIFICATIONS: &[&str] = &[
     "accept-changes.retired",
     "events.event",
+    "sourceControl.read.retired",
     "workspace.repositoryContext.retired",
     "workspace.repositorySelection.retired",
 ];
@@ -694,6 +698,9 @@ pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("search.messages", "Read: workspace-scoped chat search."),
     ("search.notes", "Read: workspace-scoped note search."),
     ("skill.list", "Client boot: available skills for the composer. Names and descriptions only."),
+    ("sourceControl.read.capture", "Read acquisition: original socket, durable host execution and workspace membership; configured nonsecret instance descriptors only."),
+    ("sourceControl.read.detail", "Read: explicit target in the original resource lifetime, with current durable authority and original managed connection/cache fences."),
+    ("sourceControl.read.release", "Release: original socket only, no new read authority or cross-socket lookup."),
     ("specialist.get", "Read: one specialist definition. Create/edit/delete stay daemon administration."),
     ("specialist.list", "Client boot: the specialist catalog the delegate picker renders."),
     ("stats.getRateHistory", "Read: usage rate history. Usage/stats read."),

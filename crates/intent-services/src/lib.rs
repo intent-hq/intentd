@@ -1140,6 +1140,7 @@ pub struct Services {
     /// Exact ordinary API allocation; clones cannot bind replacement owners.
     repository_wire_owner: Arc<OnceLock<Weak<Services>>>,
     repository_review_capacity: Arc<repository_native_wire::review::Capacity>,
+    repository_resource_capacity: Arc<repository_native_wire::resource::Capacity>,
     repository_selection_capacity: Arc<repository_native_wire::selection::Capacity>,
     /// Original invalidation owner for this Services instance. Clones share it;
     /// Store must accept this exact observer before it can be used.
@@ -1615,6 +1616,7 @@ impl Services {
             repository_connection_directory,
             repository_lifecycle_registry: Arc::default(),
             repository_wire_owner: Arc::default(),
+            repository_resource_capacity: Arc::default(),
             repository_review_capacity: Arc::default(),
             repository_selection_capacity: Arc::default(),
             principal_identity_refreshed_at: Arc::new(tokio::sync::Mutex::new(None)),
@@ -17443,6 +17445,25 @@ impl WorkspaceApi for Services {
         query: intent_core::repository_request::RepositorySelectionBoundQuery,
     ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositorySelectionReleased>> {
         repository_native_wire::selection::release(self, query)
+    }
+
+    fn repository_resource_capture(
+        &self,
+        query: intent_core::repository_request::RepositoryResourceQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositoryResourceCapture>> {
+        repository_native_wire::resource::capture(self, query)
+    }
+    fn repository_resource_detail(
+        &self,
+        query: intent_core::repository_request::RepositoryResourceDetailQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositoryResourceResult>> {
+        repository_native_wire::resource::detail(self, query)
+    }
+    fn repository_resource_release(
+        &self,
+        query: intent_core::repository_request::RepositoryResourceBoundQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositoryContextReleased>> {
+        repository_native_wire::resource::release(self, query)
     }
 
     fn repository_context_capture(

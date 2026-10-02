@@ -5,6 +5,93 @@ struct OrdinaryApi;
 impl WorkspaceApi for OrdinaryApi {}
 
 #[test]
+fn repository_resource_strict_targets_and_original_lifetime() {
+    use serde_json::{json, Value};
+    let good = json!({"workspaceId":"w","readLifetimeId":"original","target":{"repository":{"provider":"gitlab","instanceBaseUrl":"https://forge.example:8443/install","projectPath":"Team/Sub/Project"},"kind":"merge-request","number":7}});
+    for kind in ["merge-request", "issue"] {
+        let mut value = good.clone();
+        value["target"]["kind"] = json!(kind);
+        let parsed: RepositoryResourceDetailQuery = serde_json::from_value(value).unwrap();
+        assert!(!parsed.refresh);
+        assert_eq!(parsed.target.number, 7);
+        assert_eq!(parsed.target.repository.project_path, "Team/Sub/Project");
+    }
+    for number in [
+        Value::Null,
+        json!(0),
+        json!(-1),
+        json!(1.5),
+        json!(9_007_199_254_740_992_u64),
+        json!("7"),
+    ] {
+        let mut bad = good.clone();
+        bad["target"]["number"] = number;
+        assert!(serde_json::from_value::<RepositoryResourceDetailQuery>(bad).is_err());
+    }
+    for (pointer, value) in [
+        ("/target/kind", json!("pull-request")),
+        ("/target/repository/provider", json!("github")),
+        ("/target", Value::Null),
+        ("/readLifetimeId", Value::Null),
+        ("/readLifetimeId", json!("")),
+    ] {
+        let mut bad = good.clone();
+        *bad.pointer_mut(pointer).unwrap() = value;
+        assert!(serde_json::from_value::<RepositoryResourceDetailQuery>(bad).is_err());
+    }
+    for level in ["", "/target", "/target/repository"] {
+        for key in [
+            "accountId",
+            "connection",
+            "generation",
+            "caller",
+            "authority",
+        ] {
+            let mut bad = good.clone();
+            bad.pointer_mut(level)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert(key.into(), json!("injected"));
+            assert!(serde_json::from_value::<RepositoryResourceDetailQuery>(bad).is_err());
+        }
+    }
+    for refresh in [Value::Null, json!("true"), json!(0)] {
+        let mut bad = good.clone();
+        bad["refresh"] = refresh;
+        assert!(serde_json::from_value::<RepositoryResourceDetailQuery>(bad).is_err());
+    }
+    assert!(serde_json::from_value::<RepositoryResourceQuery>(
+        json!({"workspaceId":"w","instanceBaseUrl":"https://forged"})
+    )
+    .is_err());
+    assert!(serde_json::from_value::<RepositoryResourceBoundQuery>(
+        json!({"workspaceId":"w","readLifetimeId":"original","renew":true})
+    )
+    .is_err());
+}
+
+#[tokio::test]
+async fn repository_resource_unsupported_api_refuses_without_fallback() {
+    let api: &dyn WorkspaceApi = &OrdinaryApi;
+    let query = RepositoryResourceQuery {
+        workspace_id: "w".into(),
+    };
+    assert!(matches!(
+        api.repository_resource_capture(query).await,
+        Err(crate::Error::Forbidden(_))
+    ));
+    let query = RepositoryResourceBoundQuery {
+        workspace_id: "w".into(),
+        read_lifetime_id: "original".into(),
+    };
+    assert!(matches!(
+        api.repository_resource_release(query).await,
+        Err(crate::Error::Forbidden(_))
+    ));
+}
+
+#[test]
 fn existing_api_has_no_repository_read_connection_for_either_entry() {
     let api: &dyn WorkspaceApi = &OrdinaryApi;
     for entry in [

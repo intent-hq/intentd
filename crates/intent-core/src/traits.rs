@@ -55,6 +55,38 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// Acquire read-only repository context under the original native connection.
+    /// Explicit original-socket resource reads; older implementations refuse.
+    fn repository_resource_capture(
+        &self,
+        _query: crate::repository_request::RepositoryResourceQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_request::RepositoryResourceCapture>> {
+        Box::pin(async {
+            Err(crate::Error::Forbidden(
+                "Repository resource reads unavailable".into(),
+            ))
+        })
+    }
+    fn repository_resource_detail(
+        &self,
+        _query: crate::repository_request::RepositoryResourceDetailQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_request::RepositoryResourceResult>> {
+        Box::pin(async {
+            Err(crate::Error::Forbidden(
+                "Repository resource reads unavailable".into(),
+            ))
+        })
+    }
+    fn repository_resource_release(
+        &self,
+        _query: crate::repository_request::RepositoryResourceBoundQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_request::RepositoryContextReleased>> {
+        Box::pin(async {
+            Err(crate::Error::Forbidden(
+                "Repository resource reads unavailable".into(),
+            ))
+        })
+    }
+
     fn repository_context_capture(
         &self,
         query: crate::repository_request::RepositoryContextQuery,

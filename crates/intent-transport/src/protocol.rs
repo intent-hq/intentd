@@ -691,7 +691,8 @@ use std::time::{Duration, Instant};
 /// Protocol version exposed on the wire (§5.17, §5.7).
 /// Original-socket repository context capture/read/release and private retirement feed.
 /// Original-socket selection capture/save/reset/reconcile/release and private retirement.
-pub const PROTOCOL_VERSION: &str = "10.13";
+/// Explicit original-socket GitLab resource capture/detail/release and retirement.
+pub const PROTOCOL_VERSION: &str = "10.14";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

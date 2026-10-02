@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::hash::Hash;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use crate::repository_credentials::read::{
@@ -126,7 +126,7 @@ pub(crate) enum DetailAccess<'r, 'a> {
 pub(crate) struct DetailOutcome<T> {
     value: intent_sourcecontrol::Result<T>,
     quota: RateLimitStatus,
-    attribution: Option<RepositoryResponseAttribution>,
+    attribution: Option<Arc<RepositoryResponseAttribution>>,
 }
 impl<T> From<ProviderRead<T>> for DetailOutcome<T> {
     fn from((value, quota): ProviderRead<T>) -> Self {
@@ -260,13 +260,65 @@ pub(crate) struct CacheRead<T> {
     pub(crate) value: T,
     pub(crate) quota: RateLimitStatus,
     pub(crate) fetched: bool,
+    pub(crate) delivery: CacheDelivery,
+}
+
+/// A retained payload still needs its original observation at final transfer.
+/// This owns no payload or authority. Cache -> caller -> provider is the same
+/// lock order as start/install, so denial and transfer are serialized.
+#[derive(Clone)]
+pub(crate) struct CacheDelivery(Arc<DeliveryCheck>);
+type DeliveryCheck = dyn Fn(&mut CacheAdmissionAction<'_>) -> CredentialResult<()> + Send + Sync;
+impl std::fmt::Debug for CacheDelivery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CacheDelivery(original observation)")
+    }
+}
+impl CacheDelivery {
+    pub(crate) fn with_current(
+        &self,
+        action: &mut CacheAdmissionAction<'_>,
+    ) -> CredentialResult<()> {
+        (self.0)(action)
+    }
+}
+enum DeliveryObservation {
+    Complete(Arc<ObservationReceipt>),
+    Partial(ObservationTicket),
+}
+fn delivery<K: Eq + Hash + Send + Sync + 'static, L: Send + 'static, T: Send + 'static>(
+    cache: Weak<Mutex<CacheMap<K, L, T>>>,
+    key: CacheKey<K>,
+    connection: ConnectionObservations,
+    observation: DeliveryObservation,
+) -> CacheDelivery {
+    CacheDelivery(Arc::new(move |action| {
+        let cache = cache.upgrade().ok_or(RepositoryCredentialError::Retired)?;
+        let locked = cache
+            .lock()
+            .map_err(|_| RepositoryCredentialError::Indeterminate)?;
+        let Some(CacheSlot::Qualified(slot)) = locked.get(&key) else {
+            return Err(RepositoryCredentialError::Retired);
+        };
+        let current = slot.observations.belongs_to(&connection)
+            && match &observation {
+                DeliveryObservation::Complete(receipt) => {
+                    slot.observations.can_serve(receipt, &connection)
+                }
+                DeliveryObservation::Partial(ticket) => slot.observations.validate(ticket).is_ok(),
+            };
+        if !current {
+            return Err(RepositoryCredentialError::Retired);
+        }
+        action()
+    }))
 }
 
 #[derive(Debug)]
 struct Payload<T> {
     value: T,
     quota: RateLimitStatus,
-    receipt: ObservationReceipt,
+    receipt: Arc<ObservationReceipt>,
     freshness: Freshness,
 }
 
@@ -324,7 +376,11 @@ pub(crate) enum Started<T> {
 
 /// Insert request-start metadata into the SAME bounded map as response payloads.
 /// Evicting a pending slot drops its right to write; there is no tombstone map.
-pub(crate) fn start<K: Clone + Eq + Hash + Send, L: Send, T: Clone + Send>(
+pub(crate) fn start<
+    K: Clone + Eq + Hash + Send + Sync + 'static,
+    L: Send + 'static,
+    T: Clone + Send + 'static,
+>(
     cache: &SharedCache<K, L, T>,
     request: &CacheRequest<'_>,
     max_age: Duration,
@@ -333,7 +389,11 @@ pub(crate) fn start<K: Clone + Eq + Hash + Send, L: Send, T: Clone + Send>(
     start_access(cache, DetailAccess::Legacy(request), max_age, retain)
 }
 
-pub(crate) fn start_access<K: Clone + Eq + Hash + Send, L: Send, T: Clone + Send>(
+pub(crate) fn start_access<
+    K: Clone + Eq + Hash + Send + Sync + 'static,
+    L: Send + 'static,
+    T: Clone + Send + 'static,
+>(
     cache: &SharedCache<K, L, T>,
     access: DetailAccess<'_, '_>,
     max_age: Duration,
@@ -343,6 +403,8 @@ pub(crate) fn start_access<K: Clone + Eq + Hash + Send, L: Send, T: Clone + Send
     let quota = RateLimitStatus::default();
     access.check(quota)?;
     let key = request.key();
+    let delivery_cache = Arc::downgrade(cache);
+    let delivery_key = key.clone();
     let mut locked = cache.lock().unwrap();
     let cache = &mut *locked;
     access.with_current(quota, None, move || {
@@ -366,6 +428,12 @@ pub(crate) fn start_access<K: Clone + Eq + Hash + Send, L: Send, T: Clone + Send
                 value: payload.value.clone(),
                 quota: payload.quota,
                 fetched: false,
+                delivery: delivery(
+                    delivery_cache,
+                    delivery_key,
+                    request.connection.clone(),
+                    DeliveryObservation::Complete(payload.receipt.clone()),
+                ),
             }));
         }
         let previous = previous
@@ -400,7 +468,11 @@ fn new_qualified_slot<T>(request: &CacheRequest<'_>) -> QualifiedSlot<T> {
 
 /// Apply errors before any lossy mapping. Both cache kinds share connection and
 /// project lifetimes, so a denial observed by an issue also fences review data.
-pub(crate) fn finish<K: Clone + Eq + Hash + Send, L: Send, T: Clone + Send>(
+pub(crate) fn finish<
+    K: Clone + Eq + Hash + Send + Sync + 'static,
+    L: Send + 'static,
+    T: Clone + Send + 'static,
+>(
     cache: &SharedCache<K, L, T>,
     request: &CacheRequest<'_>,
     ticket: ObservationTicket,
@@ -420,7 +492,11 @@ pub(crate) fn finish<K: Clone + Eq + Hash + Send, L: Send, T: Clone + Send>(
     )
 }
 
-pub(crate) fn finish_access<K: Clone + Eq + Hash + Send, L: Send, T: Clone + Send>(
+pub(crate) fn finish_access<
+    K: Clone + Eq + Hash + Send + Sync + 'static,
+    L: Send + 'static,
+    T: Clone + Send + 'static,
+>(
     cache: &SharedCache<K, L, T>,
     access: DetailAccess<'_, '_>,
     ticket: ObservationTicket,
@@ -481,9 +557,11 @@ pub(crate) fn finish_access<K: Clone + Eq + Hash + Send, L: Send, T: Clone + Sen
         });
     }
     access.check(quota)?;
+    let delivery_cache = Arc::downgrade(cache);
+    let delivery_key = request.key();
     let mut locked = cache.lock().unwrap();
     let cache = &mut *locked;
-    access.response_current(quota, attribution.as_ref(), || {
+    access.response_current(quota, attribution.as_deref(), || {
         let Some(CacheSlot::Qualified(slot)) = cache.get_mut(&request.key()) else {
             return Err(CacheFailure::ineligible(Ineligible::DifferentSlot, quota));
         };
@@ -515,28 +593,37 @@ pub(crate) fn finish_access<K: Clone + Eq + Hash + Send, L: Send, T: Clone + Sen
         }
         access.check_in_action(quota)?;
         slot.reuse_allowed = complete(&value);
-        if slot.reuse_allowed {
-            let receipt = slot
-                .observations
-                .primary_success(ticket)
-                .map_err(|e| CacheFailure::ineligible(e, quota))?;
+        let delivery_observation = if slot.reuse_allowed {
+            let receipt = Arc::new(
+                slot.observations
+                    .primary_success(ticket)
+                    .map_err(|e| CacheFailure::ineligible(e, quota))?,
+            );
             slot.payload = Some(Payload {
                 value: value.clone(),
                 quota,
-                receipt,
+                receipt: receipt.clone(),
                 freshness,
             });
+            DeliveryObservation::Complete(receipt)
         } else {
             slot.observations
                 .partial_success(&ticket)
                 .map_err(|e| CacheFailure::ineligible(e, quota))?;
-        }
+            DeliveryObservation::Partial(ticket)
+        };
         // Partial results retain their exact fields but never refresh old cache data.
         retain(cache);
         Ok(CacheRead {
             value,
             quota,
             fetched: true,
+            delivery: delivery(
+                delivery_cache,
+                delivery_key,
+                request.connection.clone(),
+                delivery_observation,
+            ),
         })
     })
 }
@@ -695,7 +782,7 @@ where
                 )
             }
         };
-        access.response_current(quota, attribution.as_ref(), || Ok(()))?;
+        access.response_current(quota, attribution.as_deref(), || Ok(()))?;
         {
             let cache = cache.lock().unwrap();
             let Some(CacheSlot::Qualified(slot)) = cache.get(&request.key()) else {

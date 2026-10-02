@@ -645,6 +645,30 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(json!(r))
         }
+        "sourceControl.read.capture" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_capture(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.read.detail" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_detail(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.read.release" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_release(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
         "workspace.repositoryContext.capture" => {
             let input = serde_json::from_value(Value::Object(params.clone()))
                 .map_err(|e| invalid_params(format!("invalid params: {e}")))?;

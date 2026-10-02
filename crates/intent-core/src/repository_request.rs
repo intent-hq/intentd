@@ -31,6 +31,18 @@ pub enum RepositoryReadReplyKind {
 
 /// One original authenticated connection, independent of client and RPC ids.
 pub trait RepositoryReadConnection: Send + Sync {
+    /// Independent explicit resource reads; unsupported owners fail closed.
+    fn capture_resource(
+        &self,
+        _frame: &RepositoryResourceFrame,
+    ) -> Option<Arc<dyn RepositoryReadRequestScope>> {
+        None
+    }
+
+    fn take_resource_retirements(&self) -> Option<Box<dyn RepositoryResourceRetirements>> {
+        None
+    }
+
     /// Capture synchronously before the request's first await or spawn.
     /// Each call returns a distinct original request, including equal RPC ids.
     fn capture(&self) -> Arc<dyn RepositoryReadRequestScope>;
@@ -802,4 +814,182 @@ fn native_review_target<'de, D: serde::Deserializer<'de>>(
         instance_base_url,
         project_path,
     })
+}
+
+/// Explicit provider reads have their own original-socket lifetime. These
+/// queries carry identities, never a credential or permission grant.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RepositoryResourceQuery {
+    pub workspace_id: crate::WorkspaceId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RepositoryResourceBoundQuery {
+    pub workspace_id: crate::WorkspaceId,
+    #[serde(deserialize_with = "resource_lifetime")]
+    pub read_lifetime_id: String,
+}
+
+fn resource_lifetime<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<String, D::Error> {
+    let value = <String as serde::Deserialize>::deserialize(d)?;
+    if value.is_empty() || value.len() > 128 || value.chars().any(char::is_control) {
+        return Err(serde::de::Error::custom("invalid read lifetime"));
+    }
+    Ok(value)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RepositoryResourceDetailQuery {
+    pub workspace_id: crate::WorkspaceId,
+    #[serde(deserialize_with = "resource_lifetime")]
+    pub read_lifetime_id: String,
+    #[serde(deserialize_with = "resource_target")]
+    pub target: crate::ReviewTarget,
+    /// Omission means false; explicit null is rejected.
+    #[serde(default)]
+    pub refresh: bool,
+}
+
+fn resource_target<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<crate::ReviewTarget, D::Error> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Repository {
+        provider: crate::RepositoryProvider,
+        instance_base_url: String,
+        project_path: String,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Target {
+        repository: Repository,
+        kind: crate::RepositoryResourceKind,
+        number: u64,
+    }
+    let target = <Target as serde::Deserialize>::deserialize(d)?;
+    if target.repository.provider != crate::RepositoryProvider::Gitlab
+        || !matches!(
+            target.kind,
+            crate::RepositoryResourceKind::MergeRequest | crate::RepositoryResourceKind::Issue
+        )
+        || !(1..=9_007_199_254_740_991).contains(&target.number)
+        || target.repository.instance_base_url.len() > 2048
+        || target.repository.project_path.len() > 1024
+    {
+        return Err(serde::de::Error::custom("invalid explicit GitLab resource"));
+    }
+    Ok(crate::ReviewTarget {
+        repository: crate::RepositoryTarget {
+            provider: target.repository.provider,
+            instance_base_url: target.repository.instance_base_url,
+            project_path: target.repository.project_path,
+        },
+        kind: target.kind,
+        number: target.number,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RepositoryResourceFrame {
+    Capture(RepositoryResourceQuery),
+    Detail(RepositoryResourceDetailQuery),
+    Release(RepositoryResourceBoundQuery),
+}
+impl RepositoryResourceFrame {
+    #[must_use]
+    pub fn workspace_id(&self) -> &crate::WorkspaceId {
+        match self {
+            Self::Capture(q) => &q.workspace_id,
+            Self::Detail(q) => &q.workspace_id,
+            Self::Release(q) => &q.workspace_id,
+        }
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryResourceInstance {
+    pub provider: crate::RepositoryProvider,
+    pub instance_base_url: String,
+    pub availability: crate::RepositoryAvailability,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryResourceCapture {
+    pub read_lifetime_id: String,
+    pub scope: crate::ExecutionScope,
+    pub revision: crate::RepositoryContextRevision,
+    pub expires_after_ms: u64,
+    pub retirement_sequence: String,
+    pub instances: Vec<RepositoryResourceInstance>,
+}
+
+/// Decimal strings retain the provider's complete unsigned quota values;
+/// null means the response supplied no corresponding observation.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryResourceQuota {
+    pub reset_at: Option<String>,
+    pub remaining: Option<String>,
+    pub limit: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RepositoryResourceFailure {
+    Authentication,
+    ProjectDenied,
+    ResourceDenied,
+    OptionalRestricted,
+    OptionalUnavailable,
+    RateLimited,
+    Transient,
+    Unavailable,
+    Unknown,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum RepositoryResourceOutcome {
+    /// The existing qualified snapshot projection, including details and
+    /// per-signal availability. Unknown counts stay null or absent.
+    MergeRequest { snapshot: serde_json::Value },
+    /// The existing source-control Issue serialization, with no inferred fields.
+    Issue { issue: serde_json::Value },
+    /// Sanitized actual failure evidence, never a cached payload or grant.
+    Failure {
+        code: RepositoryResourceFailure,
+        status: Option<u16>,
+    },
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryResourceResult {
+    pub read_lifetime_id: String,
+    pub scope: crate::ExecutionScope,
+    pub revision: crate::RepositoryContextRevision,
+    pub target: crate::ReviewTarget,
+    pub outcome: RepositoryResourceOutcome,
+    pub quota: RepositoryResourceQuota,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryResourceRetired {
+    pub read_lifetime_ids: Vec<String>,
+    pub sequence: String,
+    pub all_retired: bool,
+    pub terminal: bool,
+}
+
+pub trait RepositoryResourceRetirements: Send {
+    fn next(&mut self) -> BoxFuture<'_, Option<RepositoryResourceRetired>>;
 }
