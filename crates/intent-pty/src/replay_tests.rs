@@ -5,6 +5,9 @@ use std::io::Cursor;
 fn fanout(cap: usize) -> Arc<Mutex<Fanout>> {
     let (tx, _) = broadcast::channel(2);
     Arc::new(Mutex::new(Fanout {
+        eof: false,
+        eof_notify: Arc::default(),
+        framing: intent_core::script_output::LineDecoder::new(false),
         scrollback: Scrollback::new(cap),
         tx,
     }))

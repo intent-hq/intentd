@@ -20,10 +20,10 @@ use intent_core::events::{
     AGENT_COMPLETED, AGENT_CREATED, AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_MESSAGE,
     AGENT_RENAMED, AGENT_RESTORED, AGENT_RETIRED, AGENT_STARTED, AGENT_STATUS_CHANGED,
     AGENT_STREAM_END, AGENT_TOOL_CALL, AGENT_UPDATED, CHAT_STREAM_DELTA, COMMENT_ADDED,
-    NOTE_CREATED, NOTE_DELETED, NOTE_PRESENCE, NOTE_UPDATED, PR_LINKED, PR_UNLINKED, PR_UPDATED,
-    TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED, WORKSPACE_ATTENTION_CHANGED,
-    WORKSPACE_CREATED, WORKSPACE_DELETED, WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_UPDATED,
-    WORKSPACE_WAITING_CHANGED,
+    COMMENT_DELETED, NOTE_CREATED, NOTE_DELETED, NOTE_PRESENCE, NOTE_UPDATED, PR_LINKED,
+    PR_UNLINKED, PR_UPDATED, TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED,
+    WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED,
+    WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_UPDATED, WORKSPACE_WAITING_CHANGED,
 };
 use intent_core::{
     extract_spec_task_ids, note_list_slim_row, now_iso, AgentId, AgentLite, ConversationProjection,
@@ -37,6 +37,9 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use crate::events::IdInfo;
+
+/// Chat snapshots have a smaller window than generic paginated RPCs.
+const CHAT_SNAPSHOT_MESSAGE_LIMIT: usize = 5;
 
 /// A subscription channel selected by the `*.subscribe` method (TB-0 §3). TB-4
 /// wires the `note` collection channel end-to-end; TB-5 adds `task`, `agent`,
@@ -693,7 +696,7 @@ pub(crate) fn channel_event_types(channel: Channel) -> Vec<String> {
             PR_UPDATED,
             PR_UNLINKED,
         ],
-        Channel::Comment => &[COMMENT_ADDED],
+        Channel::Comment => &[COMMENT_ADDED, COMMENT_DELETED],
         // The chat channel is the one consumer of the content-bearing
         // `chat:stream:delta` firehose (CS-0); the forwarder additionally
         // filters these to one agent by `sessionId == agentId`.
@@ -707,6 +710,7 @@ pub(crate) fn channel_event_types(channel: Channel) -> Vec<String> {
             AGENT_TOOL_CALL,
             AGENT_STREAM_END,
             AGENT_MESSAGE,
+            AGENT_UPDATED,
         ],
         // Transient only: the forwarder narrows the workspace-wide stream to
         // one note by `data.noteId` ([`note_presence_delta`]).
@@ -783,8 +787,8 @@ pub(crate) async fn channel_snapshot(
 /// `chat.subscribe` arriving mid-turn reconstructs a coherent in-flight message.
 ///
 /// **Bounded** (monorepo#958): exactly ONE conversation read, with no
-/// `nextToken` follow-up and the omitted `limit` resolving to the
-/// server-clamped default page, so the snapshot fetches/decodes only its
+/// `nextToken` follow-up and an explicit chat-only limit of five messages,
+/// so the snapshot fetches/decodes only its
 /// bounded newest page regardless of transcript length — the paginated op
 /// selects just that page SQL-side and never re-hydrates the full history.
 /// Older pages stay client-pulled via `agent.getConversation { nextToken }`.
@@ -817,7 +821,7 @@ pub(crate) async fn chat_snapshot(
     let (mut snapshot, overlay) = match api
         .agent_get_conversation(
             agent_id.clone(),
-            None,
+            Some(i64::try_from(CHAT_SNAPSHOT_MESSAGE_LIMIT).expect("chat limit fits in i64")),
             None,
             None,
             None,
@@ -877,7 +881,7 @@ pub(crate) async fn chat_recovery_snapshot(
     let read = || {
         api.agent_get_conversation(
             agent_id.clone(),
-            None,
+            Some(i64::try_from(CHAT_SNAPSHOT_MESSAGE_LIMIT).expect("chat limit fits in i64")),
             None,
             None,
             None,
@@ -987,7 +991,8 @@ fn apply_resume_filter(snapshot: &mut Value, since: &str) {
 /// legitimately has no blocks yet, and the client needs the id to reconcile
 /// against.
 ///
-/// **Slim page budget (§5.5).** Under `projection: "slim"` the merged page is
+/// **Chat count and slim page budget (§5.5).** The live row counts inside the
+/// five-message snapshot window. Under `projection: "slim"` the merged page is
 /// re-budgeted after the append: the persisted page arrived within
 /// [`SLIM_PAGE_BUDGET_BYTES`], but `slim_message_blocks` caps block *bodies*,
 /// not block *count*, so a streaming turn with hundreds of capped blocks can
@@ -998,8 +1003,8 @@ fn apply_resume_filter(snapshot: &mut Value, since: &str) {
 /// `truncated`/`nextToken` re-minted at the first evicted row (row `seq` is
 /// contiguous from 0, so a row's seq IS its global oldest-indexed position)
 /// so the client pulls the evicted rows via `agent.getConversation` exactly
-/// like any budget-trimmed page. Full (absent-projection) merges are never
-/// budgeted, mirroring the read path.
+/// like any budget-trimmed page. Full (absent-projection) merges enforce only
+/// the message count, without byte budgeting, mirroring the read path.
 fn merge_live_turn(
     snapshot: &mut Value,
     agent_id: &AgentId,
@@ -1054,16 +1059,15 @@ fn merge_live_turn(
         "isStreaming": is_streaming,
     }));
     obj.insert("totalMessages".to_string(), json!(total + 1));
-    if projection == Some(ConversationProjection::Slim) {
-        rebudget_merged_page(obj);
-    }
+    rebudget_merged_page(obj, projection);
 }
 
 /// Re-apply the §5.5 slim page budget to a chat snapshot's `messages` page
 /// after the live-turn append (see [`merge_live_turn`]'s budget note). The
 /// newest row — the just-appended live turn — is the anchor and always
-/// serves; oldest rows are evicted until the page fits
-/// [`SLIM_PAGE_BUDGET_BYTES`], with `truncated`/`nextToken` re-minted at the
+/// serves; oldest rows are evicted until the page fits the five-message limit
+/// and, for slim projection, [`SLIM_PAGE_BUDGET_BYTES`], with
+/// `truncated`/`nextToken` re-minted at the
 /// oldest kept row's global position (its `seq`, contiguous from 0) so the
 /// evicted rows stay reachable via `agent.getConversation { nextToken }`
 /// with no gaps or duplicates. Sizes are counted through the same discarding
@@ -1071,19 +1075,23 @@ fn merge_live_turn(
 /// so both sides of the budget agree on what a row weighs. No-op when the
 /// merged page already fits — the common case, since the persisted page
 /// arrived within budget and a typical live turn is small.
-fn rebudget_merged_page(obj: &mut Map<String, Value>) {
+fn rebudget_merged_page(obj: &mut Map<String, Value>, projection: Option<ConversationProjection>) {
     let Some(arr) = obj.get_mut("messages").and_then(Value::as_array_mut) else {
         return;
     };
-    let sizes: Vec<usize> = arr
-        .iter()
-        .map(intent_services::pagination::serialized_size)
-        .collect();
-    let (lo, _hi) = intent_services::pagination::budget_page(
-        &sizes,
-        intent_services::pagination::BudgetAnchor::Newest,
-        SLIM_PAGE_BUDGET_BYTES,
-    );
+    let mut lo = arr.len().saturating_sub(CHAT_SNAPSHOT_MESSAGE_LIMIT);
+    if projection == Some(ConversationProjection::Slim) {
+        let sizes: Vec<usize> = arr[lo..]
+            .iter()
+            .map(intent_services::pagination::serialized_size)
+            .collect();
+        let (byte_lo, _hi) = intent_services::pagination::budget_page(
+            &sizes,
+            intent_services::pagination::BudgetAnchor::Newest,
+            SLIM_PAGE_BUDGET_BYTES,
+        );
+        lo += byte_lo;
+    }
     if lo == 0 {
         return;
     }
@@ -1128,6 +1136,9 @@ pub(crate) struct ChatDeltaState {
     /// in both modes — a fragment there would clobber the client's
     /// accumulation.
     text_acc: HashMap<String, String>,
+    /// Completed snapshot rows can overlap queued chunks too. Keep their
+    /// bounded-page text across turn finalization, separate from live state.
+    snapshot_text: HashMap<String, String>,
     /// `blockId` → union of the `media` sidecar entries (§7.1) delivered for
     /// a `text` block so far this turn. In full mode every chunk delta
     /// carries the union (the block is full state, so latest-wins conflation
@@ -1164,6 +1175,7 @@ impl ChatDeltaState {
             encoding,
             projection,
             text_acc: HashMap::new(),
+            snapshot_text: HashMap::new(),
             media_acc: HashMap::new(),
             seen_ids: HashSet::new(),
             emitted_ids: HashSet::new(),
@@ -1183,11 +1195,30 @@ impl ChatDeltaState {
     /// (monorepo#2675) deltas carry only the post-snapshot fragment, so the
     /// pre-load doesn't shape the wire — but the accumulation still backs the
     /// DEGRADED terminal frame's best-effort full text, so seeding is identical
-    /// in both modes. No-op when the snapshot has no in-flight message.
+    /// in both modes. Completed rows also seed overlap text without becoming
+    /// the mapper's active turn: their queued chunks can race the page read.
     pub(crate) fn seed_from_snapshot(&mut self, snapshot: &Value) {
         let Some(messages) = snapshot.get("messages").and_then(Value::as_array) else {
             return;
         };
+        self.snapshot_text.clear();
+        for msg in messages {
+            if let Some(blocks) = msg.get("contentBlocks").and_then(Value::as_array) {
+                for block in blocks {
+                    if matches!(
+                        block.get("type").and_then(Value::as_str),
+                        Some("text" | "thinking")
+                    ) {
+                        if let (Some(id), Some(text)) = (
+                            block.get("id").and_then(Value::as_str),
+                            block.get("text").and_then(Value::as_str),
+                        ) {
+                            self.snapshot_text.insert(id.to_string(), text.to_string());
+                        }
+                    }
+                }
+            }
+        }
         let Some(msg) = messages
             .iter()
             .find(|m| m.get("isStreaming") == Some(&Value::Bool(true)))
@@ -1386,12 +1417,31 @@ impl ChatDeltaState {
         let d = &event.data;
         let block_id = d.get("blockId").and_then(Value::as_str)?.to_string();
         let message_id = d.get("messageId").and_then(Value::as_str)?.to_string();
-        self.message_id = Some(message_id.clone());
         let block_type = d.get("blockType").and_then(Value::as_str).unwrap_or("text");
         let content = d.get("content")?;
         let block = if block_type == "text" || block_type == "thinking" {
             let chunk = content.as_str().unwrap_or_default();
-            let acc = self.text_acc.entry(block_id.clone()).or_default();
+            let snapshot_text = self.snapshot_text.get(&block_id);
+            let acc = self
+                .text_acc
+                .entry(block_id.clone())
+                .or_insert_with(|| snapshot_text.cloned().unwrap_or_default());
+            if snapshot_text.is_some() {
+                self.seen_ids.insert(block_id.clone());
+            }
+            // The snapshot read and bus delivery overlap: queued chunks may
+            // already be included in the seeded prefix. Producer offsets let
+            // us discard precisely that overlap, even for repeated text.
+            let chunk = if let Some(offset) = d.get("textOffset").and_then(Value::as_u64) {
+                let offset = usize::try_from(offset).ok()?;
+                let overlap = acc.len().saturating_sub(offset);
+                if overlap >= chunk.len() {
+                    return None;
+                }
+                chunk.get(overlap..)?
+            } else {
+                chunk
+            };
             acc.push_str(chunk);
             let chunk_media = d.get("media").and_then(Value::as_object);
             if let Some(media) = chunk_media {
@@ -1427,6 +1477,7 @@ impl ChatDeltaState {
             self.remember_block(&block_id, &block);
             block
         };
+        self.message_id = Some(message_id.clone());
         let added = self.note_block(&block_id);
         let entity = self.entity(&message_id, block, None, None, false);
         Some(single_delta(added, &entity))
@@ -2261,14 +2312,15 @@ fn is_unshare_of_current_caller(event: &Event) -> bool {
 /// `comment:added` for the subscribed note re-lists the threads (with their
 /// comments) and emits the thread carrying the new comment as `updated` (a new
 /// thread upserts by `threadId`; the client merges idempotently). Events for a
-/// different note are ignored.
+/// different note are ignored. `comment:deleted` retains the thread ID, so a
+/// surviving thread is re-read and an empty thread emits `removedIds`.
 pub(crate) async fn comment_delta(
     api: &dyn WorkspaceApi,
     workspace_id: &WorkspaceId,
     note_id: &NoteId,
     event: &Event,
 ) -> Option<Value> {
-    if event.event_type != COMMENT_ADDED {
+    if !matches!(event.event_type.as_str(), COMMENT_ADDED | COMMENT_DELETED) {
         return None;
     }
     let event_note = event.data.get("noteId").and_then(Value::as_str)?;
@@ -2287,6 +2339,17 @@ pub(crate) async fn comment_delta(
         )
         .await
         .ok()?;
+    if event.event_type == COMMENT_DELETED {
+        let thread_id = event.data.get("threadId").and_then(Value::as_str)?;
+        return match result
+            .threads
+            .into_iter()
+            .find(|t| t.thread_id == thread_id)
+        {
+            Some(thread) => Some(json!({ "updated": [serde_json::to_value(thread).ok()?] })),
+            None => Some(json!({ "removedIds": [thread_id] })),
+        };
+    }
     let thread = result.threads.into_iter().find(|t| {
         t.comments
             .as_ref()

@@ -50,18 +50,40 @@ pub(super) const DEBOUNCE: Duration = Duration::from_secs(1);
 /// with the watchers).
 pub struct GitStatusRefresher {
     trigger_tx: mpsc::UnboundedSender<WorkspaceId>,
-    forward_task: JoinHandle<()>,
-    refresh_task: JoinHandle<()>,
+    forward_task: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+    refresh_task: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+    stopping: tokio::sync::watch::Sender<bool>,
 }
 
 impl Drop for GitStatusRefresher {
     fn drop(&mut self) {
-        self.forward_task.abort();
-        self.refresh_task.abort();
+        if let Some(task) = self.forward_task.get_mut() {
+            task.abort();
+        }
+        if let Some(task) = self.refresh_task.get_mut() {
+            task.abort();
+        }
     }
 }
 
 impl GitStatusRefresher {
+    /// Stop admitting refreshes and join the current branch reconciliation and
+    /// its event publication. Pending scans are rebuilt by startup watching.
+    pub async fn shutdown(&self) {
+        self.stopping.send_replace(true);
+        let mut forward = self.forward_task.lock().await;
+        if let Some(task) = forward.as_mut() {
+            task.abort();
+            let _ = task.await;
+        }
+        *forward = None;
+        let mut refresh = self.refresh_task.lock().await;
+        if let Some(task) = refresh.as_mut() {
+            let _ = task.await;
+        }
+        *refresh = None;
+    }
+
     /// Subscribe to `file:*` on `bus` and start the debounced refresh loop.
     /// `services` resolves workspace rows (worktree path, remote flag) at
     /// refresh time so the bridge always sees the current workspace state.
@@ -89,19 +111,28 @@ impl GitStatusRefresher {
                 }
             }
         });
-        let refresh_task =
-            intent_core::spawn_daemon(refresh_loop(bus, services, status_cache, trigger_rx));
+        let (stopping, stopped) = tokio::sync::watch::channel(false);
+        let refresh_task = intent_core::spawn_daemon(refresh_loop(
+            bus,
+            services,
+            status_cache,
+            trigger_rx,
+            stopped,
+        ));
         Self {
             trigger_tx,
-            forward_task,
-            refresh_task,
+            forward_task: tokio::sync::Mutex::new(Some(forward_task)),
+            refresh_task: tokio::sync::Mutex::new(Some(refresh_task)),
+            stopping,
         }
     }
 
     /// Request a debounced git-status refresh for `workspace_id` from an
     /// additional trigger source (same coalescing as the `file:*` path).
     pub fn trigger(&self, workspace_id: WorkspaceId) {
-        let _ = self.trigger_tx.send(workspace_id);
+        if !*self.stopping.borrow() {
+            let _ = self.trigger_tx.send(workspace_id);
+        }
     }
 }
 
@@ -113,11 +144,17 @@ async fn refresh_loop(
     services: Arc<dyn WorkspaceApi>,
     status_cache: Arc<GitStatusCache>,
     mut trigger_rx: mpsc::UnboundedReceiver<WorkspaceId>,
+    mut stopped: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut pending: HashMap<WorkspaceId, tokio::time::Instant> = HashMap::new();
     loop {
+        if *stopped.borrow() {
+            return;
+        }
         let next_deadline = pending.values().min().copied();
         tokio::select! {
+            biased;
+            _ = stopped.changed() => return,
             maybe = trigger_rx.recv() => match maybe {
                 Some(ws_id) => {
                     pending
@@ -134,6 +171,7 @@ async fn refresh_loop(
                     .map(|(id, _)| id.clone())
                     .collect();
                 for ws_id in due {
+                    if *stopped.borrow() { return; }
                     pending.remove(&ws_id);
                     refresh_workspace(&bus, services.as_ref(), status_cache.as_ref(), &ws_id).await;
                 }
@@ -371,6 +409,105 @@ mod tests {
                 _ => return None,
             }
         }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn shutdown_finishes_admitted_branch_refresh_before_store_close() {
+        struct HeldApi {
+            workspace: Workspace,
+            entered: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl WorkspaceApi for HeldApi {
+            fn get_workspace(&self, _: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
+                Box::pin(async move {
+                    self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                    Ok(self.workspace.clone())
+                })
+            }
+        }
+        let db = TempDb::new();
+        let root = TempDir::new("shutdown-branch");
+        {
+            let repo = git2::Repository::init(&root.path).unwrap();
+            repo.set_head("refs/heads/renamed").unwrap();
+            let tree_id = repo.index().unwrap().write_tree().unwrap();
+            let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+            repo.commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "seed",
+                &repo.find_tree(tree_id).unwrap(),
+                &[],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&db.path).await.unwrap();
+        let ws = test_workspace("shutdown-refresh", &root.path);
+        store.insert_workspace(&ws).await.unwrap();
+        store
+            .set_workspace_branch_auto_generated(&ws.id, true)
+            .await
+            .unwrap();
+        let bus = EventBus::new(store.clone());
+        let api = Arc::new(HeldApi {
+            workspace: ws.clone(),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let refresher =
+            GitStatusRefresher::start(bus.clone(), api.clone(), Arc::new(GitStatusCache::new()));
+        refresher.trigger(ws.id.clone());
+        timeout(Duration::from_secs(10), api.entered.notified())
+            .await
+            .unwrap();
+        let late_trigger = refresher.trigger_tx.clone();
+        let shutdown = refresher.shutdown();
+        tokio::pin!(shutdown);
+        let escaped = tokio::select! {
+            biased;
+            () = &mut shutdown => true,
+            () = std::future::ready(()) => false,
+        };
+        // Queue another trigger after shutdown admission closes. It must never
+        // reach get_workspace, even while the first admitted refresh settles.
+        let _ = late_trigger.send(ws.id.clone());
+        api.release.notify_one();
+        if !escaped {
+            timeout(Duration::from_secs(10), &mut shutdown)
+                .await
+                .unwrap();
+        }
+        bus.shutdown().await.unwrap();
+        store.close().await;
+        let reopened = Store::open(&db.path).await.unwrap();
+        let persisted = reopened.get_workspace(&ws.id).await.unwrap();
+        let events = reopened
+            .query_events(&intent_store::EventQuery::default())
+            .await
+            .unwrap();
+        reopened.close().await;
+        assert_eq!(
+            persisted.branch, "renamed",
+            "shutdown discarded an admitted branch reconciliation"
+        );
+        assert!(events.iter().any(|event| event.event_type
+            == intent_core::events::WORKSPACE_UPDATED
+            && event.data["changes"]["branch"] == "renamed"));
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == CHANGES_GIT_STATUS));
+        assert_eq!(
+            api.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "shutdown admitted a fresh refresh"
+        );
+        assert!(!escaped, "shutdown escaped a held refresh");
     }
 
     #[tokio::test]

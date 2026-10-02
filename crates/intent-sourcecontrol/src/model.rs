@@ -558,8 +558,48 @@ pub struct ReviewThreadTally {
 #[serde(rename_all = "camelCase")]
 pub struct PrObservation {
     pub pr: PullRequest,
+    /// Live revisions from the same observation, never the PR's stored base OID.
+    /// Internal cache/adapter identity; absent for REST-only observations.
+    #[serde(skip)]
+    pub ancestry_identity: Option<PrAncestryIdentity>,
     pub signals: MergeRequirementSignals,
     pub reviews: Option<Vec<Review>>,
     pub threads: Option<ReviewThreadTally>,
     pub conversation_count: i64,
+}
+
+/// A measured, revision-bound ancestry result. Missing old baseline fields
+/// decode to unknown; an unreadable comparison is never a zero count.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum PrAncestry {
+    #[default]
+    Unknown,
+    Known {
+        #[serde(rename = "baseSha")]
+        base_sha: String,
+        #[serde(rename = "headSha")]
+        head_sha: String,
+        #[serde(rename = "behindBy")]
+        behind_by: u64,
+    },
+}
+
+/// Immutable comparison inputs and the branch/fork identity that scopes reuse.
+/// Kept in the existing in-memory PR cache, not persisted or projected on PRs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrAncestryIdentity {
+    pub base_sha: String,
+    pub head_sha: String,
+    pub target_branch: String,
+    pub head_repository: Option<String>,
+}
+
+impl PrAncestryIdentity {
+    /// GitHub object IDs must be full commit hashes, never symbolic refs.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        let sha = |s: &str| s.len() == 40 && s.bytes().all(|c| c.is_ascii_hexdigit());
+        sha(&self.base_sha) && sha(&self.head_sha) && !self.target_branch.is_empty()
+    }
 }

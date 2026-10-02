@@ -5,9 +5,8 @@
 //! Concurrent `start()` callers share one in-flight future (a
 //! `Shared<BoxFuture>`); a `stop()` during an in-flight `start()` bumps a
 //! monotonic `external_stop_generation`, which the bind path re-checks and
-//! unwinds on. The listener performs exactly one bind attempt on the configured
-//! port and surfaces the OS error verbatim if that port is not available —
-//! there is no port walking. `stop()` runs the canonical shutdown ordering so a
+//! unwinds on. Fixed callers bind exactly their configured port. First-start
+//! assignment tries consecutive ports, committing before any accept task starts. `stop()` runs the canonical shutdown ordering so a
 //! subsequent `start()` cannot race the freed listen port.
 
 use std::io;
@@ -24,8 +23,7 @@ use tokio::task::JoinHandle;
 
 use crate::ws::{ConnCmd, WsInner};
 
-/// Default listen port (PROTOCOL §1). The listener binds exactly this port; if
-/// it is busy, `start()` returns the bind error immediately (no port walking).
+/// Preferred first-assignment port (PROTOCOL §1); ordinary start remains fixed.
 pub const DEFAULT_PORT: u16 = 5181;
 /// Heartbeat ping cadence (`HEARTBEAT_INTERVAL_MS`).
 pub(crate) const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
@@ -49,6 +47,7 @@ pub(crate) struct RunningHandles {
 #[derive(Default)]
 pub(crate) struct StartState {
     pub started: bool,
+    pub assigned_port: Option<u16>,
     pub shutting_down: bool,
     pub port: Option<u16>,
     pub start_task: Option<StartFuture>,
@@ -58,7 +57,10 @@ pub(crate) struct StartState {
 impl WsInner {
     /// Single-flight start: concurrent callers share one in-flight future;
     /// once running, returns the bound port immediately.
-    pub(crate) async fn start(self: &Arc<Self>) -> io::Result<u16> {
+    pub(crate) async fn start(
+        self: &Arc<Self>,
+        assignment: Option<PortAssignment>,
+    ) -> io::Result<u16> {
         let fut = {
             let mut st = self.state.lock().await;
             if st.started {
@@ -66,15 +68,30 @@ impl WsInner {
                     return Ok(port);
                 }
             }
-            st.shutting_down = false;
+            if st.shutting_down {
+                return Err(start_cancelled());
+            }
             if let Some(existing) = st.start_task.clone() {
                 existing
             } else {
                 let generation = self.external_stop_generation.load(Ordering::SeqCst);
                 let me = self.clone();
-                let fut = async move { me.do_start(generation).await }
-                    .boxed()
-                    .shared();
+                let assigned_port = st.assigned_port;
+                let fut = async move {
+                    let result = me
+                        .clone()
+                        .do_start(generation, assigned_port, assignment)
+                        .await;
+                    if result.is_err() {
+                        let mut st = me.state.lock().await;
+                        if me.external_stop_generation.load(Ordering::SeqCst) == generation {
+                            st.start_task = None;
+                        }
+                    }
+                    result
+                }
+                .boxed()
+                .shared();
                 st.start_task = Some(fut.clone());
                 fut
             }
@@ -90,15 +107,40 @@ impl WsInner {
     /// `running` while a later bind in the set was in flight, and installing
     /// after that would leave live listeners nothing tears down. Dropping
     /// the bound listeners on that path closes them.
-    async fn do_start(self: Arc<Self>, generation: u64) -> Result<u16, Arc<io::Error>> {
-        let (listeners, port) = self.bind_once(generation).await?;
+    async fn do_start(
+        self: Arc<Self>,
+        generation: u64,
+        assigned_port: Option<u16>,
+        assignment: Option<PortAssignment>,
+    ) -> Result<u16, Arc<io::Error>> {
+        let select = assignment.is_some() && assigned_port.is_none();
+        let first = assigned_port.unwrap_or(self.base_port);
+        let last = if select { u16::MAX } else { first };
+        let cancelled = || {
+            self.external_stop_generation.load(Ordering::SeqCst) != generation
+                || assignment.as_ref().is_some_and(|a| (a.cancelled)())
+        };
+        let (listeners, port) = select_port(first, last, cancelled, |port| {
+            bind_all(&self.bind_addresses, port)
+        })
+        .await
+        .map_err(Arc::new)?;
         let mut st = self.state.lock().await;
-        if self.external_stop_generation.load(Ordering::SeqCst) != generation {
-            st.start_task = None;
-            return Err(Arc::new(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "ws start aborted by concurrent stop",
-            )));
+        if cancelled() || st.shutting_down {
+            return Err(Arc::new(start_cancelled()));
+        }
+        // No accept task, readiness, or bound port is published until this
+        // synchronous commit succeeds. Errors drop every reserved socket.
+        if select {
+            (assignment
+                .as_ref()
+                .expect("selection has a persistence callback")
+                .persist)(port)
+            .map_err(Arc::new)?;
+            st.assigned_port = Some(port);
+        }
+        if cancelled() || st.shutting_down {
+            return Err(Arc::new(start_cancelled()));
         }
         for listener in &listeners {
             if let Ok(addr) = listener.local_addr() {
@@ -130,55 +172,6 @@ impl WsInner {
         Ok(port)
     }
 
-    /// One TCP bind attempt per configured address on the configured port —
-    /// all-or-nothing: any failure (including `EADDRINUSE`) drops the
-    /// already-bound listeners and is returned as-is, so the daemon never
-    /// silently serves fewer interfaces than configured (monorepo#3314). A
-    /// `base_port` of 0 (the E2E ephemeral seam) binds the first address on
-    /// an OS-assigned port and the remaining addresses on that same port.
-    /// An IPv6-unspecified (`::`) bind is made explicitly dual-stack (see
-    /// [`bind_listener`]). Re-checks the stop generation so a concurrent
-    /// `stop()` unwinds instead of binding.
-    async fn bind_once(
-        self: &Arc<Self>,
-        generation: u64,
-    ) -> Result<(Vec<TcpListener>, u16), Arc<io::Error>> {
-        if self.external_stop_generation.load(Ordering::SeqCst) != generation {
-            return Err(Arc::new(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "ws start aborted by concurrent stop",
-            )));
-        }
-        // Hard error (not just a debug assertion): `WsOptions` is public, and
-        // an empty set completing "successfully" would start the heartbeat
-        // and report a port with no TCP listener behind it.
-        if self.bind_addresses.is_empty() {
-            return Err(Arc::new(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "WsOptions.bind_addresses must be non-empty",
-            )));
-        }
-        let mut listeners = Vec::with_capacity(self.bind_addresses.len());
-        let mut port = self.base_port;
-        for addr in &self.bind_addresses {
-            match bind_listener(*addr, port).await {
-                Ok(listener) => {
-                    // First bind resolves an ephemeral port 0; the rest of
-                    // the set joins it on the same resolved port.
-                    port = listener.local_addr().map_err(Arc::new)?.port();
-                    listeners.push(listener);
-                }
-                Err(e) => {
-                    return Err(Arc::new(io::Error::new(
-                        e.kind(),
-                        format!("bind {addr}:{port}: {e}"),
-                    )))
-                }
-            }
-        }
-        Ok((listeners, port))
-    }
-
     /// Graceful shutdown in the canonical order (port of `stop()`): bump the
     /// stop generation (cancels an in-flight start), stop the heartbeat, close
     /// every client with `1001`, drop their subscriptions, stop accepting and
@@ -186,10 +179,12 @@ impl WsInner {
     /// cannot hit `EADDRINUSE`.
     pub(crate) async fn stop(self: &Arc<Self>) {
         self.external_stop_generation.fetch_add(1, Ordering::SeqCst);
+        let _stop = self.stop_gate.lock().await;
         let (running, start_task) = {
             let mut st = self.state.lock().await;
             st.shutting_down = true;
             st.started = false;
+            st.port = None;
             (st.running.take(), st.start_task.take())
         };
         // Let an in-flight start observe the generation bump and unwind first.
@@ -232,6 +227,75 @@ impl WsInner {
     }
 }
 
+/// The composition root commits the selected port while all listeners are held.
+pub(crate) struct PortAssignment {
+    pub persist: Arc<dyn Fn(u16) -> io::Result<()> + Send + Sync>,
+    pub cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+fn start_cancelled() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Interrupted,
+        "ws start aborted by concurrent stop",
+    )
+}
+
+/// Bounded, consecutive selection. The injected binder keeps range/error tests
+/// hermetic; production binds the entire address set in each attempt.
+async fn select_port<T, F, Fut>(
+    first: u16,
+    last: u16,
+    cancelled: impl Fn() -> bool,
+    mut bind: F,
+) -> io::Result<(T, u16)>
+where
+    F: FnMut(u16) -> Fut,
+    Fut: std::future::Future<Output = io::Result<(T, u16)>>,
+{
+    for port in first..=last {
+        if cancelled() {
+            return Err(start_cancelled());
+        }
+        match bind(port).await {
+            Ok(reserved) => return Ok(reserved),
+            Err(e) if e.kind() == io::ErrorKind::AddrInUse && port < last => {
+                // Bind often completes without yielding. Let stop() cancel even
+                // an entirely occupied range on a single-thread runtime.
+                tokio::task::yield_now().await;
+            }
+            Err(e) if e.kind() == io::ErrorKind::AddrInUse && first != last => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("WSS port range {first}..={last} exhausted: {e}"),
+                ));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "empty WSS port range",
+    ))
+}
+
+async fn bind_all(addresses: &[IpAddr], mut port: u16) -> io::Result<(Vec<TcpListener>, u16)> {
+    if addresses.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "WsOptions.bind_addresses must be non-empty",
+        ));
+    }
+    let mut listeners = Vec::with_capacity(addresses.len());
+    for addr in addresses {
+        let listener = bind_listener(*addr, port)
+            .await
+            .map_err(|e| io::Error::new(e.kind(), format!("bind {addr}:{port}: {e}")))?;
+        port = listener.local_addr()?.port();
+        listeners.push(listener);
+    }
+    Ok((listeners, port))
+}
+
 /// Bind one TCP listener at `addr:port`. An IPv6-unspecified (`::`) bind is
 /// explicitly configured dual-stack (`IPV6_V6ONLY = false`) before binding,
 /// so the IPv4 routes the pairing / `system.status` surfaces advertise for
@@ -264,6 +328,121 @@ async fn bind_listener(addr: IpAddr, port: u16) -> io::Result<TcpListener> {
 mod tests {
     use super::*;
     use std::net::Ipv6Addr;
+
+    #[tokio::test]
+    async fn selection_is_consecutive_and_stops_at_first_success() {
+        for occupied in 0..=2 {
+            let attempts = std::sync::Mutex::new(Vec::new());
+            let ((), port) = select_port(
+                5181,
+                u16::MAX,
+                || false,
+                |port| {
+                    attempts.lock().unwrap().push(port);
+                    std::future::ready(if port < 5181 + occupied {
+                        Err(io::Error::from(io::ErrorKind::AddrInUse))
+                    } else {
+                        Ok(((), port))
+                    })
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(port, 5181 + occupied);
+            assert_eq!(*attempts.lock().unwrap(), (5181..=port).collect::<Vec<_>>());
+        }
+    }
+
+    #[tokio::test]
+    async fn selection_never_wraps_and_only_retries_contention() {
+        for kind in [
+            io::ErrorKind::AddrInUse,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::AddrNotAvailable,
+        ] {
+            let mut attempts = Vec::new();
+            let error = select_port(
+                65534,
+                65535,
+                || false,
+                |port| {
+                    attempts.push(port);
+                    std::future::ready(Err::<((), u16), _>(io::Error::from(kind)))
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert_eq!(
+                attempts,
+                if kind == io::ErrorKind::AddrInUse {
+                    vec![65534, 65535]
+                } else {
+                    vec![65534]
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn selection_yields_and_cancels_between_busy_candidates() {
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signal = cancelled.clone();
+        let stop = tokio::spawn(async move {
+            signal.store(true, Ordering::SeqCst);
+        });
+        let mut attempts = 0;
+        let error = select_port(
+            5181,
+            65535,
+            || cancelled.load(Ordering::SeqCst),
+            |_| {
+                attempts += 1;
+                std::future::ready(Err::<((), u16), _>(io::Error::from(
+                    io::ErrorKind::AddrInUse,
+                )))
+            },
+        )
+        .await
+        .unwrap_err();
+        stop.await.unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn partial_bind_is_released_before_advancing() {
+        let first = IpAddr::from([127, 0, 0, 1]);
+        let second = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        let hog = match bind_listener(second, 0).await {
+            Ok(listener) => listener,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::AddrNotAvailable | io::ErrorKind::Unsupported
+                ) =>
+            {
+                return
+            }
+            Err(e) => panic!("bind IPv6 loopback: {e}"),
+        };
+        let busy = hog.local_addr().unwrap().port();
+        let error = bind_all(&[first, second], busy).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        let released = bind_listener(first, busy)
+            .await
+            .expect("partial first listener released");
+        drop(released);
+        let addresses = [first, second];
+        let (listeners, port) =
+            select_port(busy, u16::MAX, || false, |port| bind_all(&addresses, port))
+                .await
+                .unwrap();
+        assert!(port > busy);
+        assert_eq!(listeners.len(), 2);
+        assert!(bind_listener(first, port).await.is_err());
+        assert!(bind_listener(second, port).await.is_err());
+    }
 
     /// Reachability regression for the `::` bind: `advertised_hosts` includes
     /// the machine's IPv4 enumeration for an IPv6-unspecified bind, so the

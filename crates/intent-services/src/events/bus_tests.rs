@@ -382,6 +382,52 @@ async fn dropping_bus_flushes_buffered_batch_before_close() {
     assert!(sub.recv().await.is_none());
 }
 
+/// An admitted event is owned by the bus even if its publisher is cancelled.
+/// Hold the only write connection so the close checkpoint can overtake the
+/// detached writer deterministically, without sleeps or a busy database.
+#[tokio::test]
+async fn store_close_preserves_an_admitted_event_after_publisher_cancellation() {
+    let (tmp, bus) = bus().await;
+    let store = bus.store().clone();
+    let held = store.write_pool().acquire().await.unwrap();
+    let event = new_event("agent:stream:end", Some("agent-1"), ActorType::Agent);
+    {
+        let publish = bus.publish(&event);
+        tokio::pin!(publish);
+        tokio::select! {
+            biased;
+            result = &mut publish => panic!("writer passed the held connection: {result:?}"),
+            () = std::future::ready(()) => {}
+        }
+        // Cancelling the publisher must not revoke the already-enqueued event.
+    }
+    let close = async {
+        bus.shutdown().await.unwrap();
+        store.close().await;
+    };
+    tokio::pin!(close);
+    tokio::select! {
+        biased;
+        () = &mut close => panic!("close passed the held connection"),
+        () = std::future::ready(()) => {}
+    }
+    drop(held);
+    close.await;
+    assert!(
+        bus.publish(&event).await.is_err(),
+        "late admission must fail"
+    );
+    let reopened = Store::open(&tmp.path).await.unwrap();
+    let events = reopened.query_events(&EventQuery::default()).await.unwrap();
+    assert_eq!(
+        events.len(),
+        1,
+        "shutdown lost an already-admitted durable event"
+    );
+    assert_eq!(events[0].event_type, event.event_type);
+    reopened.close().await;
+}
+
 /// A lone serial publisher must not pay an artificial batch-window wait on
 /// every publish: the writer's idle path flushes as soon as a request is
 /// received. Regression guard for the earlier 20 ms window, under which N

@@ -32,6 +32,20 @@ pub(crate) async fn explicitly_refresh<T>(future: impl std::future::Future<Outpu
     FORCE_AFTER.scope(Instant::now(), Box::pin(future)).await
 }
 
+/// Preserve the original explicit demand timestamp across a retained task.
+/// Background work stays unforced; nested owners must not start a new demand.
+pub(crate) fn inherit_refresh<T>(
+    future: impl std::future::Future<Output = T>,
+) -> impl std::future::Future<Output = T> {
+    let force_after = FORCE_AFTER.try_with(|at| *at).ok();
+    async move {
+        match force_after {
+            Some(at) => FORCE_AFTER.scope(at, future).await,
+            None => future.await,
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct Key {
     scope: CacheScope,

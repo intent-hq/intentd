@@ -262,8 +262,8 @@ impl Store {
     /// # Errors
     /// Returns a database error or `NotFound` for a missing/foreign definition.
     pub async fn admit_script_run(&self, ws: &WorkspaceId, id: &str, token: &str) -> Result<()> {
-        let result = sqlx::query("UPDATE script SET pending_run_id = ?, pending_started_at = NULL, was_running = 1 WHERE workspace_id = ? AND id = ? AND mode = 'command'")
-            .bind(token).bind(ws.as_str()).bind(id).execute(self.write_pool()).await
+        let result = sqlx::query("UPDATE script SET pending_run_id = ?, latest_run_id = ?, latest_run_result = NULL, pending_started_at = NULL, was_running = CASE WHEN mode = 'command' THEN 1 ELSE was_running END WHERE workspace_id = ? AND id = ?")
+            .bind(token).bind(token).bind(ws.as_str()).bind(id).execute(self.write_pool()).await
             .map_err(|e| Error::Internal(format!("admit script run failed: {e}")))?;
         if result.rows_affected() == 0 {
             return Err(Error::NotFound(format!("script {id}")));
@@ -305,7 +305,8 @@ impl Store {
 
     /// Atomically settle the matching admission and retire explicit one-offs.
     /// A replaced, removed, already settled or newer run is an unchanged false.
-    /// Recovery keeps the legacy lost/dismiss marker, but consumes the token.
+    /// Recovery keeps the command lost marker or existing service restore marker,
+    /// but never recreates a dismissed service marker; it consumes the token.
     /// # Errors
     /// Returns a database/encoding error; neither result nor archive is changed.
     pub async fn settle_script_run(
@@ -317,8 +318,8 @@ impl Store {
         recovery: bool,
     ) -> Result<bool> {
         let encoded = serde_json::to_string(result).map_err(|e| Error::Internal(e.to_string()))?;
-        let result = sqlx::query("UPDATE script SET last_run = ?, archived_at = CASE WHEN purpose = 'oneOff' THEN coalesce(archived_at, ?) ELSE archived_at END, pending_run_id = NULL, pending_started_at = NULL, was_running = ? WHERE workspace_id = ? AND id = ? AND pending_run_id = ? AND mode = 'command'")
-            .bind(encoded).bind(&result.stopped_at).bind(recovery).bind(ws.as_str()).bind(id).bind(token)
+        let result = sqlx::query("UPDATE script SET last_run = CASE WHEN mode = 'command' THEN ? ELSE last_run END, latest_run_result = ?, archived_at = CASE WHEN purpose = 'oneOff' THEN coalesce(archived_at, ?) ELSE archived_at END, pending_run_id = NULL, pending_started_at = NULL, was_running = CASE WHEN ? THEN CASE WHEN mode = 'command' THEN 1 ELSE was_running END ELSE 0 END WHERE workspace_id = ? AND id = ? AND pending_run_id = ?")
+            .bind(&encoded).bind(&encoded).bind(&result.stopped_at).bind(recovery).bind(ws.as_str()).bind(id).bind(token)
             .execute(self.write_pool()).await.map_err(|e| Error::Internal(format!("settle script run failed: {e}")))?;
         Ok(result.rows_affected() != 0)
     }
@@ -329,7 +330,7 @@ impl Store {
     pub async fn pending_script_runs(
         &self,
     ) -> Result<Vec<(WorkspaceId, String, String, Option<String>)>> {
-        let rows = sqlx::query("SELECT workspace_id, id, pending_run_id, pending_started_at FROM script WHERE pending_run_id IS NOT NULL AND mode = 'command'")
+        let rows = sqlx::query("SELECT workspace_id, id, pending_run_id, pending_started_at FROM script WHERE pending_run_id IS NOT NULL")
             .fetch_all(self.read_pool()).await.map_err(|e| Error::Internal(format!("read pending script runs failed: {e}")))?;
         Ok(rows
             .iter()

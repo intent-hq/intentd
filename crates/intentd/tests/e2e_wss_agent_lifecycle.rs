@@ -13,6 +13,9 @@
 
 mod common;
 
+#[path = "e2e_wss_agent_lifecycle/creation_preferences.rs"]
+mod creation_preferences;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -222,7 +225,7 @@ where
                 let _ = ws.send(Message::Pong(p)).await;
             }
             Some(Ok(_)) => {}
-            other => panic!("expected text frame, got {other:?}"),
+            other => panic!("rpc {method} expected text frame, got {other:?}"),
         }
     }
 }
@@ -7016,6 +7019,48 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
     ws.0
 }
 
+/// Distinct authenticated author for tests whose invariant needs separate rows.
+async fn seed_queue_collaborator(data_dir: &Path, workspace_id: &str) -> &'static str {
+    use intent_core::{now_iso, Principal, PrincipalId, WorkspaceId, WorkspaceRole};
+    let token = "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef";
+    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
+        .await
+        .unwrap();
+    let principal = Principal {
+        id: PrincipalId::new(),
+        identity: None,
+        github_user_id: None,
+        login: Some("queue-guest".into()),
+        display_name: Some("Queue Guest".into()),
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    store.upsert_principal(&principal).await.unwrap();
+    let hash = Sha256::digest(token.as_bytes())
+        .iter()
+        .fold(String::new(), |mut hash, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(hash, "{byte:02x}");
+            hash
+        });
+    store
+        .insert_principal_credential(&principal.id, &hash)
+        .await
+        .unwrap();
+    store
+        .add_workspace_member(
+            &WorkspaceId::from(workspace_id),
+            &principal.id,
+            WorkspaceRole::Collaborator,
+        )
+        .await
+        .unwrap();
+    store.close().await;
+    token
+}
+
 fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
     use intent_core::{now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus};
     let ts = now_iso();
@@ -7164,8 +7209,8 @@ async fn boot_daemon_with_seeded_note() -> (tempfile::TempDir, Daemon, String, S
 /// WSS-2 (router): drive a broad slice of untested-over-WSS read/lifecycle
 /// router arms — `note.*` (list/get/create/update/listTasks), `mcp.servers.list`,
 /// `script.*` (list/create/status/remove), `terminal.*` (create/list/kill),
-/// `primitive.*` (addReference/addCli + note mutation), and the `pr.status`
-/// error-envelope arm — all over ONE pinned WSS RPC connection so each match
+/// `primitive.*` (addReference/addCli + note mutation), and the `pr.refresh`
+/// unlinked-workspace result — all over ONE pinned WSS RPC connection so each match
 /// arm in `intent-transport::router::dispatch` is exercised through
 /// `conn::process_frame` (which is uncounted over WSS in the COV-1 baseline).
 /// No agent turn → no `node` dependency.
@@ -7455,20 +7500,9 @@ async fn router_read_lifecycle_arms_over_wss() {
         "primitive.* appended to note body: {body}"
     );
 
-    // --- pr.status: error-envelope arm on a fresh workspace -----------------
-    // The seeded workspace has no `repository_owner`/`repository_name`/`pr_number`,
-    // so `pr.status` returns the well-defined "no active PR" envelope — still a
-    // valid hit on the router arm via the WSS path.
-    let pr_env = wss_rpc_envelope(&mut rpc, 21, "pr.status", json!({ "workspaceId": ws_id })).await;
-    assert!(
-        pr_env.get("error").is_some(),
-        "pr.status returns an error envelope on a fresh workspace: {pr_env}"
-    );
-    assert_eq!(
-        pr_env["error"]["code"],
-        json!(-32603),
-        "pr.status `Error::Internal` → -32603 (§9): {pr_env}"
-    );
+    // Retiring pr.status must keep refresh working for an unlinked workspace.
+    let refreshed = wss_rpc(&mut rpc, 21, "pr.refresh", json!({ "workspaceId": ws_id })).await;
+    assert!(refreshed["pullRequests"].is_array(), "{refreshed}");
 }
 
 /// WSS-2 (terminal.create env, §5.13 gap): the `env` param is layered onto the
@@ -9220,6 +9254,7 @@ async fn send_queued_message_now_over_wss() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
+    let guest_token = seed_queue_collaborator(&data_dir, &ws_id).await;
     let behavior = json!({ "blockUntilCancel": true, "response": "resumed" }).to_string();
     let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
@@ -9251,6 +9286,8 @@ async fn send_queued_message_now_over_wss() {
     assert!(sub_resp["subscriptionId"].is_string());
 
     let mut rpc = connect_ws(port, cfg.clone()).await;
+    let guest_url = format!("wss://localhost:{port}/ws?token={guest_token}");
+    let mut guest_rpc = common::wss_connect_with_retry(port, cfg.clone(), &guest_url).await;
     let created = wss_rpc(
         &mut rpc,
         10,
@@ -9295,7 +9332,7 @@ async fn send_queued_message_now_over_wss() {
     .await;
     let first_id = q_first["queuedMessage"]["id"].as_str().unwrap().to_string();
     let q_second = wss_rpc(
-        &mut rpc,
+        &mut guest_rpc,
         13,
         "agent.queueMessage",
         json!({ "agentId": agent_id, "content": "send me now" }),
@@ -9305,6 +9342,12 @@ async fn send_queued_message_now_over_wss() {
         .as_str()
         .unwrap()
         .to_string();
+
+    assert_ne!(first_id, second_id, "different authors keep distinct rows");
+    assert_ne!(
+        q_first["queuedMessage"]["messageMetadata"]["fromPrincipalId"],
+        q_second["queuedMessage"]["messageMetadata"]["fromPrincipalId"]
+    );
 
     // Send the SECOND entry now: response mirrors sendMessage and echoes the
     // ENTRY id as the delivered messageId.
@@ -9436,6 +9479,7 @@ async fn queue_drain_skips_under_edit_message_and_suppresses_idle_over_wss() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
+    let guest_token = seed_queue_collaborator(&data_dir, &ws_id).await;
     // First turn delays 1.2s so we have a deterministic setup window to enqueue
     // + toggle editing + enqueue again while the agent is busy. Subsequent
     // queue-drained turns proceed at full mock speed.
@@ -9469,6 +9513,8 @@ async fn queue_drain_skips_under_edit_message_and_suppresses_idle_over_wss() {
     assert!(sub_resp["subscriptionId"].is_string());
 
     let mut rpc = connect_ws(port, cfg.clone()).await;
+    let guest_url = format!("wss://localhost:{port}/ws?token={guest_token}");
+    let mut guest_rpc = common::wss_connect_with_retry(port, cfg.clone(), &guest_url).await;
     let created = wss_rpc(
         &mut rpc,
         10,
@@ -9523,7 +9569,7 @@ async fn queue_drain_skips_under_edit_message_and_suppresses_idle_over_wss() {
 
     // Enqueue msg_drain — the ready-to-send entry the worker MUST drain.
     let q_drain = wss_rpc(
-        &mut rpc,
+        &mut guest_rpc,
         14,
         "agent.queueMessage",
         json!({ "agentId": agent_id, "content": "drain-me" }),
@@ -9543,7 +9589,9 @@ async fn queue_drain_skips_under_edit_message_and_suppresses_idle_over_wss() {
     assert_eq!(pre_q.len(), 2, "queue mid-turn: {pre_q:?}");
     assert_eq!(pre_q[0]["id"].as_str(), Some(edit_mid.as_str()));
     assert_eq!(pre_q[0]["editing"], true);
-    assert_eq!(pre_q[1]["content"], "drain-me");
+    assert_eq!(pre_q[1]["content"], q_drain["queuedMessage"]["content"]);
+    assert!(pre_q[1]["content"].as_str().unwrap().ends_with("drain-me"));
+    assert_ne!(pre_q[0]["author"], pre_q[1]["author"]);
     assert!(pre_q[1].get("editing").is_none());
 
     // Collect events until we have observed TWO terminal `agent:stream:end`s:
@@ -11170,8 +11218,8 @@ async fn workspace_create_no_prompt_creates_agent_over_wss() {
 /// `workspace.create` with a name-less `initialAgent` carrying a specialist
 /// derives the agent's name from the specialist's resolved display name
 /// (frontmatter `name` — "Coordinator" for the embedded `spec-writer`) and
-/// marks it explicitly set, so the opening-turn `setAgentName`
-/// (`skipIfExplicitlySet: true`) cannot rename it away.
+/// leaves it generated, so the opening-turn `setAgentName` can give it a
+/// task-specific name.
 #[intent_test_macros::daemon_test]
 async fn workspace_create_nameless_initial_agent_derives_specialist_name_over_wss() {
     let Some(script) = gate("WSS workspace.create specialist-derived initial-agent name E2E")
@@ -11222,14 +11270,14 @@ async fn workspace_create_nameless_initial_agent_derives_specialist_name_over_ws
         "name derived from spec-writer's display name: {created}"
     );
     assert_eq!(
-        created["initialAgent"]["nameExplicitlySet"], true,
-        "specialist-derived default counts as explicitly set: {created}"
+        created["initialAgent"]["nameExplicitlySet"], false,
+        "specialist-derived default remains a generated placeholder: {created}"
     );
 
     // The derived name is persisted, not just projected into the create result.
     let got = wss_rpc(&mut rpc, 11, "agent.get", json!({ "agentId": agent_id })).await;
     assert_eq!(got["agent"]["name"], "Coordinator");
-    assert_eq!(got["agent"]["nameExplicitlySet"], true);
+    assert_eq!(got["agent"]["nameExplicitlySet"], false);
 }
 
 /// When a delegated agent calls `report_to_parent`, the report persists and is
@@ -13059,6 +13107,7 @@ async fn interrupt_mid_tool_call_settles_and_drains_queue_over_wss() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
+    let guest_token = seed_queue_collaborator(&data_dir, &ws_id).await;
     let behavior = json!({ "parkMidToolCall": true, "response": "resumed" }).to_string();
     let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
@@ -13089,6 +13138,8 @@ async fn interrupt_mid_tool_call_settles_and_drains_queue_over_wss() {
     assert!(sub_resp["subscriptionId"].is_string());
 
     let mut rpc = connect_ws(port, cfg.clone()).await;
+    let guest_url = format!("wss://localhost:{port}/ws?token={guest_token}");
+    let mut guest_rpc = common::wss_connect_with_retry(port, cfg.clone(), &guest_url).await;
     let created = wss_rpc(
         &mut rpc,
         10,
@@ -13133,13 +13184,18 @@ async fn interrupt_mid_tool_call_settles_and_drains_queue_over_wss() {
     .await;
     assert_eq!(q1["success"], true, "queue one: {q1}");
     let q2 = wss_rpc(
-        &mut rpc,
+        &mut guest_rpc,
         13,
         "agent.queueMessage",
         json!({ "workspaceId": &ws_id, "agentId": &agent_id, "content": QUEUED_TWO }),
     )
     .await;
     assert_eq!(q2["success"], true, "queue two: {q2}");
+    assert_ne!(q1["queuedMessage"]["id"], q2["queuedMessage"]["id"]);
+    assert_ne!(
+        q1["queuedMessage"]["messageMetadata"]["fromPrincipalId"],
+        q2["queuedMessage"]["messageMetadata"]["fromPrincipalId"]
+    );
     let queue = wss_rpc(
         &mut rpc,
         14,
@@ -13152,6 +13208,12 @@ async fn interrupt_mid_tool_call_settles_and_drains_queue_over_wss() {
         Some(2),
         "both entries parked behind the tool call: {queue}"
     );
+    let queued_turn_ids: Vec<String> = queue["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["turnId"].as_str().expect("queued turn id").to_owned())
+        .collect();
 
     // (1) The interrupt lands mid tool-call: preempted, never parked.
     let interrupted = wss_rpc(
@@ -13179,19 +13241,21 @@ async fn interrupt_mid_tool_call_settles_and_drains_queue_over_wss() {
     let mut saw_preempt_end = false;
     let mut saw_interrupt_chunk = false;
     let mut stream_ends = 0usize;
+    let mut last_end_was_queued_turn = false;
     let mut saw_settle_idle = false;
+    let mut saw_persisted_idle = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while let Some(frame) = wss_event_opt_until(&mut sub, deadline).await {
         let event = &frame["params"]["event"];
-        if event["data"]["agentId"]
-            .as_str()
-            .is_some_and(|id| id != agent_id)
-        {
+        if event["data"]["agentId"] != json!(agent_id) {
             continue;
         }
         match event["type"].as_str() {
             Some("agent:stream:end") => {
                 stream_ends += 1;
+                last_end_was_queued_turn = event["data"]["turnId"]
+                    .as_str()
+                    .is_some_and(|id| queued_turn_ids.iter().any(|queued| queued == id));
                 if !saw_preempt_end {
                     assert_eq!(
                         event["data"]["interruptReason"], "preempted_by_message",
@@ -13211,11 +13275,23 @@ async fn interrupt_mid_tool_call_settles_and_drains_queue_over_wss() {
                 }
             }
             Some("agent:idle") if saw_preempt_end => {
+                assert!(
+                    last_end_was_queued_turn,
+                    "idle must follow a queued turn's terminal: {event}"
+                );
                 assert_ne!(
                     event["data"]["reason"], "interrupted",
                     "a preemption is not a settlement — no synthetic interrupted idle: {event}"
                 );
                 saw_settle_idle = true;
+            }
+            Some("agent:status-changed")
+                if saw_settle_idle && event["data"]["status"] == "idle" =>
+            {
+                // The earlier idle event precedes end_turn's durable status
+                // write. Ignore the preemption's idle status before this turn.
+                assert_eq!(event["data"]["isActive"], false);
+                saw_persisted_idle = true;
                 break;
             }
             _ => {}
@@ -13238,6 +13314,11 @@ async fn interrupt_mid_tool_call_settles_and_drains_queue_over_wss() {
         "preempt end + interrupt turn end + at least one drained turn end: {stream_ends}"
     );
 
+    assert!(
+        saw_persisted_idle,
+        "worker persisted idle after the final turn's idle event"
+    );
+
     // Settled: nothing left parked, status idle.
     let queue = wss_rpc(
         &mut rpc,
@@ -13256,6 +13337,16 @@ async fn interrupt_mid_tool_call_settles_and_drains_queue_over_wss() {
         got["agent"]["status"], "idle",
         "session settled to idle, not stuck responding: {got}"
     );
+
+    for flag in [
+        "isStreaming",
+        "isProcessing",
+        "isResponding",
+        "isWaitingOnTool",
+        "turnInFlight",
+    ] {
+        assert_eq!(got["agent"][flag], false, "settled {flag}: {got}");
+    }
 
     // Transcript: every user row landed, in delivery order, after the marker.
     let conv = wss_rpc(
@@ -13311,12 +13402,13 @@ async fn interrupt_mid_tool_call_settles_and_drains_queue_over_wss() {
 /// `workspace_api` tool call served by the daemon's MCP server (the agent JS
 /// polls `ws.note.list` until a release note exists). Zero assistant output
 /// has streamed at that point, so the preemption takes the combined-delivery
-/// path (the preempted message rides the interrupt prompt). Two
-/// normal-priority entries are parked behind the target before the
-/// interrupt. The contract is the same as the user-interrupt variant: the
+/// path (the preempted message rides the interrupt prompt). Two consecutive
+/// same-human submissions share one normal-priority entry behind the target
+/// before the interrupt. The contract is the same as the user-interrupt variant: the
 /// sibling's send reports `delivered` (not queued), the target settles
 /// (`agent:idle`, `agent.get` idle, empty queue), and the transcript carries
-/// the interrupt row ahead of both parked entries.
+/// the interrupt row ahead of both merged contributions in arrival order,
+/// delivered exactly once under the surviving queue identity.
 #[intent_test_macros::daemon_test]
 async fn a2a_interrupt_during_in_flight_tool_call_settles_and_drains_over_wss() {
     let Some(script) = gate("A2A interrupt during in-flight tool call E2E (#5669)") else {
@@ -13459,7 +13551,8 @@ async fn a2a_interrupt_during_in_flight_tool_call_settles_and_drains_over_wss() 
         "the target's tool call announced itself (entered note)"
     );
 
-    // Two normal-priority entries park behind the busy turn.
+    // Consecutive submissions by one human share a pending entry.
+    let mut queued_responses = Vec::new();
     for (id, content) in [(13, QUEUED_ONE), (14, QUEUED_TWO)] {
         let q = wss_rpc(
             &mut rpc,
@@ -13469,6 +13562,7 @@ async fn a2a_interrupt_during_in_flight_tool_call_settles_and_drains_over_wss() 
         )
         .await;
         assert_eq!(q["success"], true, "queue: {q}");
+        queued_responses.push(q["queuedMessage"].clone());
     }
     let queue = wss_rpc(
         &mut rpc,
@@ -13479,9 +13573,32 @@ async fn a2a_interrupt_during_in_flight_tool_call_settles_and_drains_over_wss() 
     .await;
     assert_eq!(
         queue["queue"].as_array().map(Vec::len),
-        Some(2),
-        "both entries parked behind the tool call: {queue}"
+        Some(1),
+        "both same-author contributions share one parked entry: {queue}"
     );
+    let merged_content = format!("{QUEUED_ONE}\n\n{QUEUED_TWO}");
+    assert_eq!(queue["queue"][0]["content"], merged_content);
+    for field in ["id", "turnId", "queuedAt"] {
+        assert_eq!(
+            queued_responses[0][field], queued_responses[1][field],
+            "stable {field}"
+        );
+        assert_eq!(queue["queue"][0][field], queued_responses[0][field]);
+    }
+    let author_id = &queued_responses[0]["messageMetadata"]["fromPrincipalId"];
+    assert!(author_id.is_string(), "authenticated author stamp");
+    assert_eq!(
+        queued_responses[1]["messageMetadata"]["fromPrincipalId"],
+        *author_id
+    );
+    assert_eq!(queue["queue"][0]["author"]["principalId"], *author_id);
+    assert_eq!(queued_responses[1]["content"], merged_content);
+    let queued_turn_ids: Vec<String> = queue["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["turnId"].as_str().expect("queued turn id").to_owned())
+        .collect();
 
     // The sibling relays an interrupt-priority send into the busy target.
     let relayed = wss_rpc(
@@ -13500,6 +13617,7 @@ async fn a2a_interrupt_during_in_flight_tool_call_settles_and_drains_over_wss() 
     let mut sender_done = false;
     let mut saw_preempt_end = false;
     let mut target_complete_ends = 0usize;
+    let mut last_end_was_queued_turn = false;
     let is_target_stream_end = |event: &Value| {
         event["type"] == "agent:stream:end" && event["data"]["agentId"] == json!(target_id)
     };
@@ -13508,6 +13626,9 @@ async fn a2a_interrupt_during_in_flight_tool_call_settles_and_drains_over_wss() 
     while let Some(frame) = wss_event_opt_until(&mut sub, deadline).await {
         let event = &frame["params"]["event"];
         if is_target_stream_end(event) {
+            last_end_was_queued_turn = event["data"]["turnId"]
+                .as_str()
+                .is_some_and(|id| queued_turn_ids.iter().any(|queued| queued == id));
             if is_target_preempt_end(event) {
                 saw_preempt_end = true;
             } else {
@@ -13571,9 +13692,13 @@ async fn a2a_interrupt_during_in_flight_tool_call_settles_and_drains_over_wss() 
     // Settlement: the target drains its queue and goes idle.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     let mut saw_settle_idle = false;
+    let mut saw_persisted_idle = false;
     while let Some(frame) = wss_event_opt_until(&mut sub, deadline).await {
         let event = &frame["params"]["event"];
         if is_target_stream_end(event) {
+            last_end_was_queued_turn = event["data"]["turnId"]
+                .as_str()
+                .is_some_and(|id| queued_turn_ids.iter().any(|queued| queued == id));
             if is_target_preempt_end(event) {
                 saw_preempt_end = true;
             } else {
@@ -13581,11 +13706,25 @@ async fn a2a_interrupt_during_in_flight_tool_call_settles_and_drains_over_wss() 
             }
         }
         if event["type"] == "agent:idle" && event["data"]["agentId"] == json!(target_id) {
+            assert!(
+                last_end_was_queued_turn,
+                "idle must follow a queued turn's terminal: {event}"
+            );
             assert_ne!(
                 event["data"]["reason"], "interrupted",
                 "a preemption is not a settlement — no synthetic interrupted idle: {event}"
             );
             saw_settle_idle = true;
+        }
+        if saw_settle_idle
+            && event["type"] == "agent:status-changed"
+            && event["data"]["agentId"] == json!(target_id)
+            && event["data"]["status"] == "idle"
+        {
+            // Unlike agent:idle, this event follows end_turn's status write.
+            // Filtering by target also excludes the sibling's settlement.
+            assert_eq!(event["data"]["isActive"], false);
+            saw_persisted_idle = true;
             break;
         }
     }
@@ -13600,6 +13739,10 @@ async fn a2a_interrupt_during_in_flight_tool_call_settles_and_drains_over_wss() 
     assert!(
         saw_settle_idle,
         "the target settled (agent:idle) after the A2A interrupt"
+    );
+    assert!(
+        saw_persisted_idle,
+        "target worker persisted idle after the final turn's idle event"
     );
     let listed = wss_rpc(&mut rpc, 23, "note.list", json!({ "workspaceId": &ws_id })).await;
     assert!(
@@ -13628,6 +13771,16 @@ async fn a2a_interrupt_during_in_flight_tool_call_settles_and_drains_over_wss() 
         "target settled to idle, not stuck responding: {got}"
     );
 
+    for flag in [
+        "isStreaming",
+        "isProcessing",
+        "isResponding",
+        "isWaitingOnTool",
+        "turnInFlight",
+    ] {
+        assert_eq!(got["agent"][flag], false, "settled {flag}: {got}");
+    }
+
     let conv = wss_rpc(
         &mut rpc,
         22,
@@ -13653,8 +13806,36 @@ async fn a2a_interrupt_during_in_flight_tool_call_settles_and_drains_over_wss() 
     let one_idx = user_idx(QUEUED_ONE).expect("queued one delivered");
     let two_idx = user_idx(QUEUED_TWO).expect("queued two delivered");
     assert!(
-        urgent_idx < one_idx && one_idx < two_idx,
-        "the interrupt row lands ahead of both parked entries: urgent={urgent_idx} one={one_idx} two={two_idx}"
+        urgent_idx < one_idx && one_idx == two_idx,
+        "the interrupt precedes the single merged row: urgent={urgent_idx} one={one_idx} two={two_idx}"
+    );
+    let merged_text = messages[one_idx]["contentBlocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|block| block["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        merged_text.starts_with(&merged_content),
+        "contribution order: {merged_text}"
+    );
+    for needle in [QUEUED_ONE, QUEUED_TWO] {
+        let occurrences: usize = messages
+            .iter()
+            .filter(|row| row["role"] == "user")
+            .flat_map(|row| row["contentBlocks"].as_array().unwrap())
+            .filter_map(|block| block["text"].as_str())
+            .map(|text| text.matches(needle).count())
+            .sum();
+        assert_eq!(
+            occurrences, 1,
+            "each queued contribution delivered exactly once: {needle}"
+        );
+    }
+    assert_eq!(
+        messages[one_idx]["metadata"]["queueInfo"]["queuedMessageId"],
+        queued_responses[0]["id"]
     );
     let marker = messages
         .iter()
@@ -13843,6 +14024,197 @@ fn assert_no_file_data(v: &Value, surface: &str) {
         }
         Value::Array(items) => items.iter().for_each(|c| assert_no_file_data(c, surface)),
         _ => {}
+    }
+}
+
+/// Real TLS/WebSocket coverage for the chat-only five-row snapshot policy:
+/// fresh/stale/recent subscriptions, cursor continuation and invalidation reset.
+#[intent_test_macros::daemon_test]
+async fn five_message_chat_snapshots_and_invalidation_over_wss() {
+    use intent_core::{now_iso, AgentId, WorkspaceApi, WorkspaceId};
+    use intent_services::Services;
+    use intent_store::Store;
+
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let (ws_id, agent_id, ids) = {
+        let store = Store::open(&data_dir.join("intentd.db"))
+            .await
+            .expect("store");
+        let ws_root = common::hermetic_workspaces_root();
+        let services = Services::new(store.clone())
+            .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_settings_registry(common::registry_with_default_provider(ws_root.path()));
+        let ws = WorkspaceId::new();
+        store
+            .insert_workspace(&workspace_seed(&ws))
+            .await
+            .expect("workspace");
+        let created = services
+            .agent_create(
+                ws.clone(),
+                Some("Five messages".into()),
+                None,
+                None,
+                None,
+                None,
+                intent_core::AgentCreateExtra::default(),
+            )
+            .await
+            .expect("agent");
+        let agent = AgentId::from(created["agent"]["id"].as_str().unwrap());
+        let mut ids = Vec::new();
+        for seq in 0..12 {
+            ids.push(
+                store
+                    .append_agent_message(
+                        &agent,
+                        "user",
+                        &json!([{ "type": "text", "text": format!("message {seq}") }]),
+                        &now_iso(),
+                    )
+                    .await
+                    .expect("message")
+                    .id,
+            );
+        }
+        (ws.0, agent.0, ids)
+    };
+    let child = spawn_serve(&data_dir, "both", &[("INTENTD_AUTH_TOKEN", TOKEN)]);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    // Generic conversation paging keeps its existing default (all 12 here).
+    let generic = wss_rpc(
+        &mut rpc,
+        1,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(generic["messages"].as_array().unwrap().len(), 12);
+
+    for (since, expected_start, resumed) in [
+        (None, 7, None),
+        (Some(ids[3].as_str()), 7, Some(false)),
+        (Some(ids[9].as_str()), 10, Some(true)),
+    ] {
+        let mut chat = connect_ws(port, cfg.clone()).await;
+        let mut params = json!({ "agentId": agent_id });
+        if let Some(since) = since {
+            params["sinceMessageId"] = json!(since);
+        }
+        // Read the response envelope explicitly as well as the push envelope.
+        chat.send(Message::Text(
+            json!({ "jsonrpc": "2.0", "id": 10,
+            "method": "chat.subscribe", "params": params })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("subscribe");
+        let response: Value = loop {
+            let frame = timeout(Duration::from_secs(15), chat.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            match frame {
+                Message::Text(text) => break serde_json::from_str(&text).unwrap(),
+                Message::Ping(p) => chat.send(Message::Pong(p)).await.unwrap(),
+                other => panic!("unexpected subscribe response: {other:?}"),
+            }
+        };
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], 10);
+        assert!(response.get("error").is_none(), "{response}");
+        assert!(response["result"]["subscriptionId"].is_string());
+        let push = wss_push(&mut chat, 15).await;
+        assert_eq!(push["jsonrpc"], "2.0");
+        assert_eq!(
+            push["params"]["subscriptionId"],
+            response["result"]["subscriptionId"]
+        );
+        assert_eq!(push["params"]["kind"], "snapshot");
+        assert_eq!(push["params"]["seq"], 0);
+        let snapshot = &push["params"]["snapshot"];
+        let rows = snapshot["messages"].as_array().unwrap();
+        assert_eq!(rows.len(), 12 - expected_start);
+        for (row, expected_id) in rows.iter().zip(&ids[expected_start..]) {
+            assert_eq!(row["id"], expected_id.as_str());
+        }
+        assert_eq!(snapshot.get("resumed").and_then(Value::as_bool), resumed);
+        assert_eq!(snapshot["totalMessages"], 12);
+        assert_eq!(snapshot["truncated"], resumed != Some(true));
+        eprintln!(
+            "WSS five-message snapshot: resumed={resumed:?} rows={} bytes={}",
+            rows.len(),
+            serde_json::to_vec(snapshot).unwrap().len()
+        );
+        if resumed == Some(true) {
+            assert!(snapshot["nextToken"].is_null());
+        } else {
+            let older = wss_rpc(
+                &mut rpc,
+                11,
+                "agent.getConversation",
+                json!({
+                "workspaceId": ws_id, "agentId": agent_id, "limit": 5,
+                "nextToken": snapshot["nextToken"] }),
+            )
+            .await;
+            let older_rows = older["messages"].as_array().unwrap();
+            assert_eq!(older_rows.len(), 5);
+            for (row, expected_id) in older_rows.iter().zip(&ids[2..7]) {
+                assert_eq!(row["id"], expected_id.as_str());
+            }
+            let oldest = wss_rpc(
+                &mut rpc,
+                12,
+                "agent.getConversation",
+                json!({
+                "workspaceId": ws_id, "agentId": agent_id, "limit": 5,
+                "nextToken": older["nextToken"] }),
+            )
+            .await;
+            assert_eq!(oldest["messages"].as_array().unwrap().len(), 2);
+            assert_eq!(oldest["messages"][0]["id"], ids[0].as_str());
+            assert_eq!(oldest["messages"][1]["id"], ids[1].as_str());
+            assert!(oldest["nextToken"].is_null());
+        }
+        // An active recent-resume connection must reset to five on replacement.
+        if resumed == Some(true) {
+            let messages: Vec<Value> = (0..9)
+                .map(|seq| {
+                    json!({ "role": "user",
+                "contentBlocks": [{ "type": "text", "text": format!("replacement {seq}") }] })
+                })
+                .collect();
+            let replaced = wss_rpc(
+                &mut rpc,
+                13,
+                "agent.replaceMessages",
+                json!({
+                "workspaceId": ws_id, "agentId": agent_id, "messages": messages }),
+            )
+            .await;
+            assert_eq!(replaced["success"], true);
+            let reset = wss_push(&mut chat, 15).await;
+            assert_eq!(reset["params"]["kind"], "snapshot", "{reset}");
+            assert_eq!(reset["params"]["seq"], 1);
+            let snapshot = &reset["params"]["snapshot"];
+            assert_eq!(snapshot["resumed"], false);
+            assert_eq!(snapshot["totalMessages"], 9);
+            assert_eq!(snapshot["messages"].as_array().unwrap().len(), 5);
+            assert_eq!(snapshot["messages"][0]["seq"], 4);
+            assert_eq!(snapshot["messages"][4]["seq"], 8);
+            assert!(snapshot["nextToken"].is_string());
+        }
+        chat.close(None).await.expect("close chat");
     }
 }
 
@@ -15048,6 +15420,27 @@ async fn edit_and_regenerate_truncates_and_replays_history_over_wss() {
     assert_eq!(messages[2]["role"], "user");
     let edit_target = messages[2]["id"].as_str().expect("target id").to_string();
 
+    // A second client already holds the old transcript. Editing must reset
+    // this standing subscription without a reconnect or a manufactured gap.
+    let removed_ids = [messages[2]["id"].clone(), messages[3]["id"].clone()];
+    let mut chat = connect_ws(port, cfg.clone()).await;
+    let chat_response = wss_rpc(
+        &mut chat,
+        1,
+        "chat.subscribe",
+        json!({ "agentId": agent_id, "deltaEncoding": "incremental" }),
+    )
+    .await;
+    let initial = wss_push(&mut chat, 15).await;
+    assert_eq!(initial["params"]["seq"], 0);
+    assert_eq!(
+        initial["params"]["snapshot"]["messages"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+
     let edited = wss_rpc(
         &mut rpc,
         14,
@@ -15132,6 +15525,59 @@ async fn edit_and_regenerate_truncates_and_replays_history_over_wss() {
         "result messageId names the persisted regenerated user row (PROTOCOL §5.5)"
     );
     assert_eq!(messages[3]["role"], "assistant");
+
+    let replacement_assistant_id = messages[3]["id"].clone();
+    timeout(Duration::from_secs(30), async {
+        let mut saw_reset = false;
+        let mut seq = 0;
+        loop {
+            let frame = wss_push(&mut chat, 30).await;
+            let params = &frame["params"];
+            assert_eq!(params["subscriptionId"], chat_response["subscriptionId"]);
+            seq += 1;
+            assert_eq!(params["seq"], seq, "reset keeps the sequence contiguous");
+            if params["kind"] == "snapshot" {
+                let snapshot = &params["snapshot"];
+                assert_eq!(snapshot["resumed"], false, "discard the cached suffix");
+                assert_eq!(snapshot["deltaEncoding"], "incremental");
+                let rows = snapshot["messages"].as_array().expect("reset rows");
+                assert!(rows.iter().all(|row| !removed_ids.contains(&row["id"])));
+                saw_reset = true;
+                // A fast replacement can finish before the bounded reset read.
+                if rows
+                    .iter()
+                    .any(|row| row["id"] == replacement_assistant_id && row["isStreaming"] != true)
+                {
+                    break;
+                }
+            } else {
+                let entities = ["added", "updated"]
+                    .into_iter()
+                    .flat_map(|key| params["delta"][key].as_array().into_iter().flatten());
+                let mut completed = false;
+                for entity in entities {
+                    if saw_reset {
+                        assert!(
+                            !removed_ids.contains(&entity["messageId"]),
+                            "old row restored: {frame}"
+                        );
+                    }
+                    completed |= entity["messageId"] == replacement_assistant_id
+                        && entity["streamingComplete"] == true;
+                }
+                if completed {
+                    assert!(
+                        saw_reset,
+                        "replacement streamed without invalidating the old transcript"
+                    );
+                    break;
+                }
+            }
+        }
+        assert!(saw_reset, "edit must reset the standing chat subscription");
+    })
+    .await
+    .expect("standing chat converged through the regenerated turn");
 
     // Outbound-prompt contract (fresh session + history replay): the
     // regenerated turn's prompt carries the kept prefix as `<supervisor>` XML
@@ -18892,3 +19338,122 @@ mod member_tools;
 
 #[path = "e2e_wss_agent_lifecycle/member_transport.rs"]
 mod member_transport;
+
+/// Generated specialist names receive the first-user-message naming hint over
+/// WSS even in a titled workspace. Explicit and task-derived names are retained.
+#[intent_test_macros::daemon_test]
+async fn specialist_placeholder_first_message_naming_over_wss() {
+    let Some(script) = gate("specialist placeholder naming E2E") else {
+        return;
+    };
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path();
+    let ws_id = seed_workspace_only(data_dir).await;
+    let prompt_log = data_dir.join("naming-prompts.jsonl");
+    let prompt_log_str = prompt_log.to_string_lossy().into_owned();
+    let behavior = json!({"response": "Naming test response"}).to_string();
+    let env = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+        ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
+        ("MOCK_AGENT_PROMPT_LOG", prompt_log_str.as_str()),
+    ];
+    let _daemon = Daemon {
+        child: spawn_serve(data_dir, "both", &env),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let mut sub = connect_ws(port, cfg).await;
+    let subscribed = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({
+            "eventTypes": ["agent:*"], "workspaceId": ws_id,
+        }),
+    )
+    .await;
+    assert!(subscribed["subscriptionId"].is_string());
+
+    for (index, (name, explicit, needs_name)) in [
+        (None, false, true),
+        (Some("Implementor 2"), false, true),
+        (Some("Implementor"), true, false),
+        (Some("Fix the sidebar"), false, false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut params = json!({
+            "workspaceId": ws_id, "provider": "mock", "model": "default",
+            "specialistId": "implementor",
+        });
+        if let Some(name) = name {
+            params["name"] = json!(name);
+            params["nameExplicitlySet"] = json!(explicit);
+        }
+        let created = wss_rpc(&mut rpc, 10, "agent.create", params).await;
+        let agent_id = created["agent"]["id"].as_str().unwrap();
+        assert_eq!(created["agent"]["name"], name.unwrap_or("Implementor"));
+        assert_eq!(created["agent"]["nameExplicitlySet"], explicit);
+
+        for turn in 0..2 {
+            let content = format!("Naming case {index} turn {turn}: fix sidebar selection");
+            let sent = wss_rpc(
+                &mut rpc,
+                11,
+                "agent.sendMessage",
+                json!({
+                    "workspaceId": ws_id, "agentId": agent_id, "content": content,
+                }),
+            )
+            .await;
+            assert_eq!(sent["success"], true);
+            timeout(Duration::from_secs(30), async {
+                loop {
+                    let frame = wss_event(&mut sub, 30).await;
+                    let event = &frame["params"]["event"];
+                    if event["type"] == "agent:status-changed"
+                        && event["data"]["agentId"] == agent_id
+                        && event["data"]["status"] == "idle"
+                    {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("agent turn settled");
+            let log = std::fs::read_to_string(&prompt_log).expect("provider prompt log");
+            let prompts: Vec<Value> = log
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let text = prompts
+                .iter()
+                .rev()
+                .filter_map(|prompt| prompt["text"].as_str())
+                .find(|text| text.contains(&content))
+                .expect("user message reached provider");
+            assert_eq!(
+                text.contains("This agent still has a generated name"),
+                needs_name && turn == 0,
+                "case {index} turn {turn}: {text}"
+            );
+            assert!(!text.contains("This workspace needs a title"));
+            if needs_name && turn == 0 {
+                assert!(text.contains("ws.workspace.setAgentName"));
+                assert!(text.contains("task-specific name"));
+            }
+        }
+        let got = wss_rpc(&mut rpc, 12, "agent.get", json!({"agentId": agent_id})).await;
+        assert_eq!(
+            got["agent"]["name"],
+            name.unwrap_or("Implementor"),
+            "the hint itself never mutates the stored name"
+        );
+    }
+}

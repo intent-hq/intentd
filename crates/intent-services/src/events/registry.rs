@@ -73,6 +73,7 @@ struct PendingSetup {
 /// owns (clean shutdown, matching the previous boot-time handles).
 pub struct WatcherRegistry {
     task: JoinHandle<()>,
+    stopping: tokio::sync::watch::Sender<bool>,
     /// Retained only so tests can await watch establishment; the lifecycle task
     /// owns the hub for production purposes.
     #[cfg(test)]
@@ -90,6 +91,12 @@ impl Drop for WatcherRegistry {
 }
 
 impl WatcherRegistry {
+    /// Stop lifecycle admission and join all pending filesystem publishers.
+    pub async fn shutdown(mut self) {
+        self.stopping.send_replace(true);
+        let _ = (&mut self.task).await;
+    }
+
     /// Seed watchers for every current non-archived workspace with an existing
     /// on-disk root, then follow workspace lifecycle events on `bus`.
     /// `services` resolves paths for lifecycle events whose payload does not
@@ -221,6 +228,7 @@ impl WatcherRegistry {
         let specialists = SpecialistsWatcher::start(&hub, bus.clone(), initial);
         tracing::info!("specialists watcher started");
 
+        let (stopping, stopped) = tokio::sync::watch::channel(false);
         let task = intent_core::spawn_daemon(lifecycle_loop(
             Arc::clone(&hub),
             Arc::clone(&git_common),
@@ -233,9 +241,11 @@ impl WatcherRegistry {
             skills,
             specialists,
             setup_backstop,
+            stopped,
         ));
         Self {
             task,
+            stopping,
             #[cfg(test)]
             hub,
             #[cfg(test)]
@@ -375,21 +385,31 @@ async fn lifecycle_loop(
     skills: SkillsWatcher,
     specialists: SpecialistsWatcher,
     setup_backstop: Duration,
+    mut stopped: tokio::sync::watch::Receiver<bool>,
 ) {
     // Created workspaces awaiting `workspace:setup:completed` before their
     // watchers start. The loop sleeps toward the earliest deadline; a
     // deadline reached without a completion starts the watchers anyway.
     let mut pending: HashMap<WorkspaceId, PendingSetup> = HashMap::new();
-    loop {
+    'lifecycle: loop {
+        if *stopped.borrow() {
+            break;
+        }
         let batch = match pending.values().map(|p| p.deadline).min() {
-            None => match sub.recv().await {
-                Some(batch) => batch,
-                None => return,
-            },
-            Some(deadline) => tokio::select! {
+            None => tokio::select! {
+                biased;
+                _ = stopped.changed() => break,
                 batch = sub.recv() => match batch {
                     Some(batch) => batch,
-                    None => return,
+                    None => break,
+                },
+            },
+            Some(deadline) => tokio::select! {
+                biased;
+                _ = stopped.changed() => break,
+                batch = sub.recv() => match batch {
+                    Some(batch) => batch,
+                    None => break,
                 },
                 () = tokio::time::sleep_until(deadline) => {
                     let now = Instant::now();
@@ -424,6 +444,9 @@ async fn lifecycle_loop(
             },
         };
         for ev in batch {
+            if *stopped.borrow() {
+                break 'lifecycle;
+            }
             let ws_id = ev.workspace_id.clone();
             match ev.event_type.as_str() {
                 // Deferred start: hold the pending root until the create
@@ -567,6 +590,13 @@ async fn lifecycle_loop(
             }
         }
     }
+    // No lifecycle event can create another publisher after this point.
+    git_watchers.clear();
+    for (_, watcher) in file_watchers {
+        watcher.shutdown().await;
+    }
+    skills.shutdown().await;
+    specialists.shutdown().await;
 }
 
 /// Resolve the on-disk root for a lifecycle event: prefer the self-sufficient

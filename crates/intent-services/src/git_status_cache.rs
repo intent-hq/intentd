@@ -10,7 +10,7 @@
 //! walk.
 //!
 //! Freshness comes from invalidation, not from polling: every daemon-observed
-//! change marks the entry stale — git mutations (`git.stage`, `git.commit`,
+//! change marks the entry stale — git mutations (`git.stage`, `git.agentCommit`,
 //! branch switches, accept-changes steps) invalidate inline as they publish
 //! `changes:git-status`, and external edits reach
 //! [`crate::GitStatusRefresher`] via the `file:*` watcher and the `.git`

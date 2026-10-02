@@ -215,7 +215,16 @@ pub(crate) async fn handle(
     is_local: bool,
     reverse: &ReverseChannel,
 ) -> Option<String> {
-    handle_with_host_environment(req, api, bus, None, is_local, reverse).await
+    handle_with_host_environment(
+        req,
+        api,
+        bus,
+        None,
+        is_local,
+        reverse,
+        &intent_services::host_exec::HostExecRuntime::default(),
+    )
+    .await
 }
 
 pub(crate) async fn handle_with_host_environment(
@@ -225,6 +234,7 @@ pub(crate) async fn handle_with_host_environment(
     host_environment: Option<HostEnvironment>,
     is_local: bool,
     reverse: &ReverseChannel,
+    exec_runtime: &intent_services::host_exec::HostExecRuntime,
 ) -> Option<String> {
     let HostRequest {
         method,
@@ -638,7 +648,7 @@ pub(crate) async fn handle_with_host_environment(
                     return Some(error_frame(&id_echo, e.code, &e.message));
                 }
             };
-            match intent_services::host_exec::run_default(api, parsed).await {
+            match exec_runtime.run(api, parsed).await {
                 Ok(v) => success_frame(&id_echo, &v),
                 Err(e) => error_frame(&id_echo, e.code, &e.message),
             }

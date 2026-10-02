@@ -48,7 +48,7 @@ pub const NPX_NPM_REQUIREMENT: &str = "npm 7+";
 /// This adapter ignores `-c` argv and applies `CODEX_CONFIG` JSON on each
 /// thread start/resume. Its Codex dependency permits patch releases;
 /// verify actual runtime versions and policy precedence when updating the pin.
-pub const CODEX_ACP_NPX_PACKAGE: &str = "@agentclientprotocol/codex-acp@1.13.1";
+pub const CODEX_ACP_NPX_PACKAGE: &str = "@agentclientprotocol/codex-acp@2.1.0";
 
 /// Daemon-owned Codex subagent denial shared by persistent agents, model
 /// probes, and one-shot launches. V2 feature enabling takes precedence over

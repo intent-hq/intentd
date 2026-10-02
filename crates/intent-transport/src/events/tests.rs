@@ -588,19 +588,7 @@ mod collaborator_fan_out {
         out
     }
 
-    fn queue_ids(data: &Value) -> Vec<&str> {
-        data["queue"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|e| e["id"].as_str().unwrap())
-            .collect()
-    }
-
-    /// A guest's `agent:queue:updated` frame carries only its own entries
-    /// plus unattributed (agent-sent) ones; the other member's entry AND the
-    /// unattributable legacy human entry never reach its connection, and the
-    /// surviving entries keep their `position`.
+    /// Every workspace participant receives the shared queue in drain order.
     #[tokio::test]
     async fn guest_queue_updated_frames_are_projected_to_the_principal() {
         let principal_id = PrincipalId::new();
@@ -611,8 +599,8 @@ mod collaborator_fan_out {
         let frames = queue_frames_for(guest, &principal_id).await;
         assert_eq!(frames.len(), 1, "{frames:?}");
         assert_eq!(frames[0]["agentId"], "agent-1");
-        assert_eq!(queue_ids(&frames[0]), vec!["m-own", "m-agent"]);
-        assert_eq!(frames[0]["queue"][1]["position"], 2, "no renumbering");
+        assert_eq!(frames[0]["queue"], mixed_queue(&principal_id));
+        assert_eq!(frames[0]["queue"][1]["position"], 1, "no renumbering");
     }
 
     /// The administrator's and non-wire callers' frames are the publisher's
@@ -688,12 +676,9 @@ mod collaborator_fan_out {
         out
     }
 
-    /// A guest's `agent:queue:processing` frame for an entry it may not see
-    /// — another member's, or a human-origin entry the workspace could not
-    /// attribute — keeps the ids the FE keys the turn on but loses
-    /// `content`; its own and unattributed entries arrive whole.
+    /// Processing events carry shared content even for unknown authors.
     #[tokio::test]
-    async fn guest_queue_processing_frames_drop_foreign_content() {
+    async fn guest_queue_processing_frames_include_shared_content() {
         let principal_id = PrincipalId::new();
         let guest = Caller::Wire {
             principal_id: principal_id.clone(),
@@ -701,18 +686,9 @@ mod collaborator_fan_out {
         };
         let frames = processing_frames_for(guest, &principal_id).await;
         assert_eq!(frames.len(), 4, "{frames:?}");
-        assert_eq!(frames[0]["content"], "text of m-own", "{frames:?}");
-        assert_eq!(
-            frames[1],
-            json!({ "agentId": "agent-1", "messageId": "m-other", "turnId": "m-other" }),
-            "foreign entry: ids only"
-        );
-        assert_eq!(
-            frames[2],
-            json!({ "agentId": "agent-1", "messageId": "m-unknown", "turnId": "m-unknown" }),
-            "unknown-human entry: ids only"
-        );
-        assert_eq!(frames[3]["content"], "text of m-agent", "{frames:?}");
+        for (frame, id) in frames.iter().zip(PROCESSING_IDS) {
+            assert_eq!(frame["content"], format!("text of {id}"));
+        }
     }
 
     /// The administrator's and non-wire callers' processing frames carry the
@@ -1717,4 +1693,97 @@ mod emit_path_taxonomy {
             .collect();
         assert_eq!(found, vec!["note:real-emit".to_string()]);
     }
+}
+
+#[tokio::test]
+async fn permission_delivery_rechecks_guest_management_without_visibility_cache() {
+    use intent_core::{BoxFuture, HostRole, Workspace, WorkspaceMembership, WorkspaceRole};
+    use std::sync::atomic::AtomicBool;
+
+    struct PermissionApi {
+        manages: AtomicBool,
+        role: std::sync::Mutex<Option<HostRole>>,
+    }
+    impl WorkspaceApi for PermissionApi {
+        fn principal_host_role(
+            &self,
+            _: PrincipalId,
+        ) -> BoxFuture<'_, intent_core::Result<HostRole>> {
+            let role = *self.role.lock().unwrap();
+            Box::pin(
+                async move { role.ok_or_else(|| intent_core::Error::NotFound("revoked".into())) },
+            )
+        }
+        fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, intent_core::Result<Workspace>> {
+            let manages = self.manages.load(Ordering::SeqCst);
+            Box::pin(async move {
+                if id.as_str() != "owned" {
+                    return Err(intent_core::Error::NotFound("hidden".into()));
+                }
+                Ok(Workspace {
+                    id,
+                    membership: Some(WorkspaceMembership {
+                        can_manage: manages,
+                        owner_principal_id: None,
+                        my_role: Some(if manages {
+                            WorkspaceRole::Owner
+                        } else {
+                            WorkspaceRole::Collaborator
+                        }),
+                        member_count: 1,
+                        open_invite_count: 0,
+                    }),
+                    ..intent_core::chief_workspace()
+                })
+            })
+        }
+    }
+    let api = Arc::new(PermissionApi {
+        manages: AtomicBool::new(true),
+        role: std::sync::Mutex::new(Some(HostRole::Guest)),
+    });
+    let dyn_api: Arc<dyn WorkspaceApi> = api.clone();
+    let caller = Caller::Wire {
+        principal_id: PrincipalId::new(),
+        host_role: HostRole::Guest,
+    };
+    crate::context::with_request_context(true, Some(caller), async {
+        let mut gate = MembershipGate::for_current_caller(&dyn_api).unwrap();
+        let mut ev = Event {
+            id: "permission-event".into(),
+            workspace_id: WorkspaceId::from("owned"),
+            timestamp: intent_core::now_iso(),
+            event_type: intent_core::events::AGENT_PERMISSION_REQUEST.into(),
+            actor: EventActor::default(),
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: json!({"requestId":"secret", "workspaceId":"owned", "canManage":true}),
+        };
+        assert!(gate.allows(&ev).await);
+        ev.event_type = intent_core::events::AGENT_PERMISSION_RESOLVED.into();
+        assert!(gate.allows(&ev).await);
+        ev.workspace_id = WorkspaceId::from("unrelated");
+        assert!(
+            !gate.allows(&ev).await,
+            "payload workspace claim cannot grant access"
+        );
+        ev.workspace_id = WorkspaceId::from("owned");
+        ev.event_type = intent_core::events::TERMINAL_DATA.into();
+        assert!(!gate.allows(&ev).await, "no other guest management events");
+        ev.event_type = intent_core::events::AGENT_PERMISSION_REQUEST.into();
+        api.manages.store(false, Ordering::SeqCst);
+        assert!(
+            !gate.allows(&ev).await,
+            "demotion must bypass cached visibility"
+        );
+        api.manages.store(true, Ordering::SeqCst);
+        assert!(gate.allows(&ev).await, "restored ownership");
+        *api.role.lock().unwrap() = None;
+        assert!(!gate.allows(&ev).await, "revoked identity fails closed");
+        *api.role.lock().unwrap() = Some(HostRole::Member);
+        assert!(gate.allows(&ev).await, "member behavior retained");
+    })
+    .await;
 }

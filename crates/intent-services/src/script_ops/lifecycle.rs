@@ -1,7 +1,7 @@
 //! Durable definition changes share admission locks with start/run/restart.
 use super::{
-    json, now_iso, publish_event, script_event, Error, HashSet, ManagedScript, Result,
-    ScriptManager, ScriptMode, ScriptStatus, Value, WorkspaceId, SCRIPT_CHANGED,
+    json, now_iso, Error, HashSet, ManagedScript, Result, ScriptManager, ScriptMode, ScriptStatus,
+    Value, WorkspaceId,
 };
 
 impl ScriptManager {
@@ -33,27 +33,35 @@ impl ScriptManager {
     }
 
     async fn prepare_admission(&self, ws: &WorkspaceId, id: &str, restart: bool) -> Result<()> {
-        self.set_archive(ws, id, None).await?;
-        let command = self
+        if self
             .scripts
             .lock()
             .unwrap()
             .get(&(ws.clone(), id.to_owned()))
-            .is_some_and(|m| m.def.mode == ScriptMode::Command);
-        if command {
-            let token = uuid::Uuid::new_v4().to_string();
-            self.store.admit_script_run(ws, id, &token).await?;
-            let mut scripts = self.scripts.lock().unwrap();
-            let m = scripts.get_mut(&(ws.clone(), id.to_owned())).unwrap();
-            m.run_id = Some(token);
-            m.run_generation = (!restart).then_some(m.generation);
-            m.pending_result = None;
+            .is_some_and(|m| m.run_id.is_some())
+        {
+            return Err(Error::Internal(
+                "previous script run has not durably settled".into(),
+            ));
         }
+        self.set_archive(ws, id, None).await?;
+        let token = uuid::Uuid::new_v4().to_string();
+        self.store.admit_script_run(ws, id, &token).await?;
+        let mut scripts = self.scripts.lock().unwrap();
+        let m = scripts.get_mut(&(ws.clone(), id.to_owned())).unwrap();
+        // A fresh logical run has not spawned yet, including manual restarts.
+        // Automatic service attempts retain the logical run and bypass admission.
+        m.state.started_at = None;
+        m.state.stopped_at = None;
+        m.state.run_id = Some(token.clone());
+        m.run_id = Some(token);
+        m.run_generation = (!restart).then_some(m.generation);
+        m.pending_result = None;
         Ok(())
     }
 
     /// Persist first, then change the registry. Never replace the runtime/PTY.
-    async fn set_archive(
+    pub(super) async fn set_archive(
         &self,
         ws: &WorkspaceId,
         id: &str,
@@ -71,6 +79,8 @@ impl ScriptManager {
         if old == timestamp {
             return Ok(());
         }
+        let publication = self.locks.publication_lock(id);
+        let _publishing = publication.lock().await;
         if timestamp.is_some() {
             if let Some(park) = &self.parks.archive_persist {
                 park.entered.notify_one();
@@ -91,15 +101,7 @@ impl ScriptManager {
             .ok_or_else(|| Error::NotFound(format!("script {id}")))?
             .def
             .archived_at = timestamp;
-        publish_event(
-            self.bus.as_ref(),
-            script_event(
-                ws,
-                SCRIPT_CHANGED,
-                json!({"scriptId": id, "action": "updated"}),
-            ),
-        )
-        .await;
+        self.emit_changed_locked(ws, id, "updated").await;
         Ok(())
     }
 
@@ -116,7 +118,7 @@ impl ScriptManager {
         }
         let mgr = self.clone();
         let ws = ws.clone();
-        intent_core::spawn_daemon(async move { mgr.archive_owned(&ws, ids, archive).await })
+        self.spawn_owned(async move { mgr.archive_owned(&ws, ids, archive).await })
             .await
             .map_err(|e| Error::Internal(format!("archive task failed: {e}")))?
     }

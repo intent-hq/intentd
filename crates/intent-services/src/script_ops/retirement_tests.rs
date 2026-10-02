@@ -328,6 +328,7 @@ async fn retirement_durable_token_fences_rerun_replacement_removal_and_scope() {
     let id = one_off(&h, "true").await;
     let store = &h.services.store;
     let result = intent_core::ScriptLastRun {
+        run_id: None,
         outcome: intent_core::ScriptRunOutcome::Succeeded,
         exit_code: Some(0),
         started_at: None,
@@ -412,6 +413,22 @@ async fn retirement_database_failure_keeps_real_result_and_output_active() {
             .unwrap()["exitCode"],
         0
     );
+    let changes = h
+        .services
+        .store
+        .query_events(&EventQuery {
+            workspace_id: Some(h.ws.clone()),
+            event_types: vec![SCRIPT_CHANGED.to_string()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        changes.len(),
+        1,
+        "failed settlement publishes no invented result or archive"
+    );
+    assert_eq!(changes[0].data["action"], "created");
     let recovered = Services::new(Store::open(&h.tmp.path).await.unwrap());
     assert_eq!(recovered.hydrate_scripts().await.unwrap(), 1);
     let row = recovered
@@ -600,7 +617,7 @@ async fn retirement_cancelled_waiter_cannot_split_committed_result_and_registry(
 }
 
 #[intent_test_macros::daemon_test]
-async fn retirement_shutdown_in_restart_teardown_recovers_successor_admission() {
+async fn retirement_shutdown_in_restart_teardown_recovers_only_predecessor() {
     let h = harness().await;
     let id = one_off(&h, "cat").await;
     let park = Arc::new(SupervisePark::default());
@@ -637,14 +654,20 @@ async fn retirement_shutdown_in_restart_teardown_recovers_successor_admission() 
     .await
     .unwrap();
     let pending = h.services.store.pending_script_runs().await.unwrap();
-    assert_ne!(pending[0].2, old, "restart admission precedes teardown");
+    assert_eq!(
+        pending[0].2, old,
+        "successor admission must follow predecessor settlement"
+    );
     mgr.stop_all().await;
     park.release.notify_one();
-    tokio::time::timeout(LIVENESS, restart)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    assert!(
+        tokio::time::timeout(LIVENESS, restart)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err(),
+        "shutdown leaves the predecessor for recovery, without accepting a successor"
+    );
     let lock = mgr.locks.definition_lock(&id);
     let guard = lock.lock().await;
     let handle = mgr
@@ -916,7 +939,7 @@ async fn retirement_shutdown_preserves_terminal_result_before_marker_persistence
 }
 
 #[intent_test_macros::daemon_test]
-async fn retirement_shutdown_does_not_attach_predecessor_result_to_restart_admission() {
+async fn retirement_cannot_admit_successor_before_predecessor_publication() {
     let h = harness().await;
     let id = one_off(&h, "true").await;
     let park = Arc::new(SupervisePark::default());
@@ -928,42 +951,20 @@ async fn retirement_shutdown_does_not_attach_predecessor_result_to_restart_admis
         .unwrap();
     let lock = mgr.locks.definition_lock(&id);
     let guard = lock.lock().await;
-    // Commit successor admission while the predecessor still owns terminal
-    // publication. This is the durable restart-before-teardown boundary.
-    mgr.prepare_restart(&h.ws, &id).await.unwrap();
     let token = h.services.store.pending_script_runs().await.unwrap()[0]
         .2
         .clone();
-    let shutdown = {
-        let mgr = mgr.clone();
-        intent_core::spawn_daemon(async move { mgr.stop_all().await })
-    };
-    tokio::time::timeout(LIVENESS, async {
-        loop {
-            if mgr
-                .scripts
-                .lock()
-                .unwrap()
-                .get(&(h.ws.clone(), id.clone()))
-                .unwrap()
-                .stopped_by_user
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    park.release.notify_one();
-    tokio::time::timeout(LIVENESS, shutdown)
-        .await
-        .unwrap()
-        .unwrap();
-    drop(guard);
+    assert!(mgr.prepare_restart(&h.ws, &id).await.is_err());
     assert_eq!(
         h.services.store.pending_script_runs().await.unwrap()[0].2,
         token
+    );
+    park.release.notify_one();
+    drop(guard);
+    let settled = retired(&h, &id).await;
+    assert_eq!(
+        settled.last_run.unwrap().outcome,
+        intent_core::ScriptRunOutcome::Succeeded
     );
     let fresh = Services::new(Store::open(&h.tmp.path).await.unwrap());
     fresh.hydrate_scripts().await.unwrap();
@@ -974,10 +975,9 @@ async fn retirement_shutdown_does_not_attach_predecessor_result_to_restart_admis
         .unwrap()
         .unwrap();
     assert_eq!(
-        def.last_run.unwrap().outcome,
-        intent_core::ScriptRunOutcome::Interrupted
+        def.last_run.unwrap().run_id.as_deref(),
+        Some(token.as_str())
     );
-    assert!(def.archived_at.is_some());
 }
 
 async fn cancelled_observed_failure_retires(bad_cwd: bool) {
@@ -1081,4 +1081,51 @@ async fn retirement_cancelled_run_waiter_after_cwd_failure_still_retires() {
 #[intent_test_macros::daemon_test]
 async fn retirement_cancelled_run_waiter_after_spawn_failure_still_retires() {
     cancelled_observed_failure_retires(false).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn retirement_shutdown_joins_finalizer_past_supervisor_grace() {
+    let h = harness().await;
+    let id = one_off(&h, "printf final").await;
+    let park = Arc::new(SupervisePark::default());
+    let mut mgr = h.services.script_manager();
+    mgr.parks.settlement_ready = Some(park.clone());
+    let run = {
+        let mgr = mgr.clone();
+        let ws = h.ws.clone();
+        let id = id.clone();
+        intent_core::spawn_daemon(async move { mgr.run(&ws, &id, None, None).await })
+    };
+    tokio::time::timeout(LIVENESS, park.entered.notified())
+        .await
+        .unwrap();
+    // Exercise the existing grace path with final durable settlement held.
+    tokio::time::timeout(LIVENESS, mgr.stop_all())
+        .await
+        .unwrap();
+    let drain = h.services.shutdown_store_writers();
+    tokio::pin!(drain);
+    let escaped = tokio::select! {
+        biased;
+        () = &mut drain => true,
+        () = std::future::ready(()) => false,
+    };
+    park.release.notify_one();
+    tokio::time::timeout(LIVENESS, run)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    if !escaped {
+        tokio::time::timeout(LIVENESS, drain).await.unwrap();
+    }
+    let settled = retired(&h, &id).await;
+    assert_eq!(
+        settled.last_run.unwrap().outcome,
+        intent_core::ScriptRunOutcome::Succeeded
+    );
+    assert!(
+        !escaped,
+        "store barrier returned while a known script result was still unpersisted"
+    );
 }

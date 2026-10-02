@@ -1773,6 +1773,10 @@ async fn dispatch(
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
+        "agent.getCreationPreferences" => api
+            .agent_get_creation_preferences(require_ws_note(params)?)
+            .await
+            .map_err(domain_to_rpc),
         "agent.create" => {
             // Agent ids are server-assigned: reject stale clients that still
             // send `agentId` before the request reaches the service (checked
@@ -1812,6 +1816,8 @@ async fn dispatch(
             // default. The blank is dropped downstream, so the persisted
             // field is still `NULL` either way.
             let extra = AgentCreateExtra {
+                remember_specialist: opt_bool_strict(params, "rememberSpecialist")?
+                    .unwrap_or(false),
                 provider: opt_nonempty_str(params, "provider"),
                 reasoning_effort: opt_str(params, "reasoningEffort"),
                 agent_type: opt_nonempty_str(params, "agentType"),
@@ -2747,16 +2753,6 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
-        "git.commit" => {
-            let ws = require_ws_note(params)?;
-            let message = require_str_param(params, "message")?;
-            let idempotency_key = opt_str(params, "idempotencyKey");
-            let r = api
-                .git_commit(ws, message, idempotency_key)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(json!({ "ok": true, "hash": r.hash, "files": r.files }))
-        }
         "git.agentCommit" => {
             let ws = require_ws_note(params)?;
             let message = require_str_param(params, "message")?;
@@ -2800,8 +2796,7 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
-        // `git.diff` is accepted as an alias for the wire-canonical `git.diffs`.
-        "git.diffs" | "git.diff" => {
+        "git.diffs" => {
             let ws = require_ws_note(params)?;
             // §5.6 extension: `paths` narrows the diff to exactly those
             // workspace-relative files (literal matching). The legacy single
@@ -2839,8 +2834,7 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
-        // `git.log` is accepted as an alias for the wire-canonical `git.commits`.
-        "git.commits" | "git.log" => {
+        "git.commits" => {
             let ws = require_ws_note(params)?;
             // §5.5 page params arrive nested under `page` ({ continuationToken,
             // limit }); fall back to top-level `limit`/`nextToken` for parity
@@ -2918,11 +2912,6 @@ async fn dispatch(
                 Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
-        }
-        "pr.status" => {
-            let ws = require_ws_note(params)?;
-            let r = api.pr_status(ws).await.map_err(domain_to_rpc)?;
-            Ok(r)
         }
         "pr.refresh" => {
             let ws = require_ws_note(params)?;
@@ -3615,14 +3604,6 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
-        "file-tracking.getLineStats" => {
-            let ws = require_ws_note(params)?;
-            let r = api
-                .file_tracking_get_line_stats(ws)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(r)
-        }
         "file-tracking.stage" => {
             let ws = require_ws_note(params)?;
             require_present(params, "paths")?;
@@ -3643,33 +3624,10 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
-        "metrics.getWorkspaceStats" => {
-            let ws = require_ws_note(params)?;
-            let r = api
-                .metrics_get_workspace_stats(ws)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(r)
-        }
         "metrics.getAgentStats" => {
             let agent_id = require_str_param(params, "agentId")?;
             let r = api
                 .metrics_get_agent_stats(agent_id)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(r)
-        }
-        "metrics.getAllWorkspaceStats" => {
-            let r = api
-                .metrics_get_all_workspace_stats()
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(r)
-        }
-        "metrics.clearAgentStats" => {
-            let agent_id = require_str_param(params, "agentId")?;
-            let r = api
-                .metrics_clear_agent_stats(agent_id)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -3896,10 +3854,34 @@ async fn dispatch(
         }
         "search.notes" => {
             let query = require_str_param(params, "query")?;
-            let request_id = opt_str(params, "requestId");
-            api.search_notes(query, request_id)
-                .await
-                .map_err(domain_to_rpc)
+            let workspace_id = opt_str_strict(params, "workspaceId")?;
+            let prefer_workspace_id = opt_str_strict(params, "preferWorkspaceId")?;
+            for (name, id) in [
+                ("workspaceId", &workspace_id),
+                ("preferWorkspaceId", &prefer_workspace_id),
+            ] {
+                if id.as_ref().is_some_and(String::is_empty) {
+                    return Err(invalid_params(format!("{name} must not be empty")));
+                }
+            }
+            let limit = match params.get("limit") {
+                None | Some(Value::Null) => None,
+                Some(value) => Some(value.as_i64().filter(|n| *n >= 0).ok_or_else(|| {
+                    invalid_params("limit must be a nonnegative signed 64-bit integer")
+                })?),
+            };
+            let include_archived = opt_bool_strict(params, "includeArchived")?.unwrap_or(true);
+            let request_id = opt_str_strict(params, "requestId")?;
+            api.search_notes(
+                query,
+                workspace_id.map(WorkspaceId::from),
+                prefer_workspace_id.map(WorkspaceId::from),
+                limit,
+                include_archived,
+                request_id,
+            )
+            .await
+            .map_err(domain_to_rpc)
         }
         "search.codebase" => {
             let ws = require_ws_note(params)?;
@@ -3966,14 +3948,16 @@ async fn dispatch(
         "file.read" => {
             let ws = require_ws_note(params)?;
             let path = require_str_param(params, "path")?;
-            api.file_read(ws, path, None).await.map_err(domain_to_rpc)
+            api.file_read(ws, path, None, opt_git_root_id(params))
+                .await
+                .map_err(domain_to_rpc)
         }
         "file.readChunk" => {
             let ws = require_ws_note(params)?;
             let path = require_str_param(params, "path")?;
             let offset = require_u64(params, "offset")?;
             let length = require_u64(params, "length")?;
-            api.file_read_chunk(ws, path, offset, length, None)
+            api.file_read_chunk(ws, path, offset, length, None, opt_git_root_id(params))
                 .await
                 .map_err(domain_to_rpc)
         }
@@ -4205,6 +4189,20 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)
         }
+        "scriptMonitor.list" => {
+            let ws = require_ws_note(params)?;
+            let agent = opt_str(params, "agentId").map(intent_core::AgentId::from);
+            api.script_monitor_list(ws, agent)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "scriptMonitor.cancel" | "scriptMonitor.cancelRun" => {
+            let ws = require_ws_note(params)?;
+            let id = require_str_param(params, "monitorId")?;
+            api.script_monitor_cancel(ws, id, None, method == "scriptMonitor.cancelRun")
+                .await
+                .map_err(domain_to_rpc)
+        }
         "script.start" => {
             let ws = require_ws_note(params)?;
             let script_id = require_str_param(params, "scriptId")?;
@@ -4331,14 +4329,17 @@ async fn dispatch(
             }
         }
         "specialist.list" => {
-            // Optional workspaceId is routing-only. This method merges
-            // user > bundled tiers only (the project tier is not part of the live
-            // wire contract iOS calls). `specialist.get` still accepts an optional
-            // `workspacePath` for the project tier (PROTOCOL §5.11). The optional
-            // `provider` supplies the resolution context for the additive
-            // `resolvedModel`/`resolvedProvider` preview fields.
+            let workspace_path = if opt_bool_strict(params, "includeProject")?.unwrap_or(false) {
+                let workspace = api
+                    .get_workspace(require_workspace_id(params)?)
+                    .await
+                    .map_err(workspace_err)?;
+                workspace.effective_path().map(str::to_owned)
+            } else {
+                None
+            };
             let provider = opt_str(params, "provider");
-            match api.specialist_list(None, provider).await {
+            match api.specialist_list(workspace_path, provider).await {
                 Ok(v) => Ok(v),
                 // Unknown provider → -32602 with the raw message.
                 Err(Error::InvalidParams(m)) => Err(invalid_params(m)),

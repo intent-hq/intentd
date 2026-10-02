@@ -262,9 +262,16 @@ pub(crate) async fn try_dispatch(
             .map(Some);
     }
     if let Some(rest) = method.strip_prefix("script.") {
-        return script::dispatch(api, workspace_id, eval_budget.total, rest, args)
-            .await
-            .map(Some);
+        return script::dispatch(
+            api,
+            workspace_id,
+            eval_budget.total,
+            caller_agent_id,
+            rest,
+            args,
+        )
+        .await
+        .map(Some);
     }
     if let Some(rest) = method.strip_prefix("terminal.") {
         return terminal::dispatch(api, workspace_id, rest, args)

@@ -36,6 +36,83 @@ use crate::npx_cli::guard_npx_version;
 use crate::test_support::test_tempdir;
 use crate::Services;
 
+#[intent_test_macros::daemon_test]
+async fn unsloth_status_queue_drains_before_store_close() {
+    let dir = test_tempdir("unsloth-status-drain");
+    let path = dir.path().join("state.db");
+    let store = Store::open(&path).await.unwrap();
+    let bus = EventBus::new(store.clone());
+    let services = Services::new_with_file_secrets(
+        store.clone(),
+        intent_core::FileSecretStore::with_path(dir.path().join("secrets.json")),
+    )
+    .with_event_bus(bus.clone());
+    let workspace_id = WorkspaceId::new();
+    let connection = store.write_pool().acquire().await.unwrap();
+    let sender = super::spawn_unsloth_status_publisher(
+        services.clone(),
+        workspace_id,
+        AgentId::from("held-status-agent"),
+    );
+    sender
+        .send((crate::unsloth_server::StatusLevel::Info, "loading".into()))
+        .unwrap();
+    sender
+        .send((
+            crate::unsloth_server::StatusLevel::Warning,
+            "restart needed".into(),
+        ))
+        .unwrap();
+    // The finite producer has ended before the final writer drain starts.
+    drop(sender);
+    let (entered, entering) = tokio::sync::oneshot::channel();
+    *services.secrets.writer_drain_pending.lock().unwrap() = Some(entered);
+    let owner = services.clone();
+    let mut drain = intent_core::spawn_daemon(async move { owner.shutdown_store_writers().await });
+    let pending = timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            point = entering => { assert_eq!(point.unwrap(), "store-tasks"); true }
+            result = &mut drain => { result.unwrap(); false }
+        }
+    })
+    .await
+    .unwrap();
+    drop(connection);
+    if pending {
+        timeout(Duration::from_secs(5), drain)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert!(
+        pending,
+        "service shutdown discarded queued Unsloth status publications"
+    );
+    bus.shutdown().await.unwrap();
+    store.close().await;
+    let reopened = Store::open(&path).await.unwrap();
+    let mut events = reopened
+        .query_events(&intent_store::EventQuery::default())
+        .await
+        .unwrap();
+    events.sort_by(|a, b| a.id.cmp(&b.id));
+    reopened.close().await;
+    let statuses: Vec<_> = events
+        .iter()
+        .filter(|event| event.event_type == intent_core::events::AGENT_STREAM_STATUS)
+        .map(|event| {
+            (
+                event.data["message"].as_str().unwrap(),
+                event.data["level"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        statuses,
+        vec![("loading", "info"), ("restart needed", "warning")]
+    );
+}
+
 #[test]
 fn usage_origin_uses_trusted_delivery_origin_before_opaque_metadata() {
     use intent_core::MessageOrigin;
@@ -2314,7 +2391,11 @@ async fn manager_with_bus() -> (TempDb, AgentManager, EventBus) {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store).with_event_bus(bus.clone());
+    let services = Services::new_with_file_secrets(
+        store,
+        intent_core::FileSecretStore::with_path(tmp.path.with_extension("secrets.json")),
+    )
+    .with_event_bus(bus.clone());
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
     (tmp, AgentManager::new(services, sink, 8), bus)
 }
@@ -2345,6 +2426,8 @@ fn mock_handle() -> AgentHandle {
             _rules_config: None,
             _pi_extension: None,
             npx_launch_dir: None,
+            cleanup_lease: None,
+            cleanup_services: None,
         }),
         antigravity_profile: None,
         session_mcp_servers: Vec::new(),
@@ -4658,6 +4741,8 @@ fn track_mock_agent_inner(
                 _rules_config: None,
                 _pi_extension: None,
                 npx_launch_dir: None,
+                cleanup_lease: None,
+                cleanup_services: None,
             }),
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
@@ -4812,6 +4897,8 @@ fn track_mock_agent_prompt_rpc_error_inner(
                 _rules_config: None,
                 _pi_extension: None,
                 npx_launch_dir: None,
+                cleanup_lease: None,
+                cleanup_services: None,
             }),
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
@@ -6915,6 +7002,13 @@ fn flush_entry(suffix: &str, content: String) -> crate::agent_ops::QueuedMessage
         hold_kind: None,
         hold_until: None,
         child_agent_id: None,
+        merged_submission_ids: Vec::new(),
+        edit_appended: String::new(),
+        edit_prepended: String::new(),
+        editing_message_id: None,
+        latest_human_submission_at: None,
+        provisional: false,
+        submission_order: 0,
     }
 }
 
@@ -8623,6 +8717,8 @@ async fn interrupt_on_wedged_transport_still_emits_terminal_events() {
                 _rules_config: None,
                 _pi_extension: None,
                 npx_launch_dir: None,
+                cleanup_lease: None,
+                cleanup_services: None,
             }),
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
@@ -10464,6 +10560,19 @@ async fn send_queued_message_now_delivers_entry_and_preserves_rest_of_queue() {
     assert!(serde_json::to_string(&row.content)
         .unwrap()
         .contains("second queued"));
+    let events = queue_processing_payloads(&mgr, &id).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["messageId"], second_id);
+    assert_eq!(events[0]["queuedMessages"][0]["id"], second_id);
+    assert_eq!(
+        events[0]["queuedMessages"][0]["turnId"],
+        events[0]["turnId"]
+    );
+    assert_eq!(
+        events[0]["queuedMessages"][0]["content"],
+        events[0]["content"]
+    );
+    assert_eq!(events[0]["queuedMessages"].as_array().unwrap().len(), 1);
 }
 
 /// `agent.sendQueuedMessageNow` with an unknown `messageId` is `-32602` with
@@ -10601,6 +10710,10 @@ async fn send_queued_message_now_restores_entry_when_slot_unavailable() {
         "restored entry is at the FRONT (next to deliver)"
     );
     assert_eq!(queue[1]["id"], json!(other_id));
+    assert!(
+        queue_processing_payloads(&mgr, &id).await.is_empty(),
+        "lost claim never starts processing"
+    );
 }
 
 /// Transactional guarantee: a user-persist failure (duplicate row id)
@@ -10643,6 +10756,10 @@ async fn send_queued_message_now_persist_failure_requeues_front() {
     assert_eq!(queue.len(), 1, "entry restored, never lost: {queue:?}");
     assert_eq!(queue[0]["id"], json!(entry_id));
     assert!(!mgr.is_busy(&id), "the slot was released");
+    assert!(
+        queue_processing_payloads(&mgr, &id).await.is_empty(),
+        "failed transcript append never starts send-now processing"
+    );
 }
 
 #[tokio::test]
@@ -13267,84 +13384,120 @@ async fn end_turn_persists_runtime_idle_and_emits_event() {
     assert!(!mgr.is_busy(&id));
 }
 
-/// The prompt's idle signal precedes the worker's final status write. Drive
-/// those existing phases separately to pin the observation boundary without
-/// timing sleeps or a production hook (the ordering predates deletion guards).
-#[intent_test_macros::daemon_test]
+/// #5669: an idle lifecycle event is emitted before the worker saves its
+/// `RuntimeIdle` status. Hold both boundaries so scheduler speed cannot hide
+/// the distinction between turn completion and durable worker settlement.
+#[tokio::test]
 async fn prompt_idle_event_precedes_end_turn_status_persistence() {
     use intent_core::events::{AGENT_IDLE, AGENT_STATUS_CHANGED};
+
     let (_tmp, mgr, bus) = manager_with_bus().await;
-    let (ws, id) = (
-        WorkspaceId::from("idle-boundary"),
-        AgentId::from("idle-boundary-agent"),
-    );
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let ws = WorkspaceId::from("ws-idle-settlement");
+    let id = AgentId::from("idle-settlement");
     seed_agent(&mgr, &ws, &id).await;
-    let mock = track_mock_agent(&mgr, &id, false);
-    assert!(mgr.try_begin(&id, &ws).await);
-    let (connection, notifications) = {
-        let handles = mgr.handles.lock().unwrap();
-        let handle = handles.get(&id).unwrap();
-        (
-            handle.execution.connection().unwrap(),
-            handle.execution.runtime.notifications(),
-        )
-    };
-    let mut sub = bus.subscribe(SubscriptionFilter::default());
-    mgr.services
-        .run_connection_prompt_turn(
-            &connection,
-            &mut *notifications.lock().await,
-            &id,
-            &ws,
-            MGR_ACP_SID,
-            text_prompt("hi"),
+    let mock = track_mock_agent(&mgr, &id, true);
+    mgr.start_session(&id, PathBuf::from("/tmp/ws"), &test_provider())
+        .await
+        .unwrap();
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_IDLE.into(), AGENT_STATUS_CHANGED.into()],
+        batch_window: None,
+        ..Default::default()
+    });
+    let (reached, release) = mgr.services.queue_drain_commit_pause.arm();
+    let sent = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "finish this turn".into(),
             None,
+            super::TurnOptions {
+                origin: MessageOrigin::User,
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
+    assert_eq!(sent["queued"], false);
+    timeout(Duration::from_secs(10), reached)
+        .await
+        .expect("worker reached post-turn drain barrier")
+        .unwrap();
     timeout(Duration::from_secs(10), async {
         loop {
-            if sub
-                .recv()
-                .await
-                .unwrap()
+            let batch = sub.recv().await.expect("event subscription open");
+            if batch
                 .iter()
-                .any(|event| event.event_type == AGENT_IDLE)
+                .any(|ev| ev.event_type == AGENT_IDLE && ev.data["agentId"] == id.0)
             {
                 break;
             }
         }
     })
     .await
-    .unwrap();
-    assert!(!mgr.services.has_ready_to_send(&id));
-    let observed = mgr.services.agent_get(id.clone(), None).await.unwrap();
+    .expect("real turn published idle before releasing the slot");
+    assert!(mgr.is_busy(&id));
+    assert!(mgr.services.queue_snapshot(&id).is_empty());
+
+    // Take the only writer while the worker is parked after its last turn.
+    // WAL readers remain available, but end_turn cannot persist RuntimeIdle.
+    let writer = mgr.services.store.write_pool().begin().await.unwrap();
+    release.send(()).unwrap();
+    timeout(Duration::from_secs(10), async {
+        while mgr.is_busy(&id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("end_turn releases the busy slot before awaiting the writer");
+    let early = mgr
+        .services
+        .agent_get_op(id.clone(), Some(ws.clone()))
+        .await
+        .unwrap();
+    assert!(!early.is_streaming);
+    assert!(!early.is_processing);
+    assert!(!early.is_responding);
+    assert!(!early.is_waiting_on_tool);
+    assert!(!early.turn_in_flight);
     assert_eq!(
-        observed.status,
+        early.status,
         AgentStatus::Active,
-        "idle event alone is not the final status barrier"
+        "idle event and released busy slot do not imply durable idle"
     );
-    mgr.end_turn(&id).await;
+
+    writer.rollback().await.unwrap();
     timeout(Duration::from_secs(10), async {
         loop {
-            if sub.recv().await.unwrap().iter().any(|event| {
-                event.event_type == AGENT_STATUS_CHANGED && event.data["status"] == "idle"
+            let batch = sub.recv().await.expect("event subscription open");
+            if batch.iter().any(|ev| {
+                ev.event_type == AGENT_STATUS_CHANGED
+                    && ev.data["agentId"] == id.0
+                    && ev.data["status"] == "idle"
             }) {
                 break;
             }
         }
     })
     .await
-    .unwrap();
-    let settled = mgr.services.agent_get(id.clone(), None).await.unwrap();
-    assert_eq!(
-        settled.status,
-        AgentStatus::RuntimeIdle,
-        "final status event follows the persisted idle row"
-    );
-    assert!(!mgr.is_busy(&id));
+    .expect("worker publishes durable idle after the writer is released");
+    let settled = mgr
+        .services
+        .agent_get_op(id.clone(), Some(ws))
+        .await
+        .unwrap();
+    assert_eq!(settled.status, AgentStatus::RuntimeIdle);
+    assert!(!settled.is_streaming);
+    assert!(!settled.is_processing);
+    assert!(!settled.is_responding);
+    assert!(!settled.is_waiting_on_tool);
+    assert!(!settled.turn_in_flight);
+    assert!(mgr.services.queue_snapshot(&id).is_empty());
     mgr.stop(&id).await;
     mock.abort();
+    let _ = mock.await;
 }
 
 #[tokio::test]
@@ -14907,6 +15060,13 @@ async fn flush_persist_failure_for_vanished_session_drops_whole_batch() {
         hold_kind: None,
         hold_until: None,
         child_agent_id: None,
+        merged_submission_ids: Vec::new(),
+        edit_appended: String::new(),
+        edit_prepended: String::new(),
+        editing_message_id: None,
+        latest_human_submission_at: None,
+        provisional: false,
+        submission_order: 0,
     };
     let batch = vec![entry("head", true), entry("tail", false)];
     let draining = mgr.services.mark_draining(&id, &batch);
@@ -18633,6 +18793,13 @@ mod stale_redrive_tests {
             hold_kind: None,
             hold_until: None,
             child_agent_id: None,
+            merged_submission_ids: Vec::new(),
+            edit_appended: String::new(),
+            edit_prepended: String::new(),
+            editing_message_id: None,
+            latest_human_submission_at: None,
+            provisional: false,
+            submission_order: 0,
         }
     }
 
@@ -19082,6 +19249,13 @@ mod dequeue_wait_tests {
             hold_kind: None,
             hold_until: None,
             child_agent_id: None,
+            merged_submission_ids: Vec::new(),
+            edit_appended: String::new(),
+            edit_prepended: String::new(),
+            editing_message_id: None,
+            latest_human_submission_at: None,
+            provisional: false,
+            submission_order: 0,
         }
     }
 
@@ -20476,6 +20650,8 @@ mod harness_wake_tests {
                 _rules_config: None,
                 _pi_extension: None,
                 npx_launch_dir: None,
+                cleanup_lease: None,
+                cleanup_services: None,
             }),
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
@@ -23049,6 +23225,13 @@ mod flush_queued_messages_tests {
             hold_kind: None,
             hold_until: None,
             child_agent_id: None,
+            merged_submission_ids: Vec::new(),
+            edit_appended: String::new(),
+            edit_prepended: String::new(),
+            editing_message_id: None,
+            latest_human_submission_at: None,
+            provisional: false,
+            submission_order: 0,
         }
     }
 
@@ -24994,4 +25177,431 @@ async fn shutdown_durable_duplicate_draining_guards_preserve_one_entry() {
     assert_eq!(queue[0]["id"], entry.id);
     assert_eq!(queue[0]["content"], entry.content);
     assert_eq!(queue[0]["fileBlocks"], entry.file_blocks.unwrap());
+}
+
+#[tokio::test]
+async fn queue_merge_failed_transcript_append_keeps_admitted_human_barrier() {
+    let _env = EnvGuard::set_all(&[("INTENTD_PERSIST_RETRY_BACKOFF_MS", "1,1")]);
+    for send_now in [false, true] {
+        let (_tmp, mgr) = manager().await;
+        let mgr = Arc::new(mgr);
+        let ws = WorkspaceId::from("ws-pending-barrier");
+        let id = AgentId::from("pending-barrier");
+        seed_agent(&mgr, &ws, &id).await;
+        let enqueue = |message_id: &str, author: &str, content: &str| {
+            mgr.services
+                .enqueue_message_with_id(
+                    &id,
+                    Some(message_id.into()),
+                    content.into(),
+                    None,
+                    None,
+                    Some(json!({"fromPrincipalId":author})),
+                    None,
+                    false,
+                    intent_core::MessageOrigin::User,
+                )
+                .0
+        };
+        enqueue("a1", "a", "one");
+        mgr.services
+            .agent_edit_queued_message_op(id.clone(), "a1".into(), "one".into(), Some(true))
+            .await
+            .unwrap();
+        enqueue("b2", "b", "barrier");
+        sqlx::query("CREATE TRIGGER fail_pending_append BEFORE INSERT ON agent_message WHEN NEW.role = 'user' BEGIN SELECT RAISE(ABORT, 'test append failure'); END").execute(mgr.services.store.write_pool()).await.unwrap();
+        let pause = Arc::new(super::TurnStartPause::default());
+        *mgr.user_persist_pause.lock().unwrap() = Some(pause.clone());
+        let worker_mgr = mgr.clone();
+        let worker_id = id.clone();
+        let worker_ws = ws.clone();
+        let worker = tokio::spawn(async move {
+            if send_now {
+                assert!(worker_mgr
+                    .send_queued_message_now(worker_id, worker_ws, "b2".into())
+                    .await
+                    .is_err());
+            } else {
+                let admission = worker_mgr
+                    .try_begin_turn(&worker_id, &worker_ws)
+                    .await
+                    .unwrap();
+                let (entry, guard) = worker_mgr
+                    .services
+                    .dequeue_message_draining(&worker_id)
+                    .unwrap();
+                assert_eq!(entry.id, "b2");
+                assert!(matches!(
+                    worker_mgr
+                        .prepare_admitted_flush_turn(
+                            &worker_id,
+                            &worker_ws,
+                            vec![entry],
+                            guard,
+                            admission
+                        )
+                        .await,
+                    super::FlushPrep::Parked
+                ));
+            }
+        });
+        timeout(Duration::from_secs(5), pause.reached.notified())
+            .await
+            .unwrap();
+        assert_eq!(
+            enqueue("a3", "a", "three").id,
+            "a3",
+            "an admitted but unwritten B remains a human barrier"
+        );
+        pause.resume.notify_one();
+        timeout(Duration::from_secs(5), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        let queue = mgr.services.queue_snapshot(&id);
+        assert_eq!(
+            queue.len(),
+            3,
+            "failed delivery must restore B without absorbing A3: {queue:?}"
+        );
+        assert_eq!(
+            mgr.services.find_queued_message(&id, "a1").unwrap().content,
+            "one"
+        );
+        assert_eq!(
+            mgr.services.find_queued_message(&id, "a3").unwrap().content,
+            "three"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn reap_shutdown_retains_removed_child_cleanup() {
+    use crate::periodic_shutdown_tests::{entered, hold};
+    struct Cleanup(Option<u32>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            if let Some(pid) = self.0 {
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(pid.cast_signed()),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+        }
+    }
+    let (db, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("reap-tail-workspace");
+    let id = AgentId::from("reap-tail-agent");
+    seed_agent(&mgr, &ws, &id).await;
+    let (pid, watcher) = track_with_child(&mgr, &id);
+    let mut cleanup = Cleanup(Some(pid));
+    mgr.registry.set_last_active(&id, 1);
+    let (rx, release) = hold(&mgr.services, "reap");
+    let owner = mgr.clone();
+    let task =
+        tokio::spawn(async move { owner.reap_idle_older_than(Duration::from_secs(1)).await });
+    entered(rx).await;
+    assert!(!mgr.contains(&id));
+    assert!(nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid.cast_signed()), None).is_ok());
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    *mgr.services.secrets.writer_drain_pending.lock().unwrap() = Some(tx);
+    let owner = mgr.clone();
+    let mut shutdown = tokio::spawn(async move { owner.shutdown().await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            result = rx => assert_eq!(result.unwrap(), "process-registry"),
+            result = &mut shutdown => { result.unwrap(); panic!("manager shutdown detached removed child cleanup"); }
+        }
+    }).await.unwrap();
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), shutdown)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(mgr.reap_claims.lock().unwrap().is_empty());
+    assert_eq!(mgr.registry.size(), 0);
+    assert!(!watcher.await.unwrap());
+    assert_eq!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid.cast_signed()), None),
+        Err(nix::errno::Errno::ESRCH)
+    );
+    cleanup.0 = None;
+    mgr.services.shutdown_store_writers().await;
+    bus.shutdown().await.unwrap();
+    mgr.services.store.close().await;
+    let reopened = Store::open(&db.path).await.unwrap();
+    let events = reopened
+        .query_events(&intent_store::EventQuery {
+            workspace_id: Some(ws),
+            event_types: vec![intent_core::events::AGENT_PROCESS_EVICTED.into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    reopened.close().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn admission_release_revoked_queue_tail_drains() {
+    use crate::periodic_shutdown_tests::{drain_held, entered, hold};
+    let (db, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    let svc = mgr.services.clone();
+    svc.attach_agent_manager(&mgr);
+    let ws = WorkspaceId::from("release-tail-workspace");
+    let id = AgentId::from("release-tail-agent");
+    seed_agent(&mgr, &ws, &id).await;
+    let mut principal = svc.store.get_primary_principal().await.unwrap();
+    principal.id = intent_core::PrincipalId::from("revoked-tail-user");
+    principal.is_primary = false;
+    principal.identity = None;
+    principal.github_user_id = None;
+    svc.store.upsert_principal(&principal).await.unwrap();
+    svc.store
+        .revoke_principal_access(&principal.id)
+        .await
+        .unwrap();
+    svc.enqueue_message(
+        &id,
+        "revoked instruction".into(),
+        None,
+        None,
+        Some(json!({"fromPrincipalId":principal.id.0})),
+        None,
+        false,
+        intent_core::MessageOrigin::User,
+    );
+    svc.persist_queue_snapshot(&id).await;
+    assert_eq!(svc.store.load_all_agent_queues().await.unwrap().len(), 1);
+    let (rx, resume) = hold(&svc, "revoked-queue");
+    {
+        let (claim, release) = mgr.admission_claim_fns();
+        assert!(claim(&id));
+        svc.begin_settings_shutdown();
+        release(&id);
+    }
+    entered(rx).await;
+    assert!(svc.queue_snapshot(&id).is_empty());
+    assert_eq!(svc.store.load_all_agent_queues().await.unwrap().len(), 1);
+    drain_held(&svc, resume).await;
+    mgr.shutdown().await;
+    bus.shutdown().await.unwrap();
+    svc.store.close().await;
+    let reopened = Store::open(&db.path).await.unwrap();
+    assert!(reopened.load_all_agent_queues().await.unwrap().is_empty());
+    let events = reopened
+        .query_events(&intent_store::EventQuery {
+            workspace_id: Some(ws),
+            event_types: vec!["agent:queue:updated".into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    reopened.close().await;
+}
+
+#[tokio::test]
+async fn queue_merge_archive_signal_survives_failed_turn_recovery() {
+    for persisted in [false, true] {
+        let (_tmp, mgr) = manager().await;
+        let ws = WorkspaceId::from("archive-recovery");
+        let id = AgentId::from("archive-recovery-agent");
+        seed_agent(&mgr, &ws, &id).await;
+        let options = super::TurnOptions {
+            queued_at: Some("2000-01-01T00:00:00Z".into()),
+            latest_human_submission_at: Some("2002-01-01T00:00:00Z".into()),
+            origin: intent_core::MessageOrigin::User,
+            message_metadata: Some(json!({"fromPrincipalId":"a"})),
+            ..Default::default()
+        };
+        super::persist_error_and_requeue(&mgr, &id, &ws, "one\n\ntwo", &options, persisted, "boom")
+            .await;
+        assert!(mgr
+            .services
+            .has_user_origin_ready_since(&id, "2001-01-01T00:00:00Z"));
+        assert!(!mgr
+            .services
+            .has_user_origin_ready_since(&id, "2003-01-01T00:00:00Z"));
+        let row = mgr.services.dequeue_message(&id).unwrap();
+        assert_eq!(row.queued_at, "2000-01-01T00:00:00Z");
+        assert_eq!(
+            row.latest_human_submission_at,
+            options.latest_human_submission_at
+        );
+        assert_eq!(
+            super::turn_options_for_entry(&row, false).latest_human_submission_at,
+            options.latest_human_submission_at
+        );
+    }
+}
+
+#[tokio::test]
+async fn queue_merge_archive_signal_survives_combined_flush_failure() {
+    let (_tmp, mgr) = manager().await;
+    let ws = WorkspaceId::from("archive-flush-recovery");
+    let id = AgentId::from("archive-flush-recovery-agent");
+    seed_agent(&mgr, &ws, &id).await;
+    let mut first = flush_entry("first", "one".into());
+    first.user_origin = true;
+    first.queued_at = "2000-01-01T00:00:00Z".into();
+    let mut second = flush_entry("second", "two".into());
+    second.user_origin = true;
+    second.queued_at = "2000-01-01T00:00:00Z".into();
+    second.latest_human_submission_at = Some("2002-01-01T00:00:00Z".into());
+    let (_flushed, restored) = flush_then_fail(&mgr, &ws, &id, vec![first, second], "boom").await;
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].queued_at, "2000-01-01T00:00:00Z");
+    assert_eq!(
+        restored[0].latest_human_submission_at.as_deref(),
+        Some("2002-01-01T00:00:00Z")
+    );
+}
+
+async fn queue_processing_payloads(mgr: &AgentManager, id: &AgentId) -> Vec<Value> {
+    mgr.services
+        .store
+        .query_events(&intent_store::EventQuery::default())
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|event| {
+            event.event_type == intent_core::events::AGENT_QUEUE_PROCESSING
+                && event.data["agentId"] == id.0
+        })
+        .map(|event| event.data)
+        .collect()
+}
+
+#[tokio::test]
+async fn queue_processing_payload_carries_exact_consumed_batch_and_merged_rows() {
+    for batch in [false, true] {
+        let (_tmp, mgr) = manager().await;
+        let ws = WorkspaceId::new();
+        let id = AgentId::new();
+        seed_agent(&mgr, &ws, &id).await;
+        let owner = mgr.services.store.get_primary_principal().await.unwrap().id;
+        let guest = intent_core::PrincipalId::new();
+        sqlx::query(
+            "INSERT INTO principal (id,is_primary,created_at,updated_at) VALUES (?,0,'t0','t0')",
+        )
+        .bind(&guest.0)
+        .execute(mgr.services.store.write_pool())
+        .await
+        .unwrap();
+        for n in 0..2 {
+            let author = if batch && n == 1 { &guest.0 } else { &owner.0 };
+            mgr.services.enqueue_message_with_id(&id, Some(format!("part-{n}")),
+                format!("text-{n}"),
+                Some(json!([{"type":"image","data":format!("image-{n}"),"mimeType":"image/png"}])),
+                Some(json!([{"type":"resource_link","uri":format!("file:///part-{n}"),"name":format!("part-{n}")}])),
+                Some(json!({"fromPrincipalId":author,"type":"question_answers","answeredQuestionsMessageId":format!("question-{n}")})),
+                None, false, MessageOrigin::User);
+        }
+        let mut consumed = Vec::new();
+        while let Some(entry) = mgr.services.dequeue_message(&id) {
+            consumed.push(entry);
+        }
+        assert_eq!(consumed.len(), if batch { 2 } else { 1 });
+        // A later live row must never replace the already-consumed payload.
+        mgr.services.enqueue_message_with_id(
+            &id,
+            Some("later".into()),
+            "later text".into(),
+            None,
+            None,
+            Some(json!({"fromPrincipalId":owner.0})),
+            None,
+            false,
+            MessageOrigin::User,
+        );
+        let draining = mgr.services.mark_draining(&id, &consumed);
+        let super::FlushPrep::Turn { options, .. } =
+            super::prepare_flush_turn(&mgr, &id, &ws, consumed.clone(), draining).await
+        else {
+            panic!("flush starts processing")
+        };
+        let events = queue_processing_payloads(&mgr, &id).await;
+        assert_eq!(events.len(), 1, "one event regardless of batch size");
+        let event = &events[0];
+        assert_eq!(event["turnId"], consumed[0].turn_id);
+        let rows = event["queuedMessages"].as_array().unwrap();
+        let flushed = options.flushed_entries.unwrap();
+        assert_eq!(rows.len(), consumed.len());
+        for (index, row) in rows.iter().enumerate() {
+            let entry = &flushed[index];
+            assert_eq!(row["id"], consumed[index].id);
+            assert_eq!(row["turnId"], consumed[index].turn_id);
+            assert_eq!(row["content"], entry.content);
+            assert_eq!(row["imageBlocks"], *entry.image_blocks.as_ref().unwrap());
+            assert_eq!(row["fileBlocks"], *entry.file_blocks.as_ref().unwrap());
+            assert_eq!(
+                row["messageMetadata"],
+                *entry.message_metadata.as_ref().unwrap()
+            );
+            assert_eq!(
+                row["author"]["principalId"],
+                if batch && index == 1 {
+                    guest.0.as_str()
+                } else {
+                    owner.0.as_str()
+                }
+            );
+        }
+        if !batch {
+            assert_eq!(rows[0]["imageBlocks"].as_array().unwrap().len(), 2);
+            assert_eq!(rows[0]["fileBlocks"].as_array().unwrap().len(), 2);
+            assert_eq!(
+                rows[0]["messageMetadata"]["mergedMessageMetadata"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                2
+            );
+        }
+        assert_eq!(mgr.services.queue_snapshot(&id)[0]["id"], "later");
+    }
+}
+
+#[tokio::test]
+async fn queue_processing_payload_ordinary_drain_retains_recovered_merged_contributions() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::new();
+    let id = AgentId::new();
+    seed_agent(&mgr, &ws, &id).await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+    let owner = mgr.services.store.get_primary_principal().await.unwrap().id;
+    for n in 0..2 {
+        mgr.services.enqueue_message_with_id(&id, Some(format!("part-{n}")),
+            format!("text-{n}"), None, Some(json!([{"type":"resource_link","uri":format!("file:///part-{n}"),"name":format!("part-{n}")}])),
+            Some(json!({"fromPrincipalId":owner.0,"type":"question_answers","answeredQuestionsMessageId":format!("question-{n}")})),
+            None, false, MessageOrigin::User);
+    }
+    mgr.services.persist_queue_snapshot(&id).await;
+    mgr.services.agent_queues.lock().unwrap().clear();
+    assert_eq!(mgr.services.rehydrate_agent_queues().await.unwrap(), 1);
+    let queued = mgr.services.queue_snapshot(&id)[0].clone();
+    mgr.clone().try_drain_queue(id.clone(), ws).await;
+    let events = queue_processing_payloads(&mgr, &id).await;
+    assert_eq!(events.len(), 1);
+    let rows = events[0]["queuedMessages"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    for field in ["id", "turnId", "fileBlocks"] {
+        assert_eq!(rows[0][field], queued[field]);
+    }
+    assert!(rows[0]["content"]
+        .as_str()
+        .unwrap()
+        .starts_with("text-0\n\ntext-1"));
+    assert_eq!(
+        rows[0]["messageMetadata"]["mergedMessageMetadata"],
+        queued["messageMetadata"]["mergedMessageMetadata"]
+    );
+    assert_eq!(rows[0]["author"]["principalId"], owner.0);
 }

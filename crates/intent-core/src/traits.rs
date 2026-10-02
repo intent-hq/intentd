@@ -15,19 +15,18 @@ use crate::model::{
     AgentSession, BrowserTab, BrowserTabInput, ClientHostInfo, CommentAddResult,
     CommentDeleteResult, CommentGetThreadResult, CommentListResult, CommentResolveThreadResult,
     CommentRespondResult, ContextItem, Draft, EventQueryParams, EventSubscribeResult,
-    EventUnsubscribeResult, GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult,
-    GitMergeConflicts, GitPullResult, GitStatus, InvitePin, InviteProofClaim,
-    LineAttributionComputeResult, LineAttributionData, MessageOrigin, Note, NoteAddInput,
-    NoteAddResult, NoteCreate, NoteCreateResult, NoteDeleteResult, NoteEditInput,
-    NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteRestoreVersionResult,
-    NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion,
-    NoteVersionSummary, ProjectType, ReadAssetResult, RepoConfig, SaveAssetResult,
-    ScriptCreateParams, SetupScript, TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult,
-    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
-    TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskUpdateNoteStatusResult,
-    TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceCreate,
-    WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceSetupStatus, WorkspaceTask,
-    WorkspaceUpdate,
+    EventUnsubscribeResult, GitAgentCommitResult, GitBranchStatus, GitBranches, GitMergeConflicts,
+    GitPullResult, GitStatus, InvitePin, InviteProofClaim, LineAttributionComputeResult,
+    LineAttributionData, MessageOrigin, Note, NoteAddInput, NoteAddResult, NoteCreate,
+    NoteCreateResult, NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult,
+    NoteEditResult, NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
+    NoteUpdateMetadataResult, NoteVersion, NoteVersionSummary, ProjectType, ReadAssetResult,
+    RepoConfig, SaveAssetResult, ScriptCreateParams, SetupScript, TaskAgentLink,
+    TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
+    TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskRemoveAgentFromAllTasksResult,
+    TaskSetRelationsResult, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
+    TokenUsage, Workspace, WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary,
+    WorkspaceSetupStatus, WorkspaceTask, WorkspaceUpdate,
 };
 use crate::repo_ref::RepoRef;
 
@@ -1851,6 +1850,19 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Read the workspace's last explicitly remembered manual specialist.
+    fn agent_get_creation_preferences(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "agent.getCreationPreferences not implemented".into(),
+            ))
+        })
+    }
+
     /// `agent.sendToTask`: follow up with the agent assigned to a task note
     /// (PROTOCOL §5.5). `message_metadata` is the same opaque per-message
     /// payload as `agent.sendMessage` (persisted on the user row; e.g. the
@@ -3437,23 +3449,6 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::git_pull not implemented".to_string(),
-            ))
-        })
-    }
-
-    /// `git.commit` (deprecated; prefer `git_agent_commit`): commit the already
-    /// staged changes with `message`. Failures (incl. nothing to commit) are
-    /// `-32603` (PROTOCOL §5.6).
-    fn git_commit(
-        &self,
-        workspace_id: WorkspaceId,
-        message: String,
-        idempotency_key: Option<String>,
-    ) -> BoxFuture<'_, Result<GitCommitResult>> {
-        let _ = (workspace_id, message, idempotency_key);
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::git_commit not implemented".to_string(),
             ))
         })
     }
@@ -6515,14 +6510,26 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `search.notes`: GLOBAL substring search over the BE notes store (no
-    /// `workspaceId`). Returns `{ requestId, matches: NoteMatch[] }` (PROTOCOL §5.15).
+    /// `search.notes`: ranked full-text search across visible workspaces, with
+    /// optional hard scope and soft preference. Always returns inline
+    /// `{ requestId, matches: NoteMatch[], indexed: true }` (PROTOCOL §5.15).
     fn search_notes(
         &self,
         query: String,
+        workspace_id: Option<WorkspaceId>,
+        prefer_workspace_id: Option<WorkspaceId>,
+        limit: Option<i64>,
+        include_archived: bool,
         request_id: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (query, request_id);
+        let _ = (
+            query,
+            workspace_id,
+            prefer_workspace_id,
+            limit,
+            include_archived,
+            request_id,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::search_notes not implemented".to_string(),
@@ -6763,6 +6770,38 @@ pub trait WorkspaceApi: Send + Sync {
                 "WorkspaceApi::script_remove not implemented".to_string(),
             ))
         })
+    }
+
+    /// Register a script monitor using authenticated MCP owner context.
+    fn script_monitor(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        script_id: String,
+        options: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, script_id, options);
+        Box::pin(async { Err(Error::Internal("script monitoring unavailable".into())) })
+    }
+    /// List retained script monitors in an authorized workspace.
+    fn script_monitor_list(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id);
+        Box::pin(async { Err(Error::Internal("script monitoring unavailable".into())) })
+    }
+    /// Stop observation or atomically stop the bound run; owner is set by MCP only.
+    fn script_monitor_cancel(
+        &self,
+        workspace_id: WorkspaceId,
+        monitor_id: String,
+        owner: Option<AgentId>,
+        stop_run: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, monitor_id, owner, stop_run);
+        Box::pin(async { Err(Error::Internal("script monitoring unavailable".into())) })
     }
 
     /// `script.start`: spawn the script on the PTY host (service mode auto-
@@ -7080,13 +7119,15 @@ pub trait WorkspaceApi: Send + Sync {
     /// `file.read`: the file's UTF-8 contents as a **bare JSON string** (not an
     /// object), per the TS `ws.file.read` builder (PROTOCOL §5.10).
     /// `caller_agent_id` enables `CoW` sandbox containment (prefers sandbox path).
+    /// `git_root_id` selects a registered root owned by this workspace instead.
     fn file_read(
         &self,
         workspace_id: WorkspaceId,
         path: String,
         caller_agent_id: Option<AgentId>,
+        git_root_id: Option<WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, path, caller_agent_id);
+        let _ = (workspace_id, path, caller_agent_id, git_root_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::file_read not implemented".to_string(),
@@ -7100,6 +7141,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// monorepo#2458). `length` is capped at 16 MiB decoded (over-cap →
     /// `Error::InvalidParams`); a read at/past EOF returns an empty chunk.
     /// `caller_agent_id` enables `CoW` sandbox containment (prefers sandbox path).
+    /// `git_root_id` selects a registered root owned by this workspace instead.
     fn file_read_chunk(
         &self,
         workspace_id: WorkspaceId,
@@ -7107,8 +7149,16 @@ pub trait WorkspaceApi: Send + Sync {
         offset: u64,
         length: u64,
         caller_agent_id: Option<AgentId>,
+        git_root_id: Option<WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, path, offset, length, caller_agent_id);
+        let _ = (
+            workspace_id,
+            path,
+            offset,
+            length,
+            caller_agent_id,
+            git_root_id,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::file_read_chunk not implemented".to_string(),

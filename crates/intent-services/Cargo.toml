@@ -1,6 +1,6 @@
 [package]
 name = "intent-services"
-version = "0.9.127"
+version = "0.10.1"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -8,23 +8,24 @@ license.workspace = true
 description = "Shared business-logic surface invoked by every transport and the agent MCP server"
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.9.127" }
-intent-store = { path = "../intent-store", version = "0.9.127" }
-intent-git = { path = "../intent-git", version = "0.9.127" }
-intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.9.127" }
-intent-linear = { path = "../intent-linear", version = "0.9.127" }
-intent-sentry = { path = "../intent-sentry", version = "0.9.127" }
+intent-core = { path = "../intent-core", version = "0.10.1" }
+intent-store = { path = "../intent-store", version = "0.10.1" }
+intent-git = { path = "../intent-git", version = "0.10.1" }
+intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.10.1" }
+intent-linear = { path = "../intent-linear", version = "0.10.1" }
+intent-sentry = { path = "../intent-sentry", version = "0.10.1" }
 intent-voice = { path = "../intent-voice", version = "0.4.1" }
-intent-acp = { path = "../intent-acp", version = "0.9.127" }
-intent-js = { path = "../intent-js", version = "0.9.127" }
-intent-context = { path = "../intent-context", version = "0.9.127" }
-intent-providers = { path = "../intent-providers", version = "0.9.127" }
-intent-pty = { path = "../intent-pty", version = "0.9.127" }
-intent-search = { path = "../intent-search", version = "0.9.127" }
+intent-acp = { path = "../intent-acp", version = "0.10.1" }
+intent-js = { path = "../intent-js", version = "0.10.1" }
+intent-context = { path = "../intent-context", version = "0.10.1" }
+intent-providers = { path = "../intent-providers", version = "0.10.1" }
+intent-pty = { path = "../intent-pty", version = "0.10.1" }
+intent-search = { path = "../intent-search", version = "0.10.1" }
 base64 = { workspace = true }
 git2 = { workspace = true }
 ignore = { workspace = true }
 serde_json = { workspace = true }
+regex = "1.12"
 uuid = { workspace = true }
 tokio = { workspace = true }
 notify = { workspace = true }
@@ -33,7 +34,6 @@ serde = { workspace = true }
 time = { workspace = true, features = ["formatting", "local-offset"] }
 similar = { version = "3.1.1", default-features = false }
 serde_yaml = "0.9"
-async-recursion = "1.1"
 toml_edit = "0.25.5"
 tempfile = "3"
 reqwest.workspace = true

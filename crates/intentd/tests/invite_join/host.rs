@@ -5,6 +5,9 @@ use super::*;
 #[path = "sharing.rs"]
 mod sharing;
 
+#[path = "presence.rs"]
+mod presence;
+
 fn result(frame: &Value, id: i64) -> Value {
     assert_eq!(frame["jsonrpc"], "2.0");
     assert_eq!(frame["id"], id);

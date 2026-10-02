@@ -44,6 +44,9 @@ pub struct EventQuery {
     /// Guests may read only their own device events, including legacy/durable
     /// rows. Applied in SQL before limits and paging, not after fetching.
     pub client_principal_id: Option<intent_core::PrincipalId>,
+    /// Permission rows require this guest's current explicit workspace ownership.
+    /// SQL checks the durable grant before pagination, aggregation or search.
+    pub guest_permission_principal_id: Option<intent_core::PrincipalId>,
     pub workspace_id: Option<WorkspaceId>,
     pub event_types: Vec<String>,
     /// Prefix match over `event_type` (e.g. `"note:"` for the note category),
@@ -225,6 +228,15 @@ impl Store {
             qb.push(") OR json_extract(data_json, '$.principalId') = ")
                 .push_bind(principal.as_str())
                 .push(")");
+        }
+        if let Some(principal) = &q.guest_permission_principal_id {
+            qb.push(" AND (event_type NOT IN (")
+                .push_bind(intent_core::events::AGENT_PERMISSION_REQUEST)
+                .push(", ")
+                .push_bind(intent_core::events::AGENT_PERMISSION_RESOLVED)
+                .push(") OR EXISTS (SELECT 1 FROM workspace_member m WHERE m.workspace_id = event.workspace_id AND m.principal_id = ")
+                .push_bind(principal.as_str())
+                .push(" AND m.role = 'owner'))");
         }
         if let Some(ws) = &q.workspace_id {
             qb.push(" AND workspace_id = ").push_bind(ws.0.clone());

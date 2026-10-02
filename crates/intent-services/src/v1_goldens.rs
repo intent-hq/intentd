@@ -756,6 +756,8 @@ fn merge_requirements(
     unresolved: i64,
 ) -> crate::pr_ops::MergeRequirements {
     crate::pr_ops::MergeRequirements {
+        ancestry: intent_sourcecontrol::PrAncestry::Unknown,
+        branch_update_required: None,
         state: state.to_string(),
         is_draft: false,
         has_conflicts: false,
@@ -846,7 +848,9 @@ fn golden_pr_monitor_checklist_and_change_wake() {
          - state: open\n\
          - approvals: review_required (0/1 required)\n\
          - checks: 2 passed, 0 failed, 1 pending (of 3); pending required: build\n\
-         - unresolved threads: 1 (resolution required to merge)"
+         - unresolved threads: 1 (resolution required to merge)\n\
+         - branch ancestry: unknown\n\
+         - forge branch-update requirement: unknown"
     );
 }
 
@@ -906,6 +910,7 @@ fn golden_pr_monitor_checklist_branch_lines() {
     r.is_draft = true;
     r.has_conflicts = true;
     r.is_behind = true;
+    r.branch_update_required = Some(true);
     r.mergeable = Some(false);
     r.checks.failed = 1;
     r.checks.passed = 1;
@@ -922,7 +927,8 @@ fn golden_pr_monitor_checklist_branch_lines() {
          - checks: 1 passed, 1 failed, 1 pending (of 3); failing required: build\n\
          - unresolved threads: 1 (resolution required to merge)\n\
          - merge conflicts present\n\
-         - branch is behind its base\n\
+         - branch ancestry: unknown\n\
+         - forge requires a branch update before merging\n\
          - in merge queue\n\
          - blocked: merge conflicts"
     );
@@ -942,6 +948,8 @@ fn golden_pr_monitor_checklist_branch_lines() {
          - approvals: review_required (0 approving)\n\
          - checks: 2 passed, 0 failed, 1 pending (of 3) (required-check flags unavailable)\n\
          - unresolved threads: 1\n\
+         - branch ancestry: unknown\n\
+         - forge branch-update requirement: unknown\n\
          - (branch rules unreadable — approval/thread requirements unknown)"
     );
     // Thread resolution state unreadable (`threads.unresolved` absent): the
@@ -953,7 +961,9 @@ fn golden_pr_monitor_checklist_branch_lines() {
         "- state: open\n\
          - approvals: review_required (0/1 required)\n\
          - checks: 2 passed, 0 failed, 1 pending (of 3); pending required: build\n\
-         - unresolved threads: unknown (thread resolution state unreadable) (resolution required to merge)"
+         - unresolved threads: unknown (thread resolution state unreadable) (resolution required to merge)\n\
+         - branch ancestry: unknown\n\
+         - forge branch-update requirement: unknown"
     );
 }
 
@@ -2002,7 +2012,7 @@ fn golden_bundled_doctrine_hashes() {
     let expected = vec![
         "task-loop: cc1f40de9643f88529dd5fa61d1f868ae269020aa3ef5d08986a721e19c64c44".to_string(),
         "interactive: 013e064b03286569622d905efd0ee4c2a227fc18f0364d3277a95b548dd1f6c3".to_string(),
-        "workspace-agent: 6dfa5d333a6a2e8f07192595828772dad2aad6868def3737e5cd9c50363a2718"
+        "workspace-agent: a4602194c382d803f1a1143159035a93e76d0793027d469485126efa475e0ac6"
             .to_string(),
         "task-breakdown: 1e9e1e2daf42a8adadd8c31d7697f0bac02bf5a7c818b00ae4e50074e40b9e66"
             .to_string(),
@@ -2044,6 +2054,7 @@ fn golden_rtk_instruction_line() {
 #[test]
 fn golden_skills_catalog_wrapper() {
     let skill = |name: &str, description: &str, location: &str| crate::skills::SkillMetadata {
+        resource_directory: None,
         name: name.to_string(),
         description: description.to_string(),
         location: location.to_string(),

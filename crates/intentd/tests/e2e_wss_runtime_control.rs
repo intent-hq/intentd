@@ -7,6 +7,9 @@
 
 mod common;
 
+#[path = "e2e_wss_runtime_control/independent_installations.rs"]
+mod independent_installations;
+
 use intentd_test_support::GuardedChild;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
@@ -1994,4 +1997,141 @@ async fn wss_exact_update_validates_reports_failure_and_restarts_without_channel
         Some(libc::SIGHUP),
         "exact install must only restart, never SIGUSR1 channel check"
     );
+}
+
+/// Enabled secure WSS is a startup requirement, including an explicit first-boot port.
+#[test]
+fn occupied_fixed_wss_port_fails_daemon_boot() {
+    let dir = temp_data_dir();
+    let hog = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = hog.local_addr().unwrap().port();
+    let config = format!("[server.wsApi]\nenabled = true\nport = {port}\n");
+    std::fs::write(dir.path().join("config.toml"), &config).unwrap();
+    let mut child = spawn_serve_fixed_port(dir.path(), "uds", &[("INTENTD_AUTH_TOKEN", TOKEN)]);
+    let exit = child.wait_with_timeout(Duration::from_secs(30)).unwrap();
+    let log = std::fs::read_to_string(dir.path().join("daemon.log")).unwrap();
+    assert!(
+        exit.is_some(),
+        "occupied fixed WSS must exit, not serve UDS: {log}"
+    );
+    assert!(
+        !exit.unwrap().success(),
+        "secure bind failure must exit nonzero: {log}"
+    );
+    assert!(
+        log.contains("Address already in use"),
+        "actionable bind error: {log}"
+    );
+    assert!(
+        log.contains("phase=\"store_close\" state=\"completed\""),
+        "store cleanup completes: {log}"
+    );
+    assert!(
+        !dir.path().join("intentd.pid").exists(),
+        "failed boot removes pidfile"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("config.toml")).unwrap(),
+        config
+    );
+    assert!(
+        !dir.path().join("intentd.sock").exists(),
+        "no local readiness after failed boot"
+    );
+}
+
+#[tokio::test]
+async fn first_enable_publishes_assignment_and_fixed_failure_keeps_daemon_alive() {
+    let dir = temp_data_dir();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        "[server.wsApi]\nenabled = false\n",
+    )
+    .unwrap();
+    let mut daemon = spawn_serve_fixed_port(dir.path(), "uds", &[("INTENTD_AUTH_TOKEN", TOKEN)]);
+    let socket = dir.path().join("intentd.sock");
+    assert!(await_uds(&socket).await);
+    let before = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    assert!(
+        !before.contains("port ="),
+        "disabled boot must not allocate"
+    );
+    let enabled = uds_rpc(
+        &socket,
+        1,
+        "settings.update",
+        json!({"changes":[{"path":"server.wsApi.enabled","value":true}]}),
+    )
+    .await;
+    assert!(enabled.get("error").is_none(), "{enabled}");
+    let status = uds_rpc(&socket, 2, "system.status", json!({})).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    assert!(port >= 5181);
+    let assigned = enabled["result"]["applied"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["path"] == "server.wsApi.port")
+        .expect("enable publishes implicit assignment");
+    assert_eq!(assigned["value"].as_f64(), Some(f64::from(port)));
+    assert_eq!(assigned["origin"], "file");
+    let mut client = connect_ws(
+        port,
+        client_config(status["result"]["fingerprint"].as_str().unwrap()),
+    )
+    .await;
+    let setting = wss_rpc(
+        &mut client,
+        3,
+        "settings.get",
+        json!({"path":"server.wsApi.port"}),
+    )
+    .await;
+    assert_eq!(setting["result"]["value"].as_f64(), Some(f64::from(port)));
+    assert_eq!(setting["result"]["revision"], enabled["result"]["revision"]);
+    drop(client);
+    let disabled = uds_rpc(
+        &socket,
+        4,
+        "settings.update",
+        json!({"changes":[{"path":"server.wsApi.enabled","value":false}]}),
+    )
+    .await;
+    assert!(disabled.get("error").is_none(), "{disabled}");
+    await_tcp_refused(port).await;
+    let saved = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    let hog = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let failed = uds_rpc(
+        &socket,
+        5,
+        "settings.update",
+        json!({"changes":[{"path":"server.wsApi.enabled","value":true}]}),
+    )
+    .await;
+    assert!(
+        failed["error"]["data"]
+            .as_str()
+            .unwrap()
+            .contains("Address already in use"),
+        "{failed}"
+    );
+    assert!(
+        daemon.try_wait().unwrap().is_none(),
+        "runtime failure must not exit daemon"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("config.toml")).unwrap(),
+        saved
+    );
+    drop(hog);
+    let retried = uds_rpc(
+        &socket,
+        6,
+        "settings.update",
+        json!({"changes":[{"path":"server.wsApi.enabled","value":true}]}),
+    )
+    .await;
+    assert!(retried.get("error").is_none(), "{retried}");
+    let status = uds_rpc(&socket, 7, "system.status", json!({})).await;
+    assert_eq!(status["result"]["port"], port);
 }

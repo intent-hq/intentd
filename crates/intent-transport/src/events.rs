@@ -133,8 +133,20 @@ impl MembershipGate {
                 ) || (event.data["principalId"].as_str() == Some(self.principal_id.as_str())
                     && event.data["action"] == "removed"));
         }
+        if intent_core::events::is_permission_event_type(&event.event_type) {
+            // Permission grants match snapshot/answer authority, not the cached
+            // collaborator visibility verdict. Recheck retained guest ownership
+            // even when no membership invalidation event reached this stream.
+            return role.is_some()
+                && !workspace_id.is_empty()
+                && self
+                    .api
+                    .get_workspace(WorkspaceId::from(workspace_id))
+                    .await
+                    .is_ok_and(|ws| ws.membership.is_some_and(|m| m.can_manage));
+        }
         if intent_core::events::is_member_execution_event_type(&event.event_type) {
-            // Prompt/context events never use the cached visibility verdict.
+            // Execution/context events never use the cached visibility verdict.
             // Revocation takes effect before a socket is physically closed.
             if !matches!(
                 role,
@@ -192,22 +204,9 @@ impl MembershipGate {
     }
 }
 
-/// Egress projection of the per-principal queue events for the current
-/// request's caller. A non-administrator wire principal's
-/// `agent:queue:updated` keeps in `data.queue` only the entries it may see
-/// ([`intent_core::project_queue_for_caller`] — its own plus unattributed
-/// ones; `position` is not renumbered); its `agent:queue:processing` for an
-/// entry it may not see (the publisher's `metadata` attribution —
-/// [`intent_core::queue_processing_event_attribution`]: another principal's
-/// stamp, or the unknown-human marker of a human-origin entry the workspace
-/// could not attribute — under the same
-/// [`intent_core::queue_attribution_visible_to`] predicate) loses
-/// `data.content` and keeps `agentId` / `messageId` / `turnId`, so the
-/// drain-start signal still keys the turn without leaking the hidden
-/// entry's text (intentd#2068). Every other event type, and every other
-/// caller, passes through untouched. Called on events that passed the
-/// [`MembershipGate`], under the subscriber's caller re-established by the
-/// forwarder spawn.
+/// Shared queue event projection after workspace membership admission.
+/// Queue snapshots and processing content are readable by all participants;
+/// the services enforce mutation authority separately.
 pub(crate) fn project_queue_event_for_current_caller(event: &mut Event) {
     if event.event_type == AGENT_QUEUE_UPDATED {
         let Some(queue) = event.data.get_mut("queue").and_then(Value::as_array_mut) else {

@@ -62,3 +62,43 @@ impl Store {
         Ok(res.rows_affected() > 0)
     }
 }
+
+/// Internal state key; never part of the public settings registry.
+pub(crate) fn agent_creation_preferences_key(id: &intent_core::WorkspaceId) -> String {
+    format!("workspace.agentCreationPreferences:{}", id.0)
+}
+
+impl Store {
+    /// Read manual specialist memory. Absence differs from explicit General (null).
+    ///
+    /// # Errors
+    /// Returns an error on database failure or invalid persisted JSON.
+    pub async fn get_agent_creation_preferences(
+        &self,
+        id: &intent_core::WorkspaceId,
+    ) -> Result<serde_json::Value> {
+        self.get_setting(&agent_creation_preferences_key(id))
+            .await?
+            .map_or_else(
+                || Ok(serde_json::json!({})),
+                |raw| {
+                    serde_json::from_str(&raw).map_err(|e| {
+                        Error::Internal(format!("decode agent creation preferences: {e}"))
+                    })
+                },
+            )
+    }
+}
+
+pub(crate) async fn remember_agent_specialist(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    session: &intent_core::AgentSession,
+) -> Result<()> {
+    sqlx::query("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+        .bind(agent_creation_preferences_key(&session.workspace_id))
+        .bind(serde_json::json!({"specialistId": session.specialist}).to_string())
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| Error::Internal(format!("remember agent specialist failed: {e}")))?;
+    Ok(())
+}

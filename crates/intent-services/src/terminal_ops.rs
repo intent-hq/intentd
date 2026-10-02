@@ -75,7 +75,8 @@ fn resolve(terminal_id: &str) -> Result<PtyId> {
 /// command launches zsh/bash with `-l` so login profiles are loaded; explicit
 /// commands and Windows defaults are unchanged.
 #[expect(clippy::too_many_arguments)]
-pub(crate) async fn create(
+pub(crate) async fn create_owned(
+    tasks: &crate::delivery_tasks::DeliveryTasks,
     pty: Arc<PtyHost>,
     bus: Option<EventBus>,
     store: Option<Store>,
@@ -119,8 +120,38 @@ pub(crate) async fn create(
     spec.cwd = spawn_cwd;
     let pty_id = pty.spawn(spec)?;
     let terminal_id = pty_id.to_string();
-    spawn_output_stream(pty, bus, workspace_id, pty_id, terminal_id.clone());
+    spawn_output_stream(tasks, pty, bus, workspace_id, pty_id, terminal_id.clone());
     Ok(json!({ "terminalId": terminal_id }))
+}
+
+#[cfg(all(test, unix))]
+#[expect(clippy::too_many_arguments)]
+async fn create(
+    pty: Arc<PtyHost>,
+    bus: Option<EventBus>,
+    store: Option<Store>,
+    settings: Option<Arc<SettingsRegistry>>,
+    workspace_id: WorkspaceId,
+    cols: u16,
+    rows: u16,
+    cwd: Option<String>,
+    command: Option<String>,
+    env: Option<std::collections::BTreeMap<String, String>>,
+) -> Result<Value> {
+    create_owned(
+        &crate::delivery_tasks::DeliveryTasks::default(),
+        pty,
+        bus,
+        store,
+        settings,
+        workspace_id,
+        cols,
+        rows,
+        cwd,
+        command,
+        env,
+    )
+    .await
 }
 
 /// Base spawn spec for an interactive workspace terminal. Only the omitted-
@@ -517,16 +548,20 @@ fn utf8_len(b: u8) -> usize {
 /// Attach to a freshly created PTY and fan its output onto the bus as
 /// `terminal:data`, emitting a terminal `terminal:exit` when the stream closes.
 pub(crate) fn spawn_output_stream(
+    tasks: &crate::delivery_tasks::DeliveryTasks,
     pty: Arc<PtyHost>,
     bus: Option<EventBus>,
     workspace_id: WorkspaceId,
     pty_id: PtyId,
     terminal_id: String,
 ) {
-    let Ok(attachment) = pty.attach(pty_id) else {
-        return;
-    };
-    intent_core::spawn_daemon(async move {
+    let attachment = pty.attach(pty_id);
+    let _ = tasks.spawn_draining(async move {
+        let Ok(attachment) = attachment else {
+            // A concurrent host shutdown can reap the PTY before attach.
+            emit_exit(bus.as_ref(), &workspace_id, &terminal_id, None).await;
+            return;
+        };
         let mut live = attachment.live;
         // Emit any output captured between spawn and attach exactly once, then
         // tail live chunks (the host guarantees history XOR live, never both).
@@ -1088,6 +1123,50 @@ mod tests {
             }
         }
         acc
+    }
+
+    #[tokio::test]
+    async fn shutdown_joins_terminal_exit_after_host_reap() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+        let bus = EventBus::new(store.clone());
+        let pty = host();
+        let tasks = crate::delivery_tasks::DeliveryTasks::default();
+        let id = pty.spawn(SpawnSpec::new("ws-shutdown", "cat")).unwrap();
+        spawn_output_stream(
+            &tasks,
+            pty.clone(),
+            Some(bus.clone()),
+            ws("ws-shutdown"),
+            id,
+            id.to_string(),
+        );
+        let held = store.write_pool().acquire().await.unwrap();
+        pty.kill_all().await;
+        let drain = tasks.drain_finite();
+        tokio::pin!(drain);
+        tokio::select! {
+            biased;
+            () = &mut drain => panic!("terminal publisher escaped held durable write"),
+            () = std::future::ready(()) => {}
+        }
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(10), drain)
+            .await
+            .unwrap();
+        bus.shutdown().await.unwrap();
+        let events = store
+            .query_events(&intent_store::EventQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.event_type == TERMINAL_EXIT)
+                .count(),
+            1
+        );
+        store.close().await;
     }
 
     // ---- pure helpers (no spawn) ----

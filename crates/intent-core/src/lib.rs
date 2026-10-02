@@ -38,6 +38,9 @@ pub mod path_utils;
 pub mod queue_visibility_contract;
 pub mod replay_preview;
 pub mod repo_ref;
+pub mod script_monitor;
+pub mod script_output;
+pub use script_monitor::{ScriptMonitor, ScriptMonitorTrigger};
 pub mod secrets;
 pub mod server_control;
 pub mod settings_file;
@@ -115,8 +118,8 @@ pub use model::{
     CommentType, CommentWire, ContentType, ContextItem, ContextLink, ContextLinkKind, ContextUsage,
     CreatedTaskEntry, DiskUsageBreakdownEntry, Draft, Event, EventActor, EventQueryParams,
     EventSubscribeResult, EventUnsubscribeResult, FileActivity, FileStatus, GitAgentCommitResult,
-    GitBranchStatus, GitBranches, GitCommitResult, GitFileStatus, GitMergeConflicts, GitPullResult,
-    GitStatus, Hook, HookListRow, HookState, HookSummary, KnownRepo, LineAttributionAuthor,
+    GitBranchStatus, GitBranches, GitFileStatus, GitMergeConflicts, GitPullResult, GitStatus, Hook,
+    HookListRow, HookState, HookSummary, KnownRepo, LineAttributionAuthor,
     LineAttributionComputeResult, LineAttributionData, LineAttributionInfo, Note, NoteAddInput,
     NoteAddResult, NoteCreate, NoteCreateResult, NoteDeleteResult, NoteEditInput,
     NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteMetadata,

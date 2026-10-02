@@ -45,7 +45,6 @@ use crate::auth::{
 };
 use crate::conn::{self, ConnSubs};
 use crate::context::Caller;
-use crate::forward::ForwardRegistry;
 use crate::lifecycle::{StartState, DEFAULT_PORT, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT};
 use crate::reverse::{PrimaryReverseRegistry, ReverseChannel, ReverseTransport};
 use crate::rpc_limit::RpcLimiter;
@@ -396,6 +395,7 @@ pub(crate) struct WsInner {
     pub next_client_id: AtomicU64,
     pub external_stop_generation: AtomicU64,
     pub state: tokio::sync::Mutex<StartState>,
+    pub stop_gate: tokio::sync::Mutex<()>,
     /// REV-1 first-client-sticky reverse-dispatch target set. Every accepted
     /// connection registers its per-connection [`ReverseChannel`] here so
     /// agent-initiated reverse RPCs (`browser.exec`) can be routed to the
@@ -478,6 +478,7 @@ impl WsApiServer {
             next_client_id: AtomicU64::new(0),
             external_stop_generation: AtomicU64::new(0),
             state: tokio::sync::Mutex::new(StartState::default()),
+            stop_gate: tokio::sync::Mutex::new(()),
             reverse_registry: Arc::new(PrimaryReverseRegistry::new()),
             server_pairing_info: None,
             control,
@@ -521,6 +522,7 @@ impl WsApiServer {
             next_client_id: AtomicU64::new(0),
             external_stop_generation: AtomicU64::new(0),
             state: tokio::sync::Mutex::new(StartState::default()),
+            stop_gate: tokio::sync::Mutex::new(()),
             reverse_registry: Arc::new(PrimaryReverseRegistry::new()),
             server_pairing_info: None,
             control,
@@ -607,7 +609,41 @@ impl WsApiServer {
     ///
     /// Returns the underlying I/O error if binding the listener fails.
     pub async fn start(&self) -> std::io::Result<u16> {
-        self.inner.start().await
+        self.inner.start(None).await
+    }
+
+    /// Select consecutively from `base_port` through 65535, retaining every
+    /// socket while `persist` commits the assignment before serving. A successful
+    /// assignment is reused on subsequent starts of this server.
+    ///
+    /// # Errors
+    /// Returns bind, cancellation, or persistence errors without serving.
+    pub async fn start_with_port_assignment(
+        &self,
+        persist: impl Fn(u16) -> std::io::Result<()> + Send + Sync + 'static,
+    ) -> std::io::Result<u16> {
+        self.start_with_cancellable_port_assignment(persist, || false)
+            .await
+    }
+
+    /// Like `start_with_port_assignment`, with caller cancellation checked before
+    /// every bind attempt and before persistence/readiness. The predicate must
+    /// retain the caller's original cancellation state even if transport stop
+    /// completes before this start future is first polled.
+    ///
+    /// # Errors
+    /// Returns bind, cancellation, or persistence errors without serving.
+    pub async fn start_with_cancellable_port_assignment(
+        &self,
+        persist: impl Fn(u16) -> std::io::Result<()> + Send + Sync + 'static,
+        cancelled: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> std::io::Result<u16> {
+        self.inner
+            .start(Some(crate::lifecycle::PortAssignment {
+                persist: Arc::new(persist),
+                cancelled: Arc::new(cancelled),
+            }))
+            .await
     }
 
     /// Gracefully stop the listener (idempotent).
@@ -1270,7 +1306,6 @@ impl WsInner {
             .and_then(|admitted| admitted.binding(self.token_store.as_ref()?, caller.as_ref()?));
         let mut rotation = admitted.as_mut().and_then(|c| c.rotation.take());
         subs.pairing.admitted = admitted;
-        let mut forwards = ForwardRegistry::default();
         // Bind reverse authority independently of hello metadata. Members may
         // serve ordinary workspace browsers, while guests remain ineligible.
         let reverse = ReverseChannel::new(app_tx.priority_sender())
@@ -1338,7 +1373,6 @@ impl WsInner {
                         _ => {
                             // Stop streams and event producers before the bounded
                             // response drain; only already-admitted replies may leave.
-                            forwards = ForwardRegistry::default();
                             let control = revoked
                                 .ok()
                                 .and_then(|r| r.final_event)
@@ -1458,7 +1492,6 @@ impl WsInner {
                                     &self.bus,
                                     &app_tx,
                                     &mut subs,
-                                    &mut forwards,
                                     &reverse,
                                     &reverse_guard,
                                     self.control.as_ref(),
@@ -1521,7 +1554,6 @@ impl WsInner {
             }
         }
         drop(subs);
-        drop(forwards);
         reverse.close();
         drop(reverse_guard);
         if let Some(mut gate) = self.cleanup_gate.clone() {

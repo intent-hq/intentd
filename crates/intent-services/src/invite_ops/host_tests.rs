@@ -3,6 +3,8 @@ use super::*;
 use crate::tests::TempDb;
 use intent_core::with_caller;
 
+mod presence_notifications;
+
 async fn create(f: &super::tests::Fixture, login: &str) -> Value {
     with_caller(
         Caller::Daemon,

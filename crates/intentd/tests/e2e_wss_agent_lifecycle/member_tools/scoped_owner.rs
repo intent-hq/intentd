@@ -1,4 +1,4 @@
-//! Retained workspace ownership does not grant host or member-only transport access.
+//! Retained workspace ownership grants scoped permission events, but no host access.
 use super::*;
 use intent_core::WorkspaceRole;
 
@@ -13,6 +13,21 @@ async fn person_connection(
         &format!("wss://localhost:{port}/ws?token={token}"),
     )
     .await
+}
+
+async fn guest_permission_event(
+    socket: &mut WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+) -> Value {
+    timeout(Duration::from_secs(15), async {
+        loop {
+            let event = wss_event(socket, 15).await;
+            if event["params"]["event"]["type"] != "workspace:updated" {
+                return event;
+            }
+        }
+    })
+    .await
+    .expect("guest permission event")
 }
 
 #[tokio::test]
@@ -128,6 +143,14 @@ async fn permission_recovery(routed: bool) {
     wss_rpc(&mut owner_events, 1, "events.subscribe", json!({"eventTypes":["agent:permission:request","agent:permission:resolved"],"workspaceId":ws})).await;
     let mut guest_events = person_connection(port, cfg.clone(), &token).await;
     wss_rpc(&mut guest_events, 1, "events.subscribe", json!({"eventTypes":["agent:permission:request","agent:permission:resolved","workspace:updated"],"workspaceId":ws})).await;
+    let mut ordinary_events = person_connection(port, cfg.clone(), &collaborator_token).await;
+    wss_rpc(
+        &mut ordinary_events,
+        1,
+        "events.subscribe",
+        json!({"eventTypes":["agent:permission:*","workspace:updated"],"workspaceId":ws}),
+    )
+    .await;
     wss_rpc(
         &mut guest,
         3,
@@ -139,6 +162,11 @@ async fn permission_recovery(routed: bool) {
     assert_eq!(
         requested["params"]["event"]["type"],
         "agent:permission:request"
+    );
+    let guest_requested = guest_permission_event(&mut guest_events).await;
+    assert_eq!(
+        guest_requested["params"]["event"],
+        requested["params"]["event"]
     );
     let request_id = requested["params"]["event"]["data"]["requestId"]
         .as_str()
@@ -186,6 +214,14 @@ async fn permission_recovery(routed: bool) {
     );
     let refused = wss_rpc_envelope(&mut guest, 9, "agent.respondPermission", answer.clone()).await;
     assert_eq!(refused["error"]["code"], -32003);
+    let history = wss_rpc(
+        &mut guest,
+        90,
+        "event.query",
+        json!({"workspaceId":ws,"eventType":"agent:permission:*","paginate":true}),
+    )
+    .await;
+    assert_eq!(history["items"], json!([]), "demoted guest loses history");
     store
         .set_workspace_member_role(&ws, &person, WorkspaceRole::Owner)
         .await
@@ -204,7 +240,13 @@ async fn permission_recovery(routed: bool) {
         json!([])
     );
 
-    // A visible lifecycle event is an ordering barrier for both refused prompt events.
+    let guest_resolved = guest_permission_event(&mut guest_events).await;
+    assert_eq!(
+        guest_resolved["params"]["event"],
+        resolved["params"]["event"]
+    );
+
+    // A visible lifecycle event is an ordering barrier after both prompt events.
     wss_rpc(
         &mut owner,
         3,
@@ -212,20 +254,22 @@ async fn permission_recovery(routed: bool) {
         json!({"workspaceId":ws,"title":"Permission event barrier"}),
     )
     .await;
-    timeout(Duration::from_secs(15), async {
-        loop {
-            let event = wss_event(&mut guest_events, 15).await;
-            assert_eq!(
-                event["params"]["event"]["type"], "workspace:updated",
-                "guest received a member-only event: {event}"
-            );
-            if event.to_string().contains("Permission event barrier") {
-                break;
+    for events_socket in [&mut guest_events, &mut ordinary_events] {
+        timeout(Duration::from_secs(15), async {
+            loop {
+                let event = wss_event(events_socket, 15).await;
+                assert_eq!(
+                    event["params"]["event"]["type"], "workspace:updated",
+                    "guest received a member-only event: {event}"
+                );
+                if event.to_string().contains("Permission event barrier") {
+                    break;
+                }
             }
-        }
-    })
-    .await
-    .expect("visible lifecycle barrier");
+        })
+        .await
+        .expect("visible lifecycle barrier");
+    }
     for kind in ["agent:permission:request", "agent:permission:resolved"] {
         let events = wss_rpc(
             &mut guest,
@@ -234,7 +278,22 @@ async fn permission_recovery(routed: bool) {
             json!({"workspaceId":ws,"eventType":kind}),
         )
         .await;
-        assert_eq!(events, json!([]));
+        assert!(
+            !events.as_array().unwrap().is_empty(),
+            "guest durable control for {kind}"
+        );
+        let events = wss_rpc(
+            &mut ordinary,
+            12,
+            "event.query",
+            json!({"workspaceId":ws,"eventType":kind}),
+        )
+        .await;
+        assert_eq!(
+            events,
+            json!([]),
+            "ordinary collaborator cannot read prompt history"
+        );
         let events = wss_rpc(
             &mut owner,
             4,

@@ -181,6 +181,9 @@ pub(crate) fn format_wait_duration(secs: i64) -> String {
 /// persisted-entry / unparseable-`queued_at` / sub-threshold skips above
 /// cover the stamp too.
 fn annotate_dequeue_wait(msg: &mut QueuedMessage) {
+    if crate::script_monitor::monitor_id(msg.message_metadata.as_ref()).is_some() {
+        return;
+    }
     if msg.persisted || msg.content.contains(DEQUEUE_WAIT_NOTE_PREFIX) {
         return;
     }
@@ -241,6 +244,9 @@ fn annotate_dequeue_wait(msg: &mut QueuedMessage) {
 /// is replaced the same way), an object is merged into — so EVERY drained
 /// row names its entry.
 pub(crate) fn stamp_queued_message_id(msg: &mut QueuedMessage) {
+    if crate::script_monitor::monitor_id(msg.message_metadata.as_ref()).is_some() {
+        return;
+    }
     if msg.persisted {
         return;
     }
@@ -496,6 +502,10 @@ pub struct TurnOptions {
     /// so the retry still suppresses the report clear). `None` for direct
     /// sends, whose requeue stamps `now_iso()` as before.
     pub queued_at: Option<String>,
+    /// Submission IDs absorbed by a queued row, retained through failed drains.
+    pub queued_submission_ids: Vec<String>,
+    pub queued_submission_order: u64,
+    pub latest_human_submission_at: Option<String>,
     /// STAB-114 / monorepo#1014: text of the user message preempted by a
     /// zero-output interrupt, delivered AHEAD of this turn's own `content` in
     /// the SAME `session/prompt` so both messages are honored in order.
@@ -602,6 +612,9 @@ fn turn_options_for_entry(entry: &QueuedMessage, stale: bool) -> TurnOptions {
         message_metadata: entry.message_metadata.clone(),
         suppress_report_clear: stale,
         queued_at: Some(entry.queued_at.clone()),
+        queued_submission_ids: entry.submission_ids(),
+        queued_submission_order: entry.submission_order,
+        latest_human_submission_at: entry.latest_human_submission_at.clone(),
         prepend_content: entry.prepend_content.clone(),
         prepend_image_blocks: entry.prepend_image_blocks.clone(),
         prepend_file_blocks: entry.prepend_file_blocks.clone(),
@@ -1214,6 +1227,7 @@ pub struct ProcessRegistry {
     /// Optional callback for lifecycle events (queue/resume/evict). Wired by the
     /// manager to publish events + log; the registry stays testable without it.
     event_fn: Option<ProcessEventFn>,
+    event_tasks: crate::delivery_tasks::DeliveryTasks,
     /// Optional aggregate memory budget, installed once by the composition root
     /// when `agents.memoryBudgetMb` resolves to a positive budget (auto, the
     /// absent key, resolves to the recommended value; explicit 0 = off). Not
@@ -1257,6 +1271,16 @@ fn budget_admits(
 }
 
 impl ProcessRegistry {
+    // The sender travels with the physical child, including detached and
+    // Drop-started cleanup. Shutdown removes live handles before draining it.
+    fn cleanup_lease(&self) -> Option<tokio::sync::oneshot::Sender<()>> {
+        let (finished, completion) = tokio::sync::oneshot::channel();
+        self.event_tasks.spawn_draining(async move {
+            let _ = completion.await;
+        })?;
+        Some(finished)
+    }
+
     /// A registry with a fixed concurrency `cap`.
     #[must_use]
     pub fn new(cap: usize) -> Self {
@@ -1264,6 +1288,7 @@ impl ProcessRegistry {
             cap: cap.max(1),
             inner: Mutex::new(RegistryInner::default()),
             event_fn: None,
+            event_tasks: crate::delivery_tasks::DeliveryTasks::default(),
             memory: std::sync::OnceLock::new(),
         }
     }
@@ -1453,7 +1478,7 @@ impl ProcessRegistry {
             );
             if let Some(ref f) = self.event_fn {
                 let fut = f(&resumed_id, "agent:process:resumed", used, self.cap, reason);
-                intent_core::spawn_daemon(fut);
+                let _ = self.event_tasks.spawn_draining(fut);
             }
         }
         true
@@ -1531,7 +1556,7 @@ impl ProcessRegistry {
             );
             if let Some(ref f) = self.event_fn {
                 let fut = f(&resumed_id, "agent:process:resumed", used, self.cap, reason);
-                intent_core::spawn_daemon(fut);
+                let _ = self.event_tasks.spawn_draining(fut);
             }
         }
     }
@@ -1554,7 +1579,7 @@ impl ProcessRegistry {
         );
         if let Some(ref f) = self.event_fn {
             let fut = f(agent_id, "agent:process:resumed", used, self.cap, reason);
-            intent_core::spawn_daemon(fut);
+            let _ = self.event_tasks.spawn_draining(fut);
         }
     }
 
@@ -1692,7 +1717,7 @@ impl ProcessRegistry {
                     }
                     if let Some(ref f) = self.event_fn {
                         let fut = f(agent_id, "agent:process:queued", used, self.cap, reason);
-                        intent_core::spawn_daemon(fut);
+                        let _ = self.event_tasks.spawn_draining(fut);
                     }
                     owed_resume = Some(reason);
                     // A claim-contention wait re-checks on a timer too: the
@@ -1744,7 +1769,7 @@ impl ProcessRegistry {
                         );
                         if let Some(ref f) = self.event_fn {
                             let fut = f(&id, "agent:process:evicted", used, self.cap, reason);
-                            intent_core::spawn_daemon(fut);
+                            let _ = self.event_tasks.spawn_draining(fut);
                         }
                         kill().await;
                         self.deregister(&id);
@@ -1878,7 +1903,7 @@ impl ProcessRegistry {
                                 self.cap,
                                 REASON_MEMORY_BUDGET,
                             );
-                            intent_core::spawn_daemon(fut);
+                            let _ = self.event_tasks.spawn_draining(fut);
                         }
                         owed_resume = Some(REASON_MEMORY_BUDGET);
                         Action::Wait(rx)
@@ -1930,7 +1955,7 @@ impl ProcessRegistry {
                                 self.cap,
                                 REASON_MEMORY_BUDGET,
                             );
-                            intent_core::spawn_daemon(fut);
+                            let _ = self.event_tasks.spawn_draining(fut);
                         }
                         kill().await;
                         self.deregister(&id);
@@ -2110,7 +2135,7 @@ impl ProcessRegistry {
                     self.cap,
                     REASON_IDLE_TTL,
                 );
-                intent_core::spawn_daemon(fut);
+                let _ = self.event_tasks.spawn_draining(fut);
             }
             kill().await;
             self.deregister(&id);
@@ -2205,7 +2230,7 @@ impl ProcessRegistry {
                     self.cap,
                     REASON_MEMORY_BUDGET,
                 );
-                intent_core::spawn_daemon(fut);
+                let _ = self.event_tasks.spawn_draining(fut);
             }
             kill().await;
             self.deregister(&id);
@@ -2570,6 +2595,8 @@ pub struct AgentManager {
     /// Abortable background turn workers, keyed by agent. `stop` aborts the
     /// in-flight worker (interrupting the current stream).
     workers: Arc<Mutex<HashMap<AgentId, JoinHandle<()>>>>,
+    /// Workers whose slot is released but whose persistence tail is still live.
+    finishing_workers: Mutex<Vec<JoinHandle<()>>>,
     /// Agents whose ACP session was recreated (the resume-impossible fallback in
     /// [`AgentManager::start_session`] replaced a lost `acpSessionId` with a fresh
     /// `session/new`). The next turn prepends the prior conversation history as
@@ -2702,6 +2729,24 @@ pub struct AgentManager {
     user_persist_pause: Mutex<Option<Arc<TurnStartPause>>>,
 }
 
+fn spawn_unsloth_status_publisher(
+    services: Services,
+    workspace_id: WorkspaceId,
+    agent_id: AgentId,
+) -> tokio::sync::mpsc::UnboundedSender<(crate::unsloth_server::StatusLevel, String)> {
+    let (status_tx, mut status_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(crate::unsloth_server::StatusLevel, String)>();
+    let tasks = services.store_tasks.clone();
+    let _ = tasks.spawn_draining(async move {
+        while let Some((level, message)) = status_rx.recv().await {
+            services
+                .publish_status_event(&workspace_id, &agent_id, "launch", &message, level.as_str())
+                .await;
+        }
+    });
+    status_tx
+}
+
 impl AgentManager {
     /// Wire a manager over the services surface and a concrete event sink, with
     /// a global concurrency `cap`.
@@ -2768,6 +2813,7 @@ impl AgentManager {
             reap_claims: Arc::new(Mutex::new(HashSet::new())),
             agent_ws: Arc::new(Mutex::new(HashMap::new())),
             workers: Arc::new(Mutex::new(HashMap::new())),
+            finishing_workers: Mutex::new(Vec::new()),
             recreated: Arc::new(Mutex::new(HashSet::new())),
             setup_failure_notified: Arc::new(Mutex::new(HashSet::new())),
             prepend_pending: Arc::new(Mutex::new(HashSet::new())),
@@ -3069,9 +3115,15 @@ impl AgentManager {
         cwd: PathBuf,
         opts: &SpawnOptions<'_>,
     ) -> Result<()> {
-        if self.is_shutting_down() {
-            return Err(Error::NotFound("daemon is shutting down".into()));
-        }
+        let cleanup_lease = {
+            let closed = self.admission_closed.lock().unwrap();
+            if *closed {
+                return Err(Error::NotFound("daemon is shutting down".into()));
+            }
+            self.registry
+                .cleanup_lease()
+                .ok_or_else(|| Error::NotFound("daemon process cleanup is shutting down".into()))?
+        };
         // Claim-before-kill (monorepo#2247): the slot-cap/budget eviction
         // inside `acquire` claims its victim against `try_begin` exactly like
         // the reap sweeps, so a turn cannot start on the victim mid-kill. The
@@ -3431,6 +3483,9 @@ impl AgentManager {
                 _rules_config: rules_config,
                 _pi_extension: pi_extension,
                 npx_launch_dir,
+                cleanup_lease: Some(cleanup_lease),
+                #[cfg(test)]
+                cleanup_services: Some(self.services.clone()),
             }),
             antigravity_profile,
             session_mcp_servers,
@@ -4652,9 +4707,10 @@ impl AgentManager {
     ///
     /// * Fires only on the agent's **first** turn — detected by the absence of
     ///   any prior `assistant` message in the persisted transcript.
-    /// * Agent naming fires only when the name was not explicitly set and the
-    ///   session has no recognized specialist. It uses the provider-correct
-    ///   workspace API MCP tool to call `ws.workspace.setAgentName`.
+    /// * Agent naming fires only for generated generic/specialist placeholders
+    ///   whose name was not explicitly set. Intentional task names are retained.
+    ///   It uses the provider-correct workspace API MCP tool to call
+    ///   `ws.workspace.setAgentName`.
     /// * Workspace naming fires only when the workspace lookup succeeds AND
     ///   the current title is empty/whitespace or still shaped like an
     ///   auto-generated slug ([`intent_core::slug::is_workspace_slug`]).
@@ -4678,10 +4734,13 @@ impl AgentManager {
         let workspace = self.services.store.get_workspace(workspace_id).await.ok();
         let workspace_path = workspace.as_ref().and_then(crate::git_ops::worktree_path);
         let needs_agent_name = session.as_ref().is_ok_and(|s| {
-            !s.name_explicitly_set
-                && !self
-                    .services
-                    .session_has_recognized_specialist(s, workspace_path.as_deref())
+            if s.name_explicitly_set {
+                return false;
+            }
+            let specialist_name = self
+                .services
+                .session_specialist_display_name(s, workspace_path.as_deref());
+            is_generated_agent_name(&s.name, specialist_name.as_deref())
         });
         let needs_workspace_title = workspace.as_ref().is_some_and(|workspace| {
             let title = workspace.title.trim();
@@ -4768,7 +4827,7 @@ impl AgentManager {
         let body = self.build_turn_body(agent_id, &combined).await;
         // Fire-once agent/workspace naming instruction (port of
         // `agent-backend-handler.service.ts` `namingInstructions`): on the
-        // first turn, a `<system>` block asks eligible ordinary agents to name
+        // first turn, a `<system>` block asks agents with generated names to name
         // themselves and independently asks for a workspace title when needed.
         // Never mutates the persisted user message.
         let naming = self
@@ -5132,6 +5191,7 @@ impl AgentManager {
         self.services.pin_live_turn(agent_id);
         if let Some(worker) = self.workers.lock().unwrap().remove(agent_id) {
             worker.abort();
+            self.retain_finishing_worker(worker);
         }
         self.services
             .flush_pinned_turn_on_interruption(agent_id, InterruptReason::AgentStopped, None)
@@ -5293,6 +5353,7 @@ impl AgentManager {
         // child is kept alive (unlike `stop`, which also kills the child).
         if let Some(worker) = self.workers.lock().unwrap().remove(agent_id) {
             worker.abort();
+            self.retain_finishing_worker(worker);
         }
         // The abort may have landed between the streaming path's terminal-
         // error stash and the handler's take (monorepo#2050); the orphaned
@@ -6196,6 +6257,32 @@ impl AgentManager {
         }
     }
 
+    /// A suppressed or transfer-parked monitor never starts a provider turn.
+    /// Deregister while owning the slot, then release it before re-kicking;
+    /// an old worker must never clear a replacement worker or its admission.
+    async fn finish_monitor_worker(
+        self: &Arc<Self>,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        admission: TurnAdmission,
+    ) {
+        let gate = self.turn_start_gates.for_agent(agent_id);
+        let starting = gate.lock().await;
+        if self.is_shutting_down() || !self.owns_admission(agent_id, admission) {
+            return;
+        }
+        self.clear_worker(agent_id);
+        self.end_turn(agent_id).await;
+        drop(starting);
+        self.services.persist_queue_snapshot(agent_id).await;
+        self.services
+            .redeliver_completion_after_queue_mutation(agent_id)
+            .await;
+        self.clone()
+            .try_drain_queue(agent_id.clone(), workspace_id.clone())
+            .await;
+    }
+
     async fn fail_admitted_persist(
         &self,
         agent_id: &AgentId,
@@ -6615,9 +6702,17 @@ impl AgentManager {
         }
     }
 
-    /// Forget a finished worker's join handle.
+    /// Release per-agent ownership while retaining the task's persistence tail.
     fn clear_worker(&self, agent_id: &AgentId) {
-        self.workers.lock().unwrap().remove(agent_id);
+        if let Some(worker) = self.workers.lock().unwrap().remove(agent_id) {
+            self.retain_finishing_worker(worker);
+        }
+    }
+
+    fn retain_finishing_worker(&self, worker: JoinHandle<()>) {
+        let mut finishing = self.finishing_workers.lock().unwrap();
+        finishing.retain(|worker| !worker.is_finished());
+        finishing.push(worker);
     }
 
     /// The workspace a delivery to `agent_id` is bound to: the target's OWN
@@ -6686,6 +6781,13 @@ impl AgentManager {
                     "messageId exceeds maximum length of {MAX_MESSAGE_ID_LEN} bytes"
                 )));
             }
+        }
+        if options.queued_submission_order == 0 {
+            options.queued_submission_order = self
+                .services
+                .queue_submission_order
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
         }
         // A2A sender header (intent-hq/intent#3721, monorepo#1015): the runtime front door — gated
         // on the daemon-stamped `fromAgentId`, applied BEFORE every branch
@@ -7466,7 +7568,7 @@ impl AgentManager {
         // append below. Emitted AFTER the stale-redrive annotation so the
         // payload's `content` matches what is persisted/sent to the provider.
         self.services
-            .publish_queue_processing(&agent_id, &workspace_id, &next)
+            .publish_queue_processing(&agent_id, &workspace_id, std::slice::from_ref(&next))
             .await;
         // Skip the transcript append for a terminal-failure requeue whose
         // user row already reached the transcript before the failed turn
@@ -7504,6 +7606,9 @@ impl AgentManager {
             message_metadata: next.message_metadata.clone(),
             suppress_report_clear: stale,
             queued_at: Some(next.queued_at.clone()),
+            queued_submission_ids: next.submission_ids(),
+            queued_submission_order: next.submission_order,
+            latest_human_submission_at: next.latest_human_submission_at.clone(),
             prepend_content: next.prepend_content.clone(),
             prepend_image_blocks: next.prepend_image_blocks.clone(),
             prepend_file_blocks: next.prepend_file_blocks.clone(),
@@ -7667,6 +7772,9 @@ impl AgentManager {
             message_metadata: entry.message_metadata.clone(),
             suppress_report_clear: stale,
             queued_at: Some(entry.queued_at.clone()),
+            queued_submission_ids: entry.submission_ids(),
+            queued_submission_order: entry.submission_order,
+            latest_human_submission_at: entry.latest_human_submission_at.clone(),
             prepend_content: entry.prepend_content.clone(),
             prepend_image_blocks: entry.prepend_image_blocks.clone(),
             prepend_file_blocks: entry.prepend_file_blocks.clone(),
@@ -7688,8 +7796,8 @@ impl AgentManager {
             // entry user-origin so the winner's end-of-turn drain keeps its
             // user-origin semantics (attention clear, archived exemption).
             entry.user_origin = true;
-            let restored = entry.to_value(0);
-            self.services.requeue_front(&agent_id, entry);
+            let (restored, position) = self.services.requeue_front(&agent_id, entry);
+            let restored = restored.to_value(position);
             drop(draining);
             self.services.publish_queue_updated(&agent_id).await;
             #[cfg(test)]
@@ -7713,11 +7821,19 @@ impl AgentManager {
         // lost-claim arm hands the entry back undelivered); the delivery is
         // committed now (intent-hq/intent#4962).
         self.services
-            .commit_recovery_send_delivery(&agent_id, std::slice::from_ref(&entry));
+            .commit_provisional_queue_delivery(&agent_id, std::slice::from_ref(&entry));
         // Skip the transcript append for a terminal-failure requeue whose
         // user row already reached the transcript (STAB-112) — the entry id
         // already names that row.
         if !entry.persisted {
+            #[cfg(test)]
+            {
+                let pause = self.user_persist_pause.lock().unwrap().take();
+                if let Some(pause) = pause {
+                    pause.reached.notify_one();
+                    pause.resume.notified().await;
+                }
+            }
             // STAB-133: persist the entry's attachments alongside the text
             // block, under the entry id so the RPC result's `messageId` and
             // the `agent:message` event both name the actual transcript row.
@@ -7741,6 +7857,7 @@ impl AgentManager {
                 .await
             {
                 Ok(message) => {
+                    self.services.commit_queue_history(&agent_id, &entry.id);
                     self.services.invalidate_agent_list_cache(&workspace_id);
                     message
                 }
@@ -7784,6 +7901,11 @@ impl AgentManager {
                     .await;
             }
         }
+        // Only a successful append (or an already-persisted retry) starts
+        // processing. Lost claims and failed writes restore without this event.
+        self.services
+            .publish_queue_processing(&agent_id, &workspace_id, std::slice::from_ref(&entry))
+            .await;
         drop(draining);
         self.services
             .publish_queue_updated_after_drain_persist(&agent_id, &workspace_id)
@@ -7861,7 +7983,7 @@ impl AgentManager {
             return Ok(json!({"success":true,"queued":true,"messageIds":ids}));
         };
         self.services
-            .commit_recovery_send_delivery(&agent_id, &entries);
+            .commit_provisional_queue_delivery(&agent_id, &entries);
         match self
             .prepare_admitted_flush_turn(&agent_id, &workspace_id, entries, draining, admission)
             .await
@@ -8358,10 +8480,21 @@ impl AgentManager {
                 if consumed_redelivery {
                     mgr.sync_stop_redelivery(&id).await;
                 }
-                run_message_worker(mgr, id, workspace_id, content, options, user_persisted).await;
+                run_message_worker(
+                    mgr,
+                    id,
+                    workspace_id,
+                    content,
+                    options,
+                    user_persisted,
+                    admission,
+                )
+                .await;
             },
         ));
-        self.workers.lock().unwrap().insert(agent_id, handle);
+        if let Some(previous) = self.workers.lock().unwrap().insert(agent_id, handle) {
+            self.retain_finishing_worker(previous);
+        }
     }
 
     /// Claim the in-flight slot for a delivery-driven turn. Companion to
@@ -8715,6 +8848,7 @@ impl AgentManager {
         // cleared above — retry is the clean-slate escape hatch.
         if let Some(worker) = self.workers.lock().unwrap().remove(&agent_id) {
             worker.abort();
+            self.retain_finishing_worker(worker);
         }
         self.services.discard_pending_terminal_error(&agent_id);
         // Retry is the clean-slate escape hatch for the truncation-redrive
@@ -9539,22 +9673,11 @@ impl AgentManager {
             // message per agent, so publishes must preserve emission order
             // or a restart warning could be clobbered by a later-emitted
             // but earlier-published progress update.
-            let (status_tx, mut status_rx) = tokio::sync::mpsc::unbounded_channel::<(
-                crate::unsloth_server::StatusLevel,
-                String,
-            )>();
-            {
-                let services = self.services.clone();
-                let ws = workspace_id.clone();
-                let aid = agent_id.clone();
-                intent_core::spawn_daemon(async move {
-                    while let Some((level, message)) = status_rx.recv().await {
-                        services
-                            .publish_status_event(&ws, &aid, "launch", &message, level.as_str())
-                            .await;
-                    }
-                });
-            }
+            let status_tx = spawn_unsloth_status_publisher(
+                self.services.clone(),
+                workspace_id.clone(),
+                agent_id.clone(),
+            );
             let status_cb = move |level: crate::unsloth_server::StatusLevel, message: String| {
                 let _ = status_tx.send((level, message));
             };
@@ -9758,6 +9881,12 @@ impl AgentManager {
         for (_, worker) in workers {
             let _ = worker.await;
         }
+        // A worker releases its slot before redelivery and unread/attention
+        // writes. Those tails cannot be detached at the store-close boundary.
+        let finishing = std::mem::take(&mut *self.finishing_workers.lock().unwrap());
+        for worker in finishing {
+            let _ = worker.await;
+        }
         self.services.persist_shutdown_drains().await;
         // The lazy-spawn fence remains for this manager's lifetime. Persist the
         // captured identities, never a post-await re-read of the mutable maps.
@@ -9873,13 +10002,56 @@ impl AgentManager {
         // The daemon-managed Unsloth server is not an agent child — tear it
         // down explicitly so a clean shutdown never orphans it.
         self.unsloth.shutdown().await;
+        let finish = self.registry.event_tasks.drain_finite();
+        #[cfg(test)]
+        let finish = {
+            let mut finish = Box::pin(finish);
+            std::future::poll_fn(move |cx| {
+                let result = std::future::Future::poll(finish.as_mut(), cx);
+                if result.is_pending() {
+                    if let Some(tx) = self
+                        .services
+                        .secrets
+                        .writer_drain_pending
+                        .lock()
+                        .unwrap()
+                        .take()
+                    {
+                        let _ = tx.send("process-registry");
+                    }
+                }
+                result
+            })
+        };
+        finish.await;
     }
 
     /// Idle-reap hook: evict up to `max` idle agents in LRU order (count-based;
     /// the LRU `acquire`-eviction companion). Same claim-before-kill semantics
     /// (monorepo#2247) and post-sweep drain kick as
     /// [`Self::reap_idle_older_than`].
+    ///
+    /// # Panics
+    /// Panics if the shutdown admission mutex is poisoned.
     pub async fn reap_idle(self: &Arc<Self>, max: Option<usize>) -> usize {
+        let task = {
+            // Serialize admission with shutdown before any candidate is claimed.
+            let closed = self.admission_closed.lock().unwrap();
+            if *closed {
+                return 0;
+            }
+            let manager = self.clone();
+            self.registry
+                .event_tasks
+                .spawn_draining(async move { manager.reap_idle_owned(max).await })
+        };
+        match task {
+            Some(task) => task.await.unwrap_or_default(),
+            None => 0,
+        }
+    }
+
+    async fn reap_idle_owned(self: &Arc<Self>, max: Option<usize>) -> usize {
         let (try_claim, release, released) = self.reap_claim_fns();
         let reaped = self.registry.evict_idle(max, try_claim, release).await;
         self.kick_released(released).await;
@@ -9899,7 +10071,28 @@ impl AgentManager {
     /// the sweep, any released agent with a ready queue gets a drain kick so
     /// a message that parked behind the claim starts a fresh turn (the agent
     /// respawns on demand) rather than stranding until the next queue event.
+    ///
+    /// # Panics
+    /// Panics if the shutdown admission mutex is poisoned.
     pub async fn reap_idle_older_than(self: &Arc<Self>, ttl: Duration) -> usize {
+        let task = {
+            // Serialize admission with shutdown before any candidate is claimed.
+            let closed = self.admission_closed.lock().unwrap();
+            if *closed {
+                return 0;
+            }
+            let manager = self.clone();
+            self.registry
+                .event_tasks
+                .spawn_draining(async move { manager.reap_idle_older_than_owned(ttl).await })
+        };
+        match task {
+            Some(task) => task.await.unwrap_or_default(),
+            None => 0,
+        }
+    }
+
+    async fn reap_idle_older_than_owned(self: &Arc<Self>, ttl: Duration) -> usize {
         let (try_claim, release, released) = self.reap_claim_fns();
         let reaped = self
             .registry
@@ -9916,7 +10109,28 @@ impl AgentManager {
     /// a spawn attempt. No budget / no sample / under budget → no-op. Same
     /// claim-before-kill semantics (monorepo#2118) and post-sweep drain kick
     /// as [`Self::reap_idle_older_than`]. Returns the number reaped.
+    ///
+    /// # Panics
+    /// Panics if the shutdown admission mutex is poisoned.
     pub async fn reap_over_budget(self: &Arc<Self>) -> usize {
+        let task = {
+            // Serialize admission with shutdown before any candidate is claimed.
+            let closed = self.admission_closed.lock().unwrap();
+            if *closed {
+                return 0;
+            }
+            let manager = self.clone();
+            self.registry
+                .event_tasks
+                .spawn_draining(async move { manager.reap_over_budget_owned().await })
+        };
+        match task {
+            Some(task) => task.await.unwrap_or_default(),
+            None => 0,
+        }
+    }
+
+    async fn reap_over_budget_owned(self: &Arc<Self>) -> usize {
         let (try_claim, release, released) = self.reap_claim_fns();
         let reaped = self
             .registry
@@ -9934,12 +10148,16 @@ impl AgentManager {
     fn reap_claim_fns(
         &self,
     ) -> (
-        impl Fn(&AgentId) -> bool,
+        impl Fn(&AgentId) -> bool + '_,
         impl Fn(&AgentId),
         Arc<Mutex<Vec<AgentId>>>,
     ) {
         let released: Arc<Mutex<Vec<AgentId>>> = Arc::new(Mutex::new(Vec::new()));
-        let try_claim = self.try_claim_fn();
+        let claim = self.try_claim_fn();
+        let try_claim = move |id: &AgentId| {
+            let closed = self.admission_closed.lock().unwrap();
+            !*closed && claim(id)
+        };
         let release = {
             let claims = self.reap_claims.clone();
             let released = released.clone();
@@ -9991,12 +10209,15 @@ impl AgentManager {
             let services = self.services.clone();
             move |id: &AgentId| {
                 claims.lock().unwrap().remove(id);
-                let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                let Ok(_handle) = tokio::runtime::Handle::try_current() else {
                     return;
                 };
                 let services = services.clone();
                 let id = id.clone();
-                handle.spawn(async move {
+                // The released claim can discover revoked queue entries before
+                // delivery admission. Own that durable cleanup through final drain.
+                let tasks = services.store_tasks.clone();
+                let _ = tasks.spawn_draining(async move {
                     let Some(mgr) = services.agent_manager() else {
                         return;
                     };
@@ -10047,15 +10268,21 @@ impl AgentManager {
     /// loop, so no orphaned grandchildren linger.
     fn make_kill(&self, agent_id: AgentId) -> KillFn {
         let handles: Weak<Mutex<HashMap<AgentId, AgentHandle>>> = Arc::downgrade(&self.handles);
+        #[cfg(test)]
+        let services = self.services.clone();
         Arc::new(move || {
             let handles = handles.clone();
             let id = agent_id.clone();
+            #[cfg(test)]
+            let services = services.clone();
             Box::pin(async move {
                 let removed = handles
                     .upgrade()
                     .and_then(|h| h.lock().unwrap().remove(&id));
                 if let Some(mut handle) = removed {
                     if let Some(child) = RuntimeTeardown::take(&mut handle) {
+                        #[cfg(test)]
+                        services.hold_periodic_commit("reap").await;
                         child.kill_tree().await;
                     }
                 }
@@ -10264,7 +10491,7 @@ impl Drop for RetainUnlessSwept {
 /// into their OWN process groups survive the `killpg`, so they are snapshotted
 /// before the kill and swept afterwards (`intent_acp::descendant_sweep`).
 #[cfg(unix)]
-async fn kill_child_tree(mut child: Child, spawn_pid: Option<u32>) {
+async fn kill_child_tree(mut child: Child, spawn_pid: Option<u32>) -> bool {
     use intent_acp::{descendant_pids, sweep_escaped_descendants};
     use nix::sys::signal::{killpg, Signal};
     use nix::unistd::Pid;
@@ -10275,7 +10502,10 @@ async fn kill_child_tree(mut child: Child, spawn_pid: Option<u32>) {
     // and same-group descendants still need the killpg sweep.
     let Some(pid) = child.id().or(spawn_pid) else {
         let _ = child.start_kill();
-        return;
+        return matches!(
+            tokio::time::timeout(KILL_SWEEP_REAP_GRACE, child.wait()).await,
+            Ok(Ok(_))
+        );
     };
     let descendants = descendant_pids(pid).await;
     let pgid = Pid::from_raw(pid.cast_signed());
@@ -10285,13 +10515,57 @@ async fn kill_child_tree(mut child: Child, spawn_pid: Option<u32>) {
     let _ = tokio::time::timeout(PROCESS_GROUP_TERM_GRACE, child.wait()).await;
     let _ = killpg(pgid, Signal::SIGKILL);
     sweep_escaped_descendants(&descendants).await;
+    confirm_tree_exit(&mut child, pgid, &descendants, KILL_SWEEP_REAP_GRACE).await
+}
+
+/// Observe the existing sweep's completion under one fixed deadline. These
+/// probes never signal: a recycled pid/group can only cause conservative
+/// retention of the launch directory, never kill an unrelated process.
+#[cfg(unix)]
+async fn confirm_tree_exit(
+    child: &mut Child,
+    pgid: nix::unistd::Pid,
+    descendants: &[i32],
+    grace: Duration,
+) -> bool {
+    use nix::errno::Errno;
+    use nix::sys::signal::{kill, killpg};
+    use nix::unistd::Pid;
+
+    let deadline = tokio::time::Instant::now() + grace;
+    if !matches!(
+        tokio::time::timeout_at(deadline, child.wait()).await,
+        Ok(Ok(_))
+    ) {
+        return false;
+    }
+    loop {
+        if killpg(pgid, None) == Err(Errno::ESRCH)
+            && descendants
+                .iter()
+                .all(|&pid| pid > 1 && kill(Pid::from_raw(pid), None) == Err(Errno::ESRCH))
+        {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep_until(
+            deadline.min(tokio::time::Instant::now() + Duration::from_millis(10)),
+        )
+        .await;
+    }
 }
 
 /// Non-unix fallback: no process groups, so fall back to killing the direct
 /// child (`kill_on_drop` remains the safety net on drop).
 #[cfg(not(unix))]
-async fn kill_child_tree(mut child: Child, _spawn_pid: Option<u32>) {
+async fn kill_child_tree(mut child: Child, _spawn_pid: Option<u32>) -> bool {
     let _ = child.start_kill();
+    matches!(
+        tokio::time::timeout(Duration::from_millis(500), child.wait()).await,
+        Ok(Ok(_))
+    )
 }
 
 #[expect(clippy::similar_names)] // pid/pgid are the POSIX terms
@@ -10387,6 +10661,58 @@ mod kill_sweep_tests {
 
     use super::*;
 
+    #[tokio::test(start_paused = true)]
+    async fn exit_acknowledgement_deadline_never_signals_a_live_group() {
+        use nix::sys::signal::killpg;
+        use nix::unistd::Pid;
+
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pgid = Pid::from_raw(child.id().unwrap().cast_signed());
+        let before = tokio::time::Instant::now();
+        let grace = Duration::from_millis(50);
+        assert!(!confirm_tree_exit(&mut child, pgid, &[], grace).await);
+        assert_eq!(before.elapsed(), grace);
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(killpg(pgid, None).is_ok(), "observation must not signal");
+        child.kill().await.unwrap();
+        assert!(confirm_tree_exit(&mut child, pgid, &[], grace).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exit_acknowledgement_bounds_descendant_probe_after_reaped_leader() {
+        use nix::sys::signal::killpg;
+        use nix::unistd::Pid;
+
+        let mut leader = tokio::process::Command::new("true")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = Pid::from_raw(leader.id().unwrap().cast_signed());
+        leader.wait().await.unwrap();
+        let mut other = tokio::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let other_pid = other.id().unwrap().cast_signed();
+        let before = tokio::time::Instant::now();
+        let grace = Duration::from_millis(50);
+        // A still-live snapshot pid (including a recycled one) prevents a
+        // positive acknowledgement but must never receive another signal.
+        assert!(!confirm_tree_exit(&mut leader, pgid, &[other_pid], grace).await);
+        assert_eq!(before.elapsed(), grace);
+        assert!(other.try_wait().unwrap().is_none());
+        assert!(killpg(Pid::from_raw(other_pid), None).is_ok());
+        other.kill().await.unwrap();
+        assert!(confirm_tree_exit(&mut leader, pgid, &[other_pid], grace).await);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn slow_children_tear_down_in_one_shared_grace_window() {
         const N: usize = 4;
@@ -10422,6 +10748,54 @@ mod kill_sweep_tests {
                     .unwrap(),
             "sweep returned after {elapsed:?}, before the shared grace window elapsed"
         );
+    }
+}
+
+#[cfg(test)]
+mod shutdown_writer_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shutdown_joins_a_worker_after_it_releases_its_agent_slot() {
+        let (manager, agent, _dir) = super::role_reminder_tests::manager_with(None, None).await;
+        let manager = Arc::new(manager);
+        let (start, started) = tokio::sync::oneshot::channel();
+        let (reached, ready) = tokio::sync::oneshot::channel();
+        let (release, resumed) = tokio::sync::oneshot::channel();
+        let worker_manager = manager.clone();
+        let worker_agent = agent.clone();
+        let worker = intent_core::spawn_daemon(async move {
+            started.await.unwrap();
+            worker_manager.clear_worker(&worker_agent);
+            reached.send(()).unwrap();
+            resumed.await.unwrap();
+            worker_manager
+                .services
+                .raise_attention(&WorkspaceId::from("ws-1"), WorkspaceAttention::Unread)
+                .await
+                .unwrap();
+        });
+        manager.workers.lock().unwrap().insert(agent, worker);
+        start.send(()).unwrap();
+        ready.await.unwrap();
+        let shutdown = manager.shutdown();
+        tokio::pin!(shutdown);
+        tokio::select! {
+            biased;
+            () = &mut shutdown => panic!("shutdown detached the finishing writer"),
+            () = std::future::ready(()) => {}
+        }
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), shutdown)
+            .await
+            .unwrap();
+        let workspace = manager
+            .services
+            .store
+            .get_workspace(&WorkspaceId::from("ws-1"))
+            .await
+            .unwrap();
+        assert_eq!(workspace.attention, WorkspaceAttention::Unread);
     }
 }
 
@@ -10597,7 +10971,7 @@ fn extract_user_prepend(content: &Value) -> crate::agent_ops::QueuedPrepend {
 /// zero-output preemption path to combine an entry-carried `prepend_*`
 /// payload with the just-preempted message's attachments instead of
 /// clobbering one with the other.
-fn merge_block_arrays(first: Option<Value>, second: Option<Value>) -> Option<Value> {
+pub(crate) fn merge_block_arrays(first: Option<Value>, second: Option<Value>) -> Option<Value> {
     match (first, second) {
         (Some(Value::Array(mut a)), Some(Value::Array(b))) => {
             a.extend(b);
@@ -10851,6 +11225,30 @@ fn session_provider_id(session: &AgentSession, configured_default: Option<&str>)
 pub(crate) use crate::harness::v1::{
     GENERIC_AGENT_NAMING_TOOL_REFERENCE, GENERIC_NAMING_TOOL_REFERENCE,
 };
+
+/// Generated UI names use a display name plus an optional collision number;
+/// daemon-created General agents use `Agent` plus six hexadecimal characters.
+/// Task-derived names can also have `name_explicitly_set=false`, so the flag alone
+/// does not imply a placeholder.
+pub(crate) fn is_generated_agent_name(name: &str, specialist_name: Option<&str>) -> bool {
+    let name = name.trim();
+    let matches_base = |base: &str| {
+        name == base
+            || name
+                .strip_prefix(base)
+                .and_then(|suffix| suffix.strip_prefix(' '))
+                .is_some_and(|suffix| {
+                    !suffix.starts_with('0')
+                        && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                        && suffix.parse::<u64>().is_ok_and(|number| number >= 2)
+                })
+    };
+    matches_base("Agent")
+        || name.strip_prefix("Agent ").is_some_and(|suffix| {
+            suffix.len() == 6 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        || specialist_name.is_some_and(matches_base)
+}
 
 /// Provider-correct spelling of the workspace API MCP tool used for agent
 /// self-naming.
@@ -11276,6 +11674,19 @@ fn auggie_explicit_path_setting(
         .or_else(|| read_provider_path_setting(settings, "auggie"))
 }
 
+fn dequeue_worker_raced_tail(
+    services: &Services,
+    agent_id: &AgentId,
+    next: &QueuedMessage,
+) -> Option<(Vec<QueuedMessage>, DrainingGuard)> {
+    // The head was popped before the slot reclaim, so queue selectors can no
+    // longer see its monitor identity. Never attach unrelated work to its wake.
+    if crate::script_monitor::monitor_id(next.message_metadata.as_ref()).is_some() {
+        return None;
+    }
+    services.dequeue_ready_batch_draining(agent_id, false, 1)
+}
+
 /// Background turn worker: drive the current message to completion, then drain
 /// any queued messages (flipping each to in-flight). After the slot is released
 /// the loop re-checks the queue and reclaims the slot **as long as another
@@ -11291,6 +11702,7 @@ async fn run_message_worker(
     initial_content: String,
     initial_options: TurnOptions,
     initial_persisted: bool,
+    mut admission: TurnAdmission,
 ) {
     let mut content = initial_content;
     // Only the first turn carries the caller's per-turn prompt-assembly hints
@@ -11318,6 +11730,26 @@ async fn run_message_worker(
     // turn instead of failing; past it the timeout takes the terminal path.
     let mut consecutive_idle_timeouts: u32 = 0;
     'outer: loop {
+        if mgr.services.defer_script_monitor_for_export(
+            &agent_id,
+            &content,
+            options.message_metadata.as_ref(),
+        ) {
+            mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
+                .await;
+            return;
+        }
+        if !mgr
+            .services
+            .script_monitor_delivery_allowed(&agent_id, options.message_metadata.as_ref())
+            .await
+            .unwrap_or(false)
+        {
+            mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
+                .await;
+            return;
+        }
+
         // Turn-start budget re-check (monorepo#2063 B8): a warm idle process
         // about to go active re-checks the aggregate budget like a spawn
         // would — queued behind eviction, never refused. Sits at the top of
@@ -11337,6 +11769,24 @@ async fn run_message_worker(
             mgr.registry
                 .acquire_turn_start(&agent_id, try_claim, release)
                 .await;
+        }
+        if mgr.services.defer_script_monitor_for_export(
+            &agent_id,
+            &content,
+            options.message_metadata.as_ref(),
+        ) {
+            mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
+                .await;
+            return;
+        }
+        if !mgr
+            .services
+            .admit_script_monitor_turn(&agent_id, options.message_metadata.as_ref())
+            .await
+        {
+            mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
+                .await;
+            return;
         }
         match retry_spawn(&mgr, &agent_id, &workspace_id).await {
             Ok(acp_session_id) => {
@@ -11384,6 +11834,24 @@ async fn run_message_worker(
                 let prompt = mgr
                     .build_turn_prompt(&agent_id, &workspace_id, &content, &options)
                     .await;
+                if mgr.services.defer_script_monitor_for_export(
+                    &agent_id,
+                    &content,
+                    options.message_metadata.as_ref(),
+                ) {
+                    mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
+                        .await;
+                    return;
+                }
+                if !mgr
+                    .services
+                    .admit_script_monitor_turn(&agent_id, options.message_metadata.as_ref())
+                    .await
+                {
+                    mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
+                        .await;
+                    return;
+                }
                 match mgr
                     .run_turn(
                         &agent_id,
@@ -11948,7 +12416,7 @@ async fn run_message_worker(
             // annotation so the payload's `content` matches what is
             // persisted/sent to the provider.
             mgr.services
-                .publish_queue_processing(&agent_id, &workspace_id, &next)
+                .publish_queue_processing(&agent_id, &workspace_id, std::slice::from_ref(&next))
                 .await;
             let next_image_blocks = next.image_blocks.clone();
             let next_file_blocks = next.file_blocks.clone();
@@ -11971,6 +12439,7 @@ async fn run_message_worker(
                 )
                 .await
             };
+            let queued_submission_ids = next.submission_ids();
             content = next.content;
             options = TurnOptions {
                 image_blocks: next_image_blocks,
@@ -11978,6 +12447,9 @@ async fn run_message_worker(
                 message_metadata: next.message_metadata.clone(),
                 suppress_report_clear: stale,
                 queued_at: Some(next.queued_at.clone()),
+                queued_submission_ids,
+                queued_submission_order: next.submission_order,
+                latest_human_submission_at: next.latest_human_submission_at.clone(),
                 prepend_content: next.prepend_content.clone(),
                 prepend_image_blocks: next.prepend_image_blocks.clone(),
                 prepend_file_blocks: next.prepend_file_blocks.clone(),
@@ -12042,10 +12514,10 @@ async fn run_message_worker(
                 .await;
             break 'outer;
         }
-        if matches!(
-            mgr.try_begin_outcome(&agent_id, &workspace_id, false).await,
-            TryBeginOutcome::Started(_)
-        ) {
+        if let TryBeginOutcome::Started(next_admission) =
+            mgr.try_begin_outcome(&agent_id, &workspace_id, false).await
+        {
+            admission = next_admission;
             // Archived re-check on the raced pop (intent-hq/monorepo#2513):
             // the popped entry can be a wake parked by the archived gates
             // AFTER the gate at the top of this drain ran — e.g. the
@@ -12101,14 +12573,12 @@ async fn run_message_worker(
                 }
             }
             mgr.services
-                .commit_recovery_send_delivery(&agent_id, &raced);
+                .commit_provisional_queue_delivery(&agent_id, &raced);
             let mut next = raced.pop().expect("raced batch non-empty");
             let mut draining = raced_draining.take().expect("raced batch guard");
             // The first entry was popped before re-claiming the slot.
             // Fold any further ready entries into the same provider turn.
-            let extra_batch = mgr
-                .services
-                .dequeue_ready_batch_draining(&agent_id, false, 1);
+            let extra_batch = dequeue_worker_raced_tail(&mgr.services, &agent_id, &next);
             if let Some((mut batch, extra_draining)) = extra_batch {
                 batch.insert(0, next);
                 draining.merge(extra_draining);
@@ -12151,7 +12621,7 @@ async fn run_message_worker(
             // pre-release drain arm — emitted AFTER the stale-redrive
             // annotation so the payload's `content` matches the turn.
             mgr.services
-                .publish_queue_processing(&agent_id, &workspace_id, &next)
+                .publish_queue_processing(&agent_id, &workspace_id, std::slice::from_ref(&next))
                 .await;
             let next_image_blocks = next.image_blocks.clone();
             let next_file_blocks = next.file_blocks.clone();
@@ -12171,6 +12641,7 @@ async fn run_message_worker(
                 )
                 .await
             };
+            let queued_submission_ids = next.submission_ids();
             content = next.content;
             options = TurnOptions {
                 image_blocks: next_image_blocks,
@@ -12178,6 +12649,9 @@ async fn run_message_worker(
                 message_metadata: next.message_metadata.clone(),
                 suppress_report_clear: stale,
                 queued_at: Some(next.queued_at.clone()),
+                queued_submission_ids,
+                queued_submission_order: next.submission_order,
+                latest_human_submission_at: next.latest_human_submission_at.clone(),
                 prepend_content: next.prepend_content.clone(),
                 prepend_image_blocks: next.prepend_image_blocks.clone(),
                 prepend_file_blocks: next.prepend_file_blocks.clone(),
@@ -12368,7 +12842,7 @@ async fn prepare_flush_turn(
     // Drain-start signal (monorepo#1022): one event for the combined turn,
     // keyed on the head entry (its `turn_id` IS the turn's id below).
     mgr.services
-        .publish_queue_processing(agent_id, workspace_id, &entries[0])
+        .publish_queue_processing(agent_id, workspace_id, &entries)
         .await;
     // All rows persist under the combined turn's id — the provider turn runs
     // once, under the head entry's `turn_id`, so a per-entry id on row #2+
@@ -12462,6 +12936,18 @@ async fn prepare_flush_turn(
         message_metadata: entries[0].message_metadata.clone(),
         suppress_report_clear: stale_flags.iter().all(|&s| s),
         queued_at: Some(entries[0].queued_at.clone()),
+        latest_human_submission_at: entries
+            .iter()
+            .filter(|entry| entry.user_origin)
+            .filter_map(|entry| {
+                let at = entry
+                    .latest_human_submission_at
+                    .as_deref()
+                    .unwrap_or(&entry.queued_at);
+                intent_core::parse_iso(at).map(|parsed| (parsed, at))
+            })
+            .max_by_key(|(parsed, _)| *parsed)
+            .map(|(_, at)| at.to_owned()),
         prepend_content,
         prepend_image_blocks,
         prepend_file_blocks,
@@ -12528,6 +13014,32 @@ async fn persist_user(
             pause.resume.notified().await;
         }
     }
+    if let Some(id) = crate::script_monitor::wake_id(message_metadata) {
+        // A suppressed wake is successfully discarded, not a failed user send.
+        // The worker independently fences delivery before starting a turn.
+        if !mgr
+            .services
+            .script_monitor_delivery_allowed(agent_id, message_metadata)
+            .await
+            .unwrap_or(false)
+        {
+            mgr.services.commit_queue_history(agent_id, &id);
+            return true;
+        }
+        match mgr
+            .services
+            .store
+            .get_agent_message_by_id_with_pruned(agent_id, &id)
+            .await
+        {
+            Ok(Some(_)) => {
+                mgr.services.commit_queue_history(agent_id, &id);
+                return true;
+            }
+            Err(_) => return false,
+            Ok(None) => {}
+        }
+    }
     let created_at = now_iso();
     let mut blocks = user_message_blocks(content, image_blocks, file_blocks);
     let block_md = message_metadata.and_then(|md| match md {
@@ -12548,7 +13060,8 @@ async fn persist_user(
     // Bounded retry (#547): initial attempt + one retry per backoff delay.
     let backoff = persist_retry_backoff_ms();
     let mut attempt = 0usize;
-    let message_id = new_message_id();
+    let message_id =
+        crate::script_monitor::wake_id(message_metadata).unwrap_or_else(new_message_id);
     let message = loop {
         match mgr
             .services
@@ -12565,10 +13078,32 @@ async fn persist_user(
             .await
         {
             Ok(message) => {
+                if let Some(id) = crate::script_monitor::wake_id(message_metadata) {
+                    mgr.services.commit_queue_history(agent_id, &id);
+                }
+
+                if let Some(id) = message_metadata
+                    .and_then(|md| md.get("queueInfo"))
+                    .and_then(|info| info.get("queuedMessageId"))
+                    .and_then(Value::as_str)
+                {
+                    mgr.services.commit_queue_history(agent_id, id);
+                }
                 mgr.services.invalidate_agent_list_cache(workspace_id);
                 break message;
             }
             Err(e) => {
+                if let Some(id) = crate::script_monitor::wake_id(message_metadata) {
+                    if !mgr
+                        .services
+                        .script_monitor_delivery_allowed(agent_id, message_metadata)
+                        .await
+                        .unwrap_or(false)
+                    {
+                        mgr.services.commit_queue_history(agent_id, &id);
+                        return true;
+                    }
+                }
                 // Vanished-session fast exit (intent-hq/monorepo#2762): the
                 // only FK on `agent_message` is `agent_id → agent_session(id)`,
                 // so an append failure against a deleted session is permanent
@@ -13440,6 +13975,13 @@ async fn publish_error_status_and_requeue(
             hold_kind: None,
             hold_until: None,
             child_agent_id: None,
+            merged_submission_ids: options.queued_submission_ids.clone(),
+            edit_appended: String::new(),
+            edit_prepended: String::new(),
+            editing_message_id: None,
+            provisional: false,
+            submission_order: options.queued_submission_order,
+            latest_human_submission_at: options.latest_human_submission_at.clone(),
         };
         mgr.services.requeue_front(agent_id, queued);
     }
@@ -14230,6 +14772,124 @@ mod npx_launch_dir_lifetime_tests {
     use super::role_reminder_tests::manager_with;
     use super::*;
 
+    async fn removed_cleanup_shutdown(unexpected: bool) {
+        use crate::periodic_shutdown_tests::{entered, hold};
+        let tmp = crate::tests::test_tempdir("intentd-6388-cleanup-");
+        let (original, agent_id, _db) = manager_with(None, None).await;
+        let svc = original.services.clone();
+        let mgr = Arc::new(AgentManager::new(
+            svc.clone(),
+            Arc::new(BusEventSink::new(svc.event_bus.clone().unwrap())),
+            1,
+        ));
+        let mut tree = spawn_tree(tmp.path(), "owned").await;
+        let leader = tree.child.as_ref().unwrap().id().unwrap();
+        let _leader_cleanup = KillGrandchildOnDrop(leader.cast_signed());
+        let _ends = install_tree(&mgr, &mut tree, &agent_id);
+        {
+            let handles = mgr.handles.lock().unwrap();
+            let handle = handles.get(&agent_id).unwrap();
+            let mut resources = handle
+                .execution
+                .local
+                .as_ref()
+                .unwrap()
+                .resources
+                .lock()
+                .unwrap();
+            resources.cleanup_services = Some(svc.clone());
+            resources.cleanup_lease = mgr.registry.cleanup_lease();
+        }
+        mgr.registry
+            .register(agent_id.clone(), mgr.make_kill(agent_id.clone()));
+        let (rx, release) = hold(&svc, "physical-cleanup");
+        let task = if unexpected {
+            nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(leader.cast_signed()),
+                nix::sys::signal::Signal::SIGKILL,
+            )
+            .unwrap();
+            let watcher = mgr.arm_child_exit_watcher(agent_id.clone(), Some(leader));
+            intent_core::spawn_daemon(async move {
+                assert!(watcher.await.unwrap());
+            })
+        } else {
+            let owner = mgr.clone();
+            intent_core::spawn_daemon(async move {
+                let (claim, release) = owner.admission_claim_fns();
+                owner
+                    .registry
+                    .acquire(&AgentId::from("new-admission"), claim, release)
+                    .await;
+            })
+        };
+        entered(rx).await;
+        assert!(!mgr.contains(&agent_id));
+        assert!(pid_alive(tree.grandchild));
+        assert!(tree.launch_path.is_dir());
+        if unexpected {
+            drop(task);
+        } else {
+            abort_and_settle(task, "abortable admission").await;
+        }
+        let (tx, pending) = tokio::sync::oneshot::channel();
+        *svc.secrets.writer_drain_pending.lock().unwrap() = Some(tx);
+        let owner = mgr.clone();
+        let mut shutdown = intent_core::spawn_daemon(async move { owner.shutdown().await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                result = pending => assert_eq!(result.unwrap(), "process-registry"),
+                result = &mut shutdown => { result.unwrap(); panic!("shutdown omitted removed physical cleanup"); }
+            }
+        }).await.unwrap();
+        assert!(pid_alive(tree.grandchild));
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), shutdown)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!pid_alive(leader.cast_signed()));
+        assert!(
+            !pid_alive(tree.grandchild),
+            "grandchild {} alive after shutdown; launch_dir_exists={}",
+            tree.grandchild,
+            tree.launch_path.exists()
+        );
+        assert!(!tree.launch_path.exists());
+        // Cleanup has issued the group kill and released its lease, but an
+        // orphaned descendant can remain signal-0-visible until init reaps it.
+        // Keep the shutdown/launch-dir assertions immediate; bound only the
+        // observation that the identified descendant's PID has disappeared.
+        // Use signal 0 directly: pid_alive above already rejects executable
+        // descendants, but deliberately treats unreaped zombies as dead.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while nix::sys::signal::kill(nix::unistd::Pid::from_raw(tree.grandchild), None)
+                != Err(nix::errno::Errno::ESRCH)
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("cleanup killed the descendant; its orphan PID must be reaped");
+        // An aborted acquire skips its existing post-kill deregistration.
+        // Preserve that stale in-memory slot: late ID-only removal could erase
+        // a replacement runtime. The exit watcher deregisters before cleanup.
+        assert_eq!(mgr.registry.is_registered(&agent_id), !unexpected);
+        svc.shutdown_store_writers().await;
+        svc.event_bus.as_ref().unwrap().shutdown().await.unwrap();
+        svc.store.close().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_admission_cleanup_is_joined_by_shutdown() {
+        removed_cleanup_shutdown(false).await;
+    }
+
+    #[tokio::test]
+    async fn unexpected_exit_cleanup_is_joined_by_shutdown() {
+        removed_cleanup_shutdown(true).await;
+    }
+
     /// A child whose cwd is `dir`: on SIGTERM it writes `cwd-present` or
     /// `cwd-gone` to `marker` (a path outside `dir`) and exits, so the kill's
     /// `child.wait()` returns only after the verdict is on disk.
@@ -14431,7 +15091,59 @@ mod npx_launch_dir_lifetime_tests {
     }
 
     fn pid_alive(pid: i32) -> bool {
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+        let signal_probe = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None);
+        if signal_probe.is_err() {
+            return false;
+        }
+        // kill(pid, 0) still succeeds for an exited child until its parent
+        // reaps it. Such a process cannot use the launch directory anymore.
+        // Keep unknown states conservative: a live/stopped process must still
+        // fail the lifetime assertions if cleanup removes its directory.
+        #[cfg(target_os = "linux")]
+        if let Ok(stat) = {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
+            eprintln!(
+                "pid_alive({pid}): signal_probe={signal_probe:?}, stat={stat:?}, cwd={:?}, subsequent_stat={:?}",
+                std::fs::read_link(format!("/proc/{pid}/cwd")),
+                std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            );
+            stat
+        } {
+            if matches!(
+                stat.rsplit_once(") ")
+                    .and_then(|(_, fields)| fields.split_whitespace().next()),
+                Some("Z" | "X")
+            ) {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pid_alive_distinguishes_live_stopped_and_unreaped_children() {
+        use nix::sys::signal::{kill, Signal};
+        use nix::sys::wait::{waitid, Id, WaitPidFlag};
+        use nix::unistd::Pid;
+
+        let mut child = intentd_test_support::GuardedChild::spawn(
+            std::process::Command::new("sleep").arg("300"),
+        )
+        .unwrap();
+        let pid = Pid::from_raw(child.id().cast_signed());
+        assert!(pid_alive(pid.as_raw()), "an executable process is alive");
+
+        kill(pid, Signal::SIGSTOP).unwrap();
+        waitid(Id::Pid(pid), WaitPidFlag::WSTOPPED | WaitPidFlag::WNOWAIT).unwrap();
+        assert!(pid_alive(pid.as_raw()), "a stopped process can resume");
+
+        child.kill().unwrap();
+        // Observe exit without reaping, deterministically retaining a zombie.
+        waitid(Id::Pid(pid), WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT).unwrap();
+        assert!(kill(pid, None).is_ok(), "the zombie still has a pid");
+        assert!(!pid_alive(pid.as_raw()), "a zombie cannot use its cwd");
+        child.wait().unwrap();
     }
 
     /// A leader whose cwd is `dir`: it starts a same-group grandchild that
@@ -15122,42 +15834,113 @@ mod role_reminder_tests {
     }
 
     #[tokio::test]
-    async fn explicit_and_specialist_names_do_not_receive_agent_naming_instruction() {
-        let (explicit_mgr, explicit_id, _explicit_db) = manager_with(None, None).await;
-        configure_agent_name(&explicit_mgr, &explicit_id, "User Choice", true, None).await;
-        let explicit = prompt_text(
-            &explicit_mgr
-                .build_turn_prompt(
-                    &explicit_id,
-                    &WorkspaceId::from("ws-1"),
-                    "start",
-                    &TurnOptions::default(),
-                )
-                .await,
-        );
-        assert_eq!(explicit, "start");
+    async fn specialist_placeholder_naming_instruction_covers_titles_and_providers() {
+        for name in ["Implementor", "Implementor 2", "Implementor 12"] {
+            for title in ["", "Existing workspace title"] {
+                for (provider, tool) in [
+                    ("auggie", "workspace_api_workspace-mcp"),
+                    ("opencode", "workspace-mcp_workspace_api"),
+                    ("codex", "workspace_api"),
+                ] {
+                    let (mgr, agent_id, _db) = manager_with(Some("implementor"), None).await;
+                    let workspace_id = WorkspaceId::from("ws-1");
+                    configure_agent_name(&mgr, &agent_id, name, false, Some("implementor")).await;
+                    set_workspace_title(&mgr, &workspace_id, title).await;
+                    let mut session = mgr
+                        .services
+                        .store
+                        .get_agent_session(&agent_id)
+                        .await
+                        .unwrap();
+                    session.provider = Some(provider.to_string());
+                    mgr.services
+                        .store
+                        .update_agent_session(&workspace_id, &session)
+                        .await
+                        .unwrap();
+                    let instruction = mgr
+                        .build_first_turn_naming_instruction(&agent_id, &workspace_id)
+                        .await
+                        .expect("specialist placeholder needs a name");
+                    assert!(
+                        instruction.contains("ws.workspace.setAgentName"),
+                        "{name}: {instruction}"
+                    );
+                    assert!(instruction.contains(tool), "{provider}: {instruction}");
+                    assert!(instruction.contains("task-specific name"));
+                    assert_eq!(
+                        instruction.contains("This workspace needs a title"),
+                        title.is_empty()
+                    );
+                }
+            }
+        }
+    }
 
-        let (specialist_mgr, specialist_id, _specialist_db) =
-            manager_with(Some("implementor"), None).await;
+    #[tokio::test]
+    async fn explicit_and_task_names_do_not_receive_agent_naming_instruction() {
+        for (name, explicitly_set, specialist) in [
+            ("User Choice", true, None),
+            ("Implementor", true, Some("implementor")),
+            ("Implementor 2", true, Some("implementor")),
+            ("Fix the sidebar", false, Some("implementor")),
+            ("Implementor for authentication", false, Some("implementor")),
+            ("Implementor 0", false, Some("implementor")),
+            ("Fix the sidebar", false, None),
+        ] {
+            let (mgr, agent_id, _db) = manager_with(specialist, None).await;
+            configure_agent_name(&mgr, &agent_id, name, explicitly_set, specialist).await;
+            assert!(
+                mgr.build_first_turn_naming_instruction(&agent_id, &WorkspaceId::from("ws-1"))
+                    .await
+                    .is_none(),
+                "preserve intentional name {name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn specialist_naming_instruction_uses_frozen_display_name() {
+        let (mgr, agent_id, _db) = manager_with(Some("deleted-specialist"), None).await;
         configure_agent_name(
-            &specialist_mgr,
-            &specialist_id,
-            "Implementor",
+            &mgr,
+            &agent_id,
+            "Custom Builder 2",
             false,
-            Some("implementor"),
+            Some("deleted-specialist"),
         )
         .await;
-        let specialist = prompt_text(
-            &specialist_mgr
-                .build_turn_prompt(
-                    &specialist_id,
-                    &WorkspaceId::from("ws-1"),
-                    "start",
-                    &TurnOptions::default(),
-                )
-                .await,
-        );
-        assert!(!specialist.contains("ws.workspace.setAgentName"));
+        let mut session = mgr
+            .services
+            .store
+            .get_agent_session(&agent_id)
+            .await
+            .unwrap();
+        session.metadata = Some(serde_json::json!({"specialistName": "Custom Builder"}));
+        let workspace_id = WorkspaceId::from("ws-1");
+        mgr.services
+            .store
+            .update_agent_session(&workspace_id, &session)
+            .await
+            .unwrap();
+        let instruction = mgr
+            .build_first_turn_naming_instruction(&agent_id, &workspace_id)
+            .await
+            .expect("frozen specialist placeholder needs a name");
+        assert!(instruction.contains("ws.workspace.setAgentName"));
+    }
+
+    #[tokio::test]
+    async fn general_placeholder_naming_instruction_covers_numbered_names() {
+        for name in ["Agent", "Agent 2", "Agent abc123"] {
+            let (mgr, agent_id, _db) = manager_with(None, None).await;
+            configure_agent_name(&mgr, &agent_id, name, false, None).await;
+            assert!(mgr
+                .build_first_turn_naming_instruction(&agent_id, &WorkspaceId::from("ws-1"))
+                .await
+                .unwrap()
+                .contains("ws.workspace.setAgentName"));
+        }
     }
 
     #[tokio::test]
@@ -15185,8 +15968,8 @@ mod role_reminder_tests {
 
     #[tokio::test]
     async fn agent_naming_instruction_is_first_turn_only() {
-        let (mgr, agent_id, _db) = manager_with(None, None).await;
-        configure_agent_name(&mgr, &agent_id, "Agent abc123", false, None).await;
+        let (mgr, agent_id, _db) = manager_with(Some("implementor"), None).await;
+        configure_agent_name(&mgr, &agent_id, "Implementor", false, Some("implementor")).await;
         let workspace_id = WorkspaceId::from("ws-1");
         let first = prompt_text(
             &mgr.build_turn_prompt(&agent_id, &workspace_id, "first", &TurnOptions::default())
@@ -15207,7 +15990,8 @@ mod role_reminder_tests {
             &mgr.build_turn_prompt(&agent_id, &workspace_id, "later", &TurnOptions::default())
                 .await,
         );
-        assert_eq!(later, "later");
+        assert!(!later.contains("ws.workspace.setAgentName"));
+        assert!(later.ends_with("later"));
     }
 
     /// `stop()` clears `recreated`/`prepend_pending` (stale-flag hygiene) but
@@ -16561,6 +17345,8 @@ mod dead_child_respawn_tests {
                 _rules_config: None,
                 _pi_extension: None,
                 npx_launch_dir,
+                cleanup_lease: None,
+                cleanup_services: None,
             }),
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
@@ -19456,6 +20242,175 @@ mod agent_retry_tests {
         (Arc::new(AgentManager::new(services, sink, 8)), db_dir)
     }
 
+    #[intent_test_macros::daemon_test]
+    async fn suppressed_monitor_worker_releases_slot_and_allows_followup() {
+        monitor_worker_exit_releases_slot(false).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn exported_monitor_worker_releases_slot_and_allows_followup() {
+        monitor_worker_exit_releases_slot(true).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn raced_monitor_head_never_consumes_ordinary_tail() {
+        {
+            for exporting in [false, true] {
+                let agent = AgentId::from("monitor-raced-owner");
+                let ws = WorkspaceId::from("monitor-raced-workspace");
+                let (mgr, _db) = manager_with_session(&agent, &ws, AgentStatus::RuntimeIdle).await;
+                let (head, _) = mgr.services.enqueue_message(
+                &agent, "monitor head".into(), None, None,
+                Some(json!({"type":"script_monitor_wake","monitorId":"raced-monitor","workspaceId":ws})),
+                None, false, intent_core::MessageOrigin::Automatic,
+            );
+                let (next, draining) = mgr
+                    .services
+                    .dequeue_message_draining_provisional(&agent)
+                    .unwrap();
+                assert_eq!(next.id, head.id);
+                let (tail, _) = mgr.services.enqueue_message(
+                    &agent,
+                    "ordinary tail".into(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    intent_core::MessageOrigin::Automatic,
+                );
+                assert!(
+                    dequeue_worker_raced_tail(&mgr.services, &agent, &next).is_none(),
+                    "popped monitor must not absorb ordinary entries"
+                );
+                assert!(mgr.services.is_message_queued(&agent, &tail.id));
+                drop(draining);
+                let admission = mgr.try_begin_turn(&agent, &ws).await.unwrap();
+                if exporting {
+                    park_monitor_export(&mgr, &ws);
+                }
+                run_message_worker(
+                    mgr.clone(),
+                    agent.clone(),
+                    ws.clone(),
+                    next.content,
+                    TurnOptions {
+                        message_metadata: next.message_metadata,
+                        ..TurnOptions::default()
+                    },
+                    true,
+                    admission,
+                )
+                .await;
+                assert!(
+                    !mgr.services.is_message_queued(&agent, &tail.id),
+                    "ordinary tail must be re-kicked after monitor suppression/deferral"
+                );
+                assert!(
+                    mgr.is_busy(&agent),
+                    "ordinary tail owns a replacement admission"
+                );
+                if exporting {
+                    let rows = mgr.services.queue_snapshot(&agent);
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(rows[0]["content"], "monitor head");
+                }
+            }
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn stale_monitor_worker_cannot_release_successor_admission() {
+        let agent = AgentId::from("monitor-stale-worker");
+        let ws = WorkspaceId::from("monitor-stale-workspace");
+        let (mgr, _db) = manager_with_session(&agent, &ws, AgentStatus::RuntimeIdle).await;
+        let old = mgr.try_begin_turn(&agent, &ws).await.unwrap();
+        mgr.end_turn(&agent).await;
+        let new = mgr.try_begin_turn(&agent, &ws).await.unwrap();
+        mgr.finish_monitor_worker(&agent, &ws, old).await;
+        assert!(mgr.owns_admission(&agent, new));
+        assert!(mgr.is_busy(&agent));
+        assert_eq!(
+            mgr.services
+                .store
+                .get_agent_session(&agent)
+                .await
+                .unwrap()
+                .status,
+            AgentStatus::Active
+        );
+        mgr.end_turn(&agent).await;
+    }
+
+    fn park_monitor_export(mgr: &AgentManager, ws: &WorkspaceId) {
+        mgr.services.transfer_exports.lock().unwrap().insert(
+            "monitor-worker-export".into(),
+            crate::transfer_export::ExportSession {
+                initiator: None,
+                workspace_id: ws.clone(),
+                staging_dir: std::env::temp_dir(),
+                state: crate::transfer_export::ExportState::Building { aborted: false },
+                wip_paths: vec![],
+                max_chunk_bytes: 100,
+            },
+        );
+    }
+
+    async fn monitor_worker_exit_releases_slot(exporting: bool) {
+        let agent = AgentId::from("monitor-worker-owner");
+        let ws = WorkspaceId::from("monitor-worker-workspace");
+        let (mgr, _db) = manager_with_session(&agent, &ws, AgentStatus::RuntimeIdle).await;
+        let admission = mgr.try_begin_turn(&agent, &ws).await.unwrap();
+        if exporting {
+            park_monitor_export(&mgr, &ws);
+        }
+        let metadata =
+            json!({"type":"script_monitor_wake","monitorId":"removed-monitor","workspaceId":ws});
+        run_message_worker(
+            mgr.clone(),
+            agent.clone(),
+            ws.clone(),
+            "suppressed wake".into(),
+            TurnOptions {
+                message_metadata: Some(metadata),
+                ..TurnOptions::default()
+            },
+            true,
+            admission,
+        )
+        .await;
+        assert!(
+            !mgr.is_busy(&agent),
+            "a discarded/deferred wake must release its slot"
+        );
+        assert!(!mgr.turn_admissions.lock().unwrap().contains_key(&agent));
+        assert_eq!(
+            mgr.services
+                .store
+                .get_agent_session(&agent)
+                .await
+                .unwrap()
+                .status,
+            AgentStatus::RuntimeIdle
+        );
+        let (queued, _) = mgr.services.enqueue_message(
+            &agent,
+            "ordinary followup".into(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            intent_core::MessageOrigin::User,
+        );
+        mgr.clone().try_drain_queue(agent.clone(), ws).await;
+        assert!(
+            !mgr.services.is_message_queued(&agent, &queued.id),
+            "normal followup must drain even while the monitor is parked"
+        );
+        assert!(mgr.is_busy(&agent), "followup owns the new slot");
+    }
+
     #[tokio::test]
     async fn retry_from_error_status_with_empty_queue_clears_to_idle() {
         let agent_id = AgentId::from("agent-1");
@@ -20284,7 +21239,7 @@ mod agent_retry_tests {
         // The provisional holder wins its claim and commits.
         assert!(mgr.try_begin(&agent_id, &ws).await);
         mgr.services
-            .commit_recovery_send_delivery(&agent_id, std::slice::from_ref(&entry));
+            .commit_provisional_queue_delivery(&agent_id, std::slice::from_ref(&entry));
         drop(draining);
         assert!(mgr.services.parked_recovery_send(&agent_id).is_none());
     }
