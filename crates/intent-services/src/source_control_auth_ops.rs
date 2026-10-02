@@ -18,9 +18,7 @@ use std::sync::Arc;
 
 use intent_core::events::SOURCE_CONTROL_AUTH_CHANGED;
 use intent_core::{now_iso, Error, FileSecretStore, IdentityProofErrorKind, Result, WorkspaceId};
-use intent_sourcecontrol::gitlab_auth::{
-    refresh_access_token, revoke_gitlab_token, stored_credential, validate_pat,
-};
+use intent_sourcecontrol::gitlab_auth::{refresh_grant, stored_credential, validate_pat};
 use intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT as GITLAB_SECRET_ACCOUNT;
 use intent_sourcecontrol::identity_proof::provider::{CreatedProof, ProofProvider};
 use intent_sourcecontrol::{
@@ -34,8 +32,10 @@ use crate::events::EventBus;
 use crate::github_auth_ops::{self, FlowPhase, FlowSlot, MAX_CONSECUTIVE_POLL_ERRORS};
 use crate::{publish_event, system_actor};
 
+mod probe_owner;
+
 #[cfg(test)]
-mod startup_tests;
+pub(crate) mod startup_tests;
 
 /// Env override for the origin GitLab API / OAuth calls go to — the
 /// spawned-daemon test seam (consulted only when
@@ -180,6 +180,15 @@ pub(crate) struct GitlabAuthState {
     pub(crate) flow: Option<GitlabFlowSlot>,
     pub(crate) starting: Option<GitlabStartupIntent>,
     pub(crate) unsupported_hosts: HashSet<String>,
+    #[cfg(test)]
+    pub(crate) persistence_test_lease: Option<intent_sourcecontrol::gitlab_auth::PersistenceLease>,
+    #[cfg(test)]
+    pub(crate) before_terminal_publish: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+    #[cfg(test)]
+    pub(crate) revoke_gate_polled: Option<tokio::sync::oneshot::Sender<bool>>,
 }
 
 pub(crate) type GitlabAuthStateHandle = Arc<tokio::sync::Mutex<GitlabAuthState>>;
@@ -285,6 +294,8 @@ async fn is_resident(state: &GitlabAuthStateHandle, flow_id: u64) -> bool {
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn run_gitlab_poll_loop(
     state: GitlabAuthStateHandle,
+    shutdown: Arc<crate::delivery_tasks::DeliveryTasks>,
+    secrets: Arc<crate::settings::AsyncSecretStore>,
     bus: Option<EventBus>,
     registry: Option<Arc<crate::SettingsRegistry>>,
     gate: GitlabCredentialGate,
@@ -299,8 +310,14 @@ pub(crate) async fn run_gitlab_poll_loop(
         if remaining.is_zero() {
             break FlowPhase::Expired;
         }
-        tokio::time::sleep(github_auth_ops::poll_sleep(flow.interval_secs()).min(remaining)).await;
-        let _gate = gate.lock().await;
+        // Stop idle polling promptly, but never drop an admitted exchange or
+        // persistence continuation in response to the shutdown signal.
+        tokio::select! {
+            biased;
+            () = shutdown.closed() => return,
+            () = tokio::time::sleep(github_auth_ops::poll_sleep(flow.interval_secs()).min(remaining)) => {}
+        }
+        let gate_lease = Arc::new(gate.clone().lock_owned().await);
         if !is_resident(&state, flow_id).await {
             tracing::info!(host, "gitlab device grant superseded; poll loop stopped");
             return;
@@ -311,7 +328,7 @@ pub(crate) async fn run_gitlab_poll_loop(
         match flow.exchange_once().await {
             Ok(GitlabExchange::Pending) => consecutive_errors = 0,
             Ok(GitlabExchange::Authorized(grant)) => {
-                let mut guard = state.lock().await;
+                let mut guard = state.clone().lock_owned().await;
                 if !matches!(guard.flow.as_ref(), Some(f) if f.slot.flow_id == flow_id) {
                     drop(grant);
                     tracing::info!(
@@ -320,19 +337,56 @@ pub(crate) async fn run_gitlab_poll_loop(
                     );
                     return;
                 }
-                if let Err(e) = grant.commit().await {
-                    // The instance issued the grant once; there is nothing
-                    // left to poll for.
-                    tracing::warn!(error = %e, host, "could not persist gitlab device grant");
+                let operation = secrets.settled_operation(Arc::new(tokio::sync::Notify::new()));
+                let worker_secrets = operation.clone();
+                let lease: intent_sourcecontrol::gitlab_auth::PersistenceLease = {
+                    #[cfg(test)]
+                    let lease = Arc::new((gate_lease.clone(), guard.persistence_test_lease.take()));
+                    #[cfg(not(test))]
+                    let lease = gate_lease.clone();
+                    lease
+                };
+                let registry = registry.clone();
+                let worker_bus = bus.clone();
+                let worker_host = host.clone();
+                // The poll supervisor retains gate_lease through worker failure
+                // and receipt settlement. The state guard preserves the existing
+                // atomic write/slot/binding/event transition on ordinary results.
+                let worker = intent_core::spawn_daemon(async move {
+                    worker_secrets.persist_gitlab_grant(grant, lease).await?;
+                    guard.flow = None;
                     drop(guard);
-                    break FlowPhase::Error;
+                    bind_gitlab_host(registry.as_deref(), &worker_host);
+                    publish_auth_changed(
+                        worker_bus.as_ref(),
+                        Provider::Gitlab,
+                        &worker_host,
+                        "authorized",
+                    )
+                    .await;
+                    Ok::<(), Error>(())
+                });
+                let committed = worker.await;
+                #[cfg(test)]
+                if committed.is_err() {
+                    operation.gitlab_poll_worker_failed.notify_one();
                 }
-                guard.flow = None;
-                drop(guard);
-                bind_gitlab_host(registry.as_deref(), &host);
-                tracing::info!(status = "authorized", host, "gitlab device grant finished");
-                publish_auth_changed(bus.as_ref(), Provider::Gitlab, &host, "authorized").await;
-                return;
+                operation.finish_operation().await;
+                match committed {
+                    Ok(Ok(())) => return,
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, host, "could not persist gitlab device grant");
+                        break FlowPhase::Error;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, host, "gitlab grant worker failed; outcome unknown after write settlement");
+                        let mut guard = state.lock().await;
+                        if matches!(guard.flow.as_ref(), Some(f) if f.slot.flow_id == flow_id) {
+                            guard.flow = None;
+                        }
+                        return;
+                    }
+                }
             }
             Ok(GitlabExchange::Expired) => break FlowPhase::Expired,
             Ok(GitlabExchange::Denied) => break FlowPhase::Denied,
@@ -350,11 +404,23 @@ pub(crate) async fn run_gitlab_poll_loop(
             }
         }
     };
+    // Iteration ownership has ended. Reacquire before checking residency and
+    // retain ownership through the terminal event, so a newer PAT/revoke either
+    // supersedes this flow or publishes after this outcome.
+    let _terminal_gate = gate.lock().await;
     {
         let mut guard = state.lock().await;
         match guard.flow.as_mut() {
             Some(f) if f.slot.flow_id == flow_id => f.slot.phase = phase,
             _ => return,
+        }
+    }
+    #[cfg(test)]
+    {
+        let seam = state.lock().await.before_terminal_publish.take();
+        if let Some((entered, release)) = seam {
+            let _ = entered.send(());
+            let _ = release.await;
         }
     }
     let status = phase.as_wire();
@@ -434,11 +500,16 @@ async fn load_gitlab_token(
 /// Clear a device-grant connection whose access token can no longer be
 /// renewed, and tell subscribers (`status: "expired"`). The caller holds the
 /// [`GitlabCredentialGate`].
-async fn disconnect_gitlab(store: FileSecretStore, bus: Option<&EventBus>, host: &str) {
-    if let Err(e) = revoke_gitlab_token(store).await {
-        tracing::warn!(error = %e, host, "could not clear the gitlab credential");
-    }
+async fn disconnect_gitlab(
+    store: FileSecretStore,
+    secrets: &crate::settings::AsyncSecretStore,
+    lease: intent_sourcecontrol::gitlab_auth::PersistenceLease,
+    bus: Option<&EventBus>,
+    host: &str,
+) -> Result<()> {
+    secrets.revoke_gitlab_token(store, lease).await?;
     publish_auth_changed(bus, Provider::Gitlab, host, "expired").await;
+    Ok(())
 }
 
 /// [`disconnect_gitlab`] only if `host` is still the bound instance and the
@@ -446,7 +517,13 @@ async fn disconnect_gitlab(store: FileSecretStore, bus: Option<&EventBus>, host:
 /// pair in the meantime holds a credential the instance never saw fail, and
 /// that connection stays; a host that lost the binding no longer owns the
 /// stored credential.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keep the retained lease explicit alongside the existing credential phase inputs"
+)]
 async fn disconnect_gitlab_if_current(
+    secrets: &crate::settings::AsyncSecretStore,
+    retained: &probe_owner::RetainedGate,
     store: FileSecretStore,
     bound: &(dyn Fn() -> bool + Sync),
     gate: &GitlabCredentialGate,
@@ -454,10 +531,11 @@ async fn disconnect_gitlab_if_current(
     host: &str,
     rejected: &str,
 ) -> Result<()> {
-    let _gate = gate.lock().await;
+    let lease = probe_owner::acquire(gate, retained).await;
     if bound() && stored_access_token(&store).await?.as_deref() == Some(rejected) {
-        disconnect_gitlab(store, bus, host).await;
+        disconnect_gitlab(store, secrets, lease, bus, host).await?;
     }
+    retained.lock().unwrap().take();
     Ok(())
 }
 
@@ -472,6 +550,8 @@ async fn disconnect_gitlab_if_current(
 /// credential is never refreshed. The caller holds the
 /// [`GitlabCredentialGate`] and has checked the binding.
 async fn refresh_stored_credential_if_needed(
+    secrets: &crate::settings::AsyncSecretStore,
+    lease: intent_sourcecontrol::gitlab_auth::PersistenceLease,
     host: &GitlabHost,
     client_id: Option<&str>,
     store: &FileSecretStore,
@@ -482,7 +562,7 @@ async fn refresh_stored_credential_if_needed(
         .map_err(crate::pr_ops::map_sc_err)?;
     let mut refreshed = false;
     if credential.needs_refresh() {
-        match try_refresh(host, client_id, store.clone()).await {
+        match try_refresh(host, client_id, store.clone(), secrets, lease.clone()).await {
             Ok(()) => {
                 refreshed = true;
                 credential = stored_credential(store.clone())
@@ -490,10 +570,11 @@ async fn refresh_stored_credential_if_needed(
                     .map_err(crate::pr_ops::map_sc_err)?;
             }
             Err(RefreshFailure::Unrecoverable) => {
-                disconnect_gitlab(store.clone(), bus, host.host()).await;
+                disconnect_gitlab(store.clone(), secrets, lease.clone(), bus, host.host()).await?;
                 return Ok(None);
             }
             Err(RefreshFailure::Transient) => {}
+            Err(RefreshFailure::Persistence(error)) => return Err(error),
         }
     }
     Ok(Some((credential, refreshed)))
@@ -530,6 +611,22 @@ async fn refresh_stored_credential_if_needed(
 /// other `github.*` methods); a rejected credential is an outcome, not an
 /// error.
 pub(crate) async fn probe_gitlab(
+    services: &crate::Services,
+    host: &GitlabHost,
+) -> Result<ProbeOutcome> {
+    match services.owned_gitlab_probe(host.clone(), false).await? {
+        probe_owner::Reply::Probe(result) => Ok(result),
+        probe_owner::Reply::Token(_) => unreachable!("probe response"),
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keep the retained lease explicit alongside the existing credential phase inputs"
+)]
+async fn probe_gitlab_owned(
+    secrets: &crate::settings::AsyncSecretStore,
+    retained: &probe_owner::RetainedGate,
     host: &GitlabHost,
     bound: &(dyn Fn() -> bool + Sync),
     client_id: Option<&str>,
@@ -538,12 +635,19 @@ pub(crate) async fn probe_gitlab(
     bus: Option<&EventBus>,
 ) -> Result<ProbeOutcome> {
     let (token, method, refreshed) = {
-        let _gate = gate.lock().await;
+        let lease = probe_owner::acquire(gate, retained).await;
         if !bound() {
             return Ok(ProbeOutcome::NotConfigured);
         }
-        let Some((credential, refreshed)) =
-            refresh_stored_credential_if_needed(host, client_id, &store, bus).await?
+        let Some((credential, refreshed)) = refresh_stored_credential_if_needed(
+            secrets,
+            lease.clone(),
+            host,
+            client_id,
+            &store,
+            bus,
+        )
+        .await?
         else {
             return Ok(ProbeOutcome::NotConfigured);
         };
@@ -552,6 +656,7 @@ pub(crate) async fn probe_gitlab(
         };
         (token, method, refreshed)
     };
+    retained.lock().unwrap().take();
     match validate_pat(host, &token).await {
         Ok(user) => return Ok(ProbeOutcome::Configured { user, method }),
         Err(intent_sourcecontrol::Error::Auth(_)) if method == "device" && !refreshed => {}
@@ -561,18 +666,19 @@ pub(crate) async fn probe_gitlab(
     // 401 on a device credential: one refresh, one retry. Skip the exchange
     // when a peer already replaced the rejected token; retry with theirs.
     let (token, method) = {
-        let _gate = gate.lock().await;
+        let lease = probe_owner::acquire(gate, retained).await;
         if !bound() {
             return Ok(ProbeOutcome::NotConfigured);
         }
         if stored_access_token(&store).await?.as_deref() == Some(token.as_str()) {
-            match try_refresh(host, client_id, store.clone()).await {
+            match try_refresh(host, client_id, store.clone(), secrets, lease.clone()).await {
                 Ok(()) => {}
                 Err(RefreshFailure::Unrecoverable) => {
-                    disconnect_gitlab(store, bus, host.host()).await;
+                    disconnect_gitlab(store, secrets, lease.clone(), bus, host.host()).await?;
                     return Ok(ProbeOutcome::NotConfigured);
                 }
                 Err(RefreshFailure::Transient) => return Ok(ProbeOutcome::Rejected),
+                Err(RefreshFailure::Persistence(error)) => return Err(error),
             }
         }
         let credential = stored_credential(store.clone())
@@ -583,10 +689,21 @@ pub(crate) async fn probe_gitlab(
         };
         (token, method)
     };
+    retained.lock().unwrap().take();
     match validate_pat(host, &token).await {
         Ok(user) => Ok(ProbeOutcome::Configured { user, method }),
         Err(intent_sourcecontrol::Error::Auth(_)) => {
-            disconnect_gitlab_if_current(store, bound, gate, bus, host.host(), &token).await?;
+            disconnect_gitlab_if_current(
+                secrets,
+                retained,
+                store,
+                bound,
+                gate,
+                bus,
+                host.host(),
+                &token,
+            )
+            .await?;
             Ok(ProbeOutcome::NotConfigured)
         }
         Err(e) => Err(crate::pr_ops::map_sc_err(e)),
@@ -594,6 +711,7 @@ pub(crate) async fn probe_gitlab(
 }
 
 enum RefreshFailure {
+    Persistence(Error),
     /// The instance refused the refresh token (or none is stored / no client
     /// id can run the exchange): the connection cannot be renewed.
     Unrecoverable,
@@ -605,6 +723,8 @@ async fn try_refresh(
     host: &GitlabHost,
     client_id: Option<&str>,
     store: FileSecretStore,
+    secrets: &crate::settings::AsyncSecretStore,
+    lease: intent_sourcecontrol::gitlab_auth::PersistenceLease,
 ) -> std::result::Result<(), RefreshFailure> {
     let Some(client_id) = client_id else {
         tracing::warn!(
@@ -613,8 +733,12 @@ async fn try_refresh(
         );
         return Err(RefreshFailure::Unrecoverable);
     };
-    match refresh_access_token(host, client_id, store).await {
-        Ok(()) => {
+    match refresh_grant(host, client_id, store).await {
+        Ok(grant) => {
+            secrets
+                .persist_gitlab_grant(grant, lease)
+                .await
+                .map_err(RefreshFailure::Persistence)?;
             tracing::info!(host = host.host(), "gitlab access token refreshed");
             Ok(())
         }
@@ -753,37 +877,10 @@ impl crate::Services {
     pub(crate) async fn stored_proof_token(&self, target: &Target) -> Result<String> {
         match target {
             Target::Github => github_auth_ops::load_stored_token(&self.secrets).await,
-            Target::Gitlab { host } => {
-                let _gate = self.gitlab_credential_gate.lock().await;
-                if !self.gitlab_host_is_bound(host) {
-                    return Err(Error::IdentityProof(
-                        IdentityProofErrorKind::GitlabNotConnected,
-                    ));
-                }
-                let client_id = self.gitlab_client_id(host);
-                let Some((credential, _)) = refresh_stored_credential_if_needed(
-                    host,
-                    client_id.as_deref(),
-                    &self.gitlab_secret_store,
-                    self.event_bus.as_ref(),
-                )
-                .await?
-                else {
-                    return Err(Error::IdentityProof(
-                        IdentityProofErrorKind::GitlabNotConnected,
-                    ));
-                };
-                if credential == StoredCredential::None {
-                    return Err(Error::IdentityProof(
-                        IdentityProofErrorKind::GitlabNotConnected,
-                    ));
-                }
-                stored_access_token(&self.gitlab_secret_store)
-                    .await?
-                    .ok_or(Error::IdentityProof(
-                        IdentityProofErrorKind::GitlabNotConnected,
-                    ))
-            }
+            Target::Gitlab { host } => match self.owned_gitlab_probe(host.clone(), true).await? {
+                probe_owner::Reply::Token(token) => Ok(token),
+                probe_owner::Reply::Probe(_) => unreachable!("proof response"),
+            },
         }
     }
 
@@ -931,28 +1028,11 @@ impl crate::Services {
             }
             Err(e) => return Err(crate::pr_ops::map_sc_err(e)),
         }
-        let _gate = self.gitlab_credential_gate.lock().await;
-        intent_sourcecontrol::gitlab_auth::persist_gitlab_token(
-            self.gitlab_secret_store.clone(),
+        self.owned_direct_secret_mutation(crate::direct_secret_ops::Mutation::GitlabPat(
+            host,
             intent_sourcecontrol::SecretString::from(token),
-        )
+        ))
         .await
-        .map_err(crate::pr_ops::map_sc_err)?;
-        {
-            let mut guard = self.gitlab_auth.lock().await;
-            guard.flow = None;
-            guard.starting = None;
-        }
-        bind_gitlab_host(self.settings_registry.as_deref(), host.host());
-        tracing::info!(host = host.host(), "gitlab personal access token connected");
-        publish_auth_changed(
-            self.event_bus.as_ref(),
-            Provider::Gitlab,
-            host.host(),
-            "authorized",
-        )
-        .await;
-        Ok(pat_connect_response())
     }
 
     /// `sourceControl.connect { provider: "gitlab" }` (device grant): the
@@ -966,6 +1046,9 @@ impl crate::Services {
         };
         let (flow_id, client_id) = {
             let mut guard = self.gitlab_auth.lock().await;
+            if self.settings_tasks.is_closed() || self.store_tasks.is_closed() {
+                return Err(Error::Internal("daemon is shutting down".into()));
+            }
             if let Some(f) = guard.flow.as_ref() {
                 if f.host == host.host() && f.slot.is_live() {
                     return Ok(github_auth_ops::connect_response(&f.slot));
@@ -993,6 +1076,12 @@ impl crate::Services {
         )
         .await;
         let mut guard = self.gitlab_auth.lock().await;
+        if self.settings_tasks.is_closed() {
+            if matches!(guard.starting.as_ref(), Some(s) if s.id == flow_id) {
+                guard.starting = None;
+            }
+            return Err(Error::Internal("daemon is shutting down".into()));
+        }
         if !matches!(guard.starting.as_ref(), Some(s) if s.id == flow_id) {
             // Keep same-host reuse when a concurrent request already installed
             // its live flow, but never resurrect a superseded startup.
@@ -1020,16 +1109,23 @@ impl crate::Services {
             Err(e) => return Err(crate::pr_ops::map_sc_err(e)),
         };
         let deadline = Instant::now() + std::time::Duration::from_secs(auth.expires_in);
-        intent_core::spawn_daemon(run_gitlab_poll_loop(
-            self.gitlab_auth.clone(),
-            self.event_bus.clone(),
-            self.settings_registry.clone(),
-            self.gitlab_credential_gate.clone(),
-            flow_id,
-            host.host().to_string(),
-            flow,
-            deadline,
-        ));
+        // Registration and publication share the state lock with shutdown's
+        // cancellation, so shutdown sees every poll admitted across its fence.
+        let _poll = self
+            .store_tasks
+            .spawn_draining(run_gitlab_poll_loop(
+                self.gitlab_auth.clone(),
+                self.settings_tasks.clone(),
+                self.secrets.clone(),
+                self.event_bus.clone(),
+                self.settings_registry.clone(),
+                self.gitlab_credential_gate.clone(),
+                flow_id,
+                host.host().to_string(),
+                flow,
+                deadline,
+            ))
+            .ok_or_else(|| Error::Internal("daemon is shutting down".into()))?;
         let slot = FlowSlot {
             flow_id,
             user_code: auth.user_code,

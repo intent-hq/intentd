@@ -53,7 +53,11 @@ async fn congested_terminal_forwarder_preserves_cursor_ranges_and_exit_order() {
         None,
         None,
         "sub-1".into(),
-        OutboundSender { priority, bulk },
+        OutboundSender {
+            priority,
+            bulk,
+            shutdown: None,
+        },
         false,
     );
     let reader = async {

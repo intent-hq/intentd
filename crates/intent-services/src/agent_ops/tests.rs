@@ -35120,6 +35120,186 @@ async fn resume_interrupted_marker_is_idempotent_on_retry() {
     );
 }
 
+async fn suspend_shutdown_fixture() -> (TempDb, Services, WorkspaceId, AgentId, EventBus) {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.unwrap();
+    let bus = EventBus::new(store.clone());
+    let svc = Services::new_with_file_secrets(
+        store,
+        intent_core::FileSecretStore::with_path(tmp.path.with_extension("secrets")),
+    )
+    .with_settings_registry(test_registry_with_default_provider(&tmp))
+    .with_event_bus(bus.clone());
+    let aid = create_agent(&svc, &ws, "Suspended").await;
+    svc.store
+        .set_acp_session_id(&ws, &aid, "suspend-session")
+        .await
+        .unwrap();
+    svc.store
+        .insert_interrupted_agent_with_reason(
+            &aid,
+            &ws,
+            "active",
+            &now_iso(),
+            Some("system_suspend"),
+        )
+        .await
+        .unwrap();
+    (tmp, svc, ws, aid, bus)
+}
+
+#[intent_test_macros::daemon_test]
+async fn suspend_sweep_refuses_after_early_close() {
+    let (tmp, svc, _, aid, bus) = suspend_shutdown_fixture().await;
+    svc.begin_settings_shutdown();
+    assert_eq!(
+        svc.resume_suspend_interrupted_agents().await,
+        0,
+        "closed admission claimed a suspend row"
+    );
+    svc.shutdown_store_writers().await;
+    bus.shutdown().await.unwrap();
+    svc.store.close().await;
+    let reopened = Store::open(&tmp.path).await.unwrap();
+    assert!(reopened
+        .get_interrupted_agent(&aid)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(!reopened
+        .get_agent_messages(&aid, None)
+        .await
+        .unwrap()
+        .iter()
+        .any(|m| m.role == "user"));
+    reopened.close().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn suspend_self_heal_refuses_late_schedule() {
+    let (_tmp, svc, _, aid, _bus) = suspend_shutdown_fixture().await;
+    svc.begin_settings_shutdown();
+    assert!(
+        !svc.schedule_suspend_self_heal(Duration::from_secs(3600)),
+        "late self-heal escaped closed admission"
+    );
+    svc.shutdown_store_writers().await;
+    assert!(svc
+        .store
+        .get_interrupted_agent(&aid)
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[intent_test_macros::daemon_test]
+async fn suspend_idle_self_heal_stops_without_claiming() {
+    let (_tmp, svc, _, aid, bus) = suspend_shutdown_fixture().await;
+    assert!(svc.schedule_suspend_self_heal(Duration::from_secs(3600)));
+    timeout(Duration::from_secs(5), svc.shutdown_store_writers())
+        .await
+        .unwrap();
+    assert!(svc
+        .store
+        .get_interrupted_agent(&aid)
+        .await
+        .unwrap()
+        .is_some());
+    bus.shutdown().await.unwrap();
+    svc.store.close().await;
+}
+
+async fn assert_suspend_claim_shutdown(reset: bool) {
+    let (tmp, mut svc, _, aid, bus) = suspend_shutdown_fixture().await;
+    let manager = reset.then(|| {
+        Arc::new(crate::agent_manager::AgentManager::new(
+            svc.clone(),
+            Arc::new(crate::agent_manager::BusEventSink::new(bus.clone())),
+            4,
+        ))
+    });
+    if let Some(manager) = &manager {
+        svc.attach_agent_manager(manager);
+    }
+    let park = Arc::new(crate::CompletionClassifyPark::default());
+    svc.interrupted_resume_park = Some(park.clone());
+    let owner = svc.clone();
+    let caller =
+        intent_core::spawn_daemon(async move { owner.resume_suspend_interrupted_agents().await });
+    timeout(Duration::from_secs(5), park.entered.notified())
+        .await
+        .unwrap();
+    assert!(
+        svc.store
+            .get_interrupted_agent(&aid)
+            .await
+            .unwrap()
+            .is_none(),
+        "claim must precede hold"
+    );
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    if let Some(manager) = &manager {
+        manager.begin_shutdown();
+    }
+    let (entered, entering) = tokio::sync::oneshot::channel();
+    *svc.secrets.writer_drain_pending.lock().unwrap() = Some(entered);
+    let owner = svc.clone();
+    let mut drain = intent_core::spawn_daemon(async move { owner.shutdown_store_writers().await });
+    let pending = timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            point = entering => { assert_eq!(point.unwrap(), "settings-tasks"); true }
+            result = &mut drain => { result.unwrap(); false }
+        }
+    })
+    .await
+    .unwrap();
+    park.release.notify_one();
+    if pending {
+        timeout(Duration::from_secs(5), drain)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert!(pending, "shutdown discarded a claimed suspend resume");
+    if let Some(manager) = &manager {
+        manager.shutdown().await;
+    }
+    bus.shutdown().await.unwrap();
+    svc.store.close().await;
+    let reopened = Store::open(&tmp.path).await.unwrap();
+    assert_eq!(
+        reopened
+            .get_interrupted_agent(&aid)
+            .await
+            .unwrap()
+            .is_some(),
+        reset
+    );
+    let messages = reopened.get_agent_messages(&aid, None).await.unwrap();
+    assert_eq!(
+        messages.iter().filter(|m| m.role == "user").count(),
+        usize::from(!reset)
+    );
+    let events = reopened
+        .query_events(&intent_store::EventQuery::default())
+        .await
+        .unwrap();
+    assert!(!events.iter().any(|e| e.event_type == AGENT_FAILED));
+    reopened.close().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn suspend_claimed_delivery_survives_caller_abort() {
+    assert_suspend_claim_shutdown(false).await;
+}
+#[intent_test_macros::daemon_test]
+async fn suspend_claimed_reset_survives_caller_abort() {
+    assert_suspend_claim_shutdown(true).await;
+}
+
 /// Wake-resume Task D: the sweep resumes ONLY rows tagged `system_suspend`
 /// (what Task C enrolls) and leaves rows a user left pending for other reasons
 /// (daemon restart, agent stop, …) untouched.
@@ -36433,6 +36613,166 @@ async fn delete_clears_failure_wake_dedup_in_both_roles() {
         !svc.failure_wake_is_duplicate(&child, &other, "bang"),
         "parent-role entry swept"
     );
+}
+
+// Exercise the real settlement SQL and cleanup, using pre-created clone artifacts.
+// Native filesystem clone support is deliberately outside this fixture.
+async fn assert_cow_provision_shutdown(target: u8) {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.unwrap();
+    let bus = EventBus::new(store.clone());
+    let svc = Services::new_with_file_secrets(
+        store.clone(),
+        intent_core::FileSecretStore::with_path(tmp.path.with_extension("secrets")),
+    )
+    .with_settings_registry(test_registry_with_default_provider(&tmp))
+    .with_event_bus(bus.clone());
+    let aid = create_agent(&svc, &ws, "Provisioning").await;
+    let (_directory, path) = fake_provisioned_sandbox(&svc, &ws, &aid).await;
+    if target == 1 {
+        let mut session = store.get_agent_session(&aid).await.unwrap();
+        session.status = AgentStatus::Deleted;
+        store.update_agent_session(&ws, &session).await.unwrap();
+    } else if target == 2 {
+        store.delete_agent_session(&ws, &aid).await.unwrap();
+    }
+    let connection = store.write_pool().acquire().await.unwrap();
+    let owner = svc.clone();
+    let task_ws = ws.clone();
+    let task_aid = aid.clone();
+    let task_path = path.clone();
+    let (entered, entering) = tokio::sync::oneshot::channel();
+    let (done, finished) = tokio::sync::oneshot::channel();
+    assert!(svc.spawn_sandbox_provisioning(&aid, async move {
+        let mut entered = Some(entered);
+        let settlement = owner.settle_provisioned_sandbox(
+            &task_ws,
+            &task_aid,
+            task_path,
+            "sb/test".into(),
+            "abc123".into(),
+            None,
+        );
+        tokio::pin!(settlement);
+        std::future::poll_fn(|cx| {
+            let result = std::future::Future::poll(settlement.as_mut(), cx);
+            if result.is_pending() {
+                if let Some(entered) = entered.take() {
+                    let _ = entered.send(());
+                }
+            }
+            result
+        })
+        .await;
+        let _ = done.send(());
+    }));
+    timeout(Duration::from_secs(5), entering)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(svc.sandbox_provisioning.lock().unwrap().contains_key(&aid));
+    let (entered, entering) = tokio::sync::oneshot::channel();
+    *svc.secrets.writer_drain_pending.lock().unwrap() = Some(entered);
+    let owner = svc.clone();
+    let mut drain = intent_core::spawn_daemon(async move { owner.shutdown_store_writers().await });
+    let pending = timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            point = entering => { assert_eq!(point.unwrap(), "store-tasks"); true }
+            result = &mut drain => { result.unwrap(); false }
+        }
+    })
+    .await
+    .unwrap();
+    drop(connection);
+    timeout(Duration::from_secs(5), finished)
+        .await
+        .unwrap()
+        .unwrap();
+    if pending {
+        timeout(Duration::from_secs(5), drain)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert!(pending, "shutdown discarded admitted CoW settlement");
+    assert!(!svc.sandbox_provisioning.lock().unwrap().contains_key(&aid));
+    bus.shutdown().await.unwrap();
+    store.close().await;
+    let reopened = Store::open(&tmp.path).await.unwrap();
+    let sandbox = reopened.get_sandbox(&ws, &aid).await.unwrap();
+    let events = reopened
+        .query_events(&intent_store::EventQuery::default())
+        .await
+        .unwrap();
+    assert_eq!(path.exists(), target == 0);
+    assert_eq!(sandbox.is_some(), target == 0);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == "sandbox:cow:created")
+            .count(),
+        usize::from(target == 0)
+    );
+    if target == 0 {
+        assert_eq!(
+            reopened
+                .get_agent_session(&aid)
+                .await
+                .unwrap()
+                .sandbox_path
+                .as_deref(),
+            path.to_str()
+        );
+    } else if target == 1 {
+        assert!(reopened
+            .get_agent_session(&aid)
+            .await
+            .unwrap()
+            .sandbox_path
+            .is_none());
+    }
+    reopened.close().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn cow_provision_live_settlement_survives_shutdown() {
+    assert_cow_provision_shutdown(0).await;
+}
+#[intent_test_macros::daemon_test]
+async fn cow_provision_deleted_cleanup_survives_shutdown() {
+    assert_cow_provision_shutdown(1).await;
+}
+#[intent_test_macros::daemon_test]
+async fn cow_provision_missing_cleanup_survives_shutdown() {
+    assert_cow_provision_shutdown(2).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn cow_provision_refusal_leaves_no_wait_gate() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let svc = Services::new_with_file_secrets(
+        store.clone(),
+        intent_core::FileSecretStore::with_path(tmp.path.with_extension("secrets")),
+    );
+    svc.shutdown_store_writers().await;
+    let aid = AgentId::new();
+    let (effect, observed) = tokio::sync::oneshot::channel();
+    let admitted = svc.spawn_sandbox_provisioning(&aid, async move {
+        let _ = effect.send(());
+    });
+    assert!(
+        !admitted,
+        "new CoW provisioning escaped closed writer admission"
+    );
+    assert!(observed.await.is_err());
+    assert!(!svc.sandbox_provisioning.lock().unwrap().contains_key(&aid));
+    timeout(Duration::from_secs(1), svc.await_sandbox_provisioning(&aid))
+        .await
+        .unwrap();
+    store.close().await;
 }
 
 /// Simulate a completed `CoW` clone (on-disk dir + store record) for

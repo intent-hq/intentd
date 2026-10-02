@@ -139,6 +139,9 @@ pub struct Options {
     /// `workspace:setup:completed` publish. `None` (the CLI path, tests)
     /// records nothing.
     pub setup_states: Option<WorkspaceSetupStates>,
+    /// Stop admitting workspace units during daemon shutdown. An admitted
+    /// unit is joined in full before returning, preserving restart idempotence.
+    pub stopping: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl fmt::Debug for Options {
@@ -151,6 +154,7 @@ impl fmt::Debug for Options {
             .field("app_dir", &self.app_dir)
             .field("event_bus", &self.event_bus.is_some())
             .field("setup_states", &self.setup_states.is_some())
+            .field("stopping", &self.stopping)
             .finish()
     }
 }
@@ -584,6 +588,31 @@ const TEST_IMPORT_HOLD_FILE_ENV: &str = "INTENTD_TEST_LEGACY_IMPORT_HOLD_FILE";
 /// directories. App-level blobs import once at the end (non-dry-run only,
 /// when `opts.app_dir` is set).
 pub async fn run(store: &Store, opts: &Options) -> anyhow::Result<Report> {
+    run_inner(
+        store,
+        opts,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+fn check_stopping(opts: &Options) -> anyhow::Result<()> {
+    if opts
+        .stopping
+        .as_ref()
+        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+    {
+        anyhow::bail!("legacy import interrupted by daemon shutdown");
+    }
+    Ok(())
+}
+
+async fn run_inner(
+    store: &Store,
+    opts: &Options,
+    #[cfg(test)] unit_barrier: Option<std::sync::Arc<tokio::sync::Barrier>>,
+) -> anyhow::Result<Report> {
     let mut report = Report {
         dry_run: opts.dry_run,
         ..Report::default()
@@ -593,6 +622,7 @@ pub async fn run(store: &Store, opts: &Options) -> anyhow::Result<Report> {
         .map(PathBuf::from);
     let mut seen: HashSet<String> = HashSet::new();
     for root in &opts.roots {
+        check_stopping(opts)?;
         // Candidate discovery (directory scan + manifest stat) is blocking
         // filesystem work — run it off the async runtime.
         let candidates: Vec<(PathBuf, PathBuf)> = {
@@ -620,14 +650,17 @@ pub async fn run(store: &Store, opts: &Options) -> anyhow::Result<Report> {
             .await
         };
         for (dir, manifest) in candidates {
+            check_stopping(opts)?;
             // Test seam (see [`TEST_IMPORT_HOLD_FILE_ENV`]): pause here while
             // the hold file exists, keeping the run in flight without
             // importing further workspaces.
             if let Some(hold) = &test_hold_file {
                 while hold.exists() {
+                    check_stopping(opts)?;
                     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
                 }
             }
+            check_stopping(opts)?;
             // Task-join isolation: the whole per-workspace unit (manifest
             // handling, store writes, extras) runs in its own spawned task,
             // so even a panic is contained — it surfaces as a `JoinError`
@@ -638,8 +671,20 @@ pub async fn run(store: &Store, opts: &Options) -> anyhow::Result<Report> {
                 let seen = seen.clone();
                 let dir = dir.clone();
                 let manifest = manifest.clone();
+                #[cfg(test)]
+                let unit_barrier = unit_barrier.clone();
                 intent_core::spawn_daemon(async move {
-                    import_one(&store, &dir, &manifest, &opts, &seen).await
+                    #[cfg(test)]
+                    if let Some(barrier) = &unit_barrier {
+                        barrier.wait().await;
+                        barrier.wait().await;
+                    }
+                    let result = import_one(&store, &dir, &manifest, &opts, &seen).await;
+                    #[cfg(test)]
+                    if let Some(barrier) = &unit_barrier {
+                        barrier.wait().await;
+                    }
+                    result
                 })
             };
             match task.await {
@@ -677,6 +722,7 @@ pub async fn run(store: &Store, opts: &Options) -> anyhow::Result<Report> {
             tokio::task::yield_now().await;
         }
     }
+    check_stopping(opts)?;
     if !opts.dry_run {
         if let Some(app_dir) = &opts.app_dir {
             let landed: HashSet<String> = report
@@ -2171,6 +2217,7 @@ pub async fn decide_first_boot_import(
 /// [`LEGACY_IMPORT_FAILURES_KEY`]; `intentd import-legacy --force` is the
 /// documented manual retry path. Only a run-level error (the scan itself
 /// failed) withholds the marker so the next boot retries.
+#[expect(clippy::too_many_arguments)]
 pub async fn run_first_boot_import(
     store: &Store,
     roots: Vec<PathBuf>,
@@ -2179,6 +2226,7 @@ pub async fn run_first_boot_import(
     event_bus: Option<EventBus>,
     setup_states: Option<WorkspaceSetupStates>,
     resumed: bool,
+    stopping: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) {
     tracing::info!(
         resumed,
@@ -2192,6 +2240,7 @@ pub async fn run_first_boot_import(
         app_dir,
         event_bus,
         setup_states,
+        stopping,
     };
     match run(store, &opts).await {
         Ok(report) => {
@@ -2258,6 +2307,7 @@ pub async fn maybe_import_on_first_boot(
                 None,
                 None,
                 decision == FirstBootDecision::Resume,
+                None,
             )
             .await;
         }
@@ -2364,6 +2414,103 @@ mod tests {
         let notes_dir = ws_dir.join(".workspace").join("notes");
         std::fs::create_dir_all(&notes_dir).unwrap();
         std::fs::write(notes_dir.join(name), contents).unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_settles_admitted_legacy_workspace_before_returning() {
+        use std::{sync::Arc, time::Duration};
+
+        let (root, _root_guard) = temp_root("shutdown");
+        let workspace = write_legacy_workspace(&root, "ws-a", &json!({}));
+        write_legacy_note(&workspace, "spec.md", "# Durable imported note");
+        write_legacy_workspace(&root, "ws-b", &json!({}));
+        let (store, _db_guard) = open_store().await;
+        store
+            .set_setting(LEGACY_IMPORT_PENDING_MARKER_KEY, "started")
+            .await
+            .unwrap();
+        let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let importer = intent_core::spawn_daemon({
+            let store = store.clone();
+            let barrier = barrier.clone();
+            let stopping = stopping.clone();
+            let root = root.clone();
+            async move {
+                let options = Options {
+                    stopping: Some(stopping),
+                    ..opts(vec![root])
+                };
+                run_inner(&store, &options, Some(barrier)).await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(10), barrier.wait())
+            .await
+            .unwrap();
+        // The composition root stops admission, then joins the active unit.
+        stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+        let close = async {
+            assert!(importer.await.unwrap().is_err());
+        };
+        tokio::pin!(close);
+        let returned_while_unit_held = tokio::time::timeout(Duration::from_secs(10), &mut close)
+            .await
+            .is_ok();
+        barrier.wait().await;
+        // Join our fixture's completion even on the failing path.
+        tokio::time::timeout(Duration::from_secs(10), barrier.wait())
+            .await
+            .unwrap();
+        if !returned_while_unit_held {
+            close.await;
+        }
+        assert_eq!(store.list_workspaces(true).await.unwrap().len(), 1);
+        assert!(store
+            .get_note(&WorkspaceId::from("ws-a"), &NoteId::from("spec"))
+            .await
+            .unwrap()
+            .content
+            .contains("Durable imported note"));
+        assert!(store
+            .get_setting(LEGACY_IMPORT_PENDING_MARKER_KEY)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(store
+            .get_setting(LEGACY_IMPORT_MARKER_KEY)
+            .await
+            .unwrap()
+            .is_none());
+        run_first_boot_import(
+            &store,
+            vec![root.clone()],
+            None,
+            None,
+            None,
+            None,
+            true,
+            Some(stopping),
+        )
+        .await;
+        assert!(store
+            .get_setting(LEGACY_IMPORT_MARKER_KEY)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_setting(LEGACY_IMPORT_PENDING_MARKER_KEY)
+            .await
+            .unwrap()
+            .is_some());
+        // The pending run can resume idempotently: active unit is complete,
+        // the unadmitted unit is imported on the next run.
+        let resumed = run(&store, &opts(vec![root])).await.unwrap();
+        assert_eq!(resumed.imported(), 1);
+        store.close().await;
+        assert!(
+            !returned_while_unit_held,
+            "shutdown returned while an admitted legacy workspace could still write"
+        );
     }
 
     #[tokio::test]
@@ -3006,7 +3153,17 @@ mod tests {
             decide_first_boot_import(&store, true, std::slice::from_ref(&root)).await,
             FirstBootDecision::Resume
         );
-        run_first_boot_import(&store, vec![root.clone()], None, None, None, None, true).await;
+        run_first_boot_import(
+            &store,
+            vec![root.clone()],
+            None,
+            None,
+            None,
+            None,
+            true,
+            None,
+        )
+        .await;
 
         // Both workspaces present (ws-a was skipped as already in DB), the
         // completion marker is written, and the pending marker is cleared.

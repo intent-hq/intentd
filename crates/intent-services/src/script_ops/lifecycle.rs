@@ -116,7 +116,7 @@ impl ScriptManager {
         }
         let mgr = self.clone();
         let ws = ws.clone();
-        intent_core::spawn_daemon(async move { mgr.archive_owned(&ws, ids, archive).await })
+        self.spawn_owned(async move { mgr.archive_owned(&ws, ids, archive).await })
             .await
             .map_err(|e| Error::Internal(format!("archive task failed: {e}")))?
     }

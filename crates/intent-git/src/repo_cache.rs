@@ -1631,7 +1631,12 @@ fn run_git_os_streamed(
         cmd.arg("-c").arg(token_helper_config());
         cmd.env(TOKEN_ENV, token);
     }
-    let mut child = cmd
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let child = cmd
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
@@ -1644,6 +1649,15 @@ fn run_git_os_streamed(
         .spawn()
         .map_err(|e| Error::Internal(format!("failed to spawn git: {e}")))?;
 
+    wait_for_cache_git(child, args, timeout, on_chunk)
+}
+
+fn wait_for_cache_git(
+    mut child: std::process::Child,
+    args: &[&std::ffi::OsStr],
+    timeout: Duration,
+    on_chunk: Option<ProgressChunkFn>,
+) -> Result<()> {
     // Drain stdout (piped only when streaming) on its own thread so the
     // child never blocks on a full pipe; its text feeds the callback only.
     let stdout_drain = child.stdout.take().map(|stdout| {
@@ -1685,9 +1699,9 @@ fn run_git_os_streamed(
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                // The child has exited, so both pipes are at EOF — the drain
-                // threads finish promptly; join them so every chunk reached
-                // the callback before we return.
+                // An owned helper can retain a pipe after the direct child
+                // exits. Reap the group before joining its output callbacks.
+                reap_cache_child_group(&mut child);
                 join_stdout(stdout_drain);
                 if status.success() {
                     let _ = read_stderr(drain);
@@ -1705,8 +1719,9 @@ fn run_git_os_streamed(
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    reap_cache_child_group(&mut child);
+                    join_stdout(stdout_drain);
+                    let _ = read_stderr(drain);
                     return Err(Error::Internal(format!(
                         "git {} timed out after {}s",
                         subcommand_name(args),
@@ -1716,12 +1731,28 @@ fn run_git_os_streamed(
                 std::thread::sleep(GIT_POLL);
             }
             Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                reap_cache_child_group(&mut child);
+                join_stdout(stdout_drain);
+                let _ = read_stderr(drain);
                 return Err(Error::Internal(format!("git wait failed: {e}")));
             }
         }
     }
+}
+
+/// Every cache command starts in its own process group. Helpers must lose
+/// their inherited output pipes before the final progress callbacks are joined.
+fn reap_cache_child_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // SAFETY: this PID belongs to our child, started with process_group(0).
+        // A negative PID signals only that owned process group.
+        unsafe {
+            libc::kill(-child.id().cast_signed(), libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Drain a child's stderr chunk-by-chunk: invoke `cb` once per
@@ -2635,6 +2666,81 @@ mod tests {
         let path = task.await.unwrap().unwrap();
         assert_eq!(path, cache_path);
         assert!(path.join("a.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cache_timeout_joins_progress_callback_before_returning() {
+        use std::{io::BufRead, os::unix::process::CommandExt};
+
+        struct CleanupGroup(u32);
+        impl Drop for CleanupGroup {
+            fn drop(&mut self) {
+                // SAFETY: the PID came from our child spawned in a fresh
+                // process group; the negative PID selects only that group.
+                unsafe {
+                    libc::kill(-self.0.cast_signed(), libc::SIGKILL);
+                }
+            }
+        }
+        let mut child = Command::new("sh")
+            .args(["-c", "echo progress >&2; echo ready; read line"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let _cleanup = CleanupGroup(child.id());
+        let _stdin = child.stdin.take().unwrap();
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready.trim(), "ready");
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let finished_tx = std::sync::Mutex::new(Some(finished_tx));
+        let callback: ProgressChunkFn = Arc::new(move |_| {
+            if let Some(tx) = entered_tx.lock().unwrap().take() {
+                tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+                finished_tx
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap()
+                    .send(())
+                    .unwrap();
+            }
+        });
+        let mut job = tokio::task::spawn_blocking(move || {
+            wait_for_cache_git(
+                child,
+                &[std::ffi::OsStr::new("clone")],
+                Duration::ZERO,
+                Some(callback),
+            )
+        });
+        tokio::time::timeout(Duration::from_secs(10), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let returned_while_callback_held = tokio::time::timeout(Duration::from_secs(10), &mut job)
+            .await
+            .is_ok();
+        release_tx.send(()).unwrap();
+        finished_rx.await.unwrap();
+        if !returned_while_callback_held {
+            assert!(job.await.unwrap().is_err());
+        }
+        assert!(
+            !returned_while_callback_held,
+            "cache timeout returned while a progress callback still owned its persistence channel"
+        );
     }
 
     /// The blocking closure outlives a cancelled async caller. Its guard must

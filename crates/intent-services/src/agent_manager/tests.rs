@@ -36,6 +36,83 @@ use crate::npx_cli::guard_npx_version;
 use crate::test_support::test_tempdir;
 use crate::Services;
 
+#[intent_test_macros::daemon_test]
+async fn unsloth_status_queue_drains_before_store_close() {
+    let dir = test_tempdir("unsloth-status-drain");
+    let path = dir.path().join("state.db");
+    let store = Store::open(&path).await.unwrap();
+    let bus = EventBus::new(store.clone());
+    let services = Services::new_with_file_secrets(
+        store.clone(),
+        intent_core::FileSecretStore::with_path(dir.path().join("secrets.json")),
+    )
+    .with_event_bus(bus.clone());
+    let workspace_id = WorkspaceId::new();
+    let connection = store.write_pool().acquire().await.unwrap();
+    let sender = super::spawn_unsloth_status_publisher(
+        services.clone(),
+        workspace_id,
+        AgentId::from("held-status-agent"),
+    );
+    sender
+        .send((crate::unsloth_server::StatusLevel::Info, "loading".into()))
+        .unwrap();
+    sender
+        .send((
+            crate::unsloth_server::StatusLevel::Warning,
+            "restart needed".into(),
+        ))
+        .unwrap();
+    // The finite producer has ended before the final writer drain starts.
+    drop(sender);
+    let (entered, entering) = tokio::sync::oneshot::channel();
+    *services.secrets.writer_drain_pending.lock().unwrap() = Some(entered);
+    let owner = services.clone();
+    let mut drain = intent_core::spawn_daemon(async move { owner.shutdown_store_writers().await });
+    let pending = timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            point = entering => { assert_eq!(point.unwrap(), "store-tasks"); true }
+            result = &mut drain => { result.unwrap(); false }
+        }
+    })
+    .await
+    .unwrap();
+    drop(connection);
+    if pending {
+        timeout(Duration::from_secs(5), drain)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert!(
+        pending,
+        "service shutdown discarded queued Unsloth status publications"
+    );
+    bus.shutdown().await.unwrap();
+    store.close().await;
+    let reopened = Store::open(&path).await.unwrap();
+    let mut events = reopened
+        .query_events(&intent_store::EventQuery::default())
+        .await
+        .unwrap();
+    events.sort_by(|a, b| a.id.cmp(&b.id));
+    reopened.close().await;
+    let statuses: Vec<_> = events
+        .iter()
+        .filter(|event| event.event_type == intent_core::events::AGENT_STREAM_STATUS)
+        .map(|event| {
+            (
+                event.data["message"].as_str().unwrap(),
+                event.data["level"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        statuses,
+        vec![("loading", "info"), ("restart needed", "warning")]
+    );
+}
+
 #[test]
 fn usage_origin_uses_trusted_delivery_origin_before_opaque_metadata() {
     use intent_core::MessageOrigin;
@@ -2314,7 +2391,11 @@ async fn manager_with_bus() -> (TempDb, AgentManager, EventBus) {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store).with_event_bus(bus.clone());
+    let services = Services::new_with_file_secrets(
+        store,
+        intent_core::FileSecretStore::with_path(tmp.path.with_extension("secrets.json")),
+    )
+    .with_event_bus(bus.clone());
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
     (tmp, AgentManager::new(services, sink, 8), bus)
 }
@@ -2345,6 +2426,8 @@ fn mock_handle() -> AgentHandle {
             _rules_config: None,
             _pi_extension: None,
             npx_launch_dir: None,
+            cleanup_lease: None,
+            cleanup_services: None,
         }),
         antigravity_profile: None,
         session_mcp_servers: Vec::new(),
@@ -4658,6 +4741,8 @@ fn track_mock_agent_inner(
                 _rules_config: None,
                 _pi_extension: None,
                 npx_launch_dir: None,
+                cleanup_lease: None,
+                cleanup_services: None,
             }),
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
@@ -4812,6 +4897,8 @@ fn track_mock_agent_prompt_rpc_error_inner(
                 _rules_config: None,
                 _pi_extension: None,
                 npx_launch_dir: None,
+                cleanup_lease: None,
+                cleanup_services: None,
             }),
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
@@ -8629,6 +8716,8 @@ async fn interrupt_on_wedged_transport_still_emits_terminal_events() {
                 _rules_config: None,
                 _pi_extension: None,
                 npx_launch_dir: None,
+                cleanup_lease: None,
+                cleanup_services: None,
             }),
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
@@ -20536,6 +20625,8 @@ mod harness_wake_tests {
                 _rules_config: None,
                 _pi_extension: None,
                 npx_launch_dir: None,
+                cleanup_lease: None,
+                cleanup_services: None,
             }),
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
@@ -25191,4 +25282,135 @@ async fn queue_merge_failed_transcript_append_keeps_admitted_human_barrier() {
             "three"
         );
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn reap_shutdown_retains_removed_child_cleanup() {
+    use crate::periodic_shutdown_tests::{entered, hold};
+    struct Cleanup(Option<u32>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            if let Some(pid) = self.0 {
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(pid.cast_signed()),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+        }
+    }
+    let (db, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("reap-tail-workspace");
+    let id = AgentId::from("reap-tail-agent");
+    seed_agent(&mgr, &ws, &id).await;
+    let (pid, watcher) = track_with_child(&mgr, &id);
+    let mut cleanup = Cleanup(Some(pid));
+    mgr.registry.set_last_active(&id, 1);
+    let (rx, release) = hold(&mgr.services, "reap");
+    let owner = mgr.clone();
+    let task =
+        tokio::spawn(async move { owner.reap_idle_older_than(Duration::from_secs(1)).await });
+    entered(rx).await;
+    assert!(!mgr.contains(&id));
+    assert!(nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid.cast_signed()), None).is_ok());
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    *mgr.services.secrets.writer_drain_pending.lock().unwrap() = Some(tx);
+    let owner = mgr.clone();
+    let mut shutdown = tokio::spawn(async move { owner.shutdown().await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            result = rx => assert_eq!(result.unwrap(), "process-registry"),
+            result = &mut shutdown => { result.unwrap(); panic!("manager shutdown detached removed child cleanup"); }
+        }
+    }).await.unwrap();
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), shutdown)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(mgr.reap_claims.lock().unwrap().is_empty());
+    assert_eq!(mgr.registry.size(), 0);
+    assert!(!watcher.await.unwrap());
+    assert_eq!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid.cast_signed()), None),
+        Err(nix::errno::Errno::ESRCH)
+    );
+    cleanup.0 = None;
+    mgr.services.shutdown_store_writers().await;
+    bus.shutdown().await.unwrap();
+    mgr.services.store.close().await;
+    let reopened = Store::open(&db.path).await.unwrap();
+    let events = reopened
+        .query_events(&intent_store::EventQuery {
+            workspace_id: Some(ws),
+            event_types: vec![intent_core::events::AGENT_PROCESS_EVICTED.into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    reopened.close().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn admission_release_revoked_queue_tail_drains() {
+    use crate::periodic_shutdown_tests::{drain_held, entered, hold};
+    let (db, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    let svc = mgr.services.clone();
+    svc.attach_agent_manager(&mgr);
+    let ws = WorkspaceId::from("release-tail-workspace");
+    let id = AgentId::from("release-tail-agent");
+    seed_agent(&mgr, &ws, &id).await;
+    let mut principal = svc.store.get_primary_principal().await.unwrap();
+    principal.id = intent_core::PrincipalId::from("revoked-tail-user");
+    principal.is_primary = false;
+    principal.identity = None;
+    principal.github_user_id = None;
+    svc.store.upsert_principal(&principal).await.unwrap();
+    svc.store
+        .revoke_principal_access(&principal.id)
+        .await
+        .unwrap();
+    svc.enqueue_message(
+        &id,
+        "revoked instruction".into(),
+        None,
+        None,
+        Some(json!({"fromPrincipalId":principal.id.0})),
+        None,
+        false,
+        intent_core::MessageOrigin::User,
+    );
+    svc.persist_queue_snapshot(&id).await;
+    assert_eq!(svc.store.load_all_agent_queues().await.unwrap().len(), 1);
+    let (rx, resume) = hold(&svc, "revoked-queue");
+    {
+        let (claim, release) = mgr.admission_claim_fns();
+        assert!(claim(&id));
+        svc.begin_settings_shutdown();
+        release(&id);
+    }
+    entered(rx).await;
+    assert!(svc.queue_snapshot(&id).is_empty());
+    assert_eq!(svc.store.load_all_agent_queues().await.unwrap().len(), 1);
+    drain_held(&svc, resume).await;
+    mgr.shutdown().await;
+    bus.shutdown().await.unwrap();
+    svc.store.close().await;
+    let reopened = Store::open(&db.path).await.unwrap();
+    assert!(reopened.load_all_agent_queues().await.unwrap().is_empty());
+    let events = reopened
+        .query_events(&intent_store::EventQuery {
+            workspace_id: Some(ws),
+            event_types: vec!["agent:queue:updated".into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    reopened.close().await;
 }

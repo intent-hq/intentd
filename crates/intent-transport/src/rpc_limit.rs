@@ -27,7 +27,7 @@
 //! sub-cap or reserved local headroom is tracked separately.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
@@ -53,6 +53,26 @@ pub struct RpcLimiter {
     /// Whether the cap is currently saturated, so sustained overload logs one
     /// WARN per transition into saturation instead of one per rejected frame.
     saturated: Arc<AtomicBool>,
+    requests: Arc<RequestState>,
+    host_exec: Arc<intent_services::host_exec::HostExecRuntime>,
+}
+
+#[derive(Default)]
+struct RequestState {
+    admission: Mutex<(bool, usize)>,
+    changed: tokio::sync::Notify,
+}
+
+/// Owns the store-using lifetime of one admitted handler, including inline
+/// handlers that do not consume an overload permit. Idle sockets own none.
+pub(crate) struct RequestGuard(Arc<RequestState>);
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        let mut admission = self.0.admission.lock().unwrap();
+        admission.1 -= 1;
+        self.0.changed.notify_waiters();
+    }
 }
 
 impl RpcLimiter {
@@ -66,6 +86,8 @@ impl RpcLimiter {
         Self {
             semaphore: Some(Arc::new(Semaphore::new(max_outstanding as usize))),
             saturated: Arc::new(AtomicBool::new(false)),
+            requests: Arc::default(),
+            host_exec: Arc::default(),
         }
     }
 
@@ -76,6 +98,8 @@ impl RpcLimiter {
         Self {
             semaphore: None,
             saturated: Arc::new(AtomicBool::new(false)),
+            requests: Arc::default(),
+            host_exec: Arc::default(),
         }
     }
 
@@ -108,6 +132,72 @@ impl RpcLimiter {
     pub(crate) fn available_permits(&self) -> Option<usize> {
         self.semaphore.as_ref().map(|s| s.available_permits())
     }
+
+    /// Share command ownership with agent-JS execution in the composition root.
+    #[must_use]
+    pub fn with_host_exec(
+        mut self,
+        runtime: Arc<intent_services::host_exec::HostExecRuntime>,
+    ) -> Self {
+        self.host_exec = runtime;
+        self
+    }
+
+    pub(crate) fn host_exec(&self) -> Arc<intent_services::host_exec::HostExecRuntime> {
+        self.host_exec.clone()
+    }
+
+    pub(crate) fn admit_request(&self) -> Option<RequestGuard> {
+        let mut admission = self.requests.admission.lock().unwrap();
+        if admission.0 {
+            return None;
+        }
+        admission.1 += 1;
+        Some(RequestGuard(self.requests.clone()))
+    }
+
+    /// Close request admission before any daemon teardown await.
+    ///
+    /// # Panics
+    /// Panics if the admission lock is poisoned.
+    pub fn begin_shutdown(&self) {
+        self.requests.admission.lock().unwrap().0 = true;
+        self.requests.changed.notify_waiters();
+    }
+
+    /// Wait for daemon shutdown, including when it began before this call.
+    ///
+    /// # Panics
+    /// Panics if the admission lock is poisoned.
+    pub async fn closed(&self) {
+        loop {
+            let changed = self.requests.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.requests.admission.lock().unwrap().0 {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    /// Join admitted handlers after releasing cancellable external waits.
+    /// No connection, response backpressure, or remote peer owns a guard.
+    ///
+    /// # Panics
+    /// Panics if the admission lock is poisoned.
+    pub async fn drain(&self) {
+        self.begin_shutdown();
+        loop {
+            let changed = self.requests.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.requests.admission.lock().unwrap().1 == 0 {
+                return;
+            }
+            changed.await;
+        }
+    }
 }
 
 impl std::fmt::Debug for RpcLimiter {
@@ -129,6 +219,30 @@ pub(crate) struct Overloaded {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_fences_unlimited_requests_and_drains_only_admitted_handlers() {
+        let limiter = RpcLimiter::unlimited();
+        let admitted = limiter.admit_request().unwrap();
+        limiter.begin_shutdown();
+        assert!(limiter.admit_request().is_none());
+        let drain = limiter.drain();
+        tokio::pin!(drain);
+        tokio::select! {
+            biased;
+            () = &mut drain => panic!("admitted handler was not drained"),
+            () = std::future::ready(()) => {}
+        }
+        drop(admitted);
+        tokio::time::timeout(std::time::Duration::from_secs(1), drain)
+            .await
+            .unwrap();
+        // An idle connection's limiter clone does not keep shutdown alive.
+        let idle_connection = limiter.clone();
+        tokio::time::timeout(std::time::Duration::from_secs(1), idle_connection.drain())
+            .await
+            .unwrap();
+    }
 
     #[test]
     fn zero_is_unlimited() {

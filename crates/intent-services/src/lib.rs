@@ -105,6 +105,7 @@ mod source_control_auth_ops;
 
 mod agent_list_cache;
 pub mod checkpoint;
+mod direct_secret_ops;
 mod fast_mode;
 mod harness;
 mod history_xml;
@@ -170,6 +171,8 @@ mod workspace_branch;
 mod workspace_status;
 pub mod workspace_vocabulary;
 
+#[cfg(test)]
+mod periodic_shutdown_tests;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
@@ -574,12 +577,21 @@ pub struct Services {
     /// best-effort upsert spawned at group create/enroll can never land after
     /// a later sweep/settlement delete and resurrect the row
     /// (intent-hq/intent#4460). Lazily spawned on first use.
-    group_persist_lane: Arc<OnceLock<agent_subscriptions::GroupPersistSender>>,
+    group_persist_lane: Arc<OnceLock<agent_subscriptions::GroupPersistLane>>,
     /// Serializes strict completion-only ask registration so a watch is
     /// durably persisted before it becomes visible to completion delivery.
     completion_watch_registration_gate: Arc<tokio::sync::Mutex<()>>,
     /// Cancellation and drain ownership for automatic agent delivery tasks.
     delivery_tasks: Arc<delivery_tasks::DeliveryTasks>,
+    /// Finite derived-state writers drained after request and agent producers.
+    store_tasks: Arc<delivery_tasks::DeliveryTasks>,
+    settings_tasks: Arc<delivery_tasks::DeliveryTasks>,
+    /// Set only inside a registered settings/primary-auth owner. Its finite
+    /// primary-auth children may finish after root admission closes.
+    primary_auth_admitted: bool,
+    terminal_tasks: Arc<delivery_tasks::DeliveryTasks>,
+    pending_delete_tasks: Arc<delivery_tasks::DeliveryTasks>,
+    host_exec_runtime: Arc<host_exec::HostExecRuntime>,
     /// Child agent ids with an active terminal-delivery retry task, mapped
     /// to pending attempts and a schedule generation. Ownership is coalesced per CHILD, not per
     /// watch (intent-hq/intent#3728): one delivery pass processes ALL of the
@@ -1150,6 +1162,12 @@ pub struct Services {
     /// so the [`AgentManager`]'s turn worker and the delegate front doors
     /// observe the same gates.
     sandbox_provisioning: Arc<Mutex<HashMap<AgentId, tokio::sync::watch::Receiver<()>>>>,
+    #[cfg(test)]
+    sandbox_merge_marked: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    periodic_commit_hold: Arc<Mutex<Option<periodic_shutdown_tests::CommitHold>>>,
+    #[cfg(test)]
+    sandbox_merge_finish: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
     /// Single-flight registry for in-flight `git.diffs` walks: concurrent
     /// calls with an identical `(workspace_id, paths, staged, commit_hash)`
     /// identity coalesce onto one blocking-pool libgit2 walk and share its
@@ -1416,6 +1434,15 @@ impl Services {
     /// Wire the services surface over a persistence handle.
     #[must_use]
     pub fn new(store: Store) -> Self {
+        Self::new_with_file_secrets(store, intent_core::FileSecretStore::new())
+    }
+
+    /// Wire explicit file storage before any default secret-store constructor
+    /// can run. Isolated auth fixtures must not trigger legacy host migration.
+    pub(crate) fn new_with_file_secrets(
+        store: Store,
+        file_secrets: intent_core::FileSecretStore,
+    ) -> Self {
         let mcp_hub = Arc::new(McpHub::with_oauth_store(store.clone()));
         Self {
             store,
@@ -1450,6 +1477,12 @@ impl Services {
             group_persist_lane: Arc::new(OnceLock::new()),
             completion_watch_registration_gate: Arc::new(tokio::sync::Mutex::new(())),
             delivery_tasks: Arc::new(delivery_tasks::DeliveryTasks::default()),
+            store_tasks: Arc::new(delivery_tasks::DeliveryTasks::default()),
+            settings_tasks: Arc::new(delivery_tasks::DeliveryTasks::default()),
+            primary_auth_admitted: false,
+            terminal_tasks: Arc::new(delivery_tasks::DeliveryTasks::default()),
+            pending_delete_tasks: Arc::new(delivery_tasks::DeliveryTasks::default()),
+            host_exec_runtime: Arc::default(),
             completion_delivery_retries: Arc::new(Mutex::new(HashMap::new())),
             completion_group_delivery_retries: Arc::new(Mutex::new(HashSet::new())),
             agent_failure_streaks: Arc::new(Mutex::new(HashMap::new())),
@@ -1494,7 +1527,7 @@ impl Services {
             archive_predrop_park: None,
             queue_mutation_gate_park: None,
             secrets: Arc::new(settings::AsyncSecretStore::new(Arc::new(
-                intent_core::FileSecretStore::new(),
+                file_secrets.clone(),
             ))),
             settings_registry: None,
             settings_revision: Arc::new(AtomicU64::new(0)),
@@ -1527,7 +1560,7 @@ impl Services {
             collaboration_auth: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             github_login_base_uri: None,
             gitlab_auth: source_control_auth_ops::new_gitlab_state(),
-            gitlab_secret_store: intent_core::FileSecretStore::new(),
+            gitlab_secret_store: file_secrets,
             gitlab_credential_gate: source_control_auth_ops::new_gitlab_credential_gate(),
             principal_identity_refreshed_at: Arc::new(tokio::sync::Mutex::new(None)),
             identity_transition: Arc::new(tokio::sync::Mutex::new(())),
@@ -1558,6 +1591,12 @@ impl Services {
             agent_list_cache: Arc::new(agent_list_cache::AgentListProjectionCache::new()),
             turn_attachments: Arc::new(intent_core::TurnAttachmentRegistry::new()),
             sandbox_provisioning: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            sandbox_merge_marked: Arc::default(),
+            #[cfg(test)]
+            periodic_commit_hold: Arc::default(),
+            #[cfg(test)]
+            sandbox_merge_finish: Arc::default(),
             git_diffs_inflight: Arc::new(git_diff_singleflight::DiffSingleFlight::default()),
             git_diffs_slow_warns: Arc::new(git_diff_singleflight::SlowWalkWarnLimiter::default()),
             git_diffs_walk_probe: None,
@@ -2238,6 +2277,7 @@ impl Services {
             self.script_parks.clone(),
         )
         .with_settings(self.settings_registry.clone())
+        .with_tasks(self.store_tasks.clone())
     }
 
     /// Test seam: raise the `script.*` too-fast-exit floor so the no-restart
@@ -2811,7 +2851,7 @@ impl Services {
             .unwrap_or(LAST_ACTIVITY_DEBOUNCE_MS);
 
         // Spawn a task that sleeps for the debounce window, then derives + emits.
-        let handle = intent_core::spawn_daemon(async move {
+        let Some(handle) = self.store_tasks.spawn_draining(async move {
             tokio::time::sleep(std::time::Duration::from_millis(debounce_ms)).await;
 
             // Inner block so the gen-guarded self-removal below runs on every
@@ -2902,7 +2942,9 @@ impl Services {
                     }
                 }
             }
-        });
+        }) else {
+            return;
+        };
 
         // Store the abort handle with generation. Only insert if no entry exists or our
         // generation is newer (prevents older schedules from overwriting newer ones).
@@ -3473,7 +3515,7 @@ impl Services {
         }
 
         let services = self.clone();
-        intent_core::spawn_daemon(async move {
+        let _ = self.store_tasks.spawn_draining(async move {
             for candidate in candidates {
                 if let Err(e) = services.backfill_one_workspace(candidate.clone()).await {
                     tracing::debug!(
@@ -3864,7 +3906,7 @@ impl Services {
             .unwrap_or(WORKSPACE_IDLE_DEBOUNCE_MS);
 
         // Spawn a task that sleeps for the debounce window, then emits idle.
-        let handle = intent_core::spawn_daemon(async move {
+        let Some(handle) = self.store_tasks.spawn_draining(async move {
             tokio::time::sleep(std::time::Duration::from_millis(debounce_ms)).await;
 
             // Guard emission: verify debouncer still current AND count still zero.
@@ -3938,7 +3980,9 @@ impl Services {
                 // (no running agent demotes a task-stage rollup to `idle`).
                 this.maybe_emit_display_status_changed(&ws_id).await;
             }
-        });
+        }) else {
+            return;
+        };
 
         // Store the abort handle with generation. Only insert if no entry exists or our
         // generation is newer (prevents older schedules from overwriting newer ones).
@@ -4501,9 +4545,8 @@ impl Services {
     /// Override the per-workspace auto-commit generation cool-down window
     /// (defaults to `GENERATION_COOLDOWN_MS` in `auto_commit`, or the
     /// `INTENTD_AUTO_COMMIT_COOLDOWN_MS` env seam). Tests compress it so the
-    /// cool-down expiry path completes in milliseconds; unix-only for the same
-    /// reason as [`Self::with_auto_commit_timeout_ms`].
-    #[cfg(all(test, unix))]
+    /// cool-down expiry path completes in milliseconds.
+    #[cfg(test)]
     pub(crate) fn with_auto_commit_cooldown_ms(mut self, ms: u64) -> Self {
         self.auto_commit_cooldown_ms = Some(ms);
         self
@@ -4904,18 +4947,7 @@ impl Services {
                 continue;
             };
             let root_id = root.id.clone();
-            let refreshed = match tokio::time::timeout(
-                self.pr_refresh_fetch_timeout,
-                self.refresh_git_root_pr(root, sc),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(Error::Internal(format!(
-                    "git root PR refresh timed out after {:?}",
-                    self.pr_refresh_fetch_timeout
-                ))),
-            };
+            let refreshed = self.refresh_git_root_pr(root, sc).await;
             match refreshed {
                 Err(Error::RateLimited(detail)) => {
                     intent_sourcecontrol::traffic::with_caller(
@@ -5177,11 +5209,28 @@ impl Services {
         root: intent_core::WorkspaceGitRoot,
         sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
     ) -> Result<pr_ops::PrRefreshOutcome> {
-        intent_sourcecontrol::traffic::with_caller(
-            intent_sourcecontrol::traffic::Caller::GitRootRefresh,
-            self.refresh_git_root_pr_accounted(root, sc),
-        )
-        .await
+        let services = self.clone();
+        let sc = sc.clone();
+        let caller = intent_core::current_caller().unwrap_or(intent_core::Caller::Daemon);
+        let wire = intent_core::caller::current_wire_credential();
+        let owner = self
+            .store_tasks
+            .spawn_draining(pr_discovery::inherit_refresh(
+                intent_sourcecontrol::traffic::inherit_context(intent_core::with_caller(
+                    caller,
+                    intent_core::caller::with_wire_credential(wire, async move {
+                        intent_sourcecontrol::traffic::with_caller(
+                            intent_sourcecontrol::traffic::Caller::GitRootRefresh,
+                            services.refresh_git_root_pr_accounted(root, &sc),
+                        )
+                        .await
+                    }),
+                )),
+            ))
+            .ok_or_else(|| Error::Internal("PR refresh writers are shutting down".into()))?;
+        owner
+            .await
+            .map_err(|error| Error::Internal(format!("PR refresh worker failed: {error}")))?
     }
 
     async fn refresh_git_root_pr_accounted(
@@ -5190,6 +5239,7 @@ impl Services {
         sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
     ) -> Result<pr_ops::PrRefreshOutcome> {
         use pr_ops::PrRefreshOutcome;
+        let fetch_deadline = tokio::time::Instant::now() + self.pr_refresh_fetch_timeout;
         let Some(repo_ref) = root.repo() else {
             return Ok(PrRefreshOutcome::Skipped);
         };
@@ -5215,10 +5265,17 @@ impl Services {
         // delta persist below and the sweep pauses globally (monorepo#2961).
         let mut discovery_rate_limited: Option<String> = None;
         let mut outcome = if let Some(number) = root.pr_number {
-            let pr = self
-                .linked_pr_record(sc.as_ref(), &repo_ref, number)
-                .await
-                .map_err(pr_ops::map_sc_err)?;
+            let pr = tokio::time::timeout_at(
+                fetch_deadline,
+                self.linked_pr_record(sc.as_ref(), &repo_ref, number),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(intent_sourcecontrol::Error::Api(
+                    "PR refresh timed out".into(),
+                ))
+            })
+            .map_err(pr_ops::map_sc_err)?;
             fetched_fresh.push(number);
             // Clear a stale link only on a positive mismatch against the
             // root's current branch; an unreadable HEAD (empty branch)
@@ -5257,16 +5314,22 @@ impl Services {
                     intent_core::PullRequestStatus::Merged | intent_core::PullRequestStatus::Closed
                 ) && !branch.is_empty()
                 {
-                    let discovered = match self
-                        .discover_shared_pr(
+                    let discovered = match tokio::time::timeout_at(
+                        fetch_deadline,
+                        self.discover_shared_pr(
                             sc.as_ref(),
                             &repo_ref,
                             &branch,
                             None,
                             (pr.state == intent_sourcecontrol::PrState::Merged).then_some(number),
-                        )
-                        .await
-                    {
+                        ),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(intent_sourcecontrol::Error::Api(
+                            "PR refresh timed out".into(),
+                        ))
+                    }) {
                         Ok(found) => found,
                         // A rate-limited discovery still degrades to the
                         // plain update path (the status delta persists),
@@ -5313,10 +5376,17 @@ impl Services {
         } else if branch.is_empty() {
             PrRefreshOutcome::Skipped
         } else {
-            let found = self
-                .discover_shared_pr(sc.as_ref(), &repo_ref, &branch, None, None)
-                .await
-                .map_err(pr_ops::map_sc_err)?;
+            let found = tokio::time::timeout_at(
+                fetch_deadline,
+                self.discover_shared_pr(sc.as_ref(), &repo_ref, &branch, None, None),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(intent_sourcecontrol::Error::Api(
+                    "PR refresh timed out".into(),
+                ))
+            })
+            .map_err(pr_ops::map_sc_err)?;
             match found {
                 Some(pr) => {
                     fetched_fresh.push(pr.number);
@@ -5332,9 +5402,8 @@ impl Services {
             }
         };
         // Each heal re-fetch gets a tenth of the per-root budget: the five
-        // capped entries can consume at most half of it, so a hung pool
-        // fetch (monorepo#1988 lineage) can never starve the linked-PR
-        // delta persist below out of the caller's PR_REFRESH_FETCH_TIMEOUT.
+        // capped entries consume at most half of it. These read-only budgets
+        // never cover the linked-PR delta persist/publication below.
         // A rate-limited relink discovery skips the heal entirely — its
         // re-fetches would only burn into the same exhausted quota.
         let mut rate_limited = discovery_rate_limited;
@@ -5401,12 +5470,8 @@ impl Services {
     /// those lacking repo/branch info, are skipped. A missing forge token (no
     /// injected/registry provider) surfaces as `Internal`.
     ///
-    /// Deliberately not wrapped in [`PR_REFRESH_FETCH_TIMEOUT`] here: the
-    /// `pr.refresh` RPC path is caller-scoped — a hang blocks only the
-    /// calling RPC, which the client-level network timeouts already bound.
-    /// The background callers wrap this future in that timeout themselves:
-    /// the refresh sweep ([`Services::refresh_all_workspace_prs`]) and the
-    /// PR-monitor terminal path (`refresh_workspace_pr_after_terminal`).
+    /// Forge reads have a bounded deadline. Once a linkage write commits, its
+    /// event publication remains owned until settlement, even if the caller leaves.
     ///
     /// # Errors
     ///
@@ -5463,11 +5528,28 @@ impl Services {
         ws: Workspace,
         sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
     ) -> Result<pr_ops::PrRefreshOutcome> {
-        intent_sourcecontrol::traffic::with_caller(
-            intent_sourcecontrol::traffic::Caller::WorkspaceRefresh,
-            self.refresh_workspace_pr_with_sc_accounted(ws, sc),
-        )
-        .await
+        let services = self.clone();
+        let sc = sc.clone();
+        let caller = intent_core::current_caller().unwrap_or(intent_core::Caller::Daemon);
+        let wire = intent_core::caller::current_wire_credential();
+        let owner = self
+            .store_tasks
+            .spawn_draining(pr_discovery::inherit_refresh(
+                intent_sourcecontrol::traffic::inherit_context(intent_core::with_caller(
+                    caller,
+                    intent_core::caller::with_wire_credential(wire, async move {
+                        intent_sourcecontrol::traffic::with_caller(
+                            intent_sourcecontrol::traffic::Caller::WorkspaceRefresh,
+                            services.refresh_workspace_pr_with_sc_accounted(ws, &sc),
+                        )
+                        .await
+                    }),
+                )),
+            ))
+            .ok_or_else(|| Error::Internal("PR refresh writers are shutting down".into()))?;
+        owner
+            .await
+            .map_err(|error| Error::Internal(format!("PR refresh worker failed: {error}")))?
     }
 
     async fn refresh_workspace_pr_with_sc_accounted(
@@ -5476,6 +5558,7 @@ impl Services {
         sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
     ) -> Result<pr_ops::PrRefreshOutcome> {
         use pr_ops::PrRefreshOutcome;
+        let fetch_deadline = tokio::time::Instant::now() + self.pr_refresh_fetch_timeout;
 
         if ws.is_remote || ws.archived {
             return Ok(PrRefreshOutcome::Skipped);
@@ -5485,10 +5568,17 @@ impl Services {
         };
 
         if let Some(number) = ws.pr_number {
-            let pr = self
-                .linked_pr_record(sc.as_ref(), &repo_ref, number)
-                .await
-                .map_err(pr_ops::map_sc_err)?;
+            let pr = tokio::time::timeout_at(
+                fetch_deadline,
+                self.linked_pr_record(sc.as_ref(), &repo_ref, number),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(intent_sourcecontrol::Error::Api(
+                    "PR refresh timed out".into(),
+                ))
+            })
+            .map_err(pr_ops::map_sc_err)?;
             // Clear a stale link only on a positive mismatch against BOTH
             // the workspace's branch and its baseRef (review workspaces
             // link PRs whose head equals the workspace's `baseRef`, §7.6);
@@ -5506,6 +5596,8 @@ impl Services {
                         pr_ops::rebase_workspace_pr_pool(ws, persisted, &[]);
                     })
                     .await?;
+                #[cfg(test)]
+                self.hold_periodic_commit("pr").await;
                 publish_event(self.event_bus.as_ref(), pr_unlinked_event(&ws.id)).await;
                 self.maybe_emit_display_status_changed(&ws.id).await;
                 return Ok(PrRefreshOutcome::Unlinked);
@@ -5538,16 +5630,22 @@ impl Services {
                 intent_core::PullRequestStatus::Merged | intent_core::PullRequestStatus::Closed
             ) && (!ws.branch.is_empty() || ws.base_ref.is_some())
             {
-                let discovered = match self
-                    .discover_shared_pr(
+                let discovered = match tokio::time::timeout_at(
+                    fetch_deadline,
+                    self.discover_shared_pr(
                         sc.as_ref(),
                         &repo_ref,
                         &ws.branch,
                         ws.base_ref.as_deref(),
                         (pr.state == intent_sourcecontrol::PrState::Merged).then_some(number),
-                    )
-                    .await
-                {
+                    ),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(intent_sourcecontrol::Error::Api(
+                        "PR refresh timed out".into(),
+                    ))
+                }) {
                     Ok(found) => found,
                     // A rate-limited discovery still degrades to the plain
                     // update path (the status delta persists), but the
@@ -5581,6 +5679,8 @@ impl Services {
                             pr_ops::rebase_workspace_pr_pool(ws, persisted, &refreshed);
                         })
                         .await?;
+                    #[cfg(test)]
+                    self.hold_periodic_commit("pr").await;
                     publish_event(self.event_bus.as_ref(), pr_linked_event(&ws)).await;
                     self.maybe_emit_display_status_changed(&ws.id).await;
                     return Ok(PrRefreshOutcome::Linked);
@@ -5600,6 +5700,8 @@ impl Services {
                         pr_ops::rebase_workspace_pr_pool(ws, persisted, &refreshed);
                     })
                     .await?;
+                #[cfg(test)]
+                self.hold_periodic_commit("pr").await;
                 publish_event(self.event_bus.as_ref(), pr_updated_event(&ws)).await;
                 self.maybe_emit_display_status_changed(&ws.id).await;
             }
@@ -5620,16 +5722,23 @@ impl Services {
             if ws.branch.is_empty() && ws.base_ref.is_none() {
                 return Ok(PrRefreshOutcome::Skipped);
             }
-            let found = self
-                .discover_shared_pr(
+            let found = tokio::time::timeout_at(
+                fetch_deadline,
+                self.discover_shared_pr(
                     sc.as_ref(),
                     &repo_ref,
                     &ws.branch,
                     ws.base_ref.as_deref(),
                     None,
-                )
-                .await
-                .map_err(pr_ops::map_sc_err)?;
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(intent_sourcecontrol::Error::Api(
+                    "PR refresh timed out".into(),
+                ))
+            })
+            .map_err(pr_ops::map_sc_err)?;
             match found {
                 Some(pr) => {
                     let mut info = pr_ops::build_pr_info(&pr);
@@ -5644,6 +5753,8 @@ impl Services {
                             pr_ops::rebase_workspace_pr_pool(ws, persisted, &[pr.number]);
                         })
                         .await?;
+                    #[cfg(test)]
+                    self.hold_periodic_commit("pr").await;
                     publish_event(self.event_bus.as_ref(), pr_linked_event(&ws)).await;
                     self.maybe_emit_display_status_changed(&ws.id).await;
                     Ok(PrRefreshOutcome::Linked)
@@ -5863,6 +5974,20 @@ impl Services {
     /// so a hung forge call maps into the existing log-and-continue error
     /// path instead of wedging the loop (intent-hq/monorepo#1988 lineage).
     async fn refresh_all_workspace_prs(&self, tick: u64) {
+        let services = self.clone();
+        if let Some(owner) =
+            self.store_tasks
+                .spawn_draining(intent_sourcecontrol::traffic::inherit_context(async move {
+                    services.refresh_all_workspace_prs_owned(tick).await;
+                }))
+        {
+            if let Err(error) = owner.await {
+                tracing::error!(%error, "PR refresh sweep failed");
+            }
+        }
+    }
+
+    async fn refresh_all_workspace_prs_owned(&self, tick: u64) {
         let mut workspaces = match self.store.list_workspaces(false).await {
             Ok(list) => list,
             Err(e) => {
@@ -5902,32 +6027,22 @@ impl Services {
             .await;
         }
         for ws in workspaces {
+            if self.settings_tasks.is_closed() {
+                break;
+            }
             // STAB-3 fix: refresh all workspaces (discovery + update), not just
             // those already linked. `refresh_workspace_pr_with_sc` skips
             // ineligible workspaces internally.
             let ws_id = ws.id.clone();
-            // The timeout is defense in depth above the client-level network
-            // timeouts: a refresh that pends indefinitely maps to the same
-            // log-and-continue path as any other per-workspace error instead
-            // of wedging the sweep for every other workspace.
+            // Forge reads share a deadline inside the refresh. Its admitted
+            // store/event continuation remains owned after that deadline.
             //
             // The rate-limit gate is re-checked per workspace (not once per
             // sweep) so a limit hit mid-sweep stops the remaining forge
             // calls immediately instead of burning them into the exhausted
             // quota (monorepo#2961).
             if let Some(sc) = sc.as_ref().filter(|_| !self.sweeps_rate_limited()) {
-                let refreshed = match tokio::time::timeout(
-                    self.pr_refresh_fetch_timeout,
-                    self.refresh_workspace_pr_with_sc(ws.clone(), sc),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_) => Err(Error::Internal(format!(
-                        "PR refresh timed out after {:?}",
-                        self.pr_refresh_fetch_timeout
-                    ))),
-                };
+                let refreshed = self.refresh_workspace_pr_with_sc(ws.clone(), sc).await;
                 match refreshed {
                     Err(Error::RateLimited(detail)) => {
                         intent_sourcecontrol::traffic::with_caller(
@@ -5984,7 +6099,11 @@ impl Services {
             ticker.tick().await;
             let mut tick: u64 = 0;
             loop {
-                ticker.tick().await;
+                tokio::select! {
+                    biased;
+                    () = services.settings_tasks.closed() => break,
+                    _ = ticker.tick() => {}
+                }
                 services.refresh_all_workspace_prs(tick).await;
                 tick = tick.wrapping_add(1);
             }
@@ -6078,6 +6197,26 @@ impl Services {
     /// writes through; the live path stays unguarded so a legitimate recount
     /// can still lower the tally.
     pub(crate) async fn recompute_workspace_token_usage(
+        &self,
+        workspace_id: &WorkspaceId,
+        guard_zero_regression: bool,
+    ) -> Result<bool> {
+        let services = self.clone();
+        let workspace_id = workspace_id.clone();
+        let owner = self
+            .store_tasks
+            .spawn_draining(async move {
+                services
+                    .recompute_workspace_token_usage_owned(&workspace_id, guard_zero_regression)
+                    .await
+            })
+            .ok_or_else(|| Error::Internal("token usage writers are shutting down".into()))?;
+        owner
+            .await
+            .map_err(|error| Error::Internal(format!("token usage worker failed: {error}")))?
+    }
+
+    async fn recompute_workspace_token_usage_owned(
         &self,
         workspace_id: &WorkspaceId,
         guard_zero_regression: bool,
@@ -6203,6 +6342,8 @@ impl Services {
         let Some(usage) = written else {
             return Ok(false);
         };
+        #[cfg(test)]
+        self.hold_periodic_commit("token").await;
         // Post-commit publish: commits serialize at the write pool but these
         // publishes can interleave, so a subscriber may briefly observe the
         // events out of commit order. Each event still carries a committed
@@ -6267,7 +6408,11 @@ impl Services {
             // Consume the immediate first tick so the loop waits one interval.
             ticker.tick().await;
             loop {
-                ticker.tick().await;
+                tokio::select! {
+                    biased;
+                    () = services.settings_tasks.closed() => break,
+                    _ = ticker.tick() => {}
+                }
                 services.scan_all_token_usage().await;
             }
         })
@@ -6309,6 +6454,111 @@ impl Services {
                 }
             })
             .unwrap_or_else(|| intent_core::spawn_daemon(async {}))
+    }
+
+    /// Shared one-shot command owner for the wire and agent-JS surfaces.
+    #[must_use]
+    pub fn host_exec_runtime(&self) -> Arc<host_exec::HostExecRuntime> {
+        self.host_exec_runtime.clone()
+    }
+
+    /// Drain finite derived-state writers after all request/agent producers
+    /// have settled and before closing the event bus or the store.
+    pub fn begin_settings_shutdown(&self) {
+        self.settings_tasks.close();
+    }
+
+    /// Finish admitted runtime hooks before final listener teardown. Concurrent
+    /// service/test drainers serialize through the finite owner drain.
+    pub async fn shutdown_settings(&self) {
+        self.begin_settings_shutdown();
+        let drain = self.settings_tasks.drain_finite();
+        #[cfg(test)]
+        let drain = {
+            let mut drain = Box::pin(drain);
+            std::future::poll_fn(move |cx| {
+                let result = std::future::Future::poll(drain.as_mut(), cx);
+                if result.is_pending() {
+                    if let Some(tx) = self
+                        .secrets
+                        .writer_drain_pending
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take()
+                    {
+                        let _ = tx.send("settings-tasks");
+                    }
+                }
+                result
+            })
+        };
+        drain.await;
+    }
+
+    pub async fn shutdown_store_writers(&self) {
+        self.shutdown_settings().await;
+        // Called after RPC/agent admission is fenced, root schedulers joined,
+        // and PtyHost::kill_all has refused/reaped every late PTY spawn.
+        // Pending undo waits are discarded on restart by their wire contract;
+        // a timer that already claimed its delete finishes the cascade.
+        self.pending_delete_tasks.shutdown().await;
+        // Device-flow cancellation is cooperative: remove the generation and
+        // join any in-flight token write/reconciliation instead of aborting it.
+        self.github_auth_flow.lock().await.take();
+        {
+            let acquire = self.gitlab_auth.lock();
+            #[cfg(test)]
+            let acquire = {
+                let mut acquire = Box::pin(acquire);
+                std::future::poll_fn(move |cx| {
+                    let result = std::future::Future::poll(acquire.as_mut(), cx);
+                    if result.is_pending() {
+                        if let Some(tx) = self
+                            .secrets
+                            .writer_drain_pending
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .take()
+                        {
+                            let _ = tx.send("gitlab-state");
+                        }
+                    }
+                    result
+                })
+            };
+            let mut gitlab = acquire.await;
+            gitlab.starting = None;
+            gitlab.flow = None;
+        }
+        self.shutdown_collaboration_flows().await;
+        let drain = self.store_tasks.drain_finite();
+        #[cfg(test)]
+        let drain = {
+            let mut drain = Box::pin(drain);
+            std::future::poll_fn(move |cx| {
+                let result = std::future::Future::poll(drain.as_mut(), cx);
+                if result.is_pending() {
+                    if let Some(tx) = self
+                        .secrets
+                        .writer_drain_pending
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take()
+                    {
+                        let _ = tx.send("store-tasks");
+                    }
+                }
+                result
+            })
+        };
+        drain.await;
+        self.secrets.shutdown_mutations().await;
+        // Setup tails may register a terminal publisher while they settle.
+        // No terminal publisher is closed until all setup tails have joined.
+        self.terminal_tasks.drain_finite().await;
+        // Finite parents (including those awaiting group acknowledgements)
+        // must settle before the ordered persistence lane closes admission.
+        self.shutdown_group_persistence().await;
     }
 
     /// Stop and drain automatic delivery work without retiring its durable
@@ -9357,6 +9607,15 @@ impl Services {
             .update_sandbox_status(workspace_id, agent_id, SandboxStatus::Merged, &now_iso())
             .await;
 
+        #[cfg(test)]
+        {
+            let finish = self.sandbox_merge_finish.lock().unwrap().take();
+            if let Some(finish) = finish {
+                self.sandbox_merge_marked.notify_one();
+                let _ = finish.await;
+            }
+        }
+
         if let Err(e) =
             crate::sandbox_ops::discard_sandbox(&self.store, workspace_id, agent_id).await
         {
@@ -9483,6 +9742,23 @@ impl Services {
     /// - `Conflict` / hard errors → `retry_count` incremented, sandbox
     ///   returned to `merge_pending`.
     pub async fn sweep_merge_pending_sandboxes(&self) -> MergeSweepSummary {
+        let services = self.clone();
+        let Some(owner) = self
+            .store_tasks
+            .spawn_draining(async move { services.sweep_merge_pending_sandboxes_owned().await })
+        else {
+            return MergeSweepSummary::default();
+        };
+        match owner.await {
+            Ok(summary) => summary,
+            Err(error) => {
+                tracing::error!(%error, "merge retry sweep worker failed");
+                MergeSweepSummary::default()
+            }
+        }
+    }
+
+    async fn sweep_merge_pending_sandboxes_owned(&self) -> MergeSweepSummary {
         use crate::sandbox_ops::{merge_sandbox, MergeOutcome};
         use intent_store::SandboxStatus;
 
@@ -10706,7 +10982,7 @@ impl Services {
         let key = (workspace_id.clone(), note_id.clone());
         let services = self.clone();
         let key_for_task = key.clone();
-        let handle = intent_core::spawn_daemon(async move {
+        let Some(handle) = self.store_tasks.spawn_draining(async move {
             tokio::time::sleep(LINE_ATTRIBUTION_DEBOUNCE).await;
             let (ws, nid) = key_for_task;
             if let Err(err) = services
@@ -10726,7 +11002,9 @@ impl Services {
                     map.remove(&(ws, nid));
                 }
             }
-        });
+        }) else {
+            return;
+        };
         let abort = handle.abort_handle();
         if let Ok(mut map) = self.line_attribution_debouncers.lock() {
             if let Some(prev) = map.insert(key, abort) {
@@ -16177,7 +16455,7 @@ impl Services {
             return serde_json::json!({ "requestId": request_id, "matches": matches });
         };
         let stream_request_id = request_id.to_string();
-        intent_core::spawn_daemon(async move {
+        let _ = self.store_tasks.spawn_draining(async move {
             let mut emitted = 0usize;
             let mut cancelled = false;
             for chunk in matches.chunks(search_ops::STREAM_BATCH_SIZE) {
@@ -16274,6 +16552,7 @@ impl Services {
         &self,
         applied: &[serde_json::Value],
         control: &Arc<dyn intent_core::ServerControl>,
+        is_tcp: bool,
     ) -> Result<()> {
         /// Priority for hook application order: lower values apply first.
         fn hook_priority(path: &str) -> u8 {
@@ -16470,7 +16749,7 @@ impl Services {
                                 }
                             } else {
                                 // Guard: refuse to stop the listener from a TCP connection
-                                if control.is_tcp_connection() {
+                                if is_tcp {
                                     return Err(Error::InvalidParams(
                                         "cannot disable server.wsApi.enabled from a TCP connection (would self-terminate)".to_string()
                                     ));
@@ -16547,7 +16826,7 @@ impl Services {
                         if control.ws_listener_port().await.is_some() {
                             if change.get("value").and_then(serde_json::Value::as_bool)
                                 == Some(true)
-                                && control.is_tcp_connection()
+                                && is_tcp
                             {
                                 return Err(Error::InvalidParams(
                                     "cannot enable server.tunnel.only from a TCP connection \
@@ -16622,7 +16901,10 @@ impl Services {
             })
             .collect();
         if let Some(control) = self.server_control.get() {
-            if let Err(e) = self.apply_server_setting_hooks(&applied, control).await {
+            if let Err(e) = self
+                .apply_server_setting_hooks(&applied, control, control.is_tcp_connection())
+                .await
+            {
                 tracing::warn!(
                     error = %e,
                     "config.toml live-reload: server runtime hook failed; effective \
@@ -16895,418 +17177,11 @@ impl WorkspaceApi for Services {
         &self,
         changes: serde_json::Value,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            /// Which store a captured old value belongs to, so the rollback
-            /// path restores it through the same seam that persisted it.
-            enum OldStore {
-                Db,
-                Registry,
-            }
-            Self::require_administrator("settings.update")?;
-            // A GitLab credential write is serialized with the credential
-            // mutations that run under the credential gate (auth-status
-            // probe refresh, identity-proof refresh, device completion): an
-            // in-flight refresh must not re-store the old device grant after
-            // the PAT and its sibling cleanup landed. Lock order is
-            // credential gate → revision gate: the credential gate is taken
-            // BEFORE the revision gate so a slow gate holder (a secret-store
-            // read under the gate has no timeout) only delays GitLab token
-            // batches, never every settings.get / getAll / update / reset.
-            // Other credential operations do not take the revision gate. The
-            // default-model injection below never adds a credential path, so
-            // inspecting the caller's batch here is sufficient.
-            let _credential_guard = if Self::batch_touches_gitlab_credential(&changes) {
-                Some(self.gitlab_credential_gate.lock().await)
-            } else {
-                None
-            };
-            let secret_paths: Vec<&str> = changes
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|entry| entry.get("path").and_then(serde_json::Value::as_str))
-                .filter(|path| settings::find_definition(path).is_some_and(|def| def.sensitive))
-                .collect();
-            let has_secrets = !secret_paths.is_empty();
-            let _secret_guards = self.settings_secret_gates.write(&secret_paths).await;
-            let mut revision_guard = Some(self.settings_revision_gate.write().await);
-            let caller_changes = changes.clone();
-            // A default-provider switch re-resolves `model.default` for the
-            // new provider (monorepo#3177). Appended BEFORE the old-value
-            // snapshot below so a hook-failure rollback also restores the
-            // injected key.
-            let mut changes = changes;
-            self.reresolve_default_model_on_provider_switch(&mut changes);
-            // Pre-flight self-termination guard: enabling server.tunnel.only
-            // from a direct TCP (WSS) connection would rebind the listener to
-            // loopback and drop the caller's own connection. Reject before
-            // anything persists so no rollback (and no listener restart that
-            // would sever the caller) is ever needed; the in-hook guard
-            // remains as a backstop for other invocation paths.
-            if let (Some(control), Some(entries)) = (self.server_control.get(), changes.as_array())
-            {
-                if control.is_tcp_connection()
-                    && entries.iter().any(|e| {
-                        e.get("path").and_then(|v| v.as_str()) == Some("server.tunnel.only")
-                            && e.get("value").and_then(serde_json::Value::as_bool) == Some(true)
-                    })
-                {
-                    return Err(Error::InvalidParams(
-                        "cannot enable server.tunnel.only from a TCP connection \
-                         (loopback rebind would self-terminate)"
-                            .to_string(),
-                    ));
-                }
-            }
-            // Reject malformed/pinned mixed batches before any secret write.
-            self.settings_service().validate_update(&changes)?;
-            let secrets = if has_secrets {
-                drop(revision_guard.take());
-                let secrets = self.settings_service().update_secrets(&changes).await?;
-                revision_guard = Some(self.settings_revision_gate.write().await);
-                secrets
-            } else {
-                settings::SecretSettingsUpdate::default()
-            };
-            // Another writer or file reload may have committed during secret
-            // I/O. Re-resolve against that snapshot and capture ordinary priors
-            // only now, so failure compensation cannot erase its commit.
-            let mut changes = caller_changes;
-            self.reresolve_default_model_on_provider_switch(&mut changes);
-            let mut secrets_compensated = false;
-            let result = async {
-                // Capture ordinary priors for hook-failure compensation. Secret
-                // priors were captured under their account guards before I/O;
-                // ordinary priors must reflect commits made while it was in flight.
-                // Fail closed on snapshot reads and compensate the staged secrets.
-                let registry = self.settings_registry.as_deref();
-                let old_values = if let Some(entries) = changes.as_array() {
-                    let mut old = Vec::new();
-                    for entry in entries {
-                        if let Some(path) = entry.get("path").and_then(|v| v.as_str()) {
-                            // Look up the definition to check if this setting is sensitive
-                            if let Some(_def) = crate::settings::find_definition(path).filter(|def| !def.sensitive) {
-                                if let Some(reg) =
-                                    registry.filter(|_| KNOWN_PATHS.contains(&path))
-                                {
-                                    // TOML-backed setting: capture the file-layer
-                                    // value from the registry snapshot. Origin
-                                    // `file` → present (restore that value);
-                                    // `default` → absent (rollback removes the
-                                    // key). A pinned key rejects the apply, so it
-                                    // never needs a rollback.
-                                    let snap = reg.snapshot();
-                                    let raw = match snap.origin(path) {
-                                        Some(SettingOrigin::File) => {
-                                            snap.get(path).map(|v| v.to_string())
-                                        }
-                                        _ => None,
-                                    };
-                                    old.push((path.to_string(), raw, OldStore::Registry));
-                                } else {
-                                    // Non-sensitive setting: capture from DB
-                                    match self.store.get_setting(path).await {
-                                        Ok(Some(raw)) => {
-                                            old.push((path.to_string(), Some(raw), OldStore::Db));
-                                        }
-                                        Ok(None) => {
-                                            // Confirmed absent; mark for deletion on rollback.
-                                            old.push((path.to_string(), None, OldStore::Db));
-                                        }
-                                        Err(e) => {
-                                            return Err(Error::Internal(format!(
-                                                "settings.update: failed to read setting {path} during snapshot capture: {e}"
-                                            )));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    old
-                } else {
-                    Vec::new()
-                };
-
-                let port_was_unassigned_before_update = registry.is_some_and(|reg| reg.snapshot().ws_api_port_policy() == WsApiPortPolicy::Unassigned);
-                let mut applied = secrets.merge_applied(self.settings_service().update_non_secrets(&changes).await?);
-                let port_was_unassigned = registry.is_some_and(|reg| reg.snapshot().ws_api_port_policy() == WsApiPortPolicy::Unassigned);
-                if !applied.is_empty() {
-                    // Apply server runtime hooks (§5.12): start/stop the WSS listener
-                    // when server.wsApi.enabled changes, restart it when
-                    // server.wsApi.port changes while running.
-                    if let Some(control) = self.server_control.get() {
-                        // Remember whether the listener/tunnel were up before the
-                        // hooks so a failed batch (e.g. a restart-on-new-value hook
-                        // that stopped one of them and then failed to start it) can
-                        // put them back up after the persistence rollback.
-                        let mut listener_was_running = control.ws_listener_port().await.is_some();
-                        let mut tunnel_was_running = control.tunnel_address().await.is_some();
-                        if let Err(e) = self.apply_server_setting_hooks(&applied, control).await {
-                            // Rollback: restore old values for ALL settings in the batch.
-                            // Log rollback failures but don't let them mask the original hook error.
-                            // Registry-backed restores are collected and applied as ONE batch
-                            // (a single config.toml rewrite + one change publication) instead of
-                            // per-key applies.
-                            let mut rollback_failed = false;
-                            let mut port_needs_publication = port_was_unassigned_before_update;
-                            let mut compensating_changes = Vec::new();
-                            let mut registry_restores: Vec<(String, serde_json::Value)> = Vec::new();
-                            for (path, old_val, old_store) in old_values {
-                                let rollback_result = match old_store {
-                                    OldStore::Registry => {
-                                        // TOML-backed setting: restore the prior file
-                                        // value (or remove the key when it was absent);
-                                        // `Null` clears back to the schema default.
-                                        // Deferred into one registry batch below.
-                                        let value = old_val
-                                            .as_deref()
-                                            .and_then(|raw| serde_json::from_str(raw).ok())
-                                            .unwrap_or(serde_json::Value::Null);
-                                        registry_restores.push((path.clone(), value));
-                                        Ok(())
-                                    }
-                                    OldStore::Db => {
-                                        // Non-sensitive setting: restore to DB or delete
-                                        if let Some(val) = &old_val {
-                                            self.store.set_setting(&path, val).await
-                                        } else {
-                                            self.store.delete_setting(&path).await.map(|_| ())
-                                        }
-                                    }
-                                };
-                                if let Err(rollback_err) = rollback_result {
-                                    tracing::error!(
-                                        path = %path,
-                                        error = %rollback_err,
-                                        "settings.update rollback failed for key"
-                                    );
-                                    rollback_failed = true;
-                                } else {
-                                    // Build a change record for compensating hook application.
-                                    // For settings with a prior persisted value, use that value.
-                                    // For unset settings (old_val == None), use the schema default
-                                    // so the compensating hook can restore runtime state (e.g., if
-                                    // server.wsApi.enabled was unset/defaulting to false, and the
-                                    // batch temporarily enabled it before failing, compensating hook
-                                    // with default=false will stop the listener).
-                                    let val_json = if let Some(val) = old_val {
-                                        serde_json::from_str(&val).unwrap_or(serde_json::Value::Null)
-                                    } else if let Some(def) = crate::settings::find_definition(&path) {
-                                        def.default_value.unwrap_or(serde_json::Value::Null)
-                                    } else {
-                                        serde_json::Value::Null
-                                    };
-                                    compensating_changes.push(serde_json::json!({
-                                        "path": path,
-                                        "value": val_json
-                                    }));
-                                }
-                            }
-
-                            // Restore all TOML-backed keys as one atomic registry batch
-                            // (single config.toml rewrite, single change publication).
-                            if !registry_restores.is_empty() {
-                                if let Some(reg) = registry {
-                                    if let Err(rollback_err) = reg.apply(&registry_restores) {
-                                        tracing::error!(
-                                            error = %rollback_err,
-                                            "settings.update registry rollback batch failed"
-                                        );
-                                        rollback_failed = true;
-                                    }
-                                }
-                            }
-
-                            // Restore credentials before compensating runtime hooks, as in
-                            // the original ordering. A GitHub revoke/device completion during
-                            // those hooks must not be overwritten by a later secret restore.
-                            if has_secrets {
-                                // Readers/writers may enter while secret rollback is
-                                // pending. Commit the surviving assignment's revision
-                                // before releasing the gate, never exposing new values
-                                // under the previous revision.
-                                self.publish_ws_port_assignment(port_needs_publication).await;
-                                let runtime_before = self.settings_service().server_values().await;
-                                drop(revision_guard.take());
-                                rollback_failed |= secrets.rollback(&self.secrets).await;
-                                secrets_compensated = true;
-                                revision_guard = Some(self.settings_revision_gate.write().await);
-                                // A newer transaction may already have published its
-                                // own port. Only a subsequent compensating assignment
-                                // can now belong to this recovery.
-                                port_needs_publication = registry.is_some_and(|reg| reg.snapshot().ws_api_port_policy() == WsApiPortPolicy::Unassigned);
-                                let runtime_after = self.settings_service().server_values().await;
-                                match (runtime_before, runtime_after) {
-                                    (Ok(before), Ok(after)) => {
-                                        // Ordinary rollback finished before the gate was released.
-                                        // Another writer may since have committed a server value;
-                                        // its runtime hook takes precedence over this old recovery.
-                                        compensating_changes.retain(|change| {
-                                            let path = change["path"].as_str().unwrap_or("");
-                                            !path.starts_with("server.")
-                                                || before.get(path) == after.get(path)
-                                        });
-                                        if before.get("server.wsApi.enabled") != after.get("server.wsApi.enabled") {
-                                            listener_was_running = after.get("server.wsApi.enabled")
-                                                .and_then(serde_json::Value::as_bool).unwrap_or(false);
-                                        }
-                                        if before.get("server.tunnel.enabled") != after.get("server.tunnel.enabled") {
-                                            tunnel_was_running = after.get("server.tunnel.enabled")
-                                                .and_then(serde_json::Value::as_bool).unwrap_or(false);
-                                        }
-                                    }
-                                    (Err(error), _) | (_, Err(error)) => {
-                                        tracing::error!(%error, "settings.update could not verify runtime settings during rollback");
-                                        rollback_failed = true;
-                                        compensating_changes.clear();
-                                        listener_was_running = false;
-                                        tunnel_was_running = false;
-                                    }
-                                }
-                            }
-
-                            // Apply compensating hooks: re-apply the prior values through the same
-                            // hook path to restore runtime state (e.g., stop a listener that was
-                            // started before a later hook in the batch failed). This reuses the
-                            // deterministic priority-sorted dispatch from apply_server_setting_hooks.
-                            if !compensating_changes.is_empty() {
-                                if let Err(compensating_err) = self
-                                    .apply_server_setting_hooks(&compensating_changes, control)
-                                    .await
-                                {
-                                    tracing::error!(
-                                        error = ?compensating_err,
-                                        "settings.update compensating hook application failed during rollback"
-                                    );
-                                    // Log but don't fail — the persistence rollback succeeded
-                                }
-                            }
-
-                            // A restart-on-new-value hook (port / bindAddress) stops the
-                            // listener before starting it, so a start failure leaves it
-                            // down even though the compensating hooks saw nothing to
-                            // restart. The persisted values are rolled back by now and
-                            // start re-reads them, so bring the listener back up if it
-                            // was running when the batch began.
-                            if listener_was_running && control.ws_listener_port().await.is_none() {
-                                match control.start_ws_listener().await {
-                                    Ok(port) => tracing::info!(
-                                        port,
-                                        "settings.update rollback: restarted WSS listener on prior settings"
-                                    ),
-                                    Err(restart_err) => tracing::error!(
-                                        error = ?restart_err,
-                                        "settings.update rollback: failed to restart WSS listener on prior settings"
-                                    ),
-                                }
-                            }
-
-                            // Same for the tunnel: a restart-on-new-value hook
-                            // (derpUrl / port) stops the sidecar before starting
-                            // it, so a start failure (e.g. a bad new DERP URL)
-                            // leaves it down. The persisted values are rolled back
-                            // by now and start re-reads them, so bring the sidecar
-                            // back up if it was running when the batch began.
-                            if tunnel_was_running && control.tunnel_address().await.is_none() {
-                                match control.start_tunnel().await {
-                                    Ok(address) => tracing::info!(
-                                        address = %address,
-                                        "settings.update rollback: restarted tailcat tunnel on prior settings"
-                                    ),
-                                    Err(restart_err) => tracing::error!(
-                                        error = ?restart_err,
-                                        "settings.update rollback: failed to restart tailcat tunnel on prior settings"
-                                    ),
-                                }
-                            }
-
-                            // A successful listener assignment is durable even if a later
-                            // hook fails (for example tunnel startup). Publish only that
-                            // surviving change after compensation, at its own revision.
-                            self.publish_ws_port_assignment(port_needs_publication).await;
-
-                            // Return an error that indicates incomplete rollback if any writes failed
-                            if rollback_failed {
-                                return Err(Error::Internal(format!(
-                                    "settings.update hook failed ({e}), and rollback was incomplete (see logs)"
-                                )));
-                            }
-                            // Return the hook error to the caller
-                            return Err(e);
-                        }
-                    }
-                    self.include_ws_port_assignment(port_was_unassigned, &mut applied);
-                    let revision = self.settings_revision.fetch_add(1, Ordering::SeqCst) + 1;
-                    publish_event(
-                        self.event_bus.as_ref(),
-                        settings_changed_event(&applied, revision),
-                    )
-                    .await;
-                    self.on_settings_applied(&applied);
-                    return Ok(serde_json::json!({ "applied": applied, "revision": revision }));
-                }
-                Ok(serde_json::json!({
-                    "applied": applied,
-                    "revision": self.settings_revision.load(Ordering::SeqCst),
-                }))
-            }.await;
-            // Validation/persistence failures have no runtime hooks to recover.
-            // Compensate their staged secrets without the revision gate too;
-            // a hook failure already restored them before runtime recovery.
-            drop(revision_guard);
-            if let Err(error) = result {
-                if !secrets_compensated && secrets.rollback(&self.secrets).await {
-                    return Err(Error::Internal(format!(
-                        "settings.update failed ({error}), and secret rollback was incomplete (see logs)"
-                    )));
-                }
-                return Err(error);
-            }
-            result
-        })
+        Box::pin(self.owned_settings_mutation(changes, None))
     }
 
     fn settings_reset(&self, path: String) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            Self::require_administrator("settings.reset")?;
-            // Same serialization and lock order as `settings.update`
-            // (credential gate → revision gate): a GitLab credential reset
-            // must not race an in-flight refresh under the gate, and waiting
-            // on that gate must not hold up unrelated settings traffic.
-            let _credential_guard = if path == intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT {
-                Some(self.gitlab_credential_gate.lock().await)
-            } else {
-                None
-            };
-            let _secret_guards = self.settings_secret_gates.write(&[&path]).await;
-            let sensitive = settings::find_definition(&path).is_some_and(|def| def.sensitive);
-            let mut revision_guard = if sensitive {
-                None
-            } else {
-                Some(self.settings_revision_gate.write().await)
-            };
-            let (result, changed) = self.settings_service().reset_with_change(&path).await?;
-            if revision_guard.is_none() {
-                revision_guard = Some(self.settings_revision_gate.write().await);
-            }
-            let _revision_guard = revision_guard;
-            let revision = if changed {
-                let revision = self.settings_revision.fetch_add(1, Ordering::SeqCst) + 1;
-                publish_event(
-                    self.event_bus.as_ref(),
-                    settings_changed_event(std::slice::from_ref(&result), revision),
-                )
-                .await;
-                self.on_settings_applied(std::slice::from_ref(&result));
-                revision
-            } else {
-                self.settings_revision.load(Ordering::SeqCst)
-            };
-            let mut result = result;
-            result["revision"] = serde_json::json!(revision);
-            Ok(result)
-        })
+        Box::pin(self.owned_settings_mutation(serde_json::Value::Null, Some(path)))
     }
 
     fn settings_heal_default_provider(
@@ -17796,7 +17671,8 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             Self::require_administrator("mcp.serversCreate")?;
-            self.mcp_servers_service().create(config).await
+            self.owned_direct_secret_mutation(direct_secret_ops::Mutation::McpCreate(config))
+                .await
         })
     }
 
@@ -17807,14 +17683,18 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             Self::require_administrator("mcp.serversUpdate")?;
-            self.mcp_servers_service().update(&server_id, config).await
+            self.owned_direct_secret_mutation(direct_secret_ops::Mutation::McpUpdate(
+                server_id, config,
+            ))
+            .await
         })
     }
 
     fn mcp_servers_delete(&self, server_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             Self::require_administrator("mcp.serversDelete")?;
-            self.mcp_servers_service().delete(&server_id).await
+            self.owned_direct_secret_mutation(direct_secret_ops::Mutation::McpDelete(server_id))
+                .await
         })
     }
 
@@ -17825,41 +17705,26 @@ impl WorkspaceApi for Services {
         workspace_id: Option<WorkspaceId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            if let Some(ws) = workspace_id {
-                self.require_workspace_manager(&ws, "mcp.serversToggle")
+            if let Some(ws) = &workspace_id {
+                self.require_workspace_manager(ws, "mcp.serversToggle")
                     .await?;
-                let out = self
-                    .mcp_servers_service()
-                    .toggle_workspace(ws.as_str(), &server_id, enabled)
-                    .await?;
-                // Self-sufficient `workspace:updated` delta (§6.5) so live
-                // clients mirror the workspace-scoped toggle without a
-                // follow-up read.
-                publish_event(
-                    self.event_bus.as_ref(),
-                    workspace_updated_event(
-                        &ws,
-                        &serde_json::json!({
-                            "mcpServerToggled": {
-                                "serverId": server_id,
-                                "workspaceDisabled": !enabled,
-                            }
-                        }),
-                    ),
-                )
-                .await;
-                Ok(out)
             } else {
                 Self::require_administrator("mcp.serversToggle")?;
-                self.mcp_servers_service().toggle(&server_id, enabled).await
             }
+            self.owned_direct_secret_mutation(direct_secret_ops::Mutation::McpToggle(
+                server_id,
+                enabled,
+                workspace_id,
+            ))
+            .await
         })
     }
 
     fn mcp_servers_restart(&self, server_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             Self::require_administrator("mcp.serversRestart")?;
-            self.mcp_servers_service().restart(&server_id).await
+            self.owned_direct_secret_mutation(direct_secret_ops::Mutation::McpRestart(server_id))
+                .await
         })
     }
 
@@ -18350,7 +18215,8 @@ impl WorkspaceApi for Services {
             // Management admission also permits deletion retries for missing
             // workspaces; a member must not spawn an unmanageable terminal there.
             self.require_member(&workspace_id).await?;
-            terminal_ops::create(
+            terminal_ops::create_owned(
+                &self.terminal_tasks,
                 pty,
                 bus,
                 Some(store),
@@ -21583,7 +21449,8 @@ impl WorkspaceApi for Services {
                             .clone()
                             .unwrap_or_default();
                         let worktree_for_read = worktree_path_buf.clone();
-                        intent_core::spawn_daemon(async move {
+                        let terminal_tasks = self.terminal_tasks.clone();
+                        let _ = self.store_tasks.spawn_draining(async move {
                             tracing::info!(
                                 workspace = %workspace_id.as_str(),
                                 script_length = script.len(),
@@ -21726,6 +21593,7 @@ impl WorkspaceApi for Services {
                                     );
                                     // Spawn output stream to fan setup script output to event bus
                                     crate::terminal_ops::spawn_output_stream(
+                                        &terminal_tasks,
                                         pty_for_setup.clone(),
                                         bus_for_setup.clone(),
                                         workspace_id.clone(),
@@ -22448,7 +22316,7 @@ impl WorkspaceApi for Services {
             let store_bg = store.clone();
             let worktree_locks_bg = worktree_locks.clone();
             let branch_auto_generated_bg = branch_auto_generated;
-            intent_core::spawn_daemon(async move {
+            let _ = services.store_tasks.spawn_draining(async move {
                 // Re-check that the workspace is actually deleted. If it
                 // exists now (same-slug recreate landed before this task ran),
                 // skip the worktree cleanup entirely — the new workspace owns
@@ -22716,8 +22584,14 @@ impl WorkspaceApi for Services {
                 key,
                 delete_at.clone(),
                 move |generation| {
-                    intent_core::spawn_daemon(async move {
-                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    let tasks = timer_services.pending_delete_tasks.clone();
+                    let stopping = tasks.clone();
+                    tasks.spawn_draining(async move {
+                        tokio::select! {
+                            biased;
+                            () = stopping.closed() => return,
+                            () = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {}
+                        }
                         // Claim-or-abstain: only the timer that still owns the
                         // entry commits. A cancel or an immediate delete that
                         // raced ahead removed/superseded the entry — do nothing.
@@ -22738,7 +22612,7 @@ impl WorkspaceApi for Services {
                                 "scheduled workspace delete failed at commit"
                             );
                         }
-                    })
+                    }).unwrap_or_else(|| intent_core::spawn_daemon(async {}))
                 },
             ) {
                 return Ok(existing);
@@ -22827,7 +22701,7 @@ impl WorkspaceApi for Services {
             // stops running for good — the hook is `cancelled` by the sweep
             // like any other hook in the workspace.
             let id_for_log = id.clone();
-            let tail = intent_core::spawn_daemon(async move {
+            let tail = self.store_tasks.spawn_draining(async move {
                 let mut ws = ws;
                 // Announce the committed guest sweep first — one
                 // `{ members, removedPrincipalId, memberCount }` delta per
@@ -22976,6 +22850,8 @@ impl WorkspaceApi for Services {
             // tail runs on. A `JoinError` means the tail itself panicked —
             // the row is already archived, so surface it rather than
             // reporting a bogus success shape.
+            let tail =
+                tail.ok_or_else(|| Error::Internal("daemon writer admission closed".into()))?;
             let mut ws = tail.await.map_err(|e| {
                 // The `JoinError` text names no workspace, so log the id —
                 // otherwise a panicked tail is undiagnosable from daemon logs.
@@ -28421,37 +28297,39 @@ impl WorkspaceApi for Services {
             // `gh` lookups can take a few seconds.
             let spawn_request_id = request_id.clone();
             let spawn_target = target.clone();
-            intent_core::spawn_daemon(host_execution::background_execution(
-                self.clone(),
-                None,
-                async move {
-                    let token = github_git_token_for_url(registry.as_deref(), &url).await;
-                    let result = clone_ops::perform_clone(clone_ops::CloneJob {
-                        request_id: spawn_request_id,
-                        workspace_id: None,
-                        url: url.clone(),
-                        target_path: spawn_target,
-                        token,
-                        bus,
-                        progress: None,
-                        // Standalone `git.clone` keeps its historical plain
-                        // (non-recursive) clone.
-                        recurse_submodules: false,
-                    })
-                    .await;
-                    if let Err(failure) = result {
-                        let _ = host_execution::git_error(
-                            Error::CloneFailed {
-                                category: failure
-                                    .category
-                                    .unwrap_or(intent_core::CloneErrorCategory::Other),
-                                detail: failure.detail,
-                            },
-                            Some(&url),
-                        );
-                    }
-                },
-            ));
+            let _ = self
+                .store_tasks
+                .spawn_draining(host_execution::background_execution(
+                    self.clone(),
+                    None,
+                    async move {
+                        let token = github_git_token_for_url(registry.as_deref(), &url).await;
+                        let result = clone_ops::perform_clone(clone_ops::CloneJob {
+                            request_id: spawn_request_id,
+                            workspace_id: None,
+                            url: url.clone(),
+                            target_path: spawn_target,
+                            token,
+                            bus,
+                            progress: None,
+                            // Standalone `git.clone` keeps its historical plain
+                            // (non-recursive) clone.
+                            recurse_submodules: false,
+                        })
+                        .await;
+                        if let Err(failure) = result {
+                            let _ = host_execution::git_error(
+                                Error::CloneFailed {
+                                    category: failure
+                                        .category
+                                        .unwrap_or(intent_core::CloneErrorCategory::Other),
+                                    detail: failure.detail,
+                                },
+                                Some(&url),
+                            );
+                        }
+                    },
+                ));
             Ok(serde_json::json!({
                 "requestId": request_id,
                 "targetPath": target.to_string_lossy(),
@@ -28483,7 +28361,7 @@ impl WorkspaceApi for Services {
                 .is_ok()
             {
                 let store = store.clone();
-                intent_core::spawn_daemon(async move {
+                let _ = self.store_tasks.spawn_draining(async move {
                     // Same root set as the teardown sweeps: the boot root plus
                     // the currently configured `workspace.worktreesLocation`
                     // (workspaces provisioned there live there).
@@ -28591,7 +28469,7 @@ impl WorkspaceApi for Services {
             // serializes behind this ensure on the per-repo cache lock.
             let task_owner = owner.clone();
             let task_repo = repo.clone();
-            intent_core::spawn_daemon(host_execution::background_execution(
+            let _ = self.store_tasks.spawn_draining(host_execution::background_execution(
                 self.clone(),
                 None,
                 async move {
@@ -28710,256 +28588,291 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let this = self.clone();
+        let tasks = self.store_tasks.clone();
         Box::pin(async move {
+            let caller = intent_core::current_caller();
+            let wire = intent_core::caller::current_wire_credential();
             if let Some(agent) = agent_id.as_ref() {
-                self.require_agent_member(agent).await?;
+                this.require_agent_member(agent).await?;
             }
-            let auto_commit_enabled = this.effective_auto_commit(&workspace_id).await;
-            // With a `git_root_id` the commit targets the registered
-            // secondary root (monorepo#2053); resolution shares
-            // `resolve_git_read_root` so an unknown/foreign id fails with the
-            // identical `Unknown git root: {id}` InvalidParams. Param
-            // validation precedes the auto-commit gate below, so a bad id is
-            // `-32602` (the §5.6 documented contract) even when the gate
-            // would also reject. `None` keeps the primary-worktree behavior
-            // (gate first, then worktree lookup — and its error message)
-            // exactly.
-            let mut resolved = None;
-            if git_root_id.is_some() {
-                let ws = store
-                    .get_workspace(&workspace_id)
-                    .await
-                    .map_err(|e| Error::Internal(format!("Failed to commit: {e}")))?;
-                let worktree = this
-                    .resolve_git_read_root(&ws, git_root_id.as_ref())
-                    .await?
-                    .ok_or_else(|| {
+            let operation = async move {
+                let auto_commit_enabled = this.effective_auto_commit(&workspace_id).await;
+                // With a `git_root_id` the commit targets the registered
+                // secondary root (monorepo#2053); resolution shares
+                // `resolve_git_read_root` so an unknown/foreign id fails with the
+                // identical `Unknown git root: {id}` InvalidParams. Param
+                // validation precedes the auto-commit gate below, so a bad id is
+                // `-32602` (the §5.6 documented contract) even when the gate
+                // would also reject. `None` keeps the primary-worktree behavior
+                // (gate first, then worktree lookup — and its error message)
+                // exactly.
+                let mut resolved = None;
+                if git_root_id.is_some() {
+                    let ws = store
+                        .get_workspace(&workspace_id)
+                        .await
+                        .map_err(|e| Error::Internal(format!("Failed to commit: {e}")))?;
+                    let worktree = this
+                        .resolve_git_read_root(&ws, git_root_id.as_ref())
+                        .await?
+                        .ok_or_else(|| {
+                            Error::Internal(
+                                "Failed to commit: workspace has no worktree".to_string(),
+                            )
+                        })?;
+                    resolved = Some((ws, worktree));
+                }
+                // userRequested bypasses the auto-commit gate (TS parity); the
+                // gate reads the per-workspace resolution (override → global).
+                git_ops::assert_agent_commit_allowed(auto_commit_enabled, user_requested)?;
+                let (ws, worktree) = if let Some(pair) = resolved {
+                    pair
+                } else {
+                    let ws = store
+                        .get_workspace(&workspace_id)
+                        .await
+                        .map_err(|e| Error::Internal(format!("Failed to commit: {e}")))?;
+                    let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
                         Error::Internal("Failed to commit: workspace has no worktree".to_string())
                     })?;
-                resolved = Some((ws, worktree));
-            }
-            // userRequested bypasses the auto-commit gate (TS parity); the
-            // gate reads the per-workspace resolution (override → global).
-            git_ops::assert_agent_commit_allowed(auto_commit_enabled, user_requested)?;
-            let (ws, worktree) = if let Some(pair) = resolved {
-                pair
-            } else {
-                let ws = store
-                    .get_workspace(&workspace_id)
-                    .await
-                    .map_err(|e| Error::Internal(format!("Failed to commit: {e}")))?;
-                let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
-                    Error::Internal("Failed to commit: workspace has no worktree".to_string())
-                })?;
-                (ws, worktree)
-            };
-            // Commit-set selection (TS parity, monorepo#939): an explicit
-            // `files` list is committed as-is; without one, a `userRequested`
-            // checkpoint commits only the already-staged paths (plain
-            // `git commit` semantics — a user checkpoint must not sweep up
-            // other agents' worktree changes), while an agent-initiated commit
-            // commits only the paths the file-tracking attribution pipeline
-            // credits to the committing agent (`tracked_changes` rows at stage
-            // unstaged/staged), intersected with the actual worktree changes so
-            // a stale attribution row never resurrects a committed/reverted
-            // file. Without an `agent_id` attribution is impossible, so the
-            // commit is refused rather than sweeping the whole worktree.
-            let explicit_files = files.as_deref().is_some_and(|f| !f.is_empty());
-            let (to_commit, needs_stage, attribution_filtered) = match files {
-                Some(f) if !f.is_empty() => {
-                    git_ops::reject_submodule_internal_files(&worktree, &f)?;
-                    (f, true, false)
-                }
-                _ if user_requested => (intent_git::commit::staged_paths(&worktree)?, false, false),
-                _ if git_root_id.is_some() => {
-                    // The file-tracking attribution pipeline only observes the
-                    // primary worktree, so an agent-initiated commit on a
-                    // secondary root cannot be attribution-filtered — require
-                    // an explicit commit set instead of sweeping the root.
-                    return Err(Error::Internal(
-                        "Agent-initiated commit on a registered git root requires an \
-                         explicit `files` list"
-                            .to_string(),
-                    ));
-                }
-                _ => {
-                    let Some(agent) = agent_id.as_ref() else {
+                    (ws, worktree)
+                };
+                // Commit-set selection (TS parity, monorepo#939): an explicit
+                // `files` list is committed as-is; without one, a `userRequested`
+                // checkpoint commits only the already-staged paths (plain
+                // `git commit` semantics — a user checkpoint must not sweep up
+                // other agents' worktree changes), while an agent-initiated commit
+                // commits only the paths the file-tracking attribution pipeline
+                // credits to the committing agent (`tracked_changes` rows at stage
+                // unstaged/staged), intersected with the actual worktree changes so
+                // a stale attribution row never resurrects a committed/reverted
+                // file. Without an `agent_id` attribution is impossible, so the
+                // commit is refused rather than sweeping the whole worktree.
+                let explicit_files = files.as_deref().is_some_and(|f| !f.is_empty());
+                let (to_commit, needs_stage, attribution_filtered) = match files {
+                    Some(f) if !f.is_empty() => {
+                        git_ops::reject_submodule_internal_files(&worktree, &f)?;
+                        (f, true, false)
+                    }
+                    _ if user_requested => {
+                        (intent_git::commit::staged_paths(&worktree)?, false, false)
+                    }
+                    _ if git_root_id.is_some() => {
+                        // The file-tracking attribution pipeline only observes the
+                        // primary worktree, so an agent-initiated commit on a
+                        // secondary root cannot be attribution-filtered — require
+                        // an explicit commit set instead of sweeping the root.
                         return Err(Error::Internal(
-                            "Agent-initiated commit without an agentId cannot be attributed: \
-                             pass an explicit `files` list"
+                            "Agent-initiated commit on a registered git root requires an \
+                         explicit `files` list"
                                 .to_string(),
                         ));
-                    };
-                    let attributed: HashSet<String> = store
-                        .list_tracked_changes(&workspace_id)
-                        .await?
-                        .into_iter()
-                        .filter(|r| {
-                            matches!(r.stage.as_str(), "unstaged" | "staged")
-                                && r.agent_id.as_deref() == Some(agent.as_str())
-                        })
-                        .map(|r| crate::file_tracking::normalize_path(&r.path))
-                        .collect();
-                    let changed = intent_git::commit::all_changed_paths(&worktree)?;
-                    let filtered: Vec<String> = changed
-                        .iter()
-                        .filter(|p| attributed.contains(&crate::file_tracking::normalize_path(p)))
-                        .cloned()
-                        .collect();
-                    // Drop submodule-internal paths before the emptiness
-                    // check (monorepo#1714 follow-up): auto-commit must never
-                    // flatten a submodule's gitlink into the superproject.
-                    let (filtered, dropped_by_submodule) =
-                        git_ops::drop_submodule_internal_paths(&worktree, filtered);
-                    for (submodule, dropped) in &dropped_by_submodule {
-                        tracing::debug!(
-                            workspace = %workspace_id.0,
-                            agent = %agent.as_str(),
-                            submodule = %submodule,
-                            dropped,
-                            "agentCommit: dropped submodule-internal paths from \
-                             attribution-filtered commit set"
-                        );
                     }
-                    if filtered.is_empty() && !changed.is_empty() {
-                        // Diagnosable skip (monorepo#939 trade-off): agent
-                        // work not visible to the attribution pipeline (e.g.
-                        // terminal/shell edits) is no longer swept — surface
-                        // it at debug so lost auto-commits can be traced
-                        // without re-firing a warn on every idle while the
-                        // worktree stays dirty.
-                        tracing::debug!(
-                            workspace = %workspace_id.0,
-                            agent = %agent.as_str(),
-                            dirty = changed.len(),
-                            "agentCommit: worktree is dirty but no changes are \
-                             attributed to this agent; nothing will be committed"
-                        );
-                    }
-                    (filtered, true, true)
-                }
-            };
-            // An explicitly requested staged-only merge can record ancestry
-            // without changing HEAD's tree. Let the full-index commit path
-            // preserve its parents and attribution; empty automatic commits
-            // and ordinary empty checkpoints remain rejected.
-            if to_commit.is_empty()
-                && !(user_requested
-                    && !needs_stage
-                    && intent_git::commit::has_pending_merge(&worktree)?)
-            {
-                return Err(Error::Internal(if user_requested {
-                    "No staged changes found to commit".to_string()
-                } else {
-                    "No uncommitted changes found for this agent".to_string()
-                }));
-            }
-            // With an explicit commit set (named `files` or the attribution
-            // filter), commit exactly those paths (`git commit -- <paths>`
-            // semantics) so paths another actor pre-staged are never swept
-            // into this commit. The `userRequested` staged-only checkpoint
-            // commits the index as-is.
-            let outcome = if needs_stage {
-                match intent_git::commit::commit_paths_with_trailers(
-                    &worktree,
-                    &message,
-                    agent_id.as_ref().map(AgentId::as_str),
-                    linked_note_id.as_ref().map(NoteId::as_str),
-                    &to_commit,
-                ) {
-                    Ok(o) => o,
-                    Err(e) => {
-                        // Remediation hint (monorepo#2053): a primary-target
-                        // commit whose explicit `files` match nothing, where
-                        // the paths exist under a registered secondary root,
-                        // was almost certainly aimed at that root — name it
-                        // and suggest `gitRootId` instead of a bare pathspec
-                        // error.
-                        if git_root_id.is_none()
-                            && explicit_files
-                            && format!("{e}").contains("did not match any files")
-                        {
-                            if let Some(root) = this
-                                .find_git_root_containing(&workspace_id, &to_commit)
-                                .await
-                            {
-                                return Err(Error::Internal(format!(
-                                    "{e}. The files exist under the registered git root \
-                                     {path} (id: {id}) — pass gitRootId to commit there.",
-                                    path = root.path,
-                                    id = root.id
-                                )));
-                            }
-                        }
-                        return Err(e);
-                    }
-                }
-            } else {
-                intent_git::commit::commit_with_trailers(
-                    &worktree,
-                    &message,
-                    agent_id.as_ref().map(AgentId::as_str),
-                    linked_note_id.as_ref().map(NoteId::as_str),
-                )?
-            };
-            // Staged content became a commit → the cached scan still lists it
-            // as pending (monorepo#1648).
-            this.git_status_cache.invalidate(&worktree);
-            if attribution_filtered {
-                // Mirror `ac_commit`: move the committed paths' attribution
-                // rows (staged/unstaged → committed) so the audit trail stays
-                // consistent with the git stage. Best-effort, but loud — a
-                // stuck row makes the next filtered commit resurrect the path.
-                for path in &outcome.files {
-                    let key = crate::file_tracking::normalize_path(path);
-                    for from in ["staged", "unstaged"] {
-                        if let Err(e) = store
-                            .set_tracked_change_stage(&workspace_id, &key, from, "committed")
-                            .await
-                        {
-                            tracing::warn!(
-                                path = %key,
-                                error = %e,
-                                "agentCommit: failed to advance attribution row to committed"
+                    _ => {
+                        let Some(agent) = agent_id.as_ref() else {
+                            return Err(Error::Internal(
+                                "Agent-initiated commit without an agentId cannot be attributed: \
+                             pass an explicit `files` list"
+                                    .to_string(),
+                            ));
+                        };
+                        let attributed: HashSet<String> = store
+                            .list_tracked_changes(&workspace_id)
+                            .await?
+                            .into_iter()
+                            .filter(|r| {
+                                matches!(r.stage.as_str(), "unstaged" | "staged")
+                                    && r.agent_id.as_deref() == Some(agent.as_str())
+                            })
+                            .map(|r| crate::file_tracking::normalize_path(&r.path))
+                            .collect();
+                        let changed = intent_git::commit::all_changed_paths(&worktree)?;
+                        let filtered: Vec<String> = changed
+                            .iter()
+                            .filter(|p| {
+                                attributed.contains(&crate::file_tracking::normalize_path(p))
+                            })
+                            .cloned()
+                            .collect();
+                        // Drop submodule-internal paths before the emptiness
+                        // check (monorepo#1714 follow-up): auto-commit must never
+                        // flatten a submodule's gitlink into the superproject.
+                        let (filtered, dropped_by_submodule) =
+                            git_ops::drop_submodule_internal_paths(&worktree, filtered);
+                        for (submodule, dropped) in &dropped_by_submodule {
+                            tracing::debug!(
+                                workspace = %workspace_id.0,
+                                agent = %agent.as_str(),
+                                submodule = %submodule,
+                                dropped,
+                                "agentCommit: dropped submodule-internal paths from \
+                                 attribution-filtered commit set"
                             );
                         }
+                        if filtered.is_empty() && !changed.is_empty() {
+                            // Diagnosable skip (monorepo#939 trade-off): agent
+                            // work not visible to the attribution pipeline (e.g.
+                            // terminal/shell edits) is no longer swept — surface
+                            // it at debug so lost auto-commits can be traced
+                            // without re-firing a warn on every idle while the
+                            // worktree stays dirty.
+                            tracing::debug!(
+                                workspace = %workspace_id.0,
+                                agent = %agent.as_str(),
+                                dirty = changed.len(),
+                                "agentCommit: worktree is dirty but no changes are \
+                                 attributed to this agent; nothing will be committed"
+                            );
+                        }
+                        (filtered, true, true)
+                    }
+                };
+                // An explicitly requested staged-only merge can record ancestry
+                // without changing HEAD's tree. Let the full-index commit path
+                // preserve its parents and attribution; empty automatic commits
+                // and ordinary empty checkpoints remain rejected.
+                if to_commit.is_empty()
+                    && !(user_requested
+                        && !needs_stage
+                        && intent_git::commit::has_pending_merge(&worktree)?)
+                {
+                    return Err(Error::Internal(if user_requested {
+                        "No staged changes found to commit".to_string()
+                    } else {
+                        "No uncommitted changes found for this agent".to_string()
+                    }));
+                }
+                // With an explicit commit set (named `files` or the attribution
+                // filter), commit exactly those paths (`git commit -- <paths>`
+                // semantics) so paths another actor pre-staged are never swept
+                // into this commit. The `userRequested` staged-only checkpoint
+                // commits the index as-is.
+                let outcome = if needs_stage {
+                    match intent_git::commit::commit_paths_with_trailers(
+                        &worktree,
+                        &message,
+                        agent_id.as_ref().map(AgentId::as_str),
+                        linked_note_id.as_ref().map(NoteId::as_str),
+                        &to_commit,
+                    ) {
+                        Ok(o) => o,
+                        Err(e) => {
+                            // Remediation hint (monorepo#2053): a primary-target
+                            // commit whose explicit `files` match nothing, where
+                            // the paths exist under a registered secondary root,
+                            // was almost certainly aimed at that root — name it
+                            // and suggest `gitRootId` instead of a bare pathspec
+                            // error.
+                            if git_root_id.is_none()
+                                && explicit_files
+                                && format!("{e}").contains("did not match any files")
+                            {
+                                if let Some(root) = this
+                                    .find_git_root_containing(&workspace_id, &to_commit)
+                                    .await
+                                {
+                                    return Err(Error::Internal(format!(
+                                        "{e}. The files exist under the registered git root \
+                                     {path} (id: {id}) — pass gitRootId to commit there.",
+                                        path = root.path,
+                                        id = root.id
+                                    )));
+                                }
+                            }
+                            return Err(e);
+                        }
+                    }
+                } else {
+                    intent_git::commit::commit_with_trailers(
+                        &worktree,
+                        &message,
+                        agent_id.as_ref().map(AgentId::as_str),
+                        linked_note_id.as_ref().map(NoteId::as_str),
+                    )?
+                };
+                #[cfg(test)]
+                this.hold_periodic_commit("git").await;
+                // Staged content became a commit → the cached scan still lists it
+                // as pending (monorepo#1648).
+                this.git_status_cache.invalidate(&worktree);
+                if attribution_filtered {
+                    // Mirror `ac_commit`: move the committed paths' attribution
+                    // rows (staged/unstaged → committed) so the audit trail stays
+                    // consistent with the git stage. Best-effort, but loud — a
+                    // stuck row makes the next filtered commit resurrect the path.
+                    for path in &outcome.files {
+                        let key = crate::file_tracking::normalize_path(path);
+                        for from in ["staged", "unstaged"] {
+                            if let Err(e) = store
+                                .set_tracked_change_stage(&workspace_id, &key, from, "committed")
+                                .await
+                            {
+                                tracing::warn!(
+                                    path = %key,
+                                    error = %e,
+                                    "agentCommit: failed to advance attribution row to committed"
+                                );
+                            }
+                        }
                     }
                 }
-            }
-            // Report the commit's actual delta (`outcome.files`), not the
-            // requested set — with a pathspec-limited commit they match, and
-            // for an explicit `files` list the delta is the truth (a named
-            // but unchanged path is not part of the commit).
-            let file_count = i64::try_from(outcome.files.len()).expect("value fits in i64");
-            // `git:commit` mirrors the reserved `GitOperationEvent` FE shape;
-            // `changes:git-status` feeds the FE bridge's `git:status-changed`
-            // relay so the UI refreshes without a follow-up `git.status` read.
-            // Both carry an additive `gitRootId` for root-targeted commits
-            // (and the status payload is read from the target root).
-            publish_event(
-                bus.as_ref(),
-                tag_git_root_id(
-                    git_commit_event(&ws.id, &outcome.hash, &message, &outcome.files),
-                    git_root_id.as_ref(),
-                ),
-            )
-            .await;
-            let status = intent_git::status::status(&worktree)
-                .unwrap_or_else(|_| intent_git::status::empty_status());
-            let status_json = serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
-            publish_event(
-                bus.as_ref(),
-                tag_git_root_id(
-                    changes_git_status_event(&ws.id, &status_json),
-                    git_root_id.as_ref(),
-                ),
-            )
-            .await;
-            Ok(intent_core::GitAgentCommitResult {
-                hash: outcome.hash,
-                files: outcome.files,
-                file_count,
-            })
+                // Report the commit's actual delta (`outcome.files`), not the
+                // requested set — with a pathspec-limited commit they match, and
+                // for an explicit `files` list the delta is the truth (a named
+                // but unchanged path is not part of the commit).
+                let file_count = i64::try_from(outcome.files.len()).expect("value fits in i64");
+                // `git:commit` mirrors the reserved `GitOperationEvent` FE shape;
+                // `changes:git-status` feeds the FE bridge's `git:status-changed`
+                // relay so the UI refreshes without a follow-up `git.status` read.
+                // Both carry an additive `gitRootId` for root-targeted commits
+                // (and the status payload is read from the target root).
+                publish_event(
+                    bus.as_ref(),
+                    tag_git_root_id(
+                        git_commit_event(&ws.id, &outcome.hash, &message, &outcome.files),
+                        git_root_id.as_ref(),
+                    ),
+                )
+                .await;
+                let status = intent_git::status::status(&worktree)
+                    .unwrap_or_else(|_| intent_git::status::empty_status());
+                let status_json = serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
+                publish_event(
+                    bus.as_ref(),
+                    tag_git_root_id(
+                        changes_git_status_event(&ws.id, &status_json),
+                        git_root_id.as_ref(),
+                    ),
+                )
+                .await;
+                Ok(intent_core::GitAgentCommitResult {
+                    hash: outcome.hash,
+                    files: outcome.files,
+                    file_count,
+                })
+            };
+            let owner = tasks
+                .spawn_draining(async move {
+                    // Preserve the legacy optional-agent gate above, including
+                    // its unbound no-agent path. A fresh child also preserves
+                    // an absent caller instead of inheriting the drain owner's
+                    // daemon identity.
+                    let request = async move {
+                        let operation = intent_core::caller::with_wire_credential(wire, operation);
+                        match caller {
+                            Some(caller) => intent_core::with_caller(caller, operation).await,
+                            None => operation.await,
+                        }
+                    };
+                    let worker = tokio::spawn(request); // caller-binding: allow — preserves the captured optional caller, including absence.
+                    worker.await.map_err(|error| {
+                        Error::Internal(format!("Git commit worker failed: {error}"))
+                    })?
+                })
+                .ok_or_else(|| Error::Internal("Git commit writers are shutting down".into()))?;
+            owner
+                .await
+                .map_err(|error| Error::Internal(format!("Git commit worker failed: {error}")))?
         })
     }
 
@@ -32031,6 +31944,9 @@ impl WorkspaceApi for Services {
             // cancelAuth / revoke / authStatus stay responsive meanwhile.
             {
                 let mut slot = state.lock().await;
+                if self.settings_tasks.is_closed() || self.store_tasks.is_closed() {
+                    return Err(Error::Internal("daemon is shutting down".into()));
+                }
                 // A connect while a flow is live returns the SAME codes — no
                 // restart, no second poll task.
                 if let Some(s) = slot.as_ref() {
@@ -32050,6 +31966,14 @@ impl WorkspaceApi for Services {
             .await
             .map_err(pr_ops::map_sc_err)?;
             let mut slot = state.lock().await;
+            // Root admission stops before finite child tails drain. Keep this
+            // check, registration and publication under the same flow lock
+            // that shutdown takes when cancelling the resident generation.
+            // There is no await between them: an accepted poll is visible to
+            // that cancellation, while a response arriving later is refused.
+            if self.settings_tasks.is_closed() {
+                return Err(Error::Internal("daemon is shutting down".into()));
+            }
             // A concurrent connect raced us while the lock was released: keep
             // the resident live flow (single-flow invariant) and drop ours —
             // its handle never spawned a poll task, so nothing leaks.
@@ -32059,7 +31983,8 @@ impl WorkspaceApi for Services {
                 }
             }
             let flow_id = github_auth_ops::next_flow_id();
-            let owner = github_auth_ops::CredentialOwner::new(secrets);
+            let owner =
+                github_auth_ops::CredentialOwner::new(&secrets, self.settings_tasks.clone());
             let flow = flow.with_identity_guard(
                 api_base.as_deref(),
                 owner.identity_guard(identity_guard, state.clone(), flow_id),
@@ -32069,15 +31994,18 @@ impl WorkspaceApi for Services {
             // gh CLI sync only makes sense against the production login host
             // (see `github_auth_ops::is_production_login_host`).
             let sync_gh = github_auth_ops::is_production_login_host(&base_uri);
-            intent_core::spawn_daemon(github_auth_ops::run_poll_loop(
-                state.clone(),
-                bus,
-                owner,
-                flow_id,
-                flow,
-                deadline,
-                sync_gh,
-            ));
+            let _poll = self
+                .store_tasks
+                .spawn_draining(github_auth_ops::run_poll_loop(
+                    state.clone(),
+                    bus,
+                    owner,
+                    flow_id,
+                    flow,
+                    deadline,
+                    sync_gh,
+                ))
+                .ok_or_else(|| Error::Internal("daemon is shutting down".into()))?;
             let new_slot = github_auth_ops::FlowSlot {
                 flow_id,
                 user_code: auth.user_code,
@@ -32125,66 +32053,10 @@ impl WorkspaceApi for Services {
     }
 
     fn github_revoke(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
-        // Delete the stored `sourceControl.github.token` (device-flow slot of
-        // the resolution chain) and orphan any in-flight flow (its poll task
-        // exits cooperatively and reconciles a raced authorize by deleting
-        // the just-persisted token). Env / `gh` CLI fallbacks are untouched —
-        // authStatus reflects them on next probe. When gh's active login IS
-        // the token being revoked (the login the authorize-side sync
-        // created), gh is best-effort logged out too — same production-host
-        // gate as the login sync, so mock-host tests never touch a real `gh`.
-        let state = self.github_auth_flow.clone();
-        let secrets = self.secrets.clone();
-        let bus = self.event_bus.clone();
-        let logout_gh = github_auth_ops::is_production_login_host(
-            &github_auth_ops::resolve_login_base_uri(self.github_login_base_uri.as_deref()),
-        );
         Box::pin(async move {
             Self::require_administrator("github.revoke")?;
-            // Per-credential ownership never spans unrelated settings I/O.
-            // Advance before mutation: even a partial failed revoke must not
-            // let an older batch or device completion resurrect credentials.
-            let mut credential = secrets.github_mutation().await?;
-            *credential += 1;
-            // Capture the stored token BEFORE it is deleted so the detached
-            // logout can match it against gh's active login. Fail-soft: a
-            // load failure only skips the logout, never the revoke. 🔒 The
-            // token stays in memory — never logged or embedded in errors.
-            let revoked_token = if logout_gh {
-                secrets
-                    .load(github_auth_ops::SECRET_ACCOUNT)
-                    .await
-                    .unwrap_or_else(|e| {
-                        tracing::debug!(
-                            error = %e,
-                            "could not read stored github token before revoke; \
-                             skipping gh CLI logout"
-                        );
-                        None
-                    })
-            } else {
-                None
-            };
-            {
-                let mut slot = state.lock().await;
-                *slot = None;
-            }
-            github_auth_ops::delete_stored_token(&secrets).await?;
-            source_control_auth_ops::publish_auth_changed(
-                bus.as_ref(),
-                source_control_auth_ops::Provider::Github,
-                source_control_auth_ops::GITHUB_HOST,
-                "revoked",
-            )
-            .await;
-            if logout_gh {
-                // Detached + fail-soft (same pattern as the login sync): a
-                // logout failure can never fail or delay the revoke.
-                intent_core::spawn_daemon(intent_sourcecontrol::gh_sync::logout_gh_after_revoke(
-                    revoked_token,
-                ));
-            }
-            Ok(serde_json::json!({ "ok": true }))
+            self.owned_direct_secret_mutation(direct_secret_ops::Mutation::GithubRevoke)
+                .await
         })
     }
 
@@ -32447,15 +32319,7 @@ impl WorkspaceApi for Services {
                 }
                 source_control_auth_ops::Target::Gitlab { host, .. } => {
                     let client_id = self.gitlab_client_id(&host);
-                    let probe = source_control_auth_ops::probe_gitlab(
-                        &host,
-                        &|| self.gitlab_host_is_bound(&host),
-                        client_id.as_deref(),
-                        self.gitlab_secret_store.clone(),
-                        &self.gitlab_credential_gate,
-                        self.event_bus.as_ref(),
-                    )
-                    .await?;
+                    let probe = source_control_auth_ops::probe_gitlab(self, &host).await?;
                     let (is_configured, method, user) = match probe {
                         source_control_auth_ops::ProbeOutcome::Configured { user, method } => (
                             true,
@@ -32585,55 +32449,10 @@ impl WorkspaceApi for Services {
             match target {
                 source_control_auth_ops::Target::Github => self.github_revoke().await,
                 source_control_auth_ops::Target::Gitlab { host, .. } => {
-                    // Slot clear, binding read, credential read, delete and
-                    // event ride one hold of the gate: a device completion
-                    // in flight for another host cannot bind it and commit
-                    // between this call's checks, and subscribers observe
-                    // events in store order. The slot clear aborts a flow
-                    // for exactly this host (its poll task exits
-                    // cooperatively at its next tick).
-                    let _gate = self.gitlab_credential_gate.lock().await;
-                    {
-                        let mut guard = self.gitlab_auth.lock().await;
-                        if guard.flow.as_ref().is_some_and(|f| f.host == host.host()) {
-                            guard.flow = None;
-                        }
-                        if guard
-                            .starting
-                            .as_ref()
-                            .is_some_and(|s| s.host == host.host())
-                        {
-                            guard.starting = None;
-                        }
-                    }
-                    // Only the bound instance owns the stored token — read
-                    // NOW, under the gate, not at resolve time: revoking
-                    // another host is a successful no-op that never deletes
-                    // it and never emits `revoked` for it. With nothing
-                    // stored (never connected / already revoked) there is no
-                    // connection to end either: ok, no delete, no event.
-                    if self.gitlab_host_is_bound(&host) {
-                        let stored = intent_sourcecontrol::gitlab_auth::stored_credential(
-                            self.gitlab_secret_store.clone(),
-                        )
-                        .await
-                        .map_err(pr_ops::map_sc_err)?;
-                        if stored != intent_sourcecontrol::StoredCredential::None {
-                            intent_sourcecontrol::gitlab_auth::revoke_gitlab_token(
-                                self.gitlab_secret_store.clone(),
-                            )
-                            .await
-                            .map_err(pr_ops::map_sc_err)?;
-                            source_control_auth_ops::publish_auth_changed(
-                                self.event_bus.as_ref(),
-                                source_control_auth_ops::Provider::Gitlab,
-                                host.host(),
-                                "revoked",
-                            )
-                            .await;
-                        }
-                    }
-                    Ok(serde_json::json!({ "ok": true }))
+                    self.owned_direct_secret_mutation(direct_secret_ops::Mutation::GitlabRevoke(
+                        host,
+                    ))
+                    .await
                 }
             }
         })
@@ -32679,16 +32498,7 @@ impl WorkspaceApi for Services {
                     }
                 }
                 source_control_auth_ops::Target::Gitlab { host, .. } => {
-                    let client_id = self.gitlab_client_id(&host);
-                    let probe = source_control_auth_ops::probe_gitlab(
-                        &host,
-                        &|| self.gitlab_host_is_bound(&host),
-                        client_id.as_deref(),
-                        self.gitlab_secret_store.clone(),
-                        &self.gitlab_credential_gate,
-                        self.event_bus.as_ref(),
-                    )
-                    .await?;
+                    let probe = source_control_auth_ops::probe_gitlab(self, &host).await?;
                     match probe {
                         source_control_auth_ops::ProbeOutcome::Configured { user, .. } => {
                             Ok(serde_json::json!({
@@ -34127,7 +33937,9 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.require_host_execution("host.exec").await?;
-            host_exec::run_for_workspace(self, workspace_id, params).await
+            self.host_exec_runtime
+                .run_for_workspace(self, workspace_id, params)
+                .await
         })
     }
 
@@ -37204,5 +37016,465 @@ pub(crate) mod setup_runner {
             assert_eq!(find_sh_in_path("/nonexistent;/also-missing", ';'), None);
             std::fs::remove_dir_all(&dir).ok();
         }
+    }
+}
+
+impl Services {
+    async fn settings_update_owned(
+        &self,
+        changes: serde_json::Value,
+        is_tcp: bool,
+    ) -> Result<serde_json::Value> {
+        /// Which store a captured old value belongs to, so the rollback
+        /// path restores it through the same seam that persisted it.
+        enum OldStore {
+            Db,
+            Registry,
+        }
+        Self::require_administrator("settings.update")?;
+        // A GitLab credential write is serialized with the credential
+        // mutations that run under the credential gate (auth-status
+        // probe refresh, identity-proof refresh, device completion): an
+        // in-flight refresh must not re-store the old device grant after
+        // the PAT and its sibling cleanup landed. Lock order is
+        // credential gate → revision gate: the credential gate is taken
+        // BEFORE the revision gate so a slow gate holder (a secret-store
+        // read under the gate has no timeout) only delays GitLab token
+        // batches, never every settings.get / getAll / update / reset.
+        // Other credential operations do not take the revision gate. The
+        // default-model injection below never adds a credential path, so
+        // inspecting the caller's batch here is sufficient.
+        let has_secrets = changes.as_array().into_iter().flatten().any(|entry| {
+            entry
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|path| {
+                    settings::find_definition(path).is_some_and(|def| def.sensitive)
+                })
+        });
+        let mut revision_guard = Some(self.settings_revision_gate.write().await);
+        let caller_changes = changes.clone();
+        // A default-provider switch re-resolves `model.default` for the
+        // new provider (monorepo#3177). Appended BEFORE the old-value
+        // snapshot below so a hook-failure rollback also restores the
+        // injected key.
+        let mut changes = changes;
+        self.reresolve_default_model_on_provider_switch(&mut changes);
+        // Pre-flight self-termination guard: enabling server.tunnel.only
+        // from a direct TCP (WSS) connection would rebind the listener to
+        // loopback and drop the caller's own connection. Reject before
+        // anything persists so no rollback (and no listener restart that
+        // would sever the caller) is ever needed; the in-hook guard
+        // remains as a backstop for other invocation paths.
+        if let (Some(_control), Some(entries)) = (self.server_control.get(), changes.as_array()) {
+            if is_tcp
+                && entries.iter().any(|e| {
+                    e.get("path").and_then(|v| v.as_str()) == Some("server.tunnel.only")
+                        && e.get("value").and_then(serde_json::Value::as_bool) == Some(true)
+                })
+            {
+                return Err(Error::InvalidParams(
+                    "cannot enable server.tunnel.only from a TCP connection \
+                         (loopback rebind would self-terminate)"
+                        .to_string(),
+                ));
+            }
+        }
+        // Reject malformed/pinned mixed batches before any secret write.
+        self.settings_service().validate_update(&changes)?;
+        let secrets = if has_secrets {
+            drop(revision_guard.take());
+            let secrets = self.settings_service().update_secrets(&changes).await?;
+            revision_guard = Some(self.settings_revision_gate.write().await);
+            secrets
+        } else {
+            settings::SecretSettingsUpdate::default()
+        };
+        // Another writer or file reload may have committed during secret
+        // I/O. Re-resolve against that snapshot and capture ordinary priors
+        // only now, so failure compensation cannot erase its commit.
+        let mut changes = caller_changes;
+        self.reresolve_default_model_on_provider_switch(&mut changes);
+        let mut secrets_compensated = false;
+        let result = async {
+                // Capture ordinary priors for hook-failure compensation. Secret
+                // priors were captured under their account guards before I/O;
+                // ordinary priors must reflect commits made while it was in flight.
+                // Fail closed on snapshot reads and compensate the staged secrets.
+                let registry = self.settings_registry.as_deref();
+                let old_values = if let Some(entries) = changes.as_array() {
+                    let mut old = Vec::new();
+                    for entry in entries {
+                        if let Some(path) = entry.get("path").and_then(|v| v.as_str()) {
+                            // Look up the definition to check if this setting is sensitive
+                            if let Some(_def) = crate::settings::find_definition(path).filter(|def| !def.sensitive) {
+                                if let Some(reg) =
+                                    registry.filter(|_| KNOWN_PATHS.contains(&path))
+                                {
+                                    // TOML-backed setting: capture the file-layer
+                                    // value from the registry snapshot. Origin
+                                    // `file` → present (restore that value);
+                                    // `default` → absent (rollback removes the
+                                    // key). A pinned key rejects the apply, so it
+                                    // never needs a rollback.
+                                    let snap = reg.snapshot();
+                                    let raw = match snap.origin(path) {
+                                        Some(SettingOrigin::File) => {
+                                            snap.get(path).map(|v| v.to_string())
+                                        }
+                                        _ => None,
+                                    };
+                                    old.push((path.to_string(), raw, OldStore::Registry));
+                                } else {
+                                    // Non-sensitive setting: capture from DB
+                                    match self.store.get_setting(path).await {
+                                        Ok(Some(raw)) => {
+                                            old.push((path.to_string(), Some(raw), OldStore::Db));
+                                        }
+                                        Ok(None) => {
+                                            // Confirmed absent; mark for deletion on rollback.
+                                            old.push((path.to_string(), None, OldStore::Db));
+                                        }
+                                        Err(e) => {
+                                            return Err(Error::Internal(format!(
+                                                "settings.update: failed to read setting {path} during snapshot capture: {e}"
+                                            )));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    old
+                } else {
+                    Vec::new()
+                };
+
+                let port_was_unassigned_before_update = registry.is_some_and(|reg| reg.snapshot().ws_api_port_policy() == WsApiPortPolicy::Unassigned);
+                let mut applied = secrets.merge_applied(self.settings_service().update_non_secrets(&changes).await?);
+                let port_was_unassigned = registry.is_some_and(|reg| reg.snapshot().ws_api_port_policy() == WsApiPortPolicy::Unassigned);
+                if !applied.is_empty() {
+                    // Apply server runtime hooks (§5.12): start/stop the WSS listener
+                    // when server.wsApi.enabled changes, restart it when
+                    // server.wsApi.port changes while running.
+                    if let Some(control) = self.server_control.get() {
+                        // Remember whether the listener/tunnel were up before the
+                        // hooks so a failed batch (e.g. a restart-on-new-value hook
+                        // that stopped one of them and then failed to start it) can
+                        // put them back up after the persistence rollback.
+                        let mut listener_was_running = control.ws_listener_port().await.is_some();
+                        let mut tunnel_was_running = control.tunnel_address().await.is_some();
+                        if let Err(e) = self.apply_server_setting_hooks(&applied, control, is_tcp).await {
+                            // Rollback: restore old values for ALL settings in the batch.
+                            // Log rollback failures but don't let them mask the original hook error.
+                            // Registry-backed restores are collected and applied as ONE batch
+                            // (a single config.toml rewrite + one change publication) instead of
+                            // per-key applies.
+                            let mut rollback_failed = false;
+                            let mut port_needs_publication = port_was_unassigned_before_update;
+                            let mut compensating_changes = Vec::new();
+                            let mut registry_restores: Vec<(String, serde_json::Value)> = Vec::new();
+                            for (path, old_val, old_store) in old_values {
+                                let rollback_result = match old_store {
+                                    OldStore::Registry => {
+                                        // TOML-backed setting: restore the prior file
+                                        // value (or remove the key when it was absent);
+                                        // `Null` clears back to the schema default.
+                                        // Deferred into one registry batch below.
+                                        let value = old_val
+                                            .as_deref()
+                                            .and_then(|raw| serde_json::from_str(raw).ok())
+                                            .unwrap_or(serde_json::Value::Null);
+                                        registry_restores.push((path.clone(), value));
+                                        Ok(())
+                                    }
+                                    OldStore::Db => {
+                                        // Non-sensitive setting: restore to DB or delete
+                                        if let Some(val) = &old_val {
+                                            self.store.set_setting(&path, val).await
+                                        } else {
+                                            self.store.delete_setting(&path).await.map(|_| ())
+                                        }
+                                    }
+                                };
+                                if let Err(rollback_err) = rollback_result {
+                                    tracing::error!(
+                                        path = %path,
+                                        error = %rollback_err,
+                                        "settings.update rollback failed for key"
+                                    );
+                                    rollback_failed = true;
+                                } else {
+                                    // Build a change record for compensating hook application.
+                                    // For settings with a prior persisted value, use that value.
+                                    // For unset settings (old_val == None), use the schema default
+                                    // so the compensating hook can restore runtime state (e.g., if
+                                    // server.wsApi.enabled was unset/defaulting to false, and the
+                                    // batch temporarily enabled it before failing, compensating hook
+                                    // with default=false will stop the listener).
+                                    let val_json = if let Some(val) = old_val {
+                                        serde_json::from_str(&val).unwrap_or(serde_json::Value::Null)
+                                    } else if let Some(def) = crate::settings::find_definition(&path) {
+                                        def.default_value.unwrap_or(serde_json::Value::Null)
+                                    } else {
+                                        serde_json::Value::Null
+                                    };
+                                    compensating_changes.push(serde_json::json!({
+                                        "path": path,
+                                        "value": val_json
+                                    }));
+                                }
+                            }
+
+                            // Restore all TOML-backed keys as one atomic registry batch
+                            // (single config.toml rewrite, single change publication).
+                            if !registry_restores.is_empty() {
+                                if let Some(reg) = registry {
+                                    if let Err(rollback_err) = reg.apply(&registry_restores) {
+                                        tracing::error!(
+                                            error = %rollback_err,
+                                            "settings.update registry rollback batch failed"
+                                        );
+                                        rollback_failed = true;
+                                    }
+                                }
+                            }
+
+                            // Restore credentials before compensating runtime hooks, as in
+                            // the original ordering. A GitHub revoke/device completion during
+                            // those hooks must not be overwritten by a later secret restore.
+                            if has_secrets {
+                                // Readers/writers may enter while secret rollback is
+                                // pending. Commit the surviving assignment's revision
+                                // before releasing the gate, never exposing new values
+                                // under the previous revision.
+                                self.publish_ws_port_assignment(port_needs_publication).await;
+                                let runtime_before = self.settings_service().server_values().await;
+                                drop(revision_guard.take());
+                                rollback_failed |= secrets.rollback(&self.secrets).await;
+                                secrets_compensated = true;
+                                revision_guard = Some(self.settings_revision_gate.write().await);
+                                // A newer transaction may already have published its
+                                // own port. Only a subsequent compensating assignment
+                                // can now belong to this recovery.
+                                port_needs_publication = registry.is_some_and(|reg| reg.snapshot().ws_api_port_policy() == WsApiPortPolicy::Unassigned);
+                                let runtime_after = self.settings_service().server_values().await;
+                                match (runtime_before, runtime_after) {
+                                    (Ok(before), Ok(after)) => {
+                                        // Ordinary rollback finished before the gate was released.
+                                        // Another writer may since have committed a server value;
+                                        // its runtime hook takes precedence over this old recovery.
+                                        compensating_changes.retain(|change| {
+                                            let path = change["path"].as_str().unwrap_or("");
+                                            !path.starts_with("server.")
+                                                || before.get(path) == after.get(path)
+                                        });
+                                        if before.get("server.wsApi.enabled") != after.get("server.wsApi.enabled") {
+                                            listener_was_running = after.get("server.wsApi.enabled")
+                                                .and_then(serde_json::Value::as_bool).unwrap_or(false);
+                                        }
+                                        if before.get("server.tunnel.enabled") != after.get("server.tunnel.enabled") {
+                                            tunnel_was_running = after.get("server.tunnel.enabled")
+                                                .and_then(serde_json::Value::as_bool).unwrap_or(false);
+                                        }
+                                    }
+                                    (Err(error), _) | (_, Err(error)) => {
+                                        tracing::error!(%error, "settings.update could not verify runtime settings during rollback");
+                                        rollback_failed = true;
+                                        compensating_changes.clear();
+                                        listener_was_running = false;
+                                        tunnel_was_running = false;
+                                    }
+                                }
+                            }
+
+                            // Apply compensating hooks: re-apply the prior values through the same
+                            // hook path to restore runtime state (e.g., stop a listener that was
+                            // started before a later hook in the batch failed). This reuses the
+                            // deterministic priority-sorted dispatch from apply_server_setting_hooks.
+                            if !compensating_changes.is_empty() {
+                                if let Err(compensating_err) = self
+                                    .apply_server_setting_hooks(&compensating_changes, control, is_tcp)
+                                    .await
+                                {
+                                    tracing::error!(
+                                        error = ?compensating_err,
+                                        "settings.update compensating hook application failed during rollback"
+                                    );
+                                    // Log but don't fail — the persistence rollback succeeded
+                                }
+                            }
+
+                            // A restart-on-new-value hook (port / bindAddress) stops the
+                            // listener before starting it, so a start failure leaves it
+                            // down even though the compensating hooks saw nothing to
+                            // restart. The persisted values are rolled back by now and
+                            // start re-reads them, so bring the listener back up if it
+                            // was running when the batch began.
+                            if listener_was_running && control.ws_listener_port().await.is_none() {
+                                match control.start_ws_listener().await {
+                                    Ok(port) => tracing::info!(
+                                        port,
+                                        "settings.update rollback: restarted WSS listener on prior settings"
+                                    ),
+                                    Err(restart_err) => tracing::error!(
+                                        error = ?restart_err,
+                                        "settings.update rollback: failed to restart WSS listener on prior settings"
+                                    ),
+                                }
+                            }
+
+                            // Same for the tunnel: a restart-on-new-value hook
+                            // (derpUrl / port) stops the sidecar before starting
+                            // it, so a start failure (e.g. a bad new DERP URL)
+                            // leaves it down. The persisted values are rolled back
+                            // by now and start re-reads them, so bring the sidecar
+                            // back up if it was running when the batch began.
+                            if tunnel_was_running && control.tunnel_address().await.is_none() {
+                                match control.start_tunnel().await {
+                                    Ok(address) => tracing::info!(
+                                        address = %address,
+                                        "settings.update rollback: restarted tailcat tunnel on prior settings"
+                                    ),
+                                    Err(restart_err) => tracing::error!(
+                                        error = ?restart_err,
+                                        "settings.update rollback: failed to restart tailcat tunnel on prior settings"
+                                    ),
+                                }
+                            }
+
+                            // A successful listener assignment is durable even if a later
+                            // hook fails (for example tunnel startup). Publish only that
+                            // surviving change after compensation, at its own revision.
+                            self.publish_ws_port_assignment(port_needs_publication).await;
+
+                            // Return an error that indicates incomplete rollback if any writes failed
+                            if rollback_failed {
+                                return Err(Error::Internal(format!(
+                                    "settings.update hook failed ({e}), and rollback was incomplete (see logs)"
+                                )));
+                            }
+                            // Return the hook error to the caller
+                            return Err(e);
+                        }
+                    }
+                    self.include_ws_port_assignment(port_was_unassigned, &mut applied);
+                    let revision = self.settings_revision.fetch_add(1, Ordering::SeqCst) + 1;
+                    publish_event(
+                        self.event_bus.as_ref(),
+                        settings_changed_event(&applied, revision),
+                    )
+                    .await;
+                    self.on_settings_applied(&applied);
+                    return Ok(serde_json::json!({ "applied": applied, "revision": revision }));
+                }
+                Ok(serde_json::json!({
+                    "applied": applied,
+                    "revision": self.settings_revision.load(Ordering::SeqCst),
+                }))
+            }.await;
+        // Validation/persistence failures have no runtime hooks to recover.
+        // Compensate their staged secrets without the revision gate too;
+        // a hook failure already restored them before runtime recovery.
+        drop(revision_guard);
+        if let Err(error) = result {
+            if !secrets_compensated && secrets.rollback(&self.secrets).await {
+                return Err(Error::Internal(format!(
+                        "settings.update failed ({error}), and secret rollback was incomplete (see logs)"
+                    )));
+            }
+            return Err(error);
+        }
+        result
+    }
+
+    async fn settings_reset_owned(&self, path: String) -> Result<serde_json::Value> {
+        Self::require_administrator("settings.reset")?;
+        // Same serialization and lock order as `settings.update`
+        // (credential gate → revision gate): a GitLab credential reset
+        // must not race an in-flight refresh under the gate, and waiting
+        // on that gate must not hold up unrelated settings traffic.
+        let sensitive = settings::find_definition(&path).is_some_and(|def| def.sensitive);
+        let mut revision_guard = if sensitive {
+            None
+        } else {
+            Some(self.settings_revision_gate.write().await)
+        };
+        let (result, changed) = self.settings_service().reset_with_change(&path).await?;
+        if revision_guard.is_none() {
+            revision_guard = Some(self.settings_revision_gate.write().await);
+        }
+        let _revision_guard = revision_guard;
+        let revision = if changed {
+            let revision = self.settings_revision.fetch_add(1, Ordering::SeqCst) + 1;
+            publish_event(
+                self.event_bus.as_ref(),
+                settings_changed_event(std::slice::from_ref(&result), revision),
+            )
+            .await;
+            self.on_settings_applied(std::slice::from_ref(&result));
+            revision
+        } else {
+            self.settings_revision.load(Ordering::SeqCst)
+        };
+        let mut result = result;
+        result["revision"] = serde_json::json!(revision);
+        Ok(result)
+    }
+
+    async fn owned_settings_mutation(
+        &self,
+        changes: serde_json::Value,
+        reset: Option<String>,
+    ) -> Result<serde_json::Value> {
+        Self::require_administrator(if reset.is_some() {
+            "settings.reset"
+        } else {
+            "settings.update"
+        })?;
+        let caller = intent_core::current_caller()
+            .ok_or_else(|| Error::Internal("settings caller missing".into()))?;
+        let credential = intent_core::caller::current_wire_credential();
+        let is_tcp = self
+            .server_control
+            .get()
+            .is_none_or(|control| control.is_tcp_connection());
+        let mut operation = self.clone();
+        operation.secrets = Arc::new(self.secrets.operation());
+        let (response, receiver) = tokio::sync::oneshot::channel();
+        if self.settings_tasks.spawn_draining(async move {
+            operation.primary_auth_admitted = true;
+            let primary = reset.as_deref().is_some_and(|path| path == intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT)
+                || Self::batch_touches_gitlab_credential(&changes);
+            let _credential_guard = if primary {
+                Some(operation.gitlab_credential_gate.clone().lock_owned().await)
+            } else { None };
+            let paths: Vec<&str> = match &reset {
+                Some(path) => vec![path.as_str()],
+                None => changes.as_array().into_iter().flatten().filter_map(|entry| entry.get("path").and_then(serde_json::Value::as_str)).collect(),
+            };
+            let _account_guards = operation.settings_secret_gates.write(&paths).await;
+            // The supervisor, not the fallible algorithm, owns these guards.
+            // A panic becomes an unknown failure, then actual writes still
+            // settle before another same-account operation can proceed.
+            let worker = operation.clone();
+            let result = intent_core::spawn_daemon(intent_core::with_caller(caller,
+                intent_core::caller::with_wire_credential(credential, async move {
+                    match reset {
+                        Some(path) => worker.settings_reset_owned(path).await,
+                        None => worker.settings_update_owned(changes, is_tcp).await,
+                    }
+                })
+            )).await.unwrap_or_else(|error| Err(Error::Internal(format!("settings operation failed: {error}; state may be unknown — reconcile before retrying"))));
+            let _ = response.send(result);
+            // Caller caps and unknown-state response are preserved. This tail
+            // never resumes skipped work or blindly restores after that error.
+            operation.secrets.finish_operation().await;
+        }).is_none() {
+            return Err(Error::Internal("daemon is shutting down".into()));
+        }
+        receiver.await.map_err(|_| {
+            Error::Internal("settings completion owner failed; state may be unknown".into())
+        })?
     }
 }

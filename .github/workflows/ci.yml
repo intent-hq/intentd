@@ -1641,7 +1641,7 @@ jobs:
           rustup toolchain install "$channel" --profile minimal --no-self-update
           echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
       - name: Install release cache regression wrapper
-        uses: mozilla-actions/sccache-action@d651010b8da762cde178750d8eda7b5febfe147a # v0.0.9
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
         with:
           version: v0.17.0
           disable_annotations: 'true'
@@ -1738,7 +1738,7 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
       - name: Install the exact production adapter pin
@@ -1769,7 +1769,7 @@ jobs:
           PI_CLI_TEST_ENTRY: ${{ github.workspace }}/.pi-runtime-test/node_modules/@earendil-works/pi-coding-agent/dist/cli.js
           PI_ACP_EVIDENCE_DIR: ${{ github.workspace }}/pi-path-evidence
         run: node --test --test-reporter=tap crates/intentd/tests/fixtures/pi-runtime-compat.test.mjs | tee pi-path-evidence/runtime.tap
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: pi-session-pinned-${{ matrix.os }}-node${{ matrix.node }}

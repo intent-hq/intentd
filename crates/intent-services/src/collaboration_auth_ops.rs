@@ -33,8 +33,43 @@ pub(crate) type AuthState = Arc<Mutex<HashMap<String, Arc<Credential>>>>;
 
 pub(crate) struct Credential {
     store: FileSecretStore,
+    secrets: Arc<crate::settings::AsyncSecretStore>,
     gate: Arc<Mutex<()>>,
     state: Mutex<State>,
+    #[cfg(test)]
+    sleep_pending: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    #[cfg(test)]
+    commit_test_lease: std::sync::Mutex<Option<PersistenceLease>>,
+}
+
+enum CredentialRequest {
+    Status {
+        only_user: bool,
+    },
+    Select {
+        external_id: String,
+    },
+    ProofCreate {
+        nonce: String,
+        label: String,
+        expected: PrincipalIdentity,
+    },
+    ProofDelete {
+        proof_id: String,
+    },
+}
+
+struct CredentialOperation<'a> {
+    entry: &'a Credential,
+    target: &'a Target,
+    lease: PersistenceLease,
+    secrets: &'a crate::settings::AsyncSecretStore,
+    generation: u64,
+}
+
+enum CredentialReply {
+    Value(Value),
+    Proof(ProofProvider, CreatedProof),
 }
 
 #[derive(Default)]
@@ -179,32 +214,25 @@ fn account(store: &FileSecretStore) -> Result<Option<Account>> {
 }
 
 async fn save_account(
-    entry: &Credential,
-    lease: PersistenceLease,
+    secrets: &crate::settings::AsyncSecretStore,
     account: &Account,
 ) -> Result<()> {
     let data = serde_json::to_string(account).map_err(|e| Error::Internal(e.to_string()))?;
-    io(&entry.store, lease, move |store| {
-        store.store(ACCOUNT, &data)
-    })
-    .await
+    secrets.store(ACCOUNT, &data).await
 }
 
-async fn clear(entry: &Credential, lease: PersistenceLease, target: &Target) -> Result<bool> {
+async fn clear(secrets: &crate::settings::AsyncSecretStore, target: &Target) -> Result<bool> {
     let token_key = target.token_account();
-    io(&entry.store, lease, move |store| {
-        let present = store.load(token_key)?.is_some();
-        for key in [
-            token_key,
-            ACCOUNT,
-            intent_sourcecontrol::gitlab_token::REFRESH_SECRET_ACCOUNT,
-            intent_sourcecontrol::gitlab_token::EXPIRES_AT_SECRET_ACCOUNT,
-        ] {
-            store.delete(key)?;
-        }
-        Ok(present)
-    })
-    .await
+    let present = secrets.load_fresh(token_key).await?.is_some();
+    for key in [
+        token_key,
+        ACCOUNT,
+        intent_sourcecontrol::gitlab_token::REFRESH_SECRET_ACCOUNT,
+        intent_sourcecontrol::gitlab_token::EXPIRES_AT_SECRET_ACCOUNT,
+    ] {
+        secrets.delete(key).await?;
+    }
+    Ok(present)
 }
 
 fn flow_response(state: &State) -> Value {
@@ -282,12 +310,20 @@ impl Services {
             .or_insert_with(|| {
                 let mut directory = self.gitlab_secret_store.path().as_os_str().to_os_string();
                 directory.push(".collaboration");
+                let store = FileSecretStore::with_path(
+                    std::path::PathBuf::from(directory).join(format!("{digest}.json")),
+                );
                 Arc::new(Credential {
-                    store: FileSecretStore::with_path(
-                        std::path::PathBuf::from(directory).join(format!("{digest}.json")),
-                    ),
+                    secrets: Arc::new(crate::settings::AsyncSecretStore::new(Arc::new(
+                        store.clone(),
+                    ))),
+                    store,
                     gate: Arc::new(Mutex::new(())),
                     state: Mutex::new(State::default()),
+                    #[cfg(test)]
+                    sleep_pending: std::sync::Mutex::new(None),
+                    #[cfg(test)]
+                    commit_test_lease: std::sync::Mutex::new(None),
                 })
             })
             .clone())
@@ -364,27 +400,23 @@ impl Services {
         lease: PersistenceLease,
         target: &Target,
         client_id: &str,
+        secrets: &crate::settings::AsyncSecretStore,
     ) -> Result<bool> {
         let Target::Gitlab { host } = target else {
             return Ok(false);
         };
-        match gitlab_auth::refresh_access_token_with_lease(
-            host,
-            client_id,
-            entry.store.clone(),
-            Some(lease.clone()),
-        )
-        .await
-        {
-            Ok(scopes) => {
+        match gitlab_auth::refresh_grant(host, client_id, entry.store.clone()).await {
+            Ok(grant) => {
+                let scopes = grant.granted_scopes().map(<[String]>::to_vec);
+                secrets.persist_gitlab_grant(grant, lease.clone()).await?;
                 if let Some(mut saved) = io(&entry.store, lease.clone(), |s| account(&s)).await? {
                     saved.scopes = scopes;
-                    save_account(entry, lease, &saved).await?;
+                    save_account(secrets, &saved).await?;
                 }
                 Ok(true)
             }
             Err(intent_sourcecontrol::Error::Auth(_)) => {
-                clear(entry, lease, target).await?;
+                clear(secrets, target).await?;
                 self.collaboration_event(target, "expired", None).await;
                 Ok(false)
             }
@@ -399,6 +431,7 @@ impl Services {
         entry: &Credential,
         lease: PersistenceLease,
         target: &Target,
+        secrets: &crate::settings::AsyncSecretStore,
     ) -> Result<Option<(Account, String, Target)>> {
         let Some(mut saved) = io(&entry.store, lease.clone(), |s| account(&s)).await? else {
             return Ok(None);
@@ -416,7 +449,13 @@ impl Services {
         };
         let refreshed = if credential.needs_refresh() {
             if !self
-                .collaboration_refresh(entry, lease.clone(), &target, saved.device_client_id()?)
+                .collaboration_refresh(
+                    entry,
+                    lease.clone(),
+                    &target,
+                    saved.device_client_id()?,
+                    secrets,
+                )
                 .await?
             {
                 return Ok(None);
@@ -447,7 +486,7 @@ impl Services {
                     // grant observed during authorization, never requested scopes.
                     saved.scopes = observed.scopes.or(saved.scopes);
                     check_scopes(&target, saved.scopes.as_deref())?;
-                    save_account(entry, lease, &saved).await?;
+                    save_account(secrets, &saved).await?;
                     return Ok(Some((saved, token, target)));
                 }
                 Err(Error::SourceControlUnauthorized { .. })
@@ -461,6 +500,7 @@ impl Services {
                             lease.clone(),
                             &target,
                             saved.device_client_id()?,
+                            secrets,
                         )
                         .await?
                     {
@@ -471,7 +511,7 @@ impl Services {
                         .ok_or_else(|| target.not_connected())?;
                 }
                 Err(Error::SourceControlUnauthorized { .. }) => {
-                    clear(entry, lease, &target).await?;
+                    clear(secrets, &target).await?;
                     self.collaboration_event(&target, "expired", None).await;
                     return Ok(None);
                 }
@@ -481,17 +521,128 @@ impl Services {
         Ok(None)
     }
 
+    async fn collaboration_request(
+        &self,
+        provider: &str,
+        host: Option<&str>,
+        request: CredentialRequest,
+    ) -> Result<CredentialReply> {
+        let target = Self::collaboration_target(provider, host)?;
+        let entry = self.collaboration_credential(&target).await?;
+        let caller = intent_core::current_caller()
+            .ok_or_else(|| Error::Internal("credential caller missing".into()))?;
+        let credential = intent_core::caller::current_wire_credential();
+        let expired = Arc::new(tokio::sync::Notify::new());
+        let secrets = entry.secrets.settled_operation(expired.clone());
+        let service = self.clone();
+        let (response, receiver) = tokio::sync::oneshot::channel();
+        let owner = async move {
+            // Reserve a new explicit identity choice before waiting for this
+            // credential. Only admitted roots may invalidate an older choice.
+            let generation = if matches!(request, CredentialRequest::Select { .. }) {
+                service
+                    .identity_rekey_generation
+                    .fetch_add(1, Ordering::SeqCst)
+                    + 1
+            } else {
+                service.identity_rekey_generation.load(Ordering::SeqCst)
+            };
+            let lease: PersistenceLease = Arc::new(entry.gate.clone().lock_owned().await);
+            let worker_lease = lease.clone();
+            let worker_secrets = secrets.clone();
+            let mut worker = intent_core::spawn_daemon(intent_core::with_caller(
+                caller,
+                intent_core::caller::with_wire_credential(credential, async move {
+                    let operation = CredentialOperation {
+                        entry: &entry,
+                        target: &target,
+                        lease: worker_lease,
+                        secrets: &worker_secrets,
+                        generation,
+                    };
+                    match request {
+                        CredentialRequest::Status { only_user } => service
+                            .collaboration_status_owned(operation, only_user)
+                            .await
+                            .map(CredentialReply::Value),
+                        CredentialRequest::Select { external_id } => service
+                            .collaboration_select_owned(operation, &external_id)
+                            .await
+                            .map(CredentialReply::Value),
+                        CredentialRequest::ProofCreate {
+                            nonce,
+                            label,
+                            expected,
+                        } => service
+                            .collaboration_proof_create_owned(operation, &nonce, &label, expected)
+                            .await
+                            .map(|(provider, proof)| CredentialReply::Proof(provider, proof)),
+                        CredentialRequest::ProofDelete { proof_id } => service
+                            .collaboration_proof_delete_owned(operation, &proof_id)
+                            .await
+                            .map(|()| CredentialReply::Value(Value::Null)),
+                    }
+                }),
+            ));
+            let mut response = Some(response);
+            let joined = tokio::select! {
+                biased;
+                () = expired.notified() => {
+                    let _ = response.take().unwrap().send(Err(Error::Internal(
+                        "collaboration credential write timed out; operation continues, state may be unknown".into()
+                    )));
+                    worker.await
+                }
+                result = &mut worker => result,
+            };
+            let result = joined.unwrap_or_else(|error| {
+                Err(Error::Internal(format!(
+                    "collaboration credential worker failed: {error}; state may be unknown"
+                )))
+            });
+            if let Some(response) = response {
+                let _ = response.send(result);
+            }
+            secrets.finish_operation().await;
+            drop(lease);
+        };
+        if self.settings_tasks.spawn_draining(owner).is_none() {
+            return Err(Error::Internal("daemon is shutting down".into()));
+        }
+        receiver.await.map_err(|_| {
+            Error::Internal("collaboration credential owner failed; state may be unknown".into())
+        })?
+    }
+
     pub(crate) async fn collaboration_status(
         &self,
         provider: &str,
         host: Option<&str>,
         only_user: bool,
     ) -> Result<Value> {
-        let target = Self::collaboration_target(provider, host)?;
-        let entry = self.collaboration_credential(&target).await?;
-        let lease: PersistenceLease = Arc::new(entry.gate.clone().lock_owned().await);
+        match self
+            .collaboration_request(provider, host, CredentialRequest::Status { only_user })
+            .await?
+        {
+            CredentialReply::Value(value) => Ok(value),
+            CredentialReply::Proof(..) => unreachable!("status reply"),
+        }
+    }
+
+    async fn collaboration_status_owned(
+        &self,
+        operation: CredentialOperation<'_>,
+        only_user: bool,
+    ) -> Result<Value> {
+        let CredentialOperation {
+            entry,
+            target,
+            lease,
+            secrets,
+            generation: _,
+        } = operation;
         let probed = self
-            .collaboration_probe(&entry, lease.clone(), &target)
+            .collaboration_probe(entry, lease.clone(), target, secrets)
             .await?;
         if only_user {
             return Ok(json!({"user":probed.map(|(a,_,_)|a.user)}));
@@ -503,7 +654,7 @@ impl Services {
             target.host(),
             probed.as_ref().map(|(a, _, _)| a.method.as_str()),
             probed.as_ref().map(|(a, _, _)| a.user.clone()),
-            !state.unsupported && self.collaboration_client_id(&target).is_some(),
+            !state.unsupported && self.collaboration_client_id(target).is_some(),
         );
         wire["purpose"] = json!("collaboration");
         wire["requestedScopes"] = json!(target.scopes());
@@ -539,17 +690,165 @@ impl Services {
     ) -> Result<Value> {
         let target = Self::collaboration_target(provider, host)?;
         let entry = self.collaboration_credential(&target).await?;
-        // Invalidate start/exchange immediately, then serialize deletion with IO.
-        {
-            let mut state = entry.state.lock().await;
-            state.generation += 1;
-            state.flow = None;
+        let caller = intent_core::current_caller()
+            .ok_or_else(|| Error::Internal("credential caller missing".into()))?;
+        let credential = intent_core::caller::current_wire_credential();
+        let expired = Arc::new(tokio::sync::Notify::new());
+        let secrets = entry.secrets.settled_operation(expired.clone());
+        let service = self.clone();
+        let (response, receiver) = tokio::sync::oneshot::channel();
+        let owner = async move {
+            // Invalidate start/exchange before waiting for the existing IO.
+            {
+                let mut state = entry.state.lock().await;
+                state.generation += 1;
+                state.flow = None;
+            }
+            let lease: PersistenceLease = Arc::new(entry.gate.clone().lock_owned().await);
+            let worker_secrets = secrets.clone();
+            let worker_lease = lease.clone();
+            let mut worker = intent_core::spawn_daemon(intent_core::with_caller(
+                caller,
+                intent_core::caller::with_wire_credential(credential, async move {
+                    let key = target.token_account();
+                    let present = io(&entry.store, worker_lease, move |store| store.load(key))
+                        .await?
+                        .is_some();
+                    for key in [
+                        key,
+                        ACCOUNT,
+                        intent_sourcecontrol::gitlab_token::REFRESH_SECRET_ACCOUNT,
+                        intent_sourcecontrol::gitlab_token::EXPIRES_AT_SECRET_ACCOUNT,
+                    ] {
+                        worker_secrets.delete(key).await?;
+                    }
+                    if present {
+                        service.collaboration_event(&target, "revoked", None).await;
+                    }
+                    Ok(json!({"ok":true}))
+                }),
+            ));
+            let mut response = Some(response);
+            let joined = tokio::select! {
+                biased;
+                () = expired.notified() => {
+                    let _ = response.take().unwrap().send(Err(Error::Internal(
+                        "collaboration credential write timed out; revoke continues, state may be unknown".into()
+                    )));
+                    worker.await
+                }
+                result = &mut worker => result,
+            };
+            let result = joined.unwrap_or_else(|error| {
+                Err(Error::Internal(format!(
+                    "collaboration revoke failed: {error}; state may be unknown"
+                )))
+            });
+            if let Some(response) = response {
+                let _ = response.send(result);
+            }
+            secrets.finish_operation().await;
+            drop(lease);
+        };
+        if self.settings_tasks.spawn_draining(owner).is_none() {
+            return Err(Error::Internal("daemon is shutting down".into()));
         }
-        let lease: PersistenceLease = Arc::new(entry.gate.clone().lock_owned().await);
-        if clear(&entry, lease.clone(), &target).await? {
-            self.collaboration_event(&target, "revoked", None).await;
+        receiver.await.map_err(|_| {
+            Error::Internal("collaboration revoke owner failed; state may be unknown".into())
+        })?
+    }
+
+    async fn collaboration_connect_pat(
+        &self,
+        target: Target,
+        entry: Arc<Credential>,
+        token: String,
+    ) -> Result<Value> {
+        let caller = intent_core::current_caller()
+            .ok_or_else(|| Error::Internal("credential caller missing".into()))?;
+        let credential = intent_core::caller::current_wire_credential();
+        let expired = Arc::new(tokio::sync::Notify::new());
+        let secrets = entry.secrets.settled_operation(expired.clone());
+        let service = self.clone();
+        let (response, receiver) = tokio::sync::oneshot::channel();
+        let owner = async move {
+            let generation = {
+                let mut state = entry.state.lock().await;
+                state.generation += 1;
+                state.flow = None;
+                state.generation
+            };
+            let account = intent_core::with_caller(
+                caller.clone(),
+                intent_core::caller::with_wire_credential(
+                    credential.clone(),
+                    service.collaboration_verify(&target, &token, "pat"),
+                ),
+            )
+            .await;
+            let account = match account {
+                Ok(account) => account,
+                Err(error) => {
+                    let _ = response.send(Err(error));
+                    return;
+                }
+            };
+            let lease: PersistenceLease = Arc::new(entry.gate.clone().lock_owned().await);
+            let worker_secrets = secrets.clone();
+            let mut worker = intent_core::spawn_daemon(intent_core::with_caller(
+                caller,
+                intent_core::caller::with_wire_credential(credential, async move {
+                    let state = entry.state.lock().await;
+                    if state.generation != generation {
+                        return Err(Error::IdentityMismatch);
+                    }
+                    // Clear old proof receipts before the first token effect. Each
+                    // sequential write retains its actual result on this owner's ledger.
+                    worker_secrets.delete(ACCOUNT).await?;
+                    worker_secrets.store(target.token_account(), &token).await?;
+                    worker_secrets
+                        .delete(intent_sourcecontrol::gitlab_token::REFRESH_SECRET_ACCOUNT)
+                        .await?;
+                    worker_secrets
+                        .delete(intent_sourcecontrol::gitlab_token::EXPIRES_AT_SECRET_ACCOUNT)
+                        .await?;
+                    let data = serde_json::to_string(&account)
+                        .map_err(|e| Error::Internal(e.to_string()))?;
+                    worker_secrets.store(ACCOUNT, &data).await?;
+                    service
+                        .collaboration_event(&target, "authorized", None)
+                        .await;
+                    Ok(json!({"ok":true,"method":"pat","purpose":"collaboration"}))
+                }),
+            ));
+            let mut response = Some(response);
+            let joined = tokio::select! {
+                biased;
+                () = expired.notified() => {
+                    let _ = response.take().unwrap().send(Err(Error::Internal(
+                        "collaboration credential write timed out; PAT continues, state may be unknown".into()
+                    )));
+                    worker.await
+                }
+                result = &mut worker => result,
+            };
+            let result = joined.unwrap_or_else(|error| {
+                Err(Error::Internal(format!(
+                    "collaboration PAT failed: {error}; state may be unknown"
+                )))
+            });
+            if let Some(response) = response {
+                let _ = response.send(result);
+            }
+            secrets.finish_operation().await;
+            drop(lease);
+        };
+        if self.settings_tasks.spawn_draining(owner).is_none() {
+            return Err(Error::Internal("daemon is shutting down".into()));
         }
-        Ok(json!({"ok":true}))
+        receiver.await.map_err(|_| {
+            Error::Internal("collaboration PAT owner failed; state may be unknown".into())
+        })?
     }
 
     pub(crate) async fn collaboration_connect(
@@ -582,8 +881,14 @@ impl Services {
         } else {
             None
         };
+        if let Some(token) = pat_token {
+            return self.collaboration_connect_pat(target, entry, token).await;
+        }
         let generation = {
             let mut state = entry.state.lock().await;
+            if self.settings_tasks.is_closed() || self.store_tasks.is_closed() {
+                return Err(Error::Internal("daemon is shutting down".into()));
+            }
             if method == "device" && state.flow.as_ref().is_some_and(FlowSlot::is_live) {
                 return Ok(flow_response(&state));
             }
@@ -591,27 +896,6 @@ impl Services {
             state.flow = None;
             state.generation
         };
-        if let Some(token) = pat_token {
-            let account = self.collaboration_verify(&target, &token, "pat").await?;
-            let lease: PersistenceLease = Arc::new(entry.gate.clone().lock_owned().await);
-            let state = entry.state.lock().await;
-            if state.generation != generation {
-                return Err(Error::IdentityMismatch);
-            }
-            // Fail closed if either subsequent write fails: a new token must
-            // never inherit the previous account's proof-cleanup receipts.
-            io(&entry.store, lease.clone(), |s| s.delete(ACCOUNT)).await?;
-            gitlab_auth::persist_gitlab_token_with_lease(
-                entry.store.clone(),
-                token.into(),
-                lease.clone(),
-            )
-            .await
-            .map_err(crate::pr_ops::map_sc_err)?;
-            save_account(&entry, lease.clone(), &account).await?;
-            self.collaboration_event(&target, "authorized", None).await;
-            return Ok(json!({"ok":true,"method":"pat","purpose":"collaboration"}));
-        }
         let unsupported = || Error::DeviceGrantUnsupported {
             provider: provider.into(),
             host: target.host().into(),
@@ -623,17 +907,24 @@ impl Services {
             Target::Github => {
                 let base =
                     github_auth_ops::resolve_login_base_uri(self.github_login_base_uri.as_deref());
-                intent_sourcecontrol::device_flow::start_at(&base, &client_id, target.scopes())
-                    .await
-                    .map(|(auth, flow)| {
-                        (
-                            auth.user_code,
-                            auth.verification_uri,
-                            auth.expires_in,
-                            auth.interval,
-                            Flow::Github(flow.with_store(entry.store.clone())),
-                        )
-                    })
+                intent_sourcecontrol::device_flow::start_at_with_store(
+                    &base,
+                    &client_id,
+                    target.scopes(),
+                    entry.store.clone(),
+                )
+                .await
+                .map(|(auth, flow)| {
+                    #[cfg(test)]
+                    assert_eq!(flow.persistence_path(), entry.store.path());
+                    (
+                        auth.user_code,
+                        auth.verification_uri,
+                        auth.expires_in,
+                        auth.interval,
+                        Flow::Github(flow),
+                    )
+                })
             }
             Target::Gitlab { host } => {
                 gitlab_auth::start_device_grant_with_store(host, &client_id, entry.store.clone())
@@ -649,24 +940,34 @@ impl Services {
                     })
             }
         };
+        let mut state = entry.state.lock().await;
+        if self.settings_tasks.is_closed() {
+            return Err(Error::Internal("daemon is shutting down".into()));
+        }
+        if state.generation != generation {
+            return Err(Error::IdentityMismatch);
+        }
         let (user_code, verification_uri, expires, interval, flow) = match started {
             Ok(r) => r,
             Err(intent_sourcecontrol::Error::DeviceGrantUnsupported(_)) => {
-                let mut state = entry.state.lock().await;
-                if state.generation != generation {
-                    return Err(Error::IdentityMismatch);
-                }
                 state.unsupported = true;
                 return Err(unsupported());
             }
             Err(e) => return Err(crate::pr_ops::map_sc_err(e)),
         };
-        let mut state = entry.state.lock().await;
-        if state.generation != generation {
-            return Err(Error::IdentityMismatch);
-        }
         state.unsupported = false;
         let deadline = Instant::now() + Duration::from_secs(expires);
+        // Register before publishing under the same state lock shutdown uses
+        // to retire flows. A refused poll must never advertise usable codes.
+        let service = self.clone();
+        let poll_entry = entry.clone();
+        self.store_tasks
+            .spawn_draining(async move {
+                service
+                    .collaboration_poll(poll_entry, target, generation, deadline, flow)
+                    .await;
+            })
+            .ok_or_else(|| Error::Internal("daemon is shutting down".into()))?;
         state.flow_id = uuid::Uuid::new_v4().to_string();
         state.flow = Some(FlowSlot {
             flow_id: github_auth_ops::next_flow_id(),
@@ -676,15 +977,36 @@ impl Services {
             deadline,
             phase: FlowPhase::Pending,
         });
-        let result = flow_response(&state);
-        drop(state);
-        let service = self.clone();
-        intent_core::spawn_daemon(async move {
-            service
-                .collaboration_poll(entry, target, generation, deadline, flow)
-                .await;
-        });
-        Ok(result)
+        Ok(flow_response(&state))
+    }
+
+    pub(crate) async fn shutdown_collaboration_flows(&self) {
+        let entries: Vec<_> = self
+            .collaboration_auth
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect();
+        for entry in entries {
+            let acquire = entry.state.lock();
+            #[cfg(test)]
+            let acquire = {
+                let mut acquire = Box::pin(acquire);
+                std::future::poll_fn(move |cx| {
+                    let result = std::future::Future::poll(acquire.as_mut(), cx);
+                    if result.is_pending() {
+                        if let Some(tx) = self.secrets.writer_drain_pending.lock().unwrap().take() {
+                            let _ = tx.send("collaboration-state");
+                        }
+                    }
+                    result
+                })
+            };
+            let mut state = acquire.await;
+            state.generation += 1;
+            state.flow = None;
+        }
     }
 
     async fn collaboration_poll(
@@ -699,8 +1021,29 @@ impl Services {
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if !remaining.is_zero() {
-                tokio::time::sleep(github_auth_ops::poll_sleep(flow.interval()).min(remaining))
-                    .await;
+                let sleep =
+                    tokio::time::sleep(github_auth_ops::poll_sleep(flow.interval()).min(remaining));
+                #[cfg(test)]
+                let sleep = {
+                    let mut sleep = Box::pin(sleep);
+                    let entry = entry.clone();
+                    std::future::poll_fn(move |cx| {
+                        let result = std::future::Future::poll(sleep.as_mut(), cx);
+                        if result.is_pending() {
+                            if let Some(pending) = entry.sleep_pending.lock().unwrap().take() {
+                                let _ = pending.send(());
+                            }
+                        }
+                        result
+                    })
+                };
+                // Cancel idle recurrence only; an exchange or write already
+                // admitted below retains its existing completion path.
+                tokio::select! {
+                    biased;
+                    () = self.settings_tasks.closed() => return,
+                    () = sleep => {}
+                }
             }
             if entry.state.lock().await.generation != generation {
                 return;
@@ -729,25 +1072,21 @@ impl Services {
                 Exchange::Grant(grant) => Some(self.verify_grant(&target, grant).await),
                 _ => None,
             };
-            let mut state = entry.state.lock().await;
-            if state.generation != generation || state.flow.is_none() {
-                return;
-            }
             let phase = match (outcome, verified) {
                 (Exchange::Grant(grant), Some(Ok(account))) => {
-                    let prepared = io(&entry.store, lease.clone(), |s| s.delete(ACCOUNT)).await;
-                    if prepared.is_ok()
-                        && grant.commit(lease.clone()).await.is_ok()
-                        && save_account(&entry, lease.clone(), &account).await.is_ok()
-                    {
-                        None
-                    } else {
-                        Some(FlowPhase::Error)
-                    }
+                    self.collaboration_commit_grant(
+                        entry, target, generation, lease, grant, account,
+                    )
+                    .await;
+                    return;
                 }
                 (Exchange::Terminal(phase), _) => Some(phase),
                 _ => Some(FlowPhase::Error),
             };
+            let mut state = entry.state.lock().await;
+            if state.generation != generation || state.flow.is_none() {
+                return;
+            }
             if let Some(phase) = phase {
                 if let Some(slot) = &mut state.flow {
                     slot.phase = phase;
@@ -763,6 +1102,81 @@ impl Services {
             .await;
             return;
         }
+    }
+
+    async fn collaboration_commit_grant(
+        &self,
+        entry: Arc<Credential>,
+        target: Target,
+        generation: u64,
+        lease: PersistenceLease,
+        grant: Grant,
+        account: Account,
+    ) {
+        // The tracked poll owns this supervisor and credential guard. The child
+        // may fail, but its registered physical writes must settle before the
+        // guard is released or shutdown can join this poll.
+        let secrets = entry
+            .secrets
+            .settled_operation(Arc::new(tokio::sync::Notify::new()));
+        let worker_secrets = secrets.clone();
+        let worker_entry = entry.clone();
+        let worker_target = target.clone();
+        let worker_lease = lease.clone();
+        let service = self.clone();
+        let worker = intent_core::spawn_daemon(async move {
+            let mut state = worker_entry.state.lock().await;
+            if state.generation != generation || state.flow.is_none() {
+                return;
+            }
+            let persisted: Result<()> = async {
+                worker_secrets.delete(ACCOUNT).await?;
+                #[cfg(test)]
+                let worker_lease: PersistenceLease = {
+                    let held = worker_entry.commit_test_lease.lock().unwrap().take();
+                    Arc::new((worker_lease, held))
+                };
+                grant.commit(&worker_secrets, worker_lease).await?;
+                let data = serde_json::to_string(&account)
+                    .map_err(|error| Error::Internal(error.to_string()))?;
+                worker_secrets.store(ACCOUNT, &data).await
+            }
+            .await;
+            if persisted.is_ok() {
+                state.flow = None;
+            } else if let Some(flow) = &mut state.flow {
+                flow.phase = FlowPhase::Error;
+            }
+            service
+                .collaboration_event(
+                    &worker_target,
+                    if persisted.is_ok() {
+                        "authorized"
+                    } else {
+                        "error"
+                    },
+                    Some(&state.flow_id),
+                )
+                .await;
+        });
+        let joined = worker.await;
+        #[cfg(test)]
+        if joined.is_err() {
+            secrets.gitlab_poll_worker_failed.notify_one();
+        }
+        secrets.finish_operation().await;
+        if let Err(error) = joined {
+            tracing::warn!(%error, "collaboration grant worker failed; credential state may be unknown");
+            let mut state = entry.state.lock().await;
+            if state.generation == generation && state.flow.is_some() {
+                if let Some(flow) = &mut state.flow {
+                    flow.phase = FlowPhase::Error;
+                }
+                self.collaboration_event(&target, "error", Some(&state.flow_id))
+                    .await;
+            }
+        }
+        drop(lease);
     }
 
     async fn verify_grant(&self, target: &Target, grant: &Grant) -> Result<Account> {
@@ -807,18 +1221,36 @@ impl Services {
         host: Option<&str>,
         external_id: &str,
     ) -> Result<Value> {
-        let target = Self::collaboration_target(provider, host)?;
-        let entry = self.collaboration_credential(&target).await?;
-        // Reserve the explicit choice before a network probe. A later explicit
-        // setting/select supersedes this request, including a failed newer choice.
-        let generation = self
-            .identity_rekey_generation
-            .fetch_add(1, Ordering::SeqCst)
-            + 1;
-        let lease: PersistenceLease = Arc::new(entry.gate.clone().lock_owned().await);
+        match self
+            .collaboration_request(
+                provider,
+                host,
+                CredentialRequest::Select {
+                    external_id: external_id.into(),
+                },
+            )
+            .await?
+        {
+            CredentialReply::Value(value) => Ok(value),
+            CredentialReply::Proof(..) => unreachable!("selection reply"),
+        }
+    }
+
+    async fn collaboration_select_owned(
+        &self,
+        operation: CredentialOperation<'_>,
+        external_id: &str,
+    ) -> Result<Value> {
+        let CredentialOperation {
+            entry,
+            target,
+            lease,
+            secrets,
+            generation,
+        } = operation;
         let credential_generation = entry.state.lock().await.generation;
         let (account, _, _) = self
-            .collaboration_probe(&entry, lease.clone(), &target)
+            .collaboration_probe(entry, lease.clone(), target, secrets)
             .await?
             .ok_or_else(|| target.not_connected())?;
         if account.identity.external_user_id != external_id {
@@ -853,18 +1285,45 @@ impl Services {
         label: &str,
         expected: PrincipalIdentity,
     ) -> Result<(ProofProvider, CreatedProof)> {
+        match self
+            .collaboration_request(
+                provider,
+                host,
+                CredentialRequest::ProofCreate {
+                    nonce: nonce.into(),
+                    label: label.into(),
+                    expected,
+                },
+            )
+            .await?
+        {
+            CredentialReply::Proof(provider, proof) => Ok((provider, proof)),
+            CredentialReply::Value(_) => unreachable!("proof reply"),
+        }
+    }
+
+    async fn collaboration_proof_create_owned(
+        &self,
+        operation: CredentialOperation<'_>,
+        nonce: &str,
+        label: &str,
+        expected: PrincipalIdentity,
+    ) -> Result<(ProofProvider, CreatedProof)> {
+        let CredentialOperation {
+            entry,
+            target,
+            lease,
+            secrets,
+            generation,
+        } = operation;
         let nonce = github_auth_ops::proof_line_param("nonce", nonce)?;
         let label = github_auth_ops::proof_line_param("hostLabel", label)?;
-        let target = Self::collaboration_target(provider, host)?;
         if expected.provider != target.provider().as_wire() || expected.host != target.host() {
             return Err(Error::IdentityMismatch);
         }
-        let generation = self.identity_rekey_generation.load(Ordering::SeqCst);
-        let entry = self.collaboration_credential(&target).await?;
-        let lease: PersistenceLease = Arc::new(entry.gate.clone().lock_owned().await);
         let credential_generation = entry.state.lock().await.generation;
         let (account, token, target) = self
-            .collaboration_probe(&entry, lease.clone(), &target)
+            .collaboration_probe(entry, lease.clone(), target, secrets)
             .await?
             .ok_or_else(|| target.not_connected())?;
         if account.identity != expected {
@@ -902,11 +1361,7 @@ impl Services {
         // generation. Keeping this receipt in the isolated store survives restart.
         let key = format!("identity.proof.{}", created.proof_id);
         let receipt = account.generation.clone();
-        if let Err(e) = io(&entry.store, lease.clone(), move |s| {
-            s.store(&key, &receipt)
-        })
-        .await
-        {
+        if let Err(e) = secrets.store(&key, &receipt).await {
             let _ = proof.delete(&token, &created.proof_id).await;
             return Err(e);
         }
@@ -919,15 +1374,35 @@ impl Services {
         host: Option<&str>,
         proof_id: &str,
     ) -> Result<()> {
-        let target = Self::collaboration_target(provider, host)?;
-        let proof = self.proof_provider(&target);
+        self.collaboration_request(
+            provider,
+            host,
+            CredentialRequest::ProofDelete {
+                proof_id: proof_id.into(),
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn collaboration_proof_delete_owned(
+        &self,
+        operation: CredentialOperation<'_>,
+        proof_id: &str,
+    ) -> Result<()> {
+        let CredentialOperation {
+            entry,
+            target,
+            lease,
+            secrets,
+            generation: _,
+        } = operation;
+        let proof = self.proof_provider(target);
         if !proof.valid_proof_id(proof_id) {
             return Err(Error::InvalidParams("invalid proofId".into()));
         }
-        let entry = self.collaboration_credential(&target).await?;
-        let lease: PersistenceLease = Arc::new(entry.gate.clone().lock_owned().await);
         let (account, token, target) = self
-            .collaboration_probe(&entry, lease.clone(), &target)
+            .collaboration_probe(entry, lease.clone(), target, secrets)
             .await?
             .ok_or_else(|| target.not_connected())?;
         let proof = self.proof_provider(&target);
@@ -1001,10 +1476,14 @@ impl Flow {
     }
 }
 impl Grant {
-    async fn commit(self, lease: PersistenceLease) -> intent_sourcecontrol::Result<()> {
+    async fn commit(
+        self,
+        secrets: &crate::settings::AsyncSecretStore,
+        lease: PersistenceLease,
+    ) -> Result<()> {
         match self {
-            Self::Github(g) => g.commit(Some(Box::new(lease))).await,
-            Self::Gitlab(g, _) => g.commit_with_lease(Some(lease)).await,
+            Self::Github(g) => secrets.persist_github_grant(g, Some(Box::new(lease))).await,
+            Self::Gitlab(g, _) => secrets.persist_gitlab_grant(g, lease).await,
         }
     }
 }
@@ -1024,14 +1503,1959 @@ mod tests {
     use super::*;
     use crate::tests::{pr::StubForge, TempDb};
     use intent_core::{with_caller, Caller, HostRole, PrincipalId, WorkspaceApi};
+    use intent_sourcecontrol::GitlabHost;
     use intent_store::Store;
 
     async fn fixture() -> (TempDb, Services) {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.unwrap();
         let secrets = FileSecretStore::with_path(tmp.path.with_extension("secrets"));
-        let services = Services::new(store).with_gitlab_secret_store(secrets);
+        let services = Services::new_with_file_secrets(store, secrets);
         (tmp, services)
+    }
+
+    async fn assert_probe_settlement(disconnect: bool) {
+        use intent_sourcecontrol::gitlab_token::{
+            EXPIRES_AT_SECRET_ACCOUNT, REFRESH_SECRET_ACCOUNT, SECRET_ACCOUNT,
+        };
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        for outcome in 0..5 {
+            let (tmp, service) = fixture().await;
+            let bus = crate::EventBus::new(service.store.clone());
+            let service = service.with_event_bus(bus.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let host = GitlabHost::parse("gitlab.probe.test")
+                .unwrap()
+                .with_api_origin(&base)
+                .unwrap();
+            let target = Target::Gitlab { host: host.clone() };
+            let server = intent_core::spawn_daemon(async move {
+                let mut replies = vec![(
+                    "POST",
+                    "/oauth/token",
+                    if disconnect { 400 } else { 200 },
+                    if disconnect {
+                        json!({"error":"invalid_grant"})
+                    } else {
+                        json!({"access_token":"rotated-token","refresh_token":"rotated-refresh","expires_in":7200,"scope":"api"})
+                    },
+                )];
+                if !disconnect && outcome < 2 {
+                    replies.extend([
+                        (
+                            "GET",
+                            "/api/v4/user",
+                            200,
+                            json!({"id":42,"username":"observed-user","name":"Observed"}),
+                        ),
+                        (
+                            "GET",
+                            "/api/v4/personal_access_tokens/self",
+                            200,
+                            json!({"id":7,"scopes":["api"]}),
+                        ),
+                    ]);
+                }
+                for (method, path, status, body) in replies {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    reader.read_line(&mut line).await.unwrap();
+                    assert!(line.starts_with(&format!("{method} {path} ")));
+                    let mut length = 0;
+                    loop {
+                        line.clear();
+                        reader.read_line(&mut line).await.unwrap();
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some((key, value)) = line.split_once(':') {
+                            if key.eq_ignore_ascii_case("content-length") {
+                                length = value.trim().parse().unwrap();
+                            }
+                        }
+                    }
+                    reader.read_exact(&mut vec![0; length]).await.unwrap();
+                    let body = body.to_string();
+                    reader.get_mut().write_all(format!("HTTP/1.1 {status} Test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                }
+            });
+            let entry = service.collaboration_credential(&target).await.unwrap();
+            let raw = entry.store.clone();
+            let mut saved = Account::new(
+                ForgeUser::on("gitlab", host.host(), "42", "old-user", None),
+                json!({"id":"42","login":"old-user"}),
+                "device",
+                Some(vec!["api".into()]),
+            )
+            .unwrap();
+            saved.gitlab_binding = Some(GitlabBinding {
+                base_url: host.base_url().into(),
+                client_id: Some("private-client".into()),
+            });
+            for (key, value) in [
+                (SECRET_ACCOUNT, "old-token"),
+                (REFRESH_SECRET_ACCOUNT, "old-refresh"),
+                (EXPIRES_AT_SECRET_ACCOUNT, "1"),
+            ] {
+                raw.store(key, value).unwrap();
+            }
+            raw.store(ACCOUNT, &serde_json::to_string(&saved).unwrap())
+                .unwrap();
+            drop(entry);
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let (release, held) = std::sync::mpsc::channel();
+            let backend = Arc::new(HeldRevoke {
+                store: raw.clone(),
+                entered: entered.clone(),
+                release: std::sync::Mutex::new(if disconnect { Some(held) } else { None }),
+                outcome: match outcome {
+                    2 => 1,
+                    3 => 2,
+                    _ => 0,
+                },
+            });
+            let secrets = crate::settings::AsyncSecretStore::with_timings(
+                backend,
+                Duration::from_secs(5),
+                if matches!(outcome, 0 | 4) {
+                    Duration::from_secs(5)
+                } else {
+                    Duration::from_millis(10)
+                },
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+            );
+            // Refresh uses the actual grant closure; disconnect uses the backend delete.
+            // Separate channels avoid moving the disconnect receiver into the refresh hook.
+            let (refresh_release, refresh_held) = std::sync::mpsc::channel();
+            if !disconnect {
+                let signal = entered.clone();
+                *secrets.before_gitlab_persistence.lock().unwrap() = Some(Box::new(move || {
+                    signal.notify_one();
+                    let _ = refresh_held.recv();
+                    match outcome {
+                        2 => Err(Error::Internal("controlled refresh write error".into())),
+                        3 => panic!("controlled refresh backend panic"),
+                        _ => Ok(()),
+                    }
+                }));
+            }
+            let (fail, failing) = tokio::sync::oneshot::channel();
+            if outcome == 4 {
+                *secrets.panic_mutation_caller.lock().unwrap() = Some(failing);
+            }
+            {
+                let mut entries = service.collaboration_auth.lock().await;
+                Arc::get_mut(entries.values_mut().next().unwrap())
+                    .unwrap()
+                    .secrets = Arc::new(secrets);
+            }
+            let entry = service.collaboration_credential(&target).await.unwrap();
+            for key in [
+                SECRET_ACCOUNT,
+                REFRESH_SECRET_ACCOUNT,
+                EXPIRES_AT_SECRET_ACCOUNT,
+                ACCOUNT,
+            ] {
+                assert!(entry.secrets.load(key).await.unwrap().is_some());
+            }
+            let owner = service.clone();
+            let caller = intent_core::spawn_daemon(async move {
+                owner
+                    .identity_get_user("gitlab".into(), Some("gitlab.probe.test".into()))
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(5), entered.notified())
+                .await
+                .unwrap();
+            if outcome == 0 {
+                caller.abort();
+                assert!(caller.await.unwrap_err().is_cancelled());
+            } else {
+                if outcome == 4 {
+                    fail.send(()).unwrap();
+                }
+                let error = tokio::time::timeout(Duration::from_secs(5), caller)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains(if outcome == 4 {
+                        "credential worker failed"
+                    } else {
+                        "timed out"
+                    }),
+                    "{error}"
+                );
+            }
+            assert_eq!(entry.secrets.mutation_counts_for_test(), (1, 1));
+            assert!(entry.gate.try_lock().is_err());
+            assert_eq!(
+                raw.load(SECRET_ACCOUNT).unwrap().as_deref(),
+                Some("old-token")
+            );
+            let (pending, pending_rx) = tokio::sync::oneshot::channel();
+            *service.secrets.writer_drain_pending.lock().unwrap() = Some(pending);
+            let owner = service.clone();
+            let drain =
+                intent_core::spawn_daemon(async move { owner.shutdown_store_writers().await });
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), pending_rx)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                "settings-tasks"
+            );
+            assert!(!drain.is_finished());
+            if disconnect {
+                release.send(()).unwrap();
+            } else {
+                refresh_release.send(()).unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(5), drain)
+                .await
+                .unwrap()
+                .unwrap();
+            server.await.unwrap();
+            assert_eq!(entry.secrets.mutation_counts_for_test(), (0, 1));
+            assert!(entry.gate.try_lock().is_ok());
+            for key in [
+                SECRET_ACCOUNT,
+                REFRESH_SECRET_ACCOUNT,
+                EXPIRES_AT_SECRET_ACCOUNT,
+                ACCOUNT,
+            ] {
+                assert_eq!(
+                    entry.secrets.load(key).await.unwrap(),
+                    raw.load(key).unwrap(),
+                    "cache {key}, outcome {outcome}"
+                );
+            }
+            assert_eq!(
+                raw.load(SECRET_ACCOUNT).unwrap().as_deref(),
+                if matches!(outcome, 2 | 3) {
+                    Some("old-token")
+                } else if disconnect {
+                    None
+                } else {
+                    Some("rotated-token")
+                }
+            );
+            if disconnect {
+                assert_eq!(raw.load(ACCOUNT).unwrap().is_none(), outcome < 2);
+                assert_eq!(
+                    raw.load(REFRESH_SECRET_ACCOUNT).unwrap().is_none(),
+                    outcome < 2
+                );
+            } else {
+                assert_eq!(
+                    account(&raw).unwrap().unwrap().user["login"],
+                    if outcome < 2 {
+                        "observed-user"
+                    } else {
+                        "old-user"
+                    }
+                );
+            }
+            bus.shutdown().await.unwrap();
+            service.store.close().await;
+            let reopened = Store::open(&tmp.path).await.unwrap();
+            let events = reopened
+                .query_events(&intent_store::EventQuery::default())
+                .await
+                .unwrap();
+            reopened.close().await;
+            let auth: Vec<_> = events
+                .iter()
+                .filter(|e| e.event_type == intent_core::events::IDENTITY_AUTH_CHANGED)
+                .collect();
+            assert_eq!(auth.len(), usize::from(disconnect && outcome < 2));
+            if let Some(event) = auth.first() {
+                assert_eq!(event.data["status"], "expired");
+            }
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn collaboration_refresh_retains_actual_result_through_shutdown() {
+        assert_probe_settlement(false).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn collaboration_probe_disconnect_retains_actual_result_through_shutdown() {
+        assert_probe_settlement(true).await;
+    }
+
+    struct HeldCredentialTail {
+        store: FileSecretStore,
+        key: &'static str,
+        entered: Arc<tokio::sync::Notify>,
+        release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        outcome: u8,
+    }
+
+    impl crate::settings::SecretStore for HeldCredentialTail {
+        fn load(&self, key: &str) -> Result<Option<String>> {
+            self.store.load(key)
+        }
+        fn delete(&self, key: &str) -> Result<()> {
+            self.store.delete(key)
+        }
+        fn store(&self, key: &str, value: &str) -> Result<()> {
+            if key == self.key {
+                let held = self.release.lock().unwrap().take();
+                if let Some(held) = held {
+                    self.entered.notify_one();
+                    let _ = held.recv();
+                    match self.outcome {
+                        2 => return Err(Error::Internal("controlled receipt write error".into())),
+                        3 => panic!("controlled receipt backend panic"),
+                        _ => {}
+                    }
+                }
+            }
+            self.store.store(key, value)
+        }
+    }
+
+    async fn assert_credential_tail_settlement(mode: u8) {
+        use intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let select = mode == 0;
+        let delete = mode == 2;
+        for outcome in 0..if select || delete { 2 } else { 5 } {
+            let (tmp, service) = fixture().await;
+            let bus = crate::EventBus::new(service.store.clone());
+            let service = service.with_event_bus(bus.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let host = GitlabHost::parse("gitlab.tail.test")
+                .unwrap()
+                .with_api_origin(&format!("http://{}", listener.local_addr().unwrap()))
+                .unwrap();
+            let target = Target::Gitlab { host: host.clone() };
+            let entry = service.collaboration_credential(&target).await.unwrap();
+            let raw = entry.store.clone();
+            let mut saved = Account::new(
+                ForgeUser::on("gitlab", host.host(), "42", "tail-user", None),
+                json!({"id":"42","login":"tail-user"}),
+                "pat",
+                Some(vec!["api".into()]),
+            )
+            .unwrap();
+            saved.gitlab_binding = Some(GitlabBinding {
+                base_url: host.base_url().into(),
+                client_id: None,
+            });
+            raw.store(SECRET_ACCOUNT, "private-pat").unwrap();
+            raw.store(ACCOUNT, &serde_json::to_string(&saved).unwrap())
+                .unwrap();
+            if delete {
+                raw.store("identity.proof.77", &saved.generation).unwrap();
+            }
+            drop(entry);
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let (release, held) = std::sync::mpsc::channel();
+            let secrets = crate::settings::AsyncSecretStore::with_timings(
+                Arc::new(HeldCredentialTail {
+                    store: raw.clone(),
+                    key: if select || delete {
+                        ACCOUNT
+                    } else {
+                        "identity.proof.77"
+                    },
+                    entered: entered.clone(),
+                    release: std::sync::Mutex::new(Some(held)),
+                    outcome,
+                }),
+                Duration::from_secs(5),
+                if matches!(outcome, 0 | 4) {
+                    Duration::from_secs(5)
+                } else {
+                    Duration::from_millis(10)
+                },
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+            );
+            let panic_slot = secrets.panic_mutation_caller.clone();
+            let (fail, failing) = tokio::sync::oneshot::channel();
+            let server = intent_core::spawn_daemon(async move {
+                let user = json!({"id":42,"username":"tail-user","name":"Tail User"});
+                let scopes = json!({"id":7,"scopes":["api"]});
+                let snippet = json!({"id":77,"author":{"id":42,"username":"tail-user"},"files":[{"path":intent_sourcecontrol::identity_proof::PROOF_FILE_NAME}]});
+                let mut replies = vec![
+                    ("GET", "/api/v4/user", user.clone()),
+                    ("GET", "/api/v4/personal_access_tokens/self", scopes.clone()),
+                ];
+                if delete {
+                    replies.extend([
+                        ("GET", "/api/v4/snippets/77", snippet.clone()),
+                        ("DELETE", "/api/v4/snippets/77", Value::Null),
+                    ]);
+                } else if !select {
+                    replies.extend([
+                        ("POST", "/api/v4/snippets", snippet.clone()),
+                        ("GET", "/api/v4/user", user),
+                        ("GET", "/api/v4/personal_access_tokens/self", scopes),
+                    ]);
+                    if matches!(outcome, 2 | 3) {
+                        replies.extend([
+                            ("GET", "/api/v4/snippets/77", snippet),
+                            ("DELETE", "/api/v4/snippets/77", Value::Null),
+                        ]);
+                    }
+                }
+                let mut failing = Some(failing);
+                for (index, (method, path, body)) in replies.into_iter().enumerate() {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    reader.read_line(&mut line).await.unwrap();
+                    assert!(line.starts_with(&format!("{method} {path} ")));
+                    let mut length = 0;
+                    let mut authorized = false;
+                    loop {
+                        line.clear();
+                        reader.read_line(&mut line).await.unwrap();
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some((key, value)) = line.split_once(':') {
+                            if key.eq_ignore_ascii_case("content-length") {
+                                length = value.trim().parse().unwrap();
+                            }
+                            if key.eq_ignore_ascii_case("authorization") {
+                                assert_eq!(value.trim(), "Bearer private-pat");
+                                authorized = true;
+                            }
+                        }
+                    }
+                    assert!(authorized);
+                    reader.read_exact(&mut vec![0; length]).await.unwrap();
+                    // The probe's ACCOUNT write has already returned; the next
+                    // write can only be this proof's receipt after verification.
+                    if outcome == 4 && index == 4 {
+                        *panic_slot.lock().unwrap() = failing.take();
+                    }
+                    let body = body.to_string();
+                    reader.get_mut().write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                }
+            });
+            {
+                let mut entries = service.collaboration_auth.lock().await;
+                Arc::get_mut(entries.values_mut().next().unwrap())
+                    .unwrap()
+                    .secrets = Arc::new(secrets);
+            }
+            let entry = service.collaboration_credential(&target).await.unwrap();
+            assert_eq!(
+                entry.secrets.load("identity.proof.77").await.unwrap(),
+                if delete {
+                    Some(saved.generation.clone())
+                } else {
+                    None
+                }
+            );
+            let expected = saved.identity.clone();
+            let owner = service.clone();
+            let caller = intent_core::spawn_daemon(async move {
+                if select {
+                    owner
+                        .identity_select(
+                            "gitlab".into(),
+                            Some("gitlab.tail.test".into()),
+                            "42".into(),
+                        )
+                        .await
+                } else if delete {
+                    owner
+                        .source_control_identity_proof_delete(
+                            "gitlab".into(),
+                            Some("gitlab.tail.test".into()),
+                            "77".into(),
+                            Some("collaboration".into()),
+                        )
+                        .await
+                } else {
+                    owner
+                        .source_control_identity_proof_create(
+                            "gitlab".into(),
+                            Some("gitlab.tail.test".into()),
+                            "nonce".into(),
+                            "test-host".into(),
+                            Some("collaboration".into()),
+                            Some(expected),
+                        )
+                        .await
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(5), entered.notified())
+                .await
+                .unwrap();
+            if outcome == 0 {
+                caller.abort();
+                assert!(caller.await.unwrap_err().is_cancelled());
+            } else {
+                if outcome == 4 {
+                    fail.send(()).unwrap();
+                }
+                let error = tokio::time::timeout(Duration::from_secs(5), caller)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains(if outcome == 4 {
+                        "credential worker failed"
+                    } else {
+                        "timed out"
+                    }),
+                    "{error}"
+                );
+            }
+            assert!(entry.gate.try_lock().is_err());
+            assert_eq!(entry.secrets.mutation_counts_for_test(), (1, 1));
+            assert_eq!(
+                raw.load("identity.proof.77").unwrap(),
+                if delete {
+                    Some(saved.generation.clone())
+                } else {
+                    None
+                }
+            );
+            let (pending, pending_rx) = tokio::sync::oneshot::channel();
+            *service.secrets.writer_drain_pending.lock().unwrap() = Some(pending);
+            let owner = service.clone();
+            let drain =
+                intent_core::spawn_daemon(async move { owner.shutdown_store_writers().await });
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), pending_rx)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                "settings-tasks"
+            );
+            assert!(!drain.is_finished());
+            release.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), drain)
+                .await
+                .unwrap()
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(entry.gate.try_lock().is_ok());
+            assert_eq!(entry.secrets.mutation_counts_for_test(), (0, 1));
+            assert_eq!(
+                raw.load(SECRET_ACCOUNT).unwrap().as_deref(),
+                Some("private-pat")
+            );
+            let receipt = raw.load("identity.proof.77").unwrap();
+            assert_eq!(
+                receipt.as_deref(),
+                if delete || (!select && matches!(outcome, 0 | 1 | 4)) {
+                    Some(saved.generation.as_str())
+                } else {
+                    None
+                }
+            );
+            assert_eq!(
+                entry.secrets.load("identity.proof.77").await.unwrap(),
+                receipt
+            );
+            bus.shutdown().await.unwrap();
+            service.store.close().await;
+            let reopened = Store::open(&tmp.path).await.unwrap();
+            let primary = reopened.get_primary_principal().await.unwrap();
+            assert_eq!(
+                primary
+                    .identity
+                    .as_ref()
+                    .map(|identity| identity.external_user_id.as_str()),
+                if select { Some("42") } else { None }
+            );
+            let events = reopened
+                .query_events(&intent_store::EventQuery::default())
+                .await
+                .unwrap();
+            reopened.close().await;
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(
+                        |event| event.event_type == intent_core::events::PRINCIPAL_IDENTITY_CHANGED
+                    )
+                    .count(),
+                usize::from(select)
+            );
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn collaboration_selection_retains_identity_tail_through_shutdown() {
+        assert_credential_tail_settlement(0).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn collaboration_proof_retains_receipt_and_cleanup_through_shutdown() {
+        assert_credential_tail_settlement(1).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn collaboration_proof_delete_survives_caller_abandonment() {
+        assert_credential_tail_settlement(2).await;
+    }
+
+    struct HeldGrantResult {
+        entered: Arc<tokio::sync::Notify>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl Drop for HeldGrantResult {
+        fn drop(&mut self) {
+            self.entered.notify_one();
+            let _ = self.release.lock().unwrap().recv();
+        }
+    }
+
+    async fn device_grant_fixture(
+        github: bool,
+    ) -> (
+        TempDb,
+        Services,
+        crate::EventBus,
+        Target,
+        Arc<Credential>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let (tmp, service) = fixture().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = GitlabHost::parse("gitlab.grant.test")
+            .unwrap()
+            .with_api_origin(&format!("http://{}", listener.local_addr().unwrap()))
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let responses = if github {
+                vec![
+                    (
+                        "POST",
+                        "/login/device/code",
+                        json!({"device_code":"private-code","user_code":"CODE","verification_uri":"https://github.com/login/device","expires_in":900,"interval":1}),
+                    ),
+                    (
+                        "POST",
+                        "/login/oauth/access_token",
+                        json!({"access_token":"private-grant","token_type":"bearer","scope":"gist"}),
+                    ),
+                    (
+                        "GET",
+                        "/user",
+                        json!({"id":42,"login":"grant-user","name":"Grant User","avatar_url":"https://example.com/avatar"}),
+                    ),
+                ]
+            } else {
+                vec![
+                    (
+                        "POST",
+                        "/oauth/authorize_device",
+                        json!({"device_code":"private-code","user_code":"CODE","verification_uri":"https://gitlab.grant.test/device","expires_in":900,"interval":1}),
+                    ),
+                    (
+                        "POST",
+                        "/oauth/token",
+                        json!({"access_token":"private-grant","refresh_token":"private-refresh","expires_in":7200,"scope":"api"}),
+                    ),
+                    (
+                        "GET",
+                        "/api/v4/user",
+                        json!({"id":42,"username":"grant-user","name":"Grant User"}),
+                    ),
+                    (
+                        "GET",
+                        "/api/v4/personal_access_tokens/self",
+                        json!({"id":7,"scopes":["api"]}),
+                    ),
+                ]
+            };
+            for (method, path, body) in responses {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                assert!(line.starts_with(&format!("{method} {path} ")));
+                let mut length = 0;
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).await.unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((key, value)) = line.split_once(':') {
+                        if key.eq_ignore_ascii_case("content-length") {
+                            length = value.trim().parse().unwrap();
+                        }
+                    }
+                }
+                reader.read_exact(&mut vec![0; length]).await.unwrap();
+                let body = body.to_string();
+                reader.get_mut().write_all(format!("HTTP/1.1 200 OK\r\nx-oauth-scopes: gist\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let registry =
+            Arc::new(crate::SettingsRegistry::load(tmp.path.with_extension("toml")).unwrap());
+        registry
+            .apply(&[
+                ("sourceControl.gitlab.host".into(), json!(host.host())),
+                (
+                    "sourceControl.gitlab.apiBaseUrl".into(),
+                    json!(host.base_url()),
+                ),
+                (
+                    "sourceControl.gitlab.oauthClientId".into(),
+                    json!("private-client"),
+                ),
+            ])
+            .unwrap();
+        let bus = crate::EventBus::new(service.store.clone());
+        let service = service
+            .with_settings_registry(registry)
+            .with_event_bus(bus.clone());
+        let service = if github {
+            service
+                .with_github_login_base_uri(host.base_url())
+                .with_github_api_base_uri(host.base_url())
+        } else {
+            service
+        };
+        let target = if github {
+            Target::Github
+        } else {
+            Target::Gitlab { host }
+        };
+        let entry = service.collaboration_credential(&target).await.unwrap();
+        assert!(entry.store.path().starts_with(
+            tmp.path
+                .with_extension("secrets")
+                .with_extension("secrets.collaboration")
+        ));
+        (tmp, service, bus, target, entry, server)
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn collaboration_device_retains_late_grant_result_and_account() {
+        let (tmp, service, bus, target, entry, server) = device_grant_fixture(false).await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let (release, held) = std::sync::mpsc::channel();
+        *entry.commit_test_lease.lock().unwrap() = Some(Arc::new(HeldGrantResult {
+            entered: entered.clone(),
+            release: std::sync::Mutex::new(held),
+        }));
+        service
+            .identity_connect(
+                target.provider().as_wire().into(),
+                matches!(target, Target::Gitlab { .. }).then(|| target.host().into()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        assert_eq!(
+            entry
+                .store
+                .load(intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT)
+                .unwrap()
+                .as_deref(),
+            Some("private-grant")
+        );
+        // timing-guard: cross the legacy ten-second engine wait while its
+        // completed physical write is held before returning the actual result.
+        tokio::time::sleep(Duration::from_secs(11)).await;
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), service.shutdown_store_writers())
+            .await
+            .unwrap();
+        server.await.unwrap();
+        let saved = account(&entry.store).unwrap();
+        bus.shutdown().await.unwrap();
+        service.store.close().await;
+        let reopened = Store::open(&tmp.path).await.unwrap();
+        let events = reopened
+            .query_events(&intent_store::EventQuery::default())
+            .await
+            .unwrap();
+        reopened.close().await;
+        assert!(
+            saved.is_some(),
+            "late successful grant lost account continuation"
+        );
+        assert_eq!(saved.unwrap().user["login"], "grant-user");
+        assert_eq!(
+            events
+                .iter()
+                .filter(
+                    |e| e.event_type == intent_core::events::IDENTITY_AUTH_CHANGED
+                        && e.data["status"] == "authorized"
+                )
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(
+            |e| e.event_type == intent_core::events::IDENTITY_AUTH_CHANGED
+                && e.data["status"] == "error"
+        ));
+    }
+
+    async fn assert_device_write_outcomes(github: bool, outcomes: std::ops::Range<u8>) {
+        use intent_sourcecontrol::gitlab_token::{
+            EXPIRES_AT_SECRET_ACCOUNT, REFRESH_SECRET_ACCOUNT,
+        };
+        for outcome in outcomes {
+            let (tmp, service, bus, target, entry, server) = device_grant_fixture(github).await;
+            let token_key = target.token_account();
+            let raw = entry.store.clone();
+            for (key, value) in [
+                (token_key, "old-token"),
+                (REFRESH_SECRET_ACCOUNT, "old-refresh"),
+                (EXPIRES_AT_SECRET_ACCOUNT, "1"),
+                (ACCOUNT, "old-account"),
+            ] {
+                raw.store(key, value).unwrap();
+            }
+            drop(entry);
+            let backend = Arc::new(HeldPat {
+                store: raw.clone(),
+                entered: Arc::new(tokio::sync::Notify::new()),
+                release: std::sync::Mutex::new(None),
+                arm_worker_failure: std::sync::Mutex::new(None),
+                outcome: 0,
+            });
+            let secrets = crate::settings::AsyncSecretStore::with_timings(
+                backend.clone(),
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+            );
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let signal = entered.clone();
+            let (release, held) = std::sync::mpsc::channel();
+            let partial_store = raw.clone();
+            let before: Box<dyn FnOnce() -> Result<()> + Send> = Box::new(move || {
+                signal.notify_one();
+                let _ = held.recv();
+                match outcome {
+                    1 => Err(Error::Internal("controlled grant prewrite error".into())),
+                    2 => panic!("controlled grant backend panic"),
+                    4 => {
+                        // Model the engine's non-atomic tuple: one real token
+                        // write succeeded before the next operation failed.
+                        partial_store.store(token_key, "partial-grant")?;
+                        Err(Error::Internal("controlled partial grant write".into()))
+                    }
+                    _ => Ok(()),
+                }
+            });
+            if github {
+                *secrets.before_github_persistence.lock().unwrap() = Some(before);
+            } else {
+                *secrets.before_gitlab_persistence.lock().unwrap() = Some(before);
+            }
+            let (fail, failing) = tokio::sync::oneshot::channel();
+            if matches!(outcome, 3 | 5) {
+                let slot = secrets.panic_mutation_caller.clone();
+                *backend.arm_worker_failure.lock().unwrap() = Some(Box::new(move || {
+                    *slot.lock().unwrap() = Some(failing);
+                }));
+            }
+            {
+                let mut entries = service.collaboration_auth.lock().await;
+                Arc::get_mut(entries.values_mut().next().unwrap())
+                    .unwrap()
+                    .secrets = Arc::new(secrets);
+            }
+            let entry = service.collaboration_credential(&target).await.unwrap();
+            for key in [
+                token_key,
+                REFRESH_SECRET_ACCOUNT,
+                EXPIRES_AT_SECRET_ACCOUNT,
+                ACCOUNT,
+            ] {
+                assert!(entry.secrets.load(key).await.unwrap().is_some());
+            }
+            service
+                .identity_connect(
+                    target.provider().as_wire().into(),
+                    matches!(target, Target::Gitlab { .. }).then(|| target.host().into()),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), entered.notified())
+                .await
+                .unwrap();
+            server.await.unwrap();
+            if matches!(outcome, 3 | 5) {
+                fail.send(()).unwrap();
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    entry.secrets.gitlab_poll_worker_failed.notified(),
+                )
+                .await
+                .unwrap();
+            }
+            assert_eq!(entry.secrets.mutation_counts_for_test(), (1, 1));
+            assert!(entry.gate.try_lock().is_err());
+            assert_eq!(raw.load(token_key).unwrap().as_deref(), Some("old-token"));
+            assert_eq!(raw.load(ACCOUNT).unwrap(), None);
+            let newer = if outcome == 5 {
+                let generation = entry.state.lock().await.generation;
+                let owner = service.clone();
+                let newer_target = target.clone();
+                let revoke = intent_core::spawn_daemon(async move {
+                    owner
+                        .identity_revoke(
+                            newer_target.provider().as_wire().into(),
+                            matches!(newer_target, Target::Gitlab { .. })
+                                .then(|| newer_target.host().into()),
+                        )
+                        .await
+                });
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if entry.state.lock().await.generation != generation {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(entry.state.lock().await.flow.is_none());
+                assert!(!revoke.is_finished());
+                assert!(entry.gate.try_lock().is_err());
+                Some(revoke)
+            } else {
+                None
+            };
+            let (pending, pending_rx) = tokio::sync::oneshot::channel();
+            *service.secrets.writer_drain_pending.lock().unwrap() = Some(pending);
+            let owner = service.clone();
+            let drain =
+                intent_core::spawn_daemon(async move { owner.shutdown_store_writers().await });
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), pending_rx)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                if outcome == 5 {
+                    "settings-tasks"
+                } else if outcome == 3 {
+                    "store-tasks"
+                } else {
+                    "collaboration-state"
+                }
+            );
+            assert!(service.settings_tasks.is_closed());
+            assert!(!drain.is_finished());
+            release.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), drain)
+                .await
+                .unwrap()
+                .unwrap();
+            if let Some(newer) = newer {
+                newer.await.unwrap().unwrap();
+            }
+            assert!(entry.gate.try_lock().is_ok());
+            assert_eq!(
+                entry.secrets.mutation_counts_for_test(),
+                (0, if outcome == 5 { 2 } else { 1 })
+            );
+            for key in [
+                token_key,
+                REFRESH_SECRET_ACCOUNT,
+                EXPIRES_AT_SECRET_ACCOUNT,
+                ACCOUNT,
+            ] {
+                assert_eq!(
+                    entry.secrets.load(key).await.unwrap(),
+                    raw.load(key).unwrap(),
+                    "stale private cache for {key}"
+                );
+            }
+            assert_eq!(
+                raw.load(token_key).unwrap().as_deref(),
+                match outcome {
+                    0 | 3 => Some("private-grant"),
+                    4 => Some("partial-grant"),
+                    5 => None,
+                    _ => Some("old-token"),
+                }
+            );
+            assert_eq!(
+                raw.load(REFRESH_SECRET_ACCOUNT).unwrap().as_deref(),
+                match outcome {
+                    0 | 3 if !github => Some("private-refresh"),
+                    5 => None,
+                    _ => Some("old-refresh"),
+                }
+            );
+            assert_eq!(account(&raw).unwrap().is_some(), outcome == 0);
+            bus.shutdown().await.unwrap();
+            service.store.close().await;
+            let reopened = Store::open(&tmp.path).await.unwrap();
+            let events = reopened
+                .query_events(&intent_store::EventQuery::default())
+                .await
+                .unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(
+                        |e| e.event_type == intent_core::events::IDENTITY_AUTH_CHANGED
+                            && e.data["status"] == "authorized"
+                    )
+                    .count(),
+                usize::from(outcome == 0)
+            );
+            if outcome == 5 {
+                let statuses: Vec<_> = events
+                    .iter()
+                    .filter(|e| e.event_type == intent_core::events::IDENTITY_AUTH_CHANGED)
+                    .map(|e| e.data["status"].as_str().unwrap())
+                    .collect();
+                assert_eq!(
+                    statuses,
+                    vec!["revoked"],
+                    "old grant published after newer owner"
+                );
+            }
+            reopened.close().await;
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn collaboration_device_retains_prewrite_and_worker_failure_through_drain() {
+        assert_device_write_outcomes(false, 0..4).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn collaboration_device_partial_result_invalidates_private_siblings() {
+        assert_device_write_outcomes(false, 4..5).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn collaboration_device_worker_failure_cannot_publish_over_newer_revoke() {
+        assert_device_write_outcomes(false, 5..6).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn collaboration_github_device_retains_actual_results_through_drain() {
+        assert_device_write_outcomes(true, 0..6).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn collaboration_proof_create_refuses_after_early_close() {
+        assert_collaboration_probe_root_refused("proof-create").await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn collaboration_proof_delete_refuses_after_early_close() {
+        assert_collaboration_probe_root_refused("proof-delete").await;
+    }
+
+    async fn assert_collaboration_probe_root_refused(operation: &str) {
+        let (tmp, service) = fixture().await;
+        let bus = crate::EventBus::new(service.store.clone());
+        let service = service.with_event_bus(bus.clone());
+        let host = "gitlab.closed-probe.test";
+        let entry = service
+            .collaboration_credential(&Target::Gitlab {
+                host: GitlabHost::parse(host).unwrap(),
+            })
+            .await
+            .unwrap();
+        service.begin_settings_shutdown();
+        let generation = service.identity_rekey_generation.load(Ordering::SeqCst);
+        let result = match operation {
+            "status" => {
+                service
+                    .identity_auth_status("gitlab".into(), Some(host.into()))
+                    .await
+            }
+            "user" => {
+                service
+                    .identity_get_user("gitlab".into(), Some(host.into()))
+                    .await
+            }
+            "select" => {
+                service
+                    .identity_select("gitlab".into(), Some(host.into()), "42".into())
+                    .await
+            }
+            "proof-create" => {
+                service
+                    .source_control_identity_proof_create(
+                        "gitlab".into(),
+                        Some(host.into()),
+                        "nonce".into(),
+                        "host".into(),
+                        Some("collaboration".into()),
+                        ForgeUser::on("gitlab", host, "42", "person", None).identity,
+                    )
+                    .await
+            }
+            "proof-delete" => {
+                service
+                    .source_control_identity_proof_delete(
+                        "gitlab".into(),
+                        Some(host.into()),
+                        "77".into(),
+                        Some("collaboration".into()),
+                    )
+                    .await
+            }
+            _ => unreachable!(),
+        };
+        let after = service.identity_rekey_generation.load(Ordering::SeqCst);
+        service.shutdown_store_writers().await;
+        bus.shutdown().await.unwrap();
+        service.store.close().await;
+        let reopened = Store::open(&tmp.path).await.unwrap();
+        let events = reopened
+            .query_events(&intent_store::EventQuery::default())
+            .await
+            .unwrap();
+        reopened.close().await;
+        assert!(
+            matches!(result,Err(Error::Internal(ref message)) if message.contains("shutting down")),
+            "collaboration {operation} escaped closed root admission: {result:?}"
+        );
+        assert_eq!(
+            generation, after,
+            "refused selection changed identity generation"
+        );
+        assert_eq!(entry.secrets.mutation_counts_for_test().0, 0);
+        assert!(entry.store.load(ACCOUNT).unwrap().is_none());
+        assert!(!events
+            .iter()
+            .any(|e| e.event_type == intent_core::events::IDENTITY_AUTH_CHANGED));
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn collaboration_status_root_refuses_after_early_close() {
+        assert_collaboration_probe_root_refused("status").await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn collaboration_user_root_refuses_after_early_close() {
+        assert_collaboration_probe_root_refused("user").await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn collaboration_select_root_refuses_after_early_close() {
+        assert_collaboration_probe_root_refused("select").await;
+    }
+
+    async fn device_start_fixture() -> (
+        TempDb,
+        Services,
+        GitlabHost,
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let (tmp, service) = fixture().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = GitlabHost::parse("gitlab.device.test")
+            .unwrap()
+            .with_api_origin(&format!("http://{}", listener.local_addr().unwrap()))
+            .unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let server = tokio::spawn({
+            let entered = entered.clone();
+            let release = release.clone();
+            async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                assert!(line.starts_with("POST /oauth/authorize_device "));
+                let mut length = 0;
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).await.unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((key, value)) = line.split_once(':') {
+                        if key.eq_ignore_ascii_case("content-length") {
+                            length = value.trim().parse().unwrap();
+                        }
+                    }
+                }
+                reader.read_exact(&mut vec![0; length]).await.unwrap();
+                entered.notify_one();
+                release.notified().await;
+                let body=json!({"device_code":"private-code","user_code":"CODE","verification_uri":"https://gitlab.device.test/device","expires_in":900,"interval":3600}).to_string();
+                reader.get_mut().write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",body.len(),body).as_bytes()).await.unwrap();
+            }
+        });
+        let registry =
+            Arc::new(crate::SettingsRegistry::load(tmp.path.with_extension("toml")).unwrap());
+        registry
+            .apply(&[
+                ("sourceControl.gitlab.host".into(), json!(host.host())),
+                (
+                    "sourceControl.gitlab.apiBaseUrl".into(),
+                    json!(host.base_url()),
+                ),
+                (
+                    "sourceControl.gitlab.oauthClientId".into(),
+                    json!("private-client"),
+                ),
+            ])
+            .unwrap();
+        (
+            tmp,
+            service.with_settings_registry(registry),
+            host,
+            entered,
+            release,
+            server,
+        )
+    }
+
+    async fn assert_device_start_refused(close_during_http: bool, final_close: bool) {
+        let (_tmp, service, host, entered, release, server) = device_start_fixture().await;
+        let entry = service
+            .collaboration_credential(&Target::Gitlab { host: host.clone() })
+            .await
+            .unwrap();
+        if !close_during_http {
+            if final_close {
+                service.shutdown_store_writers().await;
+            } else {
+                service.begin_settings_shutdown();
+            }
+            release.notify_one();
+        }
+        let generation = entry.state.lock().await.generation;
+        let worker = service.clone();
+        let caller = intent_core::spawn_daemon(async move {
+            worker
+                .identity_connect("gitlab".into(), Some(host.host().into()), None, None)
+                .await
+        });
+        if close_during_http {
+            tokio::time::timeout(Duration::from_secs(5), entered.notified())
+                .await
+                .unwrap();
+            service.begin_settings_shutdown();
+            release.notify_one();
+        }
+        let result = tokio::time::timeout(Duration::from_secs(5), caller)
+            .await
+            .unwrap()
+            .unwrap();
+        server.abort();
+        let _ = server.await;
+        let has_flow = entry.state.lock().await.flow.is_some();
+        let after = entry.state.lock().await.generation;
+        service.shutdown_store_writers().await;
+        service.store.close().await;
+        assert!(
+            matches!(result,Err(Error::Internal(ref message)) if message.contains("shutting down")),
+            "collaboration device flow escaped closed admission: {result:?}"
+        );
+        assert!(!has_flow);
+        if !close_during_http {
+            assert_eq!(generation, after);
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn collaboration_device_refuses_after_early_close() {
+        assert_device_start_refused(false, false).await;
+    }
+    #[intent_test_macros::daemon_test]
+    async fn collaboration_device_refuses_after_writer_close() {
+        assert_device_start_refused(false, true).await;
+    }
+    #[intent_test_macros::daemon_test]
+    async fn collaboration_device_refuses_when_shutdown_wins_http_start() {
+        assert_device_start_refused(true, false).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn collaboration_device_shutdown_joins_an_actually_sleeping_poll() {
+        let (_tmp, service, host, _entered, release, server) = device_start_fixture().await;
+        let entry = service
+            .collaboration_credential(&Target::Gitlab { host: host.clone() })
+            .await
+            .unwrap();
+        let (pending, pending_rx) = tokio::sync::oneshot::channel();
+        *entry.sleep_pending.lock().unwrap() = Some(pending);
+        release.notify_one();
+        let result = service
+            .identity_connect("gitlab".into(), Some(host.host().into()), None, None)
+            .await
+            .unwrap();
+        assert_eq!(result["ok"], true);
+        server.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), pending_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(entry.state.lock().await.flow.is_some());
+        tokio::time::timeout(Duration::from_secs(5), service.shutdown_store_writers())
+            .await
+            .unwrap();
+        assert!(entry.state.lock().await.flow.is_none());
+        assert!(service.store_tasks.is_closed());
+        assert!(entry
+            .store
+            .load(intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT)
+            .unwrap()
+            .is_none());
+        service.store.close().await;
+    }
+
+    async fn assert_pat_refused_after_close(final_close: bool) {
+        let (tmp, service) = fixture().await;
+        let (host, server) = crate::source_control_auth_ops::startup_tests::pat_host().await;
+        let registry =
+            Arc::new(crate::SettingsRegistry::load(tmp.path.with_extension("toml")).unwrap());
+        registry
+            .apply(&[
+                ("sourceControl.gitlab.host".into(), json!(host.host())),
+                (
+                    "sourceControl.gitlab.apiBaseUrl".into(),
+                    json!(host.base_url()),
+                ),
+            ])
+            .unwrap();
+        let service = service.with_settings_registry(registry);
+        let target = Target::Gitlab { host: host.clone() };
+        let entry = service.collaboration_credential(&target).await.unwrap();
+        entry
+            .store
+            .store(target.token_account(), "saved-private-token")
+            .unwrap();
+        entry.store.store(ACCOUNT, "saved-private-account").unwrap();
+        if final_close {
+            service.shutdown_store_writers().await;
+        } else {
+            service.begin_settings_shutdown();
+        }
+        let generation = entry.state.lock().await.generation;
+        let result = service
+            .identity_connect(
+                "gitlab".into(),
+                Some(host.host().into()),
+                Some("pat".into()),
+                Some("valid-pat".into()),
+            )
+            .await;
+        server.abort();
+        let _ = server.await;
+        let token = entry.store.load(target.token_account()).unwrap();
+        let account = entry.store.load(ACCOUNT).unwrap();
+        let after_generation = entry.state.lock().await.generation;
+        service.shutdown_store_writers().await;
+        service.store.close().await;
+        assert!(
+            matches!(result, Err(Error::Internal(ref message)) if message.contains("shutting down")),
+            "collaboration PAT escaped closed admission: {result:?}"
+        );
+        assert_eq!(token.as_deref(), Some("saved-private-token"));
+        assert_eq!(account.as_deref(), Some("saved-private-account"));
+        assert_eq!(generation, after_generation);
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn collaboration_pat_refuses_after_early_close() {
+        assert_pat_refused_after_close(false).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn collaboration_pat_refuses_after_writer_close() {
+        assert_pat_refused_after_close(true).await;
+    }
+
+    async fn assert_revoke_refused_after_close(final_close: bool) {
+        let (tmp, service) = fixture().await;
+        let bus = crate::EventBus::new(service.store.clone());
+        let service = service.with_event_bus(bus.clone());
+        let entry = service
+            .collaboration_credential(&Target::Github)
+            .await
+            .unwrap();
+        entry
+            .store
+            .store(github_auth_ops::SECRET_ACCOUNT, "saved-private-token")
+            .unwrap();
+        entry.store.store(ACCOUNT, "saved-private-account").unwrap();
+        entry.state.lock().await.flow = Some(FlowSlot {
+            flow_id: github_auth_ops::next_flow_id(),
+            user_code: "saved-code".into(),
+            verification_uri: "https://github.com/login/device".into(),
+            interval: 60,
+            deadline: Instant::now() + Duration::from_secs(900),
+            phase: FlowPhase::Pending,
+        });
+        if final_close {
+            service.shutdown_store_writers().await;
+        } else {
+            service.begin_settings_shutdown();
+        }
+        let before = {
+            let state = entry.state.lock().await;
+            (
+                state.generation,
+                state
+                    .flow
+                    .as_ref()
+                    .map(|slot| (slot.flow_id, slot.phase.as_wire())),
+            )
+        };
+        let result = service.identity_revoke("github".into(), None).await;
+        let token = entry.store.load(github_auth_ops::SECRET_ACCOUNT).unwrap();
+        let account = entry.store.load(ACCOUNT).unwrap();
+        let after = {
+            let state = entry.state.lock().await;
+            (
+                state.generation,
+                state
+                    .flow
+                    .as_ref()
+                    .map(|slot| (slot.flow_id, slot.phase.as_wire())),
+            )
+        };
+        assert_eq!(before, after);
+        assert_eq!(entry.secrets.mutation_counts_for_test().0, 0);
+        service.shutdown_store_writers().await;
+        bus.shutdown().await.unwrap();
+        service.store.close().await;
+        let reopened = Store::open(&tmp.path).await.unwrap();
+        assert!(!reopened
+            .query_events(&intent_store::EventQuery::default())
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| e.event_type == intent_core::events::IDENTITY_AUTH_CHANGED));
+        reopened.close().await;
+        assert!(
+            matches!(result, Err(Error::Internal(ref message)) if message.contains("shutting down")),
+            "collaboration revoke escaped closed admission: {result:?}"
+        );
+        assert_eq!(token.as_deref(), Some("saved-private-token"));
+        assert_eq!(account.as_deref(), Some("saved-private-account"));
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn collaboration_revoke_refuses_after_early_close() {
+        assert_revoke_refused_after_close(false).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn collaboration_revoke_refuses_after_writer_close() {
+        assert_revoke_refused_after_close(true).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn collaboration_direct_endpoints_refuse_members_before_admission() {
+        let (tmp, service) = fixture().await;
+        let (host, server) = crate::source_control_auth_ops::startup_tests::pat_host().await;
+        let registry =
+            Arc::new(crate::SettingsRegistry::load(tmp.path.with_extension("toml")).unwrap());
+        registry
+            .apply(&[
+                ("sourceControl.gitlab.host".into(), json!(host.host())),
+                (
+                    "sourceControl.gitlab.apiBaseUrl".into(),
+                    json!(host.base_url()),
+                ),
+            ])
+            .unwrap();
+        let bus = crate::EventBus::new(service.store.clone());
+        let service = service
+            .with_settings_registry(registry)
+            .with_event_bus(bus.clone());
+        for target in [Target::Github, Target::Gitlab { host: host.clone() }] {
+            let entry = service.collaboration_credential(&target).await.unwrap();
+            entry
+                .store
+                .store(target.token_account(), "saved-private-token")
+                .unwrap();
+            entry.store.store(ACCOUNT, "saved-private-account").unwrap();
+            with_caller(
+                Caller::Wire {
+                    principal_id: PrincipalId::new(),
+                    host_role: HostRole::Member,
+                },
+                async {
+                    let result = service
+                        .identity_revoke(
+                            target.provider().as_wire().into(),
+                            matches!(target, Target::Gitlab { .. }).then(|| target.host().into()),
+                        )
+                        .await;
+                    assert!(matches!(result, Err(Error::Forbidden(_))), "{result:?}");
+                    if matches!(target, Target::Gitlab { .. }) {
+                        let result = service
+                            .identity_connect(
+                                "gitlab".into(),
+                                Some(host.host().into()),
+                                Some("pat".into()),
+                                Some("valid-pat".into()),
+                            )
+                            .await;
+                        assert!(matches!(result, Err(Error::Forbidden(_))), "{result:?}");
+                    }
+                },
+            )
+            .await;
+            assert_eq!(entry.secrets.mutation_counts_for_test(), (0, 0));
+            assert_eq!(entry.state.lock().await.generation, 0);
+            assert_eq!(
+                entry.store.load(target.token_account()).unwrap().as_deref(),
+                Some("saved-private-token")
+            );
+            assert_eq!(
+                entry.store.load(ACCOUNT).unwrap().as_deref(),
+                Some("saved-private-account")
+            );
+        }
+        server.abort();
+        let _ = server.await;
+        service.shutdown_store_writers().await;
+        bus.shutdown().await.unwrap();
+        service.store.close().await;
+        let reopened = Store::open(&tmp.path).await.unwrap();
+        assert!(!reopened
+            .query_events(&intent_store::EventQuery::default())
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| e.event_type == intent_core::events::IDENTITY_AUTH_CHANGED));
+        reopened.close().await;
+    }
+
+    struct HeldPat {
+        store: FileSecretStore,
+        entered: Arc<tokio::sync::Notify>,
+        release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        arm_worker_failure: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        outcome: u8,
+    }
+
+    impl crate::settings::SecretStore for HeldPat {
+        fn load(&self, key: &str) -> Result<Option<String>> {
+            self.store.load(key)
+        }
+        fn store(&self, key: &str, value: &str) -> Result<()> {
+            if key == intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT {
+                let held = self.release.lock().unwrap().take();
+                if let Some(held) = held {
+                    self.entered.notify_one();
+                    let _ = held.recv();
+                    self.store.store(key, value)?;
+                    match self.outcome {
+                        1 => return Err(Error::Internal("controlled partial PAT write".into())),
+                        2 => panic!("controlled partial PAT backend panic"),
+                        _ => return Ok(()),
+                    }
+                }
+            }
+            self.store.store(key, value)
+        }
+        fn delete(&self, key: &str) -> Result<()> {
+            self.store.delete(key)?;
+            if key == ACCOUNT {
+                if let Some(arm) = self.arm_worker_failure.lock().unwrap().take() {
+                    arm();
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn collaboration_pat_retains_partial_results_and_guard_through_shutdown() {
+        use intent_sourcecontrol::gitlab_token::{
+            EXPIRES_AT_SECRET_ACCOUNT, REFRESH_SECRET_ACCOUNT, SECRET_ACCOUNT,
+        };
+        for outcome in 0..5 {
+            let (tmp, service) = fixture().await;
+            let (host, server) = crate::source_control_auth_ops::startup_tests::pat_host().await;
+            let registry =
+                Arc::new(crate::SettingsRegistry::load(tmp.path.with_extension("toml")).unwrap());
+            registry
+                .apply(&[
+                    ("sourceControl.gitlab.host".into(), json!(host.host())),
+                    (
+                        "sourceControl.gitlab.apiBaseUrl".into(),
+                        json!(host.base_url()),
+                    ),
+                ])
+                .unwrap();
+            let bus = crate::EventBus::new(service.store.clone());
+            let service = service
+                .with_settings_registry(registry)
+                .with_event_bus(bus.clone());
+            let target = Target::Gitlab { host: host.clone() };
+            let entry = service.collaboration_credential(&target).await.unwrap();
+            let raw = entry.store.clone();
+            for (key, value) in [
+                (SECRET_ACCOUNT, "old-token"),
+                (REFRESH_SECRET_ACCOUNT, "old-refresh"),
+                (EXPIRES_AT_SECRET_ACCOUNT, "9999999999"),
+                (ACCOUNT, "old-account"),
+            ] {
+                raw.store(key, value).unwrap();
+            }
+            drop(entry);
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let (release, held) = std::sync::mpsc::channel();
+            let backend = Arc::new(HeldPat {
+                store: raw.clone(),
+                entered: entered.clone(),
+                release: std::sync::Mutex::new(Some(held)),
+                arm_worker_failure: std::sync::Mutex::new(None),
+                outcome,
+            });
+            let secrets = crate::settings::AsyncSecretStore::with_timings(
+                backend.clone(),
+                Duration::from_secs(5),
+                if matches!(outcome, 0 | 3) {
+                    Duration::from_secs(5)
+                } else {
+                    Duration::from_millis(10)
+                },
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+            );
+            let (fail, failing) = tokio::sync::oneshot::channel();
+            if outcome == 3 {
+                let slot = secrets.panic_mutation_caller.clone();
+                *backend.arm_worker_failure.lock().unwrap() = Some(Box::new(move || {
+                    *slot.lock().unwrap() = Some(failing);
+                }));
+            }
+            {
+                let mut entries = service.collaboration_auth.lock().await;
+                Arc::get_mut(entries.values_mut().next().unwrap())
+                    .unwrap()
+                    .secrets = Arc::new(secrets);
+            }
+            let entry = service.collaboration_credential(&target).await.unwrap();
+            for key in [
+                SECRET_ACCOUNT,
+                REFRESH_SECRET_ACCOUNT,
+                EXPIRES_AT_SECRET_ACCOUNT,
+                ACCOUNT,
+            ] {
+                assert!(entry.secrets.load(key).await.unwrap().is_some());
+            }
+            let worker = service.clone();
+            let caller = intent_core::spawn_daemon(async move {
+                worker
+                    .identity_connect(
+                        "gitlab".into(),
+                        Some(host.host().into()),
+                        Some("pat".into()),
+                        Some("new-pat".into()),
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(5), entered.notified())
+                .await
+                .unwrap();
+            server.await.unwrap();
+            if outcome == 0 {
+                caller.abort();
+                assert!(caller.await.unwrap_err().is_cancelled());
+            } else if outcome == 3 {
+                fail.send(()).unwrap();
+                let error = tokio::time::timeout(Duration::from_secs(5), caller)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("PAT failed"),
+                    "expected worker failure: {error}"
+                );
+            } else {
+                let error = tokio::time::timeout(Duration::from_secs(5), caller)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap_err();
+                assert!(error.to_string().contains("timed out"));
+            }
+            assert!(entry.gate.try_lock().is_err());
+            assert_eq!(entry.secrets.mutation_counts_for_test(), (1, 1));
+            assert_eq!(
+                raw.load(SECRET_ACCOUNT).unwrap().as_deref(),
+                Some("old-token")
+            );
+            assert!(raw.load(ACCOUNT).unwrap().is_none());
+            let (pending, pending_rx) = tokio::sync::oneshot::channel();
+            *service.secrets.writer_drain_pending.lock().unwrap() = Some(pending);
+            let worker = service.clone();
+            let drain =
+                intent_core::spawn_daemon(async move { worker.shutdown_store_writers().await });
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), pending_rx)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                "settings-tasks"
+            );
+            assert!(!drain.is_finished());
+            release.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), drain)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(entry.gate.try_lock().is_ok());
+            assert_eq!(
+                entry.secrets.load(SECRET_ACCOUNT).await.unwrap().as_deref(),
+                Some("new-pat")
+            );
+            for key in [REFRESH_SECRET_ACCOUNT, EXPIRES_AT_SECRET_ACCOUNT] {
+                assert_eq!(
+                    entry.secrets.load(key).await.unwrap().is_none(),
+                    matches!(outcome, 0 | 4)
+                );
+            }
+            assert_eq!(
+                entry.secrets.load(ACCOUNT).await.unwrap().is_some(),
+                matches!(outcome, 0 | 4)
+            );
+            assert_eq!(entry.secrets.mutation_counts_for_test(), (0, 1));
+            bus.shutdown().await.unwrap();
+            service.store.close().await;
+            let reopened = Store::open(&tmp.path).await.unwrap();
+            let events = reopened
+                .query_events(&intent_store::EventQuery::default())
+                .await
+                .unwrap();
+            reopened.close().await;
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(
+                        |e| e.event_type == intent_core::events::IDENTITY_AUTH_CHANGED
+                            && e.data["status"] == "authorized"
+                    )
+                    .count(),
+                usize::from(matches!(outcome, 0 | 4))
+            );
+        }
+    }
+
+    struct HeldRevoke {
+        store: FileSecretStore,
+        entered: Arc<tokio::sync::Notify>,
+        release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        outcome: u8,
+    }
+
+    impl crate::settings::SecretStore for HeldRevoke {
+        fn load(&self, key: &str) -> Result<Option<String>> {
+            self.store.load(key)
+        }
+        fn store(&self, key: &str, value: &str) -> Result<()> {
+            self.store.store(key, value)
+        }
+        fn delete(&self, key: &str) -> Result<()> {
+            let held = self.release.lock().unwrap().take();
+            if let Some(held) = held {
+                self.entered.notify_one();
+                let _ = held.recv();
+                match self.outcome {
+                    1 => return Err(Error::InvalidParams("controlled revoke failure".into())),
+                    2 => panic!("controlled revoke backend panic"),
+                    _ => {}
+                }
+            }
+            self.store.delete(key)
+        }
+    }
+
+    async fn assert_revoke_retains_results_and_guard(target: Target) {
+        use std::future::Future;
+        for outcome in 0..5 {
+            let (tmp, service) = fixture().await;
+            let bus = crate::EventBus::new(service.store.clone());
+            let service = service.with_event_bus(bus.clone());
+            let entry = service.collaboration_credential(&target).await.unwrap();
+            let raw = entry.store.clone();
+            let token_key = target.token_account();
+            let mut keys = vec![token_key, ACCOUNT];
+            if matches!(target, Target::Gitlab { .. }) {
+                keys.extend([
+                    intent_sourcecontrol::gitlab_token::REFRESH_SECRET_ACCOUNT,
+                    intent_sourcecontrol::gitlab_token::EXPIRES_AT_SECRET_ACCOUNT,
+                ]);
+            }
+            for key in &keys {
+                raw.store(key, "old-private-value").unwrap();
+            }
+            drop(entry);
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let (release, held) = std::sync::mpsc::channel();
+            let secrets = crate::settings::AsyncSecretStore::with_timings(
+                Arc::new(HeldRevoke {
+                    store: raw.clone(),
+                    entered: entered.clone(),
+                    release: std::sync::Mutex::new(Some(held)),
+                    outcome,
+                }),
+                Duration::from_secs(5),
+                if matches!(outcome, 0 | 3) {
+                    Duration::from_secs(5)
+                } else {
+                    Duration::from_millis(10)
+                },
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+            );
+            {
+                let mut entries = service.collaboration_auth.lock().await;
+                Arc::get_mut(entries.values_mut().next().unwrap())
+                    .unwrap()
+                    .secrets = Arc::new(secrets);
+            }
+            let entry = service.collaboration_credential(&target).await.unwrap();
+            let (fail, failing) = tokio::sync::oneshot::channel();
+            if outcome == 3 {
+                *entry.secrets.panic_mutation_caller.lock().unwrap() = Some(failing);
+            }
+            for key in &keys {
+                assert_eq!(
+                    entry.secrets.load(key).await.unwrap().as_deref(),
+                    Some("old-private-value")
+                );
+            }
+            let worker = service.clone();
+            let provider = target.provider().as_wire().to_owned();
+            let host = matches!(target, Target::Gitlab { .. }).then(|| target.host().to_owned());
+            let caller =
+                intent_core::spawn_daemon(
+                    async move { worker.identity_revoke(provider, host).await },
+                );
+            tokio::time::timeout(Duration::from_secs(5), entered.notified())
+                .await
+                .unwrap();
+            if outcome == 0 {
+                caller.abort();
+                assert!(caller.await.unwrap_err().is_cancelled());
+            } else if outcome == 3 {
+                fail.send(()).unwrap();
+                let error = tokio::time::timeout(Duration::from_secs(5), caller)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap_err();
+                assert!(error.to_string().contains("revoke failed"));
+            } else {
+                let error = tokio::time::timeout(Duration::from_secs(5), caller)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap_err();
+                assert!(error.to_string().contains("timed out"));
+            }
+            assert!(entry.gate.try_lock().is_err());
+            assert_eq!(
+                raw.load(token_key).unwrap().as_deref(),
+                Some("old-private-value")
+            );
+            assert_eq!(entry.secrets.mutation_counts_for_test(), (1, 1));
+            let (pending, pending_rx) = tokio::sync::oneshot::channel();
+            *service.secrets.writer_drain_pending.lock().unwrap() = Some(pending);
+            let worker = service.clone();
+            let mut drain = Box::pin(intent_core::spawn_daemon(async move {
+                worker.shutdown_store_writers().await;
+            }));
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), pending_rx)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                "settings-tasks"
+            );
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(
+                    drain.as_mut().poll(cx).is_pending()
+                ))
+                .await
+            );
+            release.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), drain)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(entry.gate.try_lock().is_ok());
+            assert_eq!(entry.secrets.mutation_counts_for_test(), (0, 1));
+            for key in &keys {
+                let removed = matches!(outcome, 0 | 4) || (outcome == 3 && *key == token_key);
+                assert_eq!(
+                    raw.load(key).unwrap().is_none(),
+                    removed,
+                    "raw {key}, outcome {outcome}"
+                );
+                assert_eq!(
+                    entry.secrets.load(key).await.unwrap().is_none(),
+                    removed,
+                    "cached {key}, outcome {outcome}"
+                );
+            }
+            bus.shutdown().await.unwrap();
+            service.store.close().await;
+            let reopened = Store::open(&tmp.path).await.unwrap();
+            let events = reopened
+                .query_events(&intent_store::EventQuery::default())
+                .await
+                .unwrap();
+            reopened.close().await;
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(
+                        |e| e.event_type == intent_core::events::IDENTITY_AUTH_CHANGED
+                            && e.data["status"] == "revoked"
+                    )
+                    .count(),
+                usize::from(matches!(outcome, 0 | 4))
+            );
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn collaboration_revoke_retains_results_and_guard_through_shutdown() {
+        assert_revoke_retains_results_and_guard(Target::Github).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn collaboration_gitlab_revoke_retains_siblings_and_receipts_through_shutdown() {
+        assert_revoke_retains_results_and_guard(
+            Services::collaboration_target("gitlab", Some("private-revoke.test")).unwrap(),
+        )
+        .await;
     }
 
     #[intent_test_macros::daemon_test]
@@ -1102,8 +3526,8 @@ mod tests {
         let second_store = Store::open(&tmp.path.with_extension("other.db"))
             .await
             .unwrap();
-        let second = Services::new(second_store)
-            .with_gitlab_secret_store(service.gitlab_secret_store.clone());
+        let second =
+            Services::new_with_file_secrets(second_store, service.gitlab_secret_store.clone());
         let second_entry = second
             .collaboration_credential(&Target::Github)
             .await
@@ -1274,13 +3698,16 @@ mod tests {
         )
         .unwrap();
         let lease: PersistenceLease = Arc::new(entry.gate.clone().lock_owned().await);
-        save_account(&entry, lease, &account).await.unwrap();
+        save_account(&entry.secrets, &account).await.unwrap();
+        drop(lease);
         entry
             .store
             .store("identity.proof.abcdef", &account.generation)
             .unwrap();
-        let restarted = Services::new(service.store.clone())
-            .with_gitlab_secret_store(service.gitlab_secret_store.clone());
+        let restarted = Services::new_with_file_secrets(
+            service.store.clone(),
+            service.gitlab_secret_store.clone(),
+        );
         let reloaded = restarted
             .collaboration_credential(&Target::Github)
             .await

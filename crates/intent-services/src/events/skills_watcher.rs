@@ -50,6 +50,11 @@ impl Drop for SkillsWatcher {
 }
 
 impl SkillsWatcher {
+    pub(super) async fn shutdown(mut self) {
+        let _ = self.raw_tx.send(SkillsMsg::Stop);
+        let _ = (&mut self.task).await;
+    }
+
     /// Start watching skills directories for all workspaces.
     /// `workspaces` is a list of (`workspace_id`, `workspace_path`) pairs.
     pub(super) fn start(
@@ -218,6 +223,7 @@ impl LinkedSkillWatches {
 /// (de)registration of a workspace (#611).
 #[derive(Debug, Clone)]
 enum SkillsMsg {
+    Stop,
     /// Raw change from a root watch; `None` = user tier (all workspaces).
     Change(Option<WorkspaceId>),
     /// Workspace registered after start.
@@ -330,6 +336,7 @@ async fn debounce_loop(
 
         tokio::select! {
             maybe = raw_rx.recv() => match maybe {
+                Some(SkillsMsg::Stop) => raw_rx.close(),
                 Some(SkillsMsg::Change(workspace_id)) => {
                     let deadline = tokio::time::Instant::now() + DEBOUNCE;
                     match workspace_id {

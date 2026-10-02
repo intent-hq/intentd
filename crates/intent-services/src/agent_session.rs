@@ -3717,7 +3717,7 @@ impl Services {
                 .lock()
                 .ok()
                 .and_then(|mut chain| chain.remove(agent_id));
-            let handle = intent_core::spawn_daemon(async move {
+            let handle = self.store_tasks.spawn_draining(async move {
                 if let Some(prev) = prev {
                     let _ = prev.await;
                 }
@@ -3766,8 +3766,10 @@ impl Services {
                         .await;
                 }
             });
-            if let Ok(mut chain) = self.turn_bookkeeping.lock() {
-                chain.insert(agent_id.clone(), handle);
+            if let Some(handle) = handle {
+                if let Ok(mut chain) = self.turn_bookkeeping.lock() {
+                    chain.insert(agent_id.clone(), handle);
+                }
             }
         }
         // Post-output transient fetch failure (intent-hq/intent#5419): the
@@ -4258,6 +4260,21 @@ impl Services {
         })
     }
 
+    pub(crate) fn schedule_suspend_self_heal(&self, debounce: Duration) -> bool {
+        let services = self.clone();
+        let tasks = self.settings_tasks.clone();
+        self.settings_tasks
+            .spawn_draining(async move {
+                tokio::select! {
+                    biased;
+                    () = tasks.closed() => return,
+                    () = tokio::time::sleep(debounce) => {}
+                }
+                services.resume_suspend_interrupted_agents().await;
+            })
+            .is_some()
+    }
+
     /// Enroll a sleep-induced turn failure (Task C): a transient upstream
     /// disconnect whose active window overlapped a detected host suspend. The
     /// partial turn is persisted tagged [`InterruptReason::SystemSuspend`]
@@ -4360,12 +4377,7 @@ impl Services {
                 // delivered by the worker's own end-of-turn drain
                 // (intent-hq/intent#4972). The row's atomic claim dedupes
                 // against a racing wake sweep / `resolveInterrupted`.
-                let services = self.clone();
-                let debounce = wake_resume_self_heal_debounce();
-                intent_core::spawn_daemon(async move {
-                    tokio::time::sleep(debounce).await;
-                    services.resume_suspend_interrupted_agents().await;
-                });
+                self.schedule_suspend_self_heal(wake_resume_self_heal_debounce());
             }
             Err(e) => {
                 // Fail-soft: the interrupted terminal state is still emitted

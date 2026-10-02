@@ -46909,7 +46909,7 @@ mod delete_grace_window {
     use crate::{EventBus, Services};
 
     struct Harness {
-        _tmp: TempDb,
+        tmp: TempDb,
         _ws_root: WorkspacesRoot,
         services: Services,
         bus: EventBus,
@@ -46927,12 +46927,29 @@ mod delete_grace_window {
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone());
         Harness {
-            _tmp: tmp,
+            tmp,
             _ws_root: ws_root,
             services,
             bus,
             ws,
         }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn shutdown_discards_unclaimed_delete_undo_wait() {
+        let h = harness().await;
+        h.services
+            .schedule_workspace_delete(h.ws.clone(), 60_000)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), h.services.shutdown_store_writers())
+            .await
+            .unwrap();
+        h.bus.shutdown().await.unwrap();
+        h.services.store.close().await;
+        let reopened = Store::open(&h.tmp.path).await.unwrap();
+        assert!(reopened.get_workspace(&h.ws).await.is_ok());
+        reopened.close().await;
     }
 
     /// Bounded poll until the workspace row is gone (the timer commit is
@@ -47486,7 +47503,7 @@ mod agent_delete_grace_window {
     use crate::{EventBus, Services};
 
     struct Harness {
-        _tmp: TempDb,
+        tmp: TempDb,
         _ws_root: WorkspacesRoot,
         services: Services,
         bus: EventBus,
@@ -47560,13 +47577,68 @@ mod agent_delete_grace_window {
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone());
         Harness {
-            _tmp: tmp,
+            tmp,
             _ws_root: ws_root,
             services,
             bus,
             ws,
             agent,
         }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn shutdown_retains_claimed_agent_delete() {
+        let h = harness().await;
+        h.services.shutdown_group_persistence().await;
+        h.services
+            .agent_schedule_delete_op(h.agent.clone(), None, 50)
+            .await
+            .unwrap();
+        let held = h.services.store.write_pool().acquire().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while h
+                .services
+                .pending_agent_deletes
+                .deadline(h.agent.as_str())
+                .is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("timer claimed its cascade");
+        let shutdown = h.services.shutdown_store_writers();
+        tokio::pin!(shutdown);
+        let returned_early = tokio::select! {
+            biased;
+            () = &mut shutdown => true,
+            () = std::future::ready(()) => false,
+        };
+        drop(held);
+        if !returned_early {
+            tokio::time::timeout(Duration::from_secs(5), &mut shutdown)
+                .await
+                .unwrap();
+        }
+        assert!(
+            !returned_early,
+            "shutdown abandoned a claimed agent-delete cascade"
+        );
+        h.bus.shutdown().await.unwrap();
+        h.services.store.close().await;
+        let reopened = Store::open(&h.tmp.path).await.unwrap();
+        assert!(matches!(
+            reopened.get_agent_session(&h.agent).await,
+            Err(Error::NotFound(_))
+        ));
+        let events = reopened
+            .query_events(&intent_store::EventQuery::default())
+            .await
+            .unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "agent:deleted"));
+        reopened.close().await;
     }
 
     /// Bounded poll until the session row is gone (the timer commit is
