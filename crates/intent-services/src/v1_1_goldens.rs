@@ -55,7 +55,7 @@ fn golden_bundled_doctrine_hashes_v1_1() {
     let expected = vec![
         "task-loop: e32d87b000bcedabc851b210bad79f5dff418b7dd557281b6bb5fef2227c7a7f".to_string(),
         "interactive: cbfd6cde2815921f87d1c6f7c12bfa21ece95cd75c61872b102822d5087e4e9a".to_string(),
-        "workspace-agent: 89a7e3f47facf923ee392478597fe0e160b4e7cf6ad5f47be17cceeb26ddd542"
+        "workspace-agent: d3b5abe503e72a2361c7496cb54e29bbbcbe91ec5b05d233619144c655cfb857"
             .to_string(),
         "task-breakdown: f108c8b0295dc9a1a013f0e105eee7b79faafdc1f009d4a54be74e4386fdda8c"
             .to_string(),

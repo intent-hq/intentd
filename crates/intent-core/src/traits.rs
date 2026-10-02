@@ -6774,6 +6774,38 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Register a script monitor using authenticated MCP owner context.
+    fn script_monitor(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        script_id: String,
+        options: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, script_id, options);
+        Box::pin(async { Err(Error::Internal("script monitoring unavailable".into())) })
+    }
+    /// List retained script monitors in an authorized workspace.
+    fn script_monitor_list(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id);
+        Box::pin(async { Err(Error::Internal("script monitoring unavailable".into())) })
+    }
+    /// Stop observation or atomically stop the bound run; owner is set by MCP only.
+    fn script_monitor_cancel(
+        &self,
+        workspace_id: WorkspaceId,
+        monitor_id: String,
+        owner: Option<AgentId>,
+        stop_run: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, monitor_id, owner, stop_run);
+        Box::pin(async { Err(Error::Internal("script monitoring unavailable".into())) })
+    }
+
     /// `script.start`: spawn the script on the PTY host (service mode auto-
     /// restarts per policy); returns `{ ok, scriptId }` (PROTOCOL §5.8).
     /// Workspace-scoped.

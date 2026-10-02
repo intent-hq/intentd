@@ -182,25 +182,59 @@ async fn script_snapshot_detached_completion_cannot_clear_successor_marker() {
     tokio::time::timeout(LIVENESS, park.entered.notified())
         .await
         .unwrap();
-    create(
-        &h,
-        ScriptCreateParams {
-            script_id: Some(id.clone()),
-            name: "successor service".into(),
-            command: "cat".into(),
-            mode: ScriptMode::Service,
-            purpose: Some(intent_core::ScriptPurpose::Saved),
-            ..Default::default()
-        },
-    )
-    .await;
+    let replacement = {
+        let services = h.services.clone();
+        let ws = h.ws.clone();
+        let id = id.clone();
+        intent_core::spawn_daemon(async move {
+            services
+                .script_create(
+                    ws,
+                    ScriptCreateParams {
+                        script_id: Some(id),
+                        name: "successor service".into(),
+                        command: "cat".into(),
+                        mode: ScriptMode::Service,
+                        purpose: Some(intent_core::ScriptPurpose::Saved),
+                        ..Default::default()
+                    },
+                )
+                .await
+        })
+    };
+    tokio::time::timeout(LIVENESS, async {
+        loop {
+            if mgr
+                .scripts
+                .lock()
+                .unwrap()
+                .get(&(h.ws.clone(), id.clone()))
+                .unwrap()
+                .stopped_by_user
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        !replacement.is_finished(),
+        "replacement waits for predecessor settlement"
+    );
+    park.release.notify_one();
+    tokio::time::timeout(LIVENESS, replacement)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     let mut sub = subscribe(&h);
     h.services
         .script_start(h.ws.clone(), id.clone())
         .await
         .unwrap();
     await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
-    park.release.notify_one();
     tokio::time::timeout(LIVENESS, run)
         .await
         .unwrap()
@@ -224,10 +258,21 @@ async fn script_snapshot_detached_completion_cannot_clear_successor_marker() {
         })
         .await
         .unwrap();
-    assert!(
-        !events.iter().any(|e| e.data["status"] == "exited"),
-        "old completion escaped generation fence"
-    );
+    let successor_token = mgr.status(&h.ws, &id).unwrap()["runId"].clone();
+    let successor = events
+        .iter()
+        .find(|e| e.data["status"] == "running" && e.data["runId"] == successor_token)
+        .expect("successor running event");
+    for terminal in events.iter().filter(|e| e.data["status"] == "exited") {
+        assert_ne!(
+            terminal.data["runId"], successor_token,
+            "predecessor retains its own identity"
+        );
+        assert!(
+            terminal.timestamp < successor.timestamp,
+            "no predecessor terminal publication after the successor starts"
+        );
+    }
     assert_eq!(
         h.services.script_manager().status(&h.ws, &id).unwrap()["status"],
         "running"

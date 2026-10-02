@@ -714,7 +714,9 @@ use std::time::{Duration, Instant};
 // file-tracking.getLineStats, metrics.getWorkspaceStats/getAllWorkspaceStats/
 // clearAgentStats, and forward.create/list/close. Canonical git reads,
 // pr.refresh, metrics.getAgentStats, MCP operations and binary /tunnel remain.
-pub const PROTOCOL_VERSION: &str = "12.0";
+// Version 12.1 adds durable one-shot script monitors with guarded cancellation,
+// bounded output triggers and automatic owner wakes (scriptMonitors: 1).
+pub const PROTOCOL_VERSION: &str = "12.1";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text
