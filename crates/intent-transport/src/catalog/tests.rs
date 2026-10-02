@@ -72,7 +72,6 @@ fn extract_fastpath_methods() -> HashSet<String> {
         ("client.rs", "client."),
         ("drafts.rs", "drafts."),
         ("browser.rs", "browser."),
-        ("forward.rs", "forward."),
         ("host.rs", "host."),
         ("control.rs", "system."),
         ("pairing.rs", "pairing."),
@@ -184,18 +183,19 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// Direct user retirement (protocol 10.10): +1 router method (`agent.retire`).
 /// Reversible script history (protocol 10.11): +2 router methods
 /// (`script.archive`, `script.restore`).
-const EXPECTED_TOTAL_METHODS: usize = 414;
+/// Durable script monitors (protocol 12.1): +3 router methods.
+const EXPECTED_TOTAL_METHODS: usize = 404;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
-/// This includes both git.diffs and git.commits (the canonical forms) even
-/// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 354;
+/// Protocol 12.0 removes five router methods, three fast paths and two aliases.
+/// Protocol 12.1 adds the three script-monitor controls.
+const EXPECTED_ROUTER_METHODS: usize = 349;
 
 /// Golden count: fast-path methods (intercepted before router).
-const EXPECTED_FASTPATH_METHODS: usize = 58;
+const EXPECTED_FASTPATH_METHODS: usize = 55;
 
 /// Golden count: method aliases.
-const EXPECTED_ALIASES: usize = 2;
+const EXPECTED_ALIASES: usize = 0;
 
 /// Golden count: server→client notifications.
 const EXPECTED_NOTIFICATIONS: usize = 1;
@@ -577,7 +577,6 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "events.unsubscribe",
     "file-tracking.getAgentLocks",
     "file-tracking.getChanges",
-    "file-tracking.getLineStats",
     "file-tracking.loadCommits",
     "file-tracking.stage",
     "file-tracking.unstage",
@@ -597,9 +596,6 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "file.stat",
     "file.tree",
     "file.write",
-    "forward.close",
-    "forward.create",
-    "forward.list",
     "git.agentCommit",
     "git.branchDiff",
     "git.branchStatus",
@@ -721,10 +717,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "mcp.servers.toggle",
     "mcp.servers.update",
     "mcp.testConnection",
-    "metrics.clearAgentStats",
     "metrics.getAgentStats",
-    "metrics.getAllWorkspaceStats",
-    "metrics.getWorkspaceStats",
     "models.list",
     "note.add",
     "note.create",
@@ -748,7 +741,6 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "pairing.getInfo",
     "pairing.getSelfInfo",
     "pr.refresh",
-    "pr.status",
     "prMonitor.cancel",
     "prMonitor.flush",
     "prMonitor.list",
@@ -1194,13 +1186,9 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "debug.sampleStacks",
     "file-tracking.getAgentLocks",
     "file-tracking.getChanges",
-    "file-tracking.getLineStats",
     "file-tracking.loadCommits",
     "file-tracking.stage",
     "file-tracking.unstage",
-    "forward.close",
-    "forward.create",
-    "forward.list",
     "git.agentCommit",
     "git.clone",
     "github.authStatus",
@@ -1292,8 +1280,6 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "mcp.servers.toggle",
     "mcp.servers.update",
     "mcp.testConnection",
-    "metrics.clearAgentStats",
-    "metrics.getAllWorkspaceStats",
     "pairing.getInfo",
     "prMonitor.cancel",
     "prMonitor.flush",
@@ -1506,6 +1492,28 @@ fn collaborator_refused_golden_is_sorted_unique_and_disjoint() {
 }
 
 #[test]
+fn retired_rpc_names_are_absent_from_catalog_and_authorization() {
+    for method in [
+        "git.diff",
+        "git.log",
+        "pr.status",
+        "file-tracking.getLineStats",
+        "metrics.getWorkspaceStats",
+        "metrics.getAllWorkspaceStats",
+        "metrics.clearAgentStats",
+        "forward.create",
+        "forward.list",
+        "forward.close",
+    ] {
+        assert!(!ROUTER_METHODS.contains(&method), "{method}");
+        assert!(!FASTPATH_METHODS.contains(&method), "{method}");
+        assert_eq!(canonical_method(method), method);
+        assert!(!collaborator_may_call(method), "{method}");
+        assert!(!super::member_may_call(method), "{method}");
+    }
+}
+
+#[test]
 fn collaborator_lookup_canonicalises_aliases_and_denies_by_default() {
     for (alias, canonical) in METHOD_ALIASES {
         assert_eq!(canonical_method(alias), *canonical);
@@ -1516,14 +1524,10 @@ fn collaborator_lookup_canonicalises_aliases_and_denies_by_default() {
         );
     }
     assert_eq!(canonical_method("note.get"), "note.get");
-    assert!(
-        collaborator_may_call("git.diff"),
-        "git.diff is treated as git.diffs"
-    );
-    assert!(
-        collaborator_may_call("git.log"),
-        "git.log is treated as git.commits"
-    );
+    assert!(!collaborator_may_call("git.diff"));
+    assert!(!collaborator_may_call("git.log"));
+    assert!(collaborator_may_call("git.diffs"));
+    assert!(collaborator_may_call("git.commits"));
     for allowed in [
         "client.hello",
         "events.subscribe",
@@ -1533,7 +1537,6 @@ fn collaborator_lookup_canonicalises_aliases_and_denies_by_default() {
         "system.status",
         "host.status",
         "principal.me",
-        "pr.status",
         "pr.refresh",
         "prMonitor.list",
         "presence.snapshot",
@@ -1555,7 +1558,6 @@ fn collaborator_lookup_canonicalises_aliases_and_denies_by_default() {
         "host.openInEditor",
         "browser.exec",
         "browser.listTabs",
-        "forward.create",
         "github.authStatus",
         "github.pulls.create",
         "github.pulls.get",
@@ -1683,8 +1685,6 @@ mod unbound_owner_only_methods {
         ("agent.memoryUsage", "ok"),
         // No gate: process-wide stack sampler.
         ("debug.sampleStacks", "ok"),
-        // No gate: daemon-wide metrics read.
-        ("metrics.getAllWorkspaceStats", "ok"),
         // No gate: no-manager early return `{ running: false }`.
         ("unsloth.status", "ok"),
         // No gate: no-manager early return `{ stopped: false }`.
@@ -1789,7 +1789,6 @@ mod unbound_owner_only_methods {
             ("debug.sampleStacks", json!({ "durationMs": 1 })),
             ("file-tracking.getAgentLocks", json!({ "workspaceId": ws })),
             ("file-tracking.getChanges", json!({ "workspaceId": ws })),
-            ("file-tracking.getLineStats", json!({ "workspaceId": ws })),
             ("file-tracking.loadCommits", json!({ "workspaceId": ws })),
             (
                 "file-tracking.stage",
@@ -1890,8 +1889,6 @@ mod unbound_owner_only_methods {
                 "mcp.testConnection",
                 json!({ "url": "http://127.0.0.1:9/" }),
             ),
-            ("metrics.clearAgentStats", json!({ "agentId": "a1" })),
-            ("metrics.getAllWorkspaceStats", json!({})),
             (
                 "prMonitor.cancel",
                 json!({ "workspaceId": ws, "monitorId": "m1" }),
@@ -2492,8 +2489,6 @@ fn member_methods_and_administrator_remainder_are_classified() {
         "mcp.servers.restart",
         "mcp.servers.update",
         "mcp.testConnection",
-        "metrics.clearAgentStats",
-        "metrics.getAllWorkspaceStats",
         "pairing.getInfo",
         "providers.setup.cancel",
         "providers.setup.login",

@@ -106,7 +106,6 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "event.workspaceSummary",
     "file-tracking.getAgentLocks",
     "file-tracking.getChanges",
-    "file-tracking.getLineStats",
     "file-tracking.loadCommits",
     "file-tracking.stage",
     "file-tracking.unstage",
@@ -221,10 +220,7 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "mcp.servers.toggle",
     "mcp.servers.update",
     "mcp.testConnection",
-    "metrics.clearAgentStats",
     "metrics.getAgentStats",
-    "metrics.getAllWorkspaceStats",
-    "metrics.getWorkspaceStats",
     "models.list",
     "note.add",
     "note.create",
@@ -245,7 +241,6 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "note.update",
     "note.updateMetadata",
     "pr.refresh",
-    "pr.status",
     "prMonitor.cancel",
     "prMonitor.flush",
     "prMonitor.list",
@@ -394,13 +389,10 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
 
 /// Method aliases (wire-accepted → canonical).
 ///
-/// The daemon accepts these 2 alias forms and dispatches them to their canonical
-/// counterparts. The wire accepts both, but the canonical name is the documented
-/// form in docs/protocol/05-method-catalog.md. Runtime (not test-only): the
+/// No legacy aliases remain after protocol 12.0. Runtime (not test-only): the
 /// collaborator allowlist lookup canonicalises through it, so an alias can
 /// never bypass the classification of its canonical method.
-pub(crate) const METHOD_ALIASES: &[(&str, &str)] =
-    &[("git.diff", "git.diffs"), ("git.log", "git.commits")];
+pub(crate) const METHOD_ALIASES: &[(&str, &str)] = &[];
 
 /// The canonical spelling of `method`: the alias target when `method` is in
 /// [`METHOD_ALIASES`], otherwise `method` itself.
@@ -415,7 +407,7 @@ pub(crate) fn canonical_method(method: &str) -> &str {
 /// Fast-path methods (intercepted before `router::dispatch`).
 ///
 /// These 55 methods are handled by dedicated fast-path modules (`events.rs`,
-/// `client.rs`, `drafts.rs`, `browser.rs`, `forward.rs`, `host.rs`, `control.rs`,
+/// `client.rs`, `drafts.rs`, `browser.rs`, `host.rs`, `control.rs`,
 /// `pairing.rs`, `server.rs`, `invite.rs`, `presence.rs`) before reaching the main router. They share the same JSON-RPC
 /// envelope validation but are dispatched earlier in the connection task for
 /// performance or to access per-connection state (e.g., `client_id` binding for
@@ -435,9 +427,6 @@ pub(crate) const FASTPATH_METHODS: &[&str] = &[
     "drafts.set",
     "events.subscribe",
     "events.unsubscribe",
-    "forward.close",
-    "forward.create",
-    "forward.list",
     "host.checkAuggie",
     "host.checkGh",
     "host.checkGit",
@@ -642,7 +631,6 @@ pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("host.status", "Client boot: OS / hostname / display probe the desktop needs to render locality. The one host.* read that reveals no path and runs nothing (matrix exception)."),
     ("host.toolAvailability", "Client boot: which optional host tools are installed (booleans only). Matrix exception alongside host.status."),
     ("metrics.getAgentStats", "Read: usage counters of one agent. Usage/stats read."),
-    ("metrics.getWorkspaceStats", "Read: usage counters of one workspace. Usage/stats read."),
     ("models.list", "Client boot: the provider/model catalog the composer renders. No credentials in the payload."),
     ("note.add", "Edit: appends to a note; actor recorded. Workspace-scoped."),
     ("note.create", "Edit: creates a note. Workspace-scoped."),
@@ -669,7 +657,6 @@ pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("note.updateMetadata", "Edit: note title/tags."),
     ("pairing.getSelfInfo", "Personal pairing: revalidate and return only this connection's admitted bearer and current principal; no credential or authority override."),
     ("pr.refresh", "Read+: re-fetches the workspace's PR (owner/repo/number from the workspace record, no caller-controlled target) with the primary user's GitHub quota (decided) and persists the badge state on the workspace — the trio's only write."),
-    ("pr.status", "Read: the workspace PR badge summary. Target resolved from the workspace record only."),
     ("prMonitor.list", "Read: PR monitors of the workspace. Cancel/flush stay owner-only."),
     ("presence.snapshot", "Presence: the current online roster of a member workspace (the presence:changed payload on demand); ephemeral read, no host reach."),
     ("presence.update", "Presence: the connection's own focus set and typing target, member workspaces only; transient, never persisted. Returns the connection's opaque typing source handle."),
@@ -769,13 +756,9 @@ pub(crate) const MEMBER_METHODS: &[&str] = &[
     "browser.upsertTab",
     "file-tracking.getAgentLocks",
     "file-tracking.getChanges",
-    "file-tracking.getLineStats",
     "file-tracking.loadCommits",
     "file-tracking.stage",
     "file-tracking.unstage",
-    "forward.close",
-    "forward.create",
-    "forward.list",
     "git.agentCommit",
     "git.clone",
     "github.branches.list",

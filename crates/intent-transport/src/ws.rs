@@ -45,7 +45,6 @@ use crate::auth::{
 };
 use crate::conn::{self, ConnSubs};
 use crate::context::Caller;
-use crate::forward::ForwardRegistry;
 use crate::lifecycle::{StartState, DEFAULT_PORT, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT};
 use crate::reverse::{PrimaryReverseRegistry, ReverseChannel, ReverseTransport};
 use crate::rpc_limit::RpcLimiter;
@@ -1307,7 +1306,6 @@ impl WsInner {
             .and_then(|admitted| admitted.binding(self.token_store.as_ref()?, caller.as_ref()?));
         let mut rotation = admitted.as_mut().and_then(|c| c.rotation.take());
         subs.pairing.admitted = admitted;
-        let mut forwards = ForwardRegistry::default();
         // Bind reverse authority independently of hello metadata. Members may
         // serve ordinary workspace browsers, while guests remain ineligible.
         let reverse = ReverseChannel::new(app_tx.priority_sender())
@@ -1375,7 +1373,6 @@ impl WsInner {
                         _ => {
                             // Stop streams and event producers before the bounded
                             // response drain; only already-admitted replies may leave.
-                            forwards = ForwardRegistry::default();
                             let control = revoked
                                 .ok()
                                 .and_then(|r| r.final_event)
@@ -1495,7 +1492,6 @@ impl WsInner {
                                     &self.bus,
                                     &app_tx,
                                     &mut subs,
-                                    &mut forwards,
                                     &reverse,
                                     &reverse_guard,
                                     self.control.as_ref(),
@@ -1558,7 +1554,6 @@ impl WsInner {
             }
         }
         drop(subs);
-        drop(forwards);
         reverse.close();
         drop(reverse_guard);
         if let Some(mut gate) = self.cleanup_gate.clone() {
