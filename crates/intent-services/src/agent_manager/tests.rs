@@ -10560,6 +10560,19 @@ async fn send_queued_message_now_delivers_entry_and_preserves_rest_of_queue() {
     assert!(serde_json::to_string(&row.content)
         .unwrap()
         .contains("second queued"));
+    let events = queue_processing_payloads(&mgr, &id).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["messageId"], second_id);
+    assert_eq!(events[0]["queuedMessages"][0]["id"], second_id);
+    assert_eq!(
+        events[0]["queuedMessages"][0]["turnId"],
+        events[0]["turnId"]
+    );
+    assert_eq!(
+        events[0]["queuedMessages"][0]["content"],
+        events[0]["content"]
+    );
+    assert_eq!(events[0]["queuedMessages"].as_array().unwrap().len(), 1);
 }
 
 /// `agent.sendQueuedMessageNow` with an unknown `messageId` is `-32602` with
@@ -10697,6 +10710,10 @@ async fn send_queued_message_now_restores_entry_when_slot_unavailable() {
         "restored entry is at the FRONT (next to deliver)"
     );
     assert_eq!(queue[1]["id"], json!(other_id));
+    assert!(
+        queue_processing_payloads(&mgr, &id).await.is_empty(),
+        "lost claim never starts processing"
+    );
 }
 
 /// Transactional guarantee: a user-persist failure (duplicate row id)
@@ -10739,6 +10756,10 @@ async fn send_queued_message_now_persist_failure_requeues_front() {
     assert_eq!(queue.len(), 1, "entry restored, never lost: {queue:?}");
     assert_eq!(queue[0]["id"], json!(entry_id));
     assert!(!mgr.is_busy(&id), "the slot was released");
+    assert!(
+        queue_processing_payloads(&mgr, &id).await.is_empty(),
+        "failed transcript append never starts send-now processing"
+    );
 }
 
 #[tokio::test]
@@ -25475,4 +25496,147 @@ async fn queue_merge_archive_signal_survives_combined_flush_failure() {
         restored[0].latest_human_submission_at.as_deref(),
         Some("2002-01-01T00:00:00Z")
     );
+}
+
+async fn queue_processing_payloads(mgr: &AgentManager, id: &AgentId) -> Vec<Value> {
+    mgr.services
+        .store
+        .query_events(&intent_store::EventQuery::default())
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|event| {
+            event.event_type == intent_core::events::AGENT_QUEUE_PROCESSING
+                && event.data["agentId"] == id.0
+        })
+        .map(|event| event.data)
+        .collect()
+}
+
+#[tokio::test]
+async fn queue_processing_payload_carries_exact_consumed_batch_and_merged_rows() {
+    for batch in [false, true] {
+        let (_tmp, mgr) = manager().await;
+        let ws = WorkspaceId::new();
+        let id = AgentId::new();
+        seed_agent(&mgr, &ws, &id).await;
+        let owner = mgr.services.store.get_primary_principal().await.unwrap().id;
+        let guest = intent_core::PrincipalId::new();
+        sqlx::query(
+            "INSERT INTO principal (id,is_primary,created_at,updated_at) VALUES (?,0,'t0','t0')",
+        )
+        .bind(&guest.0)
+        .execute(mgr.services.store.write_pool())
+        .await
+        .unwrap();
+        for n in 0..2 {
+            let author = if batch && n == 1 { &guest.0 } else { &owner.0 };
+            mgr.services.enqueue_message_with_id(&id, Some(format!("part-{n}")),
+                format!("text-{n}"),
+                Some(json!([{"type":"image","data":format!("image-{n}"),"mimeType":"image/png"}])),
+                Some(json!([{"type":"resource_link","uri":format!("file:///part-{n}"),"name":format!("part-{n}")}])),
+                Some(json!({"fromPrincipalId":author,"type":"question_answers","answeredQuestionsMessageId":format!("question-{n}")})),
+                None, false, MessageOrigin::User);
+        }
+        let mut consumed = Vec::new();
+        while let Some(entry) = mgr.services.dequeue_message(&id) {
+            consumed.push(entry);
+        }
+        assert_eq!(consumed.len(), if batch { 2 } else { 1 });
+        // A later live row must never replace the already-consumed payload.
+        mgr.services.enqueue_message_with_id(
+            &id,
+            Some("later".into()),
+            "later text".into(),
+            None,
+            None,
+            Some(json!({"fromPrincipalId":owner.0})),
+            None,
+            false,
+            MessageOrigin::User,
+        );
+        let draining = mgr.services.mark_draining(&id, &consumed);
+        let super::FlushPrep::Turn { options, .. } =
+            super::prepare_flush_turn(&mgr, &id, &ws, consumed.clone(), draining).await
+        else {
+            panic!("flush starts processing")
+        };
+        let events = queue_processing_payloads(&mgr, &id).await;
+        assert_eq!(events.len(), 1, "one event regardless of batch size");
+        let event = &events[0];
+        assert_eq!(event["turnId"], consumed[0].turn_id);
+        let rows = event["queuedMessages"].as_array().unwrap();
+        let flushed = options.flushed_entries.unwrap();
+        assert_eq!(rows.len(), consumed.len());
+        for (index, row) in rows.iter().enumerate() {
+            let entry = &flushed[index];
+            assert_eq!(row["id"], consumed[index].id);
+            assert_eq!(row["turnId"], consumed[index].turn_id);
+            assert_eq!(row["content"], entry.content);
+            assert_eq!(row["imageBlocks"], *entry.image_blocks.as_ref().unwrap());
+            assert_eq!(row["fileBlocks"], *entry.file_blocks.as_ref().unwrap());
+            assert_eq!(
+                row["messageMetadata"],
+                *entry.message_metadata.as_ref().unwrap()
+            );
+            assert_eq!(
+                row["author"]["principalId"],
+                if batch && index == 1 {
+                    guest.0.as_str()
+                } else {
+                    owner.0.as_str()
+                }
+            );
+        }
+        if !batch {
+            assert_eq!(rows[0]["imageBlocks"].as_array().unwrap().len(), 2);
+            assert_eq!(rows[0]["fileBlocks"].as_array().unwrap().len(), 2);
+            assert_eq!(
+                rows[0]["messageMetadata"]["mergedMessageMetadata"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                2
+            );
+        }
+        assert_eq!(mgr.services.queue_snapshot(&id)[0]["id"], "later");
+    }
+}
+
+#[tokio::test]
+async fn queue_processing_payload_ordinary_drain_retains_recovered_merged_contributions() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::new();
+    let id = AgentId::new();
+    seed_agent(&mgr, &ws, &id).await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+    let owner = mgr.services.store.get_primary_principal().await.unwrap().id;
+    for n in 0..2 {
+        mgr.services.enqueue_message_with_id(&id, Some(format!("part-{n}")),
+            format!("text-{n}"), None, Some(json!([{"type":"resource_link","uri":format!("file:///part-{n}"),"name":format!("part-{n}")}])),
+            Some(json!({"fromPrincipalId":owner.0,"type":"question_answers","answeredQuestionsMessageId":format!("question-{n}")})),
+            None, false, MessageOrigin::User);
+    }
+    mgr.services.persist_queue_snapshot(&id).await;
+    mgr.services.agent_queues.lock().unwrap().clear();
+    assert_eq!(mgr.services.rehydrate_agent_queues().await.unwrap(), 1);
+    let queued = mgr.services.queue_snapshot(&id)[0].clone();
+    mgr.clone().try_drain_queue(id.clone(), ws).await;
+    let events = queue_processing_payloads(&mgr, &id).await;
+    assert_eq!(events.len(), 1);
+    let rows = events[0]["queuedMessages"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    for field in ["id", "turnId", "fileBlocks"] {
+        assert_eq!(rows[0][field], queued[field]);
+    }
+    assert!(rows[0]["content"]
+        .as_str()
+        .unwrap()
+        .starts_with("text-0\n\ntext-1"));
+    assert_eq!(
+        rows[0]["messageMetadata"]["mergedMessageMetadata"],
+        queued["messageMetadata"]["mergedMessageMetadata"]
+    );
+    assert_eq!(rows[0]["author"]["principalId"], owner.0);
 }

@@ -7538,7 +7538,7 @@ impl AgentManager {
         // append below. Emitted AFTER the stale-redrive annotation so the
         // payload's `content` matches what is persisted/sent to the provider.
         self.services
-            .publish_queue_processing(&agent_id, &workspace_id, &next)
+            .publish_queue_processing(&agent_id, &workspace_id, std::slice::from_ref(&next))
             .await;
         // Skip the transcript append for a terminal-failure requeue whose
         // user row already reached the transcript before the failed turn
@@ -7871,6 +7871,11 @@ impl AgentManager {
                     .await;
             }
         }
+        // Only a successful append (or an already-persisted retry) starts
+        // processing. Lost claims and failed writes restore without this event.
+        self.services
+            .publish_queue_processing(&agent_id, &workspace_id, std::slice::from_ref(&entry))
+            .await;
         drop(draining);
         self.services
             .publish_queue_updated_after_drain_persist(&agent_id, &workspace_id)
@@ -12101,7 +12106,7 @@ async fn run_message_worker(
             // annotation so the payload's `content` matches what is
             // persisted/sent to the provider.
             mgr.services
-                .publish_queue_processing(&agent_id, &workspace_id, &next)
+                .publish_queue_processing(&agent_id, &workspace_id, std::slice::from_ref(&next))
                 .await;
             let next_image_blocks = next.image_blocks.clone();
             let next_file_blocks = next.file_blocks.clone();
@@ -12327,7 +12332,7 @@ async fn run_message_worker(
             // pre-release drain arm — emitted AFTER the stale-redrive
             // annotation so the payload's `content` matches the turn.
             mgr.services
-                .publish_queue_processing(&agent_id, &workspace_id, &next)
+                .publish_queue_processing(&agent_id, &workspace_id, std::slice::from_ref(&next))
                 .await;
             let next_image_blocks = next.image_blocks.clone();
             let next_file_blocks = next.file_blocks.clone();
@@ -12548,7 +12553,7 @@ async fn prepare_flush_turn(
     // Drain-start signal (monorepo#1022): one event for the combined turn,
     // keyed on the head entry (its `turn_id` IS the turn's id below).
     mgr.services
-        .publish_queue_processing(agent_id, workspace_id, &entries[0])
+        .publish_queue_processing(agent_id, workspace_id, &entries)
         .await;
     // All rows persist under the combined turn's id — the provider turn runs
     // once, under the head entry's `turn_id`, so a per-entry id on row #2+

@@ -7531,6 +7531,8 @@ impl Services {
         // A terminal-failure requeue whose user row already reached the
         // transcript must not double-append (STAB-112).
         if entry.persisted {
+            self.publish_queue_processing(&agent_id, &workspace_id, std::slice::from_ref(&entry))
+                .await;
             drop(draining);
             self.publish_queue_updated_after_drain_persist(&agent_id, &workspace_id)
                 .await;
@@ -7587,6 +7589,9 @@ impl Services {
                 return Err(e);
             }
         };
+        self.commit_queue_history(&agent_id, &entry.id);
+        self.publish_queue_processing(&agent_id, &workspace_id, std::slice::from_ref(&entry))
+            .await;
         self.invalidate_agent_list_cache(&workspace_id);
         // Refresh agent_session.updated_at so the FE agent-card timestamp
         // reflects message activity, not just status transitions (STAB-19).
@@ -16264,27 +16269,37 @@ impl Services {
     /// [`intent_core::FROM_PRINCIPAL_ID_KEY`], the unknown-human marker
     /// [`intent_core::QUEUE_AUTHOR_UNKNOWN_HUMAN_KEY`] for a human-origin
     /// entry the workspace cannot attribute, nothing for an entry with no
-    /// human author. The transport projects `content` out of the frame for
-    /// a non-administrator wire subscriber the attribution does not name
-    /// (intentd#2068): the entry is hidden from that member's queue, so its
-    /// text must not leak through the drain-start signal.
+    /// human author. Authorized workspace participants receive the shared
+    /// processing payload. `queuedMessages` contains the exact selected rows,
+    /// including every row in a flush, rather than a later queue snapshot.
+    /// It describes an admitted processing attempt, not successful persistence
+    /// or provider delivery; a failed append restores the queue as usual.
     pub(crate) async fn publish_queue_processing(
         &self,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
-        message: &QueuedMessage,
+        messages: &[QueuedMessage],
     ) {
+        let Some(message) = messages.first() else {
+            return;
+        };
+        let mut resolver = crate::principal_ops::MessageAuthorResolver::new(self, workspace_id);
+        let mut queued_messages: Vec<_> = messages
+            .iter()
+            .enumerate()
+            .map(|(position, entry)| entry.to_value(position))
+            .collect();
+        resolver.attach_queue(&mut queued_messages).await;
         let mut data = json!({
             "agentId": agent_id.0,
             "messageId": message.id,
             "content": message.content,
+            "queuedMessages": queued_messages,
         });
         if !message.turn_id.is_empty() {
             data["turnId"] = Value::String(message.turn_id.clone());
         }
-        let fallback = crate::principal_ops::MessageAuthorResolver::new(self, workspace_id)
-            .fallback_principal_id()
-            .await;
+        let fallback = resolver.fallback_principal_id().await;
         let metadata =
             intent_core::queue_processing_event_metadata(&intent_core::queue_attribution_with(
                 message.message_metadata.as_ref(),

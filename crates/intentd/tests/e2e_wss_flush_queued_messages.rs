@@ -822,6 +822,27 @@ async fn flush_combines_queued_messages_into_one_turn_over_wss() {
         "exactly ONE agent:queue:processing for the combined turn: {:?}",
         obs.processing_turn_ids
     );
+    let processing_rows = obs.processing_frames[0]["queuedMessages"]
+        .as_array()
+        .unwrap();
+    assert_eq!(processing_rows.len(), 2);
+    for (index, row) in processing_rows.iter().enumerate() {
+        assert_eq!(row["id"], setup.queued_ids[index]);
+        assert_eq!(
+            row["messageMetadata"]["queueInfo"]["queuedMessageId"],
+            setup.queued_ids[index]
+        );
+        assert!(row["author"]["principalId"].is_string());
+    }
+    assert_ne!(processing_rows[0]["author"], processing_rows[1]["author"]);
+    assert_eq!(
+        processing_rows[0]["turnId"],
+        obs.processing_frames[0]["turnId"]
+    );
+    assert_ne!(
+        processing_rows[1]["turnId"],
+        obs.processing_frames[0]["turnId"]
+    );
     // (4) Every flushed row's echo correlates with the combined turn. The
     // first user-row echo is the kick-off's (its own direct turn's id).
     let combined_turn_id = &obs.processing_turn_ids[0];
@@ -1001,6 +1022,14 @@ async fn flush_disabled_drains_queue_one_turn_per_message_over_wss() {
         "one agent:queue:processing per drained message: {:?}",
         obs.processing_turn_ids
     );
+    for (index, frame) in obs.processing_frames.iter().enumerate() {
+        let rows = frame["queuedMessages"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], setup.queued_ids[index]);
+        assert_eq!(rows[0]["id"], frame["messageId"]);
+        assert_eq!(rows[0]["turnId"], frame["turnId"]);
+        assert_eq!(rows[0]["content"], frame["content"]);
+    }
     // Legacy one-at-a-time correlation: each drained row's echo carries its
     // own turn's turnId, matching the processing signals in drain order (the
     // first user-row echo is the kick-off's, from its own direct turn).

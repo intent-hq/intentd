@@ -14533,7 +14533,8 @@ async fn unstamped_human_entries_fail_closed_when_the_fallback_lookup_fails() {
         event_types: vec![intent_core::events::AGENT_QUEUE_PROCESSING.to_string()],
         ..Default::default()
     });
-    svc.publish_queue_processing(&id, &ws, &legacy).await;
+    svc.publish_queue_processing(&id, &ws, std::slice::from_ref(&legacy))
+        .await;
     let mut processing_event = None;
     while let Ok(Some(batch)) = timeout(Duration::from_secs(5), processing.recv()).await {
         for evt in batch
@@ -47667,4 +47668,66 @@ async fn shutdown_claimed_resume_at_barrier(inside_send: bool) {
         1,
         "retry does not duplicate the interruption marker"
     );
+}
+
+#[tokio::test]
+async fn send_queued_message_now_store_only_processing_requires_successful_persistence() {
+    for outcome in ["new", "persisted", "failure"] {
+        let (_tmp, svc, ws, _bus) = setup_with_bus().await;
+        let agent = create_agent(&svc, &ws, "Processing").await;
+        let queued = svc
+            .agent_queue_message_op(
+                agent.clone(),
+                "queued text".into(),
+                Some(json!([{"type":"image","data":"payload","mimeType":"image/png"}])),
+                Some(json!([{"type":"resource_link","uri":"file:///payload","name":"payload"}])),
+                Some(json!({"type":"question_answers","answeredQuestionsMessageId":"question"})),
+            )
+            .await
+            .unwrap();
+        let entry_id = queued["queuedMessage"]["id"].as_str().unwrap().to_string();
+        if outcome != "new" {
+            svc.store
+                .append_agent_message_with_id(
+                    &agent,
+                    &entry_id,
+                    "user",
+                    &json!([{"type":"text","text":"existing"}]),
+                    None,
+                    &now_iso(),
+                )
+                .await
+                .unwrap();
+        }
+        if outcome == "persisted" {
+            svc.agent_queues.lock().unwrap().get_mut(&agent).unwrap()[0].persisted = true;
+        }
+        let result = svc
+            .agent_send_queued_message_now_op(agent.clone(), entry_id.clone())
+            .await;
+        assert_eq!(result.is_ok(), outcome != "failure");
+        let events: Vec<_> = svc
+            .store
+            .query_events(&intent_store::EventQuery::default())
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event_type == intent_core::events::AGENT_QUEUE_PROCESSING)
+            .collect();
+        if outcome == "failure" {
+            assert!(events.is_empty());
+            assert_eq!(svc.queue_snapshot(&agent)[0]["id"], entry_id);
+        } else {
+            assert_eq!(events.len(), 1);
+            let row = &events[0].data["queuedMessages"][0];
+            for field in ["id", "turnId", "content", "imageBlocks", "fileBlocks"] {
+                assert_eq!(row[field], queued["queuedMessage"][field], "{field}");
+            }
+            assert_eq!(
+                row["messageMetadata"]["answeredQuestionsMessageId"],
+                "question"
+            );
+            assert!(svc.queue_snapshot(&agent).is_empty());
+        }
+    }
 }
