@@ -1017,8 +1017,8 @@ async fn member_pr_read_missing_auth_does_not_consume_collaboration_credentials_
     let reply = wss_rpc_envelope(
         &mut client,
         2,
-        "github.pulls.get",
-        json!({"owner":"fake-org","repo":"fake-repo","number":7}),
+        "github.pulls.list",
+        json!({"owner":"fake-org","repo":"fake-repo"}),
     )
     .await;
     assert_eq!(reply["error"]["code"], -32603);
@@ -1040,8 +1040,8 @@ async fn member_pr_read_missing_auth_does_not_consume_collaboration_credentials_
     let legacy = wss_rpc_envelope(
         &mut owner,
         1,
-        "github.pulls.get",
-        json!({"owner":"fake-org","repo":"fake-repo","number":7}),
+        "github.pulls.list",
+        json!({"owner":"fake-org","repo":"fake-repo"}),
     )
     .await;
     assert_eq!(legacy["error"]["code"], -32603);
@@ -1107,7 +1107,7 @@ impl PrAuthServer {
                     }
                 }
                 let request = String::from_utf8_lossy(&bytes);
-                if request.contains("/pulls/7 ") {
+                if request.starts_with("GET /repos/fake-org/fake-repo/pulls") {
                     headers.lock().unwrap().push(
                         request
                             .lines()
@@ -1152,6 +1152,8 @@ async fn member_pr_read_typed_rejections_are_safe_and_non_auth_errors_stay_legac
             Ok(())
         }
     }
+    // Use the uncached list route so rate-limit responses do not pause later
+    // cases through the single-PR read cache. Every case must hit this fixture.
     let fake = PrAuthServer::start().await;
     let dir = temp_data_dir();
     let ws = WorkspaceId::new();
@@ -1232,8 +1234,8 @@ async fn member_pr_read_typed_rejections_are_safe_and_non_auth_errors_stay_legac
         let legacy = wss_rpc_envelope(
             &mut owner,
             2,
-            "github.pulls.get",
-            json!({"owner":"fake-org","repo":"fake-repo","number":7}),
+            "github.pulls.list",
+            json!({"owner":"fake-org","repo":"fake-repo"}),
         )
         .await;
         let before_member = fake.authorization.lock().unwrap().len();
@@ -1259,8 +1261,8 @@ async fn member_pr_read_typed_rejections_are_safe_and_non_auth_errors_stay_legac
         let reply = wss_rpc_envelope(
             &mut client,
             2,
-            "github.pulls.get",
-            json!({"owner":"fake-org","repo":"fake-repo","number":7}),
+            "github.pulls.list",
+            json!({"owner":"fake-org","repo":"fake-repo"}),
         )
         .await;
         assert!(
