@@ -15,19 +15,18 @@ use crate::model::{
     AgentSession, BrowserTab, BrowserTabInput, ClientHostInfo, CommentAddResult,
     CommentDeleteResult, CommentGetThreadResult, CommentListResult, CommentResolveThreadResult,
     CommentRespondResult, ContextItem, Draft, EventQueryParams, EventSubscribeResult,
-    EventUnsubscribeResult, GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult,
-    GitMergeConflicts, GitPullResult, GitStatus, InvitePin, InviteProofClaim,
-    LineAttributionComputeResult, LineAttributionData, MessageOrigin, Note, NoteAddInput,
-    NoteAddResult, NoteCreate, NoteCreateResult, NoteDeleteResult, NoteEditInput,
-    NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteRestoreVersionResult,
-    NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion,
-    NoteVersionSummary, ProjectType, ReadAssetResult, RepoConfig, SaveAssetResult,
-    ScriptCreateParams, SetupScript, TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult,
-    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
-    TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskUpdateNoteStatusResult,
-    TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceCreate,
-    WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceSetupStatus, WorkspaceTask,
-    WorkspaceUpdate,
+    EventUnsubscribeResult, GitAgentCommitResult, GitBranchStatus, GitBranches, GitMergeConflicts,
+    GitPullResult, GitStatus, InvitePin, InviteProofClaim, LineAttributionComputeResult,
+    LineAttributionData, MessageOrigin, Note, NoteAddInput, NoteAddResult, NoteCreate,
+    NoteCreateResult, NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult,
+    NoteEditResult, NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
+    NoteUpdateMetadataResult, NoteVersion, NoteVersionSummary, ProjectType, ReadAssetResult,
+    RepoConfig, SaveAssetResult, ScriptCreateParams, SetupScript, TaskAgentLink,
+    TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
+    TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskRemoveAgentFromAllTasksResult,
+    TaskSetRelationsResult, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
+    TokenUsage, Workspace, WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary,
+    WorkspaceSetupStatus, WorkspaceTask, WorkspaceUpdate,
 };
 use crate::repo_ref::RepoRef;
 
@@ -3434,23 +3433,6 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::git_pull not implemented".to_string(),
-            ))
-        })
-    }
-
-    /// `git.commit` (deprecated; prefer `git_agent_commit`): commit the already
-    /// staged changes with `message`. Failures (incl. nothing to commit) are
-    /// `-32603` (PROTOCOL §5.6).
-    fn git_commit(
-        &self,
-        workspace_id: WorkspaceId,
-        message: String,
-        idempotency_key: Option<String>,
-    ) -> BoxFuture<'_, Result<GitCommitResult>> {
-        let _ = (workspace_id, message, idempotency_key);
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::git_commit not implemented".to_string(),
             ))
         })
     }
