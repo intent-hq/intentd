@@ -38,6 +38,9 @@ use std::time::{Duration, Instant};
 
 use crate::events::IdInfo;
 
+/// Chat snapshots have a smaller window than generic paginated RPCs.
+const CHAT_SNAPSHOT_MESSAGE_LIMIT: usize = 5;
+
 /// A subscription channel selected by the `*.subscribe` method (TB-0 §3). TB-4
 /// wires the `note` collection channel end-to-end; TB-5 adds `task`, `agent`,
 /// `workspace`, and `comment`, all reusing the same snapshot+delta machinery.
@@ -784,8 +787,8 @@ pub(crate) async fn channel_snapshot(
 /// `chat.subscribe` arriving mid-turn reconstructs a coherent in-flight message.
 ///
 /// **Bounded** (monorepo#958): exactly ONE conversation read, with no
-/// `nextToken` follow-up and the omitted `limit` resolving to the
-/// server-clamped default page, so the snapshot fetches/decodes only its
+/// `nextToken` follow-up and an explicit chat-only limit of five messages,
+/// so the snapshot fetches/decodes only its
 /// bounded newest page regardless of transcript length — the paginated op
 /// selects just that page SQL-side and never re-hydrates the full history.
 /// Older pages stay client-pulled via `agent.getConversation { nextToken }`.
@@ -818,7 +821,7 @@ pub(crate) async fn chat_snapshot(
     let (mut snapshot, overlay) = match api
         .agent_get_conversation(
             agent_id.clone(),
-            None,
+            Some(i64::try_from(CHAT_SNAPSHOT_MESSAGE_LIMIT).expect("chat limit fits in i64")),
             None,
             None,
             None,
@@ -878,7 +881,7 @@ pub(crate) async fn chat_recovery_snapshot(
     let read = || {
         api.agent_get_conversation(
             agent_id.clone(),
-            None,
+            Some(i64::try_from(CHAT_SNAPSHOT_MESSAGE_LIMIT).expect("chat limit fits in i64")),
             None,
             None,
             None,
@@ -988,7 +991,8 @@ fn apply_resume_filter(snapshot: &mut Value, since: &str) {
 /// legitimately has no blocks yet, and the client needs the id to reconcile
 /// against.
 ///
-/// **Slim page budget (§5.5).** Under `projection: "slim"` the merged page is
+/// **Chat count and slim page budget (§5.5).** The live row counts inside the
+/// five-message snapshot window. Under `projection: "slim"` the merged page is
 /// re-budgeted after the append: the persisted page arrived within
 /// [`SLIM_PAGE_BUDGET_BYTES`], but `slim_message_blocks` caps block *bodies*,
 /// not block *count*, so a streaming turn with hundreds of capped blocks can
@@ -999,8 +1003,8 @@ fn apply_resume_filter(snapshot: &mut Value, since: &str) {
 /// `truncated`/`nextToken` re-minted at the first evicted row (row `seq` is
 /// contiguous from 0, so a row's seq IS its global oldest-indexed position)
 /// so the client pulls the evicted rows via `agent.getConversation` exactly
-/// like any budget-trimmed page. Full (absent-projection) merges are never
-/// budgeted, mirroring the read path.
+/// like any budget-trimmed page. Full (absent-projection) merges enforce only
+/// the message count, without byte budgeting, mirroring the read path.
 fn merge_live_turn(
     snapshot: &mut Value,
     agent_id: &AgentId,
@@ -1055,16 +1059,15 @@ fn merge_live_turn(
         "isStreaming": is_streaming,
     }));
     obj.insert("totalMessages".to_string(), json!(total + 1));
-    if projection == Some(ConversationProjection::Slim) {
-        rebudget_merged_page(obj);
-    }
+    rebudget_merged_page(obj, projection);
 }
 
 /// Re-apply the §5.5 slim page budget to a chat snapshot's `messages` page
 /// after the live-turn append (see [`merge_live_turn`]'s budget note). The
 /// newest row — the just-appended live turn — is the anchor and always
-/// serves; oldest rows are evicted until the page fits
-/// [`SLIM_PAGE_BUDGET_BYTES`], with `truncated`/`nextToken` re-minted at the
+/// serves; oldest rows are evicted until the page fits the five-message limit
+/// and, for slim projection, [`SLIM_PAGE_BUDGET_BYTES`], with
+/// `truncated`/`nextToken` re-minted at the
 /// oldest kept row's global position (its `seq`, contiguous from 0) so the
 /// evicted rows stay reachable via `agent.getConversation { nextToken }`
 /// with no gaps or duplicates. Sizes are counted through the same discarding
@@ -1072,19 +1075,23 @@ fn merge_live_turn(
 /// so both sides of the budget agree on what a row weighs. No-op when the
 /// merged page already fits — the common case, since the persisted page
 /// arrived within budget and a typical live turn is small.
-fn rebudget_merged_page(obj: &mut Map<String, Value>) {
+fn rebudget_merged_page(obj: &mut Map<String, Value>, projection: Option<ConversationProjection>) {
     let Some(arr) = obj.get_mut("messages").and_then(Value::as_array_mut) else {
         return;
     };
-    let sizes: Vec<usize> = arr
-        .iter()
-        .map(intent_services::pagination::serialized_size)
-        .collect();
-    let (lo, _hi) = intent_services::pagination::budget_page(
-        &sizes,
-        intent_services::pagination::BudgetAnchor::Newest,
-        SLIM_PAGE_BUDGET_BYTES,
-    );
+    let mut lo = arr.len().saturating_sub(CHAT_SNAPSHOT_MESSAGE_LIMIT);
+    if projection == Some(ConversationProjection::Slim) {
+        let sizes: Vec<usize> = arr[lo..]
+            .iter()
+            .map(intent_services::pagination::serialized_size)
+            .collect();
+        let (byte_lo, _hi) = intent_services::pagination::budget_page(
+            &sizes,
+            intent_services::pagination::BudgetAnchor::Newest,
+            SLIM_PAGE_BUDGET_BYTES,
+        );
+        lo += byte_lo;
+    }
     if lo == 0 {
         return;
     }

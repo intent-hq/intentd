@@ -690,6 +690,9 @@
 //! stopping its running turn and cancelling wake sources while preserving
 //! conversation history. MCP retirement remains self-only and feature-gated.
 //!
+//! Version 13.1 adds `agent.sendQueuedMessagesNow`: explicit delivery of a
+//! selected ready queue snapshot as one interrupt-priority batch.
+//!
 //! Version 10.11 adds script purpose and durable, workspace-scoped
 //! `script.archive` / `script.restore`, plus the `script.list` archive filter.
 //! An omitted filter preserves the legacy all-definitions list. The
@@ -719,7 +722,7 @@ use std::time::{Duration, Instant};
 // Version 13.0 removes the deprecated keyed git.commit RPC. Human and agent
 // commits continue to use git.agentCommit with its existing permissions and
 // non-idempotent contract; MCP ws.git.commit is unchanged.
-pub const PROTOCOL_VERSION: &str = "13.0";
+pub const PROTOCOL_VERSION: &str = "13.1";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

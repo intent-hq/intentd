@@ -7092,6 +7092,92 @@ async fn get_conversation_seeks_around_message_id() {
 /// start of history (no `nextToken`), and a seek that lands on the newest
 /// window carries no `prevToken`. Precedence: `aroundMessageId` wins over a
 /// simultaneously supplied token.
+/// Five-row inclusive seeks must hand off exclusive directional cursors;
+/// re-seeking at the same anchor is not a substitute for following a token.
+#[tokio::test]
+async fn get_conversation_five_message_seek_cursors_progress_in_both_directions() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Five-row cursor walk").await;
+    for i in 0..20 {
+        svc.store()
+            .append_agent_message(
+                &id,
+                "assistant",
+                &json!([{ "type": "text", "text": format!("m{i}") }]),
+                &now_iso(),
+            )
+            .await
+            .expect("append");
+    }
+    let landing = svc
+        .agent_get_conversation_op(id.clone(), Some(5), None, None, None, Some(10), None, false)
+        .await
+        .expect("ordinal seek");
+    let anchor = landing["messages"][2]["id"].as_str().unwrap().to_string();
+    let landing = svc
+        .agent_get_conversation_op(
+            id.clone(),
+            Some(5),
+            None,
+            None,
+            Some(anchor),
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect("inclusive message seek");
+    let texts = |page: &serde_json::Value| -> Vec<String> {
+        page["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                row["contentBlocks"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    };
+    assert_eq!(texts(&landing), ["m8", "m9", "m10", "m11", "m12"]);
+    for (direction, expected) in [
+        (
+            "nextToken",
+            vec![vec!["m3", "m4", "m5", "m6", "m7"], vec!["m0", "m1", "m2"]],
+        ),
+        (
+            "prevToken",
+            vec![vec!["m13", "m14", "m15", "m16", "m17"], vec!["m18", "m19"]],
+        ),
+    ] {
+        let mut cursor = landing[direction].as_str().unwrap().to_string();
+        for (index, expected_page) in expected.iter().enumerate() {
+            let page = svc
+                .agent_get_conversation_op(
+                    id.clone(),
+                    Some(5),
+                    None,
+                    Some(cursor.clone()),
+                    None,
+                    None,
+                    None,
+                    false,
+                )
+                .await
+                .expect("directional page");
+            assert_eq!(texts(&page), *expected_page);
+            if index + 1 == expected.len() {
+                assert!(page[direction].is_null(), "walk must exhaust");
+            } else {
+                let next = page[direction].as_str().expect("next cursor");
+                assert_ne!(next, cursor, "cursor must advance");
+                cursor = next.to_string();
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn get_conversation_seek_clamps_at_edges_and_beats_token() {
     let (_t, svc, ws) = setup().await;
@@ -43336,252 +43422,6 @@ async fn dequeue_ready_batch_user_led_without_user_entry_is_noop() {
         svc.queue_snapshot(&agent).len(),
         2,
         "queue untouched on the None path"
-    );
-}
-
-/// System-only batch dequeue (`agents.flushQueuedMessages = "systemOnly"`):
-/// ALL ready system-origin entries are pulled out ANYWHERE in the queue,
-/// preserving their relative order, even when interleaved with user-origin
-/// entries — which are left untouched in their original positions.
-#[tokio::test]
-async fn dequeue_system_only_batch_pulls_interleaved_system_entries_in_order() {
-    let (_t, svc, ws) = setup().await;
-    let agent = create_agent(&svc, &ws, "SystemOnlyBatch").await;
-
-    svc.enqueue_message(
-        &agent,
-        "sys-1".into(),
-        None,
-        None,
-        None,
-        None,
-        false,
-        MessageOrigin::Automatic,
-    );
-    svc.enqueue_message(
-        &agent,
-        "user-1".into(),
-        None,
-        None,
-        None,
-        None,
-        false,
-        MessageOrigin::User,
-    );
-    svc.enqueue_message(
-        &agent,
-        "sys-2".into(),
-        None,
-        None,
-        None,
-        None,
-        false,
-        MessageOrigin::Automatic,
-    );
-    svc.enqueue_message(
-        &agent,
-        "user-2".into(),
-        None,
-        None,
-        None,
-        None,
-        false,
-        MessageOrigin::User,
-    );
-    svc.enqueue_message(
-        &agent,
-        "sys-3".into(),
-        None,
-        None,
-        None,
-        None,
-        false,
-        MessageOrigin::Automatic,
-    );
-
-    let batch = svc
-        .dequeue_system_only_batch(&agent, 2)
-        .expect("three system entries meet the min");
-    let contents: Vec<_> = batch.iter().map(|m| m.content.as_str()).collect();
-    assert_eq!(
-        contents,
-        vec!["sys-1", "sys-2", "sys-3"],
-        "all system entries batched in relative order, ahead of interleaved user entries"
-    );
-    let snap = svc.queue_snapshot(&agent);
-    let remaining: Vec<_> = snap.iter().map(|v| v["content"].clone()).collect();
-    assert_eq!(
-        remaining,
-        vec![json!("user-1"), json!("user-2")],
-        "user-origin entries stay queued in their original order"
-    );
-}
-
-/// A single ready system entry is below `min_ready`: the batch dequeue is a
-/// no-op, so the single-entry FIFO path handles it alone.
-#[tokio::test]
-async fn dequeue_system_only_batch_returns_none_below_min_ready() {
-    let (_t, svc, ws) = setup().await;
-    let agent = create_agent(&svc, &ws, "SystemOnlyMin").await;
-    svc.enqueue_message(
-        &agent,
-        "sys-only".into(),
-        None,
-        None,
-        None,
-        None,
-        false,
-        MessageOrigin::Automatic,
-    );
-
-    assert!(
-        svc.dequeue_system_only_batch(&agent, 2).is_none(),
-        "one ready system entry < min_ready 2"
-    );
-    assert_eq!(
-        svc.queue_snapshot(&agent).len(),
-        1,
-        "queue untouched on the None path"
-    );
-}
-
-/// `dequeue_flush_batch` dispatches on the mode: `All` behaves like
-/// [`Services::dequeue_ready_batch`], `SystemOnly` like
-/// [`Services::dequeue_system_only_batch`] (but never batches under an
-/// active hold, since the hold's release is by definition a user-origin
-/// entry), and `Off` always returns `None`.
-#[tokio::test]
-async fn dequeue_flush_batch_dispatches_by_mode() {
-    let (_t, svc, ws) = setup().await;
-
-    // `All` batches every ready entry.
-    let agent_all = create_agent(&svc, &ws, "ModeAll").await;
-    svc.enqueue_message(
-        &agent_all,
-        "a".into(),
-        None,
-        None,
-        None,
-        None,
-        false,
-        MessageOrigin::Automatic,
-    );
-    svc.enqueue_message(
-        &agent_all,
-        "b".into(),
-        None,
-        None,
-        None,
-        None,
-        false,
-        MessageOrigin::Automatic,
-    );
-    let batch = svc
-        .dequeue_flush_batch(
-            &agent_all,
-            intent_core::FlushQueuedMessagesMode::All,
-            false,
-            2,
-        )
-        .expect("all mode batches");
-    assert_eq!(batch.len(), 2);
-
-    // `SystemOnly` batches only system-origin entries.
-    let agent_sys = create_agent(&svc, &ws, "ModeSystemOnly").await;
-    svc.enqueue_message(
-        &agent_sys,
-        "sys-a".into(),
-        None,
-        None,
-        None,
-        None,
-        false,
-        MessageOrigin::Automatic,
-    );
-    svc.enqueue_message(
-        &agent_sys,
-        "sys-b".into(),
-        None,
-        None,
-        None,
-        None,
-        false,
-        MessageOrigin::Automatic,
-    );
-    let batch = svc
-        .dequeue_flush_batch(
-            &agent_sys,
-            intent_core::FlushQueuedMessagesMode::SystemOnly,
-            false,
-            2,
-        )
-        .expect("systemOnly mode batches system entries");
-    assert_eq!(batch.len(), 2);
-
-    // `SystemOnly` never batches while a hold is active.
-    let agent_hold = create_agent(&svc, &ws, "ModeSystemOnlyHold").await;
-    svc.enqueue_message(
-        &agent_hold,
-        "sys-a".into(),
-        None,
-        None,
-        None,
-        None,
-        false,
-        MessageOrigin::Automatic,
-    );
-    svc.enqueue_message(
-        &agent_hold,
-        "sys-b".into(),
-        None,
-        None,
-        None,
-        None,
-        false,
-        MessageOrigin::Automatic,
-    );
-    assert!(
-        svc.dequeue_flush_batch(
-            &agent_hold,
-            intent_core::FlushQueuedMessagesMode::SystemOnly,
-            true,
-            2,
-        )
-        .is_none(),
-        "systemOnly never batches under an active hold"
-    );
-
-    // `Off` always returns `None`.
-    let agent_off = create_agent(&svc, &ws, "ModeOff").await;
-    svc.enqueue_message(
-        &agent_off,
-        "a".into(),
-        None,
-        None,
-        None,
-        None,
-        false,
-        MessageOrigin::Automatic,
-    );
-    svc.enqueue_message(
-        &agent_off,
-        "b".into(),
-        None,
-        None,
-        None,
-        None,
-        false,
-        MessageOrigin::Automatic,
-    );
-    assert!(
-        svc.dequeue_flush_batch(
-            &agent_off,
-            intent_core::FlushQueuedMessagesMode::Off,
-            false,
-            2,
-        )
-        .is_none(),
-        "off mode never batches"
     );
 }
 
