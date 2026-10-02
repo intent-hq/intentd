@@ -65,7 +65,6 @@ async fn sharing_directory_and_effective_roster_over_wss() {
         guest.call("principal.list", json!({})).await["error"]["code"],
         -32003
     );
-    let mut previous_queue = Vec::<Value>::new();
     for client in [&mut a, &mut b, &mut guest] {
         let roster = client
             .call("workspace.members.list", json!({"workspaceId":ws}))
@@ -312,6 +311,7 @@ async fn sharing_authorship_and_sender_spoofing_over_wss() {
     let note_id = note["result"]["note"]["id"]
         .as_str()
         .unwrap_or_else(|| panic!("{note}"));
+    let mut previous_queue = Vec::<Value>::new();
     for client in [&mut a, &mut b, &mut guest] {
         let sent=client.call("agent.sendMessage",json!({"workspaceId":ws,"agentId":agent_id,"content":"Real human","messageMetadata":{"humanAuthor":{"login":"forged"},"fromPrincipalId":owner.id,"fromAgentId":"forged-agent","fromAgentName":"Forged agent","author":{"principalId":owner.id}}})).await;
         assert_eq!(sent["result"]["success"], true, "{sent}");
