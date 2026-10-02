@@ -14526,17 +14526,28 @@ mod npx_launch_dir_lifetime_tests {
         }).await.unwrap();
         assert!(pid_alive(tree.grandchild));
         release.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(10), shutdown)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(!pid_alive(leader.cast_signed()));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            shutdown.await.unwrap();
+            // These are synchronous shutdown postconditions: orphan-PID
+            // polling below must not hide delayed resource/registry cleanup.
+            assert!(!pid_alive(leader.cast_signed()));
+            assert!(!tree.launch_path.exists());
+            // An aborted acquire skips its existing post-kill deregistration.
+            // Preserve that stale in-memory slot: late ID-only removal could
+            // erase a replacement runtime. The watcher deregisters first.
+            assert_eq!(mgr.registry.is_registered(&agent_id), !unexpected);
+            // The registry has joined the physical cleanup above, but after
+            // an unexpected leader exit the grandchild belongs to init. Group
+            // SIGKILL is asynchronous: kill(pid, 0) can briefly succeed until
+            // the kernel/init retires that PID. Observe exit within the SAME
+            // shutdown budget, retaining the final no-survivor assertions.
+            while pid_alive(tree.grandchild) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
         assert!(!pid_alive(tree.grandchild));
-        assert!(!tree.launch_path.exists());
-        // An aborted acquire skips its existing post-kill deregistration.
-        // Preserve that stale in-memory slot: late ID-only removal could erase
-        // a replacement runtime. The exit watcher deregisters before cleanup.
-        assert_eq!(mgr.registry.is_registered(&agent_id), !unexpected);
         svc.shutdown_store_writers().await;
         svc.event_bus.as_ref().unwrap().shutdown().await.unwrap();
         svc.store.close().await;
