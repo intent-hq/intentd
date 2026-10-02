@@ -23,6 +23,7 @@ mod sharing;
 mod workspace_delete;
 
 mod metadata_key_json;
+mod note_line_attribution;
 mod note_search;
 
 /// A unique temp DB path inside an RAII temp dir: the dir (and with it the
@@ -10858,4 +10859,52 @@ async fn script_lifecycle_run_identity_migration_marks_only_unfinished_commands(
         assert!(row.get::<Option<String>, _>("last_run").is_none());
         assert_eq!(row.get::<String, _>("purpose"), "saved");
     }
+}
+
+/// Filtered-out task summaries must not be decoded; their statuses still
+/// resolve dependencies and contribute to the unfiltered progress rollup.
+#[tokio::test]
+async fn task_list_projects_only_matching_summaries() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "Tasks", false))
+        .await
+        .unwrap();
+    for (id, status) in [
+        ("waiting", TaskStatus::Waiting),
+        ("done", TaskStatus::Complete),
+    ] {
+        let mut n = stray_note(&ws, id, id);
+        n.parent_id = Some(NoteId::from("spec"));
+        n.metadata.task = Some(TaskMetadata {
+            status,
+            depends_on: if id == "waiting" {
+                vec![NoteId::from("done")]
+            } else {
+                vec![]
+            },
+            ..Default::default()
+        });
+        store.insert_note(&n).await.unwrap();
+    }
+    sqlx::query("ALTER TABLE note RENAME TO task_summary_probe")
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    // Evaluating the title of the filtered-out row throws. This proves SQL
+    // applies the filter before summary projection, without timing assertions.
+    sqlx::query("CREATE VIEW note AS SELECT id, workspace_id, CASE WHEN id = 'done' THEN json_extract('forbidden summary', '$') ELSE title END AS title, content, parent_id, task_json, created_at, updated_at FROM task_summary_probe")
+        .execute(store.write_pool()).await.unwrap();
+    let result = store
+        .list_workspace_tasks(&ws, Some(TaskStatus::Waiting))
+        .await
+        .unwrap();
+    assert_eq!(result.tasks.len(), 1);
+    assert_eq!(result.tasks[0].id.as_str(), "waiting");
+    assert!(result.tasks[0].unmet_depends_on.is_empty());
+    assert_eq!(result.stats.total, 2);
+    assert_eq!(result.stats.completed, 1);
+    assert!(store.list_workspace_tasks(&ws, None).await.is_err());
 }

@@ -21,6 +21,9 @@ use tokio::time::Instant;
 use crate::events::EventBus;
 use crate::system_actor;
 
+#[cfg(test)]
+pub(crate) mod credential_tests;
+
 /// Secret-store account the device flow persists the token under — the first
 /// slot of the existing resolution chain (`intent_sourcecontrol::token`).
 pub(crate) const SECRET_ACCOUNT: &str = "sourceControl.github.token";
@@ -113,6 +116,52 @@ impl FlowSlot {
 /// Shared single-flow state: at most one device flow exists at a time.
 pub(crate) type FlowState = Arc<tokio::sync::Mutex<Option<FlowSlot>>>;
 
+/// The existing identity lease also owns credential persistence. Its guard
+/// travels into the engine's blocking write, so timeout/cancellation cannot
+/// release ownership while that write can still land.
+pub(crate) struct CredentialOwner {
+    secrets: Arc<crate::settings::AsyncSecretStore>,
+    generation: Arc<AtomicU64>,
+}
+
+impl CredentialOwner {
+    pub(crate) fn new(secrets: Arc<crate::settings::AsyncSecretStore>) -> Self {
+        Self {
+            secrets,
+            generation: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub(crate) fn identity_guard(
+        &self,
+        identity: intent_sourcecontrol::device_flow::IdentityGuard,
+        state: FlowState,
+        flow_id: u64,
+    ) -> intent_sourcecontrol::device_flow::IdentityGuard {
+        let secrets = self.secrets.clone();
+        let generation = self.generation.clone();
+        Arc::new(move |client| {
+            let identity = identity.clone();
+            let secrets = secrets.clone();
+            let generation = generation.clone();
+            let state = state.clone();
+            Box::pin(async move {
+                // Identity transition -> credential -> short flow-state lock.
+                let identity_lease = identity(client).await?;
+                let mut credential = secrets.github_mutation().await.map_err(|e| e.to_string())?;
+                if !is_resident(&state, flow_id).await {
+                    return Err("GitHub authorization was cancelled or replaced".into());
+                }
+                *credential += 1;
+                generation.store(*credential, Ordering::SeqCst);
+                let lease: intent_sourcecontrol::device_flow::IdentityLease =
+                    Box::new((identity_lease, credential));
+                Ok(lease)
+            })
+        })
+    }
+}
+
 /// Mint a process-unique flow id (generation guard for [`FlowSlot`]).
 pub(crate) fn next_flow_id() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -161,12 +210,13 @@ async fn is_resident(state: &FlowState, flow_id: u64) -> bool {
 pub(crate) async fn run_poll_loop(
     state: FlowState,
     bus: Option<EventBus>,
-    secrets: Arc<crate::settings::AsyncSecretStore>,
+    owner: CredentialOwner,
     flow_id: u64,
     mut flow: DeviceFlow,
     deadline: Instant,
     sync_gh: bool,
 ) {
+    let secrets = &owner.secrets;
     let mut consecutive_errors: u32 = 0;
     // `None` = authorized (slot cleared); `Some(phase)` = terminal failure.
     let outcome: Option<FlowPhase> = loop {
@@ -206,6 +256,35 @@ pub(crate) async fn run_poll_loop(
             }
         }
     };
+    // Serialize the provenance marker, orphan cleanup and auth notification
+    // with revoke/settings. A newer owner invalidates this completion before
+    // it can delete the newer credential or announce an obsolete authorize.
+    let _credential = if outcome.is_none() {
+        let guard = match secrets.github_mutation().await {
+            Ok(guard) => guard,
+            Err(error) => {
+                tracing::warn!(%error, "could not finalize GitHub credential ownership");
+                // This poller is exiting with unknown credential state. Retire
+                // only its resident flow so callers can start a new attempt;
+                // credentials and any replacement flow belong to another owner.
+                let mut slot = state.lock().await;
+                if let Some(slot) = slot.as_mut().filter(|slot| slot.flow_id == flow_id) {
+                    slot.phase = FlowPhase::Error;
+                }
+                return;
+            }
+        };
+        if *guard != owner.generation.load(Ordering::SeqCst) {
+            let mut slot = state.lock().await;
+            if slot.as_ref().is_some_and(|s| s.flow_id == flow_id) {
+                *slot = None;
+            }
+            return;
+        }
+        Some(guard)
+    } else {
+        None
+    };
     {
         let mut slot = state.lock().await;
         match slot.as_mut() {
@@ -219,7 +298,7 @@ pub(crate) async fn run_poll_loop(
                 // authorized, the engine persisted a token a concurrent
                 // cancel/revoke meant to prevent — reconcile by deleting it.
                 if outcome.is_none() {
-                    if let Err(e) = delete_stored_token(&secrets).await {
+                    if let Err(e) = delete_stored_token(secrets).await {
                         tracing::warn!(
                             error = %e,
                             "could not delete github token after orphaned authorize"

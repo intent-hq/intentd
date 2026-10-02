@@ -3,8 +3,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use intent_core::{
-    ContentType, Error, Note, NoteId, NoteMetadata, NoteVisibility, Result, TaskMetadata,
-    TaskStatus, WorkspaceId, WorkspaceTaskStats,
+    ContentType, Error, Note, NoteId, NoteMetadata, NoteVisibility, Result, TaskListResult,
+    TaskMetadata, TaskStatus, WorkspaceId, WorkspaceTask, WorkspaceTaskStats,
 };
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
@@ -55,6 +55,123 @@ impl Store {
             .await
             .map_err(|e| Error::Internal(format!("list notes failed: {e}")))?;
         rows.iter().map(map_note_row).collect()
+    }
+
+    /// Read task summaries, dependency statuses and unfiltered stats in one snapshot.
+    /// Only the spec body is needed for link membership. Nonmatching tasks still
+    /// contribute their id, parent and status, but SQL omits their summary fields.
+    /// The workspace-wide scan (including spec) and creation-time ordering match
+    /// `list_notes`; in particular, do not sort task ids to break timestamp ties.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the query or projected metadata decoding fails.
+    pub async fn list_workspace_tasks(
+        &self,
+        workspace_id: &WorkspaceId,
+        filter: Option<TaskStatus>,
+    ) -> Result<TaskListResult> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Summary {
+            title: String,
+            updated_at: String,
+            depends_on: Vec<NoteId>,
+            conflicts_with: Vec<NoteId>,
+        }
+
+        let filter = filter.map(|s| enum_to_db(&s)).transpose()?;
+        let rows = sqlx::query(
+            "SELECT id, parent_id, json_extract(task_json, '$.status') AS status, \
+             CASE WHEN id = 'spec' THEN content END AS spec_content, \
+             CASE WHEN id != 'spec' AND (?2 IS NULL OR json_extract(task_json, '$.status') = ?2) \
+             THEN json_object('title', title, 'updatedAt', updated_at, \
+                 'dependsOn', json(COALESCE(json_extract(task_json, '$.dependsOn'), '[]')), \
+                 'conflictsWith', json(COALESCE(json_extract(task_json, '$.conflictsWith'), '[]'))) \
+             END AS summary \
+             FROM note WHERE workspace_id = ?1 AND (id = 'spec' OR task_json IS NOT NULL) \
+             ORDER BY created_at",
+        )
+        .bind(workspace_id.as_str())
+        .bind(filter)
+        .fetch_all(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("list workspace tasks failed: {e}")))?;
+
+        let mut linked = HashSet::new();
+        let mut status_by_id = HashMap::new();
+        let mut children = Vec::new();
+        let mut tasks = Vec::new();
+        for row in &rows {
+            let id: String = col(row, "id")?;
+            let status: Option<String> = col(row, "status")?;
+            let status = status
+                .as_deref()
+                .map(enum_from_db::<TaskStatus>)
+                .transpose()?;
+            if let Some(status) = status {
+                status_by_id.insert(id.clone(), status);
+            }
+            if id == "spec" {
+                let content: String = col(row, "spec_content")?;
+                linked = intent_core::extract_spec_task_ids(&content);
+                continue;
+            }
+            let status =
+                status.ok_or_else(|| Error::Internal(format!("missing task status: {id}")))?;
+            let parent_id: Option<String> = col(row, "parent_id")?;
+            if parent_id.as_deref() == Some("spec") {
+                children.push((id.clone(), status));
+            }
+            let summary: Option<String> = col(row, "summary")?;
+            if let Some(summary) = summary {
+                let summary: Summary = serde_json::from_str(&summary)
+                    .map_err(|e| Error::Internal(format!("decode task summary failed: {e}")))?;
+                tasks.push(WorkspaceTask {
+                    id: NoteId::from(id),
+                    title: if summary.title.is_empty() {
+                        "Untitled task".into()
+                    } else {
+                        summary.title
+                    },
+                    status,
+                    updated_at: summary.updated_at,
+                    parent_id: parent_id.map(NoteId::from),
+                    spec_linked: false,
+                    depends_on: summary.depends_on,
+                    conflicts_with: summary.conflicts_with,
+                    unmet_depends_on: Vec::new(),
+                });
+            }
+        }
+        for task in &mut tasks {
+            task.spec_linked = linked.contains(task.id.as_str());
+            task.unmet_depends_on = task
+                .depends_on
+                .iter()
+                .filter(|id| status_by_id.get(id.as_str()) != Some(&TaskStatus::Complete))
+                .cloned()
+                .collect();
+        }
+        let mut stats = WorkspaceTaskStats::default();
+        for (id, status) in children {
+            if !linked.is_empty() && !linked.contains(&id) {
+                continue;
+            }
+            match status {
+                TaskStatus::Cancelled => {}
+                TaskStatus::Complete => {
+                    stats.total += 1;
+                    stats.completed += 1;
+                }
+                TaskStatus::InProgress | TaskStatus::ReviewRequired => {
+                    stats.total += 1;
+                    stats.in_progress += 1;
+                }
+                _ => stats.total += 1,
+            }
+        }
+        Ok(TaskListResult { tasks, stats })
     }
 
     /// Test whether a workspace owns a note without hydrating its row.
