@@ -14755,7 +14755,50 @@ mod npx_launch_dir_lifetime_tests {
     }
 
     fn pid_alive(pid: i32) -> bool {
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+        if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() {
+            return false;
+        }
+        // kill(pid, 0) still succeeds for an exited child until its parent
+        // reaps it. Such a process cannot use the launch directory anymore.
+        // Keep unknown states conservative: a live/stopped process must still
+        // fail the lifetime assertions if cleanup removes its directory.
+        #[cfg(target_os = "linux")]
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            if matches!(
+                stat.rsplit_once(") ")
+                    .and_then(|(_, fields)| fields.split_whitespace().next()),
+                Some("Z" | "X")
+            ) {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pid_alive_distinguishes_live_stopped_and_unreaped_children() {
+        use nix::sys::signal::{kill, Signal};
+        use nix::sys::wait::{waitid, Id, WaitPidFlag};
+        use nix::unistd::Pid;
+
+        let mut child = intentd_test_support::GuardedChild::spawn(
+            std::process::Command::new("sleep").arg("300"),
+        )
+        .unwrap();
+        let pid = Pid::from_raw(child.id().cast_signed());
+        assert!(pid_alive(pid.as_raw()), "an executable process is alive");
+
+        kill(pid, Signal::SIGSTOP).unwrap();
+        waitid(Id::Pid(pid), WaitPidFlag::WSTOPPED | WaitPidFlag::WNOWAIT).unwrap();
+        assert!(pid_alive(pid.as_raw()), "a stopped process can resume");
+
+        child.kill().unwrap();
+        // Observe exit without reaping, deterministically retaining a zombie.
+        waitid(Id::Pid(pid), WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT).unwrap();
+        assert!(kill(pid, None).is_ok(), "the zombie still has a pid");
+        assert!(!pid_alive(pid.as_raw()), "a zombie cannot use its cwd");
+        child.wait().unwrap();
     }
 
     /// A leader whose cwd is `dir`: it starts a same-group grandchild that
