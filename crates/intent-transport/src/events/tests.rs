@@ -588,19 +588,7 @@ mod collaborator_fan_out {
         out
     }
 
-    fn queue_ids(data: &Value) -> Vec<&str> {
-        data["queue"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|e| e["id"].as_str().unwrap())
-            .collect()
-    }
-
-    /// A guest's `agent:queue:updated` frame carries only its own entries
-    /// plus unattributed (agent-sent) ones; the other member's entry AND the
-    /// unattributable legacy human entry never reach its connection, and the
-    /// surviving entries keep their `position`.
+    /// Every workspace participant receives the shared queue in drain order.
     #[tokio::test]
     async fn guest_queue_updated_frames_are_projected_to_the_principal() {
         let principal_id = PrincipalId::new();
@@ -611,8 +599,8 @@ mod collaborator_fan_out {
         let frames = queue_frames_for(guest, &principal_id).await;
         assert_eq!(frames.len(), 1, "{frames:?}");
         assert_eq!(frames[0]["agentId"], "agent-1");
-        assert_eq!(queue_ids(&frames[0]), vec!["m-own", "m-agent"]);
-        assert_eq!(frames[0]["queue"][1]["position"], 2, "no renumbering");
+        assert_eq!(frames[0]["queue"], mixed_queue(&principal_id));
+        assert_eq!(frames[0]["queue"][1]["position"], 1, "no renumbering");
     }
 
     /// The administrator's and non-wire callers' frames are the publisher's
@@ -688,12 +676,9 @@ mod collaborator_fan_out {
         out
     }
 
-    /// A guest's `agent:queue:processing` frame for an entry it may not see
-    /// — another member's, or a human-origin entry the workspace could not
-    /// attribute — keeps the ids the FE keys the turn on but loses
-    /// `content`; its own and unattributed entries arrive whole.
+    /// Processing events carry shared content even for unknown authors.
     #[tokio::test]
-    async fn guest_queue_processing_frames_drop_foreign_content() {
+    async fn guest_queue_processing_frames_include_shared_content() {
         let principal_id = PrincipalId::new();
         let guest = Caller::Wire {
             principal_id: principal_id.clone(),
@@ -701,18 +686,9 @@ mod collaborator_fan_out {
         };
         let frames = processing_frames_for(guest, &principal_id).await;
         assert_eq!(frames.len(), 4, "{frames:?}");
-        assert_eq!(frames[0]["content"], "text of m-own", "{frames:?}");
-        assert_eq!(
-            frames[1],
-            json!({ "agentId": "agent-1", "messageId": "m-other", "turnId": "m-other" }),
-            "foreign entry: ids only"
-        );
-        assert_eq!(
-            frames[2],
-            json!({ "agentId": "agent-1", "messageId": "m-unknown", "turnId": "m-unknown" }),
-            "unknown-human entry: ids only"
-        );
-        assert_eq!(frames[3]["content"], "text of m-agent", "{frames:?}");
+        for (frame, id) in frames.iter().zip(PROCESSING_IDS) {
+            assert_eq!(frame["content"], format!("text of {id}"));
+        }
     }
 
     /// The administrator's and non-wire callers' processing frames carry the

@@ -68,7 +68,7 @@ fn host_members_are_not_administrators() {
         host_role: crate::HostRole::Member,
     };
     assert!(!member.is_administrator());
-    assert!(!queue_attribution_visible_to(
+    assert!(queue_attribution_visible_to(
         &member,
         &QueueAttribution::UnknownHuman
     ));
@@ -179,8 +179,8 @@ pub enum QueueAttribution {
     /// An unstamped entry of human origin (a legacy pre-attribution row)
     /// whose workspace fallback could not be resolved (no owner / legacy
     /// author, or the read failed): SOMEONE wrote it, nobody knows who.
-    /// Fails closed — withheld from every non-administrator wire caller,
-    /// never surfaced to a guest as author-less.
+    /// Visible in the shared queue, but never confers authorship for editing
+    /// or same-author merging.
     UnknownHuman,
     /// No human author at all: an agent-sent or automatic (hook / monitor /
     /// system) entry. Public to every caller.
@@ -237,28 +237,11 @@ pub fn queue_attribution_with(
     }
 }
 
-/// Whether a queue entry with `attribution` may be shown to `caller`. A
-/// non-administrator wire principal (a guest collaborator) sees only entries
-/// attributed to itself plus [`QueueAttribution::Unattributed`] ones — an
-/// [`QueueAttribution::UnknownHuman`] entry is withheld like a foreign one;
-/// the administrator (workspace owner), agents and the daemon see the full
-/// queue. The one predicate behind `agent.getQueue`, the
-/// `agent:queue:updated` / `agent:queue:processing` projections and the
-/// per-id mutation gate.
+/// Queue reads are shared by all callers admitted to the workspace. This is
+/// an egress policy, not authorization to mutate someone else's entry.
 #[must_use]
-pub fn queue_attribution_visible_to(caller: &Caller, attribution: &QueueAttribution) -> bool {
-    let Caller::Wire {
-        principal_id,
-        host_role: crate::HostRole::Member | crate::HostRole::Guest,
-    } = caller
-    else {
-        return true;
-    };
-    match attribution {
-        QueueAttribution::Principal(author) => author == principal_id,
-        QueueAttribution::UnknownHuman => false,
-        QueueAttribution::Unattributed => true,
-    }
+pub fn queue_attribution_visible_to(_caller: &Caller, _attribution: &QueueAttribution) -> bool {
+    true
 }
 
 /// The attribution of a queued-message entry in wire shape (`author` already
@@ -333,27 +316,14 @@ pub fn queue_processing_event_attribution(
     QueueAttribution::Unattributed
 }
 
-/// Egress projection of a queue snapshot for `caller`: drops the entries
-/// [`queue_visible_to`] hides, keeping drain order and the entries'
-/// `position` values as they are (no renumbering). `None` (no bound caller)
-/// filters nothing.
+/// Shared queue projection. Workspace admission is checked before this egress;
+/// authorship is enforced separately by each mutation.
 #[must_use]
 pub fn project_queue_for_caller(
-    caller: Option<&Caller>,
+    _caller: Option<&Caller>,
     queue: Vec<serde_json::Value>,
 ) -> Vec<serde_json::Value> {
-    match caller {
-        Some(
-            caller @ Caller::Wire {
-                host_role: crate::HostRole::Member | crate::HostRole::Guest,
-                ..
-            },
-        ) => queue
-            .into_iter()
-            .filter(|entry| queue_visible_to(caller, entry))
-            .collect(),
-        Some(Caller::Wire { .. } | Caller::Agent { .. } | Caller::Daemon) | None => queue,
-    }
+    queue
 }
 
 #[cfg(test)]
@@ -404,11 +374,11 @@ mod tests {
     }
 
     #[test]
-    fn guest_sees_own_and_unattributed_entries_only() {
+    fn guest_sees_shared_queue_including_foreign_and_unknown_humans() {
         let guest = wire(false);
         let queue = mixed_queue();
         assert!(queue_visible_to(&guest, &queue[0]), "own entry");
-        assert!(!queue_visible_to(&guest, &queue[1]), "foreign entry");
+        assert!(queue_visible_to(&guest, &queue[1]), "foreign entry");
         assert!(
             queue_visible_to(&guest, &queue[2]),
             "agent-sent, null author"
@@ -418,17 +388,20 @@ mod tests {
             "system, absent author key"
         );
         assert!(
-            !queue_visible_to(&guest, &queue[4]),
+            queue_visible_to(&guest, &queue[4]),
             "unstamped human entry the resolver could not attribute"
         );
 
         let projected = project_queue_for_caller(Some(&guest), queue);
-        assert_eq!(ids(&projected), ["own", "agent", "system"]);
+        assert_eq!(
+            ids(&projected),
+            ["own", "foreign", "agent", "system", "unknown-human"]
+        );
         let positions: Vec<u64> = projected
             .iter()
             .map(|e| e["position"].as_u64().unwrap())
             .collect();
-        assert_eq!(positions, [0, 2, 3], "positions are not renumbered");
+        assert_eq!(positions, [0, 1, 2, 3, 4], "positions are not renumbered");
     }
 
     #[test]
@@ -491,14 +464,14 @@ mod tests {
     }
 
     #[test]
-    fn attribution_predicate_fails_closed_on_unknown_human() {
+    fn read_visibility_includes_unknown_humans() {
         let guest = wire(false);
         let own = QueueAttribution::Principal(PrincipalId("p-1".into()));
         let foreign = QueueAttribution::Principal(PrincipalId("p-2".into()));
         assert!(queue_attribution_visible_to(&guest, &own), "own");
-        assert!(!queue_attribution_visible_to(&guest, &foreign), "foreign");
+        assert!(queue_attribution_visible_to(&guest, &foreign), "foreign");
         assert!(
-            !queue_attribution_visible_to(&guest, &QueueAttribution::UnknownHuman),
+            queue_attribution_visible_to(&guest, &QueueAttribution::UnknownHuman),
             "unknown human"
         );
         assert!(
@@ -532,7 +505,7 @@ mod tests {
             json!({ "id": "e", "author": {} }),
             json!({ "id": "b", "author": { "principalId": "" } }),
         ] {
-            assert!(!queue_visible_to(&guest, &e), "human origin, no stamp: {e}");
+            assert!(queue_visible_to(&guest, &e), "human origin, no stamp: {e}");
         }
         assert!(
             queue_visible_to(
@@ -550,7 +523,7 @@ mod tests {
             "own stamp on the entry metadata"
         );
         assert!(
-            !queue_visible_to(
+            queue_visible_to(
                 &guest,
                 &json!({ "id": "f", "author": Value::Null,
                     "messageMetadata": { FROM_PRINCIPAL_ID_KEY: "p-2" } })

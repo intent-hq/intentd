@@ -6915,6 +6915,8 @@ fn flush_entry(suffix: &str, content: String) -> crate::agent_ops::QueuedMessage
         hold_kind: None,
         hold_until: None,
         child_agent_id: None,
+        merged_submission_ids: Vec::new(),
+        edit_appended: String::new(),
     }
 }
 
@@ -14943,6 +14945,8 @@ async fn flush_persist_failure_for_vanished_session_drops_whole_batch() {
         hold_kind: None,
         hold_until: None,
         child_agent_id: None,
+        merged_submission_ids: Vec::new(),
+        edit_appended: String::new(),
     };
     let batch = vec![entry("head", true), entry("tail", false)];
     let draining = mgr.services.mark_draining(&id, &batch);
@@ -18669,6 +18673,8 @@ mod stale_redrive_tests {
             hold_kind: None,
             hold_until: None,
             child_agent_id: None,
+            merged_submission_ids: Vec::new(),
+            edit_appended: String::new(),
         }
     }
 
@@ -19118,6 +19124,8 @@ mod dequeue_wait_tests {
             hold_kind: None,
             hold_until: None,
             child_agent_id: None,
+            merged_submission_ids: Vec::new(),
+            edit_appended: String::new(),
         }
     }
 
@@ -23087,6 +23095,8 @@ mod flush_queued_messages_tests {
             hold_kind: None,
             hold_until: None,
             child_agent_id: None,
+            merged_submission_ids: Vec::new(),
+            edit_appended: String::new(),
         }
     }
 

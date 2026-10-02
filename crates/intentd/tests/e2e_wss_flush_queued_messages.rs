@@ -21,13 +21,9 @@
 //! system-only batch and drain one-at-a-time — same observable shape as
 //! case 2 (one turn per message, no combined header, queue 2 → 1 → 0).
 //!
-//! Case 4 (two members, default `"all"`): the owner and a collaborator each
-//! queue one message behind the busy turn. Per-user queue visibility holds
-//! on every egress — `agent.getQueue` and the `agent:queue:updated` push
-//! show the collaborator only its own entry (owner sees both, `position`
-//! not renumbered), the owner's edit of the guest's entry and the guest's
-//! edit/remove of the owner's entry are refused (`-32602`) — and the flush
-//! still drains BOTH entries in one combined turn.
+//! Case 4: participants share the queue, consecutive submissions by the same
+//! author merge, and direct RPC mutations remain author/owner restricted.
+//! Different authors still drain as distinct rows in a combined turn.
 //!
 //! Case 5 (`agent.diagnostics`, two members + one agent-sent entry): the
 //! `queues[]` view is projected per caller exactly like `agent.getQueue`.
@@ -65,7 +61,7 @@ const GUEST_TOKEN: &str = "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefb
 
 const KICKOFF_MSG: &str = "kick-off slow turn";
 const QUEUED_ONE: &str = "queued flush one";
-const QUEUED_TWO: &str = "queued flush two";
+const QUEUED_TWO: &str = "Message from @guest\n\nqueued flush two";
 const OWNER_QUEUED: &str = "queued by owner";
 const GUEST_QUEUED: &str = "queued by guest";
 const GUEST_PREAMBLE: &str = "Message from @guest";
@@ -313,19 +309,6 @@ fn gate(test: &str) -> Option<String> {
     Some(script)
 }
 
-async fn seed_workspace_only(data_dir: &Path) -> String {
-    use intent_core::WorkspaceId;
-    use intent_store::Store;
-    let db_path = data_dir.join("intentd.db");
-    let store = Store::open(&db_path).await.expect("open store");
-    let ws = WorkspaceId::new();
-    store
-        .insert_workspace(&workspace_seed(&ws))
-        .await
-        .expect("insert ws");
-    ws.0
-}
-
 /// Seed a workspace plus a non-primary `guest` principal — credential bound
 /// to `GUEST_TOKEN`, collaborator member of the workspace — BEFORE boot.
 /// Returns `(workspace id, guest principal)`.
@@ -532,7 +515,8 @@ async fn boot_daemon(
 }
 
 async fn setup_busy_agent_with_two_queued(data_dir: &Path, script: &str) -> FlushSetup {
-    let ws_id = seed_workspace_only(data_dir).await;
+    // Different human authors remain separate entries for batch-flush coverage.
+    let (ws_id, _guest) = seed_workspace_with_guest(data_dir).await;
     let Booted {
         daemon,
         port,
@@ -590,8 +574,9 @@ async fn setup_busy_agent_with_two_queued(data_dir: &Path, script: &str) -> Flus
     )
     .await;
     assert_eq!(q1["success"], true, "queue one: {q1}");
+    let mut guest_rpc = connect_ws_as(port, cfg.clone(), GUEST_TOKEN).await;
     let q2 = wss_rpc(
-        &mut rpc,
+        &mut guest_rpc,
         13,
         "agent.queueMessage",
         json!({ "agentId": agent_id, "content": QUEUED_TWO }),
@@ -1226,40 +1211,12 @@ async fn await_queue_snapshots(
     panic!("never observed the awaited agent:queue:updated snapshot: {seen:?}")
 }
 
-/// FLUSH-4 (two members, default `agents.flushQueuedMessages = "all"`): the
-/// owner (administrator) and a collaborator (`guest`, seeded as a workspace
-/// member) each queue ONE message behind the busy turn. Per-user queue
-/// visibility holds on every egress, and the batched flush still drains
-/// both entries in ONE combined turn.
-///
-/// Contract locked down:
-/// 1. `agent.getQueue` — the owner sees both entries (its own first, the
-///    guest's second, `author.principalId` resolved on each); the guest
-///    sees ONLY its own entry, with `position` kept at 1 (not renumbered).
-/// 2. `agent:queue:updated` — the owner's subscription is pushed the full
-///    snapshots (1 → 2 entries); the guest's subscription is pushed the
-///    projected ones: the owner's entry never appears, and the last
-///    enqueue-phase snapshot is exactly `[guest entry]` at `position` 1.
-/// 3. Ownership refusals (`-32602`, no snapshot published): the owner's
-///    `agent.editQueuedMessage` of the guest's entry (`can only be edited by
-///    its author`), the guest's `agent.editQueuedMessage` and
-///    `agent.removeQueuedMessage` of the owner's entry (`queued message not
-///    found` — an invisible entry reads as absent). Both queues are
-///    unchanged afterwards. Administrator override: the guest queues a
-///    scratch entry, the owner's `agent.removeQueuedMessage` of it succeeds
-///    (`{ success: true }`) and BOTH views return to exactly their previous
-///    two-entry / one-entry state (the removal snapshots are consumed on
-///    both subscriptions).
-/// 4. Flush intact: the drain publishes ONE empty snapshot to each
-///    subscriber (2 → 0 for the owner, 1 → 0 projected for the guest),
-///    exactly ONE `agent:queue:processing` fires (same `turnId` on both
-///    subscriptions), the flushed user-row echoes link BOTH entry ids in
-///    queue order, the provider-received prompt is one combined message
-///    (batch header, owner body before the preambled guest body), and the
-///    transcript keeps two rows sharing one `batchId` — the guest's stamped
-///    `fromPrincipalId`. Both members read an empty queue afterwards.
+/// Two workspace participants share queue snapshots and processing events.
+/// Consecutive owner submissions merge across both enqueue entry points;
+/// a held edit preserves a concurrent append. Different authors stay separate
+/// and direct RPC mutations remain restricted before the batch drain.
 #[tokio::test]
-async fn two_members_see_disjoint_queues_and_flush_combines_both_over_wss() {
+async fn two_members_see_shared_queue_and_flush_combines_both_over_wss() {
     let Some(script) = gate("WSS two-member queue visibility + flush E2E") else {
         return;
     };
@@ -1343,6 +1300,86 @@ async fn two_members_see_disjoint_queues_and_flush_combines_both_over_wss() {
         .as_str()
         .expect("owner entry id")
         .to_string();
+    // Both queueMessage and busy sendMessage append to the same durable row.
+    let appended = wss_rpc(
+        &mut rpc,
+        120,
+        "agent.queueMessage",
+        json!({"agentId":agent_id,"content":"second owner submission"}),
+    )
+    .await;
+    assert_eq!(appended["queuedMessage"]["id"], owner_id);
+    assert_eq!(appended["turnId"], owner_q["turnId"]);
+    assert_eq!(appended["queuedMessage"]["position"], 0);
+    assert_eq!(
+        appended["queuedMessage"]["content"],
+        format!("{OWNER_QUEUED}\n\nsecond owner submission")
+    );
+    let busy = wss_rpc(&mut rpc, 121, "agent.sendMessage",
+        json!({"workspaceId":ws_id,"agentId":agent_id,"content":"busy owner submission","priority":"queue","messageId":"stable-busy-submission","messageMetadata":{"mergedMessageMetadata":[{"type":"question_answers","answeredQuestionsMessageId":"q1","fromPrincipalId":"spoofed"},{"type":"question_answers","answeredQuestionsMessageId":"q2","fromAgentId":"spoofed"}]}})).await;
+    assert_eq!(busy["queued"], true);
+    assert_eq!(busy["queuedMessage"]["id"], owner_id);
+    assert_eq!(busy["turnId"], owner_q["turnId"]);
+    let contributions = busy["queuedMessage"]["messageMetadata"]["mergedMessageMetadata"]
+        .as_array()
+        .unwrap();
+    for question in ["q1", "q2"] {
+        let contribution = contributions
+            .iter()
+            .find(|entry| entry["answeredQuestionsMessageId"] == question)
+            .unwrap();
+        assert_eq!(
+            contribution["fromPrincipalId"],
+            owner_q["queuedMessage"]["messageMetadata"]["fromPrincipalId"]
+        );
+        assert!(contribution.get("fromAgentId").is_none());
+    }
+    assert_eq!(
+        busy["queuedMessage"]["content"],
+        format!("{OWNER_QUEUED}\n\nsecond owner submission\n\nbusy owner submission")
+    );
+    let retry = wss_rpc(&mut rpc, 122, "agent.sendMessage",
+        json!({"workspaceId":ws_id,"agentId":agent_id,"content":"busy owner submission","priority":"queue","messageId":"stable-busy-submission","messageMetadata":{"mergedMessageMetadata":[{"type":"question_answers","answeredQuestionsMessageId":"q1","fromPrincipalId":"spoofed"},{"type":"question_answers","answeredQuestionsMessageId":"q2","fromAgentId":"spoofed"}]}})).await;
+    assert_eq!(
+        retry["queuedMessage"], busy["queuedMessage"],
+        "retry must not append twice"
+    );
+    wss_rpc(
+        &mut rpc,
+        123,
+        "agent.editQueuedMessage",
+        json!({"agentId":agent_id,"messageId":owner_id,"content":OWNER_QUEUED,"editing":true}),
+    )
+    .await;
+    let held = wss_rpc(
+        &mut rpc,
+        124,
+        "agent.queueMessage",
+        json!({"agentId":agent_id,"content":"held append"}),
+    )
+    .await;
+    assert_eq!(held["queuedMessage"]["id"], owner_id);
+    assert_eq!(held["queuedMessage"]["editing"], true);
+    let saved = wss_rpc(
+        &mut rpc,
+        125,
+        "agent.editQueuedMessage",
+        json!({"agentId":agent_id,"messageId":owner_id,"content":OWNER_QUEUED,"editing":false}),
+    )
+    .await;
+    assert_eq!(
+        saved["queuedMessage"]["content"],
+        format!("{OWNER_QUEUED}\n\nheld append")
+    );
+    // Restore the text so the existing full drain assertions stay precise.
+    wss_rpc(
+        &mut rpc,
+        126,
+        "agent.editQueuedMessage",
+        json!({"agentId":agent_id,"messageId":owner_id,"content":OWNER_QUEUED}),
+    )
+    .await;
+
     let guest_q = wss_rpc(
         &mut guest_rpc,
         100,
@@ -1407,10 +1444,10 @@ async fn two_members_see_disjoint_queues_and_flush_combines_both_over_wss() {
     .await;
     assert_eq!(
         queue_ids(&guest_view["queue"]),
-        vec![guest_id.clone()],
-        "guest reads only its own entry: {guest_view}"
+        vec![owner_id.clone(), guest_id.clone()],
+        "guest reads the shared queue: {guest_view}"
     );
-    let guest_entry = &guest_view["queue"][0];
+    let guest_entry = &guest_view["queue"][1];
     assert_eq!(
         guest_entry["position"],
         json!(1),
@@ -1430,6 +1467,15 @@ async fn two_members_see_disjoint_queues_and_flush_combines_both_over_wss() {
             .any(|q| queue_ids(q) == [owner_id.clone()]),
         "owner sees the 1-entry snapshot before the 2-entry one: {owner_pushes:?}"
     );
+    assert!(
+        owner_pushes.iter().any(|queue| {
+            queue.as_array().is_some_and(|entries| entries.len() == 1)
+                && queue[0]["id"] == owner_id
+                && queue[0]["content"]
+                    == format!("{OWNER_QUEUED}\n\nsecond owner submission\n\nbusy owner submission")
+        }),
+        "queue:updated publishes the full merged survivor: {owner_pushes:?}"
+    );
     let guest_pushes = await_queue_snapshots(&mut guest_sub, &agent_id, |q| {
         queue_ids(q).contains(&guest_id)
     })
@@ -1437,17 +1483,17 @@ async fn two_members_see_disjoint_queues_and_flush_combines_both_over_wss() {
     assert!(
         guest_pushes
             .iter()
-            .all(|q| !queue_ids(q).contains(&owner_id)),
-        "the owner's entry is never pushed to the guest: {guest_pushes:?}"
+            .all(|q| queue_ids(q).contains(&owner_id)),
+        "the owner's entry is shared with the guest: {guest_pushes:?}"
     );
     let guest_last = guest_pushes.last().expect("guest saw a snapshot");
     assert_eq!(
         queue_ids(guest_last),
-        vec![guest_id.clone()],
-        "guest's projected snapshot is exactly its own entry: {guest_last}"
+        vec![owner_id.clone(), guest_id.clone()],
+        "guest's snapshot includes both entries: {guest_last}"
     );
     assert_eq!(
-        guest_last[0]["position"],
+        guest_last[1]["position"],
         json!(1),
         "projected push keeps position 1: {guest_last}"
     );
@@ -1521,104 +1567,6 @@ async fn two_members_see_disjoint_queues_and_flush_combines_both_over_wss() {
         "refused edits/removes leave the guest's view untouched"
     );
 
-    // (3b) Administrator override: the owner CAN remove a guest-authored
-    // entry. The guest queues a scratch entry, the owner removes it, and
-    // both views return to exactly their previous state — the removal's
-    // snapshots are consumed here so (4) still sees only the drain's.
-    let scratch_q = wss_rpc(
-        &mut guest_rpc,
-        105,
-        "agent.queueMessage",
-        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "guest scratch" }),
-    )
-    .await;
-    assert_eq!(
-        scratch_q["success"], true,
-        "guest scratch queue: {scratch_q}"
-    );
-    let scratch_id = scratch_q["queuedMessage"]["id"]
-        .as_str()
-        .expect("scratch entry id")
-        .to_string();
-    let owner_grown = await_queue_snapshots(&mut owner_sub, &agent_id, |q| {
-        queue_ids(q) == [owner_id.clone(), guest_id.clone(), scratch_id.clone()]
-    })
-    .await;
-    assert_eq!(
-        owner_grown.len(),
-        1,
-        "one enqueue snapshot: {owner_grown:?}"
-    );
-    let guest_grown = await_queue_snapshots(&mut guest_sub, &agent_id, |q| {
-        queue_ids(q) == [guest_id.clone(), scratch_id.clone()]
-    })
-    .await;
-    assert_eq!(
-        guest_grown.len(),
-        1,
-        "one projected enqueue snapshot: {guest_grown:?}"
-    );
-    assert_eq!(
-        guest_grown[0][1]["position"],
-        json!(2),
-        "scratch keeps its full-queue position in the projection: {guest_grown:?}"
-    );
-
-    let owner_remove = wss_rpc_envelope(
-        &mut rpc,
-        16,
-        "agent.removeQueuedMessage",
-        json!({ "agentId": agent_id, "messageId": scratch_id }),
-    )
-    .await;
-    assert!(owner_remove.get("error").is_none(), "{owner_remove}");
-    assert_eq!(
-        owner_remove["result"],
-        json!({ "success": true }),
-        "the administrator removes the guest's entry: {owner_remove}"
-    );
-    let owner_shrunk = await_queue_snapshots(&mut owner_sub, &agent_id, |q| {
-        queue_ids(q) == [owner_id.clone(), guest_id.clone()]
-    })
-    .await;
-    assert_eq!(
-        owner_shrunk.len(),
-        1,
-        "one removal snapshot: {owner_shrunk:?}"
-    );
-    let guest_shrunk = await_queue_snapshots(&mut guest_sub, &agent_id, |q| {
-        queue_ids(q) == [guest_id.clone()]
-    })
-    .await;
-    assert_eq!(
-        guest_shrunk.len(),
-        1,
-        "one projected removal snapshot: {guest_shrunk:?}"
-    );
-
-    let owner_restored = wss_rpc(
-        &mut rpc,
-        17,
-        "agent.getQueue",
-        json!({ "agentId": agent_id }),
-    )
-    .await;
-    assert_eq!(
-        owner_restored["queue"], owner_view["queue"],
-        "only the scratch entry is gone; the owner's view is exactly as before"
-    );
-    let guest_restored = wss_rpc(
-        &mut guest_rpc,
-        106,
-        "agent.getQueue",
-        json!({ "agentId": agent_id }),
-    )
-    .await;
-    assert_eq!(
-        guest_restored["queue"], guest_view["queue"],
-        "the guest's own surviving entry is untouched"
-    );
-
     // (4) Flush intact — observed on both subscriptions: kick-off
     // stream:end, then the ONE combined flush turn. Everything the busy
     // window had to cover is done; let the kick-off turn end.
@@ -1652,9 +1600,7 @@ async fn two_members_see_disjoint_queues_and_flush_combines_both_over_wss() {
     );
     let combined_turn_id = &owner_obs.processing_turn_ids[0];
     // The drain-start frame is keyed on the batch head — the owner's entry.
-    // The owner's frame carries its content; the guest's is projected to
-    // ids only (the entry is hidden from the guest's queue), while the
-    // batch still flushes as one turn below.
+    // All participants receive the same content and surviving identity.
     let owner_processing = &owner_obs.processing_frames[0];
     assert_eq!(
         owner_processing["messageId"],
@@ -1668,9 +1614,8 @@ async fn two_members_see_disjoint_queues_and_flush_combines_both_over_wss() {
         "the owner sees its own entry's content (plus the dequeue-wait note): {owner_processing}"
     );
     assert_eq!(
-        guest_obs.processing_frames[0],
-        json!({ "agentId": agent_id, "messageId": owner_id, "turnId": combined_turn_id }),
-        "the guest's processing frame for the owner's entry carries no content"
+        guest_obs.processing_frames[0], *owner_processing,
+        "all participants receive the same processing content"
     );
     for obs in [&owner_obs, &guest_obs] {
         let linked: Vec<&String> = obs.user_row_queued_message_ids.iter().flatten().collect();

@@ -249,35 +249,56 @@ pub(crate) fn principal_attribution_name(principal: &Principal) -> String {
 pub(crate) fn stamp_principal_attribution(
     message_metadata: Option<Value>,
 ) -> Result<Option<Value>> {
-    let metadata = match message_metadata {
-        None => None,
-        Some(Value::Object(mut obj)) => {
-            obj.remove(intent_core::human_author::HUMAN_AUTHOR_KEY);
-            Some(obj)
-        }
+    let mut obj = match message_metadata {
+        None if stamping_principal_id().is_none() => return Ok(None),
+        None => serde_json::Map::new(),
+        Some(Value::Object(obj)) => obj,
         Some(_) => {
             return Err(Error::InvalidParams(
                 "messageMetadata must be an object".to_string(),
             ))
         }
     };
-    Ok(match (metadata, stamping_principal_id()) {
-        (Some(mut obj), Some(principal_id)) => {
+    // Canonical metadata is round-tripped by Retry. Preserve answer/custom tags,
+    // but authenticate each contribution exactly as the enclosing message.
+    if let Some(contributions) = obj.get_mut(crate::agent_ops::MERGED_MESSAGE_METADATA_KEY) {
+        let entries = contributions.as_array_mut().ok_or_else(|| {
+            Error::InvalidParams("mergedMessageMetadata must be an array of objects or null".into())
+        })?;
+        for entry in entries {
+            match entry {
+                Value::Object(contribution) => {
+                    contribution.remove(crate::agent_ops::MERGED_MESSAGE_METADATA_KEY);
+                    stamp_metadata_object(contribution);
+                }
+                Value::Null => {}
+                _ => {
+                    return Err(Error::InvalidParams(
+                        "mergedMessageMetadata must be an array of objects or null".into(),
+                    ))
+                }
+            }
+        }
+    }
+    stamp_metadata_object(&mut obj);
+    Ok(Some(Value::Object(obj)))
+}
+
+fn stamp_metadata_object(obj: &mut serde_json::Map<String, Value>) {
+    obj.remove(intent_core::human_author::HUMAN_AUTHOR_KEY);
+    match stamping_principal_id() {
+        Some(principal_id) => {
             obj.remove("fromAgentId");
             obj.remove("fromAgentName");
             obj.insert(
                 FROM_PRINCIPAL_ID_KEY.to_string(),
                 Value::String(principal_id.0),
             );
-            Some(Value::Object(obj))
         }
-        (Some(mut obj), None) => {
+        None => {
             obj.remove(FROM_PRINCIPAL_ID_KEY);
-            Some(Value::Object(obj))
         }
-        (None, Some(principal_id)) => Some(json!({ FROM_PRINCIPAL_ID_KEY: principal_id.0 })),
-        (None, None) => None,
-    })
+    }
 }
 
 /// `true` when a queue entry / message payload carries the daemon's human
@@ -296,6 +317,7 @@ pub(crate) fn strip_principal_attribution(message_metadata: Option<Value>) -> Op
         Some(Value::Object(mut obj)) => {
             obj.remove(FROM_PRINCIPAL_ID_KEY);
             obj.remove(intent_core::human_author::HUMAN_AUTHOR_KEY);
+            obj.remove(crate::agent_ops::MERGED_MESSAGE_METADATA_KEY);
             Some(Value::Object(obj))
         }
         other => other,

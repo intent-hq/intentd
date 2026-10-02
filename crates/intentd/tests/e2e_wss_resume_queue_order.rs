@@ -428,7 +428,8 @@ async fn interrupt_midturn_with_queued_messages(data_dir: &Path, script: &str) -
     }
     assert!(active, "agent never reached active mid-turn state");
 
-    // Queue two messages behind the parked turn.
+    // Queue a human message and a system notice behind the parked turn.
+    // Different origins preserve two entries for the FIFO recovery assertions.
     let q1 = uds_rpc(
         &socket,
         4,
@@ -441,7 +442,7 @@ async fn interrupt_midturn_with_queued_messages(data_dir: &Path, script: &str) -
         &socket,
         5,
         "agent.queueMessage",
-        json!({ "agentId": agent_id, "content": QUEUED_TWO }),
+        json!({ "agentId": agent_id, "content": QUEUED_TWO, "messageMetadata": {"source":"system"} }),
     )
     .await;
     assert_eq!(q2["result"]["success"], json!(true), "queue two: {q2}");

@@ -1,0 +1,408 @@
+//! Pending human append, durable identity and queue-lock regression coverage.
+use super::tests::{create_agent, setup};
+use super::*;
+
+fn enqueue(svc: &Services, agent: &AgentId, id: &str, author: &str, text: &str) -> QueuedMessage {
+    svc.enqueue_message_with_id(
+        agent,
+        Some(id.into()),
+        text.into(),
+        None,
+        None,
+        Some(json!({"fromPrincipalId": author})),
+        None,
+        false,
+        MessageOrigin::User,
+    )
+    .0
+}
+
+#[tokio::test]
+async fn queue_merge_same_author_keeps_identity_and_skips_system_entries() {
+    let (_tmp, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Merge").await;
+    let first = enqueue(&svc, &agent, "first", "a", "one");
+    svc.enqueue_message(
+        &agent,
+        "system".into(),
+        None,
+        None,
+        Some(json!({"source":"system"})),
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
+    let merged = enqueue(&svc, &agent, "second", "a", "two");
+    assert_eq!(merged.id, first.id);
+    assert_eq!(merged.turn_id, first.turn_id);
+    assert_eq!(merged.queued_at, first.queued_at);
+    assert_eq!(merged.content, "one\n\ntwo");
+    let retry = enqueue(&svc, &agent, "second", "a", "two");
+    assert_eq!(retry.content, merged.content);
+    assert_eq!(svc.queue_snapshot(&agent).len(), 2);
+    enqueue(&svc, &agent, "third", "b", "three");
+    enqueue(&svc, &agent, "fourth", "a", "four");
+    assert_eq!(svc.queue_snapshot(&agent).len(), 4);
+}
+
+#[tokio::test]
+async fn queue_merge_concurrent_submissions_do_not_lose_text() {
+    let (_tmp, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Merge").await;
+    std::thread::scope(|scope| {
+        for n in 0..24 {
+            let svc = &svc;
+            let agent = &agent;
+            scope.spawn(move || enqueue(svc, agent, &format!("id-{n}"), "a", &format!("text-{n}")));
+        }
+    });
+    assert_eq!(svc.queue_snapshot(&agent).len(), 1);
+    let entry = svc.dequeue_message(&agent).unwrap();
+    let texts: std::collections::HashSet<_> = entry.content.split("\n\n").collect();
+    assert_eq!(texts.len(), 24);
+    for n in 0..24 {
+        assert!(texts.contains(format!("text-{n}").as_str()));
+    }
+    let fresh = enqueue(&svc, &agent, "after-drain", "a", "new");
+    assert_ne!(fresh.id, entry.id);
+    assert_eq!(fresh.content, "new");
+}
+
+#[tokio::test]
+async fn queue_merge_preserves_edit_hold_and_appended_text_on_save() {
+    let (_tmp, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Merge").await;
+    let first = enqueue(&svc, &agent, "first", "a", "one");
+    svc.agent_edit_queued_message_op(agent.clone(), first.id.clone(), "one".into(), Some(true))
+        .await
+        .unwrap();
+    let merged = enqueue(&svc, &agent, "second", "a", "two");
+    assert!(merged.editing);
+    assert!(svc.dequeue_message(&agent).is_none());
+    let saved = svc
+        .agent_edit_queued_message_op(agent.clone(), first.id, "edited".into(), Some(false))
+        .await
+        .unwrap();
+    assert_eq!(saved["queuedMessage"]["content"], "edited\n\ntwo");
+    assert_eq!(
+        svc.dequeue_message(&agent).unwrap().content,
+        "edited\n\ntwo"
+    );
+}
+
+#[tokio::test]
+async fn queue_merge_preserves_metadata_attachments_and_restart_deduplication() {
+    let (_tmp, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Merge").await;
+    let first_metadata = json!({"fromPrincipalId":"a","type":"question_answers","answeredQuestionsMessageId":"q1","custom":1});
+    let second_metadata = json!({"fromPrincipalId":"a","type":"question_answers","answeredQuestionsMessageId":"q2","custom":2});
+    let (first, _) = svc.enqueue_message_with_id(
+        &agent,
+        Some("first".into()),
+        "one".into(),
+        Some(json!([{"imageRef":"one"}])),
+        Some(json!([{"path":"one"}])),
+        Some(first_metadata.clone()),
+        None,
+        false,
+        MessageOrigin::User,
+    );
+    let (merged, position) = svc.enqueue_message_with_id(
+        &agent,
+        Some("second".into()),
+        "two".into(),
+        Some(json!([{"imageRef":"two"}])),
+        Some(json!([{"path":"two"}])),
+        Some(second_metadata.clone()),
+        Some(QueuedPrepend {
+            content: Some("preempted".into()),
+            image_blocks: None,
+            file_blocks: None,
+        }),
+        true,
+        MessageOrigin::User,
+    );
+    assert_eq!(merged.id, first.id);
+    assert_eq!(position, 0);
+    assert_eq!(merged.prepend_content.as_deref(), Some("preempted"));
+    assert_eq!(
+        merged.image_blocks,
+        Some(json!([{"imageRef":"one"},{"imageRef":"two"}]))
+    );
+    assert_eq!(
+        merged.file_blocks,
+        Some(json!([{"path":"one"},{"path":"two"}]))
+    );
+    assert_eq!(
+        merged.message_metadata.as_ref().unwrap()[MERGED_MESSAGE_METADATA_KEY],
+        json!([first_metadata, second_metadata])
+    );
+    for question in ["q1", "q2"] {
+        svc.store
+            .append_agent_message_with_id(
+                &agent,
+                question,
+                "assistant",
+                &json!([{"type":"text","text":"question"}]),
+                None,
+                &now_iso(),
+            )
+            .await
+            .unwrap();
+        svc.record_pending_questions_marker(&ws, &agent, question)
+            .await;
+        assert!(
+            svc.resolve_pending_questions_for_answer(&ws, &agent, merged.message_metadata.as_ref())
+                .await
+        );
+    }
+    svc.persist_queue_snapshot(&agent).await;
+    svc.agent_queues.lock().unwrap().clear();
+    assert_eq!(svc.rehydrate_agent_queues().await.unwrap(), 1);
+    let retry = enqueue(&svc, &agent, "second", "a", "two");
+    assert_eq!(retry.content, "one\n\ntwo");
+    assert_eq!(retry.message_metadata, merged.message_metadata);
+}
+
+#[tokio::test]
+async fn queue_merge_unknown_and_delivered_humans_are_barriers() {
+    let (_tmp, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Merge").await;
+    enqueue(&svc, &agent, "first", "a", "one");
+    svc.enqueue_message(
+        &agent,
+        "unknown".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::User,
+    );
+    let next = enqueue(&svc, &agent, "second", "a", "two");
+    assert_eq!(next.id, "second");
+    svc.agent_queues
+        .lock()
+        .unwrap()
+        .get_mut(&agent)
+        .unwrap()
+        .last_mut()
+        .unwrap()
+        .persisted = true;
+    let fresh = enqueue(&svc, &agent, "third", "a", "three");
+    assert_eq!(fresh.id, "third");
+    assert_eq!(
+        svc.find_queued_message(&agent, "second").unwrap().content,
+        "two"
+    );
+}
+
+#[tokio::test]
+async fn queue_merge_drain_and_append_race_preserves_each_submission_once() {
+    let (_tmp, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Merge").await;
+    for n in 0..32 {
+        let first_id = format!("first-{n}");
+        let next_id = format!("next-{n}");
+        enqueue(&svc, &agent, &first_id, "a", "one");
+        let drained = std::thread::scope(|scope| {
+            let drain = scope.spawn(|| svc.dequeue_message(&agent).unwrap());
+            let append = scope.spawn(|| enqueue(&svc, &agent, &next_id, "a", "two"));
+            append.join().unwrap();
+            drain.join().unwrap()
+        });
+        let mut texts = vec![drained.content];
+        if let Some(pending) = svc.dequeue_message(&agent) {
+            texts.push(pending.content);
+        }
+        assert_eq!(texts.join("\n\n"), "one\n\ntwo");
+    }
+}
+
+#[tokio::test]
+async fn queue_workspace_owner_can_delete_but_cannot_edit_or_send_foreign_human() {
+    use intent_core::{with_caller, Caller, HostRole};
+    let (_tmp, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Permissions").await;
+    let (admin, guest) = super::tests::owner_and_guest_callers(&svc, &ws).await;
+    let owner_id = admin.principal_id().unwrap().clone();
+    let guest_id = guest.principal_id().unwrap().clone();
+    let member = Caller::Wire {
+        principal_id: guest_id.clone(),
+        host_role: HostRole::Member,
+    };
+    enqueue(&svc, &agent, "foreign", &owner_id.0, "owner input");
+    let denial = with_caller(
+        member,
+        svc.agent_remove_queued_message_op(agent.clone(), "foreign".into()),
+    )
+    .await;
+    assert!(
+        matches!(denial, Err(Error::InvalidParams(_))),
+        "ordinary host members are not moderators"
+    );
+    let owner = Caller::Wire {
+        principal_id: owner_id,
+        host_role: HostRole::Member,
+    };
+    enqueue(&svc, &agent, "guest", &guest_id.0, "guest input");
+    assert!(with_caller(
+        owner.clone(),
+        svc.agent_edit_queued_message_op(agent.clone(), "guest".into(), "hijack".into(), None)
+    )
+    .await
+    .is_err());
+    assert!(with_caller(
+        owner.clone(),
+        svc.agent_send_queued_message_now_op(agent.clone(), "guest".into())
+    )
+    .await
+    .is_err());
+    with_caller(
+        owner,
+        svc.agent_remove_queued_message_op(agent.clone(), "guest".into()),
+    )
+    .await
+    .unwrap();
+    assert!(svc.find_queued_message(&agent, "guest").is_none());
+}
+
+#[tokio::test]
+async fn queue_merge_retry_metadata_preserves_answers_and_authenticates_each_contribution() {
+    use intent_core::{with_caller, Caller, HostRole, PrincipalId};
+    let supplied = json!({"mergedMessageMetadata":[
+        {"type":"question_answers","answeredQuestionsMessageId":"q1","fromPrincipalId":"forged",
+         "fromAgentId":"forged","fromAgentName":"forged","humanAuthor":{"principalId":"forged"},
+         "mergedMessageMetadata":[{"answeredQuestionsMessageId":"nested"}]},
+        {"type":"question_answers","answeredQuestionsMessageId":"q2","custom":true}, null],
+        "custom":true});
+    let caller = Caller::Wire {
+        principal_id: PrincipalId("real".into()),
+        host_role: HostRole::Member,
+    };
+    let stamped = with_caller(caller, async {
+        crate::principal_ops::stamp_principal_attribution(Some(supplied.clone()))
+            .unwrap()
+            .unwrap()
+    })
+    .await;
+    assert_eq!(stamped["fromPrincipalId"], "real");
+    assert_eq!(
+        answered_question_ids(Some(&stamped)).collect::<Vec<_>>(),
+        vec!["q1", "q2"]
+    );
+    for contribution in stamped[MERGED_MESSAGE_METADATA_KEY]
+        .as_array()
+        .unwrap()
+        .iter()
+        .take(2)
+    {
+        assert_eq!(contribution["fromPrincipalId"], "real");
+        for key in [
+            "fromAgentId",
+            "fromAgentName",
+            "humanAuthor",
+            MERGED_MESSAGE_METADATA_KEY,
+        ] {
+            assert!(contribution.get(key).is_none());
+        }
+    }
+    assert_eq!(stamped[MERGED_MESSAGE_METADATA_KEY][1]["custom"], true);
+    assert!(stamped[MERGED_MESSAGE_METADATA_KEY][2].is_null());
+    for malformed in [json!({}), json!(["bad"]), json!([1]), json!(null)] {
+        assert!(
+            crate::principal_ops::stamp_principal_attribution(Some(json!({
+                "mergedMessageMetadata":malformed
+            })))
+            .is_err()
+        );
+    }
+    assert!(
+        crate::principal_ops::strip_principal_attribution(Some(supplied))
+            .unwrap()
+            .get(MERGED_MESSAGE_METADATA_KEY)
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn queue_merge_edit_preserves_repeated_text_and_hold_acquisition_race() {
+    let (_tmp, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Merge").await;
+    enqueue(&svc, &agent, "first", "a", "one\n\ntwo");
+    // Append wins before the editor's hold reaches the daemon.
+    enqueue(&svc, &agent, "second", "a", "two");
+    svc.agent_edit_queued_message_op(
+        agent.clone(),
+        "first".into(),
+        "one\n\ntwo".into(),
+        Some(true),
+    )
+    .await
+    .unwrap();
+    let saved = svc
+        .agent_edit_queued_message_op(
+            agent.clone(),
+            "first".into(),
+            "one\n\ntwo".into(),
+            Some(false),
+        )
+        .await
+        .unwrap();
+    assert_eq!(saved["queuedMessage"]["content"], "one\n\ntwo\n\ntwo");
+    svc.agent_edit_queued_message_op(
+        agent.clone(),
+        "first".into(),
+        "one\n\ntwo\n\ntwo".into(),
+        Some(true),
+    )
+    .await
+    .unwrap();
+    let merged = enqueue(&svc, &agent, "third", "a", "three");
+    let echo = svc
+        .agent_edit_queued_message_op(agent, "first".into(), merged.content.clone(), Some(false))
+        .await
+        .unwrap();
+    assert_eq!(echo["queuedMessage"]["content"], merged.content);
+}
+
+#[tokio::test]
+async fn queue_merge_interrupt_retains_position_and_carryover() {
+    let (_tmp, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Merge").await;
+    svc.enqueue_message(
+        &agent,
+        "system".into(),
+        None,
+        None,
+        Some(json!({"source":"system"})),
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
+    let first = enqueue(&svc, &agent, "first", "a", "one");
+    let (merged, position) = svc.enqueue_message_with_id(
+        &agent,
+        Some("interrupt".into()),
+        "two".into(),
+        None,
+        None,
+        Some(json!({"fromPrincipalId":"a"})),
+        Some(QueuedPrepend {
+            content: Some("carryover".into()),
+            image_blocks: Some(json!([{"imageRef":"carryover"}])),
+            file_blocks: None,
+        }),
+        true,
+        MessageOrigin::User,
+    );
+    assert_eq!(merged.id, first.id);
+    assert_eq!(position, 1);
+    assert!(!merged.interrupt_priority);
+    assert_eq!(merged.content, "one\n\ntwo");
+    assert_eq!(merged.prepend_content.as_deref(), Some("carryover"));
+    assert_eq!(
+        merged.prepend_image_blocks,
+        Some(json!([{"imageRef":"carryover"}]))
+    );
+}

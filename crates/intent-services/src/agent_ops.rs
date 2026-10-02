@@ -374,6 +374,8 @@ pub(crate) mod ready_delta;
 mod tests;
 
 #[cfg(test)]
+mod queue_merge_tests;
+#[cfg(test)]
 mod queue_visibility_contract_tests;
 
 #[cfg(test)]
@@ -1192,21 +1194,10 @@ enum PopCommit {
     Provisional,
 }
 
-/// A restricted wire caller's ownership check for one per-id queue mutation
-/// (multiplayer), built by [`Services::queue_entry_gate`] with its async
-/// inputs pre-resolved. Visibility applies FIRST, through the shared
-/// [`intent_core::queue_attribution_visible_to`] predicate over the entry's
-/// attribution — the same three-tier resolution as `agent.getQueue`
-/// ([`intent_core::queue_attribution_with`]: stamp, else workspace fallback
-/// for a human-origin entry — an unknown human when that fallback is
-/// missing — else unattributed): an entry the caller's `agent.getQueue`
-/// hides reads as absent for every mutation — `-32602 queued message not
-/// found`, no side effects. Then `author_only` (`agent.editQueuedMessage`)
-/// refuses a VISIBLE entry the caller did not author — this only ever
-/// reaches the administrator, who sees the whole queue: another principal's
-/// entry, and an unknown-human entry (a human wrote it, nobody can claim it;
-/// the administrator may still remove or force-send it). An entry with no
-/// human author passes.
+/// Per-entry mutation authority, independent of shared queue visibility.
+/// Attribution is resolved under the mutation lock. Editing stays author-only;
+/// send-now allows author or host owner. The remove operation additionally
+/// recognizes the workspace owner. Existing nonhuman permissions are unchanged.
 #[derive(Debug, Clone)]
 pub(crate) struct QueueEntryGate {
     principal_id: PrincipalId,
@@ -1223,11 +1214,14 @@ impl QueueEntryGate {
             entry.message_metadata.as_ref(),
             self.fallback.as_ref(),
         );
-        let caller = intent_core::Caller::Wire {
-            principal_id: self.principal_id.clone(),
-            host_role: self.host_role,
+        // Shared visibility must never grant mutation rights. Preserve the
+        // author-or-host-owner mutation gate independently of read projection.
+        let own_or_nonhuman = match &attribution {
+            intent_core::QueueAttribution::Principal(author) => *author == self.principal_id,
+            intent_core::QueueAttribution::UnknownHuman => false,
+            intent_core::QueueAttribution::Unattributed => true,
         };
-        if !intent_core::queue_attribution_visible_to(&caller, &attribution) {
+        if self.host_role != intent_core::HostRole::Owner && !own_or_nonhuman {
             return Err(Error::InvalidParams(format!(
                 "queued message not found: {}",
                 entry.id
@@ -1247,6 +1241,30 @@ impl QueueEntryGate {
             }
         }
         Ok(())
+    }
+}
+
+/// Reserved metadata containing the original metadata of merged submissions.
+pub(crate) const MERGED_MESSAGE_METADATA_KEY: &str = "mergedMessageMetadata";
+
+fn merge_queue_metadata(existing: &mut Option<Value>, incoming: Option<Value>) {
+    let Some(Value::Object(metadata)) = existing else {
+        return;
+    };
+    let original = Value::Object(metadata.clone());
+    let contributions = metadata
+        .entry(MERGED_MESSAGE_METADATA_KEY)
+        .or_insert_with(|| json!([original]));
+    if let Value::Array(contributions) = contributions {
+        if let Some(nested) = incoming
+            .as_ref()
+            .and_then(|m| m.get(MERGED_MESSAGE_METADATA_KEY))
+            .and_then(Value::as_array)
+        {
+            contributions.extend(nested.iter().cloned());
+        } else {
+            contributions.push(incoming.unwrap_or(Value::Null));
+        }
     }
 }
 
@@ -1277,6 +1295,12 @@ pub(crate) struct QueuedMessage {
     /// rehydration backfills an empty `turn_id` with the entry `id`.
     #[serde(default)]
     pub turn_id: String,
+    /// Submission ids absorbed into this surviving row (durable retry deduplication).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merged_submission_ids: Vec<String>,
+    /// Appends received while the editor holds an older draft. Internal only.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub edit_appended: String,
     pub content: String,
     pub image_blocks: Option<Value>,
     pub file_blocks: Option<Value>,
@@ -1437,6 +1461,14 @@ impl QueuedMessage {
             v["childAgentId"] = Value::String(child.clone());
         }
         v
+    }
+
+    pub(crate) fn submission_ids(&self) -> Vec<String> {
+        let mut ids = self.merged_submission_ids.clone();
+        if !ids.contains(&self.id) {
+            ids.push(self.id.clone());
+        }
+        ids
     }
 
     /// `true` while the entry carries an **unexpired** hold marker: excluded
@@ -2427,6 +2459,20 @@ pub(crate) fn answered_questions_message_id(metadata: Option<&Value>) -> Option<
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
+}
+
+/// All answered question sets in a merged human row. Contributions are a
+/// flat array authenticated at ingress; never recursively traverse client JSON.
+fn answered_question_ids(metadata: Option<&Value>) -> impl Iterator<Item = &str> {
+    let contributions = metadata
+        .and_then(|m| m.get(MERGED_MESSAGE_METADATA_KEY))
+        .and_then(Value::as_array);
+    answered_questions_message_id(metadata).into_iter().chain(
+        contributions
+            .into_iter()
+            .flatten()
+            .filter_map(|m| answered_questions_message_id(Some(m))),
+    )
 }
 
 /// `messageMetadata.type` marker on the questions-dismissed system notice
@@ -6569,14 +6615,9 @@ impl Services {
     /// as `NotFound`. Entries carry the resolved `author` projection
     /// ([`crate::principal_ops::MessageAuthorResolver::attach_queue`]) — the
     /// same shape and resolution order as `agent.getConversation` user rows.
-    /// The key is present on every row regardless: when the unscoped read
-    /// finds no session to resolve against, entries keep the `null` default
-    /// from [`QueuedMessage::to_value`]. The snapshot is then projected to the
-    /// bound caller ([`intent_core::project_queue_for_caller`]): a guest
-    /// collaborator sees only its own entries plus unattributed (agent-sent /
-    /// automatic) ones — a human-origin entry the resolver could not
-    /// attribute is withheld, not exposed — while the administrator, agents
-    /// and the daemon see the full queue.
+    /// The author key is always present. Every admitted workspace participant
+    /// receives the shared queue, including unknown human authors; mutation
+    /// permissions are checked independently.
     pub(crate) async fn agent_get_queue_op(
         &self,
         agent_id: AgentId,
@@ -6598,8 +6639,7 @@ impl Services {
                 .attach_queue(&mut queue)
                 .await;
         }
-        // Egress-only projection: a guest collaborator sees its own entries
-        // (plus null-author agent/automatic ones); `position` is not renumbered.
+        // Shared egress preserves global drain order and author attribution.
         let queue =
             intent_core::project_queue_for_caller(intent_core::current_caller().as_ref(), queue);
         Ok(json!({ "success": true, "queue": queue }))
@@ -6797,14 +6837,44 @@ impl Services {
             // instead of a mutated entry that never published and that a
             // later queue write would persist.
             let restamped = if restamp && human_authored {
-                Some(crate::principal_ops::stamp_principal_attribution(
+                let mut metadata = crate::principal_ops::stamp_principal_attribution(
                     queue[position].message_metadata.clone(),
-                )?)
+                )?;
+                if let Some(contributions) = queue[position]
+                    .message_metadata
+                    .as_ref()
+                    .and_then(|m| m.get(MERGED_MESSAGE_METADATA_KEY))
+                {
+                    if let Some(Value::Object(ref mut md)) = metadata {
+                        md.insert(MERGED_MESSAGE_METADATA_KEY.into(), contributions.clone());
+                    }
+                }
+                Some(metadata)
             } else {
                 None
             };
             if let Some(preamble) = preamble.as_deref().filter(|_| human_authored) {
                 crate::principal_ops::prepend_collaborator_preamble(&mut content, preamble);
+            }
+            // Hold acquisition can race an append after the UI captured its
+            // draft. Keep that suffix pending for the eventual save as well.
+            if !was && editing == Some(true) {
+                if let Some(suffix) = queue[position]
+                    .content
+                    .strip_prefix(&content)
+                    .filter(|suffix| suffix.starts_with("\n\n"))
+                {
+                    queue[position].edit_appended = suffix.to_string();
+                    content.clone_from(&queue[position].content);
+                }
+            } else {
+                // Editors retain the draft they held, not a rebased draft.
+                // An exact echo of the current row already includes appends;
+                // a stale/modified draft receives the pending suffix once.
+                let appended = std::mem::take(&mut queue[position].edit_appended);
+                if content != queue[position].content {
+                    content.push_str(&appended);
+                }
             }
             queue[position].content = content;
             if let Some(metadata) = restamped {
@@ -6847,15 +6917,26 @@ impl Services {
     /// found" error caused the FE's optimistic delete to roll back, leaving
     /// ghost messages on screen. The one exception is ownership
     /// ([`Self::queue_entry_gate`], checked under the queue lock against the
-    /// entry found there): a guest collaborator may remove only the entries
-    /// its `agent.getQueue` shows it, and a foreign entry is refused as
+    /// entry found there): authors, workspace owners and host owners may
+    /// remove human entries; other callers are refused as
     /// `-32602 queued message not found` untouched.
     pub(crate) async fn agent_remove_queued_message_op(
         &self,
         agent_id: AgentId,
         message_id: String,
     ) -> Result<Value> {
-        let gate = self.queue_entry_gate(&agent_id, false).await?;
+        let mut gate = self.queue_entry_gate(&agent_id, false).await?;
+        if let Some(candidate) = gate.as_ref() {
+            let workspace = self.agent_workspace(&agent_id).await?;
+            if self
+                .store
+                .get_workspace_member_role(&workspace, &candidate.principal_id)
+                .await?
+                == Some(intent_core::WorkspaceRole::Owner)
+            {
+                gate = None;
+            }
+        }
         self.park_queue_mutation_gate(gate.as_ref()).await;
         let removed = {
             let mut guard = self
@@ -7973,15 +8054,13 @@ impl Services {
         for msg in messages {
             match msg.role.as_str() {
                 "assistant" if has_question_blocks(&msg.content) => pending = Some(&msg.id),
-                "user" => {
-                    if let (Some(answered), Some(marked)) = (
-                        answered_questions_message_id(msg.metadata.as_ref()),
-                        pending,
-                    ) {
-                        if resolves(answered, marked) {
-                            pending = None;
-                        }
-                    }
+                "user"
+                    if pending.is_some_and(|marked| {
+                        answered_question_ids(msg.metadata.as_ref())
+                            .any(|answered| resolves(answered, marked))
+                    }) =>
+                {
+                    pending = None;
                 }
                 _ => {}
             }
@@ -8019,18 +8098,22 @@ impl Services {
         agent_id: &AgentId,
         message_metadata: Option<&Value>,
     ) -> bool {
-        let Some(answered) = answered_questions_message_id(message_metadata) else {
+        let answers: Vec<_> = answered_question_ids(message_metadata).collect();
+        let Some(first) = answers.first() else {
             return false;
         };
-        self.park_pending_marker_mutation("clear", answered).await;
+        self.park_pending_marker_mutation("clear", first).await;
         let lock = self.pending_question_mutation_locks.lock_for(agent_id);
         let _guard = lock.lock().await;
         let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
             return false;
         };
-        if session.pending_questions_message_id() != Some(answered) {
+        let Some(answered) = session
+            .pending_questions_message_id()
+            .filter(|marked| answers.contains(marked))
+        else {
             return false;
-        }
+        };
         self.clear_pending_questions_marker_locked(workspace_id, agent_id, Some(answered))
             .await
     }
@@ -14207,10 +14290,72 @@ impl Services {
             .lock()
             .expect("agent queue registry poisoned");
         let queue = guard.entry(agent_id.clone()).or_default();
-        if let Some((position, existing)) =
-            queue.iter().enumerate().find(|(_, queued)| queued.id == id)
+        if let Some((position, existing)) = queue
+            .iter()
+            .enumerate()
+            .find(|(_, queued)| queued.id == id || queued.merged_submission_ids.contains(&id))
         {
             return (existing.clone(), position);
+        }
+        // Selection and append share the mutation/drain lock. A popped entry
+        // is no longer a candidate, even while a draining overlay displays it.
+        let author = intent_core::lift_from_principal_id(message_metadata.as_ref());
+        if intent_core::is_human_authored_metadata(message_metadata.as_ref()) {
+            if let Some(author) = author {
+                if let Some((position, previous)) =
+                    queue.iter_mut().enumerate().rev().find(|(_, m)| {
+                        intent_core::is_human_authored_metadata(m.message_metadata.as_ref())
+                            || intent_core::human_author::is_unbound_historical_human(
+                                m.message_metadata.as_ref(),
+                            )
+                    })
+                {
+                    if !previous.persisted
+                        && !intent_core::human_author::is_unbound_historical_human(
+                            previous.message_metadata.as_ref(),
+                        )
+                        && intent_core::lift_from_principal_id(previous.message_metadata.as_ref())
+                            .as_ref()
+                            == Some(&author)
+                    {
+                        previous.content.push_str("\n\n");
+                        previous.content.push_str(&content);
+                        if previous.editing {
+                            previous.edit_appended.push_str("\n\n");
+                            previous.edit_appended.push_str(&content);
+                        }
+                        previous.image_blocks = crate::agent_manager::merge_block_arrays(
+                            previous.image_blocks.take(),
+                            image_blocks,
+                        );
+                        previous.file_blocks = crate::agent_manager::merge_block_arrays(
+                            previous.file_blocks.take(),
+                            file_blocks,
+                        );
+                        merge_queue_metadata(&mut previous.message_metadata, message_metadata);
+                        if let Some(text) = prepend.content {
+                            match &mut previous.prepend_content {
+                                Some(existing) => {
+                                    existing.push_str("\n\n");
+                                    existing.push_str(&text);
+                                }
+                                slot @ None => *slot = Some(text),
+                            }
+                        }
+                        previous.prepend_image_blocks = crate::agent_manager::merge_block_arrays(
+                            previous.prepend_image_blocks.take(),
+                            prepend.image_blocks,
+                        );
+                        previous.prepend_file_blocks = crate::agent_manager::merge_block_arrays(
+                            previous.prepend_file_blocks.take(),
+                            prepend.file_blocks,
+                        );
+                        previous.user_origin |= origin.is_user();
+                        previous.merged_submission_ids.push(id);
+                        return (previous.clone(), position);
+                    }
+                }
+            }
         }
         let queued = QueuedMessage {
             turn_id: id.clone(),
@@ -14231,6 +14376,8 @@ impl Services {
             hold_kind: None,
             hold_until: None,
             child_agent_id: None,
+            merged_submission_ids: Vec::new(),
+            edit_appended: String::new(),
         };
         let position = if interrupt {
             // Behind earlier interrupts, ahead of every normal entry.
@@ -14342,6 +14489,8 @@ impl Services {
                     hold_kind: Some(hold_kind.to_string()),
                     hold_until: Some(hold_until.to_string()),
                     child_agent_id: Some(child_agent_id.to_string()),
+                    merged_submission_ids: Vec::new(),
+                    edit_appended: String::new(),
                 };
                 queue.push(queued.clone());
                 (queued, queue.len() - 1)
@@ -15610,6 +15759,7 @@ impl Services {
             match serde_json::from_value::<QueuedMessage>(row.payload) {
                 Ok(mut message) => {
                     message.editing = false;
+                    message.edit_appended.clear();
                     if message.turn_id.is_empty() {
                         message.turn_id.clone_from(&message.id);
                     }

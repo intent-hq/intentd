@@ -496,6 +496,8 @@ pub struct TurnOptions {
     /// so the retry still suppresses the report clear). `None` for direct
     /// sends, whose requeue stamps `now_iso()` as before.
     pub queued_at: Option<String>,
+    /// Submission IDs absorbed by a queued row, retained through failed drains.
+    pub queued_submission_ids: Vec<String>,
     /// STAB-114 / monorepo#1014: text of the user message preempted by a
     /// zero-output interrupt, delivered AHEAD of this turn's own `content` in
     /// the SAME `session/prompt` so both messages are honored in order.
@@ -602,6 +604,7 @@ fn turn_options_for_entry(entry: &QueuedMessage, stale: bool) -> TurnOptions {
         message_metadata: entry.message_metadata.clone(),
         suppress_report_clear: stale,
         queued_at: Some(entry.queued_at.clone()),
+        queued_submission_ids: entry.submission_ids(),
         prepend_content: entry.prepend_content.clone(),
         prepend_image_blocks: entry.prepend_image_blocks.clone(),
         prepend_file_blocks: entry.prepend_file_blocks.clone(),
@@ -7510,6 +7513,7 @@ impl AgentManager {
             message_metadata: next.message_metadata.clone(),
             suppress_report_clear: stale,
             queued_at: Some(next.queued_at.clone()),
+            queued_submission_ids: next.submission_ids(),
             prepend_content: next.prepend_content.clone(),
             prepend_image_blocks: next.prepend_image_blocks.clone(),
             prepend_file_blocks: next.prepend_file_blocks.clone(),
@@ -7673,6 +7677,7 @@ impl AgentManager {
             message_metadata: entry.message_metadata.clone(),
             suppress_report_clear: stale,
             queued_at: Some(entry.queued_at.clone()),
+            queued_submission_ids: entry.submission_ids(),
             prepend_content: entry.prepend_content.clone(),
             prepend_image_blocks: entry.prepend_image_blocks.clone(),
             prepend_file_blocks: entry.prepend_file_blocks.clone(),
@@ -10524,7 +10529,7 @@ fn extract_user_prepend(content: &Value) -> crate::agent_ops::QueuedPrepend {
 /// zero-output preemption path to combine an entry-carried `prepend_*`
 /// payload with the just-preempted message's attachments instead of
 /// clobbering one with the other.
-fn merge_block_arrays(first: Option<Value>, second: Option<Value>) -> Option<Value> {
+pub(crate) fn merge_block_arrays(first: Option<Value>, second: Option<Value>) -> Option<Value> {
     match (first, second) {
         (Some(Value::Array(mut a)), Some(Value::Array(b))) => {
             a.extend(b);
@@ -11899,6 +11904,7 @@ async fn run_message_worker(
                 )
                 .await
             };
+            let queued_submission_ids = next.submission_ids();
             content = next.content;
             options = TurnOptions {
                 image_blocks: next_image_blocks,
@@ -11906,6 +11912,7 @@ async fn run_message_worker(
                 message_metadata: next.message_metadata.clone(),
                 suppress_report_clear: stale,
                 queued_at: Some(next.queued_at.clone()),
+                queued_submission_ids,
                 prepend_content: next.prepend_content.clone(),
                 prepend_image_blocks: next.prepend_image_blocks.clone(),
                 prepend_file_blocks: next.prepend_file_blocks.clone(),
@@ -12118,6 +12125,7 @@ async fn run_message_worker(
                 )
                 .await
             };
+            let queued_submission_ids = next.submission_ids();
             content = next.content;
             options = TurnOptions {
                 image_blocks: next_image_blocks,
@@ -12125,6 +12133,7 @@ async fn run_message_worker(
                 message_metadata: next.message_metadata.clone(),
                 suppress_report_clear: stale,
                 queued_at: Some(next.queued_at.clone()),
+                queued_submission_ids,
                 prepend_content: next.prepend_content.clone(),
                 prepend_image_blocks: next.prepend_image_blocks.clone(),
                 prepend_file_blocks: next.prepend_file_blocks.clone(),
@@ -13374,6 +13383,8 @@ async fn publish_error_status_and_requeue(
             hold_kind: None,
             hold_until: None,
             child_agent_id: None,
+            merged_submission_ids: options.queued_submission_ids.clone(),
+            edit_appended: String::new(),
         };
         mgr.services.requeue_front(agent_id, queued);
     }
