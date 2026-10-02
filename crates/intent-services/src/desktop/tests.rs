@@ -500,6 +500,16 @@ async fn owner_change_invalidates_active_control_and_old_permission_is_not_trans
     let h = Harness::new().await;
     h.remember().await;
     let active = h.agent("startControl", json!({})).await.unwrap();
+    let mut events = h
+        .services
+        .event_bus
+        .as_ref()
+        .unwrap()
+        .subscribe(SubscriptionFilter {
+            workspace_id: Some(h.workspace.0.clone()),
+            event_types: vec![DESKTOP_SESSION_CHANGED.into()],
+            ..Default::default()
+        });
     let mut principal = h.services.store.get_primary_principal().await.unwrap();
     principal.id = PrincipalId::new();
     principal.is_primary = false;
@@ -514,6 +524,22 @@ async fn owner_change_invalidates_active_control_and_old_permission_is_not_trans
         intent_core::with_caller(Caller::Daemon, h.services.desktop_current_state(&h.agent)).await,
         DesktopState::Inactive
     );
+    // Either this snapshot or the connection watcher can win invalidation.
+    // Inactive authority is immediate; the ended event follows the durable
+    // journal commit. Await that observable completion before reading its reason.
+    let ended = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let batch = events.recv().await.unwrap();
+            if let Some(event) = batch.into_iter().find(|event| {
+                event.data["sessionId"] == active["sessionId"] && event.data["status"] == "ended"
+            }) {
+                break event;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(ended.data["reason"], "owner_changed");
     assert_eq!(
         h.services
             .store
