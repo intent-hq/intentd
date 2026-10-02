@@ -258,13 +258,21 @@ async fn script_snapshot_detached_completion_cannot_clear_successor_marker() {
         })
         .await
         .unwrap();
-    assert!(
-        events
-            .iter()
-            .filter(|e| e.data["status"] == "exited")
-            .all(|e| e.data["runId"] != mgr.status(&h.ws, &id).unwrap()["runId"]),
-        "predecessor completion cannot acquire the successor run identity"
-    );
+    let successor_token = mgr.status(&h.ws, &id).unwrap()["runId"].clone();
+    let successor = events
+        .iter()
+        .find(|e| e.data["status"] == "running" && e.data["runId"] == successor_token)
+        .expect("successor running event");
+    for terminal in events.iter().filter(|e| e.data["status"] == "exited") {
+        assert_ne!(
+            terminal.data["runId"], successor_token,
+            "predecessor retains its own identity"
+        );
+        assert!(
+            terminal.timestamp < successor.timestamp,
+            "no predecessor terminal publication after the successor starts"
+        );
+    }
     assert_eq!(
         h.services.script_manager().status(&h.ws, &id).unwrap()["status"],
         "running"

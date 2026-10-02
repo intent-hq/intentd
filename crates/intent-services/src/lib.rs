@@ -9031,12 +9031,14 @@ impl Services {
         );
         let script_waits = self.active_script_monitors_for_agent(child_id).await;
         if !script_waits.is_empty() {
+            use std::fmt::Write as _;
             wake.push_str("\nActive script monitors:");
             for row in &script_waits {
-                wake.push_str(&format!(
+                let _ = write!(
+                    wake,
                     "\n- {} (run {}, expires {})",
                     row["scriptName"], row["runId"], row["expiresAt"]
-                ));
+                );
             }
         }
         let mut metadata = build_event_notification_metadata(&[event]);

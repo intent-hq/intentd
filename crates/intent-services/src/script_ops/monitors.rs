@@ -1,7 +1,10 @@
 //! Script monitors share the definition admission lock with start/restart/stop.
 //! The shorter monitor lane orders output, TTL and terminal decisions; teardown
 //! reserves its outcome then releases that lane before joining a supervisor.
-use super::*;
+use super::{
+    json, now_iso, publish_event, script_event, Error, Ordering, PtyId, Result, ScriptManager,
+    SpawnSpec, Value, WorkspaceId, LOST_AT_DAEMON_STOP_ERROR,
+};
 use intent_core::script_output::LineDecoder;
 use intent_core::{AgentId, ScriptLastRun, ScriptMonitor, ScriptMonitorTrigger, ScriptRunOutcome};
 use intent_pty::OutputChunk;
@@ -854,7 +857,7 @@ mod tests {
             json!({"ttlMs":null}),
             json!({"ttlMs":1.5}),
             json!({"ttlMs":0}),
-            json!({"ttlMs":86400001}),
+            json!({"ttlMs":86_400_001}),
             json!({"ttlMs":1,"runId":null}),
             json!({"ttlMs":1,"lineCount":0}),
             json!({"ttlMs":1,"outputPattern":"(?=x)"}),
@@ -866,7 +869,7 @@ mod tests {
             assert!(Options::parse(&value).is_err(), "{value}");
         }
         let options =
-            Options::parse(&json!({"ttlMs":1,"outputPattern":"(?i)^é+$","lineCount":1000000}))
+            Options::parse(&json!({"ttlMs":1,"outputPattern":"(?i)^é+$","lineCount":1_000_000}))
                 .unwrap();
         assert!(options.pattern.unwrap().is_match("Éé"));
     }
