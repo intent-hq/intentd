@@ -21013,9 +21013,7 @@ async fn get_subscriptions_projection_cost_is_batched_and_preview_only() {
         .unwrap();
     let group = svc.get_or_create_delegation_group(&ws, &parent);
     svc.enroll_child_in_group(&group, &first);
-    svc.agent_get_subscriptions_op(ws.clone(), parent.clone())
-        .await
-        .unwrap();
+    crate::test_tracing::warm_sqlx_pool(svc.store().read_pool()).await;
     let (one, one_count) = crate::test_tracing::count_sqlx_statements(
         svc.agent_get_subscriptions_op(ws.clone(), parent.clone()),
     )
