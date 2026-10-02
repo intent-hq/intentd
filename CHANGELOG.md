@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.138] - 2026-10-02
+
+### 🚀 Features
+
+- Remember workspace specialists and name new agents ([#2236](https://github.com/intent-hq/intentd/pull/2236))
+
+### 🐛 Bug Fixes
+
+- Distinguish PR ancestry from forge-required updates ([#2237](https://github.com/intent-hq/intentd/pull/2237))
+
+### 🧪 Testing
+
+- Stabilize subscription query-count measurement ([#2235](https://github.com/intent-hq/intentd/pull/2235))
+
+
 ## [0.9.137] - 2026-10-02
 
 ### 🚀 Features
