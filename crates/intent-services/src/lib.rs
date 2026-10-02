@@ -1962,25 +1962,22 @@ impl Services {
             .resolve_agent_type(specialist_id, workspace_path)
     }
 
-    /// Whether a session's specialist id resolved to a real specialist. New
-    /// sessions carry a frozen identity snapshot; legacy sessions resolve from
-    /// the harness-pinned specialist registry.
-    pub(crate) fn session_has_recognized_specialist(
+    /// A session's specialist display name. New sessions carry a frozen
+    /// identity snapshot; legacy sessions resolve from the harness-pinned
+    /// specialist registry.
+    pub(crate) fn session_specialist_display_name(
         &self,
         session: &AgentSession,
         workspace_path: Option<&Path>,
-    ) -> bool {
-        let Some(specialist_id) = session.specialist.as_deref() else {
-            return false;
-        };
-        if Self::session_metadata_str(session, "specialistName").is_some() {
-            return true;
+    ) -> Option<String> {
+        let specialist_id = session.specialist.as_deref()?;
+        if let Some(name) = Self::session_metadata_str(session, "specialistName") {
+            return Some(name);
         }
         let entry = crate::harness::resolve_entry(&session.harness_version);
         self.specialists_service()
             .with_embedded(entry.doctrine.specialists)
             .resolve_display_name(specialist_id, workspace_path)
-            .is_some()
     }
 
     /// Whether a session's specialist resolves to the `orchestrator` role —
@@ -29676,6 +29673,19 @@ impl WorkspaceApi for Services {
                     "lastStreamActivityAt": null,
                 }),
             }
+        })
+    }
+
+    fn agent_get_creation_preferences(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            self.store.get_workspace(&workspace_id).await?;
+            self.store
+                .get_agent_creation_preferences(&workspace_id)
+                .await
         })
     }
 

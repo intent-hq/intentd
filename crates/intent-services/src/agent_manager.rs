@@ -10983,7 +10983,7 @@ pub(crate) use crate::harness::v1::{
 /// daemon-created General agents use `Agent` plus six hexadecimal characters.
 /// Task-derived names can also have name_explicitly_set=false, so the flag alone
 /// does not imply a placeholder.
-fn is_generated_agent_name(name: &str, specialist_name: Option<&str>) -> bool {
+pub(crate) fn is_generated_agent_name(name: &str, specialist_name: Option<&str>) -> bool {
     let name = name.trim();
     let matches_base = |base: &str| {
         name == base

@@ -706,7 +706,10 @@ use std::time::{Duration, Instant};
 // per-client negotiation of this default; scriptLifecycle remains version 1.
 // Version 11.1 adds optional gitRootId to file.read and file.readChunk:
 // registered workspace-owned roots share existing filesystem confinement.
-pub const PROTOCOL_VERSION: &str = "11.1";
+// Version 11.2 is reserved for the prepared platform launch contract.
+// Version 11.3 adds workspace-scoped manual specialist preferences; platform
+// support remains independently capability-gated.
+pub const PROTOCOL_VERSION: &str = "11.3";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text
