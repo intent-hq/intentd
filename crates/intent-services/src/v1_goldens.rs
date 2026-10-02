@@ -2202,7 +2202,7 @@ async fn golden_snapshot_line_shape() {
     let obj = v.as_object().expect("object");
     assert_eq!(
         obj.keys().collect::<Vec<_>>(),
-        vec!["time", "queuedMessages"],
+        vec!["desktopControl", "time", "queuedMessages"],
         "field set + order pin: {line}"
     );
     assert_eq!(obj["queuedMessages"], json!(1));

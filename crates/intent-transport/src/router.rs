@@ -530,6 +530,29 @@ fn encode_dispatch_result(
     }
 }
 
+async fn dispatch_desktop(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    let connection = intent_core::desktop::current_connection().ok_or_else(|| {
+        domain_to_rpc(intent_core::Error::Forbidden(
+            "Desktop client.hello is required".into(),
+        ))
+    })?;
+    api.desktop_client_call(
+        method.trim_start_matches("desktop.").to_string(),
+        serde_json::Value::Object(params.clone()),
+        connection,
+    )
+    .await
+    .map_err(|e| RpcErr {
+        code: e.numeric_code(),
+        message: e.detail.clone(),
+        data: Some(serde_json::to_value(e).expect("desktop error serializes")),
+    })
+}
+
 /// Dispatch a validated request to the injected [`WorkspaceApi`].
 async fn dispatch(
     api: &dyn WorkspaceApi,
@@ -833,27 +856,10 @@ async fn dispatch(
             let clients = api.client_list().await.map_err(workspace_err)?;
             Ok(json!({ "clients": clients }))
         }
-        "desktop.getState"
-        | "desktop.setPermission"
-        | "desktop.respondPermission"
-        | "desktop.revoke" => {
-            let connection = intent_core::desktop::current_connection().ok_or_else(|| {
-                domain_to_rpc(intent_core::Error::Forbidden(
-                    "Desktop client.hello is required".into(),
-                ))
-            })?;
-            api.desktop_client_call(
-                method.trim_start_matches("desktop.").to_string(),
-                serde_json::Value::Object(params.clone()),
-                connection,
-            )
-            .await
-            .map_err(|e| RpcErr {
-                code: e.numeric_code(),
-                message: e.detail.clone(),
-                data: Some(serde_json::to_value(e).expect("desktop error serializes")),
-            })
-        }
+        "desktop.getState" => dispatch_desktop(api, method, params).await,
+        "desktop.respondPermission" => dispatch_desktop(api, method, params).await,
+        "desktop.revoke" => dispatch_desktop(api, method, params).await,
+        "desktop.setPermission" => dispatch_desktop(api, method, params).await,
         "workspace.getBrowserClient" => {
             let id = require_workspace_id(params)?;
             let browser_client = api

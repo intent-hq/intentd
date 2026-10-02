@@ -791,6 +791,21 @@ impl Store {
         )
         .await?;
 
+        // Runtime writers are stopped. Revoke/drain private desktop state once
+        // before deleting any agent, just like the recovery sweep above. A
+        // failure leaves all sessions intact; a later failure may revoke grants
+        // early but cannot leave authority attached to a deleted agent.
+        let mut desktop_tx = self
+            .write_pool()
+            .begin()
+            .await
+            .map_err(|e| Error::Internal(format!("begin workspace desktop cleanup: {e}")))?;
+        crate::desktop_repo::delete_desktop_scope(&mut desktop_tx, id, None).await?;
+        desktop_tx
+            .commit()
+            .await
+            .map_err(|e| Error::Internal(format!("commit workspace desktop cleanup: {e}")))?;
+
         // IDs only: never hydrate sessions or their transcripts. Each session
         // uses the same bounded payload/message cleanup as agent.delete.
         while let Some(agent_id) = sqlx::query_scalar::<_, String>(

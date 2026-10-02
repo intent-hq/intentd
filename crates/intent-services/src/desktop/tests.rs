@@ -1453,3 +1453,54 @@ async fn deletion_removes_private_consent_and_stop_records_in_the_same_scope() {
     let count:i64=sqlx::query_scalar("SELECT COUNT(*) FROM settings WHERE key GLOB 'desktop.v1/*' AND json_extract(value,'$.agentId')=?").bind(h.agent.as_str()).fetch_one(h.services.store.read_pool()).await.unwrap();
     assert_eq!(count, 0);
 }
+
+#[tokio::test]
+async fn workspace_desktop_cleanup_failure_preserves_sessions_and_retry_removes_scope() {
+    let h = Harness::new().await;
+    h.remember().await;
+    let active = h.agent("startControl", json!({})).await.unwrap();
+    h.agent("endControl", json!({})).await.unwrap();
+    sqlx::query("CREATE TRIGGER fail_desktop_cleanup BEFORE DELETE ON settings WHEN OLD.key GLOB 'desktop.v1/*' BEGIN SELECT RAISE(ABORT,'injected cleanup failure'); END")
+        .execute(h.services.store.write_pool()).await.unwrap();
+    assert!(h
+        .services
+        .store
+        .delete_workspace(&h.workspace)
+        .await
+        .is_err());
+    assert!(h
+        .services
+        .store
+        .get_agent_session_summary(&h.agent)
+        .await
+        .is_ok());
+    assert!(h
+        .services
+        .store
+        .desktop_terminal(active["sessionId"].as_str().unwrap())
+        .await
+        .unwrap()
+        .is_some());
+    sqlx::query("DROP TRIGGER fail_desktop_cleanup")
+        .execute(h.services.store.write_pool())
+        .await
+        .unwrap();
+    h.services
+        .store
+        .delete_workspace(&h.workspace)
+        .await
+        .unwrap();
+    assert!(h
+        .services
+        .store
+        .desktop_terminal(active["sessionId"].as_str().unwrap())
+        .await
+        .unwrap()
+        .is_none());
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM settings WHERE key GLOB 'desktop.v1/*'")
+            .fetch_one(h.services.store.read_pool())
+            .await
+            .unwrap();
+    assert_eq!(count, 0);
+}

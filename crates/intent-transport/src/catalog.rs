@@ -100,6 +100,10 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "crossWorkspace.listSiblings",
     "crossWorkspace.readNote",
     "debug.sampleStacks",
+    "desktop.getState",
+    "desktop.respondPermission",
+    "desktop.revoke",
+    "desktop.setPermission",
     "event.agentActivity",
     "event.query",
     "event.workspaceSummary",
@@ -419,10 +423,6 @@ pub(crate) fn canonical_method(method: &str) -> &str {
 #[cfg(test)]
 pub(crate) const FASTPATH_METHODS: &[&str] = &[
     "browser.closeTab",
-    "desktop.getState",
-    "desktop.setPermission",
-    "desktop.respondPermission",
-    "desktop.revoke",
     "browser.exec",
     "browser.listTabs",
     "browser.navigateTab",
@@ -498,6 +498,7 @@ pub(crate) const NOTIFICATIONS: &[&str] = &["events.event"];
 #[cfg(test)]
 pub(crate) const REVERSE_METHODS: &[&str] = &[
     "browser.exec",
+    "desktop.control",
     "host.openExternal",
     "host.openInEditor",
     "host.pickApplication",
@@ -535,7 +536,6 @@ pub(crate) const REVERSE_METHODS: &[&str] = &[
 /// `catalog/tests.rs` freezes the refused remainder so a new method must be
 /// classified explicitly.
 pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
-    ("desktop.revoke", "Release/report only: current workspace access and the retained granting principal/Stop credential are checked by the service; never grants execution."),
     ("agent.appendMessage", "Steer: appends a row to a workspace agent conversation; the caller's principal is stamped on user rows and, for a collaborator member, a user row's content carries the sender preamble (other roles byte-identical). Workspace-scoped, no host reach."),
     ("agent.cancelSubscriptions", "Steer: cancels an agent's own event subscriptions / delegation groups. Agent-scoped bookkeeping, no host reach."),
     ("agent.dismissQuestions", "Steer: dismisses an agent's pending structured questions. Agent-scoped state only."),
@@ -587,6 +587,7 @@ pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("crossWorkspace.listNotes", "Read: notes of a sibling workspace. Membership-filtered in the service layer."),
     ("crossWorkspace.listSiblings", "Read: sibling workspaces sharing the repo. Membership-filtered in the service layer."),
     ("crossWorkspace.readNote", "Read: a sibling workspace note. Membership-filtered in the service layer."),
+    ("desktop.revoke", "Release/report only: current workspace access and the retained granting principal/Stop credential are checked by the service; never grants execution."),
     ("drafts.clear", "Per-client: clears the caller's own draft. Keyed by the connection's principal-scoped client id."),
     ("drafts.get", "Per-client: reads the caller's own draft. Keyed by the connection's principal-scoped client id."),
     ("drafts.set", "Per-client: saves the caller's own draft. Keyed by the connection's principal-scoped client id."),
@@ -745,9 +746,6 @@ pub(crate) fn collaborator_may_call(method: &str) -> bool {
 /// Services still validate the referenced workspace, resource and actor; fast paths
 /// recheck durable authority. The guest allowlist above is unchanged.
 pub(crate) const MEMBER_METHODS: &[&str] = &[
-    "desktop.getState",
-    "desktop.setPermission",
-    "desktop.respondPermission",
     "accept-changes.addRemote",
     "accept-changes.execute",
     "accept-changes.getStatus",
@@ -769,6 +767,9 @@ pub(crate) const MEMBER_METHODS: &[&str] = &[
     "browser.removeTab",
     "browser.syncTabs",
     "browser.upsertTab",
+    "desktop.getState",
+    "desktop.respondPermission",
+    "desktop.setPermission",
     "file-tracking.getAgentLocks",
     "file-tracking.getChanges",
     "file-tracking.getLineStats",

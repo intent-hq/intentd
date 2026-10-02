@@ -43602,7 +43602,12 @@ async fn agent_snapshot_trivial_omits_fields_and_skips_injection() {
         .await
         .expect("snapshot");
     let obj = v.as_object().expect("object");
-    assert_eq!(obj.len(), 1, "trivial snapshot carries only time: {v}");
+    assert_eq!(
+        obj.len(),
+        2,
+        "trivial snapshot carries time and desktop state: {v}"
+    );
+    assert_eq!(v["desktopControl"], json!({"status":"inactive"}));
     let time = v["time"].as_str().expect("time string");
     assert!(
         time.ends_with('Z') && !time.contains('.'),

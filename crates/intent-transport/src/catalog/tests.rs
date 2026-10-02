@@ -184,12 +184,13 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// Direct user retirement (protocol 10.10): +1 router method (`agent.retire`).
 /// Reversible script history (protocol 10.11): +2 router methods
 /// (`script.archive`, `script.restore`).
-const EXPECTED_TOTAL_METHODS: usize = 410;
+/// Desktop control: +4 client router methods and desktop.control reverse RPC.
+const EXPECTED_TOTAL_METHODS: usize = 414;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 350;
+const EXPECTED_ROUTER_METHODS: usize = 354;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 58;
@@ -201,7 +202,7 @@ const EXPECTED_ALIASES: usize = 2;
 const EXPECTED_NOTIFICATIONS: usize = 1;
 
 /// Golden count: client-served reverse RPCs.
-const EXPECTED_REVERSE_METHODS: usize = 5;
+const EXPECTED_REVERSE_METHODS: usize = 6;
 
 #[test]
 fn router_methods_match_actual_source() {
@@ -566,6 +567,10 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "crossWorkspace.listSiblings",
     "crossWorkspace.readNote",
     "debug.sampleStacks",
+    "desktop.getState",
+    "desktop.respondPermission",
+    "desktop.revoke",
+    "desktop.setPermission",
     "drafts.clear",
     "drafts.get",
     "drafts.set",
@@ -1188,6 +1193,9 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "browser.syncTabs",
     "browser.upsertTab",
     "debug.sampleStacks",
+    "desktop.getState",
+    "desktop.respondPermission",
+    "desktop.setPermission",
     "file-tracking.getAgentLocks",
     "file-tracking.getChanges",
     "file-tracking.getLineStats",
