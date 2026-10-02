@@ -22,6 +22,39 @@ pub(crate) fn monitor_id(metadata: Option<&Value>) -> Option<&str> {
 }
 
 impl Services {
+    pub(crate) fn script_monitor_export_blocked(&self, metadata: Option<&Value>) -> bool {
+        let Some(md) = metadata.filter(|md| monitor_id(Some(md)).is_some()) else {
+            return false;
+        };
+        self.transfer_exports
+            .lock()
+            .expect("export registry")
+            .values()
+            .any(|session| md["workspaceId"].as_str() == Some(session.workspace_id.as_str()))
+    }
+
+    pub(crate) fn defer_script_monitor_for_export(
+        &self,
+        agent: &AgentId,
+        content: &str,
+        metadata: Option<&Value>,
+    ) -> bool {
+        if !self.script_monitor_export_blocked(metadata) {
+            return false;
+        }
+        self.enqueue_message_with_id(
+            agent,
+            wake_id(metadata),
+            content.to_owned(),
+            None,
+            None,
+            metadata.cloned(),
+            None,
+            false,
+            MessageOrigin::Automatic,
+        );
+        true
+    }
     pub(crate) fn start_script_monitor_maintenance(&self) {
         if self
             .script_locks
@@ -31,7 +64,7 @@ impl Services {
             return;
         }
         let services = self.clone();
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             let mut sweep = tokio::time::interval(std::time::Duration::from_secs(1));
             let mut last_prune = None;
             loop {
@@ -98,6 +131,9 @@ impl Services {
 
     async fn dispatch_script_monitor_inner(&self, row: &ScriptMonitor) -> Result<()> {
         let lane = self.script_locks.monitor_lane.lock().await;
+        if self.script_monitor_export_blocked(Some(&script_monitor_wake_metadata(row))) {
+            return Ok(());
+        }
         if !self
             .store
             .script_monitor_wake_pending(&row.monitor_id)

@@ -48,6 +48,9 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
     ("comment", "workspace_id = ?1"),
     ("draft", "workspace_id = ?1"),
     ("agent_session", "workspace_id = ?1"),
+    // Ownership must precede queue restoration; history is imported separately
+    // from live delivery so already-delivered wakes never fire again.
+    ("script_monitor", "workspace_id = ?1"),
     (
         "agent_message",
         "agent_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1)",
@@ -522,6 +525,33 @@ impl Store {
             };
             let schema = &schemas[table];
             for object in objects {
+                // Deleting a workspace suppresses its retained monitor ledger.
+                // Reimport must preserve that terminal fence, never re-arm it.
+                if *table == "script_monitor" {
+                    let existing: Option<(String, String)> =
+                        sqlx::query_as("SELECT workspace_id,state FROM script_monitor WHERE id=?")
+                            .bind(object["id"].as_str())
+                            .fetch_optional(&mut *tx)
+                            .await
+                            .map_err(|e| {
+                                Error::Internal(format!("read imported monitor fence: {e}"))
+                            })?;
+                    if existing.is_some_and(|(ws, state)| {
+                        object["workspace_id"].as_str() == Some(ws.as_str()) && state != "active"
+                    }) {
+                        continue;
+                    }
+                }
+                // Imported conversation rows are history, not fresh wakes.
+                // Stage their metadata as NULL inside this transaction, then
+                // restore it by UPDATE; keep normal INSERT delivery fences on.
+                let history_metadata = (*table == "agent_message")
+                    .then(|| object.get("metadata").and_then(serde_json::Value::as_str))
+                    .flatten()
+                    .filter(|raw| {
+                        serde_json::from_str::<serde_json::Value>(raw)
+                            .is_ok_and(|md| md["type"] == "script_monitor_wake")
+                    });
                 let map = object.as_object().ok_or_else(|| {
                     Error::InvalidParams(format!(
                         "transfer import: {table} row is not a JSON object"
@@ -546,11 +576,31 @@ impl Store {
                 );
                 let mut query = sqlx::query(&sql);
                 for (key, value) in map {
-                    query = bind_json_value(query, table, key, value)?;
+                    query = bind_json_value(
+                        query,
+                        table,
+                        key,
+                        if history_metadata.is_some() && key == "metadata" {
+                            &serde_json::Value::Null
+                        } else {
+                            value
+                        },
+                    )?;
                 }
                 query.execute(&mut *tx).await.map_err(|e| {
                     Error::Internal(format!("transfer import insert into {table} failed: {e}"))
                 })?;
+                if let Some(metadata) = history_metadata {
+                    sqlx::query("UPDATE agent_message SET metadata=? WHERE id=? AND agent_id=?")
+                        .bind(metadata)
+                        .bind(object["id"].as_str())
+                        .bind(object["agent_id"].as_str())
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| {
+                            Error::Internal(format!("restore imported monitor history: {e}"))
+                        })?;
+                }
                 inserted += 1;
             }
         }
@@ -967,6 +1017,7 @@ mod tests {
             format!("INSERT INTO hook (hook_id, workspace_id, agent_id, name, code, delay_ms, state, created_at) VALUES ('h-{ws}', '{ws}', '{agent}', 'H', 'return', 10000, 'scheduled', '{t}')"),
             format!("INSERT INTO pr_monitor (monitor_id, workspace_id, agent_id, repo_owner, repo_name, pr_number, state, created_at, updated_at) VALUES ('pm-{ws}', '{ws}', '{agent}', 'o', 'r', 1, 'active', '{t}', '{t}')"),
             format!("INSERT INTO script (id, workspace_id, name, command, mode, source, created_at) VALUES ('s-{ws}', '{ws}', 'S', 'true', 'command', 'user', '{t}')"),
+            format!("INSERT INTO script_monitor (id, workspace_id, agent_id, script_id, run_id, state, row_json, created_at) VALUES ('sm-{ws}', '{ws}', '{agent}', 's-{ws}', 'run-{ws}', 'active', '{{}}', '{t}')"),
             format!("INSERT INTO task_agent_link (workspace_id, note_id, task_key, task_text, agent_id, created_at) VALUES ('{ws}', 'n1', 'k', 'do', '{agent}', 1)"),
             format!("INSERT INTO sandbox (id, workspace_id, agent_id, path, branch, base_commit_sha, created_at, updated_at) VALUES ('sb-{ws}', '{ws}', '{agent}', '/tmp/sb', 'sb/a', 'abc', '{t}', '{t}')"),
             format!("INSERT INTO tracked_changes (id, workspace_id, path, stage, status, created_at, updated_at) VALUES ('tc-{ws}', '{ws}', 'a.txt', 'unstaged', 'modified', '{t}', '{t}')"),
@@ -1506,6 +1557,7 @@ note_line_attribution: note_id, workspace_id, computed_at, attributions_json
 comment: id, thread_id, note_id, workspace_id, kind, content, author, author_type, status, parent_id, anchor_json, anchor_text, extra_json, created_at, updated_at
 draft: workspace_id, agent_id, client_id, text, updated_at, attachments
 agent_session: id, workspace_id, backend_session_id, acp_session_id, name, name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, token_usage, token_usage_baseline, resolved_model, last_turn_model, last_turn_provider, last_assistant_preview, last_user_preview, attention_request_kind, attention_request_reason, attention_request_timestamp, last_message_role, stop_reason_timestamp, reasoning_effort, effort_levels, last_message_id, file_blocks, task_graph_enabled, harness_version, harness_features, last_tool_use_preview, retired_at, message_count, assistant_message_count, conversation_bytes, notifications_muted, last_turn_effort
+script_monitor: id, workspace_id, agent_id, script_id, run_id, state, row_json, created_at, settled_at, cancel_intent, wake_state
 agent_message: id, agent_id, seq, role, content, created_at, metadata, thumbnails, usage_model, usage_origin
 agent_message_payload: message_id, agent_id, block_ordinal, kind, encoding, body
 agent_usage_cell: agent_id, model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, thought_tokens, costs_json, human_messages, agent_messages
@@ -1517,7 +1569,7 @@ completion_watch: id, parent_workspace_id, child_workspace_id, parent_agent_id, 
 event_subscription: id, workspace_id, subscriber_agent_id, event_types, exclude_self, batch_window_ms, created_at
 hook: hook_id, workspace_id, agent_id, name, code, delay_ms, state, created_at, last_run_at, next_run_at, run_count, last_error, last_logs, last_state, expires_at, perpetual, dispatch_count, cron, run_at
 pr_monitor: monitor_id, workspace_id, agent_id, repo_owner, repo_name, pr_number, state, last_snapshot, pending_changes, pending_since, last_change_at, last_polled_at, last_error, created_at, updated_at, baseline_snapshot
-script: id, workspace_id, name, command, cwd, env, mode, category, source, auto_start, created_at, updated_at, was_running, purpose, archived_at, last_run, pending_run_id, pending_started_at
+script: id, workspace_id, name, command, cwd, env, mode, category, source, auto_start, created_at, updated_at, was_running, purpose, archived_at, last_run, pending_run_id, pending_started_at, latest_run_id, latest_run_result
 task_agent_link: workspace_id, note_id, task_key, task_text, agent_id, created_at
 sandbox: id, workspace_id, agent_id, path, branch, base_commit_sha, snapshot_commit_sha, status, created_at, updated_at, retry_count
 tracked_changes: id, workspace_id, path, stage, status, agent_id, session_id, turn, commit_hash, old_blob_sha, new_blob_sha, additions, deletions, created_at, updated_at

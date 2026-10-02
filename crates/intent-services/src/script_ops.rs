@@ -687,13 +687,40 @@ impl ScriptManager {
     ) -> Result<()> {
         let lock = self.locks.definition_lock(script_id);
         let _guard = lock.lock().await;
-        let Some(def) = self
+        let Some(mut def) = self
             .store
             .get_script_in_workspace(workspace_id, script_id)
             .await?
         else {
             return Ok(());
         };
+        let latest = self
+            .store
+            .latest_script_run(workspace_id, script_id)
+            .await?;
+        if let Some((run_id, None)) = &latest {
+            let started_at = self
+                .store
+                .pending_script_runs()
+                .await?
+                .into_iter()
+                .find(|(ws, id, run, _)| ws == workspace_id && id == script_id && run == run_id)
+                .and_then(|(_, _, _, started)| started);
+            let result = intent_core::ScriptLastRun {
+                run_id: Some(run_id.clone()),
+                outcome: intent_core::ScriptRunOutcome::Interrupted,
+                exit_code: Some(EXIT_CODE_UNOBSERVABLE),
+                started_at,
+                stopped_at: now_iso(),
+                error: Some(LOST_AT_DAEMON_STOP_ERROR.into()),
+            };
+            self.store
+                .settle_script_run(workspace_id, script_id, run_id, &result, false)
+                .await?;
+            if def.mode == ScriptMode::Command {
+                def.last_run = Some(result);
+            }
+        }
         let key = (workspace_id.clone(), script_id.to_string());
         let publication = self.locks.publication_lock(script_id);
         let publishing = publication.lock().await;
@@ -718,7 +745,10 @@ impl ScriptManager {
             key,
             ManagedScript {
                 def,
-                state: ScriptRuntimeState::default(),
+                state: ScriptRuntimeState {
+                    run_id: latest.map(|(run, _)| run),
+                    ..Default::default()
+                },
                 pty_id: None,
                 monitor_attempt: None,
                 stopped_by_user: false,

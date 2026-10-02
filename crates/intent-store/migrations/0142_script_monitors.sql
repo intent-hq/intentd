@@ -62,7 +62,7 @@ BEGIN
 END;
 
 CREATE TRIGGER script_monitor_registration_fence BEFORE INSERT ON script_monitor
-WHEN NOT EXISTS (SELECT 1 FROM agent_session a JOIN workspace w ON w.id=a.workspace_id
+WHEN new.state='active' AND NOT EXISTS (SELECT 1 FROM agent_session a JOIN workspace w ON w.id=a.workspace_id
  WHERE a.id=new.agent_id AND a.workspace_id=new.workspace_id AND a.retired_at IS NULL AND w.archived=0)
 BEGIN SELECT RAISE(ABORT,'script monitor lifecycle fence'); END;
 

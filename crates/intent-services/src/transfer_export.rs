@@ -132,6 +132,7 @@ impl Services {
         let export_id = format!("export-{}", uuid::Uuid::new_v4());
         let staging_dir = self.export_staging_root().join(&export_id);
         {
+            let _monitor_lane = self.script_locks.monitor_lane.lock().await;
             let mut exports = self
                 .transfer_exports
                 .lock()

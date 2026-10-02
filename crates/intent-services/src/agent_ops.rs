@@ -15303,7 +15303,9 @@ impl Services {
             .lock()
             .expect("agent queue registry poisoned");
         let queue = guard.get_mut(agent_id)?;
-        let idx = queue.iter().position(QueuedMessage::ready_to_send)?;
+        let idx = queue.iter().position(|m| {
+            m.ready_to_send() && !self.script_monitor_export_blocked(m.message_metadata.as_ref())
+        })?;
         Some(queue.remove(idx))
     }
 
@@ -15606,7 +15608,12 @@ impl Services {
             .lock()
             .expect("agent queue registry poisoned")
             .get(agent_id)
-            .is_some_and(|q| q.iter().any(QueuedMessage::ready_to_send))
+            .is_some_and(|q| {
+                q.iter().any(|m| {
+                    m.ready_to_send()
+                        && !self.script_monitor_export_blocked(m.message_metadata.as_ref())
+                })
+            })
     }
 
     /// `true` iff the agent's queue still holds a ready-to-send entry with

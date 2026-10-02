@@ -11509,6 +11509,13 @@ async fn run_message_worker(
     // turn instead of failing; past it the timeout takes the terminal path.
     let mut consecutive_idle_timeouts: u32 = 0;
     'outer: loop {
+        if mgr.services.defer_script_monitor_for_export(
+            &agent_id,
+            &content,
+            options.message_metadata.as_ref(),
+        ) {
+            break 'outer;
+        }
         if !mgr
             .services
             .script_monitor_delivery_allowed(&agent_id, options.message_metadata.as_ref())
@@ -11537,6 +11544,13 @@ async fn run_message_worker(
             mgr.registry
                 .acquire_turn_start(&agent_id, try_claim, release)
                 .await;
+        }
+        if mgr.services.defer_script_monitor_for_export(
+            &agent_id,
+            &content,
+            options.message_metadata.as_ref(),
+        ) {
+            break 'outer;
         }
         if !mgr
             .services
@@ -11591,6 +11605,13 @@ async fn run_message_worker(
                 let prompt = mgr
                     .build_turn_prompt(&agent_id, &workspace_id, &content, &options)
                     .await;
+                if mgr.services.defer_script_monitor_for_export(
+                    &agent_id,
+                    &content,
+                    options.message_metadata.as_ref(),
+                ) {
+                    break 'outer;
+                }
                 if !mgr
                     .services
                     .admit_script_monitor_turn(&agent_id, options.message_metadata.as_ref())

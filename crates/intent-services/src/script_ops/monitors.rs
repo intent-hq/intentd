@@ -297,7 +297,7 @@ impl ScriptManager {
             self.emit_monitor(row, &row.state).await;
             if let Some(services) = self.owner_services.clone() {
                 let row = row.clone();
-                tokio::spawn(async move {
+                intent_core::spawn_daemon(async move {
                     services.dispatch_script_monitor(&row).await;
                 });
             }
@@ -480,7 +480,7 @@ impl ScriptManager {
                 self.complete_monitor(&mut row, result).await?;
             } else if row.state != "active" {
                 if let Some(services) = self.owner_services.clone() {
-                    tokio::spawn(async move {
+                    intent_core::spawn_daemon(async move {
                         services.dispatch_script_monitor(&row).await;
                     });
                 }
