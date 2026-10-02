@@ -228,7 +228,7 @@ pub(crate) async fn installed_model_command(provider_id: &str) -> Result<AcpProb
     let cmd = crate::complete_ops::one_shot_launch(provider, None, npx, None)
         .ok_or_else(|| crate::complete_ops::missing_one_shot_adapter_message(provider_id))?;
     cmd.check_npx_version().await.map_err(|e| e.to_string())?;
-    cmd.prepare_installed().await
+    cmd.prepare_installed_catalog().await
 }
 
 async fn fetch_installed_models(provider_id: &str) -> ProviderModelsFetch {

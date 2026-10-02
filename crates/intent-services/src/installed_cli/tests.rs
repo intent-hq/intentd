@@ -41,18 +41,115 @@ fn env(command: &Command, key: &str) -> Option<OsString> {
         .and_then(|(_, v)| v.map(OsString::from))
 }
 
+async fn assert_ordinary_launch(context: InstalledContext, root: &Path) {
+    use crate::acp_adapter::{spawn_adapter_in, AcpAdapterCommand, AdapterSlots};
+    let selected = context.runtime.path().to_owned();
+    let path_env = context.runtime.cli().path_env();
+    let command = launch(&context, root);
+    assert_eq!(env(&command, path_env), Some(selected.into_os_string()));
+    context.observe(&command).await.unwrap();
+    let cmd = AcpAdapterCommand::binary(
+        "/bin/sh".into(),
+        vec!["-c".into(), "printf launched > launch-marker".into()],
+    )
+    .cwd(root.to_owned())
+    .prepare_with_context(context)
+    .await
+    .unwrap();
+    assert!(
+        cmd.installed_key().is_none(),
+        "ordinary launches have no catalog identity"
+    );
+    let mut child = spawn_adapter_in(&AdapterSlots::new(1), &cmd, Duration::from_secs(1))
+        .await
+        .unwrap()
+        .child;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !root.join("launch-marker").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    child.reap().await;
+}
+
+#[tokio::test]
+async fn installed_cli_launch_accepts_oversized_claude_config() {
+    let (root, context) = fixture(InstalledCli::Claude, "#!/bin/sh\nprintf '2.0.0\\n'\n");
+    let config = serde_json::json!({"history": "x".repeat(1024 * 1024)});
+    std::fs::write(root.path().join(".claude.json"), config.to_string()).unwrap();
+    let context = InstalledContext::from_inputs(
+        context.runtime,
+        &BTreeMap::new(),
+        context.env,
+        &context.names,
+    )
+    .unwrap_or_else(|error| panic!("catalog inspection must not block launch: {error}"));
+    let error = context
+        .clone()
+        .with_catalog_fingerprint()
+        .await
+        .err()
+        .unwrap();
+    assert!(error.contains("inspection limit"));
+    assert_ordinary_launch(context, root.path()).await;
+}
+
+#[tokio::test]
+async fn installed_cli_launch_ignores_unreadable_other_provider_file() {
+    let (root, context) = fixture(InstalledCli::Codex, "#!/bin/sh\nprintf '1.2.3\\n'\n");
+    // A directory is deterministically unreadable as a credential file, even
+    // when tests run with privileges that bypass ordinary file permissions.
+    let mut inherited = context.env;
+    inherited.insert(
+        "CLAUDE_CODE_CLIENT_KEY".into(),
+        root.path().as_os_str().to_owned(),
+    );
+    let context =
+        InstalledContext::from_inputs(context.runtime, &BTreeMap::new(), inherited, &context.names)
+            .unwrap_or_else(|error| panic!("unrelated credentials must not block launch: {error}"));
+    context.clone().with_catalog_fingerprint().await.unwrap();
+    assert_ordinary_launch(context, root.path()).await;
+}
+
+#[tokio::test]
+async fn installed_cli_catalog_retains_explicit_custom_credential_file_inputs() {
+    let (root, context) = fixture(InstalledCli::Codex, "#!/bin/sh\nprintf '1.2.3\\n'\n");
+    let mut inherited = context.env;
+    inherited.insert(
+        "AWS_SHARED_CREDENTIALS_FILE".into(),
+        root.path().as_os_str().to_owned(),
+    );
+    let names = intent_core::cli_env::CodexEnvNames::from_config(
+        "[model_providers.gateway]\nenv_key='AWS_SHARED_CREDENTIALS_FILE'\n",
+    )
+    .unwrap();
+    let context =
+        InstalledContext::from_inputs(context.runtime, &BTreeMap::new(), inherited, &names)
+            .unwrap();
+    let command = launch(&context, root.path());
+    assert_eq!(
+        env(&command, "AWS_SHARED_CREDENTIALS_FILE"),
+        Some(root.path().as_os_str().to_owned())
+    );
+    assert!(context.clone().with_catalog_fingerprint().await.is_err());
+    assert_ordinary_launch(context, root.path()).await;
+}
+
 #[tokio::test]
 async fn installed_cli_wrapper_upgrade_changes_catalog_identity_without_adapter_change() {
     let (root, context) = fixture(
         InstalledCli::Codex,
         "#!/bin/sh\nprintf 'codex-cli '; cat \"$HOME/version\"\n",
     );
+    let context = context.with_catalog_fingerprint().await.unwrap();
     std::fs::write(root.path().join("version"), "1.2.3").unwrap();
     let cmd = launch(&context, root.path());
     let (first, _) = context.observe(&cmd).await.unwrap();
     std::fs::write(root.path().join("version"), "1.2.4").unwrap();
     let (second, _) = context.observe(&cmd).await.unwrap();
-    assert_ne!(context.key(&first), context.key(&second));
+    assert_ne!(context.key(&first).unwrap(), context.key(&second).unwrap());
 }
 
 #[tokio::test]
@@ -117,9 +214,10 @@ async fn installed_cli_auth_and_config_changes_do_not_reuse_last_good_identity()
         InstalledCli::Codex,
         "#!/bin/sh\nprintf 'codex-cli 1.2.3\\n'\n",
     );
+    let context = context.with_catalog_fingerprint().await.unwrap();
     let cmd = launch(&context, root.path());
     let (identity, _) = context.observe(&cmd).await.unwrap();
-    let before = context.key(&identity);
+    let before = context.key(&identity).unwrap();
     std::fs::create_dir(root.path().join(".codex")).unwrap();
     std::fs::write(
         root.path().join(".codex/auth.json"),
@@ -132,9 +230,12 @@ async fn installed_cli_auth_and_config_changes_do_not_reuse_last_good_identity()
         context.env.clone(),
         &intent_core::cli_env::CodexEnvNames::default(),
     )
+    .unwrap()
+    .with_catalog_fingerprint()
+    .await
     .unwrap();
-    assert_ne!(before, after.key(&identity));
-    assert!(!after.key(&identity).contains("token"));
+    assert_ne!(before, after.key(&identity).unwrap());
+    assert!(!after.key(&identity).unwrap().contains("token"));
 }
 
 #[tokio::test]
@@ -182,7 +283,7 @@ async fn installed_cli_ephemeral_isolation_uses_effective_home_before_env_overri
     .unwrap();
     let cmd = crate::acp_adapter::AcpAdapterCommand::binary(PathBuf::from("/bin/true"), vec![])
         .env("CODEX_HOME", "/untrusted/home")
-        .prepare_with_context(context)
+        .prepare_with_context(context.with_catalog_fingerprint().await.unwrap())
         .await
         .unwrap();
     assert!(cmd.installed_key().unwrap().starts_with("installed-v1:"));

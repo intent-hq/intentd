@@ -18,7 +18,9 @@ use tokio::process::Command;
 pub(crate) struct InstalledContext {
     pub runtime: InstalledCliRuntime,
     env: BTreeMap<OsString, OsString>,
-    context_key: u64,
+    // Only model catalog preparation inspects auth/configuration files. Normal
+    // launches must not inherit the catalog's bounded inspection restrictions.
+    context_key: Option<u64>,
     names: intent_core::cli_env::CodexEnvNames,
 }
 
@@ -61,11 +63,10 @@ impl InstalledContext {
         });
         let mut env = inherited;
         env.extend(overlay.into_iter().map(|(k, v)| (k.into(), v.into())));
-        let context_key = context_key(runtime.cli(), &env)?;
         Ok(Self {
             runtime,
             env,
-            context_key,
+            context_key: None,
             names: names.clone(),
         })
     }
@@ -74,6 +75,15 @@ impl InstalledContext {
         tokio::task::spawn_blocking(move || Self::resolve(cli))
             .await
             .map_err(|_| "installed CLI discovery failed".to_owned())?
+    }
+
+    pub async fn with_catalog_fingerprint(mut self) -> Result<Self, String> {
+        tokio::task::spawn_blocking(move || {
+            self.context_key = Some(context_key(self.runtime.cli(), &self.env, &self.names)?);
+            Ok(self)
+        })
+        .await
+        .map_err(|_| "installed CLI catalog fingerprint task failed".to_owned())?
     }
 
     pub fn apply_isolated(&self, command: &mut Command) {
@@ -162,15 +172,16 @@ impl InstalledContext {
         }
     }
 
-    pub fn key(&self, identity: &InstalledCliIdentity) -> String {
+    pub fn key(&self, identity: &InstalledCliIdentity) -> Option<String> {
+        let context_key = self.context_key?;
         let adapter = match self.runtime.cli() {
             InstalledCli::Codex => intent_providers::CODEX_ACP_NPX_PACKAGE,
             InstalledCli::Claude => intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE,
         };
-        format!(
+        Some(format!(
             "installed-v1:{:016x}",
-            private_hash(&(adapter, identity, self.context_key))
-        )
+            private_hash(&(adapter, identity, context_key))
+        ))
     }
 
     /// Re-discovery is validation only: it never redirects an in-flight launch.
@@ -181,6 +192,9 @@ impl InstalledContext {
         dependency: ProbeDependency,
     ) -> bool {
         let Ok(current) = Self::discover(self.runtime.cli()).await else {
+            return false;
+        };
+        let Ok(current) = current.with_catalog_fingerprint().await else {
             return false;
         };
         if current.runtime != self.runtime || current.context_key != self.context_key {
@@ -237,7 +251,11 @@ fn nonempty<'a>(env: &'a BTreeMap<OsString, OsString>, key: &str) -> Option<&'a 
     env.get(std::ffi::OsStr::new(key)).filter(|v| !v.is_empty())
 }
 
-fn context_key(cli: InstalledCli, env: &BTreeMap<OsString, OsString>) -> Result<u64, String> {
+fn context_key(
+    cli: InstalledCli,
+    env: &BTreeMap<OsString, OsString>,
+    names: &intent_core::cli_env::CodexEnvNames,
+) -> Result<u64, String> {
     let home = nonempty(env, "HOME")
         .or_else(|| nonempty(env, "USERPROFILE"))
         .map(PathBuf::from);
@@ -283,8 +301,10 @@ fn context_key(cli: InstalledCli, env: &BTreeMap<OsString, OsString>) -> Result<
         "CLAUDE_CODE_CLIENT_CERT",
         "CLAUDE_CODE_CLIENT_KEY",
     ] {
-        if let Some(path) = nonempty(env, key) {
-            files.push(PathBuf::from(path));
+        if cli.accepts_env(key) || names.contains(key) {
+            if let Some(path) = nonempty(env, key) {
+                files.push(PathBuf::from(path));
+            }
         }
     }
     let mut contents = Vec::new();

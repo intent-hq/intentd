@@ -1345,6 +1345,43 @@ fn installed_cli_credential_file_rotation_rejects_last_good_account() {
                 .await
                 .unwrap();
             assert_eq!(first["models"][0]["id"], "account-a", "{key}: {first}");
+            // Failed fingerprinting must invalidate access to the previous
+            // account's models, even while its last-good entry is still fresh.
+            let credential = root.join("credential");
+            std::fs::remove_file(&credential).unwrap();
+            std::fs::create_dir(&credential).unwrap();
+            let unreadable = services
+                .models_list(Some("claude-code".into()), true)
+                .await
+                .unwrap();
+            assert_eq!(
+                unreadable["models"],
+                serde_json::json!([]),
+                "{key}: {unreadable}"
+            );
+            assert!(!unreadable["stale"].as_bool().unwrap_or(false));
+            let cached_failure = services
+                .models_list(Some("claude-code".into()), false)
+                .await
+                .unwrap();
+            assert_eq!(cached_failure["models"], serde_json::json!([]));
+            std::fs::remove_dir(&credential).unwrap();
+            std::fs::write(&credential, "account-a").unwrap();
+            if key == "CLAUDE_CODE_CLIENT_KEY" {
+                let config = root.join(".claude.json");
+                std::fs::write(
+                    &config,
+                    serde_json::json!({"history":"x".repeat(1024 * 1024)}).to_string(),
+                )
+                .unwrap();
+                let oversized = services
+                    .models_list(Some("claude-code".into()), true)
+                    .await
+                    .unwrap();
+                assert_eq!(oversized["models"], serde_json::json!([]), "{oversized}");
+                assert!(!oversized["stale"].as_bool().unwrap_or(false));
+                std::fs::remove_file(config).unwrap();
+            }
             std::fs::write(root.join("fail"), "").unwrap();
             let unchanged = services
                 .models_list(Some("claude-code".into()), true)

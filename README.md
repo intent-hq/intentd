@@ -412,6 +412,10 @@ bounded version observation, adapter pin and private auth/config fingerprint ide
 each cached catalog. Explicit refresh observes changes even behind
 an unchanged CLI wrapper. Last-good fallback is confined to that identity. Codex/Claude
 catalogs are memory-only; the first request after daemon restart must probe again.
+Catalog fingerprinting inspects relevant credential/configuration files with a 1 MiB
+limit per file. An unreadable or oversized file makes catalog discovery unavailable
+without reusing a previous account's models; these catalog inspection limits do not
+block ordinary installed-CLI launches.
 Existing sessions retain their process; new/recreated launches resolve the installed CLI
 again. Resuming across upgrades remains subject to adapter/CLI compatibility.
 

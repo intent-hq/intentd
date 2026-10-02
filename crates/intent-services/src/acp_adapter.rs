@@ -243,6 +243,17 @@ impl AcpAdapterCommand {
         self.prepare_with_context(context).await
     }
 
+    pub(crate) async fn prepare_installed_catalog(self) -> Result<Self, String> {
+        let cli = self
+            .installed_cli
+            .ok_or("catalog requires an installed CLI")?;
+        let context = crate::installed_cli::InstalledContext::discover(cli)
+            .await?
+            .with_catalog_fingerprint()
+            .await?;
+        self.prepare_with_context(context).await
+    }
+
     pub(crate) async fn prepare_with_context(
         mut self,
         context: crate::installed_cli::InstalledContext,
@@ -310,7 +321,9 @@ impl AcpAdapterCommand {
     }
 
     pub(crate) fn installed_key(&self) -> Option<String> {
-        self.installed.as_ref().map(|p| p.context.key(&p.identity))
+        self.installed
+            .as_ref()
+            .and_then(|p| p.context.key(&p.identity))
     }
 
     pub(crate) async fn installed_still_current(&self) -> bool {
