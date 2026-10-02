@@ -9353,8 +9353,8 @@ async fn send_queued_message_now_over_wss() {
 
     assert_ne!(first_id, second_id, "different authors keep distinct rows");
     assert_ne!(
-        q_first["queuedMessage"]["author"],
-        q_second["queuedMessage"]["author"]
+        q_first["queuedMessage"]["messageMetadata"]["fromPrincipalId"],
+        q_second["queuedMessage"]["messageMetadata"]["fromPrincipalId"]
     );
 
     // Send the SECOND entry now: response mirrors sendMessage and echoes the
@@ -13200,7 +13200,10 @@ async fn interrupt_mid_tool_call_settles_and_drains_queue_over_wss() {
     .await;
     assert_eq!(q2["success"], true, "queue two: {q2}");
     assert_ne!(q1["queuedMessage"]["id"], q2["queuedMessage"]["id"]);
-    assert_ne!(q1["queuedMessage"]["author"], q2["queuedMessage"]["author"]);
+    assert_ne!(
+        q1["queuedMessage"]["messageMetadata"]["fromPrincipalId"],
+        q2["queuedMessage"]["messageMetadata"]["fromPrincipalId"]
+    );
     let queue = wss_rpc(
         &mut rpc,
         14,
@@ -13583,13 +13586,20 @@ async fn a2a_interrupt_during_in_flight_tool_call_settles_and_drains_over_wss() 
     );
     let merged_content = format!("{QUEUED_ONE}\n\n{QUEUED_TWO}");
     assert_eq!(queue["queue"][0]["content"], merged_content);
-    for field in ["id", "turnId", "queuedAt", "author"] {
+    for field in ["id", "turnId", "queuedAt"] {
         assert_eq!(
             queued_responses[0][field], queued_responses[1][field],
             "stable {field}"
         );
         assert_eq!(queue["queue"][0][field], queued_responses[0][field]);
     }
+    let author_id = &queued_responses[0]["messageMetadata"]["fromPrincipalId"];
+    assert!(author_id.is_string(), "authenticated author stamp");
+    assert_eq!(
+        queued_responses[1]["messageMetadata"]["fromPrincipalId"],
+        *author_id
+    );
+    assert_eq!(queue["queue"][0]["author"]["principalId"], *author_id);
     assert_eq!(queued_responses[1]["content"], merged_content);
     let queued_turn_ids: Vec<String> = queue["queue"]
         .as_array()
