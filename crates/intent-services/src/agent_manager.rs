@@ -7740,6 +7740,14 @@ impl AgentManager {
         // user row already reached the transcript (STAB-112) — the entry id
         // already names that row.
         if !entry.persisted {
+            #[cfg(test)]
+            {
+                let pause = self.user_persist_pause.lock().unwrap().take();
+                if let Some(pause) = pause {
+                    pause.reached.notify_one();
+                    pause.resume.notified().await;
+                }
+            }
             // STAB-133: persist the entry's attachments alongside the text
             // block, under the entry id so the RPC result's `messageId` and
             // the `agent:message` event both name the actual transcript row.
@@ -7763,6 +7771,7 @@ impl AgentManager {
                 .await
             {
                 Ok(message) => {
+                    self.services.commit_queue_history(&agent_id, &entry.id);
                     self.services.invalidate_agent_list_cache(&workspace_id);
                     message
                 }
@@ -12531,6 +12540,13 @@ async fn persist_user(
             .await
         {
             Ok(message) => {
+                if let Some(id) = message_metadata
+                    .and_then(|md| md.get("queueInfo"))
+                    .and_then(|info| info.get("queuedMessageId"))
+                    .and_then(Value::as_str)
+                {
+                    mgr.services.commit_queue_history(agent_id, id);
+                }
                 mgr.services.invalidate_agent_list_cache(workspace_id);
                 break message;
             }

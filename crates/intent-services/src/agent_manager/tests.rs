@@ -25096,3 +25096,99 @@ async fn shutdown_durable_duplicate_draining_guards_preserve_one_entry() {
     assert_eq!(queue[0]["content"], entry.content);
     assert_eq!(queue[0]["fileBlocks"], entry.file_blocks.unwrap());
 }
+
+#[tokio::test]
+async fn queue_merge_failed_transcript_append_keeps_admitted_human_barrier() {
+    let _env = EnvGuard::set_all(&[("INTENTD_PERSIST_RETRY_BACKOFF_MS", "1,1")]);
+    for send_now in [false, true] {
+        let (_tmp, mgr) = manager().await;
+        let mgr = Arc::new(mgr);
+        let ws = WorkspaceId::from("ws-pending-barrier");
+        let id = AgentId::from("pending-barrier");
+        seed_agent(&mgr, &ws, &id).await;
+        let enqueue = |message_id: &str, author: &str, content: &str| {
+            mgr.services
+                .enqueue_message_with_id(
+                    &id,
+                    Some(message_id.into()),
+                    content.into(),
+                    None,
+                    None,
+                    Some(json!({"fromPrincipalId":author})),
+                    None,
+                    false,
+                    intent_core::MessageOrigin::User,
+                )
+                .0
+        };
+        enqueue("a1", "a", "one");
+        mgr.services
+            .agent_edit_queued_message_op(id.clone(), "a1".into(), "one".into(), Some(true))
+            .await
+            .unwrap();
+        enqueue("b2", "b", "barrier");
+        sqlx::query("CREATE TRIGGER fail_pending_append BEFORE INSERT ON agent_message WHEN NEW.role = 'user' BEGIN SELECT RAISE(ABORT, 'test append failure'); END").execute(mgr.services.store.write_pool()).await.unwrap();
+        let pause = Arc::new(super::TurnStartPause::default());
+        *mgr.user_persist_pause.lock().unwrap() = Some(pause.clone());
+        let worker_mgr = mgr.clone();
+        let worker_id = id.clone();
+        let worker_ws = ws.clone();
+        let worker = tokio::spawn(async move {
+            if send_now {
+                assert!(worker_mgr
+                    .send_queued_message_now(worker_id, worker_ws, "b2".into())
+                    .await
+                    .is_err());
+            } else {
+                let admission = worker_mgr
+                    .try_begin_turn(&worker_id, &worker_ws)
+                    .await
+                    .unwrap();
+                let (entry, guard) = worker_mgr
+                    .services
+                    .dequeue_message_draining(&worker_id)
+                    .unwrap();
+                assert_eq!(entry.id, "b2");
+                assert!(matches!(
+                    worker_mgr
+                        .prepare_admitted_flush_turn(
+                            &worker_id,
+                            &worker_ws,
+                            vec![entry],
+                            guard,
+                            admission
+                        )
+                        .await,
+                    super::FlushPrep::Parked
+                ));
+            }
+        });
+        timeout(Duration::from_secs(5), pause.reached.notified())
+            .await
+            .unwrap();
+        assert_eq!(
+            enqueue("a3", "a", "three").id,
+            "a3",
+            "an admitted but unwritten B remains a human barrier"
+        );
+        pause.resume.notify_one();
+        timeout(Duration::from_secs(5), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        let queue = mgr.services.queue_snapshot(&id);
+        assert_eq!(
+            queue.len(),
+            3,
+            "failed delivery must restore B without absorbing A3: {queue:?}"
+        );
+        assert_eq!(
+            mgr.services.find_queued_message(&id, "a1").unwrap().content,
+            "one"
+        );
+        assert_eq!(
+            mgr.services.find_queued_message(&id, "a3").unwrap().content,
+            "three"
+        );
+    }
+}

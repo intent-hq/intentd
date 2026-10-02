@@ -1308,7 +1308,7 @@ pub(crate) struct QueuedMessage {
     /// Latest human submission, independent of priority/drain order; persisted for restart.
     #[serde(default)]
     pub submission_order: u64,
-    /// Only true on an in-memory draining overlay before delivery commits.
+    /// True on a draining overlay until its transcript row is durable.
     #[serde(skip)]
     pub provisional: bool,
     pub content: String,
@@ -6957,7 +6957,7 @@ impl Services {
             }
             // Hold acquisition can race an append after the UI captured its
             // draft. Keep that suffix pending for the eventual save as well.
-            if was && editing == Some(true) {
+            if was && editing != Some(false) {
                 // Keep the append bookkeeping until the hold is released,
                 // including repeated holds and draft updates while held.
                 if content != queue[position].content {
@@ -15419,12 +15419,8 @@ impl Services {
                 .lock()
                 .expect("parked recovery send registry poisoned")
                 .remove(agent_id);
-            let guard = self.register_draining(
-                &mut draining,
-                agent_id,
-                std::slice::from_ref(&entry),
-                false,
-            );
+            let guard =
+                self.register_draining(&mut draining, agent_id, std::slice::from_ref(&entry));
             return RecoverySendClaim::Drained(Box::new((entry, guard)));
         }
         let popped_provisionally = draining
@@ -15471,18 +15467,21 @@ impl Services {
         agent_id: &AgentId,
         entries: &[QueuedMessage],
     ) {
-        let mut draining = self
-            .draining_queue_entries
-            .lock()
-            .expect("draining queue registry poisoned");
+        self.commit_recovery_send_delivery(agent_id, entries);
+    }
+
+    /// Admission retires recovery authorization, but undelivered input remains
+    /// an arrival barrier until the transcript append actually succeeds.
+    pub(crate) fn commit_queue_history(&self, agent_id: &AgentId, message_id: &str) {
+        let mut draining = self.draining_queue_entries.lock().unwrap();
         if let Some(overlay) = draining.get_mut(agent_id) {
             for entry in overlay {
-                if entries.iter().any(|delivered| delivered.id == entry.id) {
+                if entry.matches_submission(message_id) {
                     entry.provisional = false;
+                    entry.persisted = true;
                 }
             }
         }
-        self.commit_recovery_send_delivery(agent_id, entries);
     }
 
     /// `true` iff at least one ready-to-send queued entry is user-origin:
@@ -15578,7 +15577,11 @@ impl Services {
             .get(agent_id)
             .into_iter()
             .flatten()
-            .filter(|d| !live.iter().any(|m| m.id == d.id || m.turn_id == d.turn_id))
+            .filter(|d| {
+                !live
+                    .iter()
+                    .any(|m| m.matches_submission(&d.id) || m.turn_id == d.turn_id)
+            })
             .chain(live.iter())
             .enumerate()
             .map(|(i, m)| m.to_value(i))
@@ -15764,7 +15767,7 @@ impl Services {
             .draining_queue_entries
             .lock()
             .expect("draining queue registry poisoned");
-        self.register_draining(&mut draining, agent_id, entries, false)
+        self.register_draining(&mut draining, agent_id, entries)
     }
 
     /// Run a live-queue pop while holding the draining overlay lock (taken
@@ -15796,12 +15799,7 @@ impl Services {
         if commit == PopCommit::Delivery {
             self.commit_recovery_send_delivery(agent_id, entries);
         }
-        let guard = self.register_draining(
-            &mut draining,
-            agent_id,
-            entries,
-            commit == PopCommit::Provisional,
-        );
+        let guard = self.register_draining(&mut draining, agent_id, entries);
         Some((popped, guard))
     }
 
@@ -15810,13 +15808,12 @@ impl Services {
         draining: &mut HashMap<AgentId, Vec<QueuedMessage>>,
         agent_id: &AgentId,
         entries: &[QueuedMessage],
-        provisional: bool,
     ) -> DrainingGuard {
         draining
             .entry(agent_id.clone())
             .or_default()
             .extend(entries.iter().cloned().map(|mut entry| {
-                entry.provisional = provisional;
+                entry.provisional = !entry.persisted;
                 entry
             }));
         DrainingGuard {
@@ -15905,13 +15902,13 @@ impl Services {
             .iter()
             .map(|d| {
                 live.iter()
-                    .find(|m| m.id == d.id || m.turn_id == d.turn_id)
+                    .find(|m| m.matches_submission(&d.id) || m.turn_id == d.turn_id)
                     .unwrap_or(d)
             })
             .chain(live.iter().filter(|m| {
                 !retained
                     .iter()
-                    .any(|d| d.id == m.id || d.turn_id == m.turn_id)
+                    .any(|d| m.matches_submission(&d.id) || d.turn_id == m.turn_id)
             }))
             .filter(|m| seen_ids.insert(m.id.clone()))
             .enumerate()
@@ -15925,7 +15922,7 @@ impl Services {
                         && draining.get(agent_id).is_some_and(|entries| {
                             entries
                                 .iter()
-                                .any(|d| d.id == m.id || d.turn_id == m.turn_id)
+                                .any(|d| m.matches_submission(&d.id) || d.turn_id == m.turn_id)
                         })
                     {
                         payload["shutdownRecovery"] = Value::Bool(true);

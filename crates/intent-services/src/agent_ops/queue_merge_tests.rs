@@ -506,7 +506,12 @@ async fn queue_merge_handback_keeps_persisted_and_foreign_author_barriers() {
 
 #[tokio::test]
 async fn queue_merge_reaffirmed_edit_hold_preserves_appends_on_save_and_cancel() {
-    for draft in ["one", "edited"] {
+    for (draft, reaffirm) in [
+        ("one", Some(true)),
+        ("edited", Some(true)),
+        ("one", None),
+        ("edited", None),
+    ] {
         let (_tmp, svc, ws) = setup().await;
         let agent = create_agent(&svc, &ws, "Hold").await;
         enqueue(&svc, &agent, "first", "a", "one");
@@ -514,7 +519,7 @@ async fn queue_merge_reaffirmed_edit_hold_preserves_appends_on_save_and_cancel()
             .await
             .unwrap();
         enqueue(&svc, &agent, "second", "a", "two");
-        svc.agent_edit_queued_message_op(agent.clone(), "first".into(), "one".into(), Some(true))
+        svc.agent_edit_queued_message_op(agent.clone(), "first".into(), "one".into(), reaffirm)
             .await
             .unwrap();
         let saved = svc
@@ -609,6 +614,7 @@ async fn queue_merge_provisional_foreign_human_remains_a_barrier_until_committed
             .unwrap();
         if commit {
             svc.commit_provisional_queue_delivery(&agent, std::slice::from_ref(&popped));
+            svc.commit_queue_history(&agent, &popped.id);
         }
         let appended = enqueue(&svc, &agent, "a3", "a", "three");
         if commit {
@@ -729,4 +735,59 @@ async fn queue_merge_migrated_edit_alias_is_author_gated_and_expires_on_release(
         svc.queue_snapshot(&agent)[0]["content"],
         saved["queuedMessage"]["content"]
     );
+}
+
+#[tokio::test]
+async fn queue_merge_restored_alias_is_not_duplicated_by_frozen_draining_overlay() {
+    let (_tmp, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Frozen alias").await;
+    enqueue(&svc, &agent, "a1", "a", "one");
+    enqueue(&svc, &agent, "b", "b", "barrier");
+    enqueue(&svc, &agent, "a2", "a", "two");
+    svc.agent_remove_queued_message_op(agent.clone(), "b".into())
+        .await
+        .unwrap();
+    let (popped, guard) = svc
+        .take_queued_message_draining_gated(&agent, "a2", None, None)
+        .unwrap()
+        .unwrap();
+    svc.requeue_front(&agent, popped);
+    let snapshot = svc.queue_snapshot(&agent);
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0]["id"], "a1");
+    assert_eq!(snapshot[0]["content"], "one\n\ntwo");
+    svc.freeze_shutdown_drains();
+    svc.persist_shutdown_drains().await;
+    drop(guard);
+    let restarted = Services::new(svc.store.clone());
+    restarted.rehydrate_agent_queues().await.unwrap();
+    let rows = restarted.queue_snapshot(&agent);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "a1");
+    assert_eq!(rows[0]["content"], "one\n\ntwo");
+}
+
+#[tokio::test]
+async fn queue_merge_migrated_hold_updates_keep_prefix_and_suffix_until_release() {
+    for reaffirm in [Some(true), None] {
+        let (_tmp, svc, ws) = setup().await;
+        let agent = create_agent(&svc, &ws, "Migrated hold").await;
+        enqueue(&svc, &agent, "a1", "a", "one");
+        let (popped, guard) = svc.dequeue_message_draining_provisional(&agent).unwrap();
+        enqueue(&svc, &agent, "a2", "a", "two");
+        svc.agent_edit_queued_message_op(agent.clone(), "a2".into(), "two".into(), Some(true))
+            .await
+            .unwrap();
+        svc.requeue_front(&agent, popped);
+        drop(guard);
+        enqueue(&svc, &agent, "a3", "a", "three");
+        svc.agent_edit_queued_message_op(agent.clone(), "a2".into(), "interim".into(), reaffirm)
+            .await
+            .unwrap();
+        let saved = svc
+            .agent_edit_queued_message_op(agent, "a2".into(), "final".into(), Some(false))
+            .await
+            .unwrap();
+        assert_eq!(saved["queuedMessage"]["content"], "one\n\nfinal\n\nthree");
+    }
 }
