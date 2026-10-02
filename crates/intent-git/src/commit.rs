@@ -106,6 +106,9 @@ pub fn commit(worktree_path: &Path, message: &str) -> Result<CommitOutcome> {
         }
     }
 
+    // Calculate the receipt from the immutable trees before advancing HEAD.
+    // A metadata error must not hide the SHA of an already-created commit.
+    let files = changed_files(&repo, parent.as_ref(), &tree)?;
     let sig = repo.signature().map_err(map_git_err)?;
     let parents: Vec<&Commit> = parent.iter().chain(merge_parents.iter()).collect();
     let oid = repo
@@ -122,7 +125,6 @@ pub fn commit(worktree_path: &Path, message: &str) -> Result<CommitOutcome> {
         }
     }
 
-    let files = changed_files(&repo, parent.as_ref(), &tree)?;
     Ok(CommitOutcome {
         hash: oid.to_string(),
         files,
@@ -394,6 +396,43 @@ mod tests {
         commit_file(dir.path(), "seed.txt", "seed\n");
         let err = commit(dir.path(), "nothing").unwrap_err();
         assert!(format!("{err}").contains("nothing to commit"));
+    }
+
+    #[test]
+    fn commit_metadata_failure_does_not_advance_head() {
+        let dir = init_repo("commit-metadata-failure");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        write_file(dir.path(), "a.txt", "hi\n");
+        stage(dir.path(), &["a.txt".to_string()]).unwrap();
+        let (head, tree_path) = {
+            let repo = Repository::open(dir.path()).unwrap();
+            let parent = repo.head().unwrap().peel_to_commit().unwrap();
+            let tree = parent.tree_id().to_string();
+            (
+                parent.id(),
+                repo.path()
+                    .join("objects")
+                    .join(&tree[..2])
+                    .join(&tree[2..]),
+            )
+        };
+        // A missing parent tree makes changed-file reporting fail while the
+        // parent commit and newly staged tree remain valid commit inputs.
+        // Only this disposable repository is corrupted.
+        std::fs::remove_file(tree_path).unwrap();
+        let error = commit(dir.path(), "must not commit").unwrap_err();
+        assert!(error.to_string().contains("object not found"), "{error}");
+        let repo = Repository::open(dir.path()).unwrap();
+        assert_eq!(
+            repo.head().unwrap().target(),
+            Some(head),
+            "a metadata failure must not hide a successful commit"
+        );
+        assert!(repo
+            .index()
+            .unwrap()
+            .get_path(Path::new("a.txt"), 0)
+            .is_some());
     }
 
     #[test]
