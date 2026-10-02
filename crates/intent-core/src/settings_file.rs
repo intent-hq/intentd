@@ -381,7 +381,8 @@ pub struct ServerSettings {
     /// Defaults to loopback (`127.0.0.1`); set `0.0.0.0` to expose the
     /// listener on every interface, including untrusted networks.
     pub bind_address: BindAddress,
-    /// `server.port` — TCP port for the WSS listener (1024–65535).
+    /// `server.port` — legacy value preserved for compatibility (1024–65535).
+    /// Unused by listeners; the backend connection port is `server.wsApi.port`.
     pub port: u16,
     /// `server.originAllowList` — permitted WS origins.
     pub origin_allow_list: Option<Vec<String>>,
@@ -1742,8 +1743,8 @@ enabled = false
 # IPs (e.g. ["192.168.1.7", "100.64.0.3"] -- one listener per address, same
 # port); 0.0.0.0 exposes it on every interface, including untrusted networks.
 bindAddress = "127.0.0.1"
-# WS port -- TCP port for the WSS listener (1024-65535).
-port = 5181
+# Backend connection port is configured under [server.wsApi] below.
+# The legacy [server] port value is accepted but unused by listeners.
 # Origin allow-list -- permitted WS origins.
 # originAllowList = ["https://example.com"]
 # Max outstanding RPCs -- daemon-wide cap on outstanding slow-path RPCs across
@@ -1754,7 +1755,7 @@ maxOutstandingRpcs = 256
 [server.wsApi]
 # WS API enabled -- enable the TCP/WSS listener at runtime.
 enabled = false
-# WSS API port -- omit to select once on first enable, trying 5181 upward.
+# Backend connection port -- omit to select once on first enable, trying 5181 upward.
 # The selected port is saved here and required on every later start.
 # Set a number (1024-65535) to require that port without selection.
 # To deliberately select again, disable WSS, remove this key, and re-enable.
@@ -2695,6 +2696,18 @@ mod tests {
             Some(&serde_json::json!("both"))
         );
         assert_eq!(legacy.len(), 1);
+    }
+
+    #[test]
+    fn new_config_omits_legacy_port_but_existing_ports_remain_readable() {
+        let template: toml::Value = toml::from_str(DEFAULT_CONFIG_TEMPLATE).unwrap();
+        assert!(template["server"].get("port").is_none());
+        for legacy_port in [5182, 6200] {
+            let text = format!("[server]\nport = {legacy_port}\n[server.wsApi]\nport = 5182\n");
+            let parsed = SettingsFile::parse_str(&text).unwrap();
+            assert_eq!(parsed.server.port, legacy_port);
+            assert_eq!(parsed.server.ws_api.port, 5182);
+        }
     }
 
     #[test]

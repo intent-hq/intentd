@@ -252,6 +252,11 @@ pub(crate) const TERMINAL_CWD: &str = "terminal:cwd";
 // (start, exit, auto-restart, URL detection) as `script:state`, and definition
 // mutations as `script:changed`. All payloads carry the `scriptId`.
 pub const SCRIPT_OUTPUT: &str = "script:output";
+pub const SCRIPT_MONITOR_REGISTERED: &str = "scriptMonitor:registered";
+pub const SCRIPT_MONITOR_COMPLETED: &str = "scriptMonitor:completed";
+pub const SCRIPT_MONITOR_EXPIRED: &str = "scriptMonitor:expired";
+pub const SCRIPT_MONITOR_TRIGGERED: &str = "scriptMonitor:triggered";
+pub const SCRIPT_MONITOR_CANCELLED: &str = "scriptMonitor:cancelled";
 pub const SCRIPT_STATE: &str = "script:state";
 pub const SCRIPT_CHANGED: &str = "script:changed";
 
@@ -626,6 +631,11 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     SCRIPT_OUTPUT,
     SCRIPT_STATE,
     SCRIPT_CHANGED,
+    SCRIPT_MONITOR_REGISTERED,
+    SCRIPT_MONITOR_COMPLETED,
+    SCRIPT_MONITOR_EXPIRED,
+    SCRIPT_MONITOR_TRIGGERED,
+    SCRIPT_MONITOR_CANCELLED,
     HOOK_SCHEDULED,
     HOOK_RUN_STARTED,
     HOOK_RUN_COMPLETED,
@@ -903,6 +913,11 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (PR_MONITOR_EMITTED, "PR monitor: a debounced report was delivered; PR checklist state."),
     (PR_MONITOR_REGISTERED, "PR monitor: a monitor was registered; monitor and PR identity."),
     (PRESENCE_CHANGED, "Presence: the online members of a member workspace with their focus in that workspace and typing targets; principal profile fields already exposed by workspace.members.list. Transient."),
+    (SCRIPT_MONITOR_CANCELLED, "Script monitor: cancelled; full workspace-scoped monitor snapshot including opt-in bounded matching line."),
+    (SCRIPT_MONITOR_COMPLETED, "Script monitor: completed; full workspace-scoped monitor snapshot including opt-in bounded matching line."),
+    (SCRIPT_MONITOR_EXPIRED, "Script monitor: expired; full workspace-scoped monitor snapshot including opt-in bounded matching line."),
+    (SCRIPT_MONITOR_REGISTERED, "Script monitor: registered; full workspace-scoped monitor snapshot including opt-in bounded matching line."),
+    (SCRIPT_MONITOR_TRIGGERED, "Script monitor: triggered; full workspace-scoped monitor snapshot including opt-in bounded matching line."),
     (SEARCH_DONE, "Search: a workspace-scoped search finished; correlated by the caller's requestId."),
     (SEARCH_RESULT, "Search: a page of workspace-scoped search matches; correlated by the caller's requestId."),
     (SKILLS_CHANGED, "Skills: the discovered skill set of a workspace changed; { workspaceId } only."),

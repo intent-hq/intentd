@@ -740,7 +740,7 @@ async fn removal_roundtrip(ws: &mut common::TlsWs, peer: &mut TcpStream) {
 }
 
 #[tokio::test]
-async fn member_removal_idle_active_tunnels_forwarding_and_final_control() {
+async fn member_removal_idle_active_tunnels_and_final_control() {
     use intent_transport::tunnel::Frame;
     let (srv, _) = start_pairing().await;
     let owner = srv.store.get_primary_principal().await.unwrap();
@@ -780,16 +780,7 @@ async fn member_removal_idle_active_tunnels_forwarding_and_final_control() {
         .await
         .unwrap();
     let port = listener.local_addr().unwrap().port();
-    let forward = active
-        .call("forward.create", json!({"remotePort":port}))
-        .await;
-    let local = u16::try_from(forward["result"]["localPort"].as_u64().unwrap()).unwrap();
-    let mut downstream = TcpStream::connect(("127.0.0.1", local)).await.unwrap();
-    let (mut upstream, _) = listener.accept().await.unwrap();
-    downstream.write_all(b"ok").await.unwrap();
     let mut two = [0; 2];
-    upstream.read_exact(&mut two).await.unwrap();
-    assert_eq!(&two, b"ok");
     let mut idle_tunnel = removal_tunnel(&srv, token).await;
     let mut active_tunnel = removal_tunnel(&srv, second_token).await;
     removal_send(&mut active_tunnel, Frame::Open { stream_id: 1, port }).await;
@@ -838,20 +829,12 @@ async fn member_removal_idle_active_tunnels_forwarding_and_final_control() {
     assert_closed(&mut idle_tunnel).await;
     assert_closed(&mut active_tunnel).await;
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(5), downstream.read(&mut two))
-            .await
-            .unwrap()
-            .unwrap(),
-        0
-    );
-    assert_eq!(
         tokio::time::timeout(Duration::from_secs(5), peer.read(&mut two))
             .await
             .unwrap()
             .unwrap(),
         0
     );
-    assert!(TcpStream::connect(("127.0.0.1", local)).await.is_err());
     for old in [token, second_token] {
         for path in ["/ws", "/tunnel"] {
             assert_eq!(

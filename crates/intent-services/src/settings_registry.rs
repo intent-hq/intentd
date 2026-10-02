@@ -1080,6 +1080,38 @@ mod tests {
     }
 
     #[test]
+    fn legacy_port_is_preserved_without_selecting_the_connection_port() {
+        let (_dir, path) = temp_config(Some("[server]\nport = 5182\n"));
+        let reg = SettingsRegistry::load(&path).unwrap();
+        assert_eq!(reg.get("server.port"), Some(json!(5182)));
+        assert_eq!(
+            reg.snapshot().ws_api_port_policy(),
+            WsApiPortPolicy::Unassigned
+        );
+
+        reg.apply(&set("server.wsApi.port", json!(5182))).unwrap();
+        reg.apply(&set("server.port", json!(6200))).unwrap();
+        assert_eq!(
+            reg.snapshot().ws_api_port_policy(),
+            WsApiPortPolicy::Fixed(5182)
+        );
+        let reloaded = SettingsRegistry::load(&path).unwrap();
+        assert_eq!(reloaded.get("server.port"), Some(json!(6200)));
+        assert_eq!(reloaded.get("server.wsApi.port"), Some(json!(5182)));
+        assert_eq!(
+            reloaded.snapshot().ws_api_port_policy(),
+            WsApiPortPolicy::Fixed(5182)
+        );
+
+        reloaded.apply(&set("server.port", Value::Null)).unwrap();
+        assert_eq!(reloaded.get("server.port"), Some(json!(5181)));
+        assert_eq!(
+            reloaded.snapshot().ws_api_port_policy(),
+            WsApiPortPolicy::Fixed(5182)
+        );
+    }
+
+    #[test]
     fn ws_port_generated_config_is_unassigned_but_explicit_default_is_fixed() {
         let (_dir, path) = temp_config(None);
         let reg = SettingsRegistry::load(&path).unwrap();

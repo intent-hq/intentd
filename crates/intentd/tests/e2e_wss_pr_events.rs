@@ -699,7 +699,7 @@ async fn wss_rpc_raw(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Va
 
 /// Protocol v5.0 regression (monorepo#1506): the 11 removed `pr.*` methods
 /// fall through the router match to the normal unknown-method path — `-32601
-/// Method not found` over the wire — while `pr.status` / `pr.refresh` stay
+/// Method not found` over the wire — while `pr.refresh` stays
 /// recognized (asserted by the other tests in this file).
 #[intent_test_macros::daemon_test]
 async fn removed_pr_methods_return_method_not_found_over_wss() {
