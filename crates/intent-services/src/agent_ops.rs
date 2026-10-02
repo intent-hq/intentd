@@ -6122,15 +6122,16 @@ impl Services {
                     &workspace_id,
                     &session,
                     remember_specialist && is_manual_foreground_agent(&session),
+                    obj.contains_key("notificationsMuted")
+                        .then_some(session.notifications_muted),
                 )
                 .await?;
         }
-        // `notifications_muted` is excluded from the full-row write above
-        // (its only post-insert mutator is this scoped UPDATE), so a
-        // concurrent `agent.update` on unrelated fields — or a long-lived
-        // in-memory session persisted at turn end — can never revert the
-        // user's toggle. Same-value writes are a store-level no-op.
-        if obj.contains_key("notificationsMuted") {
+        // Mute-only requests retain their narrow write without advancing
+        // activity. Mixed requests apply an explicit mute patch in the session
+        // transaction above; ordinary row writes still exclude this column so
+        // stale sessions cannot revert a toggle. Same-value patches are no-ops.
+        if mute_only {
             self.store
                 .set_agent_notifications_muted(
                     &workspace_id,

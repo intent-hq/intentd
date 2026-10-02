@@ -238,7 +238,7 @@ async fn creation_preferences_roll_back_insert_and_update_when_memory_write_fail
     svc.agent_update(
         id.clone(),
         Some(ws.clone()),
-        json!({"specialist":null,"rememberSpecialist":true}),
+        json!({"specialist":null,"rememberSpecialist":true,"notificationsMuted":true}),
     )
     .await
     .unwrap_err();
@@ -250,6 +250,13 @@ async fn creation_preferences_roll_back_insert_and_update_when_memory_write_fail
             .specialist
             .as_deref(),
         Some("implementor")
+    );
+    assert!(
+        !svc.store
+            .get_agent_session(&id)
+            .await
+            .unwrap()
+            .notifications_muted
     );
     assert_eq!(
         svc.agent_get_creation_preferences(ws.clone())
@@ -470,5 +477,83 @@ async fn creation_preferences_initial_agent_plan_preserves_opt_in_and_name_prove
             .await
             .unwrap(),
         json!({"specialistId":"implementor"})
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn creation_preferences_mixed_mute_failure_rolls_back_all_changes() {
+    let (_tmp, svc, ws) = setup().await;
+    let bus = crate::EventBus::new(svc.store.clone());
+    let svc = svc.with_event_bus(bus.clone());
+    let created = create(
+        &svc,
+        &ws,
+        Some("implementor"),
+        AgentCreateExtra {
+            remember_specialist: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let id = AgentId(created["agent"]["id"].as_str().unwrap().into());
+    let before = svc.store.get_agent_session(&id).await.unwrap();
+    let mut sub = bus.subscribe(crate::SubscriptionFilter {
+        event_types: vec!["agent:updated".into(), "agent:renamed".into()],
+        ..Default::default()
+    });
+    sqlx::query("CREATE TRIGGER fail_preferences_mute BEFORE UPDATE OF notifications_muted ON agent_session BEGIN SELECT RAISE(ABORT, 'test mute failure'); END")
+        .execute(svc.store.write_pool()).await.unwrap();
+    let changes = json!({"specialist":null,"rememberSpecialist":true,"notificationsMuted":true});
+    svc.agent_update(id.clone(), Some(ws.clone()), changes.clone())
+        .await
+        .unwrap_err();
+    let after = svc.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(after.specialist, before.specialist);
+    assert_eq!(after.name, before.name);
+    assert_eq!(after.name_explicitly_set, before.name_explicitly_set);
+    assert_eq!(after.notifications_muted, before.notifications_muted);
+    assert_eq!(after.updated_at, before.updated_at);
+    assert_eq!(
+        svc.agent_get_creation_preferences(ws.clone())
+            .await
+            .unwrap(),
+        json!({"specialistId":"implementor"})
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), sub.recv())
+            .await
+            .is_err(),
+        "failed update must not publish a success event"
+    );
+    sqlx::query("DROP TRIGGER fail_preferences_mute")
+        .execute(svc.store.write_pool())
+        .await
+        .unwrap();
+    svc.agent_update(id.clone(), Some(ws.clone()), changes)
+        .await
+        .unwrap();
+    let after = svc.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(after.specialist, None);
+    assert_eq!(after.name, "Agent");
+    assert!(after.notifications_muted);
+    assert_eq!(
+        svc.agent_get_creation_preferences(ws.clone())
+            .await
+            .unwrap(),
+        json!({"specialistId":null})
+    );
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), sub.recv())
+        .await
+        .expect("successful mixed update event");
+    assert!(event.is_some());
+    svc.store.update_agent_session(&ws, &before).await.unwrap();
+    assert!(
+        svc.store
+            .get_agent_session(&id)
+            .await
+            .unwrap()
+            .notifications_muted,
+        "a stale ordinary row write must preserve the mute toggle"
     );
 }

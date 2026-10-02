@@ -2796,11 +2796,13 @@ impl Store {
         workspace_id: &WorkspaceId,
         s: &AgentSession,
     ) -> Result<()> {
-        self.update_agent_session_with_preferences(workspace_id, s, false)
+        self.update_agent_session_with_preferences(workspace_id, s, false, None)
             .await
     }
 
-    /// Atomically update a session and optionally remember its manual specialist.
+    /// Atomically update a session, optional manual specialist memory, and an
+    /// explicitly requested notification-mute patch. Ordinary row writes omit
+    /// the patch so stale session snapshots cannot revert the user's toggle.
     ///
     /// # Errors
     /// Returns an error if validation or either write fails.
@@ -2809,6 +2811,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         s: &AgentSession,
         remember_specialist: bool,
+        notifications_muted: Option<bool>,
     ) -> Result<()> {
         // Lightweight invariant check: read only workspace_id, model,
         // provider, acp_session_id (finding F3: no message fetch). Workspace
@@ -2867,14 +2870,14 @@ impl Store {
         // Those two attention writers are
         // the only post-insert mutators of the attention columns.
         // `notifications_muted` (0123) is excluded for the same reason: it is
-        // a user toggle whose only post-insert mutator is
-        // `set_agent_notifications_muted`, so a concurrent or long-lived
-        // in-memory session persisted here can never revert the user's mute.
+        // a user toggle changed only by explicit scoped patches, so a
+        // concurrent or long-lived in-memory session persisted here without
+        // such a patch can never revert the user's mute.
         // The creation-only Assistant marker is monotonic: once absent or
         // invalidated, a stale full-row write cannot resurrect it. Evaluate
         // the stored value in this UPDATE, not in the earlier invariant read.
         let metadata = encode_metadata(s.metadata.as_ref())?;
-        let mut tx = if remember_specialist {
+        let mut tx = if remember_specialist || notifications_muted.is_some() {
             Some(
                 self.write_pool()
                     .begin()
@@ -2939,7 +2942,22 @@ impl Store {
             return Err(Error::NotFound(format!("agent session {}", s.id)));
         }
         if let Some(mut tx) = tx {
-            crate::settings_repo::remember_agent_specialist(&mut tx, s).await?;
+            if let Some(muted) = notifications_muted {
+                sqlx::query(
+                    "UPDATE agent_session SET notifications_muted=? \
+                     WHERE id=? AND workspace_id=? AND notifications_muted != ?",
+                )
+                .bind(i64::from(muted))
+                .bind(&s.id.0)
+                .bind(&workspace_id.0)
+                .bind(i64::from(muted))
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("set notifications muted failed: {e}")))?;
+            }
+            if remember_specialist {
+                crate::settings_repo::remember_agent_specialist(&mut tx, s).await?;
+            }
             tx.commit()
                 .await
                 .map_err(|e| Error::Internal(format!("commit agent update: {e}")))?;
@@ -2950,8 +2968,9 @@ impl Store {
     /// Set the session's `notifications_muted` flag (0123) — the store side
     /// of `agent.update { notificationsMuted }`. Returns `true` when the
     /// stored value actually changed; an already-matching flag is a no-op.
-    /// Notification preferences never advance the activity timestamp. The ONLY
-    /// post-insert mutator of the column: the full-row
+    /// Notification preferences never advance the activity timestamp. Both this
+    /// narrow writer and explicit patches in mixed updates preserve the toggle:
+    /// the ordinary full-row
     /// [`Store::update_agent_session`] deliberately excludes it so a concurrent
     /// `agent.update` on unrelated fields, or a
     /// long-lived in-memory session persisted at turn end, can never revert
