@@ -1684,7 +1684,7 @@ async fn git_bindings_agent_commit_filters_to_attributed_paths() {
 //
 
 #[intent_test_macros::daemon_test]
-async fn note_bindings_edit_and_edit_lines() {
+async fn note_bindings_edit_and_cross_workspace_reads() {
     let Some(script) = gate() else { return };
 
     let db_dir = common::test_tempdir("intentd-e2e-note-");
@@ -1698,10 +1698,35 @@ async fn note_bindings_edit_and_edit_lines() {
         .with_event_bus(bus.clone());
 
     let ws = WorkspaceId::new();
-    store
-        .insert_workspace(&workspace(&ws, None))
+    let mut caller = workspace(&ws, None);
+    caller.repository_owner = Some("intent-hq".into());
+    caller.repository_name = Some("binding-fixture".into());
+    store.insert_workspace(&caller).await.expect("insert ws");
+    let sibling_id = WorkspaceId::new();
+    let mut sibling = workspace(&sibling_id, None);
+    sibling.repository_owner = caller.repository_owner.clone();
+    sibling.repository_name = caller.repository_name.clone();
+    store.insert_workspace(&sibling).await.unwrap();
+    let other_id = WorkspaceId::new();
+    let mut other = workspace(&other_id, None);
+    other.repository_owner = caller.repository_owner.clone();
+    other.repository_name = Some("unrelated-repo".into());
+    store.insert_workspace(&other).await.unwrap();
+    let sibling_note = services
+        .create_note(
+            sibling_id.clone(),
+            NoteCreate {
+                title: "Sibling evidence".into(),
+                content: Some("sibling content".into()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+            None,
+        )
         .await
-        .expect("insert ws");
+        .unwrap()
+        .note;
 
     let note = services
         .create_note(
@@ -1749,9 +1774,26 @@ async fn note_bindings_edit_and_edit_lines() {
         await ws.note.edit('{}', {{ old: 'Line 2 original', new: 'Line 2 edited' }});
         await ws.note.editLines('{}', {{ start: 4, end: 4, content: 'Line 4 edited' }});
         const updated = await ws.note.read('{}');
+        const siblings = await ws.crossWorkspace.listSiblings();
+        if (siblings.length !== 1 || siblings[0].id !== '{sibling_id}') throw new Error('wrong siblings');
+        const notes = await ws.crossWorkspace.listNotes('{sibling_id}');
+        if (!notes.some(n => n.id === '{sibling_note_id}')) throw new Error('missing sibling note');
+        const sibling = await ws.crossWorkspace.readNote('{sibling_id}', '{sibling_note_id}');
+        if (sibling.content !== 'sibling content' || sibling.sourceWorkspaceId !== '{sibling_id}') throw new Error('wrong sibling read');
+        let denied = false;
+        try {{ await ws.crossWorkspace.readNote('{other_id}', '{sibling_note_id}'); }}
+        catch (e) {{ denied = String(e).includes('same repository'); }}
+        if (!denied) throw new Error('foreign workspace read was not denied');
+        await ws.note.add('{note_id}', {{ content: 'cross-workspace checks passed' }});
         return {{ content: updated.content }};
         ",
-        note.id.0, note.id.0, note.id.0
+        note.id.0,
+        note.id.0,
+        note.id.0,
+        sibling_id = sibling_id.0,
+        sibling_note_id = sibling_note.id.0,
+        other_id = other_id.0,
+        note_id = note.id.0
     );
 
     let behavior = serde_json::json!({
@@ -1820,5 +1862,10 @@ async fn note_bindings_edit_and_edit_lines() {
         updated.content
     );
 
+    assert!(
+        updated.content.contains("cross-workspace checks passed"),
+        "MCP cross-workspace checks did not finish: {}",
+        updated.content
+    );
     manager.shutdown().await;
 }

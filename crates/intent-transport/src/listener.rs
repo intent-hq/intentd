@@ -44,7 +44,6 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 #[cfg(any(unix, windows))]
 use crate::conn::{outbound_channel, process_frame, ConnSubs};
 #[cfg(any(unix, windows))]
-use crate::forward::ForwardRegistry;
 #[cfg(any(unix, windows))]
 use crate::reverse::{ReverseChannel, ReverseTransport};
 
@@ -273,7 +272,6 @@ where
     });
 
     let mut subs = ConnSubs::default();
-    let mut forwards = ForwardRegistry::default();
     let reverse = ReverseChannel::new(out_tx.priority_sender());
     // REV-2: register this connection's reverse channel with the shared
     // target registry; it becomes an eligible `browser.exec` target once
@@ -335,7 +333,6 @@ where
                 &bus,
                 &out_tx,
                 &mut subs,
-                &mut forwards,
                 &reverse,
                 &reverse_guard,
                 control.as_ref(),
@@ -352,14 +349,13 @@ where
         }
     };
 
-    // Cleanup: abort all subscriptions + forwards, then close the outbound
+    // Cleanup: abort all subscriptions, then close the outbound
     // queue and let the writer finish. The reverse channel and its registry
     // guard hold `out_tx` clones, so both must drop before the writer can
     // observe the channel closing — otherwise the writer (and the socket's
     // write half) would outlive the connection and the peer would never see
     // EOF after a server-initiated close (e.g. an oversized frame).
     drop(subs);
-    drop(forwards);
     reverse.close();
     drop(reverse_guard);
     drop(reverse);

@@ -5395,7 +5395,6 @@ async fn file_tracking_methods_are_routed_not_method_not_found() {
     for method in [
         "file-tracking.getChanges",
         "file-tracking.loadCommits",
-        "file-tracking.getLineStats",
         "file-tracking.getAgentLocks",
     ] {
         let msg = format!(
@@ -5408,11 +5407,7 @@ async fn file_tracking_methods_are_routed_not_method_not_found() {
 
 #[tokio::test]
 async fn file_tracking_reads_require_workspace_id() {
-    for method in [
-        "file-tracking.getChanges",
-        "file-tracking.getLineStats",
-        "file-tracking.getAgentLocks",
-    ] {
+    for method in ["file-tracking.getChanges", "file-tracking.getAgentLocks"] {
         let msg = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{}}}}"#);
         let v = call(&msg).await.unwrap();
         assert_eq!(err_code(&v), -32602);
@@ -5438,43 +5433,23 @@ async fn file_tracking_stage_requires_paths() {
 }
 
 #[tokio::test]
-async fn metrics_methods_are_routed_not_method_not_found() {
-    // `getAllWorkspaceStats` takes no params; the rest carry their required id.
-    for (method, params) in [
-        ("metrics.getWorkspaceStats", r#"{"workspaceId":"ws-1"}"#),
-        ("metrics.getAgentStats", r#"{"agentId":"agent-1"}"#),
-        ("metrics.getAllWorkspaceStats", r"{}"),
-        ("metrics.clearAgentStats", r#"{"agentId":"agent-1"}"#),
-    ] {
-        let msg = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{params}}}"#);
-        let v = call(&msg).await.unwrap();
-        assert_ne!(err_code(&v), -32601, "{method} should be routed");
-    }
+async fn metrics_agent_stats_is_routed() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"metrics.getAgentStats","params":{"agentId":"agent-1"}}"#)
+        .await
+        .unwrap();
+    assert_ne!(err_code(&v), -32601);
 }
 
 #[tokio::test]
-async fn metrics_workspace_stats_requires_workspace_id() {
-    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"metrics.getWorkspaceStats","params":{}}"#)
+async fn metrics_agent_stats_requires_agent_id() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"metrics.getAgentStats","params":{}}"#)
         .await
         .unwrap();
     assert_eq!(err_code(&v), -32602);
     assert_eq!(
         v["error"]["message"],
-        serde_json::json!("workspaceId is required")
+        serde_json::json!("Missing required parameter: agentId")
     );
-}
-
-#[tokio::test]
-async fn metrics_agent_methods_require_agent_id() {
-    for method in ["metrics.getAgentStats", "metrics.clearAgentStats"] {
-        let msg = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{}}}}"#);
-        let v = call(&msg).await.unwrap();
-        assert_eq!(err_code(&v), -32602);
-        assert_eq!(
-            v["error"]["message"],
-            serde_json::json!("Missing required parameter: agentId")
-        );
-    }
 }
 
 #[tokio::test]

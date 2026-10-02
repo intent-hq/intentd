@@ -141,6 +141,71 @@ async fn stop_succeeds_when_daemon_not_running() {
     );
 }
 
+/// A successful exit alone is insufficient: `stop` can fall back to signals
+/// when its RPC disappears. Require the graceful path against a private daemon.
+#[tokio::test]
+async fn retained_cli_status_call_and_graceful_stop() {
+    let root = common::test_tempdir_in("/tmp", "itdc-preserve-");
+    let data_dir = root.path().to_path_buf();
+    let socket = data_dir.join("intentd.sock");
+    let mut daemon = Daemon {
+        child: spawn_daemon(&data_dir),
+        data_dir: data_dir.clone(),
+    };
+    await_socket(&mut daemon, &socket).await;
+
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_intentd"))
+            .args(args)
+            .env("INTENTD_DATA_DIR", &data_dir)
+            .output()
+            .expect("run isolated CLI")
+    };
+    let status = run(&["status"]);
+    assert!(status.status.success(), "{status:?}");
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(stdout.contains("intentd: up"), "{stdout}");
+    assert!(stdout.contains("transports: uds"), "{stdout}");
+    assert!(!stdout.contains("rpc unavailable"), "{stdout}");
+
+    let called = run(&["call", "system.status"]);
+    assert!(called.status.success(), "{called:?}");
+    let result: serde_json::Value = serde_json::from_slice(&called.stdout).unwrap();
+    assert!(result["transports"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("uds")));
+
+    // Reap the daemon concurrently so stop does not mistake its zombie for a
+    // live process and escalate. Both children retain cleanup guards on panic.
+    let mut stop = GuardedChild::spawn(
+        Command::new(env!("CARGO_BIN_EXE_intentd"))
+            .arg("stop")
+            .env("INTENTD_DATA_DIR", &data_dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .expect("spawn stop");
+    let exit = daemon
+        .child
+        .wait_with_timeout(Duration::from_secs(15))
+        .expect("wait for daemon")
+        .expect("daemon should stop");
+    assert!(exit.success(), "daemon did not exit gracefully: {exit}");
+    assert!(stop
+        .wait_with_timeout(Duration::from_secs(15))
+        .unwrap()
+        .expect("stop exits")
+        .success());
+    let output = stop.disarm().wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("graceful shutdown requested"), "{stdout}");
+    assert!(
+        !stdout.contains("SIGTERM") && !stdout.contains("SIGKILL"),
+        "{stdout}"
+    );
+}
+
 /// Spawn a daemon with both UDS and TCP (WSS) listeners, as `intentd pair`
 /// requires a running TCP listener to build the payload. The WSS listener is
 /// enabled via `server.wsApi.enabled` in config.toml. `token` fixes the bearer

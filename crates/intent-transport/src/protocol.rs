@@ -710,7 +710,11 @@ use std::time::{Duration, Instant};
 // events, including committed result/archive state. Presence detects support.
 // Version 11.3 adds workspace-scoped manual specialist preferences; platform
 // support remains independently capability-gated.
-pub const PROTOCOL_VERSION: &str = "11.3";
+// Version 12.0 retires git.diff/git.log aliases, pr.status,
+// file-tracking.getLineStats, metrics.getWorkspaceStats/getAllWorkspaceStats/
+// clearAgentStats, and forward.create/list/close. Canonical git reads,
+// pr.refresh, metrics.getAgentStats, MCP operations and binary /tunnel remain.
+pub const PROTOCOL_VERSION: &str = "12.0";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text
