@@ -1315,7 +1315,7 @@ pub(crate) struct QueuedMessage {
     pub image_blocks: Option<Value>,
     pub file_blocks: Option<Value>,
     pub queued_at: String,
-    /// Latest user contribution time; original queued_at remains the row identity.
+    /// Latest user contribution time; original `queued_at` remains the row identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_human_submission_at: Option<String>,
     #[serde(default)]
@@ -15562,7 +15562,7 @@ impl Services {
     /// everything else, or the interrupted worker's end-of-turn re-kick would
     /// auto-unarchive a freshly archived workspace with no post-archive user
     /// action. Merged rows use their latest human contribution timestamp while
-    /// retaining original queued_at for identity; legacy rows fall back to it.
+    /// retaining original `queued_at` for identity; legacy rows fall back to it.
     /// An unparseable effective timestamp never matches; an
     /// unparseable `since` falls back to [`Self::has_user_origin_ready`]
     /// (fail open — a row without a usable `archivedAt` cannot be compared).
