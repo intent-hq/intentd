@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use intent_core::cli_env::{
-    CodexEnvNames, CLAUDE_CLI_ENV, CLI_NETWORK_ENV, CLI_RUNTIME_ENV, CODEX_CLI_ENV,
+    is_claude_cli_env, is_codex_cli_env, CodexEnvNames, CLI_NETWORK_ENV, CLI_RUNTIME_ENV,
 };
 use intent_core::path_utils::{enhanced_path_dirs, is_executable_file};
 
@@ -49,13 +49,11 @@ impl InstalledCli {
 
     #[must_use]
     pub fn accepts_env(self, key: &str) -> bool {
-        let provider_keys = match self {
-            Self::Codex => CODEX_CLI_ENV,
-            Self::Claude => CLAUDE_CLI_ENV,
+        let provider_input = match self {
+            Self::Codex => is_codex_cli_env(key),
+            Self::Claude => is_claude_cli_env(key),
         };
-        provider_keys.contains(&key)
-            || CLI_NETWORK_ENV.contains(&key)
-            || CLI_RUNTIME_ENV.contains(&key)
+        provider_input || CLI_NETWORK_ENV.contains(&key) || CLI_RUNTIME_ENV.contains(&key)
     }
 
     /// Inherited PATH, then Intent's known install/version-manager directories,
@@ -131,7 +129,8 @@ impl InstalledCliRuntime {
     /// inheritance and removals. Unlisted custom credentials already inherited
     /// by the daemon still reach children. Pass `login_shell_codex_env_names()`
     /// for `codex_names`, or names parsed from the user config before isolating
-    /// a probe's home. This preserves config-referenced shell-only credentials.
+    /// a probe's home. This adds non-prefixed config-referenced shell credentials;
+    /// existing CODEX_/CLAUDE_ inputs do not depend on this name selection.
     /// Non-Unicode daemon env should remain inherited
     /// (callers must prevent captured values replacing such entries).
     ///

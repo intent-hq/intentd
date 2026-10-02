@@ -64,8 +64,8 @@ const ENV_END_SENTINEL: &str = "__INTENT_ENV_E__";
 /// CLI (or its backing SDK) reads it for authentication/configuration —
 /// exact names for cross-provider credentials (Anthropic/OpenAI/xAI keys,
 /// AWS credentials for Bedrock, Hugging Face tokens), one prefix per
-/// provider CLI's own env namespace. Codex/Claude use the audited exact names
-/// in `cli_env` instead of namespace-wide forwarding. Keep in sync with the provider
+/// provider CLI's own env namespace. Codex/Claude namespace and shared inputs
+/// are defined in `cli_env`, excluding Intent-owned controls. Keep in sync with the provider
 /// catalog (`intent-providers`) as providers are added or removed.
 #[cfg(unix)]
 const CREDENTIAL_ENV_EXACT: &[&str] = &[
@@ -363,8 +363,9 @@ fn try_capture_with_flags(shell: &str, flags: &[&str]) -> Option<LoginShellCaptu
     })
 }
 
-/// Load only names referenced by the user's selected Codex configuration before
-/// discarding the raw shell payload. The config is never executed or logged.
+/// Add non-prefixed names referenced by the user's Codex configuration before
+/// discarding the raw shell payload. Existing provider namespaces are captured
+/// independently of configuration. The config is never executed or logged.
 #[cfg(unix)]
 fn capture_credential_env(payload: &str) -> (BTreeMap<String, String>, CodexEnvNames) {
     // Unit tests inject homes directly below; never inspect the developer's
@@ -387,13 +388,17 @@ fn capture_credential_env_for(
         .split('\0')
         .filter_map(|entry| entry.split_once('='))
         .find_map(|(name, value)| (name == "CODEX_HOME").then_some(value));
+    // Select the value the child inherits first. An empty or non-Unicode
+    // inherited value still shadows the shell, but Codex uses its default home.
     let home = inherited_home
+        .or_else(|| shell_home.map(std::ffi::OsStr::new))
+        .and_then(std::ffi::OsStr::to_str)
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .or_else(|| shell_home.map(PathBuf::from))
         .or_else(|| default_home.map(|home| home.join(".codex")));
-    let names = home.filter(|home| !home.as_os_str().is_empty())
+    let names = home
         .map(|home| CodexEnvNames::from_home(&home).unwrap_or_else(|_| {
-            tracing::warn!("could not read Codex config credential references; custom shell credentials unavailable");
+            tracing::warn!("could not read Codex config credential references; additional non-prefixed shell credentials unavailable");
             CodexEnvNames::default()
         })).unwrap_or_default();
     (parse_credential_env_with_names(payload, &names), names)
@@ -442,6 +447,7 @@ pub fn login_shell_credential_env() -> &'static BTreeMap<String, String> {
 /// [`login_shell_credential_env`]. Carry these into the provider environment
 /// overlay, including when a probe subsequently isolates `CODEX_HOME`.
 /// Like the captured shell values, this selection is cached until restart.
+/// CODEX_/CLAUDE_ values are retained independently of these selected names.
 #[must_use]
 pub fn login_shell_codex_env_names() -> &'static CodexEnvNames {
     &login_shell_capture().codex_env_names
@@ -1264,7 +1270,6 @@ mod tests {
             "CODEX_PATH",
             "CLAUDE_CODE_EXECUTABLE",
             "CODEX_CONFIG",
-            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS",
             "NODE_OPTIONS",
             "UNRELATED_SECRET",
         ] {
@@ -1295,12 +1300,95 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn compatibility_regression_empty_or_non_unicode_home_uses_default() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = unique_temp_dir("effective-codex-home");
+        let default = root.path().join(".codex");
+        let shell = root.path().join("shell-home");
+        let opaque = root
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"opaque-\xff"));
+        for (home, name) in [
+            (&default, "DEFAULT_TOKEN"),
+            (&shell, "SHELL_TOKEN"),
+            (&opaque, "OPAQUE_TOKEN"),
+        ] {
+            std::fs::create_dir_all(home).unwrap();
+            std::fs::write(
+                home.join("config.toml"),
+                format!("[model_providers.gateway]\nenv_key=\"{name}\"\n"),
+            )
+            .unwrap();
+        }
+        for (inherited, shell_home) in [
+            (None, ""),
+            (Some(std::ffi::OsStr::new("")), shell.to_str().unwrap()),
+            (Some(opaque.as_os_str()), shell.to_str().unwrap()),
+        ] {
+            let payload = format!("CODEX_HOME={shell_home}\0DEFAULT_TOKEN=synthetic\0SHELL_TOKEN=synthetic\0OPAQUE_TOKEN=synthetic\0");
+            let (captured, names) =
+                capture_credential_env_for(&payload, inherited, Some(root.path()));
+            assert!(
+                names.contains("DEFAULT_TOKEN"),
+                "effective home must fall back to default"
+            );
+            assert!(captured.contains_key("DEFAULT_TOKEN"));
+            assert!(!names.contains("SHELL_TOKEN"));
+            assert!(!names.contains("OPAQUE_TOKEN"));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn compatibility_regression_namespace_capture_is_independent_of_config_selection() {
+        let root = unique_temp_dir("namespace-capture");
+        let config = root.path().join("config.toml");
+        let payload = concat!(
+            "CODEX_FIRST_TOKEN=first\0CODEX_SECOND_TOKEN=second\0",
+            "CODEX_SYSTEM_TOKEN=system\0CODEX_SYSTEM_HEADER=header\0",
+            "CLAUDE_CUSTOM_TOKEN=claude\0UNRELATED_SECRET=excluded\0",
+            "CODEX_PATH=/wrong\0CODEX_CONFIG=unsafe\0CLAUDE_CODE_EXECUTABLE=/wrong\0",
+        );
+        // Missing, malformed, or a first-selected user config must not prune
+        // the namespace snapshot needed by other layers or later selections.
+        for contents in [
+            None,
+            Some("malformed = ["),
+            Some("[model_providers.gateway]\nenv_key=\"CODEX_FIRST_TOKEN\""),
+        ] {
+            if let Some(contents) = contents {
+                std::fs::write(&config, contents).unwrap();
+            }
+            let (captured, _) =
+                capture_credential_env_for(payload, Some(root.path().as_os_str()), None);
+            for key in [
+                "CODEX_FIRST_TOKEN",
+                "CODEX_SECOND_TOKEN",
+                "CODEX_SYSTEM_TOKEN",
+                "CODEX_SYSTEM_HEADER",
+                "CLAUDE_CUSTOM_TOKEN",
+            ] {
+                assert!(captured.contains_key(key), "namespace snapshot lost {key}");
+            }
+            for key in [
+                "UNRELATED_SECRET",
+                "CODEX_PATH",
+                "CODEX_CONFIG",
+                "CLAUDE_CODE_EXECUTABLE",
+            ] {
+                assert!(!captured.contains_key(key));
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn configured_codex_credentials_survive_shell_capture_with_home_precedence() {
         let root = unique_temp_dir("codex-config-env");
         let shell_home = root.path().join("shell home");
         let daemon_home = root.path().join("daemon home");
         for (home, key) in [
-            (&shell_home, "CODEX_GATEWAY_TOKEN"),
+            (&shell_home, "GATEWAY_TOKEN"),
             (&daemon_home, "DAEMON_TOKEN"),
         ] {
             std::fs::create_dir_all(home).unwrap();
@@ -1308,11 +1396,11 @@ mod tests {
                 "[model_providers.gateway]\nenv_key = \"{key}\"\nenv_http_headers = {{Auth = \"GATEWAY_HEADER_TOKEN\"}}"
             )).unwrap();
         }
-        let payload = format!("CODEX_HOME={}\0CODEX_GATEWAY_TOKEN=synthetic\0DAEMON_TOKEN=other\0GATEWAY_HEADER_TOKEN=header\0UNRELATED_SECRET=excluded\0CODEX_PATH=/wrong\0", shell_home.display());
+        let payload = format!("CODEX_HOME={}\0GATEWAY_TOKEN=synthetic\0DAEMON_TOKEN=other\0GATEWAY_HEADER_TOKEN=header\0UNRELATED_SECRET=excluded\0CODEX_PATH=/wrong\0", shell_home.display());
         let (captured, names) = capture_credential_env_for(&payload, None, Some(root.path()));
-        assert!(captured.contains_key("CODEX_GATEWAY_TOKEN"));
+        assert!(captured.contains_key("GATEWAY_TOKEN"));
         assert!(captured.contains_key("GATEWAY_HEADER_TOKEN"));
-        assert!(names.contains("CODEX_GATEWAY_TOKEN"));
+        assert!(names.contains("GATEWAY_TOKEN"));
         assert!(!captured.contains_key("DAEMON_TOKEN"));
         assert!(!captured.contains_key("UNRELATED_SECRET"));
         assert!(!captured.contains_key("CODEX_PATH"));
@@ -1320,7 +1408,7 @@ mod tests {
             capture_credential_env_for(&payload, Some(daemon_home.as_os_str()), Some(root.path()));
         assert!(captured.contains_key("DAEMON_TOKEN"));
         assert!(captured.contains_key("GATEWAY_HEADER_TOKEN"));
-        assert!(!captured.contains_key("CODEX_GATEWAY_TOKEN"));
+        assert!(!captured.contains_key("GATEWAY_TOKEN"));
         assert!(names.contains("DAEMON_TOKEN"));
         let default_home = root.path().join(".codex");
         std::fs::create_dir(&default_home).unwrap();

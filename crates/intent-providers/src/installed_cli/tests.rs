@@ -25,6 +25,52 @@ fn env(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
 }
 
 #[test]
+fn compatibility_regression_provider_namespace_survives_without_config_names() {
+    let dir = scratch();
+    let captured = env(&[
+        ("CODEX_FIRST_TOKEN", "first"),
+        ("CODEX_SECOND_TOKEN", "second"),
+        ("CODEX_SYSTEM_HEADER", "header"),
+        ("CLAUDE_CUSTOM_TOKEN", "claude"),
+        ("CODEX_PATH", "/wrong"),
+        ("CODEX_CONFIG", "unsafe"),
+        ("CLAUDE_CODE_EXECUTABLE", "/wrong"),
+        ("LD_PRELOAD", "unsafe"),
+    ]);
+    for cli in [InstalledCli::Codex, InstalledCli::Claude] {
+        executable(&dir.path().join(cli.command()), "#!/bin/sh\nexit 0\n");
+        let runtime = cli.resolve_in_dirs(&[dir.path().into()], false).unwrap();
+        let selected = runtime
+            .environment(
+                &captured,
+                &env(&[("CODEX_SECOND_TOKEN", "")]),
+                &BTreeMap::new(),
+                &CodexEnvNames::default(),
+            )
+            .unwrap();
+        assert_eq!(selected[cli.path_env()], runtime.path().to_str().unwrap());
+        assert!(!selected.contains_key("LD_PRELOAD"));
+        match cli {
+            InstalledCli::Codex => {
+                assert_eq!(selected["CODEX_FIRST_TOKEN"], "first");
+                assert_eq!(selected["CODEX_SECOND_TOKEN"], "");
+                assert_eq!(selected["CODEX_SYSTEM_HEADER"], "header");
+                assert_eq!(
+                    selected["CODEX_CONFIG"],
+                    crate::CODEX_SUBAGENT_POLICY_CONFIG
+                );
+                assert!(!selected.contains_key("CLAUDE_CUSTOM_TOKEN"));
+            }
+            InstalledCli::Claude => {
+                assert_eq!(selected["CLAUDE_CUSTOM_TOKEN"], "claude");
+                assert!(!selected.contains_key("CODEX_FIRST_TOKEN"));
+                assert!(!selected.contains_key("CODEX_CONFIG"));
+            }
+        }
+    }
+}
+
+#[test]
 fn canonical_names_are_separate_from_adapters_and_missing_is_actionable() {
     let dir = scratch();
     for name in ["codex-acp", "claude-agent-acp", "npx"] {
@@ -191,15 +237,13 @@ fn audited_environment_preserves_empty_values_and_daemon_authority() {
 }
 
 #[test]
-fn audited_environment_excludes_policy_and_unknown_names() {
+fn audited_environment_excludes_policy_and_unrelated_names() {
     for cli in [InstalledCli::Codex, InstalledCli::Claude] {
         for key in [
             "CODEX_PATH",
             "CLAUDE_CODE_EXECUTABLE",
             "CODEX_CONFIG",
             "NODE_OPTIONS",
-            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS",
-            "CODEX_UNKNOWN",
             "UNRELATED_SECRET",
         ] {
             assert!(!cli.accepts_env(key), "unexpected shell capture: {key}");
@@ -343,20 +387,20 @@ fn custom_codex_auth_and_header_credentials_survive_overlay_and_isolation() {
     let names = CodexEnvNames::from_config(
         r#"
         [model_providers.gateway]
-        env_key = "CODEX_GATEWAY_TOKEN"
+        env_key = "GATEWAY_TOKEN"
         env_http_headers = { "Authorization" = "CUSTOM_HEADER_TOKEN", "Reserved" = "CODEX_PATH" }
     "#,
     )
     .unwrap();
     let captured = env(&[
-        ("CODEX_GATEWAY_TOKEN", "shell-key"),
+        ("GATEWAY_TOKEN", "shell-key"),
         ("CUSTOM_HEADER_TOKEN", "shell-header"),
-        ("CODEX_UNRELATED", "excluded"),
+        ("UNRELATED_SECRET", "excluded"),
         ("CODEX_PATH", "/wrong"),
         ("CLAUDE_CODE_API_KEY_HELPER_TTL_MS", "30000"),
         ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
     ]);
-    let inherited = env(&[("CODEX_GATEWAY_TOKEN", "")]);
+    let inherited = env(&[("GATEWAY_TOKEN", "")]);
     let overrides = env(&[
         ("CUSTOM_HEADER_TOKEN", "daemon-header"),
         ("CODEX_HOME", "/isolated"),
@@ -364,11 +408,11 @@ fn custom_codex_auth_and_header_credentials_survive_overlay_and_isolation() {
     let selected = runtime
         .environment(&captured, &inherited, &overrides, &names)
         .unwrap();
-    assert_eq!(selected["CODEX_GATEWAY_TOKEN"], "");
+    assert_eq!(selected["GATEWAY_TOKEN"], "");
     assert_eq!(selected["CUSTOM_HEADER_TOKEN"], "daemon-header");
     assert_eq!(selected["CODEX_HOME"], "/isolated");
     assert_eq!(selected["CODEX_PATH"], runtime.path().to_str().unwrap());
-    assert!(!selected.contains_key("CODEX_UNRELATED"));
+    assert!(!selected.contains_key("UNRELATED_SECRET"));
     executable(&dir.path().join("claude"), "#!/bin/sh\nexit 0\n");
     let claude = InstalledCli::Claude
         .resolve_in_dirs(&[dir.path().into()], false)
@@ -376,7 +420,7 @@ fn custom_codex_auth_and_header_credentials_survive_overlay_and_isolation() {
     let selected = claude
         .environment(&captured, &BTreeMap::new(), &BTreeMap::new(), &names)
         .unwrap();
-    assert!(!selected.contains_key("CODEX_GATEWAY_TOKEN"));
+    assert!(!selected.contains_key("GATEWAY_TOKEN"));
     assert!(!selected.contains_key("CUSTOM_HEADER_TOKEN"));
     assert_eq!(selected["CLAUDE_CODE_API_KEY_HELPER_TTL_MS"], "30000");
     assert_eq!(selected["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"], "1");

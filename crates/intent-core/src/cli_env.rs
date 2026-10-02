@@ -1,12 +1,13 @@
-//! Audited environment names for installed provider CLIs. Values are secrets.
+//! Compatible provider namespaces and audited shared CLI inputs. Values are secrets.
 //!
 //! Shared with login-shell capture so GUI/service launches recover the same
-//! configuration without importing arbitrary shell variables. These lists cover
-//! auth, configuration locations, endpoints, model aliases and networking, not
-//! runtime selection, tool policy, shell hooks, or arbitrary Node options.
+//! configuration without importing every shell variable. Preserve the existing
+//! CODEX_/CLAUDE_ namespaces independently of config-layer or provider selection;
+//! exact names add shared auth, endpoint and network inputs. Intent's selected
+//! executable and enforced policy remain authoritative at launch.
 //! Sources: <https://code.claude.com/docs/en/env-vars> and Codex's configuration
 //! reference (<https://developers.openai.com/codex/config-reference/>).
-//! Custom Codex `env_key` / `env_http_headers` names are selected from user
+//! Non-prefixed Codex `env_key` / `env_http_headers` names are added from user
 //! configuration by [`CodexEnvNames`], never by accepting arbitrary shell env.
 
 /// Proxy and CA settings consumed by the native CLIs and/or their Node adapters.
@@ -120,10 +121,27 @@ pub const CLAUDE_CLI_ENV: &[&str] = &[
 /// Whether a name is relevant to either installed CLI, for shell capture.
 #[must_use]
 pub fn is_installed_cli_env(name: &str) -> bool {
-    CODEX_CLI_ENV.contains(&name)
-        || CLAUDE_CLI_ENV.contains(&name)
+    is_codex_cli_env(name)
+        || is_claude_cli_env(name)
         || CLI_NETWORK_ENV.contains(&name)
         || CLI_RUNTIME_ENV.contains(&name)
+}
+
+/// Preserve the Codex namespace without coupling credentials to one config layer.
+/// Runtime selection and enforced adapter policy are supplied by Intent instead.
+#[must_use]
+pub fn is_codex_cli_env(name: &str) -> bool {
+    CODEX_CLI_ENV.contains(&name)
+        || (name.starts_with("CODEX_")
+            && !name.eq_ignore_ascii_case("CODEX_PATH")
+            && !name.eq_ignore_ascii_case("CODEX_CONFIG"))
+}
+
+/// Preserve Claude's existing namespace, excluding its selected runtime path.
+#[must_use]
+pub fn is_claude_cli_env(name: &str) -> bool {
+    CLAUDE_CLI_ENV.contains(&name)
+        || (name.starts_with("CLAUDE_") && !name.eq_ignore_ascii_case("CLAUDE_CODE_EXECUTABLE"))
 }
 
 /// Exact custom credential names read from Codex model-provider configuration.
