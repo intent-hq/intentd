@@ -6071,6 +6071,7 @@ mod tests {
                     let scripts = mgr.scripts.lock().unwrap();
                     let running = scripts.get(&(h.ws.clone(), id.clone())).unwrap();
                     (running.state.restart_count > 0
+                        || running.run_id.is_none()
                         || running
                             .supervisor
                             .as_ref()
