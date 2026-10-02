@@ -39,10 +39,11 @@ pub use gitlab_token::GitlabTokenSource;
 pub use model::{
     AuthStatus, Branch, BranchRules, CheckRun, CheckState, Comment, CommentAnchor, Issue,
     IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeQueueRemoval,
-    MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrInvolvement,
-    PrObservation, PrPatch, PrQuery, PrState, PullRequest, RateLimitStatus, Repo, RepoRef, Review,
-    ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment, ReviewThreadTally,
-    ReviewVerdict, RollupCheck, RollupCheckKind, ScCapabilities, UserIdentity,
+    MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrAncestry,
+    PrAncestryIdentity, PrInvolvement, PrObservation, PrPatch, PrQuery, PrState, PullRequest,
+    RateLimitStatus, Repo, RepoRef, Review, ReviewComment, ReviewDecision, ReviewThread,
+    ReviewThreadComment, ReviewThreadTally, ReviewVerdict, RollupCheck, RollupCheckKind,
+    ScCapabilities, UserIdentity,
 };
 pub use registry::{GithubSettings, GitlabSettings, SourceControlRegistry, SourceControlSettings};
 /// Re-exported so callers can hand [`gitlab_auth::persist_gitlab_token`] a
@@ -264,6 +265,18 @@ pub trait SourceControl: Send + Sync {
     /// would, [`Error::RateLimited`] included.
     async fn pr_observation(&self, _repo: &RepoRef, _number: u64) -> Result<Option<PrObservation>> {
         Ok(None)
+    }
+
+    /// Compare the observed immutable revisions in the base repository. One
+    /// bounded attempt; ordinary failures degrade to unknown at the service
+    /// boundary, while quota exhaustion must propagate. Unsupported hosts add
+    /// no requests and cannot establish current ancestry.
+    async fn pr_ancestry(
+        &self,
+        _repo: &RepoRef,
+        _identity: &PrAncestryIdentity,
+    ) -> Result<PrAncestry> {
+        Ok(PrAncestry::Unknown)
     }
 
     /// List issue/PR (conversation) comments.

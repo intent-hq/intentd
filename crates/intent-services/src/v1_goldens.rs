@@ -756,6 +756,8 @@ fn merge_requirements(
     unresolved: i64,
 ) -> crate::pr_ops::MergeRequirements {
     crate::pr_ops::MergeRequirements {
+        ancestry: intent_sourcecontrol::PrAncestry::Unknown,
+        branch_update_required: None,
         state: state.to_string(),
         is_draft: false,
         has_conflicts: false,

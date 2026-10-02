@@ -4,7 +4,7 @@
 //! reordered pages below are controlled experiments, not observed GitHub churn.
 
 #[path = "../../../../intent-sourcecontrol/tests/support/qwen.rs"]
-mod qwen;
+pub(super) mod qwen;
 
 use std::collections::BTreeMap;
 

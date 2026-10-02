@@ -51,7 +51,7 @@
 //! Actual spend on a quiet PR is lower than the cost model: every sweep
 //! poll issues `get_pr`, but the sub-reads (merge-requirements probe,
 //! reviews, review threads, conversation comments) are skipped while the
-//! PR's change fingerprint — `updatedAt`, head SHA, lifecycle/draft flags,
+//! PR's change fingerprint — `updatedAt`, head/live base SHA, target/fork, lifecycle/draft flags,
 //! mergeability — is unchanged since the last full fetch, bounded by
 //! [`PR_MONITOR_MAX_CHEAP_POLLS`] and [`PR_MONITOR_MAX_CHEAP_AGE`] so
 //! signals the fingerprint does not cover (check runs, merge-queue events)
@@ -490,6 +490,7 @@ impl PrMonitorSnapshot {
 /// removed" change from a sibling monitor's baseline.
 #[derive(Debug, Clone)]
 pub struct SharedPrSnapshot {
+    ancestry_identity: Option<intent_sourcecontrol::PrAncestryIdentity>,
     pub(crate) title: String,
     pub(crate) url: String,
     pub(crate) head_sha: Option<String>,
@@ -623,6 +624,8 @@ impl SharedPrSnapshot {
 struct PrFingerprint {
     updated_at: String,
     head_sha: Option<String>,
+    target_branch: String,
+    ancestry_identity: Option<intent_sourcecontrol::PrAncestryIdentity>,
     state: PrState,
     draft: bool,
     mergeable: Option<bool>,
@@ -630,10 +633,15 @@ struct PrFingerprint {
 }
 
 impl PrFingerprint {
-    fn of(pr: &PullRequest) -> Self {
+    fn of(
+        pr: &PullRequest,
+        ancestry_identity: Option<&intent_sourcecontrol::PrAncestryIdentity>,
+    ) -> Self {
         Self {
             updated_at: pr.updated_at.clone(),
             head_sha: pr.head_sha.clone(),
+            target_branch: pr.target_branch.clone(),
+            ancestry_identity: ancestry_identity.cloned(),
             state: pr.state,
             draft: pr.draft,
             mergeable: pr.mergeable,
@@ -732,7 +740,7 @@ impl PrCacheEntry {
         Self {
             authorization: None,
             record_started_at: now,
-            fingerprint: PrFingerprint::of(&pr),
+            fingerprint: PrFingerprint::of(&pr, snapshot.ancestry_identity.as_ref()),
             pr,
             snapshot,
             fetched_at: now,
@@ -906,7 +914,7 @@ static NONE: std::sync::LazyLock<HashSet<PrKey>> = std::sync::LazyLock::new(Hash
 ///
 /// | path | before | after |
 /// |---|---|---|
-/// | happy (host folds the read) | 6 — `get_pr`, `merge_requirements` (GraphQL + branch-rules REST = 2 HTTP), `list_reviews`, `review_decision`, `get_review_threads`, `list_comments` (7 HTTP) | 2 — `pr_observation` (1 GraphQL request, 1 rate-limit point), `branch_rules` |
+/// | happy (host folds the read) | 6 — `get_pr`, `merge_requirements` (GraphQL + branch-rules REST = 2 HTTP), `list_reviews`, `review_decision`, `get_review_threads`, `list_comments` (7 HTTP) | up to 3 — `pr_observation` (1 GraphQL request), `branch_rules` (unless cached), `pr_ancestry` (one REST compare when live revisions are known and PR open) |
 /// | host without a folded read | 6 (7 HTTP) | 6 (7 HTTP), unchanged |
 /// | REST fallback (probe + threads down), host without a folded read | 8 | 8, unchanged |
 /// | REST fallback, host with a folded read whose GraphQL is down | 8 | 9 — the failed `pr_observation` attempt, then the 8 |
@@ -978,6 +986,7 @@ async fn shared_snapshot_from_observation(
     let read =
         pr_ops::merge_requirements_from_observation(sc, repo_ref, number, &observation).await?;
     let snapshot = SharedPrSnapshot {
+        ancestry_identity: observation.ancestry_identity.clone(),
         title: observation.pr.title.clone(),
         url: observation.pr.url.clone(),
         head_sha: observation.pr.head_sha.clone(),
@@ -1139,7 +1148,12 @@ async fn poll_pr(
         .map_err(pr_ops::map_sc_err)?,
     };
     ensure_current_pr_authorization(authorization.as_ref())?;
-    let fingerprint = PrFingerprint::of(&pr);
+    let fingerprint = PrFingerprint::of(
+        &pr,
+        observation
+            .as_ref()
+            .and_then(|o| o.ancestry_identity.as_ref()),
+    );
     let now = Instant::now();
     let reused = {
         let mut cache = cache.lock().unwrap();
@@ -1235,6 +1249,7 @@ async fn finish_shared_snapshot(
         }
     };
     let snapshot = SharedPrSnapshot {
+        ancestry_identity: None,
         title: pr.title.clone(),
         url: pr.url.clone(),
         head_sha: pr.head_sha.clone(),
@@ -4356,6 +4371,7 @@ impl Services {
 
 #[cfg(test)]
 mod tests {
+    mod ancestry_regression;
     mod quota_regression;
     mod qwen_regression;
     use std::path::PathBuf;
@@ -4914,6 +4930,7 @@ mod tests {
             let (review_comment_count, unresolved) =
                 crate::pr_ops::count_thread_comments(&thread_page(&s.threads));
             Ok(Some(PrObservation {
+                ancestry_identity: None,
                 pr: s.pr_record(number),
                 signals: s.signals(),
                 reviews: (!folded.overflow_reviews).then(|| s.reviews()),
@@ -5368,6 +5385,8 @@ mod tests {
             conversation_count: 1,
             review_comment_count: 2,
             requirements: MergeRequirements {
+                ancestry: intent_sourcecontrol::PrAncestry::Unknown,
+                branch_update_required: None,
                 state: "open".into(),
                 is_draft: false,
                 has_conflicts: false,
@@ -5896,6 +5915,7 @@ mod tests {
     /// materialize tests vary `ejection_known` and the previous snapshot.
     fn shared_from(s: &PrMonitorSnapshot, ejection_known: bool) -> SharedPrSnapshot {
         SharedPrSnapshot {
+            ancestry_identity: None,
             title: s.title.clone(),
             url: s.url.clone(),
             head_sha: s.head_sha.clone(),

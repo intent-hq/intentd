@@ -47,6 +47,9 @@ pub struct State {
     pub rest_unreadable: bool,
     pub rest_fault: Option<CheckFault>,
     pub rest_head: Option<String>,
+    pub compare_status: u16,
+    pub compare: Value,
+    pub ancestry_page_change: Option<(&'static str, Value)>,
 }
 
 impl State {
@@ -80,6 +83,9 @@ impl State {
             rest_unreadable: false,
             rest_fault: None,
             rest_head: None,
+            compare_status: 200,
+            compare: json!({"behind_by": 1, "commits": []}),
+            ancestry_page_change: None,
         }
     }
 
@@ -143,6 +149,9 @@ impl State {
             _ => {}
         }
         if offset > 0 {
+            if let Some((field, value)) = &self.ancestry_page_change {
+                pr[*field] = value.clone();
+            }
             match self.fault {
                 Some(CheckFault::HeadChanged) => {
                     pr["headRefOid"] = json!("different-head");
@@ -153,6 +162,12 @@ impl State {
                 }
                 _ => {}
             }
+        }
+        if !query.contains("baseRef{target{oid}}") {
+            pr.as_object_mut().unwrap().remove("baseRef");
+        }
+        if !query.contains("headRepository{id}") {
+            pr.as_object_mut().unwrap().remove("headRepository");
         }
         pr
     }
@@ -169,6 +184,9 @@ impl State {
     }
 
     fn respond(&self, target: &str, body: &Value) -> (u16, Value) {
+        if target.contains("/compare/") {
+            return (self.compare_status, self.compare.clone());
+        }
         if target == "/graphql" {
             let query = body["query"].as_str().unwrap();
             if (query.contains("GetPrObservation") && self.mode != ReadMode::Folded)
