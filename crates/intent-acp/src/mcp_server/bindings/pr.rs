@@ -214,6 +214,67 @@ mod tests {
         (spy, api, WorkspaceId::from_string("ws-pr"))
     }
 
+    struct ProjectionApi(Value);
+
+    impl WorkspaceApi for ProjectionApi {
+        fn pr_state(
+            &self,
+            _workspace_id: WorkspaceId,
+            _pr_number: u64,
+            _repo: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async { Ok(json!({"requirements": self.0})) })
+        }
+
+        fn pr_monitor_start(
+            &self,
+            _workspace_id: WorkspaceId,
+            _agent_id: AgentId,
+            _pr_number: u64,
+            _repo: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async {
+                Ok(json!({"ok": true, "requirements": self.0, "monitor": {"lastSnapshot": self.0}}))
+            })
+        }
+
+        fn pr_monitor_list(
+            &self,
+            _workspace_id: WorkspaceId,
+            _agent_id: Option<AgentId>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async { Ok(json!({"monitors": [{"lastSnapshot": self.0}]})) })
+        }
+    }
+
+    #[tokio::test]
+    async fn ancestry_projections_pass_through_snapshot_registration_and_list() {
+        for fields in [
+            json!({"isBehind":false,"ancestry":{"status":"known","baseSha":"a".repeat(40),"headSha":"b".repeat(40),"behindBy":1},"branchUpdateRequired":false}),
+            json!({"isBehind":true,"ancestry":{"status":"unknown"},"branchUpdateRequired":true}),
+            json!({"isBehind":false,"ancestry":{"status":"unknown"}}),
+            json!({"isBehind":false}),
+        ] {
+            let api: Arc<dyn WorkspaceApi> = Arc::new(ProjectionApi(fields.clone()));
+            let ws = WorkspaceId::from("ws-pr");
+            let caller = AgentId::from("agent-caller");
+            let args = json!({"prNumber":7});
+            let snapshot = dispatch(&api, &ws, Some(&caller), "snapshot", &args)
+                .await
+                .unwrap();
+            let registered = dispatch(&api, &ws, Some(&caller), "monitor", &args)
+                .await
+                .unwrap();
+            let listed = dispatch(&api, &ws, Some(&caller), "monitors", &json!({}))
+                .await
+                .unwrap();
+            assert_eq!(snapshot["requirements"], fields);
+            assert_eq!(registered["requirements"], fields);
+            assert_eq!(registered["monitor"]["lastSnapshot"], fields);
+            assert_eq!(listed[0]["lastSnapshot"], fields);
+        }
+    }
+
     #[tokio::test]
     async fn monitor_methods_without_caller_context_never_reach_the_service() {
         for (method, args) in [

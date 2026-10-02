@@ -136,6 +136,21 @@ impl Transport {
         quota_probe: bool,
         operation_override: Option<Operation>,
     ) -> octocrab::Octocrab {
+        self.client_with_retry_policy(quota_probe, operation_override, !quota_probe)
+    }
+
+    /// Optional ancestry reads get one attempt; the next bounded full refresh
+    /// is their retry. Keep normal PR accounting and quota admission intact.
+    pub fn comparison_client(&self) -> octocrab::Octocrab {
+        self.client_with_retry_policy(false, Some(Operation::PrDetail), false)
+    }
+
+    fn client_with_retry_policy(
+        &self,
+        quota_probe: bool,
+        operation_override: Option<Operation>,
+        retry_errors: bool,
+    ) -> octocrab::Octocrab {
         let pool = self.pool.clone();
         let graphql_path = format!("{}/graphql", self.base.path().trim_end_matches('/'));
         // Octocrab buffers requests on another task; capture before that hop.
@@ -192,10 +207,10 @@ impl Transport {
         // the gate-owned quota probes. Every retry enters `counted` separately.
         let retry = tower::retry::Retry::new(
             AdmittedRetry {
-                policy: if quota_probe {
-                    RetryConfig::None
-                } else {
+                policy: if retry_errors {
                     RetryConfig::Simple(3)
+                } else {
+                    RetryConfig::None
                 },
                 admission: retry_admission,
             },
