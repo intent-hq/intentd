@@ -614,7 +614,7 @@ jobs:
   # lose the strict up-to-date race against main. This job diffs the PR
   # against its base and emits fast_path=true only when the diff has exactly
   # the release shape (files ⊆ {CHANGELOG.md, Cargo.lock, crates/*/Cargo.toml}
-  # and every non-changelog change is a uniform old→new version-string flip;
+  # and every non-changelog change is a package version or its matching local dependency;
   # see scripts/release-pr-fast-path.sh). The diff shape is the ONLY signal —
   # never branch name or author — so a PR can't spoof its way past the heavy
   # checks: any real code change breaks the shape. Fail-safe, not fail-open:
@@ -1623,6 +1623,10 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
+      - name: Test release metadata and auto-cut guards (offline)
+        run: |
+          python3 -S scripts/test-release-pr-fast-path.py
+          python3 -S scripts/test-auto-cut-alpha.py
       - name: Test release quota failure guidance (offline)
         run: python3 -S scripts/test-release-plz-release.py
       - name: Test aggregate-channel-notes.sh
