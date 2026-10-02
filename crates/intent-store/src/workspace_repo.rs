@@ -811,7 +811,11 @@ impl Store {
 
         #[cfg(test)]
         {
-            let barrier = self.desktop_delete_barrier.lock().unwrap().clone();
+            let barrier = self
+                .desktop_delete_barrier
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             if let Some(barrier) = barrier {
                 barrier.entered.notify_one();
                 barrier.release.notified().await;
