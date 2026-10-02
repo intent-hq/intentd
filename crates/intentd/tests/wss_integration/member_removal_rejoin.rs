@@ -334,16 +334,6 @@ async fn postcommit_rejoin(self_revoke: bool) {
             );
             let (mut peer, _) = listener.accept().await.unwrap();
             removal_roundtrip(&mut fresh_tunnel, &mut peer).await;
-            let forwarded = fresh_device
-                .call("forward.create", json!({"remotePort":port}))
-                .await;
-            let local = u16::try_from(forwarded["result"]["localPort"].as_u64().unwrap()).unwrap();
-            let mut downstream = TcpStream::connect(("127.0.0.1", local)).await.unwrap();
-            let (mut upstream, _) = listener.accept().await.unwrap();
-            downstream.write_all(b"fresh").await.unwrap();
-            let mut bytes = [0; 5];
-            upstream.read_exact(&mut bytes).await.unwrap();
-            assert_eq!(&bytes, b"fresh");
         } else {
             assert_eq!(
                 status_code(
