@@ -2628,6 +2628,97 @@ async fn wss_agent_retire_cascade_guard_hooks_and_watches() {
     srv.ws.stop().await;
 }
 
+/// Real pinned TLS + authenticated JSON-RPC contract for bundled footer rows.
+#[intent_test_macros::daemon_test]
+async fn wss_get_subscriptions_bundles_slim_agents() {
+    use serde_json::json;
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("model.defaultProvider", json!("auggie"));
+    let created = wss_call(srv.port, srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Subscriptions"}}"#).await;
+    let ws = created["result"]["workspace"]["id"].as_str().unwrap();
+    let mut ids = Vec::new();
+    for (id, name) in [(2, "Parent"), (3, "Participant")] {
+        let created = wss_call(srv.port, srv.cfg.clone(), &json!({
+            "jsonrpc":"2.0", "id":id, "method":"agent.create", "params":{"workspaceId":ws,"name":name}
+        }).to_string()).await;
+        ids.push(
+            created["result"]["agent"]["id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    let parent = &ids[0];
+    let child = &ids[1];
+    let mut session = srv
+        .store
+        .get_agent_session_summary(&intent_core::AgentId::from(child.as_str()))
+        .await
+        .unwrap();
+    session.context_references = Some(json!([{"text": "context".repeat(5000)}]));
+    session.completion_report = Some("report".repeat(5000));
+    session.initial_message = Some("initial".repeat(5000));
+    srv.store
+        .update_agent_session(&WorkspaceId::from(ws), &session)
+        .await
+        .unwrap();
+    srv.store
+        .set_agent_session_status(
+            &WorkspaceId::from(ws),
+            &intent_core::AgentId::from(child.as_str()),
+            intent_core::AgentStatus::Active,
+            true,
+            &now_iso(),
+            None,
+        )
+        .await
+        .unwrap();
+    srv.api
+        .agent_watch(
+            WorkspaceId::from(ws),
+            intent_core::AgentId::from(parent.as_str()),
+            intent_core::AgentId::from(child.as_str()),
+        )
+        .await
+        .unwrap();
+    let response = wss_call(srv.port, srv.cfg.clone(), &json!({
+        "jsonrpc":"2.0", "id":5, "method":"agent.getSubscriptions", "params":{"workspaceId":ws,"agentId":parent}
+    }).to_string()).await;
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 5);
+    assert!(response.get("error").is_none(), "{response}");
+    let result = &response["result"];
+    assert_eq!(result.as_object().unwrap().len(), 5);
+    assert_eq!(result["agents"].as_array().unwrap().len(), 1);
+    let row = &result["agents"][0];
+    assert_eq!(row["id"], *child);
+    assert_eq!(row["workspaceId"], ws);
+    assert_eq!(row["name"], "Participant");
+    for key in [
+        "messages",
+        "harnessFeatures",
+        "contextReferences",
+        "fileBlocks",
+        "effortLevels",
+        "stats",
+    ] {
+        assert!(row.get(key).is_none(), "detail-only {key}: {row}");
+    }
+    assert!(row.to_string().len() <= intent_core::AGENT_LIST_ROW_BUDGET_BYTES);
+    assert!(
+        row["metadata"]["completionReport"].as_str().unwrap().len()
+            <= intent_core::AGENT_LIST_PREVIEW_BUDGET_BYTES
+    );
+    assert!(row["metadata"].get("initialMessage").is_none());
+    assert!(result["agentStatuses"].get(parent).is_some());
+    assert!(result["agentStatuses"].get(child).is_some());
+    assert_eq!(result["subscriptions"].as_array().unwrap().len(), 1);
+    assert_eq!(result["delegationGroups"], json!([]));
+    assert_eq!(result["eventSubscriptions"], json!([]));
+    srv.ws.stop().await;
+}
+
 /// List-payload cost contract (extending monorepo#2932): `agent.list` rows
 /// bound every render-preview field — `lastAgentResponse`, `lastUserMessage`,
 /// `digest`, `lastToolUse`, `metadata.completionReport` — to the render-sized
