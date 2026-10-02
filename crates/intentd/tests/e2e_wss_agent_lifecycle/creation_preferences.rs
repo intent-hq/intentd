@@ -199,12 +199,17 @@ async fn creation_preferences_workspace_initial_agent_ui_shape_over_wss() {
     .await;
     assert!(subscribed["subscriptionId"].is_string());
     for (name, explicit, remember, specialist) in [
-        ("Implementor", Some(false), true, Some("implementor")),
-        ("My initial task", None, true, Some("implementor")),
-        ("Legacy custom", None, false, Some("implementor")),
-        ("Agent", Some(false), true, None),
+        (Some("Implementor"), Some(false), true, Some("implementor")),
+        (Some("My initial task"), None, true, Some("implementor")),
+        (Some("Legacy custom"), None, false, Some("implementor")),
+        (Some("Agent"), Some(false), true, None),
+        (None, Some(false), true, None),
     ] {
-        let mut initial = json!({"name":name,"provider":"mock","model":"default","rememberSpecialist":remember,"prompt":format!("Initial naming case {name}: fix sidebar selection")});
+        let label = name.unwrap_or("Nameless General");
+        let mut initial = json!({"provider":"mock","model":"default","rememberSpecialist":remember,"prompt":format!("Initial naming case {label}: fix sidebar selection")});
+        if let Some(name) = name {
+            initial["name"] = json!(name);
+        }
         if let Some(explicit) = explicit {
             initial["nameExplicitlySet"] = json!(explicit);
         }
@@ -219,7 +224,12 @@ async fn creation_preferences_workspace_initial_agent_ui_shape_over_wss() {
         )
         .await;
         assert!(created.get("error").is_none(), "{created}");
-        assert_eq!(created["result"]["initialAgent"]["name"], name);
+        let generated_name = created["result"]["initialAgent"]["name"].as_str().unwrap();
+        if let Some(name) = name {
+            assert_eq!(generated_name, name);
+        } else {
+            assert!(generated_name.starts_with("Agent "));
+        }
         assert_eq!(
             created["result"]["initialAgent"]["nameExplicitlySet"],
             explicit.unwrap_or(true)
@@ -244,9 +254,9 @@ async fn creation_preferences_workspace_initial_agent_ui_shape_over_wss() {
         let agent_id = created["result"]["initialAgent"]["id"].as_str().unwrap();
         for turn in 0..2 {
             let content = if turn == 0 {
-                format!("Initial naming case {name}: fix sidebar selection")
+                format!("Initial naming case {label}: fix sidebar selection")
             } else {
-                format!("Follow-up naming case {name}: check sidebar selection")
+                format!("Follow-up naming case {label}: check sidebar selection")
             };
             if turn > 0 {
                 let sent = wss_rpc(
@@ -288,15 +298,41 @@ async fn creation_preferences_workspace_initial_agent_ui_shape_over_wss() {
             assert_eq!(
                 text.contains("This agent still has a generated name"),
                 explicit == Some(false) && turn == 0,
-                "case {name} turn {turn}: {text}"
+                "case {label} turn {turn}: {text}"
             );
             assert!(!text.contains("This workspace needs a title"));
         }
         let got = wss_rpc(&mut rpc, 26, "agent.get", json!({"agentId":agent_id})).await;
         assert_eq!(
-            got["agent"]["name"], name,
+            got["agent"]["name"], generated_name,
             "naming hints do not mutate names"
         );
+        if name.is_none() {
+            let updated = wss_rpc(
+                &mut rpc,
+                27,
+                "agent.update",
+                json!({
+                    "workspaceId":ws,"agentId":agent_id,
+                    "changes":{"specialist":"implementor","rememberSpecialist":true}
+                }),
+            )
+            .await;
+            assert_eq!(
+                updated["agent"]["name"], "Implementor",
+                "welcome selection recognizes the daemon-generated General name"
+            );
+            assert_eq!(
+                wss_rpc(
+                    &mut rpc,
+                    28,
+                    "agent.getCreationPreferences",
+                    json!({"workspaceId":ws})
+                )
+                .await,
+                json!({"specialistId":"implementor"})
+            );
+        }
     }
     let before = wss_rpc(&mut rpc, 22, "workspace.list", json!({})).await;
     for initial in [
