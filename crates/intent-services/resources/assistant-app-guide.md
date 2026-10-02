@@ -1,6 +1,6 @@
 # Intent app guide for the Assistant
 
-This bundled guide supplies current app feature context. Use this copy instead of
+This bundled guide describes the app shipped with the daemon build supplying it. Use this copy instead of
 earlier copies in the conversation for UI facts; preserve the user's customized
 Assistant behavior. It describes supported paths, not the user's current settings,
 connection, permissions, or installed frontend version. Read live tools when those
@@ -22,7 +22,23 @@ requirements do not, by themselves, make a supported feature experimental.
 Multiplayer, Collaboration, and personal device pairing are currently experimental.
 Do not introduce them in routine answers about settings, devices, or mobile pairing.
 
+<!-- Sources: packages/cloudlands-fe/src/features/devices/{PersonalDevicesPanel.svelte,personal-devices-selectors.ts}; src/store/renderer/slices/principal/principal-selectors.ts; messages/en.json. -->
+
+Only when explicitly asked about personal device pairing: it pairs another device
+with the signed-in person's current access. It is separate from the local Remote
+Access QR, which grants access to that computer. Do not offer the local QR as a
+substitute or unrelated alternative. If the user asks where to test personal
+pairing, use **Settings → Devices → Signed-in devices → Pair another device as me**.
+The action requires Multiplayer to be enabled, a current signed-in identity, and
+the connection's personal-pairing capability. Connected-device list support is
+independent. Do not invent a readiness date or advise enabling the experiment for
+ordinary mobile setup.
+
 ## Finding things
+
+Answer location questions with the destination and action first. Read settings only
+when current state affects the answer or the user reports a problem; finding a
+control is not a request to change configuration.
 
 The paths below identify the documented UI destinations. `ws.app.ui.targets()` can
 omit known destinations: an omission does not mean the feature is missing. Use a
@@ -33,7 +49,9 @@ settings category is not necessarily a visible Settings section. If navigation
 cannot open a documented destination, explain how to reach it manually and check
 the current connection, access, and version rather than guessing another URL.
 
-## Settings
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/settings/SettingsSidebarNav.svelte; src/shared/app-ui-targets.ts; messages/en.json. -->
+
+## Find a setting
 
 Open Settings and use these sidebar labels (English labels shown):
 
@@ -49,8 +67,17 @@ Open Settings and use these sidebar labels (English labels shown):
 | Workspace setup | Git, shell, and workspace defaults | `/settings?tab=setup#git-workspace` |
 | Advanced | Agent backend, connection, tool output/retention, data, reset | `/settings?tab=advanced#workspace-api` |
 
-For MCP configuration, use `/settings?tab=connections#mcp-servers`; for the default
-model, use `/settings?tab=providers#utility-default-model`. Specialist entries appear
+For MCP configuration, open **Connections → MCP servers**; its reference route is `/settings?tab=connections#mcp-servers`.
+
+## Choose a model or change agent behavior
+
+<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/lib/components/settings/SettingsSidebarNav.svelte; packages/cloudlands-fe/src/shared/app-ui-targets.ts. -->
+
+For the default model, open **Settings → Providers → Default model**
+(`/settings?tab=providers#utility-default-model`). For new work, choose a model in
+the workspace creation form where offered. Available choices depend on configured
+providers; diagnose a missing provider in **Providers**. Do not promise a default
+change will switch an existing agent. Specialist entries appear
 in the Settings sidebar's Agents group. Create one at
 `/settings?tab=specialists&view=create-specialist#create-specialist`; select an
 existing specialist to edit its behavior. Global defaults and a specialist's
@@ -61,47 +88,73 @@ Settings sections and controls can depend on platform, daemon capabilities, or
 access. A supported route does not grant permissions or prove that a control is
 available on the current connection.
 
-## Mobile pairing and QR codes
+<!-- Sources: packages/cloudlands-fe/src/lib/components/settings/{DevicesSettings,WebSocketApiSettings}.svelte; packages/cloudlands-fe/src/store/renderer/slices/websocket-api/sagas/websocket-api-saga.ts. -->
+
+## Find the mobile pairing QR code
 
 Open **Settings → Devices**, open the local machine's actions menu, choose **Edit**,
-then find **Connect from other apps → Show QR Code**. The direct Remote Access
-link, `/settings?tab=devices#websocket-api`, opens the local editing panel.
-The pairing row appears when **Remote Access** is enabled and that panel is
-expanded. Generating the QR also needs a running listener port and loaded pairing
-data. If Remote Access is off, explain that it must be enabled for this flow;
-do not silently change it. If generation fails, inspect the connection/listener
-error. TLS and tunnel switches are not visibility requirements for this QR row:
+then choose **Connect from other apps → Show QR Code** to display the pairing QR.
+Use the mobile app's pairing scanner. The Remote Access reference route,
+`/settings?tab=devices#websocket-api`, opens the local editing panel.
+
+If the row is missing: it appears when **Remote Access** is enabled and that panel is
+expanded. If Remote Access is off, explain that it must be enabled for this flow;
+do not silently change it. If the row is present but generation fails, inspect the
+connection/listener error: generation needs a running listener port and loaded
+pairing data. TLS and tunnel switches are not visibility requirements for this QR row:
 do not suggest toggling them to reveal it. This QR grants access to the local
 machine; do not offer it as a substitute for someone else's restricted access.
 
-Use the mobile app's pairing scanner for the displayed QR. Pairing links and QR
-codes contain credentials; keep them private. A visible QR does not prove that the
+Pairing links and QR codes contain credentials; keep them private. A visible QR does not prove that the
 phone can reach the host. Diagnose address/network reachability separately from
 finding the QR control.
 
-## Devices and remote access
+## Find work on another device
 
 Devices lists the local machine and saved remote connections. **Add device** opens
 the connection form; a remote device's actions include **Edit** and **Connect**,
 with **Test connection** inside its editing panel. Workspaces and agents belong to a
 host, so identify the intended device before explaining missing work or changing
-host settings. Local Remote Access
-controls how other apps connect to this machine. Enabling access, changing listening
+host settings. The local Remote Access panel
+controls the desktop's local machine even while the app is connected to a remote
+daemon; it does not configure that remote host. Enabling access, changing listening
 addresses, and configuring a tunnel are separate choices from displaying pairing
 information. Read current state and respect the user's requested scope.
 
-## Workspaces, notes, and agents
+## Start or continue work
 
-Use `/workspace/new` to start a workspace for a repository and describe the work.
-Open an existing workspace from its card or sidebar entry. A workspace groups its
-working files, notes, and agent conversations; its title and status help identify it.
-Use the workspace's **Notes** panel to open the **Spec** or other notes, and **New
-note** to add shared context. Task notes track assigned work; they are not separate
-repositories. Keep decisions and deliverables in the relevant workspace note.
+<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/{CompactWorkspaceInitializer,MultiSelectTabbedSidebar,CreateAgentSection}.svelte; messages/en.json. -->
 
-Create an agent within the intended workspace, choosing its specialist and model
-where offered. Open an existing agent to continue its conversation and inspect its
-status before starting duplicate work. Specialist settings define reusable behavior;
-an agent is a particular conversation doing work. Use live workspace, note, and agent
-tools for actual IDs, progress, and available actions; never construct links from
-guessed IDs or claim work completed from a static guide.
+Open **New workspace** (`/workspace/new`), select a repository, describe the work,
+and choose **Create workspace**. The workspace groups working files, notes, and
+agent conversations. Resolve any displayed repository, Git, or provider setup
+error before retrying. If creation succeeded but sending the first message failed,
+use the form's retry instruction instead of creating a second workspace.
+
+To continue work, open its existing card or sidebar entry, then the existing agent's
+conversation. Read its status and last response before sending a follow-up. Use
+**Create new agent** in that workspace only when a separate conversation is needed;
+choose a specialist and model where offered. A specialist defines reusable behavior;
+an agent is a particular conversation doing work.
+
+## Add context, run a task, and find results
+
+<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/MultiSelectTabbedSidebar.svelte; sidebar/{AddContextSection,ContextPanel,NotesPanel}.svelte; NoteMetadataBar.svelte (sidebar/ and NoteMetadataBar paths relative to the same workspace component directory); messages/en.json. -->
+
+In the workspace sidebar, open **Context** to find the **Spec** and other notes.
+Use its **Add context** action to create a note. In layouts showing the Notes-panel
+button, its visible label is **Attach more context**; **New note** is the tooltip.
+Notes hold shared context, decisions, and deliverables for that workspace.
+
+Open a task note and inspect its status and assigned agent first. Select the
+assigned agent to continue existing work. To start an agent for the task, use the
+play button labeled **Run agent** when available. This creates an agent and sends
+the task's initial message; do not use it to duplicate work already underway.
+It is a task-note action, not an action on the Spec or every ordinary note. Access
+can hide it; explain the observed limitation instead of promising it is always there.
+
+Find results in the agent's conversation and relevant task note; follow the file
+or artifact links the agent supplied. A status label alone is not proof that work
+succeeded. Use live workspace, note, and agent tools for actual IDs, progress, and
+available actions. Never construct links from guessed IDs or claim completion from
+this static guide.

@@ -5253,16 +5253,9 @@ impl AgentManager {
             _ => synthesised.as_deref().filter(|ctx| !ctx.is_empty()),
         };
         // App knowledge follows the installed daemon, including for old Assistant chats.
-        let assistant_context = workspace_id.is_chief().then(|| {
-            [
-                Some(include_str!("../resources/assistant-app-guide.md").trim()),
-                stdin_context,
-            ]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join("\n\n")
-        });
+        let assistant_context = workspace_id
+            .is_chief()
+            .then(|| crate::assistant_context::turn_context(stdin_context));
         let stdin_context = assistant_context.as_deref().or(stdin_context);
         // Per-turn agent state snapshot (`current ws.agent.snapshot() =>
         // {...}`): the outermost RECURRING per-turn decoration — before

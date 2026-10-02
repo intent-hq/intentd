@@ -258,7 +258,7 @@ impl GuidanceBinding {
         caller_id: Option<&AgentId>,
         source: Arc<dyn RepositoryGuidanceSource>,
     ) -> Option<Self> {
-        (session.harness_version == "3.0"
+        (intent_core::harness_supports_repository_guidance(&session.harness_version)
             && session.retired_at.is_none()
             && session.workspace_id == *workspace_id
             && caller_id == Some(&session.id))
