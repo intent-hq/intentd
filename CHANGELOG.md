@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.0] - 2026-10-02
+
+### 🚀 Features
+
+- Add durable script monitors and agent wakeups ([#2244](https://github.com/intent-hq/intentd/pull/2244))
+- [**breaking**] Remove deprecated git.commit RPC ([#2239](https://github.com/intent-hq/intentd/pull/2239))
+
+### 🐛 Bug Fixes
+
+- Clarify the backend connection port and preserve legacy config ([#2243](https://github.com/intent-hq/intentd/pull/2243))
+
+### 🔧 Refactor
+
+- [**breaking**] Remove ten unused client RPC routes ([#2240](https://github.com/intent-hq/intentd/pull/2240))
+
+
 ## [0.9.138] - 2026-10-02
 
 ### 🚀 Features
