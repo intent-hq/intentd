@@ -1211,7 +1211,11 @@ async fn generation_applies_commit_quick_action_effort_before_prompt() {
             ),
         ])
         .unwrap();
-    let svc = svc.with_settings_registry(registry);
+    // Installed CLI providers ignore adapter path overrides. Route the pinned
+    // npm launch through the same isolated seam as the complete-once fixtures.
+    let svc = svc
+        .with_settings_registry(registry)
+        .with_one_shot_npx(Some(bin));
     let agent = session("effort-agent", &ws_id, None, false, "Builder", true);
     svc.store().insert_agent_session(&agent).await.unwrap();
     attribute_dirty_change(&svc, &ws_id, "effort-agent").await;

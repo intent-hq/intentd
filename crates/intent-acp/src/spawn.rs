@@ -807,6 +807,7 @@ pub fn spawn_prepared_provider(
         command: mut cmd,
         npx_launch_dir,
     } = prepared;
+    #[cfg(unix)]
     let nice_increment = agent_nice();
     let (launch, target) = opts.launch_target();
     let command_name = target.to_string_lossy().into_owned();

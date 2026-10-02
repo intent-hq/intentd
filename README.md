@@ -403,10 +403,13 @@ credential variables referenced by its configuration are included. Login-shell c
 is cached: restart the daemon after changing shell-only environment or PATH. Intent
 always enforces its Codex native-subagent denial and Claude tool restrictions.
 
-Model probes use private temporary profiles, copy supported auth/routing configuration,
-and exclude user MCP servers/hooks. They never send prompts or initiate login. The
-installed executable, bounded version observation, adapter pin and private auth/config
-fingerprint identify each cached catalog. Explicit refresh observes changes even behind
+Codex model probes use private temporary profiles, copy supported auth/routing
+configuration, and exclude user MCP servers/hooks. Claude model probes retain user
+settings for authentication (`settingSources: ["user"]`), disable tools (`tools: []`),
+and enforce `strictMcpConfig: true` with no MCP servers; they do not strip user hooks.
+Neither provider's model probes send prompts or initiate login. The installed executable,
+bounded version observation, adapter pin and private auth/config fingerprint identify
+each cached catalog. Explicit refresh observes changes even behind
 an unchanged CLI wrapper. Last-good fallback is confined to that identity. Codex/Claude
 catalogs are memory-only; the first request after daemon restart must probe again.
 Existing sessions retain their process; new/recreated launches resolve the installed CLI
@@ -414,8 +417,8 @@ again. Resuming across upgrades remains subject to adapter/CLI compatibility.
 
 The opt-in functional test runs the actual pinned adapters against synthetic installed
 CLIs over authenticated, fingerprint-pinned WSS. It replaces only CLI executables, checks
-catalog refresh and selected-model turns, and never uses provider accounts. Prepare the
-exact packages named by `crates/intent-providers/src/config.rs` outside the checkout,
+catalog refresh, selected-model turns and same-process continuity across CLI replacements,
+and never uses provider accounts. Prepare the exact packages named by `crates/intent-providers/src/config.rs` outside the checkout,
 including their optional dependencies. Set `INTENTD_TEST_CODEX_ADAPTER` and
 `INTENTD_TEST_CLAUDE_ADAPTER` to their package directories (containing `package.json`), then:
 
@@ -440,10 +443,10 @@ Package metadata applies only to an established selected entrypoint and is label
 **metadata, not measured**. The runtime measurement comes from the installed CLI, never
 from a neighboring bundled dependency. Failed version checks remain explicitly unknown.
 
-On Linux, diagnostic process probes also require `/bin/bash` for private process
-supervision. If it is unavailable, probes report a failure and their results remain
-unknown; diagnostics do not install Bash or fall back to another shell. This requirement
-applies only to diagnostic probes, not normal provider launches.
+On Linux, `/bin/bash` is required for private process supervision during both
+normal installed-CLI launch version checks and diagnostic probes. If it is unavailable,
+normal launch checks fail and diagnostic results remain unknown. Intent does not install
+Bash or fall back to another shell.
 
 On macOS, diagnostics report the selected launch and configured managed pin without
 resolving the package or inspecting ignored local adapters. Adapter and catalog diagnostic process probes are explicitly unsupported because
