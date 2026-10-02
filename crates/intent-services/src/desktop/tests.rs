@@ -1073,6 +1073,82 @@ async fn first_eligible_allow_claims_unassigned_primary_once() {
 }
 
 #[tokio::test]
+async fn invalidation_during_permission_response_never_restores_request() {
+    for decision in ["deny", "allow_once", "allow_future"] {
+        let h = Harness::new().await;
+        h.services
+            .store
+            .set_workspace_browser_client(&h.workspace, None)
+            .await
+            .unwrap();
+        let first = h.executor.connection.lock().unwrap().clone();
+        let second = DesktopConnection {
+            client_id: ClientId::from("second"),
+            connection_epoch: "second-epoch".into(),
+            ..first.clone()
+        };
+        h.executor
+            .extra_connections
+            .lock()
+            .unwrap()
+            .push(second.clone());
+        let pending = h.agent("startControl", json!({})).await.unwrap();
+        let live = h.services.desktop.get(&h.agent).unwrap();
+        let seen = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        *h.services.desktop.decision_barrier.lock().unwrap() = Some((seen.clone(), resume.clone()));
+        let services = h.services.clone();
+        let owner = h.owner.clone();
+        let args =
+            json!({"workspaceId":h.workspace,"requestId":pending["requestId"],"decision":decision});
+        let response = tokio::spawn(async move {
+            intent_core::with_caller(
+                owner,
+                services.desktop_client_op("respondPermission".into(), args, second),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), seen.notified())
+            .await
+            .unwrap();
+        h.executor.extra_connections.lock().unwrap().clear();
+        h.executor.connection.lock().unwrap().connection_epoch = "disconnected".into();
+        intent_core::with_caller(
+            Caller::Daemon,
+            h.services.desktop_end_live(live, "disconnected", true),
+        )
+        .await
+        .unwrap();
+        assert!(h
+            .services
+            .desktop
+            .candidates(pending["requestId"].as_str().unwrap())
+            .is_empty());
+        resume.notify_one();
+        let error = response
+            .await
+            .expect("stale decision must not panic")
+            .unwrap_err();
+        assert_eq!(error.code, "desktop-stale-request");
+        assert_eq!(h.services.desktop.state(&h.agent), DesktopState::Inactive);
+        assert!(h
+            .services
+            .store
+            .workspace_browser_client(&h.workspace)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!h
+            .executor
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call["operation"] == "startControl"));
+    }
+}
+
+#[tokio::test]
 async fn disconnected_candidate_does_not_prevent_last_live_denial() {
     for rehello in [false, true] {
         let h = Harness::new().await;

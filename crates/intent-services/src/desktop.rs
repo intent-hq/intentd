@@ -29,6 +29,8 @@ pub(crate) struct Runtime {
     pub(crate) changed: tokio::sync::Notify,
     watchers: Mutex<HashMap<AgentId, String>>,
     gates: Mutex<HashMap<AgentId, Arc<tokio::sync::Mutex<()>>>>,
+    #[cfg(test)]
+    decision_barrier: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -988,6 +990,14 @@ impl Services {
                     "forbidden",
                     "Desktop method is disabled in settings (agentFeatures.desktopControl = false)",
                 ));
+            }
+            #[cfg(test)]
+            {
+                let barrier = self.desktop.decision_barrier.lock().unwrap().take();
+                if let Some((seen, resume)) = barrier {
+                    seen.notify_one();
+                    resume.notified().await;
+                }
             }
             live.binding = binding;
             let claim_generation = match &live.phase {
