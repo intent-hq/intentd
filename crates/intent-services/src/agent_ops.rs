@@ -374,6 +374,8 @@ pub(crate) mod ready_delta;
 mod tests;
 
 #[cfg(test)]
+mod queue_merge_tests;
+#[cfg(test)]
 mod queue_visibility_contract_tests;
 
 #[cfg(test)]
@@ -1199,21 +1201,10 @@ enum PopCommit {
     Provisional,
 }
 
-/// A restricted wire caller's ownership check for one per-id queue mutation
-/// (multiplayer), built by [`Services::queue_entry_gate`] with its async
-/// inputs pre-resolved. Visibility applies FIRST, through the shared
-/// [`intent_core::queue_attribution_visible_to`] predicate over the entry's
-/// attribution — the same three-tier resolution as `agent.getQueue`
-/// ([`intent_core::queue_attribution_with`]: stamp, else workspace fallback
-/// for a human-origin entry — an unknown human when that fallback is
-/// missing — else unattributed): an entry the caller's `agent.getQueue`
-/// hides reads as absent for every mutation — `-32602 queued message not
-/// found`, no side effects. Then `author_only` (`agent.editQueuedMessage`)
-/// refuses a VISIBLE entry the caller did not author — this only ever
-/// reaches the administrator, who sees the whole queue: another principal's
-/// entry, and an unknown-human entry (a human wrote it, nobody can claim it;
-/// the administrator may still remove or force-send it). An entry with no
-/// human author passes.
+/// Per-entry mutation authority, independent of shared queue visibility.
+/// Attribution is resolved under the mutation lock. Editing stays author-only;
+/// send-now allows author or host owner. The remove operation additionally
+/// recognizes the workspace owner. Existing nonhuman permissions are unchanged.
 #[derive(Debug, Clone)]
 pub(crate) struct QueueEntryGate {
     principal_id: PrincipalId,
@@ -1230,11 +1221,14 @@ impl QueueEntryGate {
             entry.message_metadata.as_ref(),
             self.fallback.as_ref(),
         );
-        let caller = intent_core::Caller::Wire {
-            principal_id: self.principal_id.clone(),
-            host_role: self.host_role,
+        // Shared visibility must never grant mutation rights. Preserve the
+        // author-or-host-owner mutation gate independently of read projection.
+        let own_or_nonhuman = match &attribution {
+            intent_core::QueueAttribution::Principal(author) => *author == self.principal_id,
+            intent_core::QueueAttribution::UnknownHuman => false,
+            intent_core::QueueAttribution::Unattributed => true,
         };
-        if !intent_core::queue_attribution_visible_to(&caller, &attribution) {
+        if self.host_role != intent_core::HostRole::Owner && !own_or_nonhuman {
             return Err(Error::InvalidParams(format!(
                 "queued message not found: {}",
                 entry.id
@@ -1254,6 +1248,30 @@ impl QueueEntryGate {
             }
         }
         Ok(())
+    }
+}
+
+/// Reserved metadata containing the original metadata of merged submissions.
+pub(crate) const MERGED_MESSAGE_METADATA_KEY: &str = "mergedMessageMetadata";
+
+fn merge_queue_metadata(existing: &mut Option<Value>, incoming: Option<Value>) {
+    let Some(Value::Object(metadata)) = existing else {
+        return;
+    };
+    let original = Value::Object(metadata.clone());
+    let contributions = metadata
+        .entry(MERGED_MESSAGE_METADATA_KEY)
+        .or_insert_with(|| json!([original]));
+    if let Value::Array(contributions) = contributions {
+        if let Some(nested) = incoming
+            .as_ref()
+            .and_then(|m| m.get(MERGED_MESSAGE_METADATA_KEY))
+            .and_then(Value::as_array)
+        {
+            contributions.extend(nested.iter().cloned());
+        } else {
+            contributions.push(incoming.unwrap_or(Value::Null));
+        }
     }
 }
 
@@ -1284,10 +1302,29 @@ pub(crate) struct QueuedMessage {
     /// rehydration backfills an empty `turn_id` with the entry `id`.
     #[serde(default)]
     pub turn_id: String,
+    /// Submission ids absorbed into this surviving row (durable retry deduplication).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merged_submission_ids: Vec<String>,
+    /// Appends received while the editor holds an older draft. Internal only.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub edit_appended: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub edit_prepended: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editing_message_id: Option<String>,
+    /// Latest human submission, independent of priority/drain order; persisted for restart.
+    #[serde(default)]
+    pub submission_order: u64,
+    /// True on a draining overlay until its transcript row is durable.
+    #[serde(skip)]
+    pub provisional: bool,
     pub content: String,
     pub image_blocks: Option<Value>,
     pub file_blocks: Option<Value>,
     pub queued_at: String,
+    /// Latest user contribution time; original `queued_at` remains the row identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_human_submission_at: Option<String>,
     #[serde(default)]
     pub editing: bool,
     /// `true` when the user-message row already reached the transcript before
@@ -1424,6 +1461,8 @@ impl QueuedMessage {
         }
         if self.editing {
             v["editing"] = Value::Bool(true);
+            v["editingMessageId"] =
+                Value::String(self.editing_message_id.as_ref().unwrap_or(&self.id).clone());
         }
         if self.requeued_after_failure {
             v["requeuedAfterFailure"] = Value::Bool(true);
@@ -1444,6 +1483,106 @@ impl QueuedMessage {
             v["childAgentId"] = Value::String(child.clone());
         }
         v
+    }
+
+    fn matches_submission(&self, id: &str) -> bool {
+        self.id == id || self.merged_submission_ids.iter().any(|alias| alias == id)
+    }
+
+    fn is_human_queue_entry(&self) -> bool {
+        intent_core::is_human_authored_metadata(self.message_metadata.as_ref())
+            || intent_core::human_author::is_unbound_historical_human(
+                self.message_metadata.as_ref(),
+            )
+    }
+
+    fn can_merge_pending(&self, incoming: &Self) -> bool {
+        !self.persisted
+            && !incoming.persisted
+            && self.is_human_queue_entry()
+            && incoming.is_human_queue_entry()
+            && !intent_core::human_author::is_unbound_historical_human(
+                self.message_metadata.as_ref(),
+            )
+            && !intent_core::human_author::is_unbound_historical_human(
+                incoming.message_metadata.as_ref(),
+            )
+            && intent_core::lift_from_principal_id(self.message_metadata.as_ref()).is_some_and(
+                |author| {
+                    intent_core::lift_from_principal_id(incoming.message_metadata.as_ref())
+                        == Some(author)
+                },
+            )
+    }
+
+    fn append_pending(&mut self, incoming: Self) {
+        if incoming.user_origin {
+            let incoming_time = incoming
+                .latest_human_submission_at
+                .as_deref()
+                .unwrap_or(&incoming.queued_at);
+            let current_time = self
+                .latest_human_submission_at
+                .as_deref()
+                .unwrap_or(&self.queued_at);
+            if parse_iso(incoming_time).is_some_and(|incoming| {
+                !self.user_origin
+                    || parse_iso(current_time).is_none_or(|current| incoming > current)
+            }) {
+                self.latest_human_submission_at = Some(incoming_time.to_owned());
+            }
+        }
+        if incoming.editing && !self.editing {
+            self.editing_message_id = Some(
+                incoming
+                    .editing_message_id
+                    .clone()
+                    .unwrap_or_else(|| incoming.id.clone()),
+            );
+            self.edit_prepended = format!("{}\n\n{}", self.content, incoming.edit_prepended);
+            self.edit_appended.clone_from(&incoming.edit_appended);
+            self.editing = true;
+        } else if self.editing {
+            self.edit_appended.push_str("\n\n");
+            self.edit_appended.push_str(&incoming.content);
+        }
+        self.submission_order = self.submission_order.max(incoming.submission_order);
+        self.content.push_str("\n\n");
+        self.content.push_str(&incoming.content);
+        self.merged_submission_ids.extend(incoming.submission_ids());
+        self.image_blocks = crate::agent_manager::merge_block_arrays(
+            self.image_blocks.take(),
+            incoming.image_blocks,
+        );
+        self.file_blocks =
+            crate::agent_manager::merge_block_arrays(self.file_blocks.take(), incoming.file_blocks);
+        merge_queue_metadata(&mut self.message_metadata, incoming.message_metadata);
+        if let Some(text) = incoming.prepend_content {
+            match &mut self.prepend_content {
+                Some(existing) => {
+                    existing.push_str("\n\n");
+                    existing.push_str(&text);
+                }
+                slot @ None => *slot = Some(text),
+            }
+        }
+        self.prepend_image_blocks = crate::agent_manager::merge_block_arrays(
+            self.prepend_image_blocks.take(),
+            incoming.prepend_image_blocks,
+        );
+        self.prepend_file_blocks = crate::agent_manager::merge_block_arrays(
+            self.prepend_file_blocks.take(),
+            incoming.prepend_file_blocks,
+        );
+        self.user_origin |= incoming.user_origin;
+    }
+
+    pub(crate) fn submission_ids(&self) -> Vec<String> {
+        let mut ids = self.merged_submission_ids.clone();
+        if !ids.contains(&self.id) {
+            ids.push(self.id.clone());
+        }
+        ids
     }
 
     /// `true` while the entry carries an **unexpired** hold marker: excluded
@@ -2434,6 +2573,20 @@ pub(crate) fn answered_questions_message_id(metadata: Option<&Value>) -> Option<
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
+}
+
+/// All answered question sets in a merged human row. Contributions are a
+/// flat array authenticated at ingress; never recursively traverse client JSON.
+fn answered_question_ids(metadata: Option<&Value>) -> impl Iterator<Item = &str> {
+    let contributions = metadata
+        .and_then(|m| m.get(MERGED_MESSAGE_METADATA_KEY))
+        .and_then(Value::as_array);
+    answered_questions_message_id(metadata).into_iter().chain(
+        contributions
+            .into_iter()
+            .flatten()
+            .filter_map(|m| answered_questions_message_id(Some(m))),
+    )
 }
 
 /// `messageMetadata.type` marker on the questions-dismissed system notice
@@ -6655,14 +6808,9 @@ impl Services {
     /// as `NotFound`. Entries carry the resolved `author` projection
     /// ([`crate::principal_ops::MessageAuthorResolver::attach_queue`]) — the
     /// same shape and resolution order as `agent.getConversation` user rows.
-    /// The key is present on every row regardless: when the unscoped read
-    /// finds no session to resolve against, entries keep the `null` default
-    /// from [`QueuedMessage::to_value`]. The snapshot is then projected to the
-    /// bound caller ([`intent_core::project_queue_for_caller`]): a guest
-    /// collaborator sees only its own entries plus unattributed (agent-sent /
-    /// automatic) ones — a human-origin entry the resolver could not
-    /// attribute is withheld, not exposed — while the administrator, agents
-    /// and the daemon see the full queue.
+    /// The author key is always present. Every admitted workspace participant
+    /// receives the shared queue, including unknown human authors; mutation
+    /// permissions are checked independently.
     pub(crate) async fn agent_get_queue_op(
         &self,
         agent_id: AgentId,
@@ -6684,8 +6832,7 @@ impl Services {
                 .attach_queue(&mut queue)
                 .await;
         }
-        // Egress-only projection: a guest collaborator sees its own entries
-        // (plus null-author agent/automatic ones); `position` is not renumbered.
+        // Shared egress preserves global drain order and author attribution.
         let queue =
             intent_core::project_queue_for_caller(intent_core::current_caller().as_ref(), queue);
         Ok(json!({ "success": true, "queue": queue }))
@@ -6800,7 +6947,7 @@ impl Services {
             .lock()
             .expect("agent queue registry poisoned")
             .get(agent_id)
-            .and_then(|queue| queue.iter().find(|m| m.id == message_id))
+            .and_then(|queue| queue.iter().find(|m| m.matches_submission(message_id)))
             .cloned()
     }
 
@@ -6866,12 +7013,23 @@ impl Services {
                 .ok_or_else(|| Error::Internal("Queued message not found".to_string()))?;
             let position = queue
                 .iter()
-                .position(|m| m.id == message_id)
+                .position(|m| m.matches_submission(&message_id))
                 .ok_or_else(|| Error::Internal("Queued message not found".to_string()))?;
             if let Some(gate) = gate.as_ref() {
                 gate.check(&queue[position])?;
             }
             let was = queue[position].editing;
+            let edit_id = if was {
+                queue[position]
+                    .editing_message_id
+                    .as_ref()
+                    .unwrap_or(&queue[position].id)
+            } else {
+                &queue[position].id
+            };
+            if message_id != *edit_id {
+                return Err(Error::InvalidParams("queued edit conflict: this draft was combined into another queued message; refresh before editing".into()));
+            }
             let human_authored = queue[position].user_origin
                 || crate::principal_ops::carries_principal_stamp(
                     queue[position].message_metadata.as_ref(),
@@ -6883,14 +7041,72 @@ impl Services {
             // instead of a mutated entry that never published and that a
             // later queue write would persist.
             let restamped = if restamp && human_authored {
-                Some(crate::principal_ops::stamp_principal_attribution(
+                let mut metadata = crate::principal_ops::stamp_principal_attribution(
                     queue[position].message_metadata.clone(),
-                )?)
+                )?;
+                if let Some(contributions) = queue[position]
+                    .message_metadata
+                    .as_ref()
+                    .and_then(|m| m.get(MERGED_MESSAGE_METADATA_KEY))
+                {
+                    if let Some(Value::Object(ref mut md)) = metadata {
+                        md.insert(MERGED_MESSAGE_METADATA_KEY.into(), contributions.clone());
+                    }
+                }
+                Some(metadata)
             } else {
                 None
             };
             if let Some(preamble) = preamble.as_deref().filter(|_| human_authored) {
                 crate::principal_ops::prepend_collaborator_preamble(&mut content, preamble);
+            }
+            // A second client may have read the combined row while the first
+            // still holds its original draft. Without an editor token there is
+            // only one represented baseline: accepting a rebased acquisition
+            // would append the retained suffix again when that client saves.
+            // Reject before mutation; compare the exact represented range,
+            // never deduplicate user text by occurrence.
+            let held = &queue[position];
+            if was
+                && editing == Some(true)
+                && (!held.edit_prepended.is_empty() || !held.edit_appended.is_empty())
+                && held
+                    .content
+                    .strip_prefix(&held.edit_prepended)
+                    .and_then(|draft| draft.strip_suffix(&held.edit_appended))
+                    != Some(content.as_str())
+            {
+                return Err(Error::InvalidParams("queued edit conflict: this message received more text while another draft was held; finish that edit before starting another".into()));
+            }
+            // Hold acquisition can race an append after the UI captured its
+            // draft. Keep that suffix pending for the eventual save as well.
+            if was && editing != Some(false) {
+                // Keep the append bookkeeping until the hold is released,
+                // including repeated holds and draft updates while held.
+                if content != queue[position].content {
+                    content = format!(
+                        "{}{}{}",
+                        queue[position].edit_prepended, content, queue[position].edit_appended
+                    );
+                }
+            } else if !was && editing == Some(true) {
+                if let Some(suffix) = queue[position]
+                    .content
+                    .strip_prefix(&content)
+                    .filter(|suffix| suffix.starts_with("\n\n"))
+                {
+                    queue[position].edit_appended = suffix.to_string();
+                    content.clone_from(&queue[position].content);
+                }
+            } else {
+                // Editors retain the draft they held, not a rebased draft.
+                // An exact echo of the current row already includes appends;
+                // a stale/modified draft receives the pending suffix once.
+                let appended = std::mem::take(&mut queue[position].edit_appended);
+                let prepended = std::mem::take(&mut queue[position].edit_prepended);
+                if content != queue[position].content {
+                    content = format!("{prepended}{content}{appended}");
+                }
             }
             queue[position].content = content;
             if let Some(metadata) = restamped {
@@ -6898,6 +7114,11 @@ impl Services {
             }
             if let Some(flag) = editing {
                 queue[position].editing = flag;
+                if !flag {
+                    queue[position].editing_message_id = None;
+                } else if !was {
+                    queue[position].editing_message_id = Some(queue[position].id.clone());
+                }
             }
             let now = queue[position].editing;
             (queue[position].to_value(position), was, now)
@@ -6933,15 +7154,26 @@ impl Services {
     /// found" error caused the FE's optimistic delete to roll back, leaving
     /// ghost messages on screen. The one exception is ownership
     /// ([`Self::queue_entry_gate`], checked under the queue lock against the
-    /// entry found there): a guest collaborator may remove only the entries
-    /// its `agent.getQueue` shows it, and a foreign entry is refused as
+    /// entry found there): authors, workspace owners and host owners may
+    /// remove human entries; other callers are refused as
     /// `-32602 queued message not found` untouched.
     pub(crate) async fn agent_remove_queued_message_op(
         &self,
         agent_id: AgentId,
         message_id: String,
     ) -> Result<Value> {
-        let gate = self.queue_entry_gate(&agent_id, false).await?;
+        let mut gate = self.queue_entry_gate(&agent_id, false).await?;
+        if let Some(candidate) = gate.as_ref() {
+            let workspace = self.agent_workspace(&agent_id).await?;
+            if self
+                .store
+                .get_workspace_member_role(&workspace, &candidate.principal_id)
+                .await?
+                == Some(intent_core::WorkspaceRole::Owner)
+            {
+                gate = None;
+            }
+        }
         self.park_queue_mutation_gate(gate.as_ref()).await;
         let removed = {
             let mut guard = self
@@ -6949,7 +7181,7 @@ impl Services {
                 .lock()
                 .expect("agent queue registry poisoned");
             match guard.get_mut(&agent_id) {
-                Some(queue) => match queue.iter().position(|m| m.id == message_id) {
+                Some(queue) => match queue.iter().position(|m| m.matches_submission(&message_id)) {
                     Some(position) => {
                         if let Some(gate) = gate.as_ref() {
                             gate.check(&queue[position])?;
@@ -6997,7 +7229,7 @@ impl Services {
                 .ok_or_else(|| Error::NotFound(format!("queued message {message_id}")))?;
             let position = queue
                 .iter()
-                .position(|m| m.id == message_id)
+                .position(|m| m.matches_submission(&message_id))
                 .ok_or_else(|| Error::NotFound(format!("queued message {message_id}")))?;
             let from_agent_id = queue[position]
                 .message_metadata
@@ -7379,6 +7611,8 @@ impl Services {
         // A terminal-failure requeue whose user row already reached the
         // transcript must not double-append (STAB-112).
         if entry.persisted {
+            self.publish_queue_processing(&agent_id, &workspace_id, std::slice::from_ref(&entry))
+                .await;
             drop(draining);
             self.publish_queue_updated_after_drain_persist(&agent_id, &workspace_id)
                 .await;
@@ -7435,6 +7669,9 @@ impl Services {
                 return Err(e);
             }
         };
+        self.commit_queue_history(&agent_id, &entry.id);
+        self.publish_queue_processing(&agent_id, &workspace_id, std::slice::from_ref(&entry))
+            .await;
         self.invalidate_agent_list_cache(&workspace_id);
         // Refresh agent_session.updated_at so the FE agent-card timestamp
         // reflects message activity, not just status transitions (STAB-19).
@@ -8059,15 +8296,13 @@ impl Services {
         for msg in messages {
             match msg.role.as_str() {
                 "assistant" if has_question_blocks(&msg.content) => pending = Some(&msg.id),
-                "user" => {
-                    if let (Some(answered), Some(marked)) = (
-                        answered_questions_message_id(msg.metadata.as_ref()),
-                        pending,
-                    ) {
-                        if resolves(answered, marked) {
-                            pending = None;
-                        }
-                    }
+                "user"
+                    if pending.is_some_and(|marked| {
+                        answered_question_ids(msg.metadata.as_ref())
+                            .any(|answered| resolves(answered, marked))
+                    }) =>
+                {
+                    pending = None;
                 }
                 _ => {}
             }
@@ -8105,18 +8340,22 @@ impl Services {
         agent_id: &AgentId,
         message_metadata: Option<&Value>,
     ) -> bool {
-        let Some(answered) = answered_questions_message_id(message_metadata) else {
+        let answers: Vec<_> = answered_question_ids(message_metadata).collect();
+        let Some(first) = answers.first() else {
             return false;
         };
-        self.park_pending_marker_mutation("clear", answered).await;
+        self.park_pending_marker_mutation("clear", first).await;
         let lock = self.pending_question_mutation_locks.lock_for(agent_id);
         let _guard = lock.lock().await;
         let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
             return false;
         };
-        if session.pending_questions_message_id() != Some(answered) {
+        let Some(answered) = session
+            .pending_questions_message_id()
+            .filter(|marked| answers.contains(marked))
+        else {
             return false;
-        }
+        };
         self.clear_pending_questions_marker_locked(workspace_id, agent_id, Some(answered))
             .await
     }
@@ -14327,6 +14566,38 @@ impl Services {
         interrupt: bool,
         origin: MessageOrigin,
     ) -> (QueuedMessage, usize) {
+        let draining = self
+            .draining_queue_entries
+            .lock()
+            .expect("draining queue registry poisoned");
+        self.enqueue_message_with_id_locked(
+            agent_id,
+            message_id,
+            content,
+            image_blocks,
+            file_blocks,
+            message_metadata,
+            prepend,
+            interrupt,
+            origin,
+            &draining,
+        )
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn enqueue_message_with_id_locked(
+        &self,
+        agent_id: &AgentId,
+        message_id: Option<String>,
+        content: String,
+        image_blocks: Option<Value>,
+        file_blocks: Option<Value>,
+        message_metadata: Option<Value>,
+        prepend: Option<QueuedPrepend>,
+        interrupt: bool,
+        origin: MessageOrigin,
+        draining: &HashMap<AgentId, Vec<QueuedMessage>>,
+    ) -> (QueuedMessage, usize) {
         let prepend = prepend.unwrap_or_default();
         let id = message_id.unwrap_or_else(new_message_id);
         let mut guard = self
@@ -14334,8 +14605,22 @@ impl Services {
             .lock()
             .expect("agent queue registry poisoned");
         let queue = guard.entry(agent_id.clone()).or_default();
-        if let Some((position, existing)) =
-            queue.iter().enumerate().find(|(_, queued)| queued.id == id)
+        if let Some((position, existing)) = queue
+            .iter()
+            .enumerate()
+            .find(|(_, queued)| queued.id == id || queued.merged_submission_ids.contains(&id))
+        {
+            return (existing.clone(), position);
+        }
+        // An acknowledged submission may be retried while its row is
+        // provisionally popped (or already committing), before history is
+        // visible. It is the same submission, never another append.
+        if let Some((position, existing)) = draining
+            .get(agent_id)
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .find(|(_, entry)| entry.matches_submission(&id))
         {
             return (existing.clone(), position);
         }
@@ -14358,7 +14643,34 @@ impl Services {
             hold_kind: None,
             hold_until: None,
             child_agent_id: None,
+            merged_submission_ids: Vec::new(),
+            edit_appended: String::new(),
+            edit_prepended: String::new(),
+            editing_message_id: None,
+            latest_human_submission_at: None,
+            provisional: false,
+            submission_order: self
+                .queue_submission_order
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1,
         };
+        // Selection and append share the mutation/drain lock.
+        if let Some((position, previous)) = queue
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, entry)| entry.is_human_queue_entry())
+            .max_by_key(|(_, entry)| entry.submission_order)
+        {
+            let provisional_barrier = draining.get(agent_id).into_iter().flatten().any(|entry| {
+                entry.provisional
+                    && entry.is_human_queue_entry()
+                    && entry.submission_order > previous.submission_order
+            });
+            if !provisional_barrier && previous.can_merge_pending(&queued) {
+                previous.append_pending(queued);
+                return (previous.clone(), position);
+            }
+        }
         let position = if interrupt {
             // Behind earlier interrupts, ahead of every normal entry.
             let idx = queue.iter().take_while(|m| m.interrupt_priority).count();
@@ -14395,11 +14707,11 @@ impl Services {
         interrupt: bool,
         origin: MessageOrigin,
     ) -> (QueuedMessage, usize) {
-        let _draining = self
+        let draining = self
             .draining_queue_entries
             .lock()
             .expect("draining queue registry poisoned");
-        let (queued, position) = self.enqueue_message_with_id(
+        let (queued, position) = self.enqueue_message_with_id_locked(
             agent_id,
             Some(message_id),
             content,
@@ -14409,6 +14721,7 @@ impl Services {
             prepend,
             interrupt,
             origin,
+            &draining,
         );
         self.mark_parked_recovery_send(agent_id, queued.id.clone());
         (queued, position)
@@ -14469,6 +14782,13 @@ impl Services {
                     hold_kind: Some(hold_kind.to_string()),
                     hold_until: Some(hold_until.to_string()),
                     child_agent_id: Some(child_agent_id.to_string()),
+                    merged_submission_ids: Vec::new(),
+                    edit_appended: String::new(),
+                    edit_prepended: String::new(),
+                    editing_message_id: None,
+                    latest_human_submission_at: None,
+                    provisional: false,
+                    submission_order: 0,
                 };
                 queue.push(queued.clone());
                 (queued, queue.len() - 1)
@@ -15040,6 +15360,10 @@ impl Services {
         if messages.is_empty() {
             return;
         }
+        let draining = self
+            .draining_queue_entries
+            .lock()
+            .expect("draining queue registry poisoned");
         let mut guard = self
             .agent_queues
             .lock()
@@ -15047,6 +15371,57 @@ impl Services {
         let queue = guard.entry(agent_id.clone()).or_default();
         for (i, m) in messages.into_iter().enumerate() {
             queue.insert(i, m);
+        }
+        Self::coalesce_pending_queue(
+            queue,
+            draining
+                .get(agent_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        );
+    }
+
+    fn coalesce_pending_queue(queue: &mut Vec<QueuedMessage>, draining: &[QueuedMessage]) {
+        // Human barriers follow submission order, even when interrupts changed
+        // delivery position or a provisional pop temporarily hid an older row.
+        let mut arrivals: Vec<_> = queue
+            .iter()
+            .filter(|m| m.is_human_queue_entry())
+            .map(|m| (m.submission_order, Some(m.id.clone())))
+            .collect();
+        arrivals.extend(
+            draining
+                .iter()
+                .filter(|m| {
+                    m.provisional
+                        && m.is_human_queue_entry()
+                        && !queue.iter().any(|live| live.matches_submission(&m.id))
+                })
+                .map(|m| (m.submission_order, None)),
+        );
+        arrivals.sort_by_key(|(order, _)| *order);
+        let mut previous: Option<String> = None;
+        for (_, id) in arrivals {
+            let Some(id) = id else {
+                previous = None;
+                continue;
+            };
+            let index = queue
+                .iter()
+                .position(|m| m.id == id)
+                .expect("queued arrival");
+            if let Some(older) = previous
+                .as_ref()
+                .and_then(|previous| queue.iter().position(|m| m.id == *previous))
+            {
+                if queue[older].can_merge_pending(&queue[index]) {
+                    let incoming = queue.remove(index);
+                    let older = if index < older { older - 1 } else { older };
+                    queue[older].append_pending(incoming);
+                    continue;
+                }
+            }
+            previous = Some(id);
         }
     }
 
@@ -15076,13 +15451,35 @@ impl Services {
     /// Re-insert a message at the front of an agent's queue (used when a
     /// concurrent turn won the in-flight slot during a drain race, and by
     /// `agent.sendQueuedMessageNow`'s persist-failure restore).
-    pub(crate) fn requeue_front(&self, agent_id: &AgentId, message: QueuedMessage) {
-        self.agent_queues
+    pub(crate) fn requeue_front(
+        &self,
+        agent_id: &AgentId,
+        message: QueuedMessage,
+    ) -> (QueuedMessage, usize) {
+        let id = message.id.clone();
+        let draining = self
+            .draining_queue_entries
             .lock()
-            .expect("agent queue registry poisoned")
-            .entry(agent_id.clone())
-            .or_default()
-            .insert(0, message);
+            .expect("draining queue registry poisoned");
+        let mut queues = self
+            .agent_queues
+            .lock()
+            .expect("agent queue registry poisoned");
+        let queue = queues.entry(agent_id.clone()).or_default();
+        queue.insert(0, message);
+        Self::coalesce_pending_queue(
+            queue,
+            draining
+                .get(agent_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        );
+        let (position, entry) = queue
+            .iter()
+            .enumerate()
+            .find(|(_, entry)| entry.matches_submission(&id))
+            .expect("restored queue entry");
+        (entry.clone(), position)
     }
 
     /// Drop an agent's ENTIRE in-memory queue (intent-hq/monorepo#2762): the
@@ -15180,7 +15577,7 @@ impl Services {
                 .lock()
                 .expect("agent queue registry poisoned");
             match queues.get_mut(agent_id) {
-                Some(queue) => match queue.iter().position(|m| m.id == message_id) {
+                Some(queue) => match queue.iter().position(|m| m.matches_submission(&message_id)) {
                     Some(idx) if queue[idx].ready_to_send() => (Some(queue.remove(idx)), true),
                     Some(_) => (None, true),
                     None => (None, false),
@@ -15199,7 +15596,7 @@ impl Services {
         }
         let popped_provisionally = draining
             .get(agent_id)
-            .is_some_and(|d| d.iter().any(|m| m.id == message_id));
+            .is_some_and(|d| d.iter().any(|m| m.matches_submission(&message_id)));
         if queued || popped_provisionally {
             return RecoverySendClaim::Deferred;
         }
@@ -15230,9 +15627,31 @@ impl Services {
             .expect("parked recovery send registry poisoned");
         if parked
             .get(agent_id)
-            .is_some_and(|id| entries.iter().any(|m| m.id == *id))
+            .is_some_and(|id| entries.iter().any(|m| m.matches_submission(id)))
         {
             parked.remove(agent_id);
+        }
+    }
+
+    pub(crate) fn commit_provisional_queue_delivery(
+        &self,
+        agent_id: &AgentId,
+        entries: &[QueuedMessage],
+    ) {
+        self.commit_recovery_send_delivery(agent_id, entries);
+    }
+
+    /// Admission retires recovery authorization, but undelivered input remains
+    /// an arrival barrier until the transcript append actually succeeds.
+    pub(crate) fn commit_queue_history(&self, agent_id: &AgentId, message_id: &str) {
+        let mut draining = self.draining_queue_entries.lock().unwrap();
+        if let Some(overlay) = draining.get_mut(agent_id) {
+            for entry in overlay {
+                if entry.matches_submission(message_id) {
+                    entry.provisional = false;
+                    entry.persisted = true;
+                }
+            }
         }
     }
 
@@ -15247,14 +15666,16 @@ impl Services {
             .is_some_and(|q| q.iter().any(|m| m.ready_to_send() && m.user_origin))
     }
 
-    /// `true` iff at least one ready-to-send user-origin entry was queued at
+    /// `true` iff at least one ready-to-send user-origin entry received human input at
     /// or after `since` (RFC-3339). The archived-drain exemption uses this so
     /// only a user send made INTO the archived workspace — the explicit
     /// resurrection signal — releases the park (intent-hq/intent#3883): a
     /// user entry parked by a busy race BEFORE archival must stay parked with
     /// everything else, or the interrupted worker's end-of-turn re-kick would
     /// auto-unarchive a freshly archived workspace with no post-archive user
-    /// action. An entry with an unparseable `queued_at` never matches; an
+    /// action. Merged rows use their latest human contribution timestamp while
+    /// retaining original `queued_at` for identity; legacy rows fall back to it.
+    /// An unparseable effective timestamp never matches; an
     /// unparseable `since` falls back to [`Self::has_user_origin_ready`]
     /// (fail open — a row without a usable `archivedAt` cannot be compared).
     pub(crate) fn has_user_origin_ready_since(&self, agent_id: &AgentId, since: &str) -> bool {
@@ -15269,7 +15690,12 @@ impl Services {
                 q.iter().any(|m| {
                     m.ready_to_send()
                         && m.user_origin
-                        && parse_iso(&m.queued_at).is_some_and(|t| t >= cutoff)
+                        && parse_iso(
+                            m.latest_human_submission_at
+                                .as_deref()
+                                .unwrap_or(&m.queued_at),
+                        )
+                        .is_some_and(|t| t >= cutoff)
                 })
             })
     }
@@ -15329,7 +15755,11 @@ impl Services {
             .get(agent_id)
             .into_iter()
             .flatten()
-            .filter(|d| !live.iter().any(|m| m.id == d.id || m.turn_id == d.turn_id))
+            .filter(|d| {
+                !live
+                    .iter()
+                    .any(|m| m.matches_submission(&d.id) || m.turn_id == d.turn_id)
+            })
             .chain(live.iter())
             .enumerate()
             .map(|(i, m)| m.to_value(i))
@@ -15474,7 +15904,9 @@ impl Services {
                     .lock()
                     .expect("agent queue registry poisoned");
                 let queue = guard.get_mut(agent_id)?;
-                let idx = queue.iter().position(|m| m.id == message_id)?;
+                let idx = queue
+                    .iter()
+                    .position(|m| m.matches_submission(message_id))?;
                 if let Some(gate) = gate {
                     if let Err(e) = gate.check(&queue[idx]) {
                         refused = Some(e);
@@ -15558,7 +15990,10 @@ impl Services {
         draining
             .entry(agent_id.clone())
             .or_default()
-            .extend(entries.iter().cloned());
+            .extend(entries.iter().cloned().map(|mut entry| {
+                entry.provisional = !entry.persisted;
+                entry
+            }));
         DrainingGuard {
             overlay: Arc::clone(&self.draining_queue_entries),
             shutdown: Arc::clone(&self.draining_shutdown),
@@ -15645,13 +16080,13 @@ impl Services {
             .iter()
             .map(|d| {
                 live.iter()
-                    .find(|m| m.id == d.id || m.turn_id == d.turn_id)
+                    .find(|m| m.matches_submission(&d.id) || m.turn_id == d.turn_id)
                     .unwrap_or(d)
             })
             .chain(live.iter().filter(|m| {
                 !retained
                     .iter()
-                    .any(|d| d.id == m.id || d.turn_id == m.turn_id)
+                    .any(|d| m.matches_submission(&d.id) || d.turn_id == m.turn_id)
             }))
             .filter(|m| seen_ids.insert(m.id.clone()))
             .enumerate()
@@ -15665,7 +16100,7 @@ impl Services {
                         && draining.get(agent_id).is_some_and(|entries| {
                             entries
                                 .iter()
-                                .any(|d| d.id == m.id || d.turn_id == m.turn_id)
+                                .any(|d| m.matches_submission(&d.id) || d.turn_id == m.turn_id)
                         })
                     {
                         payload["shutdownRecovery"] = Value::Bool(true);
@@ -15728,6 +16163,13 @@ impl Services {
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn rehydrate_agent_queues(&self) -> Result<usize> {
         let rows = self.store.load_all_agent_queues().await?;
+        let max_order = rows
+            .iter()
+            .filter_map(|row| row.payload.get("submissionOrder").and_then(Value::as_u64))
+            .max()
+            .unwrap_or(0);
+        self.queue_submission_order
+            .fetch_max(max_order, std::sync::atomic::Ordering::Relaxed);
         let mut map: HashMap<AgentId, Vec<QueuedMessage>> = HashMap::new();
         let mut recover = HashSet::new();
         for row in rows {
@@ -15736,7 +16178,16 @@ impl Services {
             }
             match serde_json::from_value::<QueuedMessage>(row.payload) {
                 Ok(mut message) => {
+                    if message.submission_order == 0 {
+                        message.submission_order = self
+                            .queue_submission_order
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            + 1;
+                    }
                     message.editing = false;
+                    message.editing_message_id = None;
+                    message.edit_appended.clear();
+                    message.edit_prepended.clear();
                     if message.turn_id.is_empty() {
                         message.turn_id.clone_from(&message.id);
                     }
@@ -15925,27 +16376,37 @@ impl Services {
     /// [`intent_core::FROM_PRINCIPAL_ID_KEY`], the unknown-human marker
     /// [`intent_core::QUEUE_AUTHOR_UNKNOWN_HUMAN_KEY`] for a human-origin
     /// entry the workspace cannot attribute, nothing for an entry with no
-    /// human author. The transport projects `content` out of the frame for
-    /// a non-administrator wire subscriber the attribution does not name
-    /// (intentd#2068): the entry is hidden from that member's queue, so its
-    /// text must not leak through the drain-start signal.
+    /// human author. Authorized workspace participants receive the shared
+    /// processing payload. `queuedMessages` contains the exact selected rows,
+    /// including every row in a flush, rather than a later queue snapshot.
+    /// It describes an admitted processing attempt, not successful persistence
+    /// or provider delivery; a failed append restores the queue as usual.
     pub(crate) async fn publish_queue_processing(
         &self,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
-        message: &QueuedMessage,
+        messages: &[QueuedMessage],
     ) {
+        let Some(message) = messages.first() else {
+            return;
+        };
+        let mut resolver = crate::principal_ops::MessageAuthorResolver::new(self, workspace_id);
+        let mut queued_messages: Vec<_> = messages
+            .iter()
+            .enumerate()
+            .map(|(position, entry)| entry.to_value(position))
+            .collect();
+        resolver.attach_queue(&mut queued_messages).await;
         let mut data = json!({
             "agentId": agent_id.0,
             "messageId": message.id,
             "content": message.content,
+            "queuedMessages": queued_messages,
         });
         if !message.turn_id.is_empty() {
             data["turnId"] = Value::String(message.turn_id.clone());
         }
-        let fallback = crate::principal_ops::MessageAuthorResolver::new(self, workspace_id)
-            .fallback_principal_id()
-            .await;
+        let fallback = resolver.fallback_principal_id().await;
         let metadata =
             intent_core::queue_processing_event_metadata(&intent_core::queue_attribution_with(
                 message.message_metadata.as_ref(),

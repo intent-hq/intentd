@@ -706,7 +706,8 @@ use std::time::{Duration, Instant};
 // per-client negotiation of this default; scriptLifecycle remains version 1.
 // Version 11.1 adds optional gitRootId to file.read and file.readChunk:
 // registered workspace-owned roots share existing filesystem confinement.
-// Version 11.2 is reserved for the prepared platform launch contract.
+// Version 11.2 adds complete script.list rows to created/updated script:changed
+// events, including committed result/archive state. Presence detects support.
 // Version 11.3 adds workspace-scoped manual specialist preferences; platform
 // support remains independently capability-gated.
 pub const PROTOCOL_VERSION: &str = "11.3";

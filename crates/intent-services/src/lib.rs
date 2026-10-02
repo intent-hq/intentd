@@ -430,6 +430,7 @@ pub struct Services {
     /// live-stream coupling (flipping `queued` while a turn is mid-flight) lands
     /// with the end-to-end orchestration flow; the queue surface itself is here.
     agent_queues: Arc<Mutex<HashMap<AgentId, Vec<agent_ops::QueuedMessage>>>>,
+    queue_submission_order: Arc<AtomicU64>,
     /// Entries a drain arm has popped from `agent_queues` but whose user rows
     /// are not yet persisted (PROTOCOL §6.5 drain ordering). Client-visible
     /// snapshots ([`agent_ops::Services::queue_snapshot`]) keep listing them
@@ -1449,6 +1450,7 @@ impl Services {
             event_subscriptions: Arc::new(Mutex::new(HashMap::new())),
             event_bus: None,
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
+            queue_submission_order: Arc::new(AtomicU64::new(0)),
             draining_queue_entries: Arc::new(Mutex::new(HashMap::new())),
             draining_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             parked_recovery_sends: Arc::new(Mutex::new(HashMap::new())),
@@ -28789,6 +28791,18 @@ impl WorkspaceApi for Services {
                 };
                 #[cfg(test)]
                 this.hold_periodic_commit("git").await;
+                if let Some(error) = &outcome.index_refresh_error {
+                    // HEAD already advanced: keep the original successful receipt
+                    // and committed bookkeeping, just as for merge-state cleanup.
+                    // Returning an error here would invite callers to replay Git.
+                    tracing::warn!(
+                        workspace = %workspace_id.0,
+                        git_root_id = ?git_root_id,
+                        hash = %outcome.hash,
+                        error = %error,
+                        "agentCommit: commit created but index refresh failed; do not retry the commit"
+                    );
+                }
                 // Staged content became a commit → the cached scan still lists it
                 // as pending (monorepo#1648).
                 this.git_status_cache.invalidate(&worktree);
