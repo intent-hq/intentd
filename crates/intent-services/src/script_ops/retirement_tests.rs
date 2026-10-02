@@ -412,6 +412,11 @@ async fn retirement_database_failure_keeps_real_result_and_output_active() {
             .unwrap()["exitCode"],
         0
     );
+    let changes = h.services.store.query_events(&EventQuery {
+        workspace_id: Some(h.ws.clone()), event_types: vec![SCRIPT_CHANGED.to_string()], ..Default::default()
+    }).await.unwrap();
+    assert_eq!(changes.len(), 1, "failed settlement publishes no invented result or archive");
+    assert_eq!(changes[0].data["action"], "created");
     let recovered = Services::new(Store::open(&h.tmp.path).await.unwrap());
     assert_eq!(recovered.hydrate_scripts().await.unwrap(), 1);
     let row = recovered

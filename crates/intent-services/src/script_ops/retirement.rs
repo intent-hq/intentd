@@ -2,8 +2,8 @@
 //! The finalizer may take the definition lock; a supervisor must only enqueue it,
 //! never await it (stop/restart/remove join supervisors while holding that lock).
 use super::{
-    json, now_iso, publish_event, script_event, ManagedScript, Result, ScriptManager, WorkspaceId,
-    EXIT_CODE_UNOBSERVABLE, LOST_AT_DAEMON_STOP_ERROR, SCRIPT_CHANGED,
+    now_iso, ManagedScript, Result, ScriptManager, WorkspaceId, EXIT_CODE_UNOBSERVABLE,
+    LOST_AT_DAEMON_STOP_ERROR,
 };
 use intent_core::{ScriptLastRun, ScriptPurpose, ScriptRunOutcome};
 
@@ -132,6 +132,8 @@ impl ScriptManager {
             park.entered.notify_one();
             park.release.notified().await;
         }
+        let publication = self.locks.publication_lock(id);
+        let _publishing = publication.lock().await;
         let pending = {
             let scripts = self.scripts.lock().unwrap();
             scripts
@@ -170,15 +172,7 @@ impl ScriptManager {
                 return;
             }
         }
-        publish_event(
-            self.bus.as_ref(),
-            script_event(
-                ws,
-                SCRIPT_CHANGED,
-                json!({"scriptId":id,"action":"updated"}),
-            ),
-        )
-        .await;
+        self.emit_changed_locked(ws, id, "updated").await;
     }
 
     pub(super) async fn finish_previous_locked(&self, ws: &WorkspaceId, id: &str) {
@@ -193,7 +187,10 @@ impl ScriptManager {
         }
     }
 
-    pub(super) async fn recover_commands(&self) -> Result<()> {
+    pub(super) async fn recover_commands(
+        &self,
+    ) -> Result<std::collections::HashSet<(WorkspaceId, String)>> {
+        let mut recovered_ids = std::collections::HashSet::new();
         for (ws, id, token, started_at) in self.store.pending_script_runs().await? {
             let lock = self.locks.definition_lock(&id);
             let _guard = lock.lock().await;
@@ -226,17 +223,9 @@ impl ScriptManager {
                 }
             };
             if recovered {
-                publish_event(
-                    self.bus.as_ref(),
-                    script_event(
-                        &ws,
-                        SCRIPT_CHANGED,
-                        json!({"scriptId":id,"action":"updated"}),
-                    ),
-                )
-                .await;
+                recovered_ids.insert((ws, id));
             }
         }
-        Ok(())
+        Ok(recovered_ids)
     }
 }

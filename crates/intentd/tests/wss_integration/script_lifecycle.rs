@@ -74,10 +74,11 @@ async fn script_archive_restore_contract_over_wss() {
         let event = frame(&mut watching).await;
         if event["method"] == "events.event" {
             assert_eq!(event["params"]["event"]["type"], "script:changed");
-            assert_eq!(
-                event["params"]["event"]["data"],
-                json!({"scriptId":"retained","action":"updated"})
-            );
+            let data = &event["params"]["event"]["data"];
+            assert_eq!(data["scriptId"], "retained");
+            assert_eq!(data["action"], "updated");
+            let listed = rpc(&mut client, 40, "script.list", json!({"workspaceId":ws})).await;
+            assert_eq!(data["script"], listed["result"]["scripts"][0]);
             break;
         }
     }
@@ -134,6 +135,10 @@ async fn script_archive_restore_contract_over_wss() {
         restored,
         json!({"jsonrpc":"2.0","id":12,"result":{"restored":["retained"],"skipped":[{"scriptId":"absent","reason":"notFound"}]}})
     );
+    let event = script_event_frame(&mut watching, "retained", "script:changed").await;
+    let listed = rpc(&mut client, 41, "script.list", json!({"workspaceId":ws})).await;
+    assert_eq!(event["data"]["script"], listed["result"]["scripts"][0]);
+    assert!(event["data"]["script"].get("archivedAt").is_none());
     let status = rpc(
         &mut client,
         13,
@@ -211,7 +216,16 @@ async fn script_default_one_off_settlement_and_output_over_wss() {
                 exited = true;
             }
             if event["type"] == "script:changed" && event["data"]["action"] == "updated" {
-                assert!(exited, "archive invalidation follows final state");
+                assert!(exited, "archive snapshot follows final state");
+                let listed = rpc(&mut client, 40, "script.list", json!({"workspaceId":ws})).await;
+                let row = listed["result"]["scripts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|r| r["id"] == sid)
+                    .unwrap();
+                assert_eq!(&event["data"]["script"], row);
+                assert_eq!(row["lastRun"]["outcome"], outcome);
                 break;
             }
         }
@@ -320,5 +334,193 @@ async fn script_creation_defaults_through_mcp_and_wss() {
     assert_eq!(invalid["error"]["code"], -32602, "{invalid}");
     let saved = rpc(&mut client, 5, "script.create", json!({"workspaceId":ws,"name":"autostart", "command":"true", "mode":"command", "autoStart":true,"purpose":"saved"})).await;
     assert_eq!(saved["result"]["purpose"], "saved", "{saved}");
+    srv.ws.stop().await;
+}
+
+async fn script_event_frame(watching: &mut Ws, sid: &str, event_type: &str) -> Value {
+    loop {
+        let message = frame(watching).await;
+        let event = &message["params"]["event"];
+        if event["type"] == event_type && event["data"]["scriptId"] == sid {
+            return event.clone();
+        }
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn script_changed_full_rows_and_terminal_order_over_wss() {
+    let srv = start(WsOptions::default()).await;
+    let mut client = connect_ws(srv.port, srv.cfg.clone()).await;
+    let created = rpc(
+        &mut client,
+        1,
+        "workspace.create",
+        json!({"title":"Script snapshots"}),
+    )
+    .await;
+    let ws = created["result"]["workspace"]["id"].as_str().unwrap();
+    let mut watching = connect_ws(srv.port, srv.cfg.clone()).await;
+    rpc(
+        &mut watching,
+        2,
+        "events.subscribe",
+        json!({"workspaceId":ws,"eventTypes":["script:changed","script:state"]}),
+    )
+    .await;
+    for (sid, purpose, command, outcome, stop, timeout, bad_cwd) in [
+        (
+            "saved-success",
+            "saved",
+            "true",
+            "succeeded",
+            false,
+            false,
+            false,
+        ),
+        (
+            "saved-failure",
+            "saved",
+            "exit 7",
+            "failed",
+            false,
+            false,
+            false,
+        ),
+        (
+            "saved-stop",
+            "saved",
+            "cat",
+            "cancelled",
+            true,
+            false,
+            false,
+        ),
+        (
+            "oneoff-stop",
+            "oneOff",
+            "cat",
+            "cancelled",
+            true,
+            false,
+            false,
+        ),
+        (
+            "oneoff-timeout",
+            "oneOff",
+            "cat",
+            "cancelled",
+            false,
+            true,
+            false,
+        ),
+        (
+            "oneoff-spawn-failure",
+            "oneOff",
+            "true",
+            "failed",
+            false,
+            false,
+            true,
+        ),
+    ] {
+        let mut params = json!({"workspaceId":ws,"scriptId":sid,"name":sid,"command":command,"mode":"command","purpose":purpose});
+        if bad_cwd {
+            params["cwd"] = json!("/outside-workspace");
+        }
+        let created = rpc(&mut client, 3, "script.create", params).await;
+        assert!(created.get("error").is_none(), "{created}");
+        let event = script_event_frame(&mut watching, sid, "script:changed").await;
+        let mut expected = created["result"].clone();
+        expected["runtime"] = json!({"status":"idle","restartCount":0});
+        assert_eq!(event["data"]["script"], expected);
+        assert_eq!(event["data"]["action"], "created");
+        if timeout {
+            let run = rpc(
+                &mut client,
+                4,
+                "script.run",
+                json!({"workspaceId":ws,"scriptId":sid,"timeoutSeconds":1}),
+            )
+            .await;
+            assert_eq!(run["result"]["timedOut"], true);
+        } else {
+            let started = rpc(
+                &mut client,
+                4,
+                "script.start",
+                json!({"workspaceId":ws,"scriptId":sid}),
+            )
+            .await;
+            assert_eq!(started["result"]["ok"], true);
+            if stop {
+                loop {
+                    let event = script_event_frame(&mut watching, sid, "script:state").await;
+                    if event["data"]["status"] == "running" {
+                        break;
+                    }
+                }
+                assert_eq!(
+                    rpc(
+                        &mut client,
+                        5,
+                        "script.stop",
+                        json!({"workspaceId":ws,"scriptId":sid})
+                    )
+                    .await["result"]["ok"],
+                    true
+                );
+            }
+        }
+        let mut terminal = false;
+        let snapshot = loop {
+            let message = frame(&mut watching).await;
+            let event = &message["params"]["event"];
+            if event["data"]["scriptId"] != sid {
+                continue;
+            }
+            if event["type"] == "script:state" && event["data"]["status"] == "exited" {
+                terminal = true;
+            }
+            if event["type"] == "script:changed" {
+                assert!(
+                    terminal,
+                    "committed result must follow final runtime: {event}"
+                );
+                break event["data"]["script"].clone();
+            }
+        };
+        assert_eq!(snapshot["lastRun"]["outcome"], outcome);
+        assert_eq!(snapshot["archivedAt"].is_string(), purpose == "oneOff");
+        let list = rpc(&mut client, 6, "script.list", json!({"workspaceId":ws})).await;
+        assert_eq!(
+            &snapshot,
+            list["result"]["scripts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"] == sid)
+                .unwrap()
+        );
+        let replaced = rpc(&mut client, 7, "script.create", json!({"workspaceId":ws,"scriptId":sid,"name":"replacement","command":"true","mode":"command"})).await;
+        assert!(replaced.get("error").is_none(), "{replaced}");
+        let event = script_event_frame(&mut watching, sid, "script:changed").await;
+        assert_eq!(event["data"]["action"], "updated");
+        let row = &event["data"]["script"];
+        assert_eq!(row["runtime"], json!({"status":"idle","restartCount":0}));
+        assert!(
+            row.get("archivedAt").is_none()
+                && row.get("lastRun").is_none()
+                && row.get("cwd").is_none()
+        );
+        rpc(
+            &mut client,
+            8,
+            "script.remove",
+            json!({"workspaceId":ws,"scriptId":sid}),
+        )
+        .await;
+        let removed = script_event_frame(&mut watching, sid, "script:changed").await;
+        assert_eq!(removed["data"], json!({"scriptId":sid,"action":"removed"}));
+    }
     srv.ws.stop().await;
 }
