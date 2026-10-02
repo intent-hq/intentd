@@ -509,6 +509,7 @@ async fn creation_preferences_mixed_mute_failure_rolls_back_all_changes() {
         .await
         .unwrap_err();
     let after = svc.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(after.metadata, before.metadata);
     assert_eq!(after.specialist, before.specialist);
     assert_eq!(after.name, before.name);
     assert_eq!(after.name_explicitly_set, before.name_explicitly_set);
@@ -556,4 +557,111 @@ async fn creation_preferences_mixed_mute_failure_rolls_back_all_changes() {
             .notifications_muted,
         "a stale ordinary row write must preserve the mute toggle"
     );
+}
+
+#[intent_test_macros::daemon_test]
+async fn creation_preferences_welcome_selection_freezes_complete_instructions() {
+    let (_tmp, svc, ws) = setup().await;
+    for (initial, custom) in [
+        (None, false),
+        (None, true),
+        (Some("implementor"), false),
+        (Some("implementor"), true),
+    ] {
+        let created = create(
+            &svc,
+            &ws,
+            initial,
+            AgentCreateExtra {
+                metadata: custom.then(|| json!({"behaviorPrompt":"Caller behavior override.","specialistGeneratedBehaviorPrompt":"Caller behavior override."})),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+        for specialist in [
+            Some("implementor"),
+            Some("verifier"),
+            None,
+            Some("implementor"),
+        ] {
+            svc.agent_update(
+                id.clone(),
+                Some(ws.clone()),
+                json!({"specialist":specialist,"rememberSpecialist":true}),
+            )
+            .await
+            .unwrap();
+            let injection = svc.agent_specialist_injection(&id, None).await;
+            let reminder = svc.agent_role_reminder(&id).await;
+            if let Some(specialist) = specialist {
+                let (body, name, role) = svc
+                    .specialists_service()
+                    .resolve_prompt_injection(specialist, None)
+                    .unwrap();
+                let injection = injection.unwrap();
+                assert_eq!(
+                    injection.behavior_prompt,
+                    if custom {
+                        Some("Caller behavior override.".into())
+                    } else {
+                        body
+                    }
+                );
+                assert_eq!(injection.specialist_name, Some(name.clone()));
+                assert_eq!(injection.role_reminder, role.clone());
+                assert_eq!(
+                    reminder,
+                    role.map(|r| crate::harness::latest().role_reminder_prefix(&name, &r))
+                );
+            } else {
+                assert!(reminder.is_none());
+                if custom {
+                    assert_eq!(
+                        injection.unwrap().behavior_prompt.as_deref(),
+                        Some("Caller behavior override.")
+                    );
+                } else {
+                    assert!(injection.is_none());
+                }
+            }
+        }
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn creation_preferences_preserve_unmarked_legacy_and_changed_override_bodies() {
+    let (_tmp, svc, ws) = setup().await;
+    for legacy in [true, false] {
+        let created = create(&svc, &ws, Some("implementor"), AgentCreateExtra::default())
+            .await
+            .unwrap();
+        let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+        let mut session = svc.store.get_agent_session(&id).await.unwrap();
+        let metadata = session.metadata.as_mut().unwrap().as_object_mut().unwrap();
+        if legacy {
+            // Old rows did not distinguish a caller override from a frozen body.
+            metadata.remove("specialistGeneratedBehaviorPrompt");
+        } else {
+            metadata.insert("behaviorPrompt".into(), json!("Later explicit override."));
+        }
+        let preserved = metadata["behaviorPrompt"].as_str().unwrap().to_string();
+        svc.store.update_agent_session(&ws, &session).await.unwrap();
+        for specialist in [None, Some("verifier")] {
+            svc.agent_update(
+                id.clone(),
+                Some(ws.clone()),
+                json!({"specialist":specialist,"rememberSpecialist":true}),
+            )
+            .await
+            .unwrap();
+            let injection = svc.agent_specialist_injection(&id, None).await.unwrap();
+            assert_eq!(
+                injection.behavior_prompt.as_deref(),
+                Some(preserved.as_str())
+            );
+            assert_eq!(injection.specialist_name.is_some(), specialist.is_some());
+        }
+    }
 }

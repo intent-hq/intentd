@@ -356,3 +356,124 @@ async fn creation_preferences_workspace_initial_agent_ui_shape_over_wss() {
         "rejected initial-agent plans must leave no workspace"
     );
 }
+
+#[intent_test_macros::daemon_test]
+async fn creation_preferences_welcome_instructions_reach_first_turn_over_wss() {
+    let Some(script) = gate("initial-agent preferences and naming E2E") else {
+        return;
+    };
+    let data = temp_data_dir();
+    let prompt_log = data.path().join("initial-agent-prompts.jsonl");
+    let prompt_log_str = prompt_log.to_string_lossy().into_owned();
+    let behavior = json!({"response": "Initial agent response"}).to_string();
+    let env = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+        ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
+        ("MOCK_AGENT_PROMPT_LOG", prompt_log_str.as_str()),
+    ];
+    let _daemon = Daemon {
+        child: spawn_serve(data.path(), "both", &env),
+    };
+    let socket = data.path().join("intentd.sock");
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let mut rpc = connect_ws(
+        port,
+        client_config(status["result"]["fingerprint"].as_str().unwrap()),
+    )
+    .await;
+    let mut sub = connect_ws(
+        port,
+        client_config(status["result"]["fingerprint"].as_str().unwrap()),
+    )
+    .await;
+    let subscribed = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({"eventTypes":["agent:*"]}),
+    )
+    .await;
+    assert!(subscribed["subscriptionId"].is_string());
+
+    for custom in [false, true] {
+        let created = wss_rpc(
+            &mut rpc,
+            40,
+            "workspace.create",
+            json!({"title":"Welcome instructions"}),
+        )
+        .await;
+        let ws = &created["workspace"]["id"];
+        let mut params = json!({"workspaceId":ws,"provider":"mock","model":"default"});
+        if custom {
+            params["name"] = json!("Custom task name");
+            params["metadata"] = json!({"behaviorPrompt":"EXPLICIT_WELCOME_BEHAVIOR_OVERRIDE"});
+        }
+        let created = wss_rpc(&mut rpc, 41, "agent.create", params).await;
+        let id = &created["agent"]["id"];
+        let updated = wss_rpc(&mut rpc, 42, "agent.update", json!({"workspaceId":ws,"agentId":id,"changes":{"specialist":"implementor","rememberSpecialist":true}})).await;
+        assert_eq!(
+            updated["agent"]["name"],
+            if custom {
+                "Custom task name"
+            } else {
+                "Implementor"
+            }
+        );
+        let content = format!("Welcome instruction first turn custom={custom}");
+        let sent = wss_rpc(
+            &mut rpc,
+            43,
+            "agent.sendMessage",
+            json!({"workspaceId":ws,"agentId":id,"content":content}),
+        )
+        .await;
+        assert_eq!(sent["success"], true);
+        timeout(Duration::from_secs(30), async {
+            loop {
+                let frame = wss_event(&mut sub, 30).await;
+                let event = &frame["params"]["event"];
+                if event["type"] == "agent:status-changed"
+                    && event["data"]["agentId"] == *id
+                    && event["data"]["status"] == "idle"
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("welcome first turn settled");
+        let log = std::fs::read_to_string(&prompt_log).unwrap();
+        let prompts: Vec<Value> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let text = prompts
+            .iter()
+            .rev()
+            .filter_map(|p| p["text"].as_str())
+            .find(|text| text.contains(&content))
+            .unwrap();
+        assert!(
+            text.contains("Stay within task scope. No refactors, no scope creep."),
+            "missing specialist reminder: {text}"
+        );
+        assert_eq!(
+            text.contains("Implement your assigned task"),
+            !custom,
+            "specialist body precedence: {text}"
+        );
+        assert_eq!(
+            text.contains("EXPLICIT_WELCOME_BEHAVIOR_OVERRIDE"),
+            custom,
+            "explicit body precedence: {text}"
+        );
+        assert_eq!(
+            text.contains("This agent still has a generated name"),
+            !custom
+        );
+    }
+}

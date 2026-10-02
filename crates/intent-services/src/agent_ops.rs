@@ -4825,6 +4825,11 @@ impl Services {
         // Unknown specialist / resolution failure writes no snapshot and
         // never fails the create; a non-object caller `metadata` is left
         // untouched.
+        // Only the daemon may classify a copied specialist body as generated.
+        // Strip caller provenance even for General agents with an override.
+        if let Some(obj) = metadata.as_mut().and_then(Value::as_object_mut) {
+            obj.remove("specialistGeneratedBehaviorPrompt");
+        }
         if let Some(spec_id) = specialist.as_deref() {
             // Both snapshot resolutions below walk the specialist tier
             // directories — blocking pool (monorepo#4148).
@@ -4853,6 +4858,7 @@ impl Services {
                         .is_some_and(|s| !s.trim().is_empty());
                     if !has_override {
                         if let Some(body) = body {
+                            obj.insert("specialistGeneratedBehaviorPrompt".into(), json!(body));
                             obj.insert("behaviorPrompt".to_string(), json!(body));
                         }
                     }
@@ -5847,6 +5853,7 @@ impl Services {
             false
         };
         let mut selected_specialist_name = None;
+        let mut selected_specialist_injection = None;
 
         let prior_model = session.model.clone();
         let prior_muted = session.notifications_muted;
@@ -5964,21 +5971,26 @@ impl Services {
                         // walk the specialist tiers — blocking pool
                         // (monorepo#4148).
                         let services = self.clone();
-                        let (canonical, is_orchestrator, display_name) =
-                            tokio::task::spawn_blocking(
-                                move || -> Result<(String, bool, Option<String>)> {
-                                    let canonical = services
-                                        .specialists_service()
-                                        .canonical_id_or_err(&spec_id, wp.as_deref())?;
-                                    let is_orchestrator = services
-                                        .specialists_service()
-                                        .resolve_is_orchestrator(&canonical, wp.as_deref());
-                                    let display_name = services
-                                        .specialists_service()
-                                        .resolve_display_name(&canonical, wp.as_deref());
-                                    Ok((canonical, is_orchestrator, display_name))
-                                },
-                            )
+                        let (canonical, is_orchestrator, display_name, injection) =
+                            tokio::task::spawn_blocking(move || -> Result<_> {
+                                let canonical = services
+                                    .specialists_service()
+                                    .canonical_id_or_err(&spec_id, wp.as_deref())?;
+                                let is_orchestrator = services
+                                    .specialists_service()
+                                    .resolve_is_orchestrator(&canonical, wp.as_deref());
+                                let display_name = services
+                                    .specialists_service()
+                                    .resolve_display_name(&canonical, wp.as_deref());
+                                let injection = remember_specialist
+                                    .then(|| {
+                                        services
+                                            .specialists_service()
+                                            .resolve_prompt_injection(&canonical, wp.as_deref())
+                                    })
+                                    .flatten();
+                                Ok((canonical, is_orchestrator, display_name, injection))
+                            })
                             .await
                             .map_err(|e| {
                                 Error::Internal(format!(
@@ -5986,6 +5998,7 @@ impl Services {
                                 ))
                             })??;
                         selected_specialist_name = display_name;
+                        selected_specialist_injection = injection;
                         let meta = session
                             .metadata
                             .get_or_insert_with(|| json!(serde_json::Map::new()));
@@ -6089,10 +6102,32 @@ impl Services {
             }
             let metadata = session.metadata.get_or_insert_with(|| json!({}));
             if let Some(metadata) = metadata.as_object_mut() {
-                if let Some(name) = selected_specialist_name {
+                // Retire only a body we copied, and only if it is unchanged.
+                // Legacy unmarked bodies are indistinguishable from explicit
+                // overrides and must be preserved rather than guessed from text.
+                if let Some(generated) = metadata.remove("specialistGeneratedBehaviorPrompt") {
+                    if metadata.get("behaviorPrompt") == Some(&generated) {
+                        metadata.remove("behaviorPrompt");
+                    }
+                }
+                metadata.remove("specialistName");
+                metadata.remove("specialistRoleReminder");
+                if let Some((body, name, reminder)) = selected_specialist_injection {
+                    let has_override = metadata
+                        .get("behaviorPrompt")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| !s.trim().is_empty());
+                    if !has_override {
+                        if let Some(body) = body {
+                            metadata
+                                .insert("specialistGeneratedBehaviorPrompt".into(), json!(body));
+                            metadata.insert("behaviorPrompt".into(), json!(body));
+                        }
+                    }
                     metadata.insert("specialistName".into(), json!(name));
-                } else {
-                    metadata.remove("specialistName");
+                    if let Some(reminder) = reminder {
+                        metadata.insert("specialistRoleReminder".into(), json!(reminder));
+                    }
                 }
             }
         }
