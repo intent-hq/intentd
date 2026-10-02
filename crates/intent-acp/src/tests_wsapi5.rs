@@ -1317,7 +1317,7 @@ async fn script_run_accepts_timeout_alias() {
 async fn script_run_rejects_timeout_above_eval_budget_before_spawning() {
     // A wait longer than the eval budget would be aborted by the transport
     // while the process kept running (monorepo#4703): refuse it up front,
-    // naming the ceiling and the start + hook + status pattern.
+    // naming the ceiling and the start + monitor + output pattern.
     let (srv, api) = server();
     let resp = call(
         &srv,
@@ -1329,8 +1329,9 @@ async fn script_run_rejects_timeout_above_eval_budget_before_spawning() {
     assert!(t.contains("timeoutSeconds 600 exceeds"), "unexpected: {t}");
     assert!(t.contains("ceiling 25s, budget 30s"), "unexpected: {t}");
     assert!(t.contains("ws.script.start"), "unexpected: {t}");
-    assert!(t.contains("ws.hook.schedule"), "unexpected: {t}");
-    assert!(t.contains("ws.script.status"), "unexpected: {t}");
+    assert!(t.contains("ws.script.monitor"), "unexpected: {t}");
+    assert!(t.contains("required ttlMs"), "unexpected: {t}");
+    assert!(t.contains("ws.script.output"), "unexpected: {t}");
     assert!(
         api.script_run_calls.lock().unwrap().is_empty(),
         "no process may be started for a rejected timeout"

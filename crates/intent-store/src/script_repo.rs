@@ -305,7 +305,8 @@ impl Store {
 
     /// Atomically settle the matching admission and retire explicit one-offs.
     /// A replaced, removed, already settled or newer run is an unchanged false.
-    /// Recovery keeps the legacy lost/dismiss marker, but consumes the token.
+    /// Recovery keeps the command lost marker or existing service restore marker,
+    /// but never recreates a dismissed service marker; it consumes the token.
     /// # Errors
     /// Returns a database/encoding error; neither result nor archive is changed.
     pub async fn settle_script_run(
@@ -317,7 +318,7 @@ impl Store {
         recovery: bool,
     ) -> Result<bool> {
         let encoded = serde_json::to_string(result).map_err(|e| Error::Internal(e.to_string()))?;
-        let result = sqlx::query("UPDATE script SET last_run = CASE WHEN mode = 'command' THEN ? ELSE last_run END, latest_run_result = ?, archived_at = CASE WHEN purpose = 'oneOff' THEN coalesce(archived_at, ?) ELSE archived_at END, pending_run_id = NULL, pending_started_at = NULL, was_running = ? WHERE workspace_id = ? AND id = ? AND pending_run_id = ?")
+        let result = sqlx::query("UPDATE script SET last_run = CASE WHEN mode = 'command' THEN ? ELSE last_run END, latest_run_result = ?, archived_at = CASE WHEN purpose = 'oneOff' THEN coalesce(archived_at, ?) ELSE archived_at END, pending_run_id = NULL, pending_started_at = NULL, was_running = CASE WHEN ? THEN CASE WHEN mode = 'command' THEN 1 ELSE was_running END ELSE 0 END WHERE workspace_id = ? AND id = ? AND pending_run_id = ?")
             .bind(&encoded).bind(&encoded).bind(&result.stopped_at).bind(recovery).bind(ws.as_str()).bind(id).bind(token)
             .execute(self.write_pool()).await.map_err(|e| Error::Internal(format!("settle script run failed: {e}")))?;
         Ok(result.rows_affected() != 0)

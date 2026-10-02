@@ -2097,6 +2097,7 @@ mod tests {
     fn condensed_description_size_budget() {
         let condensed =
             condensed_workspace_api_description(false, &AgentFeaturesSettings::default(), &[]);
+        eprintln!("condensed all-on description: {} bytes", condensed.len());
         assert!(
             condensed.len() < 22_700,
             "condensed all-on description is {} bytes, over the 22.7k budget",
