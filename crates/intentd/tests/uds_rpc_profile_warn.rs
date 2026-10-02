@@ -24,7 +24,7 @@ use tokio::time::timeout;
 struct Daemon {
     child: Child,
     /// Swept after `Drop` reaps the child (fields drop after `drop()` runs).
-    _data_dir: tempfile::TempDir,
+    data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
@@ -58,7 +58,7 @@ fn spawn_daemon(prefix: &str, envs: &[(&str, &str)]) -> (Daemon, PathBuf, PathBu
     (
         Daemon {
             child,
-            _data_dir: data_dir_guard,
+            data_dir: data_dir_guard,
         },
         socket,
         log_path,
@@ -459,7 +459,7 @@ async fn queue_mutations_stay_within_statement_budget_at_depth() {
     // system messages at an authenticated RPC front door.
     daemon.child.kill().expect("stop daemon before seeding");
     daemon.child.wait().expect("reap daemon before seeding");
-    let data_dir = daemon._data_dir.path();
+    let data_dir = daemon.data_dir.path();
     let store = intent_store::Store::open(&data_dir.join("intentd.db"))
         .await
         .unwrap();
