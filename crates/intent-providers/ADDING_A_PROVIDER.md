@@ -89,7 +89,12 @@ needs. Fields that matter most:
   Ordinary catalog requests reuse identity observations for up to one minute; explicit
   refresh forces a new observation. Last-good fallback belongs only to the same identity,
   and installed-provider entries stay in memory because auth fingerprints are process-private.
-  Login-shell PATH and captured credentials retain their daemon-restart refresh behavior.
+  A cold daemon restart has no installed-provider last-good list: its first catalog read
+  must probe again. Login-shell PATH and captured credentials retain their daemon-restart
+  refresh behavior. When changing either adapter contract, run the opt-in
+  `e2e_wss_installed_cli` test with the actual packages (prerequisites in README.md).
+  That test doubles only the installed CLI protocol; it does not replace the ACP adapter.
+  Keep live-account and real-platform evidence separate from this controlled proof.
 
 **Binary discovery** — `find_provider_binary` (`crates/intent-providers/src/discover.rs`)
 resolves in precedence order: (1) explicit `providers.paths[id]` setting (must be absolute
