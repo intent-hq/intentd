@@ -1819,13 +1819,13 @@ impl ScriptManager {
                 return;
             }
             restoring = false;
-            let exit = self
+            let (exit, ended_at) = self
                 .run_one(&ws, &script_id, generation, pty_id, detect)
                 .await;
             // The too-fast decision is based on the shell's actual runtime:
-            // capture it before the straggler reap below, whose TERM-grace
-            // wait must not inflate a genuinely quick exit past the floor.
-            let ran_for = started.elapsed();
+            // run_one captures leader exit before output/straggler teardown;
+            // TERM grace must not inflate a quick exit past the floor.
+            let ran_for = ended_at.saturating_duration_since(started);
             // Group-keyed liveness (monorepo#1300): reap group
             // members that outlived the shell (a descendant trapping
             // TERM+HUP) before the exit is recorded, so `exited` means the
@@ -1917,9 +1917,9 @@ impl ScriptManager {
         generation: u64,
         pty_id: PtyId,
         detect_url: bool,
-    ) -> Option<PtyExit> {
+    ) -> (Option<PtyExit>, Instant) {
         let Ok(attachment) = self.pty.attach(pty_id) else {
-            return self.pty.try_exit(pty_id).ok().flatten();
+            return (self.pty.try_exit(pty_id).ok().flatten(), Instant::now());
         };
         let pid = self.pty.pid(pty_id);
         let mut live = attachment.live;
@@ -1936,7 +1936,7 @@ impl ScriptManager {
         }
         let mut poll = tokio::time::interval_at(tokio::time::Instant::now() + EXIT_POLL, EXIT_POLL);
         poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        loop {
+        let ended_at = loop {
             tokio::select! {
                 biased;
                 _ = poll.tick() => {
@@ -1945,6 +1945,7 @@ impl ScriptManager {
                         Ok(None) => pid.is_some_and(pid_gone),
                     };
                     if ended {
+                        let ended_at = Instant::now();
                         self.pty.reap_group_stragglers(pty_id).await;
                         let _=tokio::time::timeout(Duration::from_secs(2),self.pty.wait_output_eof(pty_id)).await;
                         for _ in 0..EXIT_DRAIN_MAX_CHUNKS {
@@ -1961,7 +1962,7 @@ impl ScriptManager {
                                 Err(TryRecvError::Empty | TryRecvError::Closed) => break,
                             }
                         }
-                        break;
+                        break ended_at;
                     }
                 }
                 recv = live.recv() => match recv {
@@ -1973,10 +1974,10 @@ impl ScriptManager {
                         }
                     }
                     Err(RecvError::Lagged(_)) => {self.monitor_gap(ws,script_id,pty_id).await;},
-                    Err(RecvError::Closed) => break,
+                    Err(RecvError::Closed) => break Instant::now(),
                 },
             }
-        }
+        };
         if !live.is_empty() {
             self.monitor_gap(ws, script_id, pty_id).await;
         }
@@ -1992,7 +1993,7 @@ impl ScriptManager {
         {
             tracing::warn!(%error,"monitor EOF failed");
         }
-        self.pty.try_exit(pty_id).ok().flatten()
+        (self.pty.try_exit(pty_id).ok().flatten(), ended_at)
     }
 
     /// Scan a chunk for the first local dev-server URL; on a first hit, latch it

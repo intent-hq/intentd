@@ -11508,6 +11508,11 @@ fn dequeue_worker_raced_tail(
     next: &QueuedMessage,
     mode: intent_core::FlushQueuedMessagesMode,
 ) -> Option<(Vec<QueuedMessage>, DrainingGuard)> {
+    // The head was popped before the slot reclaim, so queue selectors can no
+    // longer see its monitor identity. Never attach unrelated work to its wake.
+    if crate::script_monitor::monitor_id(next.message_metadata.as_ref()).is_some() {
+        return None;
+    }
     match mode {
         intent_core::FlushQueuedMessagesMode::All => {
             services.dequeue_ready_batch_draining(agent_id, false, 1)
@@ -20018,36 +20023,105 @@ mod agent_retry_tests {
             intent_core::FlushQueuedMessagesMode::All,
             intent_core::FlushQueuedMessagesMode::SystemOnly,
         ] {
-            let agent = AgentId::from("monitor-raced-owner");
-            let ws = WorkspaceId::from("monitor-raced-workspace");
-            let (mgr, _db) = manager_with_session(&agent, &ws, AgentStatus::RuntimeIdle).await;
-            let (head, _) = mgr.services.enqueue_message(
+            for exporting in [false, true] {
+                let agent = AgentId::from("monitor-raced-owner");
+                let ws = WorkspaceId::from("monitor-raced-workspace");
+                let (mgr, _db) = manager_with_session(&agent, &ws, AgentStatus::RuntimeIdle).await;
+                let (head, _) = mgr.services.enqueue_message(
                 &agent, "monitor head".into(), None, None,
                 Some(json!({"type":"script_monitor_wake","monitorId":"raced-monitor","workspaceId":ws})),
                 None, false, intent_core::MessageOrigin::Automatic,
             );
-            let (next, draining) = mgr
-                .services
-                .dequeue_message_draining_provisional(&agent)
-                .unwrap();
-            assert_eq!(next.id, head.id);
-            let (tail, _) = mgr.services.enqueue_message(
-                &agent,
-                "ordinary tail".into(),
-                None,
-                None,
-                None,
-                None,
-                false,
-                intent_core::MessageOrigin::Automatic,
-            );
-            assert!(
-                dequeue_worker_raced_tail(&mgr.services, &agent, &next, mode).is_none(),
-                "popped monitor must not absorb ordinary entries: {mode:?}"
-            );
-            assert!(mgr.services.is_message_queued(&agent, &tail.id));
-            drop(draining);
+                let (next, draining) = mgr
+                    .services
+                    .dequeue_message_draining_provisional(&agent)
+                    .unwrap();
+                assert_eq!(next.id, head.id);
+                let (tail, _) = mgr.services.enqueue_message(
+                    &agent,
+                    "ordinary tail".into(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    intent_core::MessageOrigin::Automatic,
+                );
+                assert!(
+                    dequeue_worker_raced_tail(&mgr.services, &agent, &next, mode).is_none(),
+                    "popped monitor must not absorb ordinary entries: {mode:?}"
+                );
+                assert!(mgr.services.is_message_queued(&agent, &tail.id));
+                drop(draining);
+                let admission = mgr.try_begin_turn(&agent, &ws).await.unwrap();
+                if exporting {
+                    park_monitor_export(&mgr, &ws);
+                }
+                run_message_worker(
+                    mgr.clone(),
+                    agent.clone(),
+                    ws.clone(),
+                    next.content,
+                    TurnOptions {
+                        message_metadata: next.message_metadata,
+                        ..TurnOptions::default()
+                    },
+                    true,
+                    admission,
+                )
+                .await;
+                assert!(
+                    !mgr.services.is_message_queued(&agent, &tail.id),
+                    "ordinary tail must be re-kicked after monitor suppression/deferral"
+                );
+                assert!(
+                    mgr.is_busy(&agent),
+                    "ordinary tail owns a replacement admission"
+                );
+                if exporting {
+                    let rows = mgr.services.queue_snapshot(&agent);
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(rows[0]["content"], "monitor head");
+                }
+            }
         }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn stale_monitor_worker_cannot_release_successor_admission() {
+        let agent = AgentId::from("monitor-stale-worker");
+        let ws = WorkspaceId::from("monitor-stale-workspace");
+        let (mgr, _db) = manager_with_session(&agent, &ws, AgentStatus::RuntimeIdle).await;
+        let old = mgr.try_begin_turn(&agent, &ws).await.unwrap();
+        mgr.end_turn(&agent).await;
+        let new = mgr.try_begin_turn(&agent, &ws).await.unwrap();
+        mgr.finish_monitor_worker(&agent, &ws, old).await;
+        assert!(mgr.owns_admission(&agent, new));
+        assert!(mgr.is_busy(&agent));
+        assert_eq!(
+            mgr.services
+                .store
+                .get_agent_session(&agent)
+                .await
+                .unwrap()
+                .status,
+            AgentStatus::Active
+        );
+        mgr.end_turn(&agent).await;
+    }
+
+    fn park_monitor_export(mgr: &AgentManager, ws: &WorkspaceId) {
+        mgr.services.transfer_exports.lock().unwrap().insert(
+            "monitor-worker-export".into(),
+            crate::transfer_export::ExportSession {
+                initiator: None,
+                workspace_id: ws.clone(),
+                staging_dir: std::env::temp_dir(),
+                state: crate::transfer_export::ExportState::Building { aborted: false },
+                wip_paths: vec![],
+                max_chunk_bytes: 100,
+            },
+        );
     }
 
     async fn monitor_worker_exit_releases_slot(exporting: bool) {
@@ -20056,17 +20130,7 @@ mod agent_retry_tests {
         let (mgr, _db) = manager_with_session(&agent, &ws, AgentStatus::RuntimeIdle).await;
         let admission = mgr.try_begin_turn(&agent, &ws).await.unwrap();
         if exporting {
-            mgr.services.transfer_exports.lock().unwrap().insert(
-                "monitor-worker-export".into(),
-                crate::transfer_export::ExportSession {
-                    initiator: None,
-                    workspace_id: ws.clone(),
-                    staging_dir: std::env::temp_dir(),
-                    state: crate::transfer_export::ExportState::Building { aborted: false },
-                    wip_paths: vec![],
-                    max_chunk_bytes: 100,
-                },
-            );
+            park_monitor_export(&mgr, &ws);
         }
         let metadata =
             json!({"type":"script_monitor_wake","monitorId":"removed-monitor","workspaceId":ws});

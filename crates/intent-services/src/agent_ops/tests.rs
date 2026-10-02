@@ -47993,6 +47993,12 @@ async fn send_queued_message_now_store_only_processing_requires_successful_persi
 async fn script_monitor_waiting_advisory_and_after_all_retire_on_silent_cancel() {
     for grouped in [false, true] {
         let (_t, svc, ws) = setup().await;
+        let park = Arc::new(crate::CompletionClassifyPark::default());
+        let svc = if grouped {
+            svc
+        } else {
+            svc.with_completion_claim_park(park.clone())
+        };
         let parent = create_agent(&svc, &ws, "Parent").await;
         let child = create_agent(&svc, &ws, "Child").await;
         let script = svc
@@ -48054,16 +48060,42 @@ async fn script_monitor_waiting_advisory_and_after_all_retire_on_silent_cancel()
             ))
             .await;
         }
-        svc.cancel_script_monitors(&ws, Some(&child), "owner-retired")
+        wait_for_persisted_watches(&svc, 1).await;
+        let cancellation = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws.clone();
+            let child = child.clone();
+            async move {
+                svc.cancel_script_monitors(&ws, Some(&child), "owner-retired")
+                    .await
+                    .unwrap();
+            }
+        });
+        if !grouped {
+            timeout(Duration::from_secs(5), park.entered.notified())
+                .await
+                .expect("cancellation redelivery claims the watch");
+            // The competing idle pass must yield to the existing delivery;
+            // its return does not promise that the winner has retired yet.
+            svc.handle_completion_event(&completion_event(
+                &ws,
+                AGENT_IDLE,
+                &child,
+                json!({"agentId":child}),
+            ))
+            .await;
+            assert_eq!(svc.find_watches_for_child(&child).len(), 1);
+            assert_eq!(parent_message_count(&svc, &parent).await, 1);
+            park.release.notify_one();
+        }
+        timeout(Duration::from_secs(5), cancellation)
             .await
+            .unwrap()
             .unwrap();
-        svc.handle_completion_event(&completion_event(
-            &ws,
-            AGENT_IDLE,
-            &child,
-            json!({"agentId":child}),
-        ))
-        .await;
+        // Cancellation and commit_monitor's spawned redelivery race for the
+        // same claim. Await durable retirement by the winner, preserving the
+        // exact final assertions for both individual and after_all watches.
+        wait_for_persisted_watches(&svc, 0).await;
         assert!(svc.find_watches_for_child(&child).is_empty());
         assert_eq!(parent_message_count(&svc, &parent).await, 2);
         assert!(svc
