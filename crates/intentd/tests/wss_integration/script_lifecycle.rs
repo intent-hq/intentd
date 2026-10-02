@@ -501,6 +501,16 @@ async fn script_changed_full_rows_and_terminal_order_over_wss() {
                 .find(|r| r["id"] == sid)
                 .unwrap()
         );
+        let stopped = rpc(
+            &mut client,
+            9,
+            "script.stop",
+            json!({"workspaceId":ws,"scriptId":sid}),
+        )
+        .await;
+        assert_eq!(stopped["result"]["ok"], true);
+        let dismissed = script_event_frame(&mut watching, sid, "script:state").await;
+        assert_eq!(dismissed["data"]["status"], "idle");
         let replaced = rpc(&mut client, 7, "script.create", json!({"workspaceId":ws,"scriptId":sid,"name":"replacement","command":"true","mode":"command"})).await;
         assert!(replaced.get("error").is_none(), "{replaced}");
         let event = script_event_frame(&mut watching, sid, "script:changed").await;

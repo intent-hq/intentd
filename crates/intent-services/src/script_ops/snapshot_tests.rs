@@ -290,3 +290,46 @@ async fn script_snapshot_old_url_and_state_cannot_mutate_replacement_or_rerun() 
     assert!(runtime.get("detectedUrl").is_none() && runtime.get("error").is_none());
     mgr.stop(&h.ws, &id).await.unwrap();
 }
+
+#[intent_test_macros::daemon_test]
+async fn script_snapshot_finished_stop_publishes_idle_without_changing_history() {
+    for purpose in [
+        intent_core::ScriptPurpose::OneOff,
+        intent_core::ScriptPurpose::Saved,
+    ] {
+        let h = harness().await;
+        let id = create(
+            &h,
+            ScriptCreateParams {
+                name: "finished".into(),
+                command: "true".into(),
+                mode: ScriptMode::Command,
+                purpose: Some(purpose),
+                ..Default::default()
+            },
+        )
+        .await;
+        let mgr = h.services.script_manager();
+        mgr.run(&h.ws, &id, None, Some(5)).await.unwrap();
+        let before = mgr.list(&h.ws).await.unwrap()["scripts"][0].clone();
+        mgr.stop(&h.ws, &id).await.unwrap();
+        let events = h
+            .services
+            .store
+            .query_events(&EventQuery {
+                workspace_id: Some(h.ws.clone()),
+                event_types: vec![SCRIPT_STATE.to_string()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            events.iter().any(|e| e.data["status"] == "idle"),
+            "finished stop must publish its runtime change"
+        );
+        let after = mgr.list(&h.ws).await.unwrap()["scripts"][0].clone();
+        assert_eq!(after["runtime"]["status"], "idle");
+        assert_eq!(after["archivedAt"], before["archivedAt"]);
+        assert_eq!(after["lastRun"], before["lastRun"]);
+    }
+}

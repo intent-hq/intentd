@@ -1197,7 +1197,7 @@ impl ScriptManager {
                 let mut guard = self.scripts.lock().unwrap();
                 match guard.get_mut(&key) {
                     Some(m) => {
-                        let launch_aborted = m.state.status == ScriptStatus::Starting;
+                        let previous_status = m.state.status;
                         if m.state.status != ScriptStatus::Running {
                             m.state.status = ScriptStatus::Idle;
                         }
@@ -1207,7 +1207,8 @@ impl ScriptManager {
                             dismissed = true;
                         }
                         (
-                            (dismissed || launch_aborted).then(|| m.state.clone()),
+                            (dismissed || previous_status != m.state.status)
+                                .then(|| m.state.clone()),
                             dismissed,
                         )
                     }
