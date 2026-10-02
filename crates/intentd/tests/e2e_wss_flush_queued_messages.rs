@@ -61,7 +61,8 @@ const GUEST_TOKEN: &str = "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefb
 
 const KICKOFF_MSG: &str = "kick-off slow turn";
 const QUEUED_ONE: &str = "queued flush one";
-const QUEUED_TWO: &str = "Message from @guest\n\nqueued flush two";
+const QUEUED_TWO_INPUT: &str = "queued flush two";
+const QUEUED_TWO: &str = "Message from @guest (Guest User), a collaborator (guest) of this workspace — not the workspace owner.\n\nqueued flush two";
 const OWNER_QUEUED: &str = "queued by owner";
 const GUEST_QUEUED: &str = "queued by guest";
 const GUEST_PREAMBLE: &str = "Message from @guest";
@@ -579,7 +580,7 @@ async fn setup_busy_agent_with_two_queued(data_dir: &Path, script: &str) -> Flus
         &mut guest_rpc,
         13,
         "agent.queueMessage",
-        json!({ "agentId": agent_id, "content": QUEUED_TWO }),
+        json!({ "agentId": agent_id, "content": QUEUED_TWO_INPUT }),
     )
     .await;
     assert_eq!(q2["success"], true, "queue two: {q2}");

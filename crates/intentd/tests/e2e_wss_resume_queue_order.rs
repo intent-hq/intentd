@@ -44,7 +44,8 @@ const GUEST_TOKEN: &str = "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefb
 
 const START_MSG: &str = "Start the long-running task";
 const QUEUED_ONE: &str = "preserved queue message one";
-const QUEUED_TWO: &str = "Message from @guest\n\npreserved queue message two";
+const QUEUED_TWO_INPUT: &str = "preserved queue message two";
+const QUEUED_TWO: &str = "Message from @guest (Guest User), a collaborator (guest) of this workspace — not the workspace owner.\n\npreserved queue message two";
 /// Stable prefix of the continuation wording in
 /// `Services::resume_interrupted_agent` — the delivered message embeds a
 /// per-resume humanized outage duration, so asserts match on this prefix.
@@ -483,7 +484,7 @@ async fn interrupt_midturn_with_queued_messages(data_dir: &Path, script: &str) -
         &mut guest_rpc,
         5,
         "agent.queueMessage",
-        json!({"agentId":agent_id,"content":QUEUED_TWO}),
+        json!({"agentId":agent_id,"content":QUEUED_TWO_INPUT}),
     )
     .await;
     assert_eq!(q2["success"], json!(true), "queue two: {q2}");
