@@ -435,6 +435,187 @@ use common::DaemonGuard;
 
 #[cfg(debug_assertions)]
 #[tokio::test]
+async fn blocked_exec_stream_stdin_does_not_prevent_shutdown() {
+    assert_blocked_exec_stream_shutdown(false).await;
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn blocked_exec_stream_eof_does_not_prevent_shutdown() {
+    assert_blocked_exec_stream_shutdown(true).await;
+}
+
+#[cfg(debug_assertions)]
+async fn assert_blocked_exec_stream_shutdown(eof: bool) {
+    struct StreamCleanup(i32);
+    impl Drop for StreamCleanup {
+        fn drop(&mut self) {
+            // Fallback owns only the process group identified by this fixture.
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(self.0),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    }
+    let dir = temp_data_dir();
+    let data = dir.path();
+    let socket = data.join("intentd.sock");
+    let log_path = data.join("daemon.log");
+    let pid_path = data.join("stream.pid");
+    common::enable_ws_api(data);
+    let mut command = common::serve_command();
+    command
+        .env("INTENTD_DATA_DIR", data)
+        .env("INTENTD_WORKSPACES_DIR", data.join("workspaces"))
+        .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
+        .env("INTENTD_AUTH_TOKEN", TOKEN)
+        .env("INTENTD_SECRETS_FILE", data.join("secrets.json"))
+        .env("INTENTD_TEST_EXEC_STREAM_WRITE_PENDING", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(std::fs::File::create(&log_path).unwrap()));
+    command.process_group(0);
+    let mut daemon = DaemonGuard::new(command.spawn().unwrap(), data.to_path_buf(), false);
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let mut rpc = connect_ws(
+        port,
+        client_config(status["result"]["fingerprint"].as_str().unwrap()),
+    )
+    .await;
+    let stream = wss_rpc(
+        &mut rpc,
+        1,
+        "host.execStream",
+        json!({
+            // timing-guard: keep the non-reading child alive beyond shutdown's assertion budget; shutdown must reap it.
+            "command":"sh", "args":["-c", "echo $$ > \"$1\"; exec sleep 600", "sh", pid_path]
+        }),
+    )
+    .await;
+    let id = stream["requestId"].as_str().unwrap();
+    let pid: i32 = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&pid_path) {
+                if let Ok(pid) = text.trim().parse() {
+                    break pid;
+                }
+            }
+            // timing-guard: wait for this child's observable PID publication.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let _stream_cleanup = StreamCleanup(pid);
+    let duplicate_path = data.join("duplicate-stream-started");
+    rpc.send(Message::Text(
+        json!({"jsonrpc":"2.0", "id":100,
+        "method":"host.execStream", "params":{
+            "requestId":id, "command":"sh",
+            "args":["-c", "echo started > \"$1\"", "sh", duplicate_path]
+        }})
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if let Message::Text(text) = rpc.next().await.unwrap().unwrap() {
+                let frame: Value = serde_json::from_str(&text).unwrap();
+                if frame["id"] == 100 {
+                    assert_eq!(frame["jsonrpc"], "2.0");
+                    assert_eq!(frame["error"]["code"], -32602);
+                    assert!(frame["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("already active"));
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    for request in 2..50 {
+        rpc.send(Message::Text(
+            json!({"jsonrpc":"2.0", "id":request,
+            "method":"host.execStream.write", "params":{"requestId":id,"stdin":"x".repeat(65536)}})
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    }
+    if eof {
+        rpc.send(Message::Text(
+            json!({"jsonrpc":"2.0", "id":50,
+            "method":"host.execStream.write", "params":{"requestId":id,"eof":true}})
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    }
+    let pending_message = if eof {
+        "host.execStream stdin EOF send pending"
+    } else {
+        "host.execStream stdin send pending"
+    };
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if std::fs::read_to_string(&log_path)
+                .unwrap()
+                .contains(pending_message)
+            {
+                break;
+            }
+            // timing-guard: await the actual bounded stdin send returning Pending in the admitted RPC.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        uds_rpc(&socket, 60, "system.shutdown", json!({})).await["result"]["ok"],
+        true
+    );
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(status) = daemon.child_mut().try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            // timing-guard: poll the real daemon exit after shutdown was acknowledged.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("request drain waited for stdin before cancelling its non-reading child");
+    assert_eq!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+        Err(nix::errno::Errno::ESRCH)
+    );
+    assert!(!duplicate_path.exists(), "rejected duplicate executed");
+    let store = intent_store::Store::open(&data.join("intentd.db"))
+        .await
+        .unwrap();
+    let events = store
+        .query_events(&intent_store::EventQuery::default())
+        .await
+        .unwrap();
+    let exits: Vec<_> = events
+        .iter()
+        .filter(|event| event.event_type == "host:exec:exit" && event.data["requestId"] == id)
+        .collect();
+    assert_eq!(exits.len(), 1);
+    assert_eq!(exits[0].data["cancelled"], true);
+    store.close().await;
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
 async fn cancelled_settings_hook_joins_before_main_listener_teardown() {
     use tokio::io::AsyncReadExt;
     let dir = temp_data_dir();

@@ -138,13 +138,19 @@ enum StdinMsg {
     Close,
 }
 
+#[derive(Default)]
+struct RegistryState {
+    streams: HashMap<String, StreamHandle>,
+    closed: bool,
+}
+
 /// Process-wide registry of live [`host.execStream`] jobs, keyed by
 /// `requestId`. Cheap to clone (shares the inner map). Held in a global
 /// [`OnceLock`] so the transport fast-path can drive `write` / `cancel`
 /// without threading state through every layer.
 #[derive(Clone, Default)]
 pub struct HostExecStreamRegistry {
-    inner: Arc<Mutex<HashMap<String, StreamHandle>>>,
+    inner: Arc<Mutex<RegistryState>>,
     terminal_tasks: Arc<tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
@@ -155,8 +161,21 @@ impl HostExecStreamRegistry {
         Self::default()
     }
 
-    /// Cancel all streams and join their durable terminal publications. The
-    /// composition root has already drained request admission before this call.
+    /// Fence late starts and signal existing streams before draining RPCs.
+    /// Blocked stdin senders then wake as their child is reaped.
+    ///
+    /// # Panics
+    /// Panics if the registry mutex is poisoned.
+    pub fn begin_shutdown(&self) {
+        let mut state = self.inner.lock().expect("registry poisoned");
+        state.closed = true;
+        for handle in state.streams.values() {
+            handle.cancel_token.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Cancel all streams and join their durable terminal publications. Call
+    /// [`Self::begin_shutdown`] before draining requests that may await stdin.
     ///
     /// # Errors
     /// Returns an error if a terminal writer panicked or was cancelled.
@@ -164,9 +183,7 @@ impl HostExecStreamRegistry {
     /// # Panics
     /// Panics if the registry mutex is poisoned.
     pub async fn shutdown(&self) -> Result<(), HostExecError> {
-        for handle in self.inner.lock().expect("registry poisoned").values() {
-            handle.cancel_token.store(true, Ordering::SeqCst);
-        }
+        self.begin_shutdown();
         let mut tasks = self.terminal_tasks.lock().await;
         while let Some(task) = tasks.last_mut() {
             let result = task.await;
@@ -186,7 +203,7 @@ impl HostExecStreamRegistry {
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     #[must_use]
     pub fn len(&self) -> usize {
-        self.inner.lock().expect("registry poisoned").len()
+        self.inner.lock().expect("registry poisoned").streams.len()
     }
 
     /// Whether the registry has no live streams.
@@ -195,17 +212,11 @@ impl HostExecStreamRegistry {
         self.len() == 0
     }
 
-    fn insert(&self, request_id: String, handle: StreamHandle) {
-        self.inner
-            .lock()
-            .expect("registry poisoned")
-            .insert(request_id, handle);
-    }
-
     fn remove(&self, request_id: &str) {
         self.inner
             .lock()
             .expect("registry poisoned")
+            .streams
             .remove(request_id);
     }
 
@@ -229,7 +240,13 @@ impl HostExecStreamRegistry {
     ) -> Result<(), HostExecError> {
         let sender = {
             let map = self.inner.lock().expect("registry poisoned");
-            map.get(request_id).map(|h| h.stdin_tx.clone())
+            if map.closed {
+                return Err(HostExecError {
+                    code: -32603,
+                    message: "daemon is shutting down".into(),
+                });
+            }
+            map.streams.get(request_id).map(|h| h.stdin_tx.clone())
         };
         let sender = sender.ok_or_else(|| HostExecError {
             code: -32603,
@@ -237,17 +254,48 @@ impl HostExecStreamRegistry {
         })?;
         if let Some(bytes) = data {
             if !bytes.is_empty() {
-                sender
-                    .send(StdinMsg::Data(bytes))
-                    .await
-                    .map_err(|_| HostExecError {
-                        code: -32603,
-                        message: format!("host.execStream {request_id} stdin closed"),
-                    })?;
+                let send = sender.send(StdinMsg::Data(bytes));
+                #[cfg(debug_assertions)]
+                let send = {
+                    let mut send = Box::pin(send);
+                    let mut reported = false;
+                    std::future::poll_fn(move |cx| {
+                        let result = std::future::Future::poll(send.as_mut(), cx);
+                        if result.is_pending()
+                            && !reported
+                            && std::env::var_os("INTENTD_TEST_EXEC_STREAM_WRITE_PENDING").is_some()
+                        {
+                            reported = true;
+                            tracing::info!(request_id, "host.execStream stdin send pending");
+                        }
+                        result
+                    })
+                };
+                send.await.map_err(|_| HostExecError {
+                    code: -32603,
+                    message: format!("host.execStream {request_id} stdin closed"),
+                })?;
             }
         }
         if eof {
-            let _ = sender.send(StdinMsg::Close).await;
+            let send = sender.send(StdinMsg::Close);
+            #[cfg(debug_assertions)]
+            let send = {
+                let mut send = Box::pin(send);
+                let mut reported = false;
+                std::future::poll_fn(move |cx| {
+                    let result = std::future::Future::poll(send.as_mut(), cx);
+                    if result.is_pending()
+                        && !reported
+                        && std::env::var_os("INTENTD_TEST_EXEC_STREAM_WRITE_PENDING").is_some()
+                    {
+                        reported = true;
+                        tracing::info!(request_id, "host.execStream stdin EOF send pending");
+                    }
+                    result
+                })
+            };
+            let _ = send.await;
         }
         Ok(())
     }
@@ -262,7 +310,7 @@ impl HostExecStreamRegistry {
     #[must_use]
     pub fn cancel(&self, request_id: &str) -> bool {
         let map = self.inner.lock().expect("registry poisoned");
-        match map.get(request_id) {
+        match map.streams.get(request_id) {
             Some(handle) => {
                 handle.cancel_token.store(true, Ordering::SeqCst);
                 // Drop the stdin sender's clone on the caller side; the
@@ -297,12 +345,22 @@ pub fn mint_request_id() -> String {
 ///
 /// # Errors
 ///
-/// Returns a `HostExecError` if `cwd` cannot be resolved or spawning the process fails.
+/// Returns a `HostExecError` if shutdown has begun, the request ID is already live,
+/// `cwd` cannot be resolved, or spawning fails.
+///
+/// # Panics
+/// Panics if the registry mutex is poisoned.
 pub async fn start_stream(
     api: &dyn WorkspaceApi,
     bus: EventBus,
     args: HostExecStreamArgs,
 ) -> Result<String, HostExecError> {
+    if registry().inner.lock().expect("registry poisoned").closed {
+        return Err(HostExecError {
+            code: -32603,
+            message: "daemon is shutting down".into(),
+        });
+    }
     let HostExecStreamArgs {
         common,
         request_id,
@@ -327,6 +385,26 @@ pub async fn start_stream(
         WorkspaceId::from,
     );
 
+    // The shutdown fence and spawn/publication share this short critical
+    // section. Cwd resolution above may finish after request admission closed.
+    // Acquire the async task-list lock before any physical child effect; there
+    // is no await between the fence check and terminal-owner registration.
+    let mut tasks = registry().terminal_tasks.lock().await;
+    let mut admission = registry().inner.lock().expect("registry poisoned");
+    if admission.closed {
+        return Err(HostExecError {
+            code: -32603,
+            message: "daemon is shutting down".into(),
+        });
+    }
+    // A live ID owns its cancellation handle until terminal publication. Never
+    // displace it: shutdown must be able to cancel every admitted child.
+    if admission.streams.contains_key(&request_id) {
+        return Err(HostExecError {
+            code: INVALID_PARAMS,
+            message: "host.execStream requestId is already active".into(),
+        });
+    }
     // Spawn with piped stdin so follow-up writes reach the child.
     let mut cmd = build_command(&common, cwd_resolved.as_deref());
     cmd.stdin(Stdio::piped());
@@ -347,11 +425,11 @@ pub async fn start_stream(
     // subscriber does not observe an empty stream.
     if let Some(seed) = stdin {
         if !seed.is_empty() {
-            let _ = stdin_tx.send(StdinMsg::Data(seed)).await;
+            let _ = stdin_tx.try_send(StdinMsg::Data(seed));
         }
     }
 
-    registry().insert(
+    admission.streams.insert(
         request_id.clone(),
         StreamHandle {
             stdin_tx,
@@ -417,9 +495,9 @@ pub async fn start_stream(
         .await;
     });
 
-    let mut tasks = registry().terminal_tasks.lock().await;
     tasks.retain(|task| !task.is_finished());
     tasks.push(terminal);
+    drop(admission);
 
     Ok(request_id)
 }
@@ -643,6 +721,171 @@ mod tests {
         );
         assert!(registry().is_empty());
         store.close().await;
+    }
+
+    #[cfg(unix)]
+    #[intent_test_macros::daemon_test]
+    async fn shutdown_refuses_start_held_in_workspace_lookup() {
+        use std::future::{poll_fn, Future};
+        use std::task::Poll;
+        let tmp = crate::test_support::test_tempdir("stream-late-cwd");
+        let store = intent_store::Store::open(&tmp.path().join("store.db"))
+            .await
+            .unwrap();
+        let services = crate::Services::new_with_file_secrets(
+            store.clone(),
+            intent_core::FileSecretStore::with_path(tmp.path().join("secrets.json")),
+        );
+        let bus = EventBus::new(store.clone());
+        let mut readers = Vec::new();
+        for _ in 0..store.read_pool().options().get_max_connections() {
+            readers.push(store.read_pool().acquire().await.unwrap());
+        }
+        let args = parse_args(&map(&json!({"command":"sleep", "args":["600"],
+            "workspaceId":"held-workspace"})))
+        .unwrap();
+        let start = start_stream(&services, bus.clone(), args);
+        tokio::pin!(start);
+        assert!(
+            poll_fn(|cx| Poll::Ready(start.as_mut().poll(cx).is_pending())).await,
+            "actual workspace lookup must be waiting for the held read pool"
+        );
+        assert!(registry().is_empty());
+        registry().shutdown().await.unwrap();
+        drop(readers);
+        let result = tokio::time::timeout(Duration::from_secs(5), start)
+            .await
+            .unwrap();
+        // Reap a baseline late spawn before reporting the failed refusal.
+        registry().shutdown().await.unwrap();
+        assert!(
+            result.is_err(),
+            "late workspace resolution spawned after shutdown: {result:?}"
+        );
+        let refused = start_stream(
+            &services,
+            bus.clone(),
+            parse_args(&map(&json!({
+                "command":"must-not-spawn-after-stream-shutdown"
+            })))
+            .unwrap(),
+        )
+        .await
+        .unwrap_err();
+        assert!(refused.message.contains("shutting down"));
+        assert!(registry().is_empty());
+        bus.shutdown().await.unwrap();
+        store.close().await;
+        let reopened = intent_store::Store::open(&tmp.path().join("store.db"))
+            .await
+            .unwrap();
+        assert!(reopened
+            .query_events(&intent_store::EventQuery::default())
+            .await
+            .unwrap()
+            .is_empty());
+        reopened.close().await;
+    }
+
+    #[cfg(unix)]
+    #[intent_test_macros::daemon_test]
+    async fn duplicate_live_id_preserves_original_shutdown_owner() {
+        let tmp = crate::test_support::test_tempdir("stream-duplicate-id");
+        let db = tmp.path().join("store.db");
+        let store = intent_store::Store::open(&db).await.unwrap();
+        let services = crate::Services::new_with_file_secrets(
+            store.clone(),
+            intent_core::FileSecretStore::with_path(tmp.path().join("secrets.json")),
+        );
+        let bus = EventBus::new(store.clone());
+        let pid_path = tmp.path().join("original.pid");
+        let duplicate_path = tmp.path().join("duplicate-started");
+        let id = "duplicate-live";
+        let args = parse_args(&map(&json!({
+            "requestId": id, "command": "sh",
+            "args": ["-c", "echo $$ > \"$1\"; exec sleep 600", "sh", pid_path]
+        })))
+        .unwrap();
+        start_stream(&services, bus.clone(), args).await.unwrap();
+        let pid: i32 = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(contents) = std::fs::read_to_string(&pid_path) {
+                    if let Ok(pid) = contents.trim().parse() {
+                        break pid;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        struct Cleanup(i32);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(self.0),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+        }
+        let _cleanup = Cleanup(pid);
+        let original_cancel = registry().inner.lock().unwrap().streams[id]
+            .cancel_token
+            .clone();
+        let duplicate = start_stream(
+            &services,
+            bus.clone(),
+            parse_args(&map(&json!({
+                "requestId": id, "command": "sh",
+                "args": ["-c", "echo started > \"$1\"", "sh", duplicate_path]
+            })))
+            .unwrap(),
+        )
+        .await;
+        let original_retained = registry()
+            .inner
+            .lock()
+            .unwrap()
+            .streams
+            .get(id)
+            .is_some_and(|handle| Arc::ptr_eq(&handle.cancel_token, &original_cancel));
+        // Clean up both baseline children before reporting the failed rejection.
+        // The corrected path must rely exclusively on registry shutdown.
+        if duplicate.is_ok() {
+            original_cancel.store(true, Ordering::SeqCst);
+        }
+        tokio::time::timeout(Duration::from_secs(5), registry().shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            duplicate.is_err(),
+            "duplicate live id spawned: {duplicate:?}"
+        );
+        let error = duplicate.unwrap_err();
+        assert_eq!(error.code, INVALID_PARAMS);
+        assert!(error.message.contains("already active"));
+        assert!(original_retained, "duplicate displaced the original owner");
+        assert!(!duplicate_path.exists(), "rejected child executed");
+        assert_eq!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+            Err(nix::errno::Errno::ESRCH)
+        );
+        assert!(registry().is_empty());
+        bus.shutdown().await.unwrap();
+        store.close().await;
+        let reopened = intent_store::Store::open(&db).await.unwrap();
+        let events = reopened
+            .query_events(&intent_store::EventQuery::default())
+            .await
+            .unwrap();
+        let exits: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == HOST_EXEC_EXIT && event.data["requestId"] == id)
+            .collect();
+        assert_eq!(exits.len(), 1);
+        assert_eq!(exits[0].data["cancelled"], true);
+        reopened.close().await;
     }
 
     fn map(v: &Value) -> Map<String, Value> {

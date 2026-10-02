@@ -223,6 +223,8 @@ pub(crate) struct AsyncSecretStore {
     #[cfg(test)]
     pub(crate) github_poll_worker_failed: Arc<tokio::sync::Notify>,
     #[cfg(test)]
+    pub(crate) github_poll_sleep_pending: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    #[cfg(test)]
     pub(crate) before_gitlab_persistence: MutationHook<Result<()>>,
     #[cfg(test)]
     pub(crate) gitlab_poll_worker_failed: Arc<tokio::sync::Notify>,
@@ -361,6 +363,8 @@ impl AsyncSecretStore {
             before_github_persistence: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             github_poll_worker_failed: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            github_poll_sleep_pending: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             before_gitlab_persistence: Arc::new(Mutex::new(None)),
             #[cfg(test)]

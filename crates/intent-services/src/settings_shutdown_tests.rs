@@ -1639,6 +1639,121 @@ async fn github_poll_provenance_panic_keeps_finalization_guard() {
 }
 
 #[intent_test_macros::daemon_test]
+async fn github_idle_poll_shutdown_wakes_an_actually_pending_cadence() {
+    assert_github_idle_poll_shutdown(false).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn github_idle_poll_shutdown_before_first_worker_poll() {
+    assert_github_idle_poll_shutdown(true).await;
+}
+
+async fn assert_github_idle_poll_shutdown(close_before_worker: bool) {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    let (dir, services, bus) = harness().await;
+    let raw = intent_core::FileSecretStore::with_path(dir.path().join("idle-secrets.json"));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let polls = Arc::new(AtomicUsize::new(0));
+    let observed_polls = polls.clone();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server = intent_core::spawn_daemon(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut length = 0;
+        let mut request = String::new();
+        reader.read_line(&mut request).await.unwrap();
+        assert!(request.starts_with("POST /login/device/code "));
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            if line == "\r\n" {
+                break;
+            }
+            if let Some((key, value)) = line.split_once(':') {
+                if key.eq_ignore_ascii_case("content-length") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+        }
+        reader.read_exact(&mut vec![0; length]).await.unwrap();
+        let body = json!({"device_code":"idle-code", "user_code":"IDLE", "verification_uri":"https://github.com/login/device", "expires_in":900, "interval":3600}).to_string();
+        reader.get_mut().write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
+        tokio::select! {
+            _ = stopped => {},
+            stream = listener.accept() => {
+                stream.unwrap();
+                observed_polls.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    });
+    let services = services
+        .with_secret_store(Arc::new(raw.clone()))
+        .with_github_login_base_uri(&base);
+    let (pending, observed_pending) = tokio::sync::oneshot::channel();
+    *services.secrets.github_poll_sleep_pending.lock().unwrap() = Some(pending);
+    let response = services.github_connect().await.unwrap();
+    assert_eq!(response["interval"], 3600);
+    if close_before_worker {
+        // This current-thread test has not yielded since connect registered
+        // its supervisor. Close before either worker or cadence can be polled.
+        assert!(services
+            .secrets
+            .github_poll_sleep_pending
+            .lock()
+            .unwrap()
+            .is_some());
+        services.begin_settings_shutdown();
+    } else {
+        timeout(Duration::from_secs(5), observed_pending)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert!(services.github_auth_flow.lock().await.is_some());
+    timeout(Duration::from_secs(5), services.shutdown_store_writers())
+        .await
+        .expect("shutdown retained an idle GitHub cadence until device expiry");
+    assert!(services.github_auth_flow.lock().await.is_none());
+    assert!(services.store_tasks.is_closed());
+    if close_before_worker {
+        assert!(
+            services
+                .secrets
+                .github_poll_sleep_pending
+                .lock()
+                .unwrap()
+                .is_some(),
+            "already-closed admission must win before polling the idle timer"
+        );
+    }
+    assert!(services.secrets.state.lock().unwrap().mutations.is_empty());
+    assert_eq!(
+        polls.load(Ordering::SeqCst),
+        0,
+        "shutdown before first token poll must not exchange a grant"
+    );
+    stop.send(()).unwrap();
+    server.await.unwrap();
+    for account in [
+        crate::github_auth_ops::SECRET_ACCOUNT,
+        crate::source_control_auth_ops::GITHUB_TOKEN_METHOD_ACCOUNT,
+    ] {
+        assert_eq!(raw.load(account).unwrap(), None);
+    }
+    bus.shutdown().await.unwrap();
+    services.store.close().await;
+    let reopened = Store::open(&dir.path().join("state.db")).await.unwrap();
+    assert!(!reopened
+        .query_events(&intent_store::EventQuery::default())
+        .await
+        .unwrap()
+        .iter()
+        .any(|event| event.event_type == "github:auth-changed"));
+    reopened.close().await;
+}
+
+#[intent_test_macros::daemon_test]
 async fn github_poll_shutdown_retains_real_write_and_panic_settlement() {
     use std::future::{poll_fn, Future};
     use std::task::Poll;

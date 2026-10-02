@@ -4543,9 +4543,8 @@ impl Services {
     /// Override the per-workspace auto-commit generation cool-down window
     /// (defaults to `GENERATION_COOLDOWN_MS` in `auto_commit`, or the
     /// `INTENTD_AUTO_COMMIT_COOLDOWN_MS` env seam). Tests compress it so the
-    /// cool-down expiry path completes in milliseconds; unix-only for the same
-    /// reason as [`Self::with_auto_commit_timeout_ms`].
-    #[cfg(all(test, unix))]
+    /// cool-down expiry path completes in milliseconds.
+    #[cfg(test)]
     pub(crate) fn with_auto_commit_cooldown_ms(mut self, ms: u64) -> Self {
         self.auto_commit_cooldown_ms = Some(ms);
         self
@@ -31992,7 +31991,8 @@ impl WorkspaceApi for Services {
                 }
             }
             let flow_id = github_auth_ops::next_flow_id();
-            let owner = github_auth_ops::CredentialOwner::new(&secrets);
+            let owner =
+                github_auth_ops::CredentialOwner::new(&secrets, self.settings_tasks.clone());
             let flow = flow.with_identity_guard(
                 api_base.as_deref(),
                 owner.identity_guard(identity_guard, state.clone(), flow_id),

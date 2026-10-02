@@ -134,7 +134,7 @@ pub(crate) async fn authorize(
         deadline,
         phase: FlowPhase::Pending,
     });
-    let owner = CredentialOwner::new(&services.secrets);
+    let owner = CredentialOwner::new(&services.secrets, services.settings_tasks.clone());
     let flow = flow
         .with_store(raw.clone())
         .with_identity_guard(None, owner.identity_guard(identity, state.clone(), flow_id));

@@ -2675,6 +2675,7 @@ async fn cmd_serve(
             rpc_limiter.begin_shutdown();
             manager.begin_shutdown();
             host_exec_runtime.begin_shutdown();
+            intent_services::host_exec_stream::registry().begin_shutdown();
             reverse_registry.begin_shutdown();
             let _ = startup_stop.send(true);
             let _ = stop_merge_retry.send(true);
@@ -2885,6 +2886,7 @@ async fn cmd_serve(
     services.begin_settings_shutdown();
     manager.begin_shutdown();
     host_exec_runtime.begin_shutdown();
+    intent_services::host_exec_stream::registry().begin_shutdown();
     reverse_registry.begin_shutdown();
     repository_metadata_prewarm.abort();
     let _ = repository_metadata_prewarm.await;

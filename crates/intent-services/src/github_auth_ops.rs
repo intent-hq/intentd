@@ -120,6 +120,7 @@ pub(crate) type FlowState = Arc<tokio::sync::Mutex<Option<FlowSlot>>>;
 /// travels into the engine's blocking write, so timeout/cancellation cannot
 /// release ownership while that write can still land.
 pub(crate) struct CredentialOwner {
+    settings_tasks: Arc<crate::delivery_tasks::DeliveryTasks>,
     secrets: Arc<crate::settings::AsyncSecretStore>,
     generation: Arc<AtomicU64>,
     // The supervisor owns this guard through receipt finalization, including
@@ -128,8 +129,12 @@ pub(crate) struct CredentialOwner {
 }
 
 impl CredentialOwner {
-    pub(crate) fn new(secrets: &crate::settings::AsyncSecretStore) -> Self {
+    pub(crate) fn new(
+        secrets: &crate::settings::AsyncSecretStore,
+        settings_tasks: Arc<crate::delivery_tasks::DeliveryTasks>,
+    ) -> Self {
         Self {
+            settings_tasks,
             secrets: Arc::new(secrets.settled_operation(Arc::new(tokio::sync::Notify::new()))),
             generation: Arc::new(AtomicU64::new(0)),
             finalization_guard: std::sync::Mutex::new(None),
@@ -294,7 +299,28 @@ async fn run_poll_algorithm(
             // so the loop cannot poll forever.
             break Some(FlowPhase::Expired);
         }
-        tokio::time::sleep(poll_sleep(flow.interval_secs()).min(remaining)).await;
+        let sleep = tokio::time::sleep(poll_sleep(flow.interval_secs()).min(remaining));
+        #[cfg(test)]
+        let sleep = {
+            let mut sleep = Box::pin(sleep);
+            std::future::poll_fn(move |cx| {
+                let result = std::future::Future::poll(sleep.as_mut(), cx);
+                if result.is_pending() {
+                    if let Some(pending) = secrets.github_poll_sleep_pending.lock().unwrap().take()
+                    {
+                        let _ = pending.send(());
+                    }
+                }
+                result
+            })
+        };
+        // Stop only idle recurrence. An exchange or credential write already
+        // entered below still runs through the supervisor's receipt settlement.
+        tokio::select! {
+            biased;
+            () = owner.settings_tasks.closed() => return,
+            () = sleep => {}
+        }
         // Cooperative cancellation: stop before touching the network once
         // cancel/revoke/a newer connect removed or replaced the slot.
         if !is_resident(&state, flow_id).await {
