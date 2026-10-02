@@ -1879,12 +1879,6 @@ impl Services {
             .unwrap_or_default()
     }
 
-    /// The effective `agents.flushQueuedMessages` mode (default `All`). Read
-    /// at drain time by the agent manager; cheap registry-snapshot read.
-    pub(crate) fn flush_queued_messages_mode(&self) -> intent_core::FlushQueuedMessagesMode {
-        self.effective_settings().agents.flush_queued_messages
-    }
-
     /// Resolve the effective auto-commit state for a workspace (spec Diagnosis
     /// §3b): the persisted per-workspace override when set (mirrored from the
     /// global `git.autoCommit` at create time, toggled via
@@ -29920,6 +29914,24 @@ impl WorkspaceApi for Services {
                         .await
                 }
             }
+        }))
+    }
+
+    fn agent_send_queued_messages_now(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        message_ids: Vec<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        self.execution_call(self.instruction_admission(async move {
+            self.require_agent_member_in(&agent_id, &workspace_id)
+                .await?;
+            let manager = self.agent_manager().ok_or_else(|| {
+                Error::Unsupported("explicit queue batching requires an agent manager".into())
+            })?;
+            manager
+                .send_queued_messages_now(agent_id, workspace_id, message_ids)
+                .await
         }))
     }
 

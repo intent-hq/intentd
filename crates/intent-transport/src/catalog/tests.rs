@@ -181,17 +181,18 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// GitLab snippet proof by `provider`); the `github.identityProof.*` pair
 /// stays as byte-identical aliases.
 /// Direct user retirement (protocol 10.10): +1 router method (`agent.retire`).
+/// Explicit queued batch sending (protocol 13.1): +1 router method.
 /// Reversible script history (protocol 10.11): +2 router methods
 /// (`script.archive`, `script.restore`).
 /// Durable script monitors (protocol 12.1): +3 router methods.
 /// Protocol 13.0 removes the deprecated git.commit router method.
-const EXPECTED_TOTAL_METHODS: usize = 403;
+const EXPECTED_TOTAL_METHODS: usize = 404;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.
 /// Protocol 12.1 adds the three script-monitor controls.
 /// The subsequent git.commit removal removes one more router method.
-const EXPECTED_ROUTER_METHODS: usize = 348;
+const EXPECTED_ROUTER_METHODS: usize = 349;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 55;
@@ -466,6 +467,10 @@ const USER_ORIGIN_MESSAGE_ENTRY_POINTS: &[(&str, &str)] = &[
     (
         "agent.sendQueuedMessageNow",
         "drains the entry with the stamp captured at enqueue (the drainer is not the author)",
+    ),
+    (
+        "agent.sendQueuedMessagesNow",
+        "drains the selected entries with their captured stamps; the drainer is not the author (WSS explicit batch coverage)",
     ),
     (
         "agent.sendToTask",
@@ -993,10 +998,10 @@ fn user_origin_message_entry_points_frozen() {
     }
     assert_eq!(
         USER_ORIGIN_MESSAGE_ENTRY_POINTS.len(),
-        11,
-        "the Product Brief's ten user-origin entry points plus `workspace.create`'s \
-         initialAgent kickoff; a change here needs the service matrix and \
-         docs/protocol/ updated alongside"
+        12,
+        "the user-origin entry points including explicit queue batching and \
+         workspace.create's initialAgent kickoff; a change here needs \
+         attribution coverage and docs/protocol/ updated alongside"
     );
 
     // Exhaustive partition of the FULL catalog (router + fast path): a new
