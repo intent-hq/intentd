@@ -6050,6 +6050,47 @@ mod tests {
         assert_eq!(st["status"], "exited");
     }
 
+    #[cfg(unix)]
+    #[intent_test_macros::daemon_test]
+    async fn fast_service_straggler_cleanup_does_not_enable_restart() {
+        let h = harness().await;
+        let (flag, pidfile) = straggler_paths("fast-service");
+        let cmd = straggler_command(&flag.0, &pidfile.0, "exit 1");
+        let id = create_simple(&h, "fast service", &cmd, ScriptMode::Service).await;
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .unwrap();
+        let straggler = await_straggler_pid(&pidfile.0).await;
+        let _guard = KillOnDrop(straggler);
+        let mgr = h.services.script_manager();
+        let restart_count = tokio::time::timeout(LIVENESS, async {
+            loop {
+                let result = {
+                    let scripts = mgr.scripts.lock().unwrap();
+                    let running = scripts.get(&(h.ws.clone(), id.clone())).unwrap();
+                    (running.state.restart_count > 0
+                        || running
+                            .supervisor
+                            .as_ref()
+                            .is_some_and(tokio::task::JoinHandle::is_finished))
+                    .then_some(running.state.restart_count)
+                };
+                if let Some(count) = result {
+                    break count;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("service decides whether to restart after teardown");
+        assert_eq!(
+            restart_count, 0,
+            "TERM grace is cleanup time, not service runtime"
+        );
+        await_pid_dead(straggler, "fast service descendant").await;
+    }
+
     /// A saved script runs in a PTY with no keyboard, so a pager launched by
     /// `git` (or any `PAGER`-honouring tool) would hold the run open forever.
     /// The spawn env exports `GIT_PAGER=cat`/`PAGER=cat`, which outrank
