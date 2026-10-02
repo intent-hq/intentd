@@ -236,6 +236,48 @@ impl Runtime {
     fn get(&self, agent: &AgentId) -> Option<Live> {
         self.live.lock().expect("desktop state").get(agent).cloned()
     }
+    /// Reserve only on the current session. Stop can remove authority while
+    /// the caller awaits validation; a cloned Live must never restore it.
+    fn reserve_command(&self, observed: &Live) -> DesktopResult<(String, u64)> {
+        let inactive = || error("desktop-not-active", "Desktop control is not active");
+        let Phase::Active {
+            session_id: expected,
+            ..
+        } = &observed.phase
+        else {
+            return Err(inactive());
+        };
+        // Match revocation's lock order so removal and reservation are atomic.
+        let revoked = self.revoked.lock().expect("desktop revocations");
+        if revoked.contains(expected) {
+            return Err(inactive());
+        }
+        let mut states = self.live.lock().expect("desktop state");
+        let current = states
+            .get_mut(&observed.binding.agent_id)
+            .ok_or_else(inactive)?;
+        if current.binding.connection != observed.binding.connection {
+            return Err(inactive());
+        }
+        let Phase::Active {
+            session_id,
+            sequence,
+        } = &mut current.phase
+        else {
+            return Err(inactive());
+        };
+        if session_id != expected {
+            return Err(inactive());
+        }
+        if *sequence >= 9_007_199_254_740_991 {
+            return Err(error(
+                "desktop-stale-command",
+                "Desktop sequence exhausted; end control",
+            ));
+        }
+        *sequence += 1;
+        Ok((session_id.clone(), *sequence))
+    }
     fn put(&self, live: Live) {
         if matches!(live.phase, Phase::Active { .. }) {
             self.assignment_changed(&live.binding.workspace_id);
@@ -715,7 +757,7 @@ impl Services {
         agent: &AgentId,
         action: Value,
     ) -> DesktopResult<Value> {
-        let mut live = self
+        let live = self
             .desktop
             .get(agent)
             .ok_or_else(|| error("desktop-not-active", "Desktop control is not active"))?;
@@ -728,23 +770,7 @@ impl Services {
                 resume.notified().await;
             }
         }
-        let Phase::Active {
-            session_id,
-            sequence,
-        } = &mut live.phase
-        else {
-            return Err(error("desktop-not-active", "Desktop control is not active"));
-        };
-        if *sequence >= 9_007_199_254_740_991 {
-            return Err(error(
-                "desktop-stale-command",
-                "Desktop sequence exhausted; end control",
-            ));
-        }
-        *sequence += 1;
-        let session_id = session_id.clone();
-        let sequence = *sequence;
-        self.desktop.put(live.clone());
+        let (session_id, sequence) = self.desktop.reserve_command(&live)?;
         let start = tokio::time::Instant::now();
         let deadline = start + Duration::from_secs(10);
         let command_id = id();
