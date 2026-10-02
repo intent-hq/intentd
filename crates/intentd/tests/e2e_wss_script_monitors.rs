@@ -340,7 +340,7 @@ async fn next_event(ws: &mut TlsWs, event_type: &str) -> Value {
     .unwrap_or_else(|_| panic!("timed out waiting for {event_type}"))
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn script_monitor_wss_ownership_cancel_run_events_and_isolation() {
     let f = boot().await;
     let mut client = connect(f.port, f.cfg.clone()).await;
