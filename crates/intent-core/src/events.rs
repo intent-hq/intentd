@@ -549,7 +549,16 @@ pub fn is_client_event_type(event_type: &str) -> bool {
 
 /// Every canonical event-type string in the taxonomy above. Useful for
 /// validation and the filter/subscription wiring added in later M2 tasks.
+pub const DESKTOP_PERMISSION_REQUESTED: &str = "desktop:permission-requested";
+pub const DESKTOP_PERMISSION_RESOLVED: &str = "desktop:permission-resolved";
+pub const DESKTOP_PERMISSION_CHANGED: &str = "desktop:permission-changed";
+pub const DESKTOP_SESSION_CHANGED: &str = "desktop:session-changed";
+
 pub const ALL_EVENT_TYPES: &[&str] = &[
+    DESKTOP_PERMISSION_REQUESTED,
+    DESKTOP_PERMISSION_RESOLVED,
+    DESKTOP_PERMISSION_CHANGED,
+    DESKTOP_SESSION_CHANGED,
     FILE_CHANGED,
     FILE_CREATED,
     FILE_DELETED,
@@ -873,6 +882,10 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (COMMENT_ADDED, "Comment: a comment landed on a note."),
     (COMMENT_DELETED, "Comment: a comment was deleted from a note."),
     (COMMENT_RESOLVED, "Comment: a thread was resolved."),
+    (DESKTOP_PERMISSION_CHANGED, "Desktop authority: only the retained granting principal with workspace access; live and durable delivery also enforce the exact authorized connection incarnation."),
+    (DESKTOP_PERMISSION_REQUESTED, "Desktop authority: only the retained granting principal with workspace access; live and durable delivery also enforce the exact authorized connection incarnation."),
+    (DESKTOP_PERMISSION_RESOLVED, "Desktop authority: only the retained granting principal with workspace access; live and durable delivery also enforce the exact authorized connection incarnation."),
+    (DESKTOP_SESSION_CHANGED, "Desktop authority: only the retained granting principal with workspace access; live and durable delivery also enforce the exact authorized connection incarnation."),
     (DRAFT_CHANGED, "Draft: a client's composer draft exists or was cleared; { workspaceId, agentId, clientId, hasDraft } — never the text."),
     (FILE_CHANGED, "File: a watched file changed; payload paths are workspace-relative (`events::watcher::relative_path`), never absolute."),
     (FILE_CREATED, "File: a watched file was created; workspace-relative path."),

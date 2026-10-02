@@ -10,6 +10,8 @@
 #[path = "wss_integration/comment_deletion.rs"]
 mod comment_deletion;
 mod common;
+#[path = "wss_integration/desktop_control.rs"]
+mod desktop_control;
 #[path = "wss_integration/discovery_context.rs"]
 mod discovery_context;
 #[path = "wss_integration/host_roles.rs"]

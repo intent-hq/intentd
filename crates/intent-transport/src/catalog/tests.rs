@@ -184,12 +184,13 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// Direct user retirement (protocol 10.10): +1 router method (`agent.retire`).
 /// Reversible script history (protocol 10.11): +2 router methods
 /// (`script.archive`, `script.restore`).
-const EXPECTED_TOTAL_METHODS: usize = 411;
+/// Desktop control: +4 client router methods and desktop.control reverse RPC.
+const EXPECTED_TOTAL_METHODS: usize = 415;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 351;
+const EXPECTED_ROUTER_METHODS: usize = 355;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 58;
@@ -201,7 +202,7 @@ const EXPECTED_ALIASES: usize = 2;
 const EXPECTED_NOTIFICATIONS: usize = 1;
 
 /// Golden count: client-served reverse RPCs.
-const EXPECTED_REVERSE_METHODS: usize = 5;
+const EXPECTED_REVERSE_METHODS: usize = 6;
 
 #[test]
 fn router_methods_match_actual_source() {
@@ -567,6 +568,10 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "crossWorkspace.listSiblings",
     "crossWorkspace.readNote",
     "debug.sampleStacks",
+    "desktop.getState",
+    "desktop.respondPermission",
+    "desktop.revoke",
+    "desktop.setPermission",
     "drafts.clear",
     "drafts.get",
     "drafts.set",
@@ -1189,6 +1194,9 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "browser.syncTabs",
     "browser.upsertTab",
     "debug.sampleStacks",
+    "desktop.getState",
+    "desktop.respondPermission",
+    "desktop.setPermission",
     "file-tracking.getAgentLocks",
     "file-tracking.getChanges",
     "file-tracking.getLineStats",
@@ -1782,6 +1790,18 @@ mod unbound_owner_only_methods {
                 json!({ "workspaceId": ws, "taskNoteId": "t1", "contextMessage": "c" }),
             ),
             ("debug.sampleStacks", json!({ "durationMs": 1 })),
+            (
+                "desktop.getState",
+                json!({ "workspaceId": ws, "agentId": "a1" }),
+            ),
+            (
+                "desktop.respondPermission",
+                json!({ "workspaceId": ws, "requestId": "r1", "decision": "allow_once" }),
+            ),
+            (
+                "desktop.setPermission",
+                json!({ "workspaceId": ws, "agentId": "a1", "computerId": "physical", "allowed": true }),
+            ),
             ("file-tracking.getAgentLocks", json!({ "workspaceId": ws })),
             ("file-tracking.getChanges", json!({ "workspaceId": ws })),
             ("file-tracking.getLineStats", json!({ "workspaceId": ws })),

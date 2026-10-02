@@ -131,10 +131,14 @@ pub(crate) fn with_credential_context<F: Future>(
     is_tcp: bool,
     caller: Option<Caller>,
     credential: Option<intent_core::caller::WireCredential>,
+    desktop: Option<intent_core::desktop::DesktopConnection>,
     future: F,
 ) -> impl Future<Output = F::Output> {
     intent_core::caller::with_wire_credential(
         credential,
-        with_request_context(is_tcp, caller, future),
+        intent_core::desktop::with_connection(
+            desktop,
+            with_request_context(is_tcp, caller, future),
+        ),
     )
 }

@@ -44,6 +44,33 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// `intent-services` (§3.2 rule 3). The default bodies return an internal error
 /// so downstream stubs compile until they override these methods.
 pub trait WorkspaceApi: Send + Sync {
+    fn desktop_agent_call(
+        &self,
+        _workspace: WorkspaceId,
+        _method: String,
+        _args: serde_json::Value,
+    ) -> BoxFuture<'_, crate::desktop::DesktopResult<serde_json::Value>> {
+        Box::pin(async {
+            Err(crate::desktop::DesktopError::new(
+                "desktop-unsupported",
+                "Desktop control unavailable",
+            ))
+        })
+    }
+    fn desktop_client_call(
+        &self,
+        _method: String,
+        _args: serde_json::Value,
+        _connection: crate::desktop::DesktopConnection,
+    ) -> BoxFuture<'_, crate::desktop::DesktopResult<serde_json::Value>> {
+        Box::pin(async {
+            Err(crate::desktop::DesktopError::new(
+                "desktop-unsupported",
+                "Desktop control unavailable",
+            ))
+        })
+    }
+
     /// List workspaces, optionally including archived ones (PROTOCOL §5.1).
     fn list_workspaces(&self, include_archived: bool) -> BoxFuture<'_, Result<Vec<Workspace>>> {
         let _ = include_archived;
@@ -8089,6 +8116,51 @@ pub struct ReverseLiveClient {
 /// delivered. `is_connected` is a cheap synchronous probe that lets the
 /// service surface a friendlier error before it composes the forward params.
 pub trait AgentReverseDispatch: Send + Sync {
+    /// Eligible authenticated desktop connections for an unassigned workspace.
+    /// Each candidate remains bound to its execution incarnation.
+    fn desktop_candidates(
+        &self,
+        principal: &crate::PrincipalId,
+    ) -> Vec<crate::desktop::DesktopConnection> {
+        self.desktop_resolve(&ReverseTarget::Default, principal)
+            .into_iter()
+            .collect()
+    }
+    /// Changes to admitted execution connections; consumers re-resolve authority.
+    fn desktop_changes(&self) -> Option<std::sync::Arc<tokio::sync::Notify>> {
+        None
+    }
+
+    /// Resolve the browser primary first, then require desktop capability and
+    /// the exact authenticated principal. Never fall back to another device.
+    ///
+    /// # Errors
+    /// Returns offline, unsupported or forbidden for an ineligible primary.
+    fn desktop_resolve(
+        &self,
+        _target: &ReverseTarget,
+        _principal: &crate::PrincipalId,
+    ) -> crate::desktop::DesktopResult<crate::desktop::DesktopConnection> {
+        Err(crate::desktop::DesktopError::new(
+            "desktop-unsupported",
+            "Desktop control is unavailable",
+        ))
+    }
+
+    /// Dispatch only to this exact incarnation; reconnect never replays work.
+    fn desktop_dispatch(
+        &self,
+        _connection: crate::desktop::DesktopConnection,
+        _params: serde_json::Value,
+    ) -> BoxFuture<'_, crate::desktop::DesktopResult<serde_json::Value>> {
+        Box::pin(async {
+            Err(crate::desktop::DesktopError::new(
+                "desktop-offline",
+                "Desktop connection is unavailable",
+            ))
+        })
+    }
+
     /// Whether at least one eligible client is currently connected (i.e. a
     /// [`ReverseTarget::Default`] dispatch would find a target).
     fn is_connected(&self) -> bool;

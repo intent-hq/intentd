@@ -7211,7 +7211,9 @@ fn should_resume_on_start(
 
 /// Queue restoration must succeed before serving any queue mutations.
 async fn restore_startup_queues(services: &Services) -> intent_core::Result<usize> {
-    services.rehydrate_agent_queues().await
+    let count = services.rehydrate_agent_queues().await?;
+    services.desktop_recover().await?;
+    Ok(count)
 }
 
 /// Run recovery off the listener path. Shutdown stops between operations;

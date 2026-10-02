@@ -140,7 +140,7 @@ Parameters:
   summary (required): Short description of what this call does, shown in the UI.
 
 Namespaces (index — full signatures in API below):
-  ws.help(namespace?) — runtime docs: ws.help() returns this index, ws.help("pr") the full pr docs
+  ws.help(namespace?) — full API docs
   ws.workspace.* — workspace info, title, status message
   ws.app.question.* — ask the user structured questions
   ws.note.* — notes; the spec is note id "spec"
@@ -153,6 +153,7 @@ Namespaces (index — full signatures in API below):
   ws.script.* — saved build/test/service scripts
   ws.host.* — host.exec = one-shot host command exec
   ws.hook.* — background watchers; can call full ws.* incl. pr.snapshot and host.exec
+  ws.desktop.* — desktop control
   ws.browser.* — Chrome DevTools browser automation
   ws.terminal.* — read workspace terminal output
   ws.mcp.* — external MCP tools
@@ -295,6 +296,15 @@ API:
   ws.hook.cancel(hookId) → { ok, hook }  // Stop one of YOUR OWN active hooks. Hooks are agent-owned: cancelling a hook whose `agentId` is another agent is rejected with an error naming the owner — check `agentId` from `ws.hook.list()` before cancelling, and ask the owning agent instead.
   ws.hook.runNow(hookId) → { ok, hookId }  // Trigger an immediate run of an active hook; its inter-run timer resets after the run. On a `runAt` hook the triggered run IS the one-shot fire: the hook fires EARLY and retires (whether or not it dispatched) — the one-shot contract is honored over the timestamp, so there is no later run at the original fire time.
 
+  ws.desktop.startControl() → StartResult  // Request control of the workspace primary desktop. Pending permission returns promptly: end the turn and wait for the outcome. Repeated active starts return alreadyGranted: true without a new toast. You are controlling the workspace primary desktop. Call ws.desktop.endControl() as soon as your desktop work is finished.
+  ws.desktop.endControl() → { ended, withdrawn }  // Release active control promptly; withdraw pending consent if needed. An ordinary turn boundary does not end ongoing desktop work. Never automatically retry after user Stop.
+  ws.desktop.listDisplay() → { layoutId, displays }  // Enumerate display IDs and geometry without capturing pixels. Requires active desktop control.
+  ws.desktop.screenshot({ displayId?, layoutId? }?) → { capturedAt, layoutId, displays }  // Capture one display as a saved workspace asset. An optional layoutId must still match. Omit displayId only when exactly one display is connected; otherwise list displays and ask the user which to use. Never choose an arbitrary display or fall back from a stale ID.
+  ws.desktop.click({ displayId?, layoutId, x, y, button?, clickCount? }) → { ok: true }  // Omit displayId only for one connected display; otherwise ask the user. button is left or right; clickCount is 1 or 2.
+  ws.desktop.type({ text }) → { ok: true }  // Insert exact Unicode, up to 16384 UTF-8 bytes; no implicit Enter.
+  ws.desktop.keypress({ key, modifiers? }) → { ok: true }  // Printable scalar or named key; unique Shift, Control, Alt, Meta modifiers.
+  ws.desktop.scroll({ displayId?, layoutId, x, y, deltaX, deltaY }) → { ok: true }  // Single-display inference only; otherwise choose displayId explicitly. Signed image pixels, positive right/down.
+  ws.desktop.drag({ displayId?, layoutId, from: { x, y }, to: { x, y } }) → { ok: true }  // Left drag within one display. Omit displayId only for one connected display.
   ws.browser.exec(actions, tabId?) → result | results[]  // Chrome DevTools browser automation. Each action is an object with an `action` field; common actions include `listTabs` (`scope: "mine"|"unclaimed"|"all"`, with per-tab owner + sizing + visibility info and `displayed` — a layout fact: visible AND its panel's active tab), `focusTab`, `getAccessibilityTree`, `screenshot`, `evaluate`, `navigate`, `openTab` (optional `width`/`height`, default 1280×800; hidden by default — pass `visible: true` to open into the UI, activated in its panel without stealing focus on any `position`; the result then carries `displayed` when the layout confirmed it and omits it when unknown — absent is not `false`), `showTab` (activate an owned tab in a visible panel without stealing focus — reveals a hidden tab or brings a visible-but-inactive one to the front; `focus: true` also focuses it), `claimTab` (claim an unowned user tab; `width` required), `resizeTab`, `closeTab` (requires an explicit `tabId`; no default-tabId fallback), `snapshot`, and capture/trace actions.
     Tabs are agent-owned: you may only manipulate tabs you own — claim unowned (user) tabs with `claimTab` first; ops on tabs you do not own fail with the structured `not-owner` / `already-claimed` action-result errors. Agent-opened tabs start hidden (`visibility: "hidden"` in `listTabs`); reveal them with `showTab` — `focusTab` fails on hidden tabs. `displayed` is a layout fact (visible AND its panel's active tab), not a paint guarantee, and is absent (unknown, not `false`) whenever the daemon holds no current host report for it. Actions work even when the workspace is not visible in the app: focus/activation applies to the saved layout, and `showTab {focus:true}` / `focusTab` / `openTab {visible:true}` skip the UI focus attempt, carrying a workspace-not-visible `warning` string in their result. Capture ops (`screenshot`, `getAccessibilityTree`, `evaluate`) mount an unmounted tab on demand under one request deadline — succeeding with the same `warning` when the workspace is not in view — and otherwise fail as action-result errors with a structured `errorCode`: `workspace-not-visible`, `deadline-exhausted`, `still-loading`, `navigated-away`, or `not-painting` (capture timed out at its own cap or returned an empty image — `showTab` / `focusTab` it, then retry); `navigate` mounts on demand too but without the deadline, settle, or origin check, so of these codes it yields only `workspace-not-visible` (ownership and uncoded failures still apply).
     Single-action calls return one result; multiple actions return an array. Use `ws.browser.docs("overview"|"capture"|"examples")` for the full action reference, ownership/sizing rules, `waitFor` options, and longer examples.
@@ -377,7 +387,7 @@ Parameters:
   summary (required): Short description of what this call does, shown in the UI.
 
 Namespaces (index — full signatures in API below):
-  ws.help(namespace?) — runtime docs: ws.help() returns this index, ws.help("pr") the full pr docs
+  ws.help(namespace?) — full API docs
   ws.workspace.* — workspace info, title, status message
   ws.app.* — Assistant app surface: agents, proposal, settings, specialists, ui, workspaces
   ws.app.question.* — ask the user structured questions
@@ -390,6 +400,7 @@ Namespaces (index — full signatures in API below):
   ws.event.* — activity queries + event subscriptions
   ws.script.* — saved build/test/service scripts
   ws.hook.* — background watchers; can call full ws.* incl. pr.snapshot
+  ws.desktop.* — desktop control
   ws.browser.* — Chrome DevTools browser automation
   ws.terminal.* — read workspace terminal output
   ws.mcp.* — external MCP tools
@@ -554,6 +565,15 @@ API:
   ws.hook.cancel(hookId) → { ok, hook }  // Stop one of YOUR OWN active hooks. Hooks are agent-owned: cancelling a hook whose `agentId` is another agent is rejected with an error naming the owner — check `agentId` from `ws.hook.list()` before cancelling, and ask the owning agent instead.
   ws.hook.runNow(hookId) → { ok, hookId }  // Trigger an immediate run of an active hook; its inter-run timer resets after the run. On a `runAt` hook the triggered run IS the one-shot fire: the hook fires EARLY and retires (whether or not it dispatched) — the one-shot contract is honored over the timestamp, so there is no later run at the original fire time.
 
+  ws.desktop.startControl() → StartResult  // Request control of the workspace primary desktop. Pending permission returns promptly: end the turn and wait for the outcome. Repeated active starts return alreadyGranted: true without a new toast. You are controlling the workspace primary desktop. Call ws.desktop.endControl() as soon as your desktop work is finished.
+  ws.desktop.endControl() → { ended, withdrawn }  // Release active control promptly; withdraw pending consent if needed. An ordinary turn boundary does not end ongoing desktop work. Never automatically retry after user Stop.
+  ws.desktop.listDisplay() → { layoutId, displays }  // Enumerate display IDs and geometry without capturing pixels. Requires active desktop control.
+  ws.desktop.screenshot({ displayId?, layoutId? }?) → { capturedAt, layoutId, displays }  // Capture one display as a saved workspace asset. An optional layoutId must still match. Omit displayId only when exactly one display is connected; otherwise list displays and ask the user which to use. Never choose an arbitrary display or fall back from a stale ID.
+  ws.desktop.click({ displayId?, layoutId, x, y, button?, clickCount? }) → { ok: true }  // Omit displayId only for one connected display; otherwise ask the user. button is left or right; clickCount is 1 or 2.
+  ws.desktop.type({ text }) → { ok: true }  // Insert exact Unicode, up to 16384 UTF-8 bytes; no implicit Enter.
+  ws.desktop.keypress({ key, modifiers? }) → { ok: true }  // Printable scalar or named key; unique Shift, Control, Alt, Meta modifiers.
+  ws.desktop.scroll({ displayId?, layoutId, x, y, deltaX, deltaY }) → { ok: true }  // Single-display inference only; otherwise choose displayId explicitly. Signed image pixels, positive right/down.
+  ws.desktop.drag({ displayId?, layoutId, from: { x, y }, to: { x, y } }) → { ok: true }  // Left drag within one display. Omit displayId only for one connected display.
   ws.browser.exec(actions, tabId?) → result | results[]  // Chrome DevTools browser automation. Each action is an object with an `action` field; common actions include `listTabs` (`scope: "mine"|"unclaimed"|"all"`, with per-tab owner + sizing + visibility info and `displayed` — a layout fact: visible AND its panel's active tab), `focusTab`, `getAccessibilityTree`, `screenshot`, `evaluate`, `navigate`, `openTab` (optional `width`/`height`, default 1280×800; hidden by default — pass `visible: true` to open into the UI, activated in its panel without stealing focus on any `position`; the result then carries `displayed` when the layout confirmed it and omits it when unknown — absent is not `false`), `showTab` (activate an owned tab in a visible panel without stealing focus — reveals a hidden tab or brings a visible-but-inactive one to the front; `focus: true` also focuses it), `claimTab` (claim an unowned user tab; `width` required), `resizeTab`, `closeTab` (requires an explicit `tabId`; no default-tabId fallback), `snapshot`, and capture/trace actions.
     Tabs are agent-owned: you may only manipulate tabs you own — claim unowned (user) tabs with `claimTab` first; ops on tabs you do not own fail with the structured `not-owner` / `already-claimed` action-result errors. Agent-opened tabs start hidden (`visibility: "hidden"` in `listTabs`); reveal them with `showTab` — `focusTab` fails on hidden tabs. `displayed` is a layout fact (visible AND its panel's active tab), not a paint guarantee, and is absent (unknown, not `false`) whenever the daemon holds no current host report for it. Actions work even when the workspace is not visible in the app: focus/activation applies to the saved layout, and `showTab {focus:true}` / `focusTab` / `openTab {visible:true}` skip the UI focus attempt, carrying a workspace-not-visible `warning` string in their result. Capture ops (`screenshot`, `getAccessibilityTree`, `evaluate`) mount an unmounted tab on demand under one request deadline — succeeding with the same `warning` when the workspace is not in view — and otherwise fail as action-result errors with a structured `errorCode`: `workspace-not-visible`, `deadline-exhausted`, `still-loading`, `navigated-away`, or `not-painting` (capture timed out at its own cap or returned an empty image — `showTab` / `focusTab` it, then retry); `navigate` mounts on demand too but without the deadline, settle, or origin check, so of these codes it yields only `workspace-not-visible` (ownership and uncoded failures still apply).
     Single-action calls return one result; multiple actions return an array. Use `ws.browser.docs("overview"|"capture"|"examples")` for the full action reference, ownership/sizing rules, `waitFor` options, and longer examples.
@@ -656,6 +676,9 @@ fn gated_prefixes(features: &AgentFeaturesSettings) -> Vec<(&'static str, &'stat
     }
     if !features.terminal_access {
         out.push(("ws.terminal.", "agentFeatures.terminalAccess"));
+    }
+    if !features.desktop_control {
+        out.push(("ws.desktop.", "agentFeatures.desktopControl"));
     }
     if !features.browser_automation {
         out.push(("ws.browser.", "agentFeatures.browserAutomation"));
@@ -766,6 +789,9 @@ pub(super) fn denied_feature(
     features: &AgentFeaturesSettings,
     method: &str,
 ) -> Option<&'static str> {
+    if method == "desktop.endControl" {
+        return None;
+    }
     gated_prefixes(features)
         .into_iter()
         .find_map(|(prefix, feature)| {
@@ -1309,6 +1335,7 @@ mod tests {
     const BINDINGS_CROSS_WORKSPACE: &str = include_str!("bindings/cross_workspace.rs");
     const BINDINGS_PR: &str = include_str!("bindings/pr.rs");
     const BINDINGS_BROWSER: &str = include_str!("bindings/browser.rs");
+    const BINDINGS_DESKTOP: &str = include_str!("bindings/desktop.rs");
     const BINDINGS_AGENT: &str = include_str!("bindings/agent.rs");
     const BINDINGS_EVENT: &str = include_str!("bindings/event.rs");
     const BINDINGS_GIT: &str = include_str!("bindings/git.rs");
@@ -1339,6 +1366,7 @@ mod tests {
             ("crossWorkspace", BINDINGS_CROSS_WORKSPACE),
             ("pr", BINDINGS_PR),
             ("browser", BINDINGS_BROWSER),
+            ("desktop", BINDINGS_DESKTOP),
             ("agent", BINDINGS_AGENT),
             ("event", BINDINGS_EVENT),
             ("git", BINDINGS_GIT),
@@ -1652,6 +1680,7 @@ mod tests {
                 scripts: false,
                 terminal_access: false,
                 browser_automation: false,
+                desktop_control: false,
                 rich_chat_blocks: false,
                 structured_questions: false,
                 attention_requests: false,
@@ -2093,18 +2122,27 @@ mod tests {
         }
     }
 
-    // Size budget for the system-prompt copy: the all-defaults non-chief
-    // rendering (the common case for truncating providers) includes the
-    // retirement binding by default, adding ~330 bytes to the 22k budget.
+    // Keep the existing system-prompt budget independently of desktop control.
+    // Its nine new signatures get a bounded incremental allowance; the compact
+    // tool description itself must still fit the unchanged 2000-byte limit.
     #[test]
     fn condensed_description_size_budget() {
-        let condensed =
-            condensed_workspace_api_description(false, &AgentFeaturesSettings::default(), &[]);
-        assert!(
-            condensed.len() < 22_400,
-            "condensed all-on description is {} bytes, over the 22.4k budget",
-            condensed.len()
+        let features = AgentFeaturesSettings::default();
+        let condensed = condensed_workspace_api_description(false, &features, &[]);
+        let without_desktop = condensed_workspace_api_description(
+            false,
+            &AgentFeaturesSettings {
+                desktop_control: false,
+                ..features
+            },
+            &[],
         );
+        assert!(without_desktop.len() < 22_400);
+        assert!(
+            condensed.len() - without_desktop.len() <= 1_500,
+            "desktop signatures exceed their 1500-byte allowance"
+        );
+        assert!(condensed.len() < 23_900);
     }
 
     // `[agentFeatures]` gating composes: a disabled namespace is absent from
@@ -2582,6 +2620,7 @@ mod tests {
             scripts: false,
             terminal_access: false,
             browser_automation: false,
+            desktop_control: false,
             rich_chat_blocks: false,
             structured_questions: false,
             attention_requests: false,
@@ -3066,6 +3105,7 @@ const run = async (s, out) => {{
             scripts: false,
             terminal_access: false,
             browser_automation: false,
+            desktop_control: false,
             rich_chat_blocks: false,
             structured_questions: false,
             attention_requests: false,
@@ -3368,5 +3408,38 @@ const run = async (s, out) => {{
             got.contains("`kimi-k3` on opencode (line one line two)"),
             "multi-line hint not flattened:\n{got}"
         );
+    }
+}
+
+#[cfg(test)]
+mod desktop_feature_tests {
+    use super::*;
+    #[test]
+    fn desktop_feature_prunes_acquisition_help_and_denies_hidden_dispatch() {
+        let features = AgentFeaturesSettings {
+            desktop_control: false,
+            ..Default::default()
+        };
+        for chief in [false, true] {
+            let docs = workspace_api_description(chief, &features);
+            assert!(!docs.contains("ws.desktop.startControl()"));
+            assert!(!docs.contains("ws.desktop.endControl()"));
+        }
+        for method in [
+            "startControl",
+            "listDisplay",
+            "screenshot",
+            "click",
+            "type",
+            "keypress",
+            "scroll",
+            "drag",
+        ] {
+            assert_eq!(
+                denied_feature(&features, &format!("desktop.{method}")),
+                Some("agentFeatures.desktopControl")
+            );
+        }
+        assert_eq!(denied_feature(&features, "desktop.endControl"), None);
     }
 }

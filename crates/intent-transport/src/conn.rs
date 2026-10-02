@@ -601,29 +601,36 @@ pub(crate) async fn process_frame(
             let is_tcp = crate::context::is_tcp_connection();
             let caller = crate::context::current_caller();
             let credential = intent_core::caller::current_wire_credential();
+            let desktop = intent_core::desktop::current_connection();
             let (rpc_id, method) = (rpc_id.clone(), method.clone());
             tokio::spawn(async move {
                 let _request_guard = request_guard;
-                crate::context::with_credential_context(is_tcp, caller, credential, async {
-                    finish_slow_path_rpc(
-                        permit,
-                        panic_guard::guard_frame(
-                            &method,
-                            rpc_id,
-                            host::handle_with_host_environment(
-                                req,
-                                api.as_ref(),
-                                Some(&bus),
-                                host_environment,
-                                is_local,
-                                &reverse,
-                                &exec_runtime,
+                crate::context::with_credential_context(
+                    is_tcp,
+                    caller,
+                    credential,
+                    desktop,
+                    async {
+                        finish_slow_path_rpc(
+                            permit,
+                            panic_guard::guard_frame(
+                                &method,
+                                rpc_id,
+                                host::handle_with_host_environment(
+                                    req,
+                                    api.as_ref(),
+                                    Some(&bus),
+                                    host_environment,
+                                    is_local,
+                                    &reverse,
+                                    &exec_runtime,
+                                ),
                             ),
-                        ),
-                        slot,
-                    )
-                    .await;
-                })
+                            slot,
+                        )
+                        .await;
+                    },
+                )
                 .await;
             });
             return true;
@@ -661,26 +668,33 @@ pub(crate) async fn process_frame(
             let is_tcp = crate::context::is_tcp_connection();
             let caller = crate::context::current_caller();
             let credential = intent_core::caller::current_wire_credential();
+            let desktop = intent_core::desktop::current_connection();
             let (rpc_id, method) = (rpc_id.clone(), method.clone());
             tokio::spawn(async move {
                 let _request_guard = request_guard;
-                crate::context::with_credential_context(is_tcp, caller, credential, async {
-                    let tabs = browser::TabContext {
-                        api: api.as_ref(),
-                        client_id: host_client_id.as_ref(),
-                        registry: registry.as_ref(),
-                    };
-                    finish_slow_path_rpc(
-                        permit,
-                        panic_guard::guard_frame(
-                            &method,
-                            rpc_id,
-                            browser::handle(req, &reverse, tabs),
-                        ),
-                        slot,
-                    )
-                    .await;
-                })
+                crate::context::with_credential_context(
+                    is_tcp,
+                    caller,
+                    credential,
+                    desktop,
+                    async {
+                        let tabs = browser::TabContext {
+                            api: api.as_ref(),
+                            client_id: host_client_id.as_ref(),
+                            registry: registry.as_ref(),
+                        };
+                        finish_slow_path_rpc(
+                            permit,
+                            panic_guard::guard_frame(
+                                &method,
+                                rpc_id,
+                                browser::handle(req, &reverse, tabs),
+                            ),
+                            slot,
+                        )
+                        .await;
+                    },
+                )
                 .await;
             });
             return true;
@@ -838,9 +852,10 @@ pub(crate) async fn process_frame(
     let is_tcp = crate::context::is_tcp_connection();
     let caller = crate::context::current_caller();
     let credential = intent_core::caller::current_wire_credential();
+    let desktop = intent_core::desktop::current_connection();
     tokio::spawn(async move {
         let _request_guard = request_guard;
-        crate::context::with_credential_context(is_tcp, caller, credential, async {
+        crate::context::with_credential_context(is_tcp, caller, credential, desktop, async {
             finish_slow_path_rpc(
                 permit,
                 panic_guard::guard_frame(&method, rpc_id, handle_message(api.as_ref(), &raw)),
@@ -1162,6 +1177,7 @@ async fn forward_subscription(
                     return;
                 };
                 for mut event in batch {
+                    if !intent_core::desktop::event_visible(&event) { continue; }
                     // The revocation branch sends this exact durable event once,
                     // ahead of close, rather than racing its bulk forwarder.
                     if host_removal_control && event.event_type == intent_core::events::HOST_MEMBERS_CHANGED
@@ -1574,8 +1590,9 @@ where
     let is_tcp = crate::context::is_tcp_connection();
     let caller = crate::context::current_caller();
     let credential = intent_core::caller::current_wire_credential();
+    let desktop = intent_core::desktop::current_connection();
     tokio::spawn(crate::context::with_credential_context(
-        is_tcp, caller, credential, forwarder,
+        is_tcp, caller, credential, desktop, forwarder,
     ))
 }
 

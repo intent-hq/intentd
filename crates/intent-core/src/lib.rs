@@ -170,3 +170,5 @@ pub use turn_attachments::{
     is_workspace_api_input, new_attachment_id, AttachmentPolicy, TurnAttachment,
     TurnAttachmentRegistry, ATTACHMENT_ID_KEY,
 };
+
+pub mod desktop;

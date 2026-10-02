@@ -124,6 +124,7 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "agentFeatures.scripts",
     "agentFeatures.terminalAccess",
     "agentFeatures.browserAutomation",
+    "agentFeatures.desktopControl",
     "agentFeatures.richChatBlocks",
     "agentFeatures.structuredQuestions",
     "agentFeatures.attentionRequests",
@@ -1365,6 +1366,35 @@ mod tests {
         assert!(std::fs::read_to_string(&path)
             .unwrap()
             .contains("# deliberate reset"));
+    }
+
+    #[test]
+    fn desktop_control_persists_resets_and_reloads() {
+        let (_dir, path) = temp_config(Some(""));
+        let reg = SettingsRegistry::load(&path).unwrap();
+        let key = "agentFeatures.desktopControl";
+        assert_eq!(reg.get(key), Some(json!(true)));
+        reg.apply(&set(key, json!(false))).unwrap();
+        assert_eq!(reg.get(key), Some(json!(false)));
+        assert_eq!(
+            SettingsRegistry::load(&path).unwrap().get(key),
+            Some(json!(false))
+        );
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert!(reg.apply(&set(key, json!("false"))).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        reg.apply(&set(key, Value::Null)).unwrap();
+        assert_eq!(reg.get(key), Some(json!(true)));
+        assert_eq!(reg.origin(key), Some(SettingOrigin::Default));
+        assert_eq!(
+            SettingsRegistry::load(&path).unwrap().get(key),
+            Some(json!(true))
+        );
+        reg.reload("[agentFeatures]\ndesktopControl = false\n")
+            .unwrap();
+        assert_eq!(reg.get(key), Some(json!(false)));
+        reg.reload("[agentFeatures]\n").unwrap();
+        assert_eq!(reg.get(key), Some(json!(true)));
     }
 
     #[test]

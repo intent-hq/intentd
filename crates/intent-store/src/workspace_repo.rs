@@ -762,6 +762,9 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn delete_workspace(&self, id: &WorkspaceId) -> Result<()> {
+        // Hold through every bounded sweep and final commit/failure. All private
+        // desktop producers use this same Store-level admission gate.
+        let _desktop_deletion = self.desktop_writes.delete(id).await;
         // In particular, a missing workspace must not delete opaque draft
         // keys. The final transaction also checks existence for racing deletes.
         let exists: bool =
@@ -790,6 +793,34 @@ impl Store {
             DELETE_CASCADE_BATCH,
         )
         .await?;
+
+        // Runtime writers are stopped. Revoke/drain private desktop state once
+        // before deleting any agent, just like the recovery sweep above. A
+        // failure leaves all sessions intact; a later failure may revoke grants
+        // early but cannot leave authority attached to a deleted agent.
+        let mut desktop_tx = self
+            .write_pool()
+            .begin()
+            .await
+            .map_err(|e| Error::Internal(format!("begin workspace desktop cleanup: {e}")))?;
+        crate::desktop_repo::delete_desktop_scope(&mut desktop_tx, id, None).await?;
+        desktop_tx
+            .commit()
+            .await
+            .map_err(|e| Error::Internal(format!("commit workspace desktop cleanup: {e}")))?;
+
+        #[cfg(test)]
+        {
+            let barrier = self
+                .desktop_delete_barrier
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(barrier) = barrier {
+                barrier.entered.notify_one();
+                barrier.release.notified().await;
+            }
+        }
 
         // IDs only: never hydrate sessions or their transcripts. Each session
         // uses the same bounded payload/message cleanup as agent.delete.
@@ -942,6 +973,7 @@ impl Store {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| Error::Internal(format!("delete workspace drafts failed: {e}")))?;
+            crate::desktop_repo::delete_desktop_scope(&mut tx, id, None).await?;
             sqlx::query("DELETE FROM settings WHERE key = ?")
                 .bind(crate::settings_repo::agent_creation_preferences_key(id))
                 .execute(&mut *tx)
