@@ -942,6 +942,11 @@ impl Store {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| Error::Internal(format!("delete workspace drafts failed: {e}")))?;
+            sqlx::query("DELETE FROM settings WHERE key = ?")
+                .bind(crate::settings_repo::agent_creation_preferences_key(id))
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("delete agent creation preferences: {e}")))?;
             let res = sqlx::query(DELETE_WORKSPACE_SQL)
                 .bind(&id.0)
                 .execute(&mut *tx)

@@ -18,10 +18,11 @@ use crate::error::{Error, Result};
 use crate::model::{
     AuthStatus, Branch, BranchRules, CheckRun, CheckState, Comment, CommentAnchor, Issue,
     IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeQueueRemoval,
-    MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrInvolvement,
-    PrObservation, PrPatch, PrQuery, PrState, PullRequest, RateLimitStatus, Repo, RepoRef, Review,
-    ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment, ReviewThreadTally,
-    ReviewVerdict, RollupCheck, RollupCheckKind, ScCapabilities, UserIdentity,
+    MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrAncestry,
+    PrAncestryIdentity, PrInvolvement, PrObservation, PrPatch, PrQuery, PrState, PullRequest,
+    RateLimitStatus, Repo, RepoRef, Review, ReviewComment, ReviewDecision, ReviewThread,
+    ReviewThreadComment, ReviewThreadTally, ReviewVerdict, RollupCheck, RollupCheckKind,
+    ScCapabilities, UserIdentity,
 };
 use crate::SourceControl;
 
@@ -1152,6 +1153,7 @@ query GetPrObservation($owner: String!, $repo: String!, $prNumber: Int!, $checks
       isDraft
       headRefName
       headRefOid
+      headRepository { id }
       author { login }
       mergeable
       createdAt
@@ -1168,6 +1170,7 @@ query GetPrObservation($owner: String!, $repo: String!, $prNumber: Int!, $checks
       }
       reviewDecision
       baseRefName
+      baseRef { target { oid } }
       commits(last: 1) {
         nodes {
           commit {
@@ -1253,6 +1256,19 @@ fn map_graphql_pull(pr: &Value) -> Result<PullRequest> {
         created_at: owned("createdAt"),
         updated_at: owned("updatedAt"),
     })
+}
+
+fn parse_ancestry_identity(pr: &Value) -> Option<PrAncestryIdentity> {
+    let identity = PrAncestryIdentity {
+        base_sha: pr.pointer("/baseRef/target/oid")?.as_str()?.to_string(),
+        head_sha: pr.get("headRefOid")?.as_str()?.to_string(),
+        target_branch: pr.get("baseRefName")?.as_str()?.to_string(),
+        head_repository: pr
+            .pointer("/headRepository/id")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    };
+    identity.is_valid().then_some(identity)
 }
 
 /// `author { login }` → login, `"unknown"` for a deleted account (`null`
@@ -2124,12 +2140,46 @@ impl SourceControl for GitHubSourceControl {
             .ok_or_else(|| Error::NotFound(format!("PR #{number} not found")))?;
         Ok(Some(PrObservation {
             pr: map_graphql_pull(pr)?,
+            ancestry_identity: parse_ancestry_identity(pr),
             signals: parse_merge_requirement_signals(&data),
             reviews: parse_observed_reviews(pr),
             threads: parse_observed_threads(pr),
             // Saturated like `list_comments`' single page below.
             conversation_count: observed_count(pr.get("comments")),
         }))
+    }
+
+    async fn pr_ancestry(
+        &self,
+        repo: &RepoRef,
+        identity: &PrAncestryIdentity,
+    ) -> Result<PrAncestry> {
+        if !identity.is_valid() {
+            return Ok(PrAncestry::Unknown);
+        }
+        // Validated full hashes contain only hex; no symbolic refs or path
+        // characters can reach this route. Fork commits use the base repo's
+        // network, and inaccessible commits fail rather than becoming current.
+        let route = Self::repo_path(
+            repo,
+            &format!(
+                "/compare/{}...{}?per_page=1&page=1",
+                identity.base_sha, identity.head_sha
+            ),
+        );
+        let value: Value = self
+            .transport
+            .comparison_client()
+            .get(&route, None::<&()>)
+            .await?;
+        Ok(match value.get("behind_by").and_then(Value::as_u64) {
+            Some(behind_by) => PrAncestry::Known {
+                base_sha: identity.base_sha.clone(),
+                head_sha: identity.head_sha.clone(),
+                behind_by,
+            },
+            None => PrAncestry::Unknown,
+        })
     }
 
     // Known ceiling: a single `per_page=100` page (newest first), not a full
@@ -2440,10 +2490,24 @@ impl GitHubSourceControl {
             .ok_or_else(|| invalid("missing head"))?
             .to_string();
         let mut page = data.clone();
+        let ancestry_identity = data
+            .pointer("/repository/pullRequest")
+            .and_then(parse_ancestry_identity);
         let mut contexts = Vec::new();
         let mut cursors = std::collections::HashSet::new();
         let mut expected_total = None;
         for _ in 0..MAX_PAGES {
+            if page
+                .pointer("/repository/pullRequest")
+                .and_then(parse_ancestry_identity)
+                != ancestry_identity
+            {
+                // A moving base, retarget or changed fork must not attach a
+                // comparison to mixed observations. Preserve unrelated checks.
+                if let Some(pr) = data.pointer_mut("/repository/pullRequest") {
+                    pr.as_object_mut().expect("PR object").remove("baseRef");
+                }
+            }
             if page
                 .pointer("/repository/pullRequest/headRefOid")
                 .and_then(Value::as_str)
@@ -2777,6 +2841,8 @@ mod tests {
 
     #[test]
     fn pr_observation_query_embeds_the_probe_and_strips_the_same_way() {
+        assert!(PR_OBSERVATION_QUERY.contains("baseRef { target { oid } }"));
+        assert!(!PR_OBSERVATION_QUERY.contains("baseRefOid"));
         // The folded read carries every probe selection verbatim (so the
         // same parser serves both) and the schema fallback strips exactly
         // the merge-queue lines from it too.

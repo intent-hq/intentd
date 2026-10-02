@@ -708,6 +708,8 @@ use std::time::{Duration, Instant};
 // registered workspace-owned roots share existing filesystem confinement.
 // Version 11.2 adds complete script.list rows to created/updated script:changed
 // events, including committed result/archive state. Presence detects support.
+// Version 11.3 adds workspace-scoped manual specialist preferences; platform
+// support remains independently capability-gated.
 // Version 12.0 retires git.diff/git.log aliases, pr.status,
 // file-tracking.getLineStats, metrics.getWorkspaceStats/getAllWorkspaceStats/
 // clearAgentStats, and forward.create/list/close. Canonical git reads,

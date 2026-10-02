@@ -15,9 +15,9 @@ use std::sync::Arc;
 
 use intent_core::{parse_iso, Error, PullRequestInfo, PullRequestStatus, Result, Workspace};
 use intent_sourcecontrol::{
-    CheckRun, CheckState, MergeMethod, MergeRequirementSignals, Page, PageParams, PrObservation,
-    PrQuery, PrState, PullRequest, RepoRef, Review, ReviewComment, ReviewDecision, ReviewThread,
-    ReviewThreadComment, ReviewVerdict, RollupCheck, RollupCheckKind, SourceControl,
+    CheckRun, CheckState, MergeMethod, MergeRequirementSignals, Page, PageParams, PrAncestry,
+    PrObservation, PrQuery, PrState, PullRequest, RepoRef, Review, ReviewComment, ReviewDecision,
+    ReviewThread, ReviewThreadComment, ReviewVerdict, RollupCheck, RollupCheckKind, SourceControl,
     SourceControlRegistry, SourceControlSettings,
 };
 use time::OffsetDateTime;
@@ -1125,8 +1125,14 @@ pub struct MergeRequirements {
     pub is_draft: bool,
     /// True when the forge reports merge conflicts.
     pub has_conflicts: bool,
-    /// True when the PR branch is behind its base.
+    /// Legacy forge BEHIND verdict (REST OR GraphQL), not measured ancestry.
     pub is_behind: bool,
+    /// Measured ancestry of the observed live base/head, unknown on old baselines.
+    #[serde(default)]
+    pub ancestry: PrAncestry,
+    /// Forge-required update, independent of ancestry. Absent means unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_update_required: Option<bool>,
     /// The forge's mergeability tri-state (`None` = still computing).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mergeable: Option<bool>,
@@ -1352,6 +1358,22 @@ pub(crate) fn merge_requirements(
     // `mergeable_state`; either reporting the condition is enough.
     let has_conflicts = mergeable_state == "dirty" || raw_status == "DIRTY";
     let is_behind = mergeable_state == "behind" || raw_status == "BEHIND";
+    let branch_update_required = if is_behind {
+        Some(true)
+    } else {
+        let statuses: Vec<_> = [pr.mergeable_state.as_deref(), merge_state_status.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect();
+        (!statuses.is_empty()
+            && statuses.iter().all(|status| {
+                matches!(
+                    status.to_ascii_uppercase().as_str(),
+                    "CLEAN" | "UNSTABLE" | "HAS_HOOKS"
+                )
+            }))
+        .then_some(false)
+    };
 
     let rollup: Option<&[RollupCheck]> = signals
         .filter(|s| s.checks_known)
@@ -1387,6 +1409,8 @@ pub(crate) fn merge_requirements(
         is_draft: state == "draft",
         has_conflicts,
         is_behind,
+        ancestry: PrAncestry::Unknown,
+        branch_update_required,
         mergeable: pr.mergeable,
         checks,
         approvals,
@@ -1637,7 +1661,19 @@ pub(crate) async fn merge_requirements_from_observation(
     complete &= threads_complete;
 
     let merge_queue_reported = signals.is_in_merge_queue;
-    let requirements = merge_requirements(pr, Some(&signals), &fallback_runs, &agg, unresolved);
+    let mut requirements = merge_requirements(pr, Some(&signals), &fallback_runs, &agg, unresolved);
+    if let Some(identity) = observation.ancestry_identity.as_ref().filter(|identity| {
+        pr.state == PrState::Open
+            && identity.is_valid()
+            && pr.head_sha.as_deref() == Some(identity.head_sha.as_str())
+            && pr.target_branch == identity.target_branch
+    }) {
+        // Ordinary comparison failure is itself a bounded cached unknown,
+        // not an incomplete checklist forcing a retry on every cheap poll.
+        requirements.ancestry =
+            degrade_unless_rate_limited(sc.pr_ancestry(repo_ref, identity).await)?
+                .unwrap_or_default();
+    }
     Ok(MergeRequirementsRead {
         requirements,
         review_comment_count: review_comments,
@@ -2588,6 +2624,45 @@ mod tests {
         ReviewAggregate {
             approval_count: approvals,
             changes_requested_count: changes,
+        }
+    }
+
+    #[test]
+    fn ancestry_contract_distinguishes_unknown_from_current_and_forge_updates() {
+        for (rest, graphql, expected) in [
+            (Some("clean"), Some("CLEAN"), Some(false)),
+            (None, Some("UNSTABLE"), Some(false)),
+            (Some("has_hooks"), None, Some(false)),
+            (Some("behind"), Some("CLEAN"), Some(true)),
+            (Some("clean"), Some("BEHIND"), Some(true)),
+            (Some("dirty"), Some("BEHIND"), Some(true)),
+            (Some("dirty"), Some("CLEAN"), None),
+            (Some("clean"), Some("BLOCKED"), None),
+            (Some("unknown"), Some("CLEAN"), None),
+            (None, Some("FUTURE_STATE"), None),
+            (None, None, None),
+        ] {
+            let p = pr(PrState::Open, false, Some(true), rest);
+            let signals = MergeRequirementSignals {
+                merge_state_status: graphql.map(str::to_string),
+                ..Default::default()
+            };
+            let req = merge_requirements(&p, Some(&signals), &[], &agg(0, 0), Some(0));
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["ancestry"], serde_json::json!({"status":"unknown"}));
+            assert_eq!(
+                wire.get("branchUpdateRequired"),
+                expected.map(serde_json::Value::Bool).as_ref(),
+                "{rest:?}/{graphql:?}"
+            );
+            assert_eq!(
+                req.is_behind,
+                rest == Some("behind") || graphql == Some("BEHIND")
+            );
+            assert_eq!(
+                req.has_conflicts,
+                rest == Some("dirty") || graphql == Some("DIRTY")
+            );
         }
     }
 

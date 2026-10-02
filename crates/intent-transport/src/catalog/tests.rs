@@ -183,11 +183,11 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// Direct user retirement (protocol 10.10): +1 router method (`agent.retire`).
 /// Reversible script history (protocol 10.11): +2 router methods
 /// (`script.archive`, `script.restore`).
-const EXPECTED_TOTAL_METHODS: usize = 400;
+const EXPECTED_TOTAL_METHODS: usize = 401;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.
-const EXPECTED_ROUTER_METHODS: usize = 345;
+const EXPECTED_ROUTER_METHODS: usize = 346;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 55;
@@ -517,6 +517,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "agent.enhancePrompt",
     "agent.get",
     "agent.getConversation",
+    "agent.getCreationPreferences",
     "agent.getMessageBlock",
     "agent.getModels",
     "agent.getQueue",

@@ -2084,6 +2084,7 @@ impl WorkspaceApi for FakeApi {
             Ok(serde_json::json!({
                 "agent": { "id": "agent-fake", "name": name, "workspaceId": workspace_id.as_str() },
                 "nameExplicitlySet": extra.name_explicitly_set,
+                "rememberSpecialist": extra.remember_specialist,
             }))
         })
     }
@@ -7816,3 +7817,25 @@ mod oversized_response {
 mod discovery_context;
 
 mod integration_context;
+
+#[tokio::test]
+async fn agent_create_validates_and_forwards_remember_specialist() {
+    for (value, expected) in [
+        (serde_json::json!(true), true),
+        (serde_json::json!(false), false),
+        (Value::Null, false),
+    ] {
+        let request = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"agent.create","params":{"workspaceId":"ws-1","rememberSpecialist":value}});
+        let response = call(&request.to_string()).await.unwrap();
+        assert_eq!(response["result"]["rememberSpecialist"], expected);
+    }
+    for value in [
+        serde_json::json!("true"),
+        serde_json::json!(1),
+        serde_json::json!({}),
+    ] {
+        let request = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"agent.create","params":{"workspaceId":"ws-1","rememberSpecialist":value}});
+        let response = call(&request.to_string()).await.unwrap();
+        assert_eq!(err_code(&response), -32602);
+    }
+}
