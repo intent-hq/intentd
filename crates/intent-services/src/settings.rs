@@ -8456,6 +8456,11 @@ mod rollback_order_tests {
             Arc<tokio::sync::Notify>,
             Mutex<std::sync::mpsc::Receiver<()>>,
         )>,
+        newer: Option<(
+            Arc<tokio::sync::Notify>,
+            Mutex<std::sync::mpsc::Receiver<()>>,
+        )>,
+        write_order: Mutex<Vec<&'static str>>,
     }
 
     impl SecretStore for RejectSecondSecret {
@@ -8464,6 +8469,9 @@ mod rollback_order_tests {
         }
 
         fn store(&self, account: &str, value: &str) -> Result<()> {
+            use intent_sourcecontrol::gitlab_token::{
+                EXPIRES_AT_SECRET_ACCOUNT, REFRESH_SECRET_ACCOUNT, SECRET_ACCOUNT,
+            };
             if account == "accounts.sentry.token" && value == "rejected-sentry" {
                 return Err(Error::Internal("injected second-secret failure".into()));
             }
@@ -8478,7 +8486,27 @@ mod rollback_order_tests {
                     let _ = release.lock().unwrap().recv();
                 }
             }
-            self.raw.store(account, value)
+            if account == intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT && value == "newer-pat"
+            {
+                // Record entry before the test barrier: parking this write must
+                // not hide a regression that lets it overtake compensation.
+                self.write_order.lock().unwrap().push("newer write entered");
+                if let Some((entered, release)) = &self.newer {
+                    entered.notify_one();
+                    let _ = release.lock().unwrap().recv();
+                }
+            }
+            self.raw.store(account, value)?;
+            let restored = match (account, value) {
+                (SECRET_ACCOUNT, "original-device") => Some("token restored"),
+                (REFRESH_SECRET_ACCOUNT, "original-refresh") => Some("refresh restored"),
+                (EXPIRES_AT_SECRET_ACCOUNT, "12345") => Some("expiry restored"),
+                _ => None,
+            };
+            if let Some(restored) = restored {
+                self.write_order.lock().unwrap().push(restored);
+            }
+            Ok(())
         }
 
         fn delete(&self, account: &str) -> Result<()> {
@@ -8512,13 +8540,18 @@ mod rollback_order_tests {
             .unwrap();
         let entered = Arc::new(tokio::sync::Notify::new());
         let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let newer_entered = Arc::new(tokio::sync::Notify::new());
+        let (newer_release_tx, newer_release_rx) = std::sync::mpsc::channel();
+        let secrets = Arc::new(RejectSecondSecret {
+            raw: raw.clone(),
+            reject_rollback: false,
+            rollback: concurrent.then_some((entered.clone(), Mutex::new(release_rx))),
+            newer: concurrent.then_some((newer_entered.clone(), Mutex::new(newer_release_rx))),
+            write_order: Mutex::new(Vec::new()),
+        });
         let services = crate::Services::new(store)
             .with_settings_registry(registry)
-            .with_secret_store(Arc::new(RejectSecondSecret {
-                raw: raw.clone(),
-                reject_rollback: false,
-                rollback: concurrent.then_some((entered.clone(), Mutex::new(release_rx))),
-            }))
+            .with_secret_store(secrets.clone())
             .with_event_bus(bus);
         let writer = services.clone();
         let failed = intent_core::spawn_daemon(async move {
@@ -8541,7 +8574,7 @@ mod rollback_order_tests {
                 .expect("rollback parked");
             assert!(
                 poll_fn(|cx| Poll::Ready(newer.as_mut().poll(cx).is_pending())).await,
-                "a newer credential must wait for compensation to finish"
+                "the newer request must remain pending while compensation is parked"
             );
             let ordinary = timeout(
                 Duration::from_secs(3),
@@ -8559,6 +8592,23 @@ mod rollback_order_tests {
             error.to_string().contains("injected second-secret failure"),
             "{error}"
         );
+        if concurrent {
+            // Polling the outer request starts an owned task. Hold its backing
+            // write through the intermediate assertions and revision-one probe.
+            timeout(Duration::from_secs(5), newer_entered.notified())
+                .await
+                .expect("newer write parked");
+            assert_eq!(
+                *secrets.write_order.lock().unwrap(),
+                [
+                    "token restored",
+                    "refresh restored",
+                    "expiry restored",
+                    "newer write entered",
+                ],
+                "compensation must finish before the newer write enters the backing store"
+            );
+        }
         for (account, value) in originals {
             assert_eq!(
                 raw.load(account).unwrap().as_deref(),
@@ -8580,13 +8630,27 @@ mod rollback_order_tests {
         assert_no_settings_events(&mut sub).await;
         assert_next_commit_is_revision_one(&services, &mut sub).await;
         if concurrent {
-            assert_eq!(newer.await.unwrap()["revision"], json!(2));
+            newer_release_tx.send(()).unwrap();
+            let newer = newer.await.unwrap();
+            assert_eq!(newer["revision"], json!(2));
             assert_eq!(
                 raw.load(SECRET_ACCOUNT).unwrap().as_deref(),
                 Some("newer-pat")
             );
             assert_eq!(raw.load(REFRESH_SECRET_ACCOUNT).unwrap(), None);
             assert_eq!(raw.load(EXPIRES_AT_SECRET_ACCOUNT).unwrap(), None);
+            let events = timeout(Duration::from_secs(5), sub.recv())
+                .await
+                .expect("newer settings event")
+                .unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].data["revision"], json!(2));
+            assert_eq!(
+                events[0].data["changes"],
+                json!([{"path": SECRET_ACCOUNT, "value": REDACTED_PLACEHOLDER}])
+            );
+            assert_eq!(events[0].data["changes"], newer["applied"]);
+            assert_no_settings_events(&mut sub).await;
         }
     }
 
@@ -8631,6 +8695,8 @@ mod rollback_order_tests {
                 raw: raw.clone(),
                 reject_rollback: true,
                 rollback: None,
+                newer: None,
+                write_order: Mutex::new(Vec::new()),
             }))
             .with_event_bus(bus);
         let error = services
