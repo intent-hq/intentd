@@ -47,7 +47,8 @@
 #   replying (which makes the thread blocking) or resolving it. Anything
 #   else logs and exits 0 (push runs first retry transient states within
 #   their bounded wait) — the next scheduled run retries. Never
-#   force-merges.
+#   bypasses a failed guard. Metadata-only releases use the CI identity’s
+#   existing queue exemption; other diffs retain the ordinary queue path.
 # - The PR branch is never updated from here: release-plz owns the Release
 #   PR branch content and refreshes it on every push to main, which is how
 #   the ruleset's strict up-to-date requirement gets satisfied. A branch
@@ -99,7 +100,7 @@ jobs:
   # final merge.
   auto-merge-release-pr:
     name: Auto-merge green Release PR
-    # API-only job (seconds on cron/dispatch runs; up to ~15 min of polling
+    # Lightweight job (seconds on cron/dispatch runs; up to ~15 min of polling
     # on push-triggered runs): pinned to ubuntu-latest (same rationale as
     # ci.yml's pr-title/gate jobs — a tinybox slot would be wasted on it).
     runs-on: ubuntu-latest
@@ -129,6 +130,12 @@ jobs:
             echo "enabled=false" >> "$GITHUB_OUTPUT"
             echo "::warning::RELEASE_PLZ_TOKEN secret is not configured; skipping Release PR auto-merge"
           fi
+      # Load the classifier from this trusted workflow revision, never the PR.
+      - uses: actions/checkout@v7
+        if: steps.token.outputs.enabled == 'true'
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
       - name: Merge the Release PR when green
         if: steps.token.outputs.enabled == 'true'
         shell: bash
@@ -313,25 +320,8 @@ jobs:
               exit 0
             fi
 
-            # Chained-cut freshness gate (push runs only): the Release PR
-            # head must already contain the pushed commit — otherwise
-            # release-plz has not refreshed the PR since the push, and
-            # merging now would cut a release WITHOUT the change that
-            # triggered this run. Compare status "ahead"/"identical" means
-            # the PR head's history contains PUSH_SHA. Read failures are
-            # treated as not-yet-refreshed (retried within the budget).
-            if [[ "$EVENT_NAME" == "push" ]]; then
-              head_ref=$(jq -r '.[0].headRefName' <<<"$prs")
-              cmp_status=$(gh api "repos/$GITHUB_REPOSITORY/compare/$PUSH_SHA...$head_ref" \
-                --jq '.status' 2>/dev/null) || cmp_status=""
-              if [[ "$cmp_status" != "ahead" && "$cmp_status" != "identical" ]]; then
-                transient "Release PR #$number head does not contain the pushed commit yet (compare: ${cmp_status:-unreadable})"
-                sleep 30; continue
-              fi
-            fi
-
             if ! detail=$(gh pr view "$number" --repo "$GITHUB_REPOSITORY" \
-              --json isDraft,mergeable,mergeStateStatus,statusCheckRollup); then
+              --json isDraft,mergeable,mergeStateStatus,statusCheckRollup,headRefOid,baseRefOid,baseRefName,reviewDecision); then
               transient "gh pr view failed for Release PR #$number (transient API error?)"
               sleep 30; continue
             fi
@@ -361,6 +351,36 @@ jobs:
             if [[ "$mergeable" != "MERGEABLE" ]]; then
               echo "Release PR #$number is not mergeable (mergeable=$mergeable, mergeStateStatus=$merge_state); skipping."
               exit 0
+            fi
+
+            # --admin bypasses queue rules, so enforce the clean/review/base
+            # guards explicitly before considering the metadata exemption.
+            if [[ "$merge_state" != "CLEAN" || $(jq -r '.baseRefName' <<<"$detail") != "main" ]] ||
+               [[ $(jq -r '.reviewDecision' <<<"$detail") == "CHANGES_REQUESTED" || $(jq -r '.reviewDecision' <<<"$detail") == "REVIEW_REQUIRED" ]]; then
+              transient "Release PR #$number is not clean on main or still requires review"
+              sleep 30; continue
+            fi
+            head_sha=$(jq -r '.headRefOid' <<<"$detail")
+            base_sha=$(jq -r '.baseRefOid' <<<"$detail")
+            if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ || ! "$base_sha" =~ ^[0-9a-f]{40}$ ]]; then
+              transient "Release PR #$number has unreadable head/base commits"
+              sleep 30; continue
+            fi
+
+            # Chained-cut freshness gate (push runs only): the Release PR
+            # head must already contain the pushed commit — otherwise
+            # release-plz has not refreshed the PR since the push, and
+            # merging now would cut a release WITHOUT the change that
+            # triggered this run. Compare status "ahead"/"identical" means
+            # the PR head's history contains PUSH_SHA. Read failures are
+            # treated as not-yet-refreshed (retried within the budget).
+            if [[ "$EVENT_NAME" == "push" ]]; then
+              cmp_status=$(gh api "repos/$GITHUB_REPOSITORY/compare/$PUSH_SHA...$head_sha" \
+                --jq '.status' 2>/dev/null) || cmp_status=""
+              if [[ "$cmp_status" != "ahead" && "$cmp_status" != "identical" ]]; then
+                transient "Release PR #$number head does not contain the pushed commit yet (compare: ${cmp_status:-unreadable})"
+                sleep 30; continue
+              fi
             fi
 
             # Required check "CI Gate" must be green on the current head
@@ -447,8 +467,28 @@ jobs:
             # releases), so no cut-in-progress detection is layered on.
             throttle
 
+            # Fetch immutable objects only. Never check out or run PR code.
+            # Fetch/classifier failures conservatively keep the queue path.
+            direct=false
+            if git fetch --no-tags origin "$base_sha" "$head_sha"; then
+              # The admin route must not bypass freshness, even if GitHub's
+              # cached mergeStateStatus has not caught up with main yet.
+              if ! git merge-base --is-ancestor "$base_sha" "$head_sha"; then
+                transient "Release PR #$number does not contain its current main base"
+                sleep 30; continue
+              fi
+              shape=$(bash scripts/release-pr-fast-path.sh "$base_sha" "$head_sha") || shape="fast_path=false"
+              [[ "$shape" != "fast_path=true" ]] || direct=true
+            fi
+            merge_args=(--squash --match-head-commit "$head_sha")
+            route="ordinary merge queue"
+            if [[ "$direct" == "true" ]]; then
+              merge_args+=(--admin)
+              route="direct metadata merge through the CI exemption"
+            fi
+
             if [[ "$DRY_RUN" == "true" ]]; then
-              echo "DRY RUN: would squash-merge Release PR #$number ($title)."
+              echo "DRY RUN: would request $route for Release PR #$number ($title) at $head_sha."
               exit 0
             fi
 
@@ -460,8 +500,12 @@ jobs:
             # conventional form as the PR title. A failure here is not
             # fatal: the PR state may have changed under us, and the next
             # scheduled run retries.
-            if GH_TOKEN="$RELEASE_PLZ_TOKEN" gh pr merge "$number" --repo "$GITHUB_REPOSITORY" --squash; then
-              echo "Squash-merged Release PR #$number ($title); release-plz.yml now cuts the tag and the alpha publishes automatically."
+            if GH_TOKEN="$RELEASE_PLZ_TOKEN" gh pr merge "$number" --repo "$GITHUB_REPOSITORY" "${merge_args[@]}"; then
+              if [[ "$direct" == "true" ]]; then
+                echo "Directly squash-merged Release PR #$number ($title) at $head_sha; release-plz.yml now cuts the tag."
+              else
+                echo "Submitted Release PR #$number ($title) to the ordinary merge queue; publication waits for the actual merge."
+              fi
             else
               echo "::warning::gh pr merge failed for Release PR #$number (state changed under us?); the next scheduled run retries"
             fi
