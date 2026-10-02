@@ -7710,7 +7710,8 @@ impl AgentManager {
             // entry user-origin so the winner's end-of-turn drain keeps its
             // user-origin semantics (attention clear, archived exemption).
             entry.user_origin = true;
-            let restored = self.services.requeue_front(&agent_id, entry).to_value(0);
+            let (restored, position) = self.services.requeue_front(&agent_id, entry);
+            let restored = restored.to_value(position);
             drop(draining);
             self.services.publish_queue_updated(&agent_id).await;
             #[cfg(test)]
@@ -7734,7 +7735,7 @@ impl AgentManager {
         // lost-claim arm hands the entry back undelivered); the delivery is
         // committed now (intent-hq/intent#4962).
         self.services
-            .commit_recovery_send_delivery(&agent_id, std::slice::from_ref(&entry));
+            .commit_provisional_queue_delivery(&agent_id, std::slice::from_ref(&entry));
         // Skip the transcript append for a terminal-failure requeue whose
         // user row already reached the transcript (STAB-112) — the entry id
         // already names that row.
@@ -12047,7 +12048,7 @@ async fn run_message_worker(
                 }
             }
             mgr.services
-                .commit_recovery_send_delivery(&agent_id, &raced);
+                .commit_provisional_queue_delivery(&agent_id, &raced);
             let mut next = raced.pop().expect("raced batch non-empty");
             let mut draining = raced_draining.take().expect("raced batch guard");
             // Batch flush (`agents.flushQueuedMessages`): the single `next`
@@ -13398,6 +13399,8 @@ async fn publish_error_status_and_requeue(
             merged_submission_ids: options.queued_submission_ids.clone(),
             edit_appended: String::new(),
             edit_prepended: String::new(),
+            editing_message_id: None,
+            provisional: false,
             submission_order: options.queued_submission_order,
         };
         mgr.services.requeue_front(agent_id, queued);
@@ -20243,7 +20246,7 @@ mod agent_retry_tests {
         // The provisional holder wins its claim and commits.
         assert!(mgr.try_begin(&agent_id, &ws).await);
         mgr.services
-            .commit_recovery_send_delivery(&agent_id, std::slice::from_ref(&entry));
+            .commit_provisional_queue_delivery(&agent_id, std::slice::from_ref(&entry));
         drop(draining);
         assert!(mgr.services.parked_recovery_send(&agent_id).is_none());
     }

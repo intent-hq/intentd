@@ -1303,9 +1303,14 @@ pub(crate) struct QueuedMessage {
     pub edit_appended: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub edit_prepended: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editing_message_id: Option<String>,
     /// Latest human submission, independent of priority/drain order; persisted for restart.
     #[serde(default)]
     pub submission_order: u64,
+    /// Only true on an in-memory draining overlay before delivery commits.
+    #[serde(skip)]
+    pub provisional: bool,
     pub content: String,
     pub image_blocks: Option<Value>,
     pub file_blocks: Option<Value>,
@@ -1446,6 +1451,8 @@ impl QueuedMessage {
         }
         if self.editing {
             v["editing"] = Value::Bool(true);
+            v["editingMessageId"] =
+                Value::String(self.editing_message_id.as_ref().unwrap_or(&self.id).clone());
         }
         if self.requeued_after_failure {
             v["requeuedAfterFailure"] = Value::Bool(true);
@@ -1500,6 +1507,12 @@ impl QueuedMessage {
 
     fn append_pending(&mut self, incoming: Self) {
         if incoming.editing && !self.editing {
+            self.editing_message_id = Some(
+                incoming
+                    .editing_message_id
+                    .clone()
+                    .unwrap_or_else(|| incoming.id.clone()),
+            );
             self.edit_prepended = format!("{}\n\n{}", self.content, incoming.edit_prepended);
             self.edit_appended.clone_from(&incoming.edit_appended);
             self.editing = true;
@@ -6901,6 +6914,17 @@ impl Services {
                 gate.check(&queue[position])?;
             }
             let was = queue[position].editing;
+            let edit_id = if was {
+                queue[position]
+                    .editing_message_id
+                    .as_ref()
+                    .unwrap_or(&queue[position].id)
+            } else {
+                &queue[position].id
+            };
+            if message_id != *edit_id {
+                return Err(Error::InvalidParams("queued edit conflict: this draft was combined into another queued message; refresh before editing".into()));
+            }
             let human_authored = queue[position].user_origin
                 || crate::principal_ops::carries_principal_stamp(
                     queue[position].message_metadata.as_ref(),
@@ -6967,6 +6991,11 @@ impl Services {
             }
             if let Some(flag) = editing {
                 queue[position].editing = flag;
+                if !flag {
+                    queue[position].editing_message_id = None;
+                } else if !was {
+                    queue[position].editing_message_id = Some(queue[position].id.clone());
+                }
             }
             let now = queue[position].editing;
             (queue[position].to_value(position), was, now)
@@ -14368,6 +14397,38 @@ impl Services {
         interrupt: bool,
         origin: MessageOrigin,
     ) -> (QueuedMessage, usize) {
+        let draining = self
+            .draining_queue_entries
+            .lock()
+            .expect("draining queue registry poisoned");
+        self.enqueue_message_with_id_locked(
+            agent_id,
+            message_id,
+            content,
+            image_blocks,
+            file_blocks,
+            message_metadata,
+            prepend,
+            interrupt,
+            origin,
+            &draining,
+        )
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn enqueue_message_with_id_locked(
+        &self,
+        agent_id: &AgentId,
+        message_id: Option<String>,
+        content: String,
+        image_blocks: Option<Value>,
+        file_blocks: Option<Value>,
+        message_metadata: Option<Value>,
+        prepend: Option<QueuedPrepend>,
+        interrupt: bool,
+        origin: MessageOrigin,
+        draining: &HashMap<AgentId, Vec<QueuedMessage>>,
+    ) -> (QueuedMessage, usize) {
         let prepend = prepend.unwrap_or_default();
         let id = message_id.unwrap_or_else(new_message_id);
         let mut guard = self
@@ -14379,6 +14440,18 @@ impl Services {
             .iter()
             .enumerate()
             .find(|(_, queued)| queued.id == id || queued.merged_submission_ids.contains(&id))
+        {
+            return (existing.clone(), position);
+        }
+        // An acknowledged submission may be retried while its row is
+        // provisionally popped (or already committing), before history is
+        // visible. It is the same submission, never another append.
+        if let Some((position, existing)) = draining
+            .get(agent_id)
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .find(|(_, entry)| entry.matches_submission(&id))
         {
             return (existing.clone(), position);
         }
@@ -14404,6 +14477,8 @@ impl Services {
             merged_submission_ids: Vec::new(),
             edit_appended: String::new(),
             edit_prepended: String::new(),
+            editing_message_id: None,
+            provisional: false,
             submission_order: self
                 .queue_submission_order
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -14416,7 +14491,12 @@ impl Services {
             .filter(|(_, entry)| entry.is_human_queue_entry())
             .max_by_key(|(_, entry)| entry.submission_order)
         {
-            if previous.can_merge_pending(&queued) {
+            let provisional_barrier = draining.get(agent_id).into_iter().flatten().any(|entry| {
+                entry.provisional
+                    && entry.is_human_queue_entry()
+                    && entry.submission_order > previous.submission_order
+            });
+            if !provisional_barrier && previous.can_merge_pending(&queued) {
                 previous.append_pending(queued);
                 return (previous.clone(), position);
             }
@@ -14457,11 +14537,11 @@ impl Services {
         interrupt: bool,
         origin: MessageOrigin,
     ) -> (QueuedMessage, usize) {
-        let _draining = self
+        let draining = self
             .draining_queue_entries
             .lock()
             .expect("draining queue registry poisoned");
-        let (queued, position) = self.enqueue_message_with_id(
+        let (queued, position) = self.enqueue_message_with_id_locked(
             agent_id,
             Some(message_id),
             content,
@@ -14471,6 +14551,7 @@ impl Services {
             prepend,
             interrupt,
             origin,
+            &draining,
         );
         self.mark_parked_recovery_send(agent_id, queued.id.clone());
         (queued, position)
@@ -14534,6 +14615,8 @@ impl Services {
                     merged_submission_ids: Vec::new(),
                     edit_appended: String::new(),
                     edit_prepended: String::new(),
+                    editing_message_id: None,
+                    provisional: false,
                     submission_order: 0,
                 };
                 queue.push(queued.clone());
@@ -15106,6 +15189,10 @@ impl Services {
         if messages.is_empty() {
             return;
         }
+        let draining = self
+            .draining_queue_entries
+            .lock()
+            .expect("draining queue registry poisoned");
         let mut guard = self
             .agent_queues
             .lock()
@@ -15114,20 +15201,40 @@ impl Services {
         for (i, m) in messages.into_iter().enumerate() {
             queue.insert(i, m);
         }
-        Self::coalesce_pending_queue(queue);
+        Self::coalesce_pending_queue(
+            queue,
+            draining
+                .get(agent_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        );
     }
 
-    fn coalesce_pending_queue(queue: &mut Vec<QueuedMessage>) {
+    fn coalesce_pending_queue(queue: &mut Vec<QueuedMessage>, draining: &[QueuedMessage]) {
         // Human barriers follow submission order, even when interrupts changed
         // delivery position or a provisional pop temporarily hid an older row.
         let mut arrivals: Vec<_> = queue
             .iter()
             .filter(|m| m.is_human_queue_entry())
-            .map(|m| (m.submission_order, m.id.clone()))
+            .map(|m| (m.submission_order, Some(m.id.clone())))
             .collect();
+        arrivals.extend(
+            draining
+                .iter()
+                .filter(|m| {
+                    m.provisional
+                        && m.is_human_queue_entry()
+                        && !queue.iter().any(|live| live.matches_submission(&m.id))
+                })
+                .map(|m| (m.submission_order, None)),
+        );
         arrivals.sort_by_key(|(order, _)| *order);
         let mut previous: Option<String> = None;
         for (_, id) in arrivals {
+            let Some(id) = id else {
+                previous = None;
+                continue;
+            };
             let index = queue
                 .iter()
                 .position(|m| m.id == id)
@@ -15177,20 +15284,31 @@ impl Services {
         &self,
         agent_id: &AgentId,
         message: QueuedMessage,
-    ) -> QueuedMessage {
+    ) -> (QueuedMessage, usize) {
         let id = message.id.clone();
+        let draining = self
+            .draining_queue_entries
+            .lock()
+            .expect("draining queue registry poisoned");
         let mut queues = self
             .agent_queues
             .lock()
             .expect("agent queue registry poisoned");
         let queue = queues.entry(agent_id.clone()).or_default();
         queue.insert(0, message);
-        Self::coalesce_pending_queue(queue);
-        queue
+        Self::coalesce_pending_queue(
+            queue,
+            draining
+                .get(agent_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        );
+        let (position, entry) = queue
             .iter()
-            .find(|entry| entry.matches_submission(&id))
-            .expect("restored queue entry")
-            .clone()
+            .enumerate()
+            .find(|(_, entry)| entry.matches_submission(&id))
+            .expect("restored queue entry");
+        (entry.clone(), position)
     }
 
     /// Drop an agent's ENTIRE in-memory queue (intent-hq/monorepo#2762): the
@@ -15301,8 +15419,12 @@ impl Services {
                 .lock()
                 .expect("parked recovery send registry poisoned")
                 .remove(agent_id);
-            let guard =
-                self.register_draining(&mut draining, agent_id, std::slice::from_ref(&entry));
+            let guard = self.register_draining(
+                &mut draining,
+                agent_id,
+                std::slice::from_ref(&entry),
+                false,
+            );
             return RecoverySendClaim::Drained(Box::new((entry, guard)));
         }
         let popped_provisionally = draining
@@ -15342,6 +15464,25 @@ impl Services {
         {
             parked.remove(agent_id);
         }
+    }
+
+    pub(crate) fn commit_provisional_queue_delivery(
+        &self,
+        agent_id: &AgentId,
+        entries: &[QueuedMessage],
+    ) {
+        let mut draining = self
+            .draining_queue_entries
+            .lock()
+            .expect("draining queue registry poisoned");
+        if let Some(overlay) = draining.get_mut(agent_id) {
+            for entry in overlay {
+                if entries.iter().any(|delivered| delivered.id == entry.id) {
+                    entry.provisional = false;
+                }
+            }
+        }
+        self.commit_recovery_send_delivery(agent_id, entries);
     }
 
     /// `true` iff at least one ready-to-send queued entry is user-origin:
@@ -15623,7 +15764,7 @@ impl Services {
             .draining_queue_entries
             .lock()
             .expect("draining queue registry poisoned");
-        self.register_draining(&mut draining, agent_id, entries)
+        self.register_draining(&mut draining, agent_id, entries, false)
     }
 
     /// Run a live-queue pop while holding the draining overlay lock (taken
@@ -15655,7 +15796,12 @@ impl Services {
         if commit == PopCommit::Delivery {
             self.commit_recovery_send_delivery(agent_id, entries);
         }
-        let guard = self.register_draining(&mut draining, agent_id, entries);
+        let guard = self.register_draining(
+            &mut draining,
+            agent_id,
+            entries,
+            commit == PopCommit::Provisional,
+        );
         Some((popped, guard))
     }
 
@@ -15664,11 +15810,15 @@ impl Services {
         draining: &mut HashMap<AgentId, Vec<QueuedMessage>>,
         agent_id: &AgentId,
         entries: &[QueuedMessage],
+        provisional: bool,
     ) -> DrainingGuard {
         draining
             .entry(agent_id.clone())
             .or_default()
-            .extend(entries.iter().cloned());
+            .extend(entries.iter().cloned().map(|mut entry| {
+                entry.provisional = provisional;
+                entry
+            }));
         DrainingGuard {
             overlay: Arc::clone(&self.draining_queue_entries),
             shutdown: Arc::clone(&self.draining_shutdown),
@@ -15860,6 +16010,7 @@ impl Services {
                             + 1;
                     }
                     message.editing = false;
+                    message.editing_message_id = None;
                     message.edit_appended.clear();
                     message.edit_prepended.clear();
                     if message.turn_id.is_empty() {

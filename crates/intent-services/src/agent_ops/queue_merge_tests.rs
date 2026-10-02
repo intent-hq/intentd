@@ -414,6 +414,14 @@ async fn queue_merge_provisional_handback_coalesces_newer_held_input() {
         let agent = create_agent(&svc, &ws, "Handback").await;
         let first = enqueue(&svc, &agent, "first", "a", "one");
         let (mut popped, draining) = svc.dequeue_message_draining_provisional(&agent).unwrap();
+        assert_eq!(enqueue(&svc, &agent, "first", "a", "one").id, first.id);
+        assert!(svc
+            .agent_queues
+            .lock()
+            .unwrap()
+            .get(&agent)
+            .unwrap()
+            .is_empty());
         popped.image_blocks = Some(json!([{"imageRef":"first"}]));
         let (newer, _) = svc.enqueue_message_with_id(
             &agent,
@@ -441,6 +449,7 @@ async fn queue_merge_provisional_handback_coalesces_newer_held_input() {
         assert_eq!(queue[0]["id"], first.id);
         assert_eq!(queue[0]["content"], "one\n\ntwo");
         assert_eq!(queue[0]["editing"], true);
+        assert_eq!(queue[0]["editingMessageId"], newer.id);
         assert_eq!(
             queue[0]["imageBlocks"],
             json!([{"imageRef":"first"},{"imageRef":"second"}])
@@ -454,6 +463,16 @@ async fn queue_merge_provisional_handback_coalesces_newer_held_input() {
             .await
             .unwrap();
         assert_eq!(saved["queuedMessage"]["content"], "one\n\nedited two");
+        assert!(saved["queuedMessage"].get("editingMessageId").is_none());
+        assert!(svc
+            .agent_edit_queued_message_op(
+                agent.clone(),
+                "second".into(),
+                "stale".into(),
+                Some(false)
+            )
+            .await
+            .is_err());
         assert_eq!(
             enqueue(&svc, &agent, "second", "a", "two").content,
             "one\n\nedited two"
@@ -575,4 +594,139 @@ async fn queue_merge_authenticated_authors_override_custom_metadata_labels() {
         "one\n\ntwo\n\nthree"
     );
     assert_eq!(svc.queue_snapshot(&agent).len(), 2);
+}
+
+#[tokio::test]
+async fn queue_merge_provisional_foreign_human_remains_a_barrier_until_committed() {
+    for commit in [false, true] {
+        let (_tmp, svc, ws) = setup().await;
+        let agent = create_agent(&svc, &ws, "Provisional barrier").await;
+        enqueue(&svc, &agent, "a1", "a", "one");
+        enqueue(&svc, &agent, "b2", "b", "barrier");
+        let (popped, draining) = svc
+            .take_queued_message_draining_gated(&agent, "b2", None, None)
+            .unwrap()
+            .unwrap();
+        if commit {
+            svc.commit_provisional_queue_delivery(&agent, std::slice::from_ref(&popped));
+        }
+        let appended = enqueue(&svc, &agent, "a3", "a", "three");
+        if commit {
+            assert_eq!(appended.id, "a1");
+            assert_eq!(appended.content, "one\n\nthree");
+        } else {
+            assert_eq!(appended.id, "a3");
+            svc.requeue_front(&agent, popped);
+            assert_eq!(
+                svc.find_queued_message(&agent, "a1").unwrap().content,
+                "one"
+            );
+        }
+        drop(draining);
+        assert_eq!(svc.queue_snapshot(&agent).len(), if commit { 1 } else { 3 });
+    }
+}
+
+#[tokio::test]
+async fn queue_merge_two_held_sources_rejects_displaced_draft_without_changing_survivor() {
+    let (_tmp, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Held conflict").await;
+    enqueue(&svc, &agent, "first", "a", "one");
+    svc.agent_edit_queued_message_op(agent.clone(), "first".into(), "one".into(), Some(true))
+        .await
+        .unwrap();
+    let (popped, draining) = svc
+        .take_queued_message_draining_gated(&agent, "first", None, None)
+        .unwrap()
+        .unwrap();
+    enqueue(&svc, &agent, "second", "a", "two");
+    svc.agent_edit_queued_message_op(agent.clone(), "second".into(), "two".into(), Some(true))
+        .await
+        .unwrap();
+    svc.requeue_front(&agent, popped);
+    drop(draining);
+    let before = svc.queue_snapshot(&agent);
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0]["editingMessageId"], "first");
+    for editing in [Some(true), Some(false), None] {
+        let error = svc
+            .agent_edit_queued_message_op(
+                agent.clone(),
+                "second".into(),
+                "unsaved second draft".into(),
+                editing,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidParams(ref message) if message.starts_with("queued edit conflict:"))
+        );
+        assert_eq!(svc.queue_snapshot(&agent), before);
+    }
+    let saved = svc
+        .agent_edit_queued_message_op(agent, "first".into(), "edited first".into(), Some(false))
+        .await
+        .unwrap();
+    assert_eq!(saved["queuedMessage"]["content"], "edited first\n\ntwo");
+    assert!(saved["queuedMessage"].get("editingMessageId").is_none());
+}
+
+#[tokio::test]
+async fn queue_merge_migrated_edit_alias_is_author_gated_and_expires_on_release() {
+    use intent_core::with_caller;
+    let (_tmp, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Alias permissions").await;
+    let (owner, author) = super::tests::owner_and_guest_callers(&svc, &ws).await;
+    let principal = &author.principal_id().unwrap().0;
+    enqueue(&svc, &agent, "first", principal, "one");
+    let popped = svc.dequeue_message(&agent).unwrap();
+    enqueue(&svc, &agent, "second", principal, "two");
+    with_caller(
+        author.clone(),
+        svc.agent_edit_queued_message_op(agent.clone(), "second".into(), "two".into(), Some(true)),
+    )
+    .await
+    .unwrap();
+    svc.requeue_front(&agent, popped);
+    assert!(with_caller(
+        owner,
+        svc.agent_edit_queued_message_op(
+            agent.clone(),
+            "second".into(),
+            "hijack".into(),
+            Some(false)
+        )
+    )
+    .await
+    .is_err());
+    let saved = with_caller(
+        author.clone(),
+        svc.agent_edit_queued_message_op(
+            agent.clone(),
+            "second".into(),
+            "edited".into(),
+            Some(false),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(saved["queuedMessage"]["content"]
+        .as_str()
+        .unwrap()
+        .ends_with("edited"));
+    assert!(with_caller(
+        author,
+        svc.agent_edit_queued_message_op(
+            agent.clone(),
+            "second".into(),
+            "stale".into(),
+            Some(false)
+        )
+    )
+    .await
+    .is_err());
+    assert_eq!(
+        svc.queue_snapshot(&agent)[0]["content"],
+        saved["queuedMessage"]["content"]
+    );
 }

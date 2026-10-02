@@ -6918,6 +6918,8 @@ fn flush_entry(suffix: &str, content: String) -> crate::agent_ops::QueuedMessage
         merged_submission_ids: Vec::new(),
         edit_appended: String::new(),
         edit_prepended: String::new(),
+        editing_message_id: None,
+        provisional: false,
         submission_order: 0,
     }
 }
@@ -14950,6 +14952,8 @@ async fn flush_persist_failure_for_vanished_session_drops_whole_batch() {
         merged_submission_ids: Vec::new(),
         edit_appended: String::new(),
         edit_prepended: String::new(),
+        editing_message_id: None,
+        provisional: false,
         submission_order: 0,
     };
     let batch = vec![entry("head", true), entry("tail", false)];
@@ -18680,6 +18684,8 @@ mod stale_redrive_tests {
             merged_submission_ids: Vec::new(),
             edit_appended: String::new(),
             edit_prepended: String::new(),
+            editing_message_id: None,
+            provisional: false,
             submission_order: 0,
         }
     }
@@ -19133,6 +19139,8 @@ mod dequeue_wait_tests {
             merged_submission_ids: Vec::new(),
             edit_appended: String::new(),
             edit_prepended: String::new(),
+            editing_message_id: None,
+            provisional: false,
             submission_order: 0,
         }
     }
@@ -23106,6 +23114,8 @@ mod flush_queued_messages_tests {
             merged_submission_ids: Vec::new(),
             edit_appended: String::new(),
             edit_prepended: String::new(),
+            editing_message_id: None,
+            provisional: false,
             submission_order: 0,
         }
     }
