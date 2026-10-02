@@ -4225,6 +4225,20 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)
         }
+        "scriptMonitor.list" => {
+            let ws = require_ws_note(params)?;
+            let agent = opt_str(params, "agentId").map(intent_core::AgentId::from);
+            api.script_monitor_list(ws, agent)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "scriptMonitor.cancel" | "scriptMonitor.cancelRun" => {
+            let ws = require_ws_note(params)?;
+            let id = require_str_param(params, "monitorId")?;
+            api.script_monitor_cancel(ws, id, None, method == "scriptMonitor.cancelRun")
+                .await
+                .map_err(domain_to_rpc)
+        }
         "script.start" => {
             let ws = require_ws_note(params)?;
             let script_id = require_str_param(params, "scriptId")?;

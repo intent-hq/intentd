@@ -181,6 +181,9 @@ pub(crate) fn format_wait_duration(secs: i64) -> String {
 /// persisted-entry / unparseable-`queued_at` / sub-threshold skips above
 /// cover the stamp too.
 fn annotate_dequeue_wait(msg: &mut QueuedMessage) {
+    if crate::script_monitor::monitor_id(msg.message_metadata.as_ref()).is_some() {
+        return;
+    }
     if msg.persisted || msg.content.contains(DEQUEUE_WAIT_NOTE_PREFIX) {
         return;
     }
@@ -241,6 +244,9 @@ fn annotate_dequeue_wait(msg: &mut QueuedMessage) {
 /// is replaced the same way), an object is merged into — so EVERY drained
 /// row names its entry.
 pub(crate) fn stamp_queued_message_id(msg: &mut QueuedMessage) {
+    if crate::script_monitor::monitor_id(msg.message_metadata.as_ref()).is_some() {
+        return;
+    }
     if msg.persisted {
         return;
     }
@@ -11503,6 +11509,15 @@ async fn run_message_worker(
     // turn instead of failing; past it the timeout takes the terminal path.
     let mut consecutive_idle_timeouts: u32 = 0;
     'outer: loop {
+        if !mgr
+            .services
+            .script_monitor_delivery_allowed(&agent_id, options.message_metadata.as_ref())
+            .await
+            .unwrap_or(false)
+        {
+            break 'outer;
+        }
+
         // Turn-start budget re-check (monorepo#2063 B8): a warm idle process
         // about to go active re-checks the aggregate budget like a spawn
         // would — queued behind eviction, never refused. Sits at the top of
@@ -11522,6 +11537,13 @@ async fn run_message_worker(
             mgr.registry
                 .acquire_turn_start(&agent_id, try_claim, release)
                 .await;
+        }
+        if !mgr
+            .services
+            .admit_script_monitor_turn(&agent_id, options.message_metadata.as_ref())
+            .await
+        {
+            break 'outer;
         }
         match retry_spawn(&mgr, &agent_id, &workspace_id).await {
             Ok(acp_session_id) => {
@@ -11569,6 +11591,13 @@ async fn run_message_worker(
                 let prompt = mgr
                     .build_turn_prompt(&agent_id, &workspace_id, &content, &options)
                     .await;
+                if !mgr
+                    .services
+                    .admit_script_monitor_turn(&agent_id, options.message_metadata.as_ref())
+                    .await
+                {
+                    break 'outer;
+                }
                 match mgr
                     .run_turn(
                         &agent_id,
@@ -12750,6 +12779,32 @@ async fn persist_user(
             pause.resume.notified().await;
         }
     }
+    if let Some(id) = crate::script_monitor::wake_id(message_metadata) {
+        // A suppressed wake is successfully discarded, not a failed user send.
+        // The worker independently fences delivery before starting a turn.
+        if !mgr
+            .services
+            .script_monitor_delivery_allowed(agent_id, message_metadata)
+            .await
+            .unwrap_or(false)
+        {
+            mgr.services.commit_queue_history(agent_id, &id);
+            return true;
+        }
+        match mgr
+            .services
+            .store
+            .get_agent_message_by_id_with_pruned(agent_id, &id)
+            .await
+        {
+            Ok(Some(_)) => {
+                mgr.services.commit_queue_history(agent_id, &id);
+                return true;
+            }
+            Err(_) => return false,
+            Ok(None) => {}
+        }
+    }
     let created_at = now_iso();
     let mut blocks = user_message_blocks(content, image_blocks, file_blocks);
     let block_md = message_metadata.and_then(|md| match md {
@@ -12770,7 +12825,8 @@ async fn persist_user(
     // Bounded retry (#547): initial attempt + one retry per backoff delay.
     let backoff = persist_retry_backoff_ms();
     let mut attempt = 0usize;
-    let message_id = new_message_id();
+    let message_id =
+        crate::script_monitor::wake_id(message_metadata).unwrap_or_else(new_message_id);
     let message = loop {
         match mgr
             .services
@@ -12787,6 +12843,10 @@ async fn persist_user(
             .await
         {
             Ok(message) => {
+                if let Some(id) = crate::script_monitor::wake_id(message_metadata) {
+                    mgr.services.commit_queue_history(agent_id, &id);
+                }
+
                 if let Some(id) = message_metadata
                     .and_then(|md| md.get("queueInfo"))
                     .and_then(|info| info.get("queuedMessageId"))
@@ -12798,6 +12858,17 @@ async fn persist_user(
                 break message;
             }
             Err(e) => {
+                if let Some(id) = crate::script_monitor::wake_id(message_metadata) {
+                    if !mgr
+                        .services
+                        .script_monitor_delivery_allowed(agent_id, message_metadata)
+                        .await
+                        .unwrap_or(false)
+                    {
+                        mgr.services.commit_queue_history(agent_id, &id);
+                        return true;
+                    }
+                }
                 // Vanished-session fast exit (intent-hq/monorepo#2762): the
                 // only FK on `agent_message` is `agent_id → agent_session(id)`,
                 // so an append failure against a deleted session is permanent

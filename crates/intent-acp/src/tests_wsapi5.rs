@@ -31,6 +31,7 @@ type AgentCommitCall = (String, Option<String>, bool, Option<String>);
 struct FakeApi {
     agent_commit_calls: Mutex<Vec<AgentCommitCall>>,
     script_list_calls: Mutex<u32>,
+    script_monitor_calls: Mutex<Vec<Value>>,
     script_create_calls: Mutex<Vec<ScriptCreateParams>>,
     script_start_calls: Mutex<Vec<String>>,
     script_output_calls: Mutex<Vec<(String, Option<i64>)>>,
@@ -371,6 +372,38 @@ impl WorkspaceApi for FakeApi {
             .unwrap()
             .push(params.clone());
         Box::pin(async move { Ok(json!({ "id": "s-1" })) })
+    }
+
+    fn script_monitor(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        script_id: String,
+        options: Value,
+    ) -> BoxFuture<'_, Result<Value>> {
+        self.script_monitor_calls.lock().unwrap().push(json!({"workspaceId":workspace_id,"agentId":agent_id,"scriptId":script_id,"options":options}));
+        Box::pin(async { Ok(json!({"ok":true,"monitor":{"monitorId":"m1"}})) })
+    }
+    fn script_monitor_list(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        self.script_monitor_calls
+            .lock()
+            .unwrap()
+            .push(json!({"workspaceId":workspace_id,"agentId":agent_id}));
+        Box::pin(async { Ok(json!({"monitors":[{"monitorId":"m1"}]})) })
+    }
+    fn script_monitor_cancel(
+        &self,
+        workspace_id: WorkspaceId,
+        monitor_id: String,
+        owner: Option<AgentId>,
+        stop_run: bool,
+    ) -> BoxFuture<'_, Result<Value>> {
+        self.script_monitor_calls.lock().unwrap().push(json!({"workspaceId":workspace_id,"owner":owner,"monitorId":monitor_id,"stopRun":stop_run}));
+        Box::pin(async { Ok(json!({"ok":true,"monitor":{"monitorId":"m1","state":"cancelled"}})) })
     }
 
     fn script_start(&self, _id: WorkspaceId, script_id: String) -> BoxFuture<'_, Result<Value>> {
@@ -869,6 +902,7 @@ fn agent_lite(id: &str, name: &str, status: AgentStatus, is_responding: bool) ->
         waiting_for_agent_ids: vec![],
         waiting_on_hooks: vec![],
         waiting_on_pr_monitors: vec![],
+        waiting_on_script_monitors: vec![],
         turn_in_flight: false,
         last_stream_activity_at: None,
         context_usage: None,
@@ -1575,4 +1609,58 @@ async fn script_create_keeps_omission_distinct_from_explicit_purpose() {
         assert_eq!(params.purpose, purpose);
         assert_eq!(params.script_id.as_deref(), script_id);
     }
+}
+
+#[tokio::test]
+async fn script_monitor_helpers_bind_authenticated_owner_and_workspace() {
+    let (srv, api) = server_with_caller("agent-self");
+    let response=call(&srv,"return await ws.script.monitor('s1',{ttlMs:60000,runId:'r1',outputPattern:'^ready$',lineCount:2,agentId:'spoof',workspaceId:'foreign'});").await;
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    let list = call(&srv, "return await ws.script.monitors();").await;
+    assert_eq!(body(&list), json!([{"monitorId":"m1"}]));
+    assert_eq!(
+        call(&srv, "return await ws.script.unmonitor('m1');").await["result"]["isError"],
+        false
+    );
+    let calls = api.script_monitor_calls.lock().unwrap();
+    assert_eq!(calls[0]["agentId"], "agent-self");
+    assert_eq!(calls[0]["workspaceId"], "ws-1");
+    assert_eq!(calls[0]["options"]["outputPattern"], "^ready$");
+    assert_eq!(calls[0]["options"]["lineCount"], 2);
+    assert_eq!(
+        calls[1],
+        json!({"workspaceId":"ws-1","agentId":"agent-self"})
+    );
+    assert_eq!(
+        calls[2],
+        json!({"workspaceId":"ws-1","owner":"agent-self","monitorId":"m1","stopRun":false})
+    );
+}
+
+#[tokio::test]
+async fn script_monitor_helpers_refuse_anonymous_and_do_not_escape_chief_scope() {
+    let (srv, api) = server();
+    for code in [
+        "return await ws.script.monitor('s1',{ttlMs:1});",
+        "return await ws.script.monitors();",
+        "return await ws.script.unmonitor('m1');",
+    ] {
+        assert_eq!(call(&srv, code).await["result"]["isError"], true);
+    }
+    assert!(api.script_monitor_calls.lock().unwrap().is_empty());
+    let api = Arc::new(FakeApi::default());
+    let chief = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from(CHIEF_WORKSPACE_ID))
+        .with_caller_agent_id(Some(AgentId::from("agent-chief")));
+    assert_eq!(
+        call(
+            &chief,
+            "return await ws.script.monitor('s1',{ttlMs:1,workspaceId:'foreign'});"
+        )
+        .await["result"]["isError"],
+        false
+    );
+    assert_eq!(
+        api.script_monitor_calls.lock().unwrap()[0]["workspaceId"],
+        CHIEF_WORKSPACE_ID
+    );
 }

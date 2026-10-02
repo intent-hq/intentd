@@ -4292,6 +4292,8 @@ impl Services {
         agent_id: &AgentId,
         data: &mut Value,
     ) -> Vec<Value> {
+        self.annotate_waiting_on_script_monitors(agent_id, data)
+            .await;
         if let Some(existing) = data.get("waitingOnPrMonitors").and_then(Value::as_array) {
             return existing.clone();
         }

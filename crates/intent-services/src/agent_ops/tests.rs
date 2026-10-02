@@ -47988,3 +47988,87 @@ async fn send_queued_message_now_store_only_processing_requires_successful_persi
         }
     }
 }
+
+#[intent_test_macros::daemon_test]
+async fn script_monitor_waiting_advisory_and_after_all_retire_on_silent_cancel() {
+    for grouped in [false, true] {
+        let (_t, svc, ws) = setup().await;
+        let parent = create_agent(&svc, &ws, "Parent").await;
+        let child = create_agent(&svc, &ws, "Child").await;
+        let script = svc
+            .script_create(
+                ws.clone(),
+                intent_core::ScriptCreateParams {
+                    name: "Monitor check".into(),
+                    command: "true".into(),
+                    mode: intent_core::ScriptMode::Command,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let sid = script["id"].as_str().unwrap().to_owned();
+        svc.store
+            .admit_script_run(&ws, &sid, "accepted-reservation")
+            .await
+            .unwrap();
+        let monitor = svc
+            .script_monitor(ws.clone(), child.clone(), sid, json!({"ttlMs":60000}))
+            .await
+            .unwrap();
+        let gid = grouped.then(|| {
+            let gid = svc.get_or_create_delegation_group(&ws, &parent);
+            svc.enroll_child_in_group(&gid, &child);
+            gid
+        });
+        svc.register_completion_watch(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child.clone(),
+            gid,
+        )
+        .unwrap();
+        let mut data = json!({"agentId":child});
+        svc.annotate_waiting_on_pr_monitors(&child, &mut data).await;
+        assert_eq!(
+            data["waitingOnScriptMonitors"][0]["monitorId"],
+            monitor["monitor"]["monitorId"]
+        );
+        svc.handle_completion_event(&completion_event(&ws, AGENT_IDLE, &child, data.clone()))
+            .await;
+        svc.handle_completion_event(&completion_event(&ws, AGENT_IDLE, &child, data))
+            .await;
+        assert_eq!(parent_message_count(&svc, &parent).await, 1);
+        assert!(parent_messages_text(&svc, &parent)
+            .await
+            .contains("Monitor check"));
+        assert_eq!(svc.find_watches_for_child(&child).len(), 1);
+        if grouped {
+            svc.handle_completion_event(&completion_event(
+                &ws,
+                AGENT_IDLE,
+                &parent,
+                json!({"agentId":parent}),
+            ))
+            .await;
+        }
+        svc.cancel_script_monitors(&ws, Some(&child), "owner-retired")
+            .await
+            .unwrap();
+        svc.handle_completion_event(&completion_event(
+            &ws,
+            AGENT_IDLE,
+            &child,
+            json!({"agentId":child}),
+        ))
+        .await;
+        assert!(svc.find_watches_for_child(&child).is_empty());
+        assert_eq!(parent_message_count(&svc, &parent).await, 2);
+        assert!(svc
+            .active_script_monitors_for_agent(&child)
+            .await
+            .is_empty());
+    }
+}

@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use intent_core::{ScriptCreateParams, ScriptMode, WorkspaceApi, WorkspaceId};
+use intent_core::{AgentId, ScriptCreateParams, ScriptMode, WorkspaceApi, WorkspaceId};
 use serde_json::Value;
 
 use super::{map_err, opt_bool, opt_i64, opt_str, req_str};
@@ -39,6 +39,9 @@ fn run_timeout_ceiling_secs(budget: Duration) -> i64 {
 pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.script = {
+        monitor: (scriptId, options) => host({ method: 'script.monitor', args: { scriptId, ...(options || {}) } }),
+        monitors: () => host({ method: 'script.monitors', args: {} }),
+        unmonitor: (monitorId) => host({ method: 'script.unmonitor', args: { monitorId } }),
         list: (options) => host({ method: 'script.list', args: options || {} }),
         archive: (scriptIds) => host({ method: 'script.archive', args: { scriptIds } }),
         restore: (scriptIds) => host({ method: 'script.restore', args: { scriptIds } }),
@@ -62,10 +65,36 @@ pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
     budget: Duration,
+    caller: Option<&AgentId>,
     method: &str,
     args: &Value,
 ) -> Result<Value, String> {
     match method {
+        "monitor" | "monitors" | "unmonitor" => {
+            let owner = caller
+                .ok_or("script monitoring requires an authenticated agent caller")?
+                .clone();
+            match method {
+                "monitor" => api
+                    .script_monitor(ws.clone(), owner, req_str(args, "scriptId")?, args.clone())
+                    .await
+                    .map_err(map_err),
+                "monitors" => api
+                    .script_monitor_list(ws.clone(), Some(owner))
+                    .await
+                    .map(|v| v["monitors"].clone())
+                    .map_err(map_err),
+                _ => api
+                    .script_monitor_cancel(
+                        ws.clone(),
+                        req_str(args, "monitorId")?,
+                        Some(owner),
+                        false,
+                    )
+                    .await
+                    .map_err(map_err),
+            }
+        }
         "list" => list(api, ws, args).await,
         "archive" => archive(api, ws, args, true).await,
         "restore" => archive(api, ws, args, false).await,
@@ -268,8 +297,8 @@ async fn run(
             return Err(format!(
                 "ws.script.run: timeoutSeconds {requested} exceeds what one workspace_api call \
                  can wait for (ceiling {ceiling}s, budget {}s). Start the script with \
-                 ws.script.start(scriptId) and wait with a self-checking ws.hook.schedule that \
-                 polls ws.script.status(scriptId), then read ws.script.output(scriptId).",
+                 ws.script.start(scriptId) and register ws.script.monitor with a required ttlMs; \
+                 then read ws.script.output(scriptId) after its wake.",
                 budget.as_secs()
             ));
         }

@@ -252,6 +252,11 @@ pub(crate) const TERMINAL_CWD: &str = "terminal:cwd";
 // (start, exit, auto-restart, URL detection) as `script:state`, and definition
 // mutations as `script:changed`. All payloads carry the `scriptId`.
 pub const SCRIPT_OUTPUT: &str = "script:output";
+pub const SCRIPT_MONITOR_REGISTERED: &str = "scriptMonitor:registered";
+pub const SCRIPT_MONITOR_COMPLETED: &str = "scriptMonitor:completed";
+pub const SCRIPT_MONITOR_EXPIRED: &str = "scriptMonitor:expired";
+pub const SCRIPT_MONITOR_TRIGGERED: &str = "scriptMonitor:triggered";
+pub const SCRIPT_MONITOR_CANCELLED: &str = "scriptMonitor:cancelled";
 pub const SCRIPT_STATE: &str = "script:state";
 pub const SCRIPT_CHANGED: &str = "script:changed";
 
@@ -626,6 +631,11 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     SCRIPT_OUTPUT,
     SCRIPT_STATE,
     SCRIPT_CHANGED,
+    SCRIPT_MONITOR_REGISTERED,
+    SCRIPT_MONITOR_COMPLETED,
+    SCRIPT_MONITOR_EXPIRED,
+    SCRIPT_MONITOR_TRIGGERED,
+    SCRIPT_MONITOR_CANCELLED,
     HOOK_SCHEDULED,
     HOOK_RUN_STARTED,
     HOOK_RUN_COMPLETED,
@@ -897,6 +907,11 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (PR_LINKED, "PR: a pull request was linked to the workspace; PR number/url/state."),
     (PR_UNLINKED, "PR: the workspace PR link was removed."),
     (PR_UPDATED, "PR: the linked PR's badge state changed."),
+    (SCRIPT_MONITOR_REGISTERED, "Script monitor: registered; full workspace-scoped monitor snapshot including opt-in bounded matching line."),
+    (SCRIPT_MONITOR_COMPLETED, "Script monitor: completed; full workspace-scoped monitor snapshot including opt-in bounded matching line."),
+    (SCRIPT_MONITOR_EXPIRED, "Script monitor: expired; full workspace-scoped monitor snapshot including opt-in bounded matching line."),
+    (SCRIPT_MONITOR_TRIGGERED, "Script monitor: triggered; full workspace-scoped monitor snapshot including opt-in bounded matching line."),
+    (SCRIPT_MONITOR_CANCELLED, "Script monitor: cancelled; full workspace-scoped monitor snapshot including opt-in bounded matching line."),
     (PR_MONITOR_CANCELLED, "PR monitor: a monitor was cancelled; monitor and PR identity (prMonitor.list is Collaborator+)."),
     (PR_MONITOR_CHANGED, "PR monitor: pending PR changes recorded; PR checklist state."),
     (PR_MONITOR_COMPLETED, "PR monitor: the PR merged/closed; PR identity."),

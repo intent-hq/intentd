@@ -33,22 +33,26 @@ impl ScriptManager {
     }
 
     async fn prepare_admission(&self, ws: &WorkspaceId, id: &str, restart: bool) -> Result<()> {
-        self.set_archive(ws, id, None).await?;
-        let command = self
+        if self
             .scripts
             .lock()
             .unwrap()
             .get(&(ws.clone(), id.to_owned()))
-            .is_some_and(|m| m.def.mode == ScriptMode::Command);
-        if command {
-            let token = uuid::Uuid::new_v4().to_string();
-            self.store.admit_script_run(ws, id, &token).await?;
-            let mut scripts = self.scripts.lock().unwrap();
-            let m = scripts.get_mut(&(ws.clone(), id.to_owned())).unwrap();
-            m.run_id = Some(token);
-            m.run_generation = (!restart).then_some(m.generation);
-            m.pending_result = None;
+            .is_some_and(|m| m.run_id.is_some())
+        {
+            return Err(Error::Internal(
+                "previous script run has not durably settled".into(),
+            ));
         }
+        self.set_archive(ws, id, None).await?;
+        let token = uuid::Uuid::new_v4().to_string();
+        self.store.admit_script_run(ws, id, &token).await?;
+        let mut scripts = self.scripts.lock().unwrap();
+        let m = scripts.get_mut(&(ws.clone(), id.to_owned())).unwrap();
+        m.state.run_id = Some(token.clone());
+        m.run_id = Some(token);
+        m.run_generation = (!restart).then_some(m.generation);
+        m.pending_result = None;
         Ok(())
     }
 

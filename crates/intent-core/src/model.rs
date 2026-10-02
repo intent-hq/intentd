@@ -4357,6 +4357,8 @@ pub struct AgentLite {
     /// the service projection.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub waiting_on_pr_monitors: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waiting_on_script_monitors: Vec<serde_json::Value>,
     /// Turn-liveness (STAB-125): `turnInFlight` is `true` while a
     /// `session/prompt` turn's live-turn slot is open for this agent, and
     /// `lastStreamActivityAt` is the RFC-3339 timestamp of the most recent
@@ -4549,6 +4551,7 @@ impl AgentLite {
             waiting_for_agent_ids: Vec::new(),
             waiting_on_hooks: Vec::new(),
             waiting_on_pr_monitors: Vec::new(),
+            waiting_on_script_monitors: Vec::new(),
             turn_in_flight: false,
             last_stream_activity_at: None,
             context_usage: None,
@@ -5146,6 +5149,8 @@ pub enum ScriptRunOutcome {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScriptLastRun {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     pub outcome: ScriptRunOutcome,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i64>,
@@ -5183,6 +5188,8 @@ pub enum ScriptStatus {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScriptRuntimeState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     pub status: ScriptStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
@@ -5210,6 +5217,7 @@ impl Default for ScriptRuntimeState {
     fn default() -> Self {
         Self {
             status: ScriptStatus::Idle,
+            run_id: None,
             pid: None,
             exit_code: None,
             started_at: None,
