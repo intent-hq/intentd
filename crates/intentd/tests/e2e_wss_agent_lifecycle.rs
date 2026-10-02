@@ -7016,6 +7016,42 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
     ws.0
 }
 
+/// Distinct authenticated author for tests whose invariant needs separate rows.
+async fn seed_queue_collaborator(data_dir: &Path, workspace_id: &str) -> &'static str {
+    use intent_core::{now_iso, Principal, PrincipalId, WorkspaceId, WorkspaceRole};
+    let token = "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef";
+    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
+        .await
+        .unwrap();
+    let principal = Principal {
+        id: PrincipalId::new(),
+        identity: None,
+        github_user_id: None,
+        login: Some("queue-guest".into()),
+        display_name: Some("Queue Guest".into()),
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    store.upsert_principal(&principal).await.unwrap();
+    let hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+    store
+        .insert_principal_credential(&principal.id, &hash)
+        .await
+        .unwrap();
+    store
+        .add_workspace_member(
+            &WorkspaceId::from(workspace_id),
+            &principal.id,
+            WorkspaceRole::Collaborator,
+        )
+        .await
+        .unwrap();
+    store.close().await;
+    token
+}
+
 fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
     use intent_core::{now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus};
     let ts = now_iso();
@@ -9220,6 +9256,7 @@ async fn send_queued_message_now_over_wss() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
+    let guest_token = seed_queue_collaborator(&data_dir, &ws_id).await;
     let behavior = json!({ "blockUntilCancel": true, "response": "resumed" }).to_string();
     let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
@@ -9251,6 +9288,8 @@ async fn send_queued_message_now_over_wss() {
     assert!(sub_resp["subscriptionId"].is_string());
 
     let mut rpc = connect_ws(port, cfg.clone()).await;
+    let guest_url = format!("wss://localhost:{port}/ws?token={guest_token}");
+    let mut guest_rpc = common::wss_connect_with_retry(port, cfg.clone(), &guest_url).await;
     let created = wss_rpc(
         &mut rpc,
         10,
@@ -9295,7 +9334,7 @@ async fn send_queued_message_now_over_wss() {
     .await;
     let first_id = q_first["queuedMessage"]["id"].as_str().unwrap().to_string();
     let q_second = wss_rpc(
-        &mut rpc,
+        &mut guest_rpc,
         13,
         "agent.queueMessage",
         json!({ "agentId": agent_id, "content": "send me now" }),
@@ -9305,6 +9344,12 @@ async fn send_queued_message_now_over_wss() {
         .as_str()
         .unwrap()
         .to_string();
+
+    assert_ne!(first_id, second_id, "different authors keep distinct rows");
+    assert_ne!(
+        q_first["queuedMessage"]["author"],
+        q_second["queuedMessage"]["author"]
+    );
 
     // Send the SECOND entry now: response mirrors sendMessage and echoes the
     // ENTRY id as the delivered messageId.
@@ -9436,6 +9481,7 @@ async fn queue_drain_skips_under_edit_message_and_suppresses_idle_over_wss() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
+    let guest_token = seed_queue_collaborator(&data_dir, &ws_id).await;
     // First turn delays 1.2s so we have a deterministic setup window to enqueue
     // + toggle editing + enqueue again while the agent is busy. Subsequent
     // queue-drained turns proceed at full mock speed.
@@ -9469,6 +9515,8 @@ async fn queue_drain_skips_under_edit_message_and_suppresses_idle_over_wss() {
     assert!(sub_resp["subscriptionId"].is_string());
 
     let mut rpc = connect_ws(port, cfg.clone()).await;
+    let guest_url = format!("wss://localhost:{port}/ws?token={guest_token}");
+    let mut guest_rpc = common::wss_connect_with_retry(port, cfg.clone(), &guest_url).await;
     let created = wss_rpc(
         &mut rpc,
         10,
@@ -9523,7 +9571,7 @@ async fn queue_drain_skips_under_edit_message_and_suppresses_idle_over_wss() {
 
     // Enqueue msg_drain — the ready-to-send entry the worker MUST drain.
     let q_drain = wss_rpc(
-        &mut rpc,
+        &mut guest_rpc,
         14,
         "agent.queueMessage",
         json!({ "agentId": agent_id, "content": "drain-me" }),
@@ -9543,7 +9591,9 @@ async fn queue_drain_skips_under_edit_message_and_suppresses_idle_over_wss() {
     assert_eq!(pre_q.len(), 2, "queue mid-turn: {pre_q:?}");
     assert_eq!(pre_q[0]["id"].as_str(), Some(edit_mid.as_str()));
     assert_eq!(pre_q[0]["editing"], true);
-    assert_eq!(pre_q[1]["content"], "drain-me");
+    assert_eq!(pre_q[1]["content"], q_drain["queuedMessage"]["content"]);
+    assert!(pre_q[1]["content"].as_str().unwrap().ends_with("drain-me"));
+    assert_ne!(pre_q[0]["author"], pre_q[1]["author"]);
     assert!(pre_q[1].get("editing").is_none());
 
     // Collect events until we have observed TWO terminal `agent:stream:end`s:
@@ -13059,6 +13109,7 @@ async fn interrupt_mid_tool_call_settles_and_drains_queue_over_wss() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
+    let guest_token = seed_queue_collaborator(&data_dir, &ws_id).await;
     let behavior = json!({ "parkMidToolCall": true, "response": "resumed" }).to_string();
     let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
@@ -13089,6 +13140,8 @@ async fn interrupt_mid_tool_call_settles_and_drains_queue_over_wss() {
     assert!(sub_resp["subscriptionId"].is_string());
 
     let mut rpc = connect_ws(port, cfg.clone()).await;
+    let guest_url = format!("wss://localhost:{port}/ws?token={guest_token}");
+    let mut guest_rpc = common::wss_connect_with_retry(port, cfg.clone(), &guest_url).await;
     let created = wss_rpc(
         &mut rpc,
         10,
@@ -13133,13 +13186,15 @@ async fn interrupt_mid_tool_call_settles_and_drains_queue_over_wss() {
     .await;
     assert_eq!(q1["success"], true, "queue one: {q1}");
     let q2 = wss_rpc(
-        &mut rpc,
+        &mut guest_rpc,
         13,
         "agent.queueMessage",
         json!({ "workspaceId": &ws_id, "agentId": &agent_id, "content": QUEUED_TWO }),
     )
     .await;
     assert_eq!(q2["success"], true, "queue two: {q2}");
+    assert_ne!(q1["queuedMessage"]["id"], q2["queuedMessage"]["id"]);
+    assert_ne!(q1["queuedMessage"]["author"], q2["queuedMessage"]["author"]);
     let queue = wss_rpc(
         &mut rpc,
         14,
@@ -13346,12 +13401,13 @@ async fn interrupt_mid_tool_call_settles_and_drains_queue_over_wss() {
 /// `workspace_api` tool call served by the daemon's MCP server (the agent JS
 /// polls `ws.note.list` until a release note exists). Zero assistant output
 /// has streamed at that point, so the preemption takes the combined-delivery
-/// path (the preempted message rides the interrupt prompt). Two
-/// normal-priority entries are parked behind the target before the
-/// interrupt. The contract is the same as the user-interrupt variant: the
+/// path (the preempted message rides the interrupt prompt). Two consecutive
+/// same-human submissions share one normal-priority entry behind the target
+/// before the interrupt. The contract is the same as the user-interrupt variant: the
 /// sibling's send reports `delivered` (not queued), the target settles
 /// (`agent:idle`, `agent.get` idle, empty queue), and the transcript carries
-/// the interrupt row ahead of both parked entries.
+/// the interrupt row ahead of both merged contributions in arrival order,
+/// delivered exactly once under the surviving queue identity.
 #[intent_test_macros::daemon_test]
 async fn a2a_interrupt_during_in_flight_tool_call_settles_and_drains_over_wss() {
     let Some(script) = gate("A2A interrupt during in-flight tool call E2E (#5669)") else {
@@ -13494,7 +13550,8 @@ async fn a2a_interrupt_during_in_flight_tool_call_settles_and_drains_over_wss() 
         "the target's tool call announced itself (entered note)"
     );
 
-    // Two normal-priority entries park behind the busy turn.
+    // Consecutive submissions by one human share a pending entry.
+    let mut queued_responses = Vec::new();
     for (id, content) in [(13, QUEUED_ONE), (14, QUEUED_TWO)] {
         let q = wss_rpc(
             &mut rpc,
@@ -13504,6 +13561,7 @@ async fn a2a_interrupt_during_in_flight_tool_call_settles_and_drains_over_wss() 
         )
         .await;
         assert_eq!(q["success"], true, "queue: {q}");
+        queued_responses.push(q["queuedMessage"].clone());
     }
     let queue = wss_rpc(
         &mut rpc,
@@ -13514,9 +13572,19 @@ async fn a2a_interrupt_during_in_flight_tool_call_settles_and_drains_over_wss() 
     .await;
     assert_eq!(
         queue["queue"].as_array().map(Vec::len),
-        Some(2),
-        "both entries parked behind the tool call: {queue}"
+        Some(1),
+        "both same-author contributions share one parked entry: {queue}"
     );
+    let merged_content = format!("{QUEUED_ONE}\n\n{QUEUED_TWO}");
+    assert_eq!(queue["queue"][0]["content"], merged_content);
+    for field in ["id", "turnId", "queuedAt", "author"] {
+        assert_eq!(
+            queued_responses[0][field], queued_responses[1][field],
+            "stable {field}"
+        );
+        assert_eq!(queue["queue"][0][field], queued_responses[0][field]);
+    }
+    assert_eq!(queued_responses[1]["content"], merged_content);
     let queued_turn_ids: Vec<String> = queue["queue"]
         .as_array()
         .unwrap()
@@ -13730,8 +13798,36 @@ async fn a2a_interrupt_during_in_flight_tool_call_settles_and_drains_over_wss() 
     let one_idx = user_idx(QUEUED_ONE).expect("queued one delivered");
     let two_idx = user_idx(QUEUED_TWO).expect("queued two delivered");
     assert!(
-        urgent_idx < one_idx && one_idx < two_idx,
-        "the interrupt row lands ahead of both parked entries: urgent={urgent_idx} one={one_idx} two={two_idx}"
+        urgent_idx < one_idx && one_idx == two_idx,
+        "the interrupt precedes the single merged row: urgent={urgent_idx} one={one_idx} two={two_idx}"
+    );
+    let merged_text = messages[one_idx]["contentBlocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|block| block["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        merged_text.starts_with(&merged_content),
+        "contribution order: {merged_text}"
+    );
+    for needle in [QUEUED_ONE, QUEUED_TWO] {
+        let occurrences: usize = messages
+            .iter()
+            .filter(|row| row["role"] == "user")
+            .flat_map(|row| row["contentBlocks"].as_array().unwrap())
+            .filter_map(|block| block["text"].as_str())
+            .map(|text| text.matches(needle).count())
+            .sum();
+        assert_eq!(
+            occurrences, 1,
+            "each queued contribution delivered exactly once: {needle}"
+        );
+    }
+    assert_eq!(
+        messages[one_idx]["metadata"]["queueInfo"]["queuedMessageId"],
+        queued_responses[0]["id"]
     );
     let marker = messages
         .iter()
