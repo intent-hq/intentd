@@ -229,9 +229,14 @@ async fn fast_mode_absent_option_allows_off_then_rechecks_eligible_model() {
             .config_options,
         Some(&response),
     );
-    mgr.apply_fast_mode(&id, "fast-session", "claude-code")
-        .await
-        .unwrap();
+    mgr.apply_fast_mode(
+        &id,
+        "fast-session",
+        "claude-code",
+        &mgr.capture_turn(&id).unwrap(),
+    )
+    .await
+    .unwrap();
     let state = conn
         .request(
             "session/prompt",

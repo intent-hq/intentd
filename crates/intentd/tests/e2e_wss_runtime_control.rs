@@ -10,6 +10,9 @@ mod common;
 #[path = "e2e_wss_runtime_control/independent_installations.rs"]
 mod independent_installations;
 
+#[path = "e2e_wss_runtime_control/port_lease.rs"]
+mod port_lease;
+
 use intentd_test_support::GuardedChild;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
@@ -100,6 +103,7 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> GuardedCh
 /// port (a same-port listener restart, a batch's explicit port).
 fn spawn_serve_fixed_port(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> GuardedChild {
     let mut cmd = common::serve_command_fixed_port();
+    cmd.env_remove("INTENTD_TCP_PORT");
     configure_serve(&mut cmd, data_dir, listen, env);
     GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
@@ -234,15 +238,29 @@ async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
     write_half.write_all(line.as_bytes()).await.unwrap();
     write_half.flush().await.unwrap();
     let mut reader = BufReader::new(read_half);
-    let mut buf = String::new();
-    timeout(
-        common::test_timeout(Duration::from_secs(30)),
-        reader.read_line(&mut buf),
-    )
+    timeout(common::test_timeout(Duration::from_secs(30)), async {
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            assert!(
+                reader.read_line(&mut buf).await.expect("read uds frame") > 0,
+                "UDS closed before the original RPC response"
+            );
+            let frame: Value = serde_json::from_str(buf.trim_end()).expect("invalid JSON frame");
+            if frame["id"] == json!(id) {
+                return frame;
+            }
+            // Retirement notifications may precede a shutdown reply on this
+            // same connection; a notification is not the request's result.
+            assert!(
+                common::is_repository_retirement_notification(&frame),
+                "unexpected UDS response: {frame}"
+            );
+            eprintln!("UDS RPC {id}: original notification {}", frame["method"]);
+        }
+    })
     .await
     .expect("uds rpc timed out")
-    .expect("read uds response");
-    serde_json::from_str(buf.trim_end()).expect("invalid JSON frame")
 }
 
 /// Poll until new TCP connections to `port` are refused — the listener socket
@@ -2042,6 +2060,16 @@ fn occupied_fixed_wss_port_fails_daemon_boot() {
 
 #[tokio::test]
 async fn first_enable_publishes_assignment_and_fixed_failure_keeps_daemon_alive() {
+    first_enable_scenario(false).await;
+}
+
+#[tokio::test]
+async fn first_enable_port_lease_blocks_competing_fixture_until_recovery() {
+    first_enable_scenario(true).await;
+}
+
+async fn first_enable_scenario(with_contender: bool) {
+    let lease = port_lease::acquire();
     let dir = temp_data_dir();
     std::fs::write(
         dir.path().join("config.toml"),
@@ -2124,6 +2152,11 @@ async fn first_enable_publishes_assignment_and_fixed_failure_keeps_daemon_alive(
         saved
     );
     drop(hog);
+    let contender = if with_contender {
+        Some(port_lease::Contender::start(port).await)
+    } else {
+        None
+    };
     let retried = uds_rpc(
         &socket,
         6,
@@ -2134,4 +2167,9 @@ async fn first_enable_publishes_assignment_and_fixed_failure_keeps_daemon_alive(
     assert!(retried.get("error").is_none(), "{retried}");
     let status = uds_rpc(&socket, 7, "system.status", json!({})).await;
     assert_eq!(status["result"]["port"], port);
+    if let Some(contender) = contender {
+        drop(daemon);
+        drop(lease);
+        contender.finish(port).await;
+    }
 }

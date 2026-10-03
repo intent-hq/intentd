@@ -41,7 +41,11 @@ mod note_repo;
 mod note_search_repo;
 mod note_version_repo;
 mod pr_monitor_repo;
+mod presence_focus_repo;
 mod principal_repo;
+mod repository_authority_repo;
+mod repository_lifecycle;
+mod repository_selection_repo;
 mod sandbox_repo;
 mod script_monitor_repo;
 mod script_repo;
@@ -61,6 +65,16 @@ mod workspace_mcp_repo;
 mod workspace_repo;
 mod workspace_ui_context_repo;
 
+pub use repository_lifecycle::{
+    RepositoryAcpCompatibilityEffect, RepositoryAcpCompatibilityOutcome,
+    RepositoryAcpCompatibilityPersistence, RepositoryAcpCompatibilityResult,
+    RepositoryAcpInitialization, RepositoryInitializationBinding, RepositoryInitializationClaim,
+    RepositoryInitializationConfirmation, RepositoryInitializationObservation,
+    RepositoryInitializationOutcome, RepositoryInitializationPersistence,
+    RepositoryInitializationTicket, RepositoryLifecycleKey, RepositoryLifecycleMutationTicket,
+    RepositoryLifecycleObserver, RepositoryPendingDeleteGuard,
+};
+
 pub use agent_flipped_completion_repo::AGENT_FLIPPED_COMPLETIONS_CAP;
 pub use agent_queue_repo::AgentQueueRow;
 pub(crate) use agent_repo::AgentUsageRow;
@@ -75,6 +89,7 @@ pub use delegation_group_repo::PersistedDelegationGroup;
 pub use diffs_repo::NewDiff;
 pub use event_repo::{EventQuery, NewEvent};
 pub use event_subscription_repo::PersistedEventSubscription;
+pub use hook_repo::ActiveHookMetadata;
 pub use host_membership_repo::{
     HostInviteJoinOutcome, HostJoinCredential, HostMemberRemoval, HostMembersSnapshot,
     OwnerQueuePermit,
@@ -84,12 +99,23 @@ pub use note_search_repo::{NoteFtsMatch, NoteFtsOptions};
 #[cfg(test)]
 pub(crate) use note_version_repo::MAX_NOTE_VERSIONS;
 pub use pr_monitor_repo::{
-    pr_monitor_pause_error, PrMonitorListEntry, PrMonitorPollUpdate, WorkspacePrMonitorReads,
-    PR_MONITOR_PAUSE_MARKER,
+    pr_monitor_pause_error, MonitorQualificationOutcome, MonitorTargetProvenance,
+    MonitorTargetUnresolvedReason, PersistedMonitorTarget, PrMonitorListEntry, PrMonitorPollUpdate,
+    QualifiedPrMonitor, WorkspacePrMonitorReads, PR_MONITOR_PAUSE_MARKER,
 };
 pub use principal_repo::{
     ArchivedGuestSweep, CollaboratorAddOutcome, EffectiveWorkspaceMember, InviteInsertOutcome,
     InviteJoinOutcome, WorkspaceAuthorFallback, WorkspaceGuestCount,
+};
+pub use repository_authority_repo::{
+    AuthorityRevision, RepositoryAuthoritySnapshot, RepositoryCredentialAuthority,
+    RepositoryPrincipalAuthority, RepositoryWorkspaceAuthority,
+    RepositoryWorkspaceAuthoritySnapshot, VersionedAuthority,
+};
+pub use repository_selection_repo::{
+    RepositoryRootIncarnation, RepositorySelectionBinding, RepositorySelectionChange,
+    RepositorySelectionPersistence, RepositorySelectionRevision, RepositorySelectionSnapshot,
+    RepositorySelectionWriteOutcome, RepositorySelectionWriteResult, RepositoryStoredSelection,
 };
 pub use sandbox_repo::{Sandbox, SandboxStatus};
 pub use subscription_agent_repo::SubscriptionAgentProjection;
@@ -97,6 +123,7 @@ pub use tracked_changes_repo::{NewTrackedChange, TrackedChangeRow};
 pub use transfer_repo::TRANSFER_TABLES;
 pub use usage_rate_repo::{UsageRateDelta, UsageRateRow};
 pub use usage_stats_repo::{LocalStamp, UsageStatsDelta, UsageStatsRow};
+pub use workspace_repo::{RepositoryWorkspaceDeleteDisposition, RepositoryWorkspaceDeleteOutcome};
 
 /// Total retry window for the `SQLITE_BUSY` retry helpers (monorepo#1139).
 const BUSY_RETRY_DEADLINE: Duration = Duration::from_secs(30);
@@ -331,6 +358,7 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 pub struct Store {
     write_pool: SqlitePool,
     read_pool: SqlitePool,
+    repository_lifecycle: std::sync::Arc<repository_lifecycle::LifecycleDomain>,
     /// Process-local `displayed` overlay of the browser tab registry; see
     /// `browser_tab_repo::DisplayedOverlay`.
     browser_tab_displayed: browser_tab_repo::DisplayedOverlay,
@@ -349,6 +377,9 @@ impl Store {
     /// Returns `Error::Internal` if the database cannot be opened or created, a migration fails, or the migration ledger records a version newer than this build (downgrade).
     pub async fn open(db_path: &Path) -> Result<Self> {
         let write_pool = connect_write(db_path).await?;
+        let repository_lifecycle = repository_lifecycle::domain_for(db_path)?;
+        let mut lifecycle = repository_lifecycle.write().await?;
+        lifecycle.begin(&[RepositoryLifecycleKey::Database])?;
         let read_pool = connect_read(db_path).await?;
         // Run migrations on the write pool (migrations are write operations).
         MIGRATOR.run(&write_pool).await.map_err(|e| match e {
@@ -378,7 +409,9 @@ impl Store {
                 "reaped orphaned pre-staged agent_message_payload rows"
             );
         }
+        lifecycle.settle();
         Ok(Self {
+            repository_lifecycle,
             write_pool,
             read_pool,
             browser_tab_displayed: browser_tab_repo::DisplayedOverlay::default(),

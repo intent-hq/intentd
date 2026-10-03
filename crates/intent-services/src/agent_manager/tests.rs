@@ -2401,6 +2401,283 @@ async fn manager_with_bus() -> (TempDb, AgentManager, EventBus) {
     (tmp, AgentManager::new(services, sink, 8), bus)
 }
 
+/// A worker can finish its post-release tail after another send installs a
+/// replacement. The old tail must not steal the handle used to interrupt it.
+#[tokio::test]
+async fn stale_worker_cleanup_preserves_replacement_for_interrupt() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("stale-worker-workspace");
+    let id = AgentId::from("stale-worker-agent");
+    seed_agent(&mgr, &ws, &id).await;
+    let (finish_old, old_finishing) = tokio::sync::oneshot::channel();
+    let (old_done, old_completed) = tokio::sync::oneshot::channel();
+    let old_mgr = mgr.clone();
+    let old_id = id.clone();
+    let old = tokio::spawn(async move {
+        old_finishing.await.unwrap();
+        old_mgr.clear_worker(&old_id);
+        old_done.send(()).unwrap();
+    });
+    mgr.workers.lock().unwrap().insert(id.clone(), old);
+
+    let replacement = tokio::spawn(std::future::pending::<()>());
+    let replacement_id = replacement.id();
+    let cancellation = replacement.abort_handle();
+    let previous = mgr
+        .workers
+        .lock()
+        .unwrap()
+        .insert(id.clone(), replacement)
+        .unwrap();
+    mgr.retain_finishing_worker(previous);
+    finish_old.send(()).unwrap();
+    old_completed.await.unwrap();
+    let registered = mgr.workers.lock().unwrap().get(&id).map(JoinHandle::id);
+    // Ensure failure also cleans up the synthetic pending worker.
+    cancellation.abort();
+    assert_eq!(
+        registered,
+        Some(replacement_id),
+        "the old tail deregistered its replacement"
+    );
+    mgr.shutdown().await;
+}
+
+/// Drive the real worker's post-release cleanup against a replacement prompt.
+/// Losing the replacement handle lets its append race the interruption row and
+/// requeues the older instruction ahead of newer instructions (intent#6594).
+#[tokio::test]
+async fn stale_worker_tail_cannot_requeue_interrupted_prompt_ahead_of_newer_messages() {
+    let script = mock_agent_script();
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("worker-append-owner-workspace");
+    let id = AgentId::from("worker-append-owner-agent");
+    seed_agent(&mgr, &ws, &id).await;
+    set_session_provider(&mgr, &ws, &id, "mock").await;
+    let first_provider = track_mock_agent(&mgr, &id, false);
+    mgr.handles
+        .lock()
+        .unwrap()
+        .get_mut(&id)
+        .unwrap()
+        .spawned_provider = "node".into();
+    let pause = Arc::new(super::TurnStartPause::default());
+    *mgr.worker_finish_pause.lock().unwrap() = Some(pause.clone());
+    mgr.send_message(
+        id.clone(),
+        ws.clone(),
+        "first instruction".into(),
+        None,
+        super::TurnOptions::default(),
+    )
+    .await
+    .unwrap();
+    timeout(Duration::from_secs(10), pause.reached.notified())
+        .await
+        .unwrap();
+    assert!(!mgr.is_busy(&id), "old worker released its admission");
+    assert_ne!(
+        mgr.services
+            .store
+            .get_agent_session(&id)
+            .await
+            .unwrap()
+            .status,
+        AgentStatus::Error,
+        "the first turn must finish successfully before the replacement starts"
+    );
+    assert!(mgr.services.queue_snapshot(&id).is_empty());
+    let old = mgr.workers.lock().unwrap().get(&id).unwrap().abort_handle();
+
+    let (second_provider, gate) = track_mock_agent_prompt_rpc_error_gated(
+        &mgr,
+        &id,
+        "fixture prompt failure after interruption",
+    );
+    mgr.send_message(
+        id.clone(),
+        ws.clone(),
+        "older instruction".into(),
+        None,
+        super::TurnOptions::default(),
+    )
+    .await
+    .unwrap();
+    timeout(Duration::from_secs(10), async {
+        while mgr.services.live_turn(&id).is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let live_id = mgr.services.live_turn(&id).unwrap().message_id;
+    let user_rows = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.role == "user")
+        .map(|row| (row.id, row.content))
+        .collect::<Vec<_>>();
+    assert_eq!(user_rows.len(), 2);
+    assert_eq!(
+        user_rows[0].1,
+        user_message_blocks("first instruction", None, None)
+    );
+    assert_eq!(
+        user_rows[1].1,
+        user_message_blocks("older instruction", None, None)
+    );
+    let replacement = mgr.workers.lock().unwrap().get(&id).unwrap().abort_handle();
+    pause.resume.notify_one();
+    timeout(Duration::from_secs(10), async {
+        while !old.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    for (message_id, text) in [
+        ("newer-one", "superseding instruction"),
+        ("newer-two", "follow-up instruction"),
+    ] {
+        mgr.services.enqueue_message_with_id(
+            &id,
+            Some(message_id.into()),
+            text.into(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::Automatic,
+        );
+    }
+    mgr.services.persist_queue_snapshot(&id).await;
+    let expected_queue = mgr.services.queue_snapshot(&id);
+    let interrupt_mgr = mgr.clone();
+    let interrupt_id = id.clone();
+    let interrupt = tokio::spawn(async move {
+        interrupt_mgr
+            .interrupt_inner(
+                &interrupt_id,
+                crate::agent_session::InterruptReason::PreemptedByMessage,
+                None,
+            )
+            .await
+    });
+    let interrupted_row = timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(row) = mgr
+                .services
+                .store
+                .get_agent_message_by_id(&id, &live_id)
+                .await
+                .unwrap()
+            {
+                break row;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        interrupted_row.content,
+        json!([]),
+        "the gated provider has not streamed yet"
+    );
+    // If the replacement was deregistered, it still owns the prompt receiver.
+    // Let it settle: its append then collides with the just-flushed row.
+    gate.notify_one();
+    timeout(Duration::from_secs(10), interrupt)
+        .await
+        .unwrap()
+        .unwrap();
+    timeout(Duration::from_secs(10), async {
+        while !replacement.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let row = mgr
+        .services
+        .store
+        .get_agent_message_by_id(&id, &live_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.role, "assistant");
+    assert_eq!(row.content, interrupted_row.content);
+    assert_eq!(row.metadata, interrupted_row.metadata);
+    let final_user_rows = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.role == "user")
+        .map(|row| (row.id, row.content))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        final_user_rows, user_rows,
+        "preemption must not rewrite or duplicate user payloads"
+    );
+    assert_eq!(
+        row.metadata.as_ref().unwrap()["interruptReason"],
+        "preempted_by_message"
+    );
+    let queue = mgr.services.queue_snapshot(&id);
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let failures = mgr
+        .services
+        .store
+        .query_events(&intent_store::EventQuery {
+            workspace_id: Some(ws.clone()),
+            event_types: vec![intent_core::events::AGENT_FAILED.into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    if let Some(failure) = failures.first() {
+        let error = failure.data["error"].as_str().unwrap_or("");
+        assert!(
+            error.contains("UNIQUE constraint failed: agent_message.id"),
+            "fixture failure did not reproduce the append collision: {error}"
+        );
+        panic!(
+            "interruption flush won, but unabortable replacement hit the append collision: {error}"
+        );
+    }
+    assert_eq!(
+        queue, expected_queue,
+        "newer instruction payloads and ordering must survive unchanged"
+    );
+    assert_eq!(
+        queue
+            .iter()
+            .map(|v| v["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["newer-one", "newer-two"],
+        "an interrupted worker must not restore the old instruction: {queue:?}"
+    );
+    assert!(queue
+        .iter()
+        .all(|v| v.get("requeuedAfterFailure").is_none()));
+    assert_ne!(session.status, AgentStatus::Error);
+    mgr.shutdown().await;
+    first_provider.abort();
+    second_provider.abort();
+}
+
 /// A passive agent handle over an in-memory duplex connection (no child).
 fn mock_handle() -> AgentHandle {
     let (client_w, _agent_r) = tokio::io::duplex(1024);
@@ -2416,6 +2693,7 @@ fn mock_handle() -> AgentHandle {
         },
     ));
     AgentHandle {
+        repository_origin: crate::agent_manager::RepositoryOrigin::unavailable(),
         execution: RuntimeHandle::local(LocalResources {
             connection,
             notifications: Arc::new(TokioMutex::new(note_rx)),
@@ -4731,6 +5009,7 @@ fn track_mock_agent_inner(
     mgr.handles.lock().unwrap().insert(
         id.clone(),
         AgentHandle {
+            repository_origin: crate::agent_manager::RepositoryOrigin::unavailable(),
             execution: RuntimeHandle::local(LocalResources {
                 connection,
                 notifications: Arc::new(TokioMutex::new(note_rx)),
@@ -4887,6 +5166,7 @@ fn track_mock_agent_prompt_rpc_error_inner(
     mgr.handles.lock().unwrap().insert(
         id.clone(),
         AgentHandle {
+            repository_origin: crate::agent_manager::RepositoryOrigin::unavailable(),
             execution: RuntimeHandle::local(LocalResources {
                 connection,
                 notifications: Arc::new(TokioMutex::new(note_rx)),
@@ -8707,6 +8987,7 @@ async fn interrupt_on_wedged_transport_still_emits_terminal_events() {
     mgr.handles.lock().unwrap().insert(
         id.clone(),
         AgentHandle {
+            repository_origin: crate::agent_manager::RepositoryOrigin::unavailable(),
             execution: RuntimeHandle::local(LocalResources {
                 connection: conn,
                 notifications: Arc::new(TokioMutex::new(note_rx)),
@@ -20649,6 +20930,7 @@ mod harness_wake_tests {
             ConnectionHooks::default(),
         ));
         let handle = AgentHandle {
+            repository_origin: crate::agent_manager::RepositoryOrigin::unavailable(),
             execution: RuntimeHandle::local(LocalResources {
                 connection,
                 notifications: Arc::new(TokioMutex::new(note_rx)),

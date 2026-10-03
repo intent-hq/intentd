@@ -13,8 +13,8 @@
 //! request caller in its own spawn sites and is covered by its e2e suite.)
 //!
 //! A spawn that provably never reaches the service layer may opt out with a
-//! trailing `// caller-binding: allow — <reason>`; the marker must be the
-//! line's trailing comment and the reason is required.
+//! preceding or trailing `// caller-binding: allow — <reason>`; the marker
+//! must be adjacent to the spawn and the reason is required.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -45,13 +45,16 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// `tests.rs`, `*_tests.rs`, `test_support.rs` and anything under a `tests/`
-/// directory are test code and out of scope.
+/// or `source_tests/` directory are test code and out of scope. The latter
+/// contains the repository admission modules loaded only through cfg(test).
 fn is_test_file(rel: &Path) -> bool {
     let name = rel.file_name().and_then(|n| n.to_str()).unwrap_or("");
     name == "tests.rs"
         || name == "test_support.rs"
         || name.ends_with("_tests.rs")
-        || rel.components().any(|c| c.as_os_str() == "tests")
+        || rel
+            .components()
+            .any(|c| c.as_os_str() == "tests" || c.as_os_str() == "source_tests")
 }
 
 /// Line index ranges (0-based, half-open) of `#[cfg(test)] mod … { … }`
@@ -135,7 +138,12 @@ fn scan(root: &Path) -> (usize, Vec<String>) {
             if skip.iter().any(|(a, b)| (*a..*b).contains(&i)) {
                 continue;
             }
-            if is_bare_spawn(line) {
+            if is_bare_spawn(line)
+                && !i.checked_sub(1).is_some_and(|before| {
+                    let (code, comment) = split_comment(lines[before]);
+                    code.trim().is_empty() && has_allow_marker(comment)
+                })
+            {
                 let rel = file.strip_prefix(root).unwrap_or(file);
                 offenders.push(format!("{}:{}", rel.display(), i + 1));
             }
@@ -181,6 +189,21 @@ fn bare_spawn_detection_respects_marker_and_comments() {
         "    /// wraps `tokio::spawn(` with a bound caller"
     ));
     assert!(!is_bare_spawn("    spawn_daemon(async move {"));
+}
+
+#[test]
+fn out_of_line_test_directory_is_skipped() {
+    assert!(is_test_file(Path::new(
+        "crates/intent-services/src/repository_admission/source_tests/reader.rs"
+    )));
+    assert!(!is_test_file(Path::new(
+        "crates/intent-services/src/repository_admission/source.rs"
+    )));
+    assert!(!is_test_file(Path::new(
+        "crates/intent-services/src/repository_admission/native_wire.rs"
+    )));
+    assert!(is_bare_spawn("tokio::spawn(with_caller(caller, future));"));
+    assert!(!is_bare_spawn("tokio::spawn(with_caller(caller, future)); // caller-binding: allow — caller bound by the submitted future"));
 }
 
 #[test]

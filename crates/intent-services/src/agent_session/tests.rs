@@ -2432,6 +2432,132 @@ fn tool_call_notification(update: &Value) -> IncomingNotification {
     }
 }
 
+/// A binding can successfully create a proposal before its enclosing JS
+/// fails. Preserve registered cards on failure, but never trust an error's
+/// echoed proposal payload to create a new actionable card.
+#[tokio::test]
+async fn failed_workspace_api_attaches_only_registered_proposals() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    for registered in [false, true] {
+        let mut transcript = super::Transcript::new("m1".to_string());
+        if registered {
+            services.turn_attachments().register(
+                &agent_id,
+                test_attachment("tar-created", intent_core::AttachmentPolicy::AtToolResult),
+            );
+        }
+        services.route_notification(
+            &tool_call_notification(&json!({
+                "sessionUpdate": "tool_call", "toolCallId": "transfer", "title": "workspace_api",
+                "kind": "other", "status": "in_progress",
+                "rawInput": { "code": "await ws.app.workspaces.transfer(id); throw Error('later');", "summary": "Transfer project" }
+            })), &agent_id, &workspace_id, &mut transcript,
+        ).await;
+        services.route_notification(
+            &tool_call_notification(&json!({
+                "sessionUpdate": "tool_call_update", "toolCallId": "transfer", "status": "failed",
+                "rawOutput": [{ "type": "resource", "resource": {
+                    "uri": "intent-proposal://workspace-transfer/untrusted",
+                    "mimeType": "application/vnd.intent.proposal+json",
+                    "text": "{\"kind\":\"workspace-transfer\",\"preview\":{\"title\":\"Untrusted echo\"},\"payload\":{}}"
+                }}]
+            })), &agent_id, &workspace_id, &mut transcript,
+        ).await;
+        let blocks = transcript.into_blocks();
+        assert_eq!(blocks[1]["is_error"], true);
+        assert_eq!(blocks.len(), if registered { 3 } else { 2 });
+        if registered {
+            assert!(blocks[2]["resource"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("tar-created"));
+        }
+        assert!(services
+            .turn_attachments()
+            .claim_at_tool_result(&agent_id, None, "workspace_api", None)
+            .is_empty());
+    }
+}
+
+/// Status-only completions claim and materialize the entire trusted batch,
+/// without inventing tool output, and publish the real resource block IDs.
+#[tokio::test]
+async fn status_only_workspace_api_attaches_registered_batch() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    for status in ["failed", "completed"] {
+        for registered in [false, true] {
+            let mut transcript = super::Transcript::new("m1".to_string());
+            let mut sub = bus.subscribe(SubscriptionFilter::default());
+            if registered {
+                services.turn_attachments().register_all(
+                    &agent_id,
+                    ["tar-first", "tar-second"]
+                        .into_iter()
+                        .map(|id| test_attachment(id, intent_core::AttachmentPolicy::AtToolResult))
+                        .collect(),
+                );
+            }
+            services.route_notification(
+                &tool_call_notification(&json!({
+                    "sessionUpdate": "tool_call", "toolCallId": "proposal", "title": "workspace_api",
+                    "kind": "other", "status": "in_progress",
+                    "rawInput": { "code": "await ws.app.proposal.show(p);" }
+                })), &agent_id, &workspace_id, &mut transcript,
+            ).await;
+            let terminal = tool_call_notification(&json!({
+                "sessionUpdate": "tool_call_update", "toolCallId": "proposal", "status": status
+            }));
+            services
+                .route_notification(&terminal, &agent_id, &workspace_id, &mut transcript)
+                .await;
+            let event = timeout(Duration::from_secs(2), async {
+                loop {
+                    for event in sub.recv().await.expect("subscription open") {
+                        if event.event_type == "agent:tool:call"
+                            && event.data["status"] != "started"
+                        {
+                            return event;
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("terminal tool event");
+            assert!(event.data.get("output").is_none());
+            assert!(event.data.get("resultBlockId").is_none());
+            assert!(event.data.get("resultBlockIndex").is_none());
+            if registered {
+                assert_eq!(event.data["proposalBlockIds"], json!(["m1:1", "m1:2"]));
+                let items = event.data["registeredAttachments"].as_array().unwrap();
+                assert_eq!(items.len(), 2);
+                for (i, item) in items.iter().enumerate() {
+                    assert_eq!(
+                        transcript.blocks[i + 1],
+                        crate::tool_block::build_proposal_resource_block(
+                            &format!("m1:{}", i + 1),
+                            item
+                        )
+                    );
+                }
+            } else {
+                assert!(event.data.get("proposalBlockIds").is_none());
+                assert!(event.data.get("registeredAttachments").is_none());
+            }
+            // A repeated status-only update cannot attach the consumed batch again.
+            services
+                .route_notification(&terminal, &agent_id, &workspace_id, &mut transcript)
+                .await;
+            let blocks = transcript.into_blocks();
+            assert_eq!(blocks.len(), if registered { 3 } else { 1 });
+            assert!(!blocks.iter().any(|b| b["type"] == "tool_result"));
+            assert!(services
+                .turn_attachments()
+                .finish_turn(&agent_id)
+                .is_empty());
+        }
+    }
+}
+
 /// intent-hq/intent#4491 negative control at the real claim site: a foreign
 /// tool identified authoritatively — codex `server`/`tool` metadata, a
 /// `mcp__<server>__<tool>` title, a `mcp.<server>.<tool>` title — whose

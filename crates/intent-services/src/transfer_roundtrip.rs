@@ -375,8 +375,7 @@ async fn fresh_services_with_default_provider(
             (
                 "providers.paths".to_string(),
                 serde_json::json!({
-                    "auggie": std::env::current_exe().unwrap(),
-                    "claude-code": std::env::current_exe().unwrap()
+                    "auggie": std::env::current_exe().unwrap()
                 }),
             ),
             (
@@ -914,6 +913,138 @@ async fn relay(
         .expect("import commit")
 }
 
+/// Supply canonical CLI discovery only to the roundtrip worker, without
+/// exposing its sentinel to unrelated tests in a parallel libtest process.
+#[cfg(unix)]
+fn round_trip_with_installed_cli() {
+    use intent_providers::installed_cli::InstalledCli;
+    use intentd_test_support::GuardedChild;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let root = test_tempdir("transfer-installed-cli-");
+    let bin = root.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    // Use explicit directories for the absence control: enhanced discovery can
+    // find a user's CLI outside PATH. An adapter name must not satisfy it.
+    let dirs = [bin.clone()];
+    let legacy = bin.join("claude-code");
+    std::fs::write(
+        &legacy,
+        r#"#!/bin/sh
+{
+    printf 'sentinel=%s pid=%s ppid=%s argc=%s\n' "$0" "$$" "$PPID" "$#"
+    if [ -r "/proc/$PPID/comm" ]; then
+        IFS= read -r parent_name < "/proc/$PPID/comm"
+        printf 'parent_name=%s\n' "$parent_name"
+        printf 'parent_exe='
+        /usr/bin/readlink "/proc/$PPID/exe" || true
+    fi
+    index=0
+    for arg do
+        index=$((index + 1))
+        [ "$index" -le 8 ] || break
+        case "$arg" in
+            -v|--version|-h|--help|-p|--print|-e|--eval|--input-type=module|process.execPath|process.version|process.versions.node)
+                printf 'argv[%s]=%s\n' "$index" "$arg" ;;
+            *) printf 'argv[%s]=<redacted:%s bytes>\n' "$index" "${#arg}" ;;
+        esac
+    done
+} >> "$INTENT_TRANSFER_CLI_ROOT/${0##*/}-launched"
+exit 91
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(InstalledCli::Claude.resolve_in_dirs(&dirs, false).is_err());
+    let canonical = bin.join("claude");
+    std::fs::rename(&legacy, &canonical).unwrap();
+    assert_eq!(
+        InstalledCli::Claude
+            .resolve_in_dirs(&dirs, false)
+            .unwrap()
+            .path(),
+        canonical
+    );
+    // The pinned adapter also needs npx. Its lookup prefers the sibling of
+    // the detected node, so fixture both without invoking either program.
+    for command in ["node", "npx"] {
+        std::fs::copy(&canonical, bin.join(command)).unwrap();
+    }
+    // Enhanced discovery captures a login shell even when PATH already has the
+    // CLI. Keep host startup scripts from running programs during that capture.
+    let shell = root.path().join("shell");
+    std::fs::write(
+        &shell,
+        "#!/bin/sh\nprintf 'captured\\n' >> \"$INTENT_TRANSFER_CLI_ROOT/shell-captured\"\nprintf '__INTENT_PATH_S__%s__INTENT_PATH_E__' \"$PATH\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let log_path = root.path().join("worker.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    // Coordinate the inherited PATH snapshot with existing env-mutating tests,
+    // but change only the child environment, never the parent or other tests.
+    let env_lock = crate::agent_manager::tests::EnvGuard::apply(&[]);
+    let mut paths = vec![bin];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "transfer_roundtrip::transfer_round_trip_between_two_stacks",
+            "--nocapture",
+        ])
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env("SHELL", &shell)
+        .env("INTENT_TRANSFER_CLI_ROOT", root.path())
+        // The parent owns every worker tempdir even if timeout kills the worker
+        // before its own TempDir destructors can run.
+        .env("TMPDIR", root.path())
+        .env_remove("MOCK_AGENT_SCRIPT_PATH")
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().unwrap())
+        .stderr(log);
+    let mut child = GuardedChild::spawn(&mut command).unwrap();
+    drop(env_lock);
+    let status = child.wait_with_timeout(Duration::from_secs(120)).unwrap();
+    drop(child); // Kill/reap a timed-out worker before inspecting or removing its files.
+    let worker_log = std::fs::read_to_string(&log_path).unwrap();
+    let shell_receipt = std::fs::read_to_string(root.path().join("shell-captured"));
+    eprintln!(
+        "roundtrip worker status={status:?} completed={} shell_capture={shell_receipt:?}\n{worker_log}",
+        root.path().join("completed").exists()
+    );
+    // Print every sentinel receipt before asserting so panic cleanup cannot
+    // erase the caller evidence for a later sentinel in this list.
+    for command in ["claude", "node", "npx"] {
+        if let Ok(receipt) =
+            std::fs::read_to_string(root.path().join(format!("{command}-launched")))
+        {
+            eprintln!("unexpected {command} invocation:\n{receipt}");
+        }
+    }
+    for command in ["claude", "node", "npx"] {
+        assert!(
+            !root.path().join(format!("{command}-launched")).exists(),
+            "transfer must not launch {command}"
+        );
+    }
+    assert!(
+        status.is_some_and(|status| status.success()) && root.path().join("completed").exists(),
+        "roundtrip worker failed ({status:?}):\n{worker_log}"
+    );
+    assert!(
+        shell_receipt.is_ok_and(|receipt| receipt.lines().any(|line| line == "captured")),
+        "enhanced discovery must capture the fixture shell"
+    );
+    std::fs::remove_file(canonical).unwrap();
+    assert!(InstalledCli::Claude.resolve_in_dirs(&dirs, false).is_err());
+}
+
 /// The full FE-shaped relay over two in-process stacks: plan on the source,
 /// export → chunked read → staged import → commit on the target →
 /// finalize on the source. Asserts the plan's size estimate is a sane
@@ -923,6 +1054,52 @@ async fn relay(
 /// rehydration counts, and the finalized (archived) source.
 #[intent_test_macros::daemon_test]
 async fn transfer_round_trip_between_two_stacks() {
+    #[cfg(unix)]
+    {
+        let Some(root) = std::env::var_os("INTENT_TRANSFER_CLI_ROOT") else {
+            round_trip_with_installed_cli();
+            return;
+        };
+        assert_eq!(std::env::temp_dir(), Path::new(&root));
+        assert_eq!(
+            std::env::var_os("SHELL"),
+            Some(Path::new(&root).join("shell").into_os_string())
+        );
+        eprintln!(
+            "roundtrip worker pid={}: canonical CLI discovery",
+            std::process::id()
+        );
+        assert_eq!(
+            intent_providers::installed_cli::InstalledCli::Claude
+                .resolve()
+                .unwrap()
+                .path(),
+            Path::new(&root).join("bin/claude"),
+            "the roundtrip must discover its sentinel, not a host CLI"
+        );
+        eprintln!("roundtrip worker: node discovery");
+        assert_eq!(
+            intent_providers::discover::find_node(),
+            Some(Path::new(&root).join("bin/node")),
+            "adapter discovery must select the fixture node"
+        );
+        eprintln!("roundtrip worker: provider availability");
+        let availability =
+            intent_providers::discover::provider_availability_for("claude-code", &|_| None)
+                .unwrap();
+        assert!(
+            availability.installed,
+            "fixture must supply CLI and adapter readiness"
+        );
+        assert_eq!(
+            availability.resolved_path,
+            // npx discovery prefers the canonicalized node's sibling, including
+            // when the system temp root itself is a symlink (e.g. macOS /var).
+            Some(std::fs::canonicalize(Path::new(&root).join("bin/npx")).unwrap()),
+            "the adapter must resolve through the fixture, not host npx"
+        );
+        eprintln!("roundtrip worker: original transfer body");
+    }
     let src_db = TempDir::new("rt-src-db");
     let src_ws_root = TempDir::new("rt-src-ws");
     let src_assets_root = TempDir::new("rt-src-assets");
@@ -1221,6 +1398,12 @@ async fn transfer_round_trip_between_two_stacks() {
     assert!(is_untracked(&seeded.repo, "dirty.txt"));
     assert_eq!(repo_head(&seeded.sandbox), seeded.sandbox_tip);
     assert!(seeded.sandbox.join("sb-dirty.txt").exists());
+    #[cfg(unix)]
+    std::fs::write(
+        PathBuf::from(std::env::var_os("INTENT_TRANSFER_CLI_ROOT").unwrap()).join("completed"),
+        "all roundtrip assertions passed",
+    )
+    .unwrap();
 }
 
 /// Failure injection: abort the relay mid-chunk. The source stays intact
