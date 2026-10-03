@@ -1636,6 +1636,7 @@ pub(super) fn capture_frame(c: &Connection, frame: Frame) -> Arc<dyn RepositoryR
             .map(|parent| (r.created + FRAME_TTL).min(parent.created + LEASE_TTL));
         #[cfg(any(test, feature = "repository-test-fixtures"))]
         let observation = r.probe.clone();
+        // caller-binding: allow — only finishes an unentered request lifetime; no service capability calls
         tokio::spawn(async move {
             let timeout = async {
                 if let Some(deadline) = deadline {
@@ -2167,6 +2168,7 @@ pub(crate) fn prepare(s: &Services, q: Prepare) -> BoxFuture<'_, Result<Value>> 
             let wire = c.caller.wire_credential().cloned();
             #[cfg(any(test, feature = "repository-test-fixtures"))]
             let observation = r.probe.clone();
+            // caller-binding: allow — binds the original caller and wire credential in this future
             tokio::spawn(with_caller(
                 caller,
                 with_wire_credential(wire, async move {
@@ -2721,6 +2723,7 @@ async fn remote_branch(
 }
 fn monitor(op: &Arc<Operation>) {
     let weak = Arc::downgrade(op);
+    // caller-binding: allow — only observes captured metadata and retires leases; no caller-based capability gate
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2797,6 +2800,7 @@ pub(crate) fn execute(s: &Services, q: Execute) -> BoxFuture<'_, Result<Value>> 
                 let c = r.connection.clone();
                 let owned = op.clone();
                 let queue_deadline = r.created + FRAME_TTL;
+                // caller-binding: allow — binds the original caller and wire credential in this future
                 tokio::spawn(with_caller(
                     c.caller.caller().clone(),
                     with_wire_credential(c.caller.wire_credential().cloned(), async move {
@@ -3263,6 +3267,7 @@ async fn run_stages(
         .map_err(denied)?;
         pending.stage = None;
         let alarm = op.write.retirement();
+        // caller-binding: allow — only ends the owned stage scope after its deadline
         let _timer = AbortOnDrop(tokio::spawn(async move {
             tokio::time::sleep(STAGE_TTL).await;
             alarm.end_scope();
@@ -3605,6 +3610,7 @@ async fn final_prepare_lock(c: Arc<Connection>, op: Arc<Operation>) -> Result<Fi
         .map_err(denied)?;
     let (tx, rx) = tokio::sync::oneshot::channel();
     let (release, released) = tokio::sync::oneshot::channel();
+    // caller-binding: allow — binds the original caller and wire credential in this future
     tokio::spawn(with_caller(
         c.caller.caller().clone(),
         with_wire_credential(c.caller.wire_credential().cloned(), async move {

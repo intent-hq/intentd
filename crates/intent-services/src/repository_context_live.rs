@@ -258,6 +258,7 @@ impl RepositoryContextOwner {
         let (tx, rx) = oneshot::channel();
         self.jobs.active.fetch_add(1, Ordering::AcqRel);
         let running = RunningJob(self.jobs.clone());
+        // caller-binding: allow — all three callers supply a with_caller future for the original owner
         tokio::spawn(async move {
             let _running = running;
             let result = future.await;

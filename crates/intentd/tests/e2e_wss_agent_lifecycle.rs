@@ -12940,6 +12940,7 @@ async fn interrupt_mid_tool_call_settles_and_drains_queue_over_wss() {
     let mut saw_interrupt_chunk = false;
     let mut stream_ends = 0usize;
     let mut saw_settle_idle = false;
+    let mut saw_persisted_idle = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while let Some(frame) = wss_event_opt_until(&mut sub, deadline).await {
         let event = &frame["params"]["event"];
@@ -12976,6 +12977,14 @@ async fn interrupt_mid_tool_call_settles_and_drains_queue_over_wss() {
                     "a preemption is not a settlement — no synthetic interrupted idle: {event}"
                 );
                 saw_settle_idle = true;
+            }
+            Some("agent:status-changed")
+                if saw_settle_idle
+                    && event["data"]["agentId"].as_str() == Some(agent_id.as_str())
+                    && event["data"]["status"] == "idle"
+                    && event["data"]["isActive"] == false =>
+            {
+                saw_persisted_idle = true;
                 break;
             }
             _ => {}
@@ -12998,6 +13007,12 @@ async fn interrupt_mid_tool_call_settles_and_drains_queue_over_wss() {
         "preempt end + interrupt turn end + at least one drained turn end: {stream_ends}"
     );
 
+    // agent:idle precedes end_turn persistence; the matching later status
+    // event proves that the original worker has published its settled state.
+    assert!(
+        saw_persisted_idle,
+        "terminal durable idle status was not observed"
+    );
     // Settled: nothing left parked, status idle.
     let queue = wss_rpc(
         &mut rpc,

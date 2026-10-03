@@ -380,6 +380,7 @@ pub(super) fn capture_frame(c: &Connection, frame: Frame) -> Arc<dyn RepositoryR
         let weak = Arc::downgrade(&request);
         let stop = lifetime.retirement();
         let deadline = request.deadline;
+        // caller-binding: allow — only retires the original request lifetime; no service capability calls
         tokio::spawn(async move {
             tokio::select! { () = stop.native_cancelled() => return, () = tokio::time::sleep_until(deadline) => {} }
             if let Some(r) = weak.upgrade() {
@@ -753,6 +754,7 @@ async fn capture_inner(r: &Arc<Request>) -> Result<Capture> {
     let watched = id.clone();
     let stop = lease.lifetime.retirement();
     let deadline = lease.deadline;
+    // caller-binding: allow — only retires the original resource lease; no service capability calls
     tokio::spawn(async move {
         tokio::select! { ()=stop.native_cancelled()=>{}, ()=tokio::time::sleep_until(deadline)=>{} }
         if let Some(c) = weak.upgrade() {

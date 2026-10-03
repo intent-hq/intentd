@@ -620,6 +620,7 @@ pub(super) fn capture_frame(c: &Connection, frame: Frame) -> Arc<dyn RepositoryR
     if let Some(life) = &request.lifetime {
         let retirement = life.retirement();
         let weak = Arc::downgrade(&request);
+        // caller-binding: allow — only finishes the original request lifetime; no service capability calls
         tokio::spawn(async move {
             tokio::select! { () = retirement.native_cancelled() => {}, () = tokio::time::sleep(FRAME_TTL) => {} }
             if let Some(request) = weak.upgrade() {
@@ -959,6 +960,7 @@ async fn acquire(request: &Arc<Request>) -> Result<Capture> {
     })
 }
 fn maintain(op: Arc<Operation>) {
+    // caller-binding: allow — only maintains original receipt lifetimes and retirement feed
     tokio::spawn(async move {
         let mut write_retired = false;
         loop {
@@ -1079,6 +1081,7 @@ async fn mutate(request: &Arc<Request>) -> Result<Attempt> {
         }
         let owned = request.clone();
         let operation = op.clone();
+        // caller-binding: allow — binds the original caller and wire credential before run_write
         tokio::spawn(async move {
             let c = owned.connection.clone();
             with_caller(

@@ -432,6 +432,7 @@ impl OwnedPendingDeletes {
         let inner = Arc::downgrade(&self.inner);
         let timer_attempt = attempt.clone();
         // Neither spawning nor invoking the deletion closure occurs under a map lock.
+        // caller-binding: allow — the only production delete callback binds Caller::Daemon before capability checks
         owner.timer = Some(tokio::spawn(async move {
             let Ok(deadline) = started.await else {
                 return;

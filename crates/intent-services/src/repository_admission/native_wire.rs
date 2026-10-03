@@ -345,6 +345,7 @@ impl Connection {
                 .lifetime
                 .as_ref()
                 .map(RepositorySourceLifetime::retirement);
+            // caller-binding: allow — only finishes the original request lifetime; no service capability calls
             tokio::spawn(async move {
                 if let Some(retirement) = retirement {
                     tokio::select! { () = retirement.native_cancelled() => return, () = tokio::time::sleep(FRAME_TTL) => {} }
@@ -995,6 +996,7 @@ async fn capture_inner(
     let weak = c.weak.clone();
     let expiry = tokio::time::Instant::from_std(lease.deadline);
     let watched = id.clone();
+    // caller-binding: allow — only retires the original context lease; no service capability calls
     tokio::spawn(async move {
         tokio::select! { () = retirement.native_cancelled() => {}, () = tokio::time::sleep_until(expiry) => {} }
         if let Some(c) = weak.upgrade() {
@@ -1197,6 +1199,7 @@ async fn observe_locked(
     let (release, released) = oneshot::channel();
     let caller = c.caller.caller().clone();
     let credential = c.caller.wire_credential().cloned();
+    // caller-binding: allow — binds the original caller and wire credential in this future
     tokio::spawn(with_caller(
         caller,
         with_wire_credential(credential, async move {

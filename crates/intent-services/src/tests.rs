@@ -23114,6 +23114,7 @@ pub(crate) mod pr {
     async fn pr_state_folds_a_queue_signal_served_from_the_cache() {
         let forge = queue_signal_forge(true);
         let (_t, _root, svc, ws_id) = cached_hover_setup(forge.clone(), None).await;
+        let _git = snapshot_git_root(&svc, &ws_id).await;
         assert_eq!(
             seed_display_status(&svc, &ws_id).await,
             Some(intent_core::WorkspaceDisplayStatus::PrReady)
