@@ -2727,6 +2727,8 @@ pub struct AgentManager {
     shutdown_persist_pause: Mutex<Option<Arc<TurnStartPause>>>,
     #[cfg(test)]
     user_persist_pause: Mutex<Option<Arc<TurnStartPause>>>,
+    #[cfg(test)]
+    worker_finish_pause: Mutex<Option<Arc<TurnStartPause>>>,
 }
 
 fn spawn_unsloth_status_publisher(
@@ -2834,6 +2836,8 @@ impl AgentManager {
             shutdown_persist_pause: Mutex::new(None),
             #[cfg(test)]
             user_persist_pause: Mutex::new(None),
+            #[cfg(test)]
+            worker_finish_pause: Mutex::new(None),
         }
     }
 
@@ -6704,7 +6708,16 @@ impl AgentManager {
 
     /// Release per-agent ownership while retaining the task's persistence tail.
     fn clear_worker(&self, agent_id: &AgentId) {
-        if let Some(worker) = self.workers.lock().unwrap().remove(agent_id) {
+        let mut workers = self.workers.lock().unwrap();
+        // A finishing worker may already have released its admission, allowing
+        // a new send to replace its handle. Only deregister the calling task:
+        // removing its replacement would leave that turn unabortable, racing
+        // its final append against an interruption flush (intent#6594).
+        if workers
+            .get(agent_id)
+            .is_some_and(|worker| Some(worker.id()) == tokio::task::try_id())
+        {
+            let worker = workers.remove(agent_id).expect("checked worker identity");
             self.retain_finishing_worker(worker);
         }
     }
@@ -12682,6 +12695,14 @@ async fn run_message_worker(
         mgr.services.requeue_front_batch(&agent_id, raced);
         drop(raced_draining);
         break 'outer;
+    }
+    #[cfg(test)]
+    {
+        let pause = mgr.worker_finish_pause.lock().unwrap().take();
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.resume.notified().await;
+        }
     }
     mgr.clear_worker(&agent_id);
     // Parked recovery send (intent-hq/intent#4962): a `send_message` that
