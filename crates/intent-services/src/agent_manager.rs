@@ -463,6 +463,10 @@ async fn cancel_and_settle_idle_prompt(
 /// options; queue-drained follow-up turns run with [`TurnOptions::default`]
 /// since a `QueuedMessage` has no per-turn hints of its own.
 #[derive(Debug, Default, Clone)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Shutdown, prompt, priority and queue provenance are independent per-turn flags"
+)]
 pub struct TurnOptions {
     /// Resume recovery must retain its pending interruption when shutdown
     /// refuses admission, rather than hiding it behind an ordinary queue.
