@@ -25901,6 +25901,177 @@ async fn queue_processing_payload_ordinary_drain_retains_recovered_merged_contri
 }
 
 #[tokio::test]
+async fn submission_correlation_single_merged_flush_survives_restart_and_failure() {
+    let (tmp, mgr, bus) = manager_with_bus().await;
+    let ws = WorkspaceId::from("ws-single-correlation");
+    let id = AgentId::from("a-single-correlation");
+    seed_agent(&mgr, &ws, &id).await;
+    for mid in ["single-a1", "single-a2"] {
+        mgr.services.enqueue_message_with_id(
+            &id,
+            Some(mid.into()),
+            "identical".into(),
+            None,
+            None,
+            Some(json!({"fromPrincipalId":"a"})),
+            None,
+            false,
+            MessageOrigin::User,
+        );
+    }
+    let selected = mgr.services.dequeue_message(&id).unwrap();
+    assert!(
+        mgr.services.dequeue_message(&id).is_none(),
+        "two submissions merged into one selected row"
+    );
+    let aliases = selected.submission_ids();
+    let order = selected.submission_order;
+    let turn_id = selected.turn_id.clone();
+    let (_, mut restored) =
+        flush_then_fail(&mgr, &ws, &id, vec![selected], "ordinary failure").await;
+    assert_eq!(restored.len(), 1);
+    let retry = restored.remove(0);
+    for alias in &aliases {
+        assert!(
+            retry.submission_ids().contains(alias),
+            "original alias lost: {alias}"
+        );
+    }
+    assert_eq!(retry.submission_order, order);
+    assert_eq!(retry.turn_id, turn_id);
+    assert!(retry.persisted);
+    assert!(
+        retry.recovery_sources.is_empty(),
+        "ordinary single row keeps ordinary correlation"
+    );
+    assert_eq!(
+        retry.message_metadata.as_ref().unwrap()["fromPrincipalId"],
+        "a"
+    );
+    mgr.services.requeue_front(&id, retry);
+    mgr.services.persist_queue_snapshot(&id).await;
+    bus.shutdown().await.unwrap();
+    mgr.services.store.close().await;
+    drop(mgr);
+    let store = Store::open(&tmp.path).await.unwrap();
+    let bus = EventBus::new(store.clone());
+    let services = Services::new_with_file_secrets(
+        store,
+        intent_core::FileSecretStore::with_path(tmp.path.with_extension("secrets.json")),
+    )
+    .with_event_bus(bus.clone());
+    let restarted = AgentManager::new(services, Arc::new(BusEventSink::new(bus.clone())), 8);
+    assert_eq!(
+        restarted.services.rehydrate_agent_queues().await.unwrap(),
+        1
+    );
+    for alias in &aliases {
+        let replay = restarted
+            .services
+            .submission_replay(&id, alias, Some(&json!({"fromPrincipalId":"a"})))
+            .unwrap()
+            .unwrap();
+        assert!(replay["submissionIds"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(alias)));
+        assert!(restarted
+            .services
+            .submission_replay(&id, alias, Some(&json!({"fromPrincipalId":"b"})))
+            .is_err());
+    }
+    let retry = restarted.services.dequeue_message(&id).unwrap();
+    let (_, restored) = flush_then_fail(&restarted, &ws, &id, vec![retry], "second failure").await;
+    for alias in &aliases {
+        assert!(restored[0].submission_ids().contains(alias));
+    }
+    assert_eq!(restored[0].turn_id, turn_id);
+    assert_eq!(restored[0].submission_order, order);
+    let history = restarted
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap();
+    let users: Vec<_> = history.iter().filter(|m| m.role == "user").collect();
+    assert_eq!(users.len(), 1, "redrive never duplicates the persisted row");
+    assert_eq!(
+        users[0].metadata.as_ref().unwrap()["submissionIds"],
+        json!(aliases)
+    );
+    bus.shutdown().await.unwrap();
+    restarted.services.store.close().await;
+}
+
+#[tokio::test]
+async fn submission_correlation_completed_interrupt_replay_is_complete() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-interrupt-correlation");
+    let id = AgentId::from("a-interrupt-correlation");
+    seed_agent(&mgr, &ws, &id).await;
+    let script = mock_agent_script();
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+    set_session_provider(&mgr, &ws, &id, "mock").await;
+    let options = super::TurnOptions {
+        message_metadata: Some(json!({"fromPrincipalId":"a"})),
+        ..Default::default()
+    };
+    let first = mgr
+        .interrupt_send_message(
+            id.clone(),
+            ws.clone(),
+            "urgent".into(),
+            Some("interrupt-correlation".into()),
+            options.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first["submissionIds"], json!(["interrupt-correlation"]));
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if !mgr.is_busy(&id) && mgr.workers.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("interrupt turn completed");
+    assert_eq!(
+        mgr.services
+            .store
+            .get_agent_session(&id)
+            .await
+            .unwrap()
+            .status,
+        AgentStatus::RuntimeIdle
+    );
+    let second = mgr
+        .interrupt_send_message(
+            id.clone(),
+            ws,
+            "urgent".into(),
+            Some("interrupt-correlation".into()),
+            options,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        second,
+        json!({"success":true,"queued":false,"messageId":"interrupt-correlation","submissionIds":["interrupt-correlation"],"deduplicated":true})
+    );
+    let history = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap();
+    assert_eq!(history.iter().filter(|m| m.role == "user").count(), 1);
+    assert!(!mgr.is_busy(&id));
+}
+
+#[tokio::test]
 async fn submission_correlation_mixed_recovery_survives_restart_and_repeated_failure() {
     let (tmp, mgr, bus) = manager_with_bus().await;
     let ws = WorkspaceId::from("ws-correlation");
