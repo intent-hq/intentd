@@ -1506,7 +1506,7 @@ async fn chat_delta_orphaned_block_reconciles_via_nonempty_removed_ids() {
 /// monorepo#958: the seq-0 snapshot for a LARGE transcript is the bounded
 /// newest `agent.getConversation` page — not a re-hydration of the full
 /// history. With 120 persisted messages the snapshot carries exactly the
-/// newest five (the chat-specific page), `truncated: true`,
+/// newest twenty (the chat-specific page), `truncated: true`,
 /// `totalMessages: 120`, and a non-null `nextToken` so older pages stay
 /// client-pulled via `agent.getConversation { nextToken }`.
 #[intent_test_macros::daemon_test]
@@ -1535,7 +1535,7 @@ async fn chat_subscribe_snapshot_is_bounded_for_large_transcript() {
     let agent_id = a["agent"]["id"].as_str().unwrap().to_string();
     let agent = AgentId::from(agent_id.as_str());
 
-    // A 120-message transcript — well past the five-message chat page.
+    // A 120-message transcript — well past the twenty-message chat page.
     let store = bus.store();
     for i in 0..120 {
         let mid = Uuid::now_v7().to_string();
@@ -1563,10 +1563,10 @@ async fn chat_subscribe_snapshot_is_bounded_for_large_transcript() {
         &mut rpc_reader,
         12,
         "agent.getConversation",
-        json!({ "agentId": agent_id, "limit": 5 }),
+        json!({ "agentId": agent_id, "limit": 20 }),
     )
     .await;
-    assert_eq!(want["messages"].as_array().unwrap().len(), 5);
+    assert_eq!(want["messages"].as_array().unwrap().len(), 20);
 
     let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();
     let mut sub_reader = tokio::io::BufReader::new(sub_read);
@@ -1589,12 +1589,12 @@ async fn chat_subscribe_snapshot_is_bounded_for_large_transcript() {
     let messages = snapshot["messages"].as_array().expect("snapshot messages");
     assert_eq!(
         messages.len(),
-        5,
+        20,
         "snapshot is the bounded default page, not the full 120-message history"
     );
-    // The page is the NEWEST five (seq 115..=119, oldest→newest within the page).
-    assert_eq!(messages[0]["seq"], 115);
-    assert_eq!(messages[4]["seq"], 119);
+    // The page is the NEWEST twenty (seq 100..=119, oldest→newest within the page).
+    assert_eq!(messages[0]["seq"], 100);
+    assert_eq!(messages[19]["seq"], 119);
     assert_eq!(snapshot["truncated"], true);
     assert_eq!(snapshot["totalMessages"], 120);
     assert!(
@@ -1677,7 +1677,7 @@ async fn chat_subscribe_snapshot_is_bounded_for_large_transcript() {
             .as_array()
             .unwrap()
             .len(),
-        5
+        20
     );
 
     let _ = shutdown_tx.send(());
