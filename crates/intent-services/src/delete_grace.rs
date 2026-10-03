@@ -539,5 +539,5 @@ impl OwnedPendingDeletes {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests;

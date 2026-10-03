@@ -258,7 +258,7 @@ impl RetirementNode {
 }
 
 impl RepositoryRetirement {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn with_deletion_test_dispatch<T>(
         &self,
         action: impl FnOnce() -> AdmissionResult<T>,

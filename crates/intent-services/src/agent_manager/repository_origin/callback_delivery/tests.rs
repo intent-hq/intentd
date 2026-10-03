@@ -1688,7 +1688,7 @@ async fn hard_stop_joins_real_source_dispatch_before_dropping_confirmed_bridge()
     h.node.finish().await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn blueprint_retains_the_same_typed_services_allocation_after_original_install() {
     let f = Fixture::new().await;
     let original = Arc::new(f.manager.services.clone());
