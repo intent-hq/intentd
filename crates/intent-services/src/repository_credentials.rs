@@ -266,8 +266,8 @@ impl fmt::Debug for RepositoryCredentialTicket {
 }
 
 #[cfg(test)]
-#[path = "../tests/repository_credentials/provider.rs"]
+#[path = "repository_credentials/tests/provider.rs"]
 mod tests_provider;
 #[cfg(test)]
-#[path = "../tests/repository_credentials/state.rs"]
+#[path = "repository_credentials/tests/state.rs"]
 mod tests_state;

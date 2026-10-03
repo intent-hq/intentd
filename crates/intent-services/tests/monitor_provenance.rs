@@ -1,6 +1,6 @@
 //! Reads actual old SQL columns, not modern qualified records labelled old.
 
-#[path = "../src/monitor_provenance.rs"]
+#[path = "monitor_provenance/model.rs"]
 mod monitor_provenance;
 
 use intent_core::{AgentId, PrMonitor, PrMonitorId, PrMonitorState, RepoRef, WorkspaceId};

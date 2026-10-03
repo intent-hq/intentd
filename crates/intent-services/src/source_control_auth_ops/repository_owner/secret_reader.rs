@@ -1271,5 +1271,5 @@ pub(crate) mod tests;
 // The standalone credential test wrapper has no Services owner. Include these
 // real-owner interaction cases only in the library's existing private owner.
 #[cfg(test)]
-#[path = "../../../tests/repository_credentials/read.rs"]
+#[path = "secret_reader/tests/read.rs"]
 mod read_tests;
