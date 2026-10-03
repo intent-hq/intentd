@@ -10,6 +10,7 @@ mod secret_reader;
 #[cfg(test)]
 pub(crate) mod secret_reader;
 pub(crate) use adoption::{logical_instance, RepositorySettingsWrite};
+pub(super) use secret_reader::GitlabSourceRead;
 pub(crate) use secret_reader::RepositoryReadEligibility;
 pub(crate) use secret_reader::RepositorySettledConnection;
 pub(crate) use secret_reader::{
@@ -144,6 +145,7 @@ impl GitlabCredentialGate {
     ) -> Arc<RepositoryWrite> {
         Arc::new(RepositoryWrite {
             descriptor,
+            connect: None,
             #[cfg(test)]
             write_probe: owner.write_probe.lock().unwrap().clone(),
             owner: owner.clone(),
@@ -184,6 +186,7 @@ fn map_owner_error(error: RepositoryCredentialError) -> intent_sourcecontrol::Er
 pub(crate) struct RepositoryWrite {
     owner: Arc<RepositoryOwner>,
     descriptor: Option<GitlabDescriptor>,
+    connect: Option<adoption::PreparedConnect>,
     #[cfg(test)]
     write_probe: Option<Arc<dyn Fn() + Send + Sync>>,
     state: Mutex<WriteState>,
@@ -202,6 +205,7 @@ impl RepositoryWrite {
     /// Refresh begins under the original gate BEFORE the exchange can rotate a
     /// token. Persistence calls the same fence again without starting twice.
     pub(super) fn begin(&self) -> intent_sourcecontrol::Result<()> {
+        self.check_connect_config().map_err(map_owner_error)?;
         let mut state = self
             .state
             .lock()
@@ -287,6 +291,10 @@ impl RepositoryWrite {
                     if let Err(error) = self.owner.publish_source(&binding, descriptor, fingerprint)
                     {
                         tracing::debug!(%error, "repository source evidence remains unavailable");
+                    } else if let Some(settings) = self.owner.settings.get() {
+                        if let Ok(mut source) = settings.source_descriptor.lock() {
+                            *source = Some(descriptor.clone());
+                        }
                     }
                 }
             }

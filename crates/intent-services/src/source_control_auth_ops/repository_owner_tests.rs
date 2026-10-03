@@ -13,6 +13,8 @@ use tokio::time::timeout;
 #[derive(Default)]
 pub(crate) struct Control {
     pub(crate) pause: Mutex<Option<&'static str>>,
+    pub(crate) pause_skip: AtomicUsize,
+    pub(crate) paused_user_status: Mutex<Option<u16>>,
     pub(super) entered: Notify,
     pub(crate) release: Notify,
     pub(crate) token_reply: Mutex<Option<(u16, Value)>>,
@@ -83,18 +85,42 @@ impl Server {
                     control.requests.lock().unwrap().push(path.into());
                     let pause = {
                         let mut pause = control.pause.lock().unwrap();
-                        if pause.is_some_and(|value| request.contains(value)) {
-                            pause.take();
-                            true
+                        // A supplied user status targets the actual user GET,
+                        // not the optional same-token PAT-scope request.
+                        let user_response = control.paused_user_status.lock().unwrap().is_some();
+                        if pause.is_some_and(|value| request.contains(value))
+                            && (!user_response || path == "/api/v4/user")
+                        {
+                            if control.pause_skip.load(Ordering::SeqCst) > 0 {
+                                control.pause_skip.fetch_sub(1, Ordering::SeqCst);
+                                false
+                            } else {
+                                pause.take();
+                                true
+                            }
                         } else {
                             false
                         }
+                    };
+                    let held_status = if pause && path == "/api/v4/user" {
+                        control.paused_user_status.lock().unwrap().take()
+                    } else {
+                        None
                     };
                     if pause {
                         control.entered.notify_one();
                         control.release.notified().await;
                     }
-                    let (status, body) = if path == "/oauth/authorize_device" {
+                    let (status, body) = if let Some(status) = held_status {
+                        (
+                            status,
+                            if status == 200 {
+                                json!({"id":42,"username":"fixture","name":"Fixture"})
+                            } else {
+                                json!({"message":"rejected"})
+                            },
+                        )
+                    } else if path == "/oauth/authorize_device" {
                         (
                             200,
                             json!({"device_code":"device-code", "user_code":"CODE", "verification_uri":"https://gitlab.test/device", "expires_in":900, "interval":1}),
@@ -489,6 +515,20 @@ async fn wrong_host_and_old_rejection_are_noops_but_matching_cleanup_retires() {
     let f = Fixture::new(&server, true).await;
     f.pat(&server, "pat-first").await;
     let binding = f.directory.binding().unwrap();
+    let receipt = {
+        let guard = f.svc.gitlab_credential_gate.lock().await;
+        f.svc
+            .gitlab_credential_gate
+            .capture_original_source(
+                &server.host,
+                &f.svc.gitlab_secret_store,
+                &guard,
+                Some("pat-first"),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+    };
     f.svc
         .gitlab_revoke_owned(GitlabHost::parse("other.test").unwrap())
         .await
@@ -500,6 +540,7 @@ async fn wrong_host_and_old_rejection_are_noops_but_matching_cleanup_retires() {
         None,
         &server.host,
         "old-token",
+        &receipt,
     )
     .await
     .unwrap();
@@ -512,6 +553,7 @@ async fn wrong_host_and_old_rejection_are_noops_but_matching_cleanup_retires() {
         None,
         &server.host,
         "pat-first",
+        &receipt,
     )
     .await
     .unwrap();

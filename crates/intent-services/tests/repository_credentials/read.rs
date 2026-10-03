@@ -310,20 +310,46 @@ impl ReadFixture {
         (eligibility, operation, target)
     }
     async fn refresh(&self, server: &ReadServer) {
-        self.auth
-            .service
-            .gitlab_secret_store
-            .store(EXPIRES_AT_SECRET_ACCOUNT, "0")
-            .unwrap();
-        self.auth
-            .service
-            .stored_proof_token(&crate::source_control_auth_ops::Target::Gitlab {
-                host: server.fixture.host.clone(),
-            })
+        refresh_original(&self.auth.service, &server.fixture.host)
             .await
             .unwrap();
     }
 }
+/// Exercise the actual original refresh owner without falsifying an attested
+/// tuple on disk. Expiry-triggered public behavior is covered by the WSS suite;
+/// these controls qualify rotation, quota and disclosure under the real lease.
+async fn refresh_original(
+    service: &crate::Services,
+    host: &intent_sourcecontrol::GitlabHost,
+) -> Result<()> {
+    let guard = service.gitlab_credential_gate.lock().await;
+    if !service
+        .gitlab_credential_gate
+        .original_source_current(host, &service.gitlab_secret_store, &guard, None)
+        .await
+        .map_err(|_| Error::Indeterminate)?
+    {
+        return Err(Error::Unverified);
+    }
+    let write = service
+        .gitlab_credential_gate
+        .reserve(
+            host,
+            crate::repository_credentials::RepositoryMutationKind::Refresh,
+        )
+        .map_err(|_| Error::Indeterminate)?;
+    let client = service.gitlab_client_id(host);
+    crate::source_control_auth_ops::try_refresh(
+        host,
+        client.as_deref(),
+        service.gitlab_secret_store.clone(),
+        &guard,
+        write,
+    )
+    .await
+    .map_err(|_| Error::Indeterminate)
+}
+
 fn applied(
     eligibility: &RepositoryReadEligibility,
     receipt: &RepositoryResponseAttribution,
@@ -1559,18 +1585,9 @@ async fn settled_refresh_accepts_new_actual_proof_without_mutating_old_observati
         .clone()
         .unwrap();
     *s.fixture.control.pause.lock().unwrap() = Some("grant_type=refresh_token");
-    f.auth
-        .service
-        .gitlab_secret_store
-        .store(EXPIRES_AT_SECRET_ACCOUNT, "0")
-        .unwrap();
     let service = f.auth.service.clone();
     let host = s.fixture.host.clone();
-    let refresh = tokio::spawn(async move {
-        service
-            .stored_proof_token(&crate::source_control_auth_ops::Target::Gitlab { host })
-            .await
-    });
+    let refresh = tokio::spawn(async move { refresh_original(&service, &host).await });
     s.fixture.entered().await;
     settled_error(original.reobserve(), Error::Mutating);
     settled_error(
@@ -1617,17 +1634,7 @@ async fn settled_unknown_refresh_and_external_repair_remain_unavailable() {
             std::fs::remove_file(&broken).unwrap();
             std::fs::create_dir(&broken).unwrap();
         }));
-    f.auth
-        .service
-        .gitlab_secret_store
-        .store(EXPIRES_AT_SECRET_ACCOUNT, "0")
-        .unwrap();
-    assert!(f
-        .auth
-        .service
-        .stored_proof_token(&crate::source_control_auth_ops::Target::Gitlab {
-            host: s.fixture.host.clone()
-        },)
+    assert!(refresh_original(&f.auth.service, &s.fixture.host)
         .await
         .is_err());
     settled_error(original.reobserve(), Error::Indeterminate);
@@ -1695,7 +1702,7 @@ async fn settled_descriptor_and_source_changes_cannot_select_another_owner() {
     settled_error(original.reobserve(), Error::Retired);
     settled_error(
         f.service.gitlab_repository_settled_connection(),
-        Error::Indeterminate,
+        Error::Unverified,
     );
     assert_eq!(s.control.requests.lock().unwrap().len(), requests);
 
@@ -1993,18 +2000,9 @@ async fn settled_actual_ready_before_proof_publication_does_not_attest_a_snapsho
     // The first refresh check precedes OAuth on the async caller. Pause the
     // second check inside the actual blocking persistence owner instead.
     let pause = SettledWritePause::install(&f.auth.service, 2);
-    f.auth
-        .service
-        .gitlab_secret_store
-        .store(EXPIRES_AT_SECRET_ACCOUNT, "0")
-        .unwrap();
     let service = f.auth.service.clone();
     let host = s.fixture.host.clone();
-    let refresh = tokio::spawn(async move {
-        service
-            .stored_proof_token(&crate::source_control_auth_ops::Target::Gitlab { host })
-            .await
-    });
+    let refresh = tokio::spawn(async move { refresh_original(&service, &host).await });
     pause.entered().await;
 
     // Hold descriptor while the factory takes config. The real persistence
@@ -2287,18 +2285,9 @@ async fn facts_oauth_refresh_reports_actual_mutation_and_new_settled_revision() 
     let old = connection_facts(&f.auth.service);
     let selected = old.settled().unwrap().selected().clone();
     *s.fixture.control.pause.lock().unwrap() = Some("grant_type=refresh_token");
-    f.auth
-        .service
-        .gitlab_secret_store
-        .store(EXPIRES_AT_SECRET_ACCOUNT, "0")
-        .unwrap();
     let service = f.auth.service.clone();
     let host = s.fixture.host.clone();
-    let refresh = tokio::spawn(async move {
-        service
-            .stored_proof_token(&crate::source_control_auth_ops::Target::Gitlab { host })
-            .await
-    });
+    let refresh = tokio::spawn(async move { refresh_original(&service, &host).await });
     s.fixture.entered().await;
     let pending = connection_facts(&f.auth.service);
     assert_eq!(pending.mutation(), Some(MutationKind::Refresh));
@@ -2334,17 +2323,7 @@ async fn facts_unknown_store_failure_cannot_be_fixed_by_external_byte_restore() 
                 std::fs::create_dir(&broken).unwrap();
             }
         }));
-    f.auth
-        .service
-        .gitlab_secret_store
-        .store(EXPIRES_AT_SECRET_ACCOUNT, "0")
-        .unwrap();
-    assert!(f
-        .auth
-        .service
-        .stored_proof_token(&crate::source_control_auth_ops::Target::Gitlab {
-            host: s.fixture.host.clone()
-        })
+    assert!(refresh_original(&f.auth.service, &s.fixture.host)
         .await
         .is_err());
     let unknown = connection_facts(&f.auth.service);
@@ -2686,18 +2665,9 @@ async fn facts_actual_ready_before_proof_interval_is_not_settled() {
         .gitlab_repository_settled_connection()
         .unwrap();
     let pause = SettledWritePause::install(&f.auth.service, 2);
-    f.auth
-        .service
-        .gitlab_secret_store
-        .store(EXPIRES_AT_SECRET_ACCOUNT, "0")
-        .unwrap();
     let service = f.auth.service.clone();
     let host = s.fixture.host.clone();
-    let refresh = tokio::spawn(async move {
-        service
-            .stored_proof_token(&crate::source_control_auth_ops::Target::Gitlab { host })
-            .await
-    });
+    let refresh = tokio::spawn(async move { refresh_original(&service, &host).await });
     pause.entered().await;
     let (locked, ready) = tokio::sync::oneshot::channel();
     let (release, hold) = std::sync::mpsc::channel::<()>();
@@ -3485,18 +3455,9 @@ async fn optional_output_ready_before_proof_cannot_reuse_old_settled_facts() {
     let original = connection_facts(&f.auth.service);
     let e = batch_scope(&f, &s, "group/project");
     let pause = SettledWritePause::install(&f.auth.service, 2);
-    f.auth
-        .service
-        .gitlab_secret_store
-        .store(EXPIRES_AT_SECRET_ACCOUNT, "0")
-        .unwrap();
     let service = f.auth.service.clone();
     let host = s.fixture.host.clone();
-    let refresh = tokio::spawn(async move {
-        service
-            .stored_proof_token(&crate::source_control_auth_ops::Target::Gitlab { host })
-            .await
-    });
+    let refresh = tokio::spawn(async move { refresh_original(&service, &host).await });
     pause.entered().await;
     let (entered, ready) = tokio::sync::oneshot::channel();
     let (release, wait) = std::sync::mpsc::channel::<()>();

@@ -1825,8 +1825,14 @@ async fn cmd_serve(
         .with_reverse_dispatch(reverse_registry.clone())
         .with_settings_registry(settings_registry.clone())
         .with_hooks_max_per_agent(config.hooks_max_per_agent);
-    if let Err(error) = services.initialize_gitlab_repository_binding().await {
-        tracing::debug!(%error, "repository GitLab binding remains unavailable at startup");
+    #[cfg(feature = "repository-test-fixtures")]
+    let fixture_installed = initialize_gitlab_test_transports(&services).await?;
+    #[cfg(not(feature = "repository-test-fixtures"))]
+    let fixture_installed = false;
+    if !fixture_installed {
+        if let Err(error) = services.initialize_gitlab_repository_binding().await {
+            tracing::debug!(%error, "repository GitLab binding remains unavailable at startup");
+        }
     }
     // Inject the suspend-overlap query so Task C can recognize sleep-induced
     // turn failures and enroll them for wake-resume. Left unset when wakeResume
@@ -10030,4 +10036,35 @@ mod tests {
             "threads are not descendant processes: a walk rooted at a multi-threaded child must charge nothing"
         );
     }
+}
+
+/// Deliberate test composition only. Neither normal builds nor the private app
+/// profile interprets this environment input as provider authority.
+#[cfg(feature = "repository-test-fixtures")]
+async fn initialize_gitlab_test_transports(services: &Services) -> anyhow::Result<bool> {
+    let Some(raw) = std::env::var_os("INTENTD_REPOSITORY_TEST_TRANSPORTS") else {
+        return Ok(false);
+    };
+    let raw = raw
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("invalid test transport input"))?;
+    anyhow::ensure!(raw.len() <= 4096, "oversized test transport input");
+    let pairs: Vec<(String, String)> = serde_json::from_str(raw)?;
+    anyhow::ensure!(
+        !pairs.is_empty() && pairs.len() <= 8,
+        "invalid test transport count"
+    );
+    let fixtures = pairs
+        .into_iter()
+        .map(|(instance, endpoint)| {
+            intent_sourcecontrol::GitlabDescriptor::with_loopback_endpoint(
+                intent_sourcecontrol::GitlabInstance::parse(&instance)?,
+                &endpoint,
+            )
+        })
+        .collect::<intent_sourcecontrol::Result<Vec<_>>>()?;
+    services
+        .initialize_repository_test_fixtures(fixtures)
+        .await?;
+    Ok(true)
 }

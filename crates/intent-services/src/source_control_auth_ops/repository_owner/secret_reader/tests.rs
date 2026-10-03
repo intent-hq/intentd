@@ -873,3 +873,180 @@ async fn native_review_background_absence_never_adopts_a_later_attachment() {
         Error::Unverified
     );
 }
+
+#[intent_test_macros::daemon_test]
+async fn original_auth_probe_receipt_rejects_late_200_and_401_for_same_token_successor() {
+    use intent_core::WorkspaceApi;
+    for (status, retry) in [(200, false), (401, false), (401, true)] {
+        let server = Server::new().await;
+        let f = Fixture::unadopted(&server).await;
+        if retry {
+            f.service
+                .gitlab_secret_store
+                .store(REFRESH_SECRET_ACCOUNT, "old-refresh")
+                .unwrap();
+            let expiry = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 7200;
+            f.service
+                .gitlab_secret_store
+                .store(EXPIRES_AT_SECRET_ACCOUNT, &expiry.to_string())
+                .unwrap();
+        }
+        f.service
+            .reconcile_gitlab_repository_binding()
+            .await
+            .unwrap();
+        if retry {
+            *server.control.denied_user.lock().unwrap() = Some("stored-pat");
+            // The first rotated-token GET verifies the original refresh;
+            // the second is the original auth probe's retry response.
+            *server.control.pause.lock().unwrap() = Some("rotated");
+            server
+                .control
+                .pause_skip
+                .store(1, std::sync::atomic::Ordering::SeqCst);
+        } else {
+            *server.control.pause.lock().unwrap() = Some("/api/v4/user");
+        }
+        *server.control.paused_user_status.lock().unwrap() = Some(status);
+        let service = f.service.clone();
+        let caller = intent_core::current_caller().expect("original fixture caller");
+        let mut old = tokio::spawn(intent_core::with_caller(caller, async move {
+            service.source_control_get_user("gitlab".into(), None).await
+        }));
+        tokio::select! {
+            () = server.entered() => {},
+            result = &mut old => panic!("original probe returned before the held response: {result:?}"),
+        }
+        let old_selected = f.request();
+        let token = if retry { "rotated" } else { "stored-pat" };
+        f.service
+            .gitlab_connect_pat(server.host.clone(), token.into())
+            .await
+            .unwrap();
+        let successor = f.request();
+        assert_ne!(old_selected.binding.scope, successor.binding.scope);
+        let bytes = std::fs::read(f.service.gitlab_secret_store.path()).unwrap();
+        server.control.release.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(5), old)
+            .await
+            .unwrap()
+            .unwrap();
+        eprintln!("late auth response status={status} retry={retry}: {result:?}");
+        assert_eq!(result.unwrap(), json!({"user":null}));
+        assert_eq!(
+            f.request(),
+            successor,
+            "old response cannot reject its successor"
+        );
+        assert_eq!(
+            std::fs::read(f.service.gitlab_secret_store.path()).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            f.service.own_gitlab_token(&server.host).await.as_deref(),
+            Some(token)
+        );
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn observed_auth_material_mismatch_retires_only_original_proof_without_byte_resurrection() {
+    let server = Server::new().await;
+    let f = Fixture::new(&server).await;
+    let source = f.service.gitlab_secret_store.clone();
+    let bytes = std::fs::read(source.path()).unwrap();
+    let request = f.request();
+    assert_eq!(
+        f.service.own_gitlab_token(&server.host).await.as_deref(),
+        Some("stored-pat")
+    );
+    let calls = server.control.requests.lock().unwrap().len();
+    source
+        .store(SECRET_ACCOUNT, "external-replacement")
+        .unwrap();
+    assert!(f.service.own_gitlab_token(&server.host).await.is_none());
+    std::fs::write(source.path(), bytes).unwrap();
+    assert!(f.service.own_gitlab_token(&server.host).await.is_none());
+    assert_eq!(
+        f.reader().load(&request).await.unwrap_err(),
+        Error::Unverified
+    );
+    assert_eq!(server.control.requests.lock().unwrap().len(), calls);
+    f.service
+        .gitlab_connect_pat(server.host.clone(), "stored-pat".into())
+        .await
+        .unwrap();
+    assert_ne!(f.request().binding.scope, request.binding.scope);
+    // A stale used operand does not retire the actual new proof.
+    let guard = f.service.gitlab_credential_gate.lock().await;
+    assert!(!f
+        .service
+        .gitlab_credential_gate
+        .original_source_current(&server.host, &source, &guard, Some("old-different-operand"))
+        .await
+        .unwrap());
+    drop(guard);
+    assert_eq!(
+        f.service.own_gitlab_token(&server.host).await.as_deref(),
+        Some("stored-pat")
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn external_removal_between_own_token_reads_cannot_authorize_cold_empty_operand() {
+    let server = Server::new().await;
+    let f = Fixture::unadopted(&server).await;
+    let source = f.service.gitlab_secret_store.clone();
+    source.delete(SECRET_ACCOUNT).unwrap();
+    f.service
+        .reconcile_gitlab_repository_binding()
+        .await
+        .unwrap();
+    source
+        .store(SECRET_ACCOUNT, "unattested-external-token")
+        .unwrap();
+    let owner = f.service.gitlab_credential_gate.repository.get().unwrap();
+    let external = source.clone();
+    *owner.evidence.read_probe.lock().unwrap() = Some(Arc::new(move || {
+        // Existing read checkpoint: own_gitlab_token already loaded its raw
+        // operand; the actual paired tuple read has not happened yet.
+        external.delete(SECRET_ACCOUNT).unwrap();
+    }));
+    assert!(f.service.own_gitlab_token(&server.host).await.is_none());
+    *owner.evidence.read_probe.lock().unwrap() = None;
+    assert!(source.load(SECRET_ACCOUNT).unwrap().is_none());
+    assert!(server.control.requests.lock().unwrap().is_empty());
+}
+
+#[intent_test_macros::daemon_test]
+async fn execution_presence_uses_full_configured_root_and_original_source() {
+    let server = Server::new().await;
+    let f = Fixture::new(&server).await;
+    f.registry
+        .apply(&[("sourceControl.github.tokenSource".into(), json!("explicit"))])
+        .unwrap();
+    let calls = server.control.requests.lock().unwrap().len();
+    let context = f.service.execution_context_snapshot().await.unwrap();
+    let connection = context
+        .repository_connections
+        .iter()
+        .find(|c| c.provider == "gitlab")
+        .unwrap();
+    assert!(connection.configured);
+    assert_eq!(connection.host, "gitlab.test");
+    assert_eq!(
+        f.registry
+            .snapshot()
+            .effective
+            .source_control
+            .gitlab
+            .instance_base_url
+            .as_deref(),
+        Some("https://gitlab.test/forge")
+    );
+    assert_eq!(server.control.requests.lock().unwrap().len(), calls);
+}

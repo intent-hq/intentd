@@ -11,6 +11,112 @@ struct Fixture {
     registry: Arc<SettingsRegistry>,
     directory: Arc<RepositoryConnectionDirectory>,
 }
+
+#[intent_test_macros::daemon_test]
+async fn empty_paired_source_settles_consecutive_settings_without_transport_grant() {
+    for approved in [false, true] {
+        let server = Server::new().await;
+        let f = Fixture::uninstalled(&server).await;
+        f.services
+            .gitlab_secret_store
+            .delete(SECRET_ACCOUNT)
+            .unwrap();
+        if approved {
+            f.registry
+                .apply(&[("sourceControl.gitlab.apiBaseUrl".into(), Value::Null)])
+                .unwrap();
+        }
+        f.services
+            .gitlab_credential_gate
+            .install_settings_boundary(
+                &f.registry,
+                &f.services.secrets,
+                &f.services.gitlab_secret_store,
+                None,
+            )
+            .unwrap();
+        for (host, instance) in [
+            ("second.test", "https://second.test/forge"),
+            ("third.test", "https://third.test/forge"),
+        ] {
+            let result = f
+                .services
+                .settings_update(json!([
+                    {"path":"sourceControl.gitlab.host","value":host},
+                    {"path":"sourceControl.gitlab.instanceBaseUrl","value":instance}
+                ]))
+                .await;
+            eprintln!("empty source settings approved={approved}: {result:?}");
+            result.unwrap();
+            assert_eq!(
+                f.directory.binding().unwrap_err(),
+                RepositoryCredentialError::Disconnected
+            );
+        }
+        assert!(server.control.requests.lock().unwrap().is_empty());
+        assert!(f
+            .services
+            .gitlab_secret_store
+            .load(SECRET_ACCOUNT)
+            .unwrap()
+            .is_none());
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn nonempty_or_partial_unapproved_source_cannot_settle_as_disconnected() {
+    for partial in [false, true] {
+        let server = Server::new().await;
+        let f = Fixture::uninstalled(&server).await;
+        if partial {
+            f.services
+                .gitlab_secret_store
+                .delete(SECRET_ACCOUNT)
+                .unwrap();
+            f.services
+                .gitlab_secret_store
+                .store(
+                    intent_sourcecontrol::gitlab_token::REFRESH_SECRET_ACCOUNT,
+                    "partial-refresh",
+                )
+                .unwrap();
+        }
+        f.services
+            .gitlab_credential_gate
+            .install_settings_boundary(
+                &f.registry,
+                &f.services.secrets,
+                &f.services.gitlab_secret_store,
+                None,
+            )
+            .unwrap();
+        f.services
+            .settings_update(json!([
+                {"path":"sourceControl.gitlab.oauthClientId","value":"changed-client"}
+            ]))
+            .await
+            .unwrap();
+        // A complete metadata-only batch now releases its own writer as
+        // Unverified; partial storage remains genuinely indeterminate.
+        assert_eq!(
+            f.directory.binding().unwrap_err(),
+            if partial {
+                RepositoryCredentialError::Indeterminate
+            } else {
+                RepositoryCredentialError::Unverified
+            }
+        );
+        let next = f
+            .services
+            .settings_update(json!([
+                {"path":"sourceControl.gitlab.oauthClientId","value":"later-client"}
+            ]))
+            .await;
+        assert_eq!(next.is_err(), partial);
+        assert!(server.control.requests.lock().unwrap().is_empty());
+    }
+}
+
 impl Fixture {
     async fn invalid_boot(server: &Server, case: usize, installed: bool) -> Self {
         let dir = crate::test_support::test_tempdir("repository-invalid-boot-settings");
@@ -645,22 +751,21 @@ async fn root_replacement_does_not_probe_the_previous_token_at_a_new_endpoint() 
         .unwrap();
     f.service(write.clone()).update(&changes).await.unwrap();
     let requests = server.control.requests.lock().unwrap().len();
-    assert!(f
-        .services
+    f.services
         .finish_gitlab_repository_settings(&write, false)
         .await
-        .is_err());
+        .unwrap();
     assert_eq!(server.control.requests.lock().unwrap().len(), requests);
     assert_eq!(
         f.directory.binding().unwrap_err(),
-        RepositoryCredentialError::Mutating
+        RepositoryCredentialError::Unverified
     );
     f.services
         .settle_gitlab_repository_settings(Some(&write), false, false)
         .await;
     assert_eq!(
         f.directory.binding().unwrap_err(),
-        RepositoryCredentialError::Indeterminate
+        RepositoryCredentialError::Unverified
     );
 }
 
@@ -738,10 +843,11 @@ async fn late_pat_result_cannot_publish_after_a_settings_owner_begins() {
             .await
             .unwrap();
     }
-    let current = f.directory.binding().unwrap();
+    let current = f.directory.binding().unwrap_err();
+    assert_eq!(current, RepositoryCredentialError::Unverified);
     server.control.release.notify_one();
     assert!(connect.await.unwrap().is_err());
-    assert_eq!(f.directory.binding().unwrap(), current);
+    assert_eq!(f.directory.binding().unwrap_err(), current);
     assert_eq!(
         f.services
             .gitlab_secret_store
@@ -1197,4 +1303,193 @@ async fn services_partial_ordinary_failure_cannot_claim_whole_batch_compensation
         reader.load(&expected).await.unwrap_err(),
         RepositoryCredentialError::Indeterminate
     );
+}
+
+async fn connect_fixture(server: &Server) -> Fixture {
+    let f = Fixture::uninstalled(server).await;
+    f.registry
+        .apply(&[("sourceControl.gitlab.instanceBaseUrl".into(), Value::Null)])
+        .unwrap();
+    let descriptors = ["https://gitlab.test", "https://other.test"]
+        .into_iter()
+        .map(|root| {
+            GitlabDescriptor::with_loopback_endpoint(
+                GitlabInstance::parse(root).unwrap(),
+                server.host.base_url(),
+            )
+            .unwrap()
+        })
+        .collect();
+    f.services
+        .initialize_repository_test_fixtures(descriptors)
+        .await
+        .unwrap();
+    f
+}
+
+#[intent_test_macros::daemon_test]
+async fn explicit_connect_prepares_exact_replacement_without_settings_prebind() {
+    let server = Server::new().await;
+    let f = connect_fixture(&server).await;
+    let old = std::fs::read(f.services.gitlab_secret_store.path()).unwrap();
+    *server.control.denied_user.lock().unwrap() = Some("bad-pat");
+    let bad = f
+        .services
+        .source_control_connect(
+            "gitlab".into(),
+            Some("other.test".into()),
+            Some("pat".into()),
+            Some("bad-pat".into()),
+        )
+        .await;
+    assert!(bad.is_err());
+    assert_eq!(
+        std::fs::read(f.services.gitlab_secret_store.path()).unwrap(),
+        old
+    );
+    assert_eq!(
+        f.registry.snapshot().effective.source_control.gitlab.host,
+        "gitlab.test"
+    );
+    let good = f
+        .services
+        .source_control_connect(
+            "gitlab".into(),
+            Some("other.test".into()),
+            Some("pat".into()),
+            Some("pat-second".into()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(good, json!({"ok":true,"method":"pat"}));
+    assert_eq!(
+        f.registry.snapshot().effective.source_control.gitlab.host,
+        "other.test"
+    );
+    assert_eq!(
+        f.directory.binding().unwrap().account.instance_base_url,
+        "https://other.test"
+    );
+    let host = GitlabHost::parse("other.test")
+        .unwrap()
+        .with_api_origin(server.host.base_url())
+        .unwrap();
+    assert_eq!(
+        f.services.own_gitlab_token(&host).await.as_deref(),
+        Some("pat-second")
+    );
+    let before = server.control.requests.lock().unwrap().len();
+    let wrong = host.with_api_origin("http://127.0.0.1:1").unwrap();
+    assert!(f
+        .services
+        .gitlab_connect_pat(wrong, "never-sent".into())
+        .await
+        .is_err());
+    assert_eq!(server.control.requests.lock().unwrap().len(), before);
+}
+
+#[intent_test_macros::daemon_test]
+async fn prepared_connect_refuses_stale_settings_before_any_secret_write() {
+    let server = Server::new().await;
+    let f = connect_fixture(&server).await;
+    let old = std::fs::read(f.services.gitlab_secret_store.path()).unwrap();
+    *server.control.pause.lock().unwrap() = Some("/api/v4/user");
+    let call = f.services.source_control_connect(
+        "gitlab".into(),
+        Some("other.test".into()),
+        Some("pat".into()),
+        Some("pat-second".into()),
+    );
+    tokio::pin!(call);
+    tokio::select! { result = &mut call => panic!("expected held original preflight: {result:?}"), () = server.control.entered.notified() => {} }
+    f.services
+        .settings_update(
+            json!([{"path":"sourceControl.gitlab.oauthClientId","value":"new-client"}]),
+        )
+        .await
+        .unwrap();
+    server.control.release.notify_one();
+    assert!(call.await.is_err());
+    assert_eq!(
+        std::fs::read(f.services.gitlab_secret_store.path()).unwrap(),
+        old
+    );
+    assert_eq!(
+        f.registry.snapshot().effective.source_control.gitlab.host,
+        "gitlab.test"
+    );
+    assert_eq!(
+        f.directory.binding().unwrap_err(),
+        RepositoryCredentialError::Unverified
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn completed_descriptor_change_quarantines_all_stored_consumers_without_resurrection() {
+    for expired in [false, true] {
+        let server = Server::new().await;
+        let f = connect_fixture(&server).await;
+        let source = f.services.gitlab_secret_store.clone();
+        if expired {
+            // A complete expired pair is retained as bytes, not adopted by the
+            // descriptor-only change; it must never trigger an old refresh.
+            source
+                .store(
+                    intent_sourcecontrol::gitlab_token::REFRESH_SECRET_ACCOUNT,
+                    "old-refresh",
+                )
+                .unwrap();
+            source
+                .store(
+                    intent_sourcecontrol::gitlab_token::EXPIRES_AT_SECRET_ACCOUNT,
+                    "1",
+                )
+                .unwrap();
+        }
+        let original_bytes = std::fs::read(source.path()).unwrap();
+        for host in ["other.test", "gitlab.test"] {
+            f.services
+                .settings_update(json!([{"path":"sourceControl.gitlab.host","value":host}]))
+                .await
+                .unwrap();
+            assert_eq!(
+                f.directory.binding().unwrap_err(),
+                RepositoryCredentialError::Unverified
+            );
+            let requests = server.control.requests.lock().unwrap().len();
+            let target = GitlabHost::parse(host)
+                .unwrap()
+                .with_api_origin(server.host.base_url())
+                .unwrap();
+            assert!(f.services.own_gitlab_token(&target).await.is_none());
+            assert!(f
+                .services
+                .stored_proof_token(&super::super::super::Target::Gitlab {
+                    host: target.clone()
+                })
+                .await
+                .is_err());
+            let status = f
+                .services
+                .source_control_auth_status("gitlab".into(), Some(host.into()))
+                .await
+                .unwrap();
+            assert_eq!(status["isConfigured"], false);
+            assert_eq!(
+                server.control.requests.lock().unwrap().len(),
+                requests,
+                "quarantine must not send stored credentials"
+            );
+            assert_eq!(std::fs::read(source.path()).unwrap(), original_bytes);
+        }
+        f.services
+            .gitlab_connect_pat(server.host.clone(), "fresh-pat".into())
+            .await
+            .unwrap();
+        assert!(f.directory.binding().is_ok());
+        assert_eq!(
+            f.services.own_gitlab_token(&server.host).await.as_deref(),
+            Some("fresh-pat")
+        );
+    }
 }

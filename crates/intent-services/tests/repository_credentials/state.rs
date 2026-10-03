@@ -1365,3 +1365,45 @@ fn selected_source_projection_rejects_foreign_and_unavailable_bindings() {
         Err(RepositoryCredentialError::Retired)
     );
 }
+
+#[test]
+fn completed_unverified_releases_only_its_replace_and_keeps_quota() {
+    let test = Test::new();
+    let binding = test.directory.binding().unwrap();
+    test.directory.set_child_policy(&binding, true).unwrap();
+    let future = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    test.directory.lock().unwrap().backoff_until = Some(future);
+    let old_revision = test.directory.lock().unwrap().secret_revision;
+    let old = test
+        .directory
+        .reserve_mutation(RepositoryMutationKind::Replace)
+        .unwrap();
+    test.directory.begin_mutation(&old).unwrap();
+    test.directory
+        .finish_mutation(&old, SettledCredentialState::Unverified)
+        .unwrap();
+    let state = test.directory.lock().unwrap();
+    assert_eq!(state.status, RepositoryConnectionState::Unverified);
+    assert_eq!(state.backoff_until, Some(future));
+    assert_eq!(state.secret_revision, old_revision);
+    assert!(!state.child_enabled && state.published.is_none() && state.active.is_none());
+    drop(state);
+    let next = test
+        .directory
+        .reserve_mutation(RepositoryMutationKind::Replace)
+        .unwrap();
+    test.directory.begin_mutation(&next).unwrap();
+    assert_eq!(
+        test.directory
+            .finish_mutation(&old, SettledCredentialState::Unverified)
+            .unwrap_err(),
+        RepositoryCredentialError::StaleMutation
+    );
+    test.directory
+        .finish_mutation(&next, SettledCredentialState::Indeterminate)
+        .unwrap();
+    assert!(test
+        .directory
+        .reserve_mutation(RepositoryMutationKind::Replace)
+        .is_err());
+}

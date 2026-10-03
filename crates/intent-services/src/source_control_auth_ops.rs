@@ -296,6 +296,7 @@ pub(crate) async fn run_gitlab_poll_loop(
     target: GitlabHost,
     mut flow: GitlabDeviceFlow,
     deadline: Instant,
+    write: Option<Arc<RepositoryWrite>>,
 ) {
     let host = target.host().to_string();
     let mut consecutive_errors: u32 = 0;
@@ -313,18 +314,34 @@ pub(crate) async fn run_gitlab_poll_loop(
         if Instant::now() >= deadline {
             break FlowPhase::Expired;
         }
-        let write = match gate.reserve(&target, RepositoryMutationKind::Replace) {
-            Ok(write) => write,
-            Err(error) => {
+        if let Some(write) = &write {
+            if let Err(error) = write.check_prepared_connect() {
                 tracing::warn!(%error, host, "gitlab device writer retired before exchange");
                 break FlowPhase::Error;
             }
-        };
+        }
         match flow.exchange_once().await {
             Ok(GitlabExchange::Pending) => consecutive_errors = 0,
             Ok(GitlabExchange::Authorized(grant)) => {
+                if !is_resident(&state, flow_id).await {
+                    tracing::info!(
+                        host,
+                        "gitlab device grant superseded before verification; discarded"
+                    );
+                    return;
+                }
                 if let Some(write) = &write {
-                    write.verified_user(grant.verify(&target).await.ok().map(|(user, _)| user));
+                    if write.check_prepared_connect().is_err() {
+                        break FlowPhase::Error;
+                    }
+                    let user = match grant.verify(&target).await {
+                        Ok((user, _)) => user,
+                        Err(error) => {
+                            tracing::warn!(%error, host, "gitlab device account verification failed");
+                            break FlowPhase::Error;
+                        }
+                    };
+                    write.verified_user(Some(user));
                 }
                 let mut guard = state.lock().await;
                 if !matches!(guard.flow.as_ref(), Some(f) if f.slot.flow_id == flow_id) {
@@ -356,6 +373,10 @@ pub(crate) async fn run_gitlab_poll_loop(
                 let bound = bind_gitlab_host_owned(registry.as_deref(), &host, write.as_deref());
                 if let Some(write) = &write {
                     write.confirm_publication(bound);
+                    if write.has_prepared_connect() && !bound {
+                        publish_auth_changed(bus.as_ref(), Provider::Gitlab, &host, "error").await;
+                        return;
+                    }
                 }
                 tracing::info!(status = "authorized", host, "gitlab device grant finished");
                 publish_auth_changed(bus.as_ref(), Provider::Gitlab, &host, "authorized").await;
@@ -400,6 +421,9 @@ fn bind_gitlab_host_owned(
     let Some(registry) = registry else {
         return false;
     };
+    if let Some(write) = write.filter(|write| write.has_prepared_connect()) {
+        return write.publish_connect(registry).is_ok();
+    }
     if registry
         .get("sourceControl.gitlab.host")
         .and_then(|v| v.as_str().map(str::to_string))
@@ -516,9 +540,15 @@ async fn disconnect_gitlab_if_current(
     bus: Option<&EventBus>,
     host: &GitlabHost,
     rejected: &str,
+    receipt: &repository_owner::GitlabSourceRead,
 ) -> Result<()> {
     let credential_guard = gate.lock().await;
-    if bound() && stored_access_token(&store).await?.as_deref() == Some(rejected) {
+    if bound()
+        && gate
+            .source_receipt_current(receipt, host, &store, &credential_guard, Some(rejected))
+            .await?
+        && stored_access_token(&store).await?.as_deref() == Some(rejected)
+    {
         let write = gate
             .reserve(host, RepositoryMutationKind::Disconnect)
             .map_err(crate::pr_ops::map_sc_err)?;
@@ -545,6 +575,12 @@ async fn refresh_stored_credential_if_needed(
     gate: &GitlabCredentialGate,
     guard: &GitlabCredentialGuard,
 ) -> Result<Option<(StoredCredential, bool)>> {
+    if !gate
+        .original_source_current(host, store, guard, None)
+        .await?
+    {
+        return Ok(None);
+    }
     let mut credential = stored_credential(store.clone())
         .await
         .map_err(crate::pr_ops::map_sc_err)?;
@@ -609,7 +645,7 @@ pub(crate) async fn probe_gitlab(
     gate: &GitlabCredentialGate,
     bus: Option<&EventBus>,
 ) -> Result<ProbeOutcome> {
-    let (token, method, refreshed) = {
+    let (token, method, refreshed, receipt) = {
         let credential_guard = gate.lock().await;
         if !bound() {
             return Ok(ProbeOutcome::NotConfigured);
@@ -629,19 +665,59 @@ pub(crate) async fn probe_gitlab(
         let Some((token, method)) = load_gitlab_token(&store, credential).await? else {
             return Ok(ProbeOutcome::NotConfigured);
         };
-        (token, method, refreshed)
+        let Some(receipt) = gate
+            .capture_original_source(
+                host,
+                &store,
+                &credential_guard,
+                (method != "env").then_some(token.as_str()),
+            )
+            .await?
+        else {
+            return Ok(ProbeOutcome::NotConfigured);
+        };
+        (token, method, refreshed, receipt)
     };
-    match validate_pat(host, &token).await {
+    let response = validate_pat(host, &token).await;
+    {
+        let guard = gate.lock().await;
+        if !bound()
+            || !gate
+                .source_receipt_current(
+                    &receipt,
+                    host,
+                    &store,
+                    &guard,
+                    (method != "env").then_some(token.as_str()),
+                )
+                .await?
+        {
+            return Ok(ProbeOutcome::NotConfigured);
+        }
+    }
+    match response {
         Ok(user) => return Ok(ProbeOutcome::Configured { user, method }),
         Err(intent_sourcecontrol::Error::Auth(_)) if method == "device" && !refreshed => {}
         Err(intent_sourcecontrol::Error::Auth(_)) => return Ok(ProbeOutcome::Rejected),
         Err(e) => return Err(crate::pr_ops::map_sc_err(e)),
     }
-    // 401 on a device credential: one refresh, one retry. Skip the exchange
-    // when a peer already replaced the rejected token; retry with theirs.
-    let (token, method) = {
+    // 401 on the original device credential: one refresh, one retry. An
+    // intervening replacement belongs to its own request, never this retry.
+    let (token, method, retry_receipt) = {
         let credential_guard = gate.lock().await;
         if !bound() {
+            return Ok(ProbeOutcome::NotConfigured);
+        }
+        if !gate
+            .source_receipt_current(
+                &receipt,
+                host,
+                &store,
+                &credential_guard,
+                (method != "env").then_some(token.as_str()),
+            )
+            .await?
+        {
             return Ok(ProbeOutcome::NotConfigured);
         }
         if stored_access_token(&store).await?.as_deref() == Some(token.as_str()) {
@@ -672,12 +748,41 @@ pub(crate) async fn probe_gitlab(
         let Some((token, method)) = load_gitlab_token(&store, credential).await? else {
             return Ok(ProbeOutcome::NotConfigured);
         };
-        (token, method)
+        let Some(retry_receipt) = gate
+            .capture_original_source(
+                host,
+                &store,
+                &credential_guard,
+                (method != "env").then_some(token.as_str()),
+            )
+            .await?
+        else {
+            return Ok(ProbeOutcome::NotConfigured);
+        };
+        (token, method, retry_receipt)
     };
-    match validate_pat(host, &token).await {
+    let response = validate_pat(host, &token).await;
+    {
+        let guard = gate.lock().await;
+        if !bound()
+            || !gate
+                .source_receipt_current(
+                    &retry_receipt,
+                    host,
+                    &store,
+                    &guard,
+                    (method != "env").then_some(token.as_str()),
+                )
+                .await?
+        {
+            return Ok(ProbeOutcome::NotConfigured);
+        }
+    }
+    match response {
         Ok(user) => Ok(ProbeOutcome::Configured { user, method }),
         Err(intent_sourcecontrol::Error::Auth(_)) => {
-            disconnect_gitlab_if_current(store, bound, gate, bus, host, &token).await?;
+            disconnect_gitlab_if_current(store, bound, gate, bus, host, &token, &retry_receipt)
+                .await?;
             Ok(ProbeOutcome::NotConfigured)
         }
         Err(e) => Err(crate::pr_ops::map_sc_err(e)),
@@ -864,6 +969,13 @@ impl crate::Services {
     /// probe that waited on the [`GitlabCredentialGate`] sees a rebind that
     /// landed while it waited. An unparsable configured host binds nothing.
     pub(crate) fn gitlab_host_is_bound(&self, host: &GitlabHost) -> bool {
+        self.gitlab_host_is_configured(host)
+            && self.gitlab_credential_gate.source_host_matches(host)
+    }
+
+    /// Configuration matching selects a fresh collaboration endpoint/client;
+    /// it grants no access to repository credentials or their retired source.
+    pub(crate) fn gitlab_host_is_configured(&self, host: &GitlabHost) -> bool {
         parse_gitlab_host(&self.effective_settings().source_control.gitlab.host)
             .is_ok_and(|bound| bound.host() == host.host())
     }
@@ -925,11 +1037,24 @@ impl crate::Services {
                         IdentityProofErrorKind::GitlabNotConnected,
                     ));
                 }
-                stored_access_token(&self.gitlab_secret_store)
+                let token = stored_access_token(&self.gitlab_secret_store).await?;
+                if !self
+                    .gitlab_credential_gate
+                    .original_source_current(
+                        host,
+                        &self.gitlab_secret_store,
+                        &credential_guard,
+                        token.as_deref(),
+                    )
                     .await?
-                    .ok_or(Error::IdentityProof(
+                {
+                    return Err(Error::IdentityProof(
                         IdentityProofErrorKind::GitlabNotConnected,
-                    ))
+                    ));
+                }
+                token.ok_or(Error::IdentityProof(
+                    IdentityProofErrorKind::GitlabNotConnected,
+                ))
             }
         }
     }
@@ -941,11 +1066,25 @@ impl crate::Services {
     /// an instance that restricts anonymous reads still answers the host
     /// that is connected to it. Read under the [`GitlabCredentialGate`].
     pub(crate) async fn own_gitlab_token(&self, host: &GitlabHost) -> Option<String> {
-        let _gate = self.gitlab_credential_gate.lock().await;
+        let gate = self.gitlab_credential_gate.lock().await;
         if !self.gitlab_host_is_bound(host) {
             return None;
         }
-        match stored_access_token(&self.gitlab_secret_store).await {
+        let stored = stored_access_token(&self.gitlab_secret_store).await;
+        if !self
+            .gitlab_credential_gate
+            .original_source_current(
+                host,
+                &self.gitlab_secret_store,
+                &gate,
+                stored.as_ref().ok().and_then(|token| token.as_deref()),
+            )
+            .await
+            .ok()?
+        {
+            return None;
+        }
+        match stored {
             Ok(Some(token)) => Some(token),
             Ok(None) => std::env::var(GITLAB_TOKEN_ENV)
                 .ok()
@@ -1065,13 +1204,12 @@ impl crate::Services {
     /// way a newer device connect supersedes it.
     pub(crate) async fn gitlab_connect_pat(
         &self,
-        host: GitlabHost,
+        mut host: GitlabHost,
         token: String,
     ) -> Result<Value> {
         let write = self
             .gitlab_credential_gate
-            .reserve(&host, RepositoryMutationKind::Replace)
-            .map_err(crate::pr_ops::map_sc_err)?;
+            .prepare_connect(self.settings_registry.as_deref(), &mut host)?;
         let user = match validate_pat(&host, &token).await {
             Ok(user) => user,
             Err(intent_sourcecontrol::Error::Auth(_)) => {
@@ -1114,6 +1252,11 @@ impl crate::Services {
         );
         if let Some(write) = &write {
             write.confirm_publication(bound);
+            if write.has_prepared_connect() && !bound {
+                return Err(Error::Internal(
+                    "GitLab connection publication unavailable".into(),
+                ));
+            }
         }
         tracing::info!(host = host.host(), "gitlab personal access token connected");
         publish_auth_changed(
@@ -1153,6 +1296,13 @@ impl crate::Services {
             }
         }
         if self.gitlab_host_is_bound(&host) {
+            if !self
+                .gitlab_credential_gate
+                .original_source_current(&host, &self.gitlab_secret_store, &gate, None)
+                .await?
+            {
+                return Ok(json!({"ok": true}));
+            }
             let stored = stored_credential(self.gitlab_secret_store.clone())
                 .await
                 .map_err(crate::pr_ops::map_sc_err)?;
@@ -1182,12 +1332,13 @@ impl crate::Services {
     /// gitlab twin of `github.connect` — idempotent while a flow for `host`
     /// is live, replaces a terminal / other-host slot, and spawns the poll
     /// loop. A host that cannot run the grant → `device-grant-unsupported`.
-    pub(crate) async fn gitlab_connect_device(&self, host: GitlabHost) -> Result<Value> {
+    pub(crate) async fn gitlab_connect_device(&self, mut host: GitlabHost) -> Result<Value> {
+        let authority = host.host().to_string();
         let unsupported = || Error::DeviceGrantUnsupported {
             provider: Provider::Gitlab.as_wire().to_string(),
-            host: host.host().to_string(),
+            host: authority.clone(),
         };
-        let (flow_id, client_id) = {
+        let (flow_id, client_id, write) = {
             let mut guard = self.gitlab_auth.lock().await;
             if let Some(f) = guard.flow.as_ref() {
                 if f.host == host.host() && f.slot.is_live() {
@@ -1202,12 +1353,15 @@ impl crate::Services {
             let Some(client_id) = self.gitlab_client_id(&host) else {
                 return Err(unsupported());
             };
+            let write = self
+                .gitlab_credential_gate
+                .prepare_connect(self.settings_registry.as_deref(), &mut host)?;
             let flow_id = github_auth_ops::next_flow_id();
             guard.starting = Some(GitlabStartupIntent {
                 host: host.host().to_string(),
                 id: flow_id,
             });
-            (flow_id, client_id)
+            (flow_id, client_id, write)
         };
         let started = intent_sourcecontrol::gitlab_auth::start_device_grant_with_store(
             &host,
@@ -1242,6 +1396,9 @@ impl crate::Services {
             }
             Err(e) => return Err(crate::pr_ops::map_sc_err(e)),
         };
+        if let Some(write) = &write {
+            write.check_prepared_connect()?;
+        }
         let deadline = Instant::now() + std::time::Duration::from_secs(auth.expires_in);
         intent_core::spawn_daemon(run_gitlab_poll_loop(
             self.gitlab_auth.clone(),
@@ -1252,6 +1409,7 @@ impl crate::Services {
             host.clone(),
             flow,
             deadline,
+            write,
         ));
         let slot = FlowSlot {
             flow_id,

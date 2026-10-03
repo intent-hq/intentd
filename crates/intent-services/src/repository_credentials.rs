@@ -153,6 +153,9 @@ pub(crate) struct RepositoryChildPolicyTicket {
 
 /// Facts from the sole persistence/compensation owner AFTER it has settled.
 pub(crate) enum SettledCredentialState {
+    /// A completed metadata-only replacement retained unproven credentials.
+    /// It releases only its own writer and restores no read/child authority.
+    Unverified,
     Verified(VerifiedRepositoryAccount),
     Compensated(VerifiedRepositoryAccount),
     Disconnected,

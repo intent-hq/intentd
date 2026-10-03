@@ -96,6 +96,21 @@ pub(super) struct SecretMaterial {
 }
 
 impl SecretMaterial {
+    pub(super) fn is_absent(&self) -> bool {
+        self.access.is_none() && self.refresh.is_none() && self.expiry.is_none()
+    }
+
+    pub(super) fn is_complete(&self) -> bool {
+        self.access().is_ok()
+            && match (&self.refresh, &self.expiry) {
+                (None, None) => true,
+                (Some(refresh), Some(expiry)) => {
+                    !refresh.trim().is_empty() && expiry.parse::<u64>().is_ok()
+                }
+                _ => false,
+            }
+    }
+
     fn load(store: &FileSecretStore) -> Result<Self> {
         let values = store
             .load_many(&[
@@ -140,6 +155,159 @@ pub(super) async fn load_material(
     .map_err(|_| Error::Indeterminate)?
 }
 
+/// Original provenance retained by one legacy auth HTTP attempt. It cannot
+/// authorize another request or be reconstructed from equal token bytes.
+pub(in crate::source_control_auth_ops) struct GitlabSourceRead {
+    owner: Option<Arc<RepositoryOwner>>,
+    evidence: AuthSourceEvidence,
+}
+enum AuthSourceEvidence {
+    Legacy,
+    ColdEmpty(u64),
+    Stored(Arc<AttestedSource>),
+}
+impl GitlabSourceRead {
+    fn same(&self, other: &Self) -> bool {
+        let owner_matches = match (&self.owner, &other.owner) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        };
+        owner_matches
+            && match (&self.evidence, &other.evidence) {
+                (AuthSourceEvidence::Legacy, AuthSourceEvidence::Legacy) => true,
+                (AuthSourceEvidence::ColdEmpty(a), AuthSourceEvidence::ColdEmpty(b)) => a == b,
+                (AuthSourceEvidence::Stored(a), AuthSourceEvidence::Stored(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            }
+    }
+}
+
+impl GitlabCredentialGate {
+    /// Read the actual paired source under the original credential lease.
+    /// Local quarantine never selects env fallback or reports upstream refusal.
+    pub(in crate::source_control_auth_ops) async fn capture_original_source(
+        &self,
+        host: &intent_sourcecontrol::GitlabHost,
+        store: &FileSecretStore,
+        guard: &super::GitlabCredentialGuard,
+        used_access: Option<&str>,
+    ) -> intent_core::Result<Option<GitlabSourceRead>> {
+        let unavailable =
+            || intent_core::Error::Internal("original GitLab credential source unavailable".into());
+        if !Arc::ptr_eq(&self.mutex, &guard.mutex) {
+            return Err(unavailable());
+        }
+        let owner = self.repository.get().cloned();
+        let Some(settings) = owner.as_ref().and_then(|o| o.settings.get()) else {
+            return Ok(Some(GitlabSourceRead {
+                owner,
+                evidence: AuthSourceEvidence::Legacy,
+            }));
+        };
+        let original_owner = owner.as_ref().ok_or_else(unavailable)?;
+        if settings.source.as_deref() != Some(store.path()) || !self.source_host_matches(host) {
+            return Ok(None);
+        }
+        let original = original_owner
+            .evidence
+            .published
+            .lock()
+            .map_err(|_| unavailable())?
+            .clone();
+        if original
+            .as_ref()
+            .is_some_and(|proof| original_owner.current_source(&proof.request).is_err())
+        {
+            return Ok(None);
+        }
+        #[cfg(test)]
+        let probe = original_owner.evidence.read_probe.lock().unwrap().clone();
+        #[cfg(test)]
+        if let Some(probe) = probe {
+            probe();
+        }
+        let material = load_material(store.clone(), guard.lease())
+            .await
+            .map_err(|_| unavailable())?;
+        if !self.source_host_matches(host) {
+            return Ok(None);
+        }
+        let evidence = if let Some(original) = original {
+            let Ok(current) = original_owner.current_source(&original.request) else {
+                return Ok(None);
+            };
+            if !Arc::ptr_eq(&original, &current) {
+                return Ok(None);
+            }
+            if material.fingerprint(&original_owner.evidence) != original.fingerprint {
+                original_owner
+                    .evidence
+                    .invalidate_matching(&original)
+                    .map_err(|_| unavailable())?;
+                return Ok(None);
+            }
+            // A stale operand is NOT proof that the currently attested source
+            // changed. Never retire a successor merely because its bytes differ.
+            if used_access.is_some_and(|used| !material.access().is_ok_and(|actual| actual == used))
+            {
+                return Ok(None);
+            }
+            AuthSourceEvidence::Stored(original)
+        } else {
+            // A stored operand that disappeared between the two reads cannot
+            // become a cold empty/env admission. Full source continuity still
+            // rules out descriptor away/back and late-installed authority.
+            if used_access.is_some() || !material.is_absent() {
+                return Ok(None);
+            }
+            let revision = original_owner.directory.with_connection_metadata(|m| {
+                if !matches!(
+                    m.lifecycle,
+                    crate::repository_credentials::RepositoryConnectionState::Unverified
+                        | crate::repository_credentials::RepositoryConnectionState::Disconnected
+                ) || m.mutation.is_some()
+                {
+                    return Err(Error::Unverified);
+                }
+                Ok(m.child_revision)
+            });
+            let Ok(revision) = revision else {
+                return Ok(None);
+            };
+            AuthSourceEvidence::ColdEmpty(revision)
+        };
+        Ok(Some(GitlabSourceRead { owner, evidence }))
+    }
+
+    pub(in crate::source_control_auth_ops) async fn original_source_current(
+        &self,
+        host: &intent_sourcecontrol::GitlabHost,
+        store: &FileSecretStore,
+        guard: &super::GitlabCredentialGuard,
+        used_access: Option<&str>,
+    ) -> intent_core::Result<bool> {
+        Ok(self
+            .capture_original_source(host, store, guard, used_access)
+            .await?
+            .is_some())
+    }
+
+    pub(in crate::source_control_auth_ops) async fn source_receipt_current(
+        &self,
+        original: &GitlabSourceRead,
+        host: &intent_sourcecontrol::GitlabHost,
+        store: &FileSecretStore,
+        guard: &super::GitlabCredentialGuard,
+        used_access: Option<&str>,
+    ) -> intent_core::Result<bool> {
+        Ok(self
+            .capture_original_source(host, store, guard, used_access)
+            .await?
+            .is_some_and(|current| original.same(&current)))
+    }
+}
+
 impl RepositoryOwner {
     pub(super) fn publish_source(
         &self,
@@ -171,7 +339,7 @@ impl RepositoryOwner {
     fn check_descriptor(&self, expected: &GitlabDescriptor) -> Result<()> {
         let settings = self.settings.get().ok_or(Error::Unverified)?;
         let config = settings.config.lock().map_err(|_| Error::Indeterminate)?;
-        let approved = super::adoption::approved_descriptor(&config, settings.fixture.as_ref());
+        let approved = super::adoption::approved_descriptor(&config, &settings.fixtures);
         if approved.as_ref() != Some(expected)
             || self
                 .descriptor
@@ -480,9 +648,9 @@ impl RepositoryConnectionFacts {
             }
             _ => RepositoryAttachmentState::Unpaired,
         };
-        let approved = settings.zip(view.config).and_then(|(s, config)| {
-            super::adoption::approved_descriptor(config, s.fixture.as_ref())
-        });
+        let approved = settings
+            .zip(view.config)
+            .and_then(|(s, config)| super::adoption::approved_descriptor(config, &s.fixtures));
         let approved = approved.filter(|approved| view.descriptor == Some(approved));
         let approval = if settings.is_none() {
             RepositoryDescriptorState::Unavailable
@@ -594,7 +762,7 @@ impl RepositorySettledConnection {
                     }
                     if descriptor.as_ref() != Some(actual)
                         || proof.descriptor != *actual
-                        || super::adoption::approved_descriptor(&config, settings.fixture.as_ref())
+                        || super::adoption::approved_descriptor(&config, &settings.fixtures)
                             .as_ref()
                             != Some(actual)
                         || original.is_some_and(|value| {
@@ -889,7 +1057,7 @@ impl RepositoryReadEligibility {
         let expected = self.scope.descriptor();
         if descriptor != Some(expected)
             || proof.descriptor != *expected
-            || super::adoption::approved_descriptor(config, settings.fixture.as_ref()).as_ref()
+            || super::adoption::approved_descriptor(config, &settings.fixtures).as_ref()
                 != Some(expected)
         {
             return Err(Error::BoundaryMismatch);

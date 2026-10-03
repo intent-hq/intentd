@@ -8,6 +8,13 @@ pub(crate) struct RepositoryWriterReservation {
 }
 
 impl RepositoryWriterReservation {
+    pub(crate) fn check_current(&self) -> Result<()> {
+        self.directory.check_reservation(
+            self.ticket
+                .as_ref()
+                .ok_or(RepositoryCredentialError::StaleMutation)?,
+        )
+    }
     /// `validate` performs only the existing owner's synchronous final check.
     /// The owner must keep its existing writer gates through the first effect;
     /// this adapter adds no lock around the callback or across secret/network I/O.

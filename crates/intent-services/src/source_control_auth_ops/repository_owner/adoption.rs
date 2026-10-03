@@ -17,10 +17,17 @@ use crate::settings_registry::{SettingsRegistry, SettingsSnapshot};
 
 pub(crate) struct SettingsAttachment {
     pub(super) config: Mutex<GitlabSettings>,
-    pub(super) fixture: Option<GitlabDescriptor>,
+    pub(super) fixtures: Vec<GitlabDescriptor>,
     pub(super) source: Option<std::path::PathBuf>,
     pub(super) store: Option<FileSecretStore>,
-    source_descriptor: Mutex<Option<GitlabDescriptor>>,
+    pub(super) source_descriptor: Mutex<Option<GitlabDescriptor>>,
+}
+
+/// One explicit connect's original settings and validated full replacement.
+pub(super) struct PreparedConnect {
+    original: GitlabSettings,
+    desired: GitlabSettings,
+    changes: Vec<(String, Value)>,
 }
 
 /// One existing settings batch, including its compensation. It cannot be cloned
@@ -58,7 +65,7 @@ pub(crate) fn logical_instance(config: &GitlabSettings) -> Result<GitlabInstance
 
 pub(super) fn approved_descriptor(
     config: &GitlabSettings,
-    fixture: Option<&GitlabDescriptor>,
+    fixtures: &[GitlabDescriptor],
 ) -> Option<GitlabDescriptor> {
     let instance = logical_instance(config).ok()?;
     let logical = GitlabHost::parse(instance.as_str()).ok()?;
@@ -73,12 +80,123 @@ pub(super) fn approved_descriptor(
     if transport.base_url() == logical.base_url() {
         return Some(GitlabDescriptor::new(instance));
     }
-    fixture
-        .filter(|d| d.instance() == &instance && matches_host(d, &transport))
+    fixtures
+        .iter()
+        .find(|d| d.instance() == &instance && matches_host(d, &transport))
         .cloned()
 }
 
 impl GitlabCredentialGate {
+    pub(in crate::source_control_auth_ops) fn source_host_matches(
+        &self,
+        host: &GitlabHost,
+    ) -> bool {
+        let Some(owner) = self.repository.get() else {
+            return true;
+        };
+        let Some(settings) = owner.settings.get() else {
+            return true;
+        };
+        let Ok(config) = settings.config.lock() else {
+            return false;
+        };
+        let Some(descriptor) = approved_descriptor(&config, &settings.fixtures) else {
+            return false;
+        };
+        settings.source.is_some()
+            && settings.store.is_some()
+            && matches_host(&descriptor, host)
+            && owner
+                .descriptor
+                .lock()
+                .is_ok_and(|current| current.as_ref() == Some(&descriptor))
+            && settings
+                .source_descriptor
+                .lock()
+                .is_ok_and(|source| source.as_ref() == Some(&descriptor))
+    }
+    pub(in crate::source_control_auth_ops) fn prepare_connect(
+        &self,
+        registry: Option<&SettingsRegistry>,
+        host: &mut GitlabHost,
+    ) -> Result<Option<Arc<RepositoryWrite>>> {
+        let Some(owner) = self
+            .repository
+            .get()
+            .filter(|owner| owner.settings.get().is_some())
+        else {
+            return self
+                .reserve(host, RepositoryMutationKind::Replace)
+                .map_err(crate::pr_ops::map_sc_err);
+        };
+        let registry = registry.ok_or_else(unavailable)?;
+        let original = registry.snapshot().effective.source_control.gitlab.clone();
+        let settings = owner.settings.get().ok_or_else(unavailable)?;
+        if *settings.config.lock().map_err(|_| unavailable())? != original
+            || settings.source.is_none()
+        {
+            return Err(unavailable());
+        }
+        let mut changes = Vec::new();
+        if super::super::parse_gitlab_host(&original.host)?.host() != host.host() {
+            changes.push((
+                "sourceControl.gitlab.host".into(),
+                Value::String(host.host().into()),
+            ));
+            // The public host parameter is a bare authority. It cannot move a
+            // configured relative root silently to another instance.
+            if original.instance_base_url.is_some() {
+                return Err(unavailable());
+            }
+        }
+        let desired = registry
+            .preview(&changes)?
+            .effective
+            .source_control
+            .gitlab
+            .clone();
+        let descriptor =
+            approved_descriptor(&desired, &settings.fixtures).ok_or_else(unavailable)?;
+        if !matches_host(&descriptor, host) {
+            // Only explicit connect may prepare a new logical host. Route its
+            // bare target through the exact approved full candidate; ordinary
+            // stored-token resolution never borrows this replacement authority.
+            let bare = GitlabHost::parse(host.host()).map_err(|_| unavailable())?;
+            if host.base_url() != bare.base_url() {
+                return Err(unavailable());
+            }
+            let logical =
+                GitlabHost::parse(descriptor.instance().as_str()).map_err(|_| unavailable())?;
+            let prepared = desired
+                .api_base_url
+                .as_deref()
+                .map_or_else(
+                    || Ok(logical.clone()),
+                    |endpoint| logical.clone().with_api_origin(endpoint),
+                )
+                .map_err(|_| unavailable())?;
+            if !matches_host(&descriptor, &prepared) || prepared.host() != host.host() {
+                return Err(unavailable());
+            }
+            *host = prepared;
+        }
+        let reservation = owner
+            .writers
+            .reserve(RepositoryMutationKind::Replace)
+            .map_err(|_| unavailable())?;
+        let mut write = Self::new_write(
+            owner,
+            Some(descriptor),
+            reservation,
+            RepositoryMutationKind::Replace,
+        );
+        Arc::get_mut(&mut write).ok_or_else(unavailable)?.connect = Some(PreparedConnect {
+            original,
+            desired,
+            changes,
+        });
+        Ok(Some(write))
+    }
     pub(crate) fn has_settings_boundary(&self) -> bool {
         self.repository
             .get()
@@ -95,9 +213,19 @@ impl GitlabCredentialGate {
         store: &FileSecretStore,
         fixture: Option<GitlabDescriptor>,
     ) -> Result<()> {
+        self.install_settings_fixtures(registry, secrets, store, fixture.into_iter().collect())
+    }
+
+    fn install_settings_fixtures(
+        &self,
+        registry: &SettingsRegistry,
+        secrets: &AsyncSecretStore,
+        store: &FileSecretStore,
+        fixtures: Vec<GitlabDescriptor>,
+    ) -> Result<()> {
         let owner = self.repository.get().ok_or_else(unavailable)?;
         let config = registry.snapshot().effective.source_control.gitlab.clone();
-        let descriptor = approved_descriptor(&config, fixture.as_ref());
+        let descriptor = approved_descriptor(&config, &fixtures);
         let source = secrets
             .is_paired_gitlab_store(store)
             .then(|| store.path().to_path_buf());
@@ -105,7 +233,7 @@ impl GitlabCredentialGate {
             .settings
             .set(SettingsAttachment {
                 config: Mutex::new(config),
-                fixture,
+                fixtures,
                 store: source.as_ref().map(|_| store.clone()),
                 source,
                 source_descriptor: Mutex::new(descriptor.clone()),
@@ -139,7 +267,7 @@ impl GitlabCredentialGate {
             .writers
             .reserve(RepositoryMutationKind::Replace)
             .map_err(|_| unavailable())?;
-        let descriptor = approved_descriptor(&desired, settings.fixture.as_ref());
+        let descriptor = approved_descriptor(&desired, &settings.fixtures);
         let write = Self::new_write(
             owner,
             descriptor,
@@ -190,9 +318,12 @@ impl GitlabCredentialGate {
             }
             // The successful auth owner may publish only its captured root.
             let settings = owner.settings.get().ok_or_else(unavailable)?;
-            if auth.descriptor.as_ref()
-                != approved_descriptor(new, settings.fixture.as_ref()).as_ref()
+            if auth.descriptor.as_ref() != approved_descriptor(new, &settings.fixtures).as_ref()
                 || auth.descriptor.is_none()
+                || auth
+                    .connect
+                    .as_ref()
+                    .is_some_and(|connect| old != &connect.original || new != &connect.desired)
             {
                 return Err(unavailable());
             }
@@ -214,7 +345,7 @@ impl GitlabCredentialGate {
             owner.descriptor.lock(),
             settings.source_descriptor.lock(),
         ) {
-            let new_descriptor = approved_descriptor(&next, settings.fixture.as_ref());
+            let new_descriptor = approved_descriptor(&next, &settings.fixtures);
             if *descriptor != new_descriptor {
                 *source = None;
             }
@@ -258,7 +389,7 @@ impl GitlabCredentialGate {
             return Err(unavailable());
         }
         let descriptor =
-            approved_descriptor(&current, settings.fixture.as_ref()).ok_or_else(unavailable)?;
+            approved_descriptor(&current, &settings.fixtures).ok_or_else(unavailable)?;
         if !allow_new
             && settings
                 .source_descriptor
@@ -419,13 +550,38 @@ impl crate::Services {
         &self,
         fixture: GitlabDescriptor,
     ) -> Result<()> {
+        self.initialize_repository_test_fixtures(vec![fixture])
+            .await
+    }
+
+    /// Install a bounded immutable set of exact test transports before startup.
+    /// Ordinary initialization never supplies this private authority.
+    ///
+    /// # Errors
+    /// Refuses empty/oversized or ambiguous sets and repeated installation.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "repository-test-fixtures"))]
+    pub async fn initialize_repository_test_fixtures(
+        &self,
+        fixtures: Vec<GitlabDescriptor>,
+    ) -> Result<()> {
+        if fixtures.is_empty()
+            || fixtures.len() > 8
+            || fixtures.iter().enumerate().any(|(i, entry)| {
+                fixtures[..i]
+                    .iter()
+                    .any(|prior| prior.instance() == entry.instance())
+            })
+        {
+            return Err(unavailable());
+        }
         let guard = self.gitlab_credential_gate.lock().await;
         let registry = self.settings_registry.as_deref().ok_or_else(unavailable)?;
-        self.gitlab_credential_gate.install_settings_boundary(
+        self.gitlab_credential_gate.install_settings_fixtures(
             registry,
             &self.secrets,
             &self.gitlab_secret_store,
-            Some(fixture),
+            fixtures,
         )?;
         self.reconcile_gitlab_repository_binding_locked(&guard)
             .await
@@ -512,10 +668,68 @@ impl crate::Services {
         let registry = self.settings_registry.as_deref().ok_or_else(unavailable)?;
         let current = registry.snapshot().effective.source_control.gitlab.clone();
         let settings = write.write.owner.settings.get().ok_or_else(unavailable)?;
+        // An empty original paired source needs no approved HTTP transport or
+        // account adoption. Settle only the actual batch and all three absent
+        // credential slots; partial/unknown storage must stay unavailable.
+        let owner = self
+            .gitlab_credential_gate
+            .repository
+            .get()
+            .ok_or_else(unavailable)?;
+        if !Arc::ptr_eq(owner, &write.write.owner)
+            || settings.source.as_deref() != Some(self.gitlab_secret_store.path())
+            || *settings.config.lock().map_err(|_| unavailable())? != current
+            || current
+                != if compensated {
+                    write.original.clone()
+                } else {
+                    write.desired.clone()
+                }
+        {
+            return Err(unavailable());
+        }
+        let store = settings.store.clone().ok_or_else(unavailable)?;
+        let material = load_material(store, write.lease())
+            .await
+            .map_err(|_| unavailable())?;
+        if registry.snapshot().effective.source_control.gitlab != current
+            || *settings.config.lock().map_err(|_| unavailable())? != current
+        {
+            return Err(unavailable());
+        }
+        if material.is_absent() {
+            write.write.begin().map_err(crate::pr_ops::map_sc_err)?;
+            write
+                .write
+                .complete_settings(SettledCredentialState::Disconnected)?;
+            return Ok(());
+        }
+        if !compensated
+            && current == write.desired
+            && write.original != write.desired
+            && material.is_complete()
+            && !write
+                .secret_changed
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            // The full original batch returned normally and changed metadata
+            // only. Retained bytes are NOT evidence for the new descriptor.
+            // Quarantine every stored-source consumer before releasing this
+            // matching Replace owner; unknown/partial effects stay active.
+            write.write.begin().map_err(crate::pr_ops::map_sc_err)?;
+            *settings
+                .source_descriptor
+                .lock()
+                .map_err(|_| unavailable())? = None;
+            write
+                .write
+                .complete_settings(SettledCredentialState::Unverified)?;
+            return Ok(());
+        }
         let restored_source = compensated
             && current == write.original
             && write.original_source.as_ref()
-                == approved_descriptor(&current, settings.fixture.as_ref()).as_ref()
+                == approved_descriptor(&current, &settings.fixtures).as_ref()
             && write.original_source.is_some();
         let allow_new = restored_source
             || (!compensated
@@ -548,7 +762,7 @@ impl crate::Services {
             .map_err(|_| unavailable())?;
         let token = match material.access() {
             Ok(token) => token.trim(),
-            Err(super::RepositoryCredentialError::Missing) => {
+            Err(super::RepositoryCredentialError::Missing) if material.is_absent() => {
                 if compensated.is_some() {
                     write.begin().map_err(crate::pr_ops::map_sc_err)?;
                     write.complete_settings(SettledCredentialState::Disconnected)?;
@@ -573,7 +787,7 @@ impl crate::Services {
         let settings = write.owner.settings.get().ok_or_else(unavailable)?;
         let descriptor = approved_descriptor(
             &snapshot.effective.source_control.gitlab,
-            settings.fixture.as_ref(),
+            &settings.fixtures,
         )
         .ok_or_else(unavailable)?;
         let account = VerifiedRepositoryAccount::from_verified_user(
@@ -603,6 +817,62 @@ impl crate::Services {
 }
 
 impl RepositoryWrite {
+    pub(super) fn check_connect_config(
+        &self,
+    ) -> std::result::Result<(), super::RepositoryCredentialError> {
+        if let Some(connect) = &self.connect {
+            let settings = self
+                .owner
+                .settings
+                .get()
+                .ok_or(super::RepositoryCredentialError::Unverified)?;
+            if *settings
+                .config
+                .lock()
+                .map_err(|_| super::RepositoryCredentialError::Indeterminate)?
+                != connect.original
+            {
+                return Err(super::RepositoryCredentialError::BoundaryMismatch);
+            }
+        }
+        Ok(())
+    }
+
+    pub(in crate::source_control_auth_ops) fn check_prepared_connect(&self) -> Result<()> {
+        self.check_connect_config().map_err(|_| unavailable())?;
+        let state = self.state.lock().map_err(|_| unavailable())?;
+        state
+            .reservation
+            .as_ref()
+            .ok_or_else(unavailable)?
+            .check_current()
+            .map_err(|_| unavailable())
+    }
+
+    pub(in crate::source_control_auth_ops) fn publish_connect(
+        &self,
+        registry: &SettingsRegistry,
+    ) -> Result<()> {
+        let Some(connect) = &self.connect else {
+            return Err(unavailable());
+        };
+        self.check_connect_config().map_err(|_| unavailable())?;
+        if registry.snapshot().effective.source_control.gitlab != connect.original {
+            return Err(unavailable());
+        }
+        if !connect.changes.is_empty() {
+            registry.apply_with_repository_write(&connect.changes, None, Some(self))?;
+        }
+        if registry.snapshot().effective.source_control.gitlab != connect.desired {
+            return Err(unavailable());
+        }
+        Ok(())
+    }
+
+    pub(in crate::source_control_auth_ops) fn has_prepared_connect(&self) -> bool {
+        self.connect.is_some()
+    }
+
     fn complete_settings(
         &self,
         outcome: SettledCredentialState,

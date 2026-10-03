@@ -66,6 +66,11 @@ impl RepositoryConnectionDirectory {
         Ok(())
     }
 
+    pub(crate) fn check_reservation(&self, ticket: &RepositoryMutationTicket) -> Result<()> {
+        let state = self.lock()?;
+        self.owns_reservation(&state, ticket)
+    }
+
     pub(crate) fn begin_mutation(&self, ticket: &RepositoryMutationTicket) -> Result<()> {
         let mut state = self.lock()?;
         self.owns_reservation(&state, ticket)?;
@@ -122,6 +127,18 @@ impl RepositoryConnectionDirectory {
         let previous = active.previous.clone();
         let previous_child_enabled = active.previous_child_enabled;
         match settled {
+            SettledCredentialState::Unverified => {
+                if ticket.kind != RepositoryMutationKind::Replace {
+                    return Err(RepositoryCredentialError::StaleMutation);
+                }
+                let current = state.child_revision;
+                state.child_revision = state.advance(current)?;
+                state.published = None;
+                state.child_enabled = false;
+                state.child_active = None;
+                state.status = RepositoryConnectionState::Unverified;
+                // Quota/backoff and secret revision are not reset by metadata.
+            }
             SettledCredentialState::Indeterminate => {
                 state.status = RepositoryConnectionState::Indeterminate;
                 return Ok(None);
