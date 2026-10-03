@@ -11297,7 +11297,7 @@ fn inject_git_credential_env(
     cwd: Option<&Path>,
     expose: bool,
 ) {
-    if !expose {
+    if !expose || intent_core::process_policy::ProcessPolicy::current().private_test_profile() {
         return;
     }
     let Some(intentd) = crate::daemon_exe_path() else {

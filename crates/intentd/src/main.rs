@@ -256,6 +256,9 @@ enum Command {
 }
 
 fn main() -> ExitCode {
+    // Freeze process restrictions before runtime/configuration consumers.
+    // Ordinary settings cannot relax an opted-in private test profile.
+    intent_core::process_policy::ProcessPolicy::current();
     // Capture-and-scrub the sitter's update-restart marker before the tokio
     // runtime starts (still single-threaded here, where `env::remove_var` is
     // sound): the daemon's environment is inherited by every subprocess it
@@ -1576,6 +1579,9 @@ async fn cmd_serve(
     // bearer-token enforcement on the TCP path (plain `ws://`), and skips cert
     // provisioning entirely. Dev-only; loudly warned at startup.
     let insecure = insecure || env_flag("INTENTD_INSECURE");
+    if insecure && intent_core::process_policy::ProcessPolicy::current().private_test_profile() {
+        anyhow::bail!("INTENTD_PRIVATE_TEST_PROFILE forbids --insecure / INTENTD_INSECURE");
+    }
     // Resolve the optional locality override (§5.14): `--mode local|remote`
     // forces the value reported over `host.status` regardless of transport;
     // absent ⇒ infer from the transport (UDS local, TCP/WSS remote).
@@ -4185,6 +4191,11 @@ impl intent_core::ServerControl for DaemonControl {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = intent_core::Result<u16>> + Send + '_>>
     {
         Box::pin(async move {
+            if intent_core::process_policy::ProcessPolicy::current().private_test_profile() {
+                return Err(intent_core::Error::InvalidParams(
+                    "INTENTD_PRIVATE_TEST_PROFILE forbids the WS API listener".into(),
+                ));
+            }
             let runtime = &self.ws_runtime;
 
             // Check if already running (don't hold lock across await)
@@ -4406,6 +4417,11 @@ impl intent_core::ServerControl for DaemonControl {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = intent_core::Result<String>> + Send + '_>>
     {
         Box::pin(async move {
+            if intent_core::process_policy::ProcessPolicy::current().private_test_profile() {
+                return Err(intent_core::Error::InvalidParams(
+                    "INTENTD_PRIVATE_TEST_PROFILE forbids tunnels".into(),
+                ));
+            }
             // The tunnel forwards to the WSS port, so the listener must be up
             // (clear, actionable error otherwise — the settings hook surfaces it).
             let Some(port) = self.ws_listener_port().await else {
@@ -4477,6 +4493,26 @@ fn apply_startup_pins(
             .pin(path, value, flag)
             .map_err(|e| anyhow::anyhow!("invalid startup override {flag}: {e}"))
     };
+    if intent_core::process_policy::ProcessPolicy::current().private_test_profile() {
+        for (path, value) in [
+            ("server.bindAddress", json!("127.0.0.1")),
+            ("server.wsApi.enabled", json!(false)),
+            ("server.tunnel.enabled", json!(false)),
+            ("server.tls.enabled", json!(true)),
+            ("server.auth.enabled", json!(true)),
+            ("updates.checkOnIdle", json!(false)),
+            (
+                "sourceControl.github.exposeGitCredentialToChildren",
+                json!(false),
+            ),
+        ] {
+            pin(
+                path,
+                value,
+                intent_core::process_policy::PRIVATE_TEST_PROFILE_ENV,
+            )?;
+        }
+    }
     if insecure {
         // Dev mode hard-disables TLS + bearer auth for the process lifetime.
         pin("server.tls.enabled", json!(false), "--insecure")?;
