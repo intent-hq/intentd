@@ -1827,16 +1827,7 @@ async fn native_wire_final_provider_refresh_busy_and_poison_refuse_original_cont
                     let mut held = None;
                     if mode == "refresh" {
                         let original = auth.request();
-                        f.services
-                            .gitlab_secret_store
-                            .store(EXPIRES_AT_SECRET_ACCOUNT, "0")
-                            .unwrap();
-                        f.services
-                            .stored_proof_token(&crate::source_control_auth_ops::Target::Gitlab {
-                                host: server.host.clone(),
-                            })
-                            .await
-                            .unwrap();
+                        crate::source_control_auth_ops::repository_owner::secret_reader::tests::refresh_original(&f.services, &server.host).await;
                         let current = auth.request();
                         assert_eq!(current.binding, original.binding);
                         assert!(current.secret_revision > original.secret_revision);

@@ -175,18 +175,7 @@ async fn final_verified_refresh_rejects_old_header_then_reacquires_same_binding(
                 provider.get_repo("group", "project"),
             ));
             hold_final(&mut call, &entered, &release).await;
-            f.auth
-                .service
-                .gitlab_secret_store
-                .store(EXPIRES_AT_SECRET_ACCOUNT, "0")
-                .unwrap();
-            f.auth
-                .service
-                .stored_proof_token(&Target::Gitlab {
-                    host: server.host.clone(),
-                })
-                .await
-                .unwrap();
+            crate::source_control_auth_ops::repository_owner::secret_reader::tests::refresh_original(&f.auth.service, &server.host).await;
             let fresh = f.auth.request();
             assert_eq!(fresh.binding, original.binding);
             assert!(fresh.secret_revision > original.secret_revision);

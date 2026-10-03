@@ -1518,18 +1518,9 @@ mod managed {
             (eligibility, operation, target)
         }
         async fn refresh(&self, server: &ReadServer) {
-            self.auth
-                .service
-                .gitlab_secret_store
-                .store(EXPIRES_AT_SECRET_ACCOUNT, "0")
-                .unwrap();
-            self.auth
-                .service
-                .stored_proof_token(&crate::source_control_auth_ops::Target::Gitlab {
-                    host: server.fixture.host.clone(),
-                })
-                .await
-                .unwrap();
+            crate::source_control_auth_ops::repository_owner::secret_reader::tests::refresh_original(
+                &self.auth.service, &server.fixture.host,
+            ).await;
         }
     }
 

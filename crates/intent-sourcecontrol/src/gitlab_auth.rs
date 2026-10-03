@@ -333,12 +333,13 @@ pub async fn refresh_access_token_with_lease(
     store: FileSecretStore,
     lease: Option<PersistenceLease>,
 ) -> Result<Option<Vec<String>>> {
-    refresh_access_token_observed_inner(host, client_id, store, lease, None).await
+    refresh_access_token_observed_inner(host, client_id, store, lease, None, None).await
 }
 
 /// Refresh using the existing exchange and persistence owner, with a fence that
 /// survives caller timeout. Verification failure leaves account evidence absent;
 /// it does not discard a newly rotated pair or invent an account binding.
+/// `refresh_token` is the exact caller-attested operand; this path never reloads it.
 ///
 /// # Errors
 /// As [`refresh_access_token_with_lease`], or the original writer's fence error.
@@ -348,10 +349,18 @@ pub async fn refresh_access_token_observed(
     store: FileSecretStore,
     lease: PersistenceLease,
     observer: std::sync::Arc<dyn GitlabWriteObserver>,
+    refresh_token: SecretString,
 ) -> Result<()> {
-    refresh_access_token_observed_inner(host, client_id, store, Some(lease), Some(observer))
-        .await
-        .map(|_| ())
+    refresh_access_token_observed_inner(
+        host,
+        client_id,
+        store,
+        Some(lease),
+        Some(observer),
+        Some(refresh_token),
+    )
+    .await
+    .map(|_| ())
 }
 
 async fn refresh_access_token_observed_inner(
@@ -360,6 +369,7 @@ async fn refresh_access_token_observed_inner(
     store: FileSecretStore,
     lease: Option<PersistenceLease>,
     observer: Option<std::sync::Arc<dyn GitlabWriteObserver>>,
+    refresh_operand: Option<SecretString>,
 ) -> Result<Option<Vec<String>>> {
     let client_id = client_id.trim();
     if client_id.is_empty() {
@@ -369,7 +379,12 @@ async fn refresh_access_token_observed_inner(
                 .to_string(),
         ));
     }
-    let refresh_token = {
+    // Observed repository refresh receives the exact operand attested by its
+    // original owner. Never reload another value after that admission. The
+    // independent legacy/collaboration API retains its existing store read.
+    let refresh_token = if let Some(token) = refresh_operand {
+        token
+    } else {
         let store = store.clone();
         let handle = tokio::task::spawn_blocking(move || store.load(REFRESH_SECRET_ACCOUNT));
         match timeout(SECRET_WRITE_TIMEOUT, handle).await {

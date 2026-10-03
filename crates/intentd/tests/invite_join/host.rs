@@ -276,6 +276,7 @@ async fn host_invites_admit_gitlab_without_repository_setup_over_wss() {
 async fn github_repository_host_invites_gitlab_member_over_wss() {
     exercise_host_join("gitlab", &[("GITHUB_TOKEN", OWNER_GH_TOKEN)]).await;
 }
+#[cfg(feature = "repository-test-fixtures")]
 #[tokio::test]
 async fn gitlab_repository_host_invites_github_member_over_wss() {
     exercise_host_join("github", &[("GITLAB_TOKEN", HOST_GL_PAT)]).await;
@@ -395,6 +396,7 @@ async fn host_proof_refuses_wrong_provider_instance_and_account_over_wss() {
         .is_none());
 }
 
+#[cfg(feature = "repository-test-fixtures")]
 #[tokio::test]
 async fn host_pin_lookup_refusals_preserve_an_empty_invite_list_over_wss() {
     let mock = spawn_mock_forge().await;

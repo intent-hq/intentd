@@ -4981,8 +4981,7 @@ mod live_context {
                 match mode {
                     "settings" => {services.settings_update(json!([{"path":"git.autoCommit","value":false}])).await.unwrap();}
                     "refresh" => {
-                        services.gitlab_secret_store.store(EXPIRES_AT_SECRET_ACCOUNT,"0").unwrap();
-                        services.stored_proof_token(&crate::source_control_auth_ops::Target::Gitlab{host}).await.unwrap();
+                        crate::source_control_auth_ops::repository_owner::secret_reader::tests::refresh_original(&services,&host).await;
                     }
                     _ => {services.settings_update(json!([{"path":intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT,"value":"replacement-token"}])).await.unwrap();}
                 }

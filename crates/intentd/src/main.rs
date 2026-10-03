@@ -7370,6 +7370,37 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
+/// Deliberate test composition only. Neither normal builds nor the private app
+/// profile interprets this environment input as provider authority.
+#[cfg(feature = "repository-test-fixtures")]
+async fn initialize_gitlab_test_transports(services: &Services) -> anyhow::Result<bool> {
+    let Some(raw) = std::env::var_os("INTENTD_REPOSITORY_TEST_TRANSPORTS") else {
+        return Ok(false);
+    };
+    let raw = raw
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("invalid test transport input"))?;
+    anyhow::ensure!(raw.len() <= 4096, "oversized test transport input");
+    let pairs: Vec<(String, String)> = serde_json::from_str(raw)?;
+    anyhow::ensure!(
+        !pairs.is_empty() && pairs.len() <= 8,
+        "invalid test transport count"
+    );
+    let fixtures = pairs
+        .into_iter()
+        .map(|(instance, endpoint)| {
+            intent_sourcecontrol::GitlabDescriptor::with_loopback_endpoint(
+                intent_sourcecontrol::GitlabInstance::parse(&instance)?,
+                &endpoint,
+            )
+        })
+        .collect::<intent_sourcecontrol::Result<Vec<_>>>()?;
+    services
+        .initialize_repository_test_fixtures(fixtures)
+        .await?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10036,35 +10067,4 @@ mod tests {
             "threads are not descendant processes: a walk rooted at a multi-threaded child must charge nothing"
         );
     }
-}
-
-/// Deliberate test composition only. Neither normal builds nor the private app
-/// profile interprets this environment input as provider authority.
-#[cfg(feature = "repository-test-fixtures")]
-async fn initialize_gitlab_test_transports(services: &Services) -> anyhow::Result<bool> {
-    let Some(raw) = std::env::var_os("INTENTD_REPOSITORY_TEST_TRANSPORTS") else {
-        return Ok(false);
-    };
-    let raw = raw
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("invalid test transport input"))?;
-    anyhow::ensure!(raw.len() <= 4096, "oversized test transport input");
-    let pairs: Vec<(String, String)> = serde_json::from_str(raw)?;
-    anyhow::ensure!(
-        !pairs.is_empty() && pairs.len() <= 8,
-        "invalid test transport count"
-    );
-    let fixtures = pairs
-        .into_iter()
-        .map(|(instance, endpoint)| {
-            intent_sourcecontrol::GitlabDescriptor::with_loopback_endpoint(
-                intent_sourcecontrol::GitlabInstance::parse(&instance)?,
-                &endpoint,
-            )
-        })
-        .collect::<intent_sourcecontrol::Result<Vec<_>>>()?;
-    services
-        .initialize_repository_test_fixtures(fixtures)
-        .await?;
-    Ok(true)
 }

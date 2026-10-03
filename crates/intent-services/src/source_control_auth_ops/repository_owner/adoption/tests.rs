@@ -1014,6 +1014,14 @@ async fn attached_same_account_refresh_preserves_real_ticket_quota_and_rejects_o
     let server = Server::new().await;
     let f = Fixture::new(&server).await;
     f.services
+        .gitlab_secret_store
+        .store(REFRESH_SECRET_ACCOUNT, "refresh-old")
+        .unwrap();
+    f.services
+        .gitlab_secret_store
+        .store(EXPIRES_AT_SECRET_ACCOUNT, "9999999999")
+        .unwrap();
+    f.services
         .reconcile_gitlab_repository_binding()
         .await
         .unwrap();
@@ -1048,17 +1056,12 @@ async fn attached_same_account_refresh_preserves_real_ticket_quota_and_rejects_o
         .acquire_exact(&admission, reader.as_ref(), Duration::from_secs(2))
         .await
         .unwrap();
-    f.services
-        .gitlab_secret_store
-        .store(REFRESH_SECRET_ACCOUNT, "refresh-old")
-        .unwrap();
-    f.services
-        .gitlab_secret_store
-        .store(EXPIRES_AT_SECRET_ACCOUNT, "0")
-        .unwrap();
     *server.control.pause.lock().unwrap() = Some("grant_type=refresh_token");
     let svc = f.services.clone();
-    let refresh = tokio::spawn(async move { svc.reconcile_gitlab_repository_binding().await });
+    let host = server.host.clone();
+    let refresh = tokio::spawn(async move {
+        super::super::secret_reader::tests::refresh_original(&svc, &host).await;
+    });
     server.entered().await;
     assert_eq!(
         f.directory.binding().unwrap_err(),
@@ -1076,7 +1079,7 @@ async fn attached_same_account_refresh_preserves_real_ticket_quota_and_rejects_o
         .record_backoff(ticket.dispatch_stamp(), Instant::now())
         .unwrap());
     server.control.release.notify_one();
-    refresh.await.unwrap().unwrap();
+    refresh.await.unwrap();
     assert_eq!(f.directory.binding().unwrap(), binding);
     assert!(!f
         .directory

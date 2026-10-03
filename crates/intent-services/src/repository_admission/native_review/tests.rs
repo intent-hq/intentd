@@ -1814,9 +1814,14 @@ async fn native_review_virtual_bounds_and_checked_cursor_never_revive_original()
     );
     let p = s.prepare(&f, f.query(Stage::CreatePr)).await;
     let q = command(&f, &p, Stage::CreatePr);
-    s.request(&f.services, Frame::Execute(q.clone()))
+    let execution = s
+        .request(&f.services, Frame::Execute(q.clone()))
         .await
         .unwrap();
+    eprintln!(
+        "virtual bounds original execution={execution} posts={}",
+        f.server.control.posts.load(Ordering::SeqCst)
+    );
     let op = c.review.feed.lock().unwrap().records[&q.review.operation_id].clone();
     tokio::time::pause();
     tokio::time::advance(RECEIPT_TTL + Duration::from_secs(1)).await;

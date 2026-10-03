@@ -147,6 +147,37 @@ impl Fixture {
     }
 }
 
+/// Exercise a real reserved refresh without falsifying the original attested
+/// expiry. Public expiry-triggered behavior is qualified separately.
+pub(crate) async fn refresh_original(
+    service: &crate::Services,
+    host: &intent_sourcecontrol::GitlabHost,
+) {
+    let guard = service.gitlab_credential_gate.lock().await;
+    assert!(service
+        .gitlab_credential_gate
+        .original_source_current(host, &service.gitlab_secret_store, &guard, None)
+        .await
+        .unwrap());
+    let write = service
+        .gitlab_credential_gate
+        .reserve(
+            host,
+            crate::repository_credentials::RepositoryMutationKind::Refresh,
+        )
+        .unwrap();
+    let client = service.gitlab_client_id(host);
+    assert!(crate::source_control_auth_ops::try_refresh(
+        host,
+        client.as_deref(),
+        service.gitlab_secret_store.clone(),
+        &guard,
+        write
+    )
+    .await
+    .is_ok());
+}
+
 #[intent_test_macros::daemon_test]
 async fn reader_uses_real_startup_proof_without_more_http_or_writes() {
     let server = Server::new().await;
@@ -1049,4 +1080,143 @@ async fn execution_presence_uses_full_configured_root_and_original_source() {
         Some("https://gitlab.test/forge")
     );
     assert_eq!(server.control.requests.lock().unwrap().len(), calls);
+}
+
+async fn refresh_operand_interval(retry: bool, rewrite: bool) {
+    use intent_core::WorkspaceApi;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct EnvRestore(Option<std::ffi::OsString>);
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            if let Some(value) = &self.0 {
+                std::env::set_var("GITLAB_TOKEN", value);
+            } else {
+                std::env::remove_var("GITLAB_TOKEN");
+            }
+        }
+    }
+    let _env = EnvRestore(std::env::var_os("GITLAB_TOKEN"));
+    std::env::set_var("GITLAB_TOKEN", "owned-env-fallback-must-not-run");
+    let server = Server::new().await;
+    let mut f = Fixture::unadopted(&server).await;
+    let bus = crate::events::EventBus::new(f.service.store.clone());
+    Arc::get_mut(&mut f.service).unwrap().event_bus = Some(bus);
+    let source = f.service.gitlab_secret_store.clone();
+    source.store(REFRESH_SECRET_ACCOUNT, "old-refresh").unwrap();
+    source
+        .store(
+            EXPIRES_AT_SECRET_ACCOUNT,
+            if retry { "9999999999" } else { "0" },
+        )
+        .unwrap();
+    if !retry {
+        // The actual cold exchange publishes an already-expired tuple. Do not
+        // falsify the expiry of an adopted credential to trigger the next read.
+        *server.control.token_reply.lock().unwrap() = Some((
+            200,
+            json!({"access_token":"rotated","refresh_token":"refresh-rotated","expires_in":0}),
+        ));
+    }
+    f.service
+        .reconcile_gitlab_repository_binding()
+        .await
+        .unwrap();
+    *server.control.token_reply.lock().unwrap() = None;
+    *server.control.denied_user.lock().unwrap() = retry.then_some("stored-pat");
+    let original = std::fs::read(source.path()).unwrap();
+    let old_access = source.load(SECRET_ACCOUNT).unwrap();
+    let old_expiry = source.load(EXPIRES_AT_SECRET_ACCOUNT).unwrap();
+    let before_posts = server.control.exchanges.load(Ordering::SeqCst);
+    let before_http = server.control.requests.lock().unwrap().len();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let observed = reads.clone();
+    let external = source.clone();
+    let owner = f.service.gitlab_credential_gate.repository.get().unwrap();
+    let operand_read = if retry { 5 } else { 2 };
+    *owner.evidence.read_probe.lock().unwrap() = Some(Arc::new(move || {
+        if observed.fetch_add(1, Ordering::SeqCst) + 1 == operand_read && rewrite {
+            // Earlier original-source validation has returned. Change only the
+            // real file's refresh sibling before the producer operand is read.
+            external
+                .store(REFRESH_SECRET_ACCOUNT, "external-unattested-refresh")
+                .unwrap();
+        }
+    }));
+    let result = f
+        .service
+        .source_control_get_user("gitlab".into(), None)
+        .await;
+    *owner.evidence.read_probe.lock().unwrap() = None;
+    let http = server.control.requests.lock().unwrap()[before_http..].to_vec();
+    let posts = server.control.exchanges.load(Ordering::SeqCst) - before_posts;
+    let events = f
+        .service
+        .store
+        .query_events(&intent_store::EventQuery {
+            event_types: vec![intent_core::events::SOURCE_CONTROL_AUTH_CHANGED.into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    eprintln!("refresh operand retry={retry} rewrite={rewrite} reads={} result={result:?} posts={posts} paths={http:?} auth_events={}", reads.load(Ordering::SeqCst), events.len());
+    assert!(reads.load(Ordering::SeqCst) >= operand_read);
+    assert!(
+        events.is_empty(),
+        "local refusal must not emit upstream expiry/revocation"
+    );
+    if rewrite {
+        assert!(
+            matches!(result, Err(intent_core::Error::Internal(ref message)) if message == "repository admission retired")
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), operand_read);
+        assert_eq!(posts, 0);
+        assert_eq!(http, if retry { vec!["/api/v4/user"] } else { vec![] });
+        assert_eq!(source.load(SECRET_ACCOUNT).unwrap(), old_access);
+        assert_eq!(source.load(EXPIRES_AT_SECRET_ACCOUNT).unwrap(), old_expiry);
+        assert_eq!(
+            source.load(REFRESH_SECRET_ACCOUNT).unwrap().as_deref(),
+            Some("external-unattested-refresh")
+        );
+        std::fs::write(source.path(), original).unwrap();
+        assert!(
+            f.service.own_gitlab_token(&server.host).await.is_none(),
+            "restoring bytes cannot repair the observed original proof"
+        );
+        assert_eq!(
+            server.control.exchanges.load(Ordering::SeqCst),
+            before_posts
+        );
+    } else {
+        assert_eq!(result.unwrap()["user"]["id"], "42");
+        assert_eq!(posts, 1);
+        assert_eq!(
+            source.load(REFRESH_SECRET_ACCOUNT).unwrap().as_deref(),
+            Some("refresh-rotated")
+        );
+        assert_eq!(
+            f.service.own_gitlab_token(&server.host).await.as_deref(),
+            Some("rotated")
+        );
+        assert!(f
+            .service
+            .repository_connection_directory()
+            .binding()
+            .is_ok());
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn refresh_operand_initial_interval_rewrite_is_local_without_post_or_expiry() {
+    refresh_operand_interval(false, true).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn refresh_operand_retry_interval_rewrite_is_local_without_post_or_expiry() {
+    refresh_operand_interval(true, true).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn refresh_operand_unchanged_source_initial_and_retry_remain_supported() {
+    refresh_operand_interval(false, false).await;
+    refresh_operand_interval(true, false).await;
 }

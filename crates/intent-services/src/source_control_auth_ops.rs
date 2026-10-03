@@ -807,6 +807,16 @@ async fn try_refresh(
     guard: &GitlabCredentialGuard,
     write: Option<Arc<RepositoryWrite>>,
 ) -> std::result::Result<(), RefreshFailure> {
+    let refresh_operand = if let Some(write) = &write {
+        Some(
+            write
+                .refresh_operand(&store, guard.lease())
+                .await
+                .map_err(RefreshFailure::Local)?,
+        )
+    } else {
+        None
+    };
     let Some(client_id) = client_id else {
         tracing::warn!(
             host = host.host(),
@@ -823,6 +833,9 @@ async fn try_refresh(
             store,
             guard.lease(),
             write.clone(),
+            refresh_operand.ok_or(RefreshFailure::Local(
+                intent_sourcecontrol::Error::AdmissionRetired,
+            ))?,
         )
         .await
     } else {

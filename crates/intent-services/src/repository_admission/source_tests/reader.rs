@@ -45,7 +45,6 @@ use crate::repository_credentials::{
 use crate::source_control_auth_ops::repository_owner::secret_reader::tests::{
     Fixture, PausedRead, Server,
 };
-use crate::source_control_auth_ops::Target;
 
 const BUDGET: Duration = Duration::from_secs(5);
 
@@ -905,18 +904,7 @@ async fn verified_same_binding_refresh_reacquires_real_file_without_resetting_qu
                     .acquire_exact(&request, reader.as_ref(), BUDGET)
                     .await
                     .unwrap();
-                f.auth
-                    .service
-                    .gitlab_secret_store
-                    .store(EXPIRES_AT_SECRET_ACCOUNT, "0")
-                    .unwrap();
-                f.auth
-                    .service
-                    .stored_proof_token(&Target::Gitlab {
-                        host: server.host.clone(),
-                    })
-                    .await
-                    .unwrap();
+                crate::source_control_auth_ops::repository_owner::secret_reader::tests::refresh_original(&f.auth.service, &server.host).await;
                 let fresh = f.auth.request();
                 assert_eq!(fresh.binding, old.binding);
                 assert!(fresh.secret_revision > old.secret_revision);

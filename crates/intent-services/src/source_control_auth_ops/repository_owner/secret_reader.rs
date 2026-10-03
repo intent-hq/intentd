@@ -308,6 +308,86 @@ impl GitlabCredentialGate {
     }
 }
 
+impl super::RepositoryWrite {
+    /// Load the producer operand and compare that SAME tuple with the original
+    /// settled proof before starting the exchange. A matching subsequent reload
+    /// would not bind the value actually sent to GitLab.
+    pub(in crate::source_control_auth_ops) async fn refresh_operand(
+        &self,
+        store: &FileSecretStore,
+        lease: PersistenceLease,
+    ) -> intent_sourcecontrol::Result<SecretString> {
+        let original = self
+            .owner
+            .evidence
+            .published
+            .lock()
+            .map_err(|_| Error::Indeterminate)?
+            .clone();
+        let check = || -> Result<()> {
+            let state = self.state.lock().map_err(|_| Error::Indeterminate)?;
+            state
+                .reservation
+                .as_ref()
+                .ok_or(Error::StaleMutation)?
+                .check_current()?;
+            if let Some(settings) = self.owner.settings.get() {
+                let descriptor = self.descriptor.as_ref().ok_or(Error::Unverified)?;
+                self.owner.check_descriptor(descriptor)?;
+                if settings.source.as_deref() != Some(store.path())
+                    || settings.store.as_ref().map(FileSecretStore::path) != Some(store.path())
+                    || settings
+                        .source_descriptor
+                        .lock()
+                        .map_err(|_| Error::Indeterminate)?
+                        .as_ref()
+                        != Some(descriptor)
+                {
+                    return Err(Error::BoundaryMismatch);
+                }
+                if let Some(original) = &original {
+                    let current = self.owner.current_source(&original.request)?;
+                    if !Arc::ptr_eq(original, &current) {
+                        return Err(Error::StaleMutation);
+                    }
+                } else if !matches!(
+                    self.owner.directory.binding(),
+                    Err(Error::Unverified | Error::Disconnected)
+                ) {
+                    // Cold adoption remains possible only on the original
+                    // configured source. A missing proof for a settled binding
+                    // cannot be turned into cold authority by restoring bytes.
+                    return Err(Error::Unverified);
+                }
+            }
+            Ok(())
+        };
+        check()?;
+        #[cfg(test)]
+        let probe = self.owner.evidence.read_probe.lock().unwrap().clone();
+        #[cfg(test)]
+        if let Some(probe) = probe {
+            probe();
+        }
+        let material = load_material(store.clone(), lease).await?;
+        check()?;
+        if let Some(original) = &original {
+            if material.fingerprint(&self.owner.evidence) != original.fingerprint {
+                self.owner.evidence.invalidate_matching(original)?;
+                return Err(intent_sourcecontrol::Error::AdmissionRetired);
+            }
+        }
+        if self.owner.settings.get().is_some() && !material.is_complete() {
+            return Err(intent_sourcecontrol::Error::AdmissionRetired);
+        }
+        material
+            .refresh
+            .filter(|token| !token.trim().is_empty())
+            .map(SecretString::from)
+            .ok_or(intent_sourcecontrol::Error::AdmissionRetired)
+    }
+}
+
 impl RepositoryOwner {
     pub(super) fn publish_source(
         &self,

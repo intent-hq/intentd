@@ -927,20 +927,11 @@ async fn context_output_actual_same_binding_refresh_keeps_required_output_and_om
     });
     gate.reached().await;
     assert_eq!(c.events.lock().unwrap().as_slice(), &[2]);
-    f.base
-        .auth
-        .service
-        .gitlab_secret_store
-        .store(EXPIRES_AT_SECRET_ACCOUNT, "0")
-        .unwrap();
-    f.base
-        .auth
-        .service
-        .stored_proof_token(&crate::source_control_auth_ops::Target::Gitlab {
-            host: http.fixture.host.clone(),
-        })
-        .await
-        .unwrap();
+    crate::source_control_auth_ops::repository_owner::secret_reader::tests::refresh_original(
+        &f.base.auth.service,
+        &http.fixture.host,
+    )
+    .await;
     let current = f.base.auth.request();
     assert_eq!(current.binding, original.binding);
     assert!(current.secret_revision > original.secret_revision);

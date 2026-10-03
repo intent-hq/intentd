@@ -167,13 +167,17 @@ async fn observed_partial_failure_and_panic_are_uncertain_without_rollback() {
 #[tokio::test]
 async fn observed_refresh_reports_verified_account_without_exporting_the_pair() {
     for accepted in [true, false] {
-        let mock = spawn_mock(Arc::new(move |method, path, _body| match (method, path) {
-            ("POST", "/oauth/token") => (200, json!({"access_token":"rotated","refresh_token":"rotated-refresh","expires_in":7200})),
+        let mock = spawn_mock(Arc::new(move |method, path, body| match (method, path) {
+            ("POST", "/oauth/token") => {
+                assert!(body.contains("refresh_token=old-refresh"));
+                assert!(!body.contains("unattested-reload"));
+                (200, json!({"access_token":"rotated","refresh_token":"rotated-refresh","expires_in":7200}))
+            },
             ("GET", "/api/v4/user") if accepted => (200, user_body()),
             _ => (401, json!({"error":"rejected"})),
         })).await;
         let (_dir, store) = temp_store();
-        store.store(REFRESH_SECRET_ACCOUNT, "old-refresh").unwrap();
+        store.store(REFRESH_SECRET_ACCOUNT, "unattested-reload").unwrap();
         let observer = Arc::new(Observer::default());
         refresh_access_token_observed(
             &mock.host,
@@ -181,6 +185,7 @@ async fn observed_refresh_reports_verified_account_without_exporting_the_pair() 
             store.clone(),
             Arc::new(()),
             observer.clone(),
+            SecretString::from("old-refresh"),
         )
         .await
         .unwrap();

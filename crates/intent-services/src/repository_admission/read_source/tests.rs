@@ -576,7 +576,6 @@ async fn detached_actual_file_read_cancellation_keeps_lease_and_never_dispatches
 
 #[intent_test_macros::daemon_test]
 async fn actual_same_binding_refresh_preserves_old_denial_quota_without_rebinding() {
-    use intent_sourcecontrol::gitlab_token::EXPIRES_AT_SECRET_ACCOUNT;
     for status in [401, 403, 404] {
         let http = ReadServer::new().await;
         let f = ActualRead::oauth(&http).await;
@@ -598,18 +597,11 @@ async fn actual_same_binding_refresh_preserves_old_denial_quota_without_rebindin
             .await
         });
         http.entered().await;
-        f.auth
-            .service
-            .gitlab_secret_store
-            .store(EXPIRES_AT_SECRET_ACCOUNT, "0")
-            .unwrap();
-        f.auth
-            .service
-            .stored_proof_token(&crate::source_control_auth_ops::Target::Gitlab {
-                host: http.fixture.host.clone(),
-            })
-            .await
-            .unwrap();
+        crate::source_control_auth_ops::repository_owner::secret_reader::tests::refresh_original(
+            &f.auth.service,
+            &http.fixture.host,
+        )
+        .await;
         let current = f.auth.request();
         assert_eq!(current.binding, original.binding);
         assert!(current.secret_revision > original.secret_revision);
