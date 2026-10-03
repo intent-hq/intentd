@@ -677,3 +677,265 @@ fn parse_cursor_requires_three_non_negative_integers() {
         );
     }
 }
+
+#[tokio::test]
+async fn focus_snapshot_checks_source_person_destinations_and_resource_ownership() {
+    use intent_core::{with_caller, Caller, Error, PrincipalId, WorkspaceId, WorkspaceRole};
+    let tmp = crate::tests::TempDb::new();
+    let root = crate::tests::WorkspacesRoot::new();
+    let (store, services, source, caller) = member_services(&tmp, &root).await;
+    let viewer = match &caller {
+        Caller::Wire { principal_id, .. } => principal_id.clone(),
+        _ => unreachable!(),
+    };
+    let mut person = store.get_principal(&viewer).await.unwrap();
+    person.id = PrincipalId::new(); // Same handle is deliberately NOT the same identity.
+    store.upsert_principal(&person).await.unwrap();
+    store
+        .add_workspace_member(&source, &person.id, WorkspaceRole::Collaborator)
+        .await
+        .unwrap();
+    let destination = WorkspaceId::new();
+    store
+        .insert_workspace(&crate::tests::workspace(&destination))
+        .await
+        .unwrap();
+    store
+        .add_workspace_member(&destination, &person.id, WorkspaceRole::Collaborator)
+        .await
+        .unwrap();
+    let person_caller = Caller::Wire {
+        principal_id: person.id.clone(),
+        host_role: intent_core::HostRole::Guest,
+    };
+    with_caller(person_caller.clone(), async {
+        services.presence_connect_op("person".into()).await.unwrap();
+        services
+            .presence_update_op(
+                "person".into(),
+                json!({"focus":[{"workspaceId":destination}]}),
+            )
+            .await
+            .unwrap();
+    })
+    .await;
+    let snapshot = || {
+        with_caller(
+            caller.clone(),
+            services.presence_focus_snapshot_op(source.clone(), person.id.clone()),
+        )
+    };
+    assert_eq!(snapshot().await.unwrap()["target"], Value::Null);
+    store
+        .add_workspace_member(&destination, &viewer, WorkspaceRole::Collaborator)
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot().await.unwrap()["target"],
+        json!({"workspaceId":destination})
+    );
+    // Inherited host membership works without a direct grant, but a stale admitted
+    // role is not authority after removal.
+    store
+        .remove_workspace_member(&destination, &viewer)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO host_member(principal_id, added_at) VALUES (?,?)")
+        .bind(viewer.as_str())
+        .bind(intent_core::now_iso())
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot().await.unwrap()["target"],
+        json!({"workspaceId":destination})
+    );
+    sqlx::query("DELETE FROM host_member WHERE principal_id=?")
+        .bind(viewer.as_str())
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    assert_eq!(snapshot().await.unwrap()["target"], Value::Null);
+    store
+        .add_workspace_member(&destination, &viewer, WorkspaceRole::Collaborator)
+        .await
+        .unwrap();
+    // Missing agent/note and mixed-resource entries never become destinations.
+    for focus in [
+        json!({"workspaceId":destination,"agentId":"forged"}),
+        json!({"workspaceId":destination,"noteId":"forged"}),
+        json!({"workspaceId":destination,"agentId":"forged","noteId":"forged"}),
+    ] {
+        with_caller(
+            person_caller.clone(),
+            services.presence_update_op("person".into(), json!({"focus":[focus]})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(snapshot().await.unwrap()["target"], Value::Null);
+    }
+    // Valid resource ownership is checked independently of the claimed workspace.
+    let now = intent_core::now_iso();
+    sqlx::query("INSERT INTO note(id,workspace_id,title,content,created_at,updated_at) VALUES ('view-note',?,'private title','',?,?)")
+        .bind(destination.as_str()).bind(&now).bind(&now).execute(store.write_pool()).await.unwrap();
+    sqlx::query("INSERT INTO agent_session(id,workspace_id,name,status,created_at,updated_at) VALUES ('view-agent',?,'private agent','Idle',?,?)")
+        .bind(destination.as_str()).bind(&now).bind(&now).execute(store.write_pool()).await.unwrap();
+    for (key, id) in [("agentId", "view-agent"), ("noteId", "view-note")] {
+        let mut valid = json!({"workspaceId":destination});
+        valid[key] = json!(id);
+        with_caller(
+            person_caller.clone(),
+            services.presence_update_op("person".into(), json!({"focus":[valid.clone()]})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(snapshot().await.unwrap()["target"], valid);
+        valid["workspaceId"] = json!(source);
+        with_caller(
+            person_caller.clone(),
+            services.presence_update_op("person".into(), json!({"focus":[valid]})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(snapshot().await.unwrap()["target"], Value::Null);
+    }
+    // Input order never chooses the destination. Agent, note, bare ordering
+    // and stable resource-ID ties give the same result across current views.
+    sqlx::query("INSERT INTO agent_session(id,workspace_id,name,status,created_at,updated_at) VALUES ('zzz-agent',?,'private agent','Idle',?,?)")
+        .bind(destination.as_str()).bind(&now).bind(&now).execute(store.write_pool()).await.unwrap();
+    let mut current = vec![
+        json!({"workspaceId":destination}),
+        json!({"workspaceId":destination,"noteId":"view-note"}),
+        json!({"workspaceId":destination,"agentId":"zzz-agent"}),
+        json!({"workspaceId":destination,"agentId":"view-agent"}),
+    ];
+    for _ in 0..current.len() {
+        with_caller(
+            person_caller.clone(),
+            services.presence_update_op("person".into(), json!({"focus":current})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            snapshot().await.unwrap()["target"],
+            json!({"workspaceId":destination,"agentId":"view-agent"})
+        );
+        current.rotate_left(1);
+    }
+    // Person destination access is checked too, even with a cached focus row.
+    with_caller(
+        person_caller.clone(),
+        services.presence_update_op(
+            "person".into(),
+            json!({"focus":[{"workspaceId":destination}]}),
+        ),
+    )
+    .await
+    .unwrap();
+    store
+        .remove_workspace_member(&destination, &person.id)
+        .await
+        .unwrap();
+    assert_eq!(snapshot().await.unwrap()["target"], Value::Null);
+    store
+        .add_workspace_member(&destination, &person.id, WorkspaceRole::Collaborator)
+        .await
+        .unwrap();
+    // Soft-deleted destinations must not remain reachable through cached focus.
+    sqlx::query("UPDATE workspace SET status='Deleted' WHERE id=?")
+        .bind(destination.as_str())
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    assert_eq!(snapshot().await.unwrap()["target"], Value::Null);
+    sqlx::query("UPDATE workspace SET status='Active' WHERE id=?")
+        .bind(destination.as_str())
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    // Source focus wins deterministic selection over other current windows.
+    with_caller(
+        person_caller.clone(),
+        services.presence_update_op(
+            "person".into(),
+            json!({"focus":[{"workspaceId":destination},{"workspaceId":source}]}),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        snapshot().await.unwrap()["target"],
+        json!({"workspaceId":source})
+    );
+    services.presence_disconnect_op("person".into()).await;
+    assert_eq!(snapshot().await.unwrap()["target"], Value::Null);
+    store
+        .remove_workspace_member(&source, &person.id)
+        .await
+        .unwrap();
+    let unrelated = snapshot().await.unwrap_err();
+    let unknown = with_caller(
+        caller.clone(),
+        services.presence_focus_snapshot_op(source.clone(), PrincipalId::new()),
+    )
+    .await
+    .unwrap_err();
+    let missing_source = with_caller(
+        caller.clone(),
+        services.presence_focus_snapshot_op(WorkspaceId::new(), person.id.clone()),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(unrelated.to_string(), unknown.to_string());
+    assert_eq!(unknown.to_string(), missing_source.to_string());
+    assert!(matches!(
+        with_caller(
+            Caller::Daemon,
+            services.presence_focus_snapshot_op(source, person.id)
+        )
+        .await,
+        Err(Error::Forbidden(_))
+    ));
+}
+
+#[tokio::test]
+async fn focus_move_during_async_projection_never_restores_old_target() {
+    use intent_core::{with_caller, Caller};
+    let tmp = crate::tests::TempDb::new();
+    let root = crate::tests::WorkspacesRoot::new();
+    let (_store, services, ws, caller) = member_services(&tmp, &root).await;
+    let principal = match &caller {
+        Caller::Wire { principal_id, .. } => principal_id.clone(),
+        _ => unreachable!(),
+    };
+    with_caller(caller.clone(), async {
+        services.presence_connect_op("person".into()).await.unwrap();
+        services
+            .presence_update_op("person".into(), json!({"focus":[{"workspaceId":ws}]}))
+            .await
+            .unwrap();
+    })
+    .await;
+    let pause = std::sync::Arc::new(super::ProfileFetchPause::default());
+    *services.presence.focus_fetch_pause.lock().unwrap() = Some(pause.clone());
+    let read = with_caller(
+        caller.clone(),
+        services.presence_focus_snapshot_op(ws, principal),
+    );
+    let mutation = async {
+        pause.fetched.notified().await;
+        with_caller(
+            caller,
+            services.presence_update_op("person".into(), json!({"focus":[]})),
+        )
+        .await
+        .unwrap();
+        pause.resume.notify_one();
+    };
+    let (result, ()) = tokio::time::timeout(scaled_timeout(Duration::from_secs(5)), async {
+        tokio::join!(read, mutation)
+    })
+    .await
+    .unwrap();
+    assert_eq!(result.unwrap()["target"], Value::Null);
+}

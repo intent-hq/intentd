@@ -62,6 +62,7 @@ pub(crate) enum Channel {
     /// frames. Subscribing is itself the "I am viewing" signal (the
     /// subscription holds a viewer lease released on unsubscribe / close).
     NotePresence,
+    PresenceFocus,
 }
 
 /// A classified subscription fast-path request awaiting handling by the
@@ -197,6 +198,11 @@ pub(crate) fn classify(value: &Value) -> Option<SubFastPath> {
             channel: Channel::Chat,
             params,
         }),
+        "presence.focus.subscribe" => Some(SubFastPath::Subscribe {
+            id,
+            channel: Channel::PresenceFocus,
+            params,
+        }),
         "note.presence.subscribe" => Some(SubFastPath::Subscribe {
             id,
             channel: Channel::NotePresence,
@@ -221,6 +227,7 @@ pub(crate) fn classify(value: &Value) -> Option<SubFastPath> {
         | "workspace.unsubscribe"
         | "comment.unsubscribe"
         | "chat.unsubscribe"
+        | "presence.focus.unsubscribe"
         | "note.presence.unsubscribe" => Some(SubFastPath::Unsubscribe { id, params }),
         "agent.unsubscribe" if !params.contains_key("workspaceId") => {
             Some(SubFastPath::Unsubscribe { id, params })
@@ -469,6 +476,7 @@ pub(crate) fn channel_name(channel: Channel) -> &'static str {
         Channel::Comment => "comment",
         Channel::Chat => "chat",
         Channel::NotePresence => "note.presence",
+        Channel::PresenceFocus => "presence.focus",
     }
 }
 
@@ -728,6 +736,7 @@ pub(crate) fn channel_event_types(channel: Channel) -> Vec<String> {
         // Transient only: the forwarder narrows the workspace-wide stream to
         // one note by `data.noteId` ([`note_presence_delta`]).
         Channel::NotePresence => &[NOTE_PRESENCE],
+        Channel::PresenceFocus => &[],
     };
     types.iter().map(std::string::ToString::to_string).collect()
 }
@@ -788,7 +797,7 @@ pub(crate) async fn channel_snapshot(
         // snapshot, CS-0 D3), so this generic arm is unreachable. The
         // note-presence channel's snapshot is the join's return value
         // (`note_presence_join`, served by `forward_note_presence_subscription`).
-        Channel::Chat | Channel::NotePresence => empty(),
+        Channel::Chat | Channel::NotePresence | Channel::PresenceFocus => empty(),
     }
 }
 
@@ -1939,7 +1948,7 @@ pub(crate) async fn channel_delta(
         // spec-body edit can refresh flipped `specLinked` flags
         // (monorepo#2407) — so this generic stateless arm is unreachable for
         // `Task`.
-        Channel::Task | Channel::Chat | Channel::NotePresence => None,
+        Channel::Task | Channel::Chat | Channel::NotePresence | Channel::PresenceFocus => None,
         // The chat channel uses the dedicated, stateful [`ChatDeltaState`] mapper
         // on the `forward_chat_subscription` path (CS-3) — its deltas are
         // event-payload-driven, not re-read — so this generic re-read arm is
