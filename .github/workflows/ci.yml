@@ -804,6 +804,62 @@ jobs:
       - name: Clippy (target-gated code)
         if: needs.release-fast-path.outputs.fast_path != 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && (runner.os == 'macOS' || runner.os == 'Windows')
         run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
+      # Exercise the deterministic deadline oracle and real TLS controls on
+      # macOS; listen backlog saturation cannot guarantee a pending connect.
+      - name: Tunnel deadline and TLS controls (macOS runtime)
+        if: needs.release-fast-path.outputs.fast_path != 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && runner.os == 'macOS'
+        timeout-minutes: 20
+        shell: bash
+        env:
+          INTENTD_TUNNEL_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
+          INTENTD_TUNNEL_TARGET: ${{ matrix.target }}
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          python3 -I -B -S - <<'PYTHON'
+          import os, signal, subprocess
+
+          cargo = ["rustup", "run", os.environ["INTENTD_TUNNEL_TOOLCHAIN"],
+                   "cargo", "test", "--locked", "--target", os.environ["INTENTD_TUNNEL_TARGET"]]
+          groups = [
+              (["-p", "intent-transport", "--lib"], [
+                  "tunnel::tests::connect_pending_deadline_emits_terminal_open_err",
+                  "tunnel::tests::connect_reset_preserves_error_before_deadline",
+                  "tunnel::tests::connect_success_before_deadline_relays",
+              ]),
+              (["-p", "intentd", "--test", "e2e_wss_tunnel"], [
+                  "tunnel_open_echo_eof_close_lifecycle",
+                  "tunnel_open_err_for_closed_port_keeps_connection_alive",
+                  "tunnel_close_tears_down_and_frees_stream_id",
+                  "tunnel_connections_counted_in_health_and_stopped",
+                  "tunnel_unauthenticated_upgrade_rejected",
+              ]),
+          ]
+
+          def bounded(command):
+              child = subprocess.Popen(command, stdout=subprocess.PIPE,
+                                       stderr=subprocess.STDOUT, text=True, start_new_session=True)
+              try:
+                  output, _ = child.communicate(timeout=30)
+                  print(output, end="", flush=True)
+                  assert child.returncode == 0, (command, child.returncode)
+                  return output
+              except subprocess.TimeoutExpired:
+                  os.killpg(child.pid, signal.SIGKILL)
+                  output, _ = child.communicate()
+                  print(output, end="", flush=True)
+                  raise
+
+          for package, tests in groups:
+              subprocess.run(cargo + package + ["--no-run"], check=True)
+              for test in tests:
+                  command = cargo + package + [test, "--", "--exact"]
+                  listed = bounded(command + ["--list"])
+                  assert test + ": test" in listed.splitlines(), listed
+                  assert "1 test, 0 benchmarks" in listed.splitlines(), listed
+                  output = bounded(command + ["--nocapture", "--test-threads=1"])
+                  assert "running 1 test" in output.splitlines(), output
+                  assert "test result: ok. 1 passed; 0 failed; 0 ignored;" in output, output
+          PYTHON
       # Execute the Windows Job Object fixtures on the native runner. They use
       # this test executable as the child, so no Node/npm/account setup is needed.
       - name: Codex diagnostic process ownership (Windows runtime)

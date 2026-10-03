@@ -900,49 +900,12 @@ async fn tunnel_stalled_upload_does_not_block_sibling_or_ping() {
     outcome.expect("stalled stream must not delay sibling traffic or pongs");
 }
 
-/// The daemon-side TCP connect deadline answers `OPEN_ERR` naming the
-/// timeout. A firewalled/blackholed port is simulated with a bound listener
-/// whose backlog is exhausted; if the connect happens to be accepted by the
-/// kernel anyway the test is skipped rather than flaking.
-#[intent_test_macros::daemon_test]
-async fn tunnel_connect_timeout_answers_open_err() {
-    let srv = start_with(TunnelLimits {
-        connect_timeout: Duration::from_millis(150),
-        ..TunnelLimits::default()
-    })
-    .await;
-    // Fill a listener's accept backlog so further connects hang in SYN.
-    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
-    let port = listener.local_addr().expect("addr").port();
-    let mut parked = Vec::new();
-    for _ in 0..1024 {
-        match std::net::TcpStream::connect_timeout(
-            &(Ipv4Addr::LOCALHOST, port).into(),
-            Duration::from_millis(50),
-        ) {
-            Ok(sock) => parked.push(sock),
-            Err(_) => break,
-        }
-    }
-    let mut ws = connect_tunnel(srv.port, srv.cfg.clone()).await;
-    send_frame(&mut ws, Frame::Open { stream_id: 1, port }).await;
-    match recv_frame(&mut ws).await {
-        Frame::OpenErr { stream_id, message } => {
-            assert_eq!(stream_id, 1);
-            assert!(
-                message.contains("timed out"),
-                "OPEN_ERR names the timeout: {message}"
-            );
-        }
-        // Kernel backlog behavior varies; an accepted connect is not a
-        // failure of the timeout path, just an environment we can't shape.
-        Frame::OpenOk { stream_id: 1 } => {}
-        other => panic!("expected OPEN_ERR/OPEN_OK, got {other:?}"),
-    }
-    drop(parked);
-    ws.close(None).await.expect("close ws");
-    srv.ws.stop().await;
-}
+// Connect deadline coverage lives in intent-transport's tunnel::tests:
+// connect_pending_deadline_emits_terminal_open_err,
+// connect_reset_preserves_error_before_deadline, and
+// connect_success_before_deadline_relays. Those controls prove pending/drop
+// state and exact frames without relying on platform-specific listen backlogs.
+// The real TLS/auth/error/echo/close lifecycle controls remain in this suite.
 
 /// A `DATA` message over the inbound message cap closes the connection with
 /// `1009 Message Too Big`, and an over-limit single frame still terminates
