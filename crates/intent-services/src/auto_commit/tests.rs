@@ -1196,7 +1196,7 @@ async fn generated_message_preserves_trailers() {
 async fn generation_applies_commit_quick_action_effort_before_prompt() {
     let repo = init_git_repo();
     let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
-    let (_dir, bin, log) = crate::test_support::quick_action_effort_adapter(&json!({
+    let (_dir, bin, log, _cli_env) = crate::test_support::quick_action_effort_adapter(&json!({
         "response": "{\"subject\":\"feat: configured effort\"}"
     }));
     let (_config_dir, registry) = auggie_active_registry();
@@ -1211,7 +1211,11 @@ async fn generation_applies_commit_quick_action_effort_before_prompt() {
             ),
         ])
         .unwrap();
-    let svc = svc.with_settings_registry(registry);
+    // Installed CLI providers ignore adapter path overrides. Route the pinned
+    // npm launch through the same isolated seam as the complete-once fixtures.
+    let svc = svc
+        .with_settings_registry(registry)
+        .with_one_shot_npx(Some(bin));
     let agent = session("effort-agent", &ws_id, None, false, "Builder", true);
     svc.store().insert_agent_session(&agent).await.unwrap();
     attribute_dirty_change(&svc, &ws_id, "effort-agent").await;

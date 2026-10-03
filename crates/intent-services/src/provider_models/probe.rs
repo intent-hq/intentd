@@ -126,9 +126,7 @@ where
             &adapter.conn,
             adapter.notifications,
             extract,
-            cmd.initialize_timeout(),
-            cmd.session_new_timeout(),
-            &cmd.working_dir(),
+            &cmd,
             accept_notifications,
         ),
     )
@@ -188,27 +186,33 @@ async fn drive_probe<F>(
     conn: &Connection,
     mut notifications: mpsc::UnboundedReceiver<intent_acp::IncomingNotification>,
     extract: F,
-    initialize_timeout: Duration,
-    session_new_timeout: Duration,
-    cwd: &std::path::Path,
+    command: &AcpProbeCommand,
     accept_notifications: bool,
 ) -> Result<Vec<Value>, ProbeError>
 where
     F: Fn(&Value) -> Vec<Value>,
 {
-    conn.request_timeout("initialize", initialize_params(), initialize_timeout)
-        .await
-        .map_err(map_acp_error)?;
+    conn.request_timeout(
+        "initialize",
+        initialize_params(),
+        command.initialize_timeout(),
+    )
+    .await
+    .map_err(map_acp_error)?;
 
-    let session_params = json!({
-        "cwd": cwd.to_string_lossy(),
+    let mut session_params = json!({
+        "cwd": command.working_dir().to_string_lossy(),
         "mcpServers": [],
     });
+    if let Some(meta) = command.probe_session_meta() {
+        session_params["_meta"] = meta;
+    }
 
     // Race the session/new response against model notifications: some
     // adapters publish the catalog via a session update before (or instead
     // of) including it in the session/new result.
-    let session_new = conn.request_timeout("session/new", session_params, session_new_timeout);
+    let session_new =
+        conn.request_timeout("session/new", session_params, command.session_new_timeout());
     tokio::pin!(session_new);
     let mut notifications_open = true;
     let session_result = loop {

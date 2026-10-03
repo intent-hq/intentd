@@ -21,6 +21,7 @@ pub(crate) mod agent_logs;
 pub mod agent_runtime;
 pub mod caller;
 pub mod chief_cwd;
+pub mod cli_env;
 pub mod clock;
 pub mod config;
 pub mod discovery_cache;

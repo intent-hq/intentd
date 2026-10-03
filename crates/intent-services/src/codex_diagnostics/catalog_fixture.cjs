@@ -5,7 +5,8 @@ const path = require('node:path');
 const readline = require('node:readline');
 const config = JSON.parse(fs.readFileSync(path.join(fixture, 'fixture.json'), 'utf8'));
 if (process.argv.includes('--version')) {
-  console.log(role === 'acp' ? 'codex-acp 1.13.1' : 'codex-cli 0.333.4');
+  const isolatedVersion = config.installed && process.env.CODEX_HOME === process.cwd();
+  console.log(role === 'acp' ? 'codex-acp 1.13.1' : isolatedVersion ? 'codex-cli 0.333.5' : 'codex-cli 0.333.4');
   process.exit(0);
 }
 const home = process.env.CODEX_HOME;
@@ -18,7 +19,7 @@ if (seed.includes('mcp_servers')) {
 }
 const isolation = {cwd:fs.realpathSync(process.cwd())===fs.realpathSync(home),home:process.env.HOME===home,
   profile:process.env.USERPROFILE===home,xdg:process.env.XDG_CONFIG_HOME===home,
-  config:role === 'acp'
+  config:role === 'acp' || config.installed
     ? process.env.CODEX_CONFIG === '{"agents":{"enabled":false},"features":{"multi_agent_v2":false}}'
     : !process.env.CODEX_CONFIG,
   preload:!process.env.NODE_OPTIONS?.includes('intentd-inherited-preload-canary'),

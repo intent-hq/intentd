@@ -53,8 +53,8 @@ pub const CODEX_ACP_NPX_PACKAGE: &str = "@agentclientprotocol/codex-acp@2.1.0";
 /// Daemon-owned Codex subagent denial shared by persistent agents, model
 /// probes, and one-shot launches. V2 feature enabling takes precedence over
 /// `agents.enabled` in this runtime, so both settings must be false. Set this
-/// after all environment merges and remove `CODEX_PATH` so the adapter uses
-/// its own compatible Codex dependency. Do not merge user `CODEX_CONFIG`.
+/// after all environment merges and set the resolved `CODEX_PATH` so the adapter uses
+/// the installed CLI. Do not merge user `CODEX_CONFIG`.
 pub const CODEX_SUBAGENT_POLICY_CONFIG: &str =
     r#"{"agents":{"enabled":false},"features":{"multi_agent_v2":false}}"#;
 
@@ -441,8 +441,9 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         login_docs_url: Some(
             "https://code.claude.com/docs/en/quickstart#step-2-log-in-to-your-account",
         ),
+        requires_secondary_binary: Some("claude"),
         npx_only_package: Some(CLAUDE_AGENT_ACP_NPX_PACKAGE),
-        npx_only_honors_path_override: true,
+        npx_only_honors_path_override: false,
         short_name: "Claude Code",
         // Claude Code silently truncates MCP tool descriptions at ~2k chars
         // (anthropics/claude-code#53933): serve the compact `workspace_api`
@@ -487,6 +488,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // the claude-code hint above).
         login_command_hint: Some("codex login"),
         login_docs_url: Some("https://developers.openai.com/codex/cli#cli-setup"),
+        requires_secondary_binary: Some("codex"),
         npx_only_package: Some(CODEX_ACP_NPX_PACKAGE),
         short_name: "Codex",
         ..ProviderConfig::empty("codex", "OpenAI Codex", "codex-acp")

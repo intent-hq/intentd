@@ -167,6 +167,26 @@ where
     tokio::spawn(with_caller(Caller::Daemon, f))
 }
 
+/// Spawn work with the current caller and wire credential captured at spawn.
+/// Unlike daemon-internal work, a request's child must not acquire daemon
+/// authority. An absent caller stays absent, including for standalone tools.
+/// Dropping the returned handle detaches the task, just like `tokio::spawn`;
+/// resource owners can therefore finish cleanup after their waiter is canceled.
+pub fn spawn_with_current_caller<F>(f: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let caller = current_caller();
+    let credential = current_wire_credential();
+    tokio::spawn(with_wire_credential(credential, async move {
+        match caller {
+            Some(caller) => with_caller(caller, f).await,
+            None => f.await,
+        }
+    }))
+}
+
 /// Who a queued-message entry is attributed to under the per-user queue
 /// visibility rule (multiplayer): the three tiers of the `agent.getQueue`
 /// contract, resolved by [`queue_attribution_with`] from the entry's
@@ -599,6 +619,163 @@ mod tests {
     async fn spawn_daemon_binds_the_daemon_caller() {
         let seen = spawn_daemon(async { current_caller() }).await.unwrap();
         assert_eq!(seen, Some(Caller::Daemon));
+        assert_eq!(current_caller(), None);
+    }
+
+    #[tokio::test]
+    async fn spawn_with_current_caller_preserves_identity_and_absence() {
+        for caller in [
+            wire(true),
+            wire(false),
+            Caller::Agent {
+                agent_id: AgentId("worker".into()),
+            },
+            Caller::Daemon,
+        ] {
+            // Return the handle as data; join it only after the parent scope ends.
+            let (task,) = with_caller(caller.clone(), async {
+                (spawn_with_current_caller(async {
+                    tokio::task::yield_now().await;
+                    (current_caller(), current_wire_credential().is_none())
+                }),)
+            })
+            .await;
+            let observed = with_caller(Caller::Daemon, task).await.unwrap();
+            assert_eq!(observed, (Some(caller), true));
+            assert_eq!(current_caller(), None);
+        }
+        let task = spawn_with_current_caller(async {
+            (current_caller(), current_wire_credential().is_none())
+        });
+        assert_eq!(
+            with_caller(Caller::Daemon, task).await.unwrap(),
+            (None, true)
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_with_current_caller_preserves_wire_credential() {
+        let credential = WireCredential::Principal {
+            principal_id: PrincipalId("p-1".into()),
+            token_hash: "fixture-hash".into(),
+        };
+        let (task,) = with_wire_credential(
+            Some(credential),
+            with_caller(wire(false), async {
+                (spawn_with_current_caller(async {
+                    tokio::task::yield_now().await;
+                    (current_caller(), current_wire_credential())
+                }),)
+            }),
+        )
+        .await;
+        let (caller, credential) = task.await.unwrap();
+        assert_eq!(caller, Some(wire(false)));
+        let Some(WireCredential::Principal {
+            principal_id,
+            token_hash,
+        }) = credential
+        else {
+            panic!("request credential must survive the task boundary");
+        };
+        assert_eq!(principal_id, PrincipalId("p-1".into()));
+        assert_eq!(token_hash, "fixture-hash");
+        assert!(current_wire_credential().is_none());
+    }
+
+    #[tokio::test]
+    async fn spawn_with_current_caller_credential_alone_never_creates_a_caller() {
+        let credential = WireCredential::Principal {
+            principal_id: PrincipalId("p-1".into()),
+            token_hash: "fixture-hash".into(),
+        };
+        let (task,) = with_wire_credential(Some(credential), async {
+            (spawn_with_current_caller(async {
+                (
+                    current_caller(),
+                    current_wire_credential().map(|c| c.principal_id().clone()),
+                )
+            }),)
+        })
+        .await;
+        assert_eq!(task.await.unwrap(), (None, Some(PrincipalId("p-1".into()))));
+        assert!(current_caller().is_none());
+        assert!(current_wire_credential().is_none());
+    }
+
+    #[tokio::test]
+    async fn spawn_with_current_caller_keeps_legacy_authority_revocable() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        struct Authority(AtomicBool);
+        impl LegacyCredentialAuthority for Authority {
+            fn authorize(&self) -> crate::BoxFuture<'_, crate::Result<CredentialLease>> {
+                Box::pin(async {
+                    if self.0.load(Ordering::SeqCst) {
+                        Ok(Box::new(()) as CredentialLease)
+                    } else {
+                        Err(crate::Error::Forbidden("fixture credential revoked".into()))
+                    }
+                })
+            }
+        }
+        let authority = Arc::new(Authority(AtomicBool::new(true)));
+        assert!(authority.authorize().await.is_ok());
+        let expected: Arc<dyn LegacyCredentialAuthority> = authority.clone();
+        let credential = WireCredential::Legacy {
+            principal_id: PrincipalId("p-1".into()),
+            authority: expected.clone(),
+        };
+        let (release, released) = tokio::sync::oneshot::channel();
+        let (task,) = with_wire_credential(
+            Some(credential),
+            with_caller(wire(false), async {
+                (spawn_with_current_caller(async move {
+                    released.await.unwrap();
+                    let Some(WireCredential::Legacy {
+                        principal_id,
+                        authority,
+                    }) = current_wire_credential()
+                    else {
+                        panic!("legacy authority must survive the task boundary");
+                    };
+                    assert_eq!(principal_id, PrincipalId("p-1".into()));
+                    assert!(Arc::ptr_eq(&authority, &expected));
+                    let result = authority.authorize().await;
+                    (
+                        current_caller(),
+                        matches!(result, Err(crate::Error::Forbidden(_))),
+                    )
+                }),)
+            }),
+        )
+        .await;
+        authority.0.store(false, Ordering::SeqCst);
+        release.send(()).unwrap();
+        assert_eq!(task.await.unwrap(), (Some(wire(false)), true));
+    }
+
+    #[tokio::test]
+    async fn spawn_with_current_caller_detached_owner_finishes_without_elevation() {
+        let (release, released) = tokio::sync::oneshot::channel();
+        let (finished, completion) = tokio::sync::oneshot::channel();
+        let (owner,) = with_caller(wire(false), async {
+            (spawn_with_current_caller(async move {
+                released.await.unwrap();
+                finished.send(current_caller()).unwrap();
+            }),)
+        })
+        .await;
+        drop(owner);
+        release.send(()).unwrap();
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(1), completion)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(observed, Some(wire(false)));
         assert_eq!(current_caller(), None);
     }
 

@@ -11,8 +11,19 @@ async fn fixture(
     provider: &str,
     model: &str,
     fail_off: bool,
-) -> (AgentManager, AgentId, tempfile::TempDir) {
+) -> (
+    AgentManager,
+    AgentId,
+    tempfile::TempDir,
+    super::tests::EnvGuard,
+) {
     let dir = test_tempdir("fast-mode-runtime-");
+    let cli_env = crate::test_support::installed_cli_env(
+        dir.path(),
+        intent_providers::installed_cli::InstalledCli::for_provider(provider)
+            .unwrap()
+            .command(),
+    );
     let script = dir.path().join("adapter.mjs");
     std::fs::write(&script, format!("#!/usr/bin/env node\nconst provider = {provider:?}; const failOff = {fail_off}; const logPath = {};\n{FIXTURE}", json!(dir.path().join("calls.jsonl")))).unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -39,7 +50,7 @@ async fn fixture(
     s.parent_agent_id = Some(AgentId::from("parent"));
     store.insert_agent_session(&s).await.unwrap();
     spawn_fixture(&mgr, &id, provider, model, &dir).await;
-    (mgr, id, dir)
+    (mgr, id, dir, cli_env)
 }
 
 async fn spawn_fixture(
@@ -105,7 +116,7 @@ fn calls(dir: &tempfile::TempDir) -> Vec<Value> {
 
 #[tokio::test]
 async fn fast_mode_setting_change_leaves_running_turn_untouched() {
-    let (mgr, id, dir) = fixture("claude-code", "supported", false).await;
+    let (mgr, id, dir, _cli_env) = fixture("claude-code", "supported", false).await;
     let sid = mgr
         .ensure_started(&id, &WorkspaceId::from("ws-1"))
         .await
@@ -153,7 +164,7 @@ async fn fast_mode_setting_change_leaves_running_turn_untouched() {
 #[tokio::test]
 async fn fast_mode_persistent_and_delegated_turns_reuse_adapter_and_clear_cold_resume() {
     for provider in ["claude-code", "codex"] {
-        let (mgr, id, dir) = fixture(provider, "supported", false).await;
+        let (mgr, id, dir, _cli_env) = fixture(provider, "supported", false).await;
         let off = turn(&mgr, &id).await;
         assert_eq!(off["fastMode"], false, "native enabled default cleared");
         assert_eq!(off["serviceTier"], Value::Null);
@@ -187,7 +198,7 @@ async fn fast_mode_persistent_and_delegated_turns_reuse_adapter_and_clear_cold_r
 
 #[tokio::test]
 async fn fast_mode_absent_option_allows_off_then_rechecks_eligible_model() {
-    let (mgr, id, _dir) = fixture("claude-code", "unsupported", false).await;
+    let (mgr, id, _dir, _cli_env) = fixture("claude-code", "unsupported", false).await;
     let state = turn(&mgr, &id).await;
     assert_eq!(state["model"], "unsupported");
     assert_eq!(state["controls"], json!([]));
@@ -233,7 +244,7 @@ async fn fast_mode_absent_option_allows_off_then_rechecks_eligible_model() {
 #[tokio::test]
 async fn fast_mode_failed_off_blocks_prompt_without_recycling() {
     for provider in ["claude-code", "codex"] {
-        let (mgr, id, dir) = fixture(provider, "supported", true).await;
+        let (mgr, id, dir, _cli_env) = fixture(provider, "supported", true).await;
         let err = mgr
             .ensure_started(&id, &WorkspaceId::from("ws-1"))
             .await
@@ -286,7 +297,7 @@ async fn routed_turn(mgr: &AgentManager, id: &AgentId, dir: &tempfile::TempDir) 
 
 #[tokio::test]
 async fn fast_mode_notification_removes_ineligible_control_before_warm_turn() {
-    let (mgr, id, dir) = fixture("claude-code", "supported", false).await;
+    let (mgr, id, dir, _cli_env) = fixture("claude-code", "supported", false).await;
     preference(&mgr, "claude-code", true);
     let initial = routed_turn(&mgr, &id, &dir).await;
     external_model(&mgr, &id, "unsupported").await;
@@ -310,7 +321,7 @@ async fn fast_mode_notification_removes_ineligible_control_before_warm_turn() {
 
 #[tokio::test]
 async fn fast_mode_notification_adds_control_and_clears_inherited_fast_before_warm_turn() {
-    let (mgr, id, dir) = fixture("claude-code", "unsupported", false).await;
+    let (mgr, id, dir, _cli_env) = fixture("claude-code", "unsupported", false).await;
     let initial = routed_turn(&mgr, &id, &dir).await;
     assert_eq!(initial["controls"], json!([]));
     external_model(&mgr, &id, "supported").await;

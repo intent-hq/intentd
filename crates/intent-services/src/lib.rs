@@ -94,6 +94,7 @@ mod git_status_singleflight;
 pub mod host_exec;
 pub mod host_exec_stream;
 mod host_execution;
+mod installed_cli;
 mod workspace_mutations;
 
 mod github_ops;
