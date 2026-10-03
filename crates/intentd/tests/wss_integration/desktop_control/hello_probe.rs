@@ -1,5 +1,6 @@
-//! Reproduce the renderer capability probe against real connection-bound events.
+//! State reads preserve consent; real hellos invalidate connection-bound authority.
 use super::*;
+#[cfg(unix)]
 use tokio::io::AsyncBufReadExt;
 
 #[allow(clippy::large_enum_variant)]
@@ -49,6 +50,10 @@ impl ProbeSocket {
                 "prepare" => {
                     json!({"computerId":"probe-computer","computerName":"Probe desktop","platform":"macos"})
                 }
+                "startControl" => {
+                    json!({"ready":true,"sessionId":params["sessionId"],"computerId":"probe-computer"})
+                }
+                "renew" => json!({"renewed":true,"sessionId":params["sessionId"]}),
                 "endControl" => json!({"sessionId":params["sessionId"],"ended":true}),
                 other => panic!("unexpected native operation {other}"),
             };
@@ -58,14 +63,18 @@ impl ProbeSocket {
         observed.push(frame);
     }
     async fn rpc(&mut self, method: &str, params: Value, observed: &mut Vec<Value>) -> Value {
+        let frame = self.rpc_frame(method, params, observed).await;
+        assert!(frame.get("error").is_none(), "{method}: {frame}");
+        frame["result"].clone()
+    }
+    async fn rpc_frame(&mut self, method: &str, params: Value, observed: &mut Vec<Value>) -> Value {
         self.send(json!({"jsonrpc":"2.0","id":9123,"method":method,"params":params}))
             .await;
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let frame = self.recv().await;
                 if frame["id"] == 9123 {
-                    assert!(frame.get("error").is_none(), "{method}: {frame}");
-                    return frame["result"].clone();
+                    return frame;
                 }
                 self.observe(frame, observed).await;
             }
@@ -121,7 +130,7 @@ impl ProbeSocket {
     }
 }
 
-async fn reproduce(uds: bool) {
+async fn verify_reads_and_rehello(uds: bool) {
     let (srv, services) = super::super::authenticated_devices::start_roster().await;
     let ws = WorkspaceId::new();
     srv.store
@@ -153,6 +162,7 @@ async fn reproduce(uds: bool) {
     .await
     .unwrap();
     let agent = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    #[cfg(unix)]
     let mut uds_task = None;
     let mut socket = if uds {
         #[cfg(unix)]
@@ -207,7 +217,7 @@ async fn reproduce(uds: bool) {
     socket
         .rpc(
             "events.subscribe",
-            json!({"workspaceId":ws,"eventTypes":["desktop:*"]}),
+            json!({"workspaceId":ws,"eventTypes":["desktop:*"],"replaceGroup":"desktop-probe"}),
             &mut observed,
         )
         .await;
@@ -242,6 +252,42 @@ async fn reproduce(uds: bool) {
             .await["state"]["requestId"],
         before["requestId"]
     );
+    for _ in 0..3 {
+        assert_eq!(
+            socket
+                .rpc("desktop.getState", scope.clone(), &mut observed)
+                .await["state"]["requestId"],
+            before["requestId"]
+        );
+    }
+    let accepted = socket
+        .rpc(
+            "desktop.respondPermission",
+            json!({"workspaceId":ws,"requestId":before["requestId"],"decision":"allow_once"}),
+            &mut observed,
+        )
+        .await;
+    assert_eq!(accepted["accepted"], true);
+    let active = socket
+        .agent(
+            intent_core::with_caller(
+                caller.clone(),
+                services.desktop_agent_call(ws.clone(), "startControl".into(), json!({})),
+            ),
+            &mut observed,
+        )
+        .await
+        .unwrap();
+    assert_eq!(active["status"], "active");
+    assert_eq!(active["alreadyGranted"], true);
+    for _ in 0..3 {
+        assert_eq!(
+            socket
+                .rpc("desktop.getState", scope.clone(), &mut observed)
+                .await["state"]["sessionId"],
+            active["sessionId"]
+        );
+    }
     socket
         .agent(
             intent_core::with_caller(
@@ -252,7 +298,8 @@ async fn reproduce(uds: bool) {
         )
         .await
         .unwrap();
-    // Actual FE capability-probe order: subscription A, then hello B + getState.
+    // A real rehello intentionally invalidates authority and the old subscription.
+    // Manual129 mistakenly sent this sequence for a read-only capability probe.
     socket
         .rpc("client.hello", hello.clone(), &mut observed)
         .await;
@@ -273,25 +320,103 @@ async fn reproduce(uds: bool) {
     socket.barrier(&srv, &ws, &mut observed).await;
     let prompt_delivered = delivered(&observed, &pending["requestId"]);
     // A later state read repeats the probe and invalidates the pending B request.
-    socket.rpc("client.hello", hello, &mut observed).await;
-    let after = socket.rpc("desktop.getState", scope, &mut observed).await;
+    socket
+        .rpc("client.hello", hello.clone(), &mut observed)
+        .await;
+    let after = socket
+        .rpc("desktop.getState", scope.clone(), &mut observed)
+        .await;
     eprintln!("transport={} baseline_prompt=true probe_prompt={prompt_delivered} pending_request={} state_after_second_probe={}",if uds {"UDS"}else{"WSS"},pending["requestId"],after["state"]);
+    assert!(
+        !prompt_delivered,
+        "old subscription must not receive a new incarnation's consent"
+    );
+    assert_eq!(after["state"]["status"], "inactive");
+    let stale = socket
+        .rpc_frame(
+            "desktop.respondPermission",
+            json!({"workspaceId":ws,"requestId":pending["requestId"],"decision":"allow_once"}),
+            &mut observed,
+        )
+        .await;
+    assert_eq!(stale["error"]["data"]["code"], "desktop-stale-request");
+    // Explicit renewal subscribes with the new authenticated epoch, and consent
+    // works again. Cached capability reads must not require this renewal.
+    socket
+        .rpc(
+            "events.subscribe",
+            json!({"workspaceId":ws,"eventTypes":["desktop:*"],"replaceGroup":"desktop-probe"}),
+            &mut observed,
+        )
+        .await;
+    let fresh = socket
+        .agent(
+            intent_core::with_caller(
+                caller.clone(),
+                services.desktop_agent_call(ws.clone(), "startControl".into(), json!({})),
+            ),
+            &mut observed,
+        )
+        .await
+        .unwrap();
+    assert_eq!(fresh["status"], "pending_permission");
+    socket.barrier(&srv, &ws, &mut observed).await;
+    assert!(delivered(&observed, &fresh["requestId"]));
+    assert_ne!(fresh["requestId"], pending["requestId"]);
+    socket
+        .rpc(
+            "desktop.respondPermission",
+            json!({"workspaceId":ws,"requestId":fresh["requestId"],"decision":"allow_once"}),
+            &mut observed,
+        )
+        .await;
+    let activated = socket
+        .agent(
+            intent_core::with_caller(
+                caller.clone(),
+                services.desktop_agent_call(ws.clone(), "startControl".into(), json!({})),
+            ),
+            &mut observed,
+        )
+        .await
+        .unwrap();
+    assert_eq!(activated["status"], "active");
+    socket.rpc("client.hello", hello, &mut observed).await;
+    assert_eq!(
+        socket.rpc("desktop.getState", scope, &mut observed).await["state"]["status"],
+        "inactive"
+    );
+    let action = socket
+        .agent(
+            intent_core::with_caller(
+                caller,
+                services.desktop_agent_call(ws, "listDisplay".into(), json!({})),
+            ),
+            &mut observed,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(action.code, "desktop-not-active");
+    assert_eq!(action.execution.as_deref(), Some("not_started"));
+    assert!(
+        !observed.iter().any(|frame| matches!(
+            frame["params"]["operation"].as_str(),
+            Some("prepareCommand" | "execute")
+        )),
+        "revoked action never reaches native execution"
+    );
+    #[cfg(unix)]
     if let Some(task) = uds_task {
         task.abort();
     }
     srv.ws.stop().await;
-    assert!(prompt_delivered,"capability probe lost the consent event on the existing subscription; after second probe: {}",after["state"]);
-    assert_eq!(
-        after["state"]["requestId"], pending["requestId"],
-        "capability probe invalidated pending consent"
-    );
 }
 #[tokio::test]
-async fn desktop_capability_probe_consent_wss() {
-    reproduce(false).await;
+async fn desktop_state_reads_and_real_rehello_wss() {
+    verify_reads_and_rehello(false).await;
 }
 #[cfg(unix)]
 #[tokio::test]
-async fn desktop_capability_probe_consent_uds() {
-    reproduce(true).await;
+async fn desktop_state_reads_and_real_rehello_uds() {
+    verify_reads_and_rehello(true).await;
 }
