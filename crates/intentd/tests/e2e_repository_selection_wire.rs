@@ -348,7 +348,10 @@ async fn native_selection_cold_uds_wss_manager_permission_cas_and_receipts() {
     let hello = local
         .rpc("client.hello", json!({"clientId":"selection-uds"}))
         .await;
-    assert_eq!(success(&hello)["server"]["protocolVersion"], "10.11");
+    assert_eq!(
+        success(&hello)["server"]["protocolVersion"],
+        intent_transport::PROTOCOL_VERSION
+    );
     assert_eq!(
         success(&hello)["server"]["capabilities"]["repositorySelection"],
         1

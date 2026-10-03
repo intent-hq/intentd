@@ -1013,7 +1013,10 @@ async fn native_review_real_cold_uds_wss_commit_https_push_ready_create_and_rece
             .rpc("client.hello", json!({"clientId":"owned-review"}))
             .await;
         assert_eq!(success(&hello)["server"]["capabilities"]["nativeReview"], 1);
-        assert_eq!(success(&hello)["server"]["protocolVersion"], "10.12");
+        assert_eq!(
+            success(&hello)["server"]["protocolVersion"],
+            intent_transport::PROTOCOL_VERSION
+        );
     }
     let denied = guest
         .rpc("accept-changes.prepare", h.prepare("create-pr"))

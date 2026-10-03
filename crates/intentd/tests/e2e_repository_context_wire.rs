@@ -430,7 +430,10 @@ async fn native_wire_cold_daemon_uds_wss_original_context_and_permissions() {
         success(&hello)["server"]["capabilities"]["repositoryContext"],
         1
     );
-    assert_eq!(success(&hello)["server"]["protocolVersion"], "10.10");
+    assert_eq!(
+        success(&hello)["server"]["protocolVersion"],
+        intent_transport::PROTOCOL_VERSION
+    );
     let c = uds.capture(h.query()).await;
     assert_eq!(c["coverage"]["kind"], "workspaceInventory");
     assert!(c["scope"]["authorityGeneration"].is_string());
