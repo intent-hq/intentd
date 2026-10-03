@@ -2448,6 +2448,8 @@ async fn stale_worker_cleanup_preserves_replacement_for_interrupt() {
 /// requeues the older instruction ahead of newer instructions (intent#6594).
 #[tokio::test]
 async fn stale_worker_tail_cannot_requeue_interrupted_prompt_ahead_of_newer_messages() {
+    let script = mock_agent_script();
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
     let (_tmp, mgr) = manager().await;
     let mgr = Arc::new(mgr);
     let ws = WorkspaceId::from("worker-append-owner-workspace");
@@ -2455,6 +2457,12 @@ async fn stale_worker_tail_cannot_requeue_interrupted_prompt_ahead_of_newer_mess
     seed_agent(&mgr, &ws, &id).await;
     set_session_provider(&mgr, &ws, &id, "mock").await;
     let first_provider = track_mock_agent(&mgr, &id, false);
+    mgr.handles
+        .lock()
+        .unwrap()
+        .get_mut(&id)
+        .unwrap()
+        .spawned_provider = "node".into();
     let pause = Arc::new(super::TurnStartPause::default());
     *mgr.worker_finish_pause.lock().unwrap() = Some(pause.clone());
     mgr.send_message(
@@ -2470,6 +2478,17 @@ async fn stale_worker_tail_cannot_requeue_interrupted_prompt_ahead_of_newer_mess
         .await
         .unwrap();
     assert!(!mgr.is_busy(&id), "old worker released its admission");
+    assert_ne!(
+        mgr.services
+            .store
+            .get_agent_session(&id)
+            .await
+            .unwrap()
+            .status,
+        AgentStatus::Error,
+        "the first turn must finish successfully before the replacement starts"
+    );
+    assert!(mgr.services.queue_snapshot(&id).is_empty());
     let old = mgr.workers.lock().unwrap().get(&id).unwrap().abort_handle();
 
     let (second_provider, gate) = track_mock_agent_prompt_rpc_error_gated(
@@ -2494,6 +2513,25 @@ async fn stale_worker_tail_cannot_requeue_interrupted_prompt_ahead_of_newer_mess
     .await
     .unwrap();
     let live_id = mgr.services.live_turn(&id).unwrap().message_id;
+    let user_rows = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.role == "user")
+        .map(|row| (row.id, row.content))
+        .collect::<Vec<_>>();
+    assert_eq!(user_rows.len(), 2);
+    assert_eq!(
+        user_rows[0].1,
+        user_message_blocks("first instruction", None, None)
+    );
+    assert_eq!(
+        user_rows[1].1,
+        user_message_blocks("older instruction", None, None)
+    );
     let replacement = mgr.workers.lock().unwrap().get(&id).unwrap().abort_handle();
     pause.resume.notify_one();
     timeout(Duration::from_secs(10), async {
@@ -2521,15 +2559,46 @@ async fn stale_worker_tail_cannot_requeue_interrupted_prompt_ahead_of_newer_mess
         );
     }
     mgr.services.persist_queue_snapshot(&id).await;
-    mgr.interrupt_inner(
-        &id,
-        crate::agent_session::InterruptReason::PreemptedByMessage,
-        None,
-    )
-    .await;
+    let expected_queue = mgr.services.queue_snapshot(&id);
+    let interrupt_mgr = mgr.clone();
+    let interrupt_id = id.clone();
+    let interrupt = tokio::spawn(async move {
+        interrupt_mgr
+            .interrupt_inner(
+                &interrupt_id,
+                crate::agent_session::InterruptReason::PreemptedByMessage,
+                None,
+            )
+            .await
+    });
+    let interrupted_row = timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(row) = mgr
+                .services
+                .store
+                .get_agent_message_by_id(&id, &live_id)
+                .await
+                .unwrap()
+            {
+                break row;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        interrupted_row.content,
+        json!([]),
+        "the gated provider has not streamed yet"
+    );
     // If the replacement was deregistered, it still owns the prompt receiver.
     // Let it settle: its append then collides with the just-flushed row.
     gate.notify_one();
+    timeout(Duration::from_secs(10), interrupt)
+        .await
+        .unwrap()
+        .unwrap();
     timeout(Duration::from_secs(10), async {
         while !replacement.is_finished() {
             tokio::task::yield_now().await;
@@ -2545,11 +2614,52 @@ async fn stale_worker_tail_cannot_requeue_interrupted_prompt_ahead_of_newer_mess
         .unwrap()
         .unwrap();
     assert_eq!(row.role, "assistant");
+    assert_eq!(row.content, interrupted_row.content);
+    assert_eq!(row.metadata, interrupted_row.metadata);
+    let final_user_rows = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.role == "user")
+        .map(|row| (row.id, row.content))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        final_user_rows, user_rows,
+        "preemption must not rewrite or duplicate user payloads"
+    );
     assert_eq!(
         row.metadata.as_ref().unwrap()["interruptReason"],
         "preempted_by_message"
     );
     let queue = mgr.services.queue_snapshot(&id);
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let failures = mgr
+        .services
+        .store
+        .query_events(&intent_store::EventQuery {
+            workspace_id: Some(ws.clone()),
+            event_types: vec![intent_core::events::AGENT_FAILED.into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    if let Some(failure) = failures.first() {
+        let error = failure.data["error"].as_str().unwrap_or("");
+        assert!(
+            error.contains("UNIQUE constraint failed: agent_message.id"),
+            "fixture failure did not reproduce the append collision: {error}"
+        );
+        panic!(
+            "interruption flush won, but unabortable replacement hit the append collision: {error}"
+        );
+    }
+    assert_eq!(
+        queue, expected_queue,
+        "newer instruction payloads and ordering must survive unchanged"
+    );
     assert_eq!(
         queue
             .iter()
@@ -2561,7 +2671,6 @@ async fn stale_worker_tail_cannot_requeue_interrupted_prompt_ahead_of_newer_mess
     assert!(queue
         .iter()
         .all(|v| v.get("requeuedAfterFailure").is_none()));
-    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
     assert_ne!(session.status, AgentStatus::Error);
     mgr.shutdown().await;
     first_provider.abort();
