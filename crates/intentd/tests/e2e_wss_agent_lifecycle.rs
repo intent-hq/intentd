@@ -16899,6 +16899,8 @@ async fn assert_codex_npx_subagent_policy_over_wss(advertise_load: bool) {
     let data_dir = data_dir_guard.path();
     let ws_id = seed_workspace_only(data_dir).await;
     let toolchain = common::codex_npx::install(data_dir, &script);
+    let selected_cli = std::path::absolute(data_dir.join("codex-toolchain/codex"))
+        .expect("absolute installed CLI fixture path");
     let wrapper = data_dir.join("fake-codex-acp");
     std::fs::write(
         &wrapper,
@@ -17061,8 +17063,12 @@ async fn assert_codex_npx_subagent_policy_over_wss(advertise_load: bool) {
         );
         assert_eq!(
             session["codexPolicy"],
-            json!({"config": {"agents": {"enabled": false}, "features": {"multi_agent_v2": false}}, "pathPresent": false}),
-            "daemon policy must replace enabling environment on every launch: {session}"
+            json!({
+                "config": {"agents": {"enabled": false}, "features": {"multi_agent_v2": false}},
+                "pathPresent": true,
+                "codexPath": selected_cli,
+            }),
+            "each launch must replace hostile runtime overrides with the selected installed CLI and enforce daemon policy: {session}"
         );
         let pid = session["pid"].as_u64().expect("mock child pid");
         if turn == 0 {
