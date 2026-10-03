@@ -3,7 +3,9 @@
 //! inside one scenario. Never unlink it: waiters must keep using the same inode.
 
 use super::*;
-use std::fs::{File, OpenOptions, TryLockError};
+use nix::errno::Errno;
+use nix::fcntl::{Flock, FlockArg};
+use std::fs::{File, OpenOptions};
 use std::io::{BufRead, Write};
 use std::net::TcpListener;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -30,18 +32,17 @@ fn open() -> File {
     file
 }
 
-pub(super) fn acquire() -> File {
-    let file = open();
-    acquire_bounded(&file);
-    file
+pub(super) fn acquire() -> Flock<File> {
+    acquire_bounded(open())
 }
 
-fn acquire_bounded(file: &File) {
+fn acquire_bounded(mut file: File) -> Flock<File> {
     let deadline = std::time::Instant::now() + common::daemon_startup_timeout();
     loop {
-        match file.try_lock() {
-            Ok(()) => return,
-            Err(TryLockError::WouldBlock) => {
+        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(lease) => return lease,
+            Err((returned, Errno::EWOULDBLOCK)) => {
+                file = returned;
                 assert!(
                     std::time::Instant::now() < deadline,
                     "fixture lease acquisition timed out"
@@ -50,7 +51,7 @@ fn acquire_bounded(file: &File) {
                 // timing-guard: wait for another complete cooperating scenario.
                 std::thread::sleep(Duration::from_millis(10));
             }
-            Err(error) => panic!("acquire default-port fixture lease: {error}"),
+            Err((_, error)) => panic!("acquire default-port fixture lease: {error}"),
         }
     }
 }
@@ -154,28 +155,30 @@ fn contender_process() {
         .set_write_timeout(Some(common::daemon_startup_timeout()))
         .unwrap();
     let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
-    let lease = open();
-    let listener = match lease.try_lock() {
-        Ok(()) => {
+    let initial = match Flock::lock(open(), FlockArg::LockExclusiveNonblock) {
+        Ok(lease) => {
             let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
             stream.write_all(b"bound\n").unwrap();
-            Some(listener)
+            Ok((lease, listener))
         }
-        Err(TryLockError::WouldBlock) => {
+        Err((file, Errno::EWOULDBLOCK)) => {
             stream.write_all(b"blocked\n").unwrap();
-            None
+            Err(file)
         }
-        Err(error) => panic!("contender lease failed: {error}"),
+        Err((_, error)) => panic!("contender lease failed: {error}"),
     };
     let mut request = String::new();
     reader.read_line(&mut request).unwrap();
     assert_eq!(request, "recover\n");
     // The parent sends this only after its daemon and lease have been dropped.
-    let _listener = if let Some(listener) = listener {
-        listener
-    } else {
-        acquire_bounded(&lease);
-        TcpListener::bind(("127.0.0.1", port)).expect("parent released saved port")
+    let _resources = match initial {
+        Ok(resources) => resources,
+        Err(file) => {
+            let lease = acquire_bounded(file);
+            let listener =
+                TcpListener::bind(("127.0.0.1", port)).expect("parent released saved port");
+            (lease, listener)
+        }
     };
     stream.write_all(b"bound-after-release\n").unwrap();
     request.clear();
