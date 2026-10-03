@@ -46,8 +46,8 @@ fn acquire_bounded(file: &File) {
                     std::time::Instant::now() < deadline,
                     "fixture lease acquisition timed out"
                 );
-                // timing-guard: wait for another complete cooperating scenario,
-                // never retry a bind or a failed scenario assertion.
+                // Never retry a bind or a failed scenario assertion.
+                // timing-guard: wait for another complete cooperating scenario.
                 std::thread::sleep(Duration::from_millis(10));
             }
             Err(error) => panic!("acquire default-port fixture lease: {error}"),
