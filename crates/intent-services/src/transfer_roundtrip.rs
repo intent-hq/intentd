@@ -1034,7 +1034,9 @@ async fn transfer_round_trip_between_two_stacks() {
         );
         assert_eq!(
             availability.resolved_path,
-            Some(Path::new(&root).join("bin/npx")),
+            // npx discovery prefers the canonicalized node's sibling, including
+            // when the system temp root itself is a symlink (e.g. macOS /var).
+            Some(std::fs::canonicalize(Path::new(&root).join("bin/npx")).unwrap()),
             "the adapter must resolve through the fixture, not host npx"
         );
     }
