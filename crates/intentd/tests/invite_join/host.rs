@@ -576,6 +576,7 @@ async fn guest_upgrades_to_host_member_with_same_principal_and_bearer_over_wss()
     assert_eq!(me["id"], json!(person));
 }
 
+#[cfg(feature = "repository-test-fixtures")]
 #[tokio::test]
 async fn invitation_account_search_over_wss_is_public_and_provider_qualified() {
     let mock = spawn_mock_forge().await;
@@ -650,6 +651,7 @@ async fn invitation_account_search_over_wss_is_public_and_provider_qualified() {
     );
 }
 
+#[cfg(feature = "repository-test-fixtures")]
 #[tokio::test]
 async fn invitation_account_search_over_wss_preserves_directory_errors_and_bound_fallback() {
     let mock = spawn_mock_forge().await;

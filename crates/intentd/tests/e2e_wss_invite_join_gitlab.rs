@@ -141,7 +141,11 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
             .iter()
             .find_map(|(key, value)| (*key == "INTENTD_GITLAB_API_BASE_URI").then_some(*value))
             .expect("owned GitLab mock");
-        let transports = serde_json::to_string(&[("https://gitlab.com", endpoint)]).unwrap();
+        let transports = serde_json::to_string(&[
+            ("https://gitlab.com", endpoint),
+            ("https://gitlab.custom.example:8443", endpoint),
+        ])
+        .unwrap();
         let config = data_dir.join("config.toml");
         let original = std::fs::read_to_string(&config).unwrap();
         std::fs::write(
