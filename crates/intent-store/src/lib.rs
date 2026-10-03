@@ -41,6 +41,7 @@ mod note_repo;
 mod note_search_repo;
 mod note_version_repo;
 mod pr_monitor_repo;
+mod presence_focus_repo;
 mod principal_repo;
 mod repository_authority_repo;
 mod repository_lifecycle;

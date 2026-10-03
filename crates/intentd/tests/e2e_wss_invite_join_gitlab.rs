@@ -649,6 +649,16 @@ async fn serve_conn(
     };
     let (status, body) = if path_only == "/user" {
         github_user.answer(&bearer).await
+    } else if path_only == "/search/users" {
+        assert!(
+            bearer.is_empty(),
+            "invitation search must not use repository credentials"
+        );
+        assert!(query.contains("per_page=") && query.contains("page=1"));
+        (
+            200,
+            Body::Json(json!({"items":[gh_user_json("gh-guest",9001)]})),
+        )
     } else if path_only == "/users/gh-guest" {
         (200, Body::Json(gh_user_json("gh-guest", 9001)))
     } else if let Some(id) = path_only.strip_prefix("/gists/") {
@@ -675,7 +685,12 @@ async fn serve_conn(
                 .split('&')
                 .find_map(|kv| kv.strip_prefix("username="))
                 .unwrap_or_default();
-            let users: Vec<Value> = gl_user_for_username(username).into_iter().collect();
+            let users: Vec<Value> = if query.split('&').any(|kv| kv.starts_with("search=")) {
+                assert!(query.contains("per_page=") && query.contains("page=1"));
+                vec![gl_user_json(GUEST_GL_LOGIN, GUEST_GL_ID)]
+            } else {
+                gl_user_for_username(username).into_iter().collect()
+            };
             (200, Body::Json(Value::Array(users)))
         }
     } else if let Some(rest) = path_only.strip_prefix("/api/v4/snippets/") {

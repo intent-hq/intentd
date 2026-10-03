@@ -5029,6 +5029,18 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Caller-authorized current focus for one member of a source workspace.
+    /// Used only by the connection-owned presence.focus channel. Returns a full
+    /// replacement snapshot; source/person refusal carries no destination data.
+    fn presence_focus_snapshot(
+        &self,
+        workspace_id: WorkspaceId,
+        principal_id: crate::PrincipalId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, principal_id);
+        Box::pin(async { Err(Error::Internal("presence focus not implemented".into())) })
+    }
+
     /// A connection closed (clean close or heartbeat reap alike): drop its
     /// presence row and every note-presence lease it held, publishing the
     /// resulting `presence:changed` / `note:presence` deltas. Never fails.
@@ -5174,6 +5186,22 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::host_members_remove not implemented".into(),
+            ))
+        })
+    }
+
+    /// Owner-authorized bounded public account suggestions; create still resolves the pin.
+    fn host_invite_search_accounts(
+        &self,
+        provider: String,
+        host: Option<String>,
+        query: String,
+        limit: Option<u8>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host, query, limit);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::host_invite_search_accounts not implemented".into(),
             ))
         })
     }

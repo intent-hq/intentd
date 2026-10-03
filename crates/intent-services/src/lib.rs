@@ -33024,6 +33024,17 @@ impl WorkspaceApi for Services {
         Box::pin(async move { self.presence_update_op(connection_id, params).await })
     }
 
+    fn presence_focus_snapshot(
+        &self,
+        workspace_id: WorkspaceId,
+        principal_id: intent_core::PrincipalId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.presence_focus_snapshot_op(workspace_id, principal_id)
+                .await
+        })
+    }
+
     fn presence_snapshot(
         &self,
         workspace_id: WorkspaceId,
@@ -33104,6 +33115,19 @@ impl WorkspaceApi for Services {
         principal_id: intent_core::PrincipalId,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move { self.host_members_remove_op(&principal_id).await })
+    }
+
+    fn host_invite_search_accounts(
+        &self,
+        provider: String,
+        host: Option<String>,
+        query: String,
+        limit: Option<u8>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.host_invite_search_accounts_op(&provider, host.as_deref(), &query, limit)
+                .await
+        })
     }
 
     fn host_invite_create(

@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 use crate::events::IdInfo;
 
 /// Chat snapshots default to a smaller window than generic paginated RPCs.
-const CHAT_SNAPSHOT_MESSAGE_LIMIT: usize = 5;
+const CHAT_SNAPSHOT_MESSAGE_LIMIT: usize = 20;
 const CHAT_SNAPSHOT_MAX_MESSAGE_LIMIT: u64 = 200;
 
 /// A subscription channel selected by the `*.subscribe` method (TB-0 §3). TB-4
@@ -62,6 +62,7 @@ pub(crate) enum Channel {
     /// frames. Subscribing is itself the "I am viewing" signal (the
     /// subscription holds a viewer lease released on unsubscribe / close).
     NotePresence,
+    PresenceFocus,
 }
 
 /// A classified subscription fast-path request awaiting handling by the
@@ -197,6 +198,11 @@ pub(crate) fn classify(value: &Value) -> Option<SubFastPath> {
             channel: Channel::Chat,
             params,
         }),
+        "presence.focus.subscribe" => Some(SubFastPath::Subscribe {
+            id,
+            channel: Channel::PresenceFocus,
+            params,
+        }),
         "note.presence.subscribe" => Some(SubFastPath::Subscribe {
             id,
             channel: Channel::NotePresence,
@@ -221,6 +227,7 @@ pub(crate) fn classify(value: &Value) -> Option<SubFastPath> {
         | "workspace.unsubscribe"
         | "comment.unsubscribe"
         | "chat.unsubscribe"
+        | "presence.focus.unsubscribe"
         | "note.presence.unsubscribe" => Some(SubFastPath::Unsubscribe { id, params }),
         "agent.unsubscribe" if !params.contains_key("workspaceId") => {
             Some(SubFastPath::Unsubscribe { id, params })
@@ -306,7 +313,7 @@ pub(crate) fn parse_comment_subscribe_params(
 /// full-text encoding, `"incremental"` selects append-only text deltas; any
 /// other value is a `-32602` error (a silently ignored typo would leave the
 /// client appending fragments the daemon never sends as fragments).
-/// `limit` defaults to five for absent/null; otherwise it must be an integer
+/// `limit` defaults to twenty for absent/null; otherwise it must be an integer
 /// in 1–200 and is retained for every snapshot on the subscription.
 pub(crate) fn parse_chat_subscribe_params(
     params: &Map<String, Value>,
@@ -469,6 +476,7 @@ pub(crate) fn channel_name(channel: Channel) -> &'static str {
         Channel::Comment => "comment",
         Channel::Chat => "chat",
         Channel::NotePresence => "note.presence",
+        Channel::PresenceFocus => "presence.focus",
     }
 }
 
@@ -728,6 +736,7 @@ pub(crate) fn channel_event_types(channel: Channel) -> Vec<String> {
         // Transient only: the forwarder narrows the workspace-wide stream to
         // one note by `data.noteId` ([`note_presence_delta`]).
         Channel::NotePresence => &[NOTE_PRESENCE],
+        Channel::PresenceFocus => &[],
     };
     types.iter().map(std::string::ToString::to_string).collect()
 }
@@ -788,7 +797,7 @@ pub(crate) async fn channel_snapshot(
         // snapshot, CS-0 D3), so this generic arm is unreachable. The
         // note-presence channel's snapshot is the join's return value
         // (`note_presence_join`, served by `forward_note_presence_subscription`).
-        Channel::Chat | Channel::NotePresence => empty(),
+        Channel::Chat | Channel::NotePresence | Channel::PresenceFocus => empty(),
     }
 }
 
@@ -800,7 +809,7 @@ pub(crate) async fn channel_snapshot(
 /// `chat.subscribe` arriving mid-turn reconstructs a coherent in-flight message.
 ///
 /// **Bounded** (monorepo#958): exactly ONE conversation read, with no
-/// `nextToken` follow-up and the validated subscription limit (default five),
+/// `nextToken` follow-up and the validated subscription limit (default twenty),
 /// so the snapshot fetches/decodes only its
 /// bounded newest page regardless of transcript length — the paginated op
 /// selects just that page SQL-side and never re-hydrates the full history.
@@ -1939,7 +1948,7 @@ pub(crate) async fn channel_delta(
         // spec-body edit can refresh flipped `specLinked` flags
         // (monorepo#2407) — so this generic stateless arm is unreachable for
         // `Task`.
-        Channel::Task | Channel::Chat | Channel::NotePresence => None,
+        Channel::Task | Channel::Chat | Channel::NotePresence | Channel::PresenceFocus => None,
         // The chat channel uses the dedicated, stateful [`ChatDeltaState`] mapper
         // on the `forward_chat_subscription` path (CS-3) — its deltas are
         // event-payload-driven, not re-read — so this generic re-read arm is

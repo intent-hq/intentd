@@ -356,7 +356,7 @@ async fn chat_subscription_resets_after_replace_messages_over_wss() {
 /// a fresh snapshot at the next seq that equals `agent.getConversation`
 /// (converged, not mid-turn), then keeps receiving the next turn's deltas.
 #[intent_test_macros::daemon_test]
-async fn five_message_chat_subscription_self_heals_over_wss_after_broadcast_lag() {
+async fn twenty_message_chat_subscription_self_heals_over_wss_after_broadcast_lag() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;
 
@@ -373,7 +373,7 @@ async fn five_message_chat_subscription_self_heals_over_wss_after_broadcast_lag(
 
     // A persisted user message anchors the seq-0 snapshot.
     let store = fx.bus.store();
-    for seq in 0..8 {
+    for seq in 0..23 {
         store
             .append_agent_message(
                 &AgentId::from(agent_id.as_str()),
@@ -407,7 +407,7 @@ async fn five_message_chat_subscription_self_heals_over_wss_after_broadcast_lag(
             .as_array()
             .unwrap()
             .len(),
-        5
+        20
     );
 
     // The turn starts normally: the first chunk arrives as delta seq 1.
@@ -489,7 +489,7 @@ async fn five_message_chat_subscription_self_heals_over_wss_after_broadcast_lag(
         &mut ws,
         4,
         "agent.getConversation",
-        json!({ "agentId": agent_id, "limit": 5 }),
+        json!({ "agentId": agent_id, "limit": 20 }),
     )
     .await;
     let mut want = want;
@@ -508,12 +508,12 @@ async fn five_message_chat_subscription_self_heals_over_wss_after_broadcast_lag(
         .unwrap();
     assert_eq!(
         messages.len(),
-        5,
-        "recovery retains the newest five messages"
+        20,
+        "recovery retains the newest twenty messages"
     );
     assert_eq!(messages[0]["seq"], 5);
-    assert_eq!(messages[4]["id"], mid);
-    assert_eq!(want["totalMessages"], 10);
+    assert_eq!(messages[19]["id"], mid);
+    assert_eq!(want["totalMessages"], 25);
     let older = wss_rpc(
         &mut ws,
         5,

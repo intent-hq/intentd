@@ -136,9 +136,10 @@ fn chat_params_require_agent_id() {
 #[test]
 fn chat_params_snapshot_limit_defaults_and_boundaries() {
     for (params, expected) in [
-        (json!({"agentId":"a"}), 5),
-        (json!({"agentId":"a", "limit":null}), 5),
+        (json!({"agentId":"a"}), 20),
+        (json!({"agentId":"a", "limit":null}), 20),
         (json!({"agentId":"a", "limit":1}), 1),
+        (json!({"agentId":"a", "limit":5}), 5),
         (json!({"agentId":"a", "limit":50}), 50),
         (json!({"agentId":"a", "limit":200}), 200),
     ] {
@@ -2354,17 +2355,17 @@ fn merge_live_turn_rebudget_noop_for_full_projection_and_fitting_pages() {
 }
 
 /// The count cap applies even without slim projection. Cursor re-minting must
-/// work when a complete five-row transcript first gains an unpersisted row.
+/// work when a complete twenty-row transcript first gains an unpersisted row.
 #[test]
-fn five_message_live_overlay_caps_full_and_slim_pages_without_losing_history() {
+fn twenty_message_live_overlay_caps_full_and_slim_pages_without_losing_history() {
     for projection in [None, Some(ConversationProjection::Slim)] {
-        let messages: Vec<Value> = (0..5)
+        let messages: Vec<Value> = (0..20)
             .map(|seq| {
                 json!({ "id": format!("m-{seq}"), "seq": seq,
                 "role": "user", "contentBlocks": [{ "type": "text", "text": "small" }] })
             })
             .collect();
-        let mut snapshot = json!({ "messages": messages, "totalMessages": 5,
+        let mut snapshot = json!({ "messages": messages, "totalMessages": 20,
             "truncated": false, "nextToken": null });
         let live = json!({ "messageId": "live", "contentBlocks": [] });
         merge_live_turn(
@@ -2375,13 +2376,13 @@ fn five_message_live_overlay_caps_full_and_slim_pages_without_losing_history() {
             projection,
             CHAT_SNAPSHOT_MESSAGE_LIMIT,
         );
-        assert_eq!(snapshot["messages"].as_array().unwrap().len(), 5);
+        assert_eq!(snapshot["messages"].as_array().unwrap().len(), 20);
         assert_eq!(snapshot["messages"][0]["id"], "m-1");
-        assert_eq!(snapshot["messages"][4]["id"], "live");
-        assert_eq!(snapshot["totalMessages"], 6);
+        assert_eq!(snapshot["messages"][19]["id"], "live");
+        assert_eq!(snapshot["totalMessages"], 21);
         assert_eq!(snapshot["truncated"], true);
         let older =
-            intent_services::pagination::page_window(5, Some(5), snapshot["nextToken"].as_str());
+            intent_services::pagination::page_window(20, Some(20), snapshot["nextToken"].as_str());
         assert_eq!((older.start, older.end), (0, 1));
         // A persist/slot-clear race must not count or append the same row twice.
         let unchanged = snapshot.clone();
@@ -2401,7 +2402,7 @@ fn five_message_live_overlay_caps_full_and_slim_pages_without_losing_history() {
 /// anchor still serves alone, and every displaced persisted row is reachable.
 #[test]
 fn configured_live_overlay_preserves_byte_budget_and_one_message_floor() {
-    for limit in [1, 5, 50] {
+    for limit in [1, 5, 20, 50] {
         for live_bytes in [200 * 1024, 600 * 1024] {
             let messages: Vec<Value> = (0..5)
             .map(|seq| json!({ "id": format!("m-{seq}"), "seq": seq,
@@ -3534,7 +3535,7 @@ mod chat_snapshot_bounded {
         }
     }
 
-    fn assert_five_message_snapshot(api: &TranscriptPageApi, snapshot: &Value, busy: bool) {
+    fn assert_twenty_message_snapshot(api: &TranscriptPageApi, snapshot: &Value, busy: bool) {
         let messages = snapshot["messages"].as_array().unwrap();
         eprintln!(
             "snapshot rows={} bytes={} requested_limits={:?}",
@@ -3542,22 +3543,22 @@ mod chat_snapshot_bounded {
             serde_json::to_vec(snapshot).unwrap().len(),
             api.limits.lock().unwrap()
         );
-        assert_eq!(messages.len(), 5, "newest page includes any live-turn row");
-        assert_eq!(messages[0]["id"], if busy { "m-116" } else { "m-115" });
-        assert_eq!(messages[4]["id"], if busy { "msg-live" } else { "m-119" });
+        assert_eq!(messages.len(), 20, "newest page includes any live-turn row");
+        assert_eq!(messages[0]["id"], if busy { "m-101" } else { "m-100" });
+        assert_eq!(messages[19]["id"], if busy { "msg-live" } else { "m-119" });
         assert_eq!(snapshot["truncated"], true);
         assert!(snapshot["nextToken"].is_string());
         let limits = api.limits.lock().unwrap();
         assert_eq!(limits.len(), 1, "one bounded read, no history walk");
-        assert!(limits[0].is_some_and(|limit| (1..=5).contains(&limit)));
+        assert_eq!(limits[0], Some(20));
         // The next backward page includes every row evicted by the live overlay.
         let older =
-            intent_services::pagination::page_window(120, Some(5), snapshot["nextToken"].as_str());
-        assert_eq!(older.end, if busy { 116 } else { 115 });
+            intent_services::pagination::page_window(120, Some(20), snapshot["nextToken"].as_str());
+        assert_eq!(older.end, if busy { 101 } else { 100 });
     }
 
     #[tokio::test]
-    async fn five_message_initial_snapshot_uses_the_newest_page() {
+    async fn twenty_message_initial_snapshot_uses_the_newest_page() {
         let api = TranscriptPageApi::new(false);
         let snapshot = chat_snapshot(
             &api,
@@ -3567,12 +3568,12 @@ mod chat_snapshot_bounded {
             CHAT_SNAPSHOT_MESSAGE_LIMIT,
         )
         .await;
-        assert_five_message_snapshot(&api, &snapshot, false);
+        assert_twenty_message_snapshot(&api, &snapshot, false);
         assert!(snapshot.get("resumed").is_none());
     }
 
     #[tokio::test]
-    async fn five_message_stale_resume_resets_to_the_newest_page() {
+    async fn twenty_message_stale_resume_resets_to_the_newest_page() {
         let api = TranscriptPageApi::new(false);
         let snapshot = chat_snapshot(
             &api,
@@ -3584,13 +3585,13 @@ mod chat_snapshot_bounded {
         .await;
         assert_eq!(
             snapshot["resumed"], false,
-            "anchor outside newest five must reset"
+            "anchor outside newest twenty must reset"
         );
-        assert_five_message_snapshot(&api, &snapshot, false);
+        assert_twenty_message_snapshot(&api, &snapshot, false);
     }
 
     #[tokio::test]
-    async fn five_message_snapshot_includes_live_turn_within_the_budget() {
+    async fn twenty_message_snapshot_includes_live_turn_within_the_budget() {
         let api = TranscriptPageApi::new(true);
         let snapshot = chat_snapshot(
             &api,
@@ -3600,13 +3601,13 @@ mod chat_snapshot_bounded {
             CHAT_SNAPSHOT_MESSAGE_LIMIT,
         )
         .await;
-        assert_five_message_snapshot(&api, &snapshot, true);
-        assert_eq!(snapshot["messages"][4]["isStreaming"], true);
+        assert_twenty_message_snapshot(&api, &snapshot, true);
+        assert_eq!(snapshot["messages"][19]["isStreaming"], true);
         assert_eq!(snapshot["totalMessages"], 121);
     }
 
     #[tokio::test]
-    async fn five_message_recovery_snapshot_uses_the_same_budget() {
+    async fn twenty_message_recovery_snapshot_uses_the_same_budget() {
         let api = TranscriptPageApi::new(true);
         let snapshot = chat_recovery_snapshot(
             &api,
@@ -3616,16 +3617,16 @@ mod chat_snapshot_bounded {
         )
         .await
         .unwrap();
-        assert_five_message_snapshot(&api, &snapshot, true);
+        assert_twenty_message_snapshot(&api, &snapshot, true);
     }
 
     #[tokio::test]
-    async fn five_message_recent_resume_keeps_suffix_and_live_turn() {
+    async fn twenty_message_recent_resume_keeps_suffix_and_live_turn() {
         let api = TranscriptPageApi::new(true);
         let snapshot = chat_snapshot(
             &api,
             &agent(),
-            Some("m-118"),
+            Some("m-105"),
             None,
             CHAT_SNAPSHOT_MESSAGE_LIMIT,
         )
@@ -3636,7 +3637,9 @@ mod chat_snapshot_bounded {
             .iter()
             .map(|row| row["id"].as_str().unwrap())
             .collect();
-        assert_eq!(ids, ["m-119", "msg-live"]);
+        let mut expected: Vec<_> = (106..120).map(|seq| format!("m-{seq}")).collect();
+        expected.push("msg-live".into());
+        assert_eq!(ids, expected);
         assert_eq!(snapshot["resumed"], true);
         assert_eq!(snapshot["nextToken"], Value::Null);
         assert_eq!(api.limits.lock().unwrap().len(), 1);
@@ -3644,7 +3647,7 @@ mod chat_snapshot_bounded {
 
     #[tokio::test]
     async fn configured_snapshot_limits_bound_initial_and_recovery_with_live_cursor() {
-        for limit in [1, 50, 200] {
+        for limit in [1, 5, 20, 50, 200] {
             for busy in [false, true] {
                 for recovery in [false, true] {
                     let api = TranscriptPageApi::new(busy);
