@@ -1030,6 +1030,8 @@ impl Store {
         task_graph_enabled: bool,
         remember_specialist: bool,
     ) -> Result<()> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(s.id.clone())])?;
         let mut tx = if remember_specialist {
             Some(
                 self.write_pool()
@@ -1070,6 +1072,7 @@ impl Store {
                 .await
                 .map_err(|e| Error::Internal(format!("commit agent create: {e}")))?;
         }
+        lifecycle.settle();
         Ok(())
     }
 
@@ -1111,7 +1114,9 @@ impl Store {
         // closure.
         let prepared = batch_content_cols_and_payload_rows(&owned_messages).await?;
 
-        crate::with_write_txn_retry(|| async {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(s.id.clone())])?;
+        let result = crate::with_write_txn_retry(|| async {
             let mut tx = pool.begin().await.map_err(|e| {
                 Error::Internal(format!("insert session with messages begin failed: {e}"))
             })?;
@@ -1208,7 +1213,8 @@ impl Store {
             })?;
             Ok(())
         })
-        .await
+        .await;
+        lifecycle.finish(result)
     }
 
     /// Fetch a session by id (with its message log), or `NotFound`.
@@ -2813,12 +2819,13 @@ impl Store {
         remember_specialist: bool,
         notifications_muted: Option<bool>,
     ) -> Result<()> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
         // Lightweight invariant check: read only workspace_id, model,
         // provider, acp_session_id (finding F3: no message fetch). Workspace
         // mismatch → NotFound, provider immutable, acp_session_id write-once
         // (§9.5).
         let row = sqlx::query(
-            "SELECT workspace_id, model, provider, acp_session_id FROM agent_session WHERE id = ?",
+            "SELECT workspace_id, model, provider, acp_session_id, backend_session_id, parent_agent_id, sandbox_id, sandbox_path, sandbox_branch, status FROM agent_session WHERE id = ?",
         )
         .bind(&s.id.0)
         .fetch_optional(self.read_pool())
@@ -2876,6 +2883,22 @@ impl Store {
         // The creation-only Assistant marker is monotonic: once absent or
         // invalidated, a stale full-row write cannot resurrect it. Evaluate
         // the stored value in this UPDATE, not in the earlier invariant read.
+        let binding_changed = row.get::<Option<String>, _>("model") != s.model
+            || row.get::<Option<String>, _>("provider") != s.provider
+            || current_acp_session_id != s.acp_session_id
+            || row
+                .get::<Option<String>, _>("backend_session_id")
+                .as_deref()
+                != s.backend_session_id.as_ref().map(AgentId::as_str)
+            || row.get::<Option<String>, _>("parent_agent_id").as_deref()
+                != s.parent_agent_id.as_ref().map(AgentId::as_str)
+            || row.get::<Option<String>, _>("sandbox_id") != s.sandbox_id
+            || row.get::<Option<String>, _>("sandbox_path") != s.sandbox_path
+            || row.get::<Option<String>, _>("sandbox_branch") != s.sandbox_branch
+            || (row.get::<String, _>("status") == "deleted") != (s.status == AgentStatus::Deleted);
+        if binding_changed {
+            lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(s.id.clone())])?;
+        }
         let metadata = encode_metadata(s.metadata.as_ref())?;
         let mut tx = if remember_specialist || notifications_muted.is_some() {
             Some(
@@ -2962,6 +2985,7 @@ impl Store {
                 .await
                 .map_err(|e| Error::Internal(format!("commit agent update: {e}")))?;
         }
+        lifecycle.settle();
         Ok(())
     }
 
@@ -3037,6 +3061,13 @@ impl Store {
         provider: Option<&str>,
         updated_at: &str,
     ) -> Result<()> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        let current = self.get_agent_session_summary(id).await?;
+        if current.workspace_id == *workspace_id
+            && (current.model.as_deref() != Some(model) || current.provider.as_deref() != provider)
+        {
+            lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(id.clone())])?;
+        }
         let rows = sqlx::query(
             "UPDATE agent_session SET model=?, provider=?, updated_at=? \
              WHERE id=? AND workspace_id=?",
@@ -3053,6 +3084,7 @@ impl Store {
         if rows == 0 {
             return Err(Error::NotFound(format!("agent session {id}")));
         }
+        lifecycle.settle();
         Ok(())
     }
 
@@ -3086,6 +3118,14 @@ impl Store {
         model: Option<&str>,
         updated_at: &str,
     ) -> Result<bool> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        let current = self.get_agent_session_summary(id).await?;
+        if current.workspace_id == *workspace_id
+            && current.provider.as_deref() == expected_provider
+            && (current.provider.as_deref() != Some(provider) || current.model.as_deref() != model)
+        {
+            lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(id.clone())])?;
+        }
         let rows = sqlx::query(
             "UPDATE agent_session SET provider=?, model=?, reasoning_effort=NULL, updated_at=? \
              WHERE id=? AND workspace_id=? AND provider IS ?",
@@ -3101,6 +3141,7 @@ impl Store {
         .map_err(|e| Error::Internal(format!("rehome agent session provider failed: {e}")))?
         .rows_affected();
         if rows > 0 {
+            lifecycle.settle();
             return Ok(true);
         }
         let exists = sqlx::query_scalar::<_, i64>(
@@ -3114,6 +3155,7 @@ impl Store {
         if exists == 0 {
             return Err(Error::NotFound(format!("agent session {id}")));
         }
+        lifecycle.settle();
         Ok(false)
     }
 
@@ -3431,6 +3473,13 @@ impl Store {
         updated_at: &str,
         stop_reason: Option<Option<String>>,
     ) -> Result<()> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        let current = self.get_agent_session_summary(id).await?;
+        if current.workspace_id == *workspace_id
+            && (current.status == AgentStatus::Deleted) != (status == AgentStatus::Deleted)
+        {
+            lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(id.clone())])?;
+        }
         let rows = match stop_reason {
             None => {
                 // Leave stop_reason (and its timestamp) untouched.
@@ -3474,6 +3523,7 @@ impl Store {
         if rows == 0 {
             return Err(Error::NotFound(format!("agent session {id}")));
         }
+        lifecycle.settle();
         Ok(())
     }
 
@@ -3546,6 +3596,18 @@ impl Store {
         retired_at: Option<&str>,
         updated_at: &str,
     ) -> Result<bool> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        let current: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT retired_at FROM agent_session WHERE id=? AND workspace_id=?",
+        )
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .fetch_optional(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("read agent retirement binding failed: {e}")))?;
+        if current.is_some_and(|current| current.is_some() != retired_at.is_some()) {
+            lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(id.clone())])?;
+        }
         // Compare-and-set: the write only lands when it is a real state
         // transition (set requires currently-NULL, clear requires
         // currently-set), so two concurrent retire/restore requests cannot
@@ -3567,6 +3629,7 @@ impl Store {
         .await
         .map_err(|e| Error::Internal(format!("set agent session retired_at failed: {e}")))?
         .rows_affected();
+        lifecycle.settle();
         Ok(rows > 0)
     }
 
@@ -3799,6 +3862,7 @@ impl Store {
         id: &AgentId,
         acp_session_id: &str,
     ) -> Result<()> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
         let current = self.get_agent_session(id).await?;
         if current.workspace_id != *workspace_id {
             return Err(Error::NotFound(format!("agent session {id}")));
@@ -3808,6 +3872,7 @@ impl Store {
             Some(_) => return Err(Error::Internal("acpSessionId is write-once".to_string())),
             None => {}
         }
+        lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(id.clone())])?;
         sqlx::query("UPDATE agent_session SET acp_session_id=? WHERE id=? AND workspace_id=?")
             .bind(acp_session_id)
             .bind(&id.0)
@@ -3815,6 +3880,7 @@ impl Store {
             .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("set acp session id failed: {e}")))?;
+        lifecycle.settle();
         Ok(())
     }
 
@@ -3903,6 +3969,7 @@ impl Store {
         expected_old: Option<&str>,
         acp_session_id: &str,
     ) -> Result<String> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
         let mut conn =
             self.write_pool().acquire().await.map_err(|e| {
                 Error::Internal(format!("replace acp session id acquire failed: {e}"))
@@ -3912,77 +3979,116 @@ impl Store {
             .await
             .map_err(|e| Error::Internal(format!("replace acp session id begin failed: {e}")))?;
 
-        let body_result = async {
-            let row = sqlx::query(
-                "SELECT acp_session_id, token_usage, token_usage_baseline FROM agent_session \
-                 WHERE id=? AND workspace_id=?",
-            )
-            .bind(&id.0)
-            .bind(&workspace_id.0)
-            .fetch_optional(&mut *conn)
-            .await
-            .map_err(|e| Error::Internal(format!("replace acp session id read failed: {e}")))?;
-            let stored_id = row
-                .as_ref()
-                .and_then(|r| r.get::<Option<String>, _>("acp_session_id"));
-            if stored_id.as_deref() != expected_old {
-                // The stored id changed between the caller's CAS read and this
-                // transaction: treat it as a CAS loss and keep the canonical
-                // value (falling back to the fresh id only if the row
-                // vanished). Nothing has been written, so committing below is
-                // a no-op close of a read-only transaction.
-                return Ok(stored_id.unwrap_or_else(|| acp_session_id.to_string()));
-            }
-            let (snapshot, baseline): (Option<TokenUsageTotals>, Option<TokenUsageTotals>) = row
-                .map_or((None, None), |r| {
-                    (
-                        r.get::<Option<String>, _>("token_usage")
-                            .and_then(|s| serde_json::from_str(&s).ok()),
-                        r.get::<Option<String>, _>("token_usage_baseline")
-                            .and_then(|s| serde_json::from_str(&s).ok()),
-                    )
-                });
-            let folded = match (&baseline, &snapshot) {
-                (None, None) => None,
-                (b, s) => {
-                    let b = b.clone().unwrap_or_default();
-                    let s = s.clone().unwrap_or_default();
-                    Some(TokenUsageTotals {
-                        input_tokens: b.input_tokens.saturating_add(s.input_tokens),
-                        output_tokens: b.output_tokens.saturating_add(s.output_tokens),
-                        cache_read_tokens: b.cache_read_tokens.saturating_add(s.cache_read_tokens),
-                        cache_creation_tokens: b
-                            .cache_creation_tokens
-                            .saturating_add(s.cache_creation_tokens),
-                        thought_tokens: b.thought_tokens.saturating_add(s.thought_tokens),
-                        // Cost is cumulative per ACP session exactly like the
-                        // counters, so the fold banks it the same way (§5.23).
-                        cost: UsageCost::merge(b.cost.as_ref(), s.cost.as_ref()),
-                    })
-                }
-            };
-            let folded_json = folded
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()
-                .map_err(|e| Error::Internal(format!("encode token_usage_baseline failed: {e}")))?;
-            sqlx::query(
-                "UPDATE agent_session SET acp_session_id=?, token_usage_baseline=?, \
-                 token_usage=NULL WHERE id=? AND workspace_id=?",
-            )
-            .bind(acp_session_id)
-            .bind(folded_json)
-            .bind(&id.0)
-            .bind(&workspace_id.0)
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| Error::Internal(format!("replace acp session id failed: {e}")))?;
-            Ok(acp_session_id.to_string())
-        }
-        .await;
+        let body_result = Self::write_acp_session_id_in_transaction(
+            &mut conn,
+            workspace_id,
+            id,
+            expected_old,
+            acp_session_id,
+            || lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(id.clone())]),
+        )
+        .await
+        .map(|outcome| outcome.canonical);
 
-        crate::commit_with_rollback_guard(conn, body_result, "replace acp session id commit failed")
-            .await
+        let result = crate::commit_with_rollback_guard(
+            conn,
+            body_result,
+            "replace acp session id commit failed",
+        )
+        .await;
+        lifecycle.finish(result)
+    }
+
+    /// Shared transaction body; the caller owns serialization and commit/rollback.
+    /// The hook runs only before an actual changing, existing-row write. Legacy
+    /// callers retain their canonical fallback; strict callers inspect the count.
+    pub(crate) async fn write_acp_session_id_in_transaction(
+        conn: &mut sqlx::SqliteConnection,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        expected_old: Option<&str>,
+        acp_session_id: &str,
+        before_write: impl FnOnce() -> Result<()>,
+    ) -> Result<crate::repository_lifecycle::initialization::AcpSessionWriteOutcome> {
+        use crate::repository_lifecycle::initialization::AcpSessionWriteOutcome;
+        let row = sqlx::query(
+            "SELECT acp_session_id, token_usage, token_usage_baseline FROM agent_session \
+             WHERE id=? AND workspace_id=?",
+        )
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| Error::Internal(format!("replace acp session id read failed: {e}")))?;
+        let stored_id = row
+            .as_ref()
+            .and_then(|r| r.get::<Option<String>, _>("acp_session_id"));
+        if stored_id.as_deref() != expected_old {
+            // The stored id changed between the caller's CAS read and this
+            // transaction: treat it as a CAS loss and keep the canonical
+            // value (falling back to the fresh id only if the row
+            // vanished). Nothing has been written, so committing below is
+            // a no-op close of a read-only transaction.
+            return Ok(AcpSessionWriteOutcome {
+                canonical: stored_id.unwrap_or_else(|| acp_session_id.to_string()),
+                rows_affected: 0,
+                statement_dispatched: false,
+            });
+        }
+        let row_exists = row.is_some();
+        let (snapshot, baseline): (Option<TokenUsageTotals>, Option<TokenUsageTotals>) = row
+            .map_or((None, None), |r| {
+                (
+                    r.get::<Option<String>, _>("token_usage")
+                        .and_then(|s| serde_json::from_str(&s).ok()),
+                    r.get::<Option<String>, _>("token_usage_baseline")
+                        .and_then(|s| serde_json::from_str(&s).ok()),
+                )
+            });
+        let folded = match (&baseline, &snapshot) {
+            (None, None) => None,
+            (b, s) => {
+                let b = b.clone().unwrap_or_default();
+                let s = s.clone().unwrap_or_default();
+                Some(TokenUsageTotals {
+                    input_tokens: b.input_tokens.saturating_add(s.input_tokens),
+                    output_tokens: b.output_tokens.saturating_add(s.output_tokens),
+                    cache_read_tokens: b.cache_read_tokens.saturating_add(s.cache_read_tokens),
+                    cache_creation_tokens: b
+                        .cache_creation_tokens
+                        .saturating_add(s.cache_creation_tokens),
+                    thought_tokens: b.thought_tokens.saturating_add(s.thought_tokens),
+                    // Cost is cumulative per ACP session exactly like the
+                    // counters, so the fold banks it the same way (§5.23).
+                    cost: UsageCost::merge(b.cost.as_ref(), s.cost.as_ref()),
+                })
+            }
+        };
+        let folded_json = folded
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| Error::Internal(format!("encode token_usage_baseline failed: {e}")))?;
+        if expected_old != Some(acp_session_id) && row_exists {
+            before_write()?;
+        }
+        let rows_affected = sqlx::query(
+            "UPDATE agent_session SET acp_session_id=?, token_usage_baseline=?, \
+             token_usage=NULL WHERE id=? AND workspace_id=?",
+        )
+        .bind(acp_session_id)
+        .bind(folded_json)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| Error::Internal(format!("replace acp session id failed: {e}")))?
+        .rows_affected();
+        Ok(AcpSessionWriteOutcome {
+            canonical: acp_session_id.to_string(),
+            rows_affected,
+            statement_dispatched: true,
+        })
     }
 
     /// Delete an agent session and its message log (the `agent_message` rows
@@ -4029,6 +4135,7 @@ impl Store {
         id: &AgentId,
         cleanup_recovery: bool,
     ) -> Result<bool> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
         // Confirm the session exists under THIS workspace before touching any
         // children — the pre-delete statements are keyed by agent id alone, so
         // a mismatched workspace id must remain a no-op exactly like before.
@@ -4042,6 +4149,8 @@ impl Store {
         if exists.is_none() {
             return Ok(false);
         }
+        lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(id.clone())])?;
+        lifecycle.release_serialization();
         delete_in_bounded_batches(
             self.write_pool(),
             DELETE_PAYLOAD_BATCH_SQL,
@@ -4080,6 +4189,7 @@ impl Store {
             .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("delete agent session failed: {e}")))?;
+        lifecycle.settle();
         Ok(result.rows_affected() > 0)
     }
 }

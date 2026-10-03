@@ -722,7 +722,9 @@ use std::time::{Duration, Instant};
 // Version 13.0 removes the deprecated keyed git.commit RPC. Human and agent
 // commits continue to use git.agentCommit with its existing permissions and
 // non-idempotent contract; MCP ws.git.commit is unchanged.
-pub const PROTOCOL_VERSION: &str = "13.1";
+// Version 13.3 adds qualified repository context, selection, native review,
+// companion confirmation, and explicit MR/issue detail-read capabilities.
+pub const PROTOCOL_VERSION: &str = "13.3";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

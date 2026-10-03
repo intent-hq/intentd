@@ -226,7 +226,10 @@ pub(crate) async fn try_dispatch(
             .await
             .map(Some);
     }
-    if let Some(rest) = method.strip_prefix("pr.") {
+    if let Some(rest) = method
+        .strip_prefix("pr.")
+        .or_else(|| method.strip_prefix("mr."))
+    {
         return pr::dispatch(api, workspace_id, caller_agent_id, rest, args)
             .await
             .map(Some);

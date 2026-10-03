@@ -72,12 +72,32 @@ pub(crate) async fn authorized_host() -> (GitlabHost, JoinHandle<()>) {
         .with_api_origin(&origin)
         .unwrap();
     let server = tokio::spawn(async move {
-        for body in [
-            json!({"device_code":"private-code", "user_code":"TEST", "verification_uri":"https://gitlab.result.test/device", "expires_in":60, "interval":1}),
-            json!({"access_token":"controlled-gitlab-token", "refresh_token":"controlled-refresh", "expires_in":7200}),
+        // The device grant is verified before the original writer may persist it.
+        // Keep the finite producer alive for those two genuine account reads.
+        for (request_prefix, body) in [
+            (
+                "POST /oauth/authorize_device ",
+                json!({"device_code":"private-code", "user_code":"TEST", "verification_uri":"https://gitlab.result.test/device", "expires_in":60, "interval":1}),
+            ),
+            (
+                "POST /oauth/token ",
+                json!({"access_token":"controlled-gitlab-token", "refresh_token":"controlled-refresh", "expires_in":7200}),
+            ),
+            (
+                "GET /api/v4/user ",
+                json!({"id":42,"username":"test-user","name":"Test User"}),
+            ),
+            (
+                "GET /api/v4/personal_access_tokens/self ",
+                json!({"scopes":["api"]}),
+            ),
         ] {
             let (stream, _) = listener.accept().await.unwrap();
             let mut reader = BufReader::new(stream);
+            let mut request = String::new();
+            reader.read_line(&mut request).await.unwrap();
+            assert!(request.starts_with(request_prefix), "{request}");
+            let mut bearer = None;
             let mut length = 0;
             loop {
                 let mut line = String::new();
@@ -86,10 +106,16 @@ pub(crate) async fn authorized_host() -> (GitlabHost, JoinHandle<()>) {
                     break;
                 }
                 if let Some((key, value)) = line.split_once(':') {
+                    if key.eq_ignore_ascii_case("authorization") {
+                        bearer = Some(value.trim().to_owned());
+                    }
                     if key.eq_ignore_ascii_case("content-length") {
                         length = value.trim().parse().unwrap();
                     }
                 }
+            }
+            if request_prefix.starts_with("GET ") {
+                assert_eq!(bearer.as_deref(), Some("Bearer controlled-gitlab-token"));
             }
             reader.read_exact(&mut vec![0; length]).await.unwrap();
             let body = body.to_string();

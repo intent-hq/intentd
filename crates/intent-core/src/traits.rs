@@ -43,6 +43,153 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// `intent-services` (§3.2 rule 3). The default bodies return an internal error
 /// so downstream stubs compile until they override these methods.
 pub trait WorkspaceApi: Send + Sync {
+    /// Capture a transport-owned repository read connection under its original
+    /// caller/credential binding. This carrier alone grants no read authority.
+    #[doc(hidden)]
+    fn repository_read_connection(
+        &self,
+        _entry: crate::repository_request::RepositoryWireEntry,
+    ) -> Option<std::sync::Arc<dyn crate::repository_request::RepositoryReadConnection>> {
+        None
+    }
+
+    /// Acquire read-only repository context under the original native connection.
+    /// Explicit original-socket resource reads; older implementations refuse.
+    fn repository_resource_capture(
+        &self,
+        _query: crate::repository_request::RepositoryResourceQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_request::RepositoryResourceCapture>> {
+        Box::pin(async {
+            Err(crate::Error::Forbidden(
+                "Repository resource reads unavailable".into(),
+            ))
+        })
+    }
+    fn repository_resource_detail(
+        &self,
+        _query: crate::repository_request::RepositoryResourceDetailQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_request::RepositoryResourceResult>> {
+        Box::pin(async {
+            Err(crate::Error::Forbidden(
+                "Repository resource reads unavailable".into(),
+            ))
+        })
+    }
+    fn repository_resource_release(
+        &self,
+        _query: crate::repository_request::RepositoryResourceBoundQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_request::RepositoryContextReleased>> {
+        Box::pin(async {
+            Err(crate::Error::Forbidden(
+                "Repository resource reads unavailable".into(),
+            ))
+        })
+    }
+
+    fn repository_context_capture(
+        &self,
+        query: crate::repository_request::RepositoryContextQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_request::RepositoryContextCapture>> {
+        let _ = query;
+        Box::pin(async { Err(Error::Forbidden("Repository context unavailable".into())) })
+    }
+
+    fn repository_context(
+        &self,
+        query: crate::repository_request::RepositoryContextBoundQuery,
+    ) -> BoxFuture<'_, Result<crate::RepositoryContext>> {
+        let _ = query;
+        Box::pin(async { Err(Error::Forbidden("Repository context unavailable".into())) })
+    }
+
+    fn repository_context_release(
+        &self,
+        query: crate::repository_request::RepositoryContextBoundQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_request::RepositoryContextReleased>> {
+        let _ = query;
+        Box::pin(async { Err(Error::Forbidden("Repository context unavailable".into())) })
+    }
+
+    fn native_review_prepare(
+        &self,
+        _query: crate::repository_request::NativeReviewPrepareQuery,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(crate::Error::Forbidden(
+                "Repository review unavailable".into(),
+            ))
+        })
+    }
+    fn native_review_execute(
+        &self,
+        _query: crate::repository_request::NativeReviewExecuteQuery,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(crate::Error::Forbidden(
+                "Repository review unavailable".into(),
+            ))
+        })
+    }
+    fn native_review_reconcile(
+        &self,
+        _query: crate::repository_request::NativeReviewBoundQuery,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(crate::Error::Forbidden(
+                "Repository review unavailable".into(),
+            ))
+        })
+    }
+    fn native_review_release(
+        &self,
+        _query: crate::repository_request::NativeReviewBoundQuery,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(crate::Error::Forbidden(
+                "Repository review unavailable".into(),
+            ))
+        })
+    }
+    fn repository_selection_capture(
+        &self,
+        query: crate::repository_request::RepositorySelectionQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_request::RepositorySelectionCapture>> {
+        let _ = query;
+        Box::pin(async { Err(Error::Forbidden("Repository selection unavailable".into())) })
+    }
+
+    fn repository_selection_save(
+        &self,
+        query: crate::repository_request::RepositorySelectionSaveQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_request::RepositorySelectionAttempt>> {
+        let _ = query;
+        Box::pin(async { Err(Error::Forbidden("Repository selection unavailable".into())) })
+    }
+
+    fn repository_selection_reset(
+        &self,
+        query: crate::repository_request::RepositorySelectionBoundQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_request::RepositorySelectionAttempt>> {
+        let _ = query;
+        Box::pin(async { Err(Error::Forbidden("Repository selection unavailable".into())) })
+    }
+
+    fn repository_selection_reconcile(
+        &self,
+        query: crate::repository_request::RepositorySelectionBoundQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_request::RepositorySelectionAttempt>> {
+        let _ = query;
+        Box::pin(async { Err(Error::Forbidden("Repository selection unavailable".into())) })
+    }
+
+    fn repository_selection_release(
+        &self,
+        query: crate::repository_request::RepositorySelectionBoundQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_request::RepositorySelectionReleased>> {
+        let _ = query;
+        Box::pin(async { Err(Error::Forbidden("Repository selection unavailable".into())) })
+    }
+
     /// List workspaces, optionally including archived ones (PROTOCOL §5.1).
     fn list_workspaces(&self, include_archived: bool) -> BoxFuture<'_, Result<Vec<Workspace>>> {
         let _ = include_archived;

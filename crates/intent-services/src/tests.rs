@@ -1980,7 +1980,12 @@ async fn bulk_workspace_list_serialization_matches_per_workspace_shape() {
     let mut expected = store.list_workspaces(true).await.unwrap();
     for row in &mut expected {
         row.activity = svc.workspace_activity(&row.id);
-        row.pending_delete_at = svc.pending_workspace_deletes.deadline(row.id.as_str());
+        row.pending_delete_at = svc
+            .pending_workspace_deletes
+            .deadline(&crate::delete_grace::PendingDeleteSubject::Workspace(
+                row.id.clone(),
+            ))
+            .unwrap();
         svc.enrich_workspace_aggregates_with_unread(
             row,
             Some(unread.contains(row.id.as_str())),
@@ -19537,9 +19542,57 @@ pub(crate) mod pr {
 
     // ---- ws.pr.snapshot engine (`pr_state`, MCP-only) --------------------
 
+    /// Actual local Git facts for implicit GitHub snapshot routing. Kept local
+    /// to this family so unrelated forge/metadata fixtures remain unchanged.
+    async fn snapshot_git_root(svc: &Services, id: &WorkspaceId) -> tempfile::TempDir {
+        let dir = test_tempdir("snapshot-github-root-");
+        {
+            let repo = git2::Repository::init(dir.path()).unwrap();
+            repo.remote("origin", "https://github.com/o/r").unwrap();
+        }
+        let mut ws = svc.store().get_workspace(id).await.unwrap();
+        ws.worktree_path = Some(dir.path().to_string_lossy().into_owned());
+        svc.store().update_workspace(&ws).await.unwrap();
+        // Make a fresh explicit fixture choice after root setup; current Git
+        // is not evidence of a migrated historical selection.
+        let root = intent_core::RepositoryRootId {
+            workspace_id: id.clone(),
+            kind: intent_core::RepositoryRootKind::Primary,
+        };
+        let original = svc
+            .store()
+            .repository_selection_snapshot(&root)
+            .await
+            .unwrap();
+        let result = svc
+            .store()
+            .write_repository_selection(
+                &original,
+                intent_store::RepositorySelectionChange::Automatic,
+            )
+            .await;
+        assert!(matches!(
+            result.result.unwrap(),
+            intent_store::RepositorySelectionWriteResult::Applied(_)
+        ));
+        let stored = svc
+            .store()
+            .repository_selection_snapshot(&root)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored.selection(),
+            Some(&intent_store::RepositoryStoredSelection::Saved(
+                intent_core::SavedReviewSelection::Automatic
+            ))
+        );
+        dir
+    }
+
     #[intent_test_macros::daemon_test]
     async fn state_snapshot_shape_and_counts() {
         let (_t, svc, ws) = setup(false, true).await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["repo"], "o/r");
         assert_eq!(v["prNumber"], 42);
@@ -19590,6 +19643,7 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["comments"]["conversationCount"], 1);
         assert_eq!(v["comments"]["reviewCommentCount"], 2);
@@ -19608,6 +19662,7 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["mergeable"], false);
         assert_eq!(v["mergeableState"], "dirty");
@@ -19625,6 +19680,7 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["state"], "merged");
         assert_eq!(v["isMerged"], true);
@@ -19650,6 +19706,7 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["mergeableState"], "blocked");
         assert_eq!(v["reviews"]["decision"], "none");
@@ -19671,6 +19728,7 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["mergeableState"], "clean");
         assert_eq!(v["reviews"]["decision"], "review_required");
@@ -19689,6 +19747,7 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["reviews"]["decision"], "approved");
         assert_eq!(v["reviews"]["approvals"], 1);
@@ -19704,17 +19763,18 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let err = svc.pr_state(ws, 999, None).await.unwrap_err();
         assert!(matches!(err, Error::Internal(m) if m.contains("PR #999 not found in o/r")));
     }
 
     #[intent_test_macros::daemon_test]
-    async fn state_snapshot_requires_workspace_repo() {
-        // No repository on the workspace: same "No active PR" guard as the
-        // other pr.* methods (the required prNumber does not bypass it).
+    async fn state_snapshot_unknown_root_uses_fixed_discovery_refusal() {
+        // An absent original Git root cannot infer a provider from metadata or
+        // expose new discovery details through the snapshot error.
         let (_t, svc, ws) = setup(false, false).await;
         let err = svc.pr_state(ws, 42, None).await.unwrap_err();
-        assert!(matches!(err, Error::Internal(m) if m == "No active PR"));
+        assert!(matches!(err, Error::Forbidden(m) if m == crate::repository_read_source::REFUSAL));
     }
 
     #[intent_test_macros::daemon_test]
@@ -19746,6 +19806,7 @@ pub(crate) mod pr {
         *forge.on_list_comments.lock().unwrap() = Some(Box::new(move || {
             assert!(gate.pause_for(std::time::Duration::from_secs(3600), true));
         }));
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws.clone(), 42, None).await.expect("snapshot");
         let until = svc
             .sweep_rate_limit_paused_until()
@@ -23308,6 +23369,7 @@ pub(crate) mod pr {
     async fn pr_state_folds_a_queue_signal_served_from_the_cache() {
         let forge = queue_signal_forge(true);
         let (_t, _root, svc, ws_id) = cached_hover_setup(forge.clone(), None).await;
+        let _git = snapshot_git_root(&svc, &ws_id).await;
         assert_eq!(
             seed_display_status(&svc, &ws_id).await,
             Some(intent_core::WorkspaceDisplayStatus::PrReady)
@@ -47462,7 +47524,7 @@ mod bulk_delete_pool_pressure {
         let trash = cleanup_workspace_worktree_locked(&repo, &worktree, "b54b/x", true);
         drop(guard);
 
-        assert!(trash.is_none(), "nothing to detach");
+        assert!(trash.0.is_none(), "nothing to detach");
         let loud = capture.at_or_above(tracing::Level::WARN);
         assert!(
             loud.is_empty(),
@@ -47514,7 +47576,7 @@ mod bulk_delete_pool_pressure {
         let trash = cleanup_workspace_worktree_locked(&repo, &worktree, "b54b/x", true);
         drop(guard);
 
-        assert!(trash.is_none(), "nothing detached");
+        assert!(trash.0.is_none(), "nothing detached");
         let loud = capture.at_or_above(tracing::Level::WARN);
         assert!(
             loud.iter()
@@ -47735,7 +47797,11 @@ mod agent_delete_grace_window {
             while h
                 .services
                 .pending_agent_deletes
-                .deadline(h.agent.as_str())
+                .deadline(&crate::delete_grace::PendingDeleteSubject::Agent {
+                    workspace_id: h.ws.clone(),
+                    agent_id: h.agent.clone(),
+                })
+                .unwrap()
                 .is_some()
             {
                 tokio::task::yield_now().await;
@@ -48218,6 +48284,7 @@ mod harness_versioning {
         let (_tmp, svc, ws) = setup().await;
         let created = create_agent(&svc, &ws, None).await;
         let agent = &created["agent"];
+        assert_eq!(agent["harnessVersion"], "3.0");
         assert_eq!(
             agent["harnessVersion"],
             intent_core::CURRENT_HARNESS_VERSION,
@@ -48242,6 +48309,50 @@ mod harness_versioning {
         let persisted = session.harness_features.expect("persisted snapshot");
         assert_eq!(persisted["taskGraph"], serde_json::json!(true));
         assert_eq!(persisted["peerAgents"], serde_json::json!(true));
+        let full = svc.agent_get_session_op(id).await.expect("getSession");
+        assert_eq!(full.harness_version, "3.0");
+        assert_eq!(full.harness_features.as_ref(), Some(&persisted));
+        assert_eq!(agent["harnessFeatures"], persisted);
+    }
+
+    #[tokio::test]
+    async fn child_of_saved_2_9_keeps_parent_stamp_and_snapshot() {
+        let (_tmp, svc, ws) = setup().await;
+        let created = create_agent(&svc, &ws, None).await;
+        let parent_id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+        let mut saved_features = created["agent"]["harnessFeatures"].clone();
+        saved_features["hostExec"] = serde_json::json!(false);
+        saved_features["peerAgents"] = serde_json::json!(false);
+        sqlx::query(
+            "UPDATE agent_session SET harness_version = '2.9', harness_features = ? WHERE id = ?",
+        )
+        .bind(saved_features.to_string())
+        .bind(&parent_id.0)
+        .execute(svc.store().write_pool())
+        .await
+        .unwrap();
+        let child = create_agent(&svc, &ws, Some(parent_id.clone())).await;
+        assert_eq!(child["agent"]["harnessVersion"], "3.0");
+        assert_eq!(child["agent"]["harnessFeatures"]["hostExec"], true);
+        assert_eq!(child["agent"]["harnessFeatures"]["peerAgents"], true);
+        let child_id = AgentId::from(child["agent"]["id"].as_str().unwrap());
+        let child_row = svc.store().get_agent_session(&child_id).await.unwrap();
+        assert_eq!(child_row.harness_version, "3.0");
+        assert_eq!(child_row.parent_agent_id.as_ref(), Some(&parent_id));
+        assert_eq!(
+            child_row.harness_features.as_ref(),
+            Some(&child["agent"]["harnessFeatures"])
+        );
+        let child_full = svc.agent_get_session_op(child_id).await.unwrap();
+        assert_eq!(child_full.harness_version, "3.0");
+        assert_eq!(child_full.harness_features, child_row.harness_features);
+        let parent = svc.store().get_agent_session(&parent_id).await.unwrap();
+        assert_eq!(parent.harness_version, "2.9");
+        assert_eq!(parent.harness_features.as_ref(), Some(&saved_features));
+        assert!(!svc.session_agent_features(&parent).peer_agents);
+        let parent_full = svc.agent_get_session_op(parent_id).await.unwrap();
+        assert_eq!(parent_full.harness_version, "2.9");
+        assert_eq!(parent_full.harness_features.as_ref(), Some(&saved_features));
     }
 
     /// Delegation mints LATEST, never inherits: a child created by a parent

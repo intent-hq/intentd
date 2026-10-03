@@ -104,6 +104,85 @@ mod github_auth_ops;
 mod github_browse_ops;
 mod source_control_auth_ops;
 
+// Repository sources use the original Services instance and private gates.
+// Entry and dispatch integration remain separate from observer installation.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        clippy::wildcard_imports,
+        reason = "Physical producer and repository dispatch integration remain pending"
+    )
+)]
+mod repository_admission;
+#[path = "repository_admission/durable_source.rs"]
+mod repository_admission_durable_source;
+#[path = "repository_admission/git_source.rs"]
+mod repository_admission_git_source;
+#[cfg_attr(
+    not(test),
+    expect(
+        clippy::allow_attributes,
+        reason = "The private installation API is optional in isolated manager compositions"
+    )
+)]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "The private installation API is consumed by separately composed manager integration"
+    )
+)]
+#[path = "repository_admission/installation.rs"]
+mod repository_admission_installation;
+#[cfg(test)]
+#[path = "repository_admission/source_tests.rs"]
+mod repository_admission_source_tests;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Repository entry integration remains pending")
+)]
+#[path = "repository_admission/source.rs"]
+mod repository_admission_sources;
+mod repository_context_live;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Original optional delivery is private until manager integration"
+    )
+)]
+mod repository_context_output;
+mod repository_context_reader;
+#[expect(
+    dead_code,
+    unused_imports,
+    reason = "Settings and child-policy writer integration remains inactive"
+)]
+#[cfg_attr(
+    not(test),
+    expect(
+        clippy::wildcard_imports,
+        reason = "Preserve private writer imports while native and child-policy integration is pending"
+    )
+)]
+mod repository_credential_writers;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        clippy::wildcard_imports,
+        reason = "Native credential consumers remain inactive; unit tests exercise their contracts"
+    )
+)]
+mod repository_credentials;
+#[path = "repository_admission/native_wire.rs"]
+mod repository_native_wire;
+#[path = "repository_admission/read_policy.rs"]
+mod repository_read_policy;
+#[path = "repository_admission/read_source.rs"]
+mod repository_read_source;
+
 mod agent_list_cache;
 pub mod checkpoint;
 mod direct_secret_ops;
@@ -124,6 +203,12 @@ mod nested_repos;
 mod note_merge;
 pub mod note_ops;
 mod npx_cli;
+#[expect(
+    dead_code,
+    reason = "qualified cache primitives await admitted caller-directory wiring"
+)]
+mod observation_adapter;
+mod observation_policy;
 mod one_shot_acp;
 pub mod pagination;
 pub mod pi_cli;
@@ -175,10 +260,14 @@ pub mod workspace_vocabulary;
 
 #[cfg(test)]
 mod periodic_shutdown_tests;
+#[cfg(all(test, unix))]
+#[path = "tests/repository_pending_delete.rs"]
+mod repository_pending_delete_tests;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
 mod test_tracing;
+
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -201,7 +290,7 @@ mod v2_5_goldens;
 mod v2_7_goldens;
 
 pub use acp_adapter::{adapter_slot_limit, init_adapter_slots, live_adapters};
-pub use config_watcher::ConfigWatcher;
+pub use config_watcher::{ConfigWatcher, PreparedReloadAdmission};
 pub(crate) use mcp_servers::McpHub;
 pub use settings::{
     agent_memory_budget_bytes, cleanup_retired_settings, history_replay_tool_content_chars,
@@ -1088,6 +1177,20 @@ pub struct Services {
     /// (see [`source_control_auth_ops::GitlabCredentialGate`]). Shared across
     /// clones.
     gitlab_credential_gate: source_control_auth_ops::GitlabCredentialGate,
+    /// The one repository credential directory for this server incarnation.
+    /// Clones share it; construction alone leaves the connection unverified.
+    repository_connection_directory: Arc<repository_credentials::RepositoryConnectionDirectory>,
+    /// Shared identity of this server incarnation, allocated with its repository directory.
+    daemon_boot_id: String,
+    /// Exact ordinary API allocation; clones cannot bind replacement owners.
+    repository_wire_owner: Arc<OnceLock<Weak<Services>>>,
+    repository_review_capacity: Arc<repository_native_wire::review::Capacity>,
+    repository_resource_capacity: Arc<repository_native_wire::resource::Capacity>,
+    repository_selection_capacity: Arc<repository_native_wire::selection::Capacity>,
+    /// Original invalidation owner for this Services instance. Clones share it;
+    /// Store must accept this exact observer before it can be used.
+    repository_lifecycle_registry:
+        Arc<repository_admission::lifecycle::RepositoryLifecycleRegistry>,
     /// When the primary principal's GitHub profile was last refreshed from
     /// `GET /user` on a `principal.me` read (multiplayer w1); shared across
     /// clones so the rate limit spans every RPC handle.
@@ -1333,7 +1436,7 @@ pub struct Services {
     /// here; `workspace.cancelDelete` removes it. Never persisted — a daemon
     /// restart drops every pending deletion. Shared across clones so every
     /// front door observes one set.
-    pending_workspace_deletes: delete_grace::PendingDeletes,
+    pending_workspace_deletes: delete_grace::OwnedPendingDeletes,
     workspace_mutations: workspace_mutations::WorkspaceMutations,
     startup_resume_candidates: Arc<Mutex<HashSet<AgentId>>>,
     #[cfg(test)]
@@ -1342,14 +1445,16 @@ pub struct Services {
     interrupted_resume_park: Option<Arc<CompletionClassifyPark>>,
     #[cfg(test)]
     workspace_delete_test_gate: tests::workspace_delete::DeleteGate,
+    #[cfg(all(test, unix))]
+    pending_delete_test_gate: repository_pending_delete_tests::DeletionGates,
     /// In-memory pending agent-session deletions for the delete grace window
     /// (§5.5): `agent.delete` with `undoDelayMs > 0` registers the timer
     /// here; `agent.cancelDelete` removes it. Keyed by agent id, in a
-    /// registry separate from [`Services::pending_workspace_deletes`] so the
-    /// key spaces never collide. Never persisted — a daemon restart drops
+    /// typed shared allocation with [`Services::pending_workspace_deletes`]
+    /// so workspace and Agent key spaces never collide. Never persisted — a daemon restart drops
     /// every pending deletion. Shared across clones so every front door
     /// observes one set.
-    pending_agent_deletes: delete_grace::PendingDeletes,
+    pending_agent_deletes: delete_grace::OwnedPendingDeletes,
     /// In-flight staged workspace imports (`workspace.import.*`, keyed by
     /// `importId`): manifest + staging paths + chunk cursor between `begin`
     /// and `commit`/`abort`. Shared across clones so chunks arriving over any
@@ -1436,17 +1541,45 @@ impl Services {
     /// Wire the services surface over a persistence handle.
     #[must_use]
     pub fn new(store: Store) -> Self {
-        Self::new_with_file_secrets(store, intent_core::FileSecretStore::new())
+        Self::new_with_repository_sources(store, intent_core::FileSecretStore::new(), None)
     }
 
-    /// Wire explicit file storage before any default secret-store constructor
-    /// can run. Isolated auth fixtures must not trigger legacy host migration.
+    /// Select the backing file before constructing any secret wrapper.
+    #[cfg(test)]
     pub(crate) fn new_with_file_secrets(
         store: Store,
         file_secrets: intent_core::FileSecretStore,
     ) -> Self {
+        Self::new_with_repository_sources(store, file_secrets, None)
+    }
+
+    /// Hidden test support: select disposable original sources before attachment.
+    /// Production composition must use `Services::new`.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "repository-test-fixtures"))]
+    #[must_use]
+    pub fn new_repository_fixture(
+        store: Store,
+        secrets: intent_core::FileSecretStore,
+        descriptor: Option<intent_sourcecontrol::GitlabDescriptor>,
+    ) -> Self {
+        Self::new_with_repository_sources(store, secrets, descriptor)
+    }
+
+    fn new_with_repository_sources(
+        store: Store,
+        gitlab_secret_store: intent_core::FileSecretStore,
+        descriptor: Option<intent_sourcecontrol::GitlabDescriptor>,
+    ) -> Self {
+        let pending_delete_tasks = Arc::new(delivery_tasks::DeliveryTasks::default());
+        let pending_deletes = delete_grace::OwnedPendingDeletes::new(store.clone())
+            .with_tasks(pending_delete_tasks.clone());
         let mcp_hub = Arc::new(McpHub::with_oauth_store(store.clone()));
-        Self {
+        let daemon_boot_id = uuid::Uuid::new_v4().to_string();
+        let repository_connection_directory = Arc::new(
+            repository_credentials::RepositoryConnectionDirectory::new(daemon_boot_id.clone()),
+        );
+        let services = Self {
             store,
             assets_root: None,
             event_subscriptions: Arc::new(Mutex::new(HashMap::new())),
@@ -1483,7 +1616,7 @@ impl Services {
             settings_tasks: Arc::new(delivery_tasks::DeliveryTasks::default()),
             primary_auth_admitted: false,
             terminal_tasks: Arc::new(delivery_tasks::DeliveryTasks::default()),
-            pending_delete_tasks: Arc::new(delivery_tasks::DeliveryTasks::default()),
+            pending_delete_tasks,
             host_exec_runtime: Arc::default(),
             completion_delivery_retries: Arc::new(Mutex::new(HashMap::new())),
             completion_group_delivery_retries: Arc::new(Mutex::new(HashSet::new())),
@@ -1508,6 +1641,7 @@ impl Services {
             search_cancels: intent_search::CancelRegistry::new(),
             agent_activity: Arc::new(Mutex::new(HashMap::new())),
             pty: Arc::new(intent_pty::PtyHost::new()),
+            daemon_boot_id,
             scripts: Arc::new(Mutex::new(HashMap::new())),
             script_locks: script_ops::ScriptLocks::new(),
             script_too_fast_ms: script_ops::TOO_FAST_MS,
@@ -1528,9 +1662,9 @@ impl Services {
             archive_tail_park: None,
             archive_predrop_park: None,
             queue_mutation_gate_park: None,
-            secrets: Arc::new(settings::AsyncSecretStore::new(Arc::new(
-                file_secrets.clone(),
-            ))),
+            secrets: Arc::new(settings::AsyncSecretStore::paired_gitlab(
+                gitlab_secret_store.clone(),
+            )),
             settings_registry: None,
             settings_revision: Arc::new(AtomicU64::new(0)),
             settings_revision_gate: Arc::new(tokio::sync::RwLock::new(())),
@@ -1562,8 +1696,14 @@ impl Services {
             collaboration_auth: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             github_login_base_uri: None,
             gitlab_auth: source_control_auth_ops::new_gitlab_state(),
-            gitlab_secret_store: file_secrets,
+            gitlab_secret_store,
             gitlab_credential_gate: source_control_auth_ops::new_gitlab_credential_gate(),
+            repository_connection_directory,
+            repository_lifecycle_registry: Arc::default(),
+            repository_wire_owner: Arc::default(),
+            repository_resource_capacity: Arc::default(),
+            repository_review_capacity: Arc::default(),
+            repository_selection_capacity: Arc::default(),
             principal_identity_refreshed_at: Arc::new(tokio::sync::Mutex::new(None)),
             identity_transition: Arc::new(tokio::sync::Mutex::new(())),
             identity_rekey_generation: Arc::new(AtomicU64::new(0)),
@@ -1629,7 +1769,7 @@ impl Services {
             pr_monitor_fetch_timeout: pr_monitor::PR_MONITOR_FETCH_TIMEOUT,
             pr_refresh_fetch_timeout: PR_REFRESH_FETCH_TIMEOUT,
             sweep_rate_limit: Arc::new(rate_limit::RateLimitGate::default()),
-            pending_workspace_deletes: delete_grace::PendingDeletes::default(),
+            pending_workspace_deletes: pending_deletes.clone(),
             workspace_mutations: workspace_mutations::WorkspaceMutations::default(),
             startup_resume_candidates: Arc::default(),
             #[cfg(test)]
@@ -1638,7 +1778,9 @@ impl Services {
             interrupted_resume_park: None,
             #[cfg(test)]
             workspace_delete_test_gate: tests::workspace_delete::DeleteGate::default(),
-            pending_agent_deletes: delete_grace::PendingDeletes::default(),
+            #[cfg(all(test, unix))]
+            pending_delete_test_gate: repository_pending_delete_tests::DeletionGates::default(),
+            pending_agent_deletes: pending_deletes,
             execution_invalidation: Arc::new(tokio::sync::Notify::new()),
             execution_readiness: Arc::new(Mutex::new(HashMap::new())),
             transfer_imports: Arc::new(Mutex::new(HashMap::new())),
@@ -1647,7 +1789,12 @@ impl Services {
             idempotency_inflight: Arc::new(IdempotencyInflight::default()),
             transfer_exports: Arc::new(Mutex::new(HashMap::new())),
             export_build_failpoint: None,
-        }
+        };
+        services
+            .gitlab_credential_gate
+            .attach_repository(services.repository_connection_directory(), descriptor)
+            .expect("a new credential gate has no prior repository attachment");
+        services
     }
 
     /// Pin how old a cached PR read may be and still be served on demand,
@@ -1817,8 +1964,25 @@ impl Services {
     /// `~/intent/.secrets.json`.
     #[must_use]
     pub fn with_gitlab_secret_store(mut self, store: intent_core::FileSecretStore) -> Self {
+        self.retire_repository_before_source_override();
         self.gitlab_secret_store = store;
         self
+    }
+
+    /// The original server directory; this accessor does not adopt credentials.
+    pub(crate) fn repository_connection_directory(
+        &self,
+    ) -> Arc<repository_credentials::RepositoryConnectionDirectory> {
+        self.repository_connection_directory.clone()
+    }
+
+    fn retire_repository_before_source_override(&self) {
+        if self.gitlab_credential_gate.has_settings_boundary() {
+            // Builders cannot replace an attached owner. Retire the SAME
+            // directory before changing a source, including across clones.
+            // A poisoned directory already refuses acquisition and dispatch.
+            let _ = self.repository_connection_directory.retire();
+        }
     }
 
     /// Override the GitHub API base the invite identity reads talk to
@@ -1848,6 +2012,7 @@ impl Services {
     /// same timeout / single-flight guarantees apply in tests.
     #[must_use]
     pub fn with_secret_store(mut self, secrets: Arc<dyn settings::SecretStore>) -> Self {
+        self.retire_repository_before_source_override();
         self.secrets = Arc::new(settings::AsyncSecretStore::new(secrets));
         self
     }
@@ -1858,6 +2023,7 @@ impl Services {
     /// wiring may leave it unset, keeping the legacy SQLite-only behavior.
     #[must_use]
     pub fn with_settings_registry(mut self, registry: Arc<SettingsRegistry>) -> Self {
+        self.retire_repository_before_source_override();
         self.settings_registry = Some(registry);
         self
     }
@@ -3258,7 +3424,15 @@ impl Services {
         include_agent_summary: bool,
     ) {
         ws.activity = self.workspace_activity(&ws.id);
-        ws.pending_delete_at = self.pending_workspace_deletes.deadline(ws.id.as_str());
+        ws.pending_delete_at = self
+            .pending_workspace_deletes
+            .deadline(&delete_grace::PendingDeleteSubject::Workspace(
+                ws.id.clone(),
+            ))
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, workspace = %ws.id, "pending delete display projection unavailable");
+                None
+            });
         let mut activity_max = if include_agent_summary {
             latest_activity_candidate(&[
                 ws.last_activity.as_deref(),
@@ -12787,7 +12961,8 @@ fn cleanup_workspace_worktree_locked(
     worktree: &Path,
     branch: &str,
     branch_auto_generated: bool,
-) -> Option<PathBuf> {
+) -> (Option<PathBuf>, bool) {
+    let mut completed = true;
     let checked_out = intent_git::worktree::worktree_branch(worktree);
     // An already-absent repository (retried delete, swept repo cache,
     // orphaned row) is an expected state, not a failure: there is no
@@ -12807,6 +12982,7 @@ fn cleanup_workspace_worktree_locked(
         match intent_git::worktree::detach_worktree(repo, worktree) {
             Ok(trash) => trash,
             Err(e) => {
+                completed = false;
                 tracing::warn!(
                     error = %e,
                     worktree = %worktree.display(),
@@ -12834,6 +13010,7 @@ fn cleanup_workspace_worktree_locked(
         && branch != "master";
     if deletable {
         if let Err(e) = intent_git::branches::delete_local_branch(repo, branch) {
+            completed = false;
             tracing::debug!(error = %e, branch, "could not delete workspace branch");
         }
     } else if let Some(checked_out) = checked_out {
@@ -12842,7 +13019,7 @@ fn cleanup_workspace_worktree_locked(
             "skipping branch deletion - not the auto-generated workspace branch"
         );
     }
-    trash
+    (trash, completed)
 }
 
 /// Locked phase of the `workspace.delete` cleanup for a standalone `CoW`
@@ -12857,10 +13034,12 @@ fn cleanup_workspace_worktree_locked(
 /// happens unlocked via [`cleanup_detached_worktree`]), drop the `.workspace`
 /// metadata dir, and best-effort `remove_dir` the empty parent. Best-effort
 /// throughout; returns the trash path awaiting recursive removal.
-fn cleanup_workspace_cow_checkout_locked(checkout: &Path) -> Option<PathBuf> {
+fn cleanup_workspace_cow_checkout_locked(checkout: &Path) -> (Option<PathBuf>, bool) {
+    let mut completed = true;
     let trash = match intent_git::worktree::detach_checkout_dir(checkout) {
         Ok(trash) => trash,
         Err(e) => {
+            completed = false;
             tracing::warn!(
                 error = %e,
                 checkout = %checkout.display(),
@@ -12877,7 +13056,7 @@ fn cleanup_workspace_cow_checkout_locked(checkout: &Path) -> Option<PathBuf> {
         let _ = std::fs::remove_dir_all(parent.join(".workspace"));
         let _ = std::fs::remove_dir(parent);
     }
-    trash
+    (trash, completed)
 }
 
 /// Best-effort removal of the `<root>/<workspaceId>` dir a `CoW` probe created
@@ -12976,14 +13155,16 @@ fn clear_standalone_repository_path(ws: &mut Workspace, source_standalone: bool)
 /// The empty-only parent `remove_dir` retry that the trash sibling blocked is
 /// the caller's job, back under the lock — doing it here unlocked could race
 /// a same-slug recreate's `create_dir_all(parent)`.
-fn cleanup_detached_worktree(trash: &Path) {
+fn cleanup_detached_worktree(trash: &Path) -> bool {
     if let Err(e) = intent_git::worktree::remove_detached_worktree(trash) {
         tracing::warn!(
             error = %e,
             path = %trash.display(),
             "failed to remove detached worktree dir"
         );
+        return false;
     }
+    true
 }
 
 /// Startup sweep for orphaned worktree trash directories (monorepo#473). If
@@ -16881,6 +17062,62 @@ impl Services {
         Ok(())
     }
 
+    /// Prepare an external configuration candidate under its original settings
+    /// owner before publication. Credential serialization precedes the revision
+    /// gate; account verification runs only after that gate has been released.
+    ///
+    /// # Errors
+    /// Rejects invalid or superseded candidates and unprepared relevant changes.
+    pub async fn apply_prepared_settings_reload(
+        &self,
+        text: String,
+        expected: Arc<SettingsSnapshot>,
+        mut admission: PreparedReloadAdmission,
+    ) -> Result<SettingsChanged> {
+        let registry = self
+            .settings_registry
+            .as_deref()
+            .ok_or_else(|| Error::Internal("settings registry is unavailable for reload".into()))?;
+        let candidate = registry.prepare_repository_reload_at(&text, expected)?;
+        let relevant = candidate.snapshot().effective.source_control.gitlab
+            != registry.snapshot().effective.source_control.gitlab;
+        let credential_guard = if relevant {
+            Some(admission.wait(self.gitlab_credential_gate.lock()).await?)
+        } else {
+            None
+        };
+        let revision_guard = admission.wait(self.settings_revision_gate.write()).await?;
+        let (write, result) = admission.publish(|| {
+            let write = if self.gitlab_credential_gate.has_settings_boundary() {
+                credential_guard
+                    .as_ref()
+                    .map(|guard| {
+                        self.gitlab_credential_gate.prepare_settings(
+                            registry,
+                            candidate.snapshot(),
+                            guard,
+                        )
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
+            let result = registry.publish_repository_reload(candidate, write.as_deref());
+            Ok((write, result))
+        })?;
+        admission
+            .finish(async {
+                if let Ok(notice) = &result {
+                    self.apply_external_settings_change(notice).await;
+                }
+                drop(revision_guard);
+                self.settle_gitlab_repository_settings(write.as_deref(), result.is_ok(), false)
+                    .await;
+                result
+            })
+            .await
+    }
+
     /// Apply an **externally driven** settings change (config.toml
     /// live-reload): the registry has already adopted the new file layer, so
     /// this runs the same server runtime hooks as `settings.update`
@@ -17053,19 +17290,6 @@ impl Services {
         }))
     }
 
-    /// Whether a `settings.update` batch writes the GitLab credential
-    /// ([`intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT`]), i.e. must
-    /// run under [`Self::gitlab_credential_gate`]. Placeholder entries count:
-    /// the gate is cheap and the apply decides the no-op.
-    fn batch_touches_gitlab_credential(changes: &serde_json::Value) -> bool {
-        changes.as_array().is_some_and(|entries| {
-            entries.iter().any(|e| {
-                e.get("path").and_then(|v| v.as_str())
-                    == Some(intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT)
-            })
-        })
-    }
-
     /// Default-model re-resolution on a default-provider switch
     /// (monorepo#3177). When a `settings.update` batch writes
     /// `model.defaultProvider` to a registered provider that differs from
@@ -17174,7 +17398,762 @@ impl Services {
     }
 }
 
+impl Services {
+    fn delete_workspace_with_claim(
+        &self,
+        id: WorkspaceId,
+        original_claim: Option<delete_grace::PendingDeleteClaim>,
+    ) -> BoxFuture<'_, Result<()>> {
+        let store = self.store.clone();
+        let worktree_locks = self.worktree_locks.clone();
+        let bus = self.event_bus.clone();
+        let workspaces_root = self
+            .workspaces_root
+            .clone()
+            .unwrap_or_else(default_workspaces_root);
+        // Custom `workspace.worktreesLocation` sweep target: the workspace's
+        // actual parent is derived from its persisted worktree path below,
+        // but worktree-less rows created under a custom location need the
+        // currently configured location as a candidate too.
+        let worktrees_location = self.configured_worktrees_location();
+        // Live-state teardown handles: cloned so the boxed future owns them
+        // across the store cascade below. `agent_manager()` upgrades the weak
+        // reference; read-only/test wiring with no manager attached simply
+        // skips the runtime stop and still sweeps the in-memory registries.
+        let manager = self.agent_manager();
+        let agent_queues = self.agent_queues.clone();
+        let live_turns = self.live_turns.clone();
+        let last_turn_silent_tails = self.last_turn_silent_tails.clone();
+        let truncation_redrives = self.truncation_redrives.clone();
+        let pending_truncation_redrive = self.pending_truncation_redrive.clone();
+        let agent_subscriptions = self.agent_subscriptions.clone();
+        // Full handle for the direct completion delivery below (Services is
+        // Clone — the same capture pattern the spawn helpers use).
+        let services = self.clone();
+        Box::pin(async move {
+            self.require_workspace_manager(&id, "workspace.delete")
+                .await?;
+            // Chief is virtual and never appears in `workspace.list`; delete is
+            // a no-op success (TS `workspace.repository.delete` / virtual-guard
+            // parity — the seeded row is not torn down and no cascade fires).
+            if id.is_chief() {
+                return Ok(());
+            }
+            let subject = delete_grace::PendingDeleteSubject::Workspace(id.clone());
+            let claim = match original_claim {
+                Some(claim) if claim.subject() == &subject => claim,
+                Some(_) => {
+                    return Err(Error::InvalidParams(
+                        "different original deletion subject".into(),
+                    ))
+                }
+                None => {
+                    services
+                        .pending_workspace_deletes
+                        .take_for_immediate_delete(subject)
+                        .await?
+                }
+            };
+            let mut deletion_claims = vec![claim];
+            // Close producer admission before the snapshot. Existing admitted
+            // creates/sends finish first; unrelated workspaces stay writable.
+            // Keep the permit through cleanup and terminal event publication.
+            let _deletion = services.workspace_mutations.delete(&id).await;
+            services
+                .cancel_script_monitors(&id, None, "workspace-deleted")
+                .await?;
+            // Terminate live agent sessions BEFORE the store cascade drops
+            // their rows. A same-slug recreate hitting `agent.list` after the
+            // delete would otherwise surface ghost sessions whose workers are
+            // still draining, their live-turn slots + pending message queues
+            // still populated, and their completion watches still firing. The
+            // order mirrors `agent_delete_op`: capture the workspace-scoped
+            // sessions, drop each session's runtime state, then emit
+            // `agent:deleted` per session so subscribers see the tear-down
+            // before the terminal `workspace:deleted`.
+            // Fail fast on a transient session-list error: skipping the
+            // sweep here but still deleting the workspace row leaves ghost
+            // workers, live-turn slots, queued messages, and completion
+            // watches with no owning workspace — a client can retry the
+            // delete, but silent partial success cannot recover.
+            // Summaries only (intent-hq/monorepo#4130): the sweep reads just
+            // `id` + `name`, and the full `list_agent_sessions` hydrated
+            // every session's transcript (2 statements per agent) for rows
+            // the cascade below is about to drop.
+            let sessions = store.list_agent_session_summaries(&id).await?;
+            let session_ids: Vec<AgentId> = sessions.iter().map(|s| s.id.clone()).collect();
+            // Cascade interaction (§5.5): the workspace delete — immediate
+            // or committed-from-pending — supersedes any pending agent
+            // deletions inside it. Abort their timers without per-agent
+            // cancel events; each session is deleted just below, emitting
+            // `agent:deleted` per session.
+            deletion_claims.extend(services.take_pending_agent_deletes(&sessions).await?);
+            // Batch stop: aborts each worker, drops each handle, clears
+            // busy + agent_ws, and deregisters each process — the
+            // `agent.stop` semantics per agent — then kills all detached
+            // ACP children's process groups under ONE shared grace
+            // window (`kill_child_trees`), so the delete ack pays ~one
+            // grace period total instead of one per live agent.
+            // The returned fence keeps the swept agents blocked from the
+            // lazy-spawn paths until this future completes (it drops at the
+            // end of this scope, after the store cascade below deletes the
+            // session rows): a concurrent `agent.sendMessage` that passed
+            // its store check before the sweep would otherwise respawn a
+            // replacement child during the shared grace wait and leave it
+            // running as a ghost process after the rows are gone.
+            let _teardown_fence = match manager.as_ref() {
+                Some(manager) => Some(manager.stop_many(&session_ids).await),
+                None => None,
+            };
+            for session in &sessions {
+                // Live-turn slot + pending message queue live in `Services`'
+                // maps (not touched by `manager.stop_many`); drop them so a
+                // same-slug recreate observes no ghost state. Recover through
+                // a poisoned lock via `into_inner` — the delete path is the
+                // last chance to unlink this state, so best-effort teardown
+                // outweighs propagating a mutex-poison panic.
+                live_turns
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&session.id);
+                last_turn_silent_tails
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&session.id);
+                truncation_redrives
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&session.id);
+                pending_truncation_redrive
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&session.id);
+                agent_queues
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&session.id);
+            }
+            // Sweep the deleted workspace out of the daemon-global
+            // subscription registry: drop watches whose PARENT lives here
+            // (their wake destination is gone) and groups anchored here.
+            // Watches whose parent lives elsewhere (a chief watching a child
+            // in this workspace) are kept — the `agent:deleted` events
+            // published just below still wake the cross-workspace parent.
+            // Poison recovery mirrors the per-session sweep above.
+            let parent_watch_ids: Vec<String> = {
+                let registry = agent_subscriptions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                registry
+                    .subscriptions
+                    .iter()
+                    .filter(|s| s.parent_workspace_id == id)
+                    .map(|s| s.id.clone())
+                    .collect()
+            };
+            // These rows have no FK cascade. Delete each outside the registry
+            // lock before forgetting it in memory, so failure/cancellation
+            // leaves its id available for retry. Admission also covers any
+            // delayed registration write, so none can land behind this sweep.
+            for watch_id in &parent_watch_ids {
+                store.delete_completion_watch(watch_id).await?;
+            }
+            {
+                let mut registry = agent_subscriptions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                registry
+                    .subscriptions
+                    .retain(|s| s.parent_workspace_id != id);
+                registry.delegation_groups.retain(|g| g.workspace_id != id);
+            }
+            // Emit `agent:deleted` per swept session before the worktree /
+            // store cleanup so subscribers see the terminal event for each
+            // agent ahead of `workspace:deleted`. Best-effort: emits when the
+            // bus is wired; a `None` bus (read-only wiring) is a quiet no-op.
+            for session in &sessions {
+                publish_event(
+                    bus.as_ref(),
+                    NewEvent {
+                        workspace_id: id.clone(),
+                        timestamp: now_iso(),
+                        event_type: AGENT_DELETED.to_string(),
+                        actor: system_actor(),
+                        session_id: Some(session.id.0.clone()),
+                        correlation_id: None,
+                        parent_event_id: None,
+                        metadata: None,
+                        data: serde_json::json!({
+                            "agentId": session.id.0,
+                            "agentName": session.name,
+                        }),
+                    },
+                )
+                .await;
+            }
+            // Deterministic cross-workspace consumption (monorepo#463): the
+            // publishes above are best-effort (`None` bus, logged-and-skipped
+            // delivery failures), so a chief parent's watch on a child here
+            // could otherwise leak forever (watches have no timed cleanup)
+            // and a chief-anchored after_all group would stay
+            // incomplete until restart. Deliver the same synthetic
+            // `agent:deleted` directly, BEFORE the store cascade drops the
+            // session rows (grouped delivery still resolves the child's
+            // completion report). The remove-before-deliver guard in
+            // `deliver_completion_to_watches` makes the bus loop's later
+            // processing of the published event a no-op — no duplicate wake —
+            // and `record_group_child_completion` is idempotent.
+            // The settlement clear of each child's advisory-wake period
+            // markers runs ONCE for the whole sweep (one `IN`-list statement)
+            // instead of inside every delivery (intent-hq/monorepo#4130);
+            // best-effort on the same terms as the per-child clear — the
+            // cascade below drops the rows regardless.
+            if let Err(e) = store
+                .clear_advisory_wake_deliveries_for_children(&session_ids)
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    workspace = %id.as_str(),
+                    "failed to clear advisory-wake period markers for deleted workspace"
+                );
+            }
+            for session in &sessions {
+                let event = Event {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    workspace_id: id.clone(),
+                    timestamp: now_iso(),
+                    event_type: AGENT_DELETED.to_string(),
+                    actor: system_actor(),
+                    session_id: Some(session.id.0.clone()),
+                    correlation_id: None,
+                    parent_event_id: None,
+                    metadata: None,
+                    data: serde_json::json!({
+                        "agentId": session.id.0,
+                        "agentName": session.name,
+                    }),
+                };
+                services
+                    .deliver_completion_to_watches_markers_precleared(&session.id, &event)
+                    .await;
+            }
+            // Backstop sweep: grouped watches survive delivery (group
+            // settlement owns their lifecycle) and a racing registration can
+            // land behind the loop above — after this point no watch may
+            // reference the deleted workspace as its child side. In-memory
+            // retain + best-effort delete of the persisted rows. Each
+            // affected parent then gets a refreshed
+            // `agent:subscriptions-changed` so clients converge on the
+            // shrunken watch set without polling (PROTOCOL §6.5).
+            let leaked: Vec<(String, WorkspaceId, AgentId)> = {
+                let mut registry = agent_subscriptions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut leaked = Vec::new();
+                registry.subscriptions.retain(|s| {
+                    if s.child_workspace_id == id {
+                        leaked.push((
+                            s.id.clone(),
+                            s.parent_workspace_id.clone(),
+                            s.parent_agent_id.clone(),
+                        ));
+                        false
+                    } else {
+                        true
+                    }
+                });
+                leaked
+            };
+            for (watch_id, _, _) in &leaked {
+                if let Err(e) = store.delete_completion_watch(watch_id).await {
+                    tracing::warn!("completion_watch delete failed {watch_id}: {e}");
+                }
+            }
+            let mut notified: Vec<(&WorkspaceId, &AgentId)> = Vec::new();
+            for (_, parent_ws, parent_id) in &leaked {
+                if !notified.contains(&(parent_ws, parent_id)) {
+                    notified.push((parent_ws, parent_id));
+                    services
+                        .publish_subscriptions_changed(parent_ws, parent_id)
+                        .await;
+                }
+            }
+            // Drop the workspace's event subscriptions (monorepo#947): their
+            // filter is workspace-scoped, so once the workspace is gone they
+            // can never match again — without this sweep their delivery
+            // tasks and persisted rows leak and rehydrate forever. Aborts
+            // the tasks and deletes the rows (chief-anchored subscriptions
+            // scoped to OTHER workspaces are untouched — this removes only
+            // subscriptions whose events came from the deleted workspace).
+            // Producer admission is already closed: no new subscription can
+            // register behind this sweep while the store cleanup yields.
+            services.remove_event_subscriptions_for_workspace(&id).await;
+            // Eagerly abort the workspace's live hook scheduler tasks BEFORE
+            // the store cascade drops their rows — otherwise each task would
+            // linger until its next tick before noticing the row is gone.
+            services.abort_workspace_hook_tasks(&id).await;
+            // Capture workspace state for the async cleanup below (before the
+            // row delete). Best-effort: when the workspace is already gone or
+            // the read fails, the background task simply skips the worktree
+            // step — the orphaned directory sweep can still unlink
+            // `<workspaces_root>/<id>/` on a retry, per the idempotent delete.
+            let workspace_observation = store.get_workspace(&id).await;
+            let mut known_completion =
+                matches!(&workspace_observation, Ok(_) | Err(Error::NotFound(_)));
+            let ws_for_cleanup = workspace_observation.ok();
+            let branch_observation = store.workspace_branch_auto_generated(&id).await;
+            known_completion &= matches!(&branch_observation, Ok(_) | Err(Error::NotFound(_)));
+            let branch_auto_generated = branch_observation.unwrap_or(false);
+            #[cfg(test)]
+            services.workspace_delete_test_gate.pause(&id).await;
+            // Idempotent DB delete: swallow `NotFound` so retries and
+            // orphan-dir-only cleanups don't surface as `"Failed to delete
+            // space"` on the FE. Any other error still propagates. Publish
+            // `workspace:deleted` only when we actually removed a row —
+            // subscribers dedup by id but a spurious event confuses UIs
+            // that treat it as a state transition.
+            let store_outcome = store.delete_workspace_with_outcome(&id).await;
+            known_completion &= store_outcome.disposition
+                != intent_store::RepositoryWorkspaceDeleteDisposition::Unknown;
+            match store_outcome.result {
+                Ok(()) => {
+                    publish_event(bus.as_ref(), workspace_deleted_event(&id)).await;
+                }
+                Err(Error::NotFound(_)) => {
+                    tracing::debug!(
+                        workspace = %id.as_str(),
+                        "workspace.delete: row already gone; treating as idempotent success"
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+            // Cancel any pending debounced lastActivity derivation
+            // (monorepo#3623): the timer must not outlive the workspace —
+            // it would fire against the deleted row and log a spurious
+            // not-found WARN. After the row delete, so a schedule placed
+            // by the teardown above is swept too.
+            services.cancel_last_activity_schedule(&id);
+            // Sweep the pending idle debouncer the same way (monorepo#3632):
+            // an `agent_activity_end` during the agent teardown above
+            // schedules an idle flip whose timer would otherwise outlive the
+            // workspace and emit a spurious
+            // `workspace:activity-changed { idle }` ~3s after deletion.
+            // Residual race: an `agent_activity_end` landing after this sweep
+            // can still re-arm a flip for the deleted id — the timer's
+            // every-exit-path removal self-heals the map entry, and its
+            // emit-time existence guard skips the spurious event.
+            services.cancel_idle_debounce(&id);
+            // Evict the deleted workspace's last-observed displayStatus
+            // baseline so the in-memory map does not leak for the daemon's
+            // lifetime (and a same-id recreate seeds fresh).
+            services.evict_display_status_baseline(&id);
+            // Same for the cached git status: a dirty repo's `files` vec is
+            // unbounded, so the deleted worktree's last scan must not be
+            // retained for the daemon's lifetime (monorepo#1648).
+            if let Some(worktree) = ws_for_cleanup.as_ref().and_then(git_ops::worktree_path) {
+                services.git_status_cache.evict(&worktree);
+            }
+            // Fast-ack: the client receives `{ success: true }` here while the
+            // worktree and workspace-directory cleanup proceeds asynchronously
+            // in the background. Bounded latency regardless of checkout size
+            // (no multi-GB `remove_dir_all` blocking the response).
+            //
+            // Same-slug-recreate race guard: the `create` path already takes
+            // the per-repo worktree lock before provisioning, so a recreate
+            // cannot run its `add_worktree` while this cleanup's locked phase
+            // (registration prune + rename to a trash path) is still in
+            // progress for the same repo.
+            // Residual risk: if a recreate runs *before* the background task
+            // fires (row is deleted, event is sent, response is ACKed, but the
+            // spawn hasn't yet grabbed the worktree lock), the recreate could
+            // complete and then this cleanup might delete its brand-new
+            // worktree. Mitigation: we re-check the workspace row inside the
+            // background task and skip cleanup if it exists again. This is
+            // best-effort; the cleanup is naturally idempotent, and
+            // `workspace.delete` of the recreated workspace will clean up any
+            // mismatched leftovers.
+            let workspaces_root_bg = workspaces_root.clone();
+            let worktrees_location_bg = worktrees_location.clone();
+            let id_bg = id.clone();
+            let store_bg = store.clone();
+            let worktree_locks_bg = worktree_locks.clone();
+            let branch_auto_generated_bg = branch_auto_generated;
+            #[cfg(all(test, unix))]
+            let cleanup_gate = services.pending_delete_test_gate.clone();
+            let cleanup_task = services.store_tasks.spawn_draining(async move {
+                #[cfg(all(test, unix))]
+                cleanup_gate.pause("background", &id_bg.0).await;
+                // Re-check that the workspace is actually deleted. If it
+                // exists now (same-slug recreate landed before this task ran),
+                // skip the worktree cleanup entirely — the new workspace owns
+                // the branch and directory now. Still sweep the
+                // `<workspaces_root>/<id>/` directory if it doesn't match the
+                // recreated workspace's path, for orphan-cleanup parity.
+                let recreated_observation = store_bg.get_workspace(&id_bg).await;
+                known_completion &=
+                    matches!(&recreated_observation, Ok(_) | Err(Error::NotFound(_)));
+                let recreated = recreated_observation.ok();
+                let deleted_worktree_path = ws_for_cleanup
+                    .as_ref()
+                    .and_then(|w| w.worktree_path.clone());
+                // Root-anchored ownership: the persisted checkout counts as
+                // daemon-provisioned only when its parent directory is named
+                // after the workspace id AND it lives under a root the daemon
+                // provisions into (the boot workspaces root or the currently
+                // configured `workspace.worktreesLocation`). The parent
+                // basename alone is spoofable — the workspace id derives from
+                // the initial prompt, so an `isNewRepo` caller could place
+                // their repository at `<anywhere>/<wsId>/<repo>` and a
+                // basename-only gate would route the user's folder into the
+                // delete paths below. Trade-off: a checkout provisioned under
+                // a since-changed custom location is no longer matched and its
+                // `<oldLocation>/<wsId>/` directory leaks instead of being
+                // swept — leaking is the safe direction (never delete what we
+                // cannot prove we created).
+                let checkout_owned = deleted_worktree_path.as_deref().is_some_and(|wt| {
+                    checkout_parent_is_workspace_dir(wt, &id_bg)
+                        && (Path::new(wt).starts_with(&workspaces_root_bg)
+                            || worktrees_location_bg
+                                .as_deref()
+                                .is_some_and(|loc| Path::new(wt).starts_with(loc)))
+                });
+                // A standalone row's checkout path is caller-influenced
+                // (`repository_path == worktree_path`), so unless ownership is
+                // proven above it must not seed the final
+                // `workspace_dir_candidates` sweep either — that sweep
+                // recursively removes the checkout's parent directory.
+                // Worktree-mode rows keep their persisted path: the daemon
+                // derived it at provision time (covers a since-changed custom
+                // location).
+                let is_standalone_row = ws_for_cleanup.as_ref().is_some_and(|w| {
+                    matches!(
+                        w.checkout_mode,
+                        Some(intent_core::CheckoutMode::Cow | intent_core::CheckoutMode::Direct)
+                    )
+                });
+                let sweep_worktree_path = deleted_worktree_path
+                    .as_deref()
+                    .filter(|_| !is_standalone_row || checkout_owned);
+                if let Some(ws_cleanup) = ws_for_cleanup {
+                    // Only run the worktree cleanup if the workspace is still
+                    // deleted (no recreate) or the recreate has a different
+                    // worktree path (the old worktree is now orphaned).
+                    let skip_worktree = recreated
+                        .as_ref()
+                        .is_some_and(|r| r.worktree_path == ws_cleanup.worktree_path);
+                    if !skip_worktree {
+                        let repo_dir = ws_cleanup
+                            .repository_path
+                            .as_deref()
+                            .filter(|p| !p.is_empty())
+                            .map(PathBuf::from);
+                        let wt = ws_cleanup
+                            .worktree_path
+                            .as_deref()
+                            .filter(|p| !p.is_empty())
+                            .map(PathBuf::from);
+                        if let (Some(repo_dir), Some(wt)) = (repo_dir, wt) {
+                            if !ws_cleanup.skip_worktree && !ws_cleanup.is_remote {
+                                let branch = ws_cleanup.branch.clone();
+                                let repo = repo_dir.clone();
+                                let branch_flag = branch_auto_generated_bg;
+                                let wt_locked = wt.clone();
+                                // A CoW or direct checkout is a standalone
+                                // clone: no registration to prune in the
+                                // source repo, and its workspace branch lives
+                                // only inside the clone — so the source-repo
+                                // branch-delete guard must not run (a
+                                // same-named source branch was never this
+                                // workspace's).
+                                let is_standalone = matches!(
+                                    ws_cleanup.checkout_mode,
+                                    Some(
+                                        intent_core::CheckoutMode::Cow
+                                            | intent_core::CheckoutMode::Direct
+                                    )
+                                );
+                                // Standalone-checkout removal is gated on the
+                                // root-anchored `checkout_owned` proof above
+                                // (`<root>/<wsId>/<slug>` under a daemon
+                                // root). An `isNewRepo` direct row's checkout
+                                // IS the user's repository folder
+                                // (`worktree_path == repository_path`,
+                                // intent-hq/monorepo#2611): never provisioned
+                                // by the daemon, never deleted with the
+                                // workspace.
+                                if is_standalone && !checkout_owned {
+                                    tracing::debug!(
+                                        workspace = %ws_cleanup.id.as_str(),
+                                        checkout = %wt_locked.display(),
+                                        "workspace.delete: standalone checkout is the user's repository folder; keeping it"
+                                    );
+                                } else {
+                                    // Under the per-repo lock: git-metadata work
+                                    // only (registration prune, rename of the
+                                    // checkout to a trash path, branch-delete
+                                    // guard; for CoW just the rename + metadata
+                                    // dir removal). On the rename-success path
+                                    // the multi-GB recursive removal runs below,
+                                    // after the lock is released, so concurrent
+                                    // `workspace.create` provisioning on the same
+                                    // repo is not starved by bulk deletes; only
+                                    // the rare rename-failure fallback removes
+                                    // in place under the lock.
+                                    let (trash, detached) = worktree_locks_bg
+                                        .with_lock(&repo_dir, move || async move {
+                                            let task = tokio::task::spawn_blocking(move || {
+                                                if is_standalone {
+                                                    cleanup_workspace_cow_checkout_locked(
+                                                        &wt_locked,
+                                                    )
+                                                } else {
+                                                    cleanup_workspace_worktree_locked(
+                                                        &repo,
+                                                        &wt_locked,
+                                                        &branch,
+                                                        branch_flag,
+                                                    )
+                                                }
+                                            })
+                                            .await;
+                                            match task {
+                                                Ok(trash) => trash,
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        error = %e,
+                                                        "background worktree cleanup task failed"
+                                                    );
+                                                    (None, false)
+                                                }
+                                            }
+                                        })
+                                        .await;
+                                    known_completion &= detached;
+                                    if let Some(trash) = trash {
+                                        let removal = tokio::task::spawn_blocking(move || {
+                                            cleanup_detached_worktree(&trash)
+                                        })
+                                        .await;
+                                        known_completion &= matches!(&removal, Ok(true));
+                                        if let Err(e) = removal {
+                                            tracing::warn!(
+                                                error = %e,
+                                                "background detached-worktree removal task failed"
+                                            );
+                                        }
+                                        // Retry the empty-only parent `remove_dir`
+                                        // the trash sibling blocked — back under
+                                        // the per-repo lock, so it can't race a
+                                        // same-slug recreate's freshly created
+                                        // parent between its `create_dir_all` and
+                                        // `git worktree add`. O(1) while held.
+                                        if let Some(parent) = wt.parent().map(Path::to_path_buf) {
+                                            worktree_locks_bg
+                                                .with_lock(&repo_dir, move || async move {
+                                                    let _ = std::fs::remove_dir(&parent);
+                                                })
+                                                .await;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Final sweep of the daemon-owned workspace directory
+                // (`<parent>/<id>/`). The worktree cleanup's best-effort
+                // `remove_dir` (empty-only) leaves any residual content
+                // behind, and legacy pre-daemon workspaces have a directory
+                // but no worktree path at all. Recursive best-effort removal
+                // keeps the FE `FileSystemWorkspaceRepository.findAll` scan
+                // from re-surfacing the deleted id (ENOENT WARN spam) and
+                // makes the delete idempotent for orphaned directories.
+                //
+                // Candidates cover every parent this workspace may live under
+                // (persisted worktree's parent — the location in force at
+                // create time — plus the boot root and the currently
+                // configured `workspace.worktreesLocation`), so deleting a
+                // workspace created under a custom location does not leak
+                // `<location>/<id>/`.
+                //
+                // If a same-slug recreate happened and uses the same
+                // `<parent>/<id>/` directory, skip that candidate so we don't
+                // destroy the recreated workspace's directory tree.
+                let recreated_parent = recreated
+                    .as_ref()
+                    .and_then(|r| r.worktree_path.as_deref())
+                    .filter(|p| !p.is_empty())
+                    .and_then(|wt_path| Path::new(wt_path).parent())
+                    .map(Path::to_path_buf);
+                for dir in workspace_dir_candidates(
+                    &id_bg,
+                    sweep_worktree_path,
+                    &workspaces_root_bg,
+                    worktrees_location_bg.as_deref(),
+                ) {
+                    if recreated_parent.as_deref() == Some(dir.as_path()) {
+                        continue;
+                    }
+                    // Shared parallel removal helper; `NotFound` is already
+                    // folded into `Ok` there.
+                    #[cfg(all(test, unix))]
+                    let worker_gate = cleanup_gate.clone();
+                    #[cfg(all(test, unix))]
+                    let worker_id = id_bg.0.clone();
+                    let cleanup = tokio::task::spawn_blocking(move || {
+                        #[cfg(all(test, unix))]
+                        worker_gate.pause_worker(&worker_id);
+                        let result = intent_git::fs_remove::remove_dir_all_parallel(&dir);
+                        #[cfg(all(test, unix))]
+                        worker_gate.worker_finished(&worker_id);
+                        result
+                    })
+                    .await;
+                    known_completion &= matches!(&cleanup, Ok(Ok(())));
+                    match cleanup {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => tracing::warn!(
+                            workspace = %id_bg.as_str(),
+                            error = %e,
+                            "background cleanup: failed to remove workspace directory"
+                        ),
+                        Err(join_err) => tracing::warn!(
+                            workspace = %id_bg.as_str(),
+                            error = %join_err,
+                            "background cleanup: workspace-dir task failed"
+                        ),
+                    }
+                }
+                // Only this original worker can confirm its terminal Store/FS work.
+                // Cancellation or a late blocking worker drops the claims as unknown.
+                if known_completion {
+                    for claim in deletion_claims {
+                        claim.settle_confirmed();
+                    }
+                }
+                #[cfg(all(test, unix))]
+                cleanup_gate.finished(&id_bg.0);
+            });
+            #[cfg(all(test, unix))]
+            if let Some(task) = &cleanup_task {
+                services
+                    .pending_delete_test_gate
+                    .track(&id.0, task.abort_handle());
+            }
+            drop(cleanup_task);
+            Ok(())
+        })
+    }
+}
+
 impl WorkspaceApi for Services {
+    fn repository_read_connection(
+        &self,
+        entry: intent_core::repository_request::RepositoryWireEntry,
+    ) -> Option<Arc<dyn intent_core::repository_request::RepositoryReadConnection>> {
+        repository_native_wire::connection(self, entry)
+    }
+
+    fn native_review_prepare(
+        &self,
+        query: intent_core::repository_request::NativeReviewPrepareQuery,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        repository_native_wire::review::prepare(self, query)
+    }
+    fn native_review_execute(
+        &self,
+        query: intent_core::repository_request::NativeReviewExecuteQuery,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        repository_native_wire::review::execute(self, query)
+    }
+    fn native_review_reconcile(
+        &self,
+        query: intent_core::repository_request::NativeReviewBoundQuery,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        repository_native_wire::review::reconcile(self, query)
+    }
+    fn native_review_release(
+        &self,
+        query: intent_core::repository_request::NativeReviewBoundQuery,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        repository_native_wire::review::release(self, query)
+    }
+    fn repository_selection_capture(
+        &self,
+        query: intent_core::repository_request::RepositorySelectionQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositorySelectionCapture>> {
+        repository_native_wire::selection::capture(self, query)
+    }
+
+    fn repository_selection_save(
+        &self,
+        query: intent_core::repository_request::RepositorySelectionSaveQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositorySelectionAttempt>> {
+        repository_native_wire::selection::save(self, query)
+    }
+
+    fn repository_selection_reset(
+        &self,
+        query: intent_core::repository_request::RepositorySelectionBoundQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositorySelectionAttempt>> {
+        repository_native_wire::selection::reset(self, query)
+    }
+
+    fn repository_selection_reconcile(
+        &self,
+        query: intent_core::repository_request::RepositorySelectionBoundQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositorySelectionAttempt>> {
+        repository_native_wire::selection::reconcile(self, query)
+    }
+
+    fn repository_selection_release(
+        &self,
+        query: intent_core::repository_request::RepositorySelectionBoundQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositorySelectionReleased>> {
+        repository_native_wire::selection::release(self, query)
+    }
+
+    fn repository_resource_capture(
+        &self,
+        query: intent_core::repository_request::RepositoryResourceQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositoryResourceCapture>> {
+        repository_native_wire::resource::capture(self, query)
+    }
+    fn repository_resource_detail(
+        &self,
+        query: intent_core::repository_request::RepositoryResourceDetailQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositoryResourceResult>> {
+        repository_native_wire::resource::detail(self, query)
+    }
+    fn repository_resource_release(
+        &self,
+        query: intent_core::repository_request::RepositoryResourceBoundQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositoryContextReleased>> {
+        repository_native_wire::resource::release(self, query)
+    }
+
+    fn repository_context_capture(
+        &self,
+        query: intent_core::repository_request::RepositoryContextQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositoryContextCapture>> {
+        repository_native_wire::capture(self, query)
+    }
+
+    fn repository_context(
+        &self,
+        query: intent_core::repository_request::RepositoryContextBoundQuery,
+    ) -> BoxFuture<'_, Result<intent_core::RepositoryContext>> {
+        repository_native_wire::read(self, query)
+    }
+
+    fn repository_context_release(
+        &self,
+        query: intent_core::repository_request::RepositoryContextBoundQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositoryContextReleased>> {
+        repository_native_wire::release(self, query)
+    }
+
     fn settings_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             // Daemon settings are host state: administrator-only in the matrix.
@@ -19430,7 +20409,9 @@ impl WorkspaceApi for Services {
             ws.activity = this.workspace_activity(&id);
             // Delete grace window (§5.1): surface the in-memory
             // pending-deletion deadline; O(1) map read, never persisted.
-            ws.pending_delete_at = this.pending_workspace_deletes.deadline(id.as_str());
+            ws.pending_delete_at = this
+                .pending_workspace_deletes
+                .deadline(&delete_grace::PendingDeleteSubject::Workspace(id.clone()))?;
             // The git-root PRs and monitor rows are read ONCE and shared by
             // the displayStatus derivation and the PR merge below, so the
             // detail read's statement count does not grow with the merge
@@ -22033,596 +23014,7 @@ impl WorkspaceApi for Services {
     }
 
     fn delete_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<()>> {
-        let store = self.store.clone();
-        let worktree_locks = self.worktree_locks.clone();
-        let bus = self.event_bus.clone();
-        let workspaces_root = self
-            .workspaces_root
-            .clone()
-            .unwrap_or_else(default_workspaces_root);
-        // Custom `workspace.worktreesLocation` sweep target: the workspace's
-        // actual parent is derived from its persisted worktree path below,
-        // but worktree-less rows created under a custom location need the
-        // currently configured location as a candidate too.
-        let worktrees_location = self.configured_worktrees_location();
-        // Live-state teardown handles: cloned so the boxed future owns them
-        // across the store cascade below. `agent_manager()` upgrades the weak
-        // reference; read-only/test wiring with no manager attached simply
-        // skips the runtime stop and still sweeps the in-memory registries.
-        let manager = self.agent_manager();
-        let agent_queues = self.agent_queues.clone();
-        let live_turns = self.live_turns.clone();
-        let last_turn_silent_tails = self.last_turn_silent_tails.clone();
-        let truncation_redrives = self.truncation_redrives.clone();
-        let pending_truncation_redrive = self.pending_truncation_redrive.clone();
-        let agent_subscriptions = self.agent_subscriptions.clone();
-        // Full handle for the direct completion delivery below (Services is
-        // Clone — the same capture pattern the spawn helpers use).
-        let services = self.clone();
-        Box::pin(async move {
-            self.require_workspace_manager(&id, "workspace.delete")
-                .await?;
-            // Chief is virtual and never appears in `workspace.list`; delete is
-            // a no-op success (TS `workspace.repository.delete` / virtual-guard
-            // parity — the seeded row is not torn down and no cascade fires).
-            if id.is_chief() {
-                return Ok(());
-            }
-            // Immediate-delete-while-pending (§5.1): an immediate delete
-            // supersedes a running grace window — drop the pending entry and
-            // abort its timer, then commit now. The timer-fired commit path
-            // has already claimed (removed) its entry before calling here,
-            // so this is a no-op for it.
-            services.pending_workspace_deletes.cancel(id.as_str());
-            // Close producer admission before the snapshot. Existing admitted
-            // creates/sends finish first; unrelated workspaces stay writable.
-            // Keep the permit through cleanup and terminal event publication.
-            let _deletion = services.workspace_mutations.delete(&id).await;
-            services
-                .cancel_script_monitors(&id, None, "workspace-deleted")
-                .await?;
-            // Terminate live agent sessions BEFORE the store cascade drops
-            // their rows. A same-slug recreate hitting `agent.list` after the
-            // delete would otherwise surface ghost sessions whose workers are
-            // still draining, their live-turn slots + pending message queues
-            // still populated, and their completion watches still firing. The
-            // order mirrors `agent_delete_op`: capture the workspace-scoped
-            // sessions, drop each session's runtime state, then emit
-            // `agent:deleted` per session so subscribers see the tear-down
-            // before the terminal `workspace:deleted`.
-            // Fail fast on a transient session-list error: skipping the
-            // sweep here but still deleting the workspace row leaves ghost
-            // workers, live-turn slots, queued messages, and completion
-            // watches with no owning workspace — a client can retry the
-            // delete, but silent partial success cannot recover.
-            // Summaries only (intent-hq/monorepo#4130): the sweep reads just
-            // `id` + `name`, and the full `list_agent_sessions` hydrated
-            // every session's transcript (2 statements per agent) for rows
-            // the cascade below is about to drop.
-            let sessions = store.list_agent_session_summaries(&id).await?;
-            let session_ids: Vec<AgentId> = sessions.iter().map(|s| s.id.clone()).collect();
-            // Cascade interaction (§5.5): the workspace delete — immediate
-            // or committed-from-pending — supersedes any pending agent
-            // deletions inside it. Abort their timers without per-agent
-            // cancel events; each session is deleted just below, emitting
-            // `agent:deleted` per session.
-            services.abort_pending_agent_deletes(&sessions);
-            // Batch stop: aborts each worker, drops each handle, clears
-            // busy + agent_ws, and deregisters each process — the
-            // `agent.stop` semantics per agent — then kills all detached
-            // ACP children's process groups under ONE shared grace
-            // window (`kill_child_trees`), so the delete ack pays ~one
-            // grace period total instead of one per live agent.
-            // The returned fence keeps the swept agents blocked from the
-            // lazy-spawn paths until this future completes (it drops at the
-            // end of this scope, after the store cascade below deletes the
-            // session rows): a concurrent `agent.sendMessage` that passed
-            // its store check before the sweep would otherwise respawn a
-            // replacement child during the shared grace wait and leave it
-            // running as a ghost process after the rows are gone.
-            let _teardown_fence = match manager.as_ref() {
-                Some(manager) => Some(manager.stop_many(&session_ids).await),
-                None => None,
-            };
-            for session in &sessions {
-                // Live-turn slot + pending message queue live in `Services`'
-                // maps (not touched by `manager.stop_many`); drop them so a
-                // same-slug recreate observes no ghost state. Recover through
-                // a poisoned lock via `into_inner` — the delete path is the
-                // last chance to unlink this state, so best-effort teardown
-                // outweighs propagating a mutex-poison panic.
-                live_turns
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&session.id);
-                last_turn_silent_tails
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&session.id);
-                truncation_redrives
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&session.id);
-                pending_truncation_redrive
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&session.id);
-                agent_queues
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&session.id);
-            }
-            // Sweep the deleted workspace out of the daemon-global
-            // subscription registry: drop watches whose PARENT lives here
-            // (their wake destination is gone) and groups anchored here.
-            // Watches whose parent lives elsewhere (a chief watching a child
-            // in this workspace) are kept — the `agent:deleted` events
-            // published just below still wake the cross-workspace parent.
-            // Poison recovery mirrors the per-session sweep above.
-            let parent_watch_ids: Vec<String> = {
-                let registry = agent_subscriptions
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                registry
-                    .subscriptions
-                    .iter()
-                    .filter(|s| s.parent_workspace_id == id)
-                    .map(|s| s.id.clone())
-                    .collect()
-            };
-            // These rows have no FK cascade. Delete each outside the registry
-            // lock before forgetting it in memory, so failure/cancellation
-            // leaves its id available for retry. Admission also covers any
-            // delayed registration write, so none can land behind this sweep.
-            for watch_id in &parent_watch_ids {
-                store.delete_completion_watch(watch_id).await?;
-            }
-            {
-                let mut registry = agent_subscriptions
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                registry
-                    .subscriptions
-                    .retain(|s| s.parent_workspace_id != id);
-                registry.delegation_groups.retain(|g| g.workspace_id != id);
-            }
-            // Emit `agent:deleted` per swept session before the worktree /
-            // store cleanup so subscribers see the terminal event for each
-            // agent ahead of `workspace:deleted`. Best-effort: emits when the
-            // bus is wired; a `None` bus (read-only wiring) is a quiet no-op.
-            for session in &sessions {
-                publish_event(
-                    bus.as_ref(),
-                    NewEvent {
-                        workspace_id: id.clone(),
-                        timestamp: now_iso(),
-                        event_type: AGENT_DELETED.to_string(),
-                        actor: system_actor(),
-                        session_id: Some(session.id.0.clone()),
-                        correlation_id: None,
-                        parent_event_id: None,
-                        metadata: None,
-                        data: serde_json::json!({
-                            "agentId": session.id.0,
-                            "agentName": session.name,
-                        }),
-                    },
-                )
-                .await;
-            }
-            // Deterministic cross-workspace consumption (monorepo#463): the
-            // publishes above are best-effort (`None` bus, logged-and-skipped
-            // delivery failures), so a chief parent's watch on a child here
-            // could otherwise leak forever (watches have no timed cleanup)
-            // and a chief-anchored after_all group would stay
-            // incomplete until restart. Deliver the same synthetic
-            // `agent:deleted` directly, BEFORE the store cascade drops the
-            // session rows (grouped delivery still resolves the child's
-            // completion report). The remove-before-deliver guard in
-            // `deliver_completion_to_watches` makes the bus loop's later
-            // processing of the published event a no-op — no duplicate wake —
-            // and `record_group_child_completion` is idempotent.
-            // The settlement clear of each child's advisory-wake period
-            // markers runs ONCE for the whole sweep (one `IN`-list statement)
-            // instead of inside every delivery (intent-hq/monorepo#4130);
-            // best-effort on the same terms as the per-child clear — the
-            // cascade below drops the rows regardless.
-            if let Err(e) = store
-                .clear_advisory_wake_deliveries_for_children(&session_ids)
-                .await
-            {
-                tracing::warn!(
-                    error = %e,
-                    workspace = %id.as_str(),
-                    "failed to clear advisory-wake period markers for deleted workspace"
-                );
-            }
-            for session in &sessions {
-                let event = Event {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    workspace_id: id.clone(),
-                    timestamp: now_iso(),
-                    event_type: AGENT_DELETED.to_string(),
-                    actor: system_actor(),
-                    session_id: Some(session.id.0.clone()),
-                    correlation_id: None,
-                    parent_event_id: None,
-                    metadata: None,
-                    data: serde_json::json!({
-                        "agentId": session.id.0,
-                        "agentName": session.name,
-                    }),
-                };
-                services
-                    .deliver_completion_to_watches_markers_precleared(&session.id, &event)
-                    .await;
-            }
-            // Backstop sweep: grouped watches survive delivery (group
-            // settlement owns their lifecycle) and a racing registration can
-            // land behind the loop above — after this point no watch may
-            // reference the deleted workspace as its child side. In-memory
-            // retain + best-effort delete of the persisted rows. Each
-            // affected parent then gets a refreshed
-            // `agent:subscriptions-changed` so clients converge on the
-            // shrunken watch set without polling (PROTOCOL §6.5).
-            let leaked: Vec<(String, WorkspaceId, AgentId)> = {
-                let mut registry = agent_subscriptions
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let mut leaked = Vec::new();
-                registry.subscriptions.retain(|s| {
-                    if s.child_workspace_id == id {
-                        leaked.push((
-                            s.id.clone(),
-                            s.parent_workspace_id.clone(),
-                            s.parent_agent_id.clone(),
-                        ));
-                        false
-                    } else {
-                        true
-                    }
-                });
-                leaked
-            };
-            for (watch_id, _, _) in &leaked {
-                if let Err(e) = store.delete_completion_watch(watch_id).await {
-                    tracing::warn!("completion_watch delete failed {watch_id}: {e}");
-                }
-            }
-            let mut notified: Vec<(&WorkspaceId, &AgentId)> = Vec::new();
-            for (_, parent_ws, parent_id) in &leaked {
-                if !notified.contains(&(parent_ws, parent_id)) {
-                    notified.push((parent_ws, parent_id));
-                    services
-                        .publish_subscriptions_changed(parent_ws, parent_id)
-                        .await;
-                }
-            }
-            // Drop the workspace's event subscriptions (monorepo#947): their
-            // filter is workspace-scoped, so once the workspace is gone they
-            // can never match again — without this sweep their delivery
-            // tasks and persisted rows leak and rehydrate forever. Aborts
-            // the tasks and deletes the rows (chief-anchored subscriptions
-            // scoped to OTHER workspaces are untouched — this removes only
-            // subscriptions whose events came from the deleted workspace).
-            // Producer admission is already closed: no new subscription can
-            // register behind this sweep while the store cleanup yields.
-            services.remove_event_subscriptions_for_workspace(&id).await;
-            // Eagerly abort the workspace's live hook scheduler tasks BEFORE
-            // the store cascade drops their rows — otherwise each task would
-            // linger until its next tick before noticing the row is gone.
-            services.abort_workspace_hook_tasks(&id).await;
-            // Capture workspace state for the async cleanup below (before the
-            // row delete). Best-effort: when the workspace is already gone or
-            // the read fails, the background task simply skips the worktree
-            // step — the orphaned directory sweep can still unlink
-            // `<workspaces_root>/<id>/` on a retry, per the idempotent delete.
-            let ws_for_cleanup = store.get_workspace(&id).await.ok();
-            let branch_auto_generated = store
-                .workspace_branch_auto_generated(&id)
-                .await
-                .unwrap_or(false);
-            #[cfg(test)]
-            services.workspace_delete_test_gate.pause(&id).await;
-            // Idempotent DB delete: swallow `NotFound` so retries and
-            // orphan-dir-only cleanups don't surface as `"Failed to delete
-            // space"` on the FE. Any other error still propagates. Publish
-            // `workspace:deleted` only when we actually removed a row —
-            // subscribers dedup by id but a spurious event confuses UIs
-            // that treat it as a state transition.
-            match store.delete_workspace(&id).await {
-                Ok(()) => {
-                    publish_event(bus.as_ref(), workspace_deleted_event(&id)).await;
-                }
-                Err(Error::NotFound(_)) => {
-                    tracing::debug!(
-                        workspace = %id.as_str(),
-                        "workspace.delete: row already gone; treating as idempotent success"
-                    );
-                }
-                Err(e) => return Err(e),
-            }
-            // Cancel any pending debounced lastActivity derivation
-            // (monorepo#3623): the timer must not outlive the workspace —
-            // it would fire against the deleted row and log a spurious
-            // not-found WARN. After the row delete, so a schedule placed
-            // by the teardown above is swept too.
-            services.cancel_last_activity_schedule(&id);
-            // Sweep the pending idle debouncer the same way (monorepo#3632):
-            // an `agent_activity_end` during the agent teardown above
-            // schedules an idle flip whose timer would otherwise outlive the
-            // workspace and emit a spurious
-            // `workspace:activity-changed { idle }` ~3s after deletion.
-            // Residual race: an `agent_activity_end` landing after this sweep
-            // can still re-arm a flip for the deleted id — the timer's
-            // every-exit-path removal self-heals the map entry, and its
-            // emit-time existence guard skips the spurious event.
-            services.cancel_idle_debounce(&id);
-            // Evict the deleted workspace's last-observed displayStatus
-            // baseline so the in-memory map does not leak for the daemon's
-            // lifetime (and a same-id recreate seeds fresh).
-            services.evict_display_status_baseline(&id);
-            // Same for the cached git status: a dirty repo's `files` vec is
-            // unbounded, so the deleted worktree's last scan must not be
-            // retained for the daemon's lifetime (monorepo#1648).
-            if let Some(worktree) = ws_for_cleanup.as_ref().and_then(git_ops::worktree_path) {
-                services.git_status_cache.evict(&worktree);
-            }
-            // Fast-ack: the client receives `{ success: true }` here while the
-            // worktree and workspace-directory cleanup proceeds asynchronously
-            // in the background. Bounded latency regardless of checkout size
-            // (no multi-GB `remove_dir_all` blocking the response).
-            //
-            // Same-slug-recreate race guard: the `create` path already takes
-            // the per-repo worktree lock before provisioning, so a recreate
-            // cannot run its `add_worktree` while this cleanup's locked phase
-            // (registration prune + rename to a trash path) is still in
-            // progress for the same repo.
-            // Residual risk: if a recreate runs *before* the background task
-            // fires (row is deleted, event is sent, response is ACKed, but the
-            // spawn hasn't yet grabbed the worktree lock), the recreate could
-            // complete and then this cleanup might delete its brand-new
-            // worktree. Mitigation: we re-check the workspace row inside the
-            // background task and skip cleanup if it exists again. This is
-            // best-effort; the cleanup is naturally idempotent, and
-            // `workspace.delete` of the recreated workspace will clean up any
-            // mismatched leftovers.
-            let workspaces_root_bg = workspaces_root.clone();
-            let worktrees_location_bg = worktrees_location.clone();
-            let id_bg = id.clone();
-            let store_bg = store.clone();
-            let worktree_locks_bg = worktree_locks.clone();
-            let branch_auto_generated_bg = branch_auto_generated;
-            let _ = services.store_tasks.spawn_draining(async move {
-                // Re-check that the workspace is actually deleted. If it
-                // exists now (same-slug recreate landed before this task ran),
-                // skip the worktree cleanup entirely — the new workspace owns
-                // the branch and directory now. Still sweep the
-                // `<workspaces_root>/<id>/` directory if it doesn't match the
-                // recreated workspace's path, for orphan-cleanup parity.
-                let recreated = store_bg.get_workspace(&id_bg).await.ok();
-                let deleted_worktree_path = ws_for_cleanup
-                    .as_ref()
-                    .and_then(|w| w.worktree_path.clone());
-                // Root-anchored ownership: the persisted checkout counts as
-                // daemon-provisioned only when its parent directory is named
-                // after the workspace id AND it lives under a root the daemon
-                // provisions into (the boot workspaces root or the currently
-                // configured `workspace.worktreesLocation`). The parent
-                // basename alone is spoofable — the workspace id derives from
-                // the initial prompt, so an `isNewRepo` caller could place
-                // their repository at `<anywhere>/<wsId>/<repo>` and a
-                // basename-only gate would route the user's folder into the
-                // delete paths below. Trade-off: a checkout provisioned under
-                // a since-changed custom location is no longer matched and its
-                // `<oldLocation>/<wsId>/` directory leaks instead of being
-                // swept — leaking is the safe direction (never delete what we
-                // cannot prove we created).
-                let checkout_owned = deleted_worktree_path.as_deref().is_some_and(|wt| {
-                    checkout_parent_is_workspace_dir(wt, &id_bg)
-                        && (Path::new(wt).starts_with(&workspaces_root_bg)
-                            || worktrees_location_bg
-                                .as_deref()
-                                .is_some_and(|loc| Path::new(wt).starts_with(loc)))
-                });
-                // A standalone row's checkout path is caller-influenced
-                // (`repository_path == worktree_path`), so unless ownership is
-                // proven above it must not seed the final
-                // `workspace_dir_candidates` sweep either — that sweep
-                // recursively removes the checkout's parent directory.
-                // Worktree-mode rows keep their persisted path: the daemon
-                // derived it at provision time (covers a since-changed custom
-                // location).
-                let is_standalone_row = ws_for_cleanup.as_ref().is_some_and(|w| {
-                    matches!(
-                        w.checkout_mode,
-                        Some(intent_core::CheckoutMode::Cow | intent_core::CheckoutMode::Direct)
-                    )
-                });
-                let sweep_worktree_path = deleted_worktree_path
-                    .as_deref()
-                    .filter(|_| !is_standalone_row || checkout_owned);
-                if let Some(ws_cleanup) = ws_for_cleanup {
-                    // Only run the worktree cleanup if the workspace is still
-                    // deleted (no recreate) or the recreate has a different
-                    // worktree path (the old worktree is now orphaned).
-                    let skip_worktree = recreated
-                        .as_ref()
-                        .is_some_and(|r| r.worktree_path == ws_cleanup.worktree_path);
-                    if !skip_worktree {
-                        let repo_dir = ws_cleanup
-                            .repository_path
-                            .as_deref()
-                            .filter(|p| !p.is_empty())
-                            .map(PathBuf::from);
-                        let wt = ws_cleanup
-                            .worktree_path
-                            .as_deref()
-                            .filter(|p| !p.is_empty())
-                            .map(PathBuf::from);
-                        if let (Some(repo_dir), Some(wt)) = (repo_dir, wt) {
-                            if !ws_cleanup.skip_worktree && !ws_cleanup.is_remote {
-                                let branch = ws_cleanup.branch.clone();
-                                let repo = repo_dir.clone();
-                                let branch_flag = branch_auto_generated_bg;
-                                let wt_locked = wt.clone();
-                                // A CoW or direct checkout is a standalone
-                                // clone: no registration to prune in the
-                                // source repo, and its workspace branch lives
-                                // only inside the clone — so the source-repo
-                                // branch-delete guard must not run (a
-                                // same-named source branch was never this
-                                // workspace's).
-                                let is_standalone = matches!(
-                                    ws_cleanup.checkout_mode,
-                                    Some(
-                                        intent_core::CheckoutMode::Cow
-                                            | intent_core::CheckoutMode::Direct
-                                    )
-                                );
-                                // Standalone-checkout removal is gated on the
-                                // root-anchored `checkout_owned` proof above
-                                // (`<root>/<wsId>/<slug>` under a daemon
-                                // root). An `isNewRepo` direct row's checkout
-                                // IS the user's repository folder
-                                // (`worktree_path == repository_path`,
-                                // intent-hq/monorepo#2611): never provisioned
-                                // by the daemon, never deleted with the
-                                // workspace.
-                                if is_standalone && !checkout_owned {
-                                    tracing::debug!(
-                                        workspace = %ws_cleanup.id.as_str(),
-                                        checkout = %wt_locked.display(),
-                                        "workspace.delete: standalone checkout is the user's repository folder; keeping it"
-                                    );
-                                } else {
-                                    // Under the per-repo lock: git-metadata work
-                                    // only (registration prune, rename of the
-                                    // checkout to a trash path, branch-delete
-                                    // guard; for CoW just the rename + metadata
-                                    // dir removal). On the rename-success path
-                                    // the multi-GB recursive removal runs below,
-                                    // after the lock is released, so concurrent
-                                    // `workspace.create` provisioning on the same
-                                    // repo is not starved by bulk deletes; only
-                                    // the rare rename-failure fallback removes
-                                    // in place under the lock.
-                                    let trash = worktree_locks_bg
-                                        .with_lock(&repo_dir, move || async move {
-                                            let task = tokio::task::spawn_blocking(move || {
-                                                if is_standalone {
-                                                    cleanup_workspace_cow_checkout_locked(
-                                                        &wt_locked,
-                                                    )
-                                                } else {
-                                                    cleanup_workspace_worktree_locked(
-                                                        &repo,
-                                                        &wt_locked,
-                                                        &branch,
-                                                        branch_flag,
-                                                    )
-                                                }
-                                            })
-                                            .await;
-                                            match task {
-                                                Ok(trash) => trash,
-                                                Err(e) => {
-                                                    tracing::warn!(
-                                                        error = %e,
-                                                        "background worktree cleanup task failed"
-                                                    );
-                                                    None
-                                                }
-                                            }
-                                        })
-                                        .await;
-                                    if let Some(trash) = trash {
-                                        let removal = tokio::task::spawn_blocking(move || {
-                                            cleanup_detached_worktree(&trash);
-                                        })
-                                        .await;
-                                        if let Err(e) = removal {
-                                            tracing::warn!(
-                                                error = %e,
-                                                "background detached-worktree removal task failed"
-                                            );
-                                        }
-                                        // Retry the empty-only parent `remove_dir`
-                                        // the trash sibling blocked — back under
-                                        // the per-repo lock, so it can't race a
-                                        // same-slug recreate's freshly created
-                                        // parent between its `create_dir_all` and
-                                        // `git worktree add`. O(1) while held.
-                                        if let Some(parent) = wt.parent().map(Path::to_path_buf) {
-                                            worktree_locks_bg
-                                                .with_lock(&repo_dir, move || async move {
-                                                    let _ = std::fs::remove_dir(&parent);
-                                                })
-                                                .await;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                // Final sweep of the daemon-owned workspace directory
-                // (`<parent>/<id>/`). The worktree cleanup's best-effort
-                // `remove_dir` (empty-only) leaves any residual content
-                // behind, and legacy pre-daemon workspaces have a directory
-                // but no worktree path at all. Recursive best-effort removal
-                // keeps the FE `FileSystemWorkspaceRepository.findAll` scan
-                // from re-surfacing the deleted id (ENOENT WARN spam) and
-                // makes the delete idempotent for orphaned directories.
-                //
-                // Candidates cover every parent this workspace may live under
-                // (persisted worktree's parent — the location in force at
-                // create time — plus the boot root and the currently
-                // configured `workspace.worktreesLocation`), so deleting a
-                // workspace created under a custom location does not leak
-                // `<location>/<id>/`.
-                //
-                // If a same-slug recreate happened and uses the same
-                // `<parent>/<id>/` directory, skip that candidate so we don't
-                // destroy the recreated workspace's directory tree.
-                let recreated_parent = recreated
-                    .as_ref()
-                    .and_then(|r| r.worktree_path.as_deref())
-                    .filter(|p| !p.is_empty())
-                    .and_then(|wt_path| Path::new(wt_path).parent())
-                    .map(Path::to_path_buf);
-                for dir in workspace_dir_candidates(
-                    &id_bg,
-                    sweep_worktree_path,
-                    &workspaces_root_bg,
-                    worktrees_location_bg.as_deref(),
-                ) {
-                    if recreated_parent.as_deref() == Some(dir.as_path()) {
-                        continue;
-                    }
-                    // Shared parallel removal helper; `NotFound` is already
-                    // folded into `Ok` there.
-                    let cleanup = tokio::task::spawn_blocking(move || {
-                        intent_git::fs_remove::remove_dir_all_parallel(&dir)
-                    })
-                    .await;
-                    match cleanup {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => tracing::warn!(
-                            workspace = %id_bg.as_str(),
-                            error = %e,
-                            "background cleanup: failed to remove workspace directory"
-                        ),
-                        Err(join_err) => tracing::warn!(
-                            workspace = %id_bg.as_str(),
-                            error = %join_err,
-                            "background cleanup: workspace-dir task failed"
-                        ),
-                    }
-                }
-            });
-            Ok(())
-        })
+        self.delete_workspace_with_claim(id, None)
     }
 
     fn schedule_workspace_delete(
@@ -22648,51 +23040,20 @@ impl WorkspaceApi for Services {
             // unknown workspace is the standard `NotFound` error, not a
             // timer that fails later.
             store.get_workspace(&id).await?;
-            let delay_ms = delete_grace::clamp_undo_delay_ms(undo_delay_ms);
-            let delete_at = intent_core::iso_ms_from_now(delay_ms);
-            let key = id.as_str().to_string();
             let timer_services = services.clone();
             let timer_id = id.clone();
-            // Idempotent re-schedule (§5.1): the registry arms the timer only
-            // when nothing is pending for this key — the check runs under the
-            // registry lock, so concurrent schedules converge on one deadline
-            // and only the arming call emits `workspace:delete-scheduled`.
-            if let Some(existing) = services.pending_workspace_deletes.schedule(
-                key,
-                delete_at.clone(),
-                move |generation| {
-                    let tasks = timer_services.pending_delete_tasks.clone();
-                    let stopping = tasks.clone();
-                    tasks.spawn_draining(async move {
-                        tokio::select! {
-                            biased;
-                            () = stopping.closed() => return,
-                            () = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {}
-                        }
-                        // Claim-or-abstain: only the timer that still owns the
-                        // entry commits. A cancel or an immediate delete that
-                        // raced ahead removed/superseded the entry — do nothing.
-                        if !timer_services
-                            .pending_workspace_deletes
-                            .claim(timer_id.as_str(), generation)
-                        {
-                            return;
-                        }
-                        // Commit via the existing immediate-delete cascade
-                        // (same events, fast-ack cleanup). Best-effort: the
-                        // caller is long gone, so a failure is logged, not
-                        // surfaced.
-                        if let Err(e) = timer_services.delete_workspace(timer_id.clone()).await {
-                            tracing::warn!(
-                                workspace = %timer_id.as_str(),
-                                error = %e,
-                                "scheduled workspace delete failed at commit"
-                            );
-                        }
-                    }).unwrap_or_else(|| intent_core::spawn_daemon(async {}))
-                },
-            ) {
-                return Ok(existing);
+            let scheduled = services.pending_workspace_deletes.schedule_owned(
+                delete_grace::PendingDeleteSubject::Workspace(id.clone()),
+                undo_delay_ms,
+                move |claim| intent_core::with_caller(intent_core::Caller::Daemon, async move {
+                    if let Err(e) = timer_services.delete_workspace_with_claim(timer_id.clone(), Some(claim)).await {
+                        tracing::warn!(workspace = %timer_id.as_str(), error = %e, "scheduled workspace delete failed at commit");
+                    }
+                }),
+            ).await?;
+            let delete_at = scheduled.delete_at;
+            if !scheduled.newly_armed {
+                return Ok(delete_at);
             }
             publish_event(
                 bus.as_ref(),
@@ -22709,7 +23070,10 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_workspace_manager(&id, "workspace.delete")
                 .await?;
-            let cancelled = services.pending_workspace_deletes.cancel(id.as_str());
+            let cancelled = services
+                .pending_workspace_deletes
+                .cancel_owned(&delete_grace::PendingDeleteSubject::Workspace(id.clone()))
+                .await?;
             if cancelled {
                 publish_event(bus.as_ref(), workspace_delete_cancelled_event(&id)).await;
             }
@@ -31073,20 +31437,38 @@ impl WorkspaceApi for Services {
         pr_number: u64,
         repo: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let captured = repo.is_none().then(|| {
+            repository_read_source::CapturedReview::capture(self, workspace_id.clone(), pr_number)
+        });
         let store = self.store.clone();
         let this = self.clone();
         self.execution_call(async move {
             self.require_member(&workspace_id).await?;
-            let ws = load_ws_for_pr(&store, &workspace_id).await?;
-            // Cross-repo override (`{ repo: "owner/name" }`) wins over the
-            // workspace repo; either way the resolved repo is echoed in the
-            // result so a wrong-repo read is detectable.
+            load_ws_for_pr(&store, &workspace_id).await?;
+            // Explicit GitHub addressing keeps its existing path. Implicit
+            // reads first resolve the actual original local repository.
             let repo_ref = match repo {
                 Some(slug) => {
                     let (owner, repo) = pr_ops::parse_repo_slug(&slug)?;
                     intent_sourcecontrol::RepoRef::new(owner, repo)
                 }
-                None => pr_ops::repo_of(&ws)?,
+                None => match captured
+                    .ok_or_else(repository_read_source::refused)?
+                    .read(self)
+                    .await
+                    .map_err(|_| repository_read_source::refused())?
+                {
+                    repository_read_source::ReadOutcome::Github(repo) => repo,
+                    repository_read_source::ReadOutcome::Managed { target, result } => {
+                        let read = (*result).map_err(|failure| match failure.cause {
+                            pr_monitor::qualified_cache::CacheError::Provider(error) => {
+                                pr_ops::map_sc_err(error)
+                            }
+                            _ => repository_read_source::refused(),
+                        })?;
+                        return pr_ops::qualified_review_snapshot(&target, &read.value);
+                    }
+                },
             };
             let repo_slug = format!("{}/{}", repo_ref.owner, repo_ref.name);
             // Served from the shared PR cache (§5.7): the entry is the PR
@@ -32498,10 +32880,7 @@ impl WorkspaceApi for Services {
             match target {
                 source_control_auth_ops::Target::Github => self.github_revoke().await,
                 source_control_auth_ops::Target::Gitlab { host, .. } => {
-                    self.owned_direct_secret_mutation(direct_secret_ops::Mutation::GitlabRevoke(
-                        host,
-                    ))
-                    .await
+                    self.gitlab_revoke_owned(host).await
                 }
             }
         })
@@ -37097,6 +37476,7 @@ impl Services {
         &self,
         changes: serde_json::Value,
         is_tcp: bool,
+        credential_guard: Option<&source_control_auth_ops::repository_owner::GitlabCredentialGuard>,
     ) -> Result<serde_json::Value> {
         /// Which store a captured old value belongs to, so the rollback
         /// path restores it through the same seam that persisted it.
@@ -37155,9 +37535,25 @@ impl Services {
         }
         // Reject malformed/pinned mixed batches before any secret write.
         self.settings_service().validate_update(&changes)?;
+        let repository_write =
+            self.prepare_gitlab_repository_settings(&changes, credential_guard)?;
+        let settings = self
+            .settings_service()
+            .with_repository_write(repository_write.clone());
         let secrets = if has_secrets {
             drop(revision_guard.take());
-            let secrets = self.settings_service().update_secrets(&changes).await?;
+            let secrets = match settings.update_secrets(&changes).await {
+                Ok(secrets) => secrets,
+                Err(error) => {
+                    self.settle_gitlab_repository_settings(
+                        repository_write.as_deref(),
+                        false,
+                        false,
+                    )
+                    .await;
+                    return Err(error);
+                }
+            };
             revision_guard = Some(self.settings_revision_gate.write().await);
             secrets
         } else {
@@ -37169,6 +37565,7 @@ impl Services {
         let mut changes = caller_changes;
         self.reresolve_default_model_on_provider_switch(&mut changes);
         let mut secrets_compensated = false;
+        let mut compensation_complete = false;
         let result = async {
                 // Capture ordinary priors for hook-failure compensation. Secret
                 // priors were captured under their account guards before I/O;
@@ -37224,7 +37621,14 @@ impl Services {
                 };
 
                 let port_was_unassigned_before_update = registry.is_some_and(|reg| reg.snapshot().ws_api_port_policy() == WsApiPortPolicy::Unassigned);
-                let mut applied = secrets.merge_applied(self.settings_service().update_non_secrets(&changes).await?);
+                let ordinary = match settings.update_non_secrets_with_outcome(&changes).await {
+                    Ok(applied) => applied,
+                    Err(failure) => {
+                        compensation_complete = failure.no_effect();
+                        return Err(failure.into_error());
+                    }
+                };
+                let mut applied = secrets.merge_applied(ordinary);
                 let port_was_unassigned = registry.is_some_and(|reg| reg.snapshot().ws_api_port_policy() == WsApiPortPolicy::Unassigned);
                 if !applied.is_empty() {
                     // Apply server runtime hooks (§5.12): start/stop the WSS listener
@@ -37244,6 +37648,7 @@ impl Services {
                             // (a single config.toml rewrite + one change publication) instead of
                             // per-key applies.
                             let mut rollback_failed = false;
+                            let mut runtime_compensation_complete = true;
                             let mut port_needs_publication = port_was_unassigned_before_update;
                             let mut compensating_changes = Vec::new();
                             let mut registry_restores: Vec<(String, serde_json::Value)> = Vec::new();
@@ -37303,7 +37708,7 @@ impl Services {
                             // (single config.toml rewrite, single change publication).
                             if !registry_restores.is_empty() {
                                 if let Some(reg) = registry {
-                                    if let Err(rollback_err) = reg.apply(&registry_restores) {
+                                    if let Err(rollback_err) = reg.apply_with_repository_write(&registry_restores, repository_write.as_deref(), None) {
                                         tracing::error!(
                                             error = %rollback_err,
                                             "settings.update registry rollback batch failed"
@@ -37322,7 +37727,7 @@ impl Services {
                                 // before releasing the gate, never exposing new values
                                 // under the previous revision.
                                 self.publish_ws_port_assignment(port_needs_publication).await;
-                                let runtime_before = self.settings_service().server_values().await;
+                                let runtime_before = settings.server_values().await;
                                 drop(revision_guard.take());
                                 rollback_failed |= secrets.rollback(&self.secrets).await;
                                 secrets_compensated = true;
@@ -37331,7 +37736,7 @@ impl Services {
                                 // own port. Only a subsequent compensating assignment
                                 // can now belong to this recovery.
                                 port_needs_publication = registry.is_some_and(|reg| reg.snapshot().ws_api_port_policy() == WsApiPortPolicy::Unassigned);
-                                let runtime_after = self.settings_service().server_values().await;
+                                let runtime_after = settings.server_values().await;
                                 match (runtime_before, runtime_after) {
                                     (Ok(before), Ok(after)) => {
                                         // Ordinary rollback finished before the gate was released.
@@ -37374,7 +37779,7 @@ impl Services {
                                         error = ?compensating_err,
                                         "settings.update compensating hook application failed during rollback"
                                     );
-                                    // Log but don't fail — the persistence rollback succeeded
+                                    runtime_compensation_complete = false;
                                 }
                             }
 
@@ -37390,10 +37795,10 @@ impl Services {
                                         port,
                                         "settings.update rollback: restarted WSS listener on prior settings"
                                     ),
-                                    Err(restart_err) => tracing::error!(
+                                    Err(restart_err) => { runtime_compensation_complete = false; tracing::error!(
                                         error = ?restart_err,
                                         "settings.update rollback: failed to restart WSS listener on prior settings"
-                                    ),
+                                    ); },
                                 }
                             }
 
@@ -37409,10 +37814,10 @@ impl Services {
                                         address = %address,
                                         "settings.update rollback: restarted tailcat tunnel on prior settings"
                                     ),
-                                    Err(restart_err) => tracing::error!(
+                                    Err(restart_err) => { runtime_compensation_complete = false; tracing::error!(
                                         error = ?restart_err,
                                         "settings.update rollback: failed to restart tailcat tunnel on prior settings"
-                                    ),
+                                    ); },
                                 }
                             }
 
@@ -37427,6 +37832,7 @@ impl Services {
                                     "settings.update hook failed ({e}), and rollback was incomplete (see logs)"
                                 )));
                             }
+                            compensation_complete = runtime_compensation_complete;
                             // Return the hook error to the caller
                             return Err(e);
                         }
@@ -37451,17 +37857,30 @@ impl Services {
         // a hook failure already restored them before runtime recovery.
         drop(revision_guard);
         if let Err(error) = result {
-            if !secrets_compensated && secrets.rollback(&self.secrets).await {
+            let rollback_incomplete = !secrets_compensated && secrets.rollback(&self.secrets).await;
+            self.settle_gitlab_repository_settings(
+                repository_write.as_deref(),
+                compensation_complete && !rollback_incomplete,
+                true,
+            )
+            .await;
+            if rollback_incomplete {
                 return Err(Error::Internal(format!(
                         "settings.update failed ({error}), and secret rollback was incomplete (see logs)"
                     )));
             }
             return Err(error);
         }
+        self.settle_gitlab_repository_settings(repository_write.as_deref(), true, false)
+            .await;
         result
     }
 
-    async fn settings_reset_owned(&self, path: String) -> Result<serde_json::Value> {
+    async fn settings_reset_owned(
+        &self,
+        path: String,
+        credential_guard: Option<&source_control_auth_ops::repository_owner::GitlabCredentialGuard>,
+    ) -> Result<serde_json::Value> {
         Self::require_administrator("settings.reset")?;
         // Same serialization and lock order as `settings.update`
         // (credential gate → revision gate): a GitLab credential reset
@@ -37473,11 +37892,24 @@ impl Services {
         } else {
             Some(self.settings_revision_gate.write().await)
         };
-        let (result, changed) = self.settings_service().reset_with_change(&path).await?;
+        let repository_write = self.prepare_gitlab_repository_reset(&path, credential_guard)?;
+        let reset = self
+            .settings_service()
+            .with_repository_write(repository_write.clone())
+            .reset_with_change(&path)
+            .await;
+        let (result, changed) = match reset {
+            Ok(result) => result,
+            Err(error) => {
+                drop(revision_guard);
+                self.settle_gitlab_repository_settings(repository_write.as_deref(), false, false)
+                    .await;
+                return Err(error);
+            }
+        };
         if revision_guard.is_none() {
             revision_guard = Some(self.settings_revision_gate.write().await);
         }
-        let _revision_guard = revision_guard;
         let revision = if changed {
             let revision = self.settings_revision.fetch_add(1, Ordering::SeqCst) + 1;
             publish_event(
@@ -37490,6 +37922,9 @@ impl Services {
         } else {
             self.settings_revision.load(Ordering::SeqCst)
         };
+        drop(revision_guard);
+        self.settle_gitlab_repository_settings(repository_write.as_deref(), true, false)
+            .await;
         let mut result = result;
         result["revision"] = serde_json::json!(revision);
         Ok(result)
@@ -37517,10 +37952,10 @@ impl Services {
         let (response, receiver) = tokio::sync::oneshot::channel();
         if self.settings_tasks.spawn_draining(async move {
             operation.primary_auth_admitted = true;
-            let primary = reset.as_deref().is_some_and(|path| path == intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT)
-                || Self::batch_touches_gitlab_credential(&changes);
-            let _credential_guard = if primary {
-                Some(operation.gitlab_credential_gate.clone().lock_owned().await)
+            let primary = reset.as_deref().is_some_and(|path| path.starts_with("sourceControl.gitlab."))
+                || Self::repository_settings_relevant(&changes);
+            let credential_guard = if primary {
+                Some(Arc::new(operation.gitlab_credential_gate.lock().await))
             } else { None };
             let paths: Vec<&str> = match &reset {
                 Some(path) => vec![path.as_str()],
@@ -37531,11 +37966,12 @@ impl Services {
             // A panic becomes an unknown failure, then actual writes still
             // settle before another same-account operation can proceed.
             let worker = operation.clone();
+            let worker_credential = credential_guard.clone();
             let result = intent_core::spawn_daemon(intent_core::with_caller(caller,
                 intent_core::caller::with_wire_credential(credential, async move {
                     match reset {
-                        Some(path) => worker.settings_reset_owned(path).await,
-                        None => worker.settings_update_owned(changes, is_tcp).await,
+                        Some(path) => worker.settings_reset_owned(path, worker_credential.as_deref()).await,
+                        None => worker.settings_update_owned(changes, is_tcp, worker_credential.as_deref()).await,
                     }
                 })
             )).await.unwrap_or_else(|error| Err(Error::Internal(format!("settings operation failed: {error}; state may be unknown — reconcile before retrying"))));

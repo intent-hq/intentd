@@ -19,10 +19,10 @@ pub(crate) enum Reply {
 pub(super) async fn acquire(
     gate: &GitlabCredentialGate,
     retained: &RetainedGate,
-) -> PersistenceLease {
-    let lease: PersistenceLease = Arc::new(gate.clone().lock_owned().await);
-    *retained.lock().unwrap() = Some(lease.clone());
-    lease
+) -> super::GitlabCredentialGuard {
+    let guard = gate.lock().await;
+    *retained.lock().unwrap() = Some(guard.lease());
+    guard
 }
 
 impl crate::Services {
@@ -107,7 +107,7 @@ impl crate::Services {
         host: &GitlabHost,
         retained: &RetainedGate,
     ) -> Result<String> {
-        let lease = acquire(&self.gitlab_credential_gate, retained).await;
+        let guard = acquire(&self.gitlab_credential_gate, retained).await;
         if !self.gitlab_host_is_bound(host) {
             return Err(Error::IdentityProof(
                 IdentityProofErrorKind::GitlabNotConnected,
@@ -116,11 +116,12 @@ impl crate::Services {
         let client_id = self.gitlab_client_id(host);
         let Some((credential, _)) = refresh_stored_credential_if_needed(
             &self.secrets,
-            lease,
             host,
             client_id.as_deref(),
             &self.gitlab_secret_store,
             self.event_bus.as_ref(),
+            &self.gitlab_credential_gate,
+            &guard,
         )
         .await?
         else {
@@ -133,10 +134,18 @@ impl crate::Services {
                 IdentityProofErrorKind::GitlabNotConnected,
             ));
         }
-        stored_access_token(&self.gitlab_secret_store)
+        let token = stored_access_token(&self.gitlab_secret_store).await?;
+        if !self
+            .gitlab_credential_gate
+            .original_source_current(host, &self.gitlab_secret_store, &guard, token.as_deref())
             .await?
-            .ok_or(Error::IdentityProof(
+        {
+            return Err(Error::IdentityProof(
                 IdentityProofErrorKind::GitlabNotConnected,
-            ))
+            ));
+        }
+        token.ok_or(Error::IdentityProof(
+            IdentityProofErrorKind::GitlabNotConnected,
+        ))
     }
 }
