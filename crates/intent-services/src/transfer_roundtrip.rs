@@ -972,6 +972,15 @@ exit 91
     for command in ["node", "npx"] {
         std::fs::copy(&canonical, bin.join(command)).unwrap();
     }
+    // Enhanced discovery captures a login shell even when PATH already has the
+    // CLI. Keep host startup scripts from running programs during that capture.
+    let shell = root.path().join("shell");
+    std::fs::write(
+        &shell,
+        "#!/bin/sh\nprintf 'captured\\n' >> \"$INTENT_TRANSFER_CLI_ROOT/shell-captured\"\nprintf '__INTENT_PATH_S__%s__INTENT_PATH_E__' \"$PATH\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700)).unwrap();
 
     let log_path = root.path().join("worker.log");
     let log = std::fs::File::create(&log_path).unwrap();
@@ -990,6 +999,7 @@ exit 91
             "--nocapture",
         ])
         .env("PATH", std::env::join_paths(paths).unwrap())
+        .env("SHELL", &shell)
         .env("INTENT_TRANSFER_CLI_ROOT", root.path())
         // The parent owns every worker tempdir even if timeout kills the worker
         // before its own TempDir destructors can run.
@@ -1003,8 +1013,9 @@ exit 91
     let status = child.wait_with_timeout(Duration::from_secs(120)).unwrap();
     drop(child); // Kill/reap a timed-out worker before inspecting or removing its files.
     let worker_log = std::fs::read_to_string(&log_path).unwrap();
+    let shell_receipt = std::fs::read_to_string(root.path().join("shell-captured"));
     eprintln!(
-        "roundtrip worker status={status:?} completed={}\n{worker_log}",
+        "roundtrip worker status={status:?} completed={} shell_capture={shell_receipt:?}\n{worker_log}",
         root.path().join("completed").exists()
     );
     // Print every sentinel receipt before asserting so panic cleanup cannot
@@ -1027,6 +1038,10 @@ exit 91
         "roundtrip worker failed ({status:?}):\n{}",
         worker_log
     );
+    assert!(
+        shell_receipt.is_ok_and(|receipt| receipt.lines().any(|line| line == "captured")),
+        "enhanced discovery must capture the fixture shell"
+    );
     std::fs::remove_file(canonical).unwrap();
     assert!(InstalledCli::Claude.resolve_in_dirs(&dirs, false).is_err());
 }
@@ -1047,6 +1062,10 @@ async fn transfer_round_trip_between_two_stacks() {
             return;
         };
         assert_eq!(std::env::temp_dir(), Path::new(&root));
+        assert_eq!(
+            std::env::var_os("SHELL"),
+            Some(Path::new(&root).join("shell").into_os_string())
+        );
         eprintln!(
             "roundtrip worker pid={}: canonical CLI discovery",
             std::process::id()
