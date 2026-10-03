@@ -53,7 +53,7 @@ use intent_core::{
     now_iso, AgentId, AgentStatus, Error, Hook, HookId, HookState, Result, WorkspaceApi,
     WorkspaceId,
 };
-use intent_store::NewEvent;
+use intent_store::{ActiveHookMetadata, NewEvent};
 use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -862,7 +862,7 @@ fn bound_wake_text(text: &str) -> String {
 /// Project one active hook into its idle-visibility `waitingOnHooks` entry:
 /// `{ hookId, name, nextRunAt?, expiresAt? }` — light metadata only, no
 /// code/lastState/logs.
-fn waiting_on_hooks_entry(h: Hook) -> Value {
+fn waiting_on_hooks_entry(h: ActiveHookMetadata) -> Value {
     let mut v = json!({
         "hookId": h.hook_id,
         "name": h.name,
@@ -1241,7 +1241,7 @@ impl Services {
     /// empty (visibility is best-effort and must never block an idle emit or
     /// wake delivery).
     pub(crate) async fn active_hooks_for_agent(&self, agent_id: &AgentId) -> Vec<Value> {
-        let hooks = match self.store.list_hooks_by_agent(agent_id).await {
+        let hooks = match self.store.active_hook_metadata_by_agent(agent_id).await {
             Ok(hooks) => hooks,
             Err(e) => {
                 tracing::warn!(
@@ -1252,11 +1252,7 @@ impl Services {
                 return Vec::new();
             }
         };
-        hooks
-            .into_iter()
-            .filter(|h| matches!(h.state, HookState::Scheduled | HookState::Running))
-            .map(waiting_on_hooks_entry)
-            .collect()
+        hooks.into_iter().map(waiting_on_hooks_entry).collect()
     }
 
     /// Workspace-batched variant of
@@ -1268,7 +1264,11 @@ impl Services {
         &self,
         workspace_id: &WorkspaceId,
     ) -> HashMap<String, Vec<Value>> {
-        let hooks = match self.store.list_hooks_by_workspace(workspace_id).await {
+        let hooks = match self
+            .store
+            .active_hook_metadata_by_workspace(workspace_id)
+            .await
+        {
             Ok(hooks) => hooks,
             Err(e) => {
                 tracing::warn!(
@@ -1280,10 +1280,7 @@ impl Services {
             }
         };
         let mut by_agent: HashMap<String, Vec<Value>> = HashMap::new();
-        for h in hooks
-            .into_iter()
-            .filter(|h| matches!(h.state, HookState::Scheduled | HookState::Running))
-        {
+        for h in hooks {
             let agent = h.agent_id.0.clone();
             by_agent
                 .entry(agent)

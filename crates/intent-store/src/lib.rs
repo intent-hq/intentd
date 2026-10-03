@@ -75,6 +75,7 @@ pub use delegation_group_repo::PersistedDelegationGroup;
 pub use diffs_repo::NewDiff;
 pub use event_repo::{EventQuery, NewEvent};
 pub use event_subscription_repo::PersistedEventSubscription;
+pub use hook_repo::ActiveHookMetadata;
 pub use host_membership_repo::{
     HostInviteJoinOutcome, HostJoinCredential, HostMemberRemoval, HostMembersSnapshot,
     OwnerQueuePermit,

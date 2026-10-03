@@ -24,6 +24,29 @@ const LIST_COLUMNS: &str = "hook_id, workspace_id, agent_id, name, delay_ms, sta
     CASE WHEN state IN ('scheduled', 'running') THEN last_logs END AS last_logs, \
     CASE WHEN state IN ('scheduled', 'running') THEN last_state END AS last_state";
 
+/// Active hook identity and timing for agent waiting visibility. This internal
+/// projection never loads scripts, logs, carried state, or retired hook rows.
+#[derive(Debug)]
+pub struct ActiveHookMetadata {
+    /// Owning agent, used to group a workspace read.
+    pub agent_id: AgentId,
+    /// Hook identity.
+    pub hook_id: HookId,
+    /// User-facing hook name.
+    pub name: String,
+    /// Next scheduled run, absent while running or for legacy rows.
+    pub next_run_at: Option<String>,
+    /// Expiry, absent for legacy rows.
+    pub expires_at: Option<String>,
+}
+
+const ACTIVE_BY_AGENT_SQL: &str =
+    "SELECT agent_id, hook_id, name, next_run_at, expires_at FROM hook \
+     WHERE agent_id = ? AND state IN ('scheduled', 'running') ORDER BY created_at";
+const ACTIVE_BY_WORKSPACE_SQL: &str =
+    "SELECT agent_id, hook_id, name, next_run_at, expires_at FROM hook \
+     WHERE workspace_id = ? AND state IN ('scheduled', 'running') ORDER BY created_at";
+
 fn state_to_db(state: HookState) -> &'static str {
     match state {
         HookState::Scheduled => "scheduled",
@@ -204,6 +227,55 @@ impl Store {
                 intent_core::Error::Internal(format!("list hooks by workspace failed: {e}"))
             })?;
         rows.iter().map(hook_from_row).collect()
+    }
+
+    /// Active hook metadata for one agent, oldest first. Filtering and payload
+    /// projection happen in SQL, using the partial active-agent index.
+    ///
+    /// # Errors
+    /// Returns `Error::Internal` if the database read or row decoding fails.
+    pub async fn active_hook_metadata_by_agent(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<Vec<ActiveHookMetadata>> {
+        self.active_hook_metadata(ACTIVE_BY_AGENT_SQL, &agent_id.0)
+            .await
+    }
+
+    /// Active hook metadata for a workspace, oldest first, for batched agent
+    /// decoration. The partial active-workspace index excludes retired history.
+    ///
+    /// # Errors
+    /// Returns `Error::Internal` if the database read or row decoding fails.
+    pub async fn active_hook_metadata_by_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<ActiveHookMetadata>> {
+        self.active_hook_metadata(ACTIVE_BY_WORKSPACE_SQL, &workspace_id.0)
+            .await
+    }
+
+    async fn active_hook_metadata(&self, sql: &str, id: &str) -> Result<Vec<ActiveHookMetadata>> {
+        let read = async {
+            let rows = sqlx::query(sql)
+                .bind(id)
+                .fetch_all(self.read_pool())
+                .await?;
+            rows.iter()
+                .map(|row| {
+                    Ok(ActiveHookMetadata {
+                        agent_id: AgentId(row.try_get("agent_id")?),
+                        hook_id: HookId(row.try_get("hook_id")?),
+                        name: row.try_get("name")?,
+                        next_run_at: row.try_get("next_run_at")?,
+                        expires_at: row.try_get("expires_at")?,
+                    })
+                })
+                .collect::<std::result::Result<Vec<_>, sqlx::Error>>()
+        };
+        read.await.map_err(|e| {
+            intent_core::Error::Internal(format!("read active hook metadata failed: {e}"))
+        })
     }
 
     /// The `hook.list` read for a workspace (optionally one agent's rows),
@@ -604,5 +676,58 @@ impl Store {
             .await
             .map_err(|e| intent_core::Error::Internal(format!("load active hooks failed: {e}")))?;
         rows.iter().map(hook_from_row).collect()
+    }
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+    use sqlx::{Column, Executor};
+
+    /// Exercise the production statements against migrated SQLite: scoped
+    /// partial-index seeks avoid scanning history and already supply ordering.
+    #[tokio::test]
+    async fn active_hook_metadata_queries_use_partial_indexes_and_only_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+        for (sql, index) in [
+            (ACTIVE_BY_AGENT_SQL, "idx_hook_active_agent"),
+            (ACTIVE_BY_WORKSPACE_SQL, "idx_hook_active_workspace"),
+        ] {
+            let description = store.read_pool().describe(sql).await.unwrap();
+            let columns: Vec<_> = description.columns().iter().map(Column::name).collect();
+            assert_eq!(
+                columns,
+                ["agent_id", "hook_id", "name", "next_run_at", "expires_at"]
+            );
+            let plan = sqlx::query(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .bind("missing")
+                .fetch_all(store.read_pool())
+                .await
+                .unwrap();
+            let details: Vec<String> = plan.iter().map(|row| row.get("detail")).collect();
+            assert!(
+                details
+                    .iter()
+                    .any(|line| line.contains("SEARCH") && line.contains(index)),
+                "{details:?}"
+            );
+            assert!(
+                !details
+                    .iter()
+                    .any(|line| line.contains("SCAN ") || line.contains("TEMP B-TREE")),
+                "{details:?}"
+            );
+        }
+        assert!(store
+            .active_hook_metadata_by_agent(&AgentId("missing".into()))
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .active_hook_metadata_by_workspace(&WorkspaceId("missing".into()))
+            .await
+            .unwrap()
+            .is_empty());
     }
 }
