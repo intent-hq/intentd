@@ -44,10 +44,9 @@ impl Store {
         .map_err(|_| Error::Internal("presence focus read failed".into()))?
         .ok_or_else(|| Error::NotFound("presence focus".into()))?;
         row.get::<Option<String>, _>("target")
-            .map(|value| {
+            .map_or(Ok(Value::Null), |value| {
                 serde_json::from_str(&value)
                     .map_err(|_| Error::Internal("presence focus decoding failed".into()))
             })
-            .unwrap_or(Ok(Value::Null))
     }
 }

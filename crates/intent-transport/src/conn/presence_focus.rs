@@ -1,11 +1,16 @@
 //! Private cross-workspace invalidations are triggers only: never forward their payloads.
-use super::*;
+use super::{send_fast_path_error, spawn_forwarder, ConnSubs, OutboundSender};
+use crate::{events, presence, subscriptions};
 use futures::FutureExt;
 use intent_core::events::{
-    AGENT_DELETED, HOST_MEMBERS_CHANGED, PRESENCE_CHANGED, WORKSPACE_DELETED,
+    AGENT_DELETED, AGENT_UPDATED, HOST_MEMBERS_CHANGED, NOTE_DELETED, NOTE_UPDATED,
+    PRESENCE_CHANGED, WORKSPACE_DELETED, WORKSPACE_UPDATED,
 };
-use intent_core::PrincipalId;
+use intent_core::{PrincipalId, WorkspaceApi, WorkspaceId};
+use intent_services::{EventBus, Subscription, SubscriptionFilter};
+use serde_json::{json, Value};
 use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
 
 pub(super) async fn subscribe(
     id: events::IdInfo,
@@ -104,11 +109,13 @@ async fn forward(
             // A queued invalidation (including lag) overtakes this read.
             if changes.try_recv_delivery().is_some() { continue; }
             let Ok(snapshot) = result else { return; };
-            if previous.as_ref() != Some(&snapshot) {
+            if previous.as_ref() == Some(&snapshot) {
+                drop(permit);
+            } else {
                 permit.send(subscriptions::build_snapshot_push(&subscription_id, seq, &snapshot));
                 seq += 1;
                 previous = Some(snapshot);
-            } else { drop(permit); }
+            }
             if changes.recv_delivery().await.is_none() { return; }
         }
     }).catch_unwind().await;
@@ -132,9 +139,9 @@ async fn forward(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use intent_core::Error;
+    use intent_core::{Error, EventActor};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::sync::Notify;
+    use tokio::sync::{mpsc, Notify};
 
     struct DelayedFocus {
         calls: AtomicUsize,
@@ -198,7 +205,7 @@ mod tests {
             workspace_id: WorkspaceId::from("secret-old"),
             timestamp: intent_core::now_iso(),
             event_type: WORKSPACE_UPDATED.into(),
-            actor: Default::default(),
+            actor: EventActor::default(),
             session_id: None,
             correlation_id: None,
             parent_event_id: None,
@@ -290,7 +297,7 @@ mod tests {
                         workspace_id: WorkspaceId::from("destination"),
                         timestamp: intent_core::now_iso(),
                         event_type: WORKSPACE_UPDATED.into(),
-                        actor: Default::default(),
+                        actor: EventActor::default(),
                         session_id: None,
                         correlation_id: None,
                         parent_event_id: None,
